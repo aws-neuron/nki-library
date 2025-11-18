@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nki_library"
+version = "1.0"
+description = "NeuronKernelInterfaceLibrary"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["NKI", "Neuron", "Kernels", "High-Performance", "Hardware", "AWS", "Amazon"]
+license = {text = "Apache-2.0"}
+dependencies = [
+    "neuronx-cc>=0.0.0a0",
+    "neuronx-cc-stubs>=0.0.0a0",
+    "nki>=0.0.0a0",
+]
+
+
+[project.optional-dependencies]
+test = [
+    "numpy",
+    "aws-embedded-metrics",
+    "fabric2",
+    "filelock",
+    "pytest",
+    "pytest-cov",
+    "pytest-xdist",
+    "pytest-metadata",
+    "pytest-html",
+    "ruff",
+    "pre-commit",
+    "debugpy",
+]
+
+[tool.setuptools]
+zip-safe = true
+include-package-data = true
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# Remove test exclusion to bundle tests in wheel
+# exclude = ["test"]
+
+[tool.setuptools.package-data]
+nkilib_standalone = ["py.typed"]
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+known_first_party = ["nkilib_standalone"]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+check_untyped_defs = true
+show_error_codes = true
+pretty = true
+ignore_missing_imports = true
+
+[tool.flake8]
+ignore = [
+    "E203",
+    "W503",
+    "E501",
+]
+max-line-length = 120
+
+[tool.ruff]
+ indent-width = 4
+ line-length = 120
+
+ [tool.ruff.format]
+ quote-style = "preserve"
+ indent-style = "space"
+ docstring-code-format = false
