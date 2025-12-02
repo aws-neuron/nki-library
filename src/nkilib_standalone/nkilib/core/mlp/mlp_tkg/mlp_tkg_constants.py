@@ -24,14 +24,14 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
-# common utils
-from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import get_verified_program_sharding_info
-from ...utils.allocator import sizeinbytes
-
 # subkernels utils
 from ...subkernels.layernorm_tkg import SHARDING_THRESHOLD as layernorm_threshold
 from ...subkernels.rmsnorm_tkg import SHARDING_THRESHOLD as rmsnorm_threshold
+from ...utils.allocator import sizeinbytes
+
+# common utils
+from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import get_verified_program_sharding_info
 
 # MLP utils
 from ..mlp_parameters import (
@@ -107,7 +107,7 @@ class MLPTKGConstants(nl.NKIObject):
     def calculate_constants(params: MLPParameters):
         """Calculates all constants needed for the MLP TKG kernel."""
         # --- Program sharding info ---
-        program_sharding_info = get_verified_program_sharding_info("mlp_kernel", (0, 1))
+        program_sharding_info = get_verified_program_sharding_info("mlp_tkg", (0, 1))
         num_shards = program_sharding_info[1]
         shard_id = program_sharding_info[2]
 
@@ -230,7 +230,7 @@ class MLPTKGConstants(nl.NKIObject):
         weight_dtype_size = sizeinbytes(weight_dtype)
 
         # Weight tiles are loaded [HTile, I] at a time for efficient memory access
-        gate_up_HTile = 2048
+        gate_up_HTile = 2048 * 2 if params.quant_params.is_quant() else 2048
         # number of H-tiles along H dimension
         gate_up_num_HTile_per_H = kernel_dims.H_per_shard // gate_up_HTile
         gate_up_remainderHTile = kernel_dims.H_per_shard % gate_up_HTile
@@ -246,7 +246,7 @@ class MLPTKGConstants(nl.NKIObject):
         gate_num_allocated_w_tile = min(num_required_w_tile, num_available_w_tile)
 
         if gate_num_allocated_w_tile <= 0:
-            gate_up_HTile = 512
+            gate_up_HTile = 512 * 2 if params.quant_params.is_quant() else 512
             # number of H-tiles along H dimension
             gate_up_num_HTile_per_H = kernel_dims.H_per_shard // gate_up_HTile
             gate_up_remainderHTile = kernel_dims.H_per_shard % gate_up_HTile
@@ -334,7 +334,7 @@ class MLPTKGConstants(nl.NKIObject):
 
         # --- H-tile size for Down projection ---
         if params.use_tkg_down_proj_column_tiling:
-            down_HTile = 4096
+            down_HTile = 4096 * 2 if params.quant_params.is_quant() else 4096
         else:
             down_HTile = kernel_dims.H1_shard * kernel_dims.H0
 

@@ -21,20 +21,21 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
+from ...utils.allocator import SbufManager
+
 # common utils
 from ...utils.common_types import ActFnType, NormType
-from ...utils.allocator import SbufManager
 from ...utils.logging import Logger
 
 # MLP utils
-from ..mlp_parameters import MLPParameters, mlpp_has_fused_add, mlpp_store_fused_add
+from ..mlp_parameters import MLPParameters, mlpp_has_fused_add, mlpp_store_fused_add, mlpp_has_normalization
 from .mlp_tkg_constants import MLPTKGConstants
 from .mlp_tkg_down_projection import process_down_projection
 from .mlp_tkg_gate_up_projection import process_gate_up_projection
 from .mlp_tkg_utils import input_fused_add, input_norm_load
 
 
-def mlp_tkg_invoke_kernel(
+def mlp_tkg(
     params: MLPParameters,
     output_tensor_hbm: nl.ndarray,
     output_stored_add_tensor_hbm: nl.ndarray,
@@ -45,59 +46,58 @@ def mlp_tkg_invoke_kernel(
     io_dtype = params.hidden_tensor.dtype
 
     # ---------------- Compute Kernel Dimensions & SBUF Manager ----------------
-    kernel_dims = MLPTKGConstants.calculate_constants(params)
+    dims = MLPTKGConstants.calculate_constants(params)
 
-    # TODO: replace 200KB with nl.tile_size.total_available_sbuf_size
     sbm = SbufManager(0, 200 * 1024, Logger("mlp_tkg"))
     sbm.open_scope()  # Start SBUF allocation scope
 
-    # Allocate heap tile for normalized or loaded input
-    input_sb = sbm.alloc_heap(
-        (kernel_dims.H0, kernel_dims.T, kernel_dims.H1_shard),
-        dtype=io_dtype,
-        buffer=nl.sbuf,
-        name="input_sbuf",
-    )
-
     # ---------------- Fused Add ----------------
     # Apply fused add if present (hidden + attention output)
-    hidden_hbm = params.hidden_tensor
-    fused_add_output_sb = None
+    hidden = params.hidden_tensor
     if mlpp_has_fused_add(params):
         if not params.fused_add_params.store_fused_add_result:
-            H1_dim = (
-                kernel_dims.H1_shard if params.norm_params.normalization_type == NormType.NO_NORM else kernel_dims.H1
-            )
+            H1_dim = dims.H1 if mlpp_has_normalization(params) else dims.H1_shard
             fused_add_output_sb = sbm.alloc_heap(
-                (kernel_dims.H0, kernel_dims.T, H1_dim),
+                (dims.H0, dims.T, H1_dim),
                 dtype=io_dtype,
                 buffer=nl.sbuf,
                 name="fused_add_output_sb",
             )
+            fused_add_output = fused_add_output_sb
+        else:
+            fused_add_output = output_stored_add_tensor_hbm
+
         input_fused_add(
-            input_hbm=hidden_hbm,
+            input=hidden,
             fused_add_tensor=params.fused_add_params.fused_add_tensor,
-            fused_output=(
-                output_stored_add_tensor_hbm if params.fused_add_params.store_fused_add_result else fused_add_output_sb
-            ),
+            fused_output=fused_add_output,
             normtype=params.norm_params.normalization_type,
             store_fused_add_result=params.fused_add_params.store_fused_add_result,
             sbm=sbm,
-            dims=kernel_dims,
+            dims=dims,
         )
-        hidden_hbm = output_stored_add_tensor_hbm  # Use fused result as hidden input
+        hidden = fused_add_output  # Use fused result as hidden input
 
     # ---------------- Norm / Input Load ----------------
-    input_to_read = hidden_hbm if fused_add_output_sb == None else fused_add_output_sb
-    input_norm_load(input_to_read, input_sb, params, kernel_dims, sbm)  # Norm or direct load
+    if mlpp_has_normalization(params) or (hidden.buffer != nl.sbuf):
+        # Allocate heap tile for normalized or loaded input
+        input_sb = sbm.alloc_heap(
+            (dims.H0, dims.T, dims.H1_shard),
+            dtype=io_dtype,
+            buffer=nl.sbuf,
+            name="input_sbuf",
+        )
+        input_norm_load(hidden, input_sb, params, dims, sbm)  # Norm or direct load
 
-    if fused_add_output_sb != None:
-        sbm.pop_heap()  # dealloc fused_add_output_sb
+        if hidden.buffer == nl.sbuf:
+            sbm.pop_heap()  # dealloc fused_add_output_sb
+    else:
+        input_sb = hidden
 
     # ---------------- Allocate Gate/Up/Down Projection SBUF ----------------
     # Allocate SBUF tile for gate/up projection output
     gate_up_sb = sbm.alloc_stack(
-        (kernel_dims.I0, kernel_dims.num_total_128_tiles_per_I, kernel_dims.T),
+        (dims.I0, dims.num_total_128_tiles_per_I, dims.T),
         dtype=io_dtype,
         buffer=nl.sbuf,
         name="gate_up_sbuf",
@@ -107,7 +107,7 @@ def mlp_tkg_invoke_kernel(
     gate_up_sb_before_tp = None
     if params.use_tkg_gate_up_proj_column_tiling:
         gate_up_sb_before_tp = sbm.alloc_heap(
-            (kernel_dims.T, kernel_dims.I),
+            (dims.T, dims.I),
             dtype=io_dtype,
             buffer=nl.sbuf,
             name="gate_up_sbuf_before_tp",
@@ -116,14 +116,14 @@ def mlp_tkg_invoke_kernel(
     # Allocate SBUF tile for down projection output
     if params.use_tkg_down_proj_column_tiling:
         down_sb = sbm.alloc_stack(
-            (kernel_dims.T, kernel_dims.H_per_shard),
+            (dims.T, dims.H_per_shard),
             dtype=io_dtype,
             buffer=nl.sbuf,
             name="down_sbuf",
         )
     else:
         down_sb = sbm.alloc_stack(
-            (kernel_dims.H0, kernel_dims.H1_shard, kernel_dims.T),
+            (dims.H0, dims.H1_shard, dims.T),
             dtype=io_dtype,
             buffer=nl.sbuf,
             name="down_sbuf",
@@ -135,7 +135,7 @@ def mlp_tkg_invoke_kernel(
         hidden=input_sb,
         output=gate_output,
         params=params,
-        dims=kernel_dims,
+        dims=dims,
         sbm=sbm,
     )
 
@@ -145,25 +145,21 @@ def mlp_tkg_invoke_kernel(
     # ---------- Transpose hidden if column tiling is enabled ----------
     if params.use_tkg_gate_up_proj_column_tiling:
         # Transpose hidden [T, I] to [I1, I0, T]
-        for i1_tile in range(kernel_dims.num_total_128_tiles_per_I):
-            i_tile_size = (
-                kernel_dims.I0
-                if kernel_dims.num_total_128_tiles_per_I - 1 != i1_tile
-                else kernel_dims.I - kernel_dims.I0 * i1_tile
-            )
-            psum_idx = i1_tile % kernel_dims._psum_bmax
+        for i1_tile in range(dims.num_total_128_tiles_per_I):
+            i_tile_size = dims.I0 if dims.num_total_128_tiles_per_I - 1 != i1_tile else dims.I - dims.I0 * i1_tile
+            psum_idx = i1_tile % dims._psum_bmax
             tp_psum = nl.ndarray(
-                (i_tile_size, kernel_dims.T),
+                (i_tile_size, dims.T),
                 dtype=io_dtype,
                 buffer=nl.psum,
                 name=f"transpose_psum_{i1_tile}",
-                address=(0, psum_idx * kernel_dims._psum_fmax * 4),
+                address=(0, psum_idx * dims._psum_fmax * 4),
             )
             nisa.nc_transpose(
                 dst=tp_psum,
-                data=gate_output[0 : kernel_dims.T, nl.ds(i1_tile * kernel_dims.I0, i_tile_size)],
+                data=gate_output[0 : dims.T, nl.ds(i1_tile * dims.I0, i_tile_size)],
             )
-            nisa.tensor_copy(dst=gate_up_sb[0:i_tile_size, i1_tile, 0 : kernel_dims.T], src=tp_psum)
+            nisa.tensor_copy(dst=gate_up_sb[0:i_tile_size, i1_tile, 0 : dims.T], src=tp_psum)
 
         # dealloc gate_up_sb_before_tp
         sbm.pop_heap()
@@ -173,7 +169,7 @@ def mlp_tkg_invoke_kernel(
         hidden=gate_up_sb,
         output=down_sb,
         params=params,
-        dims=kernel_dims,
+        dims=dims,
         gate_tile_info=gate_tile_info,
         sbm=sbm,
     )
@@ -181,7 +177,7 @@ def mlp_tkg_invoke_kernel(
     # ---------- Return output ----------
     if not params.store_output_in_sbuf:
         output_sb = sbm.alloc_stack(
-            (kernel_dims.T, kernel_dims.H_per_shard),
+            (dims.T, dims.H_per_shard),
             dtype=params.output_dtype,
             buffer=nl.sbuf,
             name="mlp_output_sb",
@@ -192,20 +188,20 @@ def mlp_tkg_invoke_kernel(
             # Transpose output[H0, H1, T] to [T, H]
             H0, H1, T = down_sb.shape
             for h1_tile in range(H1):
-                psum_idx = h1_tile % kernel_dims._psum_bmax
+                psum_idx = h1_tile % dims._psum_bmax
                 tp_psum = nl.ndarray(
                     (T, H0),
                     dtype=params.output_dtype,
                     buffer=nl.psum,
                     name=f"transpose_output_{h1_tile}",
-                    address=(0, psum_idx * kernel_dims._psum_fmax * 4),
+                    address=(0, psum_idx * dims._psum_fmax * 4),
                 )
                 nisa.nc_transpose(dst=tp_psum[0:T, 0:H0], data=down_sb[0:H0, h1_tile, 0:T])
                 if h1_tile % 2 == 0:
                     nisa.tensor_copy(
                         src=tp_psum[0:T, 0:H0],
                         dst=output_sb.ap(
-                            pattern=[[kernel_dims.H_per_shard, T], [H1, H0]],
+                            pattern=[[dims.H_per_shard, T], [H1, H0]],
                             offset=h1_tile,
                         ),
                         engine=nisa.engine.vector,
@@ -214,7 +210,7 @@ def mlp_tkg_invoke_kernel(
                     nisa.tensor_copy(
                         src=tp_psum[0:T, 0:H0],
                         dst=output_sb.ap(
-                            pattern=[[kernel_dims.H_per_shard, T], [H1, H0]],
+                            pattern=[[dims.H_per_shard, T], [H1, H0]],
                             offset=h1_tile,
                         ),
                         engine=nisa.engine.scalar,
@@ -226,11 +222,11 @@ def mlp_tkg_invoke_kernel(
             dst=output_tensor_hbm[
                 :,
                 nl.ds(
-                    kernel_dims.shard_id * kernel_dims.H_per_shard,
-                    kernel_dims.H_per_shard,
+                    dims.shard_id * dims.H_per_shard,
+                    dims.H_per_shard,
                 ),
             ],
-            src=output_sb[:, 0 : kernel_dims.H_per_shard],
+            src=output_sb[:, 0 : dims.H_per_shard],
         )
         # reshape back to 3D tensor
         output_tensor_hbm = output_tensor_hbm.reshape((B, S, H))

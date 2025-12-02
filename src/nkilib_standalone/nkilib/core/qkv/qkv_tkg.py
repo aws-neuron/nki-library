@@ -26,17 +26,22 @@ Multiple output layouts (BSD, NBSd) are supported to match downstream kernel req
 
 """
 
-from typing import Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional, Tuple
 
-import nki.language as nl
 import nki.isa as nisa
+import nki.language as nl
 
+from ..utils.allocator import (
+    SbufManager,
+    create_auto_alloc_manager,
+    sizeinbytes,
+)
 from ..utils.common_types import QKVOutputLayout, NormType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
-from ..utils.allocator import SbufManager, create_auto_alloc_manager, sizeinbytes
+from ..utils.logging import Logger, LogLevel
 
 from ..subkernels.rmsnorm_tkg import rmsnorm_tkg as _rmsnorm_tkg
 from ..subkernels.rmsnorm_tkg import SHARDING_THRESHOLD as rmsnorm_sharding_threshold
@@ -44,7 +49,6 @@ from ..subkernels.layernorm_tkg import layernorm_tkg as _layernorm_tkg
 from ..subkernels.layernorm_tkg import (
     SHARDING_THRESHOLD as layernorm_sharding_threshold,
 )
-
 
 # I_TILE_SIZE is chosen to match the maximum free dimension of a matmul instruction
 I_TILE_SIZE = 512
@@ -153,14 +157,14 @@ def qkv_tkg(
     """
 
     if not sbm:
-        sbm = create_auto_alloc_manager()
+        sbm = create_auto_alloc_manager(logger=Logger("qkv-sbm"))
 
     kernel_assert(
         sbm.is_auto_alloc(),
         "QKV TKG only supports auto allocation but got non-auto allocation SBM",
     )
 
-    sbm.open_scope()
+    sbm.open_scope(name="qkv_tkg")
 
     # Check program dimensionality
     _, num_shards, shard_id = get_verified_program_sharding_info("qkv_tkg", (0, 1))
@@ -222,11 +226,14 @@ def qkv_tkg(
             f"output_in_sbuf=True requires I < {I_SHARD_SIZE}, got I={I}",
         )
 
-    # Perform fused residual add in HBM
+    # Perform optional fused residual add in HBM
     # hidden_hbm: (B, S, H)
-    hidden_hbm = _fused_residual_add_hbm2hbm(fused_add, hidden, attn_prev, mlp_prev, dims, norm_type)
+    if fused_add:
+        hidden_hbm = _fused_residual_add_hbm2hbm(hidden, attn_prev, mlp_prev, dims, norm_type)
+    else:
+        hidden_hbm = hidden
 
-    # Perform fused norm and load - dispatches based on norm_type
+    # Perform optional fused norm and load - dispatches based on norm_type
     # hidden_sb: (H0, BxS, H1_sharded) if NO_NORM, (H0, BxS, H1) if RMS/LAYER_NORM
     hidden_sb, hidden_base_offset = _fused_norm_and_load(
         hidden_hbm=hidden_hbm,
@@ -441,7 +448,6 @@ def _calculate_constants(
 
 
 def _fused_residual_add_hbm2hbm(
-    fused_add: bool,
     hidden_hbm: nl.ndarray,
     attn_prev_hbm: nl.ndarray,
     mlp_prev_hbm: nl.ndarray,
@@ -452,7 +458,6 @@ def _fused_residual_add_hbm2hbm(
     Perform fused residual addition in HBM: hidden + attn_prev + mlp_prev.
 
     Args:
-        fused_add: Whether to perform fused addition
         hidden_hbm: Hidden states in HBM. Shape: (B, S, H)
         attn_prev_hbm: Previous attention residual in HBM. Shape: (B, S, H)
         mlp_prev_hbm: Previous MLP residual in HBM. Shape: (B, S, H)
@@ -462,8 +467,6 @@ def _fused_residual_add_hbm2hbm(
     Returns:
         Fused hidden states in HBM. Shape: (B, S, H)
     """
-    if not fused_add:
-        return hidden_hbm
 
     sharding_threshold = rmsnorm_sharding_threshold if norm_type == NormType.RMS_NORM else layernorm_sharding_threshold
 
@@ -573,6 +576,9 @@ def _fused_norm_and_load(
           Value: 0 if single-shard or with-norm, shard_id * H1_sharded if NO_NORM multi-shard
     """
 
+    BxS = dims.BxS
+    H0 = dims.H0
+    H1 = dims.H1
     shard_id = dims.shard_id
     num_shards = dims.num_shards
     H1_sharded = dims.H1_shard
@@ -582,29 +588,31 @@ def _fused_norm_and_load(
     if norm_type == NormType.NO_NORM:
         # Perform direct input load with no norm
         # hidden_sb: (H0, BxS, H1_sharded)
-        hidden_sb = _input_load(hidden_hbm, dims, sbm)
+        hidden_sb = sbm.alloc_stack((H0, BxS, H1_sharded), dtype=hidden_hbm.dtype, buffer=nl.sbuf)
+        hidden_sb = _input_load(hidden_hbm, hidden_sb, dims, sbm)
     elif norm_type == NormType.RMS_NORM or norm_type == NormType.LAYER_NORM:
         # Perform norm with load
+        hidden_sb = sbm.alloc_stack((H0, BxS, H1), dtype=hidden_hbm.dtype, buffer=nl.sbuf)
         if norm_type == NormType.RMS_NORM:
             # Perform rmsnorm with load
             # hidden_sb: (H0, BxS, H1)
             hidden_sb = _rmsnorm_tkg(
-                inp=hidden_hbm,
+                input=hidden_hbm,
                 gamma=norm_w,
+                output=hidden_sb,
                 eps=eps,
                 hidden_actual=hidden_actual,
-                output_in_sbuf=True,
                 sbm=sbm,
             )
         elif norm_type == NormType.LAYER_NORM:
             # Perform layernorm with load
             # hidden_sb: (H0, BxS, H1)
             hidden_sb = _layernorm_tkg(
-                inp=hidden_hbm,
+                input=hidden_hbm,
                 gamma=norm_w,
                 beta=norm_bias,
+                output=hidden_sb,
                 eps=eps,
-                output_in_sbuf=True,
                 sbm=sbm,
             )
         # Add an offset to account for no norm path having shape (H0, BxS, H1_sharded)
@@ -616,6 +624,7 @@ def _fused_norm_and_load(
 
 def _input_load(
     hidden_hbm: nl.ndarray,
+    hidden_sb: nl.ndarray,
     dims: DimensionSizes,
     sbm: SbufManager,
 ) -> nl.ndarray:
@@ -624,11 +633,12 @@ def _input_load(
 
     Args:
         hidden_hbm: Hidden states in HBM. Shape: (B, S, H)
+        hidden_sbuf: Hidden states in SBUF to be loaded to. Shape: (H0, BxS, H1_sharded)
         dims: Dimension sizes dataclass
         sbm: SbufManager object for SBUF allocation
 
     Returns:
-        Hidden states in SBUF. Shape: (H0, BxS, H1_sharded) or (H0, BxS, H1)
+        Hidden states in SBUF. Shape: (H0, BxS, H1_sharded)
     """
     # parse constants
     H0 = dims.H0
@@ -638,9 +648,7 @@ def _input_load(
     shard_id = dims.shard_id
     num_shards = dims.num_shards
     H1_sharded = dims.H1_shard
-    sbm.open_scope()
     if num_shards > 1:
-        hidden_sb = sbm.alloc((H0, BxS, H1_sharded), dtype=hidden_hbm.dtype, buffer=nl.sbuf)
         hidden_hbm = hidden_hbm.reshape((BxS, num_shards, H0, H1_sharded))
         hidden_hbm_pattern = [[H1_sharded, H0], [H, BxS], [1, H1_sharded]]
         hidden_hbm_offset = shard_id * H0 * H1_sharded
@@ -649,7 +657,6 @@ def _input_load(
             hidden_hbm.ap(pattern=hidden_hbm_pattern, offset=hidden_hbm_offset),
         )
     else:
-        hidden_sb = sbm.alloc((H0, BxS, H1), dtype=hidden_hbm.dtype, buffer=nl.sbuf)
         hidden_hbm = hidden_hbm.reshape((BxS, H0, H1))
         hidden_hbm_pattern = [[H1, H0], [H, BxS], [1, H1]]
         hidden_hbm_offset = 0
@@ -658,9 +665,53 @@ def _input_load(
             hidden_hbm.ap(pattern=hidden_hbm_pattern, offset=hidden_hbm_offset),
         )
 
-    sbm.close_scope()
-
     return hidden_sb
+
+
+def _initialize_qkv_out_with_bias(
+    qkv_out_sb: nl.ndarray,
+    qkv_bias: nl.ndarray,
+    dims: DimensionSizes,
+    shard_idx: int,
+    sbm: SbufManager,
+) -> None:
+    """
+    Initialize QKV output buffer with bias or zeros.
+
+    When bias is provided and this is shard_id 0, loads the bias into SBUF
+    and broadcasts it across all BxS partitions. Otherwise initializes to zeros.
+
+    Args:
+        qkv_out_sb: Output buffer to initialize. Shape: (BxS, I_shard_size)
+        qkv_bias: Optional bias tensor. Shape: (1, I_shard_size) or None
+        dims: Dimension sizes dataclass
+        sbm: SbufManager for SBUF allocation
+        shard_idx: Shard index for scope/buffer naming
+    """
+    BxS = dims.BxS
+
+    if qkv_bias != None and dims.shard_id == 0:
+        scope_name = f"qkv_bias_init_shard_{shard_idx}" if shard_idx is not None else "qkv_bias_init_shard"
+        sbm.open_scope(name=scope_name)
+
+        buffer_name = f"qkv_bias_sb_{shard_idx}" if shard_idx is not None else "qkv_bias_sb"
+        qkv_bias_sb = sbm.alloc_stack(
+            qkv_bias.shape,
+            dtype=qkv_bias.dtype,
+            buffer=nl.sbuf,
+            name=buffer_name,
+        )
+        nisa.dma_copy(qkv_bias_sb, qkv_bias)
+        # Broadcast bias to all BxS partitions
+        shuffle_mask = [0] * BxS + [255] * (32 - BxS)
+        nisa.nc_stream_shuffle(
+            src=qkv_bias_sb[0, 0 : qkv_bias.shape[1]],
+            dst=qkv_out_sb[0:BxS, 0 : qkv_bias.shape[1]],
+            shuffle_mask=shuffle_mask,
+        )
+        sbm.close_scope()
+    else:
+        nisa.memset(qkv_out_sb, value=0)
 
 
 def _qkv_projection_sbuf_output(
@@ -700,26 +751,32 @@ def _qkv_projection_sbuf_output(
     # Calculate shapes for sharded weights
     h_offset = dims.H1_offset * dims.H0
 
+    # Allocate qkv_out_sb in heap for now, in future pass in from top level
+    qkv_out_sb = sbm.alloc_heap((BxS, I), dtype=io_type, buffer=nl.sbuf)
+
+    _initialize_qkv_out_with_bias(qkv_out_sb, qkv_bias, dims, 0, sbm)
+
     # output_sb: (BxS, I)
     output_sb = _qkv_projection(
         hidden_sb=hidden_sb,
         qkv_w_hbm=qkv_w,
         qkv_bias_hbm=qkv_bias,
+        qkv_out_sb=qkv_out_sb,
         dims=dims,
         tiles=tiles,
+        shard_idx=0,
         sbm=sbm,
         outer_h_offset=h_offset,
         outer_h_size=dims.H_per_shard,
         outer_i_offset=0,
         outer_i_size=I,
         hidden_base_offset=hidden_base_offset,
-        shard_idx=0,
     )
 
     # Receive qkv projection output from the other neuron core when LNC > 1
     if num_shards > 1:
-        sbm.open_scope()
-        qkv_recv = sbm.alloc((BxS, I), dtype=io_type, buffer=nl.sbuf)
+        sbm.open_scope(name="output_store_sendrecv")
+        qkv_recv = sbm.alloc_stack((BxS, I), dtype=io_type, buffer=nl.sbuf)
         other_core = 1 - shard_id
         nisa.sendrecv(
             src=output_sb,
@@ -794,6 +851,8 @@ def _qkv_projection_hbm_output(
 
     # Process each I shard
     for i_shard_idx in range(tiles.num_I_shards):
+        sbm.open_scope(name=f"qkv_hbm_output_i_shard_{i_shard_idx}")
+
         # Calculate tiles for this shard
         tiles_shard = tiles
         if i_shard_idx < tiles.num_I_shards - 1:
@@ -820,6 +879,9 @@ def _qkv_projection_hbm_output(
         I_shard_end = min(I_shard_start + I_SHARD_SIZE, I)
         I_shard_size = I_shard_end - I_shard_start
 
+        # Allocate output SB that gets accumulated in HBM
+        qkv_out_sb = sbm.alloc_stack((BxS, I_shard_size), dtype=io_type, buffer=nl.sbuf)
+
         # Create bias slice for this shard if bias exists
         if qkv_bias != None:
             qkv_bias_pattern = [[I, 1], [1, I_shard_size]]
@@ -828,27 +890,30 @@ def _qkv_projection_hbm_output(
         else:
             qkv_bias_shard = None
 
+        _initialize_qkv_out_with_bias(qkv_out_sb, qkv_bias_shard, dims, i_shard_idx, sbm)
+
         # Perform QKV projection for this I shard
         # output_sb: (BxS, I_shard_size)
         output_sb = _qkv_projection(
             hidden_sb=hidden_sb,
             qkv_w_hbm=qkv_w,
             qkv_bias_hbm=qkv_bias_shard,
+            qkv_out_sb=qkv_out_sb,
             dims=dims,
             tiles=tiles_shard,
+            shard_idx=i_shard_idx,
             sbm=sbm,
             outer_h_offset=h_offset,
             outer_h_size=dims.H_per_shard,
             outer_i_offset=I_shard_start,
             outer_i_size=I_shard_size,
             hidden_base_offset=hidden_base_offset,
-            shard_idx=i_shard_idx,
         )
 
         # Receive qkv projection output from the other neuron core when LNC > 1
         if num_shards > 1:
-            sbm.open_scope()
-            qkv_recv = sbm.alloc((BxS, I_shard_size), dtype=io_type, buffer=nl.sbuf)
+            sbm.open_scope(name=f"output_store_sendrecv_shard_{i_shard_idx}")
+            qkv_recv = sbm.alloc_stack((BxS, I_shard_size), dtype=io_type, buffer=nl.sbuf)
             other_core = 1 - shard_id
             nisa.sendrecv(
                 src=output_sb,
@@ -870,6 +935,8 @@ def _qkv_projection_hbm_output(
             d_head=d_head,
             dims=dims,
         )
+
+        sbm.close_scope()
 
     # Reshape to expected output shape
     if output_layout == QKVOutputLayout.BSD:
@@ -944,15 +1011,16 @@ def _qkv_projection(
     hidden_sb: nl.ndarray,
     qkv_w_hbm: nl.ndarray,
     qkv_bias_hbm: nl.ndarray,
+    qkv_out_sb: nl.ndarray,
     dims: DimensionSizes,
     tiles: TileCounts,
+    shard_idx: int,
     sbm: SbufManager,
     outer_h_offset: int = 0,
-    outer_h_size: int = None,
+    outer_h_size: Optional[int] = None,
     outer_i_offset: int = 0,
-    outer_i_size: int = None,
-    hidden_base_offset: int = None,
-    shard_idx: int = None,
+    outer_i_size: Optional[int] = None,
+    hidden_base_offset: Optional[int] = None,
 ) -> nl.ndarray:
     # Calculate derived values from dims dataclass
     H1_sharded = dims.H1_shard
@@ -967,10 +1035,10 @@ def _qkv_projection(
     H = outer_h_size if outer_h_size != None else H_full
     I = outer_i_size if outer_i_size != None else I_full
 
-    sbm.open_scope()
+    sbm.open_scope(name=f"qkv_projection_shard_{shard_idx}")
 
-    # Allocate all buffers: output, weights, PSUMs
-    qkv_out_sb, qkv_w_sb, num_w_tile, result_psum = _allocate_qkv_buffers(
+    # Allocate all temp buffers: weights, PSUMs
+    qkv_w_sb, num_w_tile, result_psum = _allocate_qkv_buffers(
         BxS=BxS,
         I=I,
         H0=H0,
@@ -1054,14 +1122,13 @@ def _allocate_qkv_buffers(
     tiles: TileCounts,
     shard_idx: int,
     sbm: SbufManager,
-) -> Tuple[nl.ndarray, nl.ndarray, int, list]:
+) -> Tuple[nl.ndarray, int, list]:
     """
-    Allocate all buffers needed for QKV projection: output, weights, and PSUMs.
+    Allocate all buffers needed for QKV projection: weights, and PSUMs.
 
     Allocates:
-    1. Output buffer (qkv_out_sb) initialized with bias or zeros
-    2. Weight tile buffer (qkv_w_sb) sized to fit remaining SBUF space
-    3. PSUM tiles for accumulation (one per I tile)
+    1. Weight tile buffer (qkv_w_sb) sized to fit remaining SBUF space
+    2. PSUM tiles for accumulation (one per I tile)
 
     Args:
         BxS: Batch * seqlen dimension
@@ -1078,51 +1145,23 @@ def _allocate_qkv_buffers(
 
     Returns:
         Tuple of (qkv_out_sb, qkv_w_sb, num_w_tile, result_psum):
-        - qkv_out_sb: Output buffer initialized with bias or zeros
         - qkv_w_sb: Weight tile buffer
         - num_w_tile: Number of weight tiles allocated
         - result_psum: List of PSUM tiles
     """
-    # Allocate output
-    qkv_out_sb = sbm.alloc((BxS, I), dtype=output_dtype, name=f"qkv_out_shard_{shard_idx}", buffer=nl.sbuf)
-
-    # Initialize output with bias or zeros
-    if qkv_bias_hbm != None and dims.shard_id == 0:
-        sbm.open_scope()
-        qkv_bias_sb = sbm.alloc(
-            qkv_bias_hbm.shape,
-            dtype=qkv_bias_hbm.dtype,
-            buffer=nl.sbuf,
-            name=f"qkv_bias_sb_{shard_idx}",
-        )
-        nisa.dma_copy(qkv_bias_sb, qkv_bias_hbm)
-        # Broadcast bias to all BxS partitions
-        shuffle_mask = [0] * BxS + [255] * (32 - BxS)
-        nisa.nc_stream_shuffle(
-            src=qkv_bias_sb[0, 0 : qkv_bias_hbm.shape[1]],
-            dst=qkv_out_sb[0:BxS, 0 : qkv_bias_hbm.shape[1]],
-            shuffle_mask=shuffle_mask,
-        )
-        sbm.close_scope()
-    else:
-        nisa.memset(qkv_out_sb, value=0)
-
-    # Auto allocation: Estimate remaining SBUF space for weight tiles
-    io_addr = (I + BxS * H1_sharded) * sizeinbytes(output_dtype)
-    estimated_total_sbuf_size = nl.tile_size.total_available_sbuf_size
-    remaining_space = estimated_total_sbuf_size - io_addr
-    kernel_assert(
-        remaining_space >= 0,
-        f"Not enough SBUF space for qkv projection weight, provide smaller input.",
-    )
 
     # Calculate number of weight tiles that fit in remaining space
+    remaining_space = sbm.get_free_space()
     size_of_qkv_w_tile = I * tiles.num_128_tiles_per_H_tile * sizeinbytes(weight_dtype)
     num_available_w_tile = remaining_space // size_of_qkv_w_tile
     num_w_tile = min(tiles.num_H_tiles_per_H + (tiles.remainder_H_tile != 0), num_available_w_tile)
+    kernel_assert(
+        num_w_tile > 0,
+        f"Not enough SBUF space for qkv projection weight, need {size_of_qkv_w_tile}, got {remaining_space}",
+    )
 
     # Allocate weight tiles
-    qkv_w_sb = sbm.alloc(
+    qkv_w_sb = sbm.alloc_stack(
         (H0, num_w_tile, tiles.num_128_tiles_per_H_tile, I),
         name=f"qkv_w_sb_shard_{shard_idx}",
         dtype=weight_dtype,
@@ -1141,7 +1180,7 @@ def _allocate_qkv_buffers(
         )
         result_psum.append(psum_tensor)
 
-    return qkv_out_sb, qkv_w_sb, num_w_tile, result_psum
+    return qkv_w_sb, num_w_tile, result_psum
 
 
 def _process_h_tile(
@@ -1212,6 +1251,7 @@ def _process_h_tile(
         I: Effective I dimension for this projection
 
     """
+
     H0, BxS, H1 = hidden_sb.shape
 
     # Load weight tile from HBM to SBUF

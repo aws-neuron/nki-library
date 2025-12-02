@@ -26,11 +26,11 @@ from typing import Optional
 import nki.language as nl
 from nki.language import NKIObject
 
-from ...utils.kernel_helpers import get_ceil_aligned_size, NUM_HW_PSUM_BANKS
 from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, get_ceil_aligned_size
 from ...utils.tile_info import TiledDimInfo
 from ..mlp_parameters import MLPParameters
-from .mlp_cte_sharding import ShardedDim, DimShard, is_sharded_dim_bxs
+from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
 
 #
 # Local constants

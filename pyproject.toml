@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "numpy",
+    "torch",
     "aws-embedded-metrics",
     "fabric2",
     "filelock",

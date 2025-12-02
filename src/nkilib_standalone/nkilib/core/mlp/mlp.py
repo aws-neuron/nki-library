@@ -19,17 +19,17 @@ import nki
 import nki.language as nl
 
 # common utils
-from ..utils.common_types import ActFnType, NormType
+from ..utils.common_types import ActFnType, NormType, QuantizationType
 
 # MLP utils
-from .mlp_cte.mlp_cte import mlp_cte_invoke_kernel
+from .mlp_cte.mlp_cte import mlp_cte
 from .mlp_parameters import (
     MLPParameters,
     is_mlp_tkg,
     mlpp_store_fused_add,
     validate_mlp_arguments,
 )
-from .mlp_tkg.mlp_tkg import mlp_tkg_invoke_kernel
+from .mlp_tkg.mlp_tkg import mlp_tkg
 
 #
 # **********************
@@ -39,7 +39,7 @@ from .mlp_tkg.mlp_tkg import mlp_tkg_invoke_kernel
 
 
 @nki.jit
-def mlp_kernel(
+def mlp(
     hidden_tensor: nl.ndarray,
     gate_proj_weights_tensor: nl.ndarray,
     up_proj_weights_tensor: nl.ndarray,
@@ -53,12 +53,23 @@ def mlp_kernel(
     store_fused_add_result: bool = False,
     activation_fn: ActFnType = ActFnType.SiLU,
     normalization_type: NormType = NormType.NO_NORM,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    gate_w_scale: Optional[nl.ndarray] = None,
+    up_w_scale: Optional[nl.ndarray] = None,
+    down_w_scale: Optional[nl.ndarray] = None,
+    gate_up_in_scale: Optional[nl.ndarray] = None,
+    down_in_scale: Optional[nl.ndarray] = None,
     output_dtype=None,
     store_output_in_sbuf: bool = False,
     eps: float = 1e-6,
+    skip_gate_proj: bool = False,
     use_tkg_gate_up_proj_column_tiling: bool = True,
     use_tkg_down_proj_column_tiling: bool = True,
     use_tkg_down_proj_optimized_layout: bool = False,
+    gate_clamp_upper_limit: Optional[float] = None,
+    gate_clamp_lower_limit: Optional[float] = None,
+    up_clamp_upper_limit: Optional[float] = None,
+    up_clamp_lower_limit: Optional[float] = None,
     force_cte_mode: bool = False,
 ) -> list[nl.ndarray]:
     """
@@ -103,12 +114,26 @@ def mlp_kernel(
             (default: False)
         activation_fn (ActFnType): Activation function type.
         normalization_type (NormType): Type of normalization.
+        quantization_type (QuantizationType): Quantization type to use (default: QuantizationType.NONE).
+            Supported values are QuantizationType.STATIC and QuantizationType.ROW.
+            Quantization is only supported in TKG mode.
+        gate_w_scale (nl.ndarray, optional): FP8 dequantization scales for gate weights.
+            Shape is [128, I] for row-wise quantization, [128, 1] for static quantization. Defaults to None.
+        up_w_scale (nl.ndarray, optional): FP8 dequantization scales for up weights.
+            Shape is [128, I] for row-wise quantization, [128, 1] for static quantization. Defaults to None.
+        down_w_scale (nl.ndarray, optional): FP8 dequantization scales for down weights.
+            Shape is [128, I] for row-wise quantization, [128, 1] for static quantization. Defaults to None.
+        gate_up_in_scale (nl.ndarray, optional): FP8 dequantization scales for gate and up input.
+            Used for static quantization with shape [128, 1]. Defaults to None.
+        down_in_scale (nl.ndarray, optional): FP8 dequantization scales for down input.
+            Used for static quantization with shape [128, 1]. Defaults to None.
         output_dtype: Output tensor data type. Defaults to None; if None, the hidden tensor’s dtype is used.
         store_output_in_sbuf (bool): If True, stores the output in SBUF instead of HBM,
             allowing the next layer to read it directly without an additional load operation.
             This option is only available in TKG mode where output tensor is small enough to fit in SBUF.
             (default: False)
         eps (float): Epsilon value for numerical stability.
+        skip_gate_proj (bool): Skip gate projection
         use_tkg_gate_up_proj_column_tiling (bool): If True, uses column tiling for the gate
             and up projection in TKG mode. (default: True)
         use_tkg_down_proj_column_tiling (bool): If True, uses column tiling for the down projection in TKG mode.
@@ -118,6 +143,10 @@ def mlp_kernel(
             [I, lnc, H // (128 * lnc), 128]. This layout provides unit-stride weight loading,
             reducing the matrix multiplication initiation interval. Only applied when
             `use_tkg_down_proj_column_tiling` is False. (default: False)
+        gate_clamp_upper_limit (float): upper bound value to clamp on gate projection results, does not perform clamping if the value is set to None
+        gate_clamp_lower_limit (float): lower bound value to clamp on gate projection results, does not perform clamping if the value is set to None
+        up_clamp_upper_limit (float): upper bound value to clamp on up projection results, does not perform clamping if the value is set to None
+        up_clamp_lower_limit (float): lower bound value to clamp on up projection results, does not perform clamping if the value is set to None
         force_cte_mode (bool): If True, forces the use of CTE mode. (default: False)
 
     Returns:
@@ -157,12 +186,23 @@ def mlp_kernel(
         up_proj_bias_tensor=up_proj_bias_tensor,
         down_proj_bias_tensor=down_proj_bias_tensor,
         normalization_bias_tensor=normalization_bias_tensor,
+        quantization_type=quantization_type,
+        gate_w_scale=gate_w_scale,
+        up_w_scale=up_w_scale,
+        down_w_scale=down_w_scale,
+        gate_up_in_scale=gate_up_in_scale,
+        down_in_scale=down_in_scale,
         output_dtype=output_dtype,
         store_output_in_sbuf=store_output_in_sbuf,
         eps=eps,
+        skip_gate_proj=skip_gate_proj,
         use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
         use_tkg_down_proj_column_tiling=use_tkg_down_proj_column_tiling,
         use_tkg_down_proj_optimized_layout=use_tkg_down_proj_optimized_layout,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
     )
 
     # Validate MLP arguments
@@ -195,8 +235,8 @@ def mlp_kernel(
     # If batch size × sequence length <= TKG_BS_SEQLEN_THRESHOLD(currently at 96), the kernel runs in TKG mode.
     # TODO: update TKG_BS_SEQLEN_THRESHOLD to 128
     if is_mlp_tkg(mlp_params) and not force_cte_mode:
-        return mlp_tkg_invoke_kernel(mlp_params, out, fused_add_out)
+        return mlp_tkg(mlp_params, out, fused_add_out)
     else:
-        mlp_cte_invoke_kernel(mlp_params, out, fused_add_out)
+        mlp_cte(mlp_params, out, fused_add_out)
         # Return all output tensors (mlp output and optionally fused add)
         return output_tensors

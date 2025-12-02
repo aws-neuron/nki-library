@@ -20,8 +20,9 @@ TiledRangeIterator represents a single tile with size, index, and start_offset p
 
 """
 
-from typing import Tuple
 import math
+from typing import Tuple
+
 from nki.language import NKIObject
 
 

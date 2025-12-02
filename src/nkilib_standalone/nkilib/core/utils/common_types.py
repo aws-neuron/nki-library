@@ -36,6 +36,12 @@ class ActFnType(Enum):
     Swish = 3
 
 
+class QuantizationType(Enum):
+    NONE = 0
+    STATIC = 1
+    ROW = 2
+
+
 class RouterActFnType(Enum):
     """Supported activation types for RouterTopK kernel"""
 

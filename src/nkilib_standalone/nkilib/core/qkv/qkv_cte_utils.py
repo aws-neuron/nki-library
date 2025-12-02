@@ -26,11 +26,12 @@ from typing import Any, Optional
 import nki as nki
 import nki.language as nl
 
+from ..utils.allocator import SbufManager
+
 # NKI Library
 from ..utils.common_types import NormType, QKVOutputLayout
-from ..utils.allocator import SbufManager
-from ..utils.kernel_helpers import get_program_sharding_info, is_launched_as_spmd
 from ..utils.kernel_assert import kernel_assert
+from ..utils.kernel_helpers import get_program_sharding_info, is_launched_as_spmd
 
 
 # Represents unmodified user inputs, no additional data members.

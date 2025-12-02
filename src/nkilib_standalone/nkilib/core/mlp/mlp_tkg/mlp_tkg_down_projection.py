@@ -18,16 +18,22 @@ kernels - high performance MLP kernels
 """
 
 import math
+from typing import Optional
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
 
+from ...utils.allocator import SbufManager
+
 # common utils
 from ...utils.kernel_assert import kernel_assert
-from ...utils.allocator import SbufManager
 from ...utils.logging import Logger
 from ...utils.tiled_range import TiledRange
+from ...utils.interleave_copy import interleave_copy
+from ...utils.common_types import QuantizationType
+from ...utils.tensor_view import TensorView
+from ...utils.kernel_helpers import get_max_positive_value_for_dtype
 
 # MLP utils
 from ..mlp_parameters import MLPParameters, mlpp_has_down_projection_bias
@@ -43,12 +49,13 @@ def down_projection(
     hidden: nl.ndarray,
     weight: nl.ndarray,
     bias: nl.ndarray,
+    output_tile: nl.ndarray,
     weight_tiles: list[nl.ndarray],
     bias_tile: nl.ndarray,
-    zero_bias_tile: nl.ndarray,
-    output: nl.ndarray,
+    dequant_tile: nl.ndarray,
     dims: MLPTKGConstantsDimensionSizes,
     tiles: MLPTKGConstantsDownTileCounts,
+    params: MLPParameters,
 ):
     """
     Performs a single Down projection shard on the H.
@@ -74,8 +81,8 @@ def down_projection(
     ---------------------------
     - `column_tiling_dim` = [32, 64, 128], chosen based on T.
     - `column_tiling_factor` = 128 / column_tiling_dim, with a maximum factor of 4 → up to 4× speedup.
-    - `col_tiled_HTile` = HTile / column_tiling_factor
-    H/HTile * HTile/column_tiling_factor(parallel execution) * col_tiled_HTile/512 * [ I/128 * (Hidden[128, T] @ Weight[128, 512]) ]
+    - `column_tile` = HTile / column_tiling_factor
+    H/HTile * HTile/column_tiling_factor(parallel execution) * column_tile/512 * [ I/128 * (Hidden[128, T] @ Weight[128, 512]) ]
 
     Key Points:
     -----------
@@ -99,12 +106,12 @@ def down_projection(
     weight_base_idx = tiles.weight_base_idx
 
     # ---------- Bias handling ----------
-    is_bias = bias != None
+    is_bias = bias is not None
     if is_bias:
         # Load bias
         nisa.dma_copy(
             dst=bias_tile[0:1, 0:H],
-            src=bias[:, nl.ds(dims.shard_id * dims.H_per_shard, dims.H_per_shard)],
+            src=bias[:, nl.ds(dims.shard_id * H, H)],
             dge_mode=nisa.dge_mode.none,
         )
 
@@ -166,11 +173,15 @@ def down_projection(
                 weight_base_idx + hidden_tiles.index * dims.num_total_128_tiles_per_I + i_tiles.index
             ) % tiles.num_allocated_w_tile
             nisa.dma_copy(
-                dst=weight_tiles[weight_idx][0 : i_tiles.size, 0 : hidden_tiles.size],
-                src=weight[
-                    nl.ds(i_tiles.index * I0, i_tiles.size),
-                    nl.ds(dims.shard_id * dims.H_per_shard + h_offset, hidden_tiles.size),
-                ],
+                dst=weight_tiles[weight_idx].ap(
+                    pattern=[[weight_tiles[weight_idx].shape[1], i_tiles.size], [1, hidden_tiles.size]],
+                    dtype=nl.float8_e4m3 if str(weight.dtype) == "float8e4" else weight.dtype,
+                ),
+                src=weight.ap(
+                    pattern=[[weight.shape[1], i_tiles.size], [1, hidden_tiles.size]],
+                    offset=i_tiles.start_offset * weight.shape[1] + dims.shard_id * dims.H_per_shard + h_offset,
+                    dtype=nl.float8_e4m3 if str(weight.dtype) == "float8e4" else weight.dtype,
+                ),
                 dge_mode=nisa.dge_mode.none,
             )
 
@@ -200,70 +211,51 @@ def down_projection(
                     tile_size=(I0, res_h1_tile),
                 )
 
-        # ---------- Accumulate partial PSUM output to SB and optionally apply bias ----------
+        # ---------- Accumulate partial PSUM output to SB and optionally apply dequant scale and bias ----------
+        bias_tile_view = TensorView(bias_tile) if is_bias else None
+        dequant_tile_view = TensorView(dequant_tile) if params.quant_params.is_quant() else None
         for column_tile in TiledRange(h1_tiles, dims.column_tiling_factor):
             for column_idx in range(column_tile.size):
                 dst_offset = h_offset + (column_tile.index * dims.column_tiling_factor + column_idx) * dims._psum_fmax
-                cur_h = dims._psum_fmax
-                if is_bias:
-                    nisa.tensor_tensor(
-                        dst=output[0:T, nl.ds(dst_offset, dims._psum_fmax)],
-                        data1=result_psums[column_tile.index][
-                            nl.ds(dims.column_tiling_dim * column_idx, T),
-                            0 : dims._psum_fmax,
-                        ],
-                        data2=bias_tile[0:T, nl.ds(dst_offset, dims._psum_fmax)],
-                        op=nl.add,
-                    )
-                else:
-                    if column_idx % 2 == 0:
-                        nisa.activation(
-                            dst=output[0:T, nl.ds(dst_offset, dims._psum_fmax)],
-                            data=result_psums[column_tile.index][
-                                nl.ds(dims.column_tiling_dim * column_idx, T),
-                                0 : dims._psum_fmax,
-                            ],
-                            bias=zero_bias_tile[0:T, :],
-                            op=nl.copy,
-                        )
-                    else:
-                        nisa.tensor_copy(
-                            dst=output[0:T, nl.ds(dst_offset, dims._psum_fmax)],
-                            src=result_psums[column_tile.index][
-                                nl.ds(dims.column_tiling_dim * column_idx, T),
-                                0 : dims._psum_fmax,
-                            ],
-                            engine=nki.isa.vector_engine,
-                        )
+                interleave_copy(
+                    index=column_idx + column_tile.index * column_tile.size,
+                    dst=output_tile[0:T, nl.ds(dst_offset, dims._psum_fmax)],
+                    src=result_psums[column_tile.index][
+                        nl.ds(dims.column_tiling_dim * column_idx, T),
+                        0 : dims._psum_fmax,
+                    ],
+                    scale=dequant_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + dims._psum_fmax)
+                    if params.quant_params.is_quant_row()
+                    else dequant_tile_view,
+                    bias=bias_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + dims._psum_fmax)
+                    if is_bias
+                    else None,
+                )
 
         if res_h1_tile != 0:
             dst_offset = h_offset + h1_tiles * dims._psum_fmax
-            if is_bias:
-                nisa.tensor_tensor(
-                    dst=output[0:T, nl.ds(dst_offset, res_h1_tile)],
-                    data1=result_psums[h1_tiles][0:T, 0:res_h1_tile],
-                    data2=bias_tile[0:T, nl.ds(dst_offset, res_h1_tile)],
-                    op=nl.add,
-                )
-            else:
-                nisa.tensor_copy(
-                    dst=output[0:T, nl.ds(dst_offset, res_h1_tile)],
-                    src=result_psums[h1_tiles][0:T, 0:res_h1_tile],
-                    engine=nki.isa.vector_engine,
-                )
+            interleave_copy(
+                index=0,
+                dst=output_tile[0:T, nl.ds(dst_offset, res_h1_tile)],
+                src=result_psums[h1_tiles][0:T, 0:res_h1_tile],
+                scale=dequant_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + res_h1_tile)
+                if params.quant_params.is_quant_row()
+                else dequant_tile_view,
+                bias=bias_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + res_h1_tile) if is_bias else None,
+            )
 
 
 def down_projection_lhs_rhs_swap(
     hidden: nl.ndarray,
     weight: nl.ndarray,
     bias: nl.ndarray,
+    output_tile: nl.ndarray,
     weight_tiles: list[nl.ndarray],
     bias_tile: nl.ndarray,
-    zero_bias_tile: nl.ndarray,
-    output: nl.ndarray,
+    dequant_tile: nl.ndarray,
     dims: MLPTKGConstantsDimensionSizes,
     tiles: MLPTKGConstantsDownTileCounts,
-    use_tkg_down_proj_optimized_layout: bool,
+    params: MLPParameters,
 ):
     """
     Performs a single Down projection shard on the H using regular matmult with operands swapped
@@ -292,12 +284,11 @@ def down_projection_lhs_rhs_swap(
     # Offset to prevent anti-dependencies with gate/up weight loads, enabling efficient weight tile loading.
     weight_base_idx = tiles.weight_base_idx
 
-    # ---------- Bias load ----------
+    # ---------- Load Bias ----------
     is_bias = bias != None
     if is_bias:
-        bias = bias.reshape((H0, dims.H1_shard))
         nisa.dma_copy(
-            src=bias[0:H0, 0 : dims.H1_shard],
+            src=bias.ap(pattern=[[dims.H1_shard, H0], [1, dims.H1_shard]], offset=dims.shard_id * dims.H_per_shard),
             dst=bias_tile[0:H0, 0 : dims.H1_shard],
             dge_mode=nisa.dge_mode.none,
         )
@@ -347,7 +338,7 @@ def down_projection_lhs_rhs_swap(
             # When it is enabled, the framework is expected to permute the weights
             # so that the weight tile can be accessed without any stride.
             h1_tiles = TiledRange(hidden_tiles.size, H0)
-            if use_tkg_down_proj_optimized_layout:
+            if params.use_tkg_down_proj_optimized_layout:
                 for h1_tile in h1_tiles:
                     psum_idx = (h1_offset + h1_tile.index) // perBankT
                     psum_offset = (h1_offset + h1_tile.index) % perBankT
@@ -373,53 +364,45 @@ def down_projection_lhs_rhs_swap(
                     )
 
     # Reshape output to 2D
-    output = output.reshape((H0, dims.H1_shard * T))
+    output_tile = output_tile.reshape((H0, dims.H1_shard * T))
 
     # Copy PSUM output to SB
+    bias_tile_view = TensorView(bias_tile) if is_bias else None
     for psum_tiles in TiledRange(dims.H1_shard, perBankT):
         # Number of elements that each PSUM can hold
         perBankElem = perBankT * T
         # Actual number of elements in the current PSUM
         numElements = psum_tiles.size * T
 
-        if is_bias:
-            if psum_tiles.index % 2 == 0:
-                nisa.activation(
-                    dst=output[0:H0, nl.ds(psum_tiles.index * perBankElem, numElements)],
-                    data=result_psums[psum_tiles.index][0:H0, 0:numElements],
-                    bias=bias_tile.ap(
-                        pattern=[[dims.H1_shard, H0], [1, psum_tiles.size], [0, T]],
-                        offset=psum_tiles.index * psum_tiles.size,
-                    ),
-                    op=nl.copy,
-                )
-            else:
-                nisa.tensor_tensor(
-                    dst=output[0:H0, nl.ds(psum_tiles.index * perBankElem, numElements)],
-                    data1=result_psums[psum_tiles.index][0:H0, 0:numElements],
-                    data2=bias_tile.ap(
-                        pattern=[[dims.H1_shard, H0], [1, psum_tiles.size], [0, T]],
-                        offset=psum_tiles.index * psum_tiles.size,
-                    ),
-                    op=nl.add,
-                )
+        if params.quant_params.is_quant_row():
+            dequant_tile_view = (
+                TensorView(dequant_tile)
+                .slice(dim=1, start=psum_tiles.index * psum_tiles.size, end=(psum_tiles.index + 1) * psum_tiles.size)
+                .expand_dim(dim=2)
+                .broadcast(dim=2, size=T)
+            )
         else:
-            if psum_tiles.index % 2 == 0:
-                nisa.activation(
-                    dst=output[0:H0, nl.ds(psum_tiles.index * perBankElem, numElements)],
-                    data=result_psums[psum_tiles.index][0:H0, 0:numElements],
-                    bias=zero_bias_tile,
-                    op=nl.copy,
-                )
-            else:
-                nisa.tensor_copy(
-                    dst=output[0:H0, nl.ds(psum_tiles.index * perBankElem, numElements)],
-                    src=result_psums[psum_tiles.index][0:H0, 0:numElements],
-                    engine=nki.isa.vector_engine,
-                )
+            dequant_tile_view = TensorView(dequant_tile) if params.quant_params.is_quant() else None
+
+        bias_tile_view = None
+        if is_bias:
+            bias_tile_view = (
+                TensorView(bias_tile)
+                .slice(dim=1, start=psum_tiles.index * psum_tiles.size, end=(psum_tiles.index + 1) * psum_tiles.size)
+                .expand_dim(dim=2)
+                .broadcast(dim=2, size=T)
+            )
+
+        interleave_copy(
+            index=psum_tiles.index,
+            dst=output_tile[0:H0, nl.ds(psum_tiles.index * perBankElem, numElements)],
+            src=result_psums[psum_tiles.index][0:H0, 0:numElements],
+            scale=dequant_tile_view,
+            bias=bias_tile_view,
+        )
 
     # Reshape output back to 3D
-    output = output.reshape((H0, dims.H1_shard, T))
+    output_tile = output_tile.reshape((H0, dims.H1_shard, T))
 
 
 def process_down_projection(
@@ -461,9 +444,11 @@ def process_down_projection(
     If HBM out-of-memory (OOM) issues arise, we can fall back to DGE mode.
 
     """
-    down_w, down_b = (
+    down_w, down_b, down_w_scale, down_in_scale = (
         params.down_proj_weights_tensor,
         params.bias_params.down_proj_bias_tensor,
+        params.quant_params.down_w_scale,
+        params.quant_params.down_in_scale,
     )
 
     sbm.open_scope()  # Begin SBUF allocation scope
@@ -486,14 +471,51 @@ def process_down_projection(
                 buffer=nl.sbuf,
             )
 
-    # Allocate zero bias
-    zero_bias_tile = sbm.alloc_heap(
-        (dims.H0, 1),
-        dtype=hidden.dtype,
-        buffer=nl.sbuf,
-        name="down_activation_zero_bias",
-    )
-    nisa.memset(dst=zero_bias_tile, value=0.0)
+    dequant_tile = None
+    # ---------------- Static quantization ----------------
+    if params.quant_params.is_quant_static():
+        par_dims = dims.T if params.use_tkg_down_proj_column_tiling else dims.H0
+        dequant_tile = sbm.alloc_stack((par_dims, 1), dtype=down_w_scale.dtype, name=f"down_w_scale_sb", align=4)
+        nisa.dma_copy(dst=dequant_tile[:par_dims, :], src=down_w_scale[:par_dims, :], dge_mode=nisa.dge_mode.none)
+
+        # does not need to update addr since it's going to be dropped after input quant
+        in_scale_sb = sbm.alloc_heap((nl.tile_size.pmax, 1), dtype=nl.float32)
+        nisa.dma_copy(dst=in_scale_sb, src=down_in_scale, dge_mode=nisa.dge_mode.none)
+
+        # pre-apply input scales onto the weight scaling
+        nisa.activation(dst=dequant_tile, op=nl.copy, data=dequant_tile, scale=in_scale_sb[:par_dims, :])
+
+        # quantize the inputs
+        nisa.reciprocal(dst=in_scale_sb, data=in_scale_sb)
+        nisa.activation(dst=hidden, op=nl.copy, data=hidden, scale=in_scale_sb[: dims.H0, :])
+        max_pos_val = get_max_positive_value_for_dtype(down_w.dtype)
+        nisa.tensor_scalar(
+            dst=hidden, data=hidden, op0=nl.minimum, operand0=max_pos_val, op1=nl.maximum, operand1=-max_pos_val
+        )
+        sbm.pop_heap()  # in_scale_sb
+
+    # ---------------- Row quantization ----------------
+    elif params.quant_params.is_quant_row():
+        if params.use_tkg_down_proj_column_tiling:
+            dequant_tile = sbm.alloc_stack(
+                (dims.T, dims.H_per_shard), dtype=down_w_scale.dtype, name=f"down_w_scale_sb", align=4
+            )
+            nisa.dma_copy(
+                dst=dequant_tile[0 : dims.T, 0 : dims.H_per_shard],
+                src=down_w_scale[0 : dims.T, nl.ds(dims.shard_id * dims.H_per_shard, dims.H_per_shard)],
+                dge_mode=nisa.dge_mode.none,
+            )
+        else:
+            dequant_tile = sbm.alloc_stack(
+                (dims.H0, dims.H1_shard), dtype=down_w_scale.dtype, name=f"down_w_scale_sb", align=4
+            )
+            nisa.dma_copy(
+                src=down_w_scale.ap(
+                    pattern=[[dims.H1_shard, dims.H0], [1, dims.H1_shard]], offset=dims.shard_id * dims.H_per_shard
+                ),
+                dst=dequant_tile[0 : dims.H0, 0 : dims.H1_shard],
+                dge_mode=nisa.dge_mode.none,
+            )
 
     # ---------------- Allocate Weight Tiles ----------------
     # By calculating the remaining SBUF space, we allocate as many weight tiles as possible
@@ -509,7 +531,7 @@ def process_down_projection(
         weight_tile = sbm.alloc_stack(
             (dims.I0, tiles.HTile),
             name=f"down_w_tile_{i}",
-            dtype=down_w.dtype,
+            dtype=nl.float8_e4m3 if str(down_w.dtype) == "float8e4" else down_w.dtype,
             buffer=nl.sbuf,
         )
         weight_tiles.append(weight_tile)
@@ -520,12 +542,13 @@ def process_down_projection(
             hidden=hidden,
             weight=down_w,
             bias=down_b,
+            output_tile=output,
             weight_tiles=weight_tiles,
             bias_tile=bias_tile,
-            zero_bias_tile=zero_bias_tile,
-            output=output,
+            dequant_tile=dequant_tile,
             dims=dims,
             tiles=tiles,
+            params=params,
         )
 
     else:
@@ -533,16 +556,15 @@ def process_down_projection(
             hidden=hidden,
             weight=down_w,
             bias=down_b,
+            output_tile=output,
             weight_tiles=weight_tiles,
             bias_tile=bias_tile,
-            zero_bias_tile=zero_bias_tile,
-            output=output,
+            dequant_tile=dequant_tile,
             dims=dims,
             tiles=tiles,
-            use_tkg_down_proj_optimized_layout=params.use_tkg_down_proj_optimized_layout,
+            params=params,
         )
 
-    sbm.pop_heap()  # Deallocate temporary zero_bias
     sbm.close_scope()  # Close SBUF scope
 
     return output, tiles

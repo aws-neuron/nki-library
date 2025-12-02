@@ -21,7 +21,7 @@ buffer counts, PSUM bank requirements, and sharding information.
 """
 
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 import nki
 import nki.isa as nisa
@@ -29,23 +29,23 @@ import nki.language as nl
 from nki.language import NKIObject
 
 from ...utils.allocator import SbufManager
+from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import (
     NUM_HW_PSUM_BANKS,
 )
-from ...utils.kernel_assert import kernel_assert
 from ..mlp_parameters import (
     MLPParameters,
+    mlpp_has_down_projection_bias,
     mlpp_has_gate_projection,
     mlpp_has_gate_projection_bias,
-    mlpp_has_up_projection_bias,
-    mlpp_has_down_projection_bias,
     mlpp_has_layer_normalization,
-    mlpp_has_rms_normalization,
-    mlpp_has_normalization_weights,
     mlpp_has_normalization_bias,
+    mlpp_has_normalization_weights,
+    mlpp_has_rms_normalization,
+    mlpp_has_up_projection_bias,
 )
+from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
 from .mlp_cte_tile_info import MLPCTETileInfo
-from .mlp_cte_sharding import ShardedDim, DimShard, is_sharded_dim_bxs
 
 #
 # Public constants

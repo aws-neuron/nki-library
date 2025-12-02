@@ -30,9 +30,9 @@ from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info
 from ..mlp_parameters import (
     MLPParameters,
-    override_seq_len,
-    override_inter_size,
     mlpp_has_projection_bias,
+    override_inter_size,
+    override_seq_len,
 )
 
 

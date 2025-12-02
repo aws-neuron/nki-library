@@ -15,9 +15,11 @@
 
 from dataclasses import dataclass
 from typing import Optional
-from .kernel_helpers import get_ceil_quotient
-from nki.language import NKIObject
+
 import nki.language as nl
+from nki.language import NKIObject
+
+from .kernel_helpers import get_ceil_quotient
 
 
 #

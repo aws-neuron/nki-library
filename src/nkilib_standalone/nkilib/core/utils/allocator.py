@@ -19,8 +19,8 @@ The class is implemented to run in a NKI enviornment.
 
 """
 
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional
 
 import nki.language as nl
 
@@ -32,7 +32,7 @@ def sizeinbytes(dtype):
         return 4
     elif str(dtype) == str(nl.bfloat16) or str(dtype) == str(nl.float16):
         return 2
-    elif str(dtype) == str(nl.int8) or str(dtype) == str(nl.uint8):
+    elif str(dtype) == str(nl.int8) or str(dtype) == str(nl.uint8) or str(dtype) in ["float8e4", "float8_e4m3"]:
         return 1
     elif str(dtype) == str(nl.int32) or str(dtype) == str(nl.uint32):
         return 4
@@ -44,7 +44,7 @@ def align_to(value, alignment):
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _num_elts(shape):
+def num_elts(shape):
     res = 1
     for i in range(len(shape)):
         res = res * shape[i]
@@ -57,6 +57,7 @@ class Scope(nl.NKIObject):
     # number of independent sections in each stack frame,
     # used for multibuffer
     num_sections: int
+    name: str
     cur_section_id: int
 
     def __post_init__(self):
@@ -96,6 +97,14 @@ class SbufManager(nl.NKIObject):
         self.scopes = []
         self.heap = []
 
+        # Log initialization
+        total_size = sb_upper_bound - sb_lower_bound
+        self.logger.info(f"SBM initialized: range=[{sb_lower_bound}, {sb_upper_bound}), size={total_size}B")
+        self.logger.debug(
+            f"SBM config: auto_alloc={use_auto_alloc}, default_stack={default_stack_alloc}, "
+            f"stack_start={sb_lower_bound}, heap_start={sb_upper_bound}"
+        )
+
     def is_auto_alloc(self):
         return self.use_auto_alloc
 
@@ -105,15 +114,21 @@ class SbufManager(nl.NKIObject):
     def is_default_heap_alloc(self):
         return not self.default_stack_alloc
 
-    def open_scope(self, interleave_degree=1):
+    def open_scope(self, interleave_degree=1, name=""):
         """
         Add a new frame on the stack. SBUF addresses allocated on the stack will be
         automatically freed when its creation scope is closed.
 
         The optional argument `interleave_degree` helps manage multi-buffering in a loop.
         See the documentation of `increment_section` for more information.
+        The optional argument `name` helps identify scopes in debug logging.
         """
-        self.scopes.append(Scope(self.stack_curr_addr, interleave_degree))
+        self.scopes.append(Scope(self.stack_curr_addr, interleave_degree, name))
+        self.logger.info(f"Scope opened: depth={len(self.scopes)}, interleave={interleave_degree}, name='{name}'")
+        self.logger.debug(
+            f"Scope details: start_addr={self.stack_curr_addr}, sections={interleave_degree}, "
+            f"stack_depth={len(self.scopes)}, name='{name}'"
+        )
 
     def increment_section(self):
         """
@@ -143,19 +158,32 @@ class SbufManager(nl.NKIObject):
         # assert top_scope.num_sections > 1, "The top scope only have one section, call close_scope instead."
         top_scope.cur_section_id = top_scope.cur_section_id + 1
         if top_scope.cur_section_id == top_scope.num_sections:
-            self.logger.info("reset to section 0")
             top_scope.cur_section_id = 0
             self.stack_curr_addr = top_scope.starting_addr
-        self.logger.info(f"Increment to section {top_scope.cur_section_id}, stack depth {self.scopes}")
+            self.logger.info(f"Section wrap: 0/{top_scope.num_sections}")
+            self.logger.debug(
+                f"Multi-buffer wrap: section_id=0, addr={self.stack_curr_addr} (reset to {top_scope.starting_addr}), "
+                f"scope_depth={len(self.scopes)}, scope_sections={top_scope.num_sections}"
+            )
+        else:
+            self.logger.debug(
+                f"Section increment: {top_scope.cur_section_id}/{top_scope.num_sections}, "
+                f"addr={self.stack_curr_addr}, scope_depth={len(self.scopes)}"
+            )
 
     def close_scope(self):
         """
         Close the current stack scope. All tensors alloated within the scope will be freed
         """
         closing_scope = self.scopes[-1]
-
+        freed_bytes = self.stack_curr_addr - closing_scope.starting_addr
         self.stack_curr_addr = closing_scope.starting_addr
         self.scopes.pop()
+        self.logger.info(f"Scope closed: freed={freed_bytes}B, depth={len(self.scopes)}, name='{closing_scope.name}'")
+        self.logger.debug(
+            f"Scope close: name='{closing_scope.name}', start_addr={closing_scope.starting_addr}, end_addr={self.stack_curr_addr + freed_bytes}, "
+            f"freed={freed_bytes}B, new_stack_addr={self.stack_curr_addr}, remaining_depth={len(self.scopes)}"
+        )
 
     def alloc(self, shape, dtype, buffer=nl.sbuf, name=None, base_partition=0, align=1):
         """
@@ -183,7 +211,7 @@ class SbufManager(nl.NKIObject):
         else:
             return self.alloc_heap(shape, dtype, buffer=buffer, name=name, base_partition=base_partition)
 
-    def alloc_stack(self, shape, dtype, buffer=nl.sbuf, name=None, base_partition=0, align=1):
+    def alloc_stack(self, shape, dtype, buffer=nl.sbuf, name=None, base_partition=0, align=None):
         """
         Allocate a tensor on the stack which will be automatically freed when a scope closes.
         This method would raise an error if there are no open scope.
@@ -197,19 +225,26 @@ class SbufManager(nl.NKIObject):
         :return: a sbuf tensor described above.
         """
         assert buffer == nl.sbuf, "alloc_stack is only supported for SBUF tensors"
-        N = _num_elts(shape[1:])
+        N = num_elts(shape[1:])
         bytes_per_partition = N * sizeinbytes(dtype)
 
         if self.stack_curr_addr + bytes_per_partition > self.heap_curr_addr:
-            self.logger.error(
-                f"Requested on stack: {bytes_per_partition}, " + f"free: {self.heap_curr_addr - self.stack_curr_addr}"
+            available = self.heap_curr_addr - self.stack_curr_addr
+            self.logger.error(f"Stack OOM: requested={bytes_per_partition}B, available={available}B")
+            self.logger.debug(
+                f"Allocation failure: name={name}, shape={shape}, dtype={dtype}, size={bytes_per_partition}B, "
+                f"stack_addr={self.stack_curr_addr}, heap_addr={self.heap_curr_addr}, "
+                f"range=[{self.lower_bound}, {self.upper_bound})"
             )
             assert False
 
         if not self.scopes:
             self.logger.error("Cannot allocate in stack without an open scope")
+            self.logger.debug(f"Stack state: no open scopes, stack_addr={self.stack_curr_addr}")
             assert False
 
+        if align == None:
+            align = sizeinbytes(dtype)
         self.stack_curr_addr = align_to(self.stack_curr_addr, align)
         if self.use_auto_alloc:
             mloc = nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=name)
@@ -221,9 +256,15 @@ class SbufManager(nl.NKIObject):
                 name=name,
                 address=(base_partition, self.stack_curr_addr),
             )
+        addr_start = self.stack_curr_addr
         self.stack_curr_addr = self.stack_curr_addr + bytes_per_partition
-        self.stack_curr_addr = align_to(self.stack_curr_addr, align)
-        self.logger.info(f"Allocating {bytes_per_partition}, current stack addr after {self.stack_curr_addr}")
+        self.logger.info(f"Stack alloc: {bytes_per_partition}B [{name or 'unnamed'}] @ {addr_start}")
+        self.logger.debug(
+            f"Stack allocation: name={name}, shape={shape}, dtype={dtype}, size={bytes_per_partition}B, "
+            f"addr_range=[{addr_start}, {self.stack_curr_addr}), "
+            f"partition={base_partition}, align={align}, scope_depth={len(self.scopes)}, "
+            f"free_space={self.heap_curr_addr - self.stack_curr_addr}B"
+        )
 
         return mloc
 
@@ -241,12 +282,16 @@ class SbufManager(nl.NKIObject):
         :return: a sbuf tensor described above.
         """
         assert buffer == nl.sbuf, "alloc_heap is only supported for SBUF tensors"
-        N = _num_elts(shape[1:])
+        N = num_elts(shape[1:])
         bytes_per_partition = N * sizeinbytes(dtype)
 
         if self.stack_curr_addr + bytes_per_partition > self.heap_curr_addr:
-            self.logger.error(
-                f"Requested on heap: {bytes_per_partition}, " f"free: {self.heap_curr_addr - self.stack_curr_addr}"
+            available = self.heap_curr_addr - self.stack_curr_addr
+            self.logger.error(f"Heap OOM: requested={bytes_per_partition}B, available={available}B")
+            self.logger.debug(
+                f"Allocation failure: name={name}, shape={shape}, dtype={dtype}, size={bytes_per_partition}B, "
+                f"stack_addr={self.stack_curr_addr}, heap_addr={self.heap_curr_addr}, "
+                f"range=[{self.lower_bound}, {self.upper_bound})"
             )
             assert False
 
@@ -264,30 +309,46 @@ class SbufManager(nl.NKIObject):
                 name=name,
                 address=(base_partition, base_addr),
             )
-        self.logger.info(f"Allocating {bytes_per_partition}, current heap addr after {self.heap_curr_addr}")
         self.heap.append(mloc)
+        self.logger.info(f"Heap alloc: {bytes_per_partition}B [{name or 'unnamed'}] @ {self.heap_curr_addr}")
+        self.logger.debug(
+            f"Heap allocation: name={name}, shape={shape}, dtype={dtype}, size={bytes_per_partition}B, "
+            f"addr_range=[{self.heap_curr_addr}, {base_addr}), partition={base_partition}, "
+            f"heap_depth={len(self.heap)}, free_space={self.heap_curr_addr - self.stack_curr_addr}B"
+        )
 
         return mloc
 
     def pop_heap(self):
         if not self.heap:
-            self.logger.error("Invalid pop, heap is empty")
+            self.logger.error("Heap underflow: pop called on empty heap")
+            self.logger.debug(
+                f"Heap state: depth=0, stack_addr={self.stack_curr_addr}, heap_addr={self.heap_curr_addr}"
+            )
             assert False
 
         heap_top = self.heap[-1]
-        N = _num_elts(heap_top.shape[1:])
+        N = num_elts(heap_top.shape[1:])
         # Note to FE: the nl.ndarray or the sbuf.ptr should have a way of querying the shape
         bytes_per_partition = N * sizeinbytes(heap_top.dtype)
         self.heap_curr_addr = self.heap_curr_addr + bytes_per_partition
         self.heap_curr_addr = align_to(self.heap_curr_addr - 3, 4)
-        self.logger.info(f"Releasing {bytes_per_partition}, current heap addr after {self.heap_curr_addr}")
         self.heap.pop()
+        self.logger.info(f"Heap free: {bytes_per_partition}B, remaining={len(self.heap)} allocations")
+        self.logger.debug(
+            f"Heap deallocation: shape={heap_top.shape}, dtype={heap_top.dtype}, size={bytes_per_partition}B, "
+            f"heap_addr_after={self.heap_curr_addr}, heap_depth={len(self.heap)}, "
+            f"free_space={self.heap_curr_addr - self.stack_curr_addr}B"
+        )
+
+    def get_total_space(self):
+        return self.upper_bound - self.lower_bound
 
     def get_free_space(self):
-        if self.use_auto_alloc:
-            self.logger.error("get_free_space() is not supported in auto-allocation mode.")
-            assert False
         return self.heap_curr_addr - self.stack_curr_addr
+
+    def get_used_space(self):
+        return self.get_total_space() - self.get_free_space()
 
     def get_stack_curr_addr(self):
         if self.use_auto_alloc:

@@ -21,7 +21,7 @@ tiles, fused operations, and cross-partition vector loading.
 """
 
 from math import prod
-from typing import Optional, Callable
+from typing import Callable, Optional
 
 import nki
 import nki.isa as nisa
@@ -30,10 +30,9 @@ import nki.language as nl
 from ...utils.kernel_assert import kernel_assert
 from ..mlp_parameters import MLPParameters, mlpp_has_fused_add, mlpp_store_fused_add
 from .mlp_cte_constants import MLPCTEConstants
-from .mlp_cte_tile_info import MLPCTETileInfo
 from .mlp_cte_sharding import ShardedDim
+from .mlp_cte_tile_info import MlpBxsIndices, MLPCTETileInfo
 from .mlp_cte_utils import calc_vec_crossload_free_dim_len
-from .mlp_cte_tile_info import MlpBxsIndices
 
 
 # This method ensures I/O tensors where the first 2 dimensions are batch and sequence length have the correct shape

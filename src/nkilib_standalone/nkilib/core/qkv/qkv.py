@@ -19,15 +19,16 @@ QKV kernel.
 
 # Standard Library
 import math
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 # Neuron Kernel Interface
 import nki
 import nki.language as nl
 
+from ..utils.allocator import Logger, SbufManager
+
 # NKI Library
 from ..utils.common_types import NormType, QKVOutputLayout
-from ..utils.allocator import SbufManager, Logger
 
 # QKV
 from .qkv_cte import qkv_cte

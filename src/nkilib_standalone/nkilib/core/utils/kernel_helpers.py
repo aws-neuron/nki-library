@@ -14,7 +14,9 @@
 
 
 from typing import Optional, Tuple
+
 import nki.language as nl
+
 from .common_types import ActFnType, NormType
 
 # TODO: Get this constant from the NKI API once it is available
@@ -113,5 +115,7 @@ def div_ceil(n, d):
 
 
 def get_max_positive_value_for_dtype(dtype) -> float:
+    if str(dtype) == "float8e4":
+        dtype = nl.float8_e4m3
     result = _max_pos_range_map.get(dtype, None)
     return result

@@ -35,6 +35,29 @@ from ..utils.stream_shuffle_broadcast import (
 )
 from ..utils.tp_broadcast import tp_broadcast
 
+_MAX_BS = 128
+_MAX_Q = 16
+_MAX_S_ACTIVE = 8
+_MAX_S_PRIOR = 32 * 1024
+_MAX_D_HEAD = 128
+
+# Maps s_prior -> list of max bs vs allowed q_head * s_active
+# if sprior <= 256, then bs <= 128 and q_head * s_active <= 64
+# if sprior <= 2k, then if bs <= 64, q_head * s_active <= 32, otherwise q_head == s_active == 1
+# if sprior <= 8k, then if bs <= 4, q_head * s_active <= 128, if bs <= 16, q_head * s_active <= 16, otherwise q_head == s_active == 1
+# if sprior <= 16k, then if bs <= 4, q_head * s_active <= 64, otherwise q_head == s_active == 1
+# if sprior <= 32k, then if bs == 1, q_head * s_active <= 128, otherwise bs <= 4 and q_head * s_active <= 16
+_ALLOWED_CONFIGURATIONS: list[tuple[int, list[tuple[int, int]]]] = [
+    (256, [(_MAX_BS, 64)]),
+    (2 * 1024, [(64, 32), (_MAX_BS, 1)]),
+    (
+        8 * 1024,
+        [(4, _MAX_Q * _MAX_S_ACTIVE), (16, 16), (_MAX_BS, 1)],
+    ),
+    (16 * 1024, [(4, 64), (_MAX_BS, 1)]),
+    (_MAX_S_PRIOR, [(1, _MAX_Q * _MAX_S_ACTIVE), (4, 16)]),
+]
+
 
 @dataclass
 class AttnTKGConfig(nl.NKIObject):
@@ -431,6 +454,56 @@ def _compute_tile_params(cfg: AttnTKGConfig, TC: TileConstants, q, active_blocks
         atp.s_prior, TC.p_max
     )  # some tensors will have layout that splits s_prior into p_max-tiles
     atp.batch_interleave_degree = min(atp.bs, TC.psum_b_max)
+
+    kernel_assert(
+        atp.s_prior % TC.p_max == 0 or (atp.s_prior <= 256 and atp.sprior_n_prgs == 1),
+        f"sharded s_prior needs to be divisible by p_max unless s_prior is less than 256. Got sharded s_prior {atp.s_prior}",
+    )
+
+    kernel_assert(
+        0 < cfg.bs <= _MAX_BS, f"Unsupported batch size. Got {cfg.bs}, must be between 1 and {_MAX_BS}, inclusive."
+    )
+    kernel_assert(
+        0 < cfg.q_head <= _MAX_Q,
+        f"Unsupported q_head. Got {cfg.q_head}, must be between 1 and {_MAX_Q}, inclusive.",
+    )
+    kernel_assert(
+        0 < cfg.s_active <= _MAX_S_ACTIVE,
+        f"Unsupported s_active. Got {cfg.s_active}, must be between 1 and {_MAX_S_ACTIVE}, inclusive.",
+    )
+    kernel_assert(
+        0 < cfg.curr_sprior <= _MAX_S_PRIOR,
+        f"Unsupported curr_sprior. Got {cfg.curr_sprior}, must be between 1 and {_MAX_S_PRIOR}, inclusive.",
+    )
+    kernel_assert(
+        cfg.curr_sprior <= cfg.full_sprior,
+        f"s_prior must be less than s_prior_full. Got {cfg.curr_sprior} > {cfg.full_sprior}",
+    )
+    kernel_assert(
+        0 < cfg.d_head <= _MAX_D_HEAD,
+        f"Unsupported d_head. Got {cfg.d_head}, must be between 1 and {_MAX_D_HEAD}, inclusive.",
+    )
+
+    found_supported_bqs = _ALLOWED_CONFIGURATIONS[0][1]
+    for i in range(len(_ALLOWED_CONFIGURATIONS)):
+        cur_cfg = _ALLOWED_CONFIGURATIONS[i]
+        found_supported_bqs = cur_cfg[1]
+        if cfg.curr_sprior <= cur_cfg[0]:
+            break
+
+    found_supported_b, found_supported_qs = None, None
+    for i in range(len(found_supported_bqs)):
+        cur_supported_bqs = found_supported_bqs[i]
+        found_supported_b = cur_supported_bqs[0]
+        found_supported_qs = cur_supported_bqs[1]
+        if cfg.bs <= found_supported_b:
+            break
+
+    kernel_assert(
+        found_supported_b != None and cfg.bs <= found_supported_b and (cfg.q_head * cfg.s_active <= found_supported_qs),
+        f"No legal configuration found for batch size {cfg.bs}, and q_head * s_active {cfg.q_head * cfg.s_active} at s_prior {cfg.curr_sprior}. "
+        f"The current paramterization is likely to cause OOM issues. Supported configurations at this s_prior are: {found_supported_bqs} (max_batch_size, max_(q_head * s_active)).",
+    )
     return atp
 
 
@@ -571,7 +644,10 @@ def _allocate_qk_buffers(atp: AttnTileParams, TC: TileConstants, sbm: SbufManage
       I.e., the s_active_qh tiles are interleaved by batch on the free dimension.
     The cascaded max reduce later on will do a strided access on the free dimension.
     """
-    bufs.qk = sbm.alloc_stack((TC.p_max, atp.n_sprior_tile * atp.s_active_bqh), dtype=atp.inter_type)
+    bufs.qk = sbm.alloc_stack(
+        (TC.p_max, atp.n_sprior_tile * atp.s_active_bqh),
+        dtype=atp.inter_type,
+    )
     nisa.memset(bufs.qk, value=-np.inf)
     bufs.qk_io_type = sbm.alloc_stack(bufs.qk.shape, dtype=atp.io_type)  # for matmults
 
@@ -1053,7 +1129,7 @@ def _cascaded_max_reduce(
         offset=0,
     )
     nisa.tensor_reduce(
-        dst=bufs.qk_max[...], op=nl.maximum, data=qk_pat, axis=[3, 4], keepdims=False
+        dst=bufs.qk_max[...], op=nl.maximum, data=qk_pat, axis=[4], keepdims=False
     )  # The axis is modified here
 
     # The free-dim length holding max/sum reduction values from LNC2 cores and sink.
@@ -1945,8 +2021,9 @@ def _rope(inv_freqs, pos_ids, bs: int, s_a: int, d_head: int, sbm: SbufManager):
       cos: output ndarray, shape [par(d_head), bs * s_active]
       sin: output ndarray, shape [par(d_head), bs * s_active]
     """
-    # Most of the computation handles half of d_head at a time
-    kernel_assert(d_head % 2 == 0, f"RoPE expects head dim ({d_head}) to be divisible by 2")
+    # Most of the computation handles half of d_head at a time.
+    # [d_head_half : d_head_half + d_head_half] requires d_head_half to be a multiple of 32, which means d_head is a multiple of 64
+    kernel_assert(d_head % 64 == 0, f"RoPE expects head dim ({d_head}) to be divisible by 64")
     d_head_half = d_head // 2
 
     # Create outputs

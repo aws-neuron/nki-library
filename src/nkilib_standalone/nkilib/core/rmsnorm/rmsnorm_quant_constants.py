@@ -13,12 +13,12 @@
 # limitations under the License.
 
 
-import numpy as np
 from dataclasses import dataclass
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
+import numpy as np
 from nki.language import NKIObject
 
 from .rmsnorm_quant_tile_info import RMSNormQuantTileInfo

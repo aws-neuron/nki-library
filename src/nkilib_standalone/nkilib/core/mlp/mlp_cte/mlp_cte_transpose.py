@@ -25,15 +25,13 @@ from typing import Optional
 import nki.isa as nisa
 import nki.language as nl
 
-from ...utils.tile_info import TiledDimInfo
 from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import get_ceil_quotient, PSUM_BANK_SIZE
+from ...utils.kernel_helpers import PSUM_BANK_SIZE, get_ceil_quotient
+from ...utils.tile_info import TiledDimInfo
 from ..mlp_parameters import MLPParameters
-from .mlp_cte_tile_info import MLPCTETileInfo
 from .mlp_cte_constants import MLPCTEConstants
-from .mlp_cte_tile_info import MlpBxsIndices
-
+from .mlp_cte_tile_info import MlpBxsIndices, MLPCTETileInfo
 
 #
 # Transpose the source tensor tile in SBUF
@@ -315,12 +313,14 @@ def _apply_scale_bias_if_necessary(
                         nl.ds(hidden_tile_idx * H_SUBTILE_COUNT + hidden_subtile_idx, 1),
                     ],
                     op1=op1,
-                    operand1=operand1[
-                        : operand1.shape[0],
-                        nl.ds(hidden_tile_idx * H_SUBTILE_COUNT + hidden_subtile_idx, 1),
-                    ]
-                    if operand1 != None
-                    else None,
+                    operand1=(
+                        operand1[
+                            : operand1.shape[0],
+                            nl.ds(hidden_tile_idx * H_SUBTILE_COUNT + hidden_subtile_idx, 1),
+                        ]
+                        if operand1 != None
+                        else None
+                    ),
                     engine=nisa.vector_engine,
                 )
     else:

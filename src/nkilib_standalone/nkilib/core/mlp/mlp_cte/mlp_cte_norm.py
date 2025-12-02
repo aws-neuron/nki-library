@@ -20,26 +20,25 @@ pseudo-code documentation and tile-based processing.
 
 """
 
-import numpy as np
-from typing import Optional, Callable
+from typing import Callable, Optional
 
 import nki.isa as nisa
 import nki.language as nl
+import numpy as np
 
-from ...utils.kernel_assert import kernel_assert
 from ...utils.allocator import SbufManager
+from ...utils.kernel_assert import kernel_assert
 from ..mlp_parameters import (
     MLPParameters,
-    mlpp_has_rms_normalization,
     mlpp_has_layer_normalization,
+    mlpp_has_rms_normalization,
 )
 from .mlp_cte_constants import (
-    MLPCTEConstants,
-    BN_STATS_ELEMENTS_PER_TILE,
     BN_AGGR_ELEMENTS_PER_TILE,
+    BN_STATS_ELEMENTS_PER_TILE,
+    MLPCTEConstants,
 )
-from .mlp_cte_tile_info import MLPCTETileInfo
-from .mlp_cte_tile_info import MlpBxsIndices
+from .mlp_cte_tile_info import MlpBxsIndices, MLPCTETileInfo
 
 
 #

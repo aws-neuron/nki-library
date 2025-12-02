@@ -26,7 +26,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.allocator import SbufManager
-from ...utils.kernel_helpers import get_ceil_quotient, PSUM_BANK_SIZE
+from ...utils.kernel_helpers import PSUM_BANK_SIZE, get_ceil_quotient
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
     MLPParameters,
@@ -35,14 +35,13 @@ from ..mlp_parameters import (
     mlpp_has_up_projection_bias,
 )
 from .mlp_cte_constants import MLPCTEConstants
-from .mlp_cte_tile_info import MLPCTETileInfo
+from .mlp_cte_sharding import ShardedDim
+from .mlp_cte_tile_info import MlpBxsIndices, MLPCTETileInfo
 from .mlp_cte_utils import (
     apply_source_projection_activation,
     apply_source_projection_bias,
     perform_elementwise_multiply,
 )
-from .mlp_cte_tile_info import MlpBxsIndices
-from .mlp_cte_sharding import ShardedDim
 
 
 def perform_down_projection(

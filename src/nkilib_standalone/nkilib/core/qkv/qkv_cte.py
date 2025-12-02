@@ -19,22 +19,28 @@ QKV_CTE kernel.
 
 # Standard Library
 import math
-from typing import Optional, Tuple, List, cast
+from typing import List, Optional, Tuple, cast
 
 # Neuron Kernel Interface
 import nki
-import nki.language as nl
 import nki.isa as nisa
+import nki.language as nl
 from nki.isa.constants import dge_mode
+
+from ..utils.allocator import Logger, SbufManager, sizeinbytes
 
 # NKI Library
 from ..utils.common_types import NormType, QKVOutputLayout
-from ..utils.allocator import sizeinbytes
-from ..utils.allocator import SbufManager, Logger
 
 # QKV CTE
-from .qkv_cte_utils import QKV_CTE_UserInput, QKV_CTE_Config, QKV_CTE_Dims
-from .qkv_cte_utils import _validate_user_inputs, _build_config, _get_tensor_dimensions
+from .qkv_cte_utils import (
+    QKV_CTE_Config,
+    QKV_CTE_Dims,
+    QKV_CTE_UserInput,
+    _build_config,
+    _get_tensor_dimensions,
+    _validate_user_inputs,
+)
 
 # HARDWARE CONSTANTS
 P_MAX = 128
@@ -562,8 +568,8 @@ def _qkv_cte_impl(
                     elif cfg.fused_norm_type == NormType.LAYER_NORM:
                         """
                         Compute LayerNorm statistics for row of input_sb and store it bn_aggr_result_tile.
-                            mean = bn_aggr_result_sb[i_tile_S][0:s_tile_sz, 0:1] 
-                            rvar = bn_aggr_result_sb[i_tile_S][0:s_tile_sz, 1:2] #rvar(var + eps) 
+                            mean = bn_aggr_result_sb[i_tile_S][0:s_tile_sz, 0:1]
+                            rvar = bn_aggr_result_sb[i_tile_S][0:s_tile_sz, 1:2] #rvar(var + eps)
                         """
                         _compute_layer_norm_stats(
                             input_sb[i_tile_S],

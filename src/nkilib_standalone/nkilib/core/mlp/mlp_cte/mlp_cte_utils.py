@@ -20,17 +20,17 @@ elementwise multiplication, and activation functions with boolean parameter supp
 
 """
 
-import nki.language as nl
-import nki.isa as nisa
 from dataclasses import dataclass
 from typing import Optional
 
-from ...utils.kernel_helpers import get_ceil_quotient, get_nl_act_fn_from_type
+import nki.isa as nisa
+import nki.language as nl
+
 from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import get_ceil_quotient, get_nl_act_fn_from_type
 from ..mlp_parameters import MLPParameters
 from .mlp_cte_constants import MLPCTEConstants
 from .mlp_cte_tile_info import MLPCTETileInfo
-
 
 #
 # ***************

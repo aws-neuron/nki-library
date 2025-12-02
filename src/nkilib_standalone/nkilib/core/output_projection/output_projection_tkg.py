@@ -37,20 +37,20 @@ inter-core collective operations, as each core produces part of the output tenso
 
 """
 
-from typing import Optional, Tuple, List
 from dataclasses import dataclass
-import nki.isa as nisa
-import nki.language as nl
-from nki.language import static_range, affine_range
+from typing import List, Optional, Tuple
 
 # TODO: Fix this import once available in new FE.
 import neuronxcc.nki.typing as nt
+import nki
+import nki.isa as nisa
+import nki.language as nl
+from nki.language import affine_range, static_range
 
-from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ..output_projection.output_projection_utils import calculate_head_packing
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_program_sharding_info
-import nki
+from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 P_MAX = 128
 F_MAX = 512

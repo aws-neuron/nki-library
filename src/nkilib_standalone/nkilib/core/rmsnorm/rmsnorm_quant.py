@@ -18,17 +18,17 @@ from dataclasses import dataclass
 from typing import Optional
 
 import nki
+import nki.compiler as ncc
 import nki.isa as nisa
 import nki.language as nl
-import nki.compiler as ncc
 
 from ..utils.common_types import NormType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import (
     get_program_sharding_info,
+    get_verified_program_sharding_info,
     is_launched_as_spmd,
     is_rms_normalization,
-    get_verified_program_sharding_info,
 )
 from .rmsnorm_quant_constants import (
     RMSNormQuantConstants,

@@ -22,64 +22,62 @@ and complete MLP pipeline including normalization, projections, and activation f
 
 from typing import Callable
 
-import nki.language as nl
 import nki.isa as nisa
+import nki.language as nl
 
 from ...utils.allocator import SbufManager
-from ...utils.logging import Logger
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info, is_launched_as_spmd
+from ...utils.logging import Logger
 from ..mlp_parameters import (
     MLPParameters,
-    mlpp_has_gate_projection_bias,
-    mlpp_has_up_projection_bias,
     mlpp_has_down_projection_bias,
-    mlpp_has_normalization_weights,
-    mlpp_has_normalization_bias,
+    mlpp_has_gate_projection_bias,
     mlpp_has_normalization,
+    mlpp_has_normalization_bias,
+    mlpp_has_normalization_weights,
+    mlpp_has_up_projection_bias,
 )
 from .mlp_cte_constants import (
+    MAX_AVAILABLE_SBUF_SIZE,
     MLPCTEConstants,
     build_mlp_cte_constants,
     cleanup_mlp_cte_constants,
-    MAX_AVAILABLE_SBUF_SIZE,
-)
-
-from .mlp_cte_tile_info import (
-    MLPCTETileInfo,
-    MlpBxsIndices,
-    build_mlp_cte_tile_info,
-)
-from .mlp_cte_utils import is_launch_grid_valid_for_mlp
-
-from .mlp_cte_sharding import (
-    ShardedDim,
-    DimShard,
-    calculate_sharding,
-)
-from .mlp_cte_tensor_io import (
-    load_hidden_tensor_tile_opt_fused_add,
-    load_bias_vector,
-    load_vector_across_partitions,
-    store_hidden_tensor_tile,
-    store_half_hidden_tensor_tile,
 )
 from .mlp_cte_norm import (
     apply_normalization_if_necessary,
     cleanup_heap_for_normalization,
 )
-from .mlp_cte_transpose import (
-    transpose_source_tensor_tile,
-    transpose_intermediate_tensor_tile,
-)
 from .mlp_cte_projection import (
+    perform_down_projection,
     perform_gate_projection_if_necessary,
     perform_up_projection,
-    perform_down_projection,
 )
+from .mlp_cte_sharding import (
+    DimShard,
+    ShardedDim,
+    calculate_sharding,
+)
+from .mlp_cte_tensor_io import (
+    load_bias_vector,
+    load_hidden_tensor_tile_opt_fused_add,
+    load_vector_across_partitions,
+    store_half_hidden_tensor_tile,
+    store_hidden_tensor_tile,
+)
+from .mlp_cte_tile_info import (
+    MlpBxsIndices,
+    MLPCTETileInfo,
+    build_mlp_cte_tile_info,
+)
+from .mlp_cte_transpose import (
+    transpose_intermediate_tensor_tile,
+    transpose_source_tensor_tile,
+)
+from .mlp_cte_utils import is_launch_grid_valid_for_mlp
 
 
-def mlp_cte_invoke_kernel(
+def mlp_cte(
     mlp_params: MLPParameters,
     output_tensor_hbm: nl.ndarray,
     output_stored_add_tensor_hbm: nl.ndarray,
