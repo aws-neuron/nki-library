@@ -22,14 +22,16 @@ test = [
     "numpy",
     "torch",
     "aws-embedded-metrics",
+    "boto3",
     "fabric2",
     "filelock",
+    "plotext",
     "pytest",
     "pytest-cov",
     "pytest-xdist",
     "pytest-metadata",
     "pytest-html",
-    "ruff",
+    "ruff==0.4.0",
     "pre-commit",
     "debugpy",
 ]
@@ -45,13 +47,13 @@ where = ["src"]
 # exclude = ["test"]
 
 [tool.setuptools.package-data]
-nkilib_standalone = ["py.typed"]
+nkilib_src = ["py.typed"]
 
 [tool.black]
 line-length = 100
 
 [tool.isort]
-known_first_party = ["nkilib_standalone"]
+known_first_party = ["nkilib_src"]
 profile = "black"
 line_length = 100
 
@@ -70,10 +72,29 @@ ignore = [
 max-line-length = 120
 
 [tool.ruff]
- indent-width = 4
- line-length = 120
+indent-width = 4
+line-length = 120
 
- [tool.ruff.format]
- quote-style = "preserve"
- indent-style = "space"
- docstring-code-format = false
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"
+docstring-code-format = false
+
+[tool.ruff.lint]
+# Enable linting rules
+select = [
+    "S101",  # assert detection
+    "I",     # isort (import sorting)
+]
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["I"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+"test/**/*.py" = ["S101"]
+"**/test_*.py" = ["S101"]
+"**/penguin.py" = ["S101"]
