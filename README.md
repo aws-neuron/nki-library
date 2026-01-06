@@ -6,7 +6,7 @@ More details can be found in the [NKI Library Documentation](https://awsdocs-neu
 
 ## NOTE
 
-The kernels in this repo require the Neuron 2.27 release (coming soon).
+The kernels in this repo require [the Neuron 2.27 release](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.27.0/index.html).
 
 ## Kernel Reference
 
