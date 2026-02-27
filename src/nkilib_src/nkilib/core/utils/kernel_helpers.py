@@ -44,8 +44,7 @@ _act_fn_map = {
     ActFnType.SiLU: nl.silu,
     ActFnType.GELU: nl.gelu,
     ActFnType.GELU_Tanh_Approx: nl.gelu_apprx_tanh,
-    # TODO: Need to add this to nl.lang
-    # ActFnType.Swish: nl.gelu_apprx_sigmoid
+    ActFnType.Swish: nl.gelu_apprx_sigmoid,
 }
 
 
@@ -156,6 +155,11 @@ def get_floor_aligned_size(size: int, alignment_multiple: int) -> int:
     return get_floor_quotient(size, alignment_multiple) * alignment_multiple
 
 
+def is_hbm_buffer(tensor: nl.ndarray) -> bool:
+    """Check if tensor buffer is any HBM type (hbm, shared_hbm, private_hbm)."""
+    return tensor.buffer in (nl.hbm, nl.shared_hbm, nl.private_hbm)
+
+
 def get_nl_act_fn_from_type(act_fn: ActFnType):
     """
     Convert ActFnType enum to NKI language activation function.
@@ -184,15 +188,15 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
         else:
             raise error
     """
-    if act_fn.value == ActFnType.SiLU.value:
+    kernel_assert(isinstance(act_fn, ActFnType), f"Unsupported activation function type: {act_fn}")
+    if act_fn == ActFnType.SiLU:
         return nl.silu
-    elif act_fn.value == ActFnType.GELU.value:
+    elif act_fn == ActFnType.GELU:
         return nl.gelu
-    elif act_fn.value == ActFnType.GELU_Tanh_Approx.value:
+    elif act_fn == ActFnType.GELU_Tanh_Approx:
         return nl.gelu_apprx_tanh
-    elif act_fn.value == ActFnType.Swish.value:
+    elif act_fn == ActFnType.Swish:
         return nl.gelu_apprx_sigmoid
-    kernel_assert(False, f"Unsupported activation function type: {act_fn}")
 
 
 def is_launched_as_spmd() -> bool:

@@ -14,12 +14,12 @@
 
 """All-expert MoE token generation implementation with MX (microscaling) quantization support."""
 
-from typing import Optional
+from dataclasses import dataclass
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 
-# MLP parameters
 from ...mlp.mlp_parameters import MLPParameters
 from ...mlp.mlp_tkg.projection_mx_constants import (
     GATE_FUSED_IDX,
@@ -30,17 +30,14 @@ from ...mlp.mlp_tkg.projection_mx_constants import (
     UP_FUSED_IDX,
     _q_width,
 )
-
-# Common utils
+from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from .down_projection_mx_shard_I import (
     down_projection_mx_shard_I,
     load_broadcast_down_weight_scale_bias,
 )
-
-# MLP TKG projection sub-kernels (I-sharding)
-from .gate_up_mx_shard_I import (
+from .gate_up_projection_mx_shard_I import (
     gate_up_projection_mx_shard_I,
     load_gate_up_weight_scale_bias,
 )
@@ -51,7 +48,444 @@ DYNAMIC_LOOP_TOKEN_THRESHOLD = 256
 # FIXME: add @nki.jit decorator to all sub-kernels when NKIFE-557 is resolved
 
 
-def get_is_dynamic_while(E_L, T):
+@dataclass
+class AllExpertMXDims(nl.NKIObject):
+    """
+    Dimension sizes and tiling constants for all-expert MX kernel.
+
+    Stores extracted shapes from input tensors and derived tiling parameters.
+    """
+
+    T: int  # Total number of input tokens
+    E_L: int  # Number of local experts
+    I: int  # Intermediate dimension size
+    H: int  # Hidden dimension size
+    down_proj_tile_I: int  # Down projection intermediate dimension tile size
+    pmax: int  # Partition max size
+    n_prgs: int  # Number of programs (LNC shards)
+    prg_id: int  # Current program ID
+
+    def __post_init__(self):
+        """Derive tiling constants from base dimensions."""
+        self.num_tiles_in_T = div_ceil(self.T, self.pmax)
+        self.n_T32_tiles = div_ceil(self.T, 32)
+        self.n_H512_tiles = div_ceil(self.H, 512)
+        self.tile_T = min(self.T, self.pmax)
+        self.tile_H = self.H // self.n_H512_tiles // _q_width
+        self.T32_H4 = self.pmax  # Always pad to 128 due to alignment constraints
+
+        # Derived dimensions for _load_expert
+        self.I_local = self.I // 2 if self.n_prgs > 1 else self.I
+        self.n_I512_tiles = self.I_local // 512
+
+    @staticmethod
+    def extract_dims(
+        input_tensor: nl.ndarray,
+        gate_up_weights: nl.ndarray,
+        down_weights: nl.ndarray,
+        hidden_input_scale: nl.ndarray,
+    ) -> "AllExpertMXDims":
+        """
+        Extract dimension sizes and tiling constants from input tensors.
+
+        Args:
+            input_tensor (nl.ndarray): Input hidden states tensor.
+            gate_up_weights (nl.ndarray): [E_L, H, 2, I], Gate and up projection weights.
+            down_weights (nl.ndarray): [E_L, I, H], Down projection weights.
+            hidden_input_scale (nl.ndarray): Optional MX quantization scale for pre-quantized hidden_input.
+
+        Returns:
+            AllExpertMXDims: Dataclass containing all dimension sizes and tiling constants.
+        """
+        pmax = nl.tile_size.pmax
+
+        # Extract T based on input location and quantization state
+        if input_tensor.buffer == nl.sbuf:
+            if hidden_input_scale is not None:
+                # Quantized input shape: [16_H * 8_H, H/512, T]
+                T = input_tensor.shape[-1]
+            else:
+                # Non-quantized input shape: [16_H * 8_H, T, 4_H * H/512]
+                T = input_tensor.shape[1]
+        else:
+            # HBM input shape: [T, 4_H * H/512 * 16_H * 8_H]
+            T, _ = input_tensor.shape
+
+        # Extract other dimensions from weight shapes
+        E_L = gate_up_weights.shape[0]
+        I = gate_up_weights.shape[-1]
+        H = down_weights.shape[-1]
+        down_proj_tile_I = down_weights.shape[1]
+
+        # Get LNC config
+        _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx_shard_I", (0, 1))
+
+        return AllExpertMXDims(
+            T=T,
+            E_L=E_L,
+            I=I,
+            H=H,
+            down_proj_tile_I=down_proj_tile_I,
+            pmax=pmax,
+            n_prgs=n_prgs,
+            prg_id=prg_id,
+        )
+
+    @staticmethod
+    def validate_inputs(
+        input_tensor: nl.ndarray,
+        hidden_input_scale: nl.ndarray,
+        expert_affinities_masked: nl.ndarray,
+        dims: "AllExpertMXDims",
+        lhs_rhs_swap: bool,
+        output_in_sbuf: bool,
+    ) -> None:
+        """
+        Validate input tensors and configuration for all-expert MX kernel.
+
+        Args:
+            input_tensor (nl.ndarray): Input hidden states tensor.
+            hidden_input_scale (nl.ndarray): Optional MX quantization scale for pre-quantized hidden_input.
+            expert_affinities_masked (nl.ndarray): Expert affinity scores.
+            dims (AllExpertMXDims): Extracted dimension sizes.
+            lhs_rhs_swap (bool): Whether to swap LHS/RHS in matmuls.
+            output_in_sbuf (bool): Whether output should be in SBUF.
+
+        Notes:
+            - Raises AssertionError if any validation fails.
+        """
+        # Validate input dtype based on quantization state
+        if hidden_input_scale is None:
+            kernel_assert(
+                input_tensor.dtype in SUPPORTED_QMX_INPUT_DTYPES,
+                f"Expected input dtype in {SUPPORTED_QMX_INPUT_DTYPES}, got {input_tensor.dtype=}.",
+            )
+        else:
+            kernel_assert(
+                input_tensor.dtype in MX_DTYPES,
+                f"Expected quantized input dtype in {MX_DTYPES}, got {input_tensor.dtype=}",
+            )
+            kernel_assert(
+                hidden_input_scale.dtype == nl.uint8,
+                f"Expected hidden_input_scale dtype = nl.uint8, got {hidden_input_scale.dtype=}",
+            )
+
+        kernel_assert(lhs_rhs_swap, "lhs_rhs_swap=False is not yet supported!")
+
+        # Validate T alignment based on input state
+        if hidden_input_scale is None:
+            # Layout adapters only support T divisible by 32
+            kernel_assert(
+                dims.T % 32 == 0,
+                f"Expected T divisible by 32, got T={dims.T}. "
+                "To use T divisible by 4, provide prequantized input and hidden_input_scale.",
+            )
+        else:
+            # T must be divisible by 4 for MatmultMx alignment
+            kernel_assert(dims.T % 4 == 0, f"Expected T divisible by 4, got T={dims.T}")
+
+        # Validate expert affinities shape
+        kernel_assert(
+            len(expert_affinities_masked.shape) in (2, 3),
+            f"Expected 2D or 3D expert_affinities_masked, got {expert_affinities_masked.shape=}",
+        )
+
+        # Validate output location
+        kernel_assert(
+            not output_in_sbuf,
+            f"All-expert MX kernel does not yet support SBUF output, got {output_in_sbuf=}",
+        )
+
+
+@dataclass
+class AllExpertMXParams(nl.NKIObject):
+    """
+    Parameters for all-expert MX kernel extracted from MLPParameters.
+    """
+
+    # TODO: consolidate with MLPParameters rather than using a separate dataclass.
+
+    input: nl.ndarray
+    gate_up_weights: nl.ndarray
+    down_weights: nl.ndarray
+    output: nl.ndarray
+    expert_affinities_masked: nl.ndarray
+    gate_up_weights_scale: nl.ndarray
+    down_weights_scale: nl.ndarray
+    hidden_input_scale: nl.ndarray
+    gate_up_weights_bias: nl.ndarray
+    down_weights_bias: nl.ndarray
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode
+    hidden_act_fn: ActFnType
+    gate_clamp_lower_limit: float
+    gate_clamp_upper_limit: float
+    up_clamp_lower_limit: float
+    up_clamp_upper_limit: float
+    input_in_sbuf: bool
+    output_in_sbuf: bool
+    lhs_rhs_swap: bool
+    activation_compute_dtype: nki.dtype = nl.bfloat16
+
+    @staticmethod
+    def from_mlp_params(
+        mlp_params: MLPParameters,
+        output: nl.ndarray,
+        output_in_sbuf: bool = False,
+        lhs_rhs_swap: bool = True,
+        activation_compute_dtype=nl.bfloat16,
+    ) -> "AllExpertMXParams":
+        """
+        Create AllExpertMXParams from MLPParameters.
+
+        Args:
+            mlp_params (MLPParameters): Source parameters.
+            output (nl.ndarray): Output tensor.
+            output_in_sbuf (bool): Whether output should be in SBUF.
+            lhs_rhs_swap (bool): Whether to swap LHS/RHS in matmuls.
+            activation_compute_dtype: Compute dtype for activations.
+
+        Returns:
+            AllExpertMXParams: Flattened parameters for this kernel.
+        """
+        return AllExpertMXParams(
+            input=mlp_params.hidden_tensor,
+            gate_up_weights=mlp_params.gate_proj_weights_tensor,
+            down_weights=mlp_params.down_proj_weights_tensor,
+            output=output,
+            expert_affinities_masked=mlp_params.expert_params.expert_affinities,
+            gate_up_weights_scale=mlp_params.quant_params.gate_w_scale,
+            down_weights_scale=mlp_params.quant_params.down_w_scale,
+            hidden_input_scale=mlp_params.hidden_input_scale,
+            gate_up_weights_bias=(mlp_params.bias_params.gate_proj_bias_tensor if mlp_params.bias_params else None),
+            down_weights_bias=(mlp_params.bias_params.down_proj_bias_tensor if mlp_params.bias_params else None),
+            expert_affinities_scaling_mode=mlp_params.expert_params.expert_affinities_scaling_mode,
+            hidden_act_fn=mlp_params.activation_fn,
+            gate_clamp_lower_limit=mlp_params.gate_clamp_lower_limit,
+            gate_clamp_upper_limit=mlp_params.gate_clamp_upper_limit,
+            up_clamp_lower_limit=mlp_params.up_clamp_lower_limit,
+            up_clamp_upper_limit=mlp_params.up_clamp_upper_limit,
+            input_in_sbuf=mlp_params.input_in_sbuf,
+            output_in_sbuf=output_in_sbuf,
+            lhs_rhs_swap=lhs_rhs_swap,
+            activation_compute_dtype=activation_compute_dtype,
+        )
+
+
+@dataclass
+class ExpertWeightsSBUF(nl.NKIObject):
+    """Expert weights, scales, and biases loaded in SBUF for one expert."""
+
+    gate_weight_sb: nl.ndarray
+    up_weight_sb: nl.ndarray
+    down_weight_sb: nl.ndarray
+    gate_weight_scale_sb: nl.ndarray
+    up_weight_scale_sb: nl.ndarray
+    down_weight_scale_sb: nl.ndarray
+    gate_bias_sb: nl.ndarray
+    up_bias_sb: nl.ndarray
+    down_bias_sb: nl.ndarray
+
+
+def _all_expert_moe_tkg_mx(
+    mlp_params: MLPParameters,
+    output: nl.ndarray,
+    output_in_sbuf: bool = False,
+    lhs_rhs_swap: bool = True,
+    activation_compute_dtype: nki.dtype = nl.bfloat16,
+    is_all_expert_dynamic: bool = False,
+) -> nl.ndarray:
+    """
+    Perform all-expert MoE MLP on input using microscaling format (MX) weights.
+
+    Shards compute on intermediate dimension when run with LNC=2.
+
+    Dimensions:
+        B: Batch size
+        S: Sequence length
+        T: Total number of input tokens (equivalent to B*S)
+        H: Hidden dimension size of the model
+        I: Intermediate dimension size of the model after tensor parallelism
+        E_L: Number of local experts after expert parallelism
+
+    Args:
+        mlp_params (MLPParameters): MLPParameters containing all input tensors and configuration, including:
+            - hidden_tensor: Input tensor in HBM [T, H] or SBUF [H0, H/512, T] (if pre-quantized)
+            - hidden_input_scale: Optional MX quantization scale for pre-quantized input [H0, H/512, T]
+            - input_in_sbuf: Whether input is in SBUF
+        output (nl.ndarray): [min(T, 128), ⌈T/128⌉, H] in SBUF or [T, H] in HBM, Output tensor.
+        output_in_sbuf (bool): Indicates desired output buffer location (SBUF or HBM).
+        lhs_rhs_swap (bool): Indicates whether to swap LHS and RHS of gate and up projection matmuls.
+        activation_compute_dtype: Compute dtype for activations.
+        is_all_expert_dynamic: TODO: document experimental flag
+
+    Returns:
+        output (nl.ndarray): [T, H] in HBM or [min(T, 128), ⌈T/128⌉, H] in SBUF, Output tensor with MoE results.
+
+    Notes:
+        - More details on input & weight layout in doc `YFIQAmI1p2nr`
+        - When mlp_params.hidden_input_scale is provided, input is expected to be pre-quantized in SBUF
+
+    Pseudocode:
+        # Step 1: Load and quantize input (skipped if hidden_input_scale provided)
+        input_quant, input_scale = layout_adapter(input)
+
+        # Step 2: Process each expert sequentially
+        for expert_idx in range(E_L):
+            # Load expert weights
+            gate_w, up_w, down_w = load_one_expert(expert_idx)
+
+            # Compute gate/up projection and activation
+            act = gate_up_projection(input_quant, gate_w, up_w)
+
+            # Compute down projection with affinity scaling
+            expert_out = down_projection(act, down_w)
+            if affinity_scaling_mode == POST_SCALE:
+                expert_out *= expert_affinities[expert_idx]
+
+            # Accumulate results
+            if expert_idx == 0:
+                output = expert_out
+            else:
+                output += expert_out
+    """
+
+    # Initialize parameters manager, extract dims, validate inputs
+    params = AllExpertMXParams.from_mlp_params(
+        mlp_params=mlp_params,
+        output=output,
+        output_in_sbuf=output_in_sbuf,
+        lhs_rhs_swap=lhs_rhs_swap,
+        activation_compute_dtype=activation_compute_dtype,
+    )
+    dims = AllExpertMXDims.extract_dims(
+        params.input,
+        params.gate_up_weights,
+        params.down_weights,
+        params.hidden_input_scale,
+    )
+    AllExpertMXDims.validate_inputs(
+        params.input,
+        params.hidden_input_scale,
+        params.expert_affinities_masked,
+        dims,
+        params.lhs_rhs_swap,
+        params.output_in_sbuf,
+    )
+
+    # Dispatch to expert MLP implementation
+    if is_all_expert_dynamic:
+        _all_expert_mx_dynamic(params=params, dims=dims)
+    else:
+        _all_expert_mx_static(params=params, dims=dims)
+
+    return output
+
+
+def _all_expert_mx_static(
+    params: AllExpertMXParams,
+    dims: AllExpertMXDims,
+) -> nl.ndarray:
+    """
+    Static all-expert MoE computation without dynamic loop on chip (DLoC).
+
+    Processes all experts sequentially, computing the full token batch for each expert
+    before moving to the next. This is optimal when DLoC overhead exceeds benefits.
+
+    Args:
+        params (AllExpertMXParams): All kernel parameters including tensors and config.
+        dims (AllExpertMXDims): Dimension information for tiling and sharding.
+
+    Returns:
+        nl.ndarray: Output tensor with MoE computation results.
+    """
+
+    # Step 1: Optional load + swizzle + QMX input
+    if params.input_in_sbuf:
+        if params.hidden_input_scale is None:
+            input_quant_sb, input_scale_sb = _layout_adapter_qmx_sb(
+                params.input, dims.T32_H4, dims.tile_H, dims.n_T32_tiles, dims.n_H512_tiles
+            )
+        else:
+            # Input has been swizzled + MX quantized upstream
+            input_quant_sb, input_scale_sb = params.input, params.hidden_input_scale
+    else:
+        input_quant_sb, input_scale_sb = _layout_adapter_qmx_hbm(
+            params.input, dims.T32_H4, dims.tile_H, dims.n_T32_tiles, dims.n_H512_tiles
+        )
+
+    # Handle expert_affinities_masked based on its buffer type
+    if params.expert_affinities_masked.buffer == nl.sbuf:
+        kernel_assert(
+            params.expert_affinities_masked.shape[0] <= dims.pmax,
+            f"expected expert_affinities_masked shape [pmax_T, T/pmax, E_L] when T>pmax, got {params.expert_affinities_masked.shape=}",
+        )
+        expert_affinities_masked_sb = params.expert_affinities_masked
+    else:
+        # Load from HBM to SBUF
+        expert_affinities_masked_shape = (
+            (dims.T, dims.E_L) if dims.T <= dims.pmax else (dims.pmax, dims.T // dims.pmax, dims.E_L)
+        )
+        expert_affinities_masked_sb = nl.ndarray(
+            expert_affinities_masked_shape, dtype=params.expert_affinities_masked.dtype, buffer=nl.sbuf
+        )
+        if dims.T <= dims.pmax:
+            nisa.dma_copy(
+                src=params.expert_affinities_masked[...],
+                dst=expert_affinities_masked_sb[...],
+            )
+        else:
+            for t128_tile_idx in nl.affine_range(dims.T // dims.tile_T):
+                nisa.dma_copy(
+                    src=params.expert_affinities_masked[nl.ds(dims.tile_T * t128_tile_idx, dims.tile_T), :],
+                    dst=expert_affinities_masked_sb[:, t128_tile_idx, :],
+                )
+
+    # Step 2: Allocate output
+    OUTPUT_SHAPE = (dims.tile_T, dims.num_tiles_in_T, dims.H)
+    if params.output_in_sbuf:
+        output_sb = params.output
+    else:
+        output_sb = nl.ndarray(OUTPUT_SHAPE, dtype=params.activation_compute_dtype, buffer=nl.sbuf)
+
+    # Step 3: Compute expert MLPs sequentially
+    for expert_idx in nl.sequential_range(dims.E_L):
+        # Step 3.1: Load weights for this expert
+        weights = _load_expert(params=params, dims=dims, expert_idx=expert_idx)
+
+        # Step 3.2: Compute MLP for this expert
+        _compute_expert_mlp(
+            input_quant=input_quant_sb,
+            input_scale=input_scale_sb,
+            weights=weights,
+            params=params,
+            expert_affinities_masked=expert_affinities_masked_sb[...],
+            output_sb=output_sb[...],
+            output_hbm=params.output[...] if (not params.output_in_sbuf) else None,
+            expert_idx=expert_idx,
+            is_first_expert=(expert_idx == 0),
+            is_last_expert=(expert_idx == dims.E_L - 1),
+        )
+
+    return params.output
+
+
+def _all_expert_mx_dynamic(
+    params: AllExpertMXParams,
+    dims: AllExpertMXDims,
+) -> nl.ndarray:
+    """
+    All-expert MoE computation with dynamic control flow (DLoC).
+
+    Processes all experts sequentially, with tokens split into blocks for each expert. If any of the tokens in a block is
+    routed to the expert, the block is computed. Otherwise, the block is skipped. This is optimal when T is very large.
+    """
+
+    # TODO: implement
+
+    pass
+
+
+def _is_dynamic_while(E_L: int, T: int) -> bool:
     """
     Determine whether all-expert MX kernel should use dynamic loop on chip (DLoC).
 
@@ -75,7 +509,7 @@ def get_is_dynamic_while(E_L, T):
     return False
 
 
-def get_block_size(T, is_dynamic_while):
+def _get_block_size(T: int, is_dynamic_while: bool) -> int:
     """
     Determine the block size to use with dynamic loop on chip (DLoC).
 
@@ -91,7 +525,13 @@ def get_block_size(T, is_dynamic_while):
     return T
 
 
-def layout_adapter_qmx_hbm(input, T32_H4, TILE_H, n_T32_tiles, n_H512_tiles):
+def _layout_adapter_qmx_hbm(
+    input: nl.ndarray,
+    T32_H4: int,
+    TILE_H: int,
+    n_T32_tiles: int,
+    n_H512_tiles: int,
+) -> tuple[nl.ndarray, nl.ndarray]:
     """
     Load input from HBM, transform tensor into swizzled layout, and perform quantization to MXFP8.
 
@@ -130,12 +570,12 @@ def layout_adapter_qmx_hbm(input, T32_H4, TILE_H, n_T32_tiles, n_H512_tiles):
         )
         for h512_tile_idx in nl.affine_range(n_H512_tiles):
             input_transposed_psum = nl.ndarray((TILE_H, T32_H4), dtype=input_sb.dtype, buffer=nl.psum)
-            input_transposed_psum[...] = nisa.nc_transpose(input_sb[:, t32_tile_idx, h512_tile_idx, :])
-            input_swizzled_sb[:, h512_tile_idx, t32_tile_idx, :] = nisa.tensor_copy(input_transposed_psum[...])
+            nisa.nc_transpose(data=input_sb[:, t32_tile_idx, h512_tile_idx, :], dst=input_transposed_psum[...])
+            nisa.tensor_copy(src=input_transposed_psum[...], dst=input_swizzled_sb[:, h512_tile_idx, t32_tile_idx, :])
 
     # View swizzled shape as [16_H * 8_H, H/512 * T * 4_H]
     T_H4 = n_T32_tiles * T32_H4
-    T = T_H4 // 4
+    T = T_H4 // _q_width
     input_swizzled_sb = input_swizzled_sb.reshape((TILE_H, n_H512_tiles * n_T32_tiles * T32_H4))
 
     # Allocate [16_H * 8_H, H/512 * T] QMX output buffers, 4_H is x4 packed in dtype
@@ -158,7 +598,13 @@ def layout_adapter_qmx_hbm(input, T32_H4, TILE_H, n_T32_tiles, n_H512_tiles):
     return output_quant_sb, output_scale_sb
 
 
-def layout_adapter_qmx_sb(input_sb, T32_H4, TILE_H, n_T32_tiles, n_H512_tiles):
+def _layout_adapter_qmx_sb(
+    input_sb: nl.ndarray,
+    T32_H4: int,
+    TILE_H: int,
+    n_T32_tiles: int,
+    n_H512_tiles: int,
+) -> tuple[nl.ndarray, nl.ndarray]:
     """
     Transform SB input tensor into swizzled layout and perform quantization to MXFP8.
 
@@ -174,25 +620,14 @@ def layout_adapter_qmx_sb(input_sb, T32_H4, TILE_H, n_T32_tiles, n_H512_tiles):
         output_scale_sb (nl.ndarray): [16_H * 8_H, H/512, T], Scales in SBUF (located in leading 4P of each SBUF quadrant).
     """
     # TODO: migrate SB layout adapter to the new FE when we migrate the top-level MK that hits this code path. See _pre_prod_kernels/mlp_tkg/expert_mlp_tkg_all_expert_mx_impl.py.
-    kernel_assert(False, "layout_adapter_qmx_sb not yet migrated to new NKI FE")
+    kernel_assert(False, "_layout_adapter_qmx_sb not yet migrated to new NKI FE")
 
 
-def load_one_expert(
-    gate_up_weights,
-    down_weights,
-    gate_up_weights_scale,
-    down_weights_scale,
-    gate_up_weights_bias,
-    down_weights_bias,
-    expert_idx,
-    H,
-    I,
-    T,
-    n_prgs,
-    prg_id,
-    activation_compute_dtype,
-    use_PE_bias_broadcast,
-):
+def _load_expert(
+    params: AllExpertMXParams,
+    dims: AllExpertMXDims,
+    expert_idx: int,
+) -> ExpertWeightsSBUF:
     """
     Load gate, up, and down projection weight, scale, and bias tensors for one expert.
 
@@ -201,151 +636,93 @@ def load_one_expert(
     of bias and second half of H is full of zeros on NC0; NC1 is the inverse.
 
     Args:
-        gate_up_weights: Gate/up projection weights tensor.
-        down_weights: Down projection weights tensor.
-        gate_up_weights_scale: Gate/up projection scales tensor.
-        down_weights_scale: Down projection scales tensor.
-        gate_up_weights_bias: Gate/up projection bias tensor.
-        down_weights_bias: Down projection bias tensor.
+        params (AllExpertMXParams): All kernel parameters.
+        dims (AllExpertMXDims): Dimension information.
         expert_idx (int): Expert index to load.
-        H (int): Hidden dimension.
-        I (int): Intermediate dimension.
-        T (int): Number of tokens.
-        n_prgs (int): Number of programs (LNC).
-        prg_id (int): Program ID.
-        activation_compute_dtype: Compute dtype for activations.
-        use_PE_bias_broadcast (bool): Whether to use PE bias broadcast.
 
     Returns:
-        tuple: (gate_weight_sb, up_weight_sb, down_weight_sb, gate_weight_scale_sb,
-                up_weight_scale_sb, down_weight_scale_sb, gate_bias_sb, up_bias_sb, down_bias_sb)
+        ExpertWeightsSBUF: Expert weights, scales, and biases in SBUF.
     """
-
-    # Calculate constants
-    I_local = I // 2 if n_prgs > 1 else I
-    n_I512_tiles = I_local // 512
-    tile_I = down_weights.shape[1]
-    tile_T = min(T, nl.tile_size.pmax)
 
     # Load gate projection
     gate_weight_sb, gate_weight_scale_sb, gate_bias_sb = load_gate_up_weight_scale_bias(
-        weight=gate_up_weights,
-        scale=gate_up_weights_scale,
-        bias=gate_up_weights_bias,
+        weight=params.gate_up_weights,
+        scale=params.gate_up_weights_scale,
+        bias=params.gate_up_weights_bias,
         expert_idx=expert_idx,
         gate_or_up_idx=GATE_FUSED_IDX,
-        H=H,
-        I_local=I_local,
-        n_I512_tiles=n_I512_tiles,
-        prg_id=prg_id,
+        H=dims.H,
+        I_local=dims.I_local,
+        n_I512_tiles=dims.n_I512_tiles,
+        prg_id=dims.prg_id,
     )
 
     # Load up projection
     up_weight_sb, up_weight_scale_sb, up_bias_sb = load_gate_up_weight_scale_bias(
-        weight=gate_up_weights,
-        scale=gate_up_weights_scale,
-        bias=gate_up_weights_bias,
+        weight=params.gate_up_weights,
+        scale=params.gate_up_weights_scale,
+        bias=params.gate_up_weights_bias,
         expert_idx=expert_idx,
         gate_or_up_idx=UP_FUSED_IDX,
-        H=H,
-        I_local=I_local,
-        n_I512_tiles=n_I512_tiles,
-        prg_id=prg_id,
+        H=dims.H,
+        I_local=dims.I_local,
+        n_I512_tiles=dims.n_I512_tiles,
+        prg_id=dims.prg_id,
     )
 
     # Load down projection, broadcast down projection bias
     down_weight_sb, down_weight_scale_sb, down_bias_sb = load_broadcast_down_weight_scale_bias(
-        weight=down_weights,
-        scale=down_weights_scale,
-        bias=down_weights_bias,
+        weight=params.down_weights,
+        scale=params.down_weights_scale,
+        bias=params.down_weights_bias,
         expert_idx=expert_idx,
-        H=H,
-        tile_I=tile_I,
-        n_I512_tiles=n_I512_tiles,
-        tile_T=tile_T,
-        activation_compute_dtype=activation_compute_dtype,
-        use_PE_bias_broadcast=use_PE_bias_broadcast,
+        H=dims.H,
+        tile_I=dims.down_proj_tile_I,
+        n_I512_tiles=dims.n_I512_tiles,
+        tile_T=dims.tile_T,
+        activation_compute_dtype=params.activation_compute_dtype,
+        use_PE_bias_broadcast=False,  # FIXME: PE bias broadcast leads to inaccuracy
     )
 
-    return (
-        gate_weight_sb,
-        up_weight_sb,
-        down_weight_sb,
-        gate_weight_scale_sb,
-        up_weight_scale_sb,
-        down_weight_scale_sb,
-        gate_bias_sb,
-        up_bias_sb,
-        down_bias_sb,
+    return ExpertWeightsSBUF(
+        gate_weight_sb=gate_weight_sb,
+        up_weight_sb=up_weight_sb,
+        down_weight_sb=down_weight_sb,
+        gate_weight_scale_sb=gate_weight_scale_sb,
+        up_weight_scale_sb=up_weight_scale_sb,
+        down_weight_scale_sb=down_weight_scale_sb,
+        gate_bias_sb=gate_bias_sb,
+        up_bias_sb=up_bias_sb,
+        down_bias_sb=down_bias_sb,
     )
 
 
-def compute_one_block(
-    input_quant,
-    input_scale,
-    gate_weights_sb,
-    up_weights_sb,
-    down_weights_sb,
-    gate_weights_scale_sb,
-    up_weights_scale_sb,
-    down_weights_scale_sb,
-    gate_bias_sb,
-    up_bias_sb,
-    down_bias_sb,
-    expert_affinities_masked,
-    output_sb,
-    output_hbm,
-    expert_idx,
-    # Placeholder DLoC args
-    block_size,
-    token_position_to_id,
-    input_in_sbuf,
-    # Placeholder argument
-    output_in_sbuf,
-    lhs_rhs_swap,
-    gate_clamp_upper_limit,
-    gate_clamp_lower_limit,
-    up_clamp_upper_limit,
-    up_clamp_lower_limit,
-    hidden_act_fn,
-    expert_affinities_scaling_mode,
-    activation_compute_dtype,
-    is_first_expert,
-    is_last_expert,
-):
+def _compute_expert_mlp(
+    input_quant: nl.ndarray,
+    input_scale: nl.ndarray,
+    weights: ExpertWeightsSBUF,
+    params: AllExpertMXParams,
+    expert_affinities_masked: nl.ndarray,
+    output_sb: nl.ndarray,
+    output_hbm: nl.ndarray,
+    expert_idx: int,
+    is_first_expert: bool,
+    is_last_expert: bool,
+) -> nl.ndarray:
     """
     Compute expert MLP for one block of input.
 
     Args:
-        input_quant: Quantized input tensor.
-        input_scale: Input scale tensor.
-        gate_weights_sb: Gate projection weights in SBUF.
-        up_weights_sb: Up projection weights in SBUF.
-        down_weights_sb: Down projection weights in SBUF.
-        gate_weights_scale_sb: Gate projection scales in SBUF.
-        up_weights_scale_sb: Up projection scales in SBUF.
-        down_weights_scale_sb: Down projection scales in SBUF.
-        gate_bias_sb: Gate projection bias in SBUF.
-        up_bias_sb: Up projection bias in SBUF.
-        down_bias_sb: Down projection bias in SBUF.
-        expert_affinities_masked: Masked expert affinities.
-        output_sb: Output tensor in SBUF.
-        output_hbm: Output tensor in HBM.
+        input_quant (nl.ndarray): Quantized input tensor.
+        input_scale (nl.ndarray): Input scale tensor.
+        weights (ExpertWeightsSBUF): Expert weights, scales, and biases in SBUF.
+        params (AllExpertMXParams): All kernel parameters.
+        expert_affinities_masked (nl.ndarray): Masked expert affinities.
+        output_sb (nl.ndarray): Output tensor in SBUF.
+        output_hbm (nl.ndarray): Output tensor in HBM.
         expert_idx (int): Expert index.
-        block_size: Block size for dynamic loop (placeholder).
-        token_position_to_id: Token position mapping (placeholder).
-        input_in_sbuf (bool): Whether input is in SBUF.
-        output_in_sbuf (bool): Whether output is in SBUF.
-        lhs_rhs_swap (bool): Whether to swap LHS/RHS in matmul.
-        gate_clamp_upper_limit (float): Upper clamp limit for gate projection.
-        gate_clamp_lower_limit (float): Lower clamp limit for gate projection.
-        up_clamp_upper_limit (float): Upper clamp limit for up projection.
-        up_clamp_lower_limit (float): Lower clamp limit for up projection.
-        hidden_act_fn: Activation function type.
-        expert_affinities_scaling_mode: Expert affinity scaling mode.
-        activation_compute_dtype: Compute dtype for activations.
-        is_first_expert (bool): Whether this is the first expert.
-        is_last_expert (bool): Whether this is the last expert.
+        is_first_expert (bool): Whether the current expert is the first expert.
+        is_last_expert (bool): Whether the current expert is the last expert.
 
     Returns:
         output_sb: Output tensor in SBUF.
@@ -354,302 +731,40 @@ def compute_one_block(
         TODO[DLoC]: Explain what we are doing for dynamic loop.
     """
 
-    # Step 1: Process inputs
-    if input_in_sbuf:
-        # TODO: move input handling logic here
-        pass
-    else:
-        # TODO[DLoC]: Indirect load input_quant, input_scale, expert_affinities_masked
-        pass
-
-    # Step 2: Compute gate/up projection, projection clamping, activation function, and QMX
+    # Step 1: Compute gate/up projection, projection clamping, activation function, and QMX
     act_quant_sb, act_scale_sb = gate_up_projection_mx_shard_I(
         input_quant_sb=input_quant,
         input_scale_sb=input_scale,
-        gate_weight_sb=gate_weights_sb,
-        up_weight_sb=up_weights_sb,
-        gate_weight_scale_sb=gate_weights_scale_sb,
-        up_weight_scale_sb=up_weights_scale_sb,
-        gate_bias_sb=gate_bias_sb,
-        up_bias_sb=up_bias_sb,
-        lhs_rhs_swap=lhs_rhs_swap,
-        gate_clamp_upper_limit=gate_clamp_upper_limit,
-        gate_clamp_lower_limit=gate_clamp_lower_limit,
-        up_clamp_upper_limit=up_clamp_upper_limit,
-        up_clamp_lower_limit=up_clamp_lower_limit,
-        hidden_act_fn=hidden_act_fn,
-        activation_compute_dtype=activation_compute_dtype,
+        gate_weight_sb=weights.gate_weight_sb,
+        up_weight_sb=weights.up_weight_sb,
+        gate_weight_scale_sb=weights.gate_weight_scale_sb,
+        up_weight_scale_sb=weights.up_weight_scale_sb,
+        gate_bias_sb=weights.gate_bias_sb,
+        up_bias_sb=weights.up_bias_sb,
+        lhs_rhs_swap=params.lhs_rhs_swap,
+        gate_clamp_upper_limit=params.gate_clamp_upper_limit,
+        gate_clamp_lower_limit=params.gate_clamp_lower_limit,
+        up_clamp_upper_limit=params.up_clamp_upper_limit,
+        up_clamp_lower_limit=params.up_clamp_lower_limit,
+        hidden_act_fn=params.hidden_act_fn,
+        activation_compute_dtype=params.activation_compute_dtype,
     )
 
     # Step 3: Compute down projection, expert affinity scaling, expert add, LNC reduction, and SB->HBM spill
     down_projection_mx_shard_I(
         act_sb=act_quant_sb[...],
         act_scale_sb=act_scale_sb[...],
-        weight_sb=down_weights_sb,
-        weight_scale_sb=down_weights_scale_sb,
-        bias_sb=down_bias_sb,
+        weight_sb=weights.down_weight_sb,
+        weight_scale_sb=weights.down_weight_scale_sb,
+        bias_sb=weights.down_bias_sb,
         expert_affinities_masked_sb=expert_affinities_masked,
         expert_idx=expert_idx,
         out_sb=output_sb,
         out_hbm=output_hbm,
-        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-        activation_compute_dtype=activation_compute_dtype,
+        expert_affinities_scaling_mode=params.expert_affinities_scaling_mode,
+        activation_compute_dtype=params.activation_compute_dtype,
         is_first_expert=is_first_expert,
         is_last_expert=is_last_expert,
     )
 
     return output_sb
-
-
-def _all_expert_moe_tkg_mx(
-    mlp_params: MLPParameters,
-    output: nl.ndarray,
-    input_scale: nl.ndarray = None,
-    input_in_sbuf: bool = False,
-    output_in_sbuf: bool = False,
-    lhs_rhs_swap: bool = True,
-    activation_compute_dtype=nl.bfloat16,
-):
-    """
-    Perform all-expert MoE MLP on input using microscaling format (MX) weights.
-
-    Shards compute on intermediate dimension when run with LNC=2.
-
-    Dimensions:
-        B: Batch size
-        S: Sequence length
-        T: Total number of input tokens (equivalent to B*S)
-        H: Hidden dimension size of the model
-        I: Intermediate dimension size of the model after tensor parallelism
-        E_L: Number of local experts after expert parallelism
-
-    Args:
-        mlp_params (MLPParameters): MLPParameters containing all input tensors and configuration.
-        output (nl.ndarray): [min(T, 128), ⌈T/128⌉, H] in SBUF or [T, H] in HBM, Output tensor.
-        input_scale (nl.ndarray, optional): Quantization scale for input. Expected in SBUF.
-        input_in_sbuf (bool): Indicates whether inputs are in SBUF or HBM.
-        output_in_sbuf (bool): Indicates desired output buffer location (SBUF or HBM).
-        lhs_rhs_swap (bool): Indicates whether to swap LHS and RHS of gate and up projection matmuls.
-        activation_compute_dtype: Compute dtype for activations.
-
-    Returns:
-        output (nl.ndarray): [T, H] in HBM or [min(T, 128), ⌈T/128⌉, H] in SBUF, Output tensor with MoE results.
-
-    Notes:
-        - More details on input & weight layout in doc `YFIQAmI1p2nr`
-
-    Pseudocode:
-        # Step 1: Load and quantize input
-        input_quant, input_scale = layout_adapter(input)
-
-        # Step 2: Process each expert sequentially
-        for expert_idx in range(E_L):
-            # Load expert weights
-            gate_w, up_w, down_w = load_one_expert(expert_idx)
-
-            # Compute gate/up projection and activation
-            act = gate_up_projection(input_quant, gate_w, up_w)
-
-            # Compute down projection with affinity scaling
-            expert_out = down_projection(act, down_w)
-            if affinity_scaling_mode == POST_SCALE:
-                expert_out *= expert_affinities[expert_idx]
-
-            # Accumulate results
-            if expert_idx == 0:
-                output = expert_out
-            else:
-                output += expert_out
-    """
-
-    # Unpack from MLPParameters
-    input = mlp_params.hidden_tensor
-    gate_up_weights = mlp_params.gate_proj_weights_tensor
-    down_weights = mlp_params.down_proj_weights_tensor
-    gate_up_weights_scale = mlp_params.quant_params.gate_w_scale
-    down_weights_scale = mlp_params.quant_params.down_w_scale
-    gate_up_weights_bias = mlp_params.bias_params.gate_proj_bias_tensor if mlp_params.bias_params else None
-    down_weights_bias = mlp_params.bias_params.down_proj_bias_tensor if mlp_params.bias_params else None
-    expert_affinities_masked = mlp_params.expert_params.expert_affinities
-    expert_index = mlp_params.expert_params.expert_index
-    expert_affinities_scaling_mode = mlp_params.expert_params.expert_affinities_scaling_mode
-    gate_clamp_upper_limit = mlp_params.gate_clamp_upper_limit
-    gate_clamp_lower_limit = mlp_params.gate_clamp_lower_limit
-    up_clamp_upper_limit = mlp_params.up_clamp_upper_limit
-    up_clamp_lower_limit = mlp_params.up_clamp_lower_limit
-    hidden_act_fn = mlp_params.activation_fn
-
-    # Step 1: Check shapes and types, prep inputs
-    if input_scale == None:
-        kernel_assert(
-            input.dtype in SUPPORTED_QMX_INPUT_DTYPES,
-            f"Expected input dtype in {SUPPORTED_QMX_INPUT_DTYPES}, got {input.dtype=}.",
-        )
-    else:
-        kernel_assert(input.dtype in MX_DTYPES, f"Expected quantized input dtype in {MX_DTYPES}, got {input.dtype=}")
-        kernel_assert(input_scale.dtype == nl.uint8, f"Expected input_scale dtype = nl.uint8, got {input_scale.dtype=}")
-    kernel_assert(lhs_rhs_swap, "lhs_rhs_swap=False is not yet supported!")
-
-    # TODO: move constant extraction and shape validation to helper func / shape management object
-    pmax = nl.tile_size.pmax
-    if input_in_sbuf:
-        if input_scale != None:
-            # quantized input shape expected to be [16_H * 8_H, H/512, T]
-            T = input.shape[-1]
-        else:
-            # input shape expected to be [16_H * 8_H, T, 4_H * H/512]
-            T = input.shape[1]
-    else:
-        # [T, 4_H * H/512 * 16_H * 8_H]@HBM
-        T, _ = input.shape
-
-    # Shape extraction
-    E_L = gate_up_weights.shape[0]
-    I = gate_up_weights.shape[-1]
-    H = down_weights.shape[-1]
-
-    if not input_in_sbuf or input_scale == None:
-        # Layout adapters only suppoort T divisible by 32
-        kernel_assert(
-            T % 32 == 0,
-            f"Expected T divisible by 32, got {T=}. To use T divisible by 4, provide prequantized input and input_scale.",
-        )
-    else:
-        # T must be divisible by 4 to meet MatmultMx alignment constraints
-        kernel_assert(T % 4 == 0, f"Expected T divisible by 4, got {T=}")
-
-    kernel_assert(
-        len(expert_affinities_masked.shape) in (2, 3),
-        f"expected 2D or 3D expert_affinities_masked, got {expert_affinities_masked.shape=}",
-    )
-    kernel_assert(not output_in_sbuf, f"all-expert MX kernel does not yet support SBUF output, got {output_in_sbuf=}")
-
-    # LNC config
-    _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx_shard_I", (0, 1))
-
-    # Tiling strategy
-    NUM_TILES_IN_T = div_ceil(T, pmax)
-    n_T32_tiles = div_ceil(T, 32)
-    n_H512_tiles = div_ceil(H, 512)
-    TILE_T = min(T, pmax)
-    TILE_H = H // n_H512_tiles // 4
-    T32_H4 = pmax  # always pad to 128 because of above conditions
-
-    # Step 2: Optional load + swizzle + QMX input
-    if input_in_sbuf:
-        if input_scale == None:
-            input_quant_sb, input_scale_sb = layout_adapter_qmx_sb(input, T32_H4, TILE_H, n_T32_tiles, n_H512_tiles)
-        else:
-            # Input has been swizzled + MX quantized upstream
-            input_quant_sb, input_scale_sb = input, input_scale
-    else:
-        input_quant_sb, input_scale_sb = layout_adapter_qmx_hbm(input, T32_H4, TILE_H, n_T32_tiles, n_H512_tiles)
-
-    # Handle expert_affinities_masked based on its buffer type
-    if expert_affinities_masked.buffer == nl.sbuf:
-        kernel_assert(
-            expert_affinities_masked.shape[0] <= pmax,
-            f"expected expert_affinities_masked shape [128_T, T/128, E_L] when T>128, got {expert_affinities_masked.shape=}",
-        )
-        expert_affinities_masked_sb = expert_affinities_masked
-    else:
-        # Load from HBM to SBUF
-        expert_affinities_masked_shape = (T, E_L) if T <= 128 else (128, T // 128, E_L)
-        expert_affinities_masked_sb = nl.ndarray(
-            expert_affinities_masked_shape, dtype=expert_affinities_masked.dtype, buffer=nl.sbuf
-        )
-        if T <= 128:
-            nisa.dma_copy(
-                src=expert_affinities_masked[...],
-                dst=expert_affinities_masked_sb[...],
-            )
-        else:
-            for t128_tile_idx in nl.affine_range(T // TILE_T):
-                nisa.dma_copy(
-                    src=expert_affinities_masked[nl.ds(TILE_T * t128_tile_idx, TILE_T), :],
-                    dst=expert_affinities_masked_sb[:, t128_tile_idx, :],
-                )
-
-    # Step 3: Compute expert MLPs sequentially
-    # Step 3.1: Allocate output
-    OUTPUT_SHAPE = (TILE_T, NUM_TILES_IN_T, H)
-    if output_in_sbuf:
-        output_sb = output
-    else:
-        output_sb = nl.ndarray(OUTPUT_SHAPE, dtype=activation_compute_dtype, buffer=nl.sbuf)
-
-    # Step 3.2: Blockwise compute strategy
-    # NOTE: right now this section is a no-op
-    is_dynamic_while = get_is_dynamic_while(E_L, T)
-    block_size = get_block_size(T, is_dynamic_while)
-    num_blocks = T // block_size
-    num_static_blocks = 1
-    num_dynamic_blocks = num_blocks - num_static_blocks
-    for expert_idx in nl.sequential_range(E_L):
-        # Step 3.2: Compute fused gate projection, up projection, activation, and MX quantization
-        (
-            gate_weight_sb,
-            up_weight_sb,
-            down_weight_sb,
-            gate_weight_scale_sb,
-            up_weight_scale_sb,
-            down_weight_scale_sb,
-            gate_bias_sb,
-            up_bias_sb,
-            down_bias_sb,
-        ) = load_one_expert(
-            gate_up_weights=gate_up_weights,
-            down_weights=down_weights,
-            gate_up_weights_scale=gate_up_weights_scale,
-            down_weights_scale=down_weights_scale,
-            gate_up_weights_bias=gate_up_weights_bias,
-            down_weights_bias=down_weights_bias,
-            expert_idx=expert_idx,
-            H=H,
-            I=I,
-            T=T,
-            n_prgs=n_prgs,
-            prg_id=prg_id,
-            activation_compute_dtype=activation_compute_dtype,
-            # FIXME: PE bias broadcast is leads to inaccuracy, fix this and turn it on for all configs
-            use_PE_bias_broadcast=False,
-        )
-
-        # Step 3.4: Compute static block. When we are not using DLoC, it is most efficient to use one block for the entire expert MLP.
-        compute_one_block(
-            input_quant=input_quant_sb,
-            input_scale=input_scale_sb,
-            gate_weights_sb=gate_weight_sb,
-            up_weights_sb=up_weight_sb,
-            down_weights_sb=down_weight_sb,
-            gate_weights_scale_sb=gate_weight_scale_sb,
-            up_weights_scale_sb=up_weight_scale_sb,
-            down_weights_scale_sb=down_weight_scale_sb,
-            gate_bias_sb=gate_bias_sb,
-            up_bias_sb=up_bias_sb,
-            down_bias_sb=down_bias_sb,
-            expert_affinities_masked=expert_affinities_masked_sb[...],
-            output_sb=output_sb[...],
-            output_hbm=output[...] if (not output_in_sbuf) else None,
-            expert_idx=expert_idx,
-            # Placeholder DLoC args
-            block_size=None,
-            token_position_to_id=None,
-            input_in_sbuf=input_in_sbuf,
-            output_in_sbuf=output_in_sbuf,
-            lhs_rhs_swap=lhs_rhs_swap,
-            gate_clamp_upper_limit=gate_clamp_upper_limit,
-            gate_clamp_lower_limit=gate_clamp_lower_limit,
-            up_clamp_upper_limit=up_clamp_upper_limit,
-            up_clamp_lower_limit=up_clamp_lower_limit,
-            hidden_act_fn=hidden_act_fn,
-            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-            activation_compute_dtype=activation_compute_dtype,
-            is_first_expert=(expert_idx == 0),
-            is_last_expert=(expert_idx == E_L - 1),
-        )
-
-        # Step 3.5: Compute dynamic block(s)
-        # TODO[DLoC]: Implement
-
-    return output

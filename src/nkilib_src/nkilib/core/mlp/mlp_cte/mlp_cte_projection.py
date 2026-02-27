@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Projection Module
-
-Implements matrix multiplication operations for MLP projections including up, gate, and down
-projections with detailed pseudo-code documentation and optimized processing order.
-
-"""
+"""MLP CTE projection operations for up, gate, and down projections with optimized tiling."""
 
 from typing import Optional
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 
@@ -240,12 +235,12 @@ def perform_down_projection(
         other_core_program_id = 1 - indices.program_id
 
         other_core_result_tensor_sbuf_list = []
-        for i in range(BXS_SUBTILE_COUNT):
+        for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
             tensor = alloc_stack(
                 (BXS_SUBTILE_SIZE, hidden_size_per_core),
                 dtype=constants.compute_data_type,
                 buffer=nl.sbuf,
-                name=indices.get_tensor_name("other_core_result_tensor_sbuf", f"subbxs{i}"),
+                name=indices.get_tensor_name("other_core_result_tensor_sbuf", f"subbxs{bxs_subtile_idx}"),
             )
             other_core_result_tensor_sbuf_list.append(tensor)
 
@@ -472,12 +467,12 @@ def perform_quantized_down_projection(
         other_core_program_id = 1 - indices.program_id
 
         other_core_result_tensor_sbuf_list = []
-        for i in range(BXS_SUBTILE_COUNT):
+        for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
             tensor = alloc_stack(
                 (BXS_SUBTILE_SIZE, hidden_size_per_core),
                 dtype=constants.compute_data_type,
                 buffer=nl.sbuf,
-                name=indices.get_tensor_name('other_core_result_tensor_sbuf', f'subbxs{i}'),
+                name=indices.get_tensor_name('other_core_result_tensor_sbuf', f'subbxs{bxs_subtile_idx}'),
             )
             other_core_result_tensor_sbuf_list.append(tensor)
 
@@ -674,7 +669,7 @@ def perform_up_projection(
         if mlpp_has_up_projection_bias(mlp_params):
             # We need another tensor to hold the result in SBUF of the bias application
             up_proj_res_sbuf_list = []
-            for i in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+            for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                 up_proj_tensor = alloc_stack(
                     (
                         tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
@@ -683,7 +678,7 @@ def perform_up_projection(
                     ),
                     dtype=constants.compute_data_type,
                     buffer=nl.sbuf,
-                    name=indices.get_tensor_name("up_proj_res_sbuf", f"subbxs{i}"),
+                    name=indices.get_tensor_name("up_proj_res_sbuf", f"subbxs{bxs_subtile_idx}"),
                 )
                 up_proj_res_sbuf_list.append(up_proj_tensor)
 

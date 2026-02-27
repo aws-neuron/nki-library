@@ -35,7 +35,7 @@ from ...utils.allocator import SbufManager
 # common utils
 from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim, QuantizationType
 from ...utils.kernel_assert import kernel_assert
-from ...utils.logging import Logger
+from ...utils.logging import get_logger
 from ...utils.tensor_view import TensorView
 from .moe_tkg_utils import reshape_scale_for_mlp, safe_tensor_view
 
@@ -104,7 +104,7 @@ def _all_expert_moe_tkg(
     Note that now it is always use the auto allocation since expert_affinities is always in SBUF.
     """
     use_auto_alloc = H >= 16 * 1024 or hidden_in_sbuf or expert_affinities_in_sbuf
-    sbm = SbufManager(0, 200000, Logger("all_expert_moe_tkg"), use_auto_alloc=use_auto_alloc)
+    sbm = SbufManager(0, 200000, get_logger("all_expert_moe_tkg"), use_auto_alloc=use_auto_alloc)
     allocator = sbm.alloc_stack
 
     sbm.open_scope()
@@ -285,8 +285,11 @@ def _all_expert_moe_tkg(
         # Apply affinity and accumulate to SB
         if params.expert_params.expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
             for shard in range(dims.H1_shard):
-                down_sb[: dims.H0, shard, : dims.T] = nisa.tensor_tensor(
-                    down_sb[: dims.H0, shard, : dims.T], expert_affinities_sb, op=nl.multiply
+                nisa.tensor_tensor(
+                    data1=down_sb[: dims.H0, shard, : dims.T],
+                    data2=expert_affinities_sb,
+                    op=nl.multiply,
+                    dst=down_sb[: dims.H0, shard, : dims.T],
                 )
         if expertIdx == 0:
             nisa.tensor_copy(
@@ -294,10 +297,11 @@ def _all_expert_moe_tkg(
                 src=down_sb[0 : dims.H0, 0 : dims.H1_shard, 0 : dims.T],
             )
         else:
-            output_temp[0 : dims.H0, 0 : dims.H1_shard, 0 : dims.T] = nisa.tensor_tensor(
-                down_sb[0 : dims.H0, 0 : dims.H1_shard, 0 : dims.T],
-                output_temp[0 : dims.H0, 0 : dims.H1_shard, 0 : dims.T],
+            nisa.tensor_tensor(
+                data1=down_sb[0 : dims.H0, 0 : dims.H1_shard, 0 : dims.T],
+                data2=output_temp[0 : dims.H0, 0 : dims.H1_shard, 0 : dims.T],
                 op=nl.add,
+                dst=output_temp[0 : dims.H0, 0 : dims.H1_shard, 0 : dims.T],
             )
 
         sbm.increment_section()

@@ -12,17 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Sharding Module
-
-Provides sharding strategies and utilities for distributing MLP computation across multiple cores.
-Supports sharding on batch×sequence length and intermediate dimensions with automatic shard calculation.
-
-"""
+"""MLP CTE sharding strategies for distributing computation across multiple cores."""
 
 from dataclasses import dataclass
 from enum import Enum, auto
 
+import nki
 import nki.language as nl
 from nki.language import NKIObject
 
@@ -124,9 +119,10 @@ def _get_bxs_shard_size(
         if bxs <= (num_shards * bxs_tile_size):
             bxs_tile_size = bxs // num_shards
     else:
+        ignore_divisibility = bxs % tile_size_candidates[-1] != 0
         for c_idx in range(len(tile_size_candidates)):
             candidate = tile_size_candidates[c_idx]
-            if (bxs / candidate >= default_tiling_factor) and (bxs % candidate == 0):
+            if (bxs / candidate >= default_tiling_factor) and (ignore_divisibility or bxs % candidate == 0):
                 bxs_tile_size = candidate
                 break
 

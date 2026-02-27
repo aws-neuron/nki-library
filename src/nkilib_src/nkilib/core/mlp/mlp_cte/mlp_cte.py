@@ -12,23 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Main Module
-
-Main implementation of MLP Context Encoding (CTE) kernel with SPMD support, automatic sharding,
-and complete MLP pipeline including normalization, projections, and activation functions.
-
-"""
+"""MLP CTE kernel implementing context encoding computation with SPMD support and automatic sharding."""
 
 from typing import Callable
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info, is_launched_as_spmd
-from ...utils.logging import Logger
+from ...utils.logging import get_logger
 from ..mlp_parameters import (
     MLPParameters,
     mlpp_has_down_projection_bias,
@@ -92,27 +87,82 @@ def mlp_cte(
     output_tensor_hbm: nl.ndarray,
     output_stored_add_tensor_hbm: nl.ndarray,
 ):
-    """NKI kernel implementing MLP Context Encoding (CTE) computation with SPMD support.
+    """
+    MLP Context Encoding (CTE) kernel with SPMD support and automatic sharding.
 
-    Performs the MLP computation optimized for context encoding workloads with large batch
-    and sequence dimensions. Supports both single-core and multi-core SPMD execution with
-    automatic sharding across different dimensions.
+    Performs MLP computation optimized for context encoding workloads with large batch
+    and sequence dimensions. Supports both single-core and multi-core SPMD execution.
+
+    Dimensions:
+        B: Batch size
+        S: Sequence length
+        H: Hidden dimension size
+        I: Intermediate dimension size
 
     Args:
-        mlp_params: Complete MLP configuration parameters
-        output_tensor_hbm: Pre-allocated HBM output tensor for MLP results
-        output_stored_add_tensor_hbm: Pre-allocated HBM tensor for fused addition results
+        mlp_params (MLPParameters): Complete MLP configuration parameters including
+            hidden_tensor, weight tensors, normalization params, and quantization params
+        output_tensor_hbm (nl.ndarray): [B, S, H], Pre-allocated HBM output tensor for MLP results
+        output_stored_add_tensor_hbm (nl.ndarray): [B, S, H], Pre-allocated HBM tensor for
+            fused addition results (optional, can be None)
 
     Returns:
-        None
+        None: Results are written directly to output_tensor_hbm
 
-    Intended Usage:
-        This kernel is optimized for:
-        - Batch sizes (B) between 1 and 64 for optimal memory utilization
-        - Sequence lengths (S) > 1024 to amortize kernel launch overhead
-        - Hidden dimensions (H) that are multiples of 128 for efficient vectorization
-        - Intermediate dimensions (I) that are multiples of 256 for optimal tensor core usage
-        - Use when sequence length is large (context encoding scenarios)
+    Notes:
+        - Optimized for batch sizes B between 1 and 64
+        - Best performance with sequence lengths S > 1024
+        - Hidden dimensions H must be multiples of 128
+        - Intermediate dimensions I should be multiples of 256
+        - Supports RMS and Layer normalization fusion
+        - Supports FP8 quantization (static and row-wise)
+
+    Pseudocode:
+        # Step 1: Calculate sharding strategy based on tensor dimensions
+        sharding_info = calculate_sharding(mlp_params)
+
+        # Step 2: For each shard assigned to this program
+        for shard in sharding_info.shards:
+            # Step 2a: Build tile info and constants
+            tile_info = build_tile_info(shard)
+            constants = build_constants(shard)
+
+            # Step 2b: Execute MLP pipeline on shard
+            for batch in range(batch_size):
+                for bxs_tile in range(num_tiles):
+                    # Load hidden tensor with optional fused add
+                    hidden = load_hidden_tile(mlp_params.hidden_tensor)
+
+                    # Apply normalization if configured
+                    if has_normalization:
+                        hidden = normalize(hidden)
+
+                    # Transpose for projection matmuls
+                    hidden_T = transpose(hidden)
+
+                    # Gate projection: hidden @ gate_weights -> gate_out
+                    if has_gate_projection:
+                        gate_out = matmul(hidden_T, gate_weights)
+                        gate_out = activation(gate_out)
+
+                    # Up projection: hidden @ up_weights -> up_out
+                    up_out = matmul(hidden_T, up_weights)
+
+                    # Elementwise multiply gate and up results
+                    if has_gate_projection:
+                        intermediate = gate_out * up_out
+                    else:
+                        intermediate = activation(up_out)
+
+                    # Quantize intermediate if configured
+                    if has_quantization:
+                        intermediate = quantize(intermediate)
+
+                    # Down projection: intermediate @ down_weights -> output
+                    output = matmul(intermediate, down_weights)
+
+                    # Store output to HBM
+                    store_output(output, output_tensor_hbm)
     """
     kernel_assert(
         is_launch_grid_valid_for_mlp(),
@@ -123,7 +173,7 @@ def mlp_cte(
     sbm = SbufManager(
         sb_lower_bound=0,
         sb_upper_bound=MAX_AVAILABLE_SBUF_SIZE,
-        logger=Logger("mlp_cte"),
+        logger=get_logger("mlp_cte"),
     )
     sbm.open_scope(interleave_degree=top_level_interleave_degree)
 
@@ -133,15 +183,15 @@ def mlp_cte(
         _, total_programs, program_id = get_program_sharding_info()
 
         sharding_info = calculate_sharding(mlp_params)
-        for i in range(len(sharding_info.shards)):
-            shard = sharding_info.shards[i]
+        for shard_idx in range(len(sharding_info.shards)):
+            shard = sharding_info.shards[shard_idx]
             _execute_on_shard(
                 shard.shard_mlp_params,
                 sharding_info.sharded_dim,
                 shard,
                 total_programs,
                 program_id,
-                i,
+                shard_idx,
                 sbm,
                 heap_alloc,
                 output_tensor_hbm,
@@ -183,27 +233,29 @@ def _execute_on_shard(
     output_tensor_hbm: nl.ndarray,
     output_stored_add_tensor_hbm: nl.ndarray,
 ):
-    """Execute MLP computation on a single shard.
+    """
+    Execute MLP computation on a single shard.
 
-    Builds tile info and constants for the shard, then executes the computation.
+    Builds tile info and constants for the shard, then executes the full MLP pipeline.
 
     Args:
-        shard_mlp_params: MLP parameters for this shard
-        sharded_dim: Dimension being sharded
-        dim_shard: Shard configuration
-        total_programs: Total number of programs
-        program_id: Current program ID
-        shard_idx: Current shard index
-        sbm: SBUF memory manager
-        heap_alloc: Memory allocator function
-        output_tensor_hbm: Output tensor in HBM
-        output_stored_add_tensor_hbm: Stored add tensor in HBM
+        shard_mlp_params (MLPParameters): MLP parameters for this shard
+        sharded_dim (ShardedDim): Dimension being sharded (BATCH_X_SEQUENCE_LENGTH or INTERMEDIATE)
+        dim_shard (DimShard): Shard configuration with offset and size
+        total_programs (int): Total number of programs in SPMD execution
+        program_id (int): Current program ID (0 to total_programs-1)
+        shard_idx (int): Current shard index within this program
+        sbm (SbufManager): SBUF memory manager for allocation
+        heap_alloc (Callable): Memory allocator function for heap allocations
+        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM
+        output_stored_add_tensor_hbm (nl.ndarray): [B, S, H], Stored add tensor in HBM
 
     Returns:
-        None
+        None: Results written to output tensors
 
-    Intended Usage:
-        Called internally for each shard in SPMD execution
+    Notes:
+        - Called internally for each shard in SPMD execution
+        - Handles cleanup of allocated constants after execution
     """
     tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
     constants = build_mlp_cte_constants(
@@ -240,25 +292,27 @@ def _mlp_cte_single_shard(
     output_stored_add_tensor_hbm: nl.ndarray,
     sbm: SbufManager,
 ):
-    """Execute MLP computation on a single shard with detailed tile processing.
+    """
+    Execute MLP computation on a single shard with detailed tile processing.
 
     Processes all tiles within a shard, handling normalization, projections, and output storage.
 
     Args:
-        program_id: Current program ID
-        shard_idx: Current shard index
-        mlp_params: MLP configuration parameters
-        tile_info: Tiling information
-        constants: MLP CTE constants
-        output_tensor_hbm: Output tensor in HBM
-        output_stored_add_tensor_hbm: Stored add tensor in HBM
-        sbm: SBUF memory manager
+        program_id (int): Current program ID (0 to total_programs-1)
+        shard_idx (int): Current shard index within this program
+        mlp_params (MLPParameters): MLP configuration parameters
+        tile_info (MLPCTETileInfo): Tiling information for all dimensions
+        constants (MLPCTEConstants): MLP CTE constants including data types and buffer counts
+        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM
+        output_stored_add_tensor_hbm (nl.ndarray): [B, S, H], Stored add tensor in HBM
+        sbm (SbufManager): SBUF memory manager for allocation
 
     Returns:
-        None
+        None: Results written to output tensors
 
-    Intended Usage:
-        Called internally to process individual shards with full MLP pipeline
+    Notes:
+        - Called internally to process individual shards with full MLP pipeline
+        - Handles bias loading, normalization, projections, and quantization
     """
     # The handling of the outer loop depend on the sharding strategy.  For sequence length
     # and intermediate sharding, the outer loop range is the batch size. But if we shard on
@@ -390,7 +444,7 @@ def _mlp_cte_single_shard(
             hidden_tile_sbuf_list = []
             hidden_tile_scales_sbuf_list = []
 
-            for i in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+            for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                 hidden_tensor = heap_alloc(
                     (
                         tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
@@ -398,7 +452,7 @@ def _mlp_cte_single_shard(
                     ),
                     dtype=constants.hidden_tile_data_type,
                     buffer=nl.sbuf,
-                    name=indices.get_tensor_name("hidden_tensor", f"subbxs{i}"),
+                    name=indices.get_tensor_name("hidden_tensor", f"subbxs{bxs_subtile_idx}"),
                 )
                 hidden_tile_sbuf_list.append(hidden_tensor)
                 if mlpp_input_has_packed_scale(mlp_params):
@@ -406,13 +460,13 @@ def _mlp_cte_single_shard(
                         (tile_info.bxs_dim_tile.subtile_dim_info.tile_size, 1),
                         dtype=nl.float32,
                         buffer=nl.sbuf,
-                        name=indices.get_tensor_name('hidden_scale_tensor', f'subbxs{i}'),
+                        name=indices.get_tensor_name('hidden_scale_tensor', f'subbxs{bxs_subtile_idx}'),
                     )
                     hidden_tile_scales_sbuf_list.append(hidden_scale_tensor)
 
             # Create space for source projection storage in SBUF
             src_proj_res_sbuf_list = []
-            for i in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+            for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                 src_proj_tensor = stack_alloc(
                     (
                         tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
@@ -421,7 +475,7 @@ def _mlp_cte_single_shard(
                     ),
                     dtype=constants.compute_data_type,
                     buffer=nl.sbuf,
-                    name=indices.get_tensor_name("src_proj_res_sbuf", f"subbxs{i}"),
+                    name=indices.get_tensor_name("src_proj_res_sbuf", f"subbxs{bxs_subtile_idx}"),
                 )
                 src_proj_res_sbuf_list.append(src_proj_tensor)
 
@@ -453,7 +507,7 @@ def _mlp_cte_single_shard(
             # Declare our SBUF tensor for the source projection weights.
             # Create "multiple buffers" using the 2nd dimension to facilitate overlapped loads.
             src_proj_weights_sbuf_list = []
-            for i in range(constants.src_proj_weights_buffer_count):
+            for weight_buffer_idx in range(constants.src_proj_weights_buffer_count):
                 weights_tensor = heap_alloc(
                     (
                         tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_size,
@@ -466,7 +520,7 @@ def _mlp_cte_single_shard(
                         else constants.compute_data_type
                     ),
                     buffer=nl.sbuf,
-                    name=indices.get_tensor_name("weights_tensor", f"subbxs{i}"),
+                    name=indices.get_tensor_name("weights_tensor", f"buf{weight_buffer_idx}"),
                 )
                 src_proj_weights_sbuf_list.append(weights_tensor)
 
@@ -517,22 +571,22 @@ def _mlp_cte_single_shard(
             )
 
             if sbm != None:
-                for i in range(constants.src_proj_weights_buffer_count):
+                for weight_buffer_idx in range(constants.src_proj_weights_buffer_count):
                     sbm.pop_heap()  # src_proj_weights_sbuf
                 if mlpp_has_quantized_input(mlp_params):
-                    for i in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                    for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                         sbm.pop_heap()  # hidden_tile_sbuf
 
             # Perform quantization on the intermediate tensor if necessary
             if mlpp_has_quantized_weights(mlp_params):
                 intermediate_dequant_scales_sbuf_list = []
                 intermediate_tensor_sbuf_list = []
-                for i in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                     if mlp_params.quant_params.is_quant_row():
                         intermediate_dequant_scales_sbuf = stack_alloc(
                             (tile_info.bxs_dim_tile.subtile_dim_info.tile_size, 1),
                             dtype=nl.float32,
-                            name=indices.get_tensor_name('intermediate_scale_tensor', f'subbxs{i}'),
+                            name=indices.get_tensor_name('intermediate_scale_tensor', f'subbxs{bxs_subtile_idx}'),
                         )
                         intermediate_dequant_scales_sbuf_list.append(intermediate_dequant_scales_sbuf)
                     intermediate_tensor = stack_alloc(
@@ -542,7 +596,7 @@ def _mlp_cte_single_shard(
                             tile_info.src_proj_intermediate_dim_tile.tile_size,
                         ),
                         dtype=constants.down_proj_quant_data_type,
-                        name=indices.get_tensor_name('intermediate_tensor', f'subbxs{i}'),
+                        name=indices.get_tensor_name('intermediate_tensor', f'subbxs{bxs_subtile_idx}'),
                     )
                     intermediate_tensor_sbuf_list.append(intermediate_tensor)
                 perform_intermediate_quantization(
@@ -563,7 +617,7 @@ def _mlp_cte_single_shard(
             # Declare our SBUF tensor for the down projection weights.
             # Create "multiple buffers" using the 2nd dimension to facilitate overlapped loads.
             down_proj_weights_sbuf = []
-            for i in range(constants.down_proj_weights_buffer_count):
+            for weight_buffer_idx in range(constants.down_proj_weights_buffer_count):
                 down_proj_weights_tensor = stack_alloc(
                     (
                         tile_info.down_proj_intermediate_dim_tile.tile_size,
@@ -575,7 +629,7 @@ def _mlp_cte_single_shard(
                         if mlpp_has_quantized_weights(mlp_params)
                         else constants.compute_data_type
                     ),
-                    name=indices.get_tensor_name("down_proj_weights_sbuf", f"subbxs{i}"),
+                    name=indices.get_tensor_name("down_proj_weights_sbuf", f"buf{weight_buffer_idx}"),
                 )
                 down_proj_weights_sbuf.append(down_proj_weights_tensor)
 
@@ -592,14 +646,14 @@ def _mlp_cte_single_shard(
 
             if mlpp_has_quantized_input(mlp_params):
                 output_tile_sbuf_list = []
-                for i in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                     output_tile_sbuf = stack_alloc(
                         (
                             tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
                             mlp_params.hidden_size,
                         ),
                         dtype=constants.compute_data_type,
-                        name=indices.get_tensor_name('output_tensor', f'subbxs{i}'),
+                        name=indices.get_tensor_name('output_tensor', f'subbxs{bxs_subtile_idx}'),
                     )
                     output_tile_sbuf_list.append(output_tile_sbuf)
             else:
@@ -641,7 +695,7 @@ def _mlp_cte_single_shard(
                 )
 
             if sbm != None and not mlpp_has_quantized_input(mlp_params):
-                for i in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                     sbm.pop_heap()  # output_tile_sbuf aka hidden_tile_sbuf
 
             if sbm != None:

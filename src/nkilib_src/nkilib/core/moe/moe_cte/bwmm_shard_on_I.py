@@ -353,7 +353,6 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
     compute_dtype=nl.bfloat16,
     is_tensor_update_accumulating=True,
     expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
-    n_block_per_iter=1,
     gate_clamp_upper_limit: Optional[float] = None,
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
@@ -406,7 +405,6 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
         compute_dtype: Compute data type (default: nl.bfloat16).
         is_tensor_update_accumulating (bool): Whether to accumulate results over multiple blocks (default: True).
         expert_affinities_scaling_mode (ExpertAffinityScaleMode): Post or pre scaling mode (default: POST_SCALE).
-        n_block_per_iter (int): Currently unsupported (default: 1).
         gate_clamp_upper_limit (float, optional): Upper clamp limit for gate projection.
         gate_clamp_lower_limit (float, optional): Lower clamp limit for gate projection.
         up_clamp_upper_limit (float, optional): Upper clamp limit for up projection.
@@ -1435,89 +1433,6 @@ def calculate_expert_affinity_T(
         )
 
     return expert_affinity_T_broadcasted
-
-
-def calculate_expert_affinities(
-    expert_affinities_masked,
-    token_indices,
-    block_expert,
-    E,
-    NUM_TILES,
-    dtype,
-    skip_dma: SkipMode = SkipMode(),
-    token_indices_offset=0,
-):
-    """Calculate expert affinities for the current block.
-
-    Args:
-        expert_affinities_masked: Masked expert affinities tensor.
-        token_indices: Token indices tensor.
-        block_expert: Expert index tensor.
-        E: Number of experts.
-        NUM_TILES: Number of tiles.
-        dtype: Data type.
-        skip_dma: Skip DMA mode.
-        token_indices_offset: Offset for token indices.
-
-    Returns:
-        expert_affinity_f32_lst: List of tensors, each of shape (TILE_SIZE, 1).
-    """
-    v_expert = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-
-    for channel_bank_idx in range(4):
-        shuffle_mask = [0] * 32
-        nisa.nc_stream_shuffle(
-            dst=v_expert[
-                DVE_CHANNELS_PER_BANK * channel_bank_idx : DVE_CHANNELS_PER_BANK * (channel_bank_idx + 1), 0:1
-            ],
-            src=block_expert.ap(
-                pattern=[
-                    [1, 1],
-                    [1, 1],
-                ],
-                offset=0,
-            ),
-            shuffle_mask=shuffle_mask,
-        )
-
-    expert_affinity_f32_lst = []
-    for tile_idx in range(NUM_TILES):
-        expert_affinity_f32_lst.append(nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf))
-
-    for tile_idx in range(NUM_TILES):
-        addr = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=addr, op0=nl.multiply, data=token_indices[0:TILE_SIZE, token_indices_offset + tile_idx], operand0=E
-        )
-        addr_fin = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=addr_fin, data1=addr, op=nl.add, data2=v_expert)
-
-        if skip_dma.skip_token:
-            nisa.tensor_scalar(dst=addr_fin, data=addr_fin, op0=nl.maximum, operand0=-1)
-
-        expert_affinity_dtype = nl.ndarray((TILE_SIZE, 1), dtype=dtype, buffer=nl.sbuf)
-        if skip_dma.skip_token:
-            nisa.memset(value=0, dst=expert_affinity_dtype[0:TILE_SIZE, 0])
-
-        num_cols = expert_affinities_masked.shape[1]
-        addr_fin_reshaped = nl.ndarray((TILE_SIZE, 1), dtype=addr_fin.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=addr_fin_reshaped, src=addr_fin[0:TILE_SIZE, 0:1])
-
-        nisa.dma_copy(
-            dst=expert_affinity_dtype[0:TILE_SIZE, 0:1],
-            src=expert_affinities_masked.ap(
-                pattern=[[num_cols, TILE_SIZE], [1, 1]], offset=0, vector_offset=addr_fin_reshaped, indirect_dim=0
-            ),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-        )
-
-        nisa.tensor_copy(
-            dst=expert_affinity_f32_lst[tile_idx][0:TILE_SIZE, 0],
-            src=expert_affinity_dtype[0:TILE_SIZE, 0],
-            dtype=nl.float32,
-        )
-
-    return expert_affinity_f32_lst
 
 
 def load_old_block(

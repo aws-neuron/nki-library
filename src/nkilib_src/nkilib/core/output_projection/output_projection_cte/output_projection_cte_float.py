@@ -104,6 +104,7 @@ def perform_float_projection(
                     s_block_idx=s_block_idx,
                     h_block_idx=h_block_idx,
                     cfg=cfg,
+                    weight_dtype=weight.dtype,
                 )
 
 
@@ -115,6 +116,7 @@ def _process_batch_tile(
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
+    weight_dtype,
 ) -> None:
     """
     Process a single batch tile for one h_block: computes attention @ weight + bias.
@@ -127,6 +129,7 @@ def _process_batch_tile(
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         cfg (TilingConfig): Tiling configuration.
+        weight_dtype: Weight tensor dtype (attention is cast to this to avoid mixed precision errors).
 
     Returns:
         None: Writes results to output tensor via output_view.
@@ -134,8 +137,8 @@ def _process_batch_tile(
     curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
     s_start = s_block_idx * cfg.s_tile.tile_size
 
-    # Step 1: Load attention tensors
-    attention_sb = load_input_tensor_float(attention_view=attention_view, cfg=cfg)
+    # Step 1: Load attention tensors (cast to weight dtype to avoid mixed precision matmul error)
+    attention_sb = load_input_tensor_float(attention_view=attention_view, cfg=cfg, target_dtype=weight_dtype)
 
     # Step 2: Compute matmul and add bias
     result_sb = _compute_matmul_add_bias(

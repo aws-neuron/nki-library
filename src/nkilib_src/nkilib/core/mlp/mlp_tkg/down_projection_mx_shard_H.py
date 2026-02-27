@@ -34,7 +34,6 @@ from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
     _pmax,
-    _psum_bmax,
     _psum_fmax,
     _q_height,
     _q_width,
@@ -50,24 +49,28 @@ def _down_proj_prep_inter_and_weights(
         - for weight, load from HBM into SBUF.
 
     :param inter_sb: bf16[_pmax, n_I512_tile, BxS, 4] @ SB. Dim I is shuffled on 128.
-    :param weight: mxfp4_x4[_pmax, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
-    :param weight_scale: mxfp4_x4[_pmax // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
+    :param weight: mxfp_x4[_pmax, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
+    :param weight_scale: mxfp_x4[_pmax // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
     :return:
         1. (inter_qtz)        mxfp8_x4[_pmax, cfg.n_total_I512_tile, BxS]
         2. (inter_qtz_scale)  uint8[_pmax, cfg.n_total_I512_tile, BxS]
-        3. (weight_qtz)       mxfp4_x4[_pmax, cfg.n_total_I512_tile, H_sharded]
+        3. (weight_qtz)       mxfp_x4[_pmax, cfg.n_total_I512_tile, H_sharded]
         4. (weight_qtz_scale) uint8[_pmax, cfg.n_total_I512_tile, H_sharded]
     """
     n_prgs, prg_id = cfg.n_prgs, cfg.prg_id
     H, I, BxS = cfg.H, cfg.I, cfg.BxS
     H_sharded = H // n_prgs
-    p_I = _pmax if I > 512 else I // 4  # we do not pad I if I<512 to save HBM
+    p_I = _pmax if I > _psum_fmax else I // _q_width  # we do not pad I if I<512 to save HBM
 
-    # Quantize inter_sb into mxfp4_x4[_pmax, ceil(I/512), BxS] @ SB
-    # NOTE: when I%512 != 0, the final I512 tile of inter_sb will contain garbage. Also nc_matmul_mx requires 32/64/128
-    # partitions input so all 128 partitions are used (which includes garbage). However, we memset the last tile
-    # of weight_qtz and weight_qtz_scale such that the garbage does not matter.
-    inter_sb = inter_sb.reshape((_pmax, cfg.n_total_I512_tile * BxS * 4))  # flatten to 2D
+    """
+    Quantize intermediate state to MXFP8.
+    
+    Quantize inter_sb into mxfp4_x4[_pmax, ceil(I/512), BxS] @ SB.
+    When I%512 != 0, the final I512 tile of inter_sb will contain garbage.
+    nc_matmul_mx requires 32/64/128 partitions input so all 128 partitions are used (including garbage).
+    However, we memset the last tile of weight_qtz and weight_qtz_scale so the garbage does not matter.
+    """
+    inter_sb = inter_sb.reshape((_pmax, cfg.n_total_I512_tile * BxS * _q_width))
     inter_qtz = nl.ndarray((_pmax, cfg.n_total_I512_tile * BxS), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
     inter_qtz_scale = nl.ndarray(inter_qtz.shape, dtype=nl.uint8, buffer=nl.sbuf)
     nisa.quantize_mx(dst=inter_qtz, src=inter_sb, dst_scale=inter_qtz_scale)
@@ -81,9 +84,9 @@ def _down_proj_prep_inter_and_weights(
     if weight.buffer == nl.sbuf:
         weight_qtz = weight
     else:
-        # Load weight into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mxfp4_x4 (packed I)
+        # Load weight into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mxfp_x4 (packed I)
         weight_qtz = nl.ndarray(
-            (_pmax, cfg.n_total_I512_tile, H_sharded), dtype=nl.float4_e2m1fn_x4, buffer=nl.sbuf, name='down_w_qtz_sb'
+            (_pmax, cfg.n_total_I512_tile, H_sharded), dtype=weight.dtype, buffer=nl.sbuf, name='down_w_qtz_sb'
         )
         # Memset weight if input weight HBM does not pad on par dim
         if p_I != _pmax:
@@ -141,8 +144,8 @@ def down_projection_mx_tp_shard_H(
     This means the final output of shape [_pmax (H0), H//_pmax (H1), BxS] would have a contiguous H1 and strided H0.
 
     :param inter_sb: bf16[_pmax, n_I512_tile, BxS, 4] @ SB. Dim I is shuffled on 128.
-    :param weight: mxfp4_x4[_pmax, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
-    :param weight_scale: mxfp4_x4[_pmax // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
+    :param weight: mxfp_x4[_pmax, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
+    :param weight_scale: mxfp_x4[_pmax // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
     :param bias_sb [OPTIONAL]: bf16[_pmax, H_sharded//_pmax] @ SB.
     :return: bf16[_pmax, H//_pmax, BxS] @ SB.
     """
@@ -199,9 +202,9 @@ def down_projection_mx_shard_H(
     inter_sb: nl.ndarray, weight: nl.ndarray, weight_scale: nl.ndarray, bias_sb: nl.ndarray, cfg: ProjConfig
 ) -> nl.ndarray:
     """
-    Perform down projection with MXFP4 quantization.
+    Perform down projection with MXFP quantization.
 
-    Computes weight @ intermediate + bias using MXFP4 quantized weights,
+    Computes weight @ intermediate + bias using MXFP quantized weights,
     producing final MLP output. This version supports larger BxS values (CTE workloads)
     by tiling the BxS dimension.
 
@@ -209,7 +212,7 @@ def down_projection_mx_shard_H(
         inter_sb (nl.ndarray): Intermediate activations of shape [128, n_I512_tile, BxS, 4]
             in SBUF with I dimension shuffled on 128 partitions, bf16 type.
         weight (nl.ndarray): Quantized weights of shape [128, ceil(I/512), H] in HBM,
-            mxfp4_x4 type, zero-padded.
+            mxfp_x4 type (supports MXFP4/MXFP8), zero-padded.
         weight_scale (nl.ndarray): Weight scales of shape [128//8, ceil(I/512), H] in HBM,
             uint8 type, zero-padded.
         bias_sb (nl.ndarray): Optional bias of shape [1, H_sharded] in SBUF, bf16 type.
@@ -221,8 +224,9 @@ def down_projection_mx_shard_H(
 
     Notes:
         - Math: weight [I, H] @ inter_sb [I, BxS] → [BxS, H]
-        - Quantizes intermediate activations online to MXFP4
-        - Uses nc_matmul_mx for MXFP4 matrix multiplication
+        - Quantizes intermediate activations online to MXFP8
+        - Uses nc_matmul_mx for MXFP matrix multiplication
+        - Supports both MXFP4 and MXFP8 weight dtypes
         - Tiles BxS dimension in chunks of 128
         - Bias added only by program 0 when using LNC sharding
         - Supports optional partition offset for TKG scenarios
@@ -242,13 +246,47 @@ def down_projection_mx_shard_H(
     if cfg.dbg_weight:
         return weight_qtz, weight_qtz_scale
 
-    # Prepare bias broadcast if needed
+    """
+    Bias handling with two paths based on input bias shape.
+    
+    Path 1: bias_sb is (1, H) - broadcast to (128, H_sharded) using configured method
+    Path 2: bias_sb is already (128, H) - use tensor_tensor add after psum copy
+    
+    Broadcast methods (controlled by cfg.use_stream_shuffle_broadcast):
+    - True (default): Use stream_shuffle_broadcast (nc_stream_shuffle)
+    - False: Use PE broadcast via matmul with ones
+    """
     bias_broadcasted = None
     if bias_sb is not None:
         if bias_sb.shape[0] == 1:
             bias_broadcasted = nl.ndarray((BxS_tile_sz, H_sharded), dtype=bias_sb.dtype, buffer=nl.sbuf)
-            stream_shuffle_broadcast(src=bias_sb, dst=bias_broadcasted)
+
+            if cfg.use_stream_shuffle_broadcast:
+                # Stream shuffle broadcast: broadcast from partition 0 to all partitions
+                stream_shuffle_broadcast(src=bias_sb, dst=bias_broadcasted)
+            else:
+                # PE broadcast via matmul with ones tiled by 512 chunks
+                ones_sb = nl.ndarray((1, _pmax), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.memset(dst=ones_sb, value=1.0)
+
+                n_bias_tiles = div_ceil(H_sharded, _psum_fmax)
+                for i_bias_tile in nl.affine_range(n_bias_tiles):
+                    bias_h_offset = i_bias_tile * _psum_fmax
+                    bias_h_size = min(_psum_fmax, H_sharded - bias_h_offset)
+                    bias_h_slice = nl.ds(bias_h_offset, bias_h_size)
+                    bias_psum = nl.ndarray((BxS_tile_sz, bias_h_size), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(
+                        dst=bias_psum,
+                        stationary=ones_sb[:, :BxS_tile_sz],
+                        moving=bias_sb[:, bias_h_slice],
+                        is_stationary_onezero=True,
+                    )
+                    nisa.tensor_copy(
+                        dst=bias_broadcasted[:, bias_h_slice],
+                        src=bias_psum,
+                    )
         else:
+            # Path 2: Bias already broadcasted to (128, H)
             bias_broadcasted = bias_sb
 
     # Allocate output buffer
@@ -261,53 +299,55 @@ def down_projection_mx_shard_H(
         out_sb_p_start = 0
         out_sb_p_end = BxS_tile_sz
 
-    H_tile_size = 1024 if H_sharded % 1024 == 0 else 512
-    n_H_tile_sharded = H_sharded // H_tile_size
+    for i_H_tile in nl.affine_range(cfg.n_H_tile_sharded):
+        H_offset = i_H_tile * cfg.H_tile_size
+        curr_H_slice = nl.ds(H_offset, cfg.H_tile_size)
 
-    for i_H_tile in nl.affine_range(n_H_tile_sharded):
         for i_BxS_tile in nl.affine_range(n_BxS_tile):
             BxS_offset = i_BxS_tile * BxS_tile_sz
             curr_BxS = min(BxS_tile_sz, BxS - BxS_offset)
+            curr_BxS_slice = nl.ds(BxS_offset, curr_BxS)
 
-            psum_bank = nl.ndarray((curr_BxS, H_tile_size), dtype=nl.bfloat16, buffer=nl.psum)
+            psum_bank = nl.ndarray((curr_BxS, cfg.H_tile_size), dtype=nl.bfloat16, buffer=nl.psum)
 
             for i_I512_tile in nl.affine_range(cfg.n_total_I512_tile):
-                H_offset = i_H_tile * H_tile_size
                 nisa.nc_matmul_mx(
                     dst=psum_bank,
-                    stationary=inter_qtz[:, i_I512_tile, BxS_offset : BxS_offset + curr_BxS],
-                    moving=weight_qtz[:, i_I512_tile, H_offset : H_offset + H_tile_size],
-                    stationary_scale=inter_qtz_scale[:, i_I512_tile, BxS_offset : BxS_offset + curr_BxS],
-                    moving_scale=weight_qtz_scale[:, i_I512_tile, H_offset : H_offset + H_tile_size],
+                    stationary=inter_qtz[:, i_I512_tile, curr_BxS_slice],
+                    moving=weight_qtz[:, i_I512_tile, curr_H_slice],
+                    stationary_scale=inter_qtz_scale[:, i_I512_tile, curr_BxS_slice],
+                    moving_scale=weight_qtz_scale[:, i_I512_tile, curr_H_slice],
                 )
 
-            H_out_start = H_sharded * prg_id + i_H_tile * H_tile_size
+            H_out_start = H_sharded * prg_id + i_H_tile * cfg.H_tile_size
+            curr_H_out_slice = nl.ds(H_out_start, cfg.H_tile_size)
 
+            # Copy psum to output and add bias via tensor_tensor
             if cfg.out_p_offset == 0:
-                if bias_sb is not None:
+                if bias_broadcasted is not None:
                     nisa.tensor_tensor(
-                        dst=out_sb[:curr_BxS, i_BxS_tile, H_out_start : H_out_start + H_tile_size],
+                        dst=out_sb[:curr_BxS, i_BxS_tile, curr_H_out_slice],
                         data1=psum_bank,
-                        data2=bias_broadcasted[:curr_BxS, H_offset : H_offset + H_tile_size],
+                        data2=bias_broadcasted[:curr_BxS, curr_H_slice],
                         op=nl.add,
                     )
                 else:
                     engine = nisa.scalar_engine if i_BxS_tile % 2 == 0 else nisa.vector_engine
                     nisa.tensor_copy(
-                        dst=out_sb[:curr_BxS, i_BxS_tile, H_out_start : H_out_start + H_tile_size],
+                        dst=out_sb[:curr_BxS, i_BxS_tile, curr_H_out_slice],
                         src=psum_bank,
                         engine=engine,
                     )
             else:
-                if bias_sb is not None:
+                if bias_broadcasted is not None:
                     nisa.tensor_tensor(
                         dst=out_sb[
                             out_sb_p_start : out_sb_p_start + curr_BxS,
                             i_BxS_tile,
-                            H_out_start : H_out_start + H_tile_size,
+                            curr_H_out_slice,
                         ],
                         data1=psum_bank,
-                        data2=bias_broadcasted[:curr_BxS, H_offset : H_offset + H_tile_size],
+                        data2=bias_broadcasted[:curr_BxS, curr_H_slice],
                         op=nl.add,
                     )
                 else:
@@ -316,7 +356,7 @@ def down_projection_mx_shard_H(
                         dst=out_sb[
                             out_sb_p_start : out_sb_p_start + curr_BxS,
                             i_BxS_tile,
-                            H_out_start : H_out_start + H_tile_size,
+                            curr_H_out_slice,
                         ],
                         src=psum_bank,
                         engine=engine,

@@ -14,10 +14,22 @@
 
 import math
 from dataclasses import dataclass
+from typing import Tuple
 
 import nki.language as nl
 
 from ..utils.kernel_assert import kernel_assert
+
+# Flash attention: use FA when s_prior > threshold, tile size = threshold
+_FA_TILE_SIZE = 8 * 1024  # 8K - serves as both threshold and tile size
+
+
+def uses_flash_attention(s_prior: int) -> Tuple[bool, int]:
+    """
+    Return True if flash attention is used for the given s_prior (per NC).
+    Also returns the tile size.
+    """
+    return (s_prior > _FA_TILE_SIZE, _FA_TILE_SIZE)
 
 
 def is_fp8_e4m3(dtype) -> bool:
@@ -39,37 +51,76 @@ class AttnTKGConfig(nl.NKIObject):
     """
 
     # Tensor shapes
-    bs: int = 0  # Batch size
-    q_head: int = 0  # Number of query heads
-    s_active: int = 0  # Active sequence length (>1 means speculative decoding)
-    curr_sprior: int = 0  # Current prior sequence length (KV cache length for this execution)
-    full_sprior: int = 0  # Full prior sequence length (maximum KV cache capacity)
-    d_head: int = 0  # Head dimension (embedding size per head)
-    block_len: int = 0  # Block length for block KV cache (0 if not using block KV)
+    bs: int = 0
+    """Batch size. Number of independent sequences processed in parallel."""
+
+    q_head: int = 0
+    """Number of query heads. For MHA this equals num_heads; for GQA/MQA this may differ from KV heads."""
+
+    s_active: int = 0
+    """Active sequence length (tokens being generated this step). >1 indicates speculative decoding."""
+
+    curr_sprior: int = 0
+    """Current prior sequence length. The actual KV cache content length for this execution."""
+
+    full_sprior: int = 0
+    """Full prior sequence length. Maximum KV cache capacity (bucket size) that was allocated."""
+
+    d_head: int = 0
+    """Head dimension. Embedding size per attention head (typically 64 or 128)."""
+
+    block_len: int = 0
+    """Block length for block KV cache. Set to 0 for flat (contiguous) KV cache layout."""
 
     # Performance config
-    tp_k_prior: bool = (
-        False  # Specifies that k_prior is transposed (shape [B, 1, d, s_prior] instead of [B, 1, s_prior, d])
-    )
-    strided_mm1: bool = True  # Use strided memory access for first matmul to improve cache locality
-    use_pos_id: bool = (
-        False  # Generate attention mask from position IDs in-kernel instead of loading pre-generated mask
-    )
-    fuse_rope: bool = False  # Fuse RoPE (Rotary Position Embedding) computation into the kernel
-    use_gpsimd_sb2sb: bool = True  # Use GPSIMD instructions for SBUF-to-SBUF data transfers (LNC2 sharding)
-    qk_in_sb: bool = False  # Query and key tensors are already in SBUF instead of HBM
-    k_out_in_sb: bool = False  # Output key tensor after RoPE should be stored in SBUF instead of HBM
-    out_in_sb: bool = False  # Output tensor should be stored in SBUF instead of HBM
+    tp_k_prior: bool = False
+    """Whether k_prior is pre-transposed in memory. If True: [B, 1, d, s_prior]; if False: [B, 1, s_prior, d]."""
+
+    strided_mm1: bool = True
+    """Use strided memory access pattern when loading K for first matmul (QK^T). Improves MM2 V read efficiency."""
+
+    use_pos_id: bool = False
+    """Generate attention mask in-kernel from position IDs instead of loading pre-generated mask from HBM."""
+
+    fuse_rope: bool = False
+    """Fuse RoPE (Rotary Position Embedding) computation into the kernel. Reduces memory traffic."""
+
+    use_gpsimd_sb2sb: bool = True
+    """Use GPSIMD instructions for SBUF-to-SBUF data transfers during LNC2 sharding communication."""
+
+    qk_in_sb: bool = False
+    """Query and key tensors are pre-loaded in SBUF. Required for block KV cache support."""
+
+    k_out_in_sb: bool = False
+    """Output key tensor (after RoPE) should remain in SBUF instead of being stored to HBM."""
+
+    out_in_sb: bool = False
+    """Output attention tensor should remain in SBUF instead of being stored to HBM."""
 
 
 ### Constants
 @dataclass
 class TileConstants(nl.NKIObject):
-    p_max: int  # sbuf max partition dim
-    psum_f_max: int  # psum max free dim
-    psum_b_max: int  # psum max bank dim
-    sbuf_quadrant_size: int  # sbuf partition quadrant size
-    psum_f_max_bytes: int  # maximum number of bytes in psum bank
+    """Hardware tile constants for Trainium SBUF and PSUM dimensions.
+
+    These constants define the hardware limits for tiling computations on Trainium.
+    Use get_tile_constants() to obtain the actual hardware values at runtime.
+    """
+
+    p_max: int
+    """SBUF maximum partition dimension. Number of partitions in SBUF (typically 128)."""
+
+    psum_f_max: int
+    """PSUM maximum free dimension. Maximum elements in PSUM free axis (typically 512)."""
+
+    psum_b_max: int
+    """PSUM maximum bank dimension. Number of PSUM banks available for interleaving (8)."""
+
+    sbuf_quadrant_size: int
+    """SBUF partition quadrant size. Partitions per quadrant for transpose operations (32)."""
+
+    psum_f_max_bytes: int
+    """PSUM maximum bank size in bytes. Equals psum_f_max * 4 (float32 size)."""
 
     @staticmethod
     def get_tile_constants():
@@ -128,7 +179,9 @@ def is_s_prior_sharded(cfg: AttnTKGConfig, p_max: int):
 
 
 ### Block KV
-def resize_cache_block_len_for_attention_tkg_kernel(num_blocks_per_batch: int, block_len: int, n_prgs: int, p_max: int):
+def resize_cache_block_len_for_attention_tkg_kernel(
+    num_blocks_per_batch: int, block_len: int, n_prgs: int, p_max: int, full_sprior: int = 0
+):
     """
     Block KV in token gen attention requires number of blocks per batch to be a multiple of (lnc * p_max).
     This allows loading p_max blocks onto SBUF partitions in parallel.
@@ -138,8 +191,9 @@ def resize_cache_block_len_for_attention_tkg_kernel(num_blocks_per_batch: int, b
     Args:
       num_blocks_per_batch: Number of blocks in each batch. Generally the second dimension of the active blocks table.
       block_len: The size of each block.
-      lnc: Sharding level.
+      n_prgs: Sharding level.
       p_max: Maximum number of partitions.
+      full_sprior: Maximum KV cache capacity (bucket size). Used for warning suggestions.
 
     NOTE: This function is used both at trace time and by testing infrastructure. Thus, it needs to take p_max as an argument.
     """
@@ -157,15 +211,20 @@ def resize_cache_block_len_for_attention_tkg_kernel(num_blocks_per_batch: int, b
     reduced_blk_len = math.gcd(block_len, bucket_len // min_multiple)
     resize_factor = block_len // reduced_blk_len
 
-    print(
-        f"Token-gen bucket length of {num_blocks_per_batch * block_len}:",
-        f"reducing block length by {resize_factor}x,",
-        f"cache block length reduced from {block_len} to {reduced_blk_len}.",
-        f"Number of blocks per batch increased from {num_blocks_per_batch} to {resize_factor * num_blocks_per_batch}.",
-    )
-    if reduced_blk_len <= 8:
+    if resize_factor != 1:
         print(
-            "Smaller block length (<= 8) result in lower DMA bandwidth utilization.",
-            "Consider increasing bucket length to a multiple of a greater power of 2.",
+            f"Token-gen bucket length of {num_blocks_per_batch * block_len}:",
+            f"reducing block length by {resize_factor}x,",
+            f"cache block length reduced from {block_len} to {reduced_blk_len}.",
+            f"Number of blocks per batch increased from {num_blocks_per_batch} to {resize_factor * num_blocks_per_batch}.",
         )
+
+    if reduced_blk_len < 8:
+        no_resize_multiple = block_len * min_multiple
+        min_sprior_no_resize = ((bucket_len // no_resize_multiple) + 1) * no_resize_multiple
+        print(
+            f"WARNING: Smaller block length (<8) results in lower DMA bandwidth utilization. Consider increasing curr_sprior to at least {min_sprior_no_resize}."
+        )
+        if full_sprior > 0 and min_sprior_no_resize > full_sprior:
+            print(f"WARNING: This also requires increasing full_sprior to at least {min_sprior_no_resize}.")
     return reduced_blk_len, resize_factor

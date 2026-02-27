@@ -22,6 +22,7 @@ __pycache__/
 !/build-tools/
 /dist
 /.venv
+/bin/
 /stubs
 /wheelhouse/
 log-neuron-cc.txt
@@ -36,3 +37,4 @@ tmp
 pyrightconfig.json
 .vscode
 .env
+*unison*

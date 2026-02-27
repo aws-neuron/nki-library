@@ -206,6 +206,7 @@ def mlp(
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
+        force_cte_mode=force_cte_mode,
     )
 
     # Validate MLP arguments
@@ -237,7 +238,7 @@ def mlp(
     # Determine if MLP should be invoked in token-generation (TKG) mode or context encoding (CTE) mode
     # If batch size × sequence length <= TKG_BS_SEQLEN_THRESHOLD(currently at 96), the kernel runs in TKG mode.
     # TODO: update TKG_BS_SEQLEN_THRESHOLD to 128
-    if is_mlp_tkg(mlp_params) and not force_cte_mode:
+    if is_mlp_tkg(mlp_params):
         return mlp_tkg(mlp_params, out, fused_add_out)
     else:
         mlp_cte(mlp_params, out, fused_add_out)

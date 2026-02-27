@@ -350,6 +350,7 @@ def transpose_store(
     dims: MLPTKGConstantsDimensionSizes,
     output_dtype: nki.dtype,
     sbm: SbufManager,
+    T_offset: int = 0,
 ) -> None:
     """
     Transpose temporary output SBUF tensor and store to final HBM tensor.
@@ -365,6 +366,7 @@ def transpose_store(
         output_dtype (nki.dtype): Data type of the output tensor.
         sbm (SbufManager): SbufManager for buffer allocation.
     """
+
     output_sb = sbm.alloc_stack(
         (dims.T, dims.H_per_shard),
         dtype=output_dtype,
@@ -380,7 +382,6 @@ def transpose_store(
             (T, H0),
             dtype=output_dtype,
             buffer=nl.psum,
-            name=f"transpose_output_{h1_tile_idx}",
             address=None if sbm.is_auto_alloc() else (0, psum_idx * dims._psum_fmax * 4),
         )
         nisa.nc_transpose(dst=tp_psum[0:T, 0:H0], data=output_temp[0:H0, h1_tile_idx, 0:T])
@@ -394,8 +395,8 @@ def transpose_store(
         )
 
     nisa.dma_copy(
-        dst=output[:, nl.ds(dims.shard_id * dims.H_per_shard, dims.H_per_shard)],
-        src=output_sb[:, : dims.H_per_shard],
+        dst=output[nl.ds(T_offset, T), nl.ds(dims.shard_id * dims.H_per_shard, dims.H_per_shard)],
+        src=output_sb[:, 0 : dims.H_per_shard],
     )
 
 

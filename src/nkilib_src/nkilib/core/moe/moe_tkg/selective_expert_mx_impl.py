@@ -25,7 +25,7 @@ from ...mlp.mlp_tkg.down_projection_mx_shard_H import (
     ProjConfig,
     down_projection_mx_tp_shard_H,
 )
-from ...mlp.mlp_tkg.gate_up_mx_shard_H import (
+from ...mlp.mlp_tkg.gate_up_projection_mx_shard_H import (
     process_fused_gate_up_projection_mxfp4,
 )
 
@@ -462,7 +462,7 @@ def _selective_expert_moe_tkg_mxfp4(
 
                     # Handle remaining partitions if they exist
                     token_indices_on_p = nl.ndarray((_pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.tensor_copy(dst=token_indices_on_p, src=p_idx_vector_down[:, i_t, i_k], dtype=nl.int32)
+                    nisa.tensor_copy(dst=token_indices_on_p, src=p_idx_vector_down[:, i_t, i_k])
                     nisa.dma_copy(
                         dst=down_scale_sb,
                         src=down_scale_view.ap(
@@ -474,9 +474,9 @@ def _selective_expert_moe_tkg_mxfp4(
                         oob_mode=oob_mode.skip,
                     )
 
-                    # Load down proj weights into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mxfp4_x4 (packed I)
+                    # Load down proj weights into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mx_x4 (packed I)
                     down_weight_qtz_sb = nl.ndarray(
-                        (_pmax, n_I512_tile, dims.H_shard), dtype=nl.float4_e2m1fn_x4, buffer=nl.sbuf
+                        (_pmax, n_I512_tile, dims.H_shard), dtype=params.down_proj_weights_tensor.dtype, buffer=nl.sbuf
                     )
                     # Memset weight if input weight HBM does not pad on par dim
                     if p_I != _pmax:

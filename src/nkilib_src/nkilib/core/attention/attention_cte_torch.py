@@ -42,9 +42,44 @@ def attention_cte_torch_ref(
     global_cp_deg: int = None,
     cp_strided_q_slicing: bool = False,
 ):
-    """
-    PyTorch stub / reference for NKI kernel attention.attention_cte.attention_cte
-    with identical interface to the kernel.
+    """PyTorch reference implementation for attention_cte NKI kernel.
+
+    This function provides a CPU-based reference implementation with identical
+    interface to the NKI kernel for validation and testing purposes.
+
+    Summary:
+        Computes multi-head attention with support for causal masking, sliding window,
+        prefix caching, context parallelism, and GQA. All computations are performed
+        in float32 for CPU compatibility.
+
+    Args:
+        q (torch.tensor): Query tensor
+        k (torch.tensor): Key tensor
+        v (torch.tensor): Value tensor
+        scale (float, optional): Scaling factor for attention scores. Default: 1.0
+        causal_mask (bool, optional): Whether to apply causal mask. Default: True
+        k_prior (torch.tensor, optional): Prior key tensor for prefix caching. Default: None
+        v_prior (torch.tensor, optional): Prior value tensor for prefix caching. Default: None
+        prior_used_len (torch.tensor, optional): Length of prior to use. Default: None
+        sink (torch.tensor, optional): Sink token tensor. Default: None
+        sliding_window (int, optional): Sliding window size. Default: 0
+        tp_q (bool, optional): Query transpose flag. Default: True
+        tp_k (bool, optional): Key transpose flag. Default: False
+        tp_out (bool, optional): Output transpose flag. Default: False
+        cache_softmax (bool, optional): Whether to cache softmax statistics. Default: False
+        softmax_dtype (torch.dtype, optional): Data type for softmax outputs. Default: torch.float32
+        cp_offset (torch.tensor, optional): Context parallel offset. Default: None
+        global_cp_deg (int, optional): Global context parallel degree. Default: None
+        cp_strided_q_slicing (bool, optional): Whether Q is strided. Default: False
+
+    Returns:
+        torch.tensor: Attention output tensor
+        If cache_softmax is True, returns tuple of (output, neg_max, recip)
+
+    Notes:
+        - All inputs are converted to float32 for CPU compatibility
+        - Supports GQA by replicating K/V tensors
+        - Implements flash attention statistics when cache_softmax=True
     """
     # Process shapes and configs
     is_prefix_caching = k_prior is not None

@@ -13,8 +13,7 @@
 # limitations under the License.
 
 """
-QKV_CTE kernel Utils
-
+This module contains utility classes and functions for the QKV CTE kernel including configuration dataclasses, dimension management, and input validation.
 """
 
 # Standard Library
@@ -22,16 +21,19 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
-# Neuron Kernel Interface
-import nki as nki
+import nki
 import nki.language as nl
 
 from ..utils.allocator import SbufManager
 
 # NKI Library
-from ..utils.common_types import NormType, QKVOutputLayout
+from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import get_program_sharding_info, is_launched_as_spmd
+from ..utils.kernel_helpers import (
+    get_max_positive_value_for_dtype,
+    get_program_sharding_info,
+    is_launched_as_spmd,
+)
 
 
 # Represents unmodified user inputs, no additional data members.
@@ -39,6 +41,41 @@ from ..utils.kernel_helpers import get_program_sharding_info, is_launched_as_spm
 # QKV_CTE_Config and QKV_CTE_Dims.
 @dataclass
 class QKV_CTE_UserInput(nl.NKIObject):
+    """
+    Container for unmodified user inputs to QKV CTE kernel.
+
+    This dataclass captures all user-provided parameters without modification.
+    Used for initial input validation and to construct QKV_CTE_Config and QKV_CTE_Dims objects.
+
+    Attributes:
+        input (nl.ndarray): [B, S, H], Input hidden states tensor
+        fused_qkv_weights (nl.ndarray): [H, I], Fused QKV weight matrix
+        output_layout (QKVOutputLayout): Desired output tensor layout
+        bias (Optional[nl.ndarray]): [1, I], Optional bias tensor
+        fused_residual_add (Optional[bool]): Whether to perform residual addition
+        mlp_prev (Optional[nl.ndarray]): [B, S, H], Previous MLP output for residual
+        attention_prev (Optional[nl.ndarray]): [B, S, H], Previous attention output for residual
+        fused_norm_type (NormType): Type of normalization to apply
+        gamma_norm_weights (Optional[nl.ndarray]): [1, H], Normalization gamma weights
+        layer_norm_bias (Optional[nl.ndarray]): [1, H], Layer norm beta weights
+        norm_eps (Optional[float]): Epsilon for normalization stability
+        hidden_actual (Optional[int]): Actual hidden dimension if H is padded
+        fused_rope (Optional[bool]): Whether to apply RoPE
+        cos_cache (Optional[nl.ndarray]): [B, S, d_head], RoPE cosine cache
+        sin_cache (Optional[nl.ndarray]): [B, S, d_head], RoPE sine cache
+        d_head (Optional[int]): Dimension per attention head
+        num_q_heads (Optional[int]): Number of query heads
+        num_kv_heads (Optional[int]): Number of key/value heads
+        store_output_in_sbuf (bool): Whether to store output in SBUF
+        sbm (Optional[SbufManager]): Optional SBUF manager
+        use_auto_allocation (bool): Whether to use automatic SBUF allocation
+        load_input_with_DMA_transpose (bool): Whether to use DMA transpose
+        quantization_type (QuantizationType): Quantization type for QKV projection
+        qkv_w_scale (Optional[nl.ndarray]): Quantization scale for QKV weights
+        qkv_in_scale (Optional[nl.ndarray]): Quantization scale for QKV input
+        is_input_swizzled (bool): If input tensor is swizzled for MX
+    """
+
     input: nl.ndarray
     fused_qkv_weights: nl.ndarray
     output_layout: QKVOutputLayout
@@ -61,16 +98,64 @@ class QKV_CTE_UserInput(nl.NKIObject):
     d_head: Optional[int]
     num_q_heads: Optional[int]
     num_kv_heads: Optional[int]
+    # --- FP8 KV Cache Quantization Related
+    k_cache: Optional[nl.ndarray]
+    v_cache: Optional[nl.ndarray]
+    k_scale: Optional[nl.ndarray]
+    v_scale: Optional[nl.ndarray]
+    fp8_max: Optional[float]
+    fp8_min: Optional[float]
+    kv_dtype: Optional[Any]
+    # --- Block KV Cache Related
+    use_block_kv: bool
+    block_size: Optional[int]
+    slot_mapping: Optional[nl.ndarray]
     # --- Performance Related
     store_output_in_sbuf: bool
     sbm: Optional[SbufManager]
     use_auto_allocation: bool
     load_input_with_DMA_transpose: bool
+    # --- Quantization Related
+    quantization_type: QuantizationType
+    qkv_w_scale: Optional[nl.ndarray]
+    qkv_in_scale: Optional[nl.ndarray]
+    is_input_swizzled: bool
+
+
+# Represent quantization config
+@dataclass
+class QKV_Quant_Config(nl.NKIObject):
+    quantization_type: QuantizationType
+    qkv_w_scale: Optional[nl.ndarray] = None  # weight quant scale for qkv projection
+    qkv_in_scale: Optional[nl.ndarray] = None  # in_scale are same for q, k, v
+    quant_dtype: str = nl.float8_e4m3
 
 
 # Represents kernel config.
 @dataclass
 class QKV_CTE_Config(nl.NKIObject):
+    """
+    Kernel configuration for QKV CTE.
+
+    Contains both user-requested configuration and internally-derived settings
+    that control kernel behavior, data types, and optimizations.
+
+    Attributes:
+        output_layout (QKVOutputLayout): User-requested output tensor layout
+        add_bias (bool): Whether to add bias to QKV projection
+        fused_residual_add (bool): Whether to perform residual addition
+        fused_norm_type (NormType): Type of normalization to apply
+        add_layer_norm_bias (bool): Whether to add layer norm bias
+        fused_rope (bool): Whether to apply RoPE
+        use_auto_allocation (bool): Whether to use automatic SBUF allocation
+        load_input_with_DMA_transpose (bool): Whether to use DMA transpose for input loading
+        compute_mm_dtype (Any): Data type for matrix multiplication computation
+        act_dtype (Any): Data type for activations in normalization
+        psum_transpose_dtype (Any): Data type for PE array transpose (BF16 on >=Trn2)
+        use_BxS_input_reshape (bool): Whether to collapse B and S to BxS for performance
+        total_available_sbuf_space_to_this_kernel (int): Total SBUF space available per partition
+    """
+
     # User Requested
     output_layout: QKVOutputLayout
     add_bias: bool
@@ -79,6 +164,14 @@ class QKV_CTE_Config(nl.NKIObject):
     add_layer_norm_bias: bool
     fused_rope: bool
     use_auto_allocation: bool  # functional
+    # FP8 KV Cache Quantization
+    use_kv_quantization: bool
+    kv_dtype: Any
+    fp8_max: Optional[float]
+    fp8_min: Optional[float]
+    # Block KV Cache
+    use_block_kv: bool
+    block_size: Optional[int]
     # Additional Internal Config
     load_input_with_DMA_transpose: bool
     compute_mm_dtype: Any
@@ -86,6 +179,9 @@ class QKV_CTE_Config(nl.NKIObject):
     psum_transpose_dtype: Any  # On >=Trn2, PE array supports BF16 transpose.
     use_BxS_input_reshape: bool  # Collapse B and S to BxS for performance.
     total_available_sbuf_space_to_this_kernel: int  # If SbufManger is provided, we need to restrict it.
+    input_dtype: Any
+    quantization_config: QKV_Quant_Config
+    is_input_swizzled: bool
 
     def print(self):
         """
@@ -106,15 +202,45 @@ class QKV_CTE_Config(nl.NKIObject):
         print(f"  load_input_with_DMA_transpose: {self.load_input_with_DMA_transpose}")
         print(f"  compute_mm_dtype:     {self.compute_mm_dtype}")
         print(f"  act_dtype:            {self.act_dtype}")
-        print(f"  psum_transpose_dtype  {self.psum_transpose_dtype}")
+        print(f"  psum_transpose_dtype:  {self.psum_transpose_dtype}")
         print(f"  use_BxS_input_reshape: {self.use_BxS_input_reshape}")
         print(f"  total_available_sbuf_space_to_this_kernel {self.total_available_sbuf_space_to_this_kernel}")
+        print(f"  quantization_config:  {self.quantization_config}")
         print(f"")
 
 
 # Represents tensor dimensions of input tensors.
 @dataclass
 class QKV_CTE_Dims(nl.NKIObject):
+    """
+    Tensor dimensions for QKV CTE kernel.
+
+    Stores all dimension-related information including original tensor shapes,
+    potentially reshaped dimensions, sharding information, and tiling parameters.
+
+    Attributes:
+        B_orig (int): Original batch size before any reshaping
+        S_orig (int): Original sequence length before any reshaping
+        BxS (int): Product B_orig * S_orig (used if use_BxS_input_reshape is True)
+        B (int): Batch size used by kernel (could be 1 if reshaped)
+        S (int): Sequence length used by kernel (could be BxS if reshaped)
+        S_shard (int): Chunk of S each LNC core processes
+        S_shard_offset (int): Offset into S for current shard
+        H (int): Hidden dimension
+        I (int): Fused QKV dimension = (num_q_heads + 2*num_kv_heads) * d_head
+        H_actual (Optional[int]): Actual hidden dimension if H is padded
+        d_head (Optional[int]): Dimension per attention head
+        num_q_heads (Optional[int]): Number of query heads
+        num_kv_heads (Optional[int]): Number of key/value heads
+        num_heads (Optional[int]): Total number of heads
+        num_128_tiles_per_H (int): Number of 128-sized tiles in H dimension
+        num_512_tiles_per_H (int): Number of 512-sized tiles in H dimension
+        num_512_tiles_per_I (int): Number of 512-sized tiles in I dimension
+        NUM_WEIGHT_BUFFERS_DEFAULT (int): Default number of weight buffers for multi-buffering
+        WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT (int): Default block size for loading weights along H
+        MAX_S_MULTI_BUFFER_DEGREE (int): Maximum multi-buffering degree for sequence dimension
+    """
+
     B_orig: int  # Batch Size of the orginal input tensor, non-reshaped.
     S_orig: int  # Sequence Length of the orginal input tensor, non-reshaped.
     BxS: int  # B_orig * S_orig (may or not be used)
@@ -129,6 +255,9 @@ class QKV_CTE_Dims(nl.NKIObject):
     num_q_heads: Optional[int]
     num_kv_heads: Optional[int]
     num_heads: Optional[int]
+    # -- QKV Dimension Info (for KV quantization) -- #
+    q_dim: Optional[int]  # num_q_heads * d_head
+    kv_dim: Optional[int]  # num_kv_heads * d_head
     # -- Additional Tile Info -- #
     num_128_tiles_per_H: int
     num_512_tiles_per_H: int
@@ -171,11 +300,28 @@ class QKV_CTE_Dims(nl.NKIObject):
 
 def _validate_user_inputs(args: QKV_CTE_UserInput):
     """
-    Validate the inputs to the QKV_CTE kernel.
+    Validate all user inputs to the QKV CTE kernel.
+
+    Performs comprehensive validation of tensor shapes, dimensions, and configuration
+    parameters to ensure they meet kernel requirements and are mutually consistent.
+
+    Args:
+        args (QKV_CTE_UserInput): Container with all user-provided inputs
+
+    Raises:
+        AssertionError: If any validation check fails with descriptive error message
+
+    Notes:
+        - H must be <= 24576 and divisible by 128
+        - I must be <= 4096
+        - Validates consistency between input/weight shapes
+        - Validates fused operation requirements (residual add, normalization, RoPE)
+        - Validates output layout requirements
     """
 
     B, S, H = args.input.shape
     _H, I = args.fused_qkv_weights.shape
+    _, num_shards, _ = get_program_sharding_info()
 
     # H
     kernel_assert(
@@ -198,11 +344,12 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         f" larger weights.shape[1] at the moment.",
     )
 
-    kernel_assert(
-        _H == H,
-        f"[QKV CTE Kernel] Hidden dimensions of 'input' and 'fused_qkv_weights' must match,"
-        f" input.shape[2] = {H}, but fused_qkv_weights[0] = {_H}).",
-    )
+    if args.quantization_type != QuantizationType.MX:
+        kernel_assert(
+            _H == H,
+            f"[QKV CTE Kernel] Hidden dimensions of 'input' and 'fused_qkv_weights' must match,"
+            f" input.shape[2] = {H}, but fused_qkv_weights[0] = {_H}).",
+        )
 
     # Validate Output Layout.
     kernel_assert(
@@ -324,6 +471,37 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f"[QKV CTE Kernel] cos_cache or sin_cache have been provided, but fused_rope=False.",
         )
 
+    use_kv_quantization = args.k_scale is not None and args.v_scale is not None
+    if use_kv_quantization:
+        kernel_assert(
+            args.output_layout == QKVOutputLayout.BSD,
+            f"[QKV CTE Kernel] KV output quantization is only supported for BSD output layout, got {args.output_layout}",
+        )
+        kernel_assert(
+            args.num_q_heads is not None and args.num_kv_heads is not None and args.d_head is not None,
+            "[QKV CTE Kernel] Must specify num_q_heads, num_kv_heads, and d_head when KV quantization is enabled",
+        )
+        kernel_assert(
+            args.k_cache is not None and args.v_cache is not None,
+            "[QKV CTE Kernel] k_cache and v_cache must be specified for KV output quantization",
+        )
+        q_dim = args.num_q_heads * args.d_head
+        kv_dim = args.num_kv_heads * args.d_head
+        kernel_assert(
+            I == q_dim + 2 * kv_dim,
+            f"[QKV CTE Kernel] fused_qkv_dim {I} must equal q_dim {q_dim} + 2 * kv_dim {2 * kv_dim}",
+        )
+
+    if args.use_block_kv:
+        kernel_assert(
+            args.slot_mapping is not None,
+            "[QKV CTE Kernel] slot_mapping required for block KV cache",
+        )
+        kernel_assert(
+            args.block_size is not None,
+            "[QKV CTE Kernel] block_size required for block KV cache",
+        )
+
     kernel_assert(
         args.store_output_in_sbuf == False,
         f"[QKV CTE Kernel] store_output_in_sbuf is unsupported in the CTE version of qkv kernel.",
@@ -335,12 +513,76 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f"[QKV CTE Kernel] If SbufManager is provided then args.sbm.is_auto_alloc() == args.use_auto_allocation, however"
             f" use_auto_allocation = {args.use_auto_allocation}, but sbm.is_auto_alloc = {args.sbm.is_auto_alloc()}",
         )
+    # MX Quantization and is_input_swizzled validation
+    if args.quantization_type == QuantizationType.MX:
+        kernel_assert(
+            _H == H // 4,
+            f"[QKV CTE Kernel] Hidden dimensions of 'input' must be 4 * 'fused_qkv_weights' when weights are in MX,"
+            f" input.shape[2] = {H}, but fused_qkv_weights[0] = {_H}).",
+        )
+
+        kernel_assert(
+            H % 512 == 0,
+            f"[QKV CTE Kernel] Hidden dimensions of 'input' must be divisible by 512, Hidden shape = {H}.",
+        )
+
+        kernel_assert(
+            (S // num_shards) % 2 == 0,
+            f"[QKV CTE Kernel] S_Shard needs to be even for mx matrix multiplication,S_shard = {S // num_shards}.",
+        )
+
+    if args.is_input_swizzled:
+        kernel_assert(
+            args.quantization_type == QuantizationType.MX,
+            f"[QKV CTE Kernel] is_input_swizzled is only supported for MX Quantization.",
+        )
+        kernel_assert(
+            args.fused_norm_type == NormType.NO_NORM,
+            f"[QKV CTE Kernel] is_input_swizzled does not support input Normalization.",
+        )
+        kernel_assert(
+            args.fused_residual_add == False,
+            f"[QKV CTE Kernel] is_input_swizzled does not support fused residual add.",
+        )
+
+    # Quantization validation
+    if args.quantization_type == QuantizationType.STATIC:
+        kernel_assert(
+            args.fused_qkv_weights.dtype == nl.float8_e4m3 or str(args.fused_qkv_weights.dtype) == "float8e4",
+            f"[QKV CTE Kernel] When quantization_type is STATIC, currently only fp8 is supported as the qkv_weights dtype, "
+            f"but got dtype={args.fused_qkv_weights.dtype}.",
+        )
+        kernel_assert(
+            args.qkv_w_scale is not None and args.qkv_in_scale is not None,
+            f"[QKV CTE Kernel] When quantization_type is STATIC, both qkv_w_scale and qkv_in_scale must be provided, "
+            f"but got qkv_w_scale={args.qkv_w_scale}, qkv_in_scale={args.qkv_in_scale}.",
+        )
+        kernel_assert(
+            args.num_q_heads is not None and args.num_kv_heads is not None,
+            f"[QKV CTE Kernel] When quantization_type is STATIC, both num_q_heads and num_kv_heads must be specified, "
+            f"but got num_q_heads={args.num_q_heads}, num_kv_heads={args.num_kv_heads}.",
+        )
 
 
 def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     """
-    Build QKV_CTE_Config object used throughout the kernel.
-    Assumes user inputs have already been validated.
+    Build QKV_CTE_Config object from validated user inputs.
+
+    Constructs kernel configuration by deriving internal settings from user inputs,
+    including data types, optimization flags, and memory allocation parameters.
+
+    Args:
+        args (QKV_CTE_UserInput): Validated user inputs
+
+    Returns:
+        QKV_CTE_Config: Kernel configuration object with all settings
+
+    Notes:
+        - Assumes user inputs have already been validated via _validate_user_inputs
+        - Determines compute dtype (converts fp32 to bf16)
+        - Decides whether to use DMA transpose based on hardware and fusion settings
+        - Determines whether to reshape B,S to BxS for performance
+        - Sets available SBUF space based on provided SbufManager or uses maximum
     """
     _, S, _ = args.input.shape
 
@@ -361,11 +603,19 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         and (args.input.dtype == nl.bfloat16 or args.input.dtype == nl.float16)
     )
 
-    # Compute dtype used in the kernel. Even if inputs are fp32, computations will be done with bf16.
-    compute_mm_dtype = args.input.dtype if args.input.dtype != nl.float32 else nl.bfloat16
+    if args.quantization_type == QuantizationType.STATIC:
+        compute_mm_dtype = nl.float8_e4m3
+    else:
+        # Compute dtype used in the kernel. Even if inputs are fp32, computations will be done with bf16.
+        compute_mm_dtype = args.input.dtype if args.input.dtype != nl.float32 else nl.bfloat16
+
     act_dtype = nl.float32
+
     # Instances after >=Trn2 support BF16 transpose mode on PE Array.
-    psum_transpose_dtype = compute_mm_dtype if nki.isa.get_nc_version() >= nki.isa.nc_version.gen3 else nl.float32
+    if args.quantization_type == QuantizationType.STATIC:
+        psum_transpose_dtype = nl.bfloat16 if nki.isa.get_nc_version() >= nki.isa.nc_version.gen3 else nl.float32
+    else:
+        psum_transpose_dtype = compute_mm_dtype if nki.isa.get_nc_version() >= nki.isa.nc_version.gen3 else nl.float32
 
     # Decide whether to reshape input [B, S, H] -> [BxS, H] for the performance benefits, High batch tests benfit -30% or more.
     # If S is small, reshaping will increase the blocking/multi-buffering degree in the kernel,
@@ -389,6 +639,24 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         else:
             total_available_sbuf_space_to_this_kernel = args.sbm.get_free_space()
 
+    # FP8 KV Cache Quantization config
+    use_kv_quantization = args.k_scale is not None and args.v_scale is not None
+    kv_dtype = args.kv_dtype if args.kv_dtype is not None else args.input.dtype
+
+    if use_kv_quantization:
+        max_val = get_max_positive_value_for_dtype(kv_dtype)
+        fp8_max = args.fp8_max if args.fp8_max is not None else max_val
+        fp8_min = args.fp8_min if args.fp8_min is not None else -max_val
+    else:
+        fp8_max = None
+        fp8_min = None
+
+    # Set quantization config
+    quant_config = QKV_Quant_Config(quantization_type=args.quantization_type)
+    if args.quantization_type != QuantizationType.NONE:
+        quant_config.qkv_w_scale = args.qkv_w_scale
+        quant_config.qkv_in_scale = args.qkv_in_scale
+
     return QKV_CTE_Config(
         output_layout=args.output_layout,
         add_bias=add_bias,
@@ -397,20 +665,45 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         add_layer_norm_bias=add_layer_norm_bias,
         fused_rope=args.fused_rope,
         use_auto_allocation=args.use_auto_allocation,
+        use_kv_quantization=use_kv_quantization,
+        kv_dtype=kv_dtype,
+        fp8_max=fp8_max,
+        fp8_min=fp8_min,
+        use_block_kv=args.use_block_kv,
+        block_size=args.block_size,
+        # Internal Config
         load_input_with_DMA_transpose=load_input_with_DMA_transpose,
         compute_mm_dtype=compute_mm_dtype,
         act_dtype=act_dtype,
         psum_transpose_dtype=psum_transpose_dtype,
         use_BxS_input_reshape=use_BxS_input_reshape,
         total_available_sbuf_space_to_this_kernel=total_available_sbuf_space_to_this_kernel,
+        input_dtype=args.input.dtype,
+        quantization_config=quant_config,
+        is_input_swizzled=args.is_input_swizzled,
     )
 
 
 def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_CTE_Dims:
     """
-    Build QKV_CTE_Dims object to store tensor dimensions used throughout the kernel.
-    Some are pre-calculated ahead of time, e.g "S_shard".
-    Assumes user inputs have already been validated.
+    Build QKV_CTE_Dims object containing all tensor dimension information.
+
+    Extracts and computes tensor dimensions from user inputs and configuration,
+    including sharding calculations for LNC parallelism and tiling parameters.
+
+    Args:
+        args (QKV_CTE_UserInput): Validated user inputs
+        cfg (QKV_CTE_Config): Kernel configuration
+
+    Returns:
+        QKV_CTE_Dims: Object containing all dimension information
+
+    Notes:
+        - Assumes user inputs have already been validated
+        - Handles B,S to BxS reshaping based on cfg.use_BxS_input_reshape
+        - Computes S_shard and S_shard_offset for LNC sharding
+        - Pre-calculates tiling parameters for H and I dimensions
+        - Infers d_head from num_q_heads and num_kv_heads if not provided
     """
     B_orig, S_orig, H = args.input.shape
     BxS = B_orig * S_orig
@@ -455,6 +748,13 @@ def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_
     WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT = 1024
     MAX_S_MULTI_BUFFER_DEGREE = 5
 
+    # Compute q_dim and kv_dim for KV quantization
+    q_dim = None
+    kv_dim = None
+    if args.num_q_heads is not None and args.num_kv_heads is not None and d_head is not None:
+        q_dim = args.num_q_heads * d_head
+        kv_dim = args.num_kv_heads * d_head
+
     return QKV_CTE_Dims(
         B_orig=B_orig,
         S_orig=S_orig,
@@ -470,6 +770,8 @@ def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_
         num_q_heads=args.num_q_heads,
         num_kv_heads=args.num_kv_heads,
         num_heads=num_heads,
+        q_dim=q_dim,
+        kv_dim=kv_dim,
         num_128_tiles_per_H=num_128_tiles_per_H,
         num_512_tiles_per_H=num_512_tiles_per_H,
         num_512_tiles_per_I=num_512_tiles_per_I,

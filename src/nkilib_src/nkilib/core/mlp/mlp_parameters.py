@@ -26,8 +26,35 @@ from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import is_rms_normalization, normalization_uses_weights
 from ..utils.tensor_view import TensorView
 
-SUPPORTED_DTYPES = [nl.bfloat16, nl.float8_e4m3, 'float8e4']
+SUPPORTED_DTYPES = [nl.float16, nl.bfloat16, nl.float8_e4m3, 'float8e4']
 SUPPORTED_QUANT_TYPES = [QuantizationType.NONE, QuantizationType.STATIC, QuantizationType.ROW, QuantizationType.MX]
+
+
+def get_T_from_hidden_input(hidden_input: nl.ndarray, hidden_input_scale: Optional[nl.ndarray] = None) -> int:
+    """
+    Extract T (number of tokens) from hidden_input tensor based on its layout.
+
+    Args:
+        hidden_input: Input tensor with shape depending on buffer type:
+            - SBUF with scale: [H0, H/512, T] (MXFP all-expert quantized)
+            - SBUF without scale: [H0, T, H1]
+            - HBM 3D: [B, S, H] -> T = B * S
+            - HBM 2D: [T, H]
+        hidden_input_scale: Scale tensor, indicates MXFP quantized input if present
+
+    Returns:
+        T: Number of tokens
+    """
+    if hidden_input.buffer == nl.sbuf:
+        if hidden_input_scale != None:
+            return hidden_input.shape[2]
+        else:
+            return hidden_input.shape[1]
+    elif len(hidden_input.shape) == 3:
+        return hidden_input.shape[0] * hidden_input.shape[1]
+    else:
+        return hidden_input.shape[0]
+
 
 # Threshold currently set to 96 based on existing tuning; subject to future refinement.
 TKG_BS_SEQLEN_THRESHOLD = 96
@@ -338,12 +365,13 @@ class MLPParameters(NKIObject):
     hidden_size: int
     intermediate_size: int
     input_in_sbuf: bool
+    hidden_input_scale: Optional[nl.ndarray]
     store_output_in_sbuf: bool
     skip_gate_proj: bool
     use_tkg_gate_up_proj_column_tiling: bool
     use_tkg_down_proj_column_tiling: bool
     use_tkg_down_proj_optimized_layout: bool
-    shard_on_k: bool
+    shard_on_h_disabled: bool
     gate_clamp_lower_limit: Optional[float]
     gate_clamp_upper_limit: Optional[float]
     up_clamp_lower_limit: Optional[float]
@@ -378,30 +406,38 @@ class MLPParameters(NKIObject):
         use_tkg_gate_up_proj_column_tiling: bool = False,
         use_tkg_down_proj_column_tiling: bool = False,
         use_tkg_down_proj_optimized_layout: bool = False,
-        shard_on_k: bool = False,
+        shard_on_h_disabled: bool = False,
         gate_clamp_lower_limit: Optional[float] = None,
         gate_clamp_upper_limit: Optional[float] = None,
         up_clamp_lower_limit: Optional[float] = None,
         up_clamp_upper_limit: Optional[float] = None,
         expert_params: Optional[MLPExpertParameters] = None,
+        hidden_input_scale: Optional[nl.ndarray] = None,
+        force_cte_mode: bool = False,
     ):
         self.input_in_sbuf = hidden_tensor.buffer == nl.sbuf
+        self.hidden_input_scale = hidden_input_scale
         if self.input_in_sbuf:
-            # SBUF input shape: [H0, T, H1]
-            kernel_assert(len(hidden_tensor.shape) == 3, "SBUF input must have 3D shape [H0, T, H1]")
+            # SBUF input shape: [H0, T, H1] or [H0, H/512, T] for MXFP all-expert quantized input
+            kernel_assert(len(hidden_tensor.shape) == 3, "SBUF input must have 3D shape")
             # Might be sharded so get hidden_size from weights tensor
-            _, T, _ = hidden_tensor.shape
+            if hidden_input_scale != None:
+                # MXFP all-expert quantized input shape: [H0, H/512, T]
+                T = hidden_tensor.shape[2]
+            else:
+                # Non-quantized input shape: [H0, T, H1]
+                T = hidden_tensor.shape[1]
             self.batch_size = 1
             self.sequence_len = T
             self.hidden_size = down_proj_weights_tensor.shape[-1]
         elif len(hidden_tensor.shape) == 3:  # B, S, H
             self.batch_size = hidden_tensor.shape[0]
             self.sequence_len = hidden_tensor.shape[1]
-            self.hidden_size = hidden_tensor.shape[2]
+            self.hidden_size = down_proj_weights_tensor.shape[-1]
         else:  # T, H
             self.batch_size = 1
             self.sequence_len = hidden_tensor.shape[0]
-            self.hidden_size = hidden_tensor.shape[1]
+            self.hidden_size = down_proj_weights_tensor.shape[-1]
 
         if len(down_proj_weights_tensor.shape) == 3:  # E, I, H
             self.intermediate_size = down_proj_weights_tensor.shape[1]
@@ -427,11 +463,12 @@ class MLPParameters(NKIObject):
         self.use_tkg_gate_up_proj_column_tiling = use_tkg_gate_up_proj_column_tiling
         self.use_tkg_down_proj_column_tiling = use_tkg_down_proj_column_tiling
         self.use_tkg_down_proj_optimized_layout = use_tkg_down_proj_optimized_layout
-        self.shard_on_k = shard_on_k
+        self.shard_on_h_disabled = shard_on_h_disabled
         self.gate_clamp_lower_limit = gate_clamp_lower_limit
         self.gate_clamp_upper_limit = gate_clamp_upper_limit
         self.up_clamp_lower_limit = up_clamp_lower_limit
         self.up_clamp_upper_limit = up_clamp_upper_limit
+        self.force_cte_mode = force_cte_mode
 
         self.fused_add_params = MLPFusedAddParameters(fused_add_tensor, store_fused_add_result)
         self.norm_params = MLPNormalizationParameters(
@@ -452,7 +489,7 @@ class MLPParameters(NKIObject):
 
 
 def is_mlp_tkg(params: MLPParameters) -> bool:
-    return params.batch_size * params.sequence_len <= TKG_BS_SEQLEN_THRESHOLD
+    return params.batch_size * params.sequence_len <= TKG_BS_SEQLEN_THRESHOLD and not params.force_cte_mode
 
 
 def mlpp_has_quantized_weights(params: MLPParameters) -> bool:

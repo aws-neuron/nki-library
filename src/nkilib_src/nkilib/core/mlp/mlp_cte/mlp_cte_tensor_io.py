@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Tensor I/O Module
-
-Handles tensor loading and storing operations for MLP CTE kernels including hidden tensor
-tiles, fused operations, and cross-partition vector loading.
-
-"""
+"""MLP CTE tensor I/O operations for loading and storing hidden tensor tiles and vectors."""
 
 from math import prod
 from typing import Callable, Optional

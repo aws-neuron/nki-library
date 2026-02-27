@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Constants Module
-
-Defines constants and configuration parameters for MLP CTE kernels including data types,
-buffer counts, PSUM bank requirements, and sharding information.
-
-"""
+"""MLP CTE constants and configuration parameters for data types, buffer counts, and sharding."""
 
 from dataclasses import dataclass
 from typing import Optional, Tuple

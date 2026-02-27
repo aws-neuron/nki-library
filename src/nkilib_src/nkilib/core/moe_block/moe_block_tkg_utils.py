@@ -20,11 +20,50 @@ from typing import Optional
 import nki.language as nl
 
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 
 # Constants
 _pmax = 128  # sbuf max partition dim (nl.tile_size.pmax)
+_q_width = 4  # MX quantization block width
 _MX_SUPPORTED_DTYPES = (nl.float4_e2m1fn_x4,)  # TODO: add support for MXFP8
+
+
+def get_sbuf_tensor_shape(T: int, free_dim: int, is_sbuf: bool) -> tuple:
+    """
+    Get tensor shape for SBUF or HBM buffer.
+
+    SBUF has max partition dim of _pmax (128). When T > _pmax, fold to 3D tensor.
+    When num_t_tiles == 1, keep 2D shape.
+
+    Args:
+        T: Number of tokens (partition dimension)
+        free_dim: Size of free dimension
+        is_sbuf: Whether tensor is in SBUF
+
+    Returns:
+        Shape tuple: (T, free_dim) for HBM or T <= _pmax
+                     (_pmax, num_t_tiles, free_dim) for SBUF when T > _pmax
+    """
+    if not is_sbuf or T <= _pmax:
+        return (T, free_dim)
+
+    num_t_tiles = div_ceil(T, _pmax)
+    return (_pmax, num_t_tiles, free_dim)
+
+
+@dataclass
+class QuantizationConfig(nl.NKIObject):
+    """Weight quantization configuration for MoE Block TKG kernel."""
+
+    is_moe_weight_mx: bool  # Whether MoE weights use MX format
+
+
+@dataclass
+class ExpertConfig(nl.NKIObject):
+    """Expert execution configuration for MoE Block TKG kernel."""
+
+    is_all_expert: bool  # Whether using all-expert mode
+    has_shared_expert: bool  # Whether shared expert is enabled
 
 
 @dataclass
@@ -32,7 +71,7 @@ class MoEBlockTKGDims(nl.NKIObject):
     """
     Dimension constants for MoE Block TKG kernel.
 
-    Captures all dimension parameters and configuration flags parsed from input tensors.
+    Captures all dimension parameters parsed from input tensors.
 
     Args:
         B (int): Batch size.
@@ -46,9 +85,6 @@ class MoEBlockTKGDims(nl.NKIObject):
         n_prgs (int): Number of programs (LNC shards).
         prg_id (int): Current program ID.
         hidden_actual (int): Actual hidden dimension for RMSNorm.
-        is_moe_weight_mx (bool): Whether MoE weights use MX format.
-        has_shared_expert (bool): Whether shared expert is enabled.
-        is_all_expert (bool): Whether using all-expert mode.
     """
 
     B: int
@@ -62,12 +98,9 @@ class MoEBlockTKGDims(nl.NKIObject):
     n_prgs: int
     prg_id: int
     hidden_actual: int
-    is_moe_weight_mx: bool
-    has_shared_expert: bool
-    is_all_expert: bool
 
 
-def parse_moe_block_dims(
+def parse_moe_block_config(
     inp: nl.ndarray,
     router_weights: nl.ndarray,
     expert_gate_up_weights: nl.ndarray,
@@ -75,7 +108,7 @@ def parse_moe_block_dims(
     top_k: int,
     hidden_actual: Optional[int],
     is_all_expert: bool,
-) -> MoEBlockTKGDims:
+) -> tuple[MoEBlockTKGDims, QuantizationConfig, ExpertConfig]:
     """
     Parse input tensors and compute dimension constants.
 
@@ -89,7 +122,7 @@ def parse_moe_block_dims(
         is_all_expert (bool): Whether using all-expert mode.
 
     Returns:
-        MoEBlockTKGDims: Parsed dimension constants.
+        tuple: (MoEBlockTKGDims, QuantizationConfig, ExpertConfig)
     """
     B, S, H = inp.shape
     hidden_actual = H if hidden_actual == None else hidden_actual
@@ -99,7 +132,7 @@ def parse_moe_block_dims(
     is_moe_weight_mx = expert_gate_up_weights.dtype in _MX_SUPPORTED_DTYPES
     _, n_prgs, prg_id = get_verified_program_sharding_info("moe_block_tkg_kernel", (0, 1), 2)
 
-    return MoEBlockTKGDims(
+    dims = MoEBlockTKGDims(
         B=B,
         S=S,
         T=T,
@@ -111,14 +144,22 @@ def parse_moe_block_dims(
         n_prgs=n_prgs,
         prg_id=prg_id,
         hidden_actual=hidden_actual,
-        is_moe_weight_mx=is_moe_weight_mx,
-        has_shared_expert=shared_expert_gate_w != None,
-        is_all_expert=is_all_expert,
     )
+
+    quant_config = QuantizationConfig(is_moe_weight_mx=is_moe_weight_mx)
+
+    expert_config = ExpertConfig(
+        is_all_expert=is_all_expert,
+        has_shared_expert=shared_expert_gate_w != None,
+    )
+
+    return dims, quant_config, expert_config
 
 
 def validate_moe_block_inputs(
     dims: MoEBlockTKGDims,
+    quant_config: QuantizationConfig,
+    expert_config: ExpertConfig,
     shared_expert_gate_w: Optional[nl.ndarray],
     shared_expert_up_w: Optional[nl.ndarray],
     shared_expert_down_w: Optional[nl.ndarray],
@@ -133,6 +174,8 @@ def validate_moe_block_inputs(
 
     Args:
         dims (MoEBlockTKGDims): Parsed dimension constants.
+        quant_config (QuantizationConfig): Quantization configuration.
+        expert_config (ExpertConfig): Expert execution configuration.
         shared_expert_gate_w (nl.ndarray): Optional shared expert gate weights.
         shared_expert_up_w (nl.ndarray): Optional shared expert up weights.
         shared_expert_down_w (nl.ndarray): Optional shared expert down weights.
@@ -149,18 +192,20 @@ def validate_moe_block_inputs(
     kernel_assert(dims.H % _pmax == 0, f"H={dims.H} must be divisible by {_pmax}")
 
     # Token size constraints differ between selective and all-expert modes
-    if dims.is_all_expert:
-        if dims.is_moe_weight_mx:
+    if expert_config.is_all_expert:
+        if quant_config.is_moe_weight_mx:
             kernel_assert(dims.T % 4 == 0, f"all_expert mode with MXFP requires T divisible by 4, got {dims.T}")
         else:
             kernel_assert(dims.T <= 128, f"all_expert mode currently supports T <= 128, got {dims.T}")
     else:
         kernel_assert(dims.T <= 128, f"selective_load mode currently supports T <= 128, got {dims.T}")
 
-    kernel_assert(not dims.has_shared_expert, "shared_expert has not been supported in moe_block_tkg kernel yet")
+    kernel_assert(
+        not expert_config.has_shared_expert, "shared_expert has not been supported in moe_block_tkg kernel yet"
+    )
 
     # Shared expert validation (for future support)
-    if dims.has_shared_expert:
+    if expert_config.has_shared_expert:
         kernel_assert(
             shared_expert_up_w != None,
             "shared expert up weight must be a valid tensor when shared expert is enabled",
@@ -180,10 +225,12 @@ def validate_moe_block_inputs(
         )
 
     # All-expert mode specific validation
-    if dims.is_all_expert:
+    if expert_config.is_all_expert:
         kernel_assert(rank_id != None, "rank_id is required for all_expert mode")
         if residual != None:
-            kernel_assert(dims.is_moe_weight_mx, "fused residual add is only supported for MXFP in all_expert mode")
+            kernel_assert(
+                quant_config.is_moe_weight_mx, "fused residual add is only supported for MXFP in all_expert mode"
+            )
 
     # Current implementation limitations
     kernel_assert(dims.n_prgs == 2, f"moe_block_tkg only supports LNC-2; but got a spmd grid size of {dims.n_prgs}")

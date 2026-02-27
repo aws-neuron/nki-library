@@ -47,6 +47,8 @@ from .moe_cte_utils import (
 )
 
 BLOCK_PARALLEL_FACTOR = 3
+GUP_LOAD_COALESCE_FACTOR = 2
+GUP_PROJ_DIM = 2
 
 
 class DimensionSizes(NKIObject):
@@ -60,6 +62,7 @@ class DimensionSizes(NKIObject):
     def __post_init__(self):
         self.h_tile_count = div_ceil(self.H, PSUM_SIZE)
         self.h_subtile_count = PSUM_SIZE // TILE_SIZE
+        self.h_subtile_count_gup = PSUM_SIZE // TILE_SIZE // GUP_LOAD_COALESCE_FACTOR
         self.gup_tile_count = div_ceil(self.I_TP, TILE_SIZE)
         self.n_psum_tile_count = div_ceil(self.B, PSUM_SIZE)
 
@@ -121,11 +124,11 @@ def bwmm_shard_on_block(
         gate_up_proj_scale (nl.ndarray, optional): [E, 1, 2*I_TP], Dequantization scales for gate/up weights in HBM
         down_proj_scale (nl.ndarray, optional): [E, 1, H], Dequantization scales for down weights in HBM
         down_activations (nl.ndarray, optional): [N, B, H], Storage for intermediate activations in HBM
-        activation_function (common_types.ActFnType): Activation function type (SiLU, GELU, etc.)
+        activation_function (ActFnType): Activation function type (SiLU, GELU, etc.)
         skip_dma (SkipMode): DMA skip configuration for memory optimization
         compute_dtype (nki.dtype): Data type for internal computations (default: bfloat16)
         is_tensor_update_accumulating (bool): Enable accumulation for TopK > 1 scenarios
-        expert_affinities_scaling_mode (common_types.ExpertAffinityScaleMode): Expert affinity application mode
+        expert_affinities_scaling_mode (ExpertAffinityScaleMode): Expert affinity application mode
         n_block_per_iter (int): Number of blocks processed per iteration
         gate_clamp_upper_limit (float, optional): Upper clamp limit for gate projections
         gate_clamp_lower_limit (float, optional): Lower clamp limit for gate projections
@@ -230,21 +233,32 @@ def bwmm_shard_on_block(
     NUM_STATIC_BLOCKS = N
     if is_tensor_update_accumulating:
         output = nl.ndarray((dims.T, 2, dims.H), dtype=hidden_states.dtype, buffer=nl.shared_hbm)
-        bwmm_output_initialization(output, shard_id=shard_id)
     else:
         output = nl.ndarray((dims.T, dims.H), dtype=hidden_states.dtype, buffer=nl.shared_hbm)
 
     # Placeholder for FP8
     gup_scale = None
     down_scale = None
+    n_blocks_per_shard = div_ceil(NUM_STATIC_BLOCKS, num_shards)
+    n_shard_tile_count = div_ceil(n_blocks_per_shard, BLOCK_PARALLEL_FACTOR)
+
+    all_block_expert_broadcasted_per_shard = nl.ndarray((1, n_blocks_per_shard), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=all_block_expert_broadcasted_per_shard,
+        src=block_to_expert.reshape((block_to_expert.shape[0], 1)).ap(
+            pattern=[[1, 1], [2, n_blocks_per_shard]], offset=shard_id
+        ),
+    )
 
     if skip_dma.skip_weight:
         # Convert multi-dimensional ndarray with nl.par_dim to list of ndarrays
         gup_weights_load_dst_lst = []
         for h_tile_idx in range(dims.h_tile_count):
             inner_lst = []
-            for h_subtile_idx in range(dims.h_subtile_count):
-                tmp = nl.ndarray((TILE_SIZE, 2, I_TP), dtype=weights_dtype, buffer=nl.sbuf)
+            for h_subtile_idx in range(dims.h_subtile_count_gup):
+                tmp = nl.ndarray(
+                    (TILE_SIZE, GUP_LOAD_COALESCE_FACTOR, GUP_PROJ_DIM, I_TP), dtype=weights_dtype, buffer=nl.sbuf
+                )
                 nisa.memset(dst=tmp, value=0)
                 inner_lst.append(tmp)
             gup_weights_load_dst_lst.append(inner_lst)
@@ -256,12 +270,24 @@ def bwmm_shard_on_block(
         is_weight_same_as_prev_hbm = compute_same_weights_block_parallel_hbm(
             N, block_to_expert=block_to_expert, num_shards=num_shards, shard_id=shard_id, shard_strat=shard_strat
         )
+
+        on_false = nl.ndarray((1, n_blocks_per_shard), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=on_false, value=E)
+        need_skip = nl.ndarray((1, n_blocks_per_shard), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=need_skip,
+            src=is_weight_same_as_prev_hbm.reshape((1, n_blocks_per_shard)).ap(
+                pattern=[[1, 1], [1, n_blocks_per_shard]]
+            ),
+        )
+        nisa.tensor_copy_predicated(
+            dst=all_block_expert_broadcasted_per_shard,
+            src=on_false,
+            predicate=need_skip,
+        )
     else:
         gup_weights_load_dst_lst = None
         down_weights_load_dst_lst = None
-
-    n_blocks_per_shard = div_ceil(NUM_STATIC_BLOCKS, num_shards)
-    n_shard_tile_count = div_ceil(n_blocks_per_shard, BLOCK_PARALLEL_FACTOR)
 
     block_hidden_states_lst = []
     for _ in range(BLOCK_PARALLEL_FACTOR):
@@ -302,22 +328,14 @@ def bwmm_shard_on_block(
                 local_block_idx = shared_block_idx + shard_strat2new_blk_idx_offset(
                     shard_id, shard_strat, n_blocks_per_shard
                 )
-                token_pos_to_id_fp32 = nl.ndarray((1, TILE_SIZE), dtype=nl.float32, buffer=nl.sbuf)
 
-                for alloc_idx in range(NUM_TILES):
-                    offset = local_block_idx * B + TILE_SIZE * alloc_idx
-
-                    nisa.dma_copy(
-                        dst=token_pos_to_id_fp32.ap(pattern=[[TILE_SIZE, 1], [1, TILE_SIZE]]),
-                        src=token_position_to_id.ap(pattern=[[TILE_SIZE, 1], [1, TILE_SIZE]], offset=offset),
-                    )
-
-                    transposed_token_pos_to_id_fp32 = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_transpose(dst=transposed_token_pos_to_id_fp32, data=token_pos_to_id_fp32)
-
-                    nisa.tensor_copy(
-                        dst=token_indices_lst[inner_block_iter][:, alloc_idx], src=transposed_token_pos_to_id_fp32
-                    )
+                offset = local_block_idx * B
+                nisa.dma_copy(
+                    dst=token_indices_lst[inner_block_iter].ap(pattern=[[NUM_TILES, TILE_SIZE], [1, NUM_TILES]]),
+                    src=token_position_to_id.reshape((token_position_to_id.shape[0], 1)).ap(
+                        pattern=[[1, TILE_SIZE], [TILE_SIZE, NUM_TILES]], offset=offset
+                    ),
+                )
 
                 if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.PRE_SCALE:
                     v_expert = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
@@ -377,16 +395,10 @@ def bwmm_shard_on_block(
                         )
 
                 for token_tile_idx in range(NUM_TILES):
-                    # Reshape token_indices access to (TILE_SIZE, 1) for indirect indexing
-                    block_token_mapping = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.tensor_copy(
-                        dst=block_token_mapping,
-                        src=token_indices_lst[inner_block_iter][0:TILE_SIZE, token_tile_idx : token_tile_idx + 1],
+                    block_token_mapping = token_indices_lst[inner_block_iter].ap(
+                        pattern=[[NUM_TILES, TILE_SIZE], [1, 1]],
+                        offset=token_tile_idx,
                     )
-
-                    # nl.load with indirect indexing for hidden_states
-                    # hidden_states shape: (T, H)
-                    # Access: hidden_states[block_token_mapping[i], 0:H] for i in 0:TILE_SIZE
                     nisa.dma_copy(
                         dst=block_hidden_states_lst[inner_block_iter][token_tile_idx][0:TILE_SIZE, nl.ds(0, H)],
                         src=hidden_states.ap(
@@ -408,26 +420,85 @@ def bwmm_shard_on_block(
                         )
 
                 block_free_tiles = min(PSUM_SIZE // TILE_SIZE, B // TILE_SIZE)
+
                 for token_tile_idx in range(block_psum_tiles):
-                    for batch_tile_idx in range(block_free_tiles):
-                        for h_tile_idx in range(dims.h_tile_count):
-                            for h_subtile_idx in range(dims.h_subtile_count):
-                                offset = TILE_SIZE * batch_tile_idx
-                                tmp_psum = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=compute_dtype, buffer=nl.psum)
-                                nisa.nc_transpose(
-                                    dst=tmp_psum,
-                                    data=block_hidden_states_lst[inner_block_iter][
-                                        block_free_tiles * token_tile_idx + batch_tile_idx
-                                    ][
-                                        0:TILE_SIZE,
-                                        nl.ds(TILE_SIZE * h_subtile_idx + PSUM_SIZE * h_tile_idx, TILE_SIZE),
-                                    ],
-                                )
+                    # ═══════════════════════════════════════════════════════════════════════
+                    # DEFINE 8 PSUM BANK BUFFERS: 2 sets × (N_PSUM_BANKS // 2) h_subtiles
+                    # ═══════════════════════════════════════════════════════════════════════
+                    num_subtiles_per_set = N_PSUM_BANKS // 2
+                    tmp_psum_set_0 = []
+                    tmp_psum_set_1 = []
+                    for _ in range(num_subtiles_per_set):
+                        tmp_psum_set_0.append(nl.ndarray((TILE_SIZE, free_size), dtype=compute_dtype, buffer=nl.psum))
+                        tmp_psum_set_1.append(nl.ndarray((TILE_SIZE, free_size), dtype=compute_dtype, buffer=nl.psum))
+
+                    # ═══════════════════════════════════════════════════════════════════════
+                    # PROCESS H_TILES IN PAIRS (fill 8 banks, then copy 8 banks)
+                    # ═══════════════════════════════════════════════════════════════════════
+                    num_pairs = (dims.h_tile_count + 1) // 2
+
+                    for h_tile_pair in range(num_pairs):
+                        h_tile_0 = h_tile_pair * 2  # Even h_tile → Set 0
+                        h_tile_1 = h_tile_pair * 2 + 1  # Odd h_tile → Set 1
+
+                        # ───────────────────────────────────────────────────────────────────
+                        # PHASE 1: FILL ALL 8 PSUM BANKS (all transposes first)
+                        # ───────────────────────────────────────────────────────────────────
+
+                        # Fill Set 0 with h_tile_0
+                        if h_tile_0 < dims.h_tile_count:
+                            for batch_tile_idx in range(block_free_tiles):
+                                input_tile_idx = block_free_tiles * token_tile_idx + batch_tile_idx
+                                for h_subtile_idx in range(num_subtiles_per_set):
+                                    nisa.nc_transpose(
+                                        dst=tmp_psum_set_0[h_subtile_idx][
+                                            0:TILE_SIZE, batch_tile_idx * TILE_SIZE : (batch_tile_idx + 1) * TILE_SIZE
+                                        ],
+                                        data=block_hidden_states_lst[inner_block_iter][input_tile_idx][
+                                            0:TILE_SIZE,
+                                            nl.ds(TILE_SIZE * h_subtile_idx + PSUM_SIZE * h_tile_0, TILE_SIZE),
+                                        ],
+                                    )
+
+                        # Fill Set 1 with h_tile_1
+                        if h_tile_1 < dims.h_tile_count:
+                            for batch_tile_idx in range(block_free_tiles):
+                                input_tile_idx = block_free_tiles * token_tile_idx + batch_tile_idx
+                                for h_subtile_idx in range(num_subtiles_per_set):
+                                    nisa.nc_transpose(
+                                        dst=tmp_psum_set_1[h_subtile_idx][
+                                            0:TILE_SIZE, batch_tile_idx * TILE_SIZE : (batch_tile_idx + 1) * TILE_SIZE
+                                        ],
+                                        data=block_hidden_states_lst[inner_block_iter][input_tile_idx][
+                                            0:TILE_SIZE,
+                                            nl.ds(TILE_SIZE * h_subtile_idx + PSUM_SIZE * h_tile_1, TILE_SIZE),
+                                        ],
+                                    )
+
+                        # ───────────────────────────────────────────────────────────────────
+                        # PHASE 2: COPY ALL 8 PSUM BANKS (close results copied together!)
+                        # ───────────────────────────────────────────────────────────────────
+
+                        # Copy Set 0 (h_tile_0, all h_subtiles together)
+                        if h_tile_0 < dims.h_tile_count:
+                            for h_subtile_idx in range(num_subtiles_per_set):
                                 nisa.tensor_copy(
-                                    dst=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][h_subtile_idx][
-                                        0:TILE_SIZE, token_tile_idx, nl.ds(offset, TILE_SIZE)
+                                    dst=block_hidden_states_T_lst[inner_block_iter][h_tile_0][h_subtile_idx][
+                                        0:TILE_SIZE, token_tile_idx, nl.ds(0, free_size)
                                     ],
-                                    src=tmp_psum,
+                                    src=tmp_psum_set_0[h_subtile_idx],
+                                    engine=nisa.scalar_engine,
+                                )
+
+                        # Copy Set 1 (h_tile_1, all h_subtiles together)
+                        if h_tile_1 < dims.h_tile_count:
+                            for h_subtile_idx in range(num_subtiles_per_set):
+                                nisa.tensor_copy(
+                                    dst=block_hidden_states_T_lst[inner_block_iter][h_tile_1][h_subtile_idx][
+                                        0:TILE_SIZE, token_tile_idx, nl.ds(0, free_size)
+                                    ],
+                                    src=tmp_psum_set_1[h_subtile_idx],
+                                    engine=nisa.scalar_engine,
                                 )
 
         # sequential load weights and compute
@@ -439,85 +510,151 @@ def bwmm_shard_on_block(
                 local_block_idx = shared_block_idx + shard_strat2new_blk_idx_offset(
                     shard_id, shard_strat, n_blocks_per_shard
                 )
-
-                block_expert = load_block_expert(block_to_expert, local_block_idx)
-
-                new_block_expert = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                nisa.tensor_copy(src=block_expert, dst=new_block_expert)
-                if skip_dma.skip_weight:
-                    # compute whether the expert idx is same as before
-                    need_skip = nl.ndarray((1, 1), dtype=nl.uint8, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        dst=need_skip,
-                        src=is_weight_same_as_prev_hbm[outer_block_iter * BLOCK_PARALLEL_FACTOR + inner_block_iter],
-                    )
-
-                    # Create on_false with memset
-                    on_false = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.memset(dst=on_false, value=E)
+                block_expert = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_copy(
+                    dst=block_expert, src=all_block_expert_broadcasted_per_shard[0:1, linear_idx : linear_idx + 1]
+                )
 
                 gup_weights = load_gate_up_proj_weights(
-                    gate_up_proj_weight, new_block_expert, weights_dtype, skip_dma, load_dst=gup_weights_load_dst_lst
+                    gate_up_proj_weight, block_expert, weights_dtype, skip_dma, load_dst=gup_weights_load_dst_lst
                 )
 
                 dp_weights = load_down_proj_weight(
-                    down_proj_weight, new_block_expert, weights_dtype, skip_dma, load_dst=down_weights_load_dst_lst
+                    down_proj_weight, block_expert, weights_dtype, skip_dma, load_dst=down_weights_load_dst_lst
                 )
 
                 # load bias
                 if cfg.linear_bias:
-                    gate_up_bias_T = load_and_transpose_gup_bias(inps, dims, cfg, block_expert)
+                    gate_up_bias_T = load_and_transpose_gup_bias(inps, dims, cfg, block_expert, skip_dma)
+
+                if block_idx != shard_id:
+                    block_old = (
+                        bwmm_load_old_block(
+                            output,
+                            token_indices_lst[inner_block_iter],
+                            NUM_TILES,
+                            compute_dtype,
+                            skip_dma,
+                            shard_id=shard_id,
+                        )
+                        if is_tensor_update_accumulating
+                        else None
+                    )
+                else:
+                    block_old = []
+                    for alloc_idx in range(NUM_TILES):
+                        tmp = nl.ndarray((TILE_SIZE, H), dtype=compute_dtype, buffer=nl.sbuf)
+                        nisa.memset(tmp, value=0)
+                        block_old.append(tmp)
 
                 free_size = block_hidden_states_T_lst[0][0][0].shape[-1]
-                gate_and_up_proj_states_lst = []
-                for _ in range(2):
+                gate_and_up_proj_states_lst_psum = []
+                gate_and_up_proj_states_lst_sbuf = []
+                for _ in range(GUP_PROJ_DIM):
                     n_psum_lst = []
+                    n_sbuf_lst = []
                     for _ in range(dims.n_psum_tile_count):
-                        gup_lst = []
+                        gup_psum_lst = []
+                        gup_sbuf_lst = []
                         for _ in range(dims.gup_tile_count):
-                            gup_lst.append(
-                                nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum)
-                            )  # , lazy_initialization=True))
-                        n_psum_lst.append(gup_lst)
-                    gate_and_up_proj_states_lst.append(n_psum_lst)
+                            gup_psum_lst.append(nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum))
+                            gup_sbuf_lst.append(nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.sbuf))
+                        n_psum_lst.append(gup_psum_lst)
+                        n_sbuf_lst.append(gup_sbuf_lst)
+                    gate_and_up_proj_states_lst_psum.append(n_psum_lst)
+                    gate_and_up_proj_states_lst_sbuf.append(n_sbuf_lst)
 
-                for projection_idx in range(2):
-                    for i_tile_idx in range(dims.gup_tile_count):
-                        for h_tile_idx in range(dims.h_tile_count):
-                            for h_subtile_idx in range(dims.h_subtile_count):
-                                for batch_tile_idx in range(dims.n_psum_tile_count):
+                for h_tile_idx in range(dims.h_tile_count):
+                    for h_subtile_idx in range(dims.h_subtile_count_gup):
+                        for op_idx in range(GUP_LOAD_COALESCE_FACTOR):
+                            is_last_accumulation = (
+                                h_tile_idx == dims.h_tile_count - 1
+                                and h_subtile_idx == dims.h_subtile_count_gup - 1
+                                and op_idx == 1
+                            )
+
+                            if not is_last_accumulation:
+                                # ───────────────────────────────────────────────────────────────
+                                # NORMAL PATH: Just matmuls, no copies yet
+                                # ───────────────────────────────────────────────────────────────
+                                for i_tile_idx in range(dims.gup_tile_count):
                                     num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * i_tile_idx)
-                                    nisa.nc_matmul(
-                                        dst=gate_and_up_proj_states_lst[projection_idx][batch_tile_idx][i_tile_idx][
-                                            0:num_valid_k, nl.ds(0, free_size)
-                                        ],
-                                        stationary=gup_weights[h_tile_idx][h_subtile_idx][
-                                            nl.ds(0, TILE_SIZE),
-                                            projection_idx,
-                                            nl.ds(TILE_SIZE * i_tile_idx, num_valid_k),
-                                        ],
-                                        moving=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][h_subtile_idx][
-                                            0:TILE_SIZE, batch_tile_idx, nl.ds(0, free_size)
-                                        ],
-                                    )
 
-                    # add bias
-                    if cfg.linear_bias:
-                        for batch_tile_idx in range(dims.n_psum_tile_count):
-                            for i_tile_idx in range(dims.gup_tile_count):
-                                nisa.tensor_tensor(
-                                    dst=gate_and_up_proj_states_lst[projection_idx][batch_tile_idx][i_tile_idx][
-                                        0:TILE_SIZE, nl.ds(0, free_size)
-                                    ],
-                                    data1=gate_and_up_proj_states_lst[projection_idx][batch_tile_idx][i_tile_idx][
-                                        0:TILE_SIZE, nl.ds(0, free_size)
-                                    ],
-                                    data2=gate_up_bias_T.ap(
-                                        pattern=[[2 * dims.gup_tile_count, TILE_SIZE], [0, free_size]],
-                                        offset=i_tile_idx * 2 + projection_idx,
-                                    ),
-                                    op=nl.add,
-                                )
+                                    for projection_idx in range(GUP_PROJ_DIM):
+                                        for batch_tile_idx in range(dims.n_psum_tile_count):
+                                            nisa.nc_matmul(
+                                                dst=gate_and_up_proj_states_lst_psum[projection_idx][batch_tile_idx][
+                                                    i_tile_idx
+                                                ][0:num_valid_k, nl.ds(0, free_size)],
+                                                stationary=gup_weights[h_tile_idx][h_subtile_idx][
+                                                    nl.ds(0, TILE_SIZE),
+                                                    op_idx,
+                                                    projection_idx,
+                                                    nl.ds(TILE_SIZE * i_tile_idx, num_valid_k),
+                                                ],
+                                                moving=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][
+                                                    h_subtile_idx * GUP_LOAD_COALESCE_FACTOR + op_idx
+                                                ][0:TILE_SIZE, batch_tile_idx, nl.ds(0, free_size)],
+                                            )
+                            else:
+                                # ───────────────────────────────────────────────────────────────
+                                # LAST ACCUMULATION: Pipeline matmul with copy of previous tile
+                                # ───────────────────────────────────────────────────────────────
+                                for i_tile_idx in range(dims.gup_tile_count + 1):
+                                    # COPY: Previous i_tile (accumulation complete after last matmul)
+                                    if i_tile_idx > 0:
+                                        prev_tile = i_tile_idx - 1
+                                        num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * prev_tile)
+                                        for projection_idx in range(2):
+                                            for batch_tile_idx in range(dims.n_psum_tile_count):
+                                                nisa.tensor_copy(
+                                                    dst=gate_and_up_proj_states_lst_sbuf[projection_idx][
+                                                        batch_tile_idx
+                                                    ][prev_tile][0:num_valid_k, nl.ds(0, free_size)],
+                                                    src=gate_and_up_proj_states_lst_psum[projection_idx][
+                                                        batch_tile_idx
+                                                    ][prev_tile][0:num_valid_k, nl.ds(0, free_size)],
+                                                    engine=nisa.scalar_engine,
+                                                )
+                                                # add bias
+                                                if cfg.linear_bias:
+                                                    nisa.tensor_tensor(
+                                                        dst=gate_and_up_proj_states_lst_sbuf[projection_idx][
+                                                            batch_tile_idx
+                                                        ][prev_tile][0:TILE_SIZE, nl.ds(0, free_size)],
+                                                        data1=gate_and_up_proj_states_lst_sbuf[projection_idx][
+                                                            batch_tile_idx
+                                                        ][prev_tile][0:TILE_SIZE, nl.ds(0, free_size)],
+                                                        data2=gate_up_bias_T.ap(
+                                                            pattern=[
+                                                                [2 * dims.gup_tile_count, TILE_SIZE],
+                                                                [0, free_size],
+                                                            ],
+                                                            offset=prev_tile * 2 + projection_idx,
+                                                        ),
+                                                        op=nl.add,
+                                                    )
+
+                                    # MATMUL: Current i_tile
+                                    if i_tile_idx < dims.gup_tile_count:
+                                        num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * i_tile_idx)
+
+                                        for projection_idx in range(2):
+                                            for batch_tile_idx in range(dims.n_psum_tile_count):
+                                                nisa.nc_matmul(
+                                                    dst=gate_and_up_proj_states_lst_psum[projection_idx][
+                                                        batch_tile_idx
+                                                    ][i_tile_idx][0:num_valid_k, nl.ds(0, free_size)],
+                                                    stationary=gup_weights[h_tile_idx][h_subtile_idx][
+                                                        nl.ds(0, TILE_SIZE),
+                                                        op_idx,
+                                                        projection_idx,
+                                                        nl.ds(TILE_SIZE * i_tile_idx, num_valid_k),
+                                                    ],
+                                                    moving=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][
+                                                        h_subtile_idx * 2 + op_idx
+                                                    ][0:TILE_SIZE, batch_tile_idx, nl.ds(0, free_size)],
+                                                )
 
                 # Clipping the projections
                 if (
@@ -532,10 +669,10 @@ def bwmm_shard_on_block(
                             # have both lower and upper limit for gate projection
                             if cfg.gate_clamp_lower_limit is not None and cfg.gate_clamp_upper_limit is not None:
                                 nisa.tensor_scalar(
-                                    dst=gate_and_up_proj_states_lst[0][token_tile_idx][i_tile_idx][
+                                    dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
                                         0:TILE_SIZE, nl.ds(0, free_size)
                                     ],
-                                    data=gate_and_up_proj_states_lst[0][token_tile_idx][i_tile_idx][
+                                    data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
                                         0:TILE_SIZE, nl.ds(0, free_size)
                                     ],
                                     op0=nl.minimum,
@@ -546,10 +683,10 @@ def bwmm_shard_on_block(
                             else:
                                 if cfg.gate_clamp_upper_limit is not None:
                                     nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst[0][token_tile_idx][i_tile_idx][
+                                        dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
-                                        data=gate_and_up_proj_states_lst[0][token_tile_idx][i_tile_idx][
+                                        data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
                                         op0=nl.minimum,
@@ -557,10 +694,10 @@ def bwmm_shard_on_block(
                                     )
                                 if cfg.gate_clamp_lower_limit is not None:
                                     nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst[0][token_tile_idx][i_tile_idx][
+                                        dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
-                                        data=gate_and_up_proj_states_lst[0][token_tile_idx][i_tile_idx][
+                                        data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
                                         op0=nl.maximum,
@@ -571,10 +708,10 @@ def bwmm_shard_on_block(
                             # have both lower and upper limit for up projection
                             if cfg.up_clamp_upper_limit is not None and cfg.up_clamp_lower_limit is not None:
                                 nisa.tensor_scalar(
-                                    dst=gate_and_up_proj_states_lst[1][token_tile_idx][i_tile_idx][
+                                    dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
                                         0:TILE_SIZE, nl.ds(0, free_size)
                                     ],
-                                    data=gate_and_up_proj_states_lst[1][token_tile_idx][i_tile_idx][
+                                    data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
                                         0:TILE_SIZE, nl.ds(0, free_size)
                                     ],
                                     op0=nl.minimum,
@@ -585,10 +722,10 @@ def bwmm_shard_on_block(
                             else:
                                 if cfg.up_clamp_upper_limit is not None:
                                     nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst[1][token_tile_idx][i_tile_idx][
+                                        dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
-                                        data=gate_and_up_proj_states_lst[1][token_tile_idx][i_tile_idx][
+                                        data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
                                         op0=nl.minimum,
@@ -596,10 +733,10 @@ def bwmm_shard_on_block(
                                     )
                                 if cfg.up_clamp_lower_limit is not None:
                                     nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst[1][token_tile_idx][i_tile_idx][
+                                        dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
-                                        data=gate_and_up_proj_states_lst[1][token_tile_idx][i_tile_idx][
+                                        data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
                                             0:TILE_SIZE, nl.ds(0, free_size)
                                         ],
                                         op0=nl.maximum,
@@ -688,7 +825,7 @@ def bwmm_shard_on_block(
                         )
 
                 intermediate_states = compute_intermediate_states(
-                    gate_and_up_proj_states_lst,
+                    gate_and_up_proj_states_lst_sbuf,
                     B,
                     I_TP,
                     compute_dtype,
@@ -696,20 +833,6 @@ def bwmm_shard_on_block(
                     expert_affinity_T_broadcasted=expert_affinity_T_broadcasted,
                     gup_scale=gup_scale,
                 )
-
-                block_old = (
-                    bwmm_load_old_block(
-                        output,
-                        token_indices_lst[inner_block_iter],
-                        NUM_TILES,
-                        compute_dtype,
-                        skip_dma,
-                        shard_id=shard_id,
-                    )
-                    if is_tensor_update_accumulating
-                    else None
-                )
-                down_activations = None
 
                 expert_affinity_f32 = (
                     calculate_expert_affinities(
@@ -724,9 +847,10 @@ def bwmm_shard_on_block(
                     if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.POST_SCALE
                     else None
                 )
+                down_activations = None
 
                 if cfg.linear_bias:
-                    down_bias_broadcasted = load_and_broadcast_down_bias(inps, dims, cfg, block_expert)
+                    down_bias_broadcasted = load_and_broadcast_down_bias(inps, dims, cfg, block_expert, skip_dma)
                 else:
                     down_bias_broadcasted = None
                 block_new_lst = compute_block_output(
@@ -740,7 +864,6 @@ def bwmm_shard_on_block(
                     I_TP,
                     NUM_TILES,
                     output_dtype=output.dtype,
-                    compute_dtype=compute_dtype,
                     down_bias_broadcasted=down_bias_broadcasted,
                     is_tensor_update_accumulating=is_tensor_update_accumulating,
                     down_scale=down_scale,
@@ -753,6 +876,7 @@ def bwmm_shard_on_block(
                         nisa.tensor_copy(
                             dst=token_idx,
                             src=token_indices_lst[inner_block_iter][0:TILE_SIZE, token_tile_idx : token_tile_idx + 1],
+                            engine=nisa.scalar_engine,
                         )
 
                         nisa.dma_copy(
@@ -1089,28 +1213,39 @@ def load_gate_up_proj_weights(
 
     _, H, _, I_TP = gate_up_proj_weight.shape
     h_tile_count = div_ceil(H, PSUM_SIZE)
-    h_subtile_count = PSUM_SIZE // TILE_SIZE
+    h_subtile_count_gup = PSUM_SIZE // TILE_SIZE // GUP_LOAD_COALESCE_FACTOR
 
     if load_dst is None:
         load_dst = []
         for h_tile_idx in range(h_tile_count):
             h_j_lst = []
-            for h_subtile_idx in range(h_subtile_count):
-                h_j_lst.append(nl.ndarray((TILE_SIZE, 2, I_TP), dtype=gate_up_proj_weight.dtype, buffer=nl.sbuf))
+            for h_subtile_idx in range(h_subtile_count_gup):
+                h_j_lst.append(
+                    nl.ndarray(
+                        (TILE_SIZE, GUP_LOAD_COALESCE_FACTOR, GUP_PROJ_DIM, I_TP),
+                        dtype=gate_up_proj_weight.dtype,
+                        buffer=nl.sbuf,
+                    )
+                )
             load_dst.append(h_j_lst)
 
     if gate_up_proj_weight.dtype != compute_dtype:
         gup_weights = []
         for h_tile_idx in range(h_tile_count):
             h_j_lst = []
-            for h_subtile_idx in range(h_subtile_count):
-                h_j_lst.append(nl.ndarray((TILE_SIZE, 2, I_TP), dtype=compute_dtype, buffer=nl.sbuf))
+            for h_subtile_idx in range(h_subtile_count_gup):
+                h_j_lst.append(
+                    nl.ndarray(
+                        (TILE_SIZE, GUP_LOAD_COALESCE_FACTOR, GUP_PROJ_DIM, I_TP), dtype=compute_dtype, buffer=nl.sbuf
+                    )
+                )
             gup_weights.append(h_j_lst)
 
     for h_tile_idx in range(h_tile_count):
-        for h_subtile_idx in range(h_subtile_count):
-            h_offset = PSUM_SIZE * h_tile_idx + TILE_SIZE * h_subtile_idx
-            num_h = min(TILE_SIZE, H - h_offset)
+        for h_subtile_idx in range(h_subtile_count_gup):
+            h_offset = PSUM_SIZE * h_tile_idx + GUP_LOAD_COALESCE_FACTOR * TILE_SIZE * h_subtile_idx
+            h_remaining = H - h_offset
+            num_h = min(TILE_SIZE, div_ceil(h_remaining, GUP_LOAD_COALESCE_FACTOR))
 
             # Initialize with zeros for partial tiles
             if num_h < TILE_SIZE:
@@ -1124,18 +1259,19 @@ def load_gate_up_proj_weights(
             # Static offset: h_offset * 2 * I_TP
             # scalar_offset: block_expert (compiler multiplies by H*2*I_TP)
 
-            offset = h_offset * (2 * I_TP)
+            offset = h_offset * (GUP_PROJ_DIM * I_TP)
 
             nisa.dma_copy(
-                dst=load_dst[h_tile_idx][h_subtile_idx][0:num_h, 0:2, 0:I_TP],
+                dst=load_dst[h_tile_idx][h_subtile_idx][0:num_h, 0:GUP_LOAD_COALESCE_FACTOR, 0:GUP_PROJ_DIM, 0:I_TP],
                 src=gate_up_proj_weight.ap(
                     pattern=[
-                        [2 * I_TP, num_h],  # H dimension: stride=2*I_TP, count=num_h
-                        [I_TP, 2],  # gate/up dimension: stride=I_TP, count=2
-                        [1, I_TP],  # I_TP dimension: stride=1, count=I_TP
+                        [GUP_PROJ_DIM * I_TP, num_h],
+                        [TILE_SIZE * GUP_PROJ_DIM * I_TP, GUP_LOAD_COALESCE_FACTOR],
+                        [I_TP, GUP_PROJ_DIM],
+                        [1, I_TP],
                     ],
                     offset=offset,
-                    scalar_offset=block_expert,  # Compiler multiplies by (H*2*I_TP)
+                    scalar_offset=block_expert,
                 ),
                 oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
             )
@@ -1147,8 +1283,12 @@ def load_gate_up_proj_weights(
                     nisa.memset(dst=gup_weights[h_tile_idx][h_subtile_idx], value=0)
 
                 nisa.tensor_copy(
-                    dst=gup_weights[h_tile_idx][h_subtile_idx][0:num_h, 0:2, 0:I_TP],
-                    src=load_dst[h_tile_idx][h_subtile_idx][0:num_h, 0:2, 0:I_TP],
+                    dst=gup_weights[h_tile_idx][h_subtile_idx][
+                        0:num_h, 0:GUP_LOAD_COALESCE_FACTOR, 0:GUP_PROJ_DIM, 0:I_TP
+                    ],
+                    src=load_dst[h_tile_idx][h_subtile_idx][
+                        0:num_h, 0:GUP_LOAD_COALESCE_FACTOR, 0:GUP_PROJ_DIM, 0:I_TP
+                    ],
                 )
 
     return load_dst if gate_up_proj_weight.dtype == compute_dtype else gup_weights
@@ -1165,10 +1305,8 @@ def compute_block_output(
     I_TP,
     NUM_TILES,
     output_dtype,
-    compute_dtype,
     is_tensor_update_accumulating,
     down_bias_broadcasted=None,
-    allocate=False,
     down_scale=None,
 ):
     """
@@ -1224,10 +1362,10 @@ def compute_block_output(
     for token_tile_idx in range(NUM_TILES):
         for h_tile_idx in range(h_i_upper):
             buffer_type = nl.psum
-            down_proj_lst = []
+            down_proj_psum_lst = []
             for _ in range(N_PSUM_BANKS):
                 tmp = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=nl.float32, buffer=buffer_type)
-                down_proj_lst.append(tmp)
+                down_proj_psum_lst.append(tmp)
             for h_subtile_idx in range(N_PSUM_BANKS):
                 for i_tile_idx in range(gup_n_tile):
                     # Mask 1: H dimension - compute actual psum size
@@ -1243,7 +1381,7 @@ def compute_block_output(
                                 0:num_valid_k, nl.ds(TILE_SIZE * token_tile_idx, TILE_SIZE)
                             ],
                             moving=dp_weights[i_tile_idx][nl.ds(0, num_valid_k), nl.ds(psum_start, actual_psum_size)],
-                            dst=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                            dst=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                         )
 
                 if expert_affinity is not None:
@@ -1252,8 +1390,8 @@ def compute_block_output(
                             idx = (N_PSUM_BANKS * h_tile_idx) + h_subtile_idx
                             if idx < H_NUM_PSUM_TILES:
                                 nisa.tensor_tensor(
-                                    dst=down_proj_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
-                                    data1=down_proj_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
+                                    dst=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
+                                    data1=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
                                     data2=down_scale[0:TILE_SIZE, idx, 0:PSUM_SIZE],
                                     op=nl.multiply,
                                 )
@@ -1262,8 +1400,8 @@ def compute_block_output(
                             if down_bias_broadcasted is not None:
                                 bias_idx = (N_PSUM_BANKS * h_tile_idx) + h_subtile_idx
                                 nisa.tensor_tensor(
-                                    dst=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
-                                    data1=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                    dst=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                    data1=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                                     data2=down_bias_broadcasted[
                                         0:TILE_SIZE, nl.ds(bias_idx * PSUM_SIZE, actual_psum_size)
                                     ],
@@ -1272,7 +1410,7 @@ def compute_block_output(
 
                             nisa.scalar_tensor_tensor(
                                 dst=block_new_lst[token_tile_idx][0:TILE_SIZE, nl.ds(psum_start, actual_psum_size)],
-                                data=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                data=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                                 op0=nl.multiply,
                                 operand0=expert_affinity[token_tile_idx][0:TILE_SIZE, 0],
                                 op1=nl.add,
@@ -1283,8 +1421,8 @@ def compute_block_output(
                             idx = (N_PSUM_BANKS * h_tile_idx) + h_subtile_idx
                             if idx < H_NUM_PSUM_TILES:
                                 nisa.tensor_tensor(
-                                    dst=down_proj_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
-                                    data1=down_proj_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
+                                    dst=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
+                                    data1=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
                                     data2=down_scale[0:TILE_SIZE, idx, 0:PSUM_SIZE],
                                     op=nl.multiply,
                                 )
@@ -1293,8 +1431,8 @@ def compute_block_output(
                             if down_bias_broadcasted is not None:
                                 bias_idx = (N_PSUM_BANKS * h_tile_idx) + h_subtile_idx
                                 nisa.tensor_tensor(
-                                    dst=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
-                                    data1=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                    dst=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                    data1=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                                     data2=down_bias_broadcasted[
                                         0:TILE_SIZE, nl.ds(bias_idx * PSUM_SIZE, actual_psum_size)
                                     ],
@@ -1302,7 +1440,7 @@ def compute_block_output(
                                 )
                             nisa.tensor_scalar(
                                 dst=block_new_lst[token_tile_idx][0:TILE_SIZE, nl.ds(psum_start, actual_psum_size)],
-                                data=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                data=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                                 operand0=expert_affinity[token_tile_idx][0:TILE_SIZE, 0],
                                 op0=nl.multiply,
                             )
@@ -1312,8 +1450,8 @@ def compute_block_output(
                             idx = (N_PSUM_BANKS * h_tile_idx) + h_subtile_idx
                             if idx < H_NUM_PSUM_TILES:
                                 nisa.tensor_tensor(
-                                    dst=down_proj_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
-                                    data1=down_proj_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
+                                    dst=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
+                                    data1=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
                                     data2=down_scale[0:TILE_SIZE, idx, 0:PSUM_SIZE],
                                     op=nl.multiply,
                                 )
@@ -1321,7 +1459,7 @@ def compute_block_output(
                             nisa.tensor_tensor(
                                 dst=block_new_lst[token_tile_idx][0:TILE_SIZE, nl.ds(psum_start, actual_psum_size)],
                                 data1=block_old[token_tile_idx][0:TILE_SIZE, nl.ds(psum_start, actual_psum_size)],
-                                data2=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                data2=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                                 op=nl.add,
                             )
                     else:
@@ -1330,12 +1468,10 @@ def compute_block_output(
                             if idx < H_NUM_PSUM_TILES:
                                 nisa.tensor_tensor(
                                     dst=block_new_lst[token_tile_idx][
-                                        nl.arange(TILE_SIZE)[:, None],
-                                        TOTAL_PSUM_SIZE * h_tile_idx
-                                        + PSUM_SIZE * h_subtile_idx
-                                        + nl.arange(PSUM_SIZE)[None, :],
+                                        0:TILE_SIZE,
+                                        nl.ds(TOTAL_PSUM_SIZE * h_tile_idx + PSUM_SIZE * h_subtile_idx, PSUM_SIZE),
                                     ],
-                                    data1=down_proj_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
+                                    data1=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, 0:PSUM_SIZE],
                                     data2=down_scale[0:TILE_SIZE, idx, 0:PSUM_SIZE],
                                     op=nl.multiply,
                                 )
@@ -1343,7 +1479,7 @@ def compute_block_output(
                             if actual_psum_size > 0:
                                 nisa.tensor_copy(
                                     dst=block_new_lst[token_tile_idx][0:TILE_SIZE, nl.ds(psum_start, actual_psum_size)],
-                                    src=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                                    src=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                                 )
 
                 # checkpoint activations
@@ -1358,7 +1494,7 @@ def compute_block_output(
                                 nl.ds(output_block_start, TILE_SIZE),
                                 nl.ds(output_hidden_start, actual_psum_size),
                             ],
-                            src=down_proj_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
+                            src=down_proj_psum_lst[h_subtile_idx][0:TILE_SIZE, nl.ds(0, actual_psum_size)],
                         )
 
     return block_new_lst
@@ -1400,7 +1536,7 @@ def reduce_outputs(
         )
 
 
-def load_and_transpose_gup_bias(inps: InputTensors, dims: DimensionSizes, cfg: Configs, block_expert):
+def load_and_transpose_gup_bias(inps: InputTensors, dims: DimensionSizes, cfg: Configs, block_expert, skip_dma):
     """
     Load and transpose gate/up projection bias for current expert.
 
@@ -1424,6 +1560,7 @@ def load_and_transpose_gup_bias(inps: InputTensors, dims: DimensionSizes, cfg: C
         src=inps.gate_and_up_proj_bias.ap(
             pattern=[[dims.I_TP, 2], [1, dims.I_TP]], offset=0, scalar_offset=block_expert, indirect_dim=0
         ),
+        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
     )
 
     # transpose
@@ -1488,7 +1625,7 @@ def shard_strat2new_blk_idx_offset(
         return shard_id
 
 
-def load_and_broadcast_down_bias(inps: InputTensors, dims: DimensionSizes, cfg: Configs, block_expert):
+def load_and_broadcast_down_bias(inps: InputTensors, dims: DimensionSizes, cfg: Configs, block_expert, skip_dma):
     """
     Load and broadcast down projection bias for the current block.
 
@@ -1510,6 +1647,7 @@ def load_and_broadcast_down_bias(inps: InputTensors, dims: DimensionSizes, cfg: 
         src=inps.down_proj_bias.ap(
             pattern=[[dims.H, 1], [1, dims.H]], offset=0, scalar_offset=block_expert, indirect_dim=0
         ),
+        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
     )
 
     down_bias_broadcasted = nl.ndarray((TILE_SIZE, dims.H), dtype=cfg.compute_dtype, buffer=nl.sbuf)

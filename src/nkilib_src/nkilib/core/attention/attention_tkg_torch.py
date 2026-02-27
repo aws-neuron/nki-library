@@ -17,20 +17,49 @@ PyTorch reference for attention_tkg kernel
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Protocol, Tuple
 
 import torch
 
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
+from ..utils.lnc_subscriptable import LncSubscriptable
 from .attention_tkg_utils import (
     AttnTKGConfig,
     is_batch_sharded,
     resize_cache_block_len_for_attention_tkg_kernel,
 )
 
+attention_tkg_torch_ref: "LncSubscriptable[_AttentionTkgTorchRefFn]"
+"""
+PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
 
-def attention_tkg_torch_ref(
+Usage:
+    attention_tkg_torch_ref[lnc](q=..., k_active=..., ...)
+
+Args:
+    q: Query tensor
+    k_active: Active key tensor
+    v_active: Active value tensor
+    k_prior: Prior key cache tensor
+    v_prior: Prior value cache tensor
+    mask: Attention mask tensor
+    out: Output tensor (modified in-place)
+    cfg: Attention TKG configuration
+    sbm: SBUF manager (unused in torch ref)
+    inv_freqs: Inverse frequencies for RoPE
+    rope_pos_ids: Position IDs for RoPE
+    sink: Sink tensor for attention sink
+    active_blocks_table: Block table for block KV cache
+    k_out: Output tensor for RoPE'd keys (modified in-place)
+    DBG_TENSORS: Debug tensors tuple
+
+Returns:
+    Tuple of (out, k_out) tensors
+"""
+
+
+def _attention_tkg_torch_ref_impl(
     q: torch.Tensor,
     k_active: torch.Tensor,
     v_active: torch.Tensor,
@@ -46,18 +75,11 @@ def attention_tkg_torch_ref(
     active_blocks_table: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     DBG_TENSORS: Optional[tuple] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    PyTorch stub / reference for NKI kernel attention.attention_tkg.attention_tkg
-    with identical interface to the kernel.
-    """
-
-    # Currently hardcoding LNC to 2 and P_MAX to 128, the kernel determines LNC with nl.num_programs
-    # and P_MAX through nl.tile_size.pmax which isn't available in torch golden.
+) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    LNC = attention_tkg_torch_ref.lnc
+    # Currently hardcoding P_MAX to 128, the kernel determines P_MAX through nl.tile_size.pmax
+    # which isn't available in torch golden.
     # TODO: Need to find a better way to dynamically configure this. Confirm whether
-    # we should have an ExtraParams structure/parameter shared by torch refs that
-    # wraps this type of info
-    LNC = 2
     P_MAX = 128
 
     batch = cfg.bs
@@ -88,8 +110,6 @@ def attention_tkg_torch_ref(
     mask = mask.to(torch.uint8)
 
     active_mask = mask
-    if not cfg.use_pos_id:  # FIXME: Waiting for FE to remove the requirement for this reshape
-        active_mask = active_mask.reshape(cfg.curr_sprior, cfg.bs, cfg.q_head, cfg.s_active)
 
     reduced_blk_len = None
     DBG_ACTIVE_TABLE = None
@@ -102,7 +122,7 @@ def attention_tkg_torch_ref(
         v_prior = v_prior.unsqueeze(1)
 
         reduced_blk_len, resize_factor = resize_cache_block_len_for_attention_tkg_kernel(
-            s_prior // block_len, block_len, LNC, P_MAX
+            s_prior // block_len, block_len, LNC, P_MAX, s_prior_full
         )
 
         # Only reshape mask if NOT using use_pos_id (i.e., pre-computed full cache mask)
@@ -366,3 +386,56 @@ def _reshape_debug_tensor(
         return tensor.reshape((batch, q_head, lnc, p_max, s_prior // lnc // p_max, s_active)).permute(3, 2, 4, 0, 1, 5)
     else:
         return tensor.reshape((batch, q_head, lnc, s_prior // lnc // p_max, p_max, s_active)).permute(4, 2, 3, 0, 1, 5)
+
+
+# NOTE: This Protocol must match the signature of _attention_tkg_torch_ref_impl above.
+# It exists solely for IDE parameter hints when using attention_tkg_torch_ref[lnc](...).
+class _AttentionTkgTorchRefFn(Protocol):
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k_active: torch.Tensor,
+        v_active: torch.Tensor,
+        k_prior: torch.Tensor,
+        v_prior: torch.Tensor,
+        mask: torch.Tensor,
+        out: torch.Tensor,
+        cfg: AttnTKGConfig,
+        sbm: SbufManager,
+        inv_freqs: Optional[torch.Tensor] = None,
+        rope_pos_ids: Optional[torch.Tensor] = None,
+        sink: Optional[torch.Tensor] = None,
+        active_blocks_table: Optional[torch.Tensor] = None,
+        k_out: Optional[torch.Tensor] = None,
+        DBG_TENSORS: Optional[tuple] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
+
+        Usage:
+            attention_tkg_torch_ref[lnc](q=..., k_active=..., ...)
+
+        Args:
+            q: Query tensor
+            k_active: Active key tensor
+            v_active: Active value tensor
+            k_prior: Prior key cache tensor
+            v_prior: Prior value cache tensor
+            mask: Attention mask tensor
+            out: Output tensor (modified in-place)
+            cfg: Attention TKG configuration
+            sbm: SBUF manager (unused in torch ref)
+            inv_freqs: Inverse frequencies for RoPE
+            rope_pos_ids: Position IDs for RoPE
+            sink: Sink tensor for attention sink
+            active_blocks_table: Block table for block KV cache
+            k_out: Output tensor for RoPE'd keys (modified in-place)
+            DBG_TENSORS: Debug tensors tuple
+
+        Returns:
+            Tuple of (out, k_out) tensors
+        """
+        ...
+
+
+attention_tkg_torch_ref = LncSubscriptable(_attention_tkg_torch_ref_impl, _AttentionTkgTorchRefFn)

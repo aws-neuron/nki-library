@@ -18,7 +18,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.allocator import SbufManager
-from ...utils.logging import Logger
+from ...utils.logging import get_logger
 from ..mlp_parameters import (
     MLPParameters,
     mlpp_has_fused_add,
@@ -122,7 +122,7 @@ def mlp_tkg(
     # ---------------- Compute Kernel Dimensions & SBUF Manager ----------------
     dims = MLPTKGConstants.calculate_constants(params)
 
-    sbm = SbufManager(0, 200 * 1024, Logger("mlp_tkg"))
+    sbm = SbufManager(0, 200 * 1024, get_logger("mlp_tkg"))
     sbm.open_scope()  # Start SBUF allocation scope
 
     # ---------------- Fused Add ----------------

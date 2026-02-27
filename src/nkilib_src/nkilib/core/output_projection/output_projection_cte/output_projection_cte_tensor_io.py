@@ -144,6 +144,7 @@ def load_bias(
 def load_input_tensor_float(
     attention_view: TensorView,
     cfg: TilingConfig,
+    target_dtype=None,
 ) -> List[nl.ndarray]:
     """
     Load input attention tensors for float (non-quantized) projection.
@@ -151,17 +152,19 @@ def load_input_tensor_float(
     Args:
         attention_view (TensorView): View of attention tensor for current batch/s_block [N, D, curr_s_tile_size].
         cfg (TilingConfig): Tiling configuration.
+        target_dtype: Target dtype for tensor. If None, uses attention_view.dtype.
 
     Returns:
         List[nl.ndarray]: [n_size][d_size, s_block_size], Attention tensors in SBUF.
     """
     curr_s_tile_size = attention_view.shape[2]
+    dtype = target_dtype if target_dtype is not None else attention_view.dtype
     attention_sb = []
 
     for head_idx in range(cfg.n_size):
         attention_tensor = nl.ndarray(
             (cfg.d_size, cfg.s_tile.tile_size),
-            dtype=attention_view.dtype,
+            dtype=dtype,
             buffer=nl.sbuf,
         )
         attn_head_view = attention_view.select(dim=0, index=head_idx)

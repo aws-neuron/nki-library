@@ -12,17 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Tile Info Module
-
-Defines tiling information and index management for MLP CTE kernels including
-batch×sequence indices and tensor naming utilities.
-
-"""
+"""MLP CTE tiling information and index management for batch×sequence dimensions and tensor naming."""
 
 from dataclasses import dataclass
 from typing import Optional
 
+import nki
 import nki.language as nl
 from nki.language import NKIObject
 

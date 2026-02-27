@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Quantization Module
-
-Handles tensor quantization for the MLP CTE kernel with support for multiple
-quantization schemes, including dynamic row-wise and static tensor-wise.
-
-"""
+"""MLP CTE quantization functions for dynamic row-wise and static tensor-wise quantization."""
 
 from typing import Optional
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 

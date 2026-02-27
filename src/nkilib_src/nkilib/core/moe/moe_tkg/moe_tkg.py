@@ -14,23 +14,31 @@
 
 """This module implements the Mixture of Experts (MoE) token generation kernel with support for all-expert and selective-expert modes."""
 
-import math
 from typing import Optional
 
 import nki
 import nki.language as nl
 
 # MLP utils
-from ...mlp.mlp_parameters import MLPExpertParameters, MLPParameters
+from ...mlp.mlp_parameters import MLPExpertParameters, MLPParameters, get_T_from_hidden_input
 
 # common utils
-from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, NormType, QuantizationType
+from ...utils.common_types import (
+    ActFnType,
+    ExpertAffinityScaleMode,
+    NormType,
+    QuantizationType,
+)
 from ...utils.kernel_assert import kernel_assert
 from .all_expert_impl import _all_expert_moe_tkg
 from .all_expert_mx_impl import _all_expert_moe_tkg_mx
 from .moe_tkg_affinity_masking import mask_expert_affinities
 from .selective_expert_impl import _selective_expert_moe_tkg
 from .selective_expert_mx_impl import _selective_expert_moe_tkg_mxfp4
+
+# Constants
+_SUPPORTED_MX_DTYPES = (nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4)
+_MOE_TKG_ERROR_PREFIX = "[MoE TKG Kernel]"
 
 
 def moe_tkg(
@@ -45,6 +53,7 @@ def moe_tkg(
     expert_down_bias: Optional[nl.ndarray] = None,
     expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
     expert_down_weights_scale: Optional[nl.ndarray] = None,
+    hidden_input_scale: Optional[nl.ndarray] = None,
     gate_up_input_scale: Optional[nl.ndarray] = None,
     down_input_scale: Optional[nl.ndarray] = None,
     mask_unselected_experts: bool = False,
@@ -57,6 +66,7 @@ def moe_tkg(
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     output_in_sbuf: bool = False,
+    is_all_expert_dynamic: bool = False,
 ) -> nl.ndarray:
     """
     Mixture of Experts (MoE) MLP token generation kernel.
@@ -97,6 +107,10 @@ def moe_tkg(
             gate/up weights.
         expert_down_weights_scale (nl.ndarray, optional): [E_L, H] for FP8 row quantization, [E_L, 1] for FP8 static
             quantization, or [E_L, I_p/8, ceil(I/512), H] for MxFP4, Quantization scales for down weights.
+        hidden_input_scale (nl.ndarray, optional): [H0, H/512, T], MX quantization scale for pre-quantized
+            hidden_input in SBUF. When provided with MX weights in all-expert mode, indicates that hidden_input
+            is already quantized and skips internal swizzle + quantization. The hidden_input buffer must be in
+            SBUF when hidden_input_scale is provided. dtype: nl.uint8.
         gate_up_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for gate/up input.
             Used for static quantization.
         down_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for down input. Used for
@@ -116,6 +130,8 @@ def moe_tkg(
         up_clamp_lower_limit (float, optional): Lower bound value to clamp up projection results.
         output_in_sbuf (bool): If True, allocate output in SBUF with same shape as hidden_input. If False
             (default), allocate output in HBM with shape [T, H].
+        is_all_expert_dynamic (bool): If True, configures all-expert algorithm to use dynamic control flow.
+            If False (default), utilizes all-expert algorithm without dynamic control flow. Only valid when is_all_expert=True.
 
     Returns:
         output (nl.ndarray): [T, H] or same shape as hidden_input if output_in_sbuf=True, Output tensor with
@@ -144,25 +160,26 @@ def moe_tkg(
                 expert_out *= affinity
             output += expert_out
     """
-    # TODO: Currently only supports mxfp4 (nl.float4_e2m1fn_x4). Add mxfp8 dtype when implemented.
-    _MX_SUPPORTED_DTYPES = (nl.float4_e2m1fn_x4,)
-    is_mx_kernel = expert_gate_up_weights.dtype in _MX_SUPPORTED_DTYPES
 
-    if is_mx_kernel:
-        kernel_assert(
-            expert_gate_up_weights_scale != None and expert_down_weights_scale != None,
-            "Scales must be set when using MX weights",
-        )
+    # Extract quantization type
+    quant_type, is_mx_kernel = _extract_quantization_type(
+        expert_gate_up_weights=expert_gate_up_weights,
+        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
+        expert_down_weights_scale=expert_down_weights_scale,
+        gate_up_input_scale=gate_up_input_scale,
+        down_input_scale=down_input_scale,
+    )
 
     # For all-expert mode with affinity scaling, mask expert affinities based on rank_id
-    masked_expert_affinities = expert_affinities
     if is_all_expert and expert_affinities_scaling_mode != ExpertAffinityScaleMode.NO_SCALE:
-        kernel_assert(rank_id != None, "rank_id is required for all-expert mode with affinity scaling")
+        kernel_assert(
+            rank_id != None, f"{_MOE_TKG_ERROR_PREFIX} rank_id is required for all-expert mode with affinity scaling"
+        )
 
         # Get dimensions for masking
         E_L = expert_gate_up_weights.shape[0]
-        T = expert_index.shape[0]
-        K = expert_index.shape[1]
+        T = get_T_from_hidden_input(hidden_input, hidden_input_scale)
+        K = expert_index.shape[-1]
 
         masked_expert_affinities = mask_expert_affinities(
             expert_affinities=expert_affinities,
@@ -171,10 +188,13 @@ def moe_tkg(
             E_L=E_L,
             T=T,
             K=K,
-            io_dtype=hidden_input.dtype,
+            io_dtype=expert_affinities.dtype,
             mask_unselected_experts=mask_unselected_experts,
         )
+    else:
+        masked_expert_affinities = expert_affinities
 
+    # Initialize config objects
     expert_params = MLPExpertParameters(
         expert_affinities=masked_expert_affinities,
         expert_index=expert_index,
@@ -183,13 +203,6 @@ def moe_tkg(
     )
 
     output_dtype = hidden_input.dtype if output_dtype == None else output_dtype
-    quant_type = QuantizationType.NONE
-    if is_mx_kernel:
-        quant_type = QuantizationType.MX
-    elif gate_up_input_scale != None and down_input_scale != None:
-        quant_type = QuantizationType.STATIC
-    elif expert_gate_up_weights_scale != None and expert_down_weights_scale != None:
-        quant_type = QuantizationType.ROW
 
     mlp_params = MLPParameters(
         hidden_tensor=hidden_input,
@@ -206,10 +219,11 @@ def moe_tkg(
         down_w_scale=expert_down_weights_scale,
         gate_up_in_scale=gate_up_input_scale,
         down_in_scale=down_input_scale,
+        hidden_input_scale=hidden_input_scale,
         output_dtype=output_dtype,
         use_tkg_gate_up_proj_column_tiling=False,
         use_tkg_down_proj_column_tiling=False,
-        shard_on_k=is_mx_kernel and not is_all_expert,
+        shard_on_h_disabled=is_mx_kernel and not is_all_expert,
         expert_params=expert_params,
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         gate_clamp_lower_limit=gate_clamp_lower_limit,
@@ -220,41 +234,32 @@ def moe_tkg(
 
     T = mlp_params.sequence_len
     H = mlp_params.hidden_size
+
+    # Validate inputs
+    _validate_moe_tkg_inputs(
+        T=T,
+        is_all_expert=is_all_expert,
+        is_all_expert_dynamic=is_all_expert_dynamic,
+        is_mx_kernel=is_mx_kernel,
+        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
+        expert_down_weights_scale=expert_down_weights_scale,
+        hidden_input_scale=hidden_input_scale,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        gate_up_input_scale=gate_up_input_scale,
+        down_input_scale=down_input_scale,
+        expert_affinities_eager=expert_affinities_eager,
+    )
+
     # Allocate output tensor
     if output_in_sbuf:
         output = nl.ndarray(hidden_input.shape, dtype=output_dtype, buffer=nl.sbuf, name="output_sb")
     else:
         output = nl.ndarray((T, H), dtype=output_dtype, buffer=nl.shared_hbm)
 
-    # Limitations on current implementations
-    # TODO: relax all of the following restrictions
-    kernel_assert(
-        T <= 128 or (is_mx_kernel and is_all_expert),
-        "currently only batch size * seq len <= 128 is supported (except for MX all-expert mode)",
-    )
-
-    kernel_assert(
-        expert_affinities_scaling_mode != ExpertAffinityScaleMode.PRE_SCALE_DELAYED,
-        "PRE_SCALE_DELAYED option is only applicable in CTE expert_mlp case",
-    )
-
-    kernel_assert(
-        expert_affinities_scaling_mode != ExpertAffinityScaleMode.PRE_SCALE,
-        "[Expert MLP kernel] kernel does not support pre-scale mode now",
-    )
-
-    kernel_assert(
-        gate_up_input_scale == None and down_input_scale == None,
-        "static quantization are not supported in MoE TKG kernel",
-    )
-
+    # Dispatch to expert MLP implementation
     if is_all_expert:
-        kernel_assert(
-            expert_affinities_eager == None,
-            "[Expert MLP kernel] all_expert flavor does not support expert_affinities eager mode",
-        )
         if is_mx_kernel:
-            _all_expert_moe_tkg_mx(mlp_params, output)
+            _all_expert_moe_tkg_mx(mlp_params, output, is_all_expert_dynamic=is_all_expert_dynamic)
         else:
             _all_expert_moe_tkg(mlp_params, output)
     else:
@@ -262,4 +267,122 @@ def moe_tkg(
             _selective_expert_moe_tkg_mxfp4(mlp_params, output)
         else:
             _selective_expert_moe_tkg(mlp_params, output)
+
     return output
+
+
+def _extract_quantization_type(
+    expert_gate_up_weights: nl.ndarray,
+    expert_gate_up_weights_scale: Optional[nl.ndarray],
+    expert_down_weights_scale: Optional[nl.ndarray],
+    gate_up_input_scale: Optional[nl.ndarray],
+    down_input_scale: Optional[nl.ndarray],
+) -> tuple[QuantizationType, bool]:
+    """
+    Extract quantization type from kernel parameters.
+
+    Args:
+        expert_gate_up_weights (nl.ndarray): Gate/up projection weights tensor.
+        expert_gate_up_weights_scale (nl.ndarray, optional): Quantization scale for gate/up weights.
+        expert_down_weights_scale (nl.ndarray, optional): Quantization scale for down weights.
+        gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
+        down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
+
+    Returns:
+        tuple[QuantizationType, bool]: (quant_type, is_mx_kernel) tuple indicating the detected
+            quantization type and whether MX quantization is used.
+    """
+
+    quant_type = QuantizationType.NONE
+    is_mx_kernel = False
+    if expert_gate_up_weights.dtype in _SUPPORTED_MX_DTYPES:
+        quant_type = QuantizationType.MX
+        is_mx_kernel = True
+    elif gate_up_input_scale is not None and down_input_scale is not None:
+        quant_type = QuantizationType.STATIC
+    elif expert_gate_up_weights_scale is not None and expert_down_weights_scale is not None:
+        quant_type = QuantizationType.ROW
+
+    return quant_type, is_mx_kernel
+
+
+def _validate_moe_tkg_inputs(
+    T: int,
+    is_all_expert: bool,
+    is_all_expert_dynamic: bool,
+    is_mx_kernel: bool,
+    expert_gate_up_weights_scale: Optional[nl.ndarray],
+    expert_down_weights_scale: Optional[nl.ndarray],
+    hidden_input_scale: Optional[nl.ndarray],
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+    gate_up_input_scale: Optional[nl.ndarray],
+    down_input_scale: Optional[nl.ndarray],
+    expert_affinities_eager: Optional[nl.ndarray],
+) -> None:
+    """
+    Validate MoE TKG kernel input parameters.
+
+    Args:
+        T (int): Number of tokens.
+        is_all_expert (bool): Whether using all-expert mode.
+        is_all_expert_dynamic (bool): Whether all-expert mode uses dynamic control flow.
+        is_mx_kernel (bool): Whether using MX quantization.
+        expert_gate_up_weights_scale (nl.ndarray, optional): Quantization scale for gate/up weights.
+        expert_down_weights_scale (nl.ndarray, optional): Quantization scale for down weights.
+        hidden_input_scale (nl.ndarray, optional): MX quantization scale for hidden input.
+        expert_affinities_scaling_mode (ExpertAffinityScaleMode): When to apply affinity scaling.
+        gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
+        down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
+        expert_affinities_eager (nl.ndarray, optional): Eager expert affinities.
+
+    Returns:
+        None
+    """
+    # MX quantization requires scales
+    if is_mx_kernel:
+        kernel_assert(
+            expert_gate_up_weights_scale is not None and expert_down_weights_scale is not None,
+            f"{_MOE_TKG_ERROR_PREFIX} Scales must be set when using MX weights",
+        )
+
+    # Dynamic control flow can only be used with is_all_expert=True
+    kernel_assert(
+        not is_all_expert_dynamic or is_all_expert,
+        f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires is_all_expert=True, but got {is_all_expert=}",
+    )
+
+    # hidden_input_scale only supported with MX weights in ALL_EXPERT mode
+    kernel_assert(
+        hidden_input_scale == None or (is_mx_kernel and is_all_expert),
+        f"{_MOE_TKG_ERROR_PREFIX} hidden_input_scale is only supported with MX weights in all-expert mode",
+    )
+
+    # Token count limitation (except for MX all-expert mode)
+    kernel_assert(
+        T <= 128 or (is_mx_kernel and is_all_expert),
+        f"{_MOE_TKG_ERROR_PREFIX} Currently only batch size * seq len <= 128 is supported (except for MX all-expert mode)",
+    )
+
+    # Affinity scaling mode restrictions
+    kernel_assert(
+        expert_affinities_scaling_mode != ExpertAffinityScaleMode.PRE_SCALE_DELAYED,
+        f"{_MOE_TKG_ERROR_PREFIX} PRE_SCALE_DELAYED option is only applicable in CTE expert_mlp case",
+    )
+
+    kernel_assert(
+        expert_affinities_scaling_mode != ExpertAffinityScaleMode.PRE_SCALE,
+        f"{_MOE_TKG_ERROR_PREFIX} Kernel does not support pre-scale mode",
+    )
+
+    # Static quantization not supported
+    kernel_assert(
+        gate_up_input_scale == None and down_input_scale == None,
+        f"{_MOE_TKG_ERROR_PREFIX} Static quantization is not supported in MoE TKG kernel",
+    )
+
+    # All-expert mode restrictions
+    if is_all_expert:
+        kernel_assert(
+            expert_affinities_eager == None,
+            f"{_MOE_TKG_ERROR_PREFIX} expert_affinities eager mode not supported with is_all_expert=True",
+        )

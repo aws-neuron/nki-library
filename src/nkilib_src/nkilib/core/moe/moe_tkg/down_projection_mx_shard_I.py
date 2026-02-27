@@ -136,7 +136,7 @@ def load_broadcast_down_weight_scale_bias(
         if use_PE_bias_broadcast:
             H_tile_size_local = min(H_size_local, nl.tile_size.gemm_moving_fmax)
             ones_mask = nl.ndarray((1, tile_T), dtype=bias_sb.dtype, buffer=nl.sbuf)
-            ones_mask = nisa.memset(dst=ones_mask[...], value=1.0, engine=nisa.gpsimd_engine)
+            nisa.memset(dst=ones_mask[...], value=1.0, engine=nisa.gpsimd_engine)
             n_H512_tiles = div_ceil(H_size_local, nl.tile_size.gemm_moving_fmax)
             for h512_tile_idx in nl.affine_range(n_H512_tiles):
                 bias_bc_psum = nl.ndarray((tile_T, H_tile_size_local), dtype=nl.float32, buffer=nl.psum)
@@ -228,10 +228,9 @@ def down_projection_mx_shard_I(
     expert_affinities_masked_fp32_sb = nl.ndarray((TILE_T, num_T128_tiles), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(
         dst=expert_affinities_masked_fp32_sb[...],
-        src=expert_affinities_masked_sb[:, :, expert_idx : expert_idx + 1]
+        src=expert_affinities_masked_sb[:, :, expert_idx]
         if is_3D_affinities
-        else expert_affinities_masked_sb[:, expert_idx : expert_idx + 1],
-        dtype=nl.float32,
+        else expert_affinities_masked_sb[:, expert_idx],
         engine=nisa.scalar_engine,
     )
 

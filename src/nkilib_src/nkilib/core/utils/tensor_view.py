@@ -41,14 +41,14 @@ class TensorView(nl.NKIObject):
 
     Attributes:
         base_tensor (nl.ndarray): The underlying NKI tensor
-        shape (List[int]): Size of each dimension
-        strides (List[int]): Stride of each dimension in elements
+        shape (Tuple[int, ...]): Size of each dimension
+        strides (Tuple[int, ...]): Stride of each dimension in elements
         offset (int): Offset from the base tensor start in elements
     """
 
     base_tensor: nl.ndarray
-    shape: List[int]
-    strides: List[int]
+    shape: Tuple[int, ...]
+    strides: Tuple[int, ...]
     offset: int
     dtype: object
     scalar_offset: nl.ndarray = None
@@ -61,15 +61,15 @@ class TensorView(nl.NKIObject):
         return self.base_tensor.buffer == nl.sbuf
 
     @staticmethod
-    def get_trivial_strides(shape: List[int], base_stride: int = 1) -> List[int]:
+    def get_trivial_strides(shape: Tuple[int, ...], base_stride: int = 1) -> Tuple[int, ...]:
         """Compute row-major (C-style) strides for given tensor shape.
         Args:
-            shape: List of dimension shape
+            shape: Tuple of dimension sizes
             base_stride: Stride of the innermost dimension (default: 1)
         Returns:
-            List of strides in row-major order
+            Tuple of strides in row-major order
         Example:
-            For shape [2, 3, 4], returns [12, 4, 1] (assuming base_stride=1)
+            For shape (2, 3, 4), returns (12, 4, 1) (assuming base_stride=1)
         """
         # Build strides from innermost to outermost dimension
         strides = [base_stride]
@@ -81,7 +81,7 @@ class TensorView(nl.NKIObject):
         ret = []
         for i in range(len(shape)):
             ret.append(strides[len(shape) - i - 1])
-        return ret
+        return tuple(ret)
 
     def __init__(self, base_tensor: nl.ndarray):
         """Initialize a TensorView.
@@ -92,7 +92,7 @@ class TensorView(nl.NKIObject):
         """
         kernel_assert(base_tensor is not None, "Base tensor cannot be None")
         self.base_tensor = base_tensor
-        self.shape = list(base_tensor.shape)
+        self.shape = tuple(base_tensor.shape)
         self.strides = TensorView.get_trivial_strides(self.shape)
         self.offset = 0
         self.dtype = base_tensor.dtype
@@ -101,8 +101,8 @@ class TensorView(nl.NKIObject):
 
     def _copy(
         self,
-        shape: List[int] = None,
-        strides: List[int] = None,
+        shape: Tuple[int, ...] = None,
+        strides: Tuple[int, ...] = None,
         offset: int = None,
         scalar_offset: nl.ndarray = None,
         indirect_dim: Optional[int] = None,
@@ -120,8 +120,8 @@ class TensorView(nl.NKIObject):
             AssertionError: If strides contain negative values or dimensions mismatch
         """
         view = TensorView(self.base_tensor)
-        view.shape = list(shape) if shape is not None else list(self.shape)
-        view.strides = list(strides) if strides is not None else list(self.strides)
+        view.shape = tuple(shape) if shape is not None else self.shape
+        view.strides = tuple(strides) if strides is not None else self.strides
         view.offset = offset if offset is not None else self.offset
         view.scalar_offset = scalar_offset if scalar_offset is not None else self.scalar_offset
         view.indirect_dim = indirect_dim if indirect_dim is not None else self.indirect_dim
@@ -171,7 +171,7 @@ class TensorView(nl.NKIObject):
         Args:
             dim: Dimension to slice
             start: Start index (inclusive)
-            end: End index (exclusive)
+            end: End index (exclusive), clamped to shape[dim] if out of bounds
             step: Step size (default: 1)
         Returns:
             New TensorView with the sliced dimension
@@ -183,7 +183,9 @@ class TensorView(nl.NKIObject):
         kernel_assert(dim < self.get_dim(), f"Dimension {dim} out of range for {self.get_dim()}D tensor")
         kernel_assert(start >= 0, "Start index must be non-negative")
         kernel_assert(end > start, "End index must be greater than start")
-        kernel_assert(end <= self.shape[dim], f"End index {end} exceeds dimension size {self.shape[dim]}")
+
+        # Clamp end to be within bounds of shape[dim]
+        end = min(end, self.shape[dim])
 
         new_shape = []
         new_strides = []
@@ -203,7 +205,7 @@ class TensorView(nl.NKIObject):
         return self._copy(shape=new_shape, strides=new_strides, offset=new_offset)
 
     @staticmethod
-    def validate_permutation(permutation: List[int], dim: int, is_sbuf: bool) -> None:
+    def validate_permutation(permutation: Tuple[int, ...], dim: int, is_sbuf: bool) -> None:
         kernel_assert(len(permutation) == dim, f"Permutation length {len(permutation)} != dimension count {dim}")
         for i in range(dim):
             kernel_assert(permutation[i] < dim, f"Permutation index {permutation[i]} >= dimension count {dim}")
@@ -214,14 +216,14 @@ class TensorView(nl.NKIObject):
         if is_sbuf:
             kernel_assert(permutation[0] == 0, "Partition dimension stay the outermost dimension")
 
-    def permute(self, dims: List[int]) -> "TensorView":
+    def permute(self, dims: Tuple[int, ...]) -> "TensorView":
         """Create a permuted view by reordering dimensions.
         Args:
-            dims: New order of dimensions (list of dimension indices)
+            dims: New order of dimensions (tuple of dimension indices)
         Returns:
             New TensorView with permuted dimensions
         Example:
-            For a 3D tensor [X,Y,Z] and dims=[2, 0, 1] we will get a [Z,X,Y] view.
+            For a 3D tensor (X,Y,Z) and dims=(2, 0, 1) we will get a (Z,X,Y) view.
         """
         TensorView.validate_permutation(dims, self.get_dim(), self.is_sbuf())
         # verify correctness of partition dim
@@ -266,7 +268,14 @@ class TensorView(nl.NKIObject):
 
         return self._copy(shape=new_shape, strides=new_strides)
 
-    def _reshape_dim_handle_minus_one(self, dim, shape: List[int]) -> List[int]:
+    def _reshape_dim_handle_minus_one(self, dim: int, shape: Tuple[int]) -> Tuple[int]:
+        """Handle -1 in reshape shape by computing the inferred dimension size.
+        Args:
+            dim: Dimension being reshaped
+            shape: Shape with possibly one -1 element
+        Returns:
+            Shape with -1 replaced by computed value
+        """
         # Handle -1 in shape
         minus_one_index = None
         prod_shape = 1
@@ -288,9 +297,9 @@ class TensorView(nl.NKIObject):
                 new_shape.append(shape[i])
             else:
                 new_shape.append(self.shape[dim] // prod_shape)
-        return new_shape
+        return tuple(new_shape)
 
-    def reshape_dim(self, dim: int, shape: List[int]) -> "TensorView":
+    def reshape_dim(self, dim: int, shape: Tuple[int, ...]) -> "TensorView":
         """Reshape a single dimension into multiple dimensions.
         Args:
             dim: Dimension to reshape
@@ -298,8 +307,8 @@ class TensorView(nl.NKIObject):
         Returns:
             New TensorView with reshaped dimension
         Example:
-            for shape [X,24,Z] and parameters (dim=1, shape=[2,3,4]) we will get a shape of [X,2,3,4,Z]
-            for shape [X,24,Z] and parameters (dim=1, shape=[2,-1,4]) we will get a shape of [X,2,3,4,Z]
+            for shape (X,24,Z) and parameters (dim=1, shape=(2,3,4)) we will get a shape of (X,2,3,4,Z)
+            for shape (X,24,Z) and parameters (dim=1, shape=(2,-1,4)) we will get a shape of (X,2,3,4,Z)
         Note:
             The product of new shape must equal the original dimension size
         """
@@ -308,7 +317,6 @@ class TensorView(nl.NKIObject):
             # allow trivial reshape that does nothing
             kernel_assert((dim > 0) or (len(shape) == 1), "partition dim cannot be reshaped")
 
-        shape = list(shape)
         shape = self._reshape_dim_handle_minus_one(dim, shape)
         # Verify that new sizes have same total elements
         size_prod = 1
@@ -318,13 +326,13 @@ class TensorView(nl.NKIObject):
 
         # Build new shape by replacing the target dimension
         if self.get_dim() > 1:
-            new_shape = self.shape[:dim] + shape + self.shape[dim + 1 :]
+            new_shape = tuple(list(self.shape[:dim]) + list(shape) + list(self.shape[dim + 1 :]))
         else:
             new_shape = shape
 
         # Compute strides for the reshaped dimensions
         reshaped_strides = TensorView.get_trivial_strides(shape, base_stride=self.strides[dim])
-        new_strides = self.strides[:dim] + reshaped_strides + self.strides[dim + 1 :]
+        new_strides = tuple(list(self.strides[:dim]) + list(reshaped_strides) + list(self.strides[dim + 1 :]))
 
         return self._copy(shape=new_shape, strides=new_strides)
 
@@ -359,8 +367,10 @@ class TensorView(nl.NKIObject):
             flattened_size *= self.shape[i]
 
         # Build new shape and strides
-        new_shape = self.shape[:start_dim] + [flattened_size] + self.shape[end_dim + 1 :]
-        new_strides = self.strides[:start_dim] + [self.strides[end_dim]] + self.strides[end_dim + 1 :]
+        new_shape = tuple(list(self.shape[:start_dim]) + [flattened_size] + list(self.shape[end_dim + 1 :]))
+        new_strides = tuple(
+            list(self.strides[:start_dim]) + [self.strides[end_dim]] + list(self.strides[end_dim + 1 :])
+        )
 
         return self._copy(shape=new_shape, strides=new_strides)
 
@@ -378,9 +388,13 @@ class TensorView(nl.NKIObject):
             kernel_assert(dim > 0, "partition dim cannot be expanded")
 
         # Insert a new dimension of size 1 at the specified position
-        new_stride = 1 if dim == self.get_dim() else self.strides[dim]
-        new_shape = self.shape[:dim] + [1] + self.shape[dim:]
-        new_strides = self.strides[:dim] + [new_stride] + self.strides[dim:]
+        # Stride for new dim = stride needed to skip over elements at that position
+        if dim == self.get_dim():
+            new_stride = 1
+        else:
+            new_stride = self.strides[dim] * self.shape[dim]
+        new_shape = tuple(list(self.shape[:dim]) + [1] + list(self.shape[dim:]))
+        new_strides = tuple(list(self.strides[:dim]) + [new_stride] + list(self.strides[dim:]))
 
         return self._copy(shape=new_shape, strides=new_strides)
 
@@ -399,10 +413,42 @@ class TensorView(nl.NKIObject):
             kernel_assert(dim > 0, "partition dim cannot be squeezed")
 
         # Remove the specified dimension
+        new_shape = tuple(list(self.shape[:dim]) + list(self.shape[dim + 1 :]))
+        new_strides = tuple(list(self.strides[:dim]) + list(self.strides[dim + 1 :]))
+
+        return self._copy(shape=new_shape, strides=new_strides)
+
+    def _dynamic_select(self, dim: int, index: nl.ndarray) -> "TensorView":
+        """Dynamic select - find base tensor dim by stride matching.
+
+        Args:
+            dim: View dimension to select from
+            index: Dynamic index tensor (scalar in SBUF)
+        Returns:
+            New TensorView with dynamic indexing configured
+        """
+        kernel_assert(self.indirect_dim is None, "Cannot have multiple dynamic selects")
+        kernel_assert(self.strides[dim] != 0, "Cannot dynamic select on broadcast dimension (stride=0)")
+
+        view_stride = self.strides[dim]
+        base_strides = TensorView.get_trivial_strides(self.base_tensor.shape)
+
+        # Find base dim with matching stride
+        base_dim = None
+        for i in range(len(base_strides)):
+            if base_strides[i] == view_stride:
+                base_dim = i
+                break
+        kernel_assert(
+            base_dim is not None,
+            f"No base dim with stride {view_stride}; dynamic select not supported after slice(step>1) or reshape",
+        )
+
+        # Remove the selected dimension from view
         new_shape = self.shape[:dim] + self.shape[dim + 1 :]
         new_strides = self.strides[:dim] + self.strides[dim + 1 :]
 
-        return self._copy(shape=new_shape, strides=new_strides)
+        return self._copy(shape=new_shape, strides=new_strides, scalar_offset=index, indirect_dim=base_dim)
 
     def select(self, dim: int, index: Union[int, nl.ndarray]) -> "TensorView":
         """Select a single element along a dimension, reducing dimensionality.
@@ -416,11 +462,7 @@ class TensorView(nl.NKIObject):
             Dynamic: for shape [E,X,Y] and parameters (dim=0, index=scalar_tensor) we will get a shape of [X,Y]
         """
         if not isinstance(index, int):
-            # Dynamic select using scalar offset
-            base_shape = list(self.base_tensor.shape)
-            new_shape = base_shape[:dim] + base_shape[dim + 1 :]
-            new_strides = TensorView.get_trivial_strides(new_shape)
-            return self._copy(shape=new_shape, strides=new_strides, scalar_offset=index, indirect_dim=dim)
+            return self._dynamic_select(dim, index)
         # Static select by slicing a single element and then squeezing
         new_view = self.slice(dim, index, index + 1)
         return new_view.squeeze_dim(dim)
@@ -444,7 +486,7 @@ class TensorView(nl.NKIObject):
             fixed_sizes: Dictionary mapping dimension names to their known sizes
 
         Returns:
-            List of reshape operations, each dict contains reshape_dim params (dim, shape)
+            List of reshape operations, each dict contains reshape_dim params (dim, shape as tuple)
         """
         src_reshapes = []
         dim_offset = 0
@@ -456,7 +498,7 @@ class TensorView(nl.NKIObject):
                         shape.append(fixed_sizes[src_pattern[i][j]])
                     else:
                         shape.append(-1)
-                src_reshapes.append({'dim': i + dim_offset, 'shape': shape})
+                src_reshapes.append({'dim': i + dim_offset, 'shape': tuple(shape)})
                 dim_offset += len(shape) - 1
         return src_reshapes
 
@@ -479,14 +521,14 @@ class TensorView(nl.NKIObject):
         return dst_flattens
 
     @staticmethod
-    def _rearrange_expand_pattern(pattern: Tuple[Union[str, Tuple[str]]]) -> List[str]:
+    def _rearrange_expand_pattern(pattern: Tuple[Union[str, Tuple[str]]]) -> Tuple[str]:
         """Expand grouped dimension patterns into flat list of dimension names.
 
         Args:
             pattern: einops-style dimension pattern (with nesting)
 
         Returns:
-            Flat list of all dimension names in order
+            Flat tuple of all dimension names in order
         """
         ret = []
         for i in range(len(pattern)):
@@ -495,18 +537,18 @@ class TensorView(nl.NKIObject):
                     ret.append(pattern[i][j])
             else:
                 ret.append(pattern[i])
-        return ret
+        return tuple(ret)
 
     @staticmethod
-    def _rearrange_get_permutation(src_pattern: List[str], dst_pattern: List[str]) -> List[int]:
+    def _rearrange_get_permutation(src_pattern: Tuple[str], dst_pattern: Tuple[str]) -> Tuple[int, ...]:
         """Calculate permutation indices to reorder dimensions from source to destination pattern.
 
         Args:
-            src_pattern: Flat list of source dimension names in current order
-            dst_pattern: Flat list of destination dimension names in desired order
+            src_pattern: Flat Tuple of source dimension names in current order
+            dst_pattern: Flat Tuple of destination dimension names in desired order
 
         Returns:
-            List of indices indicating how to permute source dimensions to match destination
+            Tuple of indices indicating how to permute source dimensions to match destination
         """
         permutation = []
         for i in range(len(dst_pattern)):
@@ -514,7 +556,7 @@ class TensorView(nl.NKIObject):
                 if src_pattern[j] == dst_pattern[i]:
                     permutation.append(j)
                     break
-        return permutation
+        return tuple(permutation)
 
     def rearrange(
         self,
@@ -554,7 +596,7 @@ class TensorView(nl.NKIObject):
             t = t.flatten_dims(flatten['start_dim'], flatten['end_dim'])
         return t
 
-    def reshape(self, new_shape: List[int]) -> "TensorView":
+    def reshape(self, new_shape: Tuple[int, ...]) -> "TensorView":
         """Reshape the tensor to new dimensions.
         Args:
             new_shape: New dimension shape

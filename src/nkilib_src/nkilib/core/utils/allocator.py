@@ -36,7 +36,7 @@ def sizeinbytes(dtype):
         return 2
     elif str(dtype) == str(nl.int8) or str(dtype) == str(nl.uint8) or str(dtype) in ["float8e4", "float8_e4m3"]:
         return 1
-    elif str(dtype) == str(nl.int32) or str(dtype) == str(nl.uint32):
+    elif str(dtype) == str(nl.int32) or str(dtype) == str(nl.uint32) or str(dtype) == str(nl.float8_e4m3fn_x4):
         return 4
     kernel_assert(False, f"dtype size unknown! {dtype}")
 
@@ -166,7 +166,7 @@ class SbufManager(nl.NKIObject):
         the current scope. Otherwise, continue allocate on the current address.
 
         Example:
-        sbm = SbufManager(0, 128*1024, Logger())
+        sbm = SbufManager(0, 128*1024, get_logger())
         sbm.open_scope(interleave_degree=2)
 
         for i in range(4):

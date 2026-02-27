@@ -12,17 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Utilities Module
-
-Provides unified utility functions for MLP CTE kernels including bias operations,
-elementwise multiplication, and activation functions with boolean parameter support.
-
-"""
+"""MLP CTE utility functions for bias operations, elementwise multiplication, and activation functions."""
 
 from dataclasses import dataclass
 from typing import Optional
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 

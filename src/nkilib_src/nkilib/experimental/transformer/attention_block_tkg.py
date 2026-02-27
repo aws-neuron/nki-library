@@ -23,21 +23,22 @@ It performs:
         | [B, S_tkg, H]     |   | (optional)        |   |                   |   |   (transpose)     |
         +-------------------+   +-------------------+   +-------------------+   +-------------------+
 
-        +-------------------+   +-------------------+   +-------------------+   +-----------------------+
-    --> | RMSNorm Q/K       |-->|   RoPE Embedding  |-->| RMSNorm Q/K       |-->| Attention TKG         |-->
-        | (optional)        |   | (optional)        |   | (optional)        |   | (softmax(Q·Kᵀ/√d) @ V)|
-        +-------------------+   +-------------------+   +-------------------+   +-----------------------+
+        +-------------------+   +-------------------+   +-------------------+   +-------------------+
+    --> | RMSNorm Q/K       |-->|   RoPE Embedding  |-->| RMSNorm Q/K       |-->| Quantize K/V      |-->
+        | (optional)        |   | (optional)        |   | (optional)        |   | to FP8 (optional) |
+        +-------------------+   +-------------------+   +-------------------+   +-------------------+
 
-        +-------------------+   +-------------------+
-    --> | KV-Cache Update   |-->| Output Projection |
-        | (optional)        |   | (optional)        |
-        +-------------------+   +-------------------+
+        +-----------------------+   +-------------------+   +-------------------+
+    --> | Attention TKG         |-->| KV-Cache Update   |-->| Output Projection |
+        | (softmax(Q·Kᵀ/√d) @ V)|   | (optional)        |   | (optional)        |
+        +-----------------------+   +-------------------+   +-------------------+
 
 Features:
 - Supports grouped-query attention (GQA) with a single key/value head
 - LNC-2 sharding support
 - Operates with or without output projection
 - Optimized for small batch_size * sequence length typical in decoding
+- Optional FP8 KV cache quantization for memory-efficient inference
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -48,22 +49,30 @@ import nki.language as nl
 from nki.isa.constants import oob_mode
 
 from ...core.attention.attention_tkg import AttnTKGConfig, attention_tkg
+from ...core.attention.attention_tkg_utils import is_fp8_e4m3
 from ...core.embeddings.rope import RoPE_sbuf
 from ...core.output_projection.output_projection_tkg import output_projection_tkg
 from ...core.qkv.qkv import qkv_tkg
 from ...core.utils.allocator import SbufManager, create_auto_alloc_manager
 from ...core.utils.common_types import NormType, QuantizationType
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.kernel_helpers import get_verified_program_sharding_info
+from ...core.utils.kernel_helpers import (
+    get_max_positive_value_for_dtype,
+    get_verified_program_sharding_info,
+    is_hbm_buffer,
+)
 from ...core.utils.logging import Logger
-
-# ==================== Main Kernel Function ====================
+from ...core.utils.tensor_view import TensorView
 
 
 # TODO(NKI-699): Refactor API to use configuration dataclasses for better clarity
+# Note: Using keyword-only args (via *) to avoid breaking callers when adding/reordering
+# parameters, and to improve readability given the large number of arguments.
+@nki.jit
 def attention_block_tkg(
     # -- input
     X: nl.ndarray,
+    *,
     X_hidden_dim_actual: Optional[int],
     # -- rmsnorm X
     rmsnorm_X_enabled: bool,
@@ -94,9 +103,12 @@ def attention_block_tkg(
     V_cache: nl.ndarray,
     attention_mask: nl.ndarray,
     sink: Optional[nl.ndarray],
+    softmax_scale: Optional[float] = None,
     # -- KV cache update
     update_cache: bool,
     kv_cache_update_idx: Optional[nl.ndarray],
+    k_scale: Optional[nl.ndarray] = None,
+    v_scale: Optional[nl.ndarray] = None,
     # -- output projection
     W_out: Optional[nl.ndarray],
     bias_out: Optional[nl.ndarray],
@@ -145,6 +157,11 @@ def attention_block_tkg(
 
         W_qkv (nl.ndarray): [H, d_head*(q_heads+2)] @ HBM, QKV projection weights
         bias_qkv (Optional[nl.ndarray]): [1, d_head*(q_heads+2)] @ HBM, QKV bias
+        quantization_type_qkv (QuantizationType): Type of quantization for QKV projection (NONE, STATIC).
+        weight_dequant_scale_qkv (Optional[nl.ndarray]): Weight dequantization scale for QKV projection.
+            Shape: [PMAX, 1] @ HBM when quantization_type_qkv is STATIC.
+        input_dequant_scale_qkv (Optional[nl.ndarray]): Input dequantization scale for QKV projection.
+            Shape: [PMAX, 1] @ HBM when quantization_type_qkv is STATIC.
 
         rmsnorm_QK_pre_rope_enabled (bool): Apply RMSNorm to Q/K before RoPE
         rmsnorm_QK_pre_rope_eps (float): Pre-RoPE RMSNorm epsilon
@@ -162,12 +179,25 @@ def attention_block_tkg(
         V_cache (nl.ndarray): Value cache @ HBM
         attention_mask (nl.ndarray): [S_ctx, B, q_heads, S_tkg] @ HBM, Attention mask
         sink (Optional[nl.ndarray]): [H, 1] @ HBM, Attention sink tokens
+        softmax_scale (Optional[float]): Scaling factor for attention scores. If None, defaults to 1/sqrt(d_head).
+
+        k_scale (Optional[nl.ndarray]): Scale for K quantization to FP8. Shape (PMAX, 1) or (1, 1) @ HBM.
+            Must contain a single scalar value (replicated or scalar). When provided with v_scale,
+            enables FP8 KV cache quantization. Supported dtypes: float32, float16, bfloat16.
+        v_scale (Optional[nl.ndarray]): Scale for V quantization to FP8. Shape (PMAX, 1) or (1, 1) @ HBM.
+            Must contain a single scalar value (replicated or scalar). When provided with k_scale,
+            enables FP8 KV cache quantization. Supported dtypes: float32, float16, bfloat16.
 
         update_cache (bool): Update KV cache with new tokens
         kv_cache_update_idx (Optional[nl.ndarray]): [B, 1], Cache write positions (uint32_max = skip)
 
         W_out (Optional[nl.ndarray]): [q_heads*d_head, H] @ HBM, Output projection weights
         bias_out (Optional[nl.ndarray]): [1, H] @ HBM, Output projection bias
+        quantization_type_out (QuantizationType): Type of quantization for output projection (NONE, STATIC).
+        weight_dequant_scale_out (Optional[nl.ndarray]): Weight dequantization scale for output projection.
+            Shape: [PMAX, 1] @ HBM when quantization_type_out is STATIC.
+        input_dequant_scale_out (Optional[nl.ndarray]): Input dequantization scale for output projection.
+            Shape: [PMAX, 1] @ HBM when quantization_type_out is STATIC.
         transposed_out (bool): Transpose output layout (requires W_out)
         out_in_sb (bool): Return output in SBUF instead of HBM
         sbm (Optional[SbufManager]): SBUF memory manager (otherwise auto-allocated)
@@ -248,6 +278,8 @@ def attention_block_tkg(
         K_cache_transposed,
         active_blocks_table,
         W_out,
+        k_scale,
+        v_scale,
     )
 
     B, S_tkg = config['B'], config['S_tkg']
@@ -257,6 +289,7 @@ def attention_block_tkg(
     cache_had_head_dim = config['cache_had_head_dim']
     do_out_proj = config['do_out_proj']
     K_cache, V_cache = config['K_cache'], config['V_cache']
+    kv_quant = config['kv_quant']
     kv_heads = 1
     I = d_head * (q_heads + 2 * kv_heads)
 
@@ -313,16 +346,26 @@ def attention_block_tkg(
     #         V_tkg_hbm [B, 1, S_tkg, d_head] @ HBM
     # Output: attn_out [d_head, B*q_heads*S_tkg] @ SBUF or [B, q_heads, d_head, S_tkg] @ HBM
 
-    V_tkg_hbm = nl.ndarray(
-        (B, 1, S_tkg, d_head), dtype=QKV_tkg_sb.dtype, buffer=nl.shared_hbm, name="v_attention_hbm"
-    )  # for attention_tkg()
-    nisa.dma_copy(V_tkg_hbm.reshape((B * S_tkg, d_head)), V_tkg_sb)
+    # Quantize K and V to FP8 for attention when kv_quant=True
+    if kv_quant:
+        K_tkg_sb = _quantize_to_fp8(K_tkg_sb, k_scale, sbm)
+        V_tkg_sb = _quantize_to_fp8(V_tkg_sb, v_scale, sbm)
+        V_tkg_hbm = nl.ndarray(
+            (B, 1, S_tkg, d_head), dtype=nl.float8_e4m3, buffer=nl.shared_hbm, name="v_attention_hbm"
+        )
+        nisa.dma_copy(V_tkg_hbm.reshape((B * S_tkg, d_head)), V_tkg_sb)
+    else:
+        V_tkg_hbm = nl.ndarray(
+            (B, 1, S_tkg, d_head), dtype=V_tkg_sb.dtype, buffer=nl.shared_hbm, name="v_attention_hbm"
+        )
+        nisa.dma_copy(V_tkg_hbm.reshape((B * S_tkg, d_head)), V_tkg_sb)
 
     if skip_attention:
         attn_out = Q_tkg_sb
     else:
-        # Scale Q by 1/sqrt(d_head)
-        nisa.tensor_scalar(dst=Q_tkg_sb, data=Q_tkg_sb, op0=nl.multiply, operand0=(d_head ** (-0.5)))
+        # Scale Q by softmax_scale (default: 1/sqrt(d_head))
+        _softmax_scale = softmax_scale if softmax_scale is not None else d_head ** (-0.5)
+        nisa.tensor_scalar(dst=Q_tkg_sb, data=Q_tkg_sb, op0=nl.multiply, operand0=_softmax_scale)
         # Allocate attention output buffer
         allocate_attn_out_on_HBM = not do_out_proj and not out_in_sb
         if allocate_attn_out_on_HBM:
@@ -444,6 +487,8 @@ def _validate_and_extract_config(
     K_cache_transposed: bool,
     active_blocks_table: Optional[nl.ndarray],
     W_out: Optional[nl.ndarray],
+    k_scale: Optional[nl.ndarray],
+    v_scale: Optional[nl.ndarray],
 ) -> Dict[str, Any]:
     """
     Validate inputs and extract configuration parameters for attention block.
@@ -479,15 +524,15 @@ def _validate_and_extract_config(
 
     _, B, _, _ = attention_mask.shape
     if X.buffer == nl.sbuf:
-        # expecting X.shape = (pmax, B*S, H // pmax) @ SBUF
+        # X.shape = (pmax, B*S, H // pmax) @ SBUF
         kernel_assert(len(X.shape) == 3, "SBUF input X must have 3 dimensions")
         kernel_assert(X.shape[0] == nl.tile_size.pmax, f"SBUF input X dim0 must be {nl.tile_size.pmax}")
         kernel_assert(X.shape[1] % B == 0, f"SBUF input X dim1 must be divisible by B={B}")
         H = X.shape[2] * nl.tile_size.pmax
         S_tkg = X.shape[1] // B
     else:
-        # expecting X.shape = (B,S,H) @ HBM
-        kernel_assert(X.buffer == nl.hbm, "Input X must be in HBM or SBUF")
+        # X.shape = (B,S,H) @ HBM
+        kernel_assert(is_hbm_buffer(X), "Input X must be in HBM or SBUF")
         B, S_tkg, H = X.shape
 
     d_head = V_cache.shape[-1]
@@ -555,6 +600,14 @@ def _validate_and_extract_config(
             f"sin shape mismatch: expected ({half_d}, {B}, {S_tkg}), got {sin.shape}",
         )
 
+    # KV Quantization
+    if k_scale is not None and v_scale is not None:
+        kernel_assert(is_fp8_e4m3(K_cache.dtype), f'KV quantization requires float8_e4m3 K_cache, got {K_cache.dtype}')
+        kernel_assert(is_fp8_e4m3(V_cache.dtype), f'KV quantization requires float8_e4m3 V_cache, got {V_cache.dtype}')
+        kv_quant = True
+    else:
+        kv_quant = False
+
     return {
         'B': B,
         'S_tkg': S_tkg,
@@ -570,6 +623,7 @@ def _validate_and_extract_config(
         'do_out_proj': W_out is not None,
         'K_cache': K_cache,
         'V_cache': V_cache,
+        'kv_quant': kv_quant,
     }
 
 
@@ -1003,10 +1057,8 @@ def _update_flat_cache_batched(
     # Update K_cache on lnc=1
     if n_prgs == 1 or prg_id == 1:
         # Transpose K_tkg from [d_head, B*S_tkg] to [B*S_tkg, d_head] to match V_tkg layout
-        K_psum = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.psum)
-        K_reshaped_sb = nl.ndarray(K_psum.shape, K_tkg.dtype, nl.sbuf)
-        nisa.nc_transpose(dst=K_psum, data=K_tkg)
-        nisa.tensor_copy(dst=K_reshaped_sb, src=K_psum)
+        K_reshaped_sb = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.sbuf)
+        _transpose_sbuf(K_tkg, K_reshaped_sb)
 
         # Write K using same access pattern as V
         nisa.dma_copy(
@@ -1117,10 +1169,8 @@ def _update_flat_cache(
             )
 
             # Transpose K_tkg from [d_head, B*S_tkg] to [B*S_tkg, d_head]
-            K_psum = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.psum)
-            K_reshaped_sb = nl.ndarray(K_psum.shape, K_tkg.dtype, nl.sbuf)
-            nisa.nc_transpose(dst=K_psum, data=K_tkg)
-            nisa.tensor_copy(dst=K_reshaped_sb, src=K_psum)
+            K_reshaped_sb = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.sbuf)
+            _transpose_sbuf(K_tkg, K_reshaped_sb)
 
             # Write transposed K to cache
             start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
@@ -1219,10 +1269,8 @@ def _update_block_cache_batched(
 
     # Transpose K_tkg on lnc=1
     if n_prgs == 1 or prg_id == 1:
-        K_psum = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.psum)
-        K_transposed_sb = nl.ndarray(K_psum.shape, K_tkg.dtype, nl.sbuf)
-        nisa.nc_transpose(dst=K_psum, data=K_tkg)
-        nisa.tensor_copy(dst=K_transposed_sb, src=K_psum)
+        K_transposed_sb = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.sbuf)
+        _transpose_sbuf(K_tkg, K_transposed_sb)
 
     # Copy cache update indices to SBUF
     kv_cache_update_idx_sb = nl.ndarray(kv_cache_update_idx.shape, kv_cache_update_idx.dtype, nl.sbuf)
@@ -1309,10 +1357,8 @@ def _update_block_cache_scalar(
 
     # Transpose K_tkg once on lnc=1
     if n_prgs == 1 or prg_id == 1:
-        K_psum = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.psum)
-        K_transposed_sb = nl.ndarray(K_psum.shape, K_tkg.dtype, nl.sbuf)
-        nisa.nc_transpose(dst=K_psum, data=K_tkg)
-        nisa.tensor_copy(dst=K_transposed_sb, src=K_psum)
+        K_transposed_sb = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.sbuf)
+        _transpose_sbuf(K_tkg, K_transposed_sb)
 
     # Update cache per batch element using scalar_offset
     for batch_idx in range(B):
@@ -1344,3 +1390,79 @@ def _update_block_cache_scalar(
                 src=K_transposed_sb[nl.ds(batch_idx * S_tkg, S_tkg), :],
                 oob_mode=oob_mode.skip,  # skip writes for invalid batch (position_id = uint32_max)
             )
+
+
+############################# FP8 Quantization Helpers #############################
+
+_FP8_E4M3_MAX = get_max_positive_value_for_dtype(nl.float8_e4m3)
+_FP8_E4M3_MIN = -_FP8_E4M3_MAX
+
+
+def _quantize_to_fp8(tensor, scale, sbm):
+    """
+    Quantize a tensor to FP8 E4M3 format using a single scalar scale.
+
+    Computes: output = cast_to_fp8(clip(tensor * scale, [-240, 240]))
+
+    The scale must represent a single scalar value. Two shapes are supported for
+    compatibility with different APIs:
+    - (1, 1): scalar, broadcast to partition dim
+    - (PMAX, 1): assumed to contain identical values, copied directly
+
+    Args:
+        tensor: Input tensor in SBUF, shape (P, F), dtype bf16 or f32
+        scale: Scale tensor in HBM, shape (PMAX, 1) or (1, 1).
+               Must contain a single scalar value (broadcast or replicated).
+               Supported dtypes: float32, float16, bfloat16.
+        sbm: SbufManager for allocations
+
+    Returns:
+        FP8 E4M3 quantized tensor in SBUF, same shape as input
+    """
+    kernel_assert(tensor.buffer == nl.sbuf, "quantize_to_fp8 requires tensor in SBUF")
+    kernel_assert(not is_fp8_e4m3(tensor.dtype), f"quantize_to_fp8 input already FP8: {tensor.dtype}")
+
+    partition_dim = tensor.shape[0]
+
+    # Copy scale to SBUF
+    # ndarray avoids anti-dependency with other stack values
+    scale_sb = nl.ndarray(shape=(partition_dim, 1), dtype=nl.float32, buffer=nl.sbuf)
+    if scale.shape == (nl.tile_size.pmax, 1):
+        nisa.dma_copy(dst=scale_sb, src=scale[0:partition_dim, :])
+    else:
+        kernel_assert(scale.shape == (1, 1), f"scale must be (pmax, 1) or (1, 1), got {scale.shape}")
+        nisa.dma_copy(dst=scale_sb, src=TensorView(scale).broadcast(dim=0, size=partition_dim).get_view())
+
+    # Scale: multiply by scale
+    tensor_scaled = sbm.alloc_stack(tensor.shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(tensor_scaled, tensor, nl.multiply, scale_sb)
+
+    # Clip to FP8 range and cast
+    tensor_fp8 = sbm.alloc_stack(tensor.shape, dtype=nl.float8_e4m3, buffer=nl.sbuf)
+    nisa.tensor_scalar(tensor_fp8, tensor_scaled, nl.minimum, _FP8_E4M3_MAX, op1=nl.maximum, operand1=_FP8_E4M3_MIN)
+
+    return tensor_fp8
+
+
+def _transpose_sbuf(src, dst):
+    """
+    Transpose tensor from SBUF to SBUF via PSUM.
+
+    For FP8: nc_transpose doesn't support FP8, so we cast to bf16, transpose, cast back.
+
+    Args:
+        src: Source tensor in SBUF (P, F)
+        dst: Destination tensor in SBUF (F, P) - must be pre-allocated
+    """
+    if is_fp8_e4m3(src.dtype):
+        # FP8 workaround: cast to bf16, transpose, cast back
+        src_bf16 = nl.ndarray(src.shape, dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(src_bf16, src)
+        psum = nl.ndarray(dst.shape, dtype=nl.bfloat16, buffer=nl.psum)
+        nisa.nc_transpose(dst=psum, data=src_bf16)
+        nisa.tensor_copy(dst=dst, src=psum)
+    else:
+        kernel_assert(src.dtype == nl.bfloat16, f"_transpose_sbuf only supports bf16 or fp8, got {src.dtype}")
+        psum = nl.ndarray(dst.shape, dtype=src.dtype, buffer=nl.psum)
+        nisa.nc_transpose(dst=psum, data=src)
+        nisa.tensor_copy(dst=dst, src=psum)

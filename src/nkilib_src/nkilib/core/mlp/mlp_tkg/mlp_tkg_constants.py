@@ -122,9 +122,12 @@ class MLPTKGConstants(nl.NKIObject):
             MLPTKGConstantsDimensionSizes: Dataclass with all computed dimension constants.
         """
         # --- Program sharding info ---
-        program_sharding_info = get_verified_program_sharding_info("mlp_tkg", (0, 1))
-        num_shards = program_sharding_info[1]
-        shard_id = program_sharding_info[2]
+        if params.shard_on_h_disabled:
+            num_shards, shard_id = (1, 0)
+        else:
+            program_sharding_info = get_verified_program_sharding_info("mlp_tkg", (0, 1))
+            num_shards = program_sharding_info[1]
+            shard_id = program_sharding_info[2]
 
         # --- Tile size constants ---
         _pmax = nl.tile_size.pmax  # Max partition dimension in SBUF
@@ -159,16 +162,12 @@ class MLPTKGConstants(nl.NKIObject):
 
         K = None
         if params.expert_params and params.expert_params.expert_index:
-            _, K = params.expert_params.expert_index.shape
+            K = params.expert_params.expert_index.shape[-1]
 
-        if params.shard_on_k:
-            H1_per_shard_base = H1
-            H1_remainder = 0
-        else:
-            H1_per_shard_base, H1_remainder = divmod(H1, num_shards)
+        H1_per_shard_base, H1_remainder = divmod(H1, num_shards)
 
         H1_shard = H1_per_shard_base
-        H1_offset = 0 if params.shard_on_k else shard_id * H1_per_shard_base
+        H1_offset = shard_id * H1_per_shard_base
         H_shard = H1_shard * H0
         H_per_shard = H1_per_shard_base * H0
 
@@ -212,7 +211,7 @@ class MLPTKGConstants(nl.NKIObject):
         do_norm_batch_sharding = (
             mlpp_has_rms_normalization(params) and T > RMSNORM_THRESHOLD and is_T_evenly_divisible
         ) or (mlpp_has_layer_normalization(params) and T > LAYERNORM_THRESHOLD and is_T_evenly_divisible)
-        do_norm_batch_sharding = do_norm_batch_sharding and (not params.shard_on_k)
+        do_norm_batch_sharding = do_norm_batch_sharding and (not params.shard_on_h_disabled)
 
         return MLPTKGConstantsDimensionSizes(
             _pmax=_pmax,

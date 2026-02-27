@@ -20,7 +20,7 @@ import nki.language as nl
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
-from ..utils.logging import Logger, logger
+from ..utils.logging import get_logger
 from ..utils.tensor_view import TensorView
 
 # This is a heuristic to decide whether to shard on BxS to halve the computation
@@ -108,7 +108,7 @@ def layernorm_tkg(
     if not sbm:
         # Calculate required SBUF size: 16*BxS*H1 for intermediates + H0 for constants
         # Factor of 4 accounts for float32 byte size
-        sbm = SbufManager(0, (16 * BxS * H1 + H0) * 4, Logger("layernorm_tkg"), use_auto_alloc=True)
+        sbm = SbufManager(0, (16 * BxS * H1 + H0) * 4, get_logger("layernorm_tkg"), use_auto_alloc=True)
 
     # Open SBUF memory scope - lv0
     sbm.open_scope(name="layernorm_tkg")
