@@ -12,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Constants Module
-
-Defines constants and configuration parameters for MLP CTE kernels including data types,
-buffer counts, PSUM bank requirements, and sharding information.
-
-"""
+"""MLP CTE constants and configuration parameters for data types, buffer counts, and sharding."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import nki
 import nki.isa as nisa
@@ -29,22 +23,14 @@ import nki.language as nl
 from nki.language import NKIObject
 
 from ...utils.allocator import SbufManager
-from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import (
     NUM_HW_PSUM_BANKS,
+    resolve_dtype_to_nki,
 )
 from ..mlp_parameters import (
     MLPParameters,
-    mlpp_has_down_projection_bias,
-    mlpp_has_gate_projection,
-    mlpp_has_gate_projection_bias,
-    mlpp_has_layer_normalization,
-    mlpp_has_normalization_bias,
-    mlpp_has_normalization_weights,
     mlpp_has_quantized_input,
     mlpp_has_quantized_weights,
-    mlpp_has_rms_normalization,
-    mlpp_has_up_projection_bias,
 )
 from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
 from .mlp_cte_tile_info import MLPCTETileInfo
@@ -54,6 +40,8 @@ from .mlp_cte_tile_info import MLPCTETileInfo
 
 BN_STATS_ELEMENTS_PER_TILE = 6
 BN_AGGR_ELEMENTS_PER_TILE = 2
+
+MX_NEUTRAL_SCALE = 127
 
 # Total available SBUF - DynamicDMAScratchLoc - EvalAccelReservedLoc - identity tensor size for transpose
 MAX_AVAILABLE_SBUF_SIZE = 224 * 1024 - 16384 - 8 - 256
@@ -78,6 +66,12 @@ class MLPCTEConstants(NKIObject):
     bxs_dim_subtile_zero_bias_vector_sbuf: nl.ndarray
     # Bias vector of the epsilon value used for activation functions
     epsilon_bias_vector_sbuf: nl.ndarray
+    # MX Static scale vectors of 127 used for static quant MX matmuls
+    mx_stationary_neutral_scale_sbuf: nl.ndarray
+    mx_moving_neutral_scale_sbuf: nl.ndarray
+    # PSUM accumulation parameters
+    psum_accumulation_data_type: nki.dtype
+    psum_fmax: int
     # Number of PSUM banks required for various matmuls
     required_src_xpose_psum_bank_count: int
     required_int_xpose_psum_bank_count: int
@@ -126,7 +120,7 @@ def _get_compute_data_type(mlp_params: MLPParameters) -> nki.dtype:
     Intended Usage:
         Called internally to determine optimal data type for computations
     """
-    io_type = mlp_params.hidden_tensor.dtype
+    io_type = resolve_dtype_to_nki(mlp_params.hidden_tensor.dtype)
     if io_type == nl.float32:
         compute_data_type = nl.bfloat16
     elif mlpp_has_quantized_input(mlp_params):
@@ -193,8 +187,8 @@ def build_mlp_cte_constants(
     # Data types
     compute_data_type = _get_compute_data_type(mlp_params)
     activation_data_type = nl.float32
-    src_proj_quant_data_type = mlp_params.up_proj_weights_tensor.dtype
-    down_proj_quant_data_type = mlp_params.down_proj_weights_tensor.dtype
+    src_proj_quant_data_type = resolve_dtype_to_nki(mlp_params.up_proj_weights_tensor.dtype)
+    down_proj_quant_data_type = resolve_dtype_to_nki(mlp_params.down_proj_weights_tensor.dtype)
     hidden_tile_data_type = src_proj_quant_data_type if mlpp_has_quantized_input(mlp_params) else compute_data_type
     norm_weights_bias_data_type = nl.float32
 
@@ -221,6 +215,13 @@ def build_mlp_cte_constants(
         value=mlp_params.eps,
     )
 
+    if mlp_params.quant_params.is_quant_static_mx():
+        psum_accumulation_data_type = nl.bfloat16
+        psum_fmax = 1024
+    else:
+        psum_accumulation_data_type = nl.float32
+        psum_fmax = 512
+
     # PSUM bank count requirements
     required_src_xpose_psum_bank_count = min(
         NUM_HW_PSUM_BANKS,
@@ -240,6 +241,25 @@ def build_mlp_cte_constants(
     use_pe_xpose_flag = True
     xpose_data_type = _get_xpose_data_type(mlp_params, use_pe_xpose_flag, compute_data_type, src_proj_quant_data_type)
 
+    if mlp_params.quant_params.is_quant_static_mx():
+        mx_stationary_neutral_scale_sbuf = alloc_heap(
+            (nl.tile_size.pmax, nl.tile_size.pmax),
+            nl.uint8,
+            buffer=nl.sbuf,
+            name=f"mx_stationary_neutral_scale_sbuf__shard{shard_idx}__prog{program_id}",
+        )
+        mx_moving_neutral_scale_sbuf = alloc_heap(
+            (nl.tile_size.pmax, psum_fmax),
+            nl.uint8,
+            buffer=nl.sbuf,
+            name=f"mx_moving_neutral_scale_sbuf__shard{shard_idx}__prog{program_id}",
+        )
+        nisa.memset(mx_stationary_neutral_scale_sbuf, value=MX_NEUTRAL_SCALE)
+        nisa.memset(mx_moving_neutral_scale_sbuf, value=MX_NEUTRAL_SCALE)
+    else:
+        mx_stationary_neutral_scale_sbuf = None
+        mx_moving_neutral_scale_sbuf = None
+
     return MLPCTEConstants(
         compute_data_type=compute_data_type,
         activation_data_type=activation_data_type,
@@ -249,6 +269,10 @@ def build_mlp_cte_constants(
         norm_weights_bias_data_type=norm_weights_bias_data_type,
         bxs_dim_subtile_zero_bias_vector_sbuf=bias_vector_sbuf,
         epsilon_bias_vector_sbuf=epsilon_bias_vector_sbuf,
+        mx_stationary_neutral_scale_sbuf=mx_stationary_neutral_scale_sbuf,
+        mx_moving_neutral_scale_sbuf=mx_moving_neutral_scale_sbuf,
+        psum_accumulation_data_type=psum_accumulation_data_type,
+        psum_fmax=psum_fmax,
         required_src_xpose_psum_bank_count=required_src_xpose_psum_bank_count,
         required_int_xpose_psum_bank_count=required_int_xpose_psum_bank_count,
         required_src_proj_psum_bank_count=required_src_proj_psum_bank_count,
@@ -265,12 +289,13 @@ def build_mlp_cte_constants(
     )
 
 
-def cleanup_mlp_cte_constants(sbm: SbufManager):
+def cleanup_mlp_cte_constants(mlp_params: MLPParameters, sbm: SbufManager):
     """Clean up MLP CTE constants and free allocated memory.
 
     Frees memory allocated for bias vectors and other constants.
 
     Args:
+        mlp_params: MLP configuration parameters
         sbm: SBUF memory manager
 
     Returns:
@@ -280,5 +305,8 @@ def cleanup_mlp_cte_constants(sbm: SbufManager):
         Called at end of shard execution to clean up allocated memory
     """
     if sbm != None:
+        if mlp_params.quant_params.is_quant_static_mx():
+            sbm.pop_heap()  # mx_moving_neutral_scale_sbuf
+            sbm.pop_heap()  # mx_stationary_neutral_scale_sbuf
         sbm.pop_heap()  # epsilon_bias_vector_sbuf
         sbm.pop_heap()  # bias_vector_sbuf

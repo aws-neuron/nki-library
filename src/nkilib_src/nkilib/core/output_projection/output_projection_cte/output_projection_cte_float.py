@@ -29,11 +29,11 @@ from .output_projection_cte_tensor_io import (
 
 
 def perform_float_projection(
-    attention: nl.ndarray,
-    weight: nl.ndarray,
-    bias: Optional[nl.ndarray],
-    out: nl.ndarray,
-    tiling_config: TilingConfig,
+    attention_hbm: nl.ndarray,
+    weight_hbm: nl.ndarray,
+    bias_hbm: Optional[nl.ndarray],
+    out_hbm: nl.ndarray,
+    cfg: TilingConfig,
     prg_id: int,
 ) -> None:
     """
@@ -52,11 +52,11 @@ def perform_float_projection(
         - Result SBUF: P_MAX * h_block_size * dtype_size per subtile
 
     Args:
-        attention (nl.ndarray): [B, N, D, S], Input attention tensor in HBM.
-        weight (nl.ndarray): [N, D, H], Weight tensor in HBM (reshaped in main kernel).
-        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
-        out (nl.ndarray): [B, S, H], Output tensor in HBM to write results.
-        tiling_config (TilingConfig): Tiling configuration with dimension sizes.
+        attention_hbm (nl.ndarray): [B, N, D, S], Input attention tensor in HBM.
+        weight_hbm (nl.ndarray): [N, D, H], Weight tensor in HBM (reshaped in main kernel).
+        bias_hbm (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
+        out_hbm (nl.ndarray): [B, S, H], Output tensor in HBM to write results.
+        cfg (TilingConfig): Tiling configuration with dimension sizes.
         prg_id (int): Program ID for LNC sharding.
 
     Returns:
@@ -66,18 +66,21 @@ def perform_float_projection(
         - Iterates h_blocks in outer loop to limit SBUF usage for weights.
         - Reloads attention scores for each h_block.
     """
-    cfg = tiling_config
+    weight_hbm = weight_hbm.reshape((cfg.n_size, cfg.d_size, cfg.h_size))
+
+    if cfg.group_size > 1:
+        attention_hbm = attention_hbm.reshape((cfg.b_size, cfg.n_size, cfg.d_size, cfg.s_size))
 
     for h_block_idx in range(cfg.h_tile.tile_count):
         h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
 
-        weight_view = TensorView(weight).slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
-        w_sbuf = load_float_weights(weight_view=weight_view, cfg=cfg)
+        weight_view = TensorView(weight_hbm).slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
+        w_sbuf = load_float_weights(weight_view=weight_view, cfg=cfg, weight_dtype=weight_hbm.dtype)
 
         bias_sbuf = None
-        if bias is not None:
-            bias_view = TensorView(bias).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+        if bias_hbm != None:
+            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
         for batch_idx in range(cfg.b_size):
@@ -86,12 +89,12 @@ def perform_float_projection(
                 s_start = s_block_idx * cfg.s_tile.tile_size
 
                 attention_view = (
-                    TensorView(attention)
+                    TensorView(attention_hbm)
                     .select(dim=0, index=batch_idx)
                     .slice(dim=2, start=s_start, end=s_start + curr_s_tile_size)
                 )
                 output_view = (
-                    TensorView(out)
+                    TensorView(out_hbm)
                     .select(dim=0, index=batch_idx)
                     .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
                 )
@@ -104,6 +107,7 @@ def perform_float_projection(
                     s_block_idx=s_block_idx,
                     h_block_idx=h_block_idx,
                     cfg=cfg,
+                    weight_dtype=weight_hbm.dtype,
                 )
 
 
@@ -115,6 +119,7 @@ def _process_batch_tile(
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
+    weight_dtype,
 ) -> None:
     """
     Process a single batch tile for one h_block: computes attention @ weight + bias.
@@ -127,6 +132,7 @@ def _process_batch_tile(
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         cfg (TilingConfig): Tiling configuration.
+        weight_dtype: Weight tensor dtype (attention is cast to this to avoid mixed precision errors).
 
     Returns:
         None: Writes results to output tensor via output_view.
@@ -134,8 +140,8 @@ def _process_batch_tile(
     curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
     s_start = s_block_idx * cfg.s_tile.tile_size
 
-    # Step 1: Load attention tensors
-    attention_sb = load_input_tensor_float(attention_view=attention_view, cfg=cfg)
+    # Step 1: Load attention tensors (cast to weight dtype to avoid mixed precision matmul error)
+    attention_sb = load_input_tensor_float(attention_view=attention_view, cfg=cfg, target_dtype=weight_dtype)
 
     # Step 2: Compute matmul and add bias
     result_sb = _compute_matmul_add_bias(
@@ -226,7 +232,7 @@ def _compute_matmul_add_bias(
 
             # Add bias or copy result
             h_indices = h_subtile_idx * cfg.h_tile.subtile_dim_info.tile_size
-            if bias_sbuf is not None:
+            if bias_sbuf != None:
                 nisa.tensor_tensor(
                     result_sb[s_subtile_idx][:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
                     res_psum[:curr_s_subtile_size, :curr_h_subtile_size],

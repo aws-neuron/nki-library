@@ -13,3 +13,5 @@
 # limitations under the License.
 
 from .moe_tkg.moe_tkg import moe_tkg
+
+__all__ = ["moe_tkg"]

@@ -14,7 +14,6 @@
 
 """Constants and configuration dataclasses for MLP TKG kernel tiling and memory allocation."""
 
-import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,6 +26,8 @@ from ...utils.allocator import sizeinbytes
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..mlp_parameters import (
+    _Q_HEIGHT,
+    _Q_WIDTH,
     MLPParameters,
     mlpp_has_layer_normalization,
     mlpp_has_rms_normalization,
@@ -45,6 +46,8 @@ class MLPTKGConstantsDimensionSizes(nl.NKIObject):
     _pmax: int
     _psum_fmax: int
     _psum_bmax: int
+    _q_width: int
+    _q_height: int
     T: int
     H: int
     I: int
@@ -122,14 +125,19 @@ class MLPTKGConstants(nl.NKIObject):
             MLPTKGConstantsDimensionSizes: Dataclass with all computed dimension constants.
         """
         # --- Program sharding info ---
-        program_sharding_info = get_verified_program_sharding_info("mlp_tkg", (0, 1))
-        num_shards = program_sharding_info[1]
-        shard_id = program_sharding_info[2]
+        if params.shard_on_h_disabled:
+            num_shards, shard_id = (1, 0)
+        else:
+            program_sharding_info = get_verified_program_sharding_info("mlp_tkg", (0, 1))
+            num_shards = program_sharding_info[1]
+            shard_id = program_sharding_info[2]
 
         # --- Tile size constants ---
         _pmax = nl.tile_size.pmax  # Max partition dimension in SBUF
         _psum_fmax = nl.tile_size.psum_fmax  # Max free dim for psum
         _psum_bmax = 8  # Max batch dimension for psum
+        _q_width = _Q_WIDTH  # Quantization width for MX formats
+        _q_height = _Q_HEIGHT  # Quantization height for MX formats
 
         # --- Input tensor shapes ---
         # Use pre-computed dimensions from MLPParameters to support SBUF input
@@ -142,6 +150,10 @@ class MLPTKGConstants(nl.NKIObject):
             # Dense
             _, I = params.gate_proj_weights_tensor.shape
             local_E = None
+        elif weight_rank == 3:
+            # MX MLP (128, ceil(H/512), I) - MX quantized weights
+            _, _, I = params.gate_proj_weights_tensor.shape
+            local_E = None
         elif weight_rank == 4:
             # MoE (E, H, 2, I) - interface has fused gate/up
             # TODO: Support both unfused and fused gate/up
@@ -150,7 +162,7 @@ class MLPTKGConstants(nl.NKIObject):
             # MX MoE (E, 128, 2, ceil(H/512), I)
             local_E, _, _, _, I = params.gate_proj_weights_tensor.shape
         else:
-            kernel_assert(False, f"Weight tensor expected to have rank of 2, 4, or 5 but got {weight_rank}")
+            kernel_assert(False, f"Weight tensor expected to have rank of 2, 3, 4, or 5 but got {weight_rank}")
 
         # --- Derived dimensions ---
         H0 = _pmax
@@ -159,16 +171,12 @@ class MLPTKGConstants(nl.NKIObject):
 
         K = None
         if params.expert_params and params.expert_params.expert_index:
-            _, K = params.expert_params.expert_index.shape
+            K = params.expert_params.expert_index.shape[-1]
 
-        if params.shard_on_k:
-            H1_per_shard_base = H1
-            H1_remainder = 0
-        else:
-            H1_per_shard_base, H1_remainder = divmod(H1, num_shards)
+        H1_per_shard_base, H1_remainder = divmod(H1, num_shards)
 
         H1_shard = H1_per_shard_base
-        H1_offset = 0 if params.shard_on_k else shard_id * H1_per_shard_base
+        H1_offset = shard_id * H1_per_shard_base
         H_shard = H1_shard * H0
         H_per_shard = H1_per_shard_base * H0
 
@@ -212,12 +220,14 @@ class MLPTKGConstants(nl.NKIObject):
         do_norm_batch_sharding = (
             mlpp_has_rms_normalization(params) and T > RMSNORM_THRESHOLD and is_T_evenly_divisible
         ) or (mlpp_has_layer_normalization(params) and T > LAYERNORM_THRESHOLD and is_T_evenly_divisible)
-        do_norm_batch_sharding = do_norm_batch_sharding and (not params.shard_on_k)
+        do_norm_batch_sharding = do_norm_batch_sharding and (not params.shard_on_h_disabled)
 
         return MLPTKGConstantsDimensionSizes(
             _pmax=_pmax,
             _psum_fmax=_psum_fmax,
             _psum_bmax=_psum_bmax,
+            _q_width=_q_width,
+            _q_height=_q_height,
             T=T,
             H=H,
             I=I,
@@ -377,6 +387,18 @@ class MLPTKGConstants(nl.NKIObject):
         # --- H-tile size for Down projection ---
         if params.use_tkg_down_proj_column_tiling:
             down_HTile = 4096 * 2 if params.quant_params.is_quant() else 4096
+            down_HTile = min(kernel_dims.H_per_shard, down_HTile)
+            num_required_psums_per_HTile = div_ceil(down_HTile, kernel_dims._psum_fmax)
+            num_required_psum_after_column_tiling = div_ceil(
+                num_required_psums_per_HTile, kernel_dims.column_tiling_factor
+            )
+
+            while kernel_dims._psum_bmax < num_required_psum_after_column_tiling:
+                down_HTile = div_ceil(down_HTile, 2)
+                num_required_psums_per_HTile = div_ceil(down_HTile, kernel_dims._psum_fmax)
+                num_required_psum_after_column_tiling = div_ceil(
+                    num_required_psums_per_HTile, kernel_dims.column_tiling_factor
+                )
         else:
             down_HTile = kernel_dims.H1_shard * kernel_dims.H0
 

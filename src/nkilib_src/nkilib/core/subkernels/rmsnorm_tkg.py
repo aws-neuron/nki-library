@@ -22,7 +22,7 @@ import nki.language as nl
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
-from ..utils.logging import Logger
+from ..utils.logging import get_logger
 from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
 from .norm_tkg_utils import load_gamma_to_sbuf, load_input_to_sbuf, validate_shapes
@@ -44,6 +44,7 @@ def rmsnorm_tkg(
     eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = False,
+    single_core_forced: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[SbufManager] = None,
 ):
@@ -106,7 +107,7 @@ def rmsnorm_tkg(
         sbm = SbufManager(
             sb_lower_bound=0,
             sb_upper_bound=min(sbuf_size, nl.tile_size.total_available_sbuf_size),
-            logger=Logger("rmsnorm_tkg"),
+            logger=get_logger("rmsnorm_tkg"),
             use_auto_alloc=use_auto_alloc,
         )
 
@@ -121,12 +122,14 @@ def rmsnorm_tkg(
 
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
 
-    num_shards = lnc
+    num_shards = lnc if not single_core_forced else 1
     do_shard = num_shards == 2 and BxS > SHARDING_THRESHOLD and BxS % lnc == 0
     if not do_shard:
         num_shards, shard_id = 1, 0
 
-    num_H_shards_in_output_H_dim = 1 if hidden_dim_tp else lnc
+    # When single_core_forced=True, use num_shards (1) for H sharding
+    # When single_core_forced=False, use lnc for H sharding (original behavior)
+    num_H_shards_in_output_H_dim = 1 if hidden_dim_tp or single_core_forced else lnc
 
     shard_size = BxS // num_shards
 
@@ -350,7 +353,11 @@ def rmsnorm_tkg_llama_impl(
         input_sb_view = input
     else:
         input_sb_view = load_input_to_sbuf(
-            input_hbm=input, input_sb=output, num_H_shards=num_H_shards, hidden_dim_tp=hidden_dim_tp
+            input_hbm=input,
+            input_sb=output,
+            num_H_shards=num_H_shards,
+            hidden_dim_tp=hidden_dim_tp,
+            sbm=sbm,
         )
 
     # Load gamma

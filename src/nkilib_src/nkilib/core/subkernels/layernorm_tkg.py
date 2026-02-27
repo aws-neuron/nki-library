@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""LayerNorm subkernel optimized for token generation (TKG) inference with LNC sharding support."""
+
 from typing import Optional
 
 import nki.isa as nisa
@@ -20,11 +22,10 @@ import nki.language as nl
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
-from ..utils.logging import Logger, logger
+from ..utils.logging import get_logger
 from ..utils.tensor_view import TensorView
 
-# This is a heuristic to decide whether to shard on BxS to halve the computation
-# at the cost of extra local collective
+# Heuristic threshold for sharding on BxS to halve computation at the cost of extra local collective
 SHARDING_THRESHOLD = 10
 
 # TODO: workaround for NKI-395
@@ -43,35 +44,43 @@ def layernorm_tkg(
     """
     LayerNorm implementation optimized for inference token generation (decoding) phase.
 
-    The output layout is specifically choosen to make the subsquent sharded matmul efficient for LNC > 1 case
-
-    Mathematically speaking, the LNC2 result looks like the following,
-
-    result = norm_name2func[NormType.LAYER_NORM](hidden, gamma, beta, eps)
-    result = result.reshape((BxS, H))
-    t0 = result[:, 0:H//LNC_SIZE]
-    t1 = result[:, H//LNC_SIZE:]
-    t0 = t0.reshape((BxS, 128, H//128//LNC_SIZE)).transpose((1, 0, 2))
-    t1 = t1.reshape((BxS, 128, H//128//LNC_SIZE)).transpose((1, 0, 2))
-    result = np.concatenate([t0, t1], axis=2)
+    The output layout is specifically chosen to make the subsequent sharded matmul
+    efficient for LNC > 1 case. TODO: Specify intended usage range (e.g., sequence length, batch size)
 
     Dimensions:
         B: Batch size
         S: Sequence length
         H: Hidden dimension size
+        H0: Partition dimension (128)
+        H1: H // H0
 
     Args:
-        input (nl.ndarray): input tensor of shape [B, S, H]
-        gamma (nl.ndarray): gamma tensor of shape [1, H] used in normallization, this tensor is in HBM.
-        beta (nl.ndarray): Optional. beta tensor of shape [1, H] used in normallization, this tensor is in HBM.
-        output (nl.ndarray): output tensor of shape [128, B×S, H//128]
-        eps (float): epsilon to maintain numerical stability.
-        use_heap_memory(bool): Indicates whether to allocate memory on the heap instead of the stack.
-        sbm (SbufManager): Instance of SbufManager responsible for handling sbuf allocation
+        input (nl.ndarray): [B, S, H], Input tensor in HBM, or [H0, BxS, H1] if already in SBUF.
+        gamma (nl.ndarray): [1, H], Gamma tensor used in normalization, in HBM.
+        output (nl.ndarray): [H0, BxS, H1], Output tensor buffer.
+        beta (nl.ndarray): Optional. [1, H], Beta tensor used in normalization, in HBM.
+        eps (float): Epsilon to maintain numerical stability.
+        use_heap_memory (bool): Indicates whether to allocate memory on the heap instead of the stack.
+        sbm (SbufManager): Optional. Instance of SbufManager responsible for handling SBUF allocation.
 
     Returns:
-        output (nl.ndarray): output tensor of shape [128, BxS, H//128].
+        output (nl.ndarray): [H0, BxS, H1], Normalized output tensor.
 
+    Notes:
+        - H must be divisible by 128 (partition dimension).
+        - When LNC=2 and BxS > SHARDING_THRESHOLD, computation is sharded across cores.
+        - Output layout is transposed for efficient downstream sharded matmul.
+
+    Pseudocode:
+        For LNC2, the result is computed as:
+
+        result = LayerNorm(hidden, gamma, beta, eps)
+        result = result.reshape((BxS, H))
+        t0 = result[:, 0:H//LNC_SIZE]
+        t1 = result[:, H//LNC_SIZE:]
+        t0 = t0.reshape((BxS, 128, H//128//LNC_SIZE)).transpose((1, 0, 2))
+        t1 = t1.reshape((BxS, 128, H//128//LNC_SIZE)).transpose((1, 0, 2))
+        result = np.concatenate([t0, t1], axis=2)
     """
 
     # Hardware partition dim constraint
@@ -83,9 +92,7 @@ def layernorm_tkg(
     # check if output tensor is in sbuf
     output_in_sbuf = output.buffer == nl.sbuf
 
-    # Extract input tensor dimensions
-    # H0 = 128
-    # H1 = H//128
+    """Extract input tensor dimensions where H0=128 (partition dim) and H1=H//128."""
     if input_in_sbuf:
         _H0, BxS, H1 = input.shape
         kernel_assert(
@@ -108,7 +115,7 @@ def layernorm_tkg(
     if not sbm:
         # Calculate required SBUF size: 16*BxS*H1 for intermediates + H0 for constants
         # Factor of 4 accounts for float32 byte size
-        sbm = SbufManager(0, (16 * BxS * H1 + H0) * 4, Logger("layernorm_tkg"), use_auto_alloc=True)
+        sbm = SbufManager(0, (16 * BxS * H1 + H0) * 4, get_logger("layernorm_tkg"), use_auto_alloc=True)
 
     # Open SBUF memory scope - lv0
     sbm.open_scope(name="layernorm_tkg")
@@ -201,32 +208,57 @@ def layernorm_tkg_llama_impl(
     sbm: SbufManager,
 ):
     """
-    Perform Layernorm on input tensor.
+    Perform LayerNorm on a shard of the input tensor.
 
-    The input is of shape [B, S, H].
-    H0 = nl.tile_size.pmax (128)
-    H1 = H // H0
-    input is split up to [B, S, #lnc, H//#lnc], and reshaped to [BxS, #lnc, H0, H1//#lnc].
-    After input is transposed to [H0, BxS, #lnc, H1//#lnc], and reshaped back to [H0, BxS, H1].
-    Then perform LayerNorm on the combination of the [H0, #lnc, H1//#lnc] dimension.
+    The input is of shape [B, S, H]. H0 = nl.tile_size.pmax (128), H1 = H // H0.
+    Input is split to [B, S, #lnc, H//#lnc], reshaped to [BxS, #lnc, H0, H1//#lnc],
+    transposed to [H0, BxS, #lnc, H1//#lnc], and reshaped back to [H0, BxS, H1].
+    LayerNorm is then performed on the combined [H0, #lnc, H1//#lnc] dimension.
 
-    Please note that this kernel utilizes Static DMA for input data reads.
-    Experimental results indicate that Static DMA offers superior performance.
-    We may revert to DGE in the event of HBM out-of-memory (OOM) issues.
+    This kernel utilizes Static DMA for input data reads. Experimental results indicate
+    that Static DMA offers superior performance. We may revert to DGE in the event of
+    HBM out-of-memory (OOM) issues.
 
-    :param input ndarray: Tensor to perform LayerNorm on, which has shape [B, S, H].
-        H must be divisible by nl.tile_size.pmax(128). BxS*(H//128) must fit in SBUF.
-    :param gamma ndarray: Gamma to apply on the LayerNorm, which has shape [1, H].
-    :param beta ndarray: Beta to apply on the LayerNorm, which has shape [1, H].
-    :param result ndarray: result SBUF tensor of shape (H0, BxS, H1) to write the result
-    :param bs_lb int: the inclusive lower bound of where to start to process on BxS dimension
-    :param bs_count int: number of batches to process on BxS
-    :param lnc int: output sharding layout
-    :param eps float: epsilon to maintain numerical stability.
-    :param use_heap_memory bool: Indicates whether to allocate memory on the heap instead of the stack.
-    :param sbm SbufManager: Instance of SbufManager responsible for handling sbuf allocation
-    :return: The tensor with LayerNorm performed.
+    Dimensions:
+        B: Batch size
+        S: Sequence length
+        H: Hidden dimension size
+        H0: Partition dimension (128)
+        H1: H // H0
+        H2: H1 // lnc (sharded partition size)
 
+    Args:
+        input (nl.ndarray): [B, S, H] or [H0, BxS, H1] if in SBUF. Tensor to perform LayerNorm on.
+            H must be divisible by 128. BxS*(H//128) must fit in SBUF.
+        gamma (nl.ndarray): [1, H], Gamma tensor for LayerNorm.
+        beta (nl.ndarray): Optional. [1, H], Beta tensor for LayerNorm.
+        result (nl.ndarray): [H0, BxS, H1], SBUF tensor to write the result.
+        bs_lb (int): Inclusive lower bound of where to start processing on BxS dimension.
+        bs_count (int): Number of batches to process on BxS.
+        lnc (int): Output sharding layout.
+        eps (float): Epsilon to maintain numerical stability.
+        use_heap_memory (bool): Indicates whether to allocate memory on the heap instead of the stack.
+        sbm (SbufManager): Instance of SbufManager responsible for handling SBUF allocation.
+
+    Returns:
+        None. Result is written in-place to the result SBUF tensor.
+
+    Notes:
+        - Uses Static DMA for input reads for better performance.
+        - All intermediates use FP32 for numerical precision.
+        - Variance is computed as Var(X) = E[X^2] - E[X]^2.
+
+    Pseudocode:
+        1. Load input from HBM to SBUF with layout transformation
+        2. Load gamma (and optionally beta) from HBM to SBUF
+        3. Compute mean(x^2) via tensor_reduce + nc_matmul with 1/H
+        4. Compute mean(x) via tensor_reduce + nc_matmul with 1/H
+        5. Center input: input = input - mean(x)
+        6. Compute variance: var = mean(x^2) - mean(x)^2
+        7. Compute rsqrt(var + eps)
+        8. Normalize: input = input * rsqrt
+        9. Apply gamma: input = input * gamma
+        10. Optionally apply beta: input = input + beta
     """
 
     # Hardware partition dim constraint
@@ -396,7 +428,7 @@ def layernorm_tkg_llama_impl(
 
     sbm.close_scope()  # Close inner SBUF scope - lv2
 
-    # Step 2: Center the input by subtracting mean
+    # Step 3: Center the input by subtracting mean
     # Broadcast mean from (H0,BxS) to (H0,BxS,H1) for element-wise subtraction
     input_mean_view = TensorView(input_mean).expand_dim(dim=2).broadcast(dim=2, size=H1)
     nisa.tensor_tensor(
@@ -406,7 +438,7 @@ def layernorm_tkg_llama_impl(
         nl.subtract,
     )
 
-    # Step 3: Calculate variance using Var(X) = E[X^2] - E[X]^2
+    # Step 4: Calculate variance using Var(X) = E[X^2] - E[X]^2
     # Square E(x) values
     squared_input_mean = alloc_tensor((H0, BxS), dtype=inter_dtype, buffer=nl.sbuf)
     nisa.activation(dst=squared_input_mean[...], op=nl.square, data=input_mean[...], bias=zero_bias)
@@ -417,14 +449,14 @@ def layernorm_tkg_llama_impl(
     nisa.tensor_tensor(var[...], input_squared_mean[...], squared_input_mean[...], nl.subtract)
     num_allocated_tensor += 1
 
-    # Step 4: Compute normalization factor 1/sqrt(var + eps)
+    # Step 5: Compute normalization factor 1/sqrt(var + eps)
     rsqrt = alloc_tensor((H0, BxS), dtype=inter_dtype, buffer=nl.sbuf)
     eps_bias = alloc_tensor((H0, 1), dtype=inter_dtype, buffer=nl.sbuf)
     nisa.memset(eps_bias, value=eps)
     nisa.activation(dst=rsqrt[...], op=nl.rsqrt, data=var[...], bias=eps_bias)
     num_allocated_tensor += 2
 
-    # Step 5: Normalize the centered input: (input - mean) / sqrt(var + eps)
+    # Step 6: Normalize the centered input: (input - mean) / sqrt(var + eps)
     # Broadcast normalization factor from (H0,BxS) to (H0,BxS,H1)
     rsqrt_view = TensorView(rsqrt).expand_dim(dim=2).broadcast(dim=2, size=H1)
     nisa.tensor_tensor(
@@ -434,7 +466,7 @@ def layernorm_tkg_llama_impl(
         nl.multiply,
     )
 
-    # Step 6: Apply gamma scaling
+    # Step 7: Apply gamma scaling
     # Broadcast gamma from (H0,H1) to (H0,BxS,H1) for element-wise multiplication
     gamma_sb_view = TensorView(gamma_sb).expand_dim(dim=1).broadcast(dim=1, size=BxS)
     nisa.tensor_tensor(
@@ -444,7 +476,7 @@ def layernorm_tkg_llama_impl(
         nl.multiply,
     )
 
-    # Step 7: Apply beta bias if present
+    # Step 8: Apply beta bias if present
     if is_beta:
         # Broadcast beta from (H0,H1) to (H0,BxS,H1) for element-wise addition
         beta_sb_view = TensorView(beta_sb).expand_dim(dim=1).broadcast(dim=1, size=BxS)

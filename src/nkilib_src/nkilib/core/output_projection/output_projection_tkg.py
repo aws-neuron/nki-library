@@ -37,7 +37,6 @@ inter-core collective operations, as each core produces part of the output tenso
 
 """
 
-import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -51,6 +50,7 @@ from ..utils.common_types import QuantizationType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_program_sharding_info
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ..utils.tiled_range import TiledRange
 from .output_projection_utils import calculate_head_packing
 
 P_MAX = 128
@@ -61,6 +61,7 @@ MAX_VALIDATED_N_TIMES_H_SIZE = 163840
 MAX_VALIDATED_N_TIMES_H_SIZE_FP32 = MAX_VALIDATED_N_TIMES_H_SIZE // 2
 
 
+@nki.jit
 def output_projection_tkg(
     attention: nl.ndarray,
     weight: nl.ndarray,
@@ -68,9 +69,9 @@ def output_projection_tkg(
     quantization_type: QuantizationType = QuantizationType.NONE,
     weight_scale: Optional[nl.ndarray] = None,
     input_scale: Optional[nl.ndarray] = None,
-    TRANSPOSE_OUT=False,
-    OUT_IN_SB=False,
-):
+    TRANSPOSE_OUT: bool = False,
+    OUT_IN_SB: bool = False,
+) -> nl.ndarray:
     """
     Output Projection Kernel
 
@@ -98,12 +99,13 @@ def output_projection_tkg(
         bias (Optional[nl.ndarray]): Optional bias tensor in HBM
             Shape:    [1, H]
             Indexing: [1, h]
-        quantization_type (QuantizationType): Type of quantization to apply (NONE, STATIC). Default: QuantizationType.NONE.
-        weight_scale (Optional[nl.ndarray]): Optional weight scale tensor for static quantization in HBM
-            Shape:    [P_MAX, 1]
-        input_scale (Optional[nl.ndarray]): Optional input scale tensor for static quantization in HBM
-            Shape:    [P_MAX, 1]
-        TRANSPOSE_OUT (bool): Whether need to store the output in transposed shape.
+        quantization_type (QuantizationType): Type of quantization to apply (NONE, STATIC).
+            Default: QuantizationType.NONE.
+        weight_scale (Optional[nl.ndarray]): Optional weight scale tensor for quantization in HBM
+            Shape:    [P_MAX, 1] when quantization_type is STATIC
+        input_scale (Optional[nl.ndarray]): Optional input scale tensor for quantization in HBM
+            Shape:    [P_MAX, 1] when quantization_type is STATIC
+        TRANSPOSE_OUT (bool): Whether to store the output in transposed shape.
             If False, the output tensor has the following shape and indexing:
               Shape:    [B * S,     H]
               Indexing: [b * S + s, h]
@@ -153,81 +155,17 @@ def output_projection_tkg(
 
         return result
     """
-    d_original_size, b_size, n_original_size, s_size = attention.shape
-    h_size = weight.shape[1]
-    io_dtype = attention.dtype
-    _, n_prgs, prg_id = get_program_sharding_info()
 
-    # Validate weight shape
-    kernel_assert(
-        weight.shape[0] == n_original_size * d_original_size,
-        f"output_projection_tkg kernel requires weight in shape (N * D = {n_original_size * d_original_size}, H = {h_size}), but got {weight.shape}.\n"
-        f"Note: N and D inferred from attention score shape: {attention.shape}.",
-    )
-
-    # Validate bias shape
-    if bias != None:
-        kernel_assert(
-            bias.shape[0] == 1,
-            f"output_projection_tkg kernel requires bias in shape (1, H = {h_size}), but got {bias.shape}.\n"
-            f"Note: H inferred from weight shape: {weight.shape}.",
-        )
-        kernel_assert(
-            bias.shape[1] == h_size,
-            f"output_projection_tkg kernel requires bias in shape (1, H = {h_size}), but got {bias.shape}.\n"
-            f"Note: H inferred from weight shape: {weight.shape}.",
-        )
-
-    # Validate quantization scale shapes
-    if quantization_type == QuantizationType.STATIC:
-        kernel_assert(
-            weight_scale.shape == (P_MAX, 1),
-            f"Incorrect shape for weight scale for static per tensor quantization, expected ({P_MAX}, 1), got {weight_scale.shape}",
-        )
-        kernel_assert(
-            input_scale.shape == (P_MAX, 1),
-            f"Incorrect shape for qkv scale for static per tensor quantization, expected ({P_MAX}, 1), got {input_scale.shape}",
-        )
-
-    # Create and validate configuration
-    cfg = OutputProjectionTkgConfig(
-        d_original_size=d_original_size,
-        b_size=b_size,
-        n_original_size=n_original_size,
-        s_size=s_size,
-        h_size=h_size,
-        num_prgs=n_prgs,
-        prg_id=prg_id,
+    cfg = _validate_and_create_config(
+        attention=attention,
+        weight=weight,
+        bias=bias,
+        quantization_type=quantization_type,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
         transpose_out=TRANSPOSE_OUT,
         out_in_sb=OUT_IN_SB,
-        quantization_type=quantization_type,
-        has_bias=(bias != None),
-        has_weight_scale=(weight_scale != None),
-        has_input_scale=(input_scale != None),
-        io_dtype=io_dtype,
-        weight_dtype=weight.dtype,
     )
-
-    # Validate configuration
-    cfg.validate()
-
-    # Compute derived configuration (head packing + tiling)
-    cfg.compute_derived_config()
-
-    quant_dtype = weight.dtype
-
-    # TODO: support padding for odd number of heads
-    # n_heads // 2 * batch needs to be multiple of 16 for double row stride access
-    use_double_row = (
-        quantization_type == QuantizationType.STATIC
-        and cfg.n_size % 2 == 0
-        and cfg.n_size * b_size % 32 == 0
-        and b_size * s_size >= 64
-    )
-
-    # ================================================================================
-    # Execution
-    # ================================================================================
 
     # Load quantization scales
     weight_scale_sb = None
@@ -242,41 +180,32 @@ def output_projection_tkg(
         # pre-apply input scales onto the weight scaling
         nisa.activation(dst=weight_scale_sb, op=nl.copy, data=weight_scale_sb, scale=input_scale_sb)
 
-    w_reshaped = weight.reshape((cfg.n_size, cfg.d_size, h_size))
-    attn_shuffled = load_and_shuffle_attn(
+    attn_shuffled = _load_and_shuffle_attn(
         attention=attention,
-        quantization_type=quantization_type,
         input_scale_sb=input_scale_sb,
-        quant_dtype=quant_dtype,
-        d_original_size=d_original_size,
-        n_original_size=n_original_size,
-        group_size=cfg.group_size,
-        use_double_row=use_double_row,
         cfg=cfg,
     )
 
-    if not TRANSPOSE_OUT:
+    w_reshaped = weight.reshape((cfg.n_size, cfg.d_size, cfg.h_size))
+
+    if not cfg.transpose_out:
         out = (
             nl.ndarray(
-                (b_size * s_size, h_size),
-                dtype=io_dtype,
+                (cfg.b_size * cfg.s_size, cfg.h_size),
+                dtype=cfg.io_dtype,
                 buffer=nl.shared_hbm,
                 name="output_projection_tkg_out",
             )
-            if not OUT_IN_SB
+            if not cfg.out_in_sb
             else None
         )
 
         return _output_projection_tkg_impl(
             out_hbm_buffer=out,
             bias=bias,
-            prg_id=prg_id,
             w_reshaped=w_reshaped,
             weight_scale_sb=weight_scale_sb,
             attn_shuffled=attn_shuffled,
-            quantization_type=quantization_type,
-            io_dtype=io_dtype,
-            use_double_row=use_double_row,
             cfg=cfg,
         )
 
@@ -290,27 +219,23 @@ def output_projection_tkg(
         
         Check for h_size % (P_MAX * n_prgs) == 0 above should cover this
         """
-        kernel_assert(h_size == cfg.h_0_size * cfg.h_1_size * cfg.h_2_size, "")
+        kernel_assert(cfg.h_size == cfg.h_0_size * cfg.h_1_size * cfg.h_2_size, "")
         out = (
             nl.ndarray(
-                (cfg.h_1_size, cfg.h_0_size, cfg.h_2_size, b_size * s_size),
-                dtype=io_dtype,
+                (cfg.h_1_size, cfg.h_0_size, cfg.h_2_size, cfg.b_size * cfg.s_size),
+                dtype=cfg.io_dtype,
                 buffer=nl.shared_hbm,
                 name="output_projection_tkg_out",
             )
-            if not OUT_IN_SB
+            if not cfg.out_in_sb
             else None
         )
         return _output_projection_tkg_transpose_out_impl(
             out_hbm_buffer=out,
             bias=bias,
-            prg_id=prg_id,
             w_reshaped=w_reshaped,
             weight_scale_sb=weight_scale_sb,
             attn_shuffled=attn_shuffled,
-            quantization_type=quantization_type,
-            io_dtype=io_dtype,
-            use_double_row=use_double_row,
             cfg=cfg,
         )
 
@@ -334,6 +259,7 @@ class OutputProjectionTkgConfig(nl.NKIObject):
     transpose_out: bool
     out_in_sb: bool
     quantization_type: QuantizationType
+    use_double_row: bool
 
     # Optional tensors (for validation)
     has_bias: bool = False
@@ -342,7 +268,7 @@ class OutputProjectionTkgConfig(nl.NKIObject):
 
     # Data types
     io_dtype: Any = None
-    weight_dtype: Any = None
+    quant_dtype: Any = None
 
     # Computed fields (set by compute_derived_config)
     n_size: int = None
@@ -353,115 +279,186 @@ class OutputProjectionTkgConfig(nl.NKIObject):
     h_1_size: int = None
     h_2_size: int = None
 
-    def validate(self) -> None:
-        """Validate all configuration parameters."""
 
-        # Hardware constraints
-        kernel_assert(nl.tile_size.pmax == nl.tile_size.gemm_stationary_fmax, "")
-        kernel_assert(nl.tile_size.psum_fmax == nl.tile_size.gemm_moving_fmax, "")
-
-        # Shape validation
-        kernel_assert(
-            self.h_size % self.num_prgs == 0,
-            f"output_projection_tkg kernel requires hidden dimension (H = {self.h_size}) to be divisible by logical core size of {self.num_prgs}.",
-        )
-
-        # Dimension constraints
-        if self.out_in_sb and not self.transpose_out:
-            kernel_assert(
-                self.b_size * self.s_size <= P_MAX,
-                f"When OUT_IN_SB=True and TRANSPOSE_OUT=False, output_projection_tkg kernel does not support (B * S = {self.b_size * self.s_size}) > {P_MAX}.",
-            )
-
-        if self.transpose_out:
-            kernel_assert(
-                self.b_size * self.s_size <= F_MAX,
-                f"When TRANSPOSE_OUT=True, output_projection_tkg kernel does not support (B * S = {self.b_size * self.s_size}) > {F_MAX}.",
-            )
-
-        kernel_assert(
-            self.d_original_size <= P_MAX,
-            f"output_projection_tkg kernel does not support head dimension (D = {self.d_original_size}) greater than {P_MAX}.",
-        )
-
-        # Quantization validation
-        kernel_assert(
-            self.quantization_type != QuantizationType.ROW,
-            "QuantizationType ROW in not supported",
-        )
-
-        if self.quantization_type == QuantizationType.STATIC:
-            kernel_assert(
-                self.has_weight_scale,
-                "weight_scale must be provided when quantization_type is STATIC",
-            )
-            kernel_assert(
-                self.has_input_scale,
-                "input_scale must be provided when quantization_type is STATIC",
-            )
-
-        # Layout-specific validation
-        if not self.transpose_out:
-            kernel_assert(
-                self.h_size % (F_MAX * self.num_prgs) == 0,
-                f"When `TRANSPOSE_OUT` is False, output_projection_tkg kernel requires hidden dimension (H = {self.h_size}) to be a multiple of {F_MAX} * logical core size, where logical core size is {self.num_prgs}.",
-            )
-        else:
-            kernel_assert(
-                self.h_size % (P_MAX * self.num_prgs) == 0,
-                f"When `TRANSPOSE_OUT` is True, output_projection_tkg kernel requires hidden dimension (H = {self.h_size}) to be a multiple of {P_MAX} * logical core size, where logical core size is {self.num_prgs}.",
-            )
-
-            # Size limits for transpose mode
-            if self.weight_dtype == nl.float32:
-                kernel_assert(
-                    self.n_original_size * self.h_size <= MAX_VALIDATED_N_TIMES_H_SIZE_FP32,
-                    f"When `TRANSPOSE_OUT` is True and using 32bit floats, output_projection_tkg kernel is not tested for (N * H = {self.n_original_size * self.h_size}) greater than {MAX_VALIDATED_N_TIMES_H_SIZE_FP32}.",
-                )
-            else:
-                kernel_assert(
-                    self.n_original_size * self.h_size <= MAX_VALIDATED_N_TIMES_H_SIZE,
-                    f"When `TRANSPOSE_OUT` is True, output_projection_tkg kernel is not tested for (N * H = {self.n_original_size * self.h_size}) greater than {MAX_VALIDATED_N_TIMES_H_SIZE}.",
-                )
-
-    def compute_derived_config(self) -> None:
-        """Compute head packing and tiling parameters."""
-
-        # Head packing optimization
-        if self.d_original_size % 32 == 0:
-            n_size, d_size, group_size = calculate_head_packing(self.n_original_size, self.d_original_size, P_MAX)
-            self.n_size = n_size
-            self.d_size = d_size
-            self.group_size = group_size
-        else:
-            self.n_size = self.n_original_size
-            self.d_size = self.d_original_size
-            self.group_size = 1
-
-        # Tiling parameters
-        self.h_sharded = self.h_size // self.num_prgs
-
-        if self.transpose_out:
-            self.h_0_size = self.num_prgs
-            self.h_1_size = P_MAX
-            self.h_2_size = self.h_size // self.num_prgs // P_MAX
-        else:
-            self.h_0_size = -1
-            self.h_1_size = -1
-            self.h_2_size = -1
-
-
-def load_and_shuffle_attn(
+def _validate_and_create_config(
     attention: nl.ndarray,
-    d_original_size: int,
-    n_original_size: int,
-    quantization_type: QuantizationType,
+    weight: nl.ndarray,
+    bias: Optional[nl.ndarray] = None,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    weight_scale: Optional[nl.ndarray] = None,
+    input_scale: Optional[nl.ndarray] = None,
+    transpose_out: bool = False,
+    out_in_sb: bool = False,
+) -> OutputProjectionTkgConfig:
+    """
+    Validate inputs and create kernel configuration.
+
+    Performs comprehensive validation of input tensor shapes, quantization settings,
+    and layout constraints. Computes derived tiling parameters including head packing.
+
+    Args:
+        attention (nl.ndarray): [D, B, N, S], Input attention tensor.
+        weight (nl.ndarray): [N*D, H], Weight tensor.
+        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor.
+        quantization_type (QuantizationType): Quantization mode (NONE or STATIC).
+        weight_scale (Optional[nl.ndarray]): [P_MAX, 1], Weight scale for quantization.
+        input_scale (Optional[nl.ndarray]): [P_MAX, 1], Input scale for quantization.
+        transpose_out (bool): Whether to produce transposed output layout.
+        out_in_sb (bool): Whether output stays in SBUF.
+
+    Returns:
+        OutputProjectionTkgConfig: Validated configuration with computed tiling parameters.
+    """
+    d_original_size, b_size, n_original_size, s_size = attention.shape
+    n_d, h_size = weight.shape
+    io_dtype = attention.dtype
+    _, n_prgs, prg_id = get_program_sharding_info()
+
+    # Hardware constraints
+    kernel_assert(nl.tile_size.pmax == nl.tile_size.gemm_stationary_fmax, "")
+    kernel_assert(nl.tile_size.psum_fmax == nl.tile_size.gemm_moving_fmax, "")
+
+    # Validate weight shape
+    kernel_assert(
+        n_d == n_original_size * d_original_size,
+        f"output_projection_tkg kernel requires weight in shape (N * D = {n_original_size * d_original_size}, H = {h_size}), but got {weight.shape}.\n"
+        f"Note: N and D inferred from attention score shape: {attention.shape}: {n_original_size} * {d_original_size} = {n_original_size * d_original_size}.",
+    )
+
+    # Validate bias shape
+    if bias != None:
+        kernel_assert(
+            bias.shape[0] == 1,
+            f"output_projection_tkg kernel requires bias in shape (1, H = {h_size}), but got {bias.shape}.\n"
+            f"Note: H inferred from weight shape: {weight.shape}.",
+        )
+        kernel_assert(
+            bias.shape[1] == h_size,
+            f"output_projection_tkg kernel requires bias in shape (1, H = {h_size}), but got {bias.shape}.\n"
+            f"Note: H inferred from weight shape: {weight.shape}.",
+        )
+
+    # Validate quantization type
+    kernel_assert(
+        quantization_type == QuantizationType.NONE or quantization_type == QuantizationType.STATIC,
+        f"Only QuantizationType.NONE and QuantizationType.STATIC are supported, but got {quantization_type}",
+    )
+
+    # Validate quantization scale shapes
+    if quantization_type == QuantizationType.STATIC:
+        kernel_assert(weight_scale != None, f"Weight scale must be provided for quantization type {quantization_type}")
+        kernel_assert(input_scale != None, f"Input scale must be provided for quantization type {quantization_type}")
+        kernel_assert(
+            weight_scale.shape == (P_MAX, 1),
+            f"Incorrect shape for weight scale for static per tensor quantization, expected ({P_MAX}, 1), got {weight_scale.shape}",
+        )
+        kernel_assert(
+            input_scale.shape == (P_MAX, 1),
+            f"Incorrect shape for input scale for static per tensor quantization, expected ({P_MAX}, 1), got {input_scale.shape}",
+        )
+
+    # Kernel shape validation
+    kernel_assert(
+        h_size % n_prgs == 0,
+        f"output_projection_tkg kernel requires hidden dimension (H = {h_size}) to be divisible by logical core size of {n_prgs}.",
+    )
+
+    # Dimension constraints
+    if out_in_sb and not transpose_out:
+        kernel_assert(
+            b_size * s_size <= P_MAX,
+            f"When OUT_IN_SB=True and TRANSPOSE_OUT=False, output_projection_tkg kernel does not support (B * S = {b_size * s_size}) > {P_MAX}.",
+        )
+
+    kernel_assert(
+        d_original_size <= P_MAX,
+        f"output_projection_tkg kernel does not support head dimension (D = {d_original_size}) greater than {P_MAX}.",
+    )
+
+    # Layout-specific validation
+    if not transpose_out:
+        kernel_assert(
+            h_size % n_prgs == 0,
+            f"When `TRANSPOSE_OUT` is False, output_projection_tkg kernel requires hidden dimension (H = {h_size}) to be a multiple of logical core size, where logical core size is {n_prgs}.",
+        )
+    else:
+        kernel_assert(
+            h_size % (P_MAX * n_prgs) == 0,
+            f"When `TRANSPOSE_OUT` is True, output_projection_tkg kernel requires hidden dimension (H = {h_size}) to be a multiple of {P_MAX} * logical core size, where logical core size is {n_prgs}.",
+        )
+
+        # Size limits for transpose mode
+        if weight.dtype == nl.float32:
+            kernel_assert(
+                n_original_size * h_size <= MAX_VALIDATED_N_TIMES_H_SIZE_FP32,
+                f"When `TRANSPOSE_OUT` is True and using 32bit floats, output_projection_tkg kernel is not tested for (N * H = {n_original_size * h_size}) greater than {MAX_VALIDATED_N_TIMES_H_SIZE_FP32}.",
+            )
+        else:
+            kernel_assert(
+                n_original_size * h_size <= MAX_VALIDATED_N_TIMES_H_SIZE,
+                f"When `TRANSPOSE_OUT` is True, output_projection_tkg kernel is not tested for (N * H = {n_original_size * h_size}) greater than {MAX_VALIDATED_N_TIMES_H_SIZE}.",
+            )
+
+    # Compute head packing and tiling parameters
+    # Head packing optimization
+    if d_original_size % 32 == 0:
+        n_size, d_size, group_size = calculate_head_packing(n_original_size, d_original_size, P_MAX)
+    else:
+        n_size, d_size, group_size = n_original_size, d_original_size, 1
+
+    # Tiling parameters
+    h_sharded = h_size // n_prgs
+
+    if transpose_out:
+        h_0_size = n_prgs
+        h_1_size = P_MAX
+        h_2_size = h_size // n_prgs // P_MAX
+    else:
+        h_0_size = -1
+        h_1_size = -1
+        h_2_size = -1
+
+    # TODO: support padding for odd number of heads
+    # n_heads // 2 * batch needs to be multiple of 16 for double row stride access
+    use_double_row = (
+        quantization_type == QuantizationType.STATIC
+        and n_size % 2 == 0
+        and n_size * b_size % 32 == 0
+        and b_size * s_size >= 64
+    )
+
+    return OutputProjectionTkgConfig(
+        d_original_size=d_original_size,
+        b_size=b_size,
+        n_original_size=n_original_size,
+        s_size=s_size,
+        h_size=h_size,
+        num_prgs=n_prgs,
+        prg_id=prg_id,
+        transpose_out=transpose_out,
+        out_in_sb=out_in_sb,
+        quantization_type=quantization_type,
+        use_double_row=use_double_row,
+        has_bias=bias != None,
+        has_weight_scale=weight_scale != None,
+        has_input_scale=input_scale != None,
+        io_dtype=io_dtype,
+        quant_dtype=weight.dtype,
+        n_size=n_size,
+        d_size=d_size,
+        group_size=group_size,
+        h_sharded=h_sharded,
+        h_0_size=h_0_size,
+        h_1_size=h_1_size,
+        h_2_size=h_2_size,
+    )
+
+
+def _load_and_shuffle_attn(
+    attention: nl.ndarray,
     input_scale_sb: Optional[nl.ndarray],
-    quant_dtype,
-    group_size: int,
-    use_double_row: bool,
     cfg: OutputProjectionTkgConfig,
-):
+) -> nl.ndarray:
     """
     Load attention tensor to SBUF, optionally quantize, and shuffle to optimized layout.
 
@@ -472,13 +469,7 @@ def load_and_shuffle_attn(
 
     Args:
         attention (nl.ndarray): [d_original_size, B, n_original_size, S], Input attention tensor.
-        d_original_size (int): Original head dimension size before packing.
-        n_original_size (int): Original number of heads before packing.
-        quantization_type (QuantizationType): Type of quantization (NONE or STATIC).
         input_scale_sb (Optional[nl.ndarray]): [P_MAX, 1], Input scale tensor in SBUF for quantization.
-        quant_dtype: Target dtype for quantization.
-        group_size (int): Number of heads packed together in partition dimension D.
-        use_double_row (bool): Whether to use double row layout for matmul.
         cfg (OutputProjectionTkgConfig): Configuration with D=d_original_size*group_size, N=n_original_size//group_size.
 
     Returns:
@@ -492,21 +483,21 @@ def load_and_shuffle_attn(
         attn_sb = attention
     else:
         attn_sb = nl.ndarray(
-            (d_original_size, cfg.b_size, n_original_size, cfg.s_size),
+            (cfg.d_original_size, cfg.b_size, cfg.n_original_size, cfg.s_size),
             dtype=attention.dtype,
             buffer=nl.sbuf,
         )
         nisa.dma_copy(dst=attn_sb[...], src=attention[...])
 
-    if quantization_type == QuantizationType.STATIC:
+    if cfg.quantization_type == QuantizationType.STATIC:
         attn_quantized = nl.ndarray(
-            (d_original_size, cfg.b_size, n_original_size, cfg.s_size),
-            dtype=quant_dtype,
+            (cfg.d_original_size, cfg.b_size, cfg.n_original_size, cfg.s_size),
+            dtype=cfg.quant_dtype,
             buffer=nl.sbuf,
         )
         nisa.reciprocal(dst=input_scale_sb, data=input_scale_sb)
-        nisa.activation(dst=attn_sb, op=nl.copy, data=attn_sb, scale=input_scale_sb[:d_original_size, :])
-        max_pos_val = get_max_positive_value_for_dtype(quant_dtype)
+        nisa.activation(dst=attn_sb, op=nl.copy, data=attn_sb, scale=input_scale_sb[: cfg.d_original_size, :])
+        max_pos_val = get_max_positive_value_for_dtype(cfg.quant_dtype)
         nisa.tensor_scalar(
             dst=attn_quantized,
             data=attn_sb,
@@ -521,12 +512,17 @@ def load_and_shuffle_attn(
     Shuffle from attn_sb[d_original_size, B, n_original_size, S] to attn_shuffled[D, N * B * S]
     Indexing is attn_shuffled[d, n * B * S + b * S + s]
     Combined reshape + shuffle when group_size > 1
-    For double row, the shape is attn_shuffled[D, 2, N // 2 * B * S]
-    Indexing is attn_shuffled[d, n // (N//2), (n % (N//2) * B * S + b * S + s]
+
+    For double row, the shape is attn_shuffled[D, 2, N // 2 * B * S] and we need to
+    interleave heads so that adjacent head pairs are processed together:
+    - Head 0 -> row 0, pair 0: attn_shuffled[d, 0, 0:bxs]
+    - Head 1 -> row 1, pair 0: attn_shuffled[d, 1, 0:bxs]
+    - Head 2 -> row 0, pair 1: attn_shuffled[d, 0, bxs:2*bxs]
+    - Head 3 -> row 1, pair 1: attn_shuffled[d, 1, bxs:2*bxs]
     """
     tensor_shape = (
         (cfg.d_size, 2, cfg.n_size // 2 * cfg.b_size * cfg.s_size)
-        if use_double_row
+        if cfg.use_double_row
         else (cfg.d_size, cfg.n_size * cfg.b_size * cfg.s_size)
     )
 
@@ -535,25 +531,33 @@ def load_and_shuffle_attn(
         dtype=attn_sb.dtype,
         buffer=nl.sbuf,
     )
+
+    bxs_size = cfg.b_size * cfg.s_size
     # Use original n_original_size before it was divided by group_siz
-    for n_orig in static_range(n_original_size):
+    for n_orig in static_range(cfg.n_original_size):
         # Map original n to new (n_group, n_offset) coordinates
-        n_group = n_orig // group_size
-        n_offset = n_orig % group_size
+        n_group, n_offset = divmod(n_orig, cfg.group_size)
         nisa.tensor_copy(
             dst=attn_shuffled.ap(
                 pattern=[
-                    [cfg.n_size * cfg.b_size * cfg.s_size, d_original_size],
+                    [cfg.n_size * cfg.b_size * cfg.s_size, cfg.d_original_size],
                     [cfg.s_size, cfg.b_size],
                     [1, cfg.s_size],
                 ],
-                offset=n_offset * d_original_size * cfg.n_size * cfg.b_size * cfg.s_size
-                + n_group * cfg.b_size * cfg.s_size,
+                offset=n_offset * cfg.d_original_size * cfg.n_size * bxs_size
+                + (
+                    # For double_row, interleave heads so adjacent pairs are together:
+                    # pair_idx, row_idx = divmod(n_group, 2)
+                    # offset = row_idx * (n_size // 2 * bxs) + pair_idx * bxs
+                    (n_group % 2) * (cfg.n_size // 2 * bxs_size) + (n_group // 2) * bxs_size
+                    if cfg.use_double_row
+                    else n_group * bxs_size
+                ),
             ),
             src=attn_sb.ap(
                 pattern=[
-                    [cfg.b_size * n_original_size * cfg.s_size, d_original_size],
-                    [n_original_size * cfg.s_size, cfg.b_size],
+                    [cfg.b_size * cfg.n_original_size * cfg.s_size, cfg.d_original_size],
+                    [cfg.n_original_size * cfg.s_size, cfg.b_size],
                     [1, cfg.s_size],
                 ],
                 offset=cfg.s_size * n_orig,
@@ -564,17 +568,13 @@ def load_and_shuffle_attn(
 
 
 def _output_projection_tkg_impl(
-    out_hbm_buffer,
-    bias,
-    prg_id,
-    w_reshaped,
-    weight_scale_sb,
-    attn_shuffled,
-    quantization_type,
-    io_dtype,
-    use_double_row,
+    out_hbm_buffer: Optional[nl.ndarray],
+    bias: Optional[nl.ndarray],
+    w_reshaped: nl.ndarray,
+    weight_scale_sb: Optional[nl.ndarray],
+    attn_shuffled: nl.ndarray,
     cfg: OutputProjectionTkgConfig,
-):
+) -> nl.ndarray:
     """
     Core implementation for regular (non-transposed) output projection.
 
@@ -582,22 +582,17 @@ def _output_projection_tkg_impl(
     across H dimension in F_MAX-sized blocks and B*S dimension in P_MAX-sized blocks.
 
     Args:
-        out_hbm_buffer: Output buffer in HBM or None if output in SBUF.
-        bias: Optional bias tensor in HBM.
-        prg_id (int): Current logical core ID.
-        w_reshaped: Weight tensor reshaped to [N, D, H].
-        weight_scale_sb: Weight scale tensor in SBUF for quantization.
-        attn_shuffled: Shuffled attention tensor in SBUF.
-        quantization_type (QuantizationType): Quantization type.
-        io_dtype: Output data type.
-        use_double_row (bool): Whether using double row matmul mode.
-        cfg (OutputProjectionTkgTilingStrategy): Tiling configuration.
+        out_hbm_buffer (Optional[nl.ndarray]): Output buffer in HBM or None if output in SBUF.
+        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
+        w_reshaped (nl.ndarray): [N, D, H], Weight tensor reshaped.
+        weight_scale_sb (Optional[nl.ndarray]): [P_MAX, 1], Weight scale tensor in SBUF for quantization.
+        attn_shuffled (nl.ndarray): [D, N*B*S], Shuffled attention tensor in SBUF.
+        cfg (OutputProjectionTkgConfig): Kernel configuration containing dimensions and options.
 
     Returns:
-        nl.ndarray: Output tensor, either from HBM buffer or SBUF.
+        nl.ndarray: Output tensor with shape [B*S, H], either from HBM buffer or SBUF.
     """
     bxs_size = cfg.b_size * cfg.s_size
-    num_BxS_blocks = math.ceil(bxs_size / P_MAX)
     BxS_block_size = min(P_MAX, bxs_size)
     if bias != None:
         # Load bias at once, this can be improved if cfg.h_size is large.
@@ -605,7 +600,7 @@ def _output_projection_tkg_impl(
         nisa.dma_copy(
             src=bias.ap(
                 pattern=[[cfg.h_sharded, 1], [1, cfg.h_sharded]],
-                offset=prg_id * cfg.h_sharded,
+                offset=cfg.prg_id * cfg.h_sharded,
             ),
             dst=bias_sb_1d,
         )
@@ -628,99 +623,107 @@ def _output_projection_tkg_impl(
     for double row, shape is [num_h_blocks_per_prg][cfg.n_size // 2][cfg.d_size, 2, h_block_size]
     """
     w_sbuf_blocks = []
-    for h_block in affine_range(num_h_blocks_per_prg):
+    for h_block_idx in affine_range(num_h_blocks_per_prg):
         w_row = []
-        if not use_double_row:
-            for n in affine_range(cfg.n_size):
+        if not cfg.use_double_row:
+            for head_idx in affine_range(cfg.n_size):
                 w_tensor = nl.ndarray((cfg.d_size, h_block_size), dtype=w_reshaped.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(
                     src=w_reshaped.ap(
                         pattern=[[cfg.h_size, cfg.d_size], [1, h_block_size]],
-                        offset=n * cfg.d_size * cfg.h_size + (prg_id * num_h_blocks_per_prg + h_block) * h_block_size,
+                        offset=head_idx * cfg.d_size * cfg.h_size
+                        + (cfg.prg_id * num_h_blocks_per_prg + h_block_idx) * h_block_size,
                     ),
                     dst=w_tensor,
                 )
                 w_row.append(w_tensor)
         else:
-            for n in affine_range(0, cfg.n_size, 2):
+            for head_idx in affine_range(0, cfg.n_size, 2):
                 w_tensor = nl.ndarray((cfg.d_size, 2, h_block_size), dtype=w_reshaped.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(
                     src=w_reshaped.ap(
                         pattern=[[cfg.h_size, cfg.d_size], [1, h_block_size]],
-                        offset=n * cfg.d_size * cfg.h_size + (prg_id * num_h_blocks_per_prg + h_block) * h_block_size,
+                        offset=head_idx * cfg.d_size * cfg.h_size
+                        + (cfg.prg_id * num_h_blocks_per_prg + h_block_idx) * h_block_size,
                     ),
                     dst=w_tensor[:, 0, :],
                 )
                 nisa.dma_copy(
                     src=w_reshaped.ap(
                         pattern=[[cfg.h_size, cfg.d_size], [1, h_block_size]],
-                        offset=(n + 1) * cfg.d_size * cfg.h_size
-                        + (prg_id * num_h_blocks_per_prg + h_block) * h_block_size,
+                        offset=(head_idx + 1) * cfg.d_size * cfg.h_size
+                        + (cfg.prg_id * num_h_blocks_per_prg + h_block_idx) * h_block_size,
                     ),
                     dst=w_tensor[:, 1, :],
                 )
                 w_row.append(w_tensor)
         w_sbuf_blocks.append(w_row)
 
-    num_free_dim_tiles_per_h_block = h_block_size // F_MAX
-
     # Compute and write out attention @ weight (+ bias) blocks
-    for BxS_block in affine_range(num_BxS_blocks):
-        curr_BxS_block_size = min(P_MAX, bxs_size - BxS_block * P_MAX)
-
+    for bxs_block in TiledRange(bxs_size, P_MAX):
         out_sb = nl.ndarray(
-            (curr_BxS_block_size, cfg.h_sharded),
-            dtype=io_dtype,
+            (bxs_block.size, cfg.h_sharded),
+            dtype=cfg.io_dtype,
             buffer=nl.sbuf,
         )
 
-        for h_block in affine_range(num_h_blocks_per_prg):
-            for h_block_f_tile in affine_range(num_free_dim_tiles_per_h_block):
-                res_psum = nl.ndarray((curr_BxS_block_size, F_MAX), dtype=nl.float32, buffer=nl.psum)
+        for h_block_idx in affine_range(num_h_blocks_per_prg):
+            for h_block_f_tile in TiledRange(h_block_size, F_MAX):
+                res_psum = nl.ndarray((bxs_block.size, h_block_f_tile.size), dtype=nl.float32, buffer=nl.psum)
 
                 # Accumulate (B*S, F_MAX) tiled attn @ weight blocks for all cfg.n_size heads
-                if not use_double_row:
-                    for n in affine_range(cfg.n_size):
-                        stationary = attn_shuffled[:, nl.ds(n * bxs_size + BxS_block * P_MAX, curr_BxS_block_size)]
-                        moving = w_sbuf_blocks[h_block][n][:, nl.ds(h_block_f_tile * F_MAX, F_MAX)]
+                if not cfg.use_double_row:
+                    for head_idx in affine_range(cfg.n_size):
+                        stationary = attn_shuffled[
+                            :, nl.ds(head_idx * bxs_size + bxs_block.start_offset, bxs_block.size)
+                        ]
+                        moving = w_sbuf_blocks[h_block_idx][head_idx][
+                            :, nl.ds(h_block_f_tile.start_offset, h_block_f_tile.size)
+                        ]
                         nisa.nc_matmul(res_psum, stationary, moving)
                 else:
                     # for double row we use the leading free dimension of 2 and double the data per matmul
-                    for n in affine_range(cfg.n_size // 2):
-                        stationary = attn_shuffled[:, :, nl.ds(n * bxs_size + BxS_block * P_MAX, curr_BxS_block_size)]
-                        moving = w_sbuf_blocks[h_block][n][:, :, nl.ds(h_block_f_tile * F_MAX, F_MAX)]
+                    for head_idx in affine_range(cfg.n_size // 2):
+                        stationary = attn_shuffled[
+                            :, :, nl.ds(head_idx * bxs_size + bxs_block.start_offset, bxs_block.size)
+                        ]
+                        moving = w_sbuf_blocks[h_block_idx][head_idx][
+                            :, :, nl.ds(h_block_f_tile.start_offset, h_block_f_tile.size)
+                        ]
                         nisa.nc_matmul(res_psum, stationary, moving, perf_mode=matmul_perf_mode.double_row)
 
                 # Read out from psum, possibly adding bias if present.
-                h_offset = h_block * h_block_size + h_block_f_tile * F_MAX
-                if quantization_type == QuantizationType.STATIC:
+                h_offset = h_block_idx * h_block_size + h_block_f_tile.start_offset
+                out_sb_slice = out_sb[:, nl.ds(h_offset, h_block_f_tile.size)]
+                res_psum_slice = res_psum[:, : h_block_f_tile.size]
+                if cfg.quantization_type == QuantizationType.STATIC:
                     nisa.activation(
-                        dst=out_sb[:, nl.ds(h_offset, F_MAX)],
-                        data=res_psum[:, :F_MAX],
+                        dst=out_sb_slice,
+                        data=res_psum_slice,
                         op=nl.copy,
-                        scale=weight_scale_sb[:curr_BxS_block_size, :],
+                        scale=weight_scale_sb[: bxs_block.size, :],
                     )
-                    if bias != None:
+                    if cfg.has_bias:
                         nisa.tensor_tensor(
-                            dst=out_sb[:, nl.ds(h_offset, F_MAX)],
-                            data1=out_sb[:, nl.ds(h_offset, F_MAX)],
-                            data2=bias_sb[:curr_BxS_block_size, nl.ds(h_offset, F_MAX)],
+                            dst=out_sb_slice,
+                            data1=out_sb_slice,
+                            data2=bias_sb[: bxs_block.size, nl.ds(h_offset, h_block_f_tile.size)],
                             op=nl.add,
                         )
-                elif bias != None:
+                elif cfg.has_bias:
                     nisa.tensor_tensor(
-                        dst=out_sb[:, nl.ds(h_offset, F_MAX)],
-                        data1=res_psum[:, :F_MAX],
-                        data2=bias_sb[:curr_BxS_block_size, nl.ds(h_offset, F_MAX)],
+                        dst=out_sb_slice,
+                        data1=res_psum_slice,
+                        data2=bias_sb[: bxs_block.size, nl.ds(h_offset, h_block_f_tile.size)],
                         op=nl.add,
                     )
                 else:
-                    nisa.tensor_copy(dst=out_sb[:, nl.ds(h_offset, F_MAX)], src=res_psum[:, :F_MAX])
+                    nisa.tensor_copy(dst=out_sb_slice, src=res_psum_slice)
 
-        if out_hbm_buffer is not None:
+        if out_hbm_buffer != None:
             nisa.dma_copy(
                 dst=out_hbm_buffer[
-                    nl.ds(BxS_block * P_MAX, curr_BxS_block_size), nl.ds(prg_id * cfg.h_sharded, cfg.h_sharded)
+                    nl.ds(bxs_block.start_offset, bxs_block.size), nl.ds(cfg.prg_id * cfg.h_sharded, cfg.h_sharded)
                 ],
                 src=out_sb,
             )
@@ -730,17 +733,13 @@ def _output_projection_tkg_impl(
 
 
 def _output_projection_tkg_transpose_out_impl(
-    out_hbm_buffer,
-    bias,
-    prg_id,
-    w_reshaped,
-    weight_scale_sb,
-    attn_shuffled,
-    quantization_type,
-    io_dtype,
-    use_double_row,
+    out_hbm_buffer: Optional[nl.ndarray],
+    bias: Optional[nl.ndarray],
+    w_reshaped: nl.ndarray,
+    weight_scale_sb: Optional[nl.ndarray],
+    attn_shuffled: nl.ndarray,
     cfg: OutputProjectionTkgConfig,
-):
+) -> nl.ndarray:
     """
     Core implementation for transposed output projection.
 
@@ -749,16 +748,12 @@ def _output_projection_tkg_transpose_out_impl(
     PSUM banks for efficiency.
 
     Args:
-        out_hbm_buffer: Output buffer in HBM or None if output in SBUF.
-        bias: Optional bias tensor in HBM.
-        prg_id (int): Current logical core ID.
-        w_reshaped: Weight tensor reshaped to [N, D, H].
-        weight_scale_sb: Weight scale tensor in SBUF for quantization.
-        attn_shuffled: Shuffled attention tensor in SBUF.
-        quantization_type (QuantizationType): Quantization type.
-        io_dtype: Output data type.
-        use_double_row (bool): Whether using double row matmul mode.
-        cfg (OutputProjectionTkgTilingStrategy): Tiling configuration.
+        out_hbm_buffer (Optional[nl.ndarray]): Output buffer in HBM or None if output in SBUF.
+        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
+        w_reshaped (nl.ndarray): [N, D, H], Weight tensor reshaped.
+        weight_scale_sb (Optional[nl.ndarray]): [P_MAX, 1], Weight scale tensor in SBUF for quantization.
+        attn_shuffled (nl.ndarray): [D, N*B*S], Shuffled attention tensor in SBUF.
+        cfg (OutputProjectionTkgConfig): Kernel configuration containing dimensions and options.
 
     Returns:
         nl.ndarray: Output tensor in transposed layout, either from HBM buffer or SBUF.
@@ -766,7 +761,7 @@ def _output_projection_tkg_transpose_out_impl(
     bxs_size = cfg.b_size * cfg.s_size
     out_sb = nl.ndarray(
         (cfg.h_1_size, cfg.h_2_size * bxs_size),
-        dtype=io_dtype,
+        dtype=cfg.io_dtype,
         buffer=nl.sbuf,
     )
 
@@ -776,7 +771,7 @@ def _output_projection_tkg_transpose_out_impl(
             dst=bias_sb,
             src=bias.ap(
                 pattern=[[cfg.h_2_size, cfg.h_1_size], [1, cfg.h_2_size]],
-                offset=prg_id * cfg.h_1_size * cfg.h_2_size,
+                offset=cfg.prg_id * cfg.h_1_size * cfg.h_2_size,
             ),
         )
 
@@ -800,95 +795,109 @@ def _output_projection_tkg_transpose_out_impl(
                 [cfg.d_size * cfg.h_size, cfg.n_size],
                 [1, cfg.h_1_size * cfg.h_2_size],
             ],
-            offset=(cfg.h_1_size * cfg.h_2_size) * prg_id,
+            offset=(cfg.h_1_size * cfg.h_2_size) * cfg.prg_id,
         ),
     )
 
     """
-    Weights stationary, input (attn_shuffled) moving in, with B*S on free-dim each time.
-    For a PSUM bank with 512 (F_MAX) entries, we can pack multiple B*S groups (i.e. different values of h_c)
-    in one bank and copy the whole bank to SBUF at once.
-    """
-    NUM_BS_PER_PSUM_BANK = F_MAX // (bxs_size)
-    NUM_PSUM_TILES = div_ceil(cfg.h_2_size, NUM_BS_PER_PSUM_BANK)
+    Tiling Strategy:
+    - Weights stationary, input (attn_shuffled) moving in, with B*S on free-dim each time
+    - When B*S <= F_MAX: Pack multiple B*S groups (different h_2 values) in one PSUM bank
+    - When B*S > F_MAX: Tile B*S across ceil(B*S / F_MAX) PSUM tiles
 
-    for i in affine_range(NUM_PSUM_TILES):
-        """
-        Accumulate (cfg.h_1_size, F_MAX) sized attn @ weight blocks for all cfg.n_size heads,
-        for a total of NUM_PSUM_TILES different resulting psum tiles.
-        Note that each PSUM row will have NUM_BS_PER_PSUM_BANK many B*S groups.
-        In effect, we are packing part of cfg.h_2_size dimension together with B*S.
-        """
+    Memory Usage:
+    - PSUM: cfg.h_1_size * F_MAX * sizeof(float32) per tile
+    """
+    if bxs_size <= F_MAX:
+        NUM_BS_PER_PSUM_BANK = F_MAX // bxs_size
+        NUM_PSUM_BANKS_PER_BS = 1
+        NUM_PSUM_TILES = div_ceil(cfg.h_2_size, NUM_BS_PER_PSUM_BANK)
+    else:
+        NUM_PSUM_BANKS_PER_BS = div_ceil(bxs_size, F_MAX)
+        NUM_BS_PER_PSUM_BANK = 1
+        NUM_PSUM_TILES = cfg.h_2_size * NUM_PSUM_BANKS_PER_BS
+
+    for psum_tile_idx in affine_range(NUM_PSUM_TILES):
+        # Compute h_2_base and bs_tile_idx from psum_tile_idx
+        if bxs_size <= F_MAX:
+            h_2_base = psum_tile_idx * NUM_BS_PER_PSUM_BANK
+            bs_tile_idx = 0
+        else:
+            h_2_base, bs_tile_idx = divmod(psum_tile_idx, NUM_PSUM_BANKS_PER_BS)
+
+        bxs_tile_offset = bs_tile_idx * F_MAX
+        bxs_tile_size = min(F_MAX, bxs_size - bxs_tile_offset)
+
         res_psum = nl.ndarray((cfg.h_1_size, F_MAX), dtype=nl.float32, buffer=nl.psum)
-        for j in affine_range(NUM_BS_PER_PSUM_BANK):
-            h_c_offset = i * NUM_BS_PER_PSUM_BANK + j
-            if not use_double_row:
-                for n in affine_range(cfg.n_size):
-                    moving = attn_shuffled[:, nl.ds(n * bxs_size, bxs_size)]
+        # Accumulate (cfg.h_1_size, F_MAX) sized attn @ weight blocks for all cfg.n_size heads.
+        # When B*S <= F_MAX: pack multiple B*S groups in one PSUM row. Iterates once when B*S > F_MAX.
+        for bs_group_idx in affine_range(NUM_BS_PER_PSUM_BANK):
+            h_2_idx = h_2_base + bs_group_idx
+
+            psum_f_offset = bs_group_idx * bxs_size if bxs_size <= F_MAX else 0
+            curr_bxs_size = bxs_size if bxs_size <= F_MAX else bxs_tile_size
+
+            if not cfg.use_double_row:
+                for head_idx in affine_range(cfg.n_size):
+                    moving = attn_shuffled[:, nl.ds(head_idx * bxs_size + bxs_tile_offset, curr_bxs_size)]
                     stationary = w_sbuf.ap(
                         pattern=[
                             [cfg.n_size * (cfg.h_1_size * cfg.h_2_size), cfg.d_size],
                             [cfg.h_2_size, cfg.h_1_size],
                         ],
-                        offset=n * (cfg.h_1_size * cfg.h_2_size) + h_c_offset,
+                        offset=head_idx * (cfg.h_1_size * cfg.h_2_size) + h_2_idx,
                     )
-                    # if cfg.h_2_size is not divsible by NUM_BS_PER_PSUM_BANK,
+                    # if cfg.h_2_size is not divisible by NUM_BS_PER_PSUM_BANK,
                     # the last psum tile may be "incomplete".
-                    if h_c_offset < cfg.h_2_size:
+                    if h_2_idx < cfg.h_2_size:
                         nisa.nc_matmul(
-                            dst=res_psum[
-                                :,
-                                nl.ds(j * bxs_size, bxs_size),
-                            ],
+                            dst=res_psum[:, nl.ds(psum_f_offset, curr_bxs_size)],
                             stationary=stationary,
                             moving=moving,
                         )
             else:
-                for n in affine_range(cfg.n_size // 2):
-                    moving = attn_shuffled[:, :, nl.ds(n * bxs_size, bxs_size)]
+                for head_idx in affine_range(cfg.n_size // 2):
+                    moving = attn_shuffled[:, :, nl.ds(head_idx * bxs_size + bxs_tile_offset, curr_bxs_size)]
                     stationary = w_sbuf.ap(
                         pattern=[
                             [cfg.n_size * (cfg.h_1_size * cfg.h_2_size), cfg.d_size],
                             [cfg.h_1_size * cfg.h_2_size, 2],
                             [cfg.h_2_size, cfg.h_1_size],
                         ],
-                        offset=n * (cfg.h_1_size * cfg.h_2_size) + h_c_offset,
+                        offset=head_idx * 2 * (cfg.h_1_size * cfg.h_2_size) + h_2_idx,
                     )
-                    # if cfg.h_2_size is not divsible by NUM_BS_PER_PSUM_BANK,
+                    # if cfg.h_2_size is not divisible by NUM_BS_PER_PSUM_BANK,
                     # the last psum tile may be "incomplete".
-                    if h_c_offset < cfg.h_2_size:
+                    if h_2_idx < cfg.h_2_size:
                         nisa.nc_matmul(
-                            dst=res_psum[
-                                :,
-                                nl.ds(j * bxs_size, bxs_size),
-                            ],
+                            dst=res_psum[:, nl.ds(psum_f_offset, curr_bxs_size)],
                             stationary=stationary,
                             moving=moving,
                             perf_mode=matmul_perf_mode.double_row,
                         )
 
         # Last psum tile may be "incomplete" if cfg.h_2_size is not divisible by NUM_BS_PER_PSUM_BANK
-        num_BS_for_current_psum_tile = min(NUM_BS_PER_PSUM_BANK, cfg.h_2_size - i * NUM_BS_PER_PSUM_BANK)
+        num_BS_for_current_psum_tile = min(NUM_BS_PER_PSUM_BANK, cfg.h_2_size - h_2_base)
 
-        # Read out from psum, possibly adding bias if present.ß
+        # Read out from psum, possibly adding bias if present.
         dst_sb_access_pattern = [
             [cfg.h_2_size * bxs_size, cfg.h_1_size],
-            [bxs_size, num_BS_for_current_psum_tile],
-            [1, bxs_size],
+            [bxs_size, num_BS_for_current_psum_tile] if bxs_size <= F_MAX else [1, bxs_tile_size],
+            [1, bxs_tile_size] if bxs_size <= F_MAX else [0, 1],
         ]
-        dst_sb_access_offset = i * NUM_BS_PER_PSUM_BANK * bxs_size
+        dst_sb_access_offset = h_2_base * bxs_size + bxs_tile_offset
         psum_access_pattern = [
             [F_MAX, cfg.h_1_size],
-            [bxs_size, num_BS_for_current_psum_tile],
-            [1, bxs_size],
+            [bxs_tile_size, num_BS_for_current_psum_tile] if bxs_size <= F_MAX else [1, bxs_tile_size],
+            [1, bxs_tile_size] if bxs_size <= F_MAX else [0, 1],
         ]
         bias_access_pattern = [
             [cfg.h_2_size, cfg.h_1_size],
             [1, num_BS_for_current_psum_tile],
-            [0, bxs_size],
+            [0, bxs_tile_size],
         ]
-        bias_access_offset = i * NUM_BS_PER_PSUM_BANK
-        if quantization_type == QuantizationType.STATIC:
+        bias_access_offset = h_2_base
+        if cfg.quantization_type == QuantizationType.STATIC:
             nisa.activation(
                 dst=out_sb.ap(
                     pattern=dst_sb_access_pattern,
@@ -914,7 +923,7 @@ def _output_projection_tkg_transpose_out_impl(
                     ),
                     op=nl.add,
                 )
-        elif bias != None:
+        elif cfg.has_bias:
             nisa.tensor_tensor(
                 dst=out_sb.ap(
                     pattern=dst_sb_access_pattern,
@@ -939,7 +948,7 @@ def _output_projection_tkg_transpose_out_impl(
     # Store out as transposed.
     out_sb = out_sb.reshape((cfg.h_1_size, cfg.h_2_size, bxs_size))
 
-    if out_hbm_buffer is not None:
+    if out_hbm_buffer != None:
         nisa.dma_copy(
             dst=out_hbm_buffer.ap(
                 pattern=[
@@ -947,7 +956,7 @@ def _output_projection_tkg_transpose_out_impl(
                     [bxs_size, cfg.h_2_size],
                     [1, bxs_size],
                 ],
-                offset=prg_id * cfg.h_2_size * bxs_size,
+                offset=cfg.prg_id * cfg.h_2_size * bxs_size,
             ),
             src=out_sb,
         )

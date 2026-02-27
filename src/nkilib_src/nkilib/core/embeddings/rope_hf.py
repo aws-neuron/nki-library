@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""RoPE kernel for HuggingFace tensor layout [batch, heads, seq, head_dim]."""
+
 from typing import Optional, Tuple
 
 import nki
@@ -38,47 +40,53 @@ def rope_hf(
     """
     Apply Rotary Position Embedding (RoPE) to query and key tensors using HuggingFace layout.
 
-    This kernel uses following tensor layout: [batch, heads, seq, head_dim],
-    which is common in HuggingFace models (e.g., Llama). Use the `rope` kernel
-    instead for following tensor layout: [head_dim, batch, heads, seq].
+    This kernel uses tensor layout [batch, heads, seq, head_dim], common in HuggingFace
+    models (e.g., Llama). Optimized for seq_len divisible by 128 * num_lnc_shards.
 
-    RoPE encodes positional information by rotating pairs of embedding dimensions
-    using precomputed sine/cosine frequencies, enabling position-aware attention
-    without absolute position embeddings.
-
-    Forward pass formula (split-half rotation):
-        q_out[..., :half] = q[..., :half] * cos[..., :half] - q[..., half:] * sin[..., :half]
-        q_out[..., half:] = q[..., half:] * cos[..., half:] + q[..., :half] * sin[..., half:]
-        (same for k)
-
-    Backward pass reverses the rotation direction for gradient computation.
-
-    Grid: (lnc)
+    Dimensions:
+        batch_size: Batch size
+        q_heads: Number of query attention heads
+        k_heads: Number of key attention heads
+        seq_len: Sequence length (must be divisible by 128 * num_lnc_shards)
+        head_dim: Head dimension size
 
     Args:
-        q: Query tensor [batch_size, q_heads, seq_len, head_dim] in HBM.
-        k: Key tensor [batch_size, k_heads, seq_len, head_dim] in HBM.
-        q_out: Output query tensor [batch_size, q_heads, seq_len, head_dim] in HBM.
-        k_out: Output key tensor [batch_size, k_heads, seq_len, head_dim] in HBM.
-        cos: Cosine embeddings [optional(batch_size), seq_len, head_dim] or [seq_len, head_dim] in HBM.
+        q (nl.ndarray): [batch_size, q_heads, seq_len, head_dim] @ HBM, Query tensor
+        k (nl.ndarray): [batch_size, k_heads, seq_len, head_dim] @ HBM, Key tensor
+        q_out (nl.ndarray): [batch_size, q_heads, seq_len, head_dim] @ HBM, Output query tensor
+        k_out (nl.ndarray): [batch_size, k_heads, seq_len, head_dim] @ HBM, Output key tensor
+        cos (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim] @ HBM, Cosine embeddings.
             Required if rope_cache is None.
-        sin: Sine embeddings [optional(batch_size), seq_len, head_dim] or [seq_len, head_dim] in HBM.
+        sin (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim] @ HBM, Sine embeddings.
             Required if rope_cache is None.
-        rope_cache: Packed cos/sin tensor [optional(batch_size), seq_len, head_dim*2] or
-            [seq_len, head_dim*2] in HBM. First half contains cos, second half contains sin.
-            Alternative to providing separate cos/sin tensors.
-        backward: If True, compute backward pass (gradient w.r.t. inputs).
-            Default is False (forward pass).
+        rope_cache (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim*2] @ HBM,
+            Packed cos/sin tensor. First half contains cos, second half contains sin.
+        backward (bool): If True, compute backward pass (gradient w.r.t. inputs). Default False.
 
     Returns:
         Tuple[q_out, k_out]: Query and key tensors with rotary embeddings applied.
 
-    Note:
-        - Either (cos, sin) or rope_cache must be provided, not both.
-        - seq_len must be divisible by (128 * num_lnc_shards).
+    Notes:
+        - Either (cos, sin) or rope_cache must be provided, not both
+        - seq_len must be divisible by (128 * num_lnc_shards)
+        - Use `rope` kernel for layout [head_dim, batch, heads, seq_len]
 
-    See Also:
-        rope: RoPE kernel using input tensor layout [head_dim, batch, heads, seq_len].
+    Pseudocode:
+        for batch_id in range(batch_size):
+            for seq_tile_idx in range(num_seq_tiles):
+                # Load cos/sin tiles for this sequence chunk
+                cos_tile = load(cos[seq_start:seq_end])
+                sin_tile = load(sin[seq_start:seq_end])
+
+                # Apply RoPE to all Q heads
+                for head_id in range(q_heads):
+                    q_tile = load(q[batch_id, head_id, seq_start:seq_end])
+                    q_out[batch_id, head_id, seq_start:seq_end] = rotate(q_tile, cos_tile, sin_tile)
+
+                # Apply RoPE to all K heads
+                for head_id in range(k_heads):
+                    k_tile = load(k[batch_id, head_id, seq_start:seq_end])
+                    k_out[batch_id, head_id, seq_start:seq_end] = rotate(k_tile, cos_tile, sin_tile)
     """
     _, num_shards, shard_id = get_verified_program_sharding_info()
     _validate_apply_rope_inputs(q, k, cos, sin, rope_cache, num_shards)
@@ -102,14 +110,14 @@ def rope_hf(
             sin_tile = nl.ndarray((seq_tile_size, num_tiles, head_dim), dtype=q.dtype, buffer=nl.sbuf)
 
             # Slice cos, sin tiles using access pattern depending on input shapes
-            rope_shape = (rope_cache or cos).shape
+            rope_shape = (rope_cache if rope_cache != None else cos).shape
             rope_seq_len, rope_dim = rope_shape[-2:]
             if len(rope_shape) == 3:
                 rope_batch_offset = batch_id
             else:
                 rope_batch_offset = 0
 
-            if rope_cache is not None:
+            if rope_cache != None:
                 # Packed rope_cache format
                 # rope_cache: [..., head_dim*2]
                 # Access cos portion (first half of last dimension)
@@ -155,30 +163,36 @@ def _validate_apply_rope_inputs(
     Validate inputs for apply_rope operation.
 
     Args:
-      q: Query tensor [batch_size, q_heads, seq_len, head_dim]
-      k: Key tensor [batch_size, k_heads, seq_len, head_dim]
-      cos: Cosine embeddings [batch_size, seq_len, head_dim] or [batch_size, seq_len, head_dim*2] or [seq_len, head_dim*2]
-      sin: Sine embeddings [batch_size, seq_len, head_dim] or None (when cos contains packed rope_cache)
-      num_shards: Number of LNC shards
+        q (nl.ndarray): [batch_size, q_heads, seq_len, head_dim], Query tensor
+        k (nl.ndarray): [batch_size, k_heads, seq_len, head_dim], Key tensor
+        cos (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim], Cosine embeddings
+        sin (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim], Sine embeddings
+        rope_cache (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim*2], Packed cos/sin
+        num_shards (int): Number of LNC shards
+
+    Returns:
+        None
+
+    Notes:
+        - Either (cos, sin) or rope_cache must be provided, not both
+        - seq_len must be divisible by (128 * num_shards)
     """
     kernel_assert(len(q.shape) == 4, f"apply_rope only supports 4D tensors, got input shape {q.shape}")
     kernel_assert(q.shape[-1] == k.shape[-1], f"Head dim mismatch: q={q.shape[-1]}, k={k.shape[-1]}")
 
     head_dim = q.shape[-1]
 
-    if rope_cache is not None:
+    if rope_cache != None:
         # Packed rope_cache format: contains both cos and sin
         kernel_assert(
             rope_cache.shape[-1] == head_dim * 2,
             f"Packed rope_cache expects head_dim*2={head_dim * 2}, got {rope_cache.shape[-1]}",
         )
-        kernel_assert(cos is None and sin is None, "Expected either rope_cache or separate cos/sin tensors, got both")
+        kernel_assert(cos == None and sin == None, "Expected either rope_cache or separate cos/sin tensors, got both")
         rope_tensor = rope_cache
     else:
         # Separate cos/sin tensors
-        kernel_assert(
-            cos is not None and sin is not None, "Expected either rope_cache or separate cos/sin tensors, got none"
-        )
+        kernel_assert(cos != None and sin != None, "Expected either rope_cache or separate cos/sin tensors, got none")
         kernel_assert(
             cos.shape == sin.shape, f"Shape of cos Tensor: {cos.shape} doesn't match shape of sin Tensor: {sin.shape}"
         )
@@ -210,17 +224,23 @@ def _apply_rope_all_heads(
     backward: bool = False,
 ) -> None:
     """
-    Apply rotary embedding to a single tensor tile for each attention head using
-    preloaded cos/sin tiles.
+    Apply rotary embedding to a tensor for all attention heads using preloaded cos/sin tiles.
 
     Args:
-        x: Input tensor [batch_size, num_heads, seq_len, head_dim] in HBM
-        x_out: Output tensor [batch_size, num_heads, seq_len, head_dim] in HBM
-        cos_tile: Cosine embedding tile [seq_tile_size, num_tiles, head_dim] in SBUF
-        sin_tile: Sine embedding tile [seq_tile_size, num_tiles, head_dim] in SBUF
-        batch_id: Current batch index
-        seq_start: Starting sequence position
-        backward: If True, compute backward pass rotation. Default False.
+        x (nl.ndarray): [batch_size, num_heads, seq_len, head_dim] @ HBM, Input tensor
+        x_out (nl.ndarray): [batch_size, num_heads, seq_len, head_dim] @ HBM, Output tensor
+        cos_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Cosine embedding tile
+        sin_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Sine embedding tile
+        batch_id (int): Current batch index
+        seq_start (int): Starting sequence position
+        backward (bool): If True, compute backward pass rotation. Default False.
+
+    Returns:
+        None
+
+    Notes:
+        - Processes all heads sequentially for the given batch and sequence tile
+        - Writes results directly to x_out in HBM
     """
     seq_tile_size, num_tiles, head_dim = cos_tile.shape
     num_heads = x.shape[1]
@@ -255,17 +275,18 @@ def _apply_rope_single(
     """
     Apply rotary embedding to a single tensor tile in SBUF.
 
-    Computes the RoPE rotation for one tile of Q or K tensor using
-    preloaded cos/sin tiles.
-
     Args:
-        x_tile: Input tensor tile [seq_tile_size, num_tiles, head_dim] in SBUF
-        cos_tile: Cosine embedding tile [seq_tile_size, num_tiles, head_dim] in SBUF
-        sin_tile: Sine embedding tile [seq_tile_size, num_tiles, head_dim] in SBUF
-        backward: If True, compute backward pass rotation. Default False.
+        x_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Input tensor tile
+        cos_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Cosine embedding tile
+        sin_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Sine embedding tile
+        backward (bool): If True, compute backward pass rotation. Default False.
 
     Returns:
-        Rotated tensor tile [seq_tile_size, num_tiles, head_dim] in SBUF.
+        nl.ndarray: [seq_tile_size, num_tiles, head_dim] @ SBUF, Rotated tensor tile
+
+    Notes:
+        - Forward: y = [x1, x2] * [cos1, cos2] + [-x2, x1] * [sin1, sin2]
+        - Backward reverses the rotation direction for gradient computation
     """
     seq_size, num_tiles, head_dim = x_tile.shape
     result = nl.ndarray((seq_size, num_tiles, head_dim), dtype=x_tile.dtype, buffer=nl.sbuf)

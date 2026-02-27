@@ -13,10 +13,9 @@
 # limitations under the License.
 
 """
-This kernel implements blockwise matrix multiplication for Mixture of Experts (MoE) layers using MXFP4 quantization with block-level sharding. The implementation shards gate/up projections over the intermediate dimension and block accumulation over the batch dimension, processing all blocks without distinguishing between padded and non-padded blocks.
+This kernel implements blockwise matrix multiplication for Mixture of Experts (MoE) layers using MXFP4 or MXFP8 quantization with block-level sharding. The implementation shards gate/up projections over the intermediate dimension and block accumulation over the batch dimension, processing all blocks without distinguishing between padded and non-padded blocks.
 """
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import nki
@@ -25,18 +24,31 @@ import nki.language as nl
 from nki.isa.constants import dge_mode, oob_mode
 
 from ...mlp.mlp_tkg.down_projection_mx_shard_H import down_projection_mx_shard_H
-from ...mlp.mlp_tkg.gate_up_mx_shard_H import gate_up_projection_mx_tp_shard_H
-from ...mlp.mlp_tkg.projection_mx_constants import (
+from ...mlp.mlp_tkg.gate_up_projection_mx_shard_H import gate_up_projection_mx_tp_shard_H
+from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
+from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import get_nl_act_fn_from_type
+from ...utils.logging import get_logger
+from ...utils.tensor_view import TensorView
+from .bwmm_shard_on_I import DebugTensors, OutputTensors
+from .moe_cte_mx_utils import (
+    SBUF_QUADRANT_SIZE,
+    BWMMMXConfigs,
+    BWMMMXDimensionSizes,
+    InputTensors,
     ProjConfig,
+    SharedBuffers,
+    _generate_expert_index_vector,
     _pmax,
     _q_height,
     _q_width,
+    compute_hidden_index_vector,
+    convert_to_mxfp_dtype,
+    load_and_quantize_hidden_states,
+    load_hidden_states_mx,
+    quantize_block_hidden_state_T,
+    sbuf_layout_adapter,
 )
-from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
-from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import get_nl_act_fn_from_type, get_program_sharding_info, reduce
-from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from .bwmm_shard_on_I import DebugTensors, OutputTensors
 from .moe_cte_utils import (
     PSUM_SIZE,
     SkipMode,
@@ -52,82 +64,7 @@ from .moe_cte_utils import (
 DBG_KERNEL = False
 USE_DMA_TRANSPOSE = False
 
-
-@dataclass
-class InputTensors(nl.NKIObject):
-    token_position_to_id: nl.ndarray
-    block_to_expert: nl.ndarray
-    hidden_states: nl.ndarray
-    gate_up_proj_weight: nl.ndarray
-    gate_and_up_proj_bias: nl.ndarray
-    down_proj_bias: nl.ndarray
-    down_proj_weight: nl.ndarray
-    expert_affinities_masked: nl.ndarray
-    gate_up_proj_scale: nl.ndarray
-    down_proj_scale: nl.ndarray
-    p_gup_idx_vector: nl.ndarray = None
-    p_down_idx_vector: nl.ndarray = None
-    gup_scales_sb: nl.ndarray = None
-    activation_bias: nl.ndarray = None
-    conditions: nl.ndarray = None
-
-
-@dataclass
-class SharedBuffers(nl.NKIObject):
-    block_hidden_states: nl.ndarray
-    block_hidden_states_T: nl.ndarray
-    token_4_H_indices_on_p: nl.ndarray
-
-    hidden_qtz_sb: nl.ndarray
-    hidden_scale_sb: nl.ndarray
-    down_weight_qtz: nl.ndarray
-    block_old: nl.ndarray
-    # for dynamic loop
-    cond: nl.ndarray
-    index: nl.ndarray
-
-    down_scale_sb: nl.ndarray = None
-
-
-@dataclass
-class BWMMMXFP4DimensionSizes(nl.NKIObject):
-    B: int
-    H: int
-    T: int
-    E: int
-    N: int
-    I: int
-    cond_vec_len: int
-    TILESIZE: int = 512
-
-    def __post_init__(self):
-        _, num_shards, shard_id = get_program_sharding_info()
-        self.num_shards = num_shards
-        self.shard_id = shard_id
-        self.MODULO_FACTOR = self.B // self.TILESIZE
-        self.n_B128_tiles = div_ceil(self.B, _pmax)
-        self.hidden_sbuf_expected_shape = (32 * 4, self.B // 32, div_ceil(self.H, 512), 16 * 8)
-        self.p_I = _pmax if self.I > 512 else self.I // 4
-
-
-@dataclass
-class BWMMMXFP4Configs(nl.NKIObject):
-    scaling_mode: ExpertAffinityScaleMode
-    skip_dma: SkipMode
-    compute_dtype: Any
-    weight_dtype: Any
-    io_dtype: Any
-    is_tensor_update_accumulating: bool
-    use_dynamic_while: bool
-    n_static_blocks: int
-    linear_bias: bool
-    activation_function: ActFnType
-    fuse_gate_and_up_load: bool
-    gate_clamp_upper_limit: Optional[float]
-    gate_clamp_lower_limit: Optional[float]
-    up_clamp_upper_limit: Optional[float]
-    up_clamp_lower_limit: Optional[float]
-    qtz_dtype: Any
+logger = get_logger("bwmm_shard_on_block_mx")
 
 
 @nki.jit(platform_target="trn3")
@@ -155,6 +92,7 @@ def bwmm_shard_on_block_mx(
     activation_function: ActFnType = ActFnType.SiLU,
     skip_dma: SkipMode = SkipMode(False, False),
     compute_dtype=nl.bfloat16,
+    weight_dtype: Any = None,  # Target dtype for weight conversion (e.g., nl.float8_e4m3fn_x4, nl.float8_e5m2_x4)
     is_tensor_update_accumulating=True,
     expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
     gate_clamp_upper_limit: Optional[float] = None,
@@ -163,7 +101,7 @@ def bwmm_shard_on_block_mx(
     up_clamp_upper_limit: Optional[float] = None,
 ):
     """
-    Blockwise MXFP4 MoE kernel, decorated. Use as standalone kernel.
+    Blockwise MXFP MoE kernel, decorated. Use as standalone kernel.
 
     The blockwise matrix multiplication (matmul) kernel implements a Mixture of Experts (MoE)
     layer at a block granularity, offering an alternative to token dropping approaches.
@@ -171,6 +109,7 @@ def bwmm_shard_on_block_mx(
     by the user through the token_position_to_id parameter. This kernel shards the gate/up projection
     over the I dimension, and shards the block accumulation over the B dimension.
     This kernel loops over all blocks, without considering they are padded or non-padded blocks.
+    Supports both MXFP4 and MXFP8 weight quantization.
 
     Intended Usage:
         - Block size B: 128-1024 tokens
@@ -192,8 +131,10 @@ def bwmm_shard_on_block_mx(
                                         TODO: with skip_dma, id will be set to -1, so this shape can be (T, H). Similarly for expert_affinities_masked, output
         expert_affinities_masked (nl.ndarray): Tensor of expert affinities corresponding to each token of size ((T+1) * E, 1).
                                         TODO: cannot refactor to (T+1, E) as we currently don't support dynamic slice on both axis.
-        gate_up_proj_weight (nl.ndarray): Tensor of concatenated gate and up projection weights on HBM (E, H, 2, I)
-        down_proj_weight (nl.ndarray): Tensor of down projection weights on HBM (E, I, H)
+        gate_up_proj_weight (nl.ndarray): Tensor of concatenated gate and up projection weights on HBM (E, H, 2, I).
+                                          Supports MXFP4 (nl.float4_e2m1fn_x4) and MXFP8 (nl.float8_e4m3fn_x4, nl.float8_e5m2_x4).
+        down_proj_weight (nl.ndarray): Tensor of down projection weights on HBM (E, I, H).
+                                       Supports MXFP4 (nl.float4_e2m1fn_x4) and MXFP8 (nl.float8_e4m3fn_x4, nl.float8_e5m2_x4).
         block_size (int): Number of tokens per block
         token_position_to_id (nl.ndarray): Tensor of block index of the corresponding tokens on HBM (N * B,)
                                           Note that we include tokens included for padding purposes and N * B >= T.
@@ -207,7 +148,7 @@ def bwmm_shard_on_block_mx(
                               Note that if activation function is Swiglu, we expect up_bias = up_bias + 1
         down_proj_bias: nl.ndarray = None. Optional argument. A tensor of shape [E, H]
 
-        # Arguments for fp8 dequantization
+        # Arguments for quantization scales
         gate_up_proj_scale: nl.ndarray = None. A tensor of shape [E, 1, 2 * I]
         down_proj_scale: nl.ndarray = None. A tensor of shape [E, 1, H]
 
@@ -216,12 +157,16 @@ def bwmm_shard_on_block_mx(
         down_activations: nl.ndarray = None. Currently not supported
 
         # meta parameters
-        activation_function: one of the Enum in neuronxcc.nki._pre_prod_kernels.ActFnType.
+        activation_function: one of the Enum in nkilib.core.utils.common_types.ActFnType.
                               Indicate what activation function to use in the MLP block
         skip_dma: SkipMode = SkipMode(False, False),
         compute_dtype=nl.bfloat16,
+        weight_dtype: Target dtype for weight conversion when weights are passed as uint/int/float types.
+                     For MXFP4: nl.float4_e2m1fn_x4
+                     For MXFP8: nl.float8_e4m3fn_x4 or nl.float8_e5m2_x4
+                     If None, auto-detects (defaults to e4m3fn for MXFP8)
         is_tensor_update_accumulating: bool. Indicate whether we need to accumulate the results over multiple blocks
-        expert_affinities_scaling_mode: one of the Enum in neuronxcc.nki._pre_prod_kernels.ExpertAffinityScaleMode.
+        expert_affinities_scaling_mode: one of the Enum in nkilib.core.utils.common_types.ExpertAffinityScaleMode.
                                         Indicate if the kernel is doing post or pre scaling.
         n_block_per_iter: int. Currently unsupported
 
@@ -248,9 +193,9 @@ def bwmm_shard_on_block_mx(
         B = block_size
         E, _, _, _, I = gate_up_proj_weight.shape
         N = token_position_to_id.shape[0] // B
-        dims = BWMMMXFP4DimensionSizes(T, H, B, E, N, I, cond_vec_len)
+        dims = BWMMMXDimensionSizes(T, H, B, E, N, I, cond_vec_len)
         prj_cfg = ProjConfig(H, I, B, force_lnc1=True, n_prgs=1, prg_id=0)
-        configs = BWMMMXFP4Configs(...)
+        configs = BWMMMXConfigs(...)
 
         allocate reused buffers: p_gup_idx_vector, p_down_idx_vector, gup_scales_sb, activation_bias
         inps = InputTensors(...)
@@ -292,7 +237,7 @@ def bwmm_shard_on_block_mx(
     cond_vec_len = conditions.shape[0] if conditions is not None else 0
 
     N = token_position_to_id.shape[0] // B
-    dims = BWMMMXFP4DimensionSizes(T=T, H=H, B=B, E=E, N=N, I=I, cond_vec_len=cond_vec_len)
+    dims = BWMMMXDimensionSizes(T=T, H=H, B=B, E=E, N=N, I=I, cond_vec_len=cond_vec_len)
 
     prj_cfg = ProjConfig(
         H=dims.H,
@@ -301,14 +246,13 @@ def bwmm_shard_on_block_mx(
         force_lnc1=True,
         n_prgs=1,
         prg_id=0,
+        use_stream_shuffle_broadcast=False,
+        sharding_config="H",
     )
 
-    # torch/xla doesnt support passing mxfp4 tensors to kernel
-    alternative_input_mxfp4_dtypes = [nl.uint16, nl.int16, nl.float16]
-    if gate_up_proj_weight.dtype in alternative_input_mxfp4_dtypes:
-        gate_up_proj_weight = gate_up_proj_weight.view(nl.float4_e2m1fn_x4)
-    if down_proj_weight.dtype in alternative_input_mxfp4_dtypes:
-        down_proj_weight = down_proj_weight.view(nl.float4_e2m1fn_x4)
+    # Convert weights to MXFP dtype (torch/xla passes weights as alternative dtypes)
+    gate_up_proj_weight, target_dtype = convert_to_mxfp_dtype(gate_up_proj_weight, weight_dtype)
+    down_proj_weight, _ = convert_to_mxfp_dtype(down_proj_weight, target_dtype)
 
     # reused buffers
     p_gup_idx_vector = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf, name="p_idx_vector")
@@ -341,7 +285,7 @@ def bwmm_shard_on_block_mx(
         conditions=conditions,
     )
 
-    configs = BWMMMXFP4Configs(
+    configs = BWMMMXConfigs(
         skip_dma=skip_dma,
         compute_dtype=compute_dtype,
         scaling_mode=expert_affinities_scaling_mode,
@@ -397,10 +341,13 @@ def bwmm_shard_on_block_mx(
             down_proj=dbg_down_proj,
             up_proj=dbg_up_proj,
         )
-    # Allocate buffers for prefetching
-    # hidden_sbuf_expected_shape = (32 * 4, dims.B // 32, mx4_prj_cfg.n_H512_tile, 16 * 8)
+    """
+    Allocate buffers for prefetching and current block processing.
+    
+    hidden_sbuf_expected_shape defines the expected layout for hidden states:
+    (32 * 4, dims.B // 32, mx4_prj_cfg.n_H512_tile, 16 * 8)
+    """
 
-    # Current block buffers
     block_hidden_states = None
     if not USE_DMA_TRANSPOSE:
         # if we use PE transpose, we need to load to block_hidden_states first, then transpose
@@ -435,6 +382,10 @@ def bwmm_shard_on_block_mx(
     if dims.p_I != _pmax:
         nisa.memset(down_weight_qtz[:, prj_cfg.n_total_I512_tile - 1, :], value=0)
 
+    down_scale_sb = nl.ndarray(
+        (_pmax, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), dtype=inps.down_proj_scale.dtype, buffer=nl.sbuf
+    )
+
     # init counters
     # in shard-on-block we can move independently
     cond = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32) if configs.use_dynamic_while else None
@@ -447,7 +398,7 @@ def bwmm_shard_on_block_mx(
         hidden_scale_sb=hidden_scale_sb,
         block_old=block_old,
         down_weight_qtz=down_weight_qtz,
-        # down_scale_sb=down_scale_sb,
+        down_scale_sb=down_scale_sb,
         cond=cond,
         index=index,
         token_4_H_indices_on_p=token_4_H_indices_on_p,
@@ -468,8 +419,17 @@ def bwmm_shard_on_block_mx(
             n_dynamic_blocks = n_dynamic_blocks + 1 if n_dynamic_blocks % 2 == 1 else n_dynamic_blocks
             n_static_blocks = dims.N - n_dynamic_blocks
         else:
-            n_dynamic_blocks_local = n_dynamic_blocks
-            n_static_blocks = dims.N - n_dynamic_blocks_local
+            # If invalid n_dynamic_blocks is passed, auto-calculate best case combination
+            if conditions is not None and (n_dynamic_blocks < 0 or n_dynamic_blocks > dims.N):
+                n_static_blocks = dims.T // dims.B  # real blocks (best case scenario)
+                n_dynamic_blocks_local = dims.N - n_static_blocks
+                logger.info(
+                    f"n_dynamic_blocks={n_dynamic_blocks} out of range, auto-computing from T={dims.T}, B={dims.B}: "
+                    f"{n_static_blocks} static, {n_dynamic_blocks_local} dynamic"
+                )
+            else:
+                n_dynamic_blocks_local = n_dynamic_blocks
+                n_static_blocks = dims.N - n_dynamic_blocks_local
 
         nisa.dma_copy(
             dst=buffers.cond.ap(pattern=[[1, 1], [1, 1]]),
@@ -478,7 +438,7 @@ def bwmm_shard_on_block_mx(
 
         nisa.memset(dst=buffers.index[0, 0], value=n_static_blocks)
 
-        print(f"Processing {n_static_blocks} static blocks, {n_dynamic_blocks_local} dynamic blocks")
+        logger.info(f"Processing {n_static_blocks} static blocks, {n_dynamic_blocks_local} dynamic blocks")
         process_static_blocks(
             dims=dims,
             configs=configs,
@@ -489,17 +449,18 @@ def bwmm_shard_on_block_mx(
             buffers=buffers,
             num_static_blocks=n_static_blocks,
         )
-        process_dynamic_blocks(
-            dims=dims,
-            configs=configs,
-            prj_cfg=prj_cfg,
-            inps=inps,
-            outs=outs,
-            dbg_tensors=dbg_tensors,
-            buffers=buffers,
-            num_static_blocks=n_static_blocks,
-            num_dynamic_blocks=n_dynamic_blocks_local,
-        )
+        if n_dynamic_blocks_local > 0:
+            process_dynamic_blocks(
+                dims=dims,
+                configs=configs,
+                prj_cfg=prj_cfg,
+                inps=inps,
+                outs=outs,
+                dbg_tensors=dbg_tensors,
+                buffers=buffers,
+                num_static_blocks=n_static_blocks,
+                num_dynamic_blocks=n_dynamic_blocks_local,
+            )
 
     else:
         """
@@ -549,101 +510,7 @@ def bwmm_shard_on_block_mx(
     return output
 
 
-def sbuf_layout_adapter(
-    src: nl.ndarray,
-    dst: nl.ndarray,
-    dims: BWMMMXFP4DimensionSizes,
-    use_dma_tp: bool = False,
-):
-    """
-    Transpose tensor layout in SBUF to swap outermost and innermost dimensions.
-
-    Performs layout transformation from [32_T * 4_H (P), T/32, H/512, 16_H * 8_H]
-    to [16_H * 8_H(P), H/512, T/32, 32_T * 4_H] using either DMA transpose or
-    nc_transpose.
-
-    Args:
-        src (nl.ndarray): Source 4D tensor in SBUF of shape [32_T * 4_H (P), T/32, H/512, 16_H * 8_H].
-        dst (nl.ndarray): Destination 4D tensor in SBUF of shape [16_H * 8_H(P), H/512, T/32, 32_T * 4_H].
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration containing B and H.
-        use_dma_tp (bool): If True, use DMA transpose; if False, use nc_transpose method.
-
-    Returns:
-        None: Modifies dst tensor in-place.
-
-    Notes:
-        - Performs T/32 * H/512 transpose operations
-        - DMA transpose method is faster but may have hardware limitations
-        - nc_transpose method uses multi-buffering with N_PSUM_BANKS for efficient pipelining
-        - Reshapes dst tensor internally for efficient memory access patterns
-
-    Pseudocode:
-        T_div_32 = B // 32
-        H_div_512 = H // 512
-        n_transposes_per_bank = min(8, T_div_32)
-        n_PSUM_banks = T_div_32 // n_transposes_per_bank
-
-        if use_dma_tp:
-            tmp_sbuf = dma_transpose(src, axes=(3,1,2,0))
-            for H_div_512_idx in range(H_div_512):
-                for B_div_32_idx in range(T_div_32):
-                    dst[:, H_div_512_idx, B_div_32_idx, :] = tmp_sbuf[:, B_div_32_idx, H_div_512_idx, :]
-        else:
-            dst = reshape dst to [128, H_div_512, n_PSUM_banks, n_transposes_per_bank*128]
-            for H_div_512_idx in range(H_div_512):
-                for bank in range(n_PSUM_banks):
-                    tmp_res = allocate in PSUM
-                    for idx in range(n_transposes_per_bank):
-                        B_div_32_idx = bank * n_transposes_per_bank + idx
-                        tmp_res[:, idx*128:(idx+1)*128] = nc_transpose(src[:, B_div_32_idx, H_div_512_idx, :])
-                    dst[:, H_div_512_idx, bank, :] = tmp_res
-            dst = reshape dst to [128, H_div_512, T_div_32, 128]
-    """
-
-    src_sbuf = src
-
-    T_div_32 = dims.B // 32
-    H_div_512 = dims.H // 512
-
-    n_transposes_per_bank = min(8, T_div_32)
-
-    n_PSUM_banks = T_div_32 // n_transposes_per_bank  # each bank can hold 8 BF16 128x128 transpose
-
-    if use_dma_tp:
-        tmp_sbuf = nl.ndarray((_pmax, T_div_32, H_div_512, _pmax), dtype=src_sbuf.dtype)
-        nisa.dma_transpose(dst=tmp_sbuf[:, :, :, :], src=src_sbuf[:, :, :, :], axes=(3, 1, 2, 0))
-
-        for H_div_512_idx in range(H_div_512):
-            for B_div_32_idx in range(T_div_32):
-                dst[0:_pmax, H_div_512_idx, B_div_32_idx, :_pmax] = tmp_sbuf[
-                    0:_pmax, B_div_32_idx, H_div_512_idx, :_pmax
-                ]
-    else:
-        dst = dst.reshape((_pmax, H_div_512, n_PSUM_banks, n_transposes_per_bank * 32 * 4))
-        for H_div_512_idx in range(H_div_512):
-            for bank in range(n_PSUM_banks):
-                # each bank will store the results of 8 transpose
-                tmp_res = nl.ndarray((_pmax, n_transposes_per_bank * _pmax), dtype=src.dtype, buffer=nl.psum)
-
-                for idx in range(n_transposes_per_bank):
-                    B_div_32_idx = bank * n_transposes_per_bank + idx
-                    # transpose [32_T * 4_H, 16_H*8_H] -> [16_H*8_H, 32_T * 4_H]
-                    nisa.nc_transpose(
-                        dst=tmp_res[:_pmax, idx * _pmax : (idx + 1) * _pmax],
-                        data=src_sbuf[0:_pmax, B_div_32_idx, H_div_512_idx, 0:_pmax],
-                    )
-
-                # evict the full bank
-                nisa.tensor_copy(
-                    dst[0:_pmax, H_div_512_idx, bank, 0 : n_transposes_per_bank * _pmax],
-                    tmp_res[:_pmax, : n_transposes_per_bank * _pmax],
-                    engine=nisa.scalar_engine,
-                )
-
-        dst = dst.reshape((_pmax, H_div_512, T_div_32, 32 * 4))
-
-
-def load_old_block_bwmm_mxfp4(output, token_indices, block_old, NUM_TILES, dtype, shard_id, skip_dma: SkipMode):
+def load_prev_block(output, token_indices, block_old, NUM_TILES, dtype, shard_id, skip_dma: SkipMode):
     """
     Load previous block outputs for accumulation in tensor update mode.
 
@@ -708,7 +575,7 @@ def load_old_block_bwmm_mxfp4(output, token_indices, block_old, NUM_TILES, dtype
     return block_old
 
 
-def check_kernel_compatibility(dims: BWMMMXFP4DimensionSizes, configs: BWMMMXFP4Configs):
+def check_kernel_compatibility(dims: BWMMMXDimensionSizes, configs: BWMMMXConfigs):
     """
     Validate kernel configuration and dimension compatibility.
 
@@ -716,9 +583,9 @@ def check_kernel_compatibility(dims: BWMMMXFP4DimensionSizes, configs: BWMMMXFP4
     hardware constraints and implementation requirements before execution.
 
     Args:
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration containing B, H, I, N,
+        dims (BWMMMXDimensionSizes): Dimension configuration containing B, H, I, N,
             num_shards, and cond_vec_len.
-        configs (BWMMMXFP4Configs): Kernel configuration containing is_tensor_update_accumulating
+        configs (BWMMMXConfigs): Kernel configuration containing is_tensor_update_accumulating
             and use_dynamic_while flags.
 
     Returns:
@@ -758,13 +625,17 @@ def check_kernel_compatibility(dims: BWMMMXFP4DimensionSizes, configs: BWMMMXFP4
         )
 
 
-def load_gup_weights_scales_mx4(
-    inps: InputTensors, block_expert: nl.ndarray, dims: BWMMMXFP4DimensionSizes, prj_cfg: ProjConfig, skip_dma: SkipMode
+def load_gup_weights_scales_mx(
+    inps: InputTensors,
+    block_expert: nl.ndarray,
+    dims: BWMMMXDimensionSizes,
+    prj_cfg: ProjConfig,
+    skip_dma: SkipMode,
 ):
     """
     Load gate and up projection weights, scales, and biases for current expert.
 
-    Loads MXFP4 quantized weights, uint8 scales, and biases for both gate and up
+    Loads MXFP4/MXFP8 quantized weights, uint8 scales, and biases for both gate and up
     projections from HBM to SBUF for the expert assigned to the current block.
 
     Args:
@@ -772,7 +643,7 @@ def load_gup_weights_scales_mx4(
             [E, 128, 2, n_H512_tile, I], gate_up_proj_scale, gate_and_up_proj_bias,
             and buffers for scales and index vectors.
         block_expert (nl.ndarray): Expert index for current block, shape [1, 1].
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration with I, H.
+        dims (BWMMMXDimensionSizes): Dimension configuration with I, H.
         prj_cfg (ProjConfig): Projection configuration with n_H512_tile_sharded, I.
         skip_dma (SkipMode): DMA skip configuration for weight loading.
 
@@ -784,7 +655,7 @@ def load_gup_weights_scales_mx4(
 
     Notes:
         - Uses indirect DGE with block_expert for expert selection
-        - Constructs partition index vector for scale loading with proper offsets
+        - Generates index vectors on-the-fly for scale loading
         - Pads bias to 512 when I < 512 for alignment
         - Scales are loaded with zero-padding for out-of-bounds partitions
         - Gate and up projections share weight buffer (dimension 1 has size 2)
@@ -794,8 +665,8 @@ def load_gup_weights_scales_mx4(
         dma_copy gate_up_proj_weight[block_expert, :, :, :, :] to gup_weights_qtz_sb
 
         gup_scale_view = reshape gate_up_proj_scale to [E*16, 2, n_H512_tile, I]
-        construct p_gup_idx_vector: [block_expert*16+0, block_expert*16+1, ..., block_expert*16+15, -1, -1, ...]
-        dma_copy gup_scale_view[p_gup_idx_vector, :, :, :] to gup_scales_sb
+        token_indices_on_p = generate_expert_index_vector(block_expert)
+        dma_copy gup_scale_view[token_indices_on_p, :, :, :] to gup_scales_sb
 
         gup_bias_sb = allocate [128, 2, n_total_I512_tile, 128] in SBUF
         if I < 512:
@@ -811,20 +682,14 @@ def load_gup_weights_scales_mx4(
     )
     # gate_up_proj_weight shape: (E, 128, 2, n_H512_tile, I)
     # We want to load expert[block_expert] -> shape (128, 2, n_H512_tile_sharded, I)
-    full_n_H512_tile = inps.gate_up_proj_weight.shape[3]  # Get actual n_H512_tile from source tensor
+    # select expert -> (128, 2, n_H512_tile, I)
+    # slice H512 tiles -> (128, 2, n_H512_tile_sharded, I)
+    gup_weight_view = inps.gate_up_proj_weight.select(dim=0, index=block_expert).slice(
+        dim=2, start=0, end=prj_cfg.n_H512_tile_sharded
+    )
     nisa.dma_copy(
         dst=gup_weights_qtz_sb,
-        src=inps.gate_up_proj_weight.ap(
-            pattern=[
-                [2 * full_n_H512_tile * dims.I, _pmax],  # stride for partition dim (uses full n_H512_tile)
-                [full_n_H512_tile * dims.I, 2],  # stride for gate/up dim (uses full n_H512_tile)
-                [dims.I, prj_cfg.n_H512_tile_sharded],  # stride for H512 tile (only load sharded count)
-                [1, dims.I],  # stride for I dim
-            ],
-            offset=0,
-            scalar_offset=block_expert,
-            indirect_dim=0,
-        ),
+        src=gup_weight_view.get_view(),
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
     )
@@ -850,24 +715,14 @@ def load_gup_weights_scales_mx4(
         [48 49 50 51 -1 -1 -1 ..... 52 53 54 55 -1 -1 -1 .... 56 57 58 59 -1 -1 -1 .... 60 61 62 63 -1 -1 -1... -1]  
         i.e, basically the same as above, with offset 16*3 = 48
     """
-
-    n_quadrants_needed = prj_cfg.H0 // 32
-    for i_quad in nl.static_range(n_quadrants_needed):
-        # arange_4P = nisa.iota(nl.arange(i_quad*4, (i_quad+1)*4)[:, None], dtype = nl.float32)
-        arange_4P = nl.ndarray((4, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.iota(arange_4P, [[1, 1]], offset=i_quad * 4, channel_multiplier=1)
-        block_expert_broadcast = nl.ndarray((4, 1), dtype=block_expert.dtype, buffer=nl.sbuf)
-        stream_shuffle_broadcast(src=block_expert, dst=block_expert_broadcast)
-        nisa.activation(
-            dst=inps.p_gup_idx_vector[i_quad * 32 : i_quad * 32 + 4],
-            data=block_expert_broadcast,
-            op=nl.copy,
-            scale=float(scale_shape[1]),
-            bias=arange_4P,
-        )
-
-    token_indices_on_p = nl.ndarray(inps.p_gup_idx_vector.shape, dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(token_indices_on_p, inps.p_gup_idx_vector, engine=nisa.scalar_engine)
+    gup_n_quadrants_needed = prj_cfg.H0 // SBUF_QUADRANT_SIZE
+    token_indices_on_p = _generate_expert_index_vector(
+        expert_index=block_expert,
+        dst_idx_vector=inps.p_gup_idx_vector,
+        scale_factor=scale_shape[1],
+        n_quadrants_needed=gup_n_quadrants_needed,
+        n_remaining_partition=0,
+    )
     # gup_scale_view shape: (E*16, 2, n_H512_tile, I) - use FULL source tensor dimensions for strides
     # The source tensor has full n_H512_tile, we only load n_H512_tile_sharded elements
     full_n_H512_tile_scale = scale_shape[3]  # Get actual n_H512_tile from source tensor (before reshape)
@@ -943,21 +798,24 @@ def load_gup_weights_scales_mx4(
             dge_mode=dge_mode.hwdge,
         )
 
-    return gup_weights_qtz_sb, inps.gup_scales_sb, gup_bias_sb
+    return gup_weights_qtz_sb, inps.gup_scales_sb, gup_bias_sb, token_indices_on_p, gup_n_quadrants_needed
 
 
-def load_down_proj_weights_mx4(
+def load_down_proj_weights_mx(
     inps: InputTensors,
     block_expert: nl.ndarray,
     dst_weight: nl.ndarray,
-    dims: BWMMMXFP4DimensionSizes,
+    dims: BWMMMXDimensionSizes,
     prj_cfg: ProjConfig,
     skip_dma: SkipMode,
+    gup_token_indices_on_p: nl.ndarray = None,
+    gup_n_quadrants_needed: int = None,
+    dst_scale: nl.ndarray = None,
 ):
     """
     Load down projection weights, scales, and biases for current expert.
 
-    Loads MXFP4 quantized weights and uint8 scales for down projection from HBM
+    Loads MXFP4/MXFP8 quantized weights and uint8 scales for down projection from HBM
     to SBUF, constructing partition index vectors for proper expert selection.
 
     Args:
@@ -965,7 +823,7 @@ def load_down_proj_weights_mx4(
             down_proj_scale, down_proj_bias, and index vector buffer.
         block_expert (nl.ndarray): Expert index for current block, shape [1, 1].
         dst_weight (nl.ndarray): Destination buffer for weights in SBUF.
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration with I, H, p_I.
+        dims (BWMMMXDimensionSizes): Dimension configuration with I, H, p_I.
         prj_cfg (ProjConfig): Projection configuration with sharding info.
         skip_dma (SkipMode): DMA skip configuration.
 
@@ -998,21 +856,22 @@ def load_down_proj_weights_mx4(
         return down_scale_sb, down_bias_sb
     """
     """
-    DOWN WEIGHTS
+    Load down projection weights from HBM to SBUF.
+    
+    down_proj_weight shape: (E, p_I, n_total_I512_tile, H)
+    Load directly into dst_weight with scalar AP.
+    scalar_offset=block_expert with indirect_dim=0 means access starts at 
+    block_expert * (p_I * n_total_I512_tile * H)
     """
 
     # down_proj_weight shape: (E, p_I, n_total_I512_tile, H)
-    # Load directly into dst_weight with scalar AP
-    # scalar_offset=block_expert with indirect_dim=0 means access starts at block_expert * (p_I * n_total_I512_tile * H)
-
-    stride_p_I = prj_cfg.n_total_I512_tile * dims.H
+    # select expert -> (p_I, n_total_I512_tile, H)
+    # slice H for sharding -> (p_I, n_total_I512_tile, H_sharded)
+    down_weight_view = inps.down_proj_weight.select(dim=0, index=block_expert).slice(
+        dim=2, start=prj_cfg.prg_id * prj_cfg.H_sharded, end=(prj_cfg.prg_id + 1) * prj_cfg.H_sharded
+    )
     nisa.dma_copy(
-        src=inps.down_proj_weight.ap(
-            pattern=[[stride_p_I, dims.p_I], [dims.H, prj_cfg.n_total_I512_tile], [1, dims.H]],
-            offset=prj_cfg.prg_id * prj_cfg.H_sharded,
-            scalar_offset=block_expert,
-            indirect_dim=0,
-        ),
+        src=down_weight_view.get_view(),
         dst=dst_weight[: dims.p_I, :, :],
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
@@ -1024,9 +883,12 @@ def load_down_proj_weights_mx4(
     scale_shape = inps.down_proj_scale.shape
 
     # Alloc and load weight scale, which needs zero padding in sbuf
-    down_scale_sb = nl.ndarray(
-        (_pmax, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), dtype=inps.down_proj_scale.dtype, buffer=nl.sbuf
-    )  # original nl.uint8
+    if dst_scale is not None:
+        down_scale_sb = dst_scale
+    else:
+        down_scale_sb = nl.ndarray(
+            (_pmax, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), dtype=inps.down_proj_scale.dtype, buffer=nl.sbuf
+        )  # original nl.uint8
     # Memset weight scale if input weight scale HBM does not pad on par dim
     if dims.p_I != _pmax:
         nisa.memset(dst=down_scale_sb[:, prj_cfg.n_total_I512_tile - 1, :], value=0)
@@ -1034,62 +896,32 @@ def load_down_proj_weights_mx4(
         down_scale_sb.shape == (128, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), f"Got {down_scale_sb.shape}"
     )
 
-    down_scale_view = inps.down_proj_scale.reshape((scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3]))
     """
     Construct a vector DGE index to index into E*16
-    if block_expert == 0, we want something like this (tranposed to the P dimension)
-    [0 1 2 3 -1 -1 -1 ..... 4 5 6 7 -1 -1 -1 .... 8 9 10 11 -1 -1 -1 .... 12 13 14 15 -1 -1 -1... -1]  
-
-    if block_expert == 3, we want something like this
-    [48 49 50 51 -1 -1 -1 ..... 52 53 54 55 -1 -1 -1 .... 56 57 58 59 -1 -1 -1 .... 60 61 62 63 -1 -1 -1... -1]  
-    i.e, basically the same as above, with offset 16*3 = 48
+        if block_expert == 0, we want something like this (tranposed to the P dimension)
+        [0 1 2 3 -1 -1 -1 ..... 4 5 6 7 -1 -1 -1 .... 8 9 10 11 -1 -1 -1 .... 12 13 14 15 -1 -1 -1... -1]  
+    
+        if block_expert == 3, we want something like this
+        [48 49 50 51 -1 -1 -1 ..... 52 53 54 55 -1 -1 -1 .... 56 57 58 59 -1 -1 -1 .... 60 61 62 63 -1 -1 -1... -1]  
+        i.e, basically the same as above, with offset 16*3 = 48
     """
+    down_scale_view = inps.down_proj_scale.reshape((scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3]))
 
-    n_quadrants_needed, n_remaining_partition = divmod(dims.p_I, 32)
+    down_n_quadrants_needed, n_remaining_partition = divmod(dims.p_I, SBUF_QUADRANT_SIZE)
     n_remaining_partition = n_remaining_partition // _q_height
-    """
-    assume I = 384
-    p_I should be 96
-    p_I // q_height = 12
-    n_quadrants_needed = 3
 
-    assume I = 192
-    p_I should be 48
-    p_I // q_height = 6
-    n_quandrants_needed = 2
-    The second quadrant will only have 2 meaningful partition in it. 
-    """
-
-    for i_quad in nl.static_range(n_quadrants_needed):
-        arange_4P = nl.ndarray((4, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.iota(arange_4P, [[1, 1]], offset=i_quad * 4, channel_multiplier=1)
-        block_expert_broadcast = nl.ndarray((4, 1), dtype=block_expert.dtype, buffer=nl.sbuf)
-        stream_shuffle_broadcast(src=block_expert, dst=block_expert_broadcast)
-        nisa.activation(
-            dst=inps.p_down_idx_vector[i_quad * 32 : i_quad * 32 + 4],
-            data=block_expert_broadcast,
-            op=nl.copy,
-            scale=float(scale_shape[1]),
-            bias=arange_4P,
+    # Reuse gup token indices if quadrants match, otherwise regenerate
+    if gup_n_quadrants_needed is not None and gup_n_quadrants_needed == down_n_quadrants_needed:
+        token_indices_on_p = gup_token_indices_on_p
+    else:
+        token_indices_on_p = _generate_expert_index_vector(
+            expert_index=block_expert,
+            dst_idx_vector=inps.p_down_idx_vector,
+            scale_factor=scale_shape[1],
+            n_quadrants_needed=down_n_quadrants_needed,
+            n_remaining_partition=n_remaining_partition,
         )
 
-    # handle remaining partitions
-    if n_remaining_partition != 0:
-        i_quad = n_quadrants_needed
-        arange_remainder = nl.ndarray((n_remaining_partition, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.iota(arange_remainder, [[1, 1]], offset=i_quad * 4, channel_multiplier=1)
-        block_expert_broadcast_rem = nl.ndarray((n_remaining_partition, 1), dtype=block_expert.dtype, buffer=nl.sbuf)
-        stream_shuffle_broadcast(src=block_expert, dst=block_expert_broadcast_rem)
-        nisa.activation(
-            dst=inps.p_down_idx_vector[i_quad * 32 : i_quad * 32 + n_remaining_partition],
-            data=block_expert_broadcast_rem,
-            op=nl.copy,
-            scale=float(scale_shape[1]),
-            bias=arange_remainder,
-        )
-
-    token_indices_on_p = nl.ndarray(inps.p_down_idx_vector.shape, dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(token_indices_on_p, inps.p_down_idx_vector, engine=nisa.scalar_engine)
     # down_scale_view shape: (E*16, n_total_I512_tile, H)
     # accumulated shape to right of dim 0: n_total_I512_tile * H
     down_scale_stride_dim0 = prj_cfg.n_total_I512_tile * dims.H
@@ -1124,304 +956,20 @@ def load_down_proj_weights_mx4(
     return down_scale_sb, down_bias_sb
 
 
-def compute_hidden_index_vector(
-    inps: InputTensors,
-    buffers: SharedBuffers,
-    block_idx,
-    dims: BWMMMXFP4DimensionSizes,
-    skip_dma: SkipMode,
-    is_block_idx_dynamic: bool = False,
-):
-    """
-    Compute token-to-hidden-state index mapping for indirect DGE loading.
-
-    Transforms token indices into 4H-folded indices for efficient vector DGE
-    loading of hidden states with H dimension folded 4 times onto partitions.
-
-    Args:
-        inps (InputTensors): Input tensors with token_position_to_id and hidden_states.
-        buffers (SharedBuffers): Buffers including token_4_H_indices_on_p output buffer.
-        block_idx (int): Current block index.
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration with B, H.
-        skip_dma (SkipMode): DMA skip configuration.
-        is_block_idx_dynamic (bool): Whether block index is from dynamic loop.
-
-    Returns:
-        None: Modifies buffers.token_4_H_indices_on_p in-place.
-
-    Notes:
-        - Multiplies token indices by 4 and adds [0,1,2,3] for H folding
-        - Stores result in partition dimension for vector DGE
-        - Handles both static and dynamic block indexing
-        - Processes B/32 tiles sequentially
-
-    Pseudocode:
-        T = B
-        T_div_32 = T // 32
-
-        if is_block_idx_dynamic:
-            total_size = product of token_position_to_id.shape
-            reshaped = reshape token_position_to_id to [total_size//B, B]
-            dma_copy reshaped[block_idx, :] to token_indices
-        else:
-            dma_copy token_position_to_id[block_idx*B:(block_idx+1)*B] to token_indices
-
-        arange_4H = [0, 1, 2, 3]
-        all_token_4_H_indices = token_indices * 4 + arange_4H
-        all_token_4_H_indices = reshape to [1, T*4]
-
-        for T_div_32_idx in range(T_div_32):
-            token_4_H_indices = all_token_4_H_indices[:, T_div_32_idx*128:(T_div_32_idx+1)*128]
-            token_4_H_indices_psum = nc_transpose(token_4_H_indices)
-            buffers.token_4_H_indices_on_p[:, T_div_32_idx] = token_4_H_indices_psum
-    """
-    T = dims.B
-    T_div_32 = T // 32
-
-    token_position_to_id = inps.token_position_to_id
-    # We will use a 128-partition indirect DGE to load 32 tokens at a time, with H dim folded 4 times onto 4 partitions.
-    if is_block_idx_dynamic:
-        total_size = reduce(op='mul', input=token_position_to_id.shape, initial_value=1)
-        kernel_assert(total_size % dims.B == 0, "token_position_to_id shape must be divisible by B")
-        token_indices = nl.ndarray((1, dims.B), buffer=nl.sbuf, dtype=nl.int32)
-        reshaped = token_position_to_id.reshape((total_size // dims.B, dims.B))
-        nisa.dma_copy(
-            src=reshaped.ap(pattern=[[dims.B, 1], [1, dims.B]], offset=0, scalar_offset=block_idx, indirect_dim=0),
-            dst=token_indices[:, : dims.B],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
-        )
-
-    else:
-        token_indices = nl.ndarray((1, T), buffer=nl.sbuf, dtype=nl.int32)
-        nisa.dma_copy(
-            src=token_position_to_id.reshape((1, token_position_to_id.shape[0]))[
-                :, block_idx * dims.B : dims.B * (block_idx + 1)
-            ],
-            dst=token_indices[:, :T],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-        )
-    kernel_assert(token_indices.shape == (1, T), f'token_indices.shape = {token_indices.shape}')
-
-    # hidden_states has shape of [T, H]
-    # We will view it as [T * 4, H // 4], and do a 128-partition vector DGE on the outermost dim of T * 4.
-    # To do so, the loaded 32 token indices should be multiplied by 4, and each added with 0, 1, 2, 3.
-    arange_4H = nl.ndarray((1, 4), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(arange_4H, [[1, 4]], offset=0)
-
-    all_token_4_H_indices = nl.ndarray((1, T, 4), dtype=nl.float32, buffer=nl.sbuf)
-
-    # Using AP with step=0 for broadcast:
-    # - token_indices (1, T) broadcast to (1, T, 4): step=0 on the 4 dim
-    # - arange_4H (1, 4) broadcast to (1, T, 4): step=0 on the T dim
-    # token_indices shape: (1, T), so partition step = T
-    # arange_4H shape: (1, 4), so partition step = 4
-    nisa.scalar_tensor_tensor(
-        dst=all_token_4_H_indices,
-        data=token_indices.ap(
-            pattern=[[T, 1], [1, T], [0, 4]],  # step=0 broadcasts across the 4 dim
-            offset=0,
-        ),
-        op0=nl.multiply,
-        operand0=4.0,
-        op1=nl.add,
-        operand1=arange_4H.ap(
-            pattern=[[4, 1], [0, T], [1, 4]],  # step=0 broadcasts across the T dim
-            offset=0,
-        ),
-    )
-
-    all_token_4_H_indices = all_token_4_H_indices.reshape((1, T * 4))
-
-    for T_div_32_idx in range(T_div_32):
-        token_4_H_indices = all_token_4_H_indices[:, T_div_32_idx * 128 : T_div_32_idx * 128 + 128]
-
-        token_4_H_indices_psum = nl.ndarray(
-            (token_4_H_indices.shape[1], token_4_H_indices.shape[0]), dtype=token_4_H_indices.dtype, buffer=nl.psum
-        )
-        nisa.nc_transpose(dst=token_4_H_indices_psum, data=token_4_H_indices)
-
-        nisa.tensor_copy(
-            dst=buffers.token_4_H_indices_on_p[:, T_div_32_idx], src=token_4_H_indices_psum, engine=nisa.scalar_engine
-        )
-
-
-def load_hidden_states(
-    inps: InputTensors,
-    token_4_H_indices_on_p: nl.ndarray,
-    block_hidden_states,
-    dims: BWMMMXFP4DimensionSizes,
-    skip_dma: SkipMode,
-):
-    """
-    Load hidden states from HBM to SBUF using precomputed indices.
-
-    Uses indirect DGE with token_4_H_indices_on_p to gather hidden states
-    for tokens in current block.
-
-    Args:
-        inps (InputTensors): Input tensors with hidden_states [T, H].
-        token_4_H_indices_on_p (nl.ndarray): Precomputed indices [128, B/32].
-        block_hidden_states (nl.ndarray): Destination buffer [128, B/32, H/512, 128].
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration.
-        skip_dma (SkipMode): DMA skip configuration.
-
-    Returns:
-        None: Modifies block_hidden_states in-place.
-
-    Notes:
-        - Reshapes hidden_states to [T*4, H/512, 128] for folded access
-        - Processes B/32 tiles with H/512 subtiles
-        - Skips invalid tokens when skip_dma.skip_token is True
-
-    Pseudocode:
-        B = dims.B
-        H_div_512 = H // 512
-        B_div_32 = B // 32
-        hidden_states_view = reshape hidden_states to [T*4, H_div_512, 128]
-
-        for B_div_32_idx in range(B_div_32):
-            dma_copy hidden_states_view[token_4_H_indices_on_p[:, B_div_32_idx], :, :] to block_hidden_states[:, B_div_32_idx, :, :]
-    """
-    B = dims.B
-    H_div_512 = dims.H // 512
-    B_div_32 = B // 32
-
-    hidden_states_view = inps.hidden_states.reshape((dims.T * _q_width, H_div_512, _pmax))
-
-    if DBG_KERNEL:
-        pass
-
-    for B_div_32_idx in range(B_div_32):
-        nisa.dma_copy(
-            src=hidden_states_view.ap(
-                pattern=[[H_div_512 * _pmax, 32 * 4], [1, 1], [_pmax, H_div_512], [1, 16 * 8]],
-                offset=0,
-                vector_offset=token_4_H_indices_on_p.ap(
-                    [[B_div_32, _pmax], [1, 1]],
-                    offset=B_div_32_idx,
-                ),
-                indirect_dim=0,
-            ),
-            dst=block_hidden_states.ap(
-                pattern=[
-                    [B_div_32 * H_div_512 * _pmax, 32 * 4],
-                    [H_div_512 * _pmax, 1],
-                    [_pmax, H_div_512],
-                    [1, 16 * 8],
-                ],
-                offset=B_div_32_idx * H_div_512 * _pmax,
-            ),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-        )
-
-
-def quantize_block_hidden_state_T(buffers: SharedBuffers, prj_cfg: ProjConfig, dims: BWMMMXFP4DimensionSizes):
-    """
-    Quantize transposed block hidden states to MXFP4 format.
-
-    Performs online quantization of hidden states from BF16/FP32 to MXFP4
-    with per-block scaling factors.
-
-    Args:
-        buffers (SharedBuffers): Buffers with block_hidden_states_T, hidden_qtz_sb, hidden_scale_sb.
-        prj_cfg (ProjConfig): Projection configuration.
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration.
-
-    Returns:
-        None: Modifies buffers.hidden_qtz_sb and buffers.hidden_scale_sb in-place.
-
-    Notes:
-        - Input shape: [128, n_H512_tile, B/32, 128]
-        - Output quantized shape: [128, n_H512_tile, B/32, 32]
-        - Output scale shape: [128, n_H512_tile, B/32, 32]
-        - Uses quantize_mx for hardware-accelerated quantization
-
-    Pseudocode:
-        quantize_mx(
-            src=block_hidden_states_T[:128, :n_H512_tile, :B//32, :128],
-            dst=hidden_qtz_sb[:128, :n_H512_tile, :B//32, :32],
-            dst_scale=hidden_scale_sb[:128, :n_H512_tile, :B//32, :32]
-        )
-    """
-    nisa.quantize_mx(
-        src=buffers.block_hidden_states_T[:_pmax, : prj_cfg.n_H512_tile, : (dims.B // 32), :128],
-        dst=buffers.hidden_qtz_sb[:_pmax, : prj_cfg.n_H512_tile, : (dims.B // 32), :32],
-        dst_scale=buffers.hidden_scale_sb[:_pmax, : prj_cfg.n_H512_tile, : (dims.B // 32), :32],
-    )
-
-
-def load_and_quantize_hidden_states(
-    inps: InputTensors,
-    block_idx,
-    buffers: SharedBuffers,
-    dims: BWMMMXFP4DimensionSizes,
-    kernel_cfg: BWMMMXFP4Configs,
-    prj_cfg: ProjConfig,
-    is_block_idx_dynamic: bool = False,
-):
-    """
-    Load, transpose, and quantize hidden states for current block.
-
-    Orchestrates the complete pipeline: load from HBM, transpose layout,
-    and quantize to MXFP4 format.
-
-    Args:
-        inps (InputTensors): Input tensors.
-        block_idx (int): Current block index.
-        buffers (SharedBuffers): Shared buffers for intermediate results.
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration.
-        kernel_cfg (BWMMMXFP4Configs): Kernel configuration.
-        prj_cfg (ProjConfig): Projection configuration.
-        is_block_idx_dynamic (bool): Whether using dynamic block indexing.
-
-    Returns:
-        None: Modifies buffers in-place with quantized hidden states.
-
-    Notes:
-        - Supports both DMA transpose and PE transpose methods
-        - Reshapes buffers for quantization
-        - Called once per block during processing
-
-    Pseudocode:
-        if USE_DMA_TRANSPOSE:
-            load_hidden_states_with_dma_transpose(inps, block_idx, buffers.block_hidden_states_T, dims, skip_dma)
-        else:
-            compute_hidden_index_vector(inps, buffers, block_idx, dims, skip_dma, is_block_idx_dynamic)
-            load_hidden_states(inps, buffers.token_4_H_indices_on_p, buffers.block_hidden_states, dims, skip_dma)
-            sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims)
-
-        reshape buffers.hidden_qtz_sb to [128, n_H512_tile, B//32, 32]
-        reshape buffers.hidden_scale_sb to [128, n_H512_tile, B//32, 32]
-        quantize_block_hidden_state_T(buffers, prj_cfg, dims)
-    """
-    if USE_DMA_TRANSPOSE:
-        load_hidden_states_with_dma_transpose(inps, block_idx, buffers.block_hidden_states_T, dims, kernel_cfg.skip_dma)
-    else:
-        compute_hidden_index_vector(inps, buffers, block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic)
-        load_hidden_states(inps, buffers.token_4_H_indices_on_p, buffers.block_hidden_states, dims, kernel_cfg.skip_dma)
-        sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims)
-
-    buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
-    buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
-
-    # quantize. Note that online quantize can only quantize to fp8
-    quantize_block_hidden_state_T(buffers, prj_cfg, dims)
-
-
 def compute_one_block(
     block_idx: int,
     next_block_idx: int,
     buffers: SharedBuffers,
-    dims: BWMMMXFP4DimensionSizes,
+    dims: BWMMMXDimensionSizes,
     inps: InputTensors,
     outs: OutputTensors,
     dbg_tensors: DebugTensors,
-    kernel_cfg: BWMMMXFP4Configs,
+    kernel_cfg: BWMMMXConfigs,
     prj_cfg: ProjConfig,
     shard_id: Any,
     is_dummy: bool = False,
     is_dynamic: bool = False,
+    is_first_block: bool = False,
 ):
     """
     Process one block through complete MoE MLP pipeline.
@@ -1433,11 +981,11 @@ def compute_one_block(
         block_idx (int): Current block index.
         next_block_idx (int): Next block index for prefetching (None if last).
         buffers (SharedBuffers): Shared computation buffers.
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration.
+        dims (BWMMMXDimensionSizes): Dimension configuration.
         inps (InputTensors): Input tensors.
         outs (OutputTensors): Output tensors.
         dbg_tensors (DebugTensors): Debug tensors (if enabled).
-        kernel_cfg (BWMMMXFP4Configs): Kernel configuration.
+        kernel_cfg (BWMMMXConfigs): Kernel configuration.
         prj_cfg (ProjConfig): Projection configuration.
         shard_id (Any): Current shard identifier.
         is_dummy (bool): Whether this is a dummy block (for load balancing).
@@ -1471,16 +1019,18 @@ def compute_one_block(
 
         token_indices_2D = load_token_indices(token_position_to_id, block_idx, B, n_B128_tiles)
         expert_affinity = calculate_expert_affinities(expert_affinities_masked, token_indices_2D, block_expert, E, B//128, compute_dtype, skip_dma)
-        block_old = load_old_block_bwmm_mxfp4(output, token_indices_2D, block_old, B//128, compute_dtype, shard_id, skip_dma)
+        block_old = load_prev_block(output, token_indices_2D, block_old, B//128, compute_dtype, shard_id, skip_dma)
 
-        gate_proj_out = gate_up_projection_mx_tp_shard_H(hidden_qtz_sb, hidden_scale_sb, gate_weights, gate_scales, gate_bias, cfg)
+        gate_proj_out = gate_up_proj_mxfp4_tp(hidden_qtz_sb, hidden_scale_sb, gate_weights, gate_scales, gate_bias, cfg)
         gate_proj_out = clamp(gate_proj_out, gate_clamp_lower_limit, gate_clamp_upper_limit)
 
-        up_proj_out = gate_up_projection_mx_tp_shard_H(hidden_qtz_sb, hidden_scale_sb, up_weights, up_scales, up_bias, cfg)
+        up_proj_out = gate_up_proj_mxfp4_tp(hidden_qtz_sb, hidden_scale_sb, up_weights, up_scales, up_bias, cfg)
         up_proj_out = clamp(up_proj_out, up_clamp_lower_limit, up_clamp_upper_limit)
 
         if next_block_idx is not None:
-            load_and_quantize_hidden_states(inps, next_block_idx, buffers, dims, kernel_cfg, prj_cfg, is_dynamic)
+            load_and_quantize_hidden_states(
+                inps, next_block_idx, buffers, dims, kernel_cfg, prj_cfg, is_dynamic, USE_DMA_TRANSPOSE
+            )
 
         if activation_function == SiLU:
             gate_proj_out = silu(gate_proj_out)
@@ -1488,7 +1038,7 @@ def compute_one_block(
             gate_proj_out = gelu_apprx_sigmoid(gate_proj_out)
 
         intermediate_state = gate_proj_out * up_proj_out
-        block_new = down_projection_mx_shard_H(intermediate_state, down_weight, down_scale, down_bias, cfg)
+        block_new = down_proj_mxfp4(intermediate_state, down_weight, down_scale, down_bias, cfg)
 
         for n in range(B // 128):
             if is_dummy:
@@ -1515,14 +1065,22 @@ def compute_one_block(
     buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B))
     buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B))
 
-    gate_and_up_weights, gate_and_up_scales, gup_bias = load_gup_weights_scales_mx4(
-        inps, block_expert, dims, prj_cfg=prj_cfg, skip_dma=kernel_cfg.skip_dma
+    gate_and_up_weights, gate_and_up_scales, gup_bias, gup_token_indices_on_p, gup_n_quadrants_needed = (
+        load_gup_weights_scales_mx(inps, block_expert, dims, prj_cfg=prj_cfg, skip_dma=kernel_cfg.skip_dma)
     )
 
-    down_scale_sb, down_bias_sb = load_down_proj_weights_mx4(
-        inps, block_expert, buffers.down_weight_qtz, dims, prj_cfg, kernel_cfg.skip_dma
+    down_scale_sb, down_bias_sb = load_down_proj_weights_mx(
+        inps,
+        block_expert,
+        buffers.down_weight_qtz,
+        dims,
+        prj_cfg,
+        kernel_cfg.skip_dma,
+        gup_token_indices_on_p,
+        gup_n_quadrants_needed,
+        dst_scale=buffers.down_scale_sb,
     )
-    down_bias_broadcasted = nl.ndarray((_pmax, dims.H), dtype=down_bias_sb.dtype, buffer=nl.sbuf)
+    # TensorView handles broadcast in down_proj_mxfp4
     flatten_free_dim = prj_cfg.n_total_I512_tile * dims.B * _q_width
 
     if is_dynamic:
@@ -1537,25 +1095,28 @@ def compute_one_block(
         f"Expect token_indices_2D to have shape (128, {dims.n_B128_tiles}), got {token_indices_2D.shape}",
     )
 
+    # Skip load for first block (output is already zero-initialized)
+    if not is_first_block:
+        block_old = load_prev_block(
+            outs.output,
+            token_indices_2D,
+            buffers.block_old,
+            dims.B // 128,
+            kernel_cfg.compute_dtype,
+            shard_id,
+            kernel_cfg.skip_dma,
+        )
+
     expert_affinity = calculate_expert_affinities(
         inps.expert_affinities_masked,
         token_indices_2D,
         block_expert,
         dims.E,
         dims.B // 128,
-        kernel_cfg.compute_dtype,
+        nl.float32,
         kernel_cfg.skip_dma,
     )
 
-    block_old = load_old_block_bwmm_mxfp4(
-        outs.output,
-        token_indices_2D,
-        buffers.block_old,
-        dims.B // 128,
-        kernel_cfg.compute_dtype,
-        shard_id,
-        kernel_cfg.skip_dma,
-    )
     """
     GATE PROJECTION
     """
@@ -1563,17 +1124,16 @@ def compute_one_block(
     gup_scales_reshaped = gate_and_up_scales.reshape((_pmax, 2 * prj_cfg.n_H512_tile_sharded, dims.I))
     gup_bias_reshaped = gup_bias.reshape((_pmax, 2 * prj_cfg.n_total_I512_tile, _q_width))
 
-    gate_bias_sb = nl.ndarray((_pmax, prj_cfg.n_total_I512_tile, _q_width), dtype=gup_bias.dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(
-        dst=gate_bias_sb, src=gup_bias_reshaped[:, 0 : prj_cfg.n_total_I512_tile, :], engine=nisa.vector_engine
-    )
+    # Use TensorView to slice bias without tensor_copy
+    gup_bias_view = TensorView(gup_bias_reshaped)
+    gate_bias_view = gup_bias_view.slice(dim=1, start=0, end=prj_cfg.n_total_I512_tile)
 
     gate_proj_out_sb = gate_up_projection_mx_tp_shard_H(
-        hidden_qtz_sb=buffers.hidden_qtz_sb[:, :, :],
-        hidden_scale_sb=buffers.hidden_scale_sb[:, :, :],
-        weight_qtz=gup_weights_reshaped[:, 0 : prj_cfg.n_H512_tile_sharded, :],
-        weight_scale=gup_scales_reshaped[:, 0 : prj_cfg.n_H512_tile_sharded, :],
-        bias_sb=gate_bias_sb,
+        hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
+        hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
+        weight_qtz=TensorView(gup_weights_reshaped).slice(1, 0, prj_cfg.n_H512_tile_sharded),
+        weight_scale=TensorView(gup_scales_reshaped).slice(1, 0, prj_cfg.n_H512_tile_sharded),
+        bias_sb=gate_bias_view,
         cfg=prj_cfg,
     )
 
@@ -1597,20 +1157,19 @@ def compute_one_block(
     """
     UP PROJECTION
     """
-    # can't do an ap on an already sliced tensor
-    up_bias_sb = nl.ndarray((_pmax, prj_cfg.n_total_I512_tile, _q_width), dtype=gup_bias.dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(
-        dst=up_bias_sb,
-        src=gup_bias_reshaped[:, prj_cfg.n_total_I512_tile : 2 * prj_cfg.n_total_I512_tile, :],
-        engine=nisa.vector_engine,
-    )
+    # Use TensorView to slice bias without tensor_copy
+    up_bias_view = gup_bias_view.slice(dim=1, start=prj_cfg.n_total_I512_tile, end=2 * prj_cfg.n_total_I512_tile)
 
     up_proj_out_sb = gate_up_projection_mx_tp_shard_H(
-        hidden_qtz_sb=buffers.hidden_qtz_sb,
-        hidden_scale_sb=buffers.hidden_scale_sb,
-        weight_qtz=gup_weights_reshaped[:, prj_cfg.n_H512_tile_sharded : 2 * prj_cfg.n_H512_tile_sharded, :],
-        weight_scale=gup_scales_reshaped[:, prj_cfg.n_H512_tile_sharded : 2 * prj_cfg.n_H512_tile_sharded, :],
-        bias_sb=up_bias_sb,
+        hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
+        hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
+        weight_qtz=TensorView(gup_weights_reshaped).slice(
+            1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded
+        ),
+        weight_scale=TensorView(gup_scales_reshaped).slice(
+            1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded
+        ),
+        bias_sb=up_bias_view,
         cfg=prj_cfg,
     )
 
@@ -1634,15 +1193,23 @@ def compute_one_block(
         LOAD, TRANSPOSE, AND QUANTIZE BLOCK HIDDEN STATES
         """
         if USE_DMA_TRANSPOSE:
-            load_hidden_states_with_dma_transpose(
-                inps, next_block_idx, buffers.block_hidden_states_T, dims, kernel_cfg.skip_dma
+            load_hidden_states_mx(
+                inps,
+                dims,
+                kernel_cfg.skip_dma,
+                block_idx=next_block_idx,
+                block_hidden_states_T=buffers.block_hidden_states_T,
+                use_dma_transpose=True,
             )
-            stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
         else:
-            load_hidden_states(
-                inps, buffers.token_4_H_indices_on_p, buffers.block_hidden_states, dims, kernel_cfg.skip_dma
+            load_hidden_states_mx(
+                inps,
+                dims,
+                kernel_cfg.skip_dma,
+                token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
+                block_hidden_states=buffers.block_hidden_states,
+                use_dma_transpose=False,
             )
-            stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
             sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims)
 
         buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
@@ -1653,7 +1220,6 @@ def compute_one_block(
             quantize_block_hidden_state_T(buffers, prj_cfg, dims)
 
     else:
-        stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
         buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
         buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
 
@@ -1694,7 +1260,7 @@ def compute_one_block(
         inter_sb=intermediate_state_sb,
         weight=buffers.down_weight_qtz,
         weight_scale=down_scale_sb,
-        bias_sb=down_bias_broadcasted,
+        bias_sb=down_bias_sb,
         cfg=prj_cfg,
     )
 
@@ -1717,20 +1283,24 @@ def compute_one_block(
         )
 
         # accumulate
-        nisa.tensor_tensor(
-            dst=block_new[0:_pmax, n, 0 : dims.H],
-            data1=block_new[0:_pmax, n, 0 : dims.H],
-            op=nl.add,
-            data2=block_old[0:_pmax, n, 0 : dims.H],
-        )
+        if not is_first_block:
+            nisa.tensor_tensor(
+                dst=block_new[0:_pmax, n, 0 : dims.H],
+                data1=block_new[0:_pmax, n, 0 : dims.H],
+                op=nl.add,
+                data2=block_old[0:_pmax, n, 0 : dims.H],
+            )
 
-        # output shape: (num_shards, T, H)
+        """
+        Scatter write block results to output tensor.
+        
+        output shape: (num_shards, T, H)
+        block_new shape: (_pmax, n_B128_tiles, H)
+        Each partition writes H elements to output[shard_id, token_idx, :]
+        Use AP for dst with vector_offset for indirect scatter, direct slice for src
+        """
         T = outs.output.shape[-2]
         shard_offset = shard_id * T * dims.H
-
-        # block_new shape: (_pmax, n_B128_tiles, H)
-        # Scatter write: each partition writes H elements to output[shard_id, token_idx, :]
-        # Use AP for dst with vector_offset for indirect scatter, direct slice for src
 
         # (128, 2)
         block_token_mapping = token_indices_2D.ap(
@@ -1752,111 +1322,9 @@ def compute_one_block(
         )
 
 
-def load_hidden_states_with_dma_transpose(
-    inps: InputTensors, block_idx, block_hidden_states_T, dims: BWMMMXFP4DimensionSizes, skip_dma: SkipMode
-):
-    """
-    Load and transpose hidden states using DMA transpose operation.
-
-    Alternative to PE-based transpose, uses hardware DMA transpose for
-    potentially better performance.
-
-    Args:
-        inps (InputTensors): Input tensors with hidden_states and token_position_to_id.
-        block_idx (int): Current block index.
-        block_hidden_states_T (nl.ndarray): Destination buffer for transposed states.
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration.
-        skip_dma (SkipMode): DMA skip configuration.
-
-    Returns:
-        None: Modifies block_hidden_states_T in-place.
-
-    Notes:
-        - Uses nisa.dma_transpose with axes=(2,1,0)
-        - Processes B/32 tiles with multi-buffering
-        - May have hardware limitations compared to PE transpose
-        - Directly produces transposed layout
-
-    Pseudocode:
-        B = dims.B
-        H_div_512 = H // 512
-        B_div_32 = B // 32
-
-        token_indices = load token_position_to_id[block_idx*B:(block_idx+1)*B]
-        arange_4H = [0, 1, 2, 3]
-        all_token_4_H_indices = token_indices * 4 + arange_4H
-        all_token_4_H_indices = reshape to [1, B*4]
-
-        for B_div_32_idx in range(B_div_32):
-            token_4_H_indices = all_token_4_H_indices[:, B_div_32_idx*128:(B_div_32_idx+1)*128]
-            token_4_H_indices_on_p = transpose token_4_H_indices to partition dimension
-            dma_transpose hidden_states[token_4_H_indices_on_p, :, :] to block_hidden_states_T[:, :, B_div_32_idx, :] with axes=(2,1,0)
-    """
-    B = dims.B
-    H_div_512 = dims.H // 512
-    B_div_32 = B // 32
-
-    hidden_states = inps.hidden_states
-    token_position_to_id = inps.token_position_to_id
-    # We will use a 128-partition indirect DGE to load 32 tokens at a time, with H dim folded 4 times onto 4 partitions.
-    token_indices = nl.ndarray((1, dims.B), dtype=token_position_to_id.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=token_indices,
-        src=token_position_to_id.reshape((1, token_position_to_id.shape[0]))[
-            :, block_idx * dims.B : dims.B * (block_idx + 1)
-        ],
-        oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-    )
-    kernel_assert(token_indices.shape == (1, dims.B), f'token_indices.shape = {token_indices.shape}')
-    # hidden_states has shape of [T, H]
-    # We will view it as [T * 4, H // 4], and do a 128-partition vector DGE on the outermost dim of T * 4.
-    # To do so, the loaded 32 token indices should be multiplied by 4, and each added with 0, 1, 2, 3.
-    arange_4H = nl.ndarray((1, 4), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(arange_4H, [[1, 4]], offset=0)
-
-    all_token_4_H_indices = nl.ndarray((1, dims.B, 4), dtype=nl.float32, buffer=nl.sbuf)
-
-    # Using AP with step=0 for broadcast:
-    # - token_indices (1, B) broadcast to (1, B, 4): step=0 on the 4 dim
-    # - arange_4H (1, 4) broadcast to (1, B, 4): step=0 on the B dim
-    nisa.scalar_tensor_tensor(
-        dst=all_token_4_H_indices,
-        data=token_indices.ap(pattern=[[dims.B, 1], [1, dims.B], [0, 4]], offset=0),
-        op0=nl.multiply,
-        operand0=4.0,
-        op1=nl.add,
-        operand1=arange_4H.ap(pattern=[[4, 1], [0, dims.B], [1, 4]], offset=0),
-    )
-
-    all_token_4_H_indices = all_token_4_H_indices.reshape((1, dims.B * 4))
-    kernel_assert(all_token_4_H_indices.shape == (1, dims.B * 4), f'got {all_token_4_H_indices.shape}')
-    for B_div_32_idx in range(B_div_32):  # directives=[ncc.multi_buffer(8)]
-        token_4_H_indices = all_token_4_H_indices[:, B_div_32_idx * 128, B_div_32_idx * 128 + 128]
-        token_4_H_indices_psum = nl.ndarray(
-            (token_4_H_indices.shape[1], token_4_H_indices.shape[0]), dtype=token_4_H_indices.dtype, buffer=nl.psum
-        )
-        nisa.nc_transpose(dst=token_4_H_indices_psum, data=token_4_H_indices)
-
-        token_4_H_indices_on_p = nl.ndarray(token_4_H_indices_psum.shape, dtype=nl.uint32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=token_4_H_indices_on_p, src=token_4_H_indices_psum, engine=nisa.scalar_engine)
-
-        kernel_assert(
-            token_4_H_indices_on_p.shape == (128, 1), f'token_4_H_indices.shape = {token_4_H_indices_on_p.shape}'
-        )
-
-        nisa.dma_transpose(
-            dst=block_hidden_states_T[: (32 * 4), :H_div_512, B_div_32_idx, : (16 * 8)],
-            src=hidden_states.reshape((dims.T * 4, H_div_512, 128))[
-                token_4_H_indices_on_p[:, 0], :H_div_512, : (16 * 8)
-            ],
-            axes=(2, 1, 0),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-        )
-
-
 def process_static_blocks(
-    dims: BWMMMXFP4DimensionSizes,
-    configs: BWMMMXFP4Configs,
+    dims: BWMMMXDimensionSizes,
+    configs: BWMMMXConfigs,
     prj_cfg: ProjConfig,
     inps: InputTensors,
     outs: OutputTensors,
@@ -1871,8 +1339,8 @@ def process_static_blocks(
     computation and data loading.
 
     Args:
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration.
-        configs (BWMMMXFP4Configs): Kernel configuration.
+        dims (BWMMMXDimensionSizes): Dimension configuration.
+        configs (BWMMMXConfigs): Kernel configuration.
         prj_cfg (ProjConfig): Projection configuration.
         inps (InputTensors): Input tensors.
         outs (OutputTensors): Output tensors.
@@ -1916,12 +1384,24 @@ def process_static_blocks(
     first_block_idx = n_blocks_per_shard * dims.shard_id
 
     if USE_DMA_TRANSPOSE:
-        load_hidden_states_with_dma_transpose(
-            inps, first_block_idx, buffers.block_hidden_states_T, dims, configs.skip_dma
+        load_hidden_states_mx(
+            inps,
+            dims,
+            configs.skip_dma,
+            block_idx=first_block_idx,
+            block_hidden_states_T=buffers.block_hidden_states_T,
+            use_dma_transpose=True,
         )
     else:
         compute_hidden_index_vector(inps, buffers, first_block_idx, dims, configs.skip_dma, False)
-        load_hidden_states(inps, buffers.token_4_H_indices_on_p, buffers.block_hidden_states, dims, configs.skip_dma)
+        load_hidden_states_mx(
+            inps,
+            dims,
+            configs.skip_dma,
+            token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
+            block_hidden_states=buffers.block_hidden_states,
+            use_dma_transpose=False,
+        )
         sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims)
 
     buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
@@ -1948,6 +1428,7 @@ def process_static_blocks(
                 kernel_cfg=configs,
                 prj_cfg=prj_cfg,
                 shard_id=dims.shard_id,
+                is_first_block=(per_shard_block_idx == 0),
             )
 
         last_block_idx = n_blocks_per_shard * dims.shard_id + n_blocks_per_shard - 1
@@ -1983,6 +1464,7 @@ def process_static_blocks(
                 kernel_cfg=configs,
                 prj_cfg=prj_cfg,
                 shard_id=dims.shard_id,
+                is_first_block=(per_shard_block_idx == 0),
             )
 
         # one last remaining block
@@ -2006,8 +1488,8 @@ def process_static_blocks(
 
 
 def process_dynamic_blocks(
-    dims: BWMMMXFP4DimensionSizes,
-    configs: BWMMMXFP4Configs,
+    dims: BWMMMXDimensionSizes,
+    configs: BWMMMXConfigs,
     prj_cfg: ProjConfig,
     inps: InputTensors,
     outs: OutputTensors,
@@ -2023,8 +1505,8 @@ def process_dynamic_blocks(
     processing two blocks per iteration (ping-pong between shards).
 
     Args:
-        dims (BWMMMXFP4DimensionSizes): Dimension configuration.
-        configs (BWMMMXFP4Configs): Kernel configuration.
+        dims (BWMMMXDimensionSizes): Dimension configuration.
+        configs (BWMMMXConfigs): Kernel configuration.
         prj_cfg (ProjConfig): Projection configuration.
         inps (InputTensors): Input tensors with conditions vector.
         outs (OutputTensors): Output tensors.
@@ -2072,33 +1554,34 @@ def process_dynamic_blocks(
         f"num_static_blocks + num_dynamic_blocks must equal N, got {num_static_blocks} + {num_dynamic_blocks}!= {dims.N} ",
     )
 
-    print(f"Start looping over dynamic blocks {num_static_blocks} to {dims.cond_vec_len} - 1")
+    logger.info(f"Start looping over dynamic blocks {num_static_blocks} to {dims.cond_vec_len} - 1")
 
-    print("Prefetch first block for each core")
-    first_block_idx = num_static_blocks + dims.shard_id  # ping-pong
-    load_and_quantize_hidden_states(inps, first_block_idx, buffers, dims, configs, prj_cfg)
+    logger.info("Prefetch first block for each core")
+    first_block_idx = num_static_blocks + dims.shard_id
+    load_and_quantize_hidden_states(
+        inps, first_block_idx, buffers, dims, configs, prj_cfg, use_dma_transpose=USE_DMA_TRANSPOSE
+    )
 
-    # New register-based dynamic while loop
     reg = nisa.register_alloc()
     nisa.register_load(reg, buffers.cond)
     while reg:
-        # we are iterating 2 blocks at a time
-        # let's say the dynamic blocks start at block 15
-        # tandem_block_idx: 15 17 19 21 ...
-        # block_idx:
-        # - on core 0: 15 17 19 ...
-        # - on core 1: 16 18 20 ...
-        tandem_block_idx = nl.ndarray(buffers.index.shape, dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(tandem_block_idx, buffers.index, engine=nisa.vector_engine)
-        # dyn_block_idx = tandem_block_idx + dims.shard_id
-        dyn_block_idx = nl.ndarray(tandem_block_idx.shape, dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dyn_block_idx, tandem_block_idx, op0=nl.add, operand0=dims.shard_id)
+        """
+        Iterate 2 blocks at a time in ping-pong fashion.
+        
+        Example: if dynamic blocks start at block 15:
+        - tandem_block_idx: 15, 17, 19, 21, ...
+        - block_idx on core 0: 15, 17, 19, ...
+        - block_idx on core 1: 16, 18, 20, ...
+        """
+        # Compute dyn_block_idx = buffers.index + shard_id directly
+        dyn_block_idx = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dyn_block_idx, buffers.index, op0=nl.add, operand0=dims.shard_id)
 
-        # on each core, next block_idx = min(block_idx + 2, N-1)
-        tmp_fp32_val = nl.ndarray(dyn_block_idx.shape, dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(tmp_fp32_val, dyn_block_idx, op0=nl.add, operand0=2.0, op1=nl.minimum, operand1=dims.N - 1.0)
-        dyn_next_block_idx = nl.ndarray(tmp_fp32_val.shape, dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(dyn_next_block_idx, tmp_fp32_val, engine=nisa.vector_engine)
+        # Compute dyn_next_block_idx = min(dyn_block_idx + 2, N-1) directly
+        dyn_next_block_idx = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dyn_next_block_idx, dyn_block_idx, op0=nl.add, operand0=2, op1=nl.minimum, operand1=dims.N - 1
+        )
         compute_one_block(
             dyn_block_idx,
             dyn_next_block_idx,
@@ -2111,30 +1594,15 @@ def process_dynamic_blocks(
             prj_cfg=prj_cfg,
             shard_id=dims.shard_id,
             is_dynamic=True,
+            is_first_block=False,
         )
 
-        # tandem_next_block_idx = nl.add(tandem_block_idx, 2)
-        tandem_next_block_idx = nl.ndarray(tandem_block_idx.shape, dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(tandem_next_block_idx, tandem_block_idx, op0=nl.add, operand0=2)
+        # Compute tandem_next_block_idx = buffers.index + 2 directly
+        nisa.tensor_scalar(buffers.index, buffers.index, op0=nl.add, operand0=2)
 
-        cond_next = nl.ndarray((1, 1), dtype=inps.conditions.dtype, buffer=nl.sbuf)
         nisa.dma_copy(
-            dst=cond_next,
-            src=inps.conditions.ap(
-                pattern=[[1, 1], [1, 1]], offset=0, scalar_offset=tandem_next_block_idx, indirect_dim=0
-            ),
-        )
-
-        # update tandem_block_index
-        nisa.tensor_copy(
-            dst=buffers.index.ap(pattern=[[1, 1], [1, 1]], offset=0),
-            src=tandem_next_block_idx.ap(pattern=[[1, 1], [1, 1]], offset=0),
-            engine=nisa.vector_engine,
-        )
-        nisa.tensor_copy(
-            dst=buffers.cond.ap(pattern=[[1, 1], [1, 1]], offset=0),
-            src=cond_next.ap(pattern=[[1, 1], [1, 1]], offset=0),
-            engine=nisa.vector_engine,
+            dst=buffers.cond,
+            src=inps.conditions.ap(pattern=[[1, 1], [1, 1]], offset=0, scalar_offset=buffers.index, indirect_dim=0),
         )
 
         # Reload register for next iteration

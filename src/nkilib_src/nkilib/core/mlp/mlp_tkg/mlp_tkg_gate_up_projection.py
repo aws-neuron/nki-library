@@ -14,8 +14,6 @@
 
 """Gate and Up projection sub-kernels for MLP TKG with column tiling and LHS/RHS swap modes."""
 
-import math
-
 import nki
 import nki.isa as nisa
 import nki.language as nl
@@ -23,7 +21,7 @@ import nki.language as nl
 from ...utils.allocator import SbufManager, sizeinbytes
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_nl_act_fn_from_type
+from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
@@ -264,6 +262,7 @@ def gate_up_projection_lhs_rhs_swap(
     params: MLPParameters,
     op_name: str,
     sbm: SbufManager,
+    T_offset: int = 0,
 ):
     """
     Performs a single Gate or Up projection shard on the H using regular matmult with operands swapped
@@ -279,7 +278,9 @@ def gate_up_projection_lhs_rhs_swap(
     """
 
     # ---------- Configuration and Dimension Setup ----------
-    H0, T, _ = hidden.shape
+    H0, _, _ = hidden.shape
+    # Use dims.T (tile size) instead of hidden.shape[1], which may be T_total when hidden is in SBUF
+    T = dims.T
     shared_H = shard_dim_hidden[1] - shard_dim_hidden[0]
     shared_I = shard_dim_intr[1] - shard_dim_intr[0]
     I0 = dims.I0
@@ -479,7 +480,7 @@ def gate_up_projection_lhs_rhs_swap(
                 nisa.nc_matmul(
                     result_psums[i_tiles.index][0 : i_tiles.size, 0:T],
                     weight_tiles[weight_idx][0:H0, h1_tiles.index, nl.ds(i_tiles.index * I0, i_tiles.size)],
-                    hidden[0:H0, 0:T, h_start_offset + h1_tiles.index],
+                    hidden[0:H0, nl.ds(T_offset, T), h_start_offset + h1_tiles.index],
                 )
 
     # ---------- Accumulate partial PSUMs to output ----------
@@ -539,6 +540,7 @@ def process_gate_up_projection(
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,
+    T_offset: int = 0,
 ):
     """
     Performs the Gate/Up projection for MLP (T = BxS).
@@ -798,6 +800,7 @@ def process_gate_up_projection(
                     params=params,
                     op_name="gate",
                     sbm=sbm,
+                    T_offset=T_offset,
                 )
 
             # Up projection
@@ -817,6 +820,7 @@ def process_gate_up_projection(
                 params=params,
                 op_name="up",
                 sbm=sbm,
+                T_offset=T_offset,
             )
 
     if params.skip_gate_proj:

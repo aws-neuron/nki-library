@@ -14,8 +14,6 @@
 
 """Selective-expert MoE token generation implementation with MX (microscaling) FP4 quantization support."""
 
-from typing import Optional
-
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa.constants import oob_mode
@@ -25,16 +23,18 @@ from ...mlp.mlp_tkg.down_projection_mx_shard_H import (
     ProjConfig,
     down_projection_mx_tp_shard_H,
 )
-from ...mlp.mlp_tkg.gate_up_mx_shard_H import (
+from ...mlp.mlp_tkg.gate_up_projection_mx_shard_H import (
     process_fused_gate_up_projection_mxfp4,
 )
 
 # MLP utils
 from ...mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstants
+from ...mlp.mlp_tkg.mlp_tkg_utils import (
+    _layout_adapter_hbm,
+    _layout_adapter_sb,
+)
 from ...mlp.mlp_tkg.projection_mx_constants import (
     _pmax,
-    _psum_bmax,
-    _psum_fmax,
     _q_height,
     _q_width,
 )
@@ -44,126 +44,8 @@ from ...utils.kernel_helpers import div_ceil
 
 # Common utils
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ...utils.tensor_view import TensorView
 from .moe_tkg_utils import broadcast_token_affinity, gather_expert_affinities
-
-
-def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
-    """
-    Load and transpose input tensor from HBM to SBUF with swizzled layout.
-
-    Performs the following transformations:
-    1. Input layout in HBM: [T, H] with internally shuffled layout [T, 4_H, H/512, 16_H, 8_H]
-    2. Load input to SBUF: [4_T * 4_H (P), T/4, H/512, 16_H * 8_H]
-    3. Perform T/4 * H/512 transpose operations to swap outermost and innermost dims
-    4. Obtain swizzle layout: [16_H * 8_H(P), H/512, T/4, 4_T * 4_H]
-
-    Args:
-        src (nl.ndarray): [T, H], 5D tensor in HBM with internally shuffled layout [T, 4_H, H/512, 16_H, 8_H].
-        n_prgs (int): Number of programs.
-        prg_id (int): Program ID.
-
-    Returns:
-        result (nl.ndarray): [16_H * 8_H(P), H/512, ceil(T/4) * 4, 4_H], 4D tensor in SBUF with swizzled layout.
-    """
-    # Check for shape
-    kernel_assert(len(src.shape) == 2, f"expect input to be of the shape [T, H], got {src.shape}")
-    T, H = src.shape
-    kernel_assert(H % 512 == 0, f"Expect H to be a multiple of 512, got {H}")
-    H_div_512 = H // 512 // n_prgs
-    T_div_4 = div_ceil(T, 4)
-
-    # [16_H * 8_H(P), H/512, T/4, 4_T * 4_H]
-    result = nl.ndarray((_pmax, H_div_512, T_div_4, 4 * _q_width), dtype=src.dtype, buffer=nl.sbuf)
-    # [T, 4_H, H/512, 16_H * 8_H]
-    src = src.reshape((T, _q_width, H_div_512 * n_prgs, 16 * 8))
-    # [4_T * 4_H (P), T/4, H/512, 16_H * 8_H]
-    src_sbuf = nl.ndarray((4 * _q_width, T_div_4, H_div_512, 16 * 8), dtype=src.dtype, buffer=nl.sbuf)
-    nisa.memset(dst=src_sbuf, value=0.0)
-
-    # load to
-    # [4_T * 4_H (P), T/4, H/512, 16_H * 8_H]@SBUF
-    # from
-    # [T, 4_H, H/512, 16_H, 8_H]@HBM
-    for T_div_4_idx in range(T_div_4):
-        for H_4_idx in range(4):
-            for token_grp_idx in range(4):
-                actual_token_idx = token_grp_idx + T_div_4_idx * 4
-                if actual_token_idx < T:
-                    nisa.dma_copy(
-                        dst=src_sbuf[
-                            token_grp_idx * 4 + H_4_idx : token_grp_idx * 4 + H_4_idx + 1,
-                            T_div_4_idx : T_div_4_idx + 1,
-                            0:H_div_512,
-                            0 : 16 * 8,
-                        ],
-                        src=src[
-                            actual_token_idx : actual_token_idx + 1,
-                            H_4_idx : H_4_idx + 1,
-                            prg_id * H_div_512 : (prg_id + 1) * H_div_512,
-                            0 : 16 * 8,
-                        ],
-                    )
-
-    for T_div_4_idx in range(T_div_4):
-        for H_div_512_idx in range(H_div_512):
-            # transpose [4_T * 4_H, 16_H*8_H] -> [16_H*8_H, 4_T * 4_H]
-            tile_transposed = nl.ndarray((_pmax, 4 * _q_width), buffer=nl.psum, dtype=src_sbuf.dtype)
-            nisa.nc_transpose(
-                dst=tile_transposed, data=src_sbuf[0 : (4 * _q_width), T_div_4_idx, H_div_512_idx, 0:_pmax]
-            )
-            nisa.tensor_copy(dst=result[0:_pmax, H_div_512_idx, T_div_4_idx, 0 : (4 * _q_width)], src=tile_transposed)
-
-    T_padded = T_div_4 * 4
-    return result.reshape((_pmax, H_div_512, T_padded, _q_width))
-
-
-def _layout_adapter_sb(src: nl.ndarray, n_prgs: int, prg_id: int):
-    """
-    SBUF version of the layout adapter.
-
-    Args:
-        src (nl.ndarray): [_pmax, T, _q_width, n_H512_tiles], Input tensor in SBUF.
-        n_prgs (int): Number of programs.
-        prg_id (int): Program ID.
-
-    Returns:
-        shfl_sb (nl.ndarray): [_pmax, n_H512_tile_sharded, ceil_div(T, 4) * 4, _q_width], Shuffled tensor in SBUF.
-    """
-    kernel_assert(len(src.shape) == 3, f"expect input to have shape [_pmax, T, H//_pmax], got {src.shape}")
-    P, T, H_div_P = src.shape
-    kernel_assert(
-        P == _pmax and H_div_P % _q_width == 0,
-        f'Expect input SBUF shape to be ({_pmax}, T, <multiple-of-{_q_width}>), got {src.shape}',
-    )
-    n_H512_tiles = H_div_P // _q_width
-
-    src = src.reshape((P, T, _q_width, n_H512_tiles))
-
-    # Three things happen in the tensor_copy below,
-    # 1. shuffle the input SBUF (rmsnorm_out) from the layout of [H_128, T, H_4 * n_H512_tiles] to [H_128, n_H512_tiles, T, H_4]
-    # 2. shard on n_H512_tiles between the NCs if NOT shard_on_K
-    # 3. pad T to a multiple of 4 to satisfy quantization's AP restrictions
-
-    n_H512_tile_sharded = n_H512_tiles // n_prgs
-    T_padded = div_ceil(T, 4) * 4
-
-    shfl_sb = nl.ndarray((P, n_H512_tile_sharded, T_padded, _q_width), dtype=src.dtype, buffer=nl.sbuf)
-    nisa.memset(dst=shfl_sb, value=0.0)
-
-    nisa.tensor_copy(
-        dst=shfl_sb[:, :, :T, :],
-        src=src.ap(
-            pattern=[
-                [T * _q_width * n_H512_tile_sharded, P],
-                [1, n_H512_tile_sharded],
-                [_q_width * n_H512_tiles, T],
-                [n_H512_tiles, _q_width],
-            ],
-            offset=prg_id * n_H512_tile_sharded,
-        ),
-    )
-
-    return shfl_sb
 
 
 def _selective_expert_moe_tkg_mxfp4(
@@ -284,23 +166,22 @@ def _selective_expert_moe_tkg_mxfp4(
     expert_idx_scalar_broadcasted = nl.ndarray(
         (4, dims.T, K_sharded), dtype=params.expert_params.expert_index.dtype, buffer=nl.sbuf
     )
-    for i_t in range(dims.T):
-        for i_k in range(K_sharded):
-            i_k_lnc_adjusted = (i_k + shard_id * K_sharded) if shard_on_K else i_k
+    for i_k in range(K_sharded):
+        i_k_lnc_adjusted = (i_k + shard_id * K_sharded) if shard_on_K else i_k
 
-            # Transpose a slice of [T, 1 (i_k)] such that data starts on par 0
-            expert_idx_cur_k_tp_psum = nl.ndarray((4, dims.T), dtype=expert_idx_f32.dtype, buffer=nl.psum)
-            nisa.nc_transpose(
-                dst=expert_idx_cur_k_tp_psum,
-                data=expert_idx_f32.ap(
-                    pattern=[[dims.K, dims.T], [0, 4]], offset=i_k_lnc_adjusted
-                ),  # repeated (by 4 times) read on f-dim
-            )
-            nisa.activation(
-                dst=expert_idx_scalar_broadcasted[:, i_t, i_k],
-                op=nl.copy,
-                data=expert_idx_cur_k_tp_psum[:, i_t : i_t + 1],
-            )
+        # Transpose a slice of [T, 1 (i_k)] such that data starts on par 0
+        expert_idx_cur_k_tp_psum = nl.ndarray((4, dims.T), dtype=expert_idx_f32.dtype, buffer=nl.psum)
+        nisa.nc_transpose(
+            dst=expert_idx_cur_k_tp_psum,
+            data=expert_idx_f32.ap(
+                pattern=[[dims.K, dims.T], [0, 4]], offset=i_k_lnc_adjusted
+            ),  # repeated (by 4 times) read on f-dim
+        )
+        nisa.activation(
+            dst=expert_idx_scalar_broadcasted[:, :, i_k],
+            op=nl.copy,
+            data=expert_idx_cur_k_tp_psum[:, :],
+        )
 
     # Prepare expert index into vector DGE indices format
     p_idx_vector_gup = nl.ndarray((_pmax, dims.T, K_sharded), dtype=nl.float32, buffer=nl.sbuf, name="p_idx_vector_gup")
@@ -462,7 +343,7 @@ def _selective_expert_moe_tkg_mxfp4(
 
                     # Handle remaining partitions if they exist
                     token_indices_on_p = nl.ndarray((_pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.tensor_copy(dst=token_indices_on_p, src=p_idx_vector_down[:, i_t, i_k], dtype=nl.int32)
+                    nisa.tensor_copy(dst=token_indices_on_p, src=p_idx_vector_down[:, i_t, i_k])
                     nisa.dma_copy(
                         dst=down_scale_sb,
                         src=down_scale_view.ap(
@@ -474,24 +355,30 @@ def _selective_expert_moe_tkg_mxfp4(
                         oob_mode=oob_mode.skip,
                     )
 
-                    # Load down proj weights into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mxfp4_x4 (packed I)
+                    # Load down proj weights into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mx_x4 (packed I)
                     down_weight_qtz_sb = nl.ndarray(
-                        (_pmax, n_I512_tile, dims.H_shard), dtype=nl.float4_e2m1fn_x4, buffer=nl.sbuf
+                        (_pmax, n_I512_tile, dims.H_shard), dtype=params.down_proj_weights_tensor.dtype, buffer=nl.sbuf
                     )
                     # Memset weight if input weight HBM does not pad on par dim
                     if p_I != _pmax:
                         nisa.memset(dst=down_weight_qtz_sb[:, n_I512_tile - 1, :], value=0.0)
 
+                    # down_proj_weights_tensor shape: (E, p_I, n_I512_tile, H)
+                    H_offset = 0 if shard_on_K else (dims.shard_id * dims.H_shard)
+                    expert_scalar = (
+                        TensorView(expert_idx)
+                        .slice(dim=0, start=i_t, end=i_t + 1)
+                        .slice(dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1)
+                        .get_view()
+                    )
+                    down_weights_view = (
+                        TensorView(params.down_proj_weights_tensor)
+                        .select(dim=0, index=expert_scalar)
+                        .slice(dim=2, start=H_offset, end=H_offset + dims.H_shard)
+                    )
                     nisa.dma_copy(
                         dst=down_weight_qtz_sb[:p_I, :, :],
-                        src=params.down_proj_weights_tensor.ap(
-                            pattern=[[n_I512_tile * dims.H, p_I], [dims.H, n_I512_tile], [1, dims.H_shard]],
-                            offset=0 if shard_on_K else (dims.shard_id * dims.H_shard),
-                            scalar_offset=expert_idx.ap(
-                                pattern=[[dims.K, 1], [1, 1]], offset=i_t * dims.K + i_k_lnc_adjusted
-                            ),
-                            indirect_dim=0,
-                        ),
+                        src=down_weights_view.get_view(),
                         dge_mode=2,
                     )
 

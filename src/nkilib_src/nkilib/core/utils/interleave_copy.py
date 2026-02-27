@@ -13,9 +13,6 @@
 # limitations under the License.
 
 
-from typing import Optional
-
-import nki
 import nki.isa as nisa
 import nki.language as nl
 

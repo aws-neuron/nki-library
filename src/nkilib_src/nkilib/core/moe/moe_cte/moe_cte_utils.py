@@ -42,14 +42,11 @@ Usage:
     to ensure consistent behavior and reduce maintenance overhead.
 """
 
-import math
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, Optional
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import sendrecv
 from nki.isa.constants import oob_mode
 from nki.language import NKIObject
 
@@ -208,8 +205,6 @@ def stream_shuffle_broadcast(src, dst):
     """
     Broadcasts the first partition of src onto the partition dim of dst.
 
-    This is exactly the same as the one in neuronxcc.nki._pre_prod_kernels.stream_shuffle_broadcast.
-    The reason we must put it here is because we must remove the jit decorator.
     All inputs and outputs to this function are assumed to be in sbuf.
     This requires 2D src and dst, and the final dim of src matching the final dim of dst.
 
@@ -359,13 +354,12 @@ def load_token_indices_dynamic_block(
             dma_copy reshaped[block_idx_copy, idx*TILE_SIZE:(idx+1)*TILE_SIZE] to local_token_indices[:, idx]
         return local_token_indices
     """
-    local_token_indices = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=token_position_to_id.dtype, buffer=nl.sbuf)
-    total_size = reduce(op='mul', input=token_position_to_id.shape, initial_value=1)
+    local_token_indices = nl.ndarray(
+        (TILE_SIZE, NUM_TILES), dtype=token_position_to_id.dtype, buffer=nl.sbuf
+    )  # (128, n_B128_tiles)
+    total_size = reduce(op='mul', input=token_position_to_id.shape, initial_value=1)  # Blocks * Block_Size
     kernel_assert(total_size % B == 0, "token_position_to_id shape must be divisible by B")
-    reshaped_token_position_to_id = token_position_to_id.reshape((total_size // B, B))
-
-    block_idx_copy = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(block_idx_copy, block_idx)
+    reshaped_token_position_to_id = token_position_to_id.reshape((total_size // B, B))  # (Blocks, Block_Size)
 
     for idx in range(0, NUM_TILES):
         if skip_dma.skip_token:
@@ -374,13 +368,17 @@ def load_token_indices_dynamic_block(
         """
         Load contiguous TILE_SIZE elements from row block_idx.
         
-        src pattern [[B, 1], [1, TILE_SIZE]] accesses elements [offset, offset+1, ..., offset+TILE_SIZE-1] within row.
-        scalar_offset selects which row (block_idx * B added to base).
+        src AP: reshaped_token_position_to_id[block_idx, TILE_SIZE*idx : TILE_SIZE*(idx+1)]
+            - pattern [[1, TILE_SIZE], [1, 1]]: read TILE_SIZE contiguous elements (stride=1)
+            - offset = TILE_SIZE * idx: start at column TILE_SIZE*idx within the row
+            - scalar_offset with indirect_dim=0: adds block_idx * B (accumulated shape right of dim 0)
+            - effective start = TILE_SIZE*idx + block_idx*B = row block_idx, column TILE_SIZE*idx
+        dst AP: local_token_indices[:, idx] - write TLE_SIZE to column idx
         """
         nisa.dma_copy(
             dst=local_token_indices.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, 1]], offset=idx),
             src=reshaped_token_position_to_id.ap(
-                pattern=[[1, TILE_SIZE], [1, 1]], offset=TILE_SIZE * idx, scalar_offset=block_idx_copy, indirect_dim=0
+                pattern=[[1, TILE_SIZE], [1, 1]], offset=TILE_SIZE * idx, scalar_offset=block_idx, indirect_dim=0
             ),
             oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
         )
@@ -593,68 +591,49 @@ def calculate_expert_affinities(
         return expert_affinity_f32
     """
     v_expert = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-    stream_shuffle_broadcast(src=block_expert, dst=v_expert)
+    stream_shuffle_broadcast(block_expert, v_expert)
+    expert_affinity_f32_lst = []
 
-    expert_affinity_f32 = []
-    for n in range(NUM_TILES):
-        expert_affinity_f32.append(nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf))
+    # Vectorized address computation for all tiles at once
+    # addr_all[i, j] = token_indices[i, offset + j] * E
+    addr_all = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=addr_all,
+        op0=nl.multiply,
+        data=token_indices[0:TILE_SIZE, token_indices_offset : token_indices_offset + NUM_TILES],
+        operand0=E,
+    )
 
-    for n in range(NUM_TILES):
-        # Use pointer arithmetic to index into expert affinities
-        # addr = token_indices * E
-        addr = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=addr,
-            data=token_indices[0:TILE_SIZE, token_indices_offset + n],
-            op0=nl.multiply,
-            operand0=E,
-        )
+    # addr_fin_all[i, j] = addr_all[i, j] + v_expert[i, 0] (v_expert broadcasts across free dim)
+    addr_fin_all = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_tensor(
+        dst=addr_fin_all, data1=addr_all, op=nl.add, data2=v_expert.ap(pattern=[[1, TILE_SIZE], [0, NUM_TILES]])
+    )
 
-        # Cast so that we can workaround TensorScalarAddr check
-        v_expert_f32 = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(v_expert_f32, v_expert)
+    if skip_dma.skip_token:
+        nisa.tensor_scalar(dst=addr_fin_all, data=addr_fin_all, op0=nl.maximum, operand0=-1)
 
-        # addr_fin = addr + v_expert_f32
-        addr_fin = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=addr_fin,
-            data1=addr,
-            op=nl.add,
-            data2=v_expert_f32,
-        )
-
-        # Handle DMA skipping cases
-        if skip_dma.skip_token:
-            nisa.tensor_scalar(
-                dst=addr_fin,
-                data=addr_fin,
-                op0=nl.maximum,
-                operand0=-1,
-            )
-
-        expert_affinity_dtype = nl.ndarray((TILE_SIZE, 1), dtype=dtype, buffer=nl.sbuf)
-        if skip_dma.skip_token:
-            nisa.memset(expert_affinity_dtype[0:TILE_SIZE, 0], value=0)
-
-        # Create destination buffer in sbuf for DMA
-        expert_affinity_loaded = nl.ndarray((TILE_SIZE, 1), dtype=dtype, buffer=nl.sbuf)
-        # expert_affinities_masked shape: ((T+1) * E, 1)
-        # Use vector AP with addr_fin as vector_offset
-        if skip_dma.skip_token:
-            nisa.memset(expert_affinity_loaded, value=0)
-
+    # Load expert affinities for each tile
+    # Note: Cannot vectorize DMA loads because indirect addressing requires per-tile
+    # [TILE_SIZE, 1] address tensors - each tile has different row indices per partition lane
+    expert_affinity_f32_lst = []
+    num_cols = expert_affinities_masked.shape[1]
+    expert_affinity_dtype = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=dtype, buffer=nl.sbuf)
+    if skip_dma.skip_token:
+        nisa.memset(value=0, dst=expert_affinity_dtype)
+    for tile_idx in range(NUM_TILES):
         nisa.dma_copy(
-            dst=expert_affinity_loaded,
+            dst=expert_affinity_dtype[0:TILE_SIZE, tile_idx : tile_idx + 1],
             src=expert_affinities_masked.ap(
-                pattern=[[1, TILE_SIZE], [1, 1]], offset=0, vector_offset=addr_fin, indirect_dim=0
+                pattern=[[num_cols, TILE_SIZE], [1, 1]],
+                offset=0,
+                vector_offset=addr_fin_all.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, 1]], offset=tile_idx),
             ),
             oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
         )
+        expert_affinity_f32_lst.append(expert_affinity_dtype[0:TILE_SIZE, tile_idx : tile_idx + 1])
 
-        # Cast to float32 to be compatible with tensorscalarptr
-        nisa.tensor_copy(expert_affinity_f32[n][0:TILE_SIZE, 0], expert_affinity_loaded[0:TILE_SIZE, 0])
-
-    return expert_affinity_f32
+    return expert_affinity_f32_lst
 
 
 def reduce_outputs(

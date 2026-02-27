@@ -17,20 +17,53 @@ PyTorch reference for attention_tkg kernel
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Protocol, Tuple
 
 import torch
 
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
+from ..utils.lnc_subscriptable import LncSubscriptable
 from .attention_tkg_utils import (
     AttnTKGConfig,
+    get_total_n_prgs,
     is_batch_sharded,
+    is_s_prior_sharded,
     resize_cache_block_len_for_attention_tkg_kernel,
 )
+from .gen_mask_tkg_torch import build_full_attention_mask, build_swa_attention_mask
+
+attention_tkg_torch_ref: "LncSubscriptable[_AttentionTkgTorchRefFn]"
+"""
+PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
+
+Usage:
+    attention_tkg_torch_ref[lnc](q=..., k_active=..., ...)
+
+Args:
+    q: Query tensor
+    k_active: Active key tensor
+    v_active: Active value tensor
+    k_prior: Prior key cache tensor
+    v_prior: Prior value cache tensor
+    mask: Attention mask tensor
+    out: Output tensor (modified in-place)
+    cfg: Attention TKG configuration
+    sbm: SBUF manager (unused in torch ref)
+    inv_freqs: Inverse frequencies for RoPE
+    rope_pos_ids: Position IDs for RoPE
+    start_pos_ids: Per-query SWA window start positions
+    sink: Sink tensor for attention sink
+    active_blocks_table: Block table for block KV cache
+    k_out: Output tensor for RoPE'd keys (modified in-place)
+    DBG_TENSORS: Debug tensors tuple
+
+Returns:
+    Tuple of (out, k_out) tensors
+"""
 
 
-def attention_tkg_torch_ref(
+def _attention_tkg_torch_ref_impl(
     q: torch.Tensor,
     k_active: torch.Tensor,
     v_active: torch.Tensor,
@@ -42,22 +75,16 @@ def attention_tkg_torch_ref(
     sbm: SbufManager,
     inv_freqs: Optional[torch.Tensor] = None,
     rope_pos_ids: Optional[torch.Tensor] = None,
+    start_pos_ids: Optional[torch.Tensor] = None,
     sink: Optional[torch.Tensor] = None,
     active_blocks_table: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     DBG_TENSORS: Optional[tuple] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    PyTorch stub / reference for NKI kernel attention.attention_tkg.attention_tkg
-    with identical interface to the kernel.
-    """
-
-    # Currently hardcoding LNC to 2 and P_MAX to 128, the kernel determines LNC with nl.num_programs
-    # and P_MAX through nl.tile_size.pmax which isn't available in torch golden.
+) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    LNC = attention_tkg_torch_ref.lnc
+    # Currently hardcoding P_MAX to 128, the kernel determines P_MAX through nl.tile_size.pmax
+    # which isn't available in torch golden.
     # TODO: Need to find a better way to dynamically configure this. Confirm whether
-    # we should have an ExtraParams structure/parameter shared by torch refs that
-    # wraps this type of info
-    LNC = 2
     P_MAX = 128
 
     batch = cfg.bs
@@ -69,8 +96,9 @@ def attention_tkg_torch_ref(
     block_len = cfg.block_len
     is_block_kv = active_blocks_table is not None
     out_in_sb = cfg.out_in_sb
+    k_out_in_sb = cfg.k_out_in_sb
     attn_out_shape = (d_head, batch * q_head * s_active) if out_in_sb else (batch, q_head, d_head, s_active)
-    k_out_shape = (d_head, batch * s_active) if out_in_sb else (batch, 1, d_head, s_active)
+    k_out_shape = (d_head, batch * s_active) if k_out_in_sb else (batch, 1, d_head, s_active)
 
     if DBG_TENSORS:
         expected_len = 4 + (1 if is_block_kv else 0)
@@ -88,8 +116,6 @@ def attention_tkg_torch_ref(
     mask = mask.to(torch.uint8)
 
     active_mask = mask
-    if not cfg.use_pos_id:  # FIXME: Waiting for FE to remove the requirement for this reshape
-        active_mask = active_mask.reshape(cfg.curr_sprior, cfg.bs, cfg.q_head, cfg.s_active)
 
     reduced_blk_len = None
     DBG_ACTIVE_TABLE = None
@@ -102,7 +128,7 @@ def attention_tkg_torch_ref(
         v_prior = v_prior.unsqueeze(1)
 
         reduced_blk_len, resize_factor = resize_cache_block_len_for_attention_tkg_kernel(
-            s_prior // block_len, block_len, LNC, P_MAX
+            s_prior // block_len, block_len, get_total_n_prgs(cfg, LNC, P_MAX), P_MAX, s_prior_full
         )
 
         # Only reshape mask if NOT using use_pos_id (i.e., pre-computed full cache mask)
@@ -124,6 +150,7 @@ def attention_tkg_torch_ref(
 
     inv_freqs = inv_freqs.to(torch.float32) if inv_freqs is not None else None
     rope_pos_ids = rope_pos_ids.to(torch.float32) if rope_pos_ids is not None else None
+    start_pos_ids = start_pos_ids.to(torch.float32) if start_pos_ids is not None else None
     sink = sink.to(torch.float32) if sink is not None else None
 
     attn_out, attn_k_out, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM = _attention_tkg_fwd_ref(
@@ -135,6 +162,7 @@ def attention_tkg_torch_ref(
         active_mask=active_mask,
         inv_freqs=inv_freqs,
         rope_pos_ids=rope_pos_ids,
+        start_pos_ids=start_pos_ids,
         sink=sink,
         cfg=cfg,
     )
@@ -142,6 +170,7 @@ def attention_tkg_torch_ref(
     # Need to transpose and reshape if output is in sbuf
     if out_in_sb:
         attn_out = attn_out.permute(2, 0, 1, 3).reshape(attn_out_shape)
+    if k_out_in_sb:
         attn_k_out = attn_k_out.permute(2, 0, 1, 3).reshape(k_out_shape)
 
     kernel_assert(
@@ -157,8 +186,9 @@ def attention_tkg_torch_ref(
         k_out.copy_(attn_k_out)
 
     if DBG_TENSORS:
-        DBG_QK = _reshape_debug_tensor(DBG_QK, cfg, P_MAX, LNC, is_block_kv, reduced_blk_len)
-        DBG_QK_EXP = _reshape_debug_tensor(DBG_QK_EXP, cfg, P_MAX, LNC, is_block_kv, reduced_blk_len)
+        n_prgs = get_total_n_prgs(cfg, LNC, P_MAX)
+        DBG_QK = _reshape_debug_tensor(DBG_QK, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
+        DBG_QK_EXP = _reshape_debug_tensor(DBG_QK_EXP, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
 
         DBG_RESULTS = [
             DBG_QK,
@@ -269,6 +299,7 @@ def _attention_tkg_fwd_ref(
     active_mask,
     inv_freqs,
     rope_pos_ids,
+    start_pos_ids,
     sink,
     cfg: AttnTKGConfig,
 ):
@@ -286,11 +317,45 @@ def _attention_tkg_fwd_ref(
 
     # If use_pos_id, generate the prior mask with pos_id, then overwrite the last portion with active_mask
     if cfg.use_pos_id:
-        mask = torch.zeros((batch, q_head, s_prior, s_active), dtype=active_mask.dtype)
-        for b in range(batch):
-            pos_id = int(rope_pos_ids[b, 0])
-            mask[b, :, :pos_id, :] = 1
-            mask[..., -s_active:, :] = active_mask  # overwrite active mask onto the last portion of prior mask
+        if start_pos_ids is not None:
+            # SWA path: use build_swa_attention_mask for per-query windowed masks.
+
+            # Build causal active mask [batch, q_head, s_active, s_active]
+            causal_active = torch.tril(torch.ones(s_active, s_active, dtype=torch.float32, device=start_pos_ids.device))
+            causal_active = causal_active[None, None, :, :].expand(batch, q_head, s_active, s_active).clone()
+
+            # start_pos_ids and rope_pos_ids are [batch, s_active]
+            start_vals = start_pos_ids.reshape(batch * s_active)
+            end_vals = rope_pos_ids.reshape(batch * s_active)
+
+            mask = (
+                build_swa_attention_mask(
+                    start_vals=start_vals,
+                    end_vals=end_vals,
+                    batch=batch,
+                    num_heads=q_head,
+                    s_active=s_active,
+                    s_ctx=s_prior,
+                    active_mask=causal_active,
+                )
+                .permute(0, 1, 3, 2)
+                .to(active_mask.dtype)
+            )  # [batch, q_head, s_ctx, s_active] -> [batch, q_head, s_prior, s_active]
+        else:
+            # Standard path: build_full_attention_mask returns [batch, num_heads, s_active, s_ctx]
+            # We need [batch, q_head, s_prior, s_active], so permute dims 2 and 3
+            mask = (
+                build_full_attention_mask(
+                    cache_lens=rope_pos_ids[:, 0],  # pos_id for each batch
+                    batch=batch,
+                    num_heads=q_head,
+                    s_active=s_active,
+                    s_ctx=s_prior,
+                    include_active_mask=True,
+                )
+                .permute(0, 1, 3, 2)
+                .to(active_mask.dtype)
+            )  # [batch, q_head, s_ctx, s_active] -> [batch, q_head, s_prior, s_active]
     else:
         mask = active_mask
 
@@ -340,22 +405,31 @@ def _attention_tkg_fwd_ref(
     return out, k_active, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM
 
 
-# is_block_kv or bs_n_prgs == 1 : [b, n, s_prior, s_active] -> [P_MAX, lnc, sprior_tiles, [reduced_blk_len,] b, n, s_active]
+# is_block_kv or bs_n_prgs == 1 : [b, n, s_prior, s_active] -> [P_MAX, n_prgs, sprior_tiles, [reduced_blk_len,] b, n, s_active]
 # bs_n_prgs > 1: [b, n, s_prior, s_active] -> [s_prior, b, n, s_active]
 def _reshape_debug_tensor(
     tensor: torch.Tensor,
     cfg: AttnTKGConfig,
     p_max: int,
-    lnc: int,
+    n_prgs: int,
     is_block_kv: bool,
     reduced_blk_len: int = None,
 ):
     batch, q_head, s_prior, s_active = cfg.bs, cfg.q_head, cfg.curr_sprior, cfg.s_active
     batch_sharded = is_batch_sharded(cfg, p_max)
+    sprior_n_prgs = n_prgs if is_s_prior_sharded(cfg, p_max) else 1
     if is_block_kv:
         kernel_assert(reduced_blk_len is not None, "reduced_blk_len must be provided for block KV")
         return tensor.reshape(
-            (batch, q_head, lnc, s_prior // lnc // p_max // reduced_blk_len, p_max, reduced_blk_len, s_active)
+            (
+                batch,
+                q_head,
+                sprior_n_prgs,
+                s_prior // sprior_n_prgs // p_max // reduced_blk_len,
+                p_max,
+                reduced_blk_len,
+                s_active,
+            )
         ).permute(4, 2, 3, 5, 0, 1, 6)
     elif batch_sharded:
         if cfg.strided_mm1:
@@ -363,6 +437,65 @@ def _reshape_debug_tensor(
         else:
             return tensor.reshape((batch, q_head, s_prior // p_max, p_max, s_active)).permute(3, 2, 0, 1, 4)
     elif cfg.strided_mm1:
-        return tensor.reshape((batch, q_head, lnc, p_max, s_prior // lnc // p_max, s_active)).permute(3, 2, 4, 0, 1, 5)
+        return tensor.reshape(
+            (batch, q_head, sprior_n_prgs, p_max, s_prior // sprior_n_prgs // p_max, s_active)
+        ).permute(3, 2, 4, 0, 1, 5)
     else:
-        return tensor.reshape((batch, q_head, lnc, s_prior // lnc // p_max, p_max, s_active)).permute(4, 2, 3, 0, 1, 5)
+        return tensor.reshape(
+            (batch, q_head, sprior_n_prgs, s_prior // sprior_n_prgs // p_max, p_max, s_active)
+        ).permute(4, 2, 3, 0, 1, 5)
+
+
+# NOTE: This Protocol must match the signature of _attention_tkg_torch_ref_impl above.
+# It exists solely for IDE parameter hints when using attention_tkg_torch_ref[lnc](...).
+class _AttentionTkgTorchRefFn(Protocol):
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k_active: torch.Tensor,
+        v_active: torch.Tensor,
+        k_prior: torch.Tensor,
+        v_prior: torch.Tensor,
+        mask: torch.Tensor,
+        out: torch.Tensor,
+        cfg: AttnTKGConfig,
+        sbm: SbufManager,
+        inv_freqs: Optional[torch.Tensor] = None,
+        rope_pos_ids: Optional[torch.Tensor] = None,
+        start_pos_ids: Optional[torch.Tensor] = None,
+        sink: Optional[torch.Tensor] = None,
+        active_blocks_table: Optional[torch.Tensor] = None,
+        k_out: Optional[torch.Tensor] = None,
+        DBG_TENSORS: Optional[tuple] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
+
+        Usage:
+            attention_tkg_torch_ref[lnc](q=..., k_active=..., ...)
+
+        Args:
+            q: Query tensor
+            k_active: Active key tensor
+            v_active: Active value tensor
+            k_prior: Prior key cache tensor
+            v_prior: Prior value cache tensor
+            mask: Attention mask tensor
+            out: Output tensor (modified in-place)
+            cfg: Attention TKG configuration
+            sbm: SBUF manager (unused in torch ref)
+            inv_freqs: Inverse frequencies for RoPE
+            rope_pos_ids: Position IDs for RoPE
+            start_pos_ids: Per-query SWA window start positions
+            sink: Sink tensor for attention sink
+            active_blocks_table: Block table for block KV cache
+            k_out: Output tensor for RoPE'd keys (modified in-place)
+            DBG_TENSORS: Debug tensors tuple
+
+        Returns:
+            Tuple of (out, k_out) tensors
+        """
+        ...
+
+
+attention_tkg_torch_ref = LncSubscriptable(_attention_tkg_torch_ref_impl, _AttentionTkgTorchRefFn)

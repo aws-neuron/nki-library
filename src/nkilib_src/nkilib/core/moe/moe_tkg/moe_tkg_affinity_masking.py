@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Expert affinity masking utilities for all-expert MoE kernels.
-
-This module provides functions to mask expert affinities based on rank_id and expert_index,
-enabling unified API for all-expert and selective-expert MoE implementations.
-"""
+"""Expert affinity masking utilities for all-expert MoE kernels."""
 
 import nki.isa as nisa
 import nki.language as nl
+from nki.isa import engine
 from nki.isa.constants import dge_mode
 
-from ...utils.kernel_helpers import div_ceil
+from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
+from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+
+# Hardware constants
+_PARTITION_ALIGNMENT = 32  # Partition alignment for tensor operations
+_DGE_ALIGNMENT = 16  # DMA gather engine alignment requirement
 
 
 def mask_expert_affinities(
@@ -35,6 +37,7 @@ def mask_expert_affinities(
     K: int,
     io_dtype,
     mask_unselected_experts: bool,
+    output_in_sbuf: bool,
 ) -> nl.ndarray:
     """
     Mask expert affinities for all-expert MoE computation.
@@ -51,12 +54,21 @@ def mask_expert_affinities(
         K (int): Top-K value.
         io_dtype: Data type for computation.
         mask_unselected_experts (bool): If True, apply masking based on expert_index.
+        output_in_sbuf (bool): If True, output affinities in SBUF; otherwise in shared HBM.
 
     Returns:
-        expert_affinities_masked (nl.ndarray): [T, E_L], Masked affinities in SBUF.
+        expert_affinities_masked (nl.ndarray): [T, E_L]@SBUF or [128_T, T/128, E_L]@SBUF or [T, E_L]@HBM
+
+    Notes:
+        - For T <= 128, returns 2D tensor [T, E_L]
+        - For T > 128, returns 3D tiled tensor [T_par, n_T128_tiles, E_L]
+        - Uses indirect DMA with scalar_offset for rank-based expert slicing
     """
-    T_32s = 32 * div_ceil(T, 32)
-    E = expert_affinities.shape[1]  # Total number of experts
+    kernel_assert(
+        output_in_sbuf or not mask_unselected_experts,
+        f"mask_unselected_experts=True only supports output_in_sbuf=True, "
+        f"but got {mask_unselected_experts=}, {output_in_sbuf=}",
+    )
 
     # Load rank_id to SBUF
     rank_id_sbuf = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
@@ -71,34 +83,23 @@ def mask_expert_affinities(
         operand0=E_L,
     )
 
-    # Allocate masked affinities buffer and load with indirect DMA
-    if T <= 128:
-        # 2D output [T, E_L]
-        expert_affinities_masked = nl.ndarray((T, E_L), dtype=io_dtype, buffer=nl.sbuf)
-        nisa.dma_copy(
-            src=expert_affinities.ap(
-                pattern=[[E, T], [1, E_L]],
-                offset=0,
-                scalar_offset=expert_offset_sbuf,
-                indirect_dim=1,
-            ),
-            dst=expert_affinities_masked[0:T, 0:E_L],
-            dge_mode=dge_mode.unknown if T % 16 == 0 else dge_mode.swdge,
+    # Slice expert affinities based on rank_id, load to SBUF
+    if output_in_sbuf:
+        expert_affinities_masked = _load_slice_affinities_sbuf(
+            expert_affinities=expert_affinities,
+            expert_offset_sbuf=expert_offset_sbuf,
+            E_L=E_L,
+            T=T,
+            io_dtype=io_dtype,
         )
+    # Slice expert affinities into HBM intermediate buffer
     else:
-        # 3D tiled output [T_par, n_T128_tiles, E_L] for T > 128 (partition dim first)
-        T_par = min(T, 128)
-        n_T128_tiles = div_ceil(T, 128)
-        expert_affinities_masked = nl.ndarray((T_par, n_T128_tiles, E_L), dtype=io_dtype, buffer=nl.sbuf)
-        nisa.dma_copy(
-            src=expert_affinities.ap(
-                pattern=[[E, T_par], [T_par * E, n_T128_tiles], [1, E_L]],
-                offset=0,
-                scalar_offset=expert_offset_sbuf,
-                indirect_dim=0,
-            ),
-            dst=expert_affinities_masked[0:T_par, 0:n_T128_tiles, 0:E_L],
-            dge_mode=dge_mode.unknown,
+        expert_affinities_masked = _slice_affinities_hbm(
+            expert_affinities=expert_affinities,
+            expert_offset_sbuf=expert_offset_sbuf,
+            E_L=E_L,
+            T=T,
+            io_dtype=io_dtype,
         )
 
     # Apply masking based on expert_index when mask_unselected_experts=True
@@ -110,9 +111,90 @@ def mask_expert_affinities(
             E_L=E_L,
             T=T,
             K=K,
-            T_32s=T_32s,
             io_dtype=io_dtype,
         )
+
+    return expert_affinities_masked
+
+
+def _load_slice_affinities_sbuf(expert_affinities, expert_offset_sbuf, E_L, T, io_dtype):
+    """Load and slice expert affinities from HBM to SBUF based on rank offset."""
+    E = expert_affinities.shape[1]
+
+    if T <= 128:
+        # 2D output [T, E_L]
+        expert_affinities_masked = nl.ndarray((T, E_L), dtype=io_dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            src=expert_affinities.ap(
+                pattern=[[E, T], [1, E_L]],
+                offset=0,
+                scalar_offset=expert_offset_sbuf,
+                indirect_dim=1,
+            ),
+            dst=expert_affinities_masked[0:T, 0:E_L],
+            dge_mode=dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else dge_mode.swdge,
+        )
+    else:
+        # 3D tiled output [T_par, n_T128_tiles, E_L] for T > 128
+        T_par = nl.tile_size.pmax
+        n_T128_tiles = div_ceil(T, T_par)
+        last_tile_T = T % T_par
+        has_partial_tile = last_tile_T != 0
+        n_full_tiles = n_T128_tiles - 1 if has_partial_tile else n_T128_tiles
+
+        expert_affinities_masked = nl.ndarray(
+            (T_par, n_T128_tiles, E_L), dtype=io_dtype, buffer=nl.sbuf, name="expert_affinities_masked"
+        )
+
+        if n_full_tiles > 0:
+            nisa.dma_copy(
+                src=expert_affinities.ap(
+                    pattern=[[E, T_par], [T_par * E, n_full_tiles], [1, E_L]],
+                    offset=0,
+                    scalar_offset=expert_offset_sbuf,
+                    indirect_dim=1,
+                ),
+                dst=expert_affinities_masked[0:T_par, 0:n_full_tiles, 0:E_L],
+                dge_mode=dge_mode.unknown,
+            )
+
+        if has_partial_tile:
+            partial_tile_offset = n_full_tiles * T_par * E
+            nisa.dma_copy(
+                src=expert_affinities.ap(
+                    pattern=[[E, last_tile_T], [T_par * E, 1], [1, E_L]],
+                    offset=partial_tile_offset,
+                    scalar_offset=expert_offset_sbuf,
+                    indirect_dim=1,
+                ),
+                dst=expert_affinities_masked[0:last_tile_T, n_full_tiles : n_full_tiles + 1, 0:E_L],
+                dge_mode=dge_mode.unknown if last_tile_T % _DGE_ALIGNMENT == 0 else dge_mode.swdge,
+            )
+
+    return expert_affinities_masked
+
+
+def _slice_affinities_hbm(expert_affinities, expert_offset_sbuf, E_L, T, io_dtype):
+    """Load and slice expert affinities to shared HBM with LNC sharding."""
+    E = expert_affinities.shape[1]
+    _, n_prgs, prg_id = get_verified_program_sharding_info()
+    T_shard = T // 2 if n_prgs > 1 else T
+    T_offset = T_shard * prg_id
+
+    expert_affinities_masked = nl.ndarray(
+        (T, E_L), dtype=io_dtype, buffer=nl.shared_hbm, name="expert_affinities_masked_after_E_L_slice"
+    )
+    nisa.dma_copy(
+        src=expert_affinities.ap(
+            pattern=[[E, T_shard], [1, E_L]],
+            offset=T_offset,
+            scalar_offset=expert_offset_sbuf,
+            indirect_dim=1,
+        ),
+        dst=expert_affinities_masked[nl.ds(T_offset, T_shard), :],
+        dge_mode=dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else dge_mode.swdge,
+    )
+    nisa.core_barrier(expert_affinities_masked, (0, 1))
 
     return expert_affinities_masked
 
@@ -124,7 +206,6 @@ def _apply_expert_index_mask(
     E_L: int,
     T: int,
     K: int,
-    T_32s: int,
     io_dtype,
 ):
     """
@@ -140,38 +221,58 @@ def _apply_expert_index_mask(
         E_L (int): Number of local experts.
         T (int): Number of tokens.
         K (int): Top-K value.
-        T_32s (int): T rounded up to multiple of 32.
         io_dtype: Data type for computation.
+
+    Notes:
+        - Modifies expert_affinities_masked in-place
+        - Iterates through each local expert and applies element-wise masking
     """
+    T_32s = _PARTITION_ALIGNMENT * div_ceil(T, _PARTITION_ALIGNMENT)
+
+    # Load expert_index to SBUF if it's in HBM
+    if expert_index.buffer == nl.shared_hbm:
+        expert_index_sbuf = nl.ndarray((T, K), dtype=expert_index.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(src=expert_index[0:T, 0:K], dst=expert_index_sbuf[0:T, 0:K])
+    else:
+        expert_index_sbuf = expert_index
+
     # Broadcast expert_offset to [T_32s, K] for comparison
-    expert_offset_broadcast = nl.ndarray((T_32s, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(src=expert_offset_sbuf[0, 0], dst=expert_offset_broadcast[0:T_32s, 0:1])
+    expert_offset_broadcast = nl.ndarray((T_32s, 1), dtype=nl.uint32, buffer=nl.sbuf)
+    stream_shuffle_broadcast(src=expert_offset_sbuf[0:1, 0:1], dst=expert_offset_broadcast[0:T_32s, 0:1])
 
     expert_offset_f = nl.ndarray((T_32s, K), dtype=nl.float32, buffer=nl.sbuf)
     for k_idx in nl.affine_range(K):
-        nisa.tensor_copy(
-            src=expert_offset_broadcast[0:T_32s, 0:1],
-            dst=expert_offset_f[0:T_32s, k_idx : k_idx + 1],
-        )
+        if k_idx % 2 == 0:
+            nisa.tensor_copy(
+                src=expert_offset_broadcast[0:T_32s, 0:1],
+                dst=expert_offset_f[0:T_32s, k_idx : k_idx + 1],
+                engine=engine.vector,
+            )
+        else:
+            nisa.tensor_copy(
+                src=expert_offset_broadcast[0:T_32s, 0:1],
+                dst=expert_offset_f[0:T_32s, k_idx : k_idx + 1],
+                engine=engine.scalar,
+            )
 
     # For each local expert, mask affinities
     for expert_idx in nl.affine_range(E_L):
         # Check expert_index against current expert: [T, K] comparison
         expert_check = nl.ndarray((T, K), dtype=io_dtype, buffer=nl.sbuf)
-        nisa.tensor_scalar(
+        nisa.tensor_tensor(
             dst=expert_check[0:T, 0:K],
-            data=expert_index[0:T, 0:K],
-            op0=nl.equal,
-            operand0=expert_offset_f[0:T, 0:K],
+            data1=expert_index_sbuf[0:T, 0:K],
+            data2=expert_offset_f[0:T, 0:K],
+            op=nl.equal,
         )
 
         # Sum across K dimension to get match indicator [T, 1]
         expert_match = nl.ndarray((T, 1), dtype=io_dtype, buffer=nl.sbuf)
         nisa.tensor_reduce(
-            dst=expert_match[0:T, 0:1],
-            data=expert_check[0:T, 0:K],
+            dst=expert_match,
             op=nl.add,
-            axis=(1,),
+            data=expert_check,
+            axis=1,
         )
 
         # Multiply affinities by match indicator

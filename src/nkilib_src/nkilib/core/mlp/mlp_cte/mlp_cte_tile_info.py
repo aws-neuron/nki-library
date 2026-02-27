@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Tile Info Module
-
-Defines tiling information and index management for MLP CTE kernels including
-batch×sequence indices and tensor naming utilities.
-
-"""
+"""MLP CTE tiling information and index management for batch×sequence dimensions and tensor naming."""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -27,13 +21,14 @@ import nki.language as nl
 from nki.language import NKIObject
 
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, get_ceil_aligned_size
+from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, get_ceil_aligned_size
 from ...utils.tile_info import TiledDimInfo
 from ..mlp_parameters import MLPParameters
 from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
 
 #
 # Local constants
+_mx_q_width = 4
 _xpose_hidden_dim_tile_size = 512
 _layer_norm_hidden_dim_tile_size = 512
 _src_proj_hidden_dim_tile_size = 1024
@@ -88,7 +83,7 @@ def calc_batch_seqlen_dim_tile_size(
     mlp_params: MLPParameters,
     bxs_dim_size: int,
     bxs_dim_subtile_size: int,
-    src_proj_int_dim_tile_count: int,
+    src_proj_int_dim_size: int,
 ) -> int:
     """Calculate the tile size for the batch/sequence dimension.
 
@@ -99,7 +94,7 @@ def calc_batch_seqlen_dim_tile_size(
         mlp_params: MLP configuration parameters
         bxs_dim_size: Size of batch×sequence dimension
         bxs_dim_subtile_size: Subtile size for batch×sequence dimension
-        src_proj_int_dim_tile_count: Number of tiles in source projection intermediate dimension
+        src_proj_int_dim_size: Size of intermediate dim during src projection which may be rounded up to the nearest 512
 
     Returns:
         Calculated tile size for batch×sequence dimension
@@ -111,7 +106,10 @@ def calc_batch_seqlen_dim_tile_size(
     # We have to ensure that the tile size not exceed the number of PSUM banks needed during up/gate
     # projection.  It is related to the structure of the inner loops.
 
-    bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS // src_proj_int_dim_tile_count
+    accum_dtype_size = 2 if mlp_params.quant_params.is_quant_static_mx() else 4
+    psum_max_elts = NUM_HW_PSUM_BANKS * PSUM_BANK_SIZE // accum_dtype_size
+
+    bxs_dim_max_subtiles = psum_max_elts // src_proj_int_dim_size
     # This is the max tile size we can choose
     tile_size = bxs_dim_subtile_size * bxs_dim_max_subtiles
     # Special tiling optimization for LLaMA3 70B (heuristic) is to use a tile size of 384 if we can
@@ -120,6 +118,11 @@ def calc_batch_seqlen_dim_tile_size(
     else:
         aligned_bxs_dim = get_ceil_aligned_size(bxs_dim_size, nl.tile_size.pmax)
         tile_size = min(tile_size, aligned_bxs_dim)
+
+    kernel_assert(
+        not mlp_params.quant_params.is_quant_static_mx() or tile_size >= 256,
+        f"Static MX quant requires I < 8096, but got I = {mlp_params.intermediate_size}",
+    )
 
     # There are assumptions in the code that this is true
     kernel_assert(
@@ -147,6 +150,12 @@ class MLPCTETileInfo(NKIObject):
     src_proj_hidden_dim_tile: TiledDimInfo
     # Tile information for the intermediate dimension for up/gate projection
     src_proj_intermediate_dim_tile: TiledDimInfo
+    # Tile information for the batch/sequence dimension for up/gate projection with MX
+    mx_src_proj_bxs_dim_tile: TiledDimInfo
+    # Tile information for the hidden dimension for up/gate projection with MX
+    mx_src_proj_hidden_dim_tile: TiledDimInfo
+    # Tile information for the intermediate dimension used throughout the MX flow
+    mx_intermediate_dim_tile: TiledDimInfo
     # Tile information for the intermediate dimension for transposes
     xpose_intermediate_dim_tile: TiledDimInfo
     # Tile information for the hidden dimension for down projection
@@ -189,6 +198,12 @@ def build_mlp_cte_tile_info(
         mlp_params.hidden_size, _src_proj_hidden_dim_tile_size, nl.tile_size.pmax
     )
     src_proj_intermediate_dim_tile = TiledDimInfo.build(intermediate_size, _src_proj_intermediate_dim_tile_size)
+    mx_src_proj_hidden_dim_tile = TiledDimInfo.build_with_subtiling(
+        mlp_params.hidden_size, nl.tile_size.pmax * _mx_q_width, _mx_q_width
+    )
+    mx_intermediate_dim_tile = TiledDimInfo.build_with_subtiling(
+        intermediate_size, nl.tile_size.pmax * _mx_q_width, _mx_q_width
+    )
     xpose_intermediate_dim_tile = TiledDimInfo.build_with_subtiling(
         intermediate_size, _xpose_intermediate_dim_tile_size, nl.tile_size.pmax
     )
@@ -203,9 +218,12 @@ def build_mlp_cte_tile_info(
         mlp_params,
         bxs_dim_size,
         bxs_dim_subtile_size,
-        src_proj_intermediate_dim_tile.tile_count,
+        src_proj_intermediate_dim_tile.tile_count * src_proj_intermediate_dim_tile.tile_size,
     )
     bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+    mx_src_proj_bxs_dim_tile = TiledDimInfo.build_with_subtiling(
+        bxs_dim_size, bxs_dim_tile_size, 2 * bxs_dim_subtile_size
+    )
 
     return MLPCTETileInfo(
         bxs_dim_tile=bxs_dim_tile,
@@ -213,6 +231,9 @@ def build_mlp_cte_tile_info(
         xpose_hidden_dim_tile=xpose_hidden_dim_tile,
         src_proj_hidden_dim_tile=src_proj_hidden_dim_tile,
         src_proj_intermediate_dim_tile=src_proj_intermediate_dim_tile,
+        mx_src_proj_bxs_dim_tile=mx_src_proj_bxs_dim_tile,
+        mx_src_proj_hidden_dim_tile=mx_src_proj_hidden_dim_tile,
+        mx_intermediate_dim_tile=mx_intermediate_dim_tile,
         xpose_intermediate_dim_tile=xpose_intermediate_dim_tile,
         down_proj_hidden_dim_tile=down_proj_hidden_dim_tile,
         down_proj_intermediate_dim_tile=down_proj_intermediate_dim_tile,

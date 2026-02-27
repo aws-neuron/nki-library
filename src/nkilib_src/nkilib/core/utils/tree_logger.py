@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import nki.language as nl
 
-from .logging import Logger
+from .logging import Logger, LogLevel
 
 
 @dataclass
@@ -40,8 +40,11 @@ class TreeLogger(nl.NKIObject):
         self.name = name
         self.logger = logger
         self.stack_logs = []
+        self._enabled = logger.is_enabled_for(LogLevel.DEBUG)
 
     def log(self, msg: str, depth: int, is_scope_boundary: bool = False):
+        if not self._enabled:
+            return
         self.stack_logs.append(LogEntry(msg, depth, True, is_scope_boundary))
 
     def _has_depth_after(self, logs, start_idx: int, target_depth: int) -> bool:
@@ -70,7 +73,7 @@ class TreeLogger(nl.NKIObject):
         if not self.stack_logs:
             return
 
-        self.logger.info(f"[{self.name}] Allocations:")
+        self.logger.debug(f"[{self.name}] Allocations:")
         self._print_tree(self.stack_logs)
         self.stack_logs.clear()
 
@@ -101,4 +104,4 @@ class TreeLogger(nl.NKIObject):
                     prefix = prefix + "└── "
                 else:
                     prefix = prefix + "├── "
-            print(f"    {prefix}{entry.msg}")
+            self.logger.debug(f"    {prefix}{entry.msg}")

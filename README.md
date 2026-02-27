@@ -4,17 +4,12 @@ The NKI Library provides pre-built reference kernels you can use directly in you
 These kernel APIs provide the default classes, functions, and parameters you can use to integrate the NKL kernels into your models.
 More details can be found in the [NKI Library Documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/library/api/index.html)
 
-## NOTE
-
-The kernels in this repo require [the Neuron 2.27 release](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.27.0/index.html).
-
 ## Kernel Reference
 
 | Kernel API                                                                                                                                                   | Description                                                                                                                                                                          |
 |--------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | [Attention CTE Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/core/attention/attention_cte.py)                         | The kernel implements attention with support for multiple variants and optimizations.                        |
 | [Attention TKG Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/core/attention/attention_tkg.py)                         | The kernel implements attention specifically optimized for token generation use cases.                       |
-| [Cross Entropy Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/core/loss/cross_entropy.py)                              | The kernel implements memory-efficient cross entropy for large vocabularies using online log-sum-exp.        |
 | [MLP Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/core/mlp/mlp.py)                                                   | The kernel implements a Multi-Layer Perceptron with optional normalization fusion and various optimizations.           |
 | [MoE CTE Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/core/moe/moe_cte/)                       | The kernel implements Mixture of Experts optimized for Context Encoding use cases.              |
 | [MoE TKG Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/core/moe/moe_tkg/moe_tkg.py)                                   | The kernel implements Mixture of Experts optimized for Token Generation use cases.                           |
@@ -31,6 +26,10 @@ The kernels in this repo require [the Neuron 2.27 release](https://awsdocs-neuro
 | Kernel API                                                                                                                                                   | Description                                                                                                                                                                          |
 |--------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | [Attention Block TKG Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/transformer/attention_block_tkg.py)  | The kernel implements fused attention block for TKG with RMSNorm, QKV, RoPE, and output projection.          |
+| [Cross Entropy Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/loss/cross_entropy.py)                      | The kernel implements memory-efficient cross entropy loss forward and backward passes for large vocabularies. |
+| [Depthwise Conv1D Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/conv/depthwise_conv1d.py)  | The kernel implements depthwise 1D convolution using implicit GEMM.          |
+| [Blockwise MM Backward Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/moe/bwd/blockwise_mm_backward.py) | The kernel implements blockwise matrix multiplication backward pass for dropless Mixture of Experts. |
+| [Conv1D Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/conv/conv1d.py)  | The kernel implements 1D convolution using a filter replication strategy. |
 
 ## Integration with the Neuron Compiler
 

@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Normalization Module
-
-Implements RMS and Layer normalization functions for MLP CTE kernels with detailed
-pseudo-code documentation and tile-based processing.
-
-"""
+"""MLP CTE normalization functions implementing RMS and Layer normalization with tile-based processing."""
 
 from typing import Callable, Optional
 
 import nki.isa as nisa
 import nki.language as nl
-import numpy as np
 
 from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
@@ -93,14 +86,14 @@ def apply_rms_norm_to_source_tensor_tile(
     )
 
     square_accum_result_sbuf_list = []
-    for i in range(BXS_SUBTILE_COUNT):
+    for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
         square_accum_result_tensor = allocate(
             (
                 nl.par_dim(BXS_SUBTILE_SIZE),
                 1,
             ),
             dtype=constants.activation_data_type,
-            name=indices.get_tensor_name("square_accum_result_sbuf", f"subtile{i}"),
+            name=indices.get_tensor_name("square_accum_result_sbuf", f"subtile{bxs_subtile_idx}"),
         )
         square_accum_result_sbuf_list.append(square_accum_result_tensor)
 
@@ -216,14 +209,14 @@ def apply_layer_norm_to_source_tensor_tile(
     )
 
     bn_aggr_result_sbuf_list = []
-    for i in range(BXS_SUBTILE_COUNT):
+    for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
         bn_aggr_result_tensor = allocate(
             (
                 nl.par_dim(BXS_SUBTILE_SIZE),
                 BN_AGGR_ELEMENTS_PER_TILE,
             ),
             dtype=constants.activation_data_type,
-            name=indices.get_tensor_name("bn_aggr_result_sbuf", f"subtile{i}"),
+            name=indices.get_tensor_name("bn_aggr_result_sbuf", f"subtile{bxs_subtile_idx}"),
         )
         bn_aggr_result_sbuf_list.append(bn_aggr_result_tensor)
 

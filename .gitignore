@@ -17,11 +17,13 @@ __pycache__/
 /.pytest_cache
 /.mypy_cache
 
+src/nkilib_src/nkilib/version/__init__.py
 /doc/_apidoc/
 /build
 !/build-tools/
 /dist
 /.venv
+/bin/
 /stubs
 /wheelhouse/
 log-neuron-cc.txt
@@ -36,3 +38,5 @@ tmp
 pyrightconfig.json
 .vscode
 .env
+*unison*
+.idea

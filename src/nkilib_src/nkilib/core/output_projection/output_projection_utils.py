@@ -20,19 +20,18 @@ Helper functions for output projection kernels.
 from ..utils.kernel_assert import kernel_assert
 
 
-def calculate_head_packing(N, D, partition_size):
+def calculate_head_packing(N: int, D: int, partition_size: int) -> tuple[int, int, int]:
     """
     Optimize contraction dimension by folding N into D when D < partition_size.
 
     Args:
-        N (int): Number of heads
-        D (int): Head dimension size
-        partition_size (int): Hardware constraint
+        N (int): Number of heads.
+        D (int): Head dimension size.
+        partition_size (int): Hardware constraint.
 
     Returns:
-        tuple: (new_N, new_D, group_size)
+        tuple[int, int, int]: (new_N, new_D, group_size).
     """
-
     # Find largest divisor of N such that (group_size * D) <= partition_size
     group_size = N
     while (N % group_size) or (group_size * D) > partition_size:

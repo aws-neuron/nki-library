@@ -21,11 +21,18 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ..moe.moe_tkg.moe_tkg import moe_tkg as _moe_tkg
-from ..router_topk.router_topk import XSBLayout_tp201__2, XSBLayout_tp2013__1
+from ..router_topk.router_topk import XSBLayout_tp102__0, XSBLayout_tp201__2, XSBLayout_tp2013__1
 from ..router_topk.router_topk import router_topk as _router_topk
+from ..subkernels.rmsnorm_mx_quantize_tkg import rmsnorm_mx_quantize_tkg as _rmsnorm_mx_quantize_tkg
 from ..subkernels.rmsnorm_tkg import rmsnorm_tkg as _rmsnorm_tkg
 from ..utils.common_types import ActFnType, ExpertAffinityScaleMode, RouterActFnType
-from .moe_block_tkg_utils import _pmax, parse_moe_block_dims, validate_moe_block_inputs
+from .moe_block_tkg_utils import (
+    _pmax,
+    _q_width,
+    get_sbuf_tensor_shape,
+    parse_moe_block_config,
+    validate_moe_block_inputs,
+)
 
 
 @nki.jit
@@ -162,11 +169,13 @@ def moe_block_tkg(
     """
 
     # Parse dimensions and validate inputs
-    dims = parse_moe_block_dims(
+    dims, quant_config, expert_config = parse_moe_block_config(
         inp, router_weights, expert_gate_up_weights, shared_expert_gate_w, top_k, hidden_actual, is_all_expert
     )
     validate_moe_block_inputs(
         dims,
+        quant_config,
+        expert_config,
         shared_expert_gate_w,
         shared_expert_up_w,
         shared_expert_down_w,
@@ -177,34 +186,87 @@ def moe_block_tkg(
         residual,
     )
 
-    # Step 1: perform RMSNorm
+    # Convenience flags
+    is_mxfp_all_expert = quant_config.is_moe_weight_mx and expert_config.is_all_expert
+
+    # Step 1: perform RMSNorm (with optional MX quantization for MXFP all-expert mode)
     rmsnorm_out = nl.ndarray((_pmax, dims.T, dims.H_free), dtype=inp.dtype, buffer=nl.sbuf)
-    rmsnorm_out = _rmsnorm_tkg(
-        input=inp,
-        gamma=gamma,
-        output=rmsnorm_out,
-        eps=eps,
-        hidden_actual=dims.hidden_actual,
-        hidden_dim_tp=dims.is_moe_weight_mx,
-    )
+    rmsnorm_out_quant = None
+    rmsnorm_out_scale = None
+    residual_out = None
+
+    if is_mxfp_all_expert:
+        # MXFP all-expert mode: use fused RMSNorm + MX quantization
+        num_H512_tiles = dims.H // (_pmax * _q_width)
+        quant_shape = (_pmax, num_H512_tiles, dims.T)
+        rmsnorm_out_quant = nl.ndarray(quant_shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+        rmsnorm_out_scale = nl.ndarray(quant_shape, dtype=nl.uint8, buffer=nl.sbuf)
+        residual_out = nl.ndarray((dims.T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm) if residual != None else None
+
+        _rmsnorm_mx_quantize_tkg(
+            input=inp,
+            gamma=gamma,
+            output=rmsnorm_out,
+            output_quant=rmsnorm_out_quant,
+            output_scale=rmsnorm_out_scale,
+            residual=residual,
+            output_residual=residual_out,
+            eps=eps,
+            hidden_actual=dims.hidden_actual,
+            hidden_dim_tp=True,
+        )
+    else:
+        # Non-MXFP or selective-expert mode: use standard RMSNorm
+        rmsnorm_out = _rmsnorm_tkg(
+            input=inp,
+            gamma=gamma,
+            output=rmsnorm_out,
+            eps=eps,
+            hidden_actual=dims.hidden_actual,
+            hidden_dim_tp=quant_config.is_moe_weight_mx,
+            single_core_forced=True
+            if (not quant_config.is_moe_weight_mx and not expert_config.is_all_expert and dims.T > 1)
+            else False,
+        )
 
     router_in = rmsnorm_out
     if rmsnorm_out.dtype != router_mm_dtype:
         router_in = nl.ndarray((_pmax, dims.T, dims.H_free), dtype=router_mm_dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=router_in, src=rmsnorm_out, dtype=router_mm_dtype)
+        nisa.tensor_copy(dst=router_in, src=rmsnorm_out)
 
     # Step 2: compute router & topK
     router_logits = None if skip_router_logits else nl.ndarray((dims.T, dims.E), dtype=inp.dtype, buffer=nl.shared_hbm)
-    expert_index = nl.ndarray((dims.T, dims.K), dtype=nl.uint32, buffer=nl.sbuf)
+    # Selective-load: expert_index in SBUF, always stored (needed for selective loading)
+    # All-expert: expert_index in HBM, skip store when not router_pre_norm
+    skip_store_expert_index = expert_config.is_all_expert and not router_pre_norm
+    expert_index = nl.ndarray(
+        get_sbuf_tensor_shape(dims.T, dims.K, is_sbuf=True),
+        dtype=nl.uint32,
+        buffer=nl.sbuf,
+        name='expert_index',
+    )
     # For all-expert mode, expert_affinities goes to HBM (moe_tkg handles slicing to local experts)
     # For selective-expert mode, expert_affinities stays in SBUF
-    affinities_in_sbuf = not dims.is_all_expert
+    affinities_in_sbuf = not expert_config.is_all_expert
     expert_affinities = nl.ndarray(
-        (dims.T, dims.E), dtype=nl.float32, buffer=nl.sbuf if affinities_in_sbuf else nl.shared_hbm
+        get_sbuf_tensor_shape(dims.T, dims.E, is_sbuf=affinities_in_sbuf),
+        dtype=nl.float32,
+        buffer=nl.sbuf if affinities_in_sbuf else nl.shared_hbm,
+        name='expert_affinities',
     )
     expert_affinities_eager = (
-        nl.ndarray((dims.T, dims.K), dtype=nl.float32, buffer=nl.sbuf) if not dims.is_all_expert else None
+        nl.ndarray(get_sbuf_tensor_shape(dims.T, dims.K, is_sbuf=True), dtype=nl.float32, buffer=nl.sbuf)
+        if not expert_config.is_all_expert
+        else None
     )
+    # Determine x_sb_layout based on rmsnorm output layout
+    if quant_config.is_moe_weight_mx:
+        router_x_sb_layout = XSBLayout_tp201__2
+    elif not expert_config.is_all_expert and dims.T > 1:
+        router_x_sb_layout = XSBLayout_tp102__0
+    else:
+        router_x_sb_layout = XSBLayout_tp2013__1
+
     router_outputs = _router_topk(
         x=router_in,
         w=router_weights,
@@ -214,30 +276,38 @@ def moe_block_tkg(
         expert_index=expert_index,
         act_fn=router_act_fn,
         k=dims.K,
-        x_hbm_layout=0,  # Since x_input_in_sbuf=True, this value is not used but required by function signature
-        x_sb_layout=XSBLayout_tp201__2 if dims.is_moe_weight_mx else XSBLayout_tp2013__1,
-        output_in_sbuf=affinities_in_sbuf,
+        x_hbm_layout=0,
+        x_sb_layout=router_x_sb_layout,
         router_pre_norm=router_pre_norm,
         norm_topk_prob=norm_topk_prob,
         use_column_tiling=True,
-        return_eager_affi=not dims.is_all_expert,  # Only needed for selective-expert mode
+        return_eager_affi=not expert_config.is_all_expert
+        and quant_config.is_moe_weight_mx,  # Only needed for selective-expert mxfp mode
+        use_PE_broadcast_w_bias=is_mxfp_all_expert,
+        shard_on_tokens=is_mxfp_all_expert or (not expert_config.is_all_expert and dims.T > 1),
+        skip_store_expert_index=skip_store_expert_index,
         skip_store_router_logits=skip_router_logits,
-        x_input_in_sbuf=True,
-        expert_affin_in_sb=affinities_in_sbuf,
     )
     router_logits, expert_index, expert_affinities = router_outputs[0], router_outputs[1], router_outputs[2]
-    if not dims.is_all_expert:
+    if not expert_config.is_all_expert and quant_config.is_moe_weight_mx:
         expert_affinities_eager = router_outputs[3].reshape((dims.T, dims.K))
 
     # Step 3: [Optional] compute shared expert
-    if dims.has_shared_expert:
+    if expert_config.has_shared_expert:
         # TODO
         pass
 
     # Step 4: compute expert MLPs
-    if dims.is_moe_weight_mx:
+    expert_mlp_in_scale = rmsnorm_out_scale if is_mxfp_all_expert else None
+    # Determine if we're using shard_on_T for selective expert
+    selective_expert_shard_on_T = not expert_config.is_all_expert and dims.T > 1
+    if is_mxfp_all_expert:
+        expert_mlp_in = rmsnorm_out_quant
+    elif quant_config.is_moe_weight_mx or selective_expert_shard_on_T:
+        # MXFP selective-expert or shard_on_T mode: use full rmsnorm output
         expert_mlp_in = rmsnorm_out
     else:
+        # Non-MXFP mode without shard_on_T: shard the hidden dimension
         expert_mlp_in = nl.ndarray((_pmax, dims.T, dims.H_free_shard), dtype=inp.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(
             dst=expert_mlp_in, src=rmsnorm_out[:, :, nl.ds(dims.prg_id * dims.H_free_shard, dims.H_free_shard)]
@@ -249,14 +319,17 @@ def moe_block_tkg(
         expert_down_weights=expert_down_weights,
         expert_affinities=expert_affinities,
         expert_index=expert_index,
-        is_all_expert=dims.is_all_expert,
+        is_all_expert=expert_config.is_all_expert,
         rank_id=rank_id,
         expert_gate_up_bias=expert_gate_up_bias,
         expert_down_bias=expert_down_bias,
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
-        mask_unselected_experts=router_pre_norm,
-        expert_affinities_eager=expert_affinities_eager if not dims.is_all_expert else None,
+        hidden_input_scale=expert_mlp_in_scale,
+        # Only mask when router_topk doesn't perform masking (router_pre_norm=True, norm_topk_prob=False).
+        # Otherwise, expert_affinities are already masked by router_topk's scatter operation.
+        mask_unselected_experts=router_pre_norm and not norm_topk_prob,
+        expert_affinities_eager=expert_affinities_eager if not expert_config.is_all_expert else None,
         expert_affinities_scaling_mode=expert_affinities_scaling_mode,
         activation_fn=hidden_act_fn,
         output_dtype=inp.dtype,
@@ -270,5 +343,7 @@ def moe_block_tkg(
     outputs = [result]
     if not skip_router_logits:
         outputs.append(router_logits)
+    if residual_out != None:
+        outputs.append(residual_out)
 
     return tuple(outputs)

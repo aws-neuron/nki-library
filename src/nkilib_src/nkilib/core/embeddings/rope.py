@@ -13,13 +13,7 @@
 # limitations under the License.
 
 
-"""
-Rotary Position Embedding (RoPE) kernels for NeuronCore.
-
-RoPE encodes positional information by rotating embedding dimension pairs using
-precomputed sine/cosine frequencies, enabling position-aware attention without
-absolute position embeddings.
-"""
+"""Rotary Position Embedding (RoPE) kernels for NeuronCore."""
 
 import nki
 import nki.isa as nisa
@@ -42,28 +36,63 @@ def RoPE(
 ) -> nl.ndarray:
     """
     Apply Rotary Position Embedding (RoPE) to input embeddings.
-    Standalone kernel with HBM I/O and optional LNC sharding.
 
-    RoPE Formula:
-        out[even] = x[even]*cos - x[odd]*sin
-        out[odd] = x[odd]*cos + x[even]*sin
+    Standalone kernel with HBM I/O and optional LNC sharding.
+    Supports both contiguous and interleaved memory layouts with automatic
+    layout conversion via strided DMA or SBUF matmul.
+
+    Dimensions:
+        d_head: Head dimension (64 or 128)
+        B: Batch size
+        n_heads: Number of attention heads
+        S: Sequence length (divisible by n_prgs if lnc_shard=True)
 
     Args:
-        x_in: [d_head, B, n_heads, S] @ HBM
-            - d_head: head dimension (must be even, ≤128)
-            - B: batch size
-            - n_heads: number of attention heads
-            - S: sequence length (divisible by n_prgs if lnc_shard=True)
-        cos: [d_head//2, B, S] @ HBM - cosine frequencies
-        sin: [d_head//2, B, S] @ HBM - sine frequencies
-        lnc_shard: parallelize across LNC cores by tiling sequence dimension
-        contiguous_layout: memory layout in d_head dimension
-            - True: [first_half, second_half] (default, more efficient)
-            - False: [even, odd, even, odd, ...] (interleaved)
-        relayout_in_sbuf: use SBUF matmul for layout conversion (only for small tensors)
+        x_in (nl.ndarray): [d_head, B, n_heads, S] @ HBM, Input embeddings
+        cos (nl.ndarray): [d_head//2, B, S] @ HBM, Cosine frequencies
+        sin (nl.ndarray): [d_head//2, B, S] @ HBM, Sine frequencies
+        lnc_shard (bool): Parallelize across LNC cores by tiling sequence dimension
+        contiguous_layout (bool): Memory layout in d_head dimension.
+            True: [first_half, second_half] (default, more efficient).
+            False: [even, odd, even, odd, ...] (interleaved)
+        relayout_in_sbuf (bool): Use SBUF matmul for layout conversion (only for small tensors)
 
     Returns:
-        [d_head, B, n_heads, S] @ HBM - RoPE applied output
+        output (nl.ndarray): [d_head, B, n_heads, S] @ HBM, RoPE applied output
+
+    Notes:
+        - SBUF size constraint (for bf16): B * n_heads * S <= 73728 (approximately 72K).
+          This limit applies regardless of d_head. Exceeding this limit will
+          cause compilation failure. For larger sizes, tile the computation.
+        - When relayout_in_sbuf=True with interleaved layout, a stricter limit
+          applies: B * n_heads * S <= gemm_moving_fmax (typically 512)
+        - d_head must be even (pairs of elements are rotated)
+        - When lnc_shard=True, S must be divisible by number of programs
+        - For large tensors with interleaved layout, uses strided DMA
+
+    Pseudocode:
+        # Determine sharding and tile size
+        tile_size = S // n_prgs
+        tile_start = tile_size * prg_id
+
+        # Load input tile to SBUF (with optional layout conversion)
+        if is_dma_relayout:
+            x_in_sb = load_strided(x_in, even_odd_separated)
+        else:
+            x_in_sb = load_contiguous(x_in)
+
+        # Load cos/sin frequency tiles
+        cos_sb = load(cos[tile_start:tile_start+tile_size])
+        sin_sb = load(sin[tile_start:tile_start+tile_size])
+
+        # Apply RoPE rotation in SBUF
+        x_out_sb = rope_sbuf(x_in_sb, cos_sb, sin_sb)
+
+        # Store output (with optional layout conversion)
+        if is_dma_relayout:
+            store_strided(x_out, x_out_sb, even_odd_interleaved)
+        else:
+            store_contiguous(x_out, x_out_sb)
     """
 
     _validate_rope_inputs(x_in, cos, sin, 'RoPE')
@@ -158,15 +187,15 @@ def RoPE_sbuf(
         out[odd] = x[odd]*cos + x[even]*sin
 
     Args:
-        x_in_sb: [d_head, B, n_heads, S] @ SBUF - input embeddings
-        cos_sb: [d_head//2, B, S] @ SBUF - cosine frequencies
-        sin_sb: [d_head//2, B, S] @ SBUF - sine frequencies
-        x_out_sb: [d_head, B, n_heads, S] @ SBUF - output buffer
-        convert_from_interleaved: convert from interleaved to contiguous layout
+        x_in_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - input embeddings
+        cos_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - cosine frequencies
+        sin_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - sine frequencies
+        x_out_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - output buffer
+        convert_from_interleaved (bool): convert from interleaved to contiguous layout
             (only for small tensors: B*n_heads*S ≤ gemm_moving_fmax)
 
     Returns:
-        x_out_sb with RoPE applied (modified in-place)
+        nl.ndarray: x_out_sb with RoPE applied (modified in-place)
 
     Notes:
         - Assumes contiguous layout unless convert_from_interleaved=True
@@ -233,20 +262,22 @@ def RoPE_sbuf(
 
 def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
     """
-    Generate permutation matrix for layout conversion.
+    Generate permutation matrix for RoPE layout conversion.
 
-    Creates matrix P where:
-        P @ X: [e0,e1,...,o0,o1,...] -> [e0,o0,e1,o1,...] (contiguous to interleaved)
-        P^T @ X: [e0,o0,e1,o1,...] -> [e0,e1,...,o0,o1,...] (interleaved to contiguous)
+    Creates matrix P for converting between contiguous and interleaved layouts.
+    P @ X transforms [e0,e1,...,o0,o1,...] to [e0,o0,e1,o1,...].
+    P^T @ X transforms [e0,o0,e1,o1,...] to [e0,e1,...,o0,o1,...].
 
-    Implementation:
-        Uses strided access on identity matrix to build permutation.
-        For d_head=4: P = [[1,0,0,0], [0,0,1,0], [0,1,0,0], [0,0,0,1]]
-        - Even rows (0,2) get 1s in first half columns (0,1)
-        - Odd rows (1,3) get 1s in second half columns (2,3)
+    Args:
+        x_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF, Input tensor for shape info
 
     Returns:
-        [d_head, d_head] @ SBUF - permutation matrix
+        nl.ndarray: [d_head, d_head] @ SBUF, Permutation matrix
+
+    Notes:
+        - Only supports tensors where B*n_heads*S ≤ gemm_moving_fmax
+        - d_head must be even
+        - Uses strided access on identity matrix to build permutation
     """
     d_head, B, n_heads, S = x_sb.shape
     half_d = d_head // 2
@@ -261,12 +292,15 @@ def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
     identity_sb = nl.ndarray((d_head, d_head), dtype=x_sb.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=identity_sb, src=identity_hbm)
 
-    # Extract permutation via strided access pattern:
-    # Pattern [[d_head, d_head], [1, 2], [2, half_d]] reads identity with stride=2 in innermost dim
-    # For each row i: reads [i[0], i[2], i[4], ...] then [i[1], i[3], i[5], ...]
-    # Destination reshape (d_head, 2, half_d) writes: row i -> [[even_cols], [odd_cols]]
-    # Result: even rows get 1 in first half, odd rows get 1 in second half
-    # This creates P where P@X transforms [e0,e1,...,o0,o1,...] -> [e0,o0,e1,o1,...]
+    """
+    Extract permutation via strided access pattern.
+    
+    Pattern [[d_head, d_head], [1, 2], [2, half_d]] reads identity with stride=2 in innermost dim.
+    For each row i: reads [i[0], i[2], i[4], ...] then [i[1], i[3], i[5], ...].
+    Destination reshape (d_head, 2, half_d) writes: row i -> [[even_cols], [odd_cols]].
+    Result: even rows get 1 in first half, odd rows get 1 in second half.
+    This creates P where P@X transforms [e0,e1,...,o0,o1,...] -> [e0,o0,e1,o1,...].
+    """
     convert_to_interleaved_mat = nl.ndarray((d_head, d_head), dtype=x_sb.dtype, buffer=nl.sbuf)
     nisa.tensor_copy(
         dst=convert_to_interleaved_mat.reshape((d_head, 2, half_d)),
@@ -279,8 +313,20 @@ def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
 
 def _convert_from_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.ndarray) -> nl.ndarray:
     """
-    Convert interleaved to contiguous layout: [e0,o0,e1,o1,...] -> [e0,e1,...,o0,o1,...].
-    Uses P^T @ x_sb via nc_matmul. Returns a new buffer (does not modify input).
+    Convert interleaved to contiguous layout using matrix multiplication.
+
+    Transforms [e0,o0,e1,o1,...] to [e0,e1,...,o0,o1,...] via P^T @ x_sb.
+
+    Args:
+        x_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF, Input in interleaved layout
+        convert_to_interleaved_mat (nl.ndarray): [d_head, d_head] @ SBUF, Permutation matrix
+
+    Returns:
+        nl.ndarray: [d_head, B, n_heads, S] @ SBUF, Output in contiguous layout
+
+    Notes:
+        - Only supports tensors where B*n_heads*S ≤ gemm_moving_fmax
+        - Returns new buffer (does not modify input)
     """
     d_head, B, n_heads, S = x_sb.shape
     kernel_assert(x_sb.buffer == nl.sbuf, '_convert_from_interleaved: input must be in SBUF')
@@ -299,8 +345,21 @@ def _convert_from_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.n
 
 def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.ndarray) -> nl.ndarray:
     """
-    Convert contiguous to interleaved layout: [e0,e1,...,o0,o1,...] -> [e0,o0,e1,o1,...].
-    Uses P @ x_sb via nc_matmul (with pre-transpose to compensate for implicit transpose).
+    Convert contiguous to interleaved layout using matrix multiplication.
+
+    Transforms [e0,e1,...,o0,o1,...] to [e0,o0,e1,o1,...] via P @ x_sb.
+
+    Args:
+        x_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF, Input in contiguous layout
+        convert_to_interleaved_mat (nl.ndarray): [d_head, d_head] @ SBUF, Permutation matrix
+
+    Returns:
+        nl.ndarray: [d_head, B, n_heads, S] @ SBUF, Output in interleaved layout
+
+    Notes:
+        - Only supports tensors where B*n_heads*S ≤ gemm_moving_fmax
+        - Pre-transposes matrix to compensate for nc_matmul's implicit transpose
+        - Modifies input buffer in-place
     """
     d_head, B, n_heads, S = x_sb.shape
     kernel_assert(x_sb.buffer == nl.sbuf, '_convert_to_interleaved: input must be in SBUF')
@@ -323,14 +382,33 @@ def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.nda
 
 
 def _validate_rope_inputs(x_in: nl.ndarray, cos: nl.ndarray, sin: nl.ndarray, func_name: str) -> None:
-    """Validate RoPE input shapes and dtypes."""
+    """
+    Validate RoPE input tensor shapes and constraints.
+
+    Args:
+        x_in (nl.ndarray): [d_head, B, n_heads, S], Input embeddings
+        cos (nl.ndarray): [d_head//2, B, S], Cosine frequencies
+        sin (nl.ndarray): [d_head//2, B, S], Sine frequencies
+        func_name (str): Name of calling function for error messages
+
+    Returns:
+        None
+
+    Notes:
+        - Validates d_head in {64, 128}
+        - Validates B in (0, 64]
+        - Validates S in (0, 512]
+        - Validates n_heads in (0, 16]
+        - Validates cos/sin shapes match expected dimensions
+    """
     d_head, B, n_heads, S = x_in.shape
     half_d = d_head // 2
 
     kernel_assert(d_head in (64, 128), f'{func_name}: d_head must be 64 or 128, got {d_head}')
-    kernel_assert(0 < B <= 64, f'{func_name}: B must be in (0,64], got {B}')
-    kernel_assert(0 < S <= 512, f'{func_name}: S must be in (0,512], got {S}')
-    kernel_assert(0 < n_heads <= 16, f'{func_name}: n_heads must be in (0,16], got {n_heads}')
+    kernel_assert(B > 0, f'{func_name}: B must be > 0, got {B}')
+    kernel_assert(S > 0, f'{func_name}: S must be > 0, got {S}')
+    kernel_assert(n_heads > 0, f'{func_name}: n_heads must be > 0, got {n_heads}')
+
     kernel_assert(
         tuple(cos.shape) == (half_d, B, S),
         f'{func_name}: cos.shape expected ({half_d},{B},{S}), got {cos.shape}',

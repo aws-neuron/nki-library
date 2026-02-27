@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nki_library"
-version = "1.0"
+dynamic = ["version"]
 description = "NeuronKernelInterfaceLibrary"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "numpy",
+    "pandas",
     "torch",
     "aws-embedded-metrics",
     "boto3",
@@ -34,12 +35,17 @@ test = [
     "ruff==0.4.0",
     "pre-commit",
     "debugpy",
+    "pytest-cov",
+    "allpairspy"
 ]
 
 [tool.setuptools]
 zip-safe = true
 include-package-data = true
 package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "nkilib_src.nkilib.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -74,6 +80,7 @@ max-line-length = 120
 [tool.ruff]
 indent-width = 4
 line-length = 120
+extend-exclude = ["*model_config.py", "configuration/"]
 
 [tool.ruff.format]
 quote-style = "preserve"
@@ -85,10 +92,11 @@ docstring-code-format = false
 select = [
     "S101",  # assert detection
     "I",     # isort (import sorting)
+    "F401",  # unused imports
 ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
-fixable = ["I"]
+fixable = ["I", "F401"]
 unfixable = []
 
 # Allow unused variables when underscore-prefixed.

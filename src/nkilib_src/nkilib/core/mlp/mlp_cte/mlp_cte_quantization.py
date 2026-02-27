@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Quantization Module
-
-Handles tensor quantization for the MLP CTE kernel with support for multiple
-quantization schemes, including dynamic row-wise and static tensor-wise.
-
-"""
+"""MLP CTE quantization functions for dynamic row-wise and static tensor-wise quantization."""
 
 from typing import Optional
 
@@ -27,6 +21,7 @@ import nki.language as nl
 
 from ...utils.allocator import SbufManager
 from ...utils.kernel_helpers import get_max_positive_value_for_dtype
+from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters
 from .mlp_cte_constants import MLPCTEConstants
 from .mlp_cte_tile_info import MLPCTETileInfo
@@ -34,14 +29,6 @@ from .mlp_cte_tile_info import MLPCTETileInfo
 #
 # Local constants
 _MINVAL = 1e-6
-_FP8_E4M3_MAX_POS_VAL = 240.0
-
-
-def invert_static_scales(scales_sbuf: nl.ndarray):
-    nisa.reciprocal(
-        dst=scales_sbuf[0 : nl.tile_size.pmax, 0:1],
-        data=scales_sbuf[0 : nl.tile_size.pmax, 0:1],
-    )
 
 
 def perform_intermediate_static_quantization(
@@ -55,48 +42,62 @@ def perform_intermediate_static_quantization(
 ):
     # Alias these to cut down on the code size for tile information references
     bxs_dim_tile = tile_info.bxs_dim_tile
-    int_dim_tile = tile_info.src_proj_intermediate_dim_tile
+    int_dim_tile = (
+        tile_info.mx_intermediate_dim_tile
+        if mlp_params.quant_params.is_quant_static_mx()
+        else tile_info.src_proj_intermediate_dim_tile
+    )
     bias_vector = constants.bxs_dim_subtile_zero_bias_vector_sbuf
-    BXS_SUBTILE_COUNT = bxs_dim_tile.subtile_dim_info.tile_count
-    max_pos_val = _FP8_E4M3_MAX_POS_VAL
-    rounded_intermediate_dim = int_dim_tile.tile_count * int_dim_tile.tile_size
+    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size  # 128
+    max_pos_val = get_max_positive_value_for_dtype(constants.down_proj_quant_data_type)
 
-    # Reshape to get the shapes we need
-    src_proj_res_sbuf_view_list = []
-    quantized_output_sbuf_view_list = []
-    for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
-        src_proj_res_sbuf_view = src_proj_res_sbuf_list[bxs_subtile_idx].reshape(
+    tensor_bxs_size = constants.get_bxs_size(mlp_params)
+    bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
+    current_bxs_tile = bxs_tiles[bxs_tile_idx]
+
+    buffer_shape = (
+        (
+            int_dim_tile.subtile_dim_info.tile_count,  # 128
+            int_dim_tile.tile_count,  # I/512
+            BXS_SUBTILE_SIZE * int_dim_tile.subtile_dim_info.tile_size,  # 128 * 4
+        )
+        if mlp_params.quant_params.is_quant_static_mx()
+        else (
             (
-                bxs_dim_tile.subtile_dim_info.tile_size,
-                rounded_intermediate_dim,
+                bxs_dim_tile.subtile_dim_info.tile_size,  # 128
+                int_dim_tile.tile_count,  # I/512
+                int_dim_tile.tile_size,  # 512
             )
         )
-        src_proj_res_sbuf_view_list.append(src_proj_res_sbuf_view)
-        quantized_output_sbuf_view = quantized_output_sbuf_list[bxs_subtile_idx].reshape(
-            (
-                bxs_dim_tile.subtile_dim_info.tile_size,
-                rounded_intermediate_dim,
-            )
-        )
-        quantized_output_sbuf_view_list.append(quantized_output_sbuf_view)
+    )
 
-    for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
-        p_bxs_size = bxs_dim_tile.get_subtile_bound(bxs_tile_idx, bxs_subtile_idx)
-        nisa.activation(
-            dst=src_proj_res_sbuf_view_list[bxs_subtile_idx][:p_bxs_size, : mlp_params.intermediate_size],
-            op=nl.copy,
-            data=src_proj_res_sbuf_view_list[bxs_subtile_idx][:p_bxs_size, : mlp_params.intermediate_size],
-            scale=static_input_quant_scale_sbuf[:p_bxs_size, 0:1],
-            bias=bias_vector[:p_bxs_size, 0:1],
-        )
-        nisa.tensor_scalar(
-            dst=quantized_output_sbuf_view_list[bxs_subtile_idx][:p_bxs_size, : mlp_params.intermediate_size],
-            data=src_proj_res_sbuf_view_list[bxs_subtile_idx][:p_bxs_size, : mlp_params.intermediate_size],
-            op0=nl.minimum,
-            operand0=max_pos_val,
-            op1=nl.maximum,
-            operand1=-max_pos_val,
-        )
+    for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):
+        src_proj_res_sbuf_view = src_proj_res_sbuf_list[bxs_subtile.index].reshape(buffer_shape)
+        quantized_output_sbuf_view = quantized_output_sbuf_list[bxs_subtile.index].reshape(buffer_shape)
+
+        for int_tile in TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size):
+            if mlp_params.quant_params.is_quant_static_mx():
+                p_size = len(TiledRange(int_tile, int_dim_tile.subtile_dim_info.tile_size))
+                f_size = bxs_subtile.size * int_dim_tile.subtile_dim_info.tile_size
+            elif mlp_params.quant_params.is_quant_static():
+                p_size = bxs_subtile.size
+                f_size = int_tile.size
+
+            nisa.activation(
+                dst=src_proj_res_sbuf_view[:p_size, int_tile.index, :f_size],
+                op=nl.copy,
+                data=src_proj_res_sbuf_view[:p_size, int_tile.index, :f_size],
+                scale=static_input_quant_scale_sbuf[:p_size, 0:1],
+                bias=bias_vector[:p_size, 0:1],
+            )
+            nisa.tensor_scalar(
+                dst=quantized_output_sbuf_view[:p_size, int_tile.index, :f_size],
+                data=src_proj_res_sbuf_view[:p_size, int_tile.index, :f_size],
+                op0=nl.minimum,
+                operand0=max_pos_val,
+                op1=nl.maximum,
+                operand1=-max_pos_val,
+            )
 
 
 def perform_intermediate_row_quantization(
@@ -114,7 +115,7 @@ def perform_intermediate_row_quantization(
     int_dim_tile = tile_info.src_proj_intermediate_dim_tile
     bias_vector = constants.bxs_dim_subtile_zero_bias_vector_sbuf
     BXS_SUBTILE_COUNT = bxs_dim_tile.subtile_dim_info.tile_count
-    max_pos_val = _FP8_E4M3_MAX_POS_VAL
+    max_pos_val = get_max_positive_value_for_dtype(constants.down_proj_quant_data_type)
     rounded_intermediate_dim = int_dim_tile.tile_count * int_dim_tile.tile_size
 
     # Allocate buffers to store intermediate tensors
@@ -209,7 +210,7 @@ def perform_intermediate_quantization(
     static_input_quant_scale_sbuf: Optional[nl.ndarray],
     sbm: SbufManager,
 ):
-    if mlp_params.quant_params.is_quant_static():
+    if mlp_params.quant_params.is_quant_static() or mlp_params.quant_params.is_quant_static_mx():
         perform_intermediate_static_quantization(
             mlp_params,
             tile_info,

@@ -12,15 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Tensor I/O Module
+"""MLP CTE tensor I/O operations for loading and storing hidden tensor tiles and vectors."""
 
-Handles tensor loading and storing operations for MLP CTE kernels including hidden tensor
-tiles, fused operations, and cross-partition vector loading.
-
-"""
-
-from math import prod
 from typing import Callable, Optional
 
 import nki
@@ -28,7 +21,14 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.kernel_assert import kernel_assert
-from ..mlp_parameters import MLPParameters, mlpp_has_fused_add, mlpp_input_has_packed_scale, mlpp_store_fused_add
+from ...utils.tiled_range import TiledRange
+from ..mlp_parameters import (
+    MLPParameters,
+    mlpp_has_dma_xpose,
+    mlpp_has_fused_add,
+    mlpp_input_has_packed_scale,
+    mlpp_store_fused_add,
+)
 from .mlp_cte_constants import MLPCTEConstants
 from .mlp_cte_sharding import ShardedDim
 from .mlp_cte_tile_info import MlpBxsIndices, MLPCTETileInfo
@@ -82,7 +82,7 @@ def load_hidden_tensor_tile(
             nisa.dma_copy(
                 dst=output_tile_sbuf_list[bxs_subtile_idx][0:p_bxs_size, 0 : mlp_params.hidden_size],
                 src=hidden_tensor_hbm_view.ap(
-                    [[mlp_params.hidden_size, p_bxs_size], [1, mlp_params.hidden_size]],
+                    [[hidden_tensor_hbm_view.shape[2], p_bxs_size], [1, mlp_params.hidden_size]],
                     offset=hidden_tensor_offset,
                 ),
             )
@@ -205,6 +205,69 @@ def store_half_hidden_tensor_tile(
         )
 
 
+def load_and_transpose_mx_quant_hidden_tile(
+    mlp_params: MLPParameters,
+    tile_info: MLPCTETileInfo,
+    constants: MLPCTEConstants,
+    indices: MlpBxsIndices,
+    output_tile_sbuf_list: list[nl.ndarray],
+):
+    # Alias this to cut down on the code size for tile information references
+    bxs_dim_tile = tile_info.bxs_dim_tile
+    hidden_dim_tile = tile_info.mx_src_proj_hidden_dim_tile
+    H_TILE_COUNT = hidden_dim_tile.tile_count  # H/512
+    H_SUBTILE_COUNT = hidden_dim_tile.subtile_dim_info.tile_count  # 128
+    H_SUBTILE_SIZE = hidden_dim_tile.subtile_dim_info.tile_size  # 4
+    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size  # 128
+    BF16_FP8_SIZE_RATIO = 2
+
+    # This is the total BxS size from the tensor that we are loading
+    tensor_bxs_size = constants.get_bxs_size(mlp_params)
+    bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
+    current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
+    bxs_size = mlp_params.batch_size * mlp_params.sequence_len
+    tensor_bxs_offset = constants.get_bxs_offset()
+
+    # Ensure we have the shapes we need
+    hidden_tensor_hbm_view = _reshape_io_tensor(constants, mlp_params.hidden_tensor).reshape(
+        (bxs_size * 2, mlp_params.hidden_size // 2)
+    )
+
+    for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):  # 128 in BXS
+        for hidden_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):  # 512 in H
+            hidden_subtiles = TiledRange(hidden_tile, H_SUBTILE_SIZE)
+
+            # (hidden_size // 4) because we divide by 2 once to align with the HBM tensor reshape above
+            # and again because we are going to view the tensor in bf16
+            src_pattern = [
+                [mlp_params.hidden_size // 4, 2 * bxs_subtile.size],
+                [1, 1],
+                [1, 1],
+                [1, len(hidden_subtiles)],
+            ]
+            src_offset = (
+                (tensor_bxs_offset + bxs_subtile.start_offset) * mlp_params.hidden_size
+            ) // BF16_FP8_SIZE_RATIO + hidden_tile.index * H_SUBTILE_COUNT
+
+            # the hidden tensor tile has shape fp8[P(128_H), H/512, 256_S, 4_H], or using the aliases defined here:
+            #                                  fp8[H_SUBTILE_COUNT, H_TILE_COUNT, 2 * BXS_SUBTILE_SIZE, H_SUBTILE_SIZE]
+            bxs_x4_subtile_size_bf16 = 2 * BXS_SUBTILE_SIZE * H_SUBTILE_SIZE // BF16_FP8_SIZE_RATIO
+            dst_pattern = [
+                [H_TILE_COUNT * bxs_x4_subtile_size_bf16, len(hidden_subtiles)],
+                [1, 1],
+                [1, 1],
+                [1, 2 * bxs_subtile.size],
+            ]
+            dst_offset = (hidden_tile.index * bxs_x4_subtile_size_bf16) + (
+                (bxs_subtile.index % 2) * (2 * BXS_SUBTILE_SIZE)
+            )
+
+            nisa.dma_transpose(
+                src=hidden_tensor_hbm_view.ap(src_pattern, dtype=nl.bfloat16, offset=src_offset),
+                dst=output_tile_sbuf_list[bxs_subtile.index // 2].ap(dst_pattern, dtype=nl.bfloat16, offset=dst_offset),
+            )
+
+
 def load_hidden_tensor_tile_opt_fused_add(
     mlp_params: MLPParameters,
     tile_info: MLPCTETileInfo,
@@ -214,24 +277,27 @@ def load_hidden_tensor_tile_opt_fused_add(
     output_tile_scales_sbuf_list: Optional[nl.ndarray],
     output_stored_add_tensor_hbm: Optional[nl.ndarray],
 ):
-    if mlpp_has_fused_add(mlp_params):
-        # Load the hidden tensor tile with the fused add applied
-        load_fused_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
-        if mlpp_store_fused_add(mlp_params):
-            # Store the resulting fused add hidden tensor
-            store_hidden_tensor_tile(
-                mlp_params,
-                tile_info,
-                constants,
-                indices,
-                output_tile_sbuf_list,
-                output_stored_add_tensor_hbm,
-            )
-    else:  # No fused add
-        # Load the hidden tensor tile
-        load_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
-        if mlpp_input_has_packed_scale(mlp_params):
-            load_packed_hidden_scales(mlp_params, tile_info, constants, indices, output_tile_scales_sbuf_list)
+    if mlpp_has_dma_xpose(mlp_params):
+        load_and_transpose_mx_quant_hidden_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
+    else:
+        if mlpp_has_fused_add(mlp_params):
+            # Load the hidden tensor tile with the fused add applied
+            load_fused_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
+            if mlpp_store_fused_add(mlp_params):
+                # Store the resulting fused add hidden tensor
+                store_hidden_tensor_tile(
+                    mlp_params,
+                    tile_info,
+                    constants,
+                    indices,
+                    output_tile_sbuf_list,
+                    output_stored_add_tensor_hbm,
+                )
+        else:  # No fused add
+            # Load the hidden tensor tile
+            load_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
+            if mlpp_input_has_packed_scale(mlp_params):
+                load_packed_hidden_scales(mlp_params, tile_info, constants, indices, output_tile_scales_sbuf_list)
 
 
 #
@@ -291,7 +357,9 @@ def load_packed_hidden_scales(
                 src=hidden_tensor_hbm_view.ap(
                     dtype=nl.float32,
                     pattern=[[hidden_size_fp32, p_bxs_size], [1, 1]],
-                    offset=(bxs_offset * hidden_size_fp32) + (hidden_size_fp32 - 1),
+                    offset=(indices.batch_idx * hidden_tensor_hbm_view.shape[1] * hidden_size_fp32)
+                    + (bxs_offset * hidden_size_fp32)
+                    + (hidden_size_fp32 - 1),
                 ),
             )
 
@@ -312,22 +380,53 @@ def load_source_projection_row_scales(
     return src_proj_scales_sbuf
 
 
-def load_static_input_scales(static_quant_scale_hbm: nl.ndarray, allocator: Callable) -> nl.ndarray:
-    src_proj_scales_sbuf = allocator((nl.tile_size.pmax, 1), dtype=nl.float32)
+def prepare_static_scales(
+    mlp_params: MLPParameters,
+    constants: MLPCTEConstants,
+    gate_up_proj_static_input_scales_sbuf: nl.ndarray,
+    down_proj_static_input_scales_sbuf: nl.ndarray,
+    gate_proj_static_weight_scales_sbuf: nl.ndarray,
+    up_proj_static_weight_scales_sbuf: nl.ndarray,
+    down_proj_static_weight_scales_sbuf: nl.ndarray,
+):
     nisa.dma_copy(
-        dst=src_proj_scales_sbuf[0 : nl.tile_size.pmax, 0:1],
-        src=static_quant_scale_hbm[0 : nl.tile_size.pmax, 0:1],
+        dst=gate_up_proj_static_input_scales_sbuf[0 : nl.tile_size.pmax, 0:1],
+        src=mlp_params.quant_params.gate_up_in_scale[0 : nl.tile_size.pmax, 0:1],
     )
-    return src_proj_scales_sbuf
+    nisa.dma_copy(
+        dst=down_proj_static_input_scales_sbuf[0 : nl.tile_size.pmax, 0:1],
+        src=mlp_params.quant_params.down_in_scale[0 : nl.tile_size.pmax, 0:1],
+    )
+    load_and_multiply_static_weight_scales(
+        constants,
+        mlp_params.quant_params.gate_w_scale,
+        gate_up_proj_static_input_scales_sbuf,
+        gate_proj_static_weight_scales_sbuf,
+    )
+    load_and_multiply_static_weight_scales(
+        constants,
+        mlp_params.quant_params.up_w_scale,
+        gate_up_proj_static_input_scales_sbuf,
+        up_proj_static_weight_scales_sbuf,
+    )
+    load_and_multiply_static_weight_scales(
+        constants,
+        mlp_params.quant_params.down_w_scale,
+        down_proj_static_input_scales_sbuf,
+        down_proj_static_weight_scales_sbuf,
+    )
+    nisa.reciprocal(
+        dst=down_proj_static_input_scales_sbuf[0 : nl.tile_size.pmax, 0:1],
+        data=down_proj_static_input_scales_sbuf[0 : nl.tile_size.pmax, 0:1],
+    )
 
 
 def load_and_multiply_static_weight_scales(
     constants: MLPCTEConstants,
     static_weight_scale_hbm: nl.ndarray,
     static_input_scale_sbuf: nl.ndarray,
-    allocator: Callable,
+    static_weight_scale_sbuf: nl.ndarray,
 ) -> nl.ndarray:
-    static_weight_scale_sbuf = allocator((nl.tile_size.pmax, 1), dtype=nl.float32)
     nisa.dma_copy(
         dst=static_weight_scale_sbuf[0 : nl.tile_size.pmax, 0:1],
         src=static_weight_scale_hbm[0 : nl.tile_size.pmax, 0:1],
@@ -339,7 +438,6 @@ def load_and_multiply_static_weight_scales(
         bias=constants.bxs_dim_subtile_zero_bias_vector_sbuf[0 : nl.tile_size.pmax, 0:1],
         scale=static_input_scale_sbuf[0 : nl.tile_size.pmax, 0:1],
     )
-    return static_weight_scale_sbuf
 
 
 #

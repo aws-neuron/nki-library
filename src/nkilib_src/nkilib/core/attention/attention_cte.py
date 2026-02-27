@@ -99,7 +99,7 @@ Level 4: Group Loop (Q sequence processing)
 
 INTENDED USAGE:
 
-The kernel supports sequence lengths up to 32k and is optimized for q sequence
+The kernel supports sequence lengths up to 36864 and is optimized for q sequence
 length larger than ~256 (i.e., prefill/context encoding workloads). The head dimension (d)
 can be up to 128. Batch size up to 16 has been tested.
 
@@ -108,27 +108,30 @@ bfloat16 for other operations.
 
 """
 
-import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 
 from ..utils.allocator import align_to
 from ..utils.kernel_assert import assert_shape, kernel_assert
-from ..utils.kernel_helpers import PSUM_BANK_SIZE, get_verified_program_sharding_info
+from ..utils.kernel_helpers import PSUM_BANK_SIZE, div_ceil, get_verified_program_sharding_info
+from ..utils.logging import get_logger
 from ..utils.modular_allocator import ModularAllocator
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+
+logger = get_logger("attention_cte")
 
 _FLOAT32_MIN = -3.4028235e38  # used for initialization and masking
 
 """
 Kernel constraints (based on tested range, values outside range might work in practice)
 """
-_MAX_BS = 16  # max tested batch size
-_MAX_SEQLEN = 32 * 1024  # max tested seqlen
-_MAX_BS_TIMES_SEQLEN_QK = 8.0 * 16 * 1024 * 16 * 1024  # max tested bs*seqlen_q*seqlen_k
+_MAX_BS = 512  # max tested batch size
+_MAX_SEQLEN = 131072  # max allowed seqlen
+_MAX_BS_TIMES_SEQLEN_QK = 32.0 * 36864 * 36864  # max tested bs*seqlen_q*seqlen_k
 _MAX_HEAD_DIM = 128  # max supported head dim (d)
 _MIN_GLOBAL_CP_DEGREE = 1  # minimum context parallel degree
 _MAX_GLOBAL_CP_DEGREE = 32  # minimum context parallel degree
@@ -154,6 +157,7 @@ _SWA_ALLOCATION_STRATEGY_THRESHOLD = (
 )
 
 
+@nki.jit
 def attention_cte(
     q: nl.ndarray,
     k: nl.ndarray,
@@ -266,6 +270,34 @@ def attention_cte(
         cp_strided_q_slicing True  => q seqlen slice is [1, 4, 7, 10] and cp_offset is 1.
         In both cases, KV token order is simply [0, 1, 2, ..., 10, 11]
 
+    Pseudocode:
+      ```
+      # High-level algorithm (see module docstring for detailed implementation)
+      for each batch in batch_size:
+        for each section in K/V (flash attention sectioning):
+          for each Q group (128 tokens):
+            # MM1: Compute attention scores
+            scores = Q @ K^T * scale
+
+            # Apply masking (causal, sliding window, CP, prefix caching)
+            scores = apply_masks(scores)
+
+            # Softmax with running statistics for flash attention
+            max_score = max(scores)
+            exp_scores = exp(scores - max_score)
+            sum_exp = sum(exp_scores)
+
+            # Update running statistics across sections
+            update_flash_attention_stats(max_score, sum_exp)
+
+            # MM2: Compute output
+            output += exp_scores @ V
+
+          # Normalize output using flash attention correction
+          if last_section:
+            output = output / sum_exp
+      ```
+
     """
     if sliding_window is None:
         sliding_window = 0
@@ -328,11 +360,10 @@ def attention_cte(
         f"attention_cte kernel is not tested for seqlen above {_MAX_SEQLEN}, got {seqlen_k_total=}.",
     )
     bs_seqlen_qk_product = float(bs * seqlen_q) * seqlen_k_total  # use float to avoid overflow
-    kernel_assert(
-        bs_seqlen_qk_product <= _MAX_BS_TIMES_SEQLEN_QK,
-        f"attention_cte kernel is not tested for batch size x seqlen_q x seqlen_k above {_MAX_BS_TIMES_SEQLEN_QK}, "
-        f"got {bs_seqlen_qk_product=}.",
-    )
+    if bs_seqlen_qk_product <= _MAX_BS_TIMES_SEQLEN_QK:
+        logger.warn(
+            f"attention_cte kernel is not tested for batch size x seqlen_q x seqlen_k above {_MAX_BS_TIMES_SEQLEN_QK}, got {bs_seqlen_qk_product=}.",
+        )
     kernel_assert(
         sliding_window <= _MAX_SEQLEN,
         f"attention_cte kernel is not tested for sliding window above {_MAX_SEQLEN}, got {sliding_window=}.",
@@ -381,8 +412,8 @@ def attention_cte(
     num_bs_per_shard = bs // num_shard
     bs_offset = shard_id * num_bs_per_shard
 
-    for b in range(num_bs_per_shard):
-        kv_batch_id = _q_to_kv_batch_id(b + bs_offset, bs, bs_kv)
+    for batch_idx in range(num_bs_per_shard):
+        kv_batch_id = _q_to_kv_batch_id(batch_idx + bs_offset, bs, bs_kv)
         _attention_cte_impl(
             q,
             k,
@@ -391,7 +422,7 @@ def attention_cte(
             v_prior,
             prior_used_len,
             result,
-            b + bs_offset,
+            batch_idx + bs_offset,
             kv_batch_id,
             ac,
             sink=sink,
@@ -423,7 +454,7 @@ def attention_cte(
                     _SEQLEN_SHARDING_SPLIT_FACTOR_CAUSAL * s_active + _SEQLEN_SHARDING_SPLIT_FACTOR_DEFAULT * s_prior
                 ) / (s_active + s_prior)
 
-            total_grps = math.ceil(seqlen_q / _Q_GRP_SZ)
+            total_grps = div_ceil(seqlen_q, _Q_GRP_SZ)
             batch_0_grp = int(total_grps * divide_factor)
             batch_1_grp = total_grps - batch_0_grp
 
@@ -911,7 +942,7 @@ def _compute_tile_parameters(
     )
 
     # Group configuration
-    atp.num_grps = math.ceil(ac.seqlen_q / atp.sb_p)
+    atp.num_grps = div_ceil(ac.seqlen_q, atp.sb_p)
     atp.can_pack_q_load = not is_seqlen_sharded
 
     num_q_grps_per_load_dtype = 4 if ac.dtype == nl.float32 else 8  # fewer groups for float32 for SBUF memory
@@ -956,7 +987,7 @@ def _compute_tile_parameters(
         atp.section_len = total_seqlen_k
 
     kernel_assert(atp.section_len > 0, f"section_len must be positive, got {atp.section_len}")
-    atp.num_sections = math.ceil(total_seqlen_k / atp.section_len)
+    atp.num_sections = div_ceil(total_seqlen_k, atp.section_len)
 
     if not use_flash_attn:
         kernel_assert(
@@ -965,9 +996,9 @@ def _compute_tile_parameters(
         )
 
     # Tile counts per section
-    atp.num_large_tiles_per_section = math.ceil(atp.section_len / _LARGE_TILE_SZ)
-    atp.num_k_tiles_per_section = math.ceil(atp.section_len / _K_TILE_SZ)
-    atp.num_v_tiles_per_section = math.ceil(atp.section_len / _V_TILE_SZ)
+    atp.num_large_tiles_per_section = div_ceil(atp.section_len, _LARGE_TILE_SZ)
+    atp.num_k_tiles_per_section = div_ceil(atp.section_len, _K_TILE_SZ)
+    atp.num_v_tiles_per_section = div_ceil(atp.section_len, _V_TILE_SZ)
 
     # K/V tile sizes for exp and transpose/MM2
     atp.exp_inst_elems = _EXP_TILE_SZ
@@ -1116,7 +1147,7 @@ def _setup_range_select_bounds(
             operand1=0.0,
         )
         bufs.k_offset_sb_u32 = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
-        nisa.tensor_copy(bufs.k_offset_sb_u32[0, 0], k_offset_sb[0, 0], dtype=nl.uint32)
+        nisa.tensor_copy(bufs.k_offset_sb_u32[0, 0], k_offset_sb[0, 0])
 
         # Adjust range select bounds
         nisa.tensor_scalar(
@@ -1174,7 +1205,7 @@ def _allocate_attention_buffers(
     bufs.q_sb = allocator.alloc_sbuf_tensor(
         shape=(ac.d, atp.sb_p * atp.num_q_grps_per_load),
         dtype=nl.bfloat16,
-        block_dim=[math.ceil(atp.num_grps / atp.num_q_grps_per_load)],
+        block_dim=[div_ceil(atp.num_grps, atp.num_q_grps_per_load)],
         num_free_tiles=[2],
         align_to=32,  # align for dma transpose
     )
@@ -1203,7 +1234,7 @@ def _allocate_attention_buffers(
         num_free_tiles=[2],
     )
 
-    n_final_reduce_sum_elts = math.ceil(atp.section_len / atp.exp_inst_elems) + (sink is not None)
+    n_final_reduce_sum_elts = div_ceil(atp.section_len, atp.exp_inst_elems) + (sink is not None)
     bufs.exp_partial_sum = allocator.alloc_sbuf_tensor(
         shape=(atp.sb_p, n_final_reduce_sum_elts),
         dtype=nl.float32,
@@ -1273,19 +1304,19 @@ def _allocate_attention_buffers(
         # PSUM allocations for tp_flash_attn_correction_factor_psum and tp_exp_sum_reciprocal_psum
         bufs.tp_flash_attn_correction_factor_psum = []
         bufs.tp_exp_sum_reciprocal_psum = []
-        for i in range(atp.num_grps):
+        for grp_idx in range(atp.num_grps):
             tp_flash_attn_correction_factor_psum_tile = nl.ndarray(
                 (ac.d, atp.sb_p),
                 dtype=nl.float32,
                 buffer=nl.psum,
-                address=(0, ((i % 2) * 4 + 3) * PSUM_BANK_SIZE),
+                address=(0, ((grp_idx % 2) * 4 + 3) * PSUM_BANK_SIZE),
             )
             bufs.tp_flash_attn_correction_factor_psum.append(tp_flash_attn_correction_factor_psum_tile)
             tp_exp_sum_reciprocal_psum_tile = nl.ndarray(
                 (ac.d, atp.sb_p),
                 dtype=nl.float32,
                 buffer=nl.psum,
-                address=(0, ((i % 2) * 4 + 3) * PSUM_BANK_SIZE),
+                address=(0, ((grp_idx % 2) * 4 + 3) * PSUM_BANK_SIZE),
             )
             bufs.tp_exp_sum_reciprocal_psum.append(tp_exp_sum_reciprocal_psum_tile)
 
@@ -1349,16 +1380,16 @@ def _allocate_attention_buffers(
 
     # mm1_psum PSUM allocation
     bufs.mm1_psum = []
-    for i in range(atp.num_grps):
+    for grp_idx in range(atp.num_grps):
         grp_row = []
-        for j in range(atp.num_large_tiles_per_section):
+        for large_tile_idx in range(atp.num_large_tiles_per_section):
             tile_row = []
-            for k in range(4):
+            for k_tile_idx in range(4):
                 mm1_psum_tile = nl.ndarray(
                     (mm1_p, mm1_n),
                     dtype=nl.float32,
                     buffer=nl.psum,
-                    address=(0, (k % 4) * PSUM_BANK_SIZE),
+                    address=(0, (k_tile_idx % 4) * PSUM_BANK_SIZE),
                 )
                 tile_row.append(mm1_psum_tile)
             grp_row.append(tile_row)
@@ -1397,22 +1428,22 @@ def _allocate_attention_buffers(
 
     # mm2_psum allocation
     bufs.mm2_psum = []
-    for i in range(atp.num_grps):
+    for grp_idx in range(atp.num_grps):
         grp_row = []
-        for j in range(atp.num_large_tiles_per_section):
+        for large_tile_idx in range(atp.num_large_tiles_per_section):
             if ac.tp_out:
                 mm2_psum_tile = nl.ndarray(
                     (mm2_n, mm2_p),
                     dtype=nl.float32,
                     buffer=nl.psum,
-                    address=(0, ((4 + (j % 4)) * PSUM_BANK_SIZE)),
+                    address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
                 )
             else:
                 mm2_psum_tile = nl.ndarray(
                     (mm2_p, mm2_n),
                     dtype=nl.float32,
                     buffer=nl.psum,
-                    address=(0, ((4 + (j % 4)) * PSUM_BANK_SIZE)),
+                    address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
                 )
             grp_row.append(mm2_psum_tile)
         bufs.mm2_psum.append(grp_row)
@@ -1506,7 +1537,7 @@ def _check_input_and_return_shape(
             seqlen_q % cache_softmax_tile_size == 0,
             f"For cache softmax, attention_cte currently expects seqlen_q multiple of {cache_softmax_tile_size}, got {seqlen_q=}",
         )
-    padded_seq_grps = math.ceil(out_seqlen / cache_softmax_tile_size)
+    padded_seq_grps = div_ceil(out_seqlen, cache_softmax_tile_size)
     cache_softmax_shape = [batch_size, cache_softmax_tile_size, padded_seq_grps]
 
     return (seqlen_q, seqlen_k, seqlen_k_prior, d, out_shape, cache_softmax_shape)
@@ -1755,7 +1786,7 @@ def _load_k_tile(
                             nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
                 else:  # not load_offset
                     # Use strided load to load four tiles of [128, d]
-                    num_inner_f = min(math.ceil((seqlen - seqlen_offset) / sb_p), num_pe_tps)
+                    num_inner_f = min(div_ceil(seqlen - seqlen_offset, sb_p), num_pe_tps)
                     num_p = min(seqlen - seqlen_offset - num_inner_f * num_pe_tps, sb_p)
 
                     # Convert load() to access pattern with 2D mask
@@ -2439,7 +2470,7 @@ def _scale_reciprocal_write_back_impl(
             nl.copy,
             src_buf[:num_p, : ac.d],
             scale=bufs.exp_sum_reciprocal[:num_p, grp_i],
-            bias=bufs.zero_bias_tensor,
+            bias=bufs.zero_bias_tensor[:num_p],
         )
 
     _write_back_o_impl(bufs.mm2_final[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
@@ -2602,12 +2633,12 @@ def _qk_and_max_large_tile_impl(
 
             elif atp.dynamic_sel_mask or is_prior_tile:  # dynamic (compile-time unknown) mask
                 if is_prior_tile:
-                    bound0 = bufs.range_sel_lbs_prior[:, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
-                    bound1 = bufs.range_sel_ubs_prior[:, qkmax_grp]
+                    bound0 = bufs.range_sel_lbs_prior[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
+                    bound1 = bufs.range_sel_ubs_prior[:num_p, qkmax_grp]
                     comp_op1 = nl.less  # k < prior_used_len
                 else:
-                    bound0 = bufs.range_sel_lbs[:, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
-                    bound1 = bufs.range_sel_ubs[:, qkmax_grp]
+                    bound0 = bufs.range_sel_lbs[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
+                    bound1 = bufs.range_sel_ubs[:num_p, qkmax_grp]
                     comp_op1 = nl.less_equal  # k <= q + cp_offset
 
                 kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")

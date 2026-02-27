@@ -32,7 +32,8 @@ from ...mlp.mlp_tkg.mlp_tkg_utils import input_norm_load, transpose_store
 # common utils
 from ...utils.allocator import SbufManager
 from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim
-from ...utils.logging import Logger
+from ...utils.kernel_helpers import get_verified_program_sharding_info
+from ...utils.logging import get_logger
 from ...utils.tensor_view import TensorView
 from .moe_tkg_utils import (
     broadcast_token_affinity,
@@ -103,7 +104,7 @@ def _selective_expert_moe_tkg(
     # TODO: Calibrate weight tile calculations and remove auto allocation workaround
     H = params.hidden_tensor.shape[-1]
     need_auto_alloc = H >= 16 * 1024 or hidden_in_sbuf
-    sbm = SbufManager(0, 200 * 1024, Logger("selective_expert_moe_tkg"), use_auto_alloc=need_auto_alloc)
+    sbm = SbufManager(0, 200 * 1024, get_logger("selective_expert_moe_tkg"), use_auto_alloc=need_auto_alloc)
     sbm.open_scope()
 
     io_dtype = params.hidden_tensor.dtype
@@ -111,15 +112,41 @@ def _selective_expert_moe_tkg(
     expert_affinities = params.expert_params.expert_affinities
     gate_up_weights = params.gate_proj_weights_tensor
 
+    program_sharding_info = get_verified_program_sharding_info("moe_tkg", (0, 1))
+    num_shards = program_sharding_info[1]
+    shard_id = program_sharding_info[2]
+
+    T = expert_index_input.shape[0]
+    I = gate_up_weights.shape[-1]
+    shard_on_T = True
+
+    # Disable shard_on_T when:
+    # 1. T == 1: Only one token, no benefit from sharding on this dimension
+    # 2. H * I >= 3072 * 1536: Big config has mlp tkg tile size calculation bug (NKL-1013)
+    if T == 1 or H * I >= 3072 * 1536:
+        shard_on_T = False
+
+    # For odd T, use ceiling division: core 0 gets T//2, core 1 gets T - T//2
+    if shard_on_T:
+        T_first_shard = T // num_shards
+        T_second_shard = T - T_first_shard
+        T_per_shard = T_first_shard if shard_id == 0 else T_second_shard
+        T_offset = 0 if shard_id == 0 else T_first_shard
+    else:
+        T_per_shard = T
+        T_offset = 0
+
+    params.shard_on_h_disabled = shard_on_T
     dims = MLPTKGConstants.calculate_constants(params)
 
     # Load input in shape of [128(H0), T, H//128(H1)]
     if hidden_in_sbuf:
-        # Input is already in SBUF with shape [H0, T, H1_shard] (pre-sliced per shard)
+        # Input is already in SBUF
         input_sb = params.hidden_tensor
     else:
+        # TODO: only load for local tokens
         input_sb = sbm.alloc_stack(
-            [dims.H0, dims.T, dims.H1_shard],
+            [dims.H0, T, dims.H1_shard],
             dtype=io_dtype,
             buffer=nl.sbuf,
             name="input_sb",
@@ -128,7 +155,7 @@ def _selective_expert_moe_tkg(
 
     # Allocate SBUF location to accumulate output
     output_temp = sbm.alloc_stack(
-        (dims.H0, dims.H1_shard, dims.T),
+        (dims.H0, dims.H1_shard, T_per_shard),
         dtype=io_dtype,
         name=f"temp_output_sbuf",
         buffer=nl.sbuf,
@@ -155,7 +182,7 @@ def _selective_expert_moe_tkg(
     gate_up_weights = gate_up_weights.reshape((E, H, I * i_2))
 
     # Load expert index
-    if expert_index_input == nl.sbuf:
+    if expert_index_input.buffer == nl.sbuf:
         expert_idx = expert_index_input
     else:
         expert_idx = sbm.alloc_stack(
@@ -173,7 +200,7 @@ def _selective_expert_moe_tkg(
         buffer=nl.sbuf,
     )
     # Load expert affinity
-    if expert_affinities == nl.sbuf:
+    if expert_affinities.buffer == nl.sbuf:
         nisa.memset(expert_affinities_sb, value=0.0)
         nisa.tensor_copy(dst=expert_affinities_sb[0 : dims.T, 0 : dims.E], src=expert_affinities)
     else:
@@ -195,12 +222,16 @@ def _selective_expert_moe_tkg(
     initial_mlp_bias_params = params.bias_params
     initial_mlp_quant_params = params.quant_params
 
-    actual_dims_t = dims.T
+    memory_safe_degree = 2
+    if shard_on_T:
+        memory_safe_degree = 2 if dims.H * dims.I < 3072 * 1024 else 1
+
     # convert dims.T to 1 to compute output by each token
     dims.T = 1
 
-    for token_idx in range(actual_dims_t):
-        sbm.set_name_prefix(f"T{token_idx}_")
+    for local_token_idx in range(T_per_shard):
+        global_token_idx = local_token_idx + T_offset
+        sbm.set_name_prefix(f"T{global_token_idx}_")
         # Load Expert Affinities per Token using utility function
         expert_affinity_sb = sbm.alloc_stack(
             (dims._pmax, dims.K),
@@ -208,16 +239,16 @@ def _selective_expert_moe_tkg(
             buffer=nl.sbuf,
             name=f"expert_affinity_sb",
         )
-        broadcast_token_affinity(expert_affinity_sb, gathered_affinities_sb, token_idx, dims, sbm)
+        broadcast_token_affinity(expert_affinity_sb, gathered_affinities_sb, global_token_idx, dims, sbm)
 
-        sbm.open_scope(interleave_degree=2)
+        sbm.open_scope(interleave_degree=memory_safe_degree)
         for expert_k_idx in range(dims.K):
-            sbm.set_name_prefix(f"T{token_idx}_K{expert_k_idx}_")
+            sbm.set_name_prefix(f"T{global_token_idx}_K{expert_k_idx}_")
             # Gate Up projection
 
-            # Change back to scalar_offset=expert_idx[token_idx, expert_k_idx], after NKI-333 is fixed
+            # Change back to scalar_offset=expert_idx[global_token_idx, expert_k_idx], after NKI-333 is fixed
             expert_id_scalar_offset = expert_idx.ap(
-                pattern=[[dims.K, 1], [1, 1]], offset=token_idx * dims.K + expert_k_idx
+                pattern=[[dims.K, 1], [1, 1]], offset=global_token_idx * dims.K + expert_k_idx
             )
             params.gate_proj_weights_tensor = (
                 TensorView(initial_gate_proj_weights_tensor)
@@ -269,7 +300,7 @@ def _selective_expert_moe_tkg(
             )
 
             gate_tile_info = process_gate_up_projection(
-                hidden=input_sb[:, token_idx : token_idx + 1, :],
+                hidden=input_sb[:, global_token_idx : global_token_idx + 1, :],
                 output=gate_up_output[:, :, expert_k_idx : expert_k_idx + 1],
                 params=params,
                 dims=dims,
@@ -296,11 +327,11 @@ def _selective_expert_moe_tkg(
                     operand0=expert_affinity_sb[:, expert_k_idx],
                 )
             if expert_k_idx == 0:
-                nisa.tensor_copy(dst=output_temp[0 : dims.H0, 0 : dims.H1_shard, token_idx], src=down_sb)
+                nisa.tensor_copy(dst=output_temp[0 : dims.H0, 0 : dims.H1_shard, local_token_idx], src=down_sb)
             else:
                 nisa.tensor_tensor(
-                    dst=output_temp[0 : dims.H0, 0 : dims.H1_shard, token_idx],
-                    data1=output_temp[0 : dims.H0, 0 : dims.H1_shard, token_idx],
+                    dst=output_temp[0 : dims.H0, 0 : dims.H1_shard, local_token_idx],
+                    data1=output_temp[0 : dims.H0, 0 : dims.H1_shard, local_token_idx],
                     data2=down_sb,
                     op=nl.add,
                 )
@@ -308,19 +339,18 @@ def _selective_expert_moe_tkg(
             sbm.increment_section()
         sbm.close_scope()
 
-    # revert dims.T
-    dims.T = actual_dims_t
-
     # Save output result
     sbm.set_name_prefix("")
 
+    dims.T = T_per_shard
+
     # Store output
     if output.buffer == nl.sbuf:
-        # Transpose output_temp [H0, H1_shard, T] -> [H0, T, H1_shard] for SBUF output
+        # Transpose output_temp [H0, H1_shard, T_per_shard] -> [H0, T, H1_shard] for SBUF output
         for h1_idx in range(dims.H1_shard):
-            nisa.tensor_copy(dst=output[:, :, h1_idx], src=output_temp[:, h1_idx, :])
+            nisa.tensor_copy(dst=output[:, T_offset : T_offset + T_per_shard, h1_idx], src=output_temp[:, h1_idx, :])
     else:
-        transpose_store(output_temp, output, dims, params.output_dtype, sbm)
+        transpose_store(output_temp, output, dims, params.output_dtype, sbm, T_offset)
 
     sbm.close_scope()
     return output

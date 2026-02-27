@@ -32,11 +32,24 @@ from .tree_logger import TreeLogger
 def sizeinbytes(dtype):
     if str(dtype) == str(nl.float32):
         return 4
-    elif str(dtype) == str(nl.bfloat16) or str(dtype) == str(nl.float16) or str(dtype) == str(nl.uint16):
+    elif (
+        str(dtype) == str(nl.bfloat16)
+        or str(dtype) == str(nl.float16)
+        or str(dtype) == str(nl.uint16)
+        or str(dtype) == str(nl.int16)
+    ):
         return 2
-    elif str(dtype) == str(nl.int8) or str(dtype) == str(nl.uint8) or str(dtype) in ["float8e4", "float8_e4m3"]:
+    elif (
+        str(dtype) == str(nl.int8)
+        or str(dtype) == str(nl.uint8)
+        or str(dtype) in ["float8e4", "float8_e4m3", "float8_e4m3fn", "float8e5", "float8_e5m2"]
+    ):
         return 1
     elif str(dtype) == str(nl.int32) or str(dtype) == str(nl.uint32):
+        return 4
+    elif str(dtype) == str(nl.float4_e2m1fn_x4):
+        return 2
+    elif str(dtype) == str(nl.float8_e4m3fn_x4) or str(dtype) == str(nl.float8_e5m2_x4):
         return 4
     kernel_assert(False, f"dtype size unknown! {dtype}")
 
@@ -114,6 +127,12 @@ class SbufManager(nl.NKIObject):
         )
         self.prefix = ''
 
+    def _get_prefixed_name(self, name):
+        """Apply prefix to tensor name."""
+        if name is None:
+            return None
+        return f"{self.prefix}{name}"
+
     def _update_stats(self):
         stack_usage = self.stack_curr_addr - self.lower_bound
         heap_usage = self.upper_bound - self.heap_curr_addr
@@ -166,7 +185,7 @@ class SbufManager(nl.NKIObject):
         the current scope. Otherwise, continue allocate on the current address.
 
         Example:
-        sbm = SbufManager(0, 128*1024, Logger())
+        sbm = SbufManager(0, 128*1024, get_logger())
         sbm.open_scope(interleave_degree=2)
 
         for i in range(4):
@@ -280,7 +299,7 @@ class SbufManager(nl.NKIObject):
         if align == None:
             align = sizeinbytes(dtype)
         self.stack_curr_addr = align_to(self.stack_curr_addr, align)
-        tensor_name = f"{self.prefix}{name}" if name else None
+        tensor_name = self._get_prefixed_name(name)
         if self.use_auto_alloc:
             mloc = nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=tensor_name)
         else:
@@ -337,12 +356,12 @@ class SbufManager(nl.NKIObject):
             kernel_assert(False, "Heap out of memory")
 
         if align != None:
-            self.heap_curr_addr = align_to(self.heap_curr_addr, align)
+            self.heap_curr_addr = align_to(self.heap_curr_addr - (align - 1), align)
         base_addr = self.heap_curr_addr - bytes_per_partition
         self.heap_curr_addr -= bytes_per_partition
         self.heap_curr_addr = align_to(self.heap_curr_addr - 3, 4)  # heap grows down, so should the align
 
-        tensor_name = f"{self.prefix}{name}" if name else None
+        tensor_name = self._get_prefixed_name(name)
         if self.use_auto_alloc:
             mloc = nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=tensor_name)
         else:
@@ -419,6 +438,19 @@ class SbufManager(nl.NKIObject):
 
     def get_name_prefix(self):
         return self.prefix
+
+    def alloc_hbm(self, shape, dtype, buffer=nl.shared_hbm, name=None):
+        """
+        Allocate a tensor in HBM with automatic name prefixing.
+
+        :param shape: shape of the tensor to be allocated
+        :param dtype: dtype of the tensor to be allocated
+        :param buffer: type of the buffer (nl.shared_hbm or nl.hbm)
+        :param name: name of the tensor (prefix will be automatically added)
+        :return: an HBM tensor
+        """
+        tensor_name = self._get_prefixed_name(name)
+        return nl.ndarray(shape, dtype=dtype, buffer=buffer, name=tensor_name)
 
     def flush_logs(self):
         """Print buffered allocation logs in tree format."""

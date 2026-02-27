@@ -45,11 +45,13 @@ ALLOWED_P_SCALE_IDX_OFFSETS = [
     8,
     12,
 ]  # Can fit 4x scales of width 4 in P into partitions 0:16 in each SBUF quadrant
+# QuantizeMx can accept P in [32, 64, 128], corresponding to unpacked P [128, 256, 512]
+ALLOWED_QMX_P_DIM = [32, 64, 128]
+ALLOWED_QMX_UNPACKED_P_DIM = [128, 256, 512]
 
 # MMULMX config
-# MatmultMX can accept P in [32, 64, 128], corresponding to unpacked P [128, 256, 512]
-ALLOWED_P_DIM_MX = [32, 64, 128]
-ALLOWED_UNPACKED_P_DIM_MX = [128, 256, 512]
+MIN_MATMULT_MX_P_DIM = 8  # Must have at least 1x [8P, 4F] block
+MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM = 512  # 128P x 4F
 
 # Gate/up indices
 GATE_FUSED_IDX, UP_FUSED_IDX = 0, 1
@@ -84,6 +86,9 @@ class ProjConfig(nl.NKIObject):
     # This requires out_p_offset + BxS <= 128 and out_p_offset % 32 == 0
     out_p_offset: int = 0
 
+    # Bias broadcast method: True = stream shuffle broadcast (default), False = PE broadcast via matmul
+    use_stream_shuffle_broadcast: bool = True
+
     # Debug
     dbg_hidden: bool = False
     dbg_weight: bool = False
@@ -98,7 +103,7 @@ class ProjConfig(nl.NKIObject):
 
         kernel_assert(
             self.r_I512_tile % (_q_width * _q_height) == 0,
-            f"MX4 MLP Proj requires I512 tile remainder ({self.r_I512_tile}) to be divisible by {_q_width*_q_height} for quantization",
+            f"MX4 MLP Proj requires I512 tile remainder ({self.r_I512_tile}) to be divisible by {_q_width * _q_height} for quantization",
         )
 
         if self.out_p_offset != 0:
@@ -133,6 +138,12 @@ class ProjConfig(nl.NKIObject):
         )  # num partitions for remainder I512 tile (set to fill consec. 4-elt seq on the free dim)
 
         self.BxS_tile_sz = min(self.BxS, _psum_fmax * 2 // _q_width)  # double psum elts because out is in bf16
+
+        # H tile size for down projection based on matmul_mx constraints
+        # Use 2x psum_fmax (1024) if H_sharded is divisible, else use psum_fmax (512)
+        self.H_tile_size = 2 * _psum_fmax if self.H_sharded % (2 * _psum_fmax) == 0 else _psum_fmax
+        self.n_H_tile_sharded = self.H_sharded // self.H_tile_size
+
         if self.force_lnc1:
             self.n_prgs = 1
             self.prg_id = 0

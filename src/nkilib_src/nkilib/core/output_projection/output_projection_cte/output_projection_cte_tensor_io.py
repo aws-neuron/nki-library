@@ -14,13 +14,13 @@
 
 """Tensor I/O operations for output projection CTE kernel including weights, biases, and scales."""
 
-from typing import List
+from typing import List, Tuple
 
 import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.tensor_view import TensorView
-from .output_projection_cte_parameters import QuantizationConfig, TilingConfig
+from .output_projection_cte_parameters import _SBUF_QUADRANT_SIZE, QuantizationConfig, TilingConfig, _q_height, _q_width
 
 
 def get_zero_bias_vector_sbuf(tile_size: int, activation_data_type=nl.float32) -> nl.ndarray:
@@ -35,7 +35,7 @@ def get_zero_bias_vector_sbuf(tile_size: int, activation_data_type=nl.float32) -
         nl.ndarray: [tile_size, 1], Zero-initialized bias vector in SBUF.
     """
     bias_vector_sbuf = nl.ndarray((tile_size, 1), dtype=activation_data_type, buffer=nl.sbuf)
-    nisa.memset(bias_vector_sbuf, value=0.0)
+    nisa.memset(bias_vector_sbuf, value=0.0, engine=nisa.gpsimd_engine)
     return bias_vector_sbuf
 
 
@@ -144,6 +144,7 @@ def load_bias(
 def load_input_tensor_float(
     attention_view: TensorView,
     cfg: TilingConfig,
+    target_dtype=None,
 ) -> List[nl.ndarray]:
     """
     Load input attention tensors for float (non-quantized) projection.
@@ -151,17 +152,19 @@ def load_input_tensor_float(
     Args:
         attention_view (TensorView): View of attention tensor for current batch/s_block [N, D, curr_s_tile_size].
         cfg (TilingConfig): Tiling configuration.
+        target_dtype: Target dtype for tensor. If None, uses attention_view.dtype.
 
     Returns:
         List[nl.ndarray]: [n_size][d_size, s_block_size], Attention tensors in SBUF.
     """
     curr_s_tile_size = attention_view.shape[2]
+    dtype = target_dtype if target_dtype != None else attention_view.dtype
     attention_sb = []
 
     for head_idx in range(cfg.n_size):
         attention_tensor = nl.ndarray(
             (cfg.d_size, cfg.s_tile.tile_size),
-            dtype=attention_view.dtype,
+            dtype=dtype,
             buffer=nl.sbuf,
         )
         attn_head_view = attention_view.select(dim=0, index=head_idx)
@@ -309,3 +312,282 @@ def load_quantized_weights(
         w_sbuf.append(w_tensor)
 
     return w_sbuf
+
+
+# ============================================================================
+# MX Quantization Load Functions
+# ============================================================================
+
+
+def load_mx_scales_strided(data_p: int, scale_view: TensorView, padded_f: int = None) -> nl.ndarray:
+    """Load MX scales from HBM and stride across partition-dim quadrants.
+
+    Args:
+        data_p: P dimension of the data tile (must be multiple of 32, <= 128).
+        scale_view: View of scale tensor [data_p//_q_height, F].
+        padded_f: Optional padded F dimension. If provided and > scale_f, allocates
+                  larger buffer and zero-pads the extra columns.
+
+    Returns:
+        Scale tensor [data_p, F] (or [data_p, padded_f] if provided) in SBUF with strided layout.
+
+    Notes:
+        Scatter pattern places scales at positions 0-3, 32-35, 64-67, 96-99.
+    """
+    scale_p, scale_f = scale_view.shape
+    out_f = padded_f if padded_f != None else scale_f
+
+    if data_p > _SBUF_QUADRANT_SIZE:
+        scale_sbuf = nl.ndarray((data_p, out_f), dtype=scale_view.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=scale_sbuf, value=0, engine=nisa.gpsimd_engine)
+        for quadrant_idx in range(scale_p // _q_width):
+            src_slice = scale_view.slice(dim=0, start=quadrant_idx * _q_width, end=quadrant_idx * _q_width + _q_width)
+            nisa.dma_copy(
+                src=src_slice.get_view(),
+                dst=scale_sbuf[
+                    quadrant_idx * _SBUF_QUADRANT_SIZE : quadrant_idx * _SBUF_QUADRANT_SIZE + _q_width, :scale_f
+                ],
+            )
+    else:
+        scale_sbuf = nl.ndarray((scale_p, out_f), dtype=scale_view.dtype, buffer=nl.sbuf)
+        if padded_f != None and padded_f > scale_f:
+            nisa.memset(dst=scale_sbuf[:, scale_f:out_f], value=0, engine=nisa.gpsimd_engine)
+        nisa.dma_copy(src=scale_view.get_view(), dst=scale_sbuf[:, :scale_f])
+
+    return scale_sbuf
+
+
+def load_mx_weight_scales(
+    weight_scale_view: TensorView,
+    cfg: TilingConfig,
+) -> List[nl.ndarray]:
+    """Load and stride weight scales for all d_tiles.
+
+    Args:
+        weight_scale_view: View of weight scales [D // _q_height, curr_h_block_size].
+        cfg: Tiling configuration.
+
+    Returns:
+        List of strided scale tensors per d_tile.
+    """
+    w_scale_sbuf_list = []
+    for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
+        padded_size, actual_size = cfg.d_tile.get_bounds(d_tile_idx)
+        scale_slice = weight_scale_view.slice(
+            dim=0,
+            start=d_tile_idx * cfg.d_tile.tile_info.tile_size // _q_height,
+            end=d_tile_idx * cfg.d_tile.tile_info.tile_size // _q_height + actual_size // _q_height,
+        )
+        w_scale_sbuf = load_mx_scales_strided(padded_size, scale_slice)
+        w_scale_sbuf_list.append(w_scale_sbuf)
+    return w_scale_sbuf_list
+
+
+def load_mx_quantized_weights(
+    weight_view: TensorView,
+    weight_dtype,
+    cfg: TilingConfig,
+    quant_config: QuantizationConfig,
+) -> List[nl.ndarray]:
+    """Load pre-quantized MX weights for all d_tiles.
+
+    Args:
+        weight_view: View of weights [D, curr_h_block_size].
+        cfg: Tiling configuration.
+        quant_config: Quantization configuration.
+
+    Returns:
+        List of weight tensors per d_tile.
+
+    Notes:
+        Zero-pads last d_tile if padding is needed.
+    """
+    w_sbuf_list = []
+    curr_h_block_size = weight_view.shape[1]
+    for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
+        padded_size, actual_size = cfg.d_tile.get_bounds(d_tile_idx)
+        if quant_config.is_mxfp8_static_quantized:
+            w_sbuf = nl.ndarray((padded_size, cfg.h_tile.tile_size, _q_width), dtype=weight_dtype, buffer=nl.sbuf)
+        else:
+            w_sbuf = nl.ndarray((padded_size, cfg.h_tile.tile_size), dtype=weight_dtype, buffer=nl.sbuf)
+        if cfg.d_tile.needs_padding(d_tile_idx):
+            nisa.memset(dst=w_sbuf[actual_size:padded_size, :], value=0, engine=nisa.gpsimd_engine)
+        w_slice = weight_view.slice(
+            dim=0,
+            start=d_tile_idx * cfg.d_tile.tile_info.tile_size,
+            end=d_tile_idx * cfg.d_tile.tile_info.tile_size + actual_size,
+        ).get_view()
+        if quant_config.is_mxfp8_static_quantized:
+            nisa.dma_copy(dst=w_sbuf[:actual_size, :curr_h_block_size, :_q_width], src=w_slice)
+            w_sbuf_list.append(w_sbuf.reshape((padded_size, cfg.h_tile.tile_size * _q_width)))
+        else:
+            nisa.dma_copy(dst=w_sbuf[:actual_size, :curr_h_block_size], src=w_slice)
+            w_sbuf_list.append(w_sbuf)
+    return w_sbuf_list
+
+
+def load_mx_input_interleaved(
+    attention_view: TensorView,
+    cfg: TilingConfig,
+    quant_config: QuantizationConfig,
+) -> List[nl.ndarray]:
+    """Load input attention and transpose for MX quantization.
+
+    Args:
+        attention_view: View of attention [D, _q_width, curr_s_tile_size].
+        cfg: Tiling configuration.
+        quant_config: Quantization configuration.
+
+    Returns:
+        List of transposed attention tensors [d_tile_count] -> [d_tile_size, padded_S, _q_width].
+
+    Notes:
+        Transposes [D, _q_width, S] -> [D, S, _q_width] for quantize_mx input format.
+        Zero-pads D and S dimensions if padding is needed.
+
+        Engine strategy adapts based on d_tile_count to maximize throughput:
+        - d_tile_count == 1: Split work within tile between vector and scalar engines.
+          Both engines process half the data in parallel, minimizing latency for single tile.
+        - d_tile_count >= 2: Alternate engines across tiles (even tiles use vector, odd use scalar).
+          This enables pipelining where load+quantize for d_tile N on one engine overlaps with
+          load+quantize for d_tile N+1 on the other engine, since quantization depends on
+          the same d_tile's load completing.
+    """
+    curr_s_tile_size = attention_view.shape[2]
+    # nc_matmul_mx requires even number of elements in free dimension
+    padded_s_tile_size = curr_s_tile_size + (curr_s_tile_size % 2)
+    attn_sbuf_list = []
+    use_pipeline_strategy = cfg.d_tile.tile_info.tile_count >= 2
+
+    for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
+        padded_d_size, actual_d_size = cfg.d_tile.get_bounds(d_tile_idx)
+        if padded_d_size <= 0:
+            break
+
+        tmp_sbuf = nl.ndarray(
+            (padded_d_size, _q_width, padded_s_tile_size),
+            dtype=quant_config.input_data_type,
+            buffer=nl.sbuf,
+        )
+        inp_sbuf = nl.ndarray(
+            (padded_d_size, padded_s_tile_size, _q_width),
+            dtype=quant_config.input_data_type,
+            buffer=nl.sbuf,
+        )
+        if cfg.d_tile.needs_padding(d_tile_idx):
+            nisa.memset(dst=tmp_sbuf[actual_d_size:padded_d_size, :, :], value=0, engine=nisa.gpsimd_engine)
+        if curr_s_tile_size % 2 == 1:
+            nisa.memset(dst=tmp_sbuf[:, :, curr_s_tile_size:padded_s_tile_size], value=0, engine=nisa.gpsimd_engine)
+        attn_slice = attention_view.slice(
+            dim=0,
+            start=d_tile_idx * cfg.d_tile.tile_info.tile_size,
+            end=d_tile_idx * cfg.d_tile.tile_info.tile_size + actual_d_size,
+        )
+
+        nisa.dma_copy(src=attn_slice.get_view(), dst=tmp_sbuf[:actual_d_size, :, :curr_s_tile_size])
+
+        tmp_view = TensorView(tmp_sbuf).permute([0, 2, 1])
+        if use_pipeline_strategy:
+            # Pipeline across d_tiles: each tile uses one engine, enabling overlap with
+            # subsequent quantization on the same engine while other d_tiles use the other engine
+            engine = nisa.vector_engine if d_tile_idx % 2 == 0 else nisa.scalar_engine
+            nisa.tensor_copy(src=tmp_view.get_view(), dst=inp_sbuf, engine=engine)
+        else:
+            # Single d_tile: split work between engines for parallelism within tile
+            nisa.tensor_copy(
+                src=tmp_view.slice(dim=2, start=0, end=_q_width // 2).get_view(),
+                dst=inp_sbuf[:, :, : _q_width // 2],
+                engine=nisa.vector_engine,
+            )
+            nisa.tensor_copy(
+                src=tmp_view.slice(dim=2, start=_q_width // 2, end=_q_width).get_view(),
+                dst=inp_sbuf[:, :, _q_width // 2 :],
+                engine=nisa.scalar_engine,
+            )
+        attn_sbuf_list.append(inp_sbuf)
+    return attn_sbuf_list, padded_s_tile_size
+
+
+def load_mx_prequantized_input(
+    attention_view: TensorView,
+    input_scale_view: TensorView,
+    cfg: TilingConfig,
+) -> Tuple[List[nl.ndarray], List[nl.ndarray], int]:
+    """Load pre-quantized MX input attention and scales for all d_tiles.
+
+    Used when input is already quantized to float8_e4m3fn_x4 format with pre-computed
+    scales, skipping the on-device quantization step.
+
+    Args:
+        attention_view: View of pre-quantized attention [D, curr_s_tile_size] (float8_e4m3fn_x4).
+        input_scale_view: View of input scales [D//_q_height, curr_s_tile_size] (uint8).
+        cfg: Tiling configuration.
+
+    Returns:
+        Tuple of (quant_attn_list, attn_scale_list, padded_s_tile_size):
+            - quant_attn_list: [d_tile_count] -> [d_tile_size, s_tile_size] quantized attention
+            - attn_scale_list: [d_tile_count] -> [d_tile_size, s_tile_size] strided scales
+            - padded_s_tile_size: S tile size padded to even number
+
+    Notes:
+        - Reuses load_mx_scales_strided for scale loading with proper stride pattern
+        - Zero-pads D and S dimensions if padding is needed for nc_matmul_mx
+    """
+    curr_s_tile_size = attention_view.shape[1]
+    # nc_matmul_mx requires even number of elements in free dimension
+    padded_s_tile_size = curr_s_tile_size + (curr_s_tile_size % 2)
+
+    quant_attn_list = []
+    attn_scale_list = []
+
+    for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
+        padded_d_size, actual_d_size = cfg.d_tile.get_bounds(d_tile_idx)
+        if padded_d_size <= 0:
+            break
+
+        # Load quantized attention (similar to load_mx_quantized_weights)
+        quant_attn_sbuf = nl.ndarray((padded_d_size, cfg.s_tile.tile_size), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+        if cfg.d_tile.needs_padding(d_tile_idx):
+            nisa.memset(dst=quant_attn_sbuf[actual_d_size:padded_d_size, :], value=0, engine=nisa.gpsimd_engine)
+        if curr_s_tile_size % 2 == 1:
+            nisa.memset(dst=quant_attn_sbuf[:, curr_s_tile_size:padded_s_tile_size], value=0, engine=nisa.gpsimd_engine)
+
+        attn_slice = attention_view.slice(
+            dim=0,
+            start=d_tile_idx * cfg.d_tile.tile_info.tile_size,
+            end=d_tile_idx * cfg.d_tile.tile_info.tile_size + actual_d_size,
+        )
+        nisa.dma_copy(dst=quant_attn_sbuf[:actual_d_size, :curr_s_tile_size], src=attn_slice.get_view())
+        quant_attn_list.append(quant_attn_sbuf)
+
+        # Load input scales using strided pattern
+        scale_slice = input_scale_view.slice(
+            dim=0,
+            start=d_tile_idx * cfg.d_tile.tile_info.tile_size // _q_height,
+            end=d_tile_idx * cfg.d_tile.tile_info.tile_size // _q_height + actual_d_size // _q_height,
+        )
+        attn_scale_sbuf = load_mx_scales_strided(padded_d_size, scale_slice, padded_s_tile_size)
+        attn_scale_list.append(attn_scale_sbuf)
+
+    return quant_attn_list, attn_scale_list, padded_s_tile_size
+
+
+def create_constant_mx_scales(p_size: int, f_size: int, scale_value: int = 127) -> nl.ndarray:
+    """
+    Create constant MX scale tensor for static MX quantization.
+
+    For static MX FP8, we use a constant scale value (126) so that nc_matmul_mx
+    dequantizes as 2^(127-127) = 1. The actual dequantization is done separately
+    using the static scales.
+
+    Args:
+        p_size (int): Partition dimension size.
+        f_size (int): Free dimension size.
+        scale_value (int): Constant scale value (default 127).
+
+    Returns:
+        nl.ndarray: [p_size, f_size], Constant scale tensor in SBUF.
+    """
+    scale_sbuf = nl.ndarray((p_size, f_size), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.memset(dst=scale_sbuf, value=scale_value, engine=nisa.gpsimd_engine)
+    return scale_sbuf

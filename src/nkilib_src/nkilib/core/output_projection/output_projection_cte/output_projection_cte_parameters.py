@@ -28,6 +28,13 @@ from ...utils.tile_info import TiledDimInfo
 P_MAX = 128
 F_MAX = 512
 
+# TRN3 MXFP4/8 quantization block dimensions
+_q_height = 8  # Partitions per quantization block
+_q_width = 4  # Free dimension elements per quantization block
+
+# SBUF quadrant size (32 partitions per quadrant)
+_SBUF_QUADRANT_SIZE = 32
+
 # Maximum SBUF space (in bytes) allowed for weight tensors
 _MAX_WEIGHT_SBUF_BYTES = 10 * 1024 * 1024  # 10MB
 
@@ -54,7 +61,8 @@ class QuantizationConfig(nl.NKIObject):
         weight_data_type (Optional[type]): Original weight data type.
         use_double_row (bool): Whether to use double row matmul optimization.
         is_fp8_quantized (bool): Whether FP8 quantization is enabled.
-
+        is_mxfp4_quantized (bool): Whether MX FP4 quantization is enabled.
+        is_mxfp8_static_quantized: bool): Whether Static MX FP8 quantization is enabled
     Notes:
         - For STATIC quantization, both input_scales and weight_scales are required.
         - Double row optimization is enabled for STATIC quantization.
@@ -69,6 +77,39 @@ class QuantizationConfig(nl.NKIObject):
     weight_data_type: Optional[type] = None
     use_double_row: bool = False
     is_fp8_quantized: bool = False
+    is_mxfp4_quantized: bool = False
+    is_mxfp8_static_quantized: bool = False
+
+
+@dataclass
+class PaddedTileInfo(nl.NKIObject):
+    """
+    D-tile info with padding support for MX quantization.
+
+    nc_matmul_mx supports partition dim of 32, 64, 128 but not 96.
+    When contraction_dim % 128 == 96, we pad to 128 by zero-filling.
+
+    Args:
+        tile_info (TiledDimInfo): Underlying tile info with padded dimensions.
+        padding_size (int): Padding added to last tile (32 when needed, else 0).
+    """
+
+    tile_info: TiledDimInfo
+    padding_size: int = 0
+
+    def get_bounds(self, tile_idx: int) -> Tuple[int, int]:
+        """Returns (padded_size, actual_size) for the tile."""
+        padded = self.tile_info.get_tile_bound(tile_idx)
+        actual = padded - self.padding_size if tile_idx == self.tile_info.tile_count - 1 else padded
+        return padded, actual
+
+    def needs_padding(self, tile_idx: int) -> bool:
+        """Returns True if this tile requires zero-padding."""
+        return self.padding_size > 0 and tile_idx == self.tile_info.tile_count - 1
+
+    def get_actual_dim_size(self) -> int:
+        """Returns actual total dimension size (excludes padding)."""
+        return self.tile_info.tiled_dim_size - self.padding_size
 
 
 @dataclass
@@ -91,6 +132,7 @@ class TilingConfig(nl.NKIObject):
         group_size (int): Number of heads packed together (1 = no packing).
         s_tile (TiledDimInfo): Tile info for S dimension.
         h_tile (TiledDimInfo): Tile info for H dimension.
+        d_tile (PaddedTileInfo): Tile info for D dimension with padding support.
 
     Notes:
         - n_size and d_size may differ from original due to head packing.
@@ -108,6 +150,7 @@ class TilingConfig(nl.NKIObject):
     group_size: int
     s_tile: TiledDimInfo
     h_tile: TiledDimInfo
+    d_tile: PaddedTileInfo
 
 
 def _get_dtype_size(dtype) -> int:
@@ -120,11 +163,11 @@ def _get_dtype_size(dtype) -> int:
     Returns:
         int: Size in bytes for the given dtype.
     """
-    if dtype == nl.float32:
+    if dtype in (nl.float32, nl.float8_e4m3fn_x4):
         return 4
-    if dtype in (nl.float16, nl.bfloat16):
+    if dtype in (nl.float16, nl.bfloat16, nl.float4_e2m1fn_x4):
         return 2
-    if dtype == nl.float8_e4m3:
+    if dtype in (nl.float8_e4m3, nl.float8_e4m3fn):
         return 1
     return 2
 
@@ -264,7 +307,10 @@ def build_tiling_config(
     Notes:
         - n_size and d_size in config may differ from inputs due to head packing.
     """
-    n_size, d_size, group_size = _calculate_head_packing(n_size, d_size, P_MAX)
+    if quant_config.is_mxfp4_quantized or quant_config.is_mxfp8_static_quantized:
+        group_size = 1
+    else:
+        n_size, d_size, group_size = _calculate_head_packing(n_size, d_size, P_MAX)
 
     n_size, d_size, use_double_row = _calculate_double_row_head_packing(
         n_size=n_size,
@@ -280,19 +326,43 @@ def build_tiling_config(
         h_sharded_size=h_sharded_size,
         weight_dtype=weight_dtype,
     )
+    h_subtile_size = F_MAX
 
-    s_block_size = F_MAX
+    d_tile = None
+    if quant_config.is_mxfp4_quantized or quant_config.is_mxfp8_static_quantized:
+        """
+        MX quantization D-tile padding logic.
+
+        nc_matmul_mx supports partition dim of 32, 64, 128 but not 96.
+        Pad to 128 when needed by zero-filling during load.
+
+        contraction_dim represents the packed D dimension for nc_matmul_mx:
+        - Pre-quantized: N * D_packed (d_size already divided by _q_width)
+        - Online quant: N * D // _q_width (divide original D by _q_width)
+        """
+        if quant_config.input_quantized and quant_config.is_mxfp4_quantized:
+            contraction_dim = n_size * d_size
+        else:
+            contraction_dim = n_size * d_size // _q_width
+        padding_size = 32 if (contraction_dim % 128 == 96) else 0
+        padded_dim = contraction_dim + padding_size
+
+        h_subtile_size = F_MAX * 2
+        d_tile = PaddedTileInfo(
+            tile_info=TiledDimInfo.build(tiled_dim_size=padded_dim, tile_size=P_MAX),
+            padding_size=padding_size,
+        )
 
     s_tile = TiledDimInfo.build_with_subtiling(
         tiled_dim_size=s_size,
-        tile_size=s_block_size,
+        tile_size=F_MAX,
         subtile_size=P_MAX,
     )
 
     h_tile = TiledDimInfo.build_with_subtiling(
         tiled_dim_size=h_sharded_size,
         tile_size=h_block_size,
-        subtile_size=F_MAX,
+        subtile_size=h_subtile_size,
     )
 
     return TilingConfig(
@@ -307,6 +377,7 @@ def build_tiling_config(
         group_size=group_size,
         s_tile=s_tile,
         h_tile=h_tile,
+        d_tile=d_tile,
     )
 
 
@@ -339,21 +410,36 @@ def build_quantization_config(
 
     quant_data_type = None
     is_fp8_quantized = False
+    is_mxfp4_quantized = False
+    is_mxfp8_static_quantized = False
+    input_quantized = False
 
     if quantization_type == QuantizationType.STATIC:
         quant_data_type = nl.float8_e4m3
         is_fp8_quantized = True
+    elif quantization_type == QuantizationType.MX:
+        quant_data_type = nl.float4_e2m1fn_x4
+        is_mxfp4_quantized = True
+        # Pre-quantized MX input uses packed format (float8_e4m3fn_x4 or float4_e2m1fn_x4)
+        packed_dtypes = (nl.float8_e4m3fn_x4, nl.float4_e2m1fn_x4)
+        if input_data_type in packed_dtypes:
+            input_quantized = True
+    elif quantization_type == QuantizationType.STATIC_MX:
+        quant_data_type = nl.float8_e4m3fn_x4
+        is_mxfp8_static_quantized = True
 
     return QuantizationConfig(
         is_enabled=True,
         input_scales=input_scales,
         weight_scales=weight_scales,
         quant_data_type=quant_data_type,
-        input_quantized=False,
+        input_quantized=input_quantized,
         input_data_type=input_data_type,
         weight_data_type=weight_data_type,
         use_double_row=False,
         is_fp8_quantized=is_fp8_quantized,
+        is_mxfp4_quantized=is_mxfp4_quantized,
+        is_mxfp8_static_quantized=is_mxfp8_static_quantized,
     )
 
 
@@ -366,6 +452,9 @@ def validate_output_projection_inputs(
     n_prgs: int,
     attention_dtype,
     weight_dtype,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    input_scales: Optional[nl.ndarray] = None,
+    weight_scales: Optional[nl.ndarray] = None,
 ) -> None:
     """
     Validate input parameters for output projection CTE kernel.
@@ -381,6 +470,9 @@ def validate_output_projection_inputs(
         n_prgs (int): Number of logical cores (LNC).
         attention_dtype: Data type of attention tensor.
         weight_dtype: Data type of weight tensor.
+        quantization_type (QuantizationType): Type of quantization.
+        input_scales (Optional[nl.ndarray]): Input quantization scales.
+        weight_scales (Optional[nl.ndarray]): Weight quantization scales.
 
     Raises:
         AssertionError: If any validation check fails.
@@ -397,9 +489,38 @@ def validate_output_projection_inputs(
     )
 
     kernel_assert(
-        d_size <= P_MAX,
-        f"Head dimension D must not exceed {P_MAX}. Got D={d_size}",
+        d_size <= P_MAX or quantization_type == QuantizationType.MX or quantization_type == QuantizationType.STATIC_MX,
+        f"Head dimension D must not exceed {P_MAX}. Got D={d_size} and quantization_type as {quantization_type}",
     )
+
+    if quantization_type == QuantizationType.MX:
+        n_d = n_size * d_size
+        packed_dtypes = (nl.float8_e4m3fn_x4, nl.float4_e2m1fn_x4)
+        kernel_assert(
+            weight_dtype in packed_dtypes,
+            f"Weight type={weight_dtype} is not supported for MX quantization",
+        )
+        if attention_dtype not in packed_dtypes:
+            kernel_assert(n_d >= P_MAX, f"N*D={n_d} must be >= {P_MAX} for MX quantization")
+            kernel_assert(n_d % P_MAX == 0, f"N*D={n_d} must be a multiple of {P_MAX} for MX quantization")
+        else:
+            kernel_assert(
+                n_d >= P_MAX // _q_width,
+                f"N*D={n_d} must be >= {P_MAX // _q_width} for MX quantization when input is quantized",
+            )
+            kernel_assert(
+                n_d % (P_MAX // _q_width) == 0,
+                f"N*D={n_d} must be a multiple of {P_MAX // _q_width} for MX quantization",
+            )
+
+    if quantization_type == QuantizationType.STATIC_MX:
+        n_d = n_size * d_size
+        kernel_assert(
+            weight_dtype == nl.float8_e4m3fn,
+            f"Weight type={weight_dtype} is not supported for STATIC_MX quantization, expected float8_e4m3fn_x4",
+        )
+        kernel_assert(n_d >= P_MAX, f"N*D={n_d} must be >= {P_MAX} for STATIC_MX quantization")
+        kernel_assert(n_d % P_MAX == 0, f"N*D={n_d} must be a multiple of {P_MAX} for STATIC_MX quantization")
 
     kernel_assert(
         h_size <= _MAX_VALIDATED_H_SIZE,
@@ -407,7 +528,7 @@ def validate_output_projection_inputs(
     )
 
     kernel_assert(
-        n_size <= _MAX_VALIDATED_N_SIZE,
+        n_size <= _MAX_VALIDATED_N_SIZE or quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX),
         f"Number of heads N must not exceed {_MAX_VALIDATED_N_SIZE}. Got N={n_size}",
     )
 
@@ -415,3 +536,50 @@ def validate_output_projection_inputs(
         h_size % n_prgs == 0,
         f"Hidden dimension H must be divisible by LNC. Got H={h_size}, LNC={n_prgs}, H % LNC = {h_size % n_prgs}",
     )
+
+    # Scale validation for quantization types
+    if quantization_type in (QuantizationType.STATIC, QuantizationType.STATIC_MX):
+        kernel_assert(
+            input_scales != None,
+            f"input_scales is required for {quantization_type.name} quantization",
+        )
+        kernel_assert(
+            weight_scales != None,
+            f"weight_scales is required for {quantization_type.name} quantization",
+        )
+        kernel_assert(
+            input_scales.shape == (P_MAX, 1),
+            f"input_scales shape must be ({P_MAX}, 1) for {quantization_type.name} quantization. Got {input_scales.shape}",
+        )
+        kernel_assert(
+            weight_scales.shape == (P_MAX, 1),
+            f"weight_scales shape must be ({P_MAX}, 1) for {quantization_type.name} quantization. Got {weight_scales.shape}",
+        )
+
+    if quantization_type == QuantizationType.MX:
+        kernel_assert(
+            weight_scales != None,
+            "weight_scales is required for MX quantization",
+        )
+        n_d = n_size * d_size
+        packed_dtypes = (nl.float8_e4m3fn_x4, nl.float4_e2m1fn_x4)
+        if attention_dtype not in packed_dtypes:
+            # Online quantization: input_scales not needed (computed on device)
+            kernel_assert(
+                weight_scales.shape == (n_d // (_q_height * _q_width), h_size),
+                f"weight_scales shape must be ({n_d // (_q_height * _q_width)}, {h_size}) for MX quantization. Got {weight_scales.shape}",
+            )
+        else:
+            # Pre-quantized: input_scales required
+            kernel_assert(
+                input_scales != None,
+                "input_scales is required for MX quantization with pre-quantized input",
+            )
+            kernel_assert(
+                input_scales.shape == (b_size, n_d // _q_height, s_size),
+                f"input_scales shape must be ({b_size}, {n_d // _q_height}, {s_size}) for MX quantization. Got {input_scales.shape}",
+            )
+            kernel_assert(
+                weight_scales.shape == (n_d // 8, h_size),
+                f"weight_scales shape must be ({n_d // _q_height}, {h_size}) for MX quantization. Got {weight_scales.shape}",
+            )

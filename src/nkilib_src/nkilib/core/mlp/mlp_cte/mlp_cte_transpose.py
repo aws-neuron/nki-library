@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Transpose Module
-
-Implements tensor transpose operations for MLP CTE kernels including source and
-intermediate tensor transposition with optional scale and bias application.
-
-"""
+"""MLP CTE transpose operations for source and intermediate tensor transposition."""
 
 from typing import Optional
 

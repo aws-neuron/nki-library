@@ -18,17 +18,16 @@ QKV kernel.
 """
 
 # Standard Library
-import math
-from typing import List, Optional, Tuple
+from typing import Optional
 
 # Neuron Kernel Interface
 import nki
 import nki.language as nl
 
-from ..utils.allocator import Logger, SbufManager
+from ..utils.allocator import SbufManager
 
 # NKI Library
-from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from ..utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
 from ..utils.kernel_assert import kernel_assert
 
 # QKV
@@ -69,6 +68,18 @@ def qkv(
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
+    # --- FP8 KV Cache Quantization Related
+    k_cache: Optional[nl.ndarray] = None,
+    v_cache: Optional[nl.ndarray] = None,
+    k_scale: Optional[nl.ndarray] = None,
+    v_scale: Optional[nl.ndarray] = None,
+    fp8_max: Optional[float] = None,
+    fp8_min: Optional[float] = None,
+    kv_dtype: Optional[type] = None,
+    # --- Block KV Cache Related
+    use_block_kv: bool = False,
+    block_size: Optional[int] = None,
+    slot_mapping: Optional[nl.ndarray] = None,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -78,6 +89,9 @@ def qkv(
     use_auto_allocation: bool = False,
     # ----------------------------------------
     load_input_with_DMA_transpose: bool = True,
+    # ----------------------------------------
+    is_input_swizzled: bool = False,
+    weight_layout: QKVWeightLayout = QKVWeightLayout.CONTIGUOUS,
 ) -> nl.ndarray:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
@@ -117,16 +131,17 @@ def qkv(
         Input hidden states tensor of shape [B, S, H] where B=batch, S=sequence_length, H=hidden_dim.
         We name it 'input' and not 'hidden' to avoid ambiguity with the size of "hidden dimension".
     fused_qkv_weights : nl.ndarray
-        Fused QKV weight matrix of shape [H, I] where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
+        Fused QKV weight matrix of shape [H, I] or [H//4, I] for MX where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
     output_layout : QKVOutputLayout, default=QKVOutputLayout.BSD
         Output tensor layout: QKVOutputLayout.BSD=[B, S, I] or QKVOutputLayout.NBSd=[num_heads, B, S, d_head]
     bias : Optional[nl.ndarray], default=None
         Bias tensor of shape [1, I] to add to QKV projection output
     quantization_type (QuantizationType):
-        Type of quantization to apply (NONE, ROW, STATIC). Default: QuantizationType.NONE.
+        Type of quantization to apply (NONE, ROW, STATIC, MX). Default: QuantizationType.NONE.
+        Note: For MX quantization, is only supported in QKV CTE kernel.
     qkv_w_scale (nl.ndarray, optional):
         QKV weight scale tensor in HBM for QKV projection.
-        Shape:    [1, I] or [128, I] if row quantization, [1, 3] or [128, 3] if static quantization
+        Shape:    [1, I] or [128, I] if row quantization, [1, 3] or [128, 3] if static quantization, [H//32, I] if MX quantization
     qkv_in_scale (nl.ndarray, optional):
         QKV input scale tensor in HBM for QKV projection. Only required for static quantization.
         Shape:    [1, 1] or [128, 1]
@@ -170,7 +185,10 @@ def qkv(
         If 'sbm' is provided by user, user has the responsibility to set use_auto_allocation=True in the provided SbufManager.
     load_input_with_DMA_transpose : bool, default=True
         Whether to use DMA transpose optimization.
-
+    is_input_swizzled: bool, default=False
+        Whether the input tensor is swizzled (only applicable with MX Quantization).
+    weight_layout : QKVWeightLayout, default=QKVWeightLayout.CONTIGUOUS
+        Layout of fused_qkv_weights. See QKVWeightLayout docstring for packing instructions.
     Returns:
     --------
     nl.ndarray
@@ -199,7 +217,7 @@ def qkv(
       or hardware does not allow it.
 
     Supported Data Types:
-    - bf16, fp16, fp32 (fp32 inputs are internally converted to bf16 for computation)
+    - MXFP8, bf16, fp16, fp32 (fp32 inputs are internally converted to bf16 for computation)
     """
     # Note: Detailed asserts done inside qkv_cte and qkv_tkg kernels.
 
@@ -229,8 +247,6 @@ def qkv(
 
     # TODO: Once qkv_tkg is merged, uncomment if statement.
     if is_input_config_only_available_in_qkv_cte_kernel:
-        # TODO: remove this assert when QKV CTE FP8 support is merged
-        kernel_assert(quantization_type == QuantizationType.NONE, "quantization on QKV CTE is not supported yet")
         output = qkv_cte(
             input=input,
             fused_qkv_weights=fused_qkv_weights,
@@ -250,10 +266,25 @@ def qkv(
             d_head=d_head,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            fp8_max=fp8_max,
+            fp8_min=fp8_min,
+            kv_dtype=kv_dtype,
+            use_block_kv=use_block_kv,
+            block_size=block_size,
+            slot_mapping=slot_mapping,
             store_output_in_sbuf=store_output_in_sbuf,
             sbm=sbm,
             use_auto_allocation=use_auto_allocation,
             load_input_with_DMA_transpose=load_input_with_DMA_transpose,
+            quantization_type=quantization_type,
+            qkv_w_scale=qkv_w_scale,
+            qkv_in_scale=qkv_in_scale,
+            is_input_swizzled=is_input_swizzled,
+            weight_layout=weight_layout,
         )
 
     else:

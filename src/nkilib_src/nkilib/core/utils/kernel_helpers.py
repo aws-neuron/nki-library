@@ -24,6 +24,7 @@ and provide consistent behavior for common operations.
 
 from typing import List, Optional, Tuple
 
+import nki.isa as nisa
 import nki.language as nl
 
 from .common_types import ActFnType, NormType
@@ -37,6 +38,7 @@ PSUM_BANK_SIZE = 2048
 # Local constants and data structures
 _max_pos_range_map = {
     nl.float8_e4m3: 240.0,
+    nl.float8_e4m3fn: 448.0,
     nl.float8_e5m2: 57344.0,
 }
 
@@ -44,8 +46,7 @@ _act_fn_map = {
     ActFnType.SiLU: nl.silu,
     ActFnType.GELU: nl.gelu,
     ActFnType.GELU_Tanh_Approx: nl.gelu_apprx_tanh,
-    # TODO: Need to add this to nl.lang
-    # ActFnType.Swish: nl.gelu_apprx_sigmoid
+    ActFnType.Swish: nl.gelu_apprx_sigmoid,
 }
 
 
@@ -156,6 +157,11 @@ def get_floor_aligned_size(size: int, alignment_multiple: int) -> int:
     return get_floor_quotient(size, alignment_multiple) * alignment_multiple
 
 
+def is_hbm_buffer(tensor: nl.ndarray) -> bool:
+    """Check if tensor buffer is any HBM type (hbm, shared_hbm, private_hbm)."""
+    return tensor.buffer in (nl.hbm, nl.shared_hbm, nl.private_hbm)
+
+
 def get_nl_act_fn_from_type(act_fn: ActFnType):
     """
     Convert ActFnType enum to NKI language activation function.
@@ -184,15 +190,15 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
         else:
             raise error
     """
-    if act_fn.value == ActFnType.SiLU.value:
+    kernel_assert(isinstance(act_fn, ActFnType), f"Unsupported activation function type: {act_fn}")
+    if act_fn == ActFnType.SiLU:
         return nl.silu
-    elif act_fn.value == ActFnType.GELU.value:
+    elif act_fn == ActFnType.GELU:
         return nl.gelu
-    elif act_fn.value == ActFnType.GELU_Tanh_Approx.value:
+    elif act_fn == ActFnType.GELU_Tanh_Approx:
         return nl.gelu_apprx_tanh
-    elif act_fn.value == ActFnType.Swish.value:
+    elif act_fn == ActFnType.Swish:
         return nl.gelu_apprx_sigmoid
-    kernel_assert(False, f"Unsupported activation function type: {act_fn}")
 
 
 def is_launched_as_spmd() -> bool:
@@ -438,3 +444,57 @@ def reduce(op='mul', input: List = None, initial_value=None):
         elif op == 'max':
             initial_value = max(initial_value, value)
     return initial_value
+
+
+def resolve_dtype_to_nki(dtype):
+    """
+    Get NKI dtype from the dtype of some other package.
+
+    Args:
+        dtype: Data type.
+
+    Returns:
+        dtype: The same dtype in NKI.
+
+    Notes:
+        float8_e4m3fn gets resolved to float8_e4m3 if using gen3 or older
+
+    Pseudocode:
+        result = lookup nki dtype in from string representation
+        return result
+    """
+    dtype_str = str(dtype)
+    if dtype_str == 'bool':
+        return nl.bool
+    elif dtype_str == 'int8':
+        return nl.int8
+    elif dtype_str == 'int16':
+        return nl.int16
+    elif dtype_str == 'int32':
+        return nl.int32
+    elif dtype_str == 'uint8':
+        return nl.uint8
+    elif dtype_str == 'uint16':
+        return nl.uint16
+    elif dtype_str == 'uint32':
+        return nl.uint32
+    elif dtype_str == 'float16':
+        return nl.float16
+    elif dtype_str == 'float32':
+        return nl.float32
+    elif dtype_str == 'bfloat16':
+        return nl.bfloat16
+    elif dtype_str in ['float8_e4m3', 'float8e4']:
+        return nl.float8_e4m3
+    elif dtype_str == 'float8_e4m3fn':
+        # TODO: switch to nisa.get_nc_version() >= nki.isa.nc_version.gen4 after the comparison support
+        return nl.float8_e4m3fn if nisa.get_nc_version() == nisa.nc_version.gen4 else nl.float8_e4m3
+    elif dtype_str in ['float8_e5m2', 'float8e5']:
+        return nl.float8_e5m2
+    elif dtype_str == str(nl.float4_e2m1fn_x4):
+        return nl.float4_e2m1fn_x4
+    elif dtype_str == str(nl.float8_e4m3fn_x4):
+        return nl.float8_e4m3fn_x4
+    elif dtype_str == str(nl.float8_e5m2_x4):
+        return nl.float8_e5m2_x4
+    kernel_assert(False, f'Unrecognized dtype {dtype_str}')

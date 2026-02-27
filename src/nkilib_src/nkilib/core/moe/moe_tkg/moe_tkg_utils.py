@@ -44,100 +44,100 @@ def gather_expert_affinities(
         sbm (SbufManager): SBUF memory manager for allocation.
 
     Returns:
-        gathered_affinities (nl.ndarray): [_pmax, PARTITIONS_PER_Q7_CORE, PARTITIONS_PER_Q7_CORE],
+        gathered_affinities (nl.ndarray): [_pmax, PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
             Gathered affinities tensor.
 
     Notes:
         - Uses different strategies for T <= 16 vs T > 16 for optimization
-        - PARTITIONS_PER_Q7_CORE = 16 (partitions per Q7 core)
+        - PARTITIONS_PER_GPSIMD_CORE = 16 (partitions per GPSIMD core)
         - PARTITIONS_PER_QUADRANT = 32 (partitions per quadrant)
     """
     # Hardware-specific constants
-    PARTITIONS_PER_Q7_CORE = 16  # Number of partitions per Q7 core
-    kernel_assert(dims.K <= PARTITIONS_PER_Q7_CORE, f"top_k {dims.K} exceeds {PARTITIONS_PER_Q7_CORE}")
+    PARTITIONS_PER_GPSIMD_CORE = 16  # Number of partitions per GPSIMD core
+    kernel_assert(dims.K <= PARTITIONS_PER_GPSIMD_CORE, f"top_k {dims.K} exceeds {PARTITIONS_PER_GPSIMD_CORE}")
     kernel_assert(dims.E > 1, f"E={dims.E} must be > 1 for MoE (local_gather requires src_buffer_size > 1)")
 
-    if dims.T <= PARTITIONS_PER_Q7_CORE:
+    if dims.T <= PARTITIONS_PER_GPSIMD_CORE:
         # Optimized path for small token counts (T <= 16)
 
         # Convert expert indices to uint16 for local_gather operation
         expert_idx_u16 = sbm.alloc_stack(
-            (dims._pmax, PARTITIONS_PER_Q7_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
+            (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
         )
         nisa.memset(dst=expert_idx_u16, value=0.0)
         nisa.tensor_copy(dst=expert_idx_u16[0 : dims.T, 0 : dims.K], src=expert_idx[0 : dims.T, 0 : dims.K])
 
         # Prepare index values for gathering
         index_values = sbm.alloc_stack(
-            (dims._pmax, PARTITIONS_PER_Q7_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values"
+            (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values"
         )
         nisa.memset(dst=index_values, value=0.0)
         expert_indices_trans = sbm.alloc_stack(
-            (PARTITIONS_PER_Q7_CORE, PARTITIONS_PER_Q7_CORE),
+            (PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE),
             dtype=nl.uint16,
             buffer=nl.sbuf,
             name="expert_indices_trans",
         )
         nisa.nc_transpose(
             dst=expert_indices_trans,
-            data=expert_idx_u16[0:PARTITIONS_PER_Q7_CORE, 0:PARTITIONS_PER_Q7_CORE],
+            data=expert_idx_u16[0:PARTITIONS_PER_GPSIMD_CORE, 0:PARTITIONS_PER_GPSIMD_CORE],
             engine=nisa.vector_engine,
         )
         nisa.tensor_copy(
-            dst=index_values[0:PARTITIONS_PER_Q7_CORE, 0:PARTITIONS_PER_Q7_CORE],
+            dst=index_values[0:PARTITIONS_PER_GPSIMD_CORE, 0:PARTITIONS_PER_GPSIMD_CORE],
             src=expert_indices_trans,
         )
 
     else:
         # Path for larger token counts (T > 16)
         # Use DMA_copy to avoid partition alignment problems
-        active_channels = (dims.T + PARTITIONS_PER_Q7_CORE - 1) // PARTITIONS_PER_Q7_CORE
+        active_channels = (dims.T + PARTITIONS_PER_GPSIMD_CORE - 1) // PARTITIONS_PER_GPSIMD_CORE
 
         # Convert expert indices to uint16 for local_gather operation
         expert_idx_u16 = sbm.alloc_stack(
-            (128, PARTITIONS_PER_Q7_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
+            (128, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
         )
         nisa.memset(dst=expert_idx_u16, value=0.0)
         nisa.tensor_copy(dst=expert_idx_u16[0 : dims.T, 0 : dims.K], src=expert_idx[0 : dims.T, 0 : dims.K])
 
         # Fill out 16 partition layout requirement in blocks of 16 partitions up to 128 partitions total
         index_values = sbm.alloc_stack(
-            (dims._pmax, PARTITIONS_PER_Q7_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values", align=32
+            (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values", align=32
         )
         nisa.memset(dst=index_values, value=0.0)
-        for i in range(active_channels):
+        for channel_idx in range(active_channels):
             # Use DMA Transpose for better performance with larger token counts
             nisa.dma_transpose(
                 dst=index_values.ap(
                     pattern=[
-                        [PARTITIONS_PER_Q7_CORE, PARTITIONS_PER_Q7_CORE],
+                        [PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
                         [1, 1],
                         [1, 1],
-                        [1, PARTITIONS_PER_Q7_CORE],
+                        [1, PARTITIONS_PER_GPSIMD_CORE],
                     ],
-                    offset=i * PARTITIONS_PER_Q7_CORE * PARTITIONS_PER_Q7_CORE,
+                    offset=channel_idx * PARTITIONS_PER_GPSIMD_CORE * PARTITIONS_PER_GPSIMD_CORE,
                 ),
                 src=expert_idx_u16.ap(
                     pattern=[
-                        [PARTITIONS_PER_Q7_CORE, PARTITIONS_PER_Q7_CORE],
+                        [PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
                         [1, 1],
                         [1, 1],
-                        [1, PARTITIONS_PER_Q7_CORE],
+                        [1, PARTITIONS_PER_GPSIMD_CORE],
                     ],
-                    offset=i * PARTITIONS_PER_Q7_CORE * PARTITIONS_PER_Q7_CORE,
+                    offset=channel_idx * PARTITIONS_PER_GPSIMD_CORE * PARTITIONS_PER_GPSIMD_CORE,
                 ),
             )
 
     # Perform local gather to collect affinities based on indices
     gathered_affinities_sb = sbm.alloc_stack(
-        (dims._pmax, PARTITIONS_PER_Q7_CORE, PARTITIONS_PER_Q7_CORE),
+        (dims._pmax, PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE),
         dtype=expert_affinities_sb.dtype,
         buffer=nl.sbuf,
         name="gathered_affinities_sb",
     )
-    ga_sb_fdim = PARTITIONS_PER_Q7_CORE * PARTITIONS_PER_Q7_CORE
+    ga_sb_fdim = PARTITIONS_PER_GPSIMD_CORE * PARTITIONS_PER_GPSIMD_CORE
 
-    # Have to hard-code num_valid_indices for now due to NKI-408
+    # num_valid_indices is hard-coded due to compiler limitation
     nisa.memset(dst=gathered_affinities_sb, value=0.0)
     nisa.local_gather(
         dst=gathered_affinities_sb.ap([[ga_sb_fdim, dims._pmax], [1, ga_sb_fdim]]),
@@ -165,7 +165,7 @@ def broadcast_token_affinity(
 
     Args:
         dst (nl.ndarray): Destination tensor for broadcasted affinities.
-        gathered_affinities_sb (nl.ndarray): [_pmax, PARTITIONS_PER_Q7_CORE, PARTITIONS_PER_Q7_CORE],
+        gathered_affinities_sb (nl.ndarray): [_pmax, PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
             Gathered affinities tensor.
         token_index (int): Index of the current token being processed (i_t).
         dims (MLPTKGConstantsDimensionSizes): Dimension sizes object containing K, _pmax and other constants.
@@ -175,20 +175,20 @@ def broadcast_token_affinity(
         broadcasted_affinities (nl.ndarray): [_pmax, K], Broadcasted token affinities ready for computation.
 
     Notes:
-        - PARTITIONS_PER_Q7_CORE = 16 (partitions per Q7 core)
+        - PARTITIONS_PER_GPSIMD_CORE = 16 (partitions per GPSIMD core)
         - PARTITIONS_PER_QUADRANT = 32 (partitions per quadrant)
         - Uses stream shuffle for proper partition alignment
     """
     # Hardware-specific constants
-    PARTITIONS_PER_Q7_CORE = 16  # Number of partitions per Q7 core
+    PARTITIONS_PER_GPSIMD_CORE = 16  # Number of partitions per GPSIMD core
     PARTITIONS_PER_QUADRANT = 32  # Number of partitions per quadrant
 
     # Calculate partition and quadrant positions for the current token
-    current_partition_channel = token_index % PARTITIONS_PER_Q7_CORE  # Active Partition Channel 0..15
+    current_partition_channel = token_index % PARTITIONS_PER_GPSIMD_CORE  # Active Partition Channel 0..15
     current_quadrant_group = token_index // PARTITIONS_PER_QUADRANT  # Partition groups of 32
     current_quadrant_channel = token_index % PARTITIONS_PER_QUADRANT  # Active Quadrant Channel 0..31
 
-    # Select token affinities from gathered data [T, PARTITIONS_PER_Q7_CORE]
+    # Select token affinities from gathered data [T, PARTITIONS_PER_GPSIMD_CORE]
     token_affinities = gathered_affinities_sb[:, current_partition_channel, :]
 
     # Create shuffle mask for partition alignment
@@ -196,7 +196,7 @@ def broadcast_token_affinity(
 
     # Perform stream shuffle to align token affinities with partitions
     token_affinities_partition_aligned = sbm.alloc_stack(
-        (dims._pmax, PARTITIONS_PER_Q7_CORE),
+        (dims._pmax, PARTITIONS_PER_GPSIMD_CORE),
         dtype=gathered_affinities_sb.dtype,
         buffer=nl.sbuf,
         name="token_affinities_partition_aligned",
@@ -218,6 +218,9 @@ def reshape_scale_for_mlp(scale_tensor: TensorView):
 
     Returns:
         TensorView: Reshaped scale tensor with expanded dimension 0 and broadcasted to size 128.
+
+    Notes:
+        - Expands dimension 0 and broadcasts to partition size (128)
     """
     return scale_tensor.expand_dim(dim=0).broadcast(dim=0, size=128)
 
@@ -231,5 +234,8 @@ def safe_tensor_view(tensor: nl.ndarray):
 
     Returns:
         TensorView or None: TensorView wrapper if tensor != None, otherwise None.
+
+    Notes:
+        - Safe wrapper to handle optional tensor inputs
     """
     return TensorView(tensor) if tensor != None else None

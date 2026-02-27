@@ -58,6 +58,36 @@ class QuantizationType(Enum):
     STATIC = 1
     ROW = 2
     MX = 3
+    STATIC_MX = 4
+
+
+class QKVWeightLayout(Enum):
+    """Layout of fused QKV weight tensor passed to the kernel.
+
+    The kernel requires weights in a specific layout depending on quantization
+    type and whether the DMA transpose optimization is enabled. Starting from a
+    standard float checkpoint with shape [H, I] (I = fused QKV output dim):
+
+    CONTIGUOUS (non-MX):
+        Use the checkpoint weights as-is in [H, I] layout.
+
+    MX_CONTIGUOUS (MX without DMA transpose):
+        Pack every 4 consecutive H rows into float8_e4m3fn_x4:
+            w.reshape(H//4, 4, I).transpose(0, 2, 1).reshape(H//4, I*4)
+        then cast to float8_e4m3fn_x4. Result shape: [H//4, I] in x4 dtype.
+
+    MX_INTERLEAVED (MX with DMA transpose — FP8 or BF16+static-dequant input):
+        Starting from MX_CONTIGUOUS packed weights, unpack back to [H, I],
+        then reorder rows so that the x4 quads match the interleaved layout
+        produced by DMA transpose on the input:
+            h_idx = np.arange(H).reshape(2, H//4, 2).transpose(1, 0, 2).reshape(H)
+            w_reordered = w_unpacked[h_idx, :]
+        then re-pack to float8_e4m3fn_x4. Result shape: [H//4, I] in x4 dtype.
+    """
+
+    CONTIGUOUS = 0
+    MX_CONTIGUOUS = 1
+    MX_INTERLEAVED = 2
 
 
 class GateUpDim(Enum):

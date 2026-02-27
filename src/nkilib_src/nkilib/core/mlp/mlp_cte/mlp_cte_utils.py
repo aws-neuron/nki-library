@@ -12,15 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-MLP CTE Utilities Module
+"""MLP CTE utility functions for bias operations, elementwise multiplication, and activation functions."""
 
-Provides unified utility functions for MLP CTE kernels including bias operations,
-elementwise multiplication, and activation functions with boolean parameter support.
-
-"""
-
-from dataclasses import dataclass
 from typing import Optional
 
 import nki.isa as nisa
@@ -28,6 +21,7 @@ import nki.language as nl
 
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_ceil_quotient, get_nl_act_fn_from_type
+from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters
 from .mlp_cte_constants import MLPCTEConstants
 from .mlp_cte_tile_info import MLPCTETileInfo
@@ -212,52 +206,88 @@ def perform_elementwise_multiply(
     bxs_dim_tile = tile_info.bxs_dim_tile
     int_dim_tile = tile_info.src_proj_intermediate_dim_tile
     bias_vector = constants.bxs_dim_subtile_zero_bias_vector_sbuf
-    BXS_SUBTILE_COUNT = bxs_dim_tile.subtile_dim_info.tile_count
+    MX_INT_SUBTILE_SIZE = tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_size  # 4
+    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size  # 128
+    MX_BXS_SUBTILE_SIZE = tile_info.mx_src_proj_bxs_dim_tile.subtile_dim_info.tile_size  # 256
+
+    tensor_bxs_size = constants.get_bxs_size(mlp_params)
+    bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
+    current_bxs_tile = bxs_tiles[bxs_tile_idx]
 
     # Loop over all the intermediate tiles within the B x S subtiles and compute the multiply
-    for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
-        for intermediate_tile_idx in range(int_dim_tile.tile_count):
-            p_bxs_size = bxs_dim_tile.get_subtile_bound(bxs_tile_idx, bxs_subtile_idx)
-            f_int_size = int_dim_tile.get_tile_bound(intermediate_tile_idx)
+    for bxs_subtile in TiledRange(current_bxs_tile.size, BXS_SUBTILE_SIZE):
+        for int_tile in TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size):
+            if mlp_params.quant_params.is_quant_static_mx():
+                int_subtiles = TiledRange(int_tile.size, MX_INT_SUBTILE_SIZE)
 
-            if p_bxs_size <= 0 or f_int_size <= 0:
-                continue
+                dst_pattern = [
+                    [int_dim_tile.tile_count * BXS_SUBTILE_SIZE * MX_INT_SUBTILE_SIZE, len(int_subtiles)],
+                    [MX_INT_SUBTILE_SIZE, bxs_subtile.size],
+                    [1, MX_INT_SUBTILE_SIZE],
+                ]
+                dst_offset = int_tile.index * BXS_SUBTILE_SIZE * MX_INT_SUBTILE_SIZE
+                gate_data = gate_tile_sbuf_list[bxs_subtile.index].ap(pattern=dst_pattern, offset=dst_offset)
 
-            gate_data = gate_tile_sbuf_list[bxs_subtile_idx][:p_bxs_size, intermediate_tile_idx, :f_int_size]
+                if up_data_is_psum:
+                    psum_bank = (bxs_subtile.index // 2) * int_dim_tile.tile_count + int_tile.index
+                    # Read with a stride size of 4 so that 4 adjacent elements of I lie adjacent to each other in the
+                    # projection result, ready to be contracted together during down projection.
+                    up_data = up_tile_data_list[psum_bank].ap(
+                        pattern=[
+                            [MX_BXS_SUBTILE_SIZE * MX_INT_SUBTILE_SIZE, len(int_subtiles)],
+                            [1, bxs_subtile.size],
+                            [MX_BXS_SUBTILE_SIZE, MX_INT_SUBTILE_SIZE],
+                        ],
+                        offset=(bxs_subtile.index % 2) * BXS_SUBTILE_SIZE,
+                    )
+                else:
+                    up_data = up_tile_data_list[bxs_subtile.index].ap(pattern=dst_pattern, offset=dst_offset)
+                dst_tile = output_tile_sbuf_list[bxs_subtile.index].ap(pattern=dst_pattern, offset=dst_offset)
 
-            if up_data_is_psum:
-                psum_bank = bxs_subtile_idx * int_dim_tile.tile_count + intermediate_tile_idx
-                up_data = up_tile_data_list[psum_bank][:p_bxs_size, :f_int_size]
+                nisa.tensor_tensor(dst=dst_tile, data1=gate_data, data2=up_data, op=nl.multiply)
+                nisa.activation(
+                    dst=dst_tile,
+                    op=nl.copy,
+                    data=dst_tile,
+                    scale=up_static_scales_sbuf[: len(int_subtiles), 0:1],
+                    bias=bias_vector[: len(int_subtiles), 0:1],
+                )
             else:
-                up_data = up_tile_data_list[bxs_subtile_idx][:p_bxs_size, intermediate_tile_idx, :f_int_size]
-            dst_tile = output_tile_sbuf_list[bxs_subtile_idx][:p_bxs_size, intermediate_tile_idx, :f_int_size]
+                gate_data = gate_tile_sbuf_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
 
-            nisa.tensor_tensor(dst=dst_tile, data1=gate_data, data2=up_data, op=nl.multiply)
+                if up_data_is_psum:
+                    psum_bank = bxs_subtile.index * int_dim_tile.tile_count + int_tile.index
+                    up_data = up_tile_data_list[psum_bank][: bxs_subtile.size, : int_tile.size]
+                else:
+                    up_data = up_tile_data_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
+                dst_tile = output_tile_sbuf_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
 
-            if mlp_params.quant_params.is_quant_static():
-                nisa.activation(
-                    dst=dst_tile,
-                    op=nl.copy,
-                    data=dst_tile,
-                    scale=up_static_scales_sbuf[:p_bxs_size, 0:1],
-                    bias=bias_vector[:p_bxs_size, 0:1],
-                )
-            elif mlp_params.quant_params.is_quant_row():
-                nisa.tensor_tensor(
-                    dst=dst_tile,
-                    op=nl.multiply,
-                    data1=dst_tile,
-                    data2=up_weight_row_scales_sbuf[
-                        :p_bxs_size, nl.ds(intermediate_tile_idx * int_dim_tile.tile_size, f_int_size)
-                    ],
-                )
-                nisa.activation(
-                    dst=dst_tile,
-                    op=nl.copy,
-                    data=dst_tile,
-                    scale=hidden_scales_sbuf_list[bxs_subtile_idx][:p_bxs_size, 0:1],
-                    bias=bias_vector[:p_bxs_size, 0:1],
-                )
+                nisa.tensor_tensor(dst=dst_tile, data1=gate_data, data2=up_data, op=nl.multiply)
+
+                if mlp_params.quant_params.is_quant_static():
+                    nisa.activation(
+                        dst=dst_tile,
+                        op=nl.copy,
+                        data=dst_tile,
+                        scale=up_static_scales_sbuf[: bxs_subtile.size, 0:1],
+                        bias=bias_vector[: bxs_subtile.size, 0:1],
+                    )
+                elif mlp_params.quant_params.is_quant_row():
+                    nisa.tensor_tensor(
+                        dst=dst_tile,
+                        op=nl.multiply,
+                        data1=dst_tile,
+                        data2=up_weight_row_scales_sbuf[
+                            : bxs_subtile.size, nl.ds(int_tile.index * int_dim_tile.tile_size, int_tile.size)
+                        ],
+                    )
+                    nisa.activation(
+                        dst=dst_tile,
+                        op=nl.copy,
+                        data=dst_tile,
+                        scale=hidden_scales_sbuf_list[bxs_subtile.index][: bxs_subtile.size, 0:1],
+                        bias=bias_vector[: bxs_subtile.size, 0:1],
+                    )
 
 
 #
@@ -308,55 +338,83 @@ def apply_source_projection_activation(
     bxs_dim_tile = tile_info.bxs_dim_tile
     int_dim_tile = tile_info.src_proj_intermediate_dim_tile
     bias_vector = constants.bxs_dim_subtile_zero_bias_vector_sbuf
-    BXS_SUBTILE_COUNT = bxs_dim_tile.subtile_dim_info.tile_count
+    MX_INT_SUBTILE_SIZE = tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_size  # 4
+    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size  # 128
+    MX_BXS_SUBTILE_SIZE = tile_info.mx_src_proj_bxs_dim_tile.subtile_dim_info.tile_size  # 256
+
+    tensor_bxs_size = constants.get_bxs_size(mlp_params)
+    bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
+    current_bxs_tile = bxs_tiles[bxs_tile_idx]
 
     # Loop over all the intermediate tiles within the B x S subtiles and compute the activation
-    for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
-        for intermediate_tile_idx in range(int_dim_tile.tile_count):
-            # Calculate valid ranges
-            p_bxs_size = bxs_dim_tile.get_subtile_bound(bxs_tile_idx, bxs_subtile_idx)
-            f_int_size = int_dim_tile.get_tile_bound(intermediate_tile_idx)
+    for bxs_subtile in TiledRange(current_bxs_tile.size, BXS_SUBTILE_SIZE):
+        for int_tile in TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size):
+            if mlp_params.quant_params.is_quant_static_mx():
+                int_subtiles = TiledRange(int_tile.size, MX_INT_SUBTILE_SIZE)
 
-            if p_bxs_size <= 0 or f_int_size <= 0:
-                continue
+                dst_pattern = [
+                    [int_dim_tile.tile_count * BXS_SUBTILE_SIZE * MX_INT_SUBTILE_SIZE, len(int_subtiles)],
+                    [MX_INT_SUBTILE_SIZE, bxs_subtile.size],
+                    [1, MX_INT_SUBTILE_SIZE],
+                ]
+                dst_offset = int_tile.index * BXS_SUBTILE_SIZE * MX_INT_SUBTILE_SIZE
 
-            # Calculate bias sizes (might be different from data sizes)
-            p_bias_size = min(p_bxs_size, bias_vector.shape[0])
-            f_bias_size = min(f_int_size, bias_vector.shape[1])
-
-            if data_is_psum:
-                psum_bank = bxs_subtile_idx * int_dim_tile.tile_count + intermediate_tile_idx
-                proj_data = proj_data_list[psum_bank][:p_bxs_size, :f_int_size]
-            else:
-                proj_data = proj_data_list[bxs_subtile_idx][:p_bxs_size, intermediate_tile_idx, :f_int_size]
-            dst_tile = act_fn_res_sbuf_list[bxs_subtile_idx][:p_bxs_size, intermediate_tile_idx, :f_int_size]
-
-            if mlp_params.quant_params.is_quant_static():
+                if data_is_psum:
+                    psum_bank = (bxs_subtile.index // 2) * int_dim_tile.tile_count + int_tile.index
+                    # Read with a stride size of 4 so that 4 adjacent elements of I lie adjacent to each other in the
+                    # projection result, ready to be contracted together during down projection.
+                    proj_data = proj_data_list[psum_bank].ap(
+                        pattern=[
+                            [MX_BXS_SUBTILE_SIZE * MX_INT_SUBTILE_SIZE, len(int_subtiles)],
+                            [1, bxs_subtile.size],
+                            [MX_BXS_SUBTILE_SIZE, MX_INT_SUBTILE_SIZE],
+                        ],
+                        offset=(bxs_subtile.index % 2) * BXS_SUBTILE_SIZE,
+                    )
+                else:
+                    proj_data = proj_data_list[bxs_subtile.index].ap(pattern=dst_pattern, offset=dst_offset)
+                dst_tile = act_fn_res_sbuf_list[bxs_subtile.index].ap(pattern=dst_pattern, offset=dst_offset)
                 nisa.activation(
                     dst=dst_tile,
                     op=get_nl_act_fn_from_type(mlp_params.activation_fn),
                     data=proj_data,
-                    scale=src_static_scales_sbuf[:p_bxs_size, 0:1],
-                    bias=bias_vector[:p_bias_size, :f_bias_size],
-                )
-            elif mlp_params.quant_params.is_quant_row():
-                nisa.tensor_tensor(
-                    dst=dst_tile,
-                    op=nl.multiply,
-                    data1=proj_data,
-                    data2=src_weight_row_scales_sbuf[:p_bxs_size, :f_int_size],
-                )
-                nisa.activation(
-                    dst=dst_tile,
-                    op=get_nl_act_fn_from_type(mlp_params.activation_fn),
-                    data=dst_tile,
-                    scale=hidden_scales_sbuf_list[bxs_subtile_idx][:p_bxs_size, 0:1],
-                    bias=bias_vector[:p_bias_size, :f_bias_size],
+                    scale=src_static_scales_sbuf[: len(int_subtiles), 0:1],
+                    bias=bias_vector[: len(int_subtiles), 0:1],
                 )
             else:
-                nisa.activation(
-                    dst=dst_tile,
-                    op=get_nl_act_fn_from_type(mlp_params.activation_fn),
-                    data=proj_data,
-                    bias=bias_vector[:p_bias_size, :f_bias_size],
-                )
+                if data_is_psum:
+                    psum_bank = bxs_subtile.index * int_dim_tile.tile_count + int_tile.index
+                    proj_data = proj_data_list[psum_bank][: bxs_subtile.size, : int_tile.size]
+                else:
+                    proj_data = proj_data_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
+                dst_tile = act_fn_res_sbuf_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
+
+                if mlp_params.quant_params.is_quant_static():
+                    nisa.activation(
+                        dst=dst_tile,
+                        op=get_nl_act_fn_from_type(mlp_params.activation_fn),
+                        data=proj_data,
+                        scale=src_static_scales_sbuf[: bxs_subtile.size, 0:1],
+                        bias=bias_vector[: bxs_subtile.size, 0:1],
+                    )
+                elif mlp_params.quant_params.is_quant_row():
+                    nisa.tensor_tensor(
+                        dst=dst_tile,
+                        op=nl.multiply,
+                        data1=proj_data,
+                        data2=src_weight_row_scales_sbuf[: bxs_subtile.size, : int_tile.size],
+                    )
+                    nisa.activation(
+                        dst=dst_tile,
+                        op=get_nl_act_fn_from_type(mlp_params.activation_fn),
+                        data=dst_tile,
+                        scale=hidden_scales_sbuf_list[bxs_subtile.index][: bxs_subtile.size, 0:1],
+                        bias=bias_vector[: bxs_subtile.size, 0:1],
+                    )
+                elif mlp_params.quant_params.is_no_quant():
+                    nisa.activation(
+                        dst=dst_tile,
+                        op=get_nl_act_fn_from_type(mlp_params.activation_fn),
+                        data=proj_data,
+                        bias=bias_vector[: bxs_subtile.size, 0:1],
+                    )
