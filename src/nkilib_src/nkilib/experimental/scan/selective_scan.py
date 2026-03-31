@@ -144,9 +144,17 @@ def selective_scan(
                     src=carry_init[0:p_tile.size, 0:1],
                 )
 
-    # Main loop: f_tile outer (sequential for carry), state inner (sequential for SBUF accum)
+    # Main loop: f_tile outer (sequential for carry), state inner
     for i_batch in nl.affine_range(batch_size):
         for p_tile in TiledRange(channels, P_MAX):
+            # Preload full A block once per (batch, p_tile) — reused across all f_tiles
+            A_block = nl.ndarray((P_MAX, state_size), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=A_block, value=0.0)
+            nisa.dma_copy(
+                dst=A_block[0:p_tile.size, 0:state_size],
+                src=A[p_tile.start_offset:p_tile.end_offset, 0:state_size],
+            )
+
             for f_tile_idx in nl.sequential_range(num_f_tiles):
                 f_start = f_tile_idx * F_TILE_SIZE
                 f_size = min(F_TILE_SIZE, L - f_start)
@@ -179,14 +187,11 @@ def selective_scan(
                 y_tile_accum = nl.ndarray((P_MAX, F_TILE_SIZE), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.memset(dst=y_tile_accum, value=0.0)
 
+                shuffle_mask = [0] * 32
+
                 for i_state in nl.sequential_range(state_size):
-                    # Load A column vector for this state dim
-                    A_i = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                    nisa.memset(dst=A_i, value=0.0)
-                    nisa.dma_copy(
-                        dst=A_i[0:p_tile.size, 0:1],
-                        src=A[p_tile.start_offset:p_tile.end_offset, i_state:i_state + 1],
-                    )
+                    # A column from preloaded block (no DMA)
+                    A_i = A_block[0:p_tile.size, i_state:i_state + 1]
 
                     # Load carry from final_state HBM
                     carry_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -200,20 +205,18 @@ def selective_scan(
                     nisa.activation(
                         op=nl.exp,
                         data=dt_sb[0:p_tile.size, 0:f_size],
-                        scale=A_i[0:p_tile.size, 0:1],
+                        scale=A_i,
                         dst=deltaA_sb[0:p_tile.size, 0:f_size],
                     )
 
-                    # Load B, broadcast, compute deltaBx = dt*x*B
+                    # Load B row and broadcast to (p, f) via stream shuffle
                     B_row_idx = i_batch * state_size + i_state
                     B_row = nl.ndarray((1, F_TILE_SIZE), dtype=B.dtype, buffer=nl.sbuf)
                     nisa.dma_copy(
                         dst=B_row[0:1, 0:f_size],
                         src=B_2d[B_row_idx:B_row_idx + 1, f_start:f_start + f_size],
                     )
-                    # Broadcast B_row from (1, f) to (p, f) via stream shuffle
                     B_full = nl.ndarray((P_MAX, F_TILE_SIZE), dtype=nl.float32, buffer=nl.sbuf)
-                    shuffle_mask = [0] * 32
                     for i_shuf in nl.static_range((p_tile.size + 31) // 32):
                         cur_npar = min(32, p_tile.size - i_shuf * 32)
                         nisa.nc_stream_shuffle(
@@ -251,14 +254,13 @@ def selective_scan(
                         src=carry_new[0:p_tile.size, 0:1],
                     )
 
-                    # Load C, broadcast, compute C*state, accumulate into y_tile_accum
+                    # Load C row and broadcast to (p, f) via stream shuffle
                     C_row_idx = i_batch * state_size + i_state
                     C_row = nl.ndarray((1, F_TILE_SIZE), dtype=C.dtype, buffer=nl.sbuf)
                     nisa.dma_copy(
                         dst=C_row[0:1, 0:f_size],
                         src=C_2d[C_row_idx:C_row_idx + 1, f_start:f_start + f_size],
                     )
-                    # Broadcast C_row from (1, f) to (p, f) via stream shuffle
                     C_full = nl.ndarray((P_MAX, F_TILE_SIZE), dtype=nl.float32, buffer=nl.sbuf)
                     for i_shuf in nl.static_range((p_tile.size + 31) // 32):
                         cur_npar = min(32, p_tile.size - i_shuf * 32)
