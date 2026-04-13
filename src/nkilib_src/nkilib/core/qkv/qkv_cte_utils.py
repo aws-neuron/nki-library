@@ -27,13 +27,15 @@ import nki.language as nl
 from ..utils.allocator import SbufManager
 
 # NKI Library
-from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from ..utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import (
     get_max_positive_value_for_dtype,
     get_program_sharding_info,
-    is_launched_as_spmd,
 )
+from ..utils.logging import get_logger
+
+_logger = get_logger("qkv_cte")
 
 
 # Represents unmodified user inputs, no additional data members.
@@ -74,6 +76,7 @@ class QKV_CTE_UserInput(nl.NKIObject):
         qkv_w_scale (Optional[nl.ndarray]): Quantization scale for QKV weights
         qkv_in_scale (Optional[nl.ndarray]): Quantization scale for QKV input
         is_input_swizzled (bool): If input tensor is swizzled for MX
+        weight_layout (QKVWeightLayout): Layout of fused_qkv_weights
     """
 
     input: nl.ndarray
@@ -120,6 +123,7 @@ class QKV_CTE_UserInput(nl.NKIObject):
     qkv_w_scale: Optional[nl.ndarray]
     qkv_in_scale: Optional[nl.ndarray]
     is_input_swizzled: bool
+    weight_layout: QKVWeightLayout
 
 
 # Represent quantization config
@@ -129,6 +133,7 @@ class QKV_Quant_Config(nl.NKIObject):
     qkv_w_scale: Optional[nl.ndarray] = None  # weight quant scale for qkv projection
     qkv_in_scale: Optional[nl.ndarray] = None  # in_scale are same for q, k, v
     quant_dtype: str = nl.float8_e4m3
+    has_mx_static_dequant_scales: bool = False
 
 
 # Represents kernel config.
@@ -545,6 +550,62 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f"[QKV CTE Kernel] is_input_swizzled does not support fused residual add.",
         )
 
+    # FP8 input validation for MX path
+    if args.quantization_type == QuantizationType.MX and args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]:
+        kernel_assert(
+            args.fused_norm_type == NormType.NO_NORM,
+            f"[QKV CTE Kernel] FP8 input with MX quantization does not support normalization.",
+        )
+        kernel_assert(
+            args.fused_residual_add == False,
+            f"[QKV CTE Kernel] FP8 input with MX quantization does not support fused residual add.",
+        )
+
+    # Weight layout validation
+    if args.quantization_type == QuantizationType.MX:
+        _is_fp8_input = args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
+        _has_dequant = args.qkv_in_scale != None and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
+        _use_dma_xpose = (_is_fp8_input or (not _is_fp8_input and _has_dequant)) and args.load_input_with_DMA_transpose
+        if _use_dma_xpose:
+            kernel_assert(
+                args.weight_layout == QKVWeightLayout.MX_INTERLEAVED,
+                f"[QKV CTE Kernel] DMA transpose MX path requires MX_INTERLEAVED weight layout, got {args.weight_layout}.",
+            )
+        else:
+            kernel_assert(
+                args.weight_layout == QKVWeightLayout.MX_CONTIGUOUS,
+                f"[QKV CTE Kernel] Non-DMA-transpose MX path requires MX_CONTIGUOUS weight layout, got {args.weight_layout}.",
+            )
+    else:
+        kernel_assert(
+            args.weight_layout == QKVWeightLayout.CONTIGUOUS,
+            f"[QKV CTE Kernel] Non-MX quantization requires CONTIGUOUS weight layout, got {args.weight_layout}.",
+        )
+
+    # MX static dequantization scales validation
+    _is_mx_static_dequant = (
+        args.quantization_type == QuantizationType.MX
+        and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
+        and args.qkv_in_scale != None
+    )
+    if _is_mx_static_dequant:
+        kernel_assert(
+            args.qkv_w_scale is not None,
+            f"[QKV CTE Kernel] qkv_w_scale must be provided when qkv_in_scale is set with MX_INTERLEAVED layout.",
+        )
+        kernel_assert(
+            args.qkv_in_scale.shape == (1, 1) or args.qkv_in_scale.shape == (nl.tile_size.pmax, 1),
+            f"[QKV CTE Kernel] qkv_in_scale shape must be [1, 1] or [128, 1], got {args.qkv_in_scale.shape}.",
+        )
+        kernel_assert(
+            args.qkv_w_scale.shape == (1, 3) or args.qkv_w_scale.shape == (nl.tile_size.pmax, 3),
+            f"[QKV CTE Kernel] qkv_w_scale shape must be [1, 3] or [128, 3] for MX static dequant, got {args.qkv_w_scale.shape}.",
+        )
+        kernel_assert(
+            args.d_head != None and args.num_q_heads != None and args.num_kv_heads != None,
+            f"[QKV CTE Kernel] d_head, num_q_heads, and num_kv_heads must be specified when MX static dequant scales are provided.",
+        )
+
     # Quantization validation
     if args.quantization_type == QuantizationType.STATIC:
         kernel_assert(
@@ -594,20 +655,43 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     #  - 1. The hardware architecture is trn2 or higher; trn1 lacks support for this feature.
     #  - 2. fusedAdd is disabled, as it requires DMA FMA mode that is not supported yet with DMA transpose.
     #  - 3. There is no normalization, as normalization requires input to be in non-transposed layout.
-    #  - 4. The input dtype is 2-byte dtype, i.e. BF16/BF16
+    #  - 4. The input dtype is 2-byte dtype, i.e. BF16/FP16, or FP8 with MX quantization
+    _is_fp8_input = args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
+    _is_2byte_input = args.input.dtype == nl.bfloat16 or args.input.dtype == nl.float16
     load_input_with_DMA_transpose = (
         args.load_input_with_DMA_transpose
         and nki.isa.get_nc_version() >= nki.isa.nc_version.gen3
         and (args.fused_norm_type == NormType.NO_NORM)
         and args.fused_residual_add == False
-        and (args.input.dtype == nl.bfloat16 or args.input.dtype == nl.float16)
+        and (_is_2byte_input or (_is_fp8_input and args.quantization_type == QuantizationType.MX))
     )
+
+    if _is_fp8_input and args.quantization_type == QuantizationType.MX:
+        if load_input_with_DMA_transpose:
+            _logger.info("QKV CTE: Using FP8 MX DMA transpose path (pre-scaled FP8 input with neutral MX input scales)")
+        else:
+            _logger.info(
+                "QKV CTE: FP8 MX input detected but DMA transpose disabled — falling back to PE transpose path"
+            )
+
+    _has_mx_static_dequant = (
+        args.quantization_type == QuantizationType.MX
+        and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
+        and args.qkv_in_scale != None
+    )
+    if _is_2byte_input and _has_mx_static_dequant and args.quantization_type == QuantizationType.MX:
+        if load_input_with_DMA_transpose:
+            _logger.info("QKV CTE: Using BF16 MX DMA transpose path (pre-scaled BF16 input with static dequant scales)")
+        else:
+            _logger.info(
+                "QKV CTE: BF16 MX input with static dequant scales but DMA transpose disabled — falling back to PE transpose path"
+            )
 
     if args.quantization_type == QuantizationType.STATIC:
         compute_mm_dtype = nl.float8_e4m3
     else:
-        # Compute dtype used in the kernel. Even if inputs are fp32, computations will be done with bf16.
-        compute_mm_dtype = args.input.dtype if args.input.dtype != nl.float32 else nl.bfloat16
+        # Compute dtype used in the kernel. Even if inputs are fp32 or fp8, computations will be done with bf16.
+        compute_mm_dtype = nl.bfloat16 if (args.input.dtype == nl.float32 or _is_fp8_input) else args.input.dtype
 
     act_dtype = nl.float32
 
@@ -656,6 +740,11 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     if args.quantization_type != QuantizationType.NONE:
         quant_config.qkv_w_scale = args.qkv_w_scale
         quant_config.qkv_in_scale = args.qkv_in_scale
+    quant_config.has_mx_static_dequant_scales = (
+        args.quantization_type == QuantizationType.MX
+        and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
+        and args.qkv_in_scale != None
+    )
 
     return QKV_CTE_Config(
         output_layout=args.output_layout,

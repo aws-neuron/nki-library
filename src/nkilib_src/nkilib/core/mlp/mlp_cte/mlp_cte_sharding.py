@@ -17,8 +17,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 
-import nki
-import nki.language as nl
 from nki.language import NKIObject
 
 from ...utils.kernel_assert import kernel_assert
@@ -28,7 +26,6 @@ from ..mlp_parameters import (
     MLPParameters,
     mlpp_has_projection_bias,
     override_inter_size,
-    override_seq_len,
 )
 
 
@@ -62,10 +59,14 @@ def calculate_sharding(mlp_params: MLPParameters):
     # shard on I if any of those are active.
     bxs = mlp_params.batch_size * mlp_params.sequence_len
     shard_on_inter = (num_shard_workers == 2) and (bxs <= 256) and not mlpp_has_projection_bias(mlp_params)
+    shard_on_inter = shard_on_inter or (mlp_params.intermediate_size > 2048 and mlp_params.intermediate_size % 256 == 0)
     # Put some heuristics on shard on I that are conservative. There are clearly cases where the performance of sharding
     # on S is better for small sizes of S.  Those cases are where both I and H are small.
     if mlp_params.hidden_size < 7168 or mlp_params.intermediate_size < 1024:
         shard_on_inter = False
+
+    if mlp_params.intermediate_size > 4096:
+        shard_on_inter = True
 
     if shard_on_inter:
         sharded_dim = ShardedDim.INTERMEDIATE

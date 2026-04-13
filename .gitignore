@@ -17,6 +17,7 @@ __pycache__/
 /.pytest_cache
 /.mypy_cache
 
+src/nkilib_src/nkilib/version/__init__.py
 /doc/_apidoc/
 /build
 !/build-tools/
@@ -38,3 +39,4 @@ pyrightconfig.json
 .vscode
 .env
 *unison*
+.idea

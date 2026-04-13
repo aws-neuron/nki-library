@@ -321,12 +321,12 @@ def _grouped_reduce_max(
     masked_index = nl.ndarray((b, n), dtype=index.dtype, buffer=nl.sbuf)
     final_index = nl.ndarray((b, fold_factor), dtype=index.dtype, buffer=nl.sbuf)
 
-    nisa.tensor_reduce(dst=reduced_max, op=nl.maximum, data=input_tensor.reshape(reshaped_shape), axis=1)
+    nisa.tensor_reduce(dst=reduced_max, op=nl.maximum, data=input_tensor.reshape(reshaped_shape), axis=2)
     nisa.tensor_tensor(
         dst=mask, data1=input_tensor.reshape(reshaped_shape), op=nl.equal, data2=reduced_max.ap(repeat_interleave_ap)
     )
     nisa.tensor_tensor(dst=masked_index, data1=mask.reshape((b, n)), data2=index, op=nl.multiply)
-    nisa.tensor_reduce(dst=final_index, op=nl.maximum, data=masked_index.reshape(reshaped_shape), axis=1)
+    nisa.tensor_reduce(dst=final_index, op=nl.maximum, data=masked_index.reshape(reshaped_shape), axis=2)
     return reduced_max, final_index
 
 

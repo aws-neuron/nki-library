@@ -45,7 +45,6 @@ Usage:
 from enum import Enum
 from typing import Any, Optional
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa.constants import oob_mode

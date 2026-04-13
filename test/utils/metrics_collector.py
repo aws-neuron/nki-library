@@ -35,6 +35,7 @@ from aws_embedded_metrics.logger.metrics_context import MetricsContext
 from typing_extensions import override
 
 from ..utils.exceptions import UnimplementedException
+from .metadata_loader import match_model_config_id
 
 
 class MetricName:
@@ -42,43 +43,120 @@ class MetricName:
     Centralized metric name constants.
     """
 
-    # Timing metrics (recorded during test execution)
-    GOLDEN_COMPUTATION_TIME = "GoldenComputationTime"
+    # ==========================================================================
+    # Top-level timing metrics
+    # ==========================================================================
+    ELAPSED_ALL_SEC = "ElapsedAllSec"
     COMPILATION_TIME = "CompilationTime"
-    HOST_LOCK_TIME = "HostLockTime"
-    FILE_TRANSFER_TIME = "FileTransferTime"
     INFERENCE_TIME_TOTAL = "InferenceTimeTotal"
-    FILE_TRANSFER_NETWORK_TIME = "FileTransferNetworkTime"
+    VALIDATION_TIME = "ValidationTime"
+    INPUT_DUMP_TIME = "InputDumpTime"
+    ARTIFACT_PARSE_TIME = "ArtifactParseTime"
+
+    # ==========================================================================
+    # Simulation metrics
+    # ==========================================================================
+    SIMULATION_TIME = "SimulationTime"
+
+    # ==========================================================================
+    # Host management metrics
+    # ==========================================================================
+    HOST_LOCK_TIME = "HostLockTime"
+    HOST_ARCH_VALIDATION_TIME = "HostArchValidationTime"
+    CORE_ALLOCATION_TIME = "CoreAllocationTime"
+    # Core allocation sub-metrics (breakdown of CORE_ALLOCATION_TIME)
+    CORE_LOCK_INIT_TIME = "CoreLockInitTime"
+    CORE_LOCK_DEPLOY_TIME = "CoreLockDeployTime"
+    CORE_LOCK_ACQUIRE_TIME = "CoreLockAcquireTime"
+    CORE_LOCK_VERSION_CHECK_TIME = "CoreLockVersionCheckTime"
+    # Core lock contention metrics
+    CORE_LOCK_NO_CORES_COUNT = "CoreLockNoCoresCount"
+    CORE_LOCK_CONTENTION_WAIT_TIME = "CoreLockContentionWaitTime"
+    FAILED_HOSTS_COUNT = "FailedHostsCount"
+
+    # ==========================================================================
+    # File transfer metrics
+    # ==========================================================================
+    FILE_TRANSFER_UPLOAD_TIME = "FileTransferUploadTime"
+    FILE_TRANSFER_DOWNLOAD_TIME = "FileTransferDownloadTime"
+
+    # ==========================================================================
+    # SFTP file transfer metrics
+    # ==========================================================================
     FILE_TRANSFER_COMPRESSION_TIME = "FileTransferCompressionTime"
     FILE_TRANSFER_BYTES_COMPRESSED = "FileTransferBytesCompressed"
     FILE_TRANSFER_BYTES_UNCOMPRESSED = "FileTransferBytesUncompressed"
-    PROFILE_JSON_GENERATION_TIME = "ProfileJsonGenerationTime"
+
+    # ==========================================================================
+    # SFTP transfer timing metrics
+    # ==========================================================================
+    SFTP_UPLOAD_TIME = "SftpUploadTime"
+    SFTP_DOWNLOAD_TIME = "SftpDownloadTime"
+
+    # ==========================================================================
+    # S3 transfer timing metrics
+    # ==========================================================================
+    S3_UPLOAD_LOCAL_ARCHIVE_TIME = "S3UploadLocalArchiveTime"
+    S3_UPLOAD_LOCAL_TO_S3_TIME = "S3UploadLocalToS3Time"
+    S3_UPLOAD_S3_TO_REMOTE_TIME = "S3UploadS3ToRemoteTime"
+    S3_UPLOAD_REMOTE_EXTRACT_TIME = "S3UploadRemoteExtractTime"
+    S3_DOWNLOAD_REMOTE_ARCHIVE_TIME = "S3DownloadRemoteArchiveTime"
+    S3_DOWNLOAD_REMOTE_TO_S3_TIME = "S3DownloadRemoteToS3Time"
+    S3_DOWNLOAD_S3_TO_LOCAL_TIME = "S3DownloadS3ToLocalTime"
+    S3_DOWNLOAD_LOCAL_EXTRACT_TIME = "S3DownloadLocalExtractTime"
+
+    # ==========================================================================
+    # S3 transfer bytes and rates
+    # ==========================================================================
+    S3_UPLOAD_BYTES = "S3UploadBytes"
+    S3_DOWNLOAD_BYTES = "S3DownloadBytes"
+    S3_UPLOAD_LOCAL_TO_S3_RATE = "S3UploadLocalToS3Rate"
+    S3_UPLOAD_S3_TO_REMOTE_RATE = "S3UploadS3ToRemoteRate"
+    S3_DOWNLOAD_REMOTE_TO_S3_RATE = "S3DownloadRemoteToS3Rate"
+    S3_DOWNLOAD_S3_TO_LOCAL_RATE = "S3DownloadS3ToLocalRate"
+
+    # ==========================================================================
+    # Neuron profiler timing metrics (parsed from log-infer.txt)
+    # ==========================================================================
     NEURON_PROFILE_CAPTURE_TIME = "NeuronProfileCaptureTime"
     NEURON_PROFILE_SHOW_TIME = "NeuronProfileShowTime"
-    CORE_ALLOCATION_TIME = "CoreAllocationTime"
-    INFERENCE_TIME = "InferenceTime"
-    VALIDATION_TIME = "ValidationTime"
-    ELAPSED_ALL_SEC = "ElapsedAllSec"
-    DETERMINISM_CHECK_TIME = "DeterminismCheckTime"
+    PROFILE_JSON_GENERATION_TIME = "ProfileJsonGenerationTime"
 
-    # Profiler metrics (from artifacts)
+    # ==========================================================================
+    # Profiler performance metrics (parsed from ntff.json)
+    # ==========================================================================
+    INFERENCE_TIME = "InferenceTime"
+    ACTIVE_INFERENCE_TIME = "ActiveInferenceTime"
     MBU_ESTIMATED_PERCENT = "MbuEstimatedPercent"
     PROFILER_MFU = "ProfilerMFU"
-    TPB_SG_CYCLES_SUM = "TpbSgCyclesSum"
 
-    # Per-core cycle metrics (dynamically named with zero-based core index suffix)
+    # ==========================================================================
+    # Cycle count metrics (parsed from show_session_*.json)
+    # ==========================================================================
+    TPB_SG_CYCLES_SUM = "TpbSgCyclesSum"
     CYCLE_OUTLIERS_PREFIX = "CycleOutliers_CIdx_"
     CYCLE_QCD_PREFIX = "CycleQCD_CIdx_"
 
-    # Compilation metrics (from artifacts)
+    # ==========================================================================
+    # Compilation metrics (parsed from info.json)
+    # ==========================================================================
     TPB_COUNT = "TPBCount"
 
+    # ==========================================================================
     # Validation metrics
+    # ==========================================================================
+    GOLDEN_COMPUTATION_TIME = "GoldenComputationTime"
+    VALIDATION_OUTPUT_LOAD_TIME = "ValidationOutputLoadTime"
+    VALIDATION_COMPARE_TIME = "ValidationCompareTime"
     ACCURACY_HW = "AccuracyHw"
     IS_VALIDATION_SKIPPED = "IsValidationSkipped"
+    DETERMINISM_CHECK_TIME = "DeterminismCheckTime"
 
-    # Host management metrics
-    FAILED_HOSTS_COUNT = "FailedHostsCount"
+    # ==========================================================================
+    # Separation pass metrics (parsed from analysis_nc*.log)
+    # ==========================================================================
+    SEPARATED_MEMORY_TIME = "SeparatedMemoryTime"
+    SEPARATED_COMPUTE_TIME = "SeparatedComputeTime"
 
 
 class IMetricsCollector(ABC):
@@ -315,19 +393,15 @@ class MetricsCollector(IMetricsCollector):
         """
         Match test configuration to metadata and add model dimensions.
 
-        Searches metadata_list for entries where test_settings matches test_metadata_key.
-        Adds all keys from matched model_settings as dimensions
+        Searches metadata_list for entries where all keys in test_metadata_key
+        match test_settings. On match, computes a ModelConfigId (SHA256 hash)
+        for association.
         """
-        for entry in metadata_list:
-            test_settings = entry.get("test_settings", {})
-            # Check if all keys in test_metadata_key match test_settings
-            if all(test_settings.get(k) == v for k, v in test_metadata_key.items()):
-                model_settings = entry.get("model_settings", {})
-                # Add all model_settings as dimensions
-                for key, value in model_settings.items():
-                    if value is not None:
-                        self.add_dimension({key: str(value)})
-                return  # Found match, stop searching
+        config_id = match_model_config_id(test_metadata_key, metadata_list)
+        if config_id:
+            self.add_dimension({"ModelConfigId": config_id})
+        else:
+            self.logger.warning(f"No model config match found in {len(metadata_list)} entries")
 
     @override
     def has_metric(self, name: str) -> bool:
@@ -354,6 +428,11 @@ class MetricsCollector(IMetricsCollector):
         # Add dimensions
         if self.dimensions:
             self._metrics_context.set_dimensions([self.dimensions])
+
+        # Add kernel parameters as properties
+        if self.kernel_params:
+            for key, value in self.kernel_params.items():
+                self._metrics_context.set_property(key, value)
 
         # Add total elapsed time
         if self._start_time > 0:
@@ -392,6 +471,13 @@ class MetricsCollector(IMetricsCollector):
             # Always record profiler metrics for consistency
             self.record_metric(MetricName.MBU_ESTIMATED_PERCENT, -1.0, "Percent")
             self.record_metric(MetricName.PROFILER_MFU, -1.0, "Percent")
+
+        # Parse ntff_detailed.json for ActiveInferenceTime (summary-json lacks per-instruction data)
+        ntff_detailed_path = artifact_path / inference_artifact_dir / "ntff_detailed.json"
+        if ntff_detailed_path.exists():
+            self._parse_active_inference_time(ntff_detailed_path)
+        else:
+            self.record_metric(MetricName.ACTIVE_INFERENCE_TIME, -1.0, "Seconds")
 
     @override
     def set_test_name(self, test_name: str) -> None:
@@ -529,8 +615,47 @@ class MetricsCollector(IMetricsCollector):
         else:
             raise ValueError(f"Unknown target instance family: {target_instance_family}")
 
+    # Opcodes that are setup/teardown - everything else is considered work
+    _SETUP_OPCODES = {
+        "NOP",
+        "SET_ORDERING_MODE",
+        "EVENT_SEMAPHORE",
+        "EVENT_SEMAPHORE_RANGE_CLEAR",
+        "NOTIFY",
+        "COMPARE_BRANCH",
+        "DRAIN",
+        "WRITE",
+        "TENSOR_LOAD",
+    }
+
+    def _compute_active_inference_time(self, profiler_data: dict) -> float:
+        """Compute active inference time excluding setup/teardown opcodes, including DMA."""
+        min_ts, max_ts = float("inf"), 0
+
+        # Process instructions (excluding setup/teardown)
+        for inst in profiler_data.get("instruction", []):
+            if inst.get("opcode") not in self._SETUP_OPCODES:
+                ts = inst.get("timestamp", 0)
+                dur = inst.get("duration", 0)
+                min_ts = min(min_ts, ts)
+                max_ts = max(max_ts, ts + dur)
+
+        # Process DMA events (only those with semaphore ID)
+        dma_list = profiler_data.get("dma", [])
+        for dma in dma_list:
+            if dma.get("semaphore_id") == "-1":
+                continue
+            ts = dma.get("timestamp", 0)
+            dur = dma.get("duration", 0)
+            min_ts = min(min_ts, ts)
+            max_ts = max(max_ts, ts + dur)
+
+        if min_ts == float("inf"):
+            return -1.0
+        return (max_ts - min_ts) * 1e-9  # ns to seconds
+
     def _parse_ntff_json(self, ntff_path) -> None:
-        """Parse ntff.json for profiler metrics"""
+        """Parse ntff.json for profiler metrics (summary-json format)."""
         try:
             # Get hardware specs for the target platform
             target = self.dimensions["Target"]
@@ -538,7 +663,9 @@ class MetricsCollector(IMetricsCollector):
 
             with open(ntff_path, "r") as f:
                 profiler_data = json.load(f)
-            profiler_summary = profiler_data.get("summary", [{}])[0]
+
+            # summary-json format: {"n_hash...": {...}} - get first value
+            profiler_summary = next(iter(profiler_data.values()), {})
 
             infer_sec = profiler_summary.get("total_time")
 
@@ -580,6 +707,17 @@ class MetricsCollector(IMetricsCollector):
             self.logger.warning(f"Failed to parse ntff.json: {e}")
             self.record_metric(MetricName.MBU_ESTIMATED_PERCENT, -1.0, "Percent")
             self.record_metric(MetricName.PROFILER_MFU, -1.0, "Percent")
+
+    def _parse_active_inference_time(self, ntff_detailed_path) -> None:
+        """Parse ntff_detailed.json for ActiveInferenceTime (requires per-instruction data)."""
+        try:
+            with open(ntff_detailed_path, "r") as f:
+                profiler_data = json.load(f)
+            active_time = self._compute_active_inference_time(profiler_data)
+            self.record_metric(MetricName.ACTIVE_INFERENCE_TIME, float(active_time), "Seconds")
+        except Exception as e:
+            self.logger.warning(f"Failed to parse ntff_detailed.json for ActiveInferenceTime: {e}")
+            self.record_metric(MetricName.ACTIVE_INFERENCE_TIME, -1.0, "Seconds")
 
     def _iqr_filtered_average(self, cycle_list, core_id: int | None = None) -> tuple[float, int, float]:
         """
@@ -638,14 +776,15 @@ class _TimerContext:
         self.collector = collector
         self.name = name
         self.start_time = 0.0
+        self.duration = 0.0
 
     def __enter__(self):
         self.start_time = time.time()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        duration = time.time() - self.start_time
-        self.collector.record_timer(self.name, duration)
+        self.duration = time.time() - self.start_time
+        self.collector.record_timer(self.name, self.duration)
         return False  # Don't suppress exceptions
 
 

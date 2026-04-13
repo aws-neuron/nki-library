@@ -29,7 +29,14 @@ from paramiko import SSHException
 from typing_extensions import override
 
 from .common_dataclasses import INF_ARTIFACT_DIR_NAME, NeuronDeviceInfo, Platforms, TargetHost
-from .core_lock_manager import check_infra_locking_version
+from .core_lock_client import get_host_locking_version
+from .core_lock_manager import (
+    CoreAllocation,
+    CoreLockManager,
+    LockAcquisitionError,
+    LockVersionError,
+    check_lock_version,
+)
 from .exceptions import (
     InferenceException,
     LocalExecutionException,
@@ -43,27 +50,15 @@ from .resources import RemoteDirectory
 from .s3_utils import S3ArtifactUploadConfig
 
 
-@dataclass
-class CoreAllocation:
-    """Represents an allocation of logical cores on a host.
-
-    Logical cores are what the runtime sees via NEURON_RT_VISIBLE_CORES.
-    The underlying locking mechanism uses physical cores to prevent conflicts
-    between LNC1 and LNC2 tests running in parallel.
-
-    Attributes:
-        host_id: Identifier for the host where cores are allocated
-        logical_core_ids: List of logical core IDs for NEURON_RT_VISIBLE_CORES
-        lnc_config: LNC configuration (1 or 2) - physical cores per logical core
-    """
-
-    host_id: str
-    logical_core_ids: list[int]
-    lnc_config: int
-
-    def get_core_list_str(self) -> str:
-        """Get comma-separated logical core IDs for NEURON_RT_VISIBLE_CORES."""
-        return ",".join(str(core_id) for core_id in self.logical_core_ids)
+@contextlib.contextmanager
+def temporary_random_seed(seed: int) -> Generator[None, None, None]:
+    """Temporarily reseed the global RNG, restoring the original state on exit."""
+    state = random.getstate()
+    random.seed(seed)
+    try:
+        yield
+    finally:
+        random.setstate(state)
 
 
 class Host(ABC):
@@ -180,7 +175,7 @@ class LocalHost(Host):
 
     @override
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
-        result = subprocess.run([self.neuron_ls_path, "--json-output"])
+        result = subprocess.run([self.neuron_ls_path, "--json-output"], capture_output=True, text=True)
         data = json.loads(result.stdout)
         if not data:
             raise NoNeuronDevicesException("localhost")
@@ -223,6 +218,9 @@ class SshHost(Host):
         self.core_allocation_file: str = os.path.join(test_base_path, f"{self.ssh_alias}_core_allocation.json")
         self.remote_lock_dir: str = "/tmp/neuronx-cc/core_locks"
         self._lock_system_initialized: bool = False
+        # New locking system (v2+)
+        self._core_lock_manager: CoreLockManager | None = None
+        self._total_physical_cores: int | None = None
 
         self.neuron_ls_path: str = os.path.join(remote_neuron_install_dir, "neuron-ls")
 
@@ -305,7 +303,7 @@ class SshHost(Host):
         collector: IMetricsCollector,
         list_of_files_to_copy: list[str] | None = None,
     ):
-        with collector.timer(MetricName.FILE_TRANSFER_TIME):
+        with collector.timer(MetricName.FILE_TRANSFER_DOWNLOAD_TIME):
             return RemoteDirectory(remote_path, self.connection).download(
                 destination_dir_path=local_path,
                 s3_config=self.s3_config,
@@ -342,7 +340,6 @@ class SshHost(Host):
         collector: IMetricsCollector,
         skip_remote_cleanup: bool = False,
         force_local_cleanup: bool = False,
-        max_retries: int = 3,
     ):
         # Add PID to make remote path unique per process
         # allows multiple machines to run the same test on the same host
@@ -352,26 +349,10 @@ class SshHost(Host):
 
         remote_dir = RemoteDirectory(remote_full_path, self.connection)
 
-        for attempt in range(max_retries):
-            try:
-                with collector.timer(MetricName.FILE_TRANSFER_TIME):
-                    remote_dir.upload(
-                        target_directory, collector, self.s3_config, force_local_cleanup=force_local_cleanup
-                    )
+        with collector.timer(MetricName.FILE_TRANSFER_UPLOAD_TIME):
+            remote_dir.upload(target_directory, collector, self.s3_config, force_local_cleanup=force_local_cleanup)
 
-                self.__install_prerequisites__(remote_path=remote_full_path)
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                delay = (2**attempt) + random.uniform(0, 1)
-                logging.warning(
-                    f"prepare_host failed on {self.ssh_alias} (attempt {attempt + 1}/{max_retries}): {e}. "
-                    f"Retrying in {delay:.1f}s"
-                )
-                # Clean up partial upload before retry
-                remote_dir.cleanup()
-                time.sleep(delay)
+        self.__install_prerequisites__(remote_path=remote_full_path)
 
         self.remote_full_path = remote_full_path
 
@@ -420,7 +401,7 @@ class SshHost(Host):
         """
         logging.info(f"Initializing remote lock directory {self.remote_lock_dir} on {self.ssh_alias}")
         # Create with global permissions so any user can use the shared lock directory
-        # Also create flock file for coordinating concurrent lock operations
+        # Also create atomic_lock file for flock-based coordination
         result = self.connection.run(
             f"mkdir -p -m 777 {self.remote_lock_dir} && touch {self.remote_lock_dir}/atomic_lock && chmod 666 {self.remote_lock_dir}/atomic_lock 2>/dev/null || true",
             warn=True,
@@ -429,7 +410,7 @@ class SshHost(Host):
             raise RemoteExecutionException(f"Failed to create remote lock directory {self.remote_lock_dir}", result)
 
         # Check infrastructure version compatibility before any locking operations
-        check_infra_locking_version(self.connection)
+        check_lock_version(self.connection)
 
         self.__cleanup_stale_remote_locks__()
 
@@ -440,7 +421,7 @@ class SshHost(Host):
         logging.info(f"Cleaning up stale locks on {self.ssh_alias}")
         # Loops through all lock directories, extracts timeout from name, deletes if stale
         cleanup_script = f"""
-        for lock_dir in {self.remote_lock_dir}/physical_lock_*_timeout_*m; do
+        for lock_dir in {self.remote_lock_dir}/core_*_timeout_*m {self.remote_lock_dir}/physical_lock_*_timeout_*m {self.remote_lock_dir}/legacy_lock_all_timeout_*m; do
             [ -d "$lock_dir" ] || continue
             timeout=$(echo "$lock_dir" | sed 's/.*_timeout_\\([0-9]*\\)m/\\1/')
             if [ -n "$timeout" ]; then
@@ -450,16 +431,126 @@ class SshHost(Host):
         """
         self.connection.run(cleanup_script, warn=True)
 
-    def __flock_run__(self, script: str) -> str | None:
-        """Run script inside flock for atomicity. Returns stdout on success, None on failure."""
+    # ==================== BEGIN TEMPORARY LEGACY BLOCKING CODE ====================
+    # Problem: Old code uses core_{logical_core_id}_timeout_1m locks instead of
+    # core_{physical_core_id}_timeout_1m. New code needs to coexist and block old
+    # code from running at the same time to prevent "Logical Neuron Core(s) not
+    # available" errors.
+    #
+    # Solution: Two-phase locking with flock(atomic_lock) for atomicity
+    #
+    #   Acquire:
+    #     1. flock -> create all core_* locks + legacy_lock_all marker
+    #     2. If partial creation (legacy holds some), cleanup and retry
+    #     3. flock -> create physical_lock_{id} for requested cores
+    #
+    #   Release:
+    #     flock -> rmdir physical_lock_{id} -> if no physical_lock_* remain ->
+    #     rmdir legacy_lock_all + all core_*
+    #
+    # Lock files in /tmp/neuronx-cc/core_locks/:
+    #   - core_{0..N}_timeout_1m: blocks legacy code
+    #   - physical_lock_{id}_timeout_1m: actual physical core locks
+    #   - legacy_lock_all_timeout_1m: marker that legacy is fully blocked
+    #   - atomic_lock: flock file for atomicity
+    #
+    # To remove after migration:
+    #   1. Delete the section between BEGIN/END TEMPORARY markers
+    #   2. In __try_allocate_physical_cores__: remove the __temp_ensure_legacy_locks__ call
+    #   3. In __release_cores__: change __temp_release_cores_and_maybe_legacy__ to __unlock_remote_physical_cores__
+    # ==============================================================================
+
+    def __temp_flock_run__(self, script: str) -> str:
+        """TEMPORARY: Run script inside flock, return stdout. Logs warning on flock timeout or script error."""
         result = self.connection.run(
-            f"flock -w 30 {self.remote_lock_dir}/atomic_lock -c '{script}'",
+            f"flock -w 30 {self.remote_lock_dir}/atomic_lock -c '{script}; echo FLOCK_OK' || echo FLOCK_TIMEOUT",
             warn=True,
         )
-        if result.ok:
-            return result.stdout
-        logging.warning(f"flock command failed on {self.ssh_alias}: exit={result.return_code}")
-        return None
+        if "FLOCK_TIMEOUT" in result.stdout and "FLOCK_OK" not in result.stdout:
+            logging.warning(f"flock timed out on {self.ssh_alias}")
+        if result.stderr:
+            logging.warning(f"flock script error on {self.ssh_alias}: {result.stderr.strip()}")
+        return result.stdout
+
+    # --- BEGIN TEMPORARY: Legacy blocking for migration ---
+    # Old code uses core_{logical_id} locks. New code uses physical_lock_{id}.
+    # To prevent conflicts, we create all core_* locks to block old code.
+    # Remove this section after migration is complete.
+
+    def __temp_ensure_legacy_locks__(self, total_physical_cores: int) -> bool:
+        """
+        TEMPORARY: Ensure all core_* locks exist to block legacy code.
+        Returns True if legacy locks are in place, False if blocked by legacy code.
+        """
+        script = f"""
+            if [ -d "{self.remote_lock_dir}/legacy_lock_all_timeout_1m" ]; then
+                echo LEGACY_EXISTS
+            else
+                {
+            " && ".join(
+                f"mkdir -m 777 {self.remote_lock_dir}/core_{i}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m && echo C{i}"
+                for i in range(total_physical_cores)
+            )
+        } && mkdir -m 777 {self.remote_lock_dir}/legacy_lock_all_timeout_1m && echo LEGACY_CREATED
+            fi
+        """
+        stdout = self.__temp_flock_run__(script)
+
+        if "LEGACY_EXISTS" in stdout or "LEGACY_CREATED" in stdout:
+            if "LEGACY_CREATED" in stdout:
+                logging.info(f"Created all {total_physical_cores} legacy locks on {self.ssh_alias}")
+            else:
+                logging.info(f"Legacy locks already in place on {self.ssh_alias}")
+            return True
+
+        # Partial or blocked - clean up what we created
+        created_cores = [int(x[1:]) for x in stdout.split('\n') if x.startswith('C') and x[1:].isdigit()]
+        if created_cores:
+            logging.info(
+                f"Partial legacy lock ({len(created_cores)}/{total_physical_cores}) on {self.ssh_alias}, cleaning up"
+            )
+            cleanup = " ; ".join(
+                f"rmdir {self.remote_lock_dir}/core_{i}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m 2>/dev/null"
+                for i in created_cores
+            )
+            self.__temp_flock_run__(cleanup)
+        else:
+            logging.info(f"Legacy locks blocked (old code running?) on {self.ssh_alias}")
+        return False
+
+    def __temp_release_cores_and_maybe_legacy__(self, physical_core_ids: list[int]):
+        """
+        TEMPORARY: Release physical locks, then atomically check if last test.
+        If no physical locks remain, release legacy_lock_all_timeout_1m and all core_* locks.
+        """
+        if not physical_core_ids:
+            return
+
+        logging.info(f"Releasing cores {physical_core_ids} on {self.ssh_alias}")
+        physical_lock_dirs = " ".join(
+            f"{self.remote_lock_dir}/physical_lock_{core_id}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m"
+            for core_id in physical_core_ids
+        )
+
+        script = f"""
+            rmdir {physical_lock_dirs} 2>/dev/null
+            if ! ls -d {self.remote_lock_dir}/physical_lock_* >/dev/null 2>&1; then
+                rmdir {self.remote_lock_dir}/legacy_lock_all_timeout_1m 2>/dev/null
+                rmdir {self.remote_lock_dir}/core_*_timeout_*m 2>/dev/null
+                echo "CLEANED_LEGACY"
+            else
+                echo "OTHER_TESTS_RUNNING"
+            fi
+        """
+        stdout = self.__temp_flock_run__(script)
+        if "CLEANED_LEGACY" in stdout:
+            logging.info(
+                f"No physical locks remain - removed legacy_lock_all_timeout_1m and core_* locks on {self.ssh_alias}"
+            )
+        elif "OTHER_TESTS_RUNNING" in stdout:
+            logging.info(f"Released physical cores {physical_core_ids}, other tests still running on {self.ssh_alias}")
+
+    # --- END TEMPORARY: Legacy blocking for migration ---
 
     def __try_lock_remote_physical_cores__(self, physical_core_ids: list[int]) -> list[int]:
         """
@@ -479,16 +570,14 @@ class SshHost(Host):
             f"mkdir -m 777 {self.remote_lock_dir}/physical_lock_{core_id}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m 2>/dev/null && echo {core_id}"
             for core_id in physical_core_ids
         )
-        stdout = self.__flock_run__(lock_cmds)
-        if stdout is None:
-            return []
+        stdout = self.__temp_flock_run__(lock_cmds)
         locked = [int(x) for x in stdout.strip().split('\n') if x.strip().isdigit()]
         if locked:
             logging.info(f"Locked physical cores {locked} on {self.ssh_alias}")
         return locked
 
     def __unlock_remote_physical_cores__(self, physical_core_ids: list[int]):
-        """Release remote locks for physical cores. Retries to ensure locks are removed."""
+        """Release remote locks for physical cores."""
         if not physical_core_ids:
             return
         lock_dirs = " ".join(
@@ -496,17 +585,7 @@ class SshHost(Host):
             for core_id in physical_core_ids
         )
         logging.info(f"Releasing physical cores {physical_core_ids} on {self.ssh_alias}")
-        for attempt in range(5):
-            result = self.__flock_run__(f"rmdir {lock_dirs} 2>/dev/null || true")
-            if result is not None:
-                return
-            delay = (2**attempt) + random.uniform(0, 1)
-            logging.warning(
-                f"Failed to release physical cores {physical_core_ids} on {self.ssh_alias} "
-                f"(attempt {attempt + 1}/5). Retrying in {delay:.1f}s"
-            )
-            time.sleep(delay)
-        logging.error(f"Failed to release physical cores {physical_core_ids} on {self.ssh_alias} after 5 attempts")
+        self.__temp_flock_run__(f"rmdir {lock_dirs} 2>/dev/null || true")
 
     def __initialize_core_allocation_file__(self):
         """
@@ -632,6 +711,10 @@ class SshHost(Host):
 
         Returns list of locked physical core IDs, or empty list if unable to lock.
         """
+        # TEMPORARY: First ensure legacy locks are in place to block old code
+        if not self.__temp_ensure_legacy_locks__(total_physical_cores):
+            return []  # Legacy code is running, retry later
+
         # Collectives require start positions aligned to num_physical_cores.
         # Since num_physical_cores is always a multiple of lnc_config, aligning to
         # num_physical_cores automatically satisfies the lnc_config alignment requirement.
@@ -663,10 +746,10 @@ class SshHost(Host):
         """
         Release previously allocated physical cores in both local state and remote locks.
         """
-        # Update local state FIRST so concurrent __allocate_cores__ callers see
-        # the cores as available.  The remote locks are still held at this point,
-        # so any concurrent attempt to mkdir the same cores will safely fail and
-        # retry until the remote release below completes.
+        # TEMPORARY: Release physical locks, and if last test, release legacy locks too
+        self.__temp_release_cores_and_maybe_legacy__(physical_core_ids)
+
+        # Then update local state
         lock_file = FileLock(f"{self.core_allocation_file}.lock", timeout=10000)
         with lock_file.acquire():
             with open(self.core_allocation_file, "r+") as f:
@@ -679,9 +762,6 @@ class SshHost(Host):
                 f.seek(0)
                 f.truncate()
                 json.dump(core_state, f)
-
-        # Release remote physical core locks
-        self.__unlock_remote_physical_cores__(physical_core_ids)
 
     @override
     @contextlib.contextmanager
@@ -699,6 +779,80 @@ class SshHost(Host):
         Physical cores are locked to prevent conflicts between LNC1 and LNC2 tests.
         Logical core IDs are returned for use with NEURON_RT_VISIBLE_CORES.
         """
+        # Get locking version from host (creates infra_version.json with default if missing)
+        locking_version = get_host_locking_version(self.connection)
+        logging.info(f"[{self.ssh_alias}] Using locking protocol v{locking_version}")
+
+        if locking_version >= 2:
+            yield from self._get_core_allocation_v2(
+                collector, collective_ranks, lnc_config, timeout_seconds, poll_period_seconds
+            )
+            return
+
+        yield from self._get_core_allocation_v1(
+            collector, collective_ranks, lnc_config, timeout_seconds, poll_period_seconds
+        )
+
+    def _get_core_allocation_v2(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int,
+        lnc_config: int,
+        timeout_seconds: int,
+        poll_period_seconds: int,
+    ) -> Generator[CoreAllocation, None, None]:
+        """New locking path using CoreLockManager (flock + JSON state)."""
+        # Lazy initialize CoreLockManager (outside timer to avoid skewing metrics)
+        if self._core_lock_manager is None:
+            # Get total physical cores from device info
+            if self._total_physical_cores is None:
+                devices = self.get_neuron_device_info()
+                self._total_physical_cores = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
+            self._core_lock_manager = CoreLockManager(self.connection, self._total_physical_cores, collector)
+            self._core_lock_manager.initialize()
+
+        with collector.timer(MetricName.CORE_ALLOCATION_TIME):
+            logging.info(
+                f"[{self.ssh_alias}] Trying to acquire {collective_ranks} logical cores (lnc_config={lnc_config})"
+            )
+
+            # Poll until we get cores or timeout
+            start_time = time.time()
+            result = None
+            while time.time() - start_time < timeout_seconds:
+                try:
+                    result = self._core_lock_manager.acquire(collective_ranks, lnc_config)
+                    if result:
+                        break
+                except (LockAcquisitionError, LockVersionError) as e:
+                    logging.warning(f"[{self.ssh_alias}] Lock error (retryable={e.retryable}): {e}")
+                    raise
+                jitter = random.uniform(0, 0.5)
+                time.sleep(poll_period_seconds + jitter)
+
+            if not result:
+                raise TimeoutException(
+                    f"[{self.ssh_alias}] Unable to allocate {collective_ranks} logical cores within {timeout_seconds}s"
+                )
+
+            logical_cores, physical_cores = result
+            self._core_lock_manager.record_contention_metrics()
+            logging.info(f"[{self.ssh_alias}] Allocated logical cores {logical_cores} (physical: {physical_cores})")
+
+        try:
+            yield CoreAllocation(host_id=self.ssh_alias, logical_core_ids=logical_cores, lnc_config=lnc_config)
+        finally:
+            self._core_lock_manager.release(physical_cores)
+
+    def _get_core_allocation_v1(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int,
+        lnc_config: int,
+        timeout_seconds: int,
+        poll_period_seconds: int,
+    ) -> Generator[CoreAllocation, None, None]:
+        """Old locking path using mkdir-based locks (protocol version 1)."""
         with collector.timer(MetricName.CORE_ALLOCATION_TIME):
             # Initialize lock system if needed
             if not self._lock_system_initialized:
@@ -955,7 +1109,8 @@ class HostManager:
 
             # Pick randomly from top 3 hosts with lowest queue depth
             top_n = min(3, len(asc_host_infos))
-            selected_host_info = random.choice(asc_host_infos[:top_n])
+            with temporary_random_seed(time.time_ns()):
+                selected_host_info = random.choice(asc_host_infos[:top_n])
 
             selected_host_info.work_queue_depth += 1
             host = self.target_hosts[selected_host_info.host_alias]

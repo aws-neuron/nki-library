@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import argparse
 import json
 import logging
 import os
@@ -21,10 +20,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from _pytest.config import Config
+from _pytest.python import Metafunc
 
 # Set consistent hash seed for xdist workers to ensure identical test collection
 if "PYTEST_XDIST_WORKER" in os.environ and "NEURON_PYTHONHASHSEED" not in os.environ:
-    os.environ["NEURON_PYTHONHASHSEED"] = "1234"
+    os.environ["NEURON_PYTHONHASHSEED"] = "0"
 
 import uuid
 
@@ -51,6 +52,7 @@ from .utils.feature_flag_helper import (
 from .utils.host_management import HostManager
 from .utils.metrics_collector import IMetricsCollector, MetricsCollector, NoopMetricsCollector
 from .utils.metrics_emitter import IMetricsEmitter, MetricsEmitter, NoopMetricsEmitter, OutputMode
+from .utils.param_extractor import extract_pytest_params
 from .utils.pytest_test_metadata import discover_pytest_test_metadata_marks
 from .utils.qor_collector import collect_qor_from_test_dir
 from .utils.ranged_test_harness import (
@@ -62,39 +64,8 @@ from .utils.ranged_test_harness import (
     RangeTestHarness,
 )
 from .utils.s3_utils import S3ArtifactUploadConfig, prefetch_and_cache_credentials
-from .utils.simulation_constants import SIMULATION_MODE_ENV_VAR
 from .utils.sqs_emitter import SQSEmitter
 from .utils.test_orchestrator import Orchestrator
-
-
-# Simulation mode setup - must run before test collection imports nki
-def _init_simulation_mode() -> bool:
-    """Check if simulation mode requested and initialize if so. Returns True if active."""
-    # Check env var first (set by xdist master for workers, since workers don't inherit argv).
-    # If not "1", fall back to parsing --test-mode from CLI args.
-    is_simulation_enabled = os.environ.get(SIMULATION_MODE_ENV_VAR) == "1"
-    if not is_simulation_enabled:
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("--test-mode", default=None)
-        args, _ = parser.parse_known_args()
-        is_simulation_enabled = args.test_mode == "simulation"
-
-    if not is_simulation_enabled:
-        return False
-
-    try:
-        from .utils.simulation_setup import setup_simulation_mode
-
-        setup_simulation_mode()
-        return True
-    except ImportError as e:
-        raise ImportError(
-            f"Simulation mode requires NkiCpuSimulator package which is not installed: {e}\n"
-            "Use --test-mode=compile-only or --test-mode=compile-and-infer instead."
-        ) from e
-
-
-_SIMULATION_MODE_ACTIVE = _init_simulation_mode()
 
 
 def pytest_addoption(parser):
@@ -137,10 +108,23 @@ def pytest_addoption(parser):
         help="Automatically cleanup test output directory regardless of test outcome (useful for space-constrained devices)",
     )
     parser.addoption(
+        "--force-local-cleanup-keep",
+        nargs="+",
+        choices=["metrics"],
+        default=[],
+        help="Artifact types to preserve when using --force-local-cleanup (e.g., metrics)",
+    )
+    parser.addoption(
         "--debug-kernels",
         action="store_true",
         default=False,
         help="Dump additional debug output inside test directory to aid in kernel debugging",
+    )
+    parser.addoption(
+        "--enable-dge-notifs",
+        action="store_true",
+        default=False,
+        help="Enables DGE Notifications during profiling of a kernel. Turn on when debugging kernel performance.",
     )
     parser.addoption(
         "--metric-output",
@@ -172,6 +156,12 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help="Pipeline run ID (auto-generated if not provided)",
+    )
+    parser.addoption(
+        "--disable-no-tests-failure",
+        action="store_true",
+        default=False,
+        help="Log warning instead of failing (exit code 5) when no tests are collected",
     )
 
     parser.addini(
@@ -219,6 +209,12 @@ def pytest_addoption(parser):
         help=f"Which test outcomes to upload to S3: {', '.join(repr(e.value) for e in UploadOutcome)}. Requires --test-output-s3-bucket",
     )
     parser.addoption(
+        "--enable-perf-analysis",
+        action="store_true",
+        default=False,
+        help="Enable performance analysis: compiles with perf sim, generates detailed profiled JSON, and runs perf analysis producing analysis_nc00.log and analysis_nc01.log",
+    )
+    parser.addoption(
         "--platform-target",
         action="store",
         default="trn2",
@@ -239,6 +235,9 @@ def pytest_addoption(parser):
         default="singles",
         choices=["singles", "pairs", "full"],
         help="Default parameter coverage regime for unspecified tests",
+    )
+    group.addoption(
+        "--skip-coverage-parametrize", action="store_true", help="Exclude coverage_parametrize tests from collection"
     )
 
 
@@ -307,7 +306,7 @@ def setup_logging(request: pytest.FixtureRequest, test_worker_id: str, artifacts
 def host_manager(request: pytest.FixtureRequest) -> HostManager:
     target_host_file: str | None = get_feature_flag(request.config, "target_host_file")
     target_hosts_cli: list[str] = get_feature_flag(request.config, "target_host", list())
-    platform_target_str: str = get_feature_flag(request.config, "platform_target")
+    platform_target: Platforms = get_platform_target(request.config)
     neuron_installation_path: str = get_feature_flag(request.config, "neuron_tools_bin_path")
 
     ssh_config_path: str = os.path.expanduser(get_feature_flag(request.config, "ssh_config_path", "~/.ssh/config"))
@@ -320,7 +319,6 @@ def host_manager(request: pytest.FixtureRequest) -> HostManager:
     )
 
     # Build target hosts list
-    platform_target = Platforms(platform_target_str)
     target_hosts: list[TargetHost] = []
     if target_host_file:
         # Load hosts from JSON file (includes host types, defaults to platform_target if missing)
@@ -363,32 +361,55 @@ def host_manager(request: pytest.FixtureRequest) -> HostManager:
     return host_manager
 
 
+def _resolve_session_trace_mode(config) -> TraceMode:
+    """Resolve the session trace mode from CLI flags. Cached on config."""
+    if hasattr(config, "_session_trace_mode"):
+        return config._session_trace_mode
+
+    test_mode = get_feature_flag(config, "test_mode")
+    if test_mode:
+        config._session_trace_mode = TraceMode.create(test_mode)
+    elif get_feature_flag(config, "target_host") or get_feature_flag(config, "target_host_file"):
+        config._session_trace_mode = TraceMode.CompileAndInfer
+    else:
+        config._session_trace_mode = TraceMode.CompileOnly
+
+    return config._session_trace_mode
+
+
+def is_simulation_mode(config) -> bool:
+    """Check if simulation mode is active."""
+    return _resolve_session_trace_mode(config) == TraceMode.Simulator
+
+
+def _setup_simulation_mode():
+    """Initialize simulation mode. Must run before test collection imports nki."""
+    try:
+        from .utils.simulation_setup import setup_simulation_mode
+
+        setup_simulation_mode()
+    except ImportError as e:
+        raise ImportError(
+            f"Simulation mode requires NkiCpuSimulator package which is not installed: {e}\n"
+            "Use --test-mode=compile-only or --test-mode=compile-and-infer instead, "
+            "or provide --target-host to run on hardware."
+        ) from e
+
+
 @pytest.fixture(scope="session")
-def default_trace_mode(host_manager: HostManager) -> TraceMode:
-    is_local_trn = False  # TODO: implement when host_manager supports
-    is_remote_trn = not host_manager.is_local
-
-    if is_local_trn or is_remote_trn:
-        return TraceMode.CompileAndInfer
-
-    return TraceMode.Simulator
+def session_trace_mode(request: pytest.FixtureRequest) -> TraceMode:
+    """Session-wide trace mode from CLI flags. Individual tests may override via markers."""
+    return _resolve_session_trace_mode(request.config)
 
 
 @pytest.fixture
-def trace_mode(request: pytest.FixtureRequest, default_trace_mode: TraceMode) -> TraceMode:
-    # Check markers first (highest priority)
+def trace_mode(request: pytest.FixtureRequest, session_trace_mode: TraceMode) -> TraceMode:
+    """Per-test trace mode. Markers override the session default."""
     for mode in TraceMode:
         if request.node.get_closest_marker(mode.value) is not None:
             return mode
 
-    # Fall back to CLI flag
-    cli_trace_mode = get_feature_flag(request.config, "test_mode")
-    if cli_trace_mode:
-        return TraceMode.create(cli_trace_mode)
-
-    # Default fallback
-    logging.warning(f"Defaulting trace mode for {request.function.__name__} to {default_trace_mode}")
-    return default_trace_mode
+    return session_trace_mode
 
 
 @pytest.fixture
@@ -423,28 +444,10 @@ def collector(request: pytest.FixtureRequest, metric_output_mode: OutputMode | N
 
         # Auto-capture pytest parametrized params
         if hasattr(request.node, 'callspec'):
-            params = _extract_pytest_params(request.node.callspec.params)
+            params = extract_pytest_params(request.node.callspec.params)
             collector.set_kernel_params(params)
 
         return collector
-
-
-def _extract_pytest_params(callspec_params: dict) -> dict:
-    """Extract and serialize pytest parametrized values for metrics."""
-    params = {}
-    for key, value in callspec_params.items():
-        # Skip None values
-        if value is None:
-            continue
-        # Convert enums to their name
-        if hasattr(value, 'name'):
-            params[key] = value.name
-        # Handle other non-serializable types
-        elif hasattr(value, '__dict__'):
-            params[key] = str(value)
-        else:
-            params[key] = value
-    return params
 
 
 @pytest.fixture
@@ -474,20 +477,29 @@ def emitter(
 
 
 @pytest.fixture
+def perf_analysis_enabled(request: pytest.FixtureRequest) -> bool:
+    return get_feature_flag(request.config, "enable_perf_analysis", False)
+
+
+@pytest.fixture
 def test_manager(
     request: pytest.FixtureRequest,
     trace_mode: TraceMode,
     host_manager: HostManager,
     emitter: IMetricsEmitter,
+    perf_analysis_enabled: bool,
 ) -> Orchestrator:
-    return Orchestrator(request.config, trace_mode, host_manager, emitter)
+    return Orchestrator(request.config, trace_mode, host_manager, emitter, perf_analysis_enabled=perf_analysis_enabled)
+
+
+def get_platform_target(config: Config) -> Platforms:
+    platform_str = get_feature_flag(config, "platform_target")
+    return Platforms(platform_str)
 
 
 @pytest.fixture
 def platform_target(request: pytest.FixtureRequest) -> Platforms:
-    """Return the target instance family specified via --target-instance-family CLI option."""
-    platform_str = get_feature_flag(request.config, "platform_target")
-    return Platforms(platform_str)
+    return get_platform_target(request.config)
 
 
 def _pytest_configure(config):
@@ -499,7 +511,7 @@ def _pytest_configure(config):
         config.addinivalue_line("markers", f"{mark_name}: {description}")
 
 
-def _pytest_generate_tests(metafunc):
+def _pytest_generate_tests(metafunc: Metafunc):
     """Generate parameterized tests for range test fixtures.
 
     This hook integrates the RangeTestHarness with pytest's parametrization system.
@@ -616,7 +628,18 @@ def run_after_every_test(
         # Cleanup
         force_cleanup: bool = get_feature_flag(request.config, "force_local_cleanup")
         if force_cleanup:
-            shutil.rmtree(test_dir_full_path, ignore_errors=True)
+            preserve = set(get_feature_flag(request.config, "force_local_cleanup_keep") or [])
+            if preserve and os.path.isdir(test_dir_full_path):
+                # Selectively delete, preserving specified artifact types
+                for item in os.listdir(test_dir_full_path):
+                    if item not in preserve:
+                        item_path = os.path.join(test_dir_full_path, item)
+                        if os.path.isdir(item_path):
+                            shutil.rmtree(item_path, ignore_errors=True)
+                        else:
+                            os.remove(item_path)
+            else:
+                shutil.rmtree(test_dir_full_path, ignore_errors=True)
 
 
 # =========================
@@ -664,24 +687,18 @@ CLI Options:
 # This runs before xdist spawns workers, so credential pre-fetch happens once
 # and workers inherit the credentials via environment variables
 # =========================
-def pytest_configure(config):
+def pytest_configure(config: Config):
     _pytest_configure(config)  # old flow
 
-    config.addinivalue_line(
-        "markers",
-        "coverage_parametrize(**params, coverage=None, filter=None): "
-        "Intelligent test parametrization with configurable coverage strategies (singles/pairs/full) and constraint filtering",
-    )
+    # Simulation mode setup - must run before test collection imports nki.
+    if is_simulation_mode(config):
+        _setup_simulation_mode()
 
-    config.addinivalue_line(
-        "markers",
-        "fast: Mark test as a fast-running test using manual test vectors only",
-    )
-
-    config.addinivalue_line(
-        "markers",
-        "slow_simulation: Mark test as slow for CPU simulation (large tensor shapes)",
-    )
+    for p in Platforms:
+        config.addinivalue_line(
+            "markers",
+            f"{p.value}: Dynamically applied to tests targeting the {p.value} platform",
+        )
 
     # Pre-fetch AWS credentials before xdist workers spawn to avoid Isengard rate limiting
     # This only runs in the main process; workers will inherit the env vars
@@ -712,10 +729,38 @@ def pytest_configure(config):
         )
         validate_s3_credentials(s3_config)
 
+    # convert platform-target option into a pytest mark, so that we correctly collect tests elligible
+    # for that platform arch
+    platform_target = get_platform_target(config)
+    marker_expr: str | None = config.option.markexpr
 
-def pytest_collection_modifyitems(config, items):
-    """Skip tests with large shapes when running in simulation mode."""
-    if _SIMULATION_MODE_ACTIVE:
+    if marker_expr:
+        config.option.markexpr = f"{marker_expr} and {platform_target}"
+    else:
+        config.option.markexpr = str(platform_target)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
+    """Apply platform marks to collected tests and handle simulation skips.
+
+    This hook runs with tryfirst=True so that platform marks are applied before
+    pytest's built-in -m marker filtering deselects items.
+    """
+    # Deselect coverage_parametrize tests when --skip-coverage-parametrize is set
+    if get_feature_flag(config, "skip_coverage_parametrize", default_value=False):
+        items[:] = [item for item in items if not item.get_closest_marker("coverage_parametrize")]
+
+    for item in items:
+        platforms_marker = item.get_closest_marker("platforms")
+        excluded = set(platforms_marker.kwargs.get("exclude") or []) if platforms_marker else set()
+        supported = set(Platforms) - excluded
+
+        for p in supported:
+            item.add_marker(pytest.mark.__getattr__(p.value))
+
+    # Skip tests with large shapes when running in simulation mode
+    if is_simulation_mode(config):
         from .utils.simulation_setup import skip_slow_simulation_tests
 
         skip_marker = pytest.mark.skip(reason="Skipping slow simulation test (see test/simulation.md)")
@@ -730,6 +775,11 @@ def pytest_configure_node(node):
 
 def pytest_sessionfinish(session, exitstatus):
     """End of test session - emit run_complete and log QoR CSV path (master only)."""
+    # Handle --disable-no-tests-failure: convert exit code 5 (no tests collected) to 0 with warning
+    if exitstatus == 5 and get_feature_flag(session.config, "disable_no_tests_failure", False):
+        logging.warning("No tests were collected, but --disable-no-tests-failure is set - exiting with code 0")
+        session.exitstatus = 0
+
     # Only run on master (not xdist workers)
     if hasattr(session.config, "workerinput"):
         return
@@ -741,11 +791,17 @@ def pytest_sessionfinish(session, exitstatus):
 
         # Get test stats from terminal reporter
         terminalreporter = session.config.pluginmanager.get_plugin("terminalreporter")
-        # Count unique test IDs (terminal reporter includes setup/call/teardown as separate reports)
-        passed_ids = {report.nodeid for report in terminalreporter.stats.get("passed", [])}
+        # Count unique test IDs
+        # Note: A skipped test can have a "passed" setup phase, so we must exclude skipped nodeids
+        skipped_ids = {report.nodeid for report in terminalreporter.stats.get("skipped", [])}
         failed_ids = {report.nodeid for report in terminalreporter.stats.get("failed", [])}
+        xfailed_ids = {report.nodeid for report in terminalreporter.stats.get("xfailed", [])}
+        # Exclude skipped tests from passed count (their setup phase shows as "passed")
+        passed_ids = {report.nodeid for report in terminalreporter.stats.get("passed", [])} - skipped_ids
         passed = len(passed_ids)
         failed = len(failed_ids)
+        skipped = len(skipped_ids)
+        xfailed = len(xfailed_ids)
 
         emitter = SQSEmitter(collector=MetricsCollector(), queue_url=sqs_queue_url, run_id=run_id)
 
@@ -753,7 +809,14 @@ def pytest_sessionfinish(session, exitstatus):
         # This ensures only automated pipeline runs emit completion signals
         kernel_name = os.environ.get("KERNEL_NAME")
         if kernel_name:
-            emitter.emit_run_complete(kernel_name=kernel_name, tests_passed=passed, tests_total=passed + failed)
+            emitter.emit_run_complete(
+                kernel_name=kernel_name,
+                tests_passed=passed,
+                tests_total=passed + failed + skipped,
+                tests_skipped=skipped,
+                tests_xfailed=xfailed,
+            )
+
     # Log QoR CSV file path
     if hasattr(session.config, "_qor_session_id"):
         output_dir = resolve_base_output_directory(session.config)
@@ -794,20 +857,21 @@ def pytest_collection_finish(session):
 # =========================
 # PYTEST HOOK
 # =========================
-def pytest_generate_tests(metafunc):
+def pytest_generate_tests(metafunc: Metafunc):
     # Check for deprecated range tests first (old flow)
     if RANGE_TEST_FIXTURE_NAME in metafunc.fixturenames:
         return _pytest_generate_tests(metafunc)
 
     # Handle coverage_parametrize
-    marker = metafunc.definition.get_closest_marker("coverage_parametrize")
-    if not marker:
+    coverage_marker = metafunc.definition.get_closest_marker("coverage_parametrize")
+    skip_coverage = get_feature_flag(metafunc.config, "skip_coverage_parametrize", default_value=False)
+    if not coverage_marker or skip_coverage:
         return
 
     if RANGE_TEST_RNG_SEED_ENV_KEY in os.environ:
         random.seed(int(os.environ[RANGE_TEST_RNG_SEED_ENV_KEY]))
     # Parameters defined by the test
-    params = marker.kwargs.copy()
+    params = coverage_marker.kwargs.copy()
     assert params, "No parameters defined for coverage_parametrize"
     coverage_override = params.pop("coverage", None)
     filter_func = params.pop("filter", None)

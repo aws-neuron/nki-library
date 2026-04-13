@@ -204,8 +204,7 @@ def _create_boto3_session_with_retry(
             last_exception = e
             delay = min(base_delay * (2**attempt) + random.uniform(0, 1), max_delay)
             logging.warning(
-                f"Credential fetch throttled (attempt {attempt + 1}/{max_retries + 1}), "
-                f"retrying in {delay:.2f}s: {e}"
+                f"Credential fetch throttled (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.2f}s: {e}"
             )
             time.sleep(delay)
 

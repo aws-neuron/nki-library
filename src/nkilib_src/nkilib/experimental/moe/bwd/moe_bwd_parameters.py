@@ -24,7 +24,7 @@ import nki.language as nl
 from ....core.utils.kernel_assert import kernel_assert
 
 
-@dataclass
+@dataclass(frozen=True)
 class SkipMode(nl.NKIObject):
     """
     Configuration for skipping DMA operations during OOB handling.
@@ -55,7 +55,7 @@ class ActFnType(Enum):
     Swish = 3
 
 
-@dataclass
+@dataclass(frozen=True)
 class ClampLimits(nl.NKIObject):
     """
     Gradient clamping limits for numerical stability.

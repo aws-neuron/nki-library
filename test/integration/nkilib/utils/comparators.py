@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from test.integration.nkilib.utils.dtype_helper import is_float_type
 from typing import Optional, TextIO
 
 import numpy as np
+from neuron_dtypes import is_float_type
 
 
 def maxAllClose(

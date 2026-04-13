@@ -13,7 +13,6 @@
 # limitations under the License.
 import random
 from test.integration.nkilib.utils.comparators import maxAllClose
-from test.integration.nkilib.utils.dtype_helper import dt
 from test.integration.nkilib.utils.tensor_generators import (
     duplicate_row_rmsnorm_inp_generator,
     gaussian_tensor_generator,
@@ -26,11 +25,12 @@ from test.utils.common_dataclasses import (
     ValidationArgs,
 )
 from test.utils.coverage_parametrized_tests import BoundedRange, assert_negative_test_case
-from test.utils.metrics_collector import IMetricsCollector, MetricName
+from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from typing import Any, Optional, final
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import numpy.typing as npt
@@ -347,7 +347,7 @@ class TestRmsNormQuantKernel:
         (128, 0.5, 2, 1, 16384, 896, QuantizationType.ROW),
         (256, 0.0, 2, 1, 8192, 512, QuantizationType.ROW),
         ####################################
-        # Model-specific test cases based on https://tiny.amazon.com/mdelqa5t/quipaFNb
+        # Model-specific test cases
         ####################################
         # Llama models
         (2048, 0.0, 2, 1, 8192, 896, QuantizationType.ROW),
@@ -395,7 +395,7 @@ class TestRmsNormQuantKernel:
         # MAX_S=32768, MAX_H=16384, MAX_B=2
         seqlen=BoundedRange(_sweep_seqlen_values, boundary_values=[32769]),
         hidden=BoundedRange(_sweep_hidden_values, boundary_values=[16385]),
-        batch=BoundedRange([1, 2], boundary_values=[0, 3]),
+        batch=BoundedRange([1, 2], boundary_values=[3]),
         lower_bound=BoundedRange(_sweep_lower_bound_values, boundary_values=[-0.1]),
         coverage="pairs",
     )

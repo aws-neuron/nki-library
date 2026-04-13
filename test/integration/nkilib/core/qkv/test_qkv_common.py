@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
-from collections import namedtuple
-from test.integration.nkilib.core.mlp.test_mlp_common import dequantize_mx_golden, quantize_mx_golden
+from test.integration.nkilib.core.mlp.test_mlp_common import quantize_mx_golden
 from test.integration.nkilib.utils.tensor_generators import (
     gaussian_tensor_generator,
     generate_stabilized_mx_data,
@@ -29,6 +27,7 @@ import numpy as np
 from nkilib_src.nkilib.core.utils.common_types import (
     NormType,
     QKVOutputLayout,
+    QKVWeightLayout,
     QuantizationType,
 )
 
@@ -75,7 +74,9 @@ def norm_qkv_ref(
     if quantization_type == QuantizationType.STATIC:
         hidden /= qkv_in_scale
         hidden = hidden.clip(-240, 240)
+    # ROW quantization does not quantize inputs
     qkv_out = hidden @ qkv_weights.astype(dtype)
+
     if quantization_type == QuantizationType.STATIC:
         # qkv_out shape is B, S, n_heads * d
         qkv_idx = [
@@ -88,6 +89,9 @@ def norm_qkv_ref(
         qkv_out[:, :, qkv_idx[1] : qkv_idx[2]] *= qkv_w_scale[1]
         qkv_out[:, :, qkv_idx[2] : qkv_idx[3]] *= qkv_w_scale[2]
         qkv_out *= qkv_in_scale
+    elif quantization_type == QuantizationType.ROW:
+        qkv_out = qkv_out * qkv_w_scale[0, :]
+
     if bias is not None:
         qkv_out += bias
     return qkv_out
@@ -103,14 +107,16 @@ def norm_qkv_ref_mx(
     bias=None,
     norm_b=None,
     hidden_actual=None,
-    is_input_swizzled=False,
+    is_h_dim_4h_transposed=False,
 ):
     b, s, H = hidden.shape
 
-    if is_input_swizzled:
+    if is_h_dim_4h_transposed:
         hidden = hidden.reshape(b * s, _q_width, H // (p_max * _q_width), p_max).transpose(0, 2, 3, 1).reshape(b, s, H)
 
     if norm_type == NormType.RMS_NORM:
+        if is_h_dim_4h_transposed:
+            gamma = gamma.reshape(1, _q_width, H // (p_max * _q_width), p_max).transpose(0, 2, 3, 1).reshape(1, H)
         hidden = norm_name2func[norm_type](hidden, gamma, eps=eps, norm_b=norm_b, hidden_actual=hidden_actual)
     else:
         hidden = norm_name2func[norm_type](hidden, gamma, eps=eps, norm_b=norm_b)
@@ -168,7 +174,7 @@ def build_qkv_input(
     num_blocks: Optional[int] = None,
     block_size: Optional[int] = None,
     slot_mapping: Optional[np.ndarray] = None,
-    is_input_swizzled: bool = False,
+    is_h_dim_4h_transposed: bool = False,
 ):
     qkv_w_scale = None
     qkv_in_scale = None
@@ -180,7 +186,7 @@ def build_qkv_input(
 
         qkv_w_scale = qkv_w_scale.reshape(-1, fused_qkv_dim)
         input_tensor = tensor_gen(shape=(batch, seqlen, hidden_dim), dtype=dtype, name="input")
-        if is_input_swizzled:
+        if is_h_dim_4h_transposed:
             input_tensor = (
                 input_tensor.reshape(batch, seqlen, hidden_dim // (p_max * _q_width), p_max, _q_width)
                 .transpose(0, 1, 4, 2, 3)
@@ -200,16 +206,45 @@ def build_qkv_input(
             # Add small per-element deviation (±0.5%)
             qkv_w_scale = base_scale * np.random.uniform(0.995, 1.005, (128, 3)).astype(np.float32)
             qkv_in_scale = base_scale * np.random.uniform(0.995, 1.005, (128, 1)).astype(np.float32)
+        elif quantization_type == QuantizationType.ROW:
+            # For row quantization: per-output-channel weight scales, no input quantization
+            FP8_E4M3_MAX = 240.0
+            # Compute per-column (per-output-channel) scale from weight magnitudes
+            w_max = np.abs(fused_qkv_weights).max(axis=0, keepdims=True)
+            w_scale = (w_max / FP8_E4M3_MAX).astype(np.float32)
+            # Quantize weights to FP8
+            fused_qkv_weights = (fused_qkv_weights / w_scale).astype(nt.float8_e4m3)
+            # Broadcast scale to (128, fused_qkv_dim) shape
+            qkv_w_scale = np.broadcast_to(w_scale, (128, fused_qkv_dim)).astype(np.float32)
+            qkv_in_scale = None
 
     mlp_prev = tensor_gen(shape=(batch, seqlen, hidden_dim), dtype=dtype, name="mlp_prev") if fused_add else None
     attention_prev = (
         tensor_gen(shape=(batch, seqlen, hidden_dim), dtype=dtype, name="attention_prev") if fused_add else None
     )
-    gamma_norm_weights = (
-        tensor_gen(shape=(1, hidden_dim), dtype=dtype, name="gamma_norm_weights")
-        if norm_type in [NormType.RMS_NORM, NormType.LAYER_NORM]
-        else None
-    )
+    # If is_h_dim_4h_transposed, we must shuffle gamma tensor as well: otherwise non-shuffled rms_norm is applied to shuffled input.
+    # Note that in real model:
+    # -> Shuffled H in input comes from offline pre-shuffle of upstream weights, e.g. down-projection.
+    # -> Shuffled H in gamma comes from direct offline pre-shuffle of gamma weights.
+    if quantization_type == QuantizationType.MX:
+        gamma_norm_weights = (
+            tensor_gen(shape=(1, hidden_dim), dtype=dtype, name="gamma_norm_weights")
+            if norm_type in [NormType.RMS_NORM, NormType.LAYER_NORM]
+            else None
+        )
+
+        if is_h_dim_4h_transposed and norm_type in [NormType.RMS_NORM, NormType.LAYER_NORM]:
+            gamma_norm_weights = (
+                gamma_norm_weights.reshape(1, hidden_dim // (p_max * _q_width), p_max, _q_width)
+                .transpose(0, 3, 1, 2)
+                .reshape(1, hidden_dim)
+            )
+    else:
+        gamma_norm_weights = (
+            tensor_gen(shape=(1, hidden_dim), dtype=dtype, name="gamma_norm_weights")
+            if norm_type in [NormType.RMS_NORM, NormType.LAYER_NORM]
+            else None
+        )
     bias = tensor_gen(shape=(1, fused_qkv_dim), dtype=dtype, name="bias") if qkv_bias else None
     layer_norm_bias = tensor_gen(shape=(1, hidden_dim), dtype=dtype, name="layer_norm_bias") if norm_bias else None
 
@@ -259,6 +294,9 @@ def build_qkv_input(
         "sbm": None,
         "use_auto_allocation": False,
         "load_input_with_DMA_transpose": use_dma_transpose,
+        "weight_layout": QKVWeightLayout.MX_CONTIGUOUS
+        if quantization_type == QuantizationType.MX
+        else QKVWeightLayout.CONTIGUOUS,
     }
 
     if fp8_kv_cache:

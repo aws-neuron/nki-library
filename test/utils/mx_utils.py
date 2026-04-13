@@ -13,10 +13,17 @@
 # limitations under the License.
 
 
-from test.integration.nkilib.utils.dtype_helper import static_cast
-
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
+from neuron_dtypes import static_cast
+
+# Mapping from nki dtype strings to neuron_dtypes dtype objects
+NL_TO_DT_DTYPE = {
+    nl.float8_e4m3fn_x4: dt.float8_e4m3fn_x4,
+    nl.float8_e5m2_x4: dt.float8_e5m2_x4,
+    nl.float4_e2m1fn_x4: dt.float4_e2m1fn_x4,
+}
 
 
 def is_mx_quantize(quantize):
@@ -83,7 +90,7 @@ def quantize_mx_golden(in_tensor, out_x4_dtype, ocp_saturation=True, reverse_dst
     mx_data_golden = in_tensor_ / scale
     if ocp_saturation:
         mx_data_golden = np.clip(mx_data_golden, -max_val, max_val)
-    mx_data_golden = static_cast(mx_data_golden, out_x4_dtype)
+    mx_data_golden = static_cast(mx_data_golden.astype(np.float32), NL_TO_DT_DTYPE.get(out_x4_dtype, out_x4_dtype))
 
     return mx_data_golden, mx_scale_golden
 

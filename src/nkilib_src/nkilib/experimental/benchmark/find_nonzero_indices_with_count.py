@@ -69,7 +69,7 @@ def find_nonzero_indices_with_count(input_tensor: nl.ndarray) -> nl.ndarray:
         (P_MAX, T + 1), dtype=nl.int32, buffer=nl.sbuf, name="nonzero_with_count_sb"
     )
     nonzero_indices_with_count_hbm = nl.ndarray(
-        (1, T + 1), dtype=nl.int32, buffer=nl.hbm, name="nonzero_with_count_hbm"
+        (1, T + 1), dtype=nl.int32, buffer=nl.shared_hbm, name="nonzero_with_count_hbm"
     )
 
     # Load input into partition 0 of input_sb

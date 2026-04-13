@@ -14,65 +14,10 @@
 """
 Attention TKG model configuration data
 
-Config format: [batch, q_head, s_active, s_prior, s_prior_full, d_head, block_len,
-                tp_k_prior, use_pos_id, fuse_rope, outsInSB, qkvInSB, test_sink, strided_mm1, dtype]
+Config format: [AttnTKGConfig, AttnTKGTestParams]
 """
 
-import nki.language as nl
+from nkilib_src.nkilib.core.attention.attention_tkg_utils import AttnTKGConfig
+from test.integration.nkilib.core.attention.test_attention_tkg_utils import AttnTKGTestParams
 
-attention_tkg_model_configs = [
-    #  b, q, s_a,   s_p, s_p_f, d_h, b_l,  tp_k,  p_id,  fs_r, ot_sb, qk_sb,  sink, s_mm1,      dtype
-    # ============ QWEN3_32B CONFIGS ============
-    [1024, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [1024, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [1024, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [1024, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [128, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [128, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [128, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [128, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [16, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [16, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [16, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [16, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [1, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [1, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [1, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [1, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2048, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2048, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2048, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2048, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [256, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [256, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [256, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [256, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [2, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [32, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [32, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [32, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [32, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4096, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4096, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4096, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4096, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [4, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [512, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [512, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [512, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [512, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [64, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [64, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [64, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [64, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [8, 1, 1, 10240, 10240, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [8, 1, 1, 1024, 1024, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [8, 1, 1, 131072, 131072, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-    [8, 1, 1, 32768, 32768, 128, 0, True, True, True, False, False, False, True, nl.bfloat16, False],
-]
+attention_tkg_model_configs = []

@@ -17,12 +17,6 @@ Simulation mode constants - lightweight module with no heavy imports.
 This module can be safely imported before deciding whether to enable simulation mode.
 """
 
-# Environment variable to enable simulation mode.
-# pytest-xdist workers don't inherit sys.argv, so we use an env var to propagate
-# the simulation mode flag to worker processes.
-# Values: "1" = force simulation mode, any other value (including "0") = defer to CLI flag.
-SIMULATION_MODE_ENV_VAR = "NKILIB_SIMULATION_MODE"
-
 # Environment variable to run all tests in simulation mode, including large tensor tests.
 # Values: "1" = run all tests regardless of size, any other value = auto-skip large tests.
 SIMULATION_RUN_ALL_ENV_VAR = "NKILIB_SIMULATION_RUN_ALL"

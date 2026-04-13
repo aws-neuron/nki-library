@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from test.integration.nkilib.utils.dtype_helper import dt
 from typing import Any, Optional
 
-import neuronxcc.nki.language as nl
+import neuron_dtypes as dt
+import nki.language as nl
 import numpy as np
+import torch
+from nkilib_src.nkilib.core.subkernels.layernorm_torch import layer_norm_torch_ref
+from nkilib_src.nkilib.core.subkernels.rmsnorm_torch import rms_norm_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, NormType
 from scipy.special import erf, expit
 
@@ -54,6 +57,14 @@ norm_name2func = {
     NormType.RMS_NORM: rms_norm,
     NormType.LAYER_NORM: layer_norm,
     NormType.RMS_NORM_SKIP_GAMMA: rms_norm,
+}
+
+
+norm_name2func_torch = {
+    NormType.NO_NORM: lambda *x, **_: x[0],
+    NormType.RMS_NORM: rms_norm_torch_ref,
+    NormType.LAYER_NORM: layer_norm_torch_ref,
+    NormType.RMS_NORM_SKIP_GAMMA: rms_norm_torch_ref,
 }
 
 
@@ -96,11 +107,11 @@ act_fn_type2func = {
 
 
 def convert_to_torch(tensor: Optional[np.ndarray]) -> Any:
+    """
+    Convert a numpy tensor to torch.
+    """
     if tensor is None:
         return None
-
-    # Convert input tensors to other framework if needed
-    import torch
 
     # Torch cannot directly convert some types such as bf16
     try:
@@ -115,3 +126,28 @@ def convert_to_torch(tensor: Optional[np.ndarray]) -> Any:
         else:
             raise
     return result
+
+
+def convert_to_numpy(tensor: Optional[torch.Tensor], dtype=None) -> Optional[np.ndarray]:
+    """
+    Convert a torch tensor to numpy.
+    """
+    if tensor is None:
+        return None
+
+    if dtype is not None:
+        return dt.static_cast(tensor.numpy(), dtype)
+    return tensor.numpy()
+
+
+def is_dtype_mx(dtype):
+    """Check if dtype is an MX quantization format."""
+    return dtype in (nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4, nl.float8_e5m2_x4)
+
+
+def is_dtype_fp8(dtype):
+    return dtype in (nl.float8_e4m3, nl.float8_e5m2)
+
+
+def is_dtype_low_precision(dtype):
+    return is_dtype_mx(dtype) or is_dtype_fp8(dtype)

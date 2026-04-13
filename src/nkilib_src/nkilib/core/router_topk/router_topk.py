@@ -19,12 +19,18 @@ with expert affinity scattering.
 """
 
 import neuronxcc.nki.typing as nt
-import nki
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa import core_barrier, engine, reduce_cmd
 
-from ..utils import common_types, kernel_helpers, stream_shuffle_broadcast, tensor_view, tiled_range
+from ..utils import (
+    common_types,
+    cross_partition_copy,
+    kernel_helpers,
+    stream_shuffle_broadcast,
+    tensor_view,
+    tiled_range,
+)
 from ..utils.kernel_assert import kernel_assert
 
 P_MAX = 128
@@ -57,7 +63,6 @@ def router_topk(
     k: int,
     x_hbm_layout: XHBMLayout_H_T__0,
     x_sb_layout: XSBLayout_tp102__0,
-    output_in_sbuf: bool = False,
     router_pre_norm: bool = True,
     norm_topk_prob: bool = False,
     use_column_tiling: bool = False,
@@ -67,8 +72,6 @@ def router_topk(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
-    x_input_in_sbuf: bool = False,
-    expert_affin_in_sb: bool = False,
 ):
     """
     Router top-K kernel for Mixture of Experts (MoE) models.
@@ -88,18 +91,20 @@ def router_topk(
         K: Number of top experts to select per token
 
     Args:
-        x (nl.ndarray): Input tensor, shape depends on x_hbm_layout and x_input_in_sbuf.
-                        If in HBM: [H, T] or [T, H]. If in SBUF: a permutation of [128, T, H/128]
+        x (nl.ndarray): Input tensor. Buffer type is auto-detected.
+                        If in HBM: [H, T] or [T, H] depending on x_hbm_layout.
+                        If in SBUF: a permutation of [128, T, H/128] depending on x_sb_layout.
         w (nl.ndarray): Weight tensor [H, E] in HBM
         w_bias (nl.ndarray): Optional bias tensor [1, E] or [E] in HBM
         router_logits (nt.mutable_tensor): Output router logits [T, E] in HBM
-        expert_affinities (nt.mutable_tensor): Output expert affinities [T, E] in HBM or SBUF
-        expert_index (nt.mutable_tensor): Output expert indices [T, K] in HBM or SBUF
+        expert_affinities (nt.mutable_tensor): Output expert affinities [T, E] in HBM or SBUF.
+                        Buffer type is auto-detected.
+        expert_index (nt.mutable_tensor): Output expert indices [T, K] in HBM or SBUF.
+                        Buffer type is auto-detected.
         act_fn (common_types.RouterActFnType): Activation function (SOFTMAX or SIGMOID)
         k (int): Number of top experts to select (must be <= 8)
         x_hbm_layout (int): Layout of x in HBM (0=[H,T], 1=[T,H])
         x_sb_layout (int): Layout of x in SBUF (0-3, see router_topk_input_x_load for details)
-        output_in_sbuf (bool): If True, outputs are in SBUF (requires T <= PE_COLUMN_TILE_128)
         router_pre_norm (bool): If True, apply activation before top-K (ACT1 pipeline)
         norm_topk_prob (bool): If True, normalize top-K probabilities with L1 norm
         use_column_tiling (bool): Enable PE array column tiling for small T
@@ -109,8 +114,6 @@ def router_topk(
         shard_on_tokens (bool): Enable LNC sharding across token dimension
         skip_store_expert_index (bool): Skip storing expert indices to HBM
         skip_store_router_logits (bool): Skip storing router logits to HBM
-        x_input_in_sbuf (bool): If True, x is already in SBUF
-        expert_affin_in_sb (bool): If True, expert affinities output is in SBUF
 
     Returns:
         outputs (list): [router_logits, expert_index, expert_affinities, optional: expert_affinities_topk]
@@ -122,8 +125,9 @@ def router_topk(
         - SIGMOID activation requires use_indirect_dma_scatter=True
         - With use_indirect_dma_scatter, T must be <= 128 or multiple of 128
         - shard_on_tokens requires n_prgs > 1 and T divisible by 2
-        - output_in_sbuf requires T <= PE_COLUMN_TILE_128
-        - When T <= 32 with output_in_sbuf or expert_affin_in_sb, shard_on_tokens is disabled (each core processes all T)
+        - SBUF outputs require T <= PE_COLUMN_TILE_128
+        - When T <= 32 with SBUF outputs, shard_on_tokens is disabled (each core processes all T)
+        - Buffer types for x, expert_affinities, and expert_index are auto-detected via .buffer attribute
 
     Pseudocode:
         # Load inputs
@@ -170,19 +174,16 @@ def router_topk(
     """
     # The following code is split into sections correlated to the pseudo-code above
 
-    #####################################
-    # Get input shapes and validate
-    #####################################
+    """Get input shapes and validate."""
 
     # Validate layout
     kernel_assert(x_hbm_layout in (0, 1), f"x_hbm_layout must be 0 or 1, got {x_hbm_layout}")
     kernel_assert(x_sb_layout in (0, 1, 2), f"x_sb_layout must be 0, 1 or 2, got {x_sb_layout}")
 
-    """
-    TODO: The new FE is having issues with IO buffers on sbuf.
-    Once it is fixed, we can do:
-    input_in_sb = x.base_tensor.buffer == nl.sbuf
-    """
+    # Detect buffer types from tensor attributes
+    x_input_in_sbuf = x.buffer == nl.sbuf
+    expert_affin_in_sb = expert_affinities.buffer == nl.sbuf
+    expert_index_in_sb = expert_index.buffer == nl.sbuf
 
     T: int = -1
     H: int = -1
@@ -214,31 +215,28 @@ def router_topk(
     # Validate LNC sharding config -- it's only supported in certain scenarios.
     _, n_prgs, prg_id = kernel_helpers.get_verified_program_sharding_info("router_topk_kernel", (0, 1), 2)
 
-    # Determine if we actually shard on tokens for this execution
-    # When T <= 32 with SBUF output, we can't use sendrecv (partition size is 16, need T_local > 16)
-    # so each core processes all T tokens instead
-    actually_shard_on_tokens = shard_on_tokens
     if shard_on_tokens:
         kernel_assert(n_prgs > 1, f"LNC sharding only supported with n_prgs>1, got {shard_on_tokens=} {n_prgs=}")
-        # When using SBUF output with shard_on_tokens, T_local must be > 16 because SBUF partition size is 16
-        # and sendrecv requires data to be in separate partitions. For T <= 32, disable sharding.
-        if (output_in_sbuf or expert_affin_in_sb) and T <= 32:
-            actually_shard_on_tokens = False
-
-    if actually_shard_on_tokens:
         T_first_shard = T // n_prgs
         T_second_shard = T - T_first_shard
         T_local = T_first_shard if prg_id == 0 else T_second_shard
         T_offset = 0 if prg_id == 0 else T_first_shard
+        other_T_local = T_second_shard if prg_id == 0 else T_first_shard
+        # Beta 3: sendrecv requires src and dst to have matching partition dims.
+        # Use max of T_local and other_T_local for sendrecv buffer allocation.
+        T_sendrecv_size = max(T_local, other_T_local)
     else:  # If not sharding, process the full T on this core.
         T_local = T
         T_offset = 0
+        other_T_local = T_local
+        T_sendrecv_size = T_local
 
     # Validate when indirect-DMA scatter must be used
-    # If using sigmoid, only support indirect-DMA scatter. TODO: this could be supported, however.
+    # SIGMOID with router_pre_norm=False requires indirect-DMA scatter as one-hot scatter ACT2 path doesn't support SIGMOID
+    # TODO: this could be supported, however.
     kernel_assert(
-        not (act_fn == common_types.RouterActFnType.SIGMOID and not use_indirect_dma_scatter),
-        f"SIGMOID activation requires use_indirect_dma_scatter=True, got {use_indirect_dma_scatter}",
+        not (act_fn == common_types.RouterActFnType.SIGMOID and not use_indirect_dma_scatter and not router_pre_norm),
+        f"SIGMOID activation with router_pre_norm=False requires use_indirect_dma_scatter=True",
     )
 
     # If using indirect-DMA, T must be a multiple of 128
@@ -256,8 +254,18 @@ def router_topk(
     # E is expected to be less than max moving free-dim
     kernel_assert(E <= F_MAX, f"E ({E}) must be <= gemm_moving_fmax ({F_MAX})")
 
+    # skip_store_router_logits is not yet supported due to a compiler limitation:
+    # the compiler requires every mutable_tensor to have at least one store operation,
+    # but router_logits is always returned as a mutable_tensor output.
+    kernel_assert(
+        not skip_store_router_logits,
+        "skip_store_router_logits=True is not currently supported due to a compiler limitation "
+        "(NCC_IGCA090: mutable_tensor must have at least one store). "
+        "Set skip_store_router_logits=False as a workaround.",
+    )
+
     # Check 'w_bias'
-    has_bias = w_bias is not None
+    has_bias = w_bias != None
     if has_bias:
         # w_bias should be [1,E], this will assert if we cannot do the reshape
         w_bias = w_bias.reshape((1, E))
@@ -266,6 +274,7 @@ def router_topk(
     # And we tile on T.
     kernel_assert(H % P_MAX == 0, f"H ({H}) must be a multiple of pmax ({P_MAX})")
     num_h_tiles = H // P_MAX
+    num_t_tiles_total = kernel_helpers.div_ceil(T, ST_F_MAX)
 
     num_t_tiles = kernel_helpers.div_ceil(
         T_local, ST_F_MAX
@@ -279,9 +288,7 @@ def router_topk(
 
     input_dtype = x.dtype
 
-    # ###########################################
-    # # Compute router-logits (x.T @ w) + w_bias
-    # ###########################################
+    """Compute router-logits (x.T @ w) + w_bias."""
 
     """
     TensorEngine/PEArray column tiling setup.
@@ -323,9 +330,7 @@ def router_topk(
     """
     internal_x_sb_layout = x_sb_layout
 
-    # ###########################################
-    # # Load from HBM
-    # ###########################################
+    """Load from HBM."""
 
     # Load 'x'. See the comments in router_topk_input_x_load() to understand the HBM-to-SBUF layouts/access patterns.
     x_sb = None
@@ -375,9 +380,7 @@ def router_topk(
             stream_shuffle_broadcast.stream_shuffle_broadcast(
                 router_logits_bias_vector_sb, router_logits_bias_broadcasted_sb
             )
-    ###########################################
-    # Tiled matmul
-    ###########################################
+    """Tiled matmul."""
 
     # for t_tile_idx in range(num_t_tiles):
     for t_tile in tiled_range.TiledRange(T_local, ST_F_MAX):
@@ -434,9 +437,7 @@ def router_topk(
                 tile_size=tile_size,
             )
 
-        #############################
-        # Apply bias
-        #############################
+        """Apply bias."""
 
         if has_bias:
             """
@@ -455,9 +456,7 @@ def router_topk(
                 op=nl.add,
             )
 
-        #############################
-        # Merge column tiles
-        #############################
+        """Merge column tiles."""
         # Straight copy the first tile result, but not if we have bias because we already spilled PSUM using the above tensor_tensor
         if not has_bias:
             nisa.tensor_copy(
@@ -466,7 +465,10 @@ def router_topk(
             )
 
         # Accumulate the remaining tile results. This loop does not execute if use_column_tiling==false (i.e. num_pe_array_column_tiles==1)
-        for column_tile_idx in range(1, num_pe_array_column_tiles):
+        # Only accumulate column tiles that received matmul data. When num_h_tiles < num_pe_array_column_tiles,
+        # some column tile slots are empty (never written by a matmul), so we must not accumulate them.
+        num_active_column_tiles = min(num_h_tiles, num_pe_array_column_tiles)
+        for column_tile_idx in range(1, num_active_column_tiles):
             current_column_tile_column_offset = column_tile_idx * pe_array_column_tiling_size
             nisa.tensor_tensor(
                 dst=router_logits_sb[:t_tile_size_actual, t_tile_idx, :],
@@ -475,13 +477,9 @@ def router_topk(
                 op=nl.add,
             )
 
-    #############################
-    # Store router_logits
-    #############################
+    """Store router_logits."""
     if not skip_store_router_logits:
-        kernel_assert(
-            router_logits is not None, "router_logits must be provided when skip_store_router_logits is False"
-        )
+        kernel_assert(router_logits != None, "router_logits must be provided when skip_store_router_logits is False")
         """
         Caller provides router_logits and therefore specifies its dtype. A cast is implied if
         data types mismatch between routers_logits and router_logits_sb.
@@ -503,9 +501,7 @@ def router_topk(
                 name="store_router_logits_sb_remainder",
             )
 
-    ###########################################
-    # Configure Pipeline Flags
-    ###########################################
+    """Configure Pipeline Flags."""
 
     """
     After computing router-logits, the subsequent operations in this kernel are set up in a pipeline
@@ -550,9 +546,7 @@ def router_topk(
         ),
     )
 
-    ##################################################################
-    # ACT1 -- Activation Function on router-logits
-    ##################################################################
+    """ACT1 -- Activation Function on router-logits."""
 
     if pipeline_enable_act1:
         # 'Full' means the full E.
@@ -586,9 +580,7 @@ def router_topk(
 
             core_barrier(expert_affinities, (0, 1))
 
-    ###########################################
-    # topK
-    ###########################################
+    """topK."""
 
     """
     Top-K operation finds the largest K values in each partition along with their indexes.
@@ -640,27 +632,81 @@ def router_topk(
             src=router_indexes_topk_sb[:t_tile_size_actual, t_tile_idx, :k],
         )
 
-    ###########################################
-    # Store expert_index
-    ###########################################
+    """Store expert_index."""
 
-    if output_in_sbuf:
-        if actually_shard_on_tokens:
-            # With actually_shard_on_tokens, each core computes T_local tokens
-            # Copy local results to the appropriate position, then sendrecv to exchange
-            nisa.tensor_copy(
-                src=router_indexes_topk_sb[:T_local, 0, :],
-                dst=expert_index[T_offset : T_offset + T_local, :],
-            )
-            # Exchange data between cores
-            other_core_offset = (1 - prg_id) * T_local
-            nisa.sendrecv(
-                dst=expert_index[other_core_offset : other_core_offset + T_local, :],
-                src=expert_index[T_offset : T_offset + T_local, :],
-                send_to_rank=1 - prg_id,
-                recv_from_rank=1 - prg_id,
-                pipe_id=0,
-            )
+    if expert_index_in_sb and not skip_store_expert_index:
+        if shard_on_tokens:
+            if T <= PE_COLUMN_TILE_128:
+                expert_index_send = nl.ndarray((T_sendrecv_size, k), dtype=nl.uint32, buffer=nl.sbuf)
+                expert_index_recv = nl.ndarray((T_sendrecv_size, k), dtype=nl.uint32, buffer=nl.sbuf)
+                nisa.tensor_copy(src=router_indexes_topk_sb[:T_local, 0, :], dst=expert_index_send[:T_local, :])
+                nisa.sendrecv(
+                    dst=expert_index_recv,
+                    src=expert_index_send,
+                    send_to_rank=1 - prg_id,
+                    recv_from_rank=1 - prg_id,
+                    pipe_id=0,
+                )
+                other_offset = T_first_shard if prg_id == 0 else 0
+                # Core 0: T_offset=0, other_offset=T_first_shard → write local first
+                # Core 1: T_offset=T_first_shard, other_offset=0 → write recv first
+                if T_offset == 0:
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_send,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=0,
+                        num_partitions_to_copy=T_local,
+                        free_dim_size=k,
+                    )
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_recv,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=other_offset,
+                        num_partitions_to_copy=other_T_local,
+                        free_dim_size=k,
+                    )
+                else:
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_recv,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=0,
+                        num_partitions_to_copy=other_T_local,
+                        free_dim_size=k,
+                    )
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_send,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=T_offset,
+                        num_partitions_to_copy=T_local,
+                        free_dim_size=k,
+                    )
+            else:
+                # Tile-based sendrecv requires T to be a multiple of 128 for correct alignment
+                kernel_assert(
+                    T % PE_COLUMN_TILE_128 == 0,
+                    f"T ({T}) must be a multiple of 128 when T > 128 with shard_on_tokens and expert_index in SBUF",
+                )
+                other_num_t_tiles = num_t_tiles_total - num_t_tiles
+                t_local_slice = nl.ds(0, num_t_tiles) if prg_id == 0 else nl.ds(other_num_t_tiles, num_t_tiles)
+                t_remote_slice = nl.ds(num_t_tiles, other_num_t_tiles) if prg_id == 0 else nl.ds(0, other_num_t_tiles)
+
+                # Copy local results to expert_index
+                nisa.tensor_copy(
+                    src=router_indexes_topk_sb[:, :, :],
+                    dst=expert_index[:t_p_dim, t_local_slice, :],
+                )
+                # Exchange data between cores via sendrecv on tile dimension
+                nisa.sendrecv(
+                    dst=expert_index[:t_p_dim, t_remote_slice, :],
+                    src=expert_index[:t_p_dim, t_local_slice, :],
+                    send_to_rank=1 - prg_id,
+                    recv_from_rank=1 - prg_id,
+                    pipe_id=0,
+                )
         else:
             # For SBUF output, copy router_indexes_topk_sb to expert_index
             if num_t_tiles == 1:
@@ -682,9 +728,7 @@ def router_topk(
                 src=router_indexes_topk_sb[:t_remainder, num_t_whole_tiles, :k],
                 dst=_hbm_remainder_store_view(expert_index, T_offset, num_t_whole_tiles, t_p_dim, t_remainder),
             )
-    ##################################################################
-    # ACT2 -- Activation Function on top-K values, tensor declarations
-    ##################################################################
+    """ACT2 -- Activation Function on top-K values, tensor declarations."""
 
     # If doing softmax we split into two stages to facilitate the one-hot scatter technique below.
     # Declare tensors for all the intermediate steps of the tiled softmax.
@@ -710,9 +754,7 @@ def router_topk(
     for t_tile in tiled_range.TiledRange(T_local, ST_F_MAX):
         t_tile_idx = t_tile.index
         t_tile_size = t_tile.size
-        ###########################################
-        # ACT2 -- Activation
-        ###########################################
+        """ACT2 -- Activation."""
         if pipeline_enable_act2:
             if return_eager_affi or use_indirect_dma_scatter:
                 kernel_assert(
@@ -750,9 +792,7 @@ def router_topk(
                     "Should not reach this code branch. Check for valid combination of use_indirect_dma_scatter, act_fn, return_eager_affi.",
                 )
 
-        ###########################################
-        # Norm
-        ###########################################
+        """Norm."""
 
         if pipeline_enable_norm:
             # Input is router_logits_topk_sb
@@ -783,9 +823,7 @@ def router_topk(
                 operand0=sum_of_max_sb[:t_tile_size, t_tile_idx, :],
             )
 
-        ###########################################
-        # Scatter -- expert_affinities
-        ###########################################
+        """Scatter -- expert_affinities."""
 
         if pipeline_enable_scatter:
             # At this point we either fully (if return_eager_affi or use_indirect_dma_scatter) or partially (if !use_indirect_dma_scatter) have the
@@ -809,9 +847,7 @@ def router_topk(
                 """
 
                 if pipeline_enable_act2:
-                    ###########################################
-                    # Complete the softmax (ACT2 path)
-                    ###########################################
+                    """Complete the softmax (ACT2 path)."""
                     # Calculate numerator.
                     # Apply exponential to the full router-logits, but use the negmax computed from topk values.
                     nisa.activation(
@@ -853,7 +889,7 @@ def router_topk(
                 So one side of the equals must be a vector, hence we iterate through the 'k' column-vectors
                 of router_indexes_topk_truek_sb_fp32.
                 """
-                for e in range(k):
+                for expert_idx in range(k):
                     # router_indexes_topk_truek_sb_fp32 is [t_p_dim, num_t_tiles,k].
                     # We take [T,1] column slices and compare against the [1,E] expert_num_idx_arr_sbuf tensor.
                     # Broadcast rules mean that this becomes a [t_p_dim,E] vs [t_p_dim,E] comparison.
@@ -869,7 +905,7 @@ def router_topk(
                         op0=nl.equal,
                         data=expert_num_idx_arr_sbuf[:t_tile_size, :],
                         operand0=router_indexes_topk_truek_sb_fp32[
-                            :t_tile_size, t_tile_idx, e
+                            :t_tile_size, t_tile_idx, expert_idx
                         ],  # column vector [t_p_dim, 1] should be the operand
                     )
 
@@ -908,33 +944,16 @@ def router_topk(
                     )
 
                 if expert_affin_in_sb:
-                    if actually_shard_on_tokens:
-                        # With actually_shard_on_tokens, T_local = T/2, so we need to handle this differently
-                        # Each core computes T_local tokens, then we exchange via sendrecv
-                        kernel_assert(
-                            T <= PE_COLUMN_TILE_128,
-                            "If expert_affin_in_sb with actually_shard_on_tokens, then T must be <=128",
-                        )
-                        # Copy local results to the appropriate position in output
-                        # Core 0: tokens [0, T/2), Core 1: tokens [T/2, T)
-                        nisa.tensor_copy(
-                            src=expert_affinities_one_hot_scattered_sb[:T_local, t_tile_idx, :],
-                            dst=expert_affinities[T_offset : T_offset + T_local, :],
-                        )
+                    kernel_assert(
+                        T <= PE_COLUMN_TILE_128,
+                        "If expert_affin_in_sb, then T must be <=128",
+                    )
+                    if shard_on_tokens:
+                        # With shard_on_tokens, local data copy is deferred until after sendrecv
+                        # to ensure dst_start=0 is written first
+                        pass
                     else:
-                        kernel_assert(
-                            T <= PE_COLUMN_TILE_128,
-                            "If expert_affin_in_sb, then T must be <=128 because expert_affinities shape is [T,E]",
-                        )
-                        # When shard_on_tokens=True but actually_shard_on_tokens=False (T < 32),
-                        # we need to copy to the output tensor, not just reshape
-                        if shard_on_tokens:
-                            nisa.tensor_copy(
-                                src=expert_affinities_one_hot_scattered_sb[:T, t_tile_idx, :],
-                                dst=expert_affinities[:T, :],
-                            )
-                        else:
-                            expert_affinities = expert_affinities_one_hot_scattered_sb.reshape((t_p_dim, E))
+                        expert_affinities = expert_affinities_one_hot_scattered_sb.reshape((t_p_dim, E))
 
             # indirect-dma scatter
             else:
@@ -1054,29 +1073,117 @@ def router_topk(
 
             core_barrier(expert_affinities, cores=[0, 1])
 
-        # When expert_affin_in_sb and actually_shard_on_tokens, exchange data between cores via sendrecv
-        if expert_affin_in_sb and actually_shard_on_tokens and (not use_indirect_dma_scatter):
-            # Each core has computed T_local tokens, now exchange to get complete tensor
-            # Core 0 sends [0:T_local] to Core 1's [0:T_local], receives Core 1's [T_local:T] into [T_local:T]
-            # Core 1 sends [T_local:T] to Core 0's [T_local:T], receives Core 0's [0:T_local] into [0:T_local]
-            other_core_offset = (1 - prg_id) * T_local
+        # When expert_affin_in_sb and shard_on_tokens, exchange data between cores via sendrecv
+        if expert_affin_in_sb and shard_on_tokens and (not use_indirect_dma_scatter):
+            expert_affin_send = nl.ndarray((T_sendrecv_size, E), dtype=nl.float32, buffer=nl.sbuf)
+            expert_affin_recv = nl.ndarray((T_sendrecv_size, E), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                src=expert_affinities_one_hot_scattered_sb[:T_local, 0, :],
+                dst=expert_affin_send[:T_local, :],
+            )
             nisa.sendrecv(
-                dst=expert_affinities[other_core_offset : other_core_offset + T_local, :],
-                src=expert_affinities[T_offset : T_offset + T_local, :],
+                dst=expert_affin_recv,
+                src=expert_affin_send,
                 send_to_rank=1 - prg_id,
                 recv_from_rank=1 - prg_id,
                 pipe_id=0,
             )
+            other_offset = T_first_shard if prg_id == 0 else 0
+            if T_offset == 0:
+                cross_partition_copy.cross_partition_copy(
+                    src=expert_affin_send,
+                    dst=expert_affinities,
+                    src_start_partition=0,
+                    dst_start_partition=0,
+                    num_partitions_to_copy=T_local,
+                    free_dim_size=E,
+                )
+                cross_partition_copy.cross_partition_copy(
+                    src=expert_affin_recv,
+                    dst=expert_affinities,
+                    src_start_partition=0,
+                    dst_start_partition=other_offset,
+                    num_partitions_to_copy=other_T_local,
+                    free_dim_size=E,
+                )
+            else:
+                cross_partition_copy.cross_partition_copy(
+                    src=expert_affin_recv,
+                    dst=expert_affinities,
+                    src_start_partition=0,
+                    dst_start_partition=0,
+                    num_partitions_to_copy=other_T_local,
+                    free_dim_size=E,
+                )
+                cross_partition_copy.cross_partition_copy(
+                    src=expert_affin_send,
+                    dst=expert_affinities,
+                    src_start_partition=0,
+                    dst_start_partition=T_offset,
+                    num_partitions_to_copy=T_local,
+                    free_dim_size=E,
+                )
 
-    ###########################################
-    # Return
-    ###########################################
+    """Return."""
 
     outputs = [router_logits, expert_index, expert_affinities]
 
     if return_eager_affi:
-        expert_affinities_topk_sb = expert_affinities_topk_sb.reshape((t_p_dim, num_t_tiles * k))
-        outputs.append(expert_affinities_topk_sb)
+        if shard_on_tokens:
+            kernel_assert(
+                T <= PE_COLUMN_TILE_128,
+                "If return_eager_affi with shard_on_tokens, then T must be <=128",
+            )
+            expert_affinities_topk_full = nl.ndarray((T, k), dtype=nl.float32, buffer=nl.sbuf)
+            eager_affi_send = nl.ndarray((T_sendrecv_size, k), dtype=nl.float32, buffer=nl.sbuf)
+            eager_affi_recv = nl.ndarray((T_sendrecv_size, k), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(src=expert_affinities_topk_sb[:T_local, 0, :], dst=eager_affi_send[:T_local, :])
+            nisa.sendrecv(
+                dst=eager_affi_recv,
+                src=eager_affi_send,
+                send_to_rank=1 - prg_id,
+                recv_from_rank=1 - prg_id,
+                pipe_id=0,
+            )
+            other_offset = T_first_shard if prg_id == 0 else 0
+            if T_offset == 0:
+                cross_partition_copy.cross_partition_copy(
+                    src=eager_affi_send,
+                    dst=expert_affinities_topk_full,
+                    src_start_partition=0,
+                    dst_start_partition=0,
+                    num_partitions_to_copy=T_local,
+                    free_dim_size=k,
+                )
+                cross_partition_copy.cross_partition_copy(
+                    src=eager_affi_recv,
+                    dst=expert_affinities_topk_full,
+                    src_start_partition=0,
+                    dst_start_partition=other_offset,
+                    num_partitions_to_copy=other_T_local,
+                    free_dim_size=k,
+                )
+            else:
+                cross_partition_copy.cross_partition_copy(
+                    src=eager_affi_recv,
+                    dst=expert_affinities_topk_full,
+                    src_start_partition=0,
+                    dst_start_partition=0,
+                    num_partitions_to_copy=other_T_local,
+                    free_dim_size=k,
+                )
+                cross_partition_copy.cross_partition_copy(
+                    src=eager_affi_send,
+                    dst=expert_affinities_topk_full,
+                    src_start_partition=0,
+                    dst_start_partition=T_offset,
+                    num_partitions_to_copy=T_local,
+                    free_dim_size=k,
+                )
+            outputs.append(expert_affinities_topk_full)
+        else:
+            expert_affinities_topk_sb = expert_affinities_topk_sb.reshape((t_p_dim, num_t_tiles * k))
+            outputs.append(expert_affinities_topk_sb)
 
     return outputs
 
@@ -1121,39 +1228,6 @@ def _hbm_remainder_store_view(tensor, T_offset, num_t_whole_tiles, t_p_dim, t_re
     )
 
 
-# This function loads the 'x' tensor from HBM to SB.
-# sb_layout specifies the final layout in SB.
-# hbm_layout specifies the layout in HBM.
-#
-# hbm_layout
-#   0 = [H,T]
-#   1 = [T,H]
-#
-# The sb_layout options are defined here. See the diagrams in the code to better understand.
-# sb_layout (same meaning as router_topk_kernel(x_sb_layout)). num_h_tiles=H/128.
-#   0 = [128, T, H/128] where p-dim contains H elements with stride of num_h_tiles
-#   1 = [128, T, H/128] where p-dim contains H elements with stride of num_h_tiles, but H is further
-#                       interleaved inside dim-2 with a chunk size of H/256.
-#   2 = [128, T, H/128] where p-dim contains H elements with stride of 1 (i.e. consecutive)
-#   3 = [128, H/128, T/128, 128] where p-dim contains H elements with stride of 1 (i.e. consecutive)
-#
-# Supported combos (Y=yes supported. dash=No not supported)
-# ┌─────────────────────────────────┐
-# │               sb_layout         │
-# │ hbm_layout    0    1    2    3  │
-# │     0         -    -    -    Y  │
-# │     1         Y    Y    Y    -  │
-# └─────────────────────────────────┘
-#
-# Returned shapes (terms: num_h_tiles=H/128)
-# ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-# │               sb_layout                                                                                                  │
-# │ hbm_layout    0                    1                    2                     3                                          │
-# │     0         -                    -                    -                     [128,num_h_tiles,T]                        │
-# │     1         [128,T,num_h_tiles]  [128,T,num_h_tiles]  [128,T,num_h_tiles]    -                                         │
-# └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
 def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_layout=XSBLayout_tp2013__1):
     """
     Load input tensor x from HBM to SBUF with specified layout transformations.
@@ -1162,10 +1236,39 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
     and sb_layout parameters. Supports multiple layout combinations optimized for
     different access patterns in subsequent matmul operations.
 
+    hbm_layout:
+        0 = [H,T]
+        1 = [T,H]
+
+    sb_layout (same meaning as router_topk(x_sb_layout)). num_h_tiles=H/128:
+        0 = [128, T, H/128] where p-dim contains H elements with stride of num_h_tiles
+        1 = [128, T, H/128] where p-dim contains H elements with stride of num_h_tiles, but H is further
+                            interleaved inside dim-2 with a chunk size of H/256.
+        2 = [128, T, H/128] where p-dim contains H elements with stride of 1 (i.e. consecutive)
+        3 = [128, H/128, T/128, 128] where p-dim contains H elements with stride of 1 (i.e. consecutive)
+
+    Supported combos (Y=yes supported. dash=No not supported)::
+
+        ┌─────────────────────────────────┐
+        │               sb_layout         │
+        │ hbm_layout    0    1    2    3  │
+        │     0         -    -    -    Y  │
+        │     1         Y    Y    Y    -  │
+        └─────────────────────────────────┘
+
+    Returned shapes (terms: num_h_tiles=H/128)::
+
+        ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │               sb_layout                                                                                      │
+        │ hbm_layout    0                    1                    2                     3                              │
+        │     0         -                    -                    -                     [128,num_h_tiles,T]            │
+        │     1         [128,T,num_h_tiles]  [128,T,num_h_tiles]  [128,T,num_h_tiles]    -                             │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
     Args:
         x (nl.ndarray): Input tensor in HBM. Shape [H, T] if hbm_layout=0, [T, H] if hbm_layout=1
         hbm_layout (int): Layout of x in HBM (0=[H,T], 1=[T,H])
-        sb_layout (int): Target layout in SBUF (0-3). See function comments for detailed layout descriptions
+        sb_layout (int): Target layout in SBUF (0-3). See layout descriptions above
 
     Returns:
         x_sb (nl.ndarray): Input tensor in SBUF with transformed layout.
@@ -1214,9 +1317,7 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
 
     x_sb = None
 
-    #########################################
     # sb_layout == 0
-    #########################################
 
     if hbm_layout == XHBMLayout_T_H__1 and sb_layout == XSBLayout_tp102__0:
         # HBM tensor [T,H] reshaped (new view) into 128 H-tiles of size num_h_tiles=H/128.
@@ -1264,9 +1365,7 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
             dst=tensor_view.TensorView(x_sb).get_view(),
         )
 
-    #########################################
     # sb_layout == 1
-    #########################################
 
     elif hbm_layout == XHBMLayout_T_H__1 and sb_layout == XSBLayout_tp2013__1:
         # First, understand the above diagram for sb_layout == 0.
@@ -1319,9 +1418,7 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
         # We reshape to 3D to maintain compatibility with existing upstream kernels who produce this this layout in this 3D shape:
         x_sb = x_sb.reshape((P_MAX, T, num_h_tiles))
 
-    #########################################
     # sb_layout == 2
-    #########################################
 
     elif hbm_layout == XHBMLayout_T_H__1 and sb_layout == XSBLayout_tp201__2:
         # Original HBM tensor [T,H] reshaped (new view) into num_h_tiles H-tiles of size 128.
@@ -1360,9 +1457,7 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
             src=tensor_view.TensorView(x_reshape).permute([2, 0, 1]).get_view(),
             dst=tensor_view.TensorView(x_sb).get_view(),
         )
-    #########################################
     # sb_layout == 3
-    #########################################
 
     elif hbm_layout == XHBMLayout_H_T__0 and sb_layout == XSBLayout__128_Hdiv128_T__3:
         # HBM tensor [H,T] reshaped (new view) to [num_h_tiles, 128, T] where num_h_tiles = H/128.
@@ -1716,7 +1811,12 @@ def compute_activation(
             data=input_tensor[:t_tile_size, t_tile_idx : t_tile_idx + 1, :],
             bias=local_negmax_sb[:t_tile_size, t_tile_idx : t_tile_idx + 1],
             reduce_op=nl.add,
-            reduce_res=(tensor_view.TensorView(local_exp_sum_sb).select(dim=1, index=t_tile_idx).get_view()),
+            reduce_res=(
+                tensor_view.TensorView(local_exp_sum_sb)
+                .slice(dim=0, start=0, end=t_tile_size)
+                .select(dim=1, index=t_tile_idx)
+                .get_view()
+            ),
             reduce_cmd=reduce_cmd.reset_reduce,
         )
 

@@ -37,6 +37,7 @@ from aws_embedded_metrics.serializers.log_serializer import LogSerializer
 from typing_extensions import override
 
 from ..utils.exceptions import UnimplementedException
+from ..utils.feature_flag_helper import truncate_name_for_filesystem
 from ..utils.metrics_collector import IMetricsCollector, NoopMetricsCollector
 
 
@@ -198,6 +199,7 @@ class MetricsEmitter(IMetricsEmitter):
         # Generate filename with test name and readable timestamp
         test_name = emf_data.get("TestName", "unknown")
         readable_time = datetime.now(timezone.utc).strftime("%m-%d_%H-%M-%S-UTC")
+        test_name = truncate_name_for_filesystem(test_name)
         filename = f"{test_name}_{readable_time}.json"
         filepath = os.path.join(self._output_dir, filename)
 

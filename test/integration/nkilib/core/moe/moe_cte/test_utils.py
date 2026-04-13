@@ -26,7 +26,7 @@ from test.integration.nkilib.core.mlp.test_mlp_common import (
     _down_proj_golden_mx,
     _gate_up_proj_golden_mx,
 )
-from test.integration.nkilib.core.moe.moe_cte.test_moe_cte import (
+from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     generate_token_position_to_id_and_experts,
     get_n_blocks,
     map_skip_mode,
@@ -45,6 +45,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
     ExpertAffinityScaleMode,
 )
+from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 
 # MXFP4 quantization block dimensions
 _q_width = 4  # quantization width
@@ -240,6 +241,7 @@ def build_moe_bwmm_mx_cte(
     alpha: Optional[float] = None,
     use_cache: bool = False,
     is_shard_on_I: bool = False,
+    n_static_blocks: Optional[int] = None,
 ) -> dict:
     """
     Build input tensors for MoE BWMM MXFP4/MXFP8 CTE kernel testing.
@@ -323,14 +325,17 @@ def build_moe_bwmm_mx_cte(
     )
 
     # Calculate MXFP4 tensor dimensions
-    assert H % (_pmax * _q_width) == 0
+    kernel_assert(H % (_pmax * _q_width) == 0, f"H must be divisible by {_pmax * _q_width}, got {H}")
     n_H512_tile = H // (_pmax * _q_width)
 
-    assert I_TP % (_pmax * _q_width) == 0 or (I_TP < (_pmax * _q_width) and I_TP % (_q_height * _q_width) == 0)
+    kernel_assert(
+        I_TP % (_pmax * _q_width) == 0 or (I_TP < (_pmax * _q_width) and I_TP % (_q_height * _q_width) == 0),
+        f"I_TP must be divisible by {_pmax * _q_width} or (I_TP < {_pmax * _q_width} and I_TP divisible by {_q_height * _q_width}), got {I_TP}",
+    )
     n_I512_tile, r_I512_tile = divmod(I_TP, _pmax * _q_width)
     I_TP_par_dim = _pmax
     if r_I512_tile > 0:
-        assert n_I512_tile == 0
+        kernel_assert(n_I512_tile == 0, f"Expected n_I512_tile == 0 when remainder exists, got {n_I512_tile}")
         n_I512_tile = 1
         I_TP_par_dim = r_I512_tile // _q_width
 
@@ -404,6 +409,11 @@ def build_moe_bwmm_mx_cte(
 
     if is_dynamic and not is_shard_on_I:
         kernel_input['n_dynamic_blocks'] = n_dynamic_blocks
+    if n_static_blocks is not None:
+        if is_shard_on_I:
+            kernel_input['num_static_block'] = n_static_blocks
+        else:
+            kernel_input['n_static_blocks'] = n_static_blocks
     # Add clamp limits only if they have non-None values
     if gate_clamp_upper_limit is not None:
         kernel_input['gate_clamp_upper_limit'] = gate_clamp_upper_limit

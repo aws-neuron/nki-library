@@ -19,31 +19,15 @@ Tests the gate_up_projection_mx_tp_shard_H and down_projection_mx_shard_H sub-ke
 with LNC2 sharding on the H (hidden) dimension.
 """
 
-from test.integration.nkilib.core.mlp.test_mlp_common import (
-    _down_proj_golden_mx,
-    _gate_up_proj_golden_mx,
-)
-from test.integration.nkilib.utils.dtype_helper import dt
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
-from test.utils.common_dataclasses import (
-    CompilerArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    Platforms,
-    ValidationArgs,
-)
-from test.utils.metrics_collector import IMetricsCollector
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.ranged_test_harness import (
-    RangeManualGeneratorStrategy,
-    RangeTestCase,
-    RangeTestConfig,
-    TensorRangeConfig,
-    range_test_config,
-)
 from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
+import neuron_dtypes as dt
 import nki
 import nki.isa as nisa
 import nki.language as nl
@@ -51,17 +35,13 @@ import numpy as np
 import pytest
 from nkilib_src.nkilib.core.mlp.mlp_tkg.down_projection_mx_shard_H import down_projection_mx_shard_H
 from nkilib_src.nkilib.core.mlp.mlp_tkg.gate_up_projection_mx_shard_H import gate_up_projection_mx_tp_shard_H
+from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_proj_mxfp4_torch import (
+    down_proj_mxfp4_torch_ref,
+    gate_up_proj_mxfp4_torch_ref,
+)
 from nkilib_src.nkilib.core.mlp.mlp_tkg.projection_mx_constants import ProjConfig, _pmax, _q_height, _q_width
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
 from nkilib_src.nkilib.core.utils.tensor_view import TensorView
-
-# Dimension names for test configuration
-MXFP4_PROJ_CONFIG = "mxfp4_proj_config"
-BXS_DIM_NAME = "BxS"
-H_DIM_NAME = "H"
-I_DIM_NAME = "I"
-USE_STREAM_SHUFFLE_BROADCAST_NAME = "use_stream_shuffle_broadcast"
-
 
 # =============================================================================
 # Input Builders
@@ -154,48 +134,6 @@ def build_down_proj_mxfp4_input(BxS: int, H: int, I: int, use_stream_shuffle_bro
 
 
 # =============================================================================
-# Golden Functions
-# =============================================================================
-
-
-class _SimpleConfig:
-    """Simple config object for golden functions."""
-
-    def __init__(self, H, I, BxS):
-        self.H = H
-        self.I = I
-        self.BxS = BxS
-
-
-def golden_gate_up_proj_mxfp4(kernel_input: dict, dtype) -> dict:
-    """Compute golden output for gate/up projection."""
-    cfg = _SimpleConfig(kernel_input["H"], kernel_input["I"], kernel_input["BxS"])
-    gold_out = _gate_up_proj_golden_mx(
-        hidden=kernel_input["hidden_qtz"],
-        hidden_scale=kernel_input["hidden_scale"],
-        weight=kernel_input["weight_qtz"],
-        weight_scale=kernel_input["weight_scale"],
-        bias=kernel_input["bias"],
-        cfg=cfg,
-    )
-    return {"out": dt.static_cast(gold_out, dtype)}
-
-
-def golden_down_proj_mxfp4(kernel_input: dict, dtype) -> dict:
-    """Compute golden output for down projection."""
-    cfg = _SimpleConfig(kernel_input["H"], kernel_input["I"], kernel_input["BxS"])
-    gold_out = _down_proj_golden_mx(
-        inter_sb=kernel_input["inter"],
-        weight=kernel_input["weight_qtz"],
-        weight_scale=kernel_input["weight_scale"],
-        bias=kernel_input["bias"],
-        cfg=cfg,
-    )
-    # Golden returns [BxS, H] which matches wrapper output
-    return {"out": dt.static_cast(gold_out, dtype)}
-
-
-# =============================================================================
 # Kernel Wrapper Functions
 # =============================================================================
 
@@ -209,6 +147,8 @@ def gate_up_proj_mxfp4_wrapper(
     H: int,
     I: int,
     BxS: int,
+    hidden_unpack_fn=None,
+    weight_unpack_fn=None,
 ):
     """Wrapper for gate/up projection sub-kernel."""
     bias_par_dim = 128 if I >= 512 else I // 4
@@ -272,6 +212,7 @@ def down_proj_mxfp4_wrapper(
     I: int,
     BxS: int,
     use_stream_shuffle_broadcast: bool = True,
+    weight_unpack_fn=None,
 ):
     """Wrapper for down projection sub-kernel."""
     n_prgs, prg_id = nl.num_programs(0), nl.program_id(0)
@@ -330,6 +271,14 @@ MXFP4_PROJ_LNC2_TEST_VECTORS = [
     [4, 3072, 1536],
 ]
 
+GATE_UP_PARAM_NAMES = "BxS, H, I"
+_GATE_UP_ABBREVS = {"BxS": "bs"}
+GATE_UP_TEST_PARAMS = [tuple(v) for v in MXFP4_PROJ_LNC2_TEST_VECTORS]
+
+DOWN_PARAM_NAMES = "BxS, H, I, use_stream_shuffle_broadcast"
+_DOWN_ABBREVS = {"BxS": "bs", "use_stream_shuffle_broadcast": "ssb"}
+DOWN_TEST_PARAMS = [(BxS, H, I, use_ssb) for BxS, H, I in MXFP4_PROJ_LNC2_TEST_VECTORS for use_ssb in [True, False]]
+
 
 # =============================================================================
 # Test Class
@@ -341,164 +290,68 @@ MXFP4_PROJ_LNC2_TEST_VECTORS = [
     pytest_marks=["mlp", "mxfp4", "projection"],
 )
 @final
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 class TestMlpProjMxfp4Kernel:
     """Test suite for MXFP4 MLP projection kernels."""
 
-    def run_gate_up_proj_mxfp4_test(
-        self,
-        test_manager: Orchestrator,
-        compiler_args: CompilerArgs,
-        collector: IMetricsCollector,
-        BxS: int,
-        H: int,
-        I: int,
-        dtype=nl.bfloat16,
-    ):
-        kernel_input = build_gate_up_proj_mxfp4_input(BxS, H, I)
-
-        n_I512_tile = div_ceil(I, 512)
-        output_shape = (128, n_I512_tile, BxS, 4)
-        output_placeholder = {"out": np.zeros(output_shape, dtype=dtype)}
-
-        def create_lazy_golden():
-            return golden_gate_up_proj_mxfp4(kernel_input, dtype)
-
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=gate_up_proj_mxfp4_kernel,
-                compiler_input=compiler_args,
-                kernel_input=kernel_input,
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(
-                        lazy_golden_generator=create_lazy_golden,
-                        output_ndarray=output_placeholder,
-                    ),
-                    relative_accuracy=2e-2,
-                    absolute_accuracy=1e-5,
-                ),
-            ),
-        )
-
-    def run_down_proj_mxfp4_test(
-        self,
-        test_manager: Orchestrator,
-        compiler_args: CompilerArgs,
-        collector: IMetricsCollector,
-        BxS: int,
-        H: int,
-        I: int,
-        use_stream_shuffle_broadcast: bool = True,
-        dtype=nl.bfloat16,
-    ):
-        kernel_input = build_down_proj_mxfp4_input(BxS, H, I, use_stream_shuffle_broadcast)
-
-        output_shape = (BxS, H)
-        output_placeholder = {"out": np.zeros(output_shape, dtype=dtype)}
-
-        def create_lazy_golden():
-            return golden_down_proj_mxfp4(kernel_input, dtype)
-
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=down_proj_mxfp4_kernel,
-                compiler_input=compiler_args,
-                kernel_input=kernel_input,
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(
-                        lazy_golden_generator=create_lazy_golden,
-                        output_ndarray=output_placeholder,
-                    ),
-                    relative_accuracy=2e-2,
-                    absolute_accuracy=1e-5,
-                ),
-            ),
-        )
-
-    @staticmethod
-    def mxfp4_gate_up_proj_unit_config() -> RangeTestConfig:
-        test_cases = [
-            {MXFP4_PROJ_CONFIG: {BXS_DIM_NAME: BxS, H_DIM_NAME: H, I_DIM_NAME: I}}
-            for BxS, H, I in MXFP4_PROJ_LNC2_TEST_VECTORS
-        ]
-
-        return RangeTestConfig(
-            additional_params={},
-            global_tensor_configs=TensorRangeConfig(
-                tensor_configs={},
-                monotonic_step_size=1,
-                custom_generators=[RangeManualGeneratorStrategy(test_cases=test_cases)],
-            ),
-        )
-
-    @staticmethod
-    def mxfp4_down_proj_unit_config() -> RangeTestConfig:
-        test_cases = [
-            {
-                MXFP4_PROJ_CONFIG: {
-                    BXS_DIM_NAME: BxS,
-                    H_DIM_NAME: H,
-                    I_DIM_NAME: I,
-                    USE_STREAM_SHUFFLE_BROADCAST_NAME: use_ssb,
-                }
-            }
-            for BxS, H, I in MXFP4_PROJ_LNC2_TEST_VECTORS
-            for use_ssb in [True, False]
-        ]
-
-        return RangeTestConfig(
-            additional_params={},
-            global_tensor_configs=TensorRangeConfig(
-                tensor_configs={},
-                monotonic_step_size=1,
-                custom_generators=[RangeManualGeneratorStrategy(test_cases=test_cases)],
-            ),
-        )
-
     @pytest.mark.fast
-    @range_test_config(mxfp4_gate_up_proj_unit_config())
+    @pytest_parametrize(GATE_UP_PARAM_NAMES, GATE_UP_TEST_PARAMS, abbrevs=_GATE_UP_ABBREVS)
     def test_mxfp4_gate_up_proj_unit(
         self,
         test_manager: Orchestrator,
-        range_test_options: RangeTestCase,
-        collector: IMetricsCollector,
+        BxS: int,
+        H: int,
+        I: int,
         platform_target: Platforms,
     ):
-        if platform_target is not Platforms.TRN3:
-            pytest.skip("MXFP4 is only supported on TRN3.")
+        def input_generator(test_config, input_tensor_def=None):
+            return build_gate_up_proj_mxfp4_input(BxS, H, I)
 
-        compiler_args = CompilerArgs(platform_target=platform_target)
-        config = range_test_options.tensors[MXFP4_PROJ_CONFIG]
+        def output_tensors(kernel_input):
+            n_I512_tile = div_ceil(I, 512)
+            return {"out": np.zeros((128, n_I512_tile, BxS, 4), dtype=nl.bfloat16)}
 
-        self.run_gate_up_proj_mxfp4_test(
+        framework = UnitTestFramework(
             test_manager=test_manager,
-            compiler_args=compiler_args,
-            collector=collector,
-            BxS=config[BXS_DIM_NAME],
-            H=config[H_DIM_NAME],
-            I=config[I_DIM_NAME],
+            kernel_entry=gate_up_proj_mxfp4_kernel,
+            torch_ref=torch_ref_wrapper(gate_up_proj_mxfp4_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=2e-2,
+            atol=1e-5,
         )
 
     @pytest.mark.fast
-    @range_test_config(mxfp4_down_proj_unit_config())
+    @pytest_parametrize(DOWN_PARAM_NAMES, DOWN_TEST_PARAMS, abbrevs=_DOWN_ABBREVS)
     def test_mxfp4_down_proj_unit(
         self,
         test_manager: Orchestrator,
-        range_test_options: RangeTestCase,
-        collector: IMetricsCollector,
+        BxS: int,
+        H: int,
+        I: int,
+        use_stream_shuffle_broadcast: bool,
         platform_target: Platforms,
     ):
-        if platform_target is not Platforms.TRN3:
-            pytest.skip("MXFP4 is only supported on TRN3.")
+        def input_generator(test_config, input_tensor_def=None):
+            return build_down_proj_mxfp4_input(BxS, H, I, use_stream_shuffle_broadcast)
 
-        compiler_args = CompilerArgs(platform_target=platform_target)
-        config = range_test_options.tensors[MXFP4_PROJ_CONFIG]
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((BxS, H), dtype=nl.bfloat16)}
 
-        self.run_down_proj_mxfp4_test(
+        framework = UnitTestFramework(
             test_manager=test_manager,
-            compiler_args=compiler_args,
-            collector=collector,
-            BxS=config[BXS_DIM_NAME],
-            H=config[H_DIM_NAME],
-            I=config[I_DIM_NAME],
-            use_stream_shuffle_broadcast=config[USE_STREAM_SHUFFLE_BROADCAST_NAME],
+            kernel_entry=down_proj_mxfp4_kernel,
+            torch_ref=torch_ref_wrapper(down_proj_mxfp4_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=2e-2,
+            atol=1e-5,
         )

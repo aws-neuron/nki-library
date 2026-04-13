@@ -27,7 +27,11 @@ from .output_projection_cte_parameters import (
     build_tiling_config,
     validate_output_projection_inputs,
 )
-from .output_projection_cte_quantization import perform_static_quantized_projection
+from .output_projection_cte_quantization import (
+    perform_mx_quantized_projection,
+    perform_static_mx_quantized_projection,
+    perform_static_quantized_projection,
+)
 
 # pylint: disable=too-many-locals
 
@@ -40,6 +44,7 @@ def output_projection_cte(
     quantization_type: QuantizationType = QuantizationType.NONE,
     input_scales: Optional[nl.ndarray] = None,
     weight_scales: Optional[nl.ndarray] = None,
+    output_dtype: Optional[type] = None,
 ) -> nl.ndarray:
     """
     Output projection kernel optimized for Context Encoding (CTE/Prefill) scenarios.
@@ -59,9 +64,11 @@ def output_projection_cte(
         attention (nl.ndarray): [B, N, D, S], Input tensor in HBM from attention block.
         weight (nl.ndarray): [N * D, H], Weight tensor in HBM.
         bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
-        quantization_type (QuantizationType): Type of quantization (NONE or STATIC for FP8).
+        quantization_type (QuantizationType): Type of quantization (NONE, STATIC for FP8, or MX).
         input_scales (Optional[nl.ndarray]): [128, 1], Input scale tensor for FP8 quantization.
         weight_scales (Optional[nl.ndarray]): [128, 1], Weight scale tensor for FP8 quantization.
+        output_dtype (Optional[type]): Output data type. Defaults to attention.dtype for non-MX,
+            or nl.bfloat16 for MX quantization. Can be set to nl.float16 for higher precision.
 
     Returns:
         out (nl.ndarray): [B, S, H], Output tensor in HBM.
@@ -97,7 +104,7 @@ def output_projection_cte(
     _, n_prgs, prg_id = get_program_sharding_info()
 
     # Default to 1 program if not in SPMD context (e.g., simulation)
-    if n_prgs is None:
+    if n_prgs == None:
         n_prgs = 1
         prg_id = 0
 
@@ -111,6 +118,9 @@ def output_projection_cte(
         n_prgs=n_prgs,
         attention_dtype=attention.dtype,
         weight_dtype=weight.dtype,
+        quantization_type=quantization_type,
+        input_scales=input_scales,
+        weight_scales=weight_scales,
     )
 
     # Configuration
@@ -134,19 +144,13 @@ def output_projection_cte(
     )
 
     # Execution
-    out = nl.ndarray((b_size, s_size, h_size), dtype=attention.dtype, buffer=nl.shared_hbm)
-
-    weight = weight.reshape((tiling_config.n_size, tiling_config.d_size, tiling_config.h_size))
-
-    if tiling_config.group_size > 1 or quant_config.use_double_row:
-        attention = attention.reshape(
-            (
-                tiling_config.b_size,
-                tiling_config.n_size,
-                tiling_config.d_size,
-                tiling_config.s_size,
-            )
-        )
+    if output_dtype != None:
+        out_dtype = output_dtype
+    elif quantization_type == QuantizationType.MX:
+        out_dtype = nl.bfloat16
+    else:
+        out_dtype = attention.dtype
+    out = nl.ndarray((b_size, s_size, h_size), dtype=out_dtype, buffer=nl.shared_hbm)
 
     if quant_config.is_enabled and quantization_type == QuantizationType.STATIC:
         perform_static_quantized_projection(
@@ -160,13 +164,37 @@ def output_projection_cte(
             cfg=tiling_config,
             quant_config=quant_config,
         )
+    elif quant_config.is_enabled and quantization_type == QuantizationType.STATIC_MX:
+        perform_static_mx_quantized_projection(
+            attention_hbm=attention,
+            weight_hbm=weight,
+            output_hbm=out,
+            bias_hbm=bias,
+            input_scale_hbm=input_scales,
+            weight_scale_hbm=weight_scales,
+            prg_id=prg_id,
+            cfg=tiling_config,
+            quant_config=quant_config,
+        )
+    elif quant_config.is_enabled and quantization_type == QuantizationType.MX:
+        perform_mx_quantized_projection(
+            attention_hbm=attention,
+            weight_hbm=weight,
+            output_hbm=out,
+            bias_hbm=bias,
+            weight_scale_hbm=weight_scales,
+            input_scale_hbm=input_scales,
+            prg_id=prg_id,
+            cfg=tiling_config,
+            quant_config=quant_config,
+        )
     else:
         perform_float_projection(
-            attention=attention,
-            weight=weight,
-            bias=bias,
-            out=out,
-            tiling_config=tiling_config,
+            attention_hbm=attention,
+            weight_hbm=weight,
+            bias_hbm=bias,
+            out_hbm=out,
+            cfg=tiling_config,
             prg_id=prg_id,
         )
 

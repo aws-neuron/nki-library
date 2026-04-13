@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# LEGACY SWEEP TEST FRAMEWORK - Uses @range_test_config / RangeTestHarness
+# New tests should use @pytest.mark.coverage_parametrize instead
+
 """
 Comprehensive tests for Cross Entropy backward pass kernel.
 """
 
 from test.utils.common_dataclasses import CompilerArgs, KernelArgs, LazyGoldenGenerator, ValidationArgs
-from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.ranged_test_harness import (
     DimensionRangeConfig,
     RangeManualGeneratorStrategy,

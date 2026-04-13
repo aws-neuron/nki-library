@@ -32,6 +32,7 @@ from nki.isa.constants import dge_mode, oob_mode
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info, reduce
+from ...utils.tensor_view import TensorView
 from .moe_cte_utils import SkipMode, div_ceil
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -60,10 +61,8 @@ SBUF_QUADRANT_SIZE = 32
 _ALTERNATIVE_DTYPE_TO_MXFP = {
     nl.uint16: nl.float4_e2m1fn_x4,
     nl.int16: nl.float4_e2m1fn_x4,
-    nl.float16: nl.float4_e2m1fn_x4,
     nl.uint32: nl.float8_e4m3fn_x4,
     nl.int32: nl.float8_e4m3fn_x4,
-    nl.float32: nl.float8_e4m3fn_x4,
 }
 
 
@@ -99,7 +98,11 @@ def convert_to_mxfp_dtype(tensor: nl.ndarray, weight_dtype: Any = None) -> tuple
         target_dtype = weight_dtype
 
     if mxfp_target is not None:
-        tensor = tensor.view(target_dtype, shape=tensor.shape)
+        # wrap with TensorView and view as target dtype
+        tensor = TensorView(tensor).reinterpret_cast(target_dtype)
+    else:
+        # wrap with Tensor view if already in correct dtype
+        tensor = TensorView(tensor)
 
     return tensor, target_dtype
 

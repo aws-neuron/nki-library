@@ -1,7 +1,7 @@
 # NKI Library Test Framework
 
 Documentation and tools for testing NKI Library kernels.
-## Set up 
+## Set up
 
 ```bash
 # 1. Initialize Python virtual environment
@@ -19,14 +19,14 @@ make install
 make install_wheelhouse
 
 # 6. Now you can run regular make targets
-make test 
+make test
 ```
 
 ## Directory Structure
 
 ```
 test/
-├── integration/nkilib/core/        # Core kernel tests 
+├── integration/nkilib/core/        # Core kernel tests
 │   ├── attention/                  # Attention kernel tests
 │   ├── mlp/                        # MLP kernel tests
 │   ├── moe/                        # Mixture of Experts tests
@@ -62,10 +62,14 @@ make test ARGS="test/integration/nkilib/core/mlp/test_mlp_tkg.py --platform-targ
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
+| `simulation` | Run kernel on CPU via NkiCpuSimulator (no hardware required) | Numerical accuracy validation without hardware |
 | `compile-only` | Compile kernel without running on hardware | Quick syntax/structure validation |
 | `compile-and-infer` | Compile and run inference on hardware | Full validation (default) |
 
 ```bash
+# Simulation mode (no hardware required, verifies numerical accuracy on CPU)
+make test ARGS="test/integration --test-mode simulation -k 'test_name'"
+
 # Compile-only mode (no hardware required)
 make test ARGS="test/integration --test-mode compile-only -k 'test_name'"
 
@@ -78,14 +82,16 @@ make test ARGS="test/integration -k 'test_name' --target-host <hostname>"
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--test-mode` | Test execution mode: `compile-only`, `compile-and-infer` | `compile-and-infer` |
+| `--test-mode` | Test execution mode: `simulation`, `compile-only`, `compile-and-infer` | `compile-and-infer` |
 | `--output-directory` | Base directory for test artifacts | `neuron_test_output` |
 | `--debug-kernels` | Dump additional debug output for kernel debugging | `False` |
 | `--force-local-cleanup` | Auto-cleanup test output directory after tests | `False` |
+| `--force-local-cleanup-keep` | Artifact types to preserve when using `--force-local-cleanup` (e.g., `metrics`) | `[]` |
 | `--metric-output` | Enable metrics collection: `file`, `stdout`, `stderr` | `file` |
 | `--coverage` | Default coverage strategy: `singles`, `pairs`, `full` | `singles` |
 | `--validation-histograms` | Dump validation reports with histograms | `False` |
 | `--platform-target` | Target platform: `trn2`, `trn3`, etc. | `trn2` |
+| `--disable-no-tests-failure` | Log warning instead of failing when no tests are collected | `False` |
 | `-k "pattern"` | Run tests matching pattern | All tests |
 | `-m "marker"` | Run tests with specific marker (e.g., `-m fast`) | All tests |
 
@@ -232,6 +238,15 @@ For complete examples, see [`test/integration/nkilib/core/cumsum/test_cumsum.py`
 |--------|-------------|
 | `@pytest.mark.fast` | Fast tests with curated test vectors (for compile-only validation) |
 | `@pytest.mark.skip_compilation` | Skip compilation phase |
+| `@pytest.mark.slow_simulation` | Mark test as slow for CPU simulation (large tensor shapes) |
+
+## Simulation Mode (NkiCpuSimulator)
+
+Run tests on CPU without Trainium hardware via NkiCpuSimulator. See `simulation.md` for requirements, limitations, and details.
+
+```bash
+make test ARGS="test/integration --test-mode simulation -k 'test_name' -n auto"
+```
 
 ## Performance Metrics Collection
 
@@ -255,11 +270,9 @@ done
 
 The CSV contains: `TestName`, `TpbSgCyclesSum` (cycles), `MbuEstimatedPercent` (memory bandwidth utilization), `ProfilerMFU`, `InferenceTime`.
 
-**Note:** Do not use `--force-local-cleanup` when collecting metrics, as metrics are stored in the local artifact directory.
+**Note:** If you just need the resulting metrics file and none of the other test artifacts, you can conserve disk space by using `--force-local-cleanup` along with `--force-local-cleanup-keep metrics`.
 
 ### Tips
 
 - **Always rebuild before testing** - Tests run against built artifacts
-- **Redirect output for analysis:** `brazil-build integration-test ... > /tmp/test.txt 2>&1`
 - **Use parallelism** (`-n auto --dist worksteal`) - Always use unless <20 test configs
-- **Use timeouts** for long runs: `timeout 300 brazil-build integration-test ...`

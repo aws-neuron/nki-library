@@ -128,6 +128,11 @@ class TensorHistogram:
             self._print_and_log("  No valid data to display", logfile)
             return
 
+        # If values are to close to max, plotext bug results in a bin above max_bin so we need to clamp values to max
+        threshold = 1e-10
+        data_max = valid_data.max()
+        valid_data = torch.where(valid_data > data_max - threshold, data_max, valid_data)
+
         plt.clf()
 
         # Create histogram and get the counts to determine y-axis range
@@ -346,7 +351,7 @@ class TensorHistogram:
         self._print_and_log("\n" + table.render(), logfile)
 
         # Print tolerance info
-        tolerance_info = f"Tolerance: atol={atol:.2e}, rtol={rtol:.2e} ({rtol*100:.4g}%)"
+        tolerance_info = f"Tolerance: atol={atol:.2e}, rtol={rtol:.2e} ({rtol * 100:.4g}%)"
         self._print_and_log(tolerance_info, logfile)
 
         return close

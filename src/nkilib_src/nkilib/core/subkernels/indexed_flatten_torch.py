@@ -22,12 +22,12 @@ def indexed_flatten_torch_ref(
     f_len: int,
     output_len: int,
     row_offsets: torch.Tensor,
+    row_offsets_start: torch.Tensor = None,
     padding_val: int = -1,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """
     PyTorch reference implementation of indexed_flatten.
 
-    This is a reference implementation for testing the NKI indexed_flatten kernel.
     For input_tensor of shape [E, T], reshapes to [E, T//f_len, f_len] and writes
     each row's data into output at the specified row_offsets (block offsets).
 
@@ -35,29 +35,33 @@ def indexed_flatten_torch_ref(
         input_tensor (torch.Tensor): [E, T], Input tensor
         f_len (int): Block size in free dimension
         output_len (int): Length of output array
-        row_offsets (torch.Tensor): [E,], Block offsets for each row
+        row_offsets (torch.Tensor): [N,], Block offsets for each row
+        row_offsets_start (torch.Tensor): Optional 1-element tensor with starting
+            index into row_offsets array. When None, starts from index 0.
         padding_val (int): Value for unwritten positions (default: -1)
 
     Returns:
-        torch.Tensor: [output_len,], Flattened output tensor
-
-    Note:
-        Hardware-specific parameters (LNC sharding) are not included as they
-        don't affect the mathematical result.
+        dict[str, torch.Tensor]: Dictionary with key "flattened_array" containing
+            the [output_len,] flattened output tensor.
     """
     E, T = input_tensor.shape
     partitions_per_row = T // f_len
     num_output_blocks = output_len // f_len
+
+    # Determine starting index into row_offsets
+    start_idx = 0
+    if row_offsets_start != None:
+        start_idx = row_offsets_start.item() if isinstance(row_offsets_start, torch.Tensor) else int(row_offsets_start)
 
     output = torch.full((output_len,), padding_val, dtype=input_tensor.dtype, device=input_tensor.device)
     output_blocks = output.reshape(num_output_blocks, f_len)
     input_reshaped = input_tensor.reshape(E, partitions_per_row, f_len)
 
     for row_idx in range(E):
-        block_offset = row_offsets[row_idx].item()
+        block_offset = row_offsets[start_idx + row_idx].item()
         for partition_idx in range(partitions_per_row):
             out_block_idx = block_offset + partition_idx
             if 0 <= out_block_idx < num_output_blocks:
                 output_blocks[out_block_idx, :] = input_reshaped[row_idx, partition_idx, :]
 
-    return output
+    return {"flattened_array": output}

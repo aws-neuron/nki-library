@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Shared constants and configuration for MX projection sub-kernels.
-
-These constants and ProjConfig are used by both H-sharding and I-sharding projection implementations.
-"""
+"""Shared constants and configuration for MX projection sub-kernels."""
 
 from dataclasses import dataclass
 
@@ -45,11 +41,22 @@ ALLOWED_P_SCALE_IDX_OFFSETS = [
     8,
     12,
 ]  # Can fit 4x scales of width 4 in P into partitions 0:16 in each SBUF quadrant
+# QuantizeMx can accept P in [32, 64, 96, 128], corresponding to unpacked P [128, 256, 384, 512]
+ALLOWED_QMX_P_DIM = (32, 64, 96, 128)
+ALLOWED_QMX_UNPACKED_P_DIM = [128, 256, 384, 512]
+
+
+def pad_to_valid_qmx_partitions(n: int) -> int:
+    """Pad partition count to nearest valid quantize_mx size {32, 64, 96, 128}."""
+    for valid in ALLOWED_QMX_P_DIM:
+        if valid >= n:
+            return valid
+    return 128
+
 
 # MMULMX config
-# MatmultMX can accept P in [32, 64, 128], corresponding to unpacked P [128, 256, 512]
-ALLOWED_P_DIM_MX = [32, 64, 128]
-ALLOWED_UNPACKED_P_DIM_MX = [128, 256, 512]
+MIN_MATMULT_MX_P_DIM = 8  # Must have at least 1x [8P, 4F] block
+MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM = 512  # 128P x 4F
 
 # Gate/up indices
 GATE_FUSED_IDX, UP_FUSED_IDX = 0, 1
@@ -101,7 +108,7 @@ class ProjConfig(nl.NKIObject):
 
         kernel_assert(
             self.r_I512_tile % (_q_width * _q_height) == 0,
-            f"MX4 MLP Proj requires I512 tile remainder ({self.r_I512_tile}) to be divisible by {_q_width*_q_height} for quantization",
+            f"MX4 MLP Proj requires I512 tile remainder ({self.r_I512_tile}) to be divisible by {_q_width * _q_height} for quantization",
         )
 
         if self.out_p_offset != 0:

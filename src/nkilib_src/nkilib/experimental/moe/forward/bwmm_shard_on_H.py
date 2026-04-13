@@ -15,7 +15,6 @@
 """Blockwise matrix multiplication kernel with hidden dimension (H) sharding for MoE."""
 
 from dataclasses import dataclass
-from typing import Any
 
 import nki
 import nki.isa as nisa
@@ -504,9 +503,14 @@ def compute_block_output_shard(
                     if down_activations != None:
                         h_offset = dims.H_per_shard * shard_id
                         offset = block_idx * dims.B * dims.H + tile_idx * TILE_SIZE * dims.H + h_offset + o_f_offset
+                        # Beta 3: dma_copy cannot read from psum directly; copy to sbuf first
+                        down_proj_sb = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.tensor_copy(
+                            dst=down_proj_sb[0:TILE_SIZE, 0:num_h], src=down_proj[h_bank_idx][0:TILE_SIZE, 0:num_h]
+                        )
                         nisa.dma_copy(
                             dst=down_activations.ap(pattern=[[dims.H, TILE_SIZE], [1, num_h]], offset=offset),
-                            src=down_proj[h_bank_idx][0:TILE_SIZE, 0:num_h],
+                            src=down_proj_sb[0:TILE_SIZE, 0:num_h],
                         )
     return block_new
 
@@ -529,7 +533,7 @@ def store_block_output_shard(output, block_new, token_indices, dims, shard_id, s
         )
 
 
-@nki.jit(mode="trace", platform_target="trn2")
+@nki.jit(mode="trace")
 def blockwise_mm_baseline_shard_hidden(
     hidden_states: nl.ndarray,
     expert_affinities_masked: nl.ndarray,

@@ -29,6 +29,11 @@ More details can be found in the [NKI Library Documentation](https://awsdocs-neu
 | [Cross Entropy Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/loss/cross_entropy.py)                      | The kernel implements memory-efficient cross entropy loss forward and backward passes for large vocabularies. |
 | [Depthwise Conv1D Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/conv/depthwise_conv1d.py)  | The kernel implements depthwise 1D convolution using implicit GEMM.          |
 | [Blockwise MM Backward Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/moe/bwd/blockwise_mm_backward.py) | The kernel implements blockwise matrix multiplication backward pass for dropless Mixture of Experts. |
+| [Conv1D Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/conv/conv1d.py)  | The kernel implements 1D convolution using a filter replication strategy. |
+| [Dynamic Shape Kernels](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/dynamic_shapes/) | The kernels dynamic input shapes with dynamic loop tiling on dynamic dimension. |
+| [Fine-Grained AllGather Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/collectives/fg_allgather.py) | The kernel implements fine-grained ring-based all-gather. |
+| [FGCC Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/collectives/fgcc.py) | The kernel implements fused all-gather and matrix multiplication (Fine-Grained Gather Collective Compute). |
+| [Transformer TKG Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/transformer/transformer_tkg.py) | The kernel implements a transformer forward pass megakernel optimized for token generation (TKG). |
 
 ## Integration with the Neuron Compiler
 

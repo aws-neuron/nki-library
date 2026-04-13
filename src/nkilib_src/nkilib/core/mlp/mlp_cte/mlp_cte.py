@@ -16,8 +16,6 @@
 
 from typing import Callable
 
-import nki
-import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.allocator import SbufManager
@@ -26,6 +24,7 @@ from ...utils.kernel_helpers import get_program_sharding_info, is_launched_as_sp
 from ...utils.logging import get_logger
 from ..mlp_parameters import (
     MLPParameters,
+    mlpp_has_dma_xpose,
     mlpp_has_down_projection_bias,
     mlpp_has_gate_projection_bias,
     mlpp_has_normalization,
@@ -34,7 +33,11 @@ from ..mlp_parameters import (
     mlpp_has_quantized_input,
     mlpp_has_quantized_weights,
     mlpp_has_up_projection_bias,
-    mlpp_input_has_packed_scale,
+)
+from .mlp_cte_allocation import (
+    allocate_down_projection_weights,
+    allocate_hidden_tensor_tile,
+    allocate_intermediate_tensor_tile,
 )
 from .mlp_cte_constants import (
     MAX_AVAILABLE_SBUF_SIZE,
@@ -51,22 +54,18 @@ from .mlp_cte_projection import (
     perform_gate_projection_if_necessary,
     perform_up_projection,
 )
-from .mlp_cte_quantization import (
-    invert_static_scales,
-    perform_intermediate_quantization,
-)
+from .mlp_cte_quantization import perform_intermediate_quantization
 from .mlp_cte_sharding import (
     DimShard,
     ShardedDim,
     calculate_sharding,
 )
 from .mlp_cte_tensor_io import (
-    load_and_multiply_static_weight_scales,
     load_bias_vector,
     load_hidden_tensor_tile_opt_fused_add,
     load_source_projection_row_scales,
-    load_static_input_scales,
     load_vector_across_partitions,
+    prepare_static_scales,
     store_half_hidden_tensor_tile,
     store_hidden_tensor_tile,
 )
@@ -169,7 +168,9 @@ def mlp_cte(
         "Launch grid is not valid. MLP CTE only supports sharding on 1 dimension.",
     )
 
-    top_level_interleave_degree = 1 if mlp_params.hidden_size >= 8192 else 2
+    top_level_interleave_degree = (
+        1 if mlp_params.hidden_size >= 8192 or mlp_params.quant_params.is_quant_static_mx() else 2
+    )
     sbm = SbufManager(
         sb_lower_bound=0,
         sb_upper_bound=MAX_AVAILABLE_SBUF_SIZE,
@@ -279,7 +280,7 @@ def _execute_on_shard(
         output_stored_add_tensor_hbm,
         sbm,
     )
-    cleanup_mlp_cte_constants(sbm)
+    cleanup_mlp_cte_constants(shard_mlp_params, sbm)
 
 
 def _mlp_cte_single_shard(
@@ -362,7 +363,7 @@ def _mlp_cte_single_shard(
             mlp_params.quant_params.gate_w_scale,
             heap_alloc,
         )
-        if mlp_params.quant_params.is_quant_row()
+        if mlp_params.quant_params.is_quant_row() and not mlp_params.skip_gate_proj
         else None
     )
     up_proj_row_weight_scales_sbuf = (
@@ -376,40 +377,47 @@ def _mlp_cte_single_shard(
         else None
     )
     # Load all static quantization scales. Multiply weight scales by input scales
-    if mlp_params.quant_params.is_quant_static():
-        gate_up_proj_static_input_scales_sbuf = load_static_input_scales(
-            mlp_params.quant_params.gate_up_in_scale,
-            heap_alloc,
+    gate_up_proj_static_input_scales_sbuf = None
+    down_proj_static_input_scales_sbuf = None
+    gate_proj_static_weight_scales_sbuf = None
+    up_proj_static_weight_scales_sbuf = None
+    down_proj_static_weight_scales_sbuf = None
+    if mlp_params.quant_params.is_quant_static() or mlp_params.quant_params.is_quant_static_mx():
+        gate_up_proj_static_input_scales_sbuf = heap_alloc(
+            (nl.tile_size.pmax, 1),
+            dtype=nl.float32,
+            name=f'gate_up_proj_static_input_scales__shard{shard_idx}__prog{program_id}',
         )
-        down_proj_static_input_scales_sbuf = load_static_input_scales(
-            mlp_params.quant_params.down_in_scale,
-            heap_alloc,
+        down_proj_static_input_scales_sbuf = heap_alloc(
+            (nl.tile_size.pmax, 1),
+            dtype=nl.float32,
+            name=f'down_proj_static_input_scales__shard{shard_idx}__prog{program_id}',
         )
-        gate_proj_static_weight_scales_sbuf = load_and_multiply_static_weight_scales(
+        if not mlp_params.skip_gate_proj:
+            gate_proj_static_weight_scales_sbuf = heap_alloc(
+                (nl.tile_size.pmax, 1),
+                dtype=nl.float32,
+                name=f'gate_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
+            )
+        up_proj_static_weight_scales_sbuf = heap_alloc(
+            (nl.tile_size.pmax, 1),
+            dtype=nl.float32,
+            name=f'up_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
+        )
+        down_proj_static_weight_scales_sbuf = heap_alloc(
+            (nl.tile_size.pmax, 1),
+            dtype=nl.float32,
+            name=f'down_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
+        )
+        prepare_static_scales(
+            mlp_params,
             constants,
-            mlp_params.quant_params.gate_w_scale,
             gate_up_proj_static_input_scales_sbuf,
-            heap_alloc,
-        )
-        up_proj_static_weight_scales_sbuf = load_and_multiply_static_weight_scales(
-            constants,
-            mlp_params.quant_params.up_w_scale,
-            gate_up_proj_static_input_scales_sbuf,
-            heap_alloc,
-        )
-        down_proj_static_weight_scales_sbuf = load_and_multiply_static_weight_scales(
-            constants,
-            mlp_params.quant_params.down_w_scale,
             down_proj_static_input_scales_sbuf,
-            heap_alloc,
+            gate_proj_static_weight_scales_sbuf,
+            up_proj_static_weight_scales_sbuf,
+            down_proj_static_weight_scales_sbuf,
         )
-        invert_static_scales(down_proj_static_input_scales_sbuf)
-    else:
-        gate_up_proj_static_input_scales_sbuf = None
-        down_proj_static_input_scales_sbuf = None
-        gate_proj_static_weight_scales_sbuf = None
-        up_proj_static_weight_scales_sbuf = None
-        down_proj_static_weight_scales_sbuf = None
 
     # Load normalization weights and bias if necessary
     norm_weights_tensor_sbuf = (
@@ -444,40 +452,28 @@ def _mlp_cte_single_shard(
             hidden_tile_sbuf_list = []
             hidden_tile_scales_sbuf_list = []
 
-            for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
-                hidden_tensor = heap_alloc(
-                    (
-                        tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
-                        mlp_params.hidden_size,
-                    ),
-                    dtype=constants.hidden_tile_data_type,
-                    buffer=nl.sbuf,
-                    name=indices.get_tensor_name("hidden_tensor", f"subbxs{bxs_subtile_idx}"),
-                )
-                hidden_tile_sbuf_list.append(hidden_tensor)
-                if mlpp_input_has_packed_scale(mlp_params):
-                    hidden_scale_tensor = stack_alloc(
-                        (tile_info.bxs_dim_tile.subtile_dim_info.tile_size, 1),
-                        dtype=nl.float32,
-                        buffer=nl.sbuf,
-                        name=indices.get_tensor_name('hidden_scale_tensor', f'subbxs{bxs_subtile_idx}'),
-                    )
-                    hidden_tile_scales_sbuf_list.append(hidden_scale_tensor)
+            allocate_hidden_tensor_tile(
+                mlp_params,
+                tile_info,
+                constants,
+                indices,
+                hidden_tile_sbuf_list,
+                hidden_tile_scales_sbuf_list,
+                sbm,
+            )
 
             # Create space for source projection storage in SBUF
             src_proj_res_sbuf_list = []
-            for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
-                src_proj_tensor = stack_alloc(
-                    (
-                        tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
-                        tile_info.src_proj_intermediate_dim_tile.tile_count,
-                        tile_info.src_proj_intermediate_dim_tile.tile_size,
-                    ),
-                    dtype=constants.compute_data_type,
-                    buffer=nl.sbuf,
-                    name=indices.get_tensor_name("src_proj_res_sbuf", f"subbxs{bxs_subtile_idx}"),
-                )
-                src_proj_res_sbuf_list.append(src_proj_tensor)
+            allocate_intermediate_tensor_tile(
+                mlp_params,
+                tile_info,
+                constants,
+                indices,
+                "src_proj_res_sbuf",
+                constants.compute_data_type,
+                src_proj_res_sbuf_list,
+                sbm,
+            )
 
             # Load the hidden tensor tile with optional fused add and optional storage of fused add result
             load_hidden_tensor_tile_opt_fused_add(
@@ -507,13 +503,24 @@ def _mlp_cte_single_shard(
             # Declare our SBUF tensor for the source projection weights.
             # Create "multiple buffers" using the 2nd dimension to facilitate overlapped loads.
             src_proj_weights_sbuf_list = []
+            weights_tensor_shape = (
+                (
+                    tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_count,  # 128
+                    tile_info.mx_intermediate_dim_tile.tile_count,  # I/512
+                    tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_size,  # 4
+                    tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_count,  # 128
+                    tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_size,  # 4
+                )
+                if mlp_params.quant_params.is_quant_static_mx()
+                else (
+                    tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_size,
+                    tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_count,
+                    mlp_params.intermediate_size,
+                )
+            )
             for weight_buffer_idx in range(constants.src_proj_weights_buffer_count):
                 weights_tensor = heap_alloc(
-                    (
-                        tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_size,
-                        tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_count,
-                        mlp_params.intermediate_size,
-                    ),
+                    weights_tensor_shape,
                     dtype=(
                         constants.src_proj_quant_data_type
                         if mlpp_has_quantized_weights(mlp_params)
@@ -526,17 +533,18 @@ def _mlp_cte_single_shard(
 
             # Perform transpose on the source tensor to prepare for up/gate projection matmuls
             # Apply norm weights (gamma) and norm bias on hidden normalized hidden tensor
-            transpose_source_tensor_tile(
-                mlp_params,
-                tile_info,
-                constants,
-                indices,
-                hidden_tile_sbuf_list,
-                norm_weights_tensor_sbuf,
-                norm_bias_tensor_sbuf,
-                hidden_tile_sbuf_list,
-                sbm,
-            )
+            if not mlpp_has_dma_xpose(mlp_params):
+                transpose_source_tensor_tile(
+                    mlp_params,
+                    tile_info,
+                    constants,
+                    indices,
+                    hidden_tile_sbuf_list,
+                    norm_weights_tensor_sbuf,
+                    norm_bias_tensor_sbuf,
+                    hidden_tile_sbuf_list,
+                    sbm,
+                )
 
             # Perform gate projection if it has been specified in the kernel parameters
             perform_gate_projection_if_necessary(
@@ -574,31 +582,31 @@ def _mlp_cte_single_shard(
                 for weight_buffer_idx in range(constants.src_proj_weights_buffer_count):
                     sbm.pop_heap()  # src_proj_weights_sbuf
                 if mlpp_has_quantized_input(mlp_params):
-                    for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                    for bxs_subtile_idx in range(len(hidden_tile_sbuf_list)):
                         sbm.pop_heap()  # hidden_tile_sbuf
 
             # Perform quantization on the intermediate tensor if necessary
             if mlpp_has_quantized_weights(mlp_params):
                 intermediate_dequant_scales_sbuf_list = []
-                intermediate_tensor_sbuf_list = []
-                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
-                    if mlp_params.quant_params.is_quant_row():
+                if mlp_params.quant_params.is_quant_row():
+                    for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                         intermediate_dequant_scales_sbuf = stack_alloc(
                             (tile_info.bxs_dim_tile.subtile_dim_info.tile_size, 1),
                             dtype=nl.float32,
                             name=indices.get_tensor_name('intermediate_scale_tensor', f'subbxs{bxs_subtile_idx}'),
                         )
                         intermediate_dequant_scales_sbuf_list.append(intermediate_dequant_scales_sbuf)
-                    intermediate_tensor = stack_alloc(
-                        (
-                            tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
-                            tile_info.src_proj_intermediate_dim_tile.tile_count,
-                            tile_info.src_proj_intermediate_dim_tile.tile_size,
-                        ),
-                        dtype=constants.down_proj_quant_data_type,
-                        name=indices.get_tensor_name('intermediate_tensor', f'subbxs{bxs_subtile_idx}'),
-                    )
-                    intermediate_tensor_sbuf_list.append(intermediate_tensor)
+                intermediate_tensor_sbuf_list = []
+                allocate_intermediate_tensor_tile(
+                    mlp_params,
+                    tile_info,
+                    constants,
+                    indices,
+                    'intermediate_tensor',
+                    constants.down_proj_quant_data_type,
+                    intermediate_tensor_sbuf_list,
+                    sbm,
+                )
                 perform_intermediate_quantization(
                     mlp_params,
                     tile_info,
@@ -615,34 +623,27 @@ def _mlp_cte_single_shard(
                 intermediate_tensor_sbuf_list = src_proj_res_sbuf_list
 
             # Declare our SBUF tensor for the down projection weights.
-            # Create "multiple buffers" using the 2nd dimension to facilitate overlapped loads.
             down_proj_weights_sbuf = []
-            for weight_buffer_idx in range(constants.down_proj_weights_buffer_count):
-                down_proj_weights_tensor = stack_alloc(
-                    (
-                        tile_info.down_proj_intermediate_dim_tile.tile_size,
-                        tile_info.down_proj_hidden_dim_tile.tile_size
-                        * (2 if mlpp_has_quantized_weights(mlp_params) else 1),
-                    ),
-                    dtype=(
-                        constants.down_proj_quant_data_type
-                        if mlpp_has_quantized_weights(mlp_params)
-                        else constants.compute_data_type
-                    ),
-                    name=indices.get_tensor_name("down_proj_weights_sbuf", f"buf{weight_buffer_idx}"),
-                )
-                down_proj_weights_sbuf.append(down_proj_weights_tensor)
-
-            # Perform transpose on the intermediate tensor to prepare for down projection matmuls
-            transpose_intermediate_tensor_tile(
+            allocate_down_projection_weights(
                 mlp_params,
                 tile_info,
                 constants,
                 indices,
-                intermediate_tensor_sbuf_list,
-                intermediate_tensor_sbuf_list,
+                down_proj_weights_sbuf,
                 sbm,
             )
+
+            # Perform transpose on the intermediate tensor to prepare for down projection matmuls
+            if not mlp_params.quant_params.is_quant_static_mx():
+                transpose_intermediate_tensor_tile(
+                    mlp_params,
+                    tile_info,
+                    constants,
+                    indices,
+                    intermediate_tensor_sbuf_list,
+                    intermediate_tensor_sbuf_list,
+                    sbm,
+                )
 
             if mlpp_has_quantized_input(mlp_params):
                 output_tile_sbuf_list = []
@@ -709,7 +710,7 @@ def _mlp_cte_single_shard(
         if mlp_params.quant_params.is_quant_row():
             sbm.pop_heap()  # gate_proj_row_weight_scales_sbuf
             sbm.pop_heap()  # up_proj_row_weight_scales_sbuf
-        elif mlp_params.quant_params.is_quant_static():
+        elif mlp_params.quant_params.is_quant_static() or mlp_params.quant_params.is_quant_static_mx():
             sbm.pop_heap()  # gate_up_proj_static_input_scales_sbuf
             sbm.pop_heap()  # down_proj_static_input_scales_sbuf
             sbm.pop_heap()  # gate_proj_static_weight_scales_sbuf

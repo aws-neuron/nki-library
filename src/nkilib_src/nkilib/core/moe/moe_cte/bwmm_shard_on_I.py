@@ -14,14 +14,11 @@
 
 """This file contains high-performance MoE kernels implementing blockwise matrix multiplication with sharding on the intermediate dimension."""
 
-import math
-from enum import Enum
 from typing import Any, Optional
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
-import nki.tensor as ntensor
 from nki.isa import sendrecv
 from nki.isa.constants import oob_mode
 from nki.language import NKIObject
@@ -30,7 +27,6 @@ from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
 from .moe_cte_utils import (
     DVE_CHANNELS_PER_BANK,
-    N_PSUM_BANKS,
     PSUM_SIZE,
     TILE_SIZE,
     Configs,
@@ -87,7 +83,7 @@ class DimensionSizes(NKIObject):
         self.GUP_N_TILES = div_ceil(self.I_TP_sharded, TILE_SIZE)
 
 
-@nki.jit(mode="trace", platform_target="trn2")
+@nki.jit(mode="trace")
 def blockwise_mm_baseline_shard_intermediate(
     hidden_states,
     expert_affinities_masked,
@@ -327,7 +323,7 @@ def blockwise_mm_baseline_shard_intermediate(
         return output
 
 
-@nki.jit(mode="trace", platform_target="trn2")
+@nki.jit(mode="trace")
 def blockwise_mm_baseline_shard_intermediate_hybrid(
     conditions,
     hidden_states,
@@ -579,7 +575,6 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
         nisa.core_barrier(output, (0, 1))
         nisa.tensor_scalar(dst=block_idx, data=block_idx, op0=nl.add, operand0=1)
         nisa.core_barrier(block_idx, (0, 1))
-    nisa.dma_copy(output, output)
     return output
 
 
@@ -764,10 +759,7 @@ def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype):
         block_hidden_states_T.append(outer_list)
 
     block_free_tiles = min(PSUM_SIZE // TILE_SIZE, B // TILE_SIZE)
-    identity_hbm = nl.shared_constant(ntensor.identity(TILE_SIZE, dtype=nl.int8))
-    identity_sbuf = nl.ndarray((TILE_SIZE, TILE_SIZE), dtype=compute_dtype, buffer=nl.sbuf)
-
-    nisa.dma_copy(dst=identity_sbuf, src=identity_hbm)
+    identity_sbuf = nl.shared_identity_matrix(TILE_SIZE, dtype=compute_dtype)
 
     for psum_tile_idx in range(block_psum_tiles):
         for h_outer_idx in range(h_outer_tripcount):
@@ -793,7 +785,6 @@ def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype):
                 nisa.tensor_copy(
                     src=tmp_res[0:TILE_SIZE, 0:free_size],
                     dst=block_hidden_states_T[h_outer_idx][h_inner_idx][0:TILE_SIZE, psum_tile_idx, 0:free_size],
-                    dtype=compute_dtype,
                 )
 
     return block_hidden_states_T
@@ -1678,7 +1669,6 @@ def compute_down_proj_shard_on_intermediate(
                 else:
                     nisa.tensor_copy(
                         src=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
-                        dtype=cfg.compute_dtype,
                         engine=nisa.scalar_engine,
                         dst=block_new_lst[B_tile_idx][
                             0:TILE_SIZE,
@@ -2020,7 +2010,7 @@ def compute_one_block_dropping(
     dims.NUM_B_TILES_SHARDED = ORIGINAL_NUM_B_TILES_SHARDED
 
 
-@nki.jit(mode="trace", platform_target="trn2")
+@nki.jit(mode="trace")
 def blockwise_mm_shard_intermediate_dropping(
     hidden_states,
     expert_affinities_masked,

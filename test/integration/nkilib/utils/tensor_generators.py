@@ -13,12 +13,19 @@
 # limitations under the License.
 import inspect
 from dataclasses import dataclass
-from test.integration.nkilib.utils.dtype_helper import dt, static_cast
-from test.utils.mx_utils import dequantize_mx_golden, get_mx_fp_max, get_mx_max_exp, quantize_mx_golden
+from test.utils.mx_utils import NL_TO_DT_DTYPE, dequantize_mx_golden, get_mx_fp_max, get_mx_max_exp, quantize_mx_golden
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
+from neuron_dtypes import static_cast
 from typing_extensions import override
+
+# FP8 quantization constants
+FP8_E4M3_MAX = 240.0
+FP8_E5M2_MAX = 57344.0
+FP8_E4M3_SCALE = 1 / 256.0
+FP8_E5M2_SCALE = 1 / 65536.0
 
 
 def update_func_str(**arg_vals):
@@ -246,15 +253,19 @@ def np_random_sample_static_quantize_inp(seed=0):
         rand_arr = np.random.random_sample(shape)
         w_scale = np.random.random_sample()
         in_scale = np.random.random_sample()
-        if dtype in (nl.float8_e4m3, nl.float8_e5m2):
-            # For FP8, generate numbers from -range to range
-            max_range_map = {
-                nl.float8_e4m3: 240.0,
-                nl.float8_e5m2: 57344.0,
+        if dtype in (nl.float8_e4m3, nl.float8_e5m2, nl.float8_e4m3fn):
+            # FP8 dtype ranges: (min_val, max_val)
+            range_map = {
+                nl.float8_e4m3: (-240.0, 240.0),
+                nl.float8_e4m3fn: (-448.0, 448.0),
+                nl.float8_e5m2: (-57344.0, 57344.0),
             }
-            scale_map = {nl.float8_e4m3: 1 / 256.0, nl.float8_e5m2: 1 / 65536.0}
-            max_range = max_range_map[dtype]
-            rand_arr_casted = dt.static_cast(dt.static_cast(rand_arr * max_range - max_range, dtype), np.float32)
+            scale_map = {nl.float8_e4m3: 1 / 256.0, nl.float8_e4m3fn: 1 / 512.0, nl.float8_e5m2: 1 / 65536.0}
+            min_val, max_val = range_map[dtype]
+            # Generate numbers in [min_val, max_val] range
+            rand_arr_casted = dt.static_cast(
+                dt.static_cast(rand_arr * (max_val - min_val) + min_val, dtype), np.float32
+            )
             w_scale = dt.static_cast(w_scale * scale_map[dtype], np.float32)
             in_scale = dt.static_cast(in_scale * scale_map[dtype], np.float32)
             return dt.static_cast(rand_arr_casted, dtype), w_scale, in_scale
@@ -387,7 +398,7 @@ def generate_stabilized_mx_data(mx_dtype, shape, val_range=1.0):
             mantissa = 1.0 + np.random.random() * 0.5
             rand_data[i + tile_i, j + tile_j] = sign * mantissa * (2**max_exp)
 
-    rand_quantized_data = static_cast(rand_data.astype(np.float32), mx_dtype)
+    rand_quantized_data = static_cast(rand_data.astype(np.float32), NL_TO_DT_DTYPE.get(mx_dtype, mx_dtype))
 
     # Calculate mx_scale bounds based on val_range
     # max_val already takes max_exp into account

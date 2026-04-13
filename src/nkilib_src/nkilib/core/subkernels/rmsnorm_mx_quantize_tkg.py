@@ -16,7 +16,6 @@
 
 from typing import Optional
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
 
@@ -225,7 +224,7 @@ def rmsnorm_mx_quantize_tkg(
             )
 
         # Reduce squared input along H1 dimension (last free dimension)
-        nisa.tensor_reduce(dst=reduced, op=nl.add, data=square, axis=1)
+        nisa.tensor_reduce(dst=reduced, op=nl.add, data=square, axis=2)
 
         # Complete reduction across H0 dimension using matmul
         nisa.nc_matmul(dst=final_reduced, stationary=reduction_const_matrix, moving=reduced)
@@ -258,21 +257,29 @@ def rmsnorm_mx_quantize_tkg(
                 dst_scale=output_scale[0:H0, h512_tile_idx : h512_tile_idx + 1, output_tile_BxS_slice],
             )
 
-    # Step 5: Gather output_quant and output_scale across LNC cores
+    # Step 5: Gather output, output_quant, and output_scale across LNC cores
     send_to_rank = recv_from_rank = 1 - shard_id
+    # Exchange the non-quantized output so both NCs have complete data for router_topk
+    nisa.sendrecv(
+        send_to_rank=send_to_rank,
+        recv_from_rank=recv_from_rank,
+        src=output[0:H0, nl.ds(BxS_offset, shard_size), 0:H1],
+        dst=output[0:H0, nl.ds((1 - shard_id) * shard_size, shard_size), 0:H1],
+        pipe_id=0,
+    )
     nisa.sendrecv(
         send_to_rank=send_to_rank,
         recv_from_rank=recv_from_rank,
         src=output_quant[0:H0, 0:num_H512_tiles, nl.ds(BxS_offset, shard_size)],
         dst=output_quant[0:H0, 0:num_H512_tiles, nl.ds((1 - shard_id) * shard_size, shard_size)],
-        pipe_id=0,
+        pipe_id=1,
     )
     nisa.sendrecv(
         send_to_rank=send_to_rank,
         recv_from_rank=recv_from_rank,
         src=output_scale[0:H0, 0:num_H512_tiles, nl.ds(BxS_offset, shard_size)],
         dst=output_scale[0:H0, 0:num_H512_tiles, nl.ds((1 - shard_id) * shard_size, shard_size)],
-        pipe_id=1,
+        pipe_id=2,
     )
 
     # Step 6: Spill residual result to HBM (if residual add enabled)

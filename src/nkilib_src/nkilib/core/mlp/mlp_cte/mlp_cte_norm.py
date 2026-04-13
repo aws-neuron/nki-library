@@ -16,10 +16,8 @@
 
 from typing import Callable, Optional
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
-import numpy as np
 
 from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
@@ -80,7 +78,7 @@ def apply_rms_norm_to_source_tensor_tile(
 
     square_result_sbuf = allocate(
         (
-            nl.par_dim(BXS_SUBTILE_SIZE),
+            BXS_SUBTILE_SIZE,
             mlp_params.hidden_size,
         ),
         dtype=constants.activation_data_type,
@@ -91,7 +89,7 @@ def apply_rms_norm_to_source_tensor_tile(
     for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
         square_accum_result_tensor = allocate(
             (
-                nl.par_dim(BXS_SUBTILE_SIZE),
+                BXS_SUBTILE_SIZE,
                 1,
             ),
             dtype=constants.activation_data_type,
@@ -214,7 +212,7 @@ def apply_layer_norm_to_source_tensor_tile(
     for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
         bn_aggr_result_tensor = allocate(
             (
-                nl.par_dim(BXS_SUBTILE_SIZE),
+                BXS_SUBTILE_SIZE,
                 BN_AGGR_ELEMENTS_PER_TILE,
             ),
             dtype=constants.activation_data_type,

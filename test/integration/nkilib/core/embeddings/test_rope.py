@@ -13,24 +13,22 @@
 # limitations under the License.
 
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
-from test.utils.common_dataclasses import (
-    CompilerArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    ValidationArgs,
-)
-from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult, assert_negative_test_case
+from test.utils.common_dataclasses import CompilerArgs
+from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
-import neuronxcc.nki.language as nl
+import nki.language as nl
 import nkilib_src.nkilib.core.embeddings.rope as rope
 import numpy as np
 import pytest
+from nkilib_src.nkilib.core.embeddings.rope_torch import rope_torch_ref
 
-# BF16 tolerance: 7 mantissa bits → ~1% relative precision
-_RTOL = 0.01
+_BF16_EPS = 2**-7
+_RTOL = _BF16_EPS
 _ATOL = 1e-3
 
 
@@ -68,54 +66,6 @@ def generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in
     }
 
 
-def rope_single_head(x_in, cos, sin, contiguous_layout):
-    """Apply RoPE to single head: [d_head, S]."""
-    d_head, S = x_in.shape
-    x = x_in.transpose(1, 0)  # [d_head, S] -> [S, d_head]
-
-    # Convert contiguous layout to interleaved if needed
-    if contiguous_layout:
-        new_x = np.empty_like(x)
-        new_x[:, ::2] = x[:, : d_head // 2]  # even positions <- first half
-        new_x[:, 1::2] = x[:, d_head // 2 :]  # odd positions <- second half
-        x = new_x
-
-    # Prepare frequencies
-    freqs_cos = cos.transpose(1, 0)  # [half_d, S] -> [S, half_d]
-    freqs_sin = sin.transpose(1, 0)
-
-    # Split into real/imaginary pairs: [S, d_head] -> [S, d_head//2, 2]
-    xri = x.reshape(x.shape[:-1] + (-1, 2))
-    x_r, x_i = xri[..., 0], xri[..., 1]  # [S, d_head//2] each
-
-    # Apply RoPE rotation
-    x_out_r = x_r * freqs_cos - x_i * freqs_sin
-    x_out_i = x_r * freqs_sin + x_i * freqs_cos
-
-    # Recombine: [S, d_head//2, 2] -> [S, d_head]
-    x_out = np.stack([x_out_r, x_out_i], axis=-1).reshape(x.shape)
-
-    # Convert interleaved back to contiguous if needed
-    if contiguous_layout:
-        x_out = np.concatenate((x_out[:, 0::2], x_out[:, 1::2]), axis=1)
-
-    return x_out.transpose(1, 0)  # [S, d_head] -> [d_head, S]
-
-
-def golden_rope_np(kernel_input, contiguous_layout):
-    """NumPy reference implementation of RoPE."""
-    x_in, cos, sin = kernel_input["x_in"], kernel_input["cos"], kernel_input["sin"]
-    d_head, B, n_heads, S = x_in.shape
-
-    # Apply to all batch and head dimensions
-    x_out = np.empty_like(x_in)
-    for b in range(B):
-        for h in range(n_heads):
-            x_out[:, b, h, :] = rope_single_head(x_in[:, b, h, :], cos[:, b, :], sin[:, b, :], contiguous_layout)
-
-    return {"x_out": nl.static_cast(x_out, x_in.dtype)}
-
-
 @pytest_test_metadata(
     name="RoPE",
     pytest_marks=["embeddings", "rope"],
@@ -123,6 +73,32 @@ def golden_rope_np(kernel_input, contiguous_layout):
 @final
 class TestRopeKernel:
     """Test class for RoPE kernel."""
+
+    @staticmethod
+    def _output_tensors(kernel_input):
+        x_in = kernel_input["x_in"]
+        return {"x_out": np.zeros(x_in.shape, dtype=x_in.dtype)}
+
+    def _run_rope_test(
+        self, test_manager, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf, is_negative_test=False
+    ):
+        def input_generator(test_config):
+            return generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=rope.RoPE,
+            torch_ref=torch_ref_wrapper(rope_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=self._output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(),
+            rtol=_RTOL,
+            atol=_ATOL,
+            is_negative_test=is_negative_test,
+        )
 
     @pytest.mark.fast
     @pytest.mark.coverage_parametrize(
@@ -149,28 +125,16 @@ class TestRopeKernel:
         is_negative_test_case,
     ):
         """Fast tests with minimal coverage for quick validation."""
-        with assert_negative_test_case(is_negative_test_case):
-            kernel_input = generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)
-            x_in = kernel_input["x_in"]
-
-            def create_golden():
-                return golden_rope_np(kernel_input, contiguous_layout)
-
-            test_manager.execute(
-                KernelArgs(
-                    kernel_func=rope.RoPE,
-                    compiler_input=CompilerArgs(enable_birsim=True),
-                    kernel_input=kernel_input,
-                    validation_args=ValidationArgs(
-                        golden_output=LazyGoldenGenerator(
-                            lazy_golden_generator=create_golden,
-                            output_ndarray={"x_out": np.zeros(x_in.shape, dtype=x_in.dtype)},
-                        ),
-                        absolute_accuracy=_ATOL,
-                        relative_accuracy=_RTOL,
-                    ),
-                )
-            )
+        self._run_rope_test(
+            test_manager,
+            d_head,
+            B,
+            n_heads,
+            S,
+            contiguous_layout,
+            relayout_in_sbuf,
+            is_negative_test=is_negative_test_case,
+        )
 
     @pytest.mark.coverage_parametrize(
         d_head=BoundedRange([64, 128], boundary_values=[32, 63, 129, 256]),
@@ -195,31 +159,20 @@ class TestRopeKernel:
         is_negative_test_case,
     ):
         """Full sweep tests with pairwise coverage."""
-        with assert_negative_test_case(is_negative_test_case):
-            kernel_input = generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)
-            x_in = kernel_input["x_in"]
+        self._run_rope_test(
+            test_manager,
+            d_head,
+            B,
+            n_heads,
+            S,
+            contiguous_layout,
+            relayout_in_sbuf,
+            is_negative_test=is_negative_test_case,
+        )
 
-            def create_golden():
-                return golden_rope_np(kernel_input, contiguous_layout)
+    _ROPE_ABBREVS = {"d_head": "dh", "contiguous_layout": "contig", "relayout_in_sbuf": "relayout"}
 
-            # Disable birsim for negative tests (golden would crash on invalid params)
-            test_manager.execute(
-                KernelArgs(
-                    kernel_func=rope.RoPE,
-                    compiler_input=CompilerArgs(enable_birsim=not is_negative_test_case),
-                    kernel_input=kernel_input,
-                    validation_args=ValidationArgs(
-                        golden_output=LazyGoldenGenerator(
-                            lazy_golden_generator=create_golden,
-                            output_ndarray={"x_out": np.zeros(x_in.shape, dtype=x_in.dtype)},
-                        ),
-                        absolute_accuracy=_ATOL,
-                        relative_accuracy=_RTOL,
-                    ),
-                )
-            )
-
-    @pytest.mark.parametrize(
+    @pytest_parametrize(
         "d_head,B,n_heads,S,contiguous_layout,relayout_in_sbuf",
         [
             (128, 8192, 1, 8, True, False),
@@ -236,28 +189,14 @@ class TestRopeKernel:
             (128, 4, 8, 1024, True, False),
             (128, 2, 128, 256, True, False),
             (64, 2, 128, 256, True, False),
+            # non-contiguous layout large BnS
+            (128, 255, 2, 8, False, False),
+            (64, 255, 8, 6, False, False),
+            (128, 128, 4, 4, False, False),
+            (128, 64, 8, 2, False, False),
         ],
+        abbrevs=_ROPE_ABBREVS,
     )
     def test_rope_manual(self, test_manager: Orchestrator, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf):
         """Manual test cases for QoR tracking and deterministic pipeline runs."""
-        kernel_input = generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)
-        x_in = kernel_input["x_in"]
-
-        def create_golden():
-            return golden_rope_np(kernel_input, contiguous_layout)
-
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=rope.RoPE,
-                compiler_input=CompilerArgs(enable_birsim=True),
-                kernel_input=kernel_input,
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(
-                        lazy_golden_generator=create_golden,
-                        output_ndarray={"x_out": np.zeros(x_in.shape, dtype=x_in.dtype)},
-                    ),
-                    absolute_accuracy=_ATOL,
-                    relative_accuracy=_RTOL,
-                ),
-            )
-        )
+        self._run_rope_test(test_manager, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)

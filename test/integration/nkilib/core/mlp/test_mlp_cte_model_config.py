@@ -14,7 +14,7 @@
 """
 MLP CTE model configuration data
 
-Config format: [vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, norm_type, quant_type,
+Config format: [vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, rtol, norm_type, quant_type,
                 fused_add, store_add, skip_gate, act_fn_type, gate_bias, up_bias, down_bias, norm_bias]
 """
 
@@ -22,6 +22,6 @@ from nkilib_src.nkilib.core.utils.common_types import ActFnType, NormType, Quant
 
 # fmt: off
 mlp_cte_model_configs = [
-    # [vnc, batch, seqlen, hidden, intermediate, cycles, norm_type, quant_type, fused_add, store_add, skip_gate, act_fn, gate_bias, up_bias, down_bias, norm_bias]
+    # [vnc, batch, seqlen, hidden, intermediate, cycles, rtol, norm_type, quant_type, fused_add, store_add, skip_gate, act_fn, gate_bias, up_bias, down_bias, norm_bias]
 ]
 # fmt: on

@@ -94,7 +94,9 @@ def _down_proj_prep_inter_and_weights(
 
         kernel_assert(weight.shape == (p_I, cfg.n_total_I512_tile, H), "Incorrect weight shape")
         nisa.dma_copy(
-            src=weight[:, :, prg_id * H_sharded : (prg_id + 1) * H_sharded], dst=weight_qtz[:p_I, :, :], dge_mode=2
+            src=weight[:, :, prg_id * H_sharded : (prg_id + 1) * H_sharded],
+            dst=weight_qtz[:p_I, :, :],
+            dge_mode=nisa.dge_mode.hwdge,
         )
 
     # Check if weight scale is already in SBUF or needs to be loaded from HBM
@@ -126,14 +128,19 @@ def _down_proj_prep_inter_and_weights(
                         dst=weight_qtz_scale[
                             i_quad * SBUF_QUADRANT_SIZE + i_4 : i_quad * SBUF_QUADRANT_SIZE + i_4 + 1, :, :
                         ],
-                        dge_mode=2,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
 
     return inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale
 
 
 def down_projection_mx_tp_shard_H(
-    inter_sb: nl.ndarray, weight: nl.ndarray, weight_scale: nl.ndarray, bias_sb: Optional[nl.ndarray], cfg: ProjConfig
+    inter_sb: nl.ndarray,
+    weight: nl.ndarray,
+    weight_scale: nl.ndarray,
+    bias_sb: Optional[nl.ndarray],
+    cfg: ProjConfig,
+    partial_output: bool = False,
 ) -> nl.ndarray:
     """
     Performs the Down projection with H-dimension sharding. Math (Neuron matmul):
@@ -147,7 +154,8 @@ def down_projection_mx_tp_shard_H(
     :param weight: mxfp_x4[_pmax, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
     :param weight_scale: mxfp_x4[_pmax // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
     :param bias_sb [OPTIONAL]: bf16[_pmax, H_sharded//_pmax] @ SB.
-    :return: bf16[_pmax, H//_pmax, BxS] @ SB.
+    :param partial_output: If True, skips LNC synchronization and returns only local shard.
+    :return: bf16[_pmax, H1_sharded, BxS] @ SB if partial_output=True, else bf16[_pmax, H1, BxS] @ SB.
     """
     n_prgs, prg_id = cfg.n_prgs, cfg.prg_id
     kernel_assert(cfg.H_sharded % _pmax == 0, "down projection with [H, T] output layout requires H divisible by 128")
@@ -161,7 +169,8 @@ def down_projection_mx_tp_shard_H(
         return weight_qtz, weight_qtz_scale
 
     # Matmul compute, tiles on H
-    out_sb = nl.ndarray((cfg.H0, cfg.H1, cfg.BxS), dtype=nl.bfloat16, buffer=nl.sbuf)  # alloc space for full H
+    out_shape = (cfg.H0, cfg.H1_sharded, cfg.BxS) if partial_output else (cfg.H0, cfg.H1, cfg.BxS)
+    out_sb = nl.ndarray(out_shape, dtype=nl.bfloat16, buffer=nl.sbuf)
 
     for i_H1 in range(cfg.H1_sharded):
         # Allocate psum for current H128 tile
@@ -182,10 +191,12 @@ def down_projection_mx_tp_shard_H(
         act_bias_arg = None
         if bias_sb is not None:
             act_bias_arg = bias_sb[:, i_H1]
-        nisa.activation(dst=out_sb[:, i_H1 + cfg.H1_sharded * prg_id, :], op=nl.copy, data=h128_psum, bias=act_bias_arg)
+        idx = i_H1 if partial_output else cfg.H1_sharded * prg_id + i_H1
+        nisa.activation(dst=out_sb[:, idx, :], op=nl.copy, data=h128_psum, bias=act_bias_arg)
 
     # Receive projection output from the other NC when LNC > 1
-    if n_prgs > 1:
+    # Skip sendrecv if partial_output=True (caller handles synchronization or only needs local shard)
+    if not partial_output and n_prgs > 1:
         other_prg_id = 1 - prg_id
         nisa.sendrecv(
             src=out_sb[:, prg_id * cfg.H1_sharded : (prg_id + 1) * cfg.H1_sharded, :],

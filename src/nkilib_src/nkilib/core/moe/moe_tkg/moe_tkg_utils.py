@@ -14,7 +14,6 @@
 
 """Utility functions for MoE token generation kernels including expert affinity gathering and broadcasting."""
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
 
@@ -65,14 +64,14 @@ def gather_expert_affinities(
         expert_idx_u16 = sbm.alloc_stack(
             (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
         )
-        nisa.memset(dst=expert_idx_u16, value=0.0)
+        nisa.memset(dst=expert_idx_u16, value=0)
         nisa.tensor_copy(dst=expert_idx_u16[0 : dims.T, 0 : dims.K], src=expert_idx[0 : dims.T, 0 : dims.K])
 
         # Prepare index values for gathering
         index_values = sbm.alloc_stack(
             (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values"
         )
-        nisa.memset(dst=index_values, value=0.0)
+        nisa.memset(dst=index_values, value=0)
         expert_indices_trans = sbm.alloc_stack(
             (PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE),
             dtype=nl.uint16,
@@ -98,14 +97,14 @@ def gather_expert_affinities(
         expert_idx_u16 = sbm.alloc_stack(
             (128, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
         )
-        nisa.memset(dst=expert_idx_u16, value=0.0)
+        nisa.memset(dst=expert_idx_u16, value=0)
         nisa.tensor_copy(dst=expert_idx_u16[0 : dims.T, 0 : dims.K], src=expert_idx[0 : dims.T, 0 : dims.K])
 
         # Fill out 16 partition layout requirement in blocks of 16 partitions up to 128 partitions total
         index_values = sbm.alloc_stack(
             (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values", align=32
         )
-        nisa.memset(dst=index_values, value=0.0)
+        nisa.memset(dst=index_values, value=0)
         for channel_idx in range(active_channels):
             # Use DMA Transpose for better performance with larger token counts
             nisa.dma_transpose(

@@ -16,7 +16,6 @@
 
 from typing import Optional
 
-import nki
 import nki.language as nl
 
 # MLP utils
@@ -67,6 +66,7 @@ def moe_tkg(
     up_clamp_lower_limit: Optional[float] = None,
     output_in_sbuf: bool = False,
     is_all_expert_dynamic: bool = False,
+    block_size: int = None,
 ) -> nl.ndarray:
     """
     Mixture of Experts (MoE) MLP token generation kernel.
@@ -132,6 +132,10 @@ def moe_tkg(
             (default), allocate output in HBM with shape [T, H].
         is_all_expert_dynamic (bool): If True, configures all-expert algorithm to use dynamic control flow.
             If False (default), utilizes all-expert algorithm without dynamic control flow. Only valid when is_all_expert=True.
+        block_size (int): Block size for all-expert dynamic algorithm, used to group tokens for dynamic control flow. Required argument
+            when is_all_expert_dynamic=True. block_size must:
+            - Evenly divide T, resulting in at least 2 blocks.
+            - Be divisible by 8 and less than 32, divisible by 32 and less than 128, or divisible by 128.
 
     Returns:
         output (nl.ndarray): [T, H] or same shape as hidden_input if output_in_sbuf=True, Output tensor with
@@ -190,6 +194,7 @@ def moe_tkg(
             K=K,
             io_dtype=expert_affinities.dtype,
             mask_unselected_experts=mask_unselected_experts,
+            output_in_sbuf=not is_all_expert_dynamic,
         )
     else:
         masked_expert_affinities = expert_affinities
@@ -240,6 +245,7 @@ def moe_tkg(
         T=T,
         is_all_expert=is_all_expert,
         is_all_expert_dynamic=is_all_expert_dynamic,
+        block_size=block_size,
         is_mx_kernel=is_mx_kernel,
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
@@ -259,7 +265,9 @@ def moe_tkg(
     # Dispatch to expert MLP implementation
     if is_all_expert:
         if is_mx_kernel:
-            _all_expert_moe_tkg_mx(mlp_params, output, is_all_expert_dynamic=is_all_expert_dynamic)
+            _all_expert_moe_tkg_mx(
+                mlp_params, output, is_all_expert_dynamic=is_all_expert_dynamic, block_size=block_size
+            )
         else:
             _all_expert_moe_tkg(mlp_params, output)
     else:
@@ -298,9 +306,9 @@ def _extract_quantization_type(
     if expert_gate_up_weights.dtype in _SUPPORTED_MX_DTYPES:
         quant_type = QuantizationType.MX
         is_mx_kernel = True
-    elif gate_up_input_scale is not None and down_input_scale is not None:
+    elif gate_up_input_scale != None and down_input_scale != None:
         quant_type = QuantizationType.STATIC
-    elif expert_gate_up_weights_scale is not None and expert_down_weights_scale is not None:
+    elif expert_gate_up_weights_scale != None and expert_down_weights_scale != None:
         quant_type = QuantizationType.ROW
 
     return quant_type, is_mx_kernel
@@ -310,6 +318,7 @@ def _validate_moe_tkg_inputs(
     T: int,
     is_all_expert: bool,
     is_all_expert_dynamic: bool,
+    block_size: int,
     is_mx_kernel: bool,
     expert_gate_up_weights_scale: Optional[nl.ndarray],
     expert_down_weights_scale: Optional[nl.ndarray],
@@ -341,15 +350,20 @@ def _validate_moe_tkg_inputs(
     # MX quantization requires scales
     if is_mx_kernel:
         kernel_assert(
-            expert_gate_up_weights_scale is not None and expert_down_weights_scale is not None,
+            expert_gate_up_weights_scale != None and expert_down_weights_scale != None,
             f"{_MOE_TKG_ERROR_PREFIX} Scales must be set when using MX weights",
         )
 
-    # Dynamic control flow can only be used with is_all_expert=True
-    kernel_assert(
-        not is_all_expert_dynamic or is_all_expert,
-        f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires is_all_expert=True, but got {is_all_expert=}",
-    )
+    # Dynamic control flow requires is_all_expert=True and block_size != None
+    if is_all_expert_dynamic:
+        kernel_assert(
+            is_all_expert,
+            f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires is_all_expert=True, but got {is_all_expert=}",
+        )
+        kernel_assert(
+            block_size != None,
+            f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires block_size != None, but got {block_size=}",
+        )
 
     # hidden_input_scale only supported with MX weights in ALL_EXPERT mode
     kernel_assert(
@@ -357,10 +371,10 @@ def _validate_moe_tkg_inputs(
         f"{_MOE_TKG_ERROR_PREFIX} hidden_input_scale is only supported with MX weights in all-expert mode",
     )
 
-    # Token count limitation (except for MX all-expert mode)
+    # Token count limitation (except for all-expert mode which supports T-tiling)
     kernel_assert(
-        T <= 128 or (is_mx_kernel and is_all_expert),
-        f"{_MOE_TKG_ERROR_PREFIX} Currently only batch size * seq len <= 128 is supported (except for MX all-expert mode)",
+        T <= 128 or is_all_expert,
+        f"{_MOE_TKG_ERROR_PREFIX} Currently only batch size * seq len <= 128 is supported (except for all-expert mode)",
     )
 
     # Affinity scaling mode restrictions

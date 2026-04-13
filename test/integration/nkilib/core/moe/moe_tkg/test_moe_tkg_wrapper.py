@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
-import numpy as np
 from nkilib_src.nkilib.core.moe import moe_tkg
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,

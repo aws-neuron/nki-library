@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# LEGACY SWEEP TEST FRAMEWORK - Uses @range_test_config / RangeTestHarness
+# New tests should use @pytest.mark.coverage_parametrize instead
+
 """
 Tests for blockwise_mm_baseline_shard_hidden kernel (H-shard MoE).
 """

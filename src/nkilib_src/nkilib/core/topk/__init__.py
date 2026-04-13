@@ -13,3 +13,5 @@
 # limitations under the License.
 
 from .rotational_topk import topk
+
+__all__ = ["topk"]

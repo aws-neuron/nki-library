@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# LEGACY SWEEP TEST FRAMEWORK - Uses @range_test_config / RangeTestHarness
+# New tests should use @pytest.mark.coverage_parametrize instead
+
 """
 Comprehensive tests for Cross Entropy loss kernel.
-
-Based on the test grid from: https://quip-amazon.com/AnOFAD11m20n/Cross-Entropy-Test-Grid
 
 Tests the cross_entropy_forward_kernel with hardcoded optimal PB (positions_per_batch)
 and CS (chunk_size) parameters. The PB/CS values were determined through optimization

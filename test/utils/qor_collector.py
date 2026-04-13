@@ -34,6 +34,9 @@ QOR_METRICS = [
     "MbuEstimatedPercent",
     "ProfilerMFU",
     "InferenceTime",
+    "ActiveInferenceTime",
+    "SeparatedComputeTime",
+    "SeparatedMemoryTime",
 ]
 
 # Dimension fields to include in CSV

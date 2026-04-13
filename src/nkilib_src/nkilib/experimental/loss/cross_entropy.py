@@ -24,7 +24,7 @@ from ...core.utils.kernel_helpers import div_ceil, get_verified_program_sharding
 from .validation import validate_cross_entropy_backward_inputs, validate_cross_entropy_forward_inputs
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def cross_entropy_forward(
     logits_hbm: nl.ndarray,
     targets_hbm: nl.ndarray,
@@ -304,7 +304,7 @@ def cross_entropy_forward(
     return loss_hbm, lse_state_hbm
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def cross_entropy_backward(
     logits_hbm: nl.ndarray,
     targets_hbm: nl.ndarray,

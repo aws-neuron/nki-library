@@ -27,6 +27,7 @@ class LncSubscriptable(Generic[TorchRefProtocolT]):
     def __init__(self, func: Callable, protocol: TorchRefProtocolType):
         self._func = func
         self._lnc: int = 0
+        self._shard_id: int = 0
         _verify_protocol_sync(func, protocol)
 
     def __getitem__(self, lnc: int) -> TorchRefProtocolT:
@@ -46,6 +47,16 @@ class LncSubscriptable(Generic[TorchRefProtocolT]):
     def lnc(self) -> int:
         """Get the current LNC value."""
         return self._lnc
+
+    @property
+    def shard_id(self) -> int:
+        """Get the current shard ID (0 to lnc-1)."""
+        return self._shard_id
+
+    @shard_id.setter
+    def shard_id(self, value: int) -> None:
+        """Set the shard ID to simulate."""
+        self._shard_id = value
 
 
 def _verify_protocol_sync(func: Callable, protocol: TorchRefProtocolType):

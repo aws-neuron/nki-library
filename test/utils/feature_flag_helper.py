@@ -75,15 +75,18 @@ def derive_pytest_test_id() -> str:
     return test_id
 
 
+def truncate_name_for_filesystem(name: str, max_length: int = MAX_DIR_NAME_LENGTH) -> str:
+    """Truncate long file/directory names to avoid filesystem limits (255 chars).
+    Append a hash of the full name to maintain uniqueness."""
+    if len(name) <= max_length:
+        return name
+    name_hash = hashlib.md5(name.encode()).hexdigest()[:12]
+    truncated = name[: max_length - 13]
+    return f"{truncated}_{name_hash}"
+
+
 def construct_test_output_directory_name():
     test_id: str = derive_pytest_test_id()
     dir_name = f"out-{test_id}"
 
-    # Truncate long directory names to avoid filesystem limits (255 chars)
-    # Append a hash of the full name to maintain uniqueness
-    if len(dir_name) > MAX_DIR_NAME_LENGTH:
-        name_hash = hashlib.md5(dir_name.encode()).hexdigest()[:12]
-        truncated = dir_name[: MAX_DIR_NAME_LENGTH - 13]
-        dir_name = f"{truncated}_{name_hash}"
-
-    return dir_name
+    return truncate_name_for_filesystem(dir_name)

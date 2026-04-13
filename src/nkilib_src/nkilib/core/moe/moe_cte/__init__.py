@@ -30,6 +30,7 @@ __all__ = [
     "MoECTEImplementation",
     "ShardOnBlockConfig",
     "ShardOnIConfig",
+    "QuantizationConfig",
     "BlockShardStrategy",
     "SkipMode",
 ]

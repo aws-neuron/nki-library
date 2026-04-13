@@ -24,7 +24,9 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import nki.language as nl
 
+from .allocator import num_elts, sizeinbytes
 from .kernel_assert import kernel_assert
+from .kernel_helpers import is_hbm_buffer
 from .logging import Logger
 
 # Create logger instance
@@ -60,6 +62,9 @@ class TensorView(nl.NKIObject):
     def is_sbuf(self) -> bool:
         return self.base_tensor.buffer == nl.sbuf
 
+    def is_hbm(self) -> bool:
+        return is_hbm_buffer(self.base_tensor)
+
     @staticmethod
     def get_trivial_strides(shape: Tuple[int, ...], base_stride: int = 1) -> Tuple[int, ...]:
         """Compute row-major (C-style) strides for given tensor shape.
@@ -86,18 +91,113 @@ class TensorView(nl.NKIObject):
     def __init__(self, base_tensor: nl.ndarray):
         """Initialize a TensorView.
         Args:
-            base_tensor: The underlying NKI tensor
+            base_tensor: The underlying NKI tensor or another TensorView
         Raises:
             AssertionError: If base_tensor is None
         """
         kernel_assert(base_tensor is not None, "Base tensor cannot be None")
-        self.base_tensor = base_tensor
-        self.shape = tuple(base_tensor.shape)
-        self.strides = TensorView.get_trivial_strides(self.shape)
-        self.offset = 0
-        self.dtype = base_tensor.dtype
-        self.scalar_offset = None
-        self.indirect_dim = None
+
+        # If passed a TensorView, copy its state instead of wrapping
+        if isinstance(base_tensor, TensorView):
+            self.base_tensor = base_tensor.base_tensor
+            self.shape = base_tensor.shape
+            self.strides = base_tensor.strides
+            self.offset = base_tensor.offset
+            self.dtype = base_tensor.dtype
+            self.scalar_offset = base_tensor.scalar_offset
+            self.vector_offset = base_tensor.vector_offset
+            self.indirect_dim = base_tensor.indirect_dim
+        else:
+            self.base_tensor = base_tensor
+            self.shape = tuple(base_tensor.shape)
+            self.strides = TensorView.get_trivial_strides(self.shape)
+            self.offset = 0
+            self.dtype = base_tensor.dtype
+            self.scalar_offset = None
+            self.vector_offset = None
+            self.indirect_dim = None
+
+    def reinterpret_cast(self, new_dtype) -> "TensorView":
+        """Reinterpret the tensor view as a different dtype, adjusting the last dimension.
+
+        Similar to NumPy's ndarray.view(dtype) or C++ reinterpret_cast. No data is copied;
+        only the dtype, shape, and strides are adjusted to reflect the new element size.
+
+        Since strides are in units of elements (not bytes), all strides must be scaled
+        when the element size changes, so that each stride still represents the same
+        byte offset. Only the last dimension's shape changes.
+
+        Args:
+            new_dtype: Target NKI dtype to reinterpret as
+
+        Returns:
+            New TensorView with adjusted dtype, shape, and strides
+
+        Example:
+            (128, 512) float32 strides (512, 1) → reinterpret_cast(nl.uint8) → (128, 2048) strides (2048, 1)
+            (128, 2048) uint8 strides (2048, 1) → reinterpret_cast(nl.float32) → (128, 512) strides (512, 1)
+
+        Raises:
+            AssertionError: If the cast is not memory-compatible
+        """
+        old_size = sizeinbytes(self.dtype)
+        new_size = sizeinbytes(new_dtype)
+
+        if old_size == new_size:
+            return self._copy(dtype=new_dtype)
+
+        # Cross-size cast is incompatible with indirect addressing because
+        # scalar_offset/vector_offset are in base-tensor element units that
+        # would need rescaling, which is not supported.
+        kernel_assert(
+            self.indirect_dim is None,
+            "reinterpret_cast with different element sizes is not supported after dynamic/vector select",
+        )
+
+        last_dim = self.get_dim() - 1
+        last_dim_size = self.shape[last_dim]
+
+        if new_size > old_size:
+            # Casting to larger dtype: last dim shrinks, strides shrink
+            ratio = new_size // old_size
+            kernel_assert(
+                self.strides[last_dim] == 1,
+                f"reinterpret_cast to larger dtype requires contiguous last dimension (stride=1), got stride={self.strides[last_dim]}",
+            )
+            kernel_assert(
+                last_dim_size % ratio == 0,
+                f"Last dimension size {last_dim_size} not divisible by dtype size ratio {ratio}",
+            )
+            kernel_assert(
+                self.offset % ratio == 0,
+                f"Offset {self.offset} not divisible by dtype size ratio {ratio}",
+            )
+            # All strides scale down (fewer elements per same byte distance)
+            new_strides = []
+            for i in range(last_dim):
+                kernel_assert(
+                    self.strides[i] % ratio == 0,
+                    f"Stride at dimension {i} ({self.strides[i]}) not divisible by dtype size ratio {ratio}",
+                )
+                new_strides.append(self.strides[i] // ratio)
+            new_strides.append(1)
+            new_shape = self.shape[:last_dim] + (last_dim_size // ratio,)
+            new_offset = self.offset // ratio
+        else:
+            # Casting to smaller dtype: last dim grows, strides grow
+            ratio = old_size // new_size
+            kernel_assert(
+                self.strides[last_dim] == 1,
+                f"reinterpret_cast to smaller dtype requires contiguous last dimension (stride=1), got stride={self.strides[last_dim]}",
+            )
+            new_strides = []
+            for i in range(last_dim):
+                new_strides.append(self.strides[i] * ratio)
+            new_strides.append(1)
+            new_shape = self.shape[:last_dim] + (last_dim_size * ratio,)
+            new_offset = self.offset * ratio
+
+        return self._copy(shape=new_shape, strides=new_strides, offset=new_offset, dtype=new_dtype)
 
     def _copy(
         self,
@@ -105,26 +205,35 @@ class TensorView(nl.NKIObject):
         strides: Tuple[int, ...] = None,
         offset: int = None,
         scalar_offset: nl.ndarray = None,
+        vector_offset: nl.ndarray = None,
         indirect_dim: Optional[int] = None,
+        dtype: object = None,
+        base_tensor: nl.ndarray = None,
     ) -> "TensorView":
-        """Create a copy of this TensorView with optionally modified shape, strides, or offset.
+        """Create a copy of this TensorView with optionally modified shape, strides, offset, or dtype.
         Args:
             shape: New shape (defaults to current shape)
             strides: New strides (defaults to current strides)
             offset: New offset (defaults to current offset)
             scalar_offset: New scalar_offset (defaults to current scalar_offset)
+            vector_offset: New vector_offset (defaults to current vector_offset)
             indirect_dim: New indirect_dim (defaults to current indirect_dim)
+            dtype: New dtype for reinterpret casting (defaults to current dtype)
+            base_tensor: New base tensor (defaults to current base_tensor). Used when
+                dynamic select requires reshaping the base tensor to create a matching stride.
         Returns:
             New TensorView with specified modifications
         Raises:
             AssertionError: If strides contain negative values or dimensions mismatch
         """
-        view = TensorView(self.base_tensor)
+        view = TensorView(base_tensor if base_tensor is not None else self.base_tensor)
         view.shape = tuple(shape) if shape is not None else self.shape
         view.strides = tuple(strides) if strides is not None else self.strides
         view.offset = offset if offset is not None else self.offset
         view.scalar_offset = scalar_offset if scalar_offset is not None else self.scalar_offset
+        view.vector_offset = vector_offset if vector_offset is not None else self.vector_offset
         view.indirect_dim = indirect_dim if indirect_dim is not None else self.indirect_dim
+        view.dtype = dtype if dtype is not None else self.dtype
 
         # Validate strides are non-negative (required for valid memory access)
         for i in range(len(view.strides)):
@@ -132,6 +241,11 @@ class TensorView(nl.NKIObject):
         # Ensure all dimension metadata is consistent
         kernel_assert(len(view.shape) == len(view.strides), "Dimension count mismatch")
         kernel_assert(view.offset >= 0, "Offset must be non-negative")
+        # Cannot combine scalar_offset and vector_offset
+        kernel_assert(
+            view.scalar_offset is None or view.vector_offset is None,
+            "Cannot combine scalar_offset and vector_offset",
+        )
         return view
 
     def _get_pattern_and_offset(self):
@@ -156,14 +270,24 @@ class TensorView(nl.NKIObject):
         ap_pattern, offset = self._get_pattern_and_offset()
 
         if self.indirect_dim != None:
-            result = self.base_tensor.ap(
-                pattern=ap_pattern,
-                offset=offset,
-                scalar_offset=self.scalar_offset,
-                indirect_dim=self.indirect_dim,
-            )
+            if self.vector_offset is not None:
+                result = self.base_tensor.ap(
+                    pattern=ap_pattern,
+                    offset=offset,
+                    vector_offset=self.vector_offset,
+                    indirect_dim=self.indirect_dim,
+                    dtype=self.dtype,
+                )
+            else:
+                result = self.base_tensor.ap(
+                    pattern=ap_pattern,
+                    offset=offset,
+                    scalar_offset=self.scalar_offset,
+                    indirect_dim=self.indirect_dim,
+                    dtype=self.dtype,
+                )
         else:
-            result = self.base_tensor.ap(pattern=ap_pattern, offset=offset)
+            result = self.base_tensor.ap(pattern=ap_pattern, offset=offset, dtype=self.dtype)
         return result
 
     def slice(self, dim: int, start: int, end: int, step: int = 1) -> "TensorView":
@@ -181,6 +305,8 @@ class TensorView(nl.NKIObject):
             AssertionError: If slice parameters are invalid
         """
         kernel_assert(dim < self.get_dim(), f"Dimension {dim} out of range for {self.get_dim()}D tensor")
+        if self.vector_offset is not None:
+            kernel_assert(dim != 0, "Cannot slice vector_select dim (dim 0)")
         kernel_assert(start >= 0, "Start index must be non-negative")
         kernel_assert(end > start, "End index must be greater than start")
 
@@ -226,6 +352,8 @@ class TensorView(nl.NKIObject):
             For a 3D tensor (X,Y,Z) and dims=(2, 0, 1) we will get a (Z,X,Y) view.
         """
         TensorView.validate_permutation(dims, self.get_dim(), self.is_sbuf())
+        if self.vector_offset is not None:
+            kernel_assert(dims[0] == 0, "Cannot move vector_select dim (dim 0) during permute")
         # verify correctness of partition dim
         new_shape = []
         new_strides = []
@@ -252,6 +380,8 @@ class TensorView(nl.NKIObject):
         """
         kernel_assert(dim < self.get_dim(), f"Dimension {dim} out of range")
         kernel_assert(self.shape[dim] == 1, f"Can only broadcast size-1 dimensions, got size {self.shape[dim]}")
+        if self.vector_offset is not None:
+            kernel_assert(dim != 0, "Cannot broadcast vector_select dim (dim 0)")
         if self.is_sbuf():
             kernel_assert(dim != 0, "Cannot broadcast on partition dimension (dim=0) for SBUF tensors")
         new_shape = []
@@ -313,6 +443,8 @@ class TensorView(nl.NKIObject):
             The product of new shape must equal the original dimension size
         """
         kernel_assert(dim < self.get_dim(), f"Dimension {dim} out of range")
+        if self.vector_offset is not None:
+            kernel_assert(dim != 0, "Cannot reshape vector_select dim (dim 0)")
         if self.is_sbuf():
             # allow trivial reshape that does nothing
             kernel_assert((dim > 0) or (len(shape) == 1), "partition dim cannot be reshaped")
@@ -351,6 +483,8 @@ class TensorView(nl.NKIObject):
         kernel_assert(start_dim < end_dim, "Start dimension must be less than end dimension")
         kernel_assert(start_dim < self.get_dim(), f"Start dimension {start_dim} out of range")
         kernel_assert(end_dim < self.get_dim(), f"End dimension {end_dim} out of range")
+        if self.vector_offset is not None:
+            kernel_assert(start_dim != 0, "Cannot flatten vector_select dim (dim 0)")
         if self.is_sbuf():
             kernel_assert(start_dim > 0, "partition dim cannot be flattened")
 
@@ -358,7 +492,7 @@ class TensorView(nl.NKIObject):
         for i in range(start_dim, end_dim):
             kernel_assert(
                 self.strides[i] == self.shape[i + 1] * self.strides[i + 1],
-                f"Dimensions {i} and {i+1} are not contiguous in memory",
+                f"Dimensions {i} and {i + 1} are not contiguous in memory",
             )
 
         # Calculate total size of flattened dimension
@@ -384,6 +518,8 @@ class TensorView(nl.NKIObject):
             for shape [X,Y,Z] and parameters (dim=1) we will get a shape of [X,1,Y,Z]
         """
         kernel_assert(dim <= self.get_dim(), f"Dimension {dim} out of range")
+        if self.vector_offset is not None:
+            kernel_assert(dim != 0, "Cannot expand before vector_select dim (dim 0)")
         if self.is_sbuf():
             kernel_assert(dim > 0, "partition dim cannot be expanded")
 
@@ -409,6 +545,8 @@ class TensorView(nl.NKIObject):
         """
         kernel_assert(dim < self.get_dim(), f"Dimension {dim} out of range")
         kernel_assert(self.shape[dim] == 1, f"Can only squeeze size-1 dimensions, got size {self.shape[dim]}")
+        if self.vector_offset is not None:
+            kernel_assert(dim != 0, "Cannot squeeze vector_select dim (dim 0)")
         if self.is_sbuf():
             kernel_assert(dim > 0, "partition dim cannot be squeezed")
 
@@ -419,7 +557,13 @@ class TensorView(nl.NKIObject):
         return self._copy(shape=new_shape, strides=new_strides)
 
     def _dynamic_select(self, dim: int, index: nl.ndarray) -> "TensorView":
-        """Dynamic select - find base tensor dim by stride matching.
+        """Dynamic select - map a view dimension to a base tensor dimension for indirect access.
+
+        NKI's indirect access pattern (ap with indirect_dim) requires a physical base
+        tensor dimension to index into. This method finds that dimension by matching
+        the view's stride to a base tensor stride. If no match exists (e.g., after
+        slice(step>1) or reshape_dim), reshapes the base tensor to create a dimension
+        with the required stride.
 
         Args:
             dim: View dimension to select from
@@ -431,24 +575,93 @@ class TensorView(nl.NKIObject):
         kernel_assert(self.strides[dim] != 0, "Cannot dynamic select on broadcast dimension (stride=0)")
 
         view_stride = self.strides[dim]
-        base_strides = TensorView.get_trivial_strides(self.base_tensor.shape)
-
-        # Find base dim with matching stride
-        base_dim = None
-        for i in range(len(base_strides)):
-            if base_strides[i] == view_stride:
-                base_dim = i
-                break
-        kernel_assert(
-            base_dim is not None,
-            f"No base dim with stride {view_stride}; dynamic select not supported after slice(step>1) or reshape",
-        )
+        base_tensor, base_dim = self._find_or_create_base_dim_for_stride(view_stride)
 
         # Remove the selected dimension from view
         new_shape = self.shape[:dim] + self.shape[dim + 1 :]
         new_strides = self.strides[:dim] + self.strides[dim + 1 :]
 
-        return self._copy(shape=new_shape, strides=new_strides, scalar_offset=index, indirect_dim=base_dim)
+        return self._copy(
+            shape=new_shape, strides=new_strides, scalar_offset=index, indirect_dim=base_dim, base_tensor=base_tensor
+        )
+
+    def vector_select(self, dim: int, vector_offset: nl.ndarray) -> "TensorView":
+        """Dynamic vector select — mark a dimension as indirectly addressed using per-partition indices.
+
+        Each partition uses its own index from vector_offset as the base address
+        for the selected dimension. The dimension's size is changed to match the
+        partition count from vector_offset.shape[0], and its stride is preserved
+        (used by the DMA engine to scale vector_offset values).
+
+        Args:
+            dim: Dimension to apply indirect addressing to (must be 0)
+            vector_offset: SBUF tensor with per-partition indices
+        Returns:
+            New TensorView with dim 0 size set to vector_offset.shape[0]
+            and indirect addressing via vector_offset
+        """
+        kernel_assert(dim == 0, "vector_select currently only supports dim=0")
+        kernel_assert(self.indirect_dim is None, "Cannot have multiple dynamic selects")
+        kernel_assert(self.scalar_offset is None, "Cannot combine vector_select with scalar_offset")
+        kernel_assert(self.strides[dim] != 0, "Cannot vector_select on broadcast dimension (stride=0)")
+        for i in range(len(self.strides)):
+            kernel_assert(
+                self.strides[dim] >= self.strides[i],
+                "vector_select dim must have the largest stride (no permute before vector_select)",
+            )
+
+        view_stride = self.strides[dim]
+        base_tensor, base_dim = self._find_or_create_base_dim_for_stride(view_stride)
+
+        # Replace dim 0 size with partition count from vector_offset
+        p_count = vector_offset.shape[0]
+        new_shape = (p_count,) + self.shape[1:]
+
+        # Store base_dim so get_view() can resolve the correct AP pattern dim
+        return self._copy(
+            shape=new_shape,
+            vector_offset=vector_offset,
+            indirect_dim=base_dim,
+            base_tensor=base_tensor,
+        )
+
+    def _find_or_create_base_dim_for_stride(self, view_stride: int):
+        """Find base dim with matching stride, or reshape base tensor to create one.
+
+        NKI's indirect access pattern needs a physical base tensor dimension to index
+        into. When view transformations create strides not present in the original base
+        tensor, we reshape to expose the needed stride as an actual dimension.
+
+        Searches from the smallest stride (last dim) first. When reshaping,
+        skips the partition dim (dim 0 for non-HBM tensors) since it cannot be reshaped.
+
+        Returns:
+            (base_tensor, base_dim) - possibly reshaped base tensor and matching dim index
+        """
+        base_shape = list(self.base_tensor.shape)
+        base_strides = TensorView.get_trivial_strides(self.base_tensor.shape)
+        ndim = len(base_strides)
+        # Partition dim (dim 0) cannot be reshaped for non-HBM tensors (SBUF, PSUM, etc.)
+        min_reshape_dim = 0 if self.is_hbm() else 1
+
+        # Try direct match first (search from last dim)
+        for i in range(ndim - 1, -1, -1):
+            if base_strides[i] == view_stride:
+                return self.base_tensor, i
+
+        # No match - reshape base tensor to create the required stride.
+        # Search from last dim: find a dim whose stride evenly divides view_stride,
+        # then split it so the outer portion has exactly view_stride.
+        for i in range(ndim - 1, min_reshape_dim - 1, -1):
+            if view_stride % base_strides[i] == 0:
+                split_factor = view_stride // base_strides[i]
+                can_split = base_shape[i] >= split_factor and base_shape[i] % split_factor == 0
+                if can_split:
+                    outer_size = base_shape[i] // split_factor
+                    new_base_shape = tuple(base_shape[:i] + [outer_size, split_factor] + base_shape[i + 1 :])
+                    return self.base_tensor.reshape(new_base_shape), i
+
+        kernel_assert(False, f"Cannot create base dim with stride {view_stride}")
 
     def select(self, dim: int, index: Union[int, nl.ndarray]) -> "TensorView":
         """Select a single element along a dimension, reducing dimensionality.
@@ -596,20 +809,139 @@ class TensorView(nl.NKIObject):
             t = t.flatten_dims(flatten['start_dim'], flatten['end_dim'])
         return t
 
+    @staticmethod
+    def _reshape_validate(current_shape, current_strides, new_shape, is_hbm):
+        """Validate reshape preconditions.
+
+        Checks:
+            - Total element count matches between current and new shapes
+            - For non-HBM (SBUF/PSUM): partition dim (dim 0) size is preserved
+        """
+        current_numel = num_elts(current_shape)
+        new_numel = num_elts(new_shape)
+        kernel_assert(
+            current_numel == new_numel,
+            f"reshape: size mismatch {current_shape} ({current_numel} elements) -> {new_shape} ({new_numel} elements)",
+        )
+        if not is_hbm and len(current_shape) > 0:
+            kernel_assert(
+                len(new_shape) > 0 and new_shape[0] == current_shape[0],
+                f"reshape: partition dim (dim 0) size must be preserved for non-HBM tensors, "
+                f"got {current_shape[0]} -> {new_shape[0] if len(new_shape) > 0 else '(empty)'}",
+            )
+
+    @staticmethod
+    def _reshape_remove_unit_dims(current_shape, current_strides, is_hbm):
+        """Remove size-1 dimensions before contiguity analysis.
+
+        Size-1 dims have irrelevant strides (can be 0 from broadcast, or
+        arbitrary after expand_dim) that would break contiguity detection.
+        For non-HBM tensors, dim 0 (partition dim) is always preserved.
+
+        Returns:
+            (filtered_shape, filtered_strides) with size-1 dims removed
+        """
+        start = 0 if is_hbm else 1
+        filtered_shape = list(current_shape[:start])
+        filtered_strides = list(current_strides[:start])
+        for k in range(start, len(current_shape)):
+            if current_shape[k] != 1:
+                filtered_shape.append(current_shape[k])
+                filtered_strides.append(current_strides[k])
+        return filtered_shape, filtered_strides
+
+    @staticmethod
+    def _reshape_collapse_contiguous_blocks(filtered_shape, filtered_strides, is_hbm):
+        """Collapse adjacent contiguous dimensions into blocks.
+
+        Two adjacent dims i, i+1 are contiguous when:
+            stride[i] == stride[i+1] * shape[i+1]
+
+        For non-HBM tensors, dim 0 (partition dim) is always its own block.
+
+        Returns:
+            List of (block_size, innermost_stride) tuples
+        """
+        blocks = []
+        i = 0
+        if not is_hbm and len(filtered_shape) > 0:
+            blocks.append((filtered_shape[0], filtered_strides[0]))
+            i = 1
+        while i < len(filtered_shape):
+            kernel_assert(filtered_shape[i] > 0, f"reshape: zero-size dimension at index {i}")
+            size = filtered_shape[i]
+            j = i
+            while (
+                j + 1 < len(filtered_shape) and filtered_strides[j] == filtered_strides[j + 1] * filtered_shape[j + 1]
+            ):
+                j += 1
+                size *= filtered_shape[j]
+            blocks.append((size, filtered_strides[j]))
+            i = j + 1
+        if not blocks:
+            blocks.append((1, 1))
+        return blocks
+
+    @staticmethod
+    def _reshape_repartition_blocks(blocks, current_shape, current_strides, new_shape):
+        """Assign strides for new_shape by consuming contiguous blocks.
+
+        Iterates new dimensions from innermost to outermost, consuming block
+        elements.  Each new dimension must evenly divide the current block
+        remainder; otherwise the reshape is not possible without a copy.
+
+        Returns:
+            Tuple of new strides
+        """
+        new_strides = [0] * len(new_shape)
+        b = len(blocks) - 1
+        block_size, base_stride = blocks[b]
+        stride = base_stride
+
+        for idx in range(len(new_shape) - 1, -1, -1):
+            d = new_shape[idx]
+            kernel_assert(
+                d <= block_size and block_size % d == 0,
+                f"reshape: non-contiguous layout prevents reshape without copy. "
+                f"shape: {current_shape}, strides: {current_strides} -> {new_shape}",
+            )
+            new_strides[idx] = stride
+            stride *= d
+            block_size //= d
+            if block_size == 1 and b > 0:
+                b -= 1
+                block_size, base_stride = blocks[b]
+                stride = base_stride
+
+        return tuple(new_strides)
+
     def reshape(self, new_shape: Tuple[int, ...]) -> "TensorView":
-        """Reshape the tensor to new dimensions.
+        """Reshape the tensor to new dimensions without copying data.
+
+        Returns a new TensorView with the given shape over the same underlying
+        memory.  The total number of elements must be unchanged.  Fails if the
+        current memory layout is not compatible with the requested shape.
+
+        For non-HBM tensors the partition dimension (dim 0) size must be
+        preserved in the new shape.
+
         Args:
-            new_shape: New dimension shape
+            new_shape: New dimension sizes (total elements must match)
         Returns:
             New TensorView with reshaped dimensions
-        Note:
-            Currently not implemented. Would require checking memory contiguity
-            and computing appropriate strides for the new shape.
+        Raises:
+            kernel_assert failure if reshape requires a data copy
         """
-        # TODO: Implement general reshape functionality
-        # This requires checking if the tensor is contiguous and computing
-        # new strides that maintain the same memory layout
-        kernel_assert(False, "General reshape not yet implemented")
+        is_hbm = self.is_hbm()
+        TensorView._reshape_validate(self.shape, self.strides, new_shape, is_hbm)
+        # The reshape algorithm has three phases:
+        #   1. Remove unit dims — strip size-1 dims whose strides are irrelevant
+        #   2. Collapse contiguous — merge adjacent dims with contiguous strides into blocks
+        #   3. Repartition — assign new strides by splitting/merging blocks to match new_shape
+        filtered_shape, filtered_strides = TensorView._reshape_remove_unit_dims(self.shape, self.strides, is_hbm)
+        blocks = TensorView._reshape_collapse_contiguous_blocks(filtered_shape, filtered_strides, is_hbm)
+        new_strides = TensorView._reshape_repartition_blocks(blocks, self.shape, self.strides, new_shape)
+        return self._copy(shape=new_shape, strides=new_strides)
 
     def has_dynamic_access(self) -> bool:
         """Check if the tensor has dynamic access (i.e., non-contiguous memory layout).

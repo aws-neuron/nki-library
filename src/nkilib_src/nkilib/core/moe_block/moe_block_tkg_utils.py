@@ -25,7 +25,10 @@ from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 # Constants
 _pmax = 128  # sbuf max partition dim (nl.tile_size.pmax)
 _q_width = 4  # MX quantization block width
-_MX_SUPPORTED_DTYPES = (nl.float4_e2m1fn_x4,)  # TODO: add support for MXFP8
+_MX_SUPPORTED_DTYPES = (
+    nl.float4_e2m1fn_x4,
+    nl.float8_e4m3fn_x4,
+)  # TODO: add support for MXFP8
 
 
 def get_sbuf_tensor_shape(T: int, free_dim: int, is_sbuf: bool) -> tuple:
@@ -195,8 +198,6 @@ def validate_moe_block_inputs(
     if expert_config.is_all_expert:
         if quant_config.is_moe_weight_mx:
             kernel_assert(dims.T % 4 == 0, f"all_expert mode with MXFP requires T divisible by 4, got {dims.T}")
-        else:
-            kernel_assert(dims.T <= 128, f"all_expert mode currently supports T <= 128, got {dims.T}")
     else:
         kernel_assert(dims.T <= 128, f"selective_load mode currently supports T <= 128, got {dims.T}")
 

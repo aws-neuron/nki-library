@@ -22,7 +22,7 @@ from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from typing import final
 
-import neuronxcc.nki.language as nl
+import nki.language as nl
 import numpy as np
 import pytest
 import torch

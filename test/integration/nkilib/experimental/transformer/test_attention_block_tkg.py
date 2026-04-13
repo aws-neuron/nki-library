@@ -11,134 +11,540 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
+from dataclasses import replace
+from functools import lru_cache
+from inspect import signature
 from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_model_config import (
     attention_block_tkg_model_configs,
 )
+from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_utils import (
+    AttnBlkTestConfig,
+    KVScaleTest,
+)
 from test.integration.nkilib.utils.comparators import maxAllClose
-from test.integration.nkilib.utils.dtype_helper import dt
 from test.integration.nkilib.utils.tensor_generators import (
-    gaussian_tensor_generator,
     np_random_sample_static_quantize_inp,
 )
 from test.utils.common_dataclasses import (
-    MODEL_TEST_TYPE,
     TKG_INFERENCE_ARGS,
     CompilerArgs,
     CustomValidator,
     CustomValidatorWithOutputTensorData,
     KernelArgs,
-    LazyGoldenGenerator,
+    PerRankLazyGoldenGenerator,
+    PerRankLazyInputGenerator,
     Platforms,
+    TraceMode,
     ValidationArgs,
+    prepare_model_parametrize,
 )
 from test.utils.metadata_loader import load_model_configs
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import Any, Optional, final
 
+import neuron_dtypes as dt
 import nki
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
+from nki.collectives import ReplicaGroup
 from nkilib_src.nkilib.core.utils.allocator import SbufManager
-from nkilib_src.nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_program_sharding_info, is_hbm_buffer
 from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from nkilib_src.nkilib.experimental.transformer.attention_block_tkg import (
     attention_block_tkg,
 )
+from nkilib_src.nkilib.experimental.transformer.attention_block_tkg_torch import (
+    AttentionBlockTkgTorchRef,
+)
 from typing_extensions import override
 
-# Define test parameters (example values in comments)
-TEST_CONFIG = "config"
-BATCH_CFG = "batch"  # e.g., 8
-NUM_HEADS_CFG = "num_heads"  # e.g., 8
-D_HEAD_CFG = "d_head"  # e.g., 64
-H_CFG = "H"  # e.g., 6144
-H_ACTUAL_CFG = "H_actual"  # e.g., 2880
-S_CTX_CFG = "S_ctx"  # e.g., 11264
-S_MAX_CTX_CFG = "S_max_ctx"  # e.g., 11264
-S_TKG_CFG = "S_tkg"  # e.g., 1
-BLOCK_LEN_CFG = "block_len"  # e.g., 0
-UPDATE_CACHE_CFG = "update_cache"  # e.g., True
-K_CACHE_TRANSPOSED_CFG = "K_cache_transposed"  # e.g., False
-RMSNORM_X_CFG = "rmsnorm_X"  # e.g., True
-SKIP_ROPE_CFG = "skip_rope"  # e.g., False
-ROPE_CONTIGUOUS_LAYOUT_CFG = "rope_contiguous_layout"  # e.g., True
-RMSNORM_QK_CFG = "rmsnorm_qk"  # e.g., False
-QK_NORM_POST_ROPE_CFG = "qk_norm"  # e.g., False
-QK_NORM_POST_ROPE_GAMMA_CFG = "qk_norm_gamma_post_rope"  # e.g., False
-DTYPE_CFG = "dtype"  # e.g., nl.bfloat16
-LNC_CFG = "lnc"  # e.g., 2
-SKIP_OUTPUT_PROJECTION_CFG = "skip_output_projection"
-TRANSPOSED_OUT_CFG = "transposed_out"  # e.g., False
-TEST_BIAS_CFG = "test_bias"  # e.g., True
-OUT_IN_SBUF_CFG = "out_in_sbuf"  # e.g., False"
-INPUT_IN_SBUF_CFG = "input_in_sbuf"  # e.g., False"
-QUANTIZATION_TYPE = "quantization_type"  # e.g. QuantizationType.NONE
-SOFTMAX_SCALE_CFG = "softmax_scale"  # e.g., None - Optional custom softmax scale
-KV_QUANT_CFG = "kv_quant"  # e.g., False - FP8 KV cache quantization
+# Maximum memory (GB) for test tensor allocation. Tests exceeding this are skipped.
+# Override via environment variable TEST_ATTN_BLK_TKG_MAX_MEMORY_GB.
+_DEFAULT_MAX_MEMORY_GB = 20
+_MAX_MEMORY_BYTES = int(float(os.environ.get("TEST_ATTN_BLK_TKG_MAX_MEMORY_GB", _DEFAULT_MAX_MEMORY_GB)) * 1024**3)
 
 
-def generate_kernel_inputs(test_cfg: dict, skip_attention: bool):
-    from test.integration.nkilib.core.attention.test_attention_tkg import (
-        gen_deterministic_active_block_table,
-        numpy_gen_attention_cache_mask,
+def _slice_block_kv_for_all_ranks(
+    full_K_cache: np.ndarray,
+    full_V_cache: np.ndarray,
+    full_active_blocks_table: np.ndarray,
+    full_kv_cache_update_idx: np.ndarray,
+    KVDP: int,
+    B_attn: int,
+    S_ctx: int,
+    block_len: int,
+    d_head: int,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Slice block KV cache for all ranks in KV data parallelism.
+
+    vLLM treats each DP rank as an independent inference endpoint with its own KV cache.
+    Each rank has a local block pool with indices local to that rank's cache, not global indices.
+
+    The test generates golden outputs using a single global KV cache (no KV data parallelism),
+    but the kernel under test runs per-rank with local caches. This function converts the global
+    KV cache into the per-rank KV cache that vLLM provides.
+
+    For each rank, this function:
+    1. Slices active_blocks_table[B, num_active_blocks] on B to get this rank's batches
+    2. Finds which global block indices this rank uses
+    3. Creates a compact local cache with only this rank's blocks
+    4. Remaps active_blocks_table from global to local indices
+
+    Example with B=8, KVDP=4, B_attn=B/KVDP=2, S_ctx=1024, block_len=32:
+        Global cache: K_cache[256, 32, d_head]  (256 = B * S_ctx // block_len = 8 * 1024 // 32)
+        Rank 0 uses batches [0:2], references global blocks [100, 147, 212, 199, ...]
+        After slicing: K_cache_0[64, 32, d_head] with local indices [0, 1, 2, 3, ..., 62, 63]
+            (64 = B_attn * S_ctx // block_len = 2 * 1024 // 32)
+        active_blocks_table remapped: [100, 147, 212, 199, ...] -> [0, 1, 2, 3, ...]
+
+    Args:
+        full_K_cache (np.ndarray): Global K cache [num_blocks, block_len, d_head]
+        full_V_cache (np.ndarray): Global V cache [num_blocks, block_len, d_head]
+        full_active_blocks_table (np.ndarray): Global block table [B, num_active_blocks]
+        full_kv_cache_update_idx (np.ndarray): Global KV update indices [B, 1]
+        KVDP (int): KV data parallelism (number of ranks)
+        B_attn (int): Batch size of KV cache per rank
+        S_ctx (int): Context sequence length
+        block_len (int): Block length
+        d_head (int): Head dimension
+
+    Returns:
+        K_cache (list[np.ndarray]): Per-rank K caches, each [num_blocks/KVDP, block_len, d_head]
+        V_cache (list[np.ndarray]): Per-rank V caches, each [num_blocks/KVDP, block_len, d_head]
+        active_blocks_table (list[np.ndarray]): Remapped active_blocks_tables, each [B_attn, num_active_blocks]
+        kv_cache_update_idx (list[np.ndarray]): Remapped KV update indices, each [B_attn, 1]
+    """
+    # Validate input shapes
+    assert full_K_cache.ndim == 3 and full_K_cache.shape[1:] == (block_len, d_head)
+    assert full_V_cache.shape == full_K_cache.shape
+    assert full_active_blocks_table.ndim == 2 and full_active_blocks_table.shape[0] == KVDP * B_attn
+    assert full_kv_cache_update_idx.ndim == 2 and full_kv_cache_update_idx.shape[0] == KVDP * B_attn
+
+    blocks_per_rank = B_attn * S_ctx // block_len
+    K_cache, V_cache, active_blocks_table, kv_cache_update_idx = [], [], [], []
+
+    for rank_idx in range(KVDP):
+        # Slice active_blocks_table for this rank's batches
+        rank_active_blocks_table = full_active_blocks_table[rank_idx * B_attn : (rank_idx + 1) * B_attn]
+
+        # Find which global block indices this rank uses (excluding -1 padding)
+        used_blocks = np.unique(rank_active_blocks_table[rank_active_blocks_table != -1])
+
+        # Create compact local cache with only this rank's blocks
+        new_k = np.zeros((blocks_per_rank, block_len, d_head), dtype=full_K_cache.dtype)
+        new_v = np.zeros((blocks_per_rank, block_len, d_head), dtype=full_V_cache.dtype)
+
+        # Copy block data and build global->local index mapping
+        block_map = {}
+        for new_idx, old_idx in enumerate(used_blocks):
+            new_k[new_idx], new_v[new_idx] = full_K_cache[old_idx], full_V_cache[old_idx]
+            block_map[old_idx] = new_idx
+
+        # Remap active_blocks_table from global to local indices
+        new_abt = rank_active_blocks_table.copy()
+        for batch_idx in range(B_attn):
+            for col_idx in range(rank_active_blocks_table.shape[1]):
+                if rank_active_blocks_table[batch_idx, col_idx] != -1:
+                    new_abt[batch_idx, col_idx] = block_map[rank_active_blocks_table[batch_idx, col_idx]]
+
+        # Remap kv_cache_update_idx (block_idx * block_len + offset)
+        rank_kv_idx = full_kv_cache_update_idx[rank_idx * B_attn : (rank_idx + 1) * B_attn].copy()
+        for batch_idx in range(B_attn):
+            if rank_kv_idx[batch_idx, 0] != np.iinfo(np.uint32).max:
+                old_block, offset = divmod(int(rank_kv_idx[batch_idx, 0]), block_len)
+                rank_kv_idx[batch_idx, 0] = block_map.get(old_block, old_block) * block_len + offset
+
+        K_cache.append(new_k)
+        V_cache.append(new_v)
+        active_blocks_table.append(new_abt)
+        kv_cache_update_idx.append(rank_kv_idx)
+
+    return K_cache, V_cache, active_blocks_table, kv_cache_update_idx
+
+
+def _create_per_rank_inputs(
+    base_input: dict, KVDP: int, q_heads: int, d_head: int, B_attn: int, S_tkg: int, S_ctx: int, block_len: int
+) -> tuple:
+    """Create per-rank kernel inputs for KV data parallelism tests.
+
+    Slices kernel inputs per rank for multi-rank execution.
+    Each rank gets a slice of the batch dimension for K/V cache and mask,
+    while Q heads are distributed across ranks.
+
+    Args:
+        base_input (dict): Full kernel input dictionary with all tensors
+        KVDP (int): KV data parallelism (number of ranks)
+        q_heads (int): Number of query heads per rank
+        d_head (int): Head dimension
+        B_attn (int): Batch size of KV cache per rank (total_batch / KVDP)
+        S_tkg (int): Token generation sequence length
+        S_ctx (int): Context sequence length
+        block_len (int): Block length for block KV cache (0 for flat cache)
+
+    Returns:
+        per_rank_input (PerRankLazyInputGenerator): Generator that creates inputs for each rank
+        per_rank_cache (dict): Pre-sliced tensors for golden reference computation
+    """
+    total_q_heads = KVDP * q_heads
+
+    replica_group = ReplicaGroup([list(range(KVDP))])
+
+    # Slice W_qkv per rank: Q portion sliced (each rank gets q_heads), K/V replicated (GQA shares 1 KV head)
+    full_W_qkv = base_input['W_qkv']
+    q_end = total_q_heads * d_head
+    k_end = q_end + d_head
+    v_end = k_end + d_head
+    W_q_full, W_k, W_v = full_W_qkv[:, :q_end], full_W_qkv[:, q_end:k_end], full_W_qkv[:, k_end:v_end]
+    w_qkV_cache = [
+        np.concatenate([W_q_full[:, rank_idx * q_heads * d_head : (rank_idx + 1) * q_heads * d_head], W_k, W_v], axis=1)
+        for rank_idx in range(KVDP)
+    ]
+
+    # Slice bias_qkv if present
+    full_bias_qkv = base_input.get('bias_qkv')
+    if full_bias_qkv is not None:
+        bias_q_full, bias_k, bias_v = (
+            full_bias_qkv[:, :q_end],
+            full_bias_qkv[:, q_end:k_end],
+            full_bias_qkv[:, k_end:v_end],
+        )
+        bias_qkV_cache = [
+            np.concatenate(
+                [bias_q_full[:, rank_idx * q_heads * d_head : (rank_idx + 1) * q_heads * d_head], bias_k, bias_v],
+                axis=1,
+            )
+            for rank_idx in range(KVDP)
+        ]
+    else:
+        bias_qkV_cache = [None] * KVDP
+
+    # Slice W_out per rank
+    full_W_out = base_input.get('W_out')
+    w_out_slices = (
+        [
+            full_W_out[rank_idx * q_heads * d_head : (rank_idx + 1) * q_heads * d_head, :].copy()
+            for rank_idx in range(KVDP)
+        ]
+        if full_W_out is not None
+        else [None] * KVDP
     )
 
-    dtype = test_cfg[DTYPE_CFG]
-    batch = test_cfg[BATCH_CFG]
-    num_heads = test_cfg[NUM_HEADS_CFG]
-    d_head = test_cfg[D_HEAD_CFG]
-    H = test_cfg[H_CFG]
-    H_actual = test_cfg[H_ACTUAL_CFG] if test_cfg[H_ACTUAL_CFG] is not None else H
-    S_ctx = test_cfg[S_CTX_CFG]
-    S_max_ctx = test_cfg[S_MAX_CTX_CFG]
-    S_tkg = test_cfg[S_TKG_CFG]
-    out_in_sbuf = test_cfg[OUT_IN_SBUF_CFG]
-    num_q_heads = num_heads
-    num_kv_heads = 1
-    I = d_head * (num_q_heads + 2 * num_kv_heads)
+    # Slice mask per rank
+    # full_mask shape: (S_ctx, B, total_q_heads, S_tkg)
+    # Kernel needs: (S_ctx, B_attn, total_q_heads, S_tkg) - sliced batch, all heads (after gather)
+    # Golden needs: (S_ctx, B, q_heads, S_tkg) - full batch, 1 Q head
+    full_mask = base_input['attention_mask']
+    mask_slices = [full_mask[:, rank_idx * B_attn : (rank_idx + 1) * B_attn, :, :] for rank_idx in range(KVDP)]
+    golden_mask = full_mask[:, :, :q_heads, :]
 
-    quantization_type = test_cfg[QUANTIZATION_TYPE]
-    lnc = test_cfg[LNC_CFG]
-    test_bias = bool(test_cfg[TEST_BIAS_CFG])
+    # Slice K/V cache per rank
+    full_K_cache, full_V_cache = base_input['K_cache'], base_input['V_cache']
+    full_active_blocks_table = base_input.get('active_blocks_table')
+    full_kv_cache_update_idx = base_input.get('kv_cache_update_idx')
+
+    if block_len > 0:
+        K_cache, V_cache, active_blocks_table, kv_cache_update_idx = _slice_block_kv_for_all_ranks(
+            full_K_cache,
+            full_V_cache,
+            full_active_blocks_table,
+            full_kv_cache_update_idx,
+            KVDP,
+            B_attn,
+            S_ctx,
+            block_len,
+            d_head,
+        )
+    else:
+        K_cache = [full_K_cache[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)]
+        V_cache = [full_V_cache[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)]
+        active_blocks_table = [None] * KVDP
+        kv_cache_update_idx = [
+            full_kv_cache_update_idx[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)
+        ]
+
+    def create_per_rank_input(rank_id: int) -> dict:
+        result = base_input.copy()
+        result['W_qkv'] = w_qkV_cache[rank_id]
+        result['bias_qkv'] = bias_qkV_cache[rank_id]
+        result['W_out'] = w_out_slices[rank_id]
+        result['K_cache'] = K_cache[rank_id]
+        result['V_cache'] = V_cache[rank_id]
+        result['attention_mask'] = mask_slices[rank_id]
+        result['active_blocks_table'] = active_blocks_table[rank_id]
+        result['kv_cache_update_idx'] = kv_cache_update_idx[rank_id]
+        result['KVDP'] = KVDP
+        result['KVDP_replica_group'] = replica_group
+        return result
+
+    per_rank_input = PerRankLazyInputGenerator(generator=create_per_rank_input)
+    per_rank_input.base_input = base_input  # Store for golden reference
+
+    per_rank_cache = {
+        'w_qkv': w_qkV_cache,
+        'bias_qkv': bias_qkV_cache,
+        'w_out': w_out_slices,
+        'golden_mask': golden_mask,
+        'full_active_blocks_table': full_active_blocks_table,
+    }
+    return per_rank_input, per_rank_cache
+
+
+def _slice_golden_KV_cache_for_rank(
+    rank_golden: dict,
+    rank_id: int,
+    B_attn: int,
+    block_len: int,
+    d_head: int,
+    S_ctx: int,
+    per_rank_cache: dict,
+    update_cache: bool,
+) -> dict:
+    """Slice golden K/V cache output for a specific rank.
+
+    Golden computes with full batch B, so K/V outputs have shape [B, ...].
+    This function slices to [B/KVDP, ...] to match the kernel's per-rank output.
+    X_out is returned unchanged (already has correct shape from golden).
+
+    When update_cache is False, the torch ref returns K_tkg/V_tkg (raw projected
+    K/V) instead of K_cache_updated/V_cache_updated
+
+    Args:
+        rank_golden (dict): Full golden output with 'X_out' and either
+            'K_cache_updated'/'V_cache_updated' (update_cache=True) or
+            'K_tkg'/'V_tkg' (update_cache=False)
+        rank_id (int): Rank index to slice for
+        B_attn (int): Batch size of KV cache per rank (B/KVDP)
+        block_len (int): Block length for block KV cache (0 for flat cache)
+        d_head (int): Head dimension
+        S_ctx (int): Context sequence length
+        per_rank_cache (dict): Pre-computed slicing info including 'full_active_blocks_table'
+        update_cache (bool): Whether cache update is enabled
+
+    Returns:
+        dict: Golden output with X_out unchanged, K/V sliced to per-rank batch size
+    """
+    if not update_cache:
+        # K_tkg shape: [D, B, S_tkg], V_tkg shape: [B, S_tkg, D]
+        golden_k = rank_golden['K_tkg'][:, rank_id * B_attn : (rank_id + 1) * B_attn, :]
+        golden_v = rank_golden['V_tkg'][rank_id * B_attn : (rank_id + 1) * B_attn, :, :]
+        return {'X_out': rank_golden['X_out'], 'K_tkg': golden_k, 'V_tkg': golden_v}
+
+    if block_len > 0:
+        blocks_per_rank = B_attn * S_ctx // block_len
+        full_active_blocks_table = per_rank_cache['full_active_blocks_table']
+        rank_active_blocks_table = full_active_blocks_table[rank_id * B_attn : (rank_id + 1) * B_attn]
+        used_blocks = np.unique(rank_active_blocks_table[rank_active_blocks_table != -1])
+
+        golden_k = np.zeros((blocks_per_rank, block_len, d_head), dtype=rank_golden['K_cache_updated'].dtype)
+        golden_v = np.zeros((blocks_per_rank, block_len, d_head), dtype=rank_golden['V_cache_updated'].dtype)
+        for new_idx, old_idx in enumerate(used_blocks):
+            golden_k[new_idx] = rank_golden['K_cache_updated'][old_idx]
+            golden_v[new_idx] = rank_golden['V_cache_updated'][old_idx]
+    else:
+        golden_k = rank_golden['K_cache_updated'][rank_id * B_attn : (rank_id + 1) * B_attn]
+        golden_v = rank_golden['V_cache_updated'][rank_id * B_attn : (rank_id + 1) * B_attn]
+
+    return {'X_out': rank_golden['X_out'], 'K_cache_updated': golden_k, 'V_cache_updated': golden_v}
+
+
+def estimate_test_memory_bytes(cfg: AttnBlkTestConfig) -> int:
+    """Estimate total host memory (bytes) for a test config without allocating tensors.
+
+    Computes the sum of all tensor sizes created during the test.
+    """
+    batch = cfg.batch
+    num_heads = cfg.q_heads
+    d_head = cfg.d_head
+    H = cfg.H
+    S_ctx = cfg.S_ctx
+    S_max_ctx = cfg.S_max_ctx
+    S_tkg = cfg.S_tkg
+    block_len = cfg.block_len
+    kv_quant = cfg.kv_quant
+    KVDP = cfg.KVDP
+    quantization_type = cfg.quantization_type
+    skip_output_projection = cfg.skip_output_projection
+
+    is_quantized = quantization_type != QuantizationType.NONE
+    elem = 1 if is_quantized else 2  # fp8=1, bf16=2
+    kv_elem = 1 if kv_quant else elem
+    is_block_kv = block_len > 0
+
+    # KVDP inflates num_heads for input generation (mirrors _run_attention_block_test)
+    effective_heads = KVDP * num_heads if KVDP > 1 else num_heads
+    I = d_head * (effective_heads + 2)  # num_kv_heads=1 always
+
+    total = 0
+
+    # --- generate_kernel_inputs ---
+    total += batch * S_tkg * H * elem  # X
+    total += H * I * elem  # W_qkv
+    if cfg.rmsnorm_X:
+        total += H * elem  # rmsnorm_X_gamma
+    if cfg.test_bias:
+        total += I * elem  # bias_qkv
+        total += H * elem  # bias_out
+    if not cfg.skip_rope:
+        total += 2 * (d_head // 2) * batch * S_tkg * elem  # cos + sin
+    if cfg.qk_norm_pre_rope_gamma:
+        total += 2 * d_head * elem  # W_rmsnorm_Q/K_pre_rope
+    if cfg.qk_norm_post_rope_gamma:
+        total += 2 * d_head * elem  # W_rmsnorm_Q/K_post_rope
+
+    # KV cache
+    if is_block_kv:
+        num_blocks = batch * S_ctx // block_len
+        total += 2 * num_blocks * block_len * d_head * kv_elem  # K + V cache
+        total += batch * (S_ctx // block_len) * 4  # active_blocks_table (uint32)
+    else:
+        total += 2 * batch * S_max_ctx * d_head * kv_elem  # K + V cache
+
+    total += S_ctx * batch * effective_heads * S_tkg  # attention_mask (uint8)
+    total += batch * 4  # kv_cache_update_idx (uint32)
+    total += batch * 8  # cache_len (int64)
+
+    if not skip_output_projection:
+        total += effective_heads * d_head * H * elem  # W_out
+    if kv_quant:
+        total += 4 + 128 * 4  # k_scale + v_scale (float32)
+    if is_quantized:
+        total += 128 * 3 * 4 + 128 * 4  # weight/input dequant scales qkv
+        if not skip_output_projection:
+            total += 2 * 128 * 4  # weight/input dequant scales out
+
+    # --- KVDP per-rank copies (_create_per_rank_inputs) ---
+    if KVDP > 1:
+        B_attn = batch // KVDP
+        if is_block_kv:
+            rank_blocks = B_attn * S_ctx // block_len
+            total += KVDP * 2 * rank_blocks * block_len * d_head * kv_elem
+            total += KVDP * B_attn * (S_ctx // block_len) * 4
+        else:
+            total += KVDP * 2 * B_attn * S_max_ctx * d_head * kv_elem
+        total += KVDP * S_ctx * B_attn * effective_heads * S_tkg  # per-rank masks
+        total += KVDP * H * d_head * (num_heads + 2) * elem  # per-rank W_qkv
+        if not skip_output_projection:
+            total += KVDP * num_heads * d_head * H * elem  # per-rank W_out
+
+    # --- Golden reference overhead (float32 intermediates) ---
+    total += batch * S_tkg * H * 4  # X as f32
+    total += H * I * 4  # W_qkv as f32
+    total += batch * effective_heads * S_tkg * d_head * 4  # QKV output
+    total += 2 * batch * effective_heads * S_tkg * S_ctx * 4  # attn scores + softmax
+    total += batch * effective_heads * S_tkg * d_head * 4  # attn output
+    if not skip_output_projection:
+        total += batch * S_tkg * H * 4  # output projection
+
+    # --- output_placeholder (zeros_like golden) ---
+    total += batch * S_tkg * H * elem  # X_out
+    if not is_block_kv:
+        total += 2 * batch * S_max_ctx * d_head * kv_elem  # K/V out placeholders
+
+    return total
+
+
+def generate_kernel_inputs(cfg: AttnBlkTestConfig):
+    from test.integration.nkilib.core.attention.test_attention_tkg_utils import (
+        gen_deterministic_active_block_table,
+    )
+
+    from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
+
+    # Short aliases for dimensions used repeatedly in shape expressions
+    dtype = cfg.dtype
+    batch, d_head, H = cfg.batch, cfg.d_head, cfg.H
+    S_ctx, S_max_ctx, S_tkg = cfg.S_ctx, cfg.S_max_ctx, cfg.S_tkg
+    H_actual = cfg.H_actual if cfg.H_actual is not None else H
+    num_q_heads = cfg.q_heads
+    num_kv_heads = 1
+
     eps = 1e-5 if dtype == np.float32 else 1e-3
 
-    # FP8 KV cache quantization scales - initialized later with generate_quant_tensor
-    kv_quant = bool(test_cfg.get(KV_QUANT_CFG, False))
+    # ── Tensor generators ──────────────────────────────────────────────────────
+    #
+    # bf16 has 7 mantissa bits → 1 ULP = 2⁻⁷ relative to the significand.
+    # With round-to-nearest, max error is ½ ULP = 2⁻⁸. Worst case occurs at the
+    # bottom of each exponent bucket (significand=1.0): 2⁻⁸/1.0 = 1/256 ≈ 0.4%.
+    # This is the worst-case relative error when quantizing f32 to bf16.
+    #
+    # With Gaussian(0,1) weights, QKV projections have std ≈ √H, so attention
+    # scores (QK^T) have std ≈ H (thousands). When two positions score almost
+    # identically, 0.4% noise can flip which one wins:
+    #
+    #   f32 scores:  [2001.0, 1998.5, 1950.0, 1870.0]
+    #   bf16 noise:  [  -8.0,   +6.0,   -3.0,   +1.0]   (~0.4% of 2000)
+    #   bf16 scores: [1993.0, 2004.5, 1947.0, 1871.0]   ← position 1 now wins
+    #
+    #   After softmax subtracts max:
+    #     f32:  [  0.0,  -2.5, ...]  → exp → position 0 gets 92%
+    #     bf16: [-11.5,   0.0, ...]  → exp → position 1 gets 99.99%
+    #
+    # The fundamental problem: softmax exponentiates the *differences* (after
+    # subtracting max), but bf16 noise scales with the *magnitudes*. When noise
+    # exceeds the difference signal, the ranking can flip. At large scale,
+    # softmax behaves as argmax and picks a completely wrong V row. This causes
+    # random heads to fail — it's statistical, depending on which positions
+    # happen to score nearly identically.
+    #
+    # At small scale (scores ≈ 1), centered values are near zero where exp() is
+    # flat, so even if a flip occurs, the probabilities barely change.
+    #
+    # To keep scores O(1), we use W ~ N(0, 1/√fan_in). This scaling is "unitary"
+    # in the sense that it preserves variance through matmuls. Gammas, cos/sin,
+    # and other tensors are chosen similarly to keep std ≈ 0.5–1.0 up to softmax.
+    #
+    # Notes:
+    # - Not all test configs use normalization, so we can't rely on it alone.
+    # - Large biases can mask attention bugs; small biases can be masked by them.
+    # - Configs vary (RMSNorm, QK-norm, RoPE, bias on/off), but std ≈ 0.5–1.0
+    #   with reasonable biases works across all of them.
+    # - This is close to typical weight initialization in training.
+    # - After softmax, larger weights are fine — the peaky regime is past.
+    #
+    # See numerical_precision_in_transformer_attention.md for full analysis.
+    _rng = np.random.default_rng(0)
 
-    # Use uniform [-1, 1] for kv_quant (FP8 stability), gaussian otherwise (original behavior)
-    if kv_quant:
+    def uniform_activation(shape, dtype):
+        """Uniform[-1, 1]"""
+        return np.ascontiguousarray(dt.static_cast(_rng.uniform(-1.0, 1.0, shape).astype(np.float32), dtype))
 
-        def _tensor_generator(shape, dtype, name=None):
-            np.random.seed(hash(name) % (2**32) if name else 0)
-            arr = np.random.uniform(-1.0, 1.0, shape)
-            return dt.static_cast(arr, dtype)
-    else:
-        _tensor_generator = gaussian_tensor_generator()
+    def gaussian(shape, dtype, std):
+        """N(0, std)"""
+        return np.ascontiguousarray(dt.static_cast(_rng.normal(0.0, std, shape).astype(np.float32), dtype))
+
+    def fan_in_projection(shape, dtype, fan_in):
+        """N(0, 1/√fan_in). Keeps matmul output variance ≈ input variance."""
+        return gaussian(shape, dtype, std=1.0 / np.sqrt(fan_in))
+
+    def near_unity(shape, dtype):
+        """Uniform[0.5, 1.5]. RMSNorm gammas are ~1.0 in trained models."""
+        return np.ascontiguousarray(dt.static_cast(_rng.uniform(0.5, 1.5, shape).astype(np.float32), dtype))
+
+    def small_bias(shape, dtype):
+        """Uniform[-0.1, 0.1]. Biases are small in trained models."""
+        return np.ascontiguousarray(dt.static_cast(_rng.uniform(-0.1, 0.1, shape).astype(np.float32), dtype))
 
     generate_quant_tensor = np_random_sample_static_quantize_inp()
 
-    # Wrap to ensure C-contiguous arrays
-    def generate_tensor(name, shape, dtype):
-        return np.ascontiguousarray(_tensor_generator(shape, dtype, name))
-
-    # -- input
-    X = generate_tensor(name="X", shape=(batch, S_tkg, H), dtype=dtype)
+    # -- input: post-layernorm activations are O(1)
+    X = uniform_activation((batch, S_tkg, H), dtype)
     X[:, :, H_actual:] = 0.0
 
-    # -- rmsnorm X
-    rmsnorm_X = bool(test_cfg[RMSNORM_X_CFG])
-    rmsnorm_X_gamma = generate_tensor(name="rmsnorm_X_gamma", shape=(1, H), dtype=dtype) if rmsnorm_X else None
+    # -- rmsnorm X: gamma weights are ~1.0 in trained models
+    rmsnorm_X_gamma = near_unity((1, H), dtype) if cfg.rmsnorm_X else None
 
     # -- qkv projections, optional bias
-    if quantization_type == QuantizationType.NONE:
-        W_qkv = generate_tensor(name="W_qkv", shape=(H, (num_q_heads + 2 * num_kv_heads) * d_head), dtype=dtype)
+    if cfg.quantization_type == QuantizationType.NONE:
+        # W_qkv: projection from hidden dim H → QKV, fan-in-scaled by fan_in=H
+        W_qkv = fan_in_projection((H, (num_q_heads + 2 * num_kv_heads) * d_head), dtype, fan_in=H)
         weight_dequant_scale_qkv = None
         input_dequant_scale_qkv = None
     else:
@@ -151,92 +557,94 @@ def generate_kernel_inputs(test_cfg: dict, skip_attention: bool):
         weight_dequant_scale_qkv = np.array([[w_scale_q, w_scale_k, w_scale_v]])
         weight_dequant_scale_qkv = np.broadcast_to(weight_dequant_scale_qkv, (128, 3))
         input_dequant_scale_qkv = np.broadcast_to(input_dequant_scale_qkv, (128, 1))
-    bias_qkv = (
-        generate_tensor(name="bias_qkv", shape=(1, (num_q_heads + 2 * num_kv_heads) * d_head), dtype=dtype)
-        if test_bias
-        else None
-    )
+    bias_qkv = small_bias((1, (num_q_heads + 2 * num_kv_heads) * d_head), dtype) if cfg.test_bias else None
 
-    # -- rmsnorm QK
-    rmsnorm_qk = bool(test_cfg[RMSNORM_QK_CFG])
-    # -- RoPE
-    skip_rope = bool(test_cfg[SKIP_ROPE_CFG])
-    rope_contiguous_layout = bool(test_cfg[ROPE_CONTIGUOUS_LAYOUT_CFG])
-    cos = None if skip_rope else generate_tensor(name="cos", shape=(d_head // 2, batch, S_tkg), dtype=dtype)
-    sin = None if skip_rope else generate_tensor(name="sin", shape=(d_head // 2, batch, S_tkg), dtype=dtype)
+    # -- rmsnorm QK pre RoPE gamma weights
+    W_rmsnorm_Q_pre_rope = near_unity((1, d_head), dtype) if cfg.qk_norm_pre_rope_gamma else None
+    W_rmsnorm_K_pre_rope = near_unity((1, d_head), dtype) if cfg.qk_norm_pre_rope_gamma else None
+    # -- RoPE: cos/sin are bounded to [-1, 1] by definition
+    cos = None if cfg.skip_rope else uniform_activation((d_head // 2, batch, S_tkg), dtype)
+    sin = None if cfg.skip_rope else uniform_activation((d_head // 2, batch, S_tkg), dtype)
 
     # -- rmsnorm QK post RoPE
-    qk_norm_post_rope = bool(test_cfg[QK_NORM_POST_ROPE_CFG])
-    qk_norm_gamma_post_rope = bool(test_cfg[QK_NORM_POST_ROPE_GAMMA_CFG])
-    W_rmsnorm_Q_post_rope = (
-        generate_tensor(name="W_rmsnorm_Q_post_rope", shape=(1, d_head), dtype=dtype)
-        if qk_norm_gamma_post_rope
-        else None
-    )
-    W_rmsnorm_K_post_rope = (
-        generate_tensor(name="W_rmsnorm_K_post_rope", shape=(1, d_head), dtype=dtype)
-        if qk_norm_gamma_post_rope
-        else None
-    )
+    W_rmsnorm_Q_post_rope = near_unity((1, d_head), dtype) if cfg.qk_norm_post_rope_gamma else None
+    W_rmsnorm_K_post_rope = near_unity((1, d_head), dtype) if cfg.qk_norm_post_rope_gamma else None
 
     # -- Attention (and KV cache)
-    block_len = test_cfg[BLOCK_LEN_CFG]
-    is_block_kv = block_len > 0
+    is_block_kv = cfg.block_len > 0
 
     # Determine cache shapes
-    update_cache = bool(test_cfg[UPDATE_CACHE_CFG])
-    K_cache_transposed = bool(test_cfg[K_CACHE_TRANSPOSED_CFG])
-
     if is_block_kv:
-        assert not K_cache_transposed
-        assert S_ctx % block_len == 0
-        assumed_num_cache_blocks = batch * S_ctx // block_len
-        K_cache_shape = V_cache_shape = (assumed_num_cache_blocks, block_len, d_head)
+        assert not cfg.K_cache_transposed
+        assert S_ctx % cfg.block_len == 0
+        assumed_num_cache_blocks = batch * S_ctx // cfg.block_len
+        K_cache_shape = V_cache_shape = (assumed_num_cache_blocks, cfg.block_len, d_head)
     else:
         assumed_num_cache_blocks = 0
-        K_cache_shape = (batch, 1, d_head, S_max_ctx) if K_cache_transposed else (batch, 1, S_max_ctx, d_head)
+        K_cache_shape = (batch, 1, d_head, S_max_ctx) if cfg.K_cache_transposed else (batch, 1, S_max_ctx, d_head)
         V_cache_shape = (batch, 1, S_max_ctx, d_head)
 
     # Generate KV cache in FP8 when kv_quant=True
-    kv_cache_dtype = nl.float8_e4m3 if kv_quant else dtype
-    if kv_quant:
-        # FP8 scale for K/V from QKV projection (K = X @ W where X,W ~ uniform[-1,1])
-        # Var(uniform[-1,1]) = (1-(-1))²/12 = 1/3
-        # Var(K) = H * Var(X) * Var(W) = H/9  =>  std(K) = sqrt(H)/3
-        # Max ≈ 3.5*std (99.95% coverage), scale = FP8_max / max ≈ 240 / (3.5*sqrt(H)/3)
-        # Simplified to 240/sqrt(H) for full FP8 range with minimal clipping
-        k_scale_scalar = 240.0 / np.sqrt(H)
-        v_scale_scalar = 240.0 / np.sqrt(H)
+    kv_cache_dtype = nl.float8_e4m3 if cfg.kv_quant else dtype
+    if cfg.kv_quant:
+        # Determine KV scale
+        if cfg.kv_scale is KVScaleTest.DEFAULT:
+            # FP8 scale for K/V from QKV projection (K = X @ W where X ~ Uniform[-1,1], W ~ N(0, 1/√H))
+            # Var(Uniform[-1,1]) = (1-(-1))²/12 = 1/3
+            # Var(K) = H × Var(X) × Var(W) = H × (1/3) × (1/H) = 1/3  =>  std(K) ≈ 0.58
+            # Max ≈ 4×std ≈ 2.3 (99.99% coverage), scale = FP8_max / max ≈ 240 / 2.3 ≈ 104
+            k_scale_scalar = 240.0 / 2.3
+            v_scale_scalar = 240.0 / 2.3
+        else:
+            assert isinstance(
+                cfg.kv_scale, float
+            ), f"kv_scale must be KVScaleTest.DEFAULT or a float, got {cfg.kv_scale}"
+            k_scale_scalar = cfg.kv_scale
+            v_scale_scalar = cfg.kv_scale
         # Use different shapes to test both broadcast (1,1) and per-partition (PMAX,1) paths
         k_scale = np.full((1, 1), k_scale_scalar, dtype=np.float32)
         v_scale = np.full((128, 1), v_scale_scalar, dtype=np.float32)
 
         # Generate KV cache matching the distribution of scaled K/V:
-        # K/V are ~Gaussian (CLT: sum of H products) with std(K)*scale = (sqrt(H)/3)*(240/sqrt(H)) = 80
-        # H cancels out, so kv_std=80 works for any hidden dimension
+        # K/V are ~Gaussian (CLT: sum of H products) with std(K)×scale ≈ 0.58 × 104 ≈ 60
+        # Use kv_std=60 to match the expected distribution
         np.random.seed(42)
-        kv_std = 80.0
+        kv_std = 60.0
         K_cache_f32 = np.random.normal(0, kv_std, K_cache_shape).astype(np.float32)
         V_cache_f32 = np.random.normal(0, kv_std, V_cache_shape).astype(np.float32)
         K_cache = dt.static_cast(np.clip(K_cache_f32, -240, 240), kv_cache_dtype)
         V_cache = dt.static_cast(np.clip(V_cache_f32, -240, 240), kv_cache_dtype)
     else:
-        K_cache = generate_tensor(name="K_cache", shape=K_cache_shape, dtype=kv_cache_dtype)
-        V_cache = generate_tensor(name="V_cache", shape=V_cache_shape, dtype=kv_cache_dtype)
+        # KV cache stores projected K/V values which are O(1) after fan-in-scaled projection
+        K_cache = uniform_activation(K_cache_shape, kv_cache_dtype)
+        V_cache = uniform_activation(V_cache_shape, kv_cache_dtype)
         k_scale = None
         v_scale = None
 
     # pos_id (shape=(batch, 1)) defines the first position to append new KV to cache, per batch element
     cache_len = ((np.arange(batch) * 3 + (S_ctx // 4 * 3)) % (S_ctx - S_tkg))[:, np.newaxis]
     assert cache_len.max() < (S_ctx - S_tkg)  # Make sure not to go out of bound.
-    attention_mask = numpy_gen_attention_cache_mask(
-        cache_len, batch, num_heads, S_tkg, S_ctx, lnc, block_len, unify_for_cascaded=True
-    )  # mask: (S_ctx, batch, num_heads, S_tkg)
+    import torch
+
+    cache_lens_torch = torch.from_numpy(cache_len.flatten()).to(torch.float32)
+    attention_mask = build_full_attention_mask(
+        cache_lens=cache_lens_torch,
+        batch=batch,
+        num_heads=cfg.q_heads,
+        s_active=S_tkg,
+        s_ctx=S_ctx,
+        lnc=cfg.lnc,
+        block_len=cfg.block_len,
+        include_active_mask=True,
+        transposed=True,
+        enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+        KVDP=cfg.KVDP,
+    ).numpy()  # mask: (S_ctx, batch, num_heads, S_tkg)
     attention_mask = dt.static_cast(np.ascontiguousarray(attention_mask), dtype=np.uint8)
 
     active_blocks_table = (
         gen_deterministic_active_block_table(
-            batch, S_ctx, S_tkg, cache_len, block_len, batch * S_ctx // block_len
+            batch, S_ctx, S_tkg, cache_len, cfg.block_len, batch * S_ctx // cfg.block_len
         ).astype(np.uint32)
         if is_block_kv
         else None
@@ -244,14 +652,14 @@ def generate_kernel_inputs(test_cfg: dict, skip_attention: bool):
 
     # kv_cache_update_idx is (batch,) containing the start position for consecutive writes
     def generate_kv_cache_update_idx():
-        if block_len == 0:
+        if cfg.block_len == 0:
             return cache_len.astype(np.uint32)
 
         # Block KV: translate logical position to physical slot_mapping
-        logical_blks = cache_len // block_len
-        offset_in_blk = cache_len % block_len
+        logical_blks = cache_len // cfg.block_len
+        offset_in_blk = cache_len % cfg.block_len
         physical_blks = active_blocks_table[np.arange(batch)[:, None], logical_blks]
-        physical_kv_cache_update_idx = physical_blks * block_len + offset_in_blk
+        physical_kv_cache_update_idx = physical_blks * cfg.block_len + offset_in_blk
         # Mask update for last batch element to test scenario when it is just padding
         if batch > 1:
             physical_kv_cache_update_idx[-1] = -1
@@ -260,368 +668,81 @@ def generate_kernel_inputs(test_cfg: dict, skip_attention: bool):
     kv_cache_update_idx = generate_kv_cache_update_idx()
 
     # Output projection
-    skip_output_projection = test_cfg[SKIP_OUTPUT_PROJECTION_CFG]
-
     weight_dequant_scale_out = None
     input_dequant_scale_out = None
-    if skip_output_projection:
+    if cfg.skip_output_projection:
         W_out = None
-    elif quantization_type == QuantizationType.NONE:
-        W_out = generate_tensor(name="W_out", shape=(num_heads * d_head, H), dtype=dtype)
+    elif cfg.quantization_type == QuantizationType.NONE:
+        # W_out: projection from attention output → H. After softmax, probs@V has low std.
+        # Use std=0.5 to scale output back up so bias is meaningful (not at noise level).
+        W_out = gaussian((cfg.q_heads * d_head, H), dtype, std=0.5)
     else:
         W_out, weight_dequant_scale_out, input_dequant_scale_out = generate_quant_tensor(
-            shape=(num_heads * d_head, H), dtype=nl.float8_e4m3
+            shape=(cfg.q_heads * d_head, H), dtype=nl.float8_e4m3
         )
         weight_dequant_scale_out = np.broadcast_to(weight_dequant_scale_out, (128, 1))
         input_dequant_scale_out = np.broadcast_to(input_dequant_scale_out, (128, 1))
 
-    bias_out = generate_tensor(name="bias_out", shape=(1, H), dtype=dtype) if test_bias else None
-    transposed_out = bool(test_cfg[TRANSPOSED_OUT_CFG])
+    # bias_out: match the output projection scale (~0.1) so bias doesn't dominate.
+    bias_out = small_bias((1, H), dtype) if cfg.test_bias else None
 
     return {
         # -- input
         "X": X,
-        "X_in_sb": test_cfg[INPUT_IN_SBUF_CFG],
+        "X_in_sb": cfg.input_in_sb,
         "X_hidden_dim_actual": H_actual,
         # -- rmsnorm X
-        "rmsnorm_X_enabled": rmsnorm_X,
+        "rmsnorm_X_enabled": cfg.rmsnorm_X,
         "rmsnorm_X_eps": eps,
         "rmsnorm_X_gamma": rmsnorm_X_gamma,
         # -- qkv projections
         "W_qkv": W_qkv,
         "bias_qkv": bias_qkv,
-        "quantization_type_qkv": quantization_type,
+        "quantization_type_qkv": cfg.quantization_type,
         "weight_dequant_scale_qkv": weight_dequant_scale_qkv,
         "input_dequant_scale_qkv": input_dequant_scale_qkv,
         # -- QK rmsnorm pre RoPE
-        "rmsnorm_QK_enabled": rmsnorm_qk,
+        "rmsnorm_QK_enabled": cfg.qk_norm_pre_rope,
         "rmsnorm_QK_eps": eps,
+        "W_rmsnorm_Q_pre_rope": W_rmsnorm_Q_pre_rope,
+        "W_rmsnorm_K_pre_rope": W_rmsnorm_K_pre_rope,
         # -- RoPE
         "cos": cos,
         "sin": sin,
-        "rope_contiguous_layout": rope_contiguous_layout,
+        "rope_contiguous_layout": cfg.rope_contiguous_layout,
         # -- QK rmsnorm post RoPE
-        "rmsnorm_QK_post_rope_enabled": qk_norm_post_rope,
+        "rmsnorm_QK_post_rope_enabled": cfg.qk_norm_post_rope,
         "rmsnorm_QK_post_rope_eps": eps,
         "W_rmsnorm_Q_post_rope": W_rmsnorm_Q_post_rope,
         "W_rmsnorm_K_post_rope": W_rmsnorm_K_post_rope,
         # -- attention
-        "skip_attention": skip_attention,
-        "K_cache_transposed": K_cache_transposed,
+        "skip_attention": cfg.skip_attention,
+        "K_cache_transposed": cfg.K_cache_transposed,
         "active_blocks_table": active_blocks_table,
         "K_cache": K_cache,
         "V_cache": V_cache,
         "attention_mask": attention_mask,
         "sink": None,
-        "softmax_scale": test_cfg.get(SOFTMAX_SCALE_CFG),
+        "softmax_scale": cfg.softmax_scale,
+        "enable_fa_s_prior_tiling": cfg.enable_fa_s_prior_tiling,
         # -- FP8 KV cache quantization
         "k_scale": k_scale,
         "v_scale": v_scale,
         # -- KV cache update
-        "update_cache": update_cache,
+        "update_cache": cfg.update_cache,
         "kv_cache_update_idx": kv_cache_update_idx,
         # -- output projection
         "W_out": W_out,
         "bias_out": bias_out,
-        "quantization_type_out": quantization_type,
+        "quantization_type_out": cfg.quantization_type,
         "weight_dequant_scale_out": weight_dequant_scale_out,
         "input_dequant_scale_out": input_dequant_scale_out,
         # -- output
-        "transposed_out": transposed_out,
-        "out_in_sb": out_in_sbuf,
-    }
-
-
-def golden_ref_attn_blk(
-    inp_np,
-    dtype,
-    d_head,
-    num_q_heads,
-    block_len,
-    S_ctx,
-    S_max_ctx,
-    lnc,
-    quantization_type,
-):
-    from test.integration.nkilib.core.attention.test_attention_tkg import P_MAX, AttnTKGConfig, golden_attention_tkg_fwd
-    from test.integration.nkilib.core.embeddings.test_rope import rope_single_head
-    from test.integration.nkilib.core.qkv.test_qkv_tkg import golden_func_fused_add_qkv
-
-    from nkilib_src.nkilib.core.attention.attention_tkg import resize_cache_block_len_for_attention_tkg_kernel
-
-    # -- input
-    X = inp_np['X'].astype(np.float32)
-    hidden_actual = inp_np['X_hidden_dim_actual']
-    batch, S_tkg, H = X.shape
-    num_heads = num_q_heads
-    skip_attention = inp_np['skip_attention']
-
-    # -- rmsnorm X and qkv projections
-    rmsnorm_X = inp_np['rmsnorm_X_enabled']
-    rmsnorm_X_eps = inp_np['rmsnorm_X_eps']
-    rmsnorm_X_gamma = (
-        inp_np['rmsnorm_X_gamma'].astype(np.float32) if rmsnorm_X and inp_np['rmsnorm_X_gamma'] is not None else None
-    )
-
-    W_qkv = inp_np['W_qkv'].astype(np.float32)
-    bias_qkv = inp_np['bias_qkv'].astype(np.float32) if inp_np['bias_qkv'] is not None else None
-
-    qkv_input_np = {
-        "input": X,
-        "mlp_prev": None,
-        "attention_prev": None,
-        "fused_qkv_weights": W_qkv,
-        "gamma_norm_weights": rmsnorm_X_gamma,
-        "bias": bias_qkv,
-        "layer_norm_bias": None,
-        "qkv_w_scale": inp_np["weight_dequant_scale_qkv"],
-        "qkv_in_scale": inp_np["input_dequant_scale_qkv"],
-    }
-
-    # Note: result in NBSd here, to fit the RoPE golden.
-    #       The kernel outputs qkv in B_SxI though (where I=d*(q_heads+k_heads+v_heads))
-    QKV_dict = golden_func_fused_add_qkv(
-        inp_np=qkv_input_np,
-        dtype=np.float32,
-        fused_add=False,
-        norm_type=NormType.RMS_NORM if rmsnorm_X else NormType.NO_NORM,
-        eps=rmsnorm_X_eps,
-        head_dim=d_head,
-        n_kv_heads=1,
-        n_q_heads=num_q_heads,
-        output_layout=QKVOutputLayout.NBSd,
-        hidden_actual=hidden_actual,
-        quantization_type=quantization_type,
-    )
-    QKV = QKV_dict['out'].astype(np.float32)
-
-    # -- QK rmsnorm pre RoPE
-    def rms_norm(x, axis, eps, w=None):
-        normalized = x / np.sqrt((np.mean((x**2), axis=axis, keepdims=True) + eps))
-        if w is not None:
-            normalized = normalized * w
-        return normalized
-
-    rmsnorm_qk = inp_np['rmsnorm_QK_enabled']
-    rmsnorm_qk_eps = inp_np['rmsnorm_QK_eps']
-    if rmsnorm_qk:
-        for i in range(num_heads + 1):
-            QKV[i] = rms_norm(QKV[i], axis=-1, eps=rmsnorm_qk_eps)
-
-    # -- RoPE
-    cos = inp_np['cos'].astype(np.float32) if inp_np['cos'] is not None else None
-    sin = inp_np['sin'].astype(np.float32) if inp_np['sin'] is not None else None
-    rope_contiguous_layout = inp_np['rope_contiguous_layout']
-
-    # RoPE on Q and K in NBSd layout --> dBNS layout
-    skip_rope = cos is None or sin is None
-    QK = np.zeros((d_head, batch, num_heads + 1, S_tkg))  # Do Q & K together.
-    for b in range(batch):
-        for h in range(num_heads + 1):
-            cur_head = QKV[h, b, :, :].transpose(1, 0)  # d_S
-            QK[:, b, h, :] = (
-                cur_head
-                if skip_rope
-                else rope_single_head(cur_head, cos[:, b, :], sin[:, b, :], contiguous_layout=rope_contiguous_layout)
-            )
-
-    Q = QK[:, :, :num_heads, :]  # d_B_N_S
-    K = QK[:, :, num_heads, :]  # d_B_S
-
-    # -- QK rmsnorm post RoPE
-    qk_norm_post_rope = inp_np['rmsnorm_QK_post_rope_enabled']
-    rmsnorm_QK_post_rope_eps = inp_np['rmsnorm_QK_post_rope_eps']
-    W_rmsnorm_Q_post_rope = (
-        inp_np['W_rmsnorm_Q_post_rope'].astype(np.float32)
-        if qk_norm_post_rope and inp_np['W_rmsnorm_Q_post_rope'] is not None
-        else None
-    )
-    W_rmsnorm_K_post_rope = (
-        inp_np['W_rmsnorm_K_post_rope'].astype(np.float32)
-        if qk_norm_post_rope and inp_np['W_rmsnorm_K_post_rope'] is not None
-        else None
-    )
-
-    if qk_norm_post_rope:
-        w_Q = W_rmsnorm_Q_post_rope.reshape((d_head, 1, 1, 1)) if W_rmsnorm_Q_post_rope is not None else None
-        w_K = W_rmsnorm_K_post_rope.reshape((d_head, 1, 1)) if W_rmsnorm_K_post_rope is not None else None
-        Q = rms_norm(Q, axis=0, eps=rmsnorm_QK_post_rope_eps, w=w_Q)
-        K = rms_norm(K, axis=0, eps=rmsnorm_QK_post_rope_eps, w=w_K)
-
-    output = Q.copy()  # may be later overriden
-    # Last head of QKV which is NBSd where N is q_heads + 2 * kv_heads and we assume k and v are one head
-    V = QKV[-1]  # BSd
-
-    # FP8 KV cache quantization
-    kv_quant = inp_np.get('k_scale') is not None and inp_np.get('v_scale') is not None
-    if kv_quant:
-
-        def quantize_to_fp8(x, scale, target_dtype=nl.float8_e4m3):
-            FP8_E4M3_MAX = 240.0
-            x_scaled = np.multiply(x, scale[0, 0])
-            clipped_ratio = np.mean(np.abs(x_scaled) > FP8_E4M3_MAX)
-            assert clipped_ratio <= 0.01, f"Too many values clipped ({clipped_ratio:.1%}), scale may be inappropriate"
-            return dt.static_cast(np.clip(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX), target_dtype)
-
-        k_scale = inp_np['k_scale'].astype(np.float32)
-        v_scale = inp_np['v_scale'].astype(np.float32)
-        # Cast to bf16 to match kernel precision before quantization
-        K = dt.static_cast(K, nl.bfloat16).astype(np.float32)
-        V = dt.static_cast(V, nl.bfloat16).astype(np.float32)
-        K = quantize_to_fp8(K, k_scale)
-        V = quantize_to_fp8(V, v_scale)
-        K_cache = inp_np['K_cache'].astype(nl.float8_e4m3).copy()
-        V_cache = inp_np['V_cache'].astype(nl.float8_e4m3).copy()
-    else:
-        K_cache = inp_np['K_cache'].astype(np.float32).copy()
-        V_cache = inp_np['V_cache'].astype(np.float32).copy()
-
-    # Save K, V before transpose for return
-    K_new = K.copy()
-    V_new = V.copy()
-
-    # -- attention
-    is_block_kv = block_len > 0
-    K_cache_transposed = inp_np['K_cache_transposed']
-    active_blocks_table = (
-        inp_np['active_blocks_table'].astype(np.int32) if inp_np['active_blocks_table'] is not None else None
-    )
-    update_cache = inp_np['update_cache']
-    out_in_sb = inp_np['out_in_sb']
-
-    q_attn = Q.reshape(d_head, batch, num_heads, S_tkg).transpose(1, 2, 3, 0)  # q_attn.shape=(B,N,S,d)
-    k_attn_active = K.reshape(d_head, batch, 1, S_tkg).transpose(1, 2, 3, 0)  # k_attn_active.shape=(B,1,S,d)
-    v_attn_active = V.reshape(batch, 1, S_tkg, d_head)  # (b,1,S,d)
-
-    if skip_attention:
-        attn_out_B_N_d_S = Q.reshape(d_head, batch, num_heads, S_tkg).transpose(1, 2, 0, 3)
-    else:
-        _softmax_scale = inp_np.get('softmax_scale')
-        if _softmax_scale is not None:
-            q_attn = q_attn * _softmax_scale
-        else:
-            q_attn = q_attn / np.sqrt(d_head)
-
-        attention_mask = dt.static_cast(inp_np['attention_mask'], nl.uint8)
-
-        attention_tkg_input = {
-            'q': q_attn,
-            'k_active': k_attn_active,
-            'v_active': v_attn_active,
-            'k_prior': K_cache,
-            'v_prior': V_cache,
-            'active_mask': attention_mask,
-            'active_blocks_table': active_blocks_table,
-        }
-
-        AttnCfg = AttnTKGConfig(
-            bs=batch,
-            q_head=num_heads,
-            s_active=S_tkg,
-            curr_sprior=S_ctx,
-            full_sprior=S_max_ctx,
-            d_head=d_head,
-            block_len=block_len,
-            tp_k_prior=not K_cache_transposed,
-            strided_mm1=not is_block_kv,
-            use_pos_id=False,
-            fuse_rope=False,
-        )
-
-        attn_golden_output = golden_attention_tkg_fwd(
-            inp_np=attention_tkg_input,
-            cfg=AttnCfg,
-            is_block_kv=is_block_kv,
-            test_sink=False,
-            dtype=np.float32,  # avoids cast here to lower precision
-            lnc=lnc,
-            attn_out_shape=(batch, num_heads, d_head, S_tkg),
-            k_out_shape=None,
-            relative_tolerance=0,  # unused. This doesn't belong here!
-            absolute_tolerance=0,  # unused. This doesn't belong here!
-            DBG=False,
-        )
-        attn_out_B_N_d_S = attn_golden_output["golden_out"].astype(np.float32)
-        output = attn_out_B_N_d_S.transpose(2, 0, 1, 3) if out_in_sb else attn_out_B_N_d_S  # may be overriden
-
-    # -- update KV cache
-    kv_cache_update_idx = inp_np['kv_cache_update_idx']
-    if update_cache:
-        if is_block_kv:
-            # Update to the original block KV.
-            num_blocks = K_cache.shape[0]  # K_cache.shape=(blocks, block_len, d)
-            K_cache = K_cache.reshape((num_blocks * block_len, d_head))
-            V_cache = V_cache.reshape((num_blocks * block_len, d_head))
-            for b in range(batch):
-                if kv_cache_update_idx[b] == np.uint32(-1):
-                    continue
-
-                start_pos = kv_cache_update_idx[b, 0]
-                K_cache[start_pos : start_pos + S_tkg, :] = K_new[:, b, :].T
-                V_cache[start_pos : start_pos + S_tkg, :] = V_new[b, :, :]
-            K_out = K_cache.reshape(num_blocks, block_len, d_head)
-            V_out = V_cache.reshape(num_blocks, block_len, d_head)
-        else:  # not block_kv
-            for b in range(batch):
-                # Skip batch elements with invalid kv_cache_update_idx (marked as uint32(-1)).
-                # This logic is not in the kernel. It doesn't work for unclear reason
-                # if kv_cache_update_idx[b] == np.uint32(-1):
-                #     continue
-
-                start_pos = kv_cache_update_idx[b, 0]
-                # V cache is in (B,1,S,d). K cache is in (B,1,d,S) if transposed else (B,1,S,d)
-                if K_cache_transposed:
-                    K_cache[b, 0, :, start_pos : start_pos + S_tkg] = K_new[:, b, :]  # K_new is (d,B,S_tkg)
-                else:
-                    K_cache[b, 0, start_pos : start_pos + S_tkg, :] = K_new[:, b, :].T  # K_new is (d,B,S_tkg)
-                V_cache[b, 0, start_pos : start_pos + S_tkg, :] = V_new[b, :, :]  # V_new is (B,S_tkg,d)
-            K_out, V_out = K_cache, V_cache
-    else:  # no cache update
-        K_out, V_out = K_new, V_new
-
-    # -- output projection
-    skip_output_projection = inp_np['W_out'] is None
-    W_out = None if skip_output_projection else inp_np['W_out'].astype(np.float32)
-    weight_dequant_scale_out = (
-        None
-        if quantization_type == QuantizationType.NONE
-        else inp_np["weight_dequant_scale_out"][0, 0].astype(np.float32)
-    )
-    input_dequant_scale_out = (
-        None
-        if quantization_type == QuantizationType.NONE
-        else inp_np["input_dequant_scale_out"][0, 0].astype(np.float32)
-    )
-    bias_out = inp_np['bias_out'].astype(np.float32) if inp_np['bias_out'] is not None else None
-    transposed_out = inp_np['transposed_out']
-
-    if not skip_output_projection:
-        attn_out_BS_Nd = attn_out_B_N_d_S.transpose(0, 3, 1, 2).reshape((batch * S_tkg, num_heads * d_head))
-        if quantization_type == QuantizationType.STATIC:
-            attn_out_BS_Nd /= input_dequant_scale_out
-            attn_out_BS_Nd = attn_out_BS_Nd.clip(-240, 240)
-        output = (attn_out_BS_Nd @ W_out).astype(dtype)  # -> (B*S_tkg, H)
-        if quantization_type == QuantizationType.STATIC:
-            output *= weight_dequant_scale_out * input_dequant_scale_out
-        if bias_out is not None:
-            output += bias_out
-        if transposed_out:
-            # relayout to (B*S_tkg, H) --> (PMAX, lnc, H // lnc // PMAX, B*S_tkg)
-            output = output.reshape(batch * S_tkg, lnc, 128, H // lnc // 128).transpose((2, 1, 3, 0))
-
-    # -- Outputs
-    kv_dtype = nl.float8_e4m3 if kv_quant else dtype
-    if update_cache:
-        return {
-            "X_out": dt.static_cast(output, dtype),
-            "K_cache_updated": dt.static_cast(K_out, kv_dtype),  # updated K cache
-            "V_cache_updated": dt.static_cast(V_out, kv_dtype),  # update V cache
-        }
-
-    return {
-        "X_out": dt.static_cast(output, dtype),
-        "K_tkg": dt.static_cast(K_out, kv_dtype),  # generated tokens
-        "V_tkg": dt.static_cast(V_out, kv_dtype),  # generated tokens
+        "transposed_out": cfg.transposed_out,
+        "out_in_sb": cfg.output_in_sb,
+        # -- KV data parallelism
+        "KVDP": cfg.KVDP,
+        "KVDP_replica_group": None,
     }
 
 
@@ -629,7 +750,6 @@ def golden_ref_attn_blk(
 def attention_block_tkg_kernel_test_wrapper(
     # -- input
     X: nl.ndarray,
-    *,
     X_in_sb: bool,
     X_hidden_dim_actual: Optional[int],
     # -- rmsnorm X
@@ -645,6 +765,8 @@ def attention_block_tkg_kernel_test_wrapper(
     # -- QK rmsnorm pre RoPE
     rmsnorm_QK_enabled: bool,
     rmsnorm_QK_eps: Optional[float],
+    W_rmsnorm_Q_pre_rope: Optional[nl.ndarray],
+    W_rmsnorm_K_pre_rope: Optional[nl.ndarray],
     # -- RoPE embeddings
     cos: Optional[nl.ndarray],
     sin: Optional[nl.ndarray],
@@ -663,6 +785,7 @@ def attention_block_tkg_kernel_test_wrapper(
     attention_mask: nl.ndarray,
     sink: Optional[nl.ndarray],
     softmax_scale: Optional[float],
+    enable_fa_s_prior_tiling: bool,
     # -- FP8 KV cache quantization
     k_scale: Optional[nl.ndarray],
     v_scale: Optional[nl.ndarray],
@@ -679,6 +802,9 @@ def attention_block_tkg_kernel_test_wrapper(
     transposed_out: bool,
     out_in_sb: bool,
     sbm: Optional[SbufManager] = None,
+    # -- KV data parallelism
+    KVDP: int = 1,
+    KVDP_replica_group=None,
 ):
     B, S_tkg, H = X.shape
     if X_in_sb:
@@ -724,6 +850,8 @@ def attention_block_tkg_kernel_test_wrapper(
         input_dequant_scale_qkv=input_dequant_scale_qkv,
         rmsnorm_QK_pre_rope_enabled=rmsnorm_QK_enabled,
         rmsnorm_QK_pre_rope_eps=rmsnorm_QK_eps if rmsnorm_QK_eps else 1e-5,
+        rmsnorm_QK_pre_rope_W_Q=W_rmsnorm_Q_pre_rope,
+        rmsnorm_QK_pre_rope_W_K=W_rmsnorm_K_pre_rope,
         cos=cos,
         sin=sin,
         rope_contiguous_layout=rope_contiguous_layout,
@@ -739,6 +867,7 @@ def attention_block_tkg_kernel_test_wrapper(
         attention_mask=attention_mask,
         sink=sink,
         softmax_scale=softmax_scale,
+        enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
         update_cache=update_cache,
         kv_cache_update_idx=kv_cache_update_idx,
         k_scale=k_scale,
@@ -751,6 +880,8 @@ def attention_block_tkg_kernel_test_wrapper(
         transposed_out=transposed_out,
         out_in_sb=out_in_sb,
         sbm=sbm,
+        KVDP=KVDP,
+        KVDP_replica_group=KVDP_replica_group,
     )
 
     assert is_hbm_buffer(K_hbm_out)
@@ -844,290 +975,609 @@ def make_cosine_similarity_validator(
     return CosineValidator
 
 
+def _golden_ref_via_torch(kernel_input: dict, lnc: int) -> dict:
+    """Compute golden reference using the torch ref, returning numpy arrays in kernel dtypes.
+
+    torch_ref_wrapper upcasts bf16/fp8→f32 for CPU compatibility. We cast back
+    to the actual kernel IO dtypes (bf16/fp8)
+    """
+    torch_ref = AttentionBlockTkgTorchRef(lnc)
+    ignored = set(kernel_input) - set(signature(torch_ref).parameters)
+    assert not ignored, f"kernel_input keys not consumed by torch ref: {ignored}"
+    ref_output = torch_ref_wrapper(torch_ref)(**kernel_input)
+    x_dtype = kernel_input['X'].dtype
+    kv_dtype = kernel_input['K_cache'].dtype
+    output_dtypes = {
+        "X_out": x_dtype,
+        "K_tkg": kv_dtype,
+        "V_tkg": kv_dtype,
+        "K_cache_updated": kv_dtype,
+        "V_cache_updated": kv_dtype,
+    }
+    return {k: v.astype(output_dtypes[k]) for k, v in ref_output.items()}
+
+
+def _infer_output_shapes_and_dtypes(kernel_input: dict, lnc: int) -> dict:
+    """Infer output tensor shapes and dtypes by running the torch ref.
+
+    The kernel has many output-shape variants (update_cache, K_cache_transposed,
+    out_in_sb, transposed_out, block KV, …). Rather than duplicating that logic
+    here — which is brittle and has caused shape mismatches — we run the torch
+    ref once and mirror its output shapes.
+    """
+    golden = _golden_ref_via_torch(kernel_input, lnc)
+    return {k: np.zeros(v.shape, dtype=v.dtype) for k, v in golden.items()}
+
+
+def _get_tolerances(kv_quant: bool, quantization_type: QuantizationType):
+    """Return (rtol, atol) based on quantization mode."""
+    # FP8 E4M3: 3 mantissa bits, step size 16 at largest binade (128-240).
+    if kv_quant or quantization_type != QuantizationType.NONE:
+        return 0.07, 16.0
+    return 0.015, 1e-5
+
+
+def _make_cosine_validation(
+    golden_outputs: dict, rtol: float, atol: float, kv_quant: bool, name_prefix: str = ""
+) -> dict:
+    """Build per-output cosine similarity + allclose validators.
+
+    Pass rate:
+      - Non-quantized (bf16): 100% of elements within rtol. The worst-case
+      - FP8 kv_quant X_out: 99% pass rate. FP8 has coarser quantization
+    """
+    min_pass_rate_x_out = 0.99 if kv_quant else 1.0
+    return {
+        name: CustomValidatorWithOutputTensorData(
+            validator=make_cosine_similarity_validator(
+                golden,
+                rtol=rtol,
+                atol=atol,
+                min_cosine_similarity=0.99,
+                min_pass_rate=min_pass_rate_x_out if name == 'X_out' else 1.0,
+                name=f"{name_prefix}{name}",
+            ),
+            output_ndarray=golden,
+        )
+        for name, golden in golden_outputs.items()
+    }
+
+
 def _run_attention_block_test(
     test_manager: Orchestrator,
     platform_target: Platforms,
-    batch: int,
-    num_heads: int,
-    d_head: int,
-    H: int,
-    H_actual: int,
-    S_ctx: int,
-    S_max_ctx: int,
-    S_tkg: int,
-    block_len: int,
-    update_cache: bool,
-    K_cache_transposed: bool,
-    rmsnorm_X: bool,
-    skip_rope: bool,
-    rope_contiguous_layout: bool,
-    rmsnorm_QK: bool,
-    qk_norm_post_rope: bool,
-    qk_norm_post_rope_gamma: bool,
-    dtype,
-    quantization_type: QuantizationType,
-    lnc: int,
-    transposed_out: bool,
-    test_bias: bool,
-    input_in_sb: bool,
-    output_in_sb: bool,
-    softmax_scale,
-    kv_quant: bool,
-    skip_output_projection: bool = False,
-    skip_attention: bool = False,
+    cfg: AttnBlkTestConfig,
 ):
-    """Shared test execution logic for attention block TKG kernel."""
-    test_cfg = {
-        BATCH_CFG: batch,
-        NUM_HEADS_CFG: num_heads,
-        D_HEAD_CFG: d_head,
-        H_CFG: H,
-        H_ACTUAL_CFG: H_actual,
-        S_CTX_CFG: S_ctx,
-        S_MAX_CTX_CFG: S_max_ctx,
-        S_TKG_CFG: S_tkg,
-        BLOCK_LEN_CFG: block_len,
-        UPDATE_CACHE_CFG: update_cache,
-        K_CACHE_TRANSPOSED_CFG: K_cache_transposed,
-        RMSNORM_X_CFG: rmsnorm_X,
-        SKIP_ROPE_CFG: skip_rope,
-        ROPE_CONTIGUOUS_LAYOUT_CFG: rope_contiguous_layout,
-        RMSNORM_QK_CFG: rmsnorm_QK,
-        QK_NORM_POST_ROPE_CFG: qk_norm_post_rope,
-        QK_NORM_POST_ROPE_GAMMA_CFG: qk_norm_post_rope_gamma,
-        DTYPE_CFG: dtype,
-        LNC_CFG: lnc,
-        SKIP_OUTPUT_PROJECTION_CFG: skip_output_projection,
-        TRANSPOSED_OUT_CFG: transposed_out,
-        TEST_BIAS_CFG: test_bias,
-        OUT_IN_SBUF_CFG: output_in_sb,
-        INPUT_IN_SBUF_CFG: input_in_sb,
-        QUANTIZATION_TYPE: quantization_type,
-        SOFTMAX_SCALE_CFG: softmax_scale,
-        KV_QUANT_CFG: kv_quant,
-    }
+    """Shared test execution logic for attention block TKG kernel.
 
-    kernel_input = generate_kernel_inputs(test_cfg, skip_attention)
+    Single-rank case (KVDP=1):
+        Uses UnitTestFramework with torch reference (AttentionBlockTkgTorchRef).
 
-    def create_golden():
-        return golden_ref_attn_blk(
-            kernel_input, dtype, d_head, num_heads, block_len, S_ctx, S_max_ctx, lnc, quantization_type
+        INPUTS ──┬──> KERNEL ──> X_out, K/V_out ──┐
+                 │                                ├─> compare
+                 └──> GOLDEN ──> X_out, K/V_out ──┘
+
+    Multi-rank case (KVDP>1):
+        Uses manual orchestration (UnitTestFramework doesn't support PerRankLazy*).
+        Generate inputs once with total_q_heads = KVDP * q_heads, then slice per-rank.
+        This ensures:
+          - Shared data is identical across ranks: X, W_k, W_v (GQA has 1 KV head shared by all Q heads)
+          - Per-rank data is different: W_q, W_out (by head), K/V cache, mask (by batch)
+
+        For each rank:
+                                          ┌─slice K/V[B/KVDP]──> KERNEL ──> X_out, K/V[B/KVDP] ──────┐
+                                          │                                    │                     │
+        INPUTS ──slice W_q/W_out[q_heads]─┤                                    ├─> compare X_out     ├─> compare K/V
+        K/V[B],                           │                                    │                     │
+        W_q/W_out[q_heads*KVDP]           └────────────────────> GOLDEN ──> X_out, K/V[B] ──slice──> K/V[B/KVDP]
+
+    Shape changes with KVDP>1 (per rank_id):
+
+        Tensor                  Kernel                              Golden                       Description
+        ──────                  ──────                              ──────                       ───────────
+        X                       [B, S_tkg, H]                       [B, S_tkg, H]                same, shared across ranks
+        W_qkv                   [H, d*(q_heads+2)]                  [H, d*(q_heads+2)]           same, sliced Q per rank, W_k/W_v replicated (GQA)
+        W_out                   [q_heads*d, H]                      [q_heads*d, H]               same, sliced Q per rank
+        K_cache (flat)          [B/KVDP, 1, S_ctx, d_head]          [B, 1, S_ctx, d_head]        kernel sliced B, golden full
+        K_cache (block)         [num_blocks/KVDP, block_len, d]     [num_blocks, block_len, d]   kernel sliced B, golden full
+        attention_mask          [S_ctx, B/KVDP, q_heads*KVDP, S]    [S_ctx, B, q_heads, S]       kernel: sliced B, gathered heads
+
+        Note: For block KV indices (active_blocks_table and kv_cache_update_idx)
+        we remap global block indices to per-rank local indices in _slice_block_kv_for_all_ranks()
+    """
+    estimated_bytes = estimate_test_memory_bytes(cfg)
+    if estimated_bytes > _MAX_MEMORY_BYTES:
+        pytest.skip(
+            f"Estimated memory {estimated_bytes / 1024**3:.1f} GiB exceeds "
+            f"limit {_MAX_MEMORY_BYTES / 1024**3:.1f} GiB "
+            f"(set TEST_ATTN_BLK_TKG_MAX_MEMORY_GB to override)"
         )
 
-    golden_outputs = create_golden()
-    output_placeholder = {k: np.zeros_like(v) for k, v in golden_outputs.items()}
+    # Shared-fleet instances (trn2.3xlarge) have 4 NeuronCores; demote to compile-only
+    # when the test needs more ranks than available.
+    # Set TEST_ATTN_BLK_TKG_FORCE_INFER=1 to override and run on hardware anyway.
+    _MAX_SHARED_FLEET_RANKS = 4
+    if (
+        not os.environ.get("TEST_ATTN_BLK_TKG_FORCE_INFER")
+        and test_manager.trace_mode == TraceMode.CompileAndInfer
+        and (cfg.KVDP > _MAX_SHARED_FLEET_RANKS or cfg.DCP > _MAX_SHARED_FLEET_RANKS)
+    ):
+        import warnings
 
-    rtol = 0.07 if kv_quant or quantization_type != QuantizationType.NONE else 0.015
-    atol = 16.0 if kv_quant or quantization_type != QuantizationType.NONE else 1e-5
-
-    if kv_quant:
-        validation_args = ValidationArgs(
-            golden_output={
-                name: CustomValidatorWithOutputTensorData(
-                    validator=make_cosine_similarity_validator(
-                        golden,
-                        rtol=rtol,
-                        atol=atol,
-                        min_cosine_similarity=0.97,
-                        min_pass_rate=0.97 if name == 'X_out' else 1.0,
-                        name=name,
-                    ),
-                    output_ndarray=output_placeholder[name],
-                )
-                for name, golden in golden_outputs.items()
-            }
+        warnings.warn(
+            f"Demoting to compile-only: KVDP={cfg.KVDP}, DCP={cfg.DCP} exceeds shared-fleet limit "
+            f"of {_MAX_SHARED_FLEET_RANKS} NeuronCores. "
+            f"Set TEST_ATTN_BLK_TKG_FORCE_INFER=1 to override.",
+            stacklevel=2,
         )
+        test_manager.trace_mode = TraceMode.CompileOnly
+
+    rtol, atol = _get_tolerances(cfg.kv_quant, cfg.quantization_type)
+
+    if cfg.KVDP > 1:
+        _run_kvdp_test(test_manager, platform_target, cfg, rtol, atol)
     else:
-        validation_args = ValidationArgs(
-            golden_output=LazyGoldenGenerator(
-                lazy_golden_generator=create_golden,
-                output_ndarray=output_placeholder,
-            ),
-            relative_accuracy=rtol,
-            absolute_accuracy=atol,
+        _run_single_rank_test(test_manager, platform_target, cfg, rtol, atol)
+
+
+def _run_single_rank_test(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    cfg: AttnBlkTestConfig,
+    rtol: float,
+    atol: float,
+):
+    """Run single-rank test using UnitTestFramework with cosine similarity validation."""
+
+    kernel_input = generate_kernel_inputs(cfg)
+    golden_outputs = _golden_ref_via_torch(kernel_input, cfg.lnc)
+
+    # When update_cache=True, the kernel returns K_cache/V_cache in-place, causing:
+    # 1. The NKI compiler renames these inputs to K_cache.must_alias_input / V_cache.must_alias_input
+    #    in the NEFF. Rename input keys so the neuron-profile command uses the NEFF names.
+    # 2. The NEFF output files are named K_cache/V_cache (matching the aliased inputs), not
+    #    K_cache_updated/V_cache_updated (the torch ref names). Rename golden keys to match.
+    # The test framework handles the .must_alias_input suffix throughout
+    # (kernel_tracer strips it for compilation, unit_test_framework for validation).
+    if cfg.update_cache:
+        kernel_input['K_cache.must_alias_input'] = kernel_input.pop('K_cache')
+        kernel_input['V_cache.must_alias_input'] = kernel_input.pop('V_cache')
+        golden_outputs['K_cache'] = golden_outputs.pop('K_cache_updated')
+        golden_outputs['V_cache'] = golden_outputs.pop('V_cache_updated')
+
+    def input_generator(test_config):
+        return kernel_input
+
+    custom_validation = ValidationArgs(golden_output=_make_cosine_validation(golden_outputs, rtol, atol, cfg.kv_quant))
+
+    framework = UnitTestFramework(
+        test_manager=test_manager,
+        kernel_entry=nki.jit(attention_block_tkg_kernel_test_wrapper),
+        torch_ref=torch_ref_wrapper(AttentionBlockTkgTorchRef(cfg.lnc)),
+        kernel_input_generator=input_generator,
+        output_tensor_descriptor=lambda ki: _infer_output_shapes_and_dtypes(
+            {k.removesuffix(".must_alias_input"): v for k, v in ki.items()}, cfg.lnc
+        ),
+    )
+    framework.run_test(
+        test_config=None,
+        compiler_args=CompilerArgs(logical_nc_config=cfg.lnc, enable_birsim=False, platform_target=platform_target),
+        rtol=rtol,
+        atol=atol,
+        inference_args=replace(
+            TKG_INFERENCE_ARGS,
+            collective_ranks=1,
+            enable_determinism_check=False,
+        ),
+        custom_validation_args=custom_validation,
+    )
+
+
+def _run_kvdp_test(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    cfg: AttnBlkTestConfig,
+    rtol: float,
+    atol: float,
+):
+    """Run multi-rank KVDP test with manual orchestration.
+
+    UnitTestFramework doesn't support PerRankLazyInputGenerator or
+    PerRankLazyGoldenGenerator, which are needed for per-rank input slicing
+    and per-rank golden computation. So we call test_manager.execute() directly.
+    """
+
+    # Block KV with S_tkg > 1 and KVDP: _slice_block_kv_for_all_ranks remaps kv_cache_update_idx
+    # per starting block only. When S_tkg > 1 crosses a block boundary, the kernel writes to
+    # consecutive local blocks, but the remapping doesn't guarantee global block N and N+1 map
+    # to adjacent local blocks. This is an issue with the kernel interface but KVDP exposes
+    # the issue (in other cases golden and kernel behave in the same way).
+    # NKILIB-693 to fix the core issue.
+    assert not (
+        cfg.block_len > 0 and cfg.S_tkg > 1
+    ), "KVDP + block KV + S_tkg > 1 not supported (exposes potential kernel bug with S_ctx > 1)"
+    kvdp_cfg = replace(cfg, q_heads=cfg.KVDP * cfg.q_heads)
+    kernel_input = generate_kernel_inputs(kvdp_cfg)
+
+    # For KV data parallelism with KVDP ranks, each rank has q_heads, so total = KVDP * q_heads.
+    # Generate inputs once with total heads, then slice per-rank.
+    B_attn = cfg.batch // cfg.KVDP
+    kernel_input, per_rank_cache = _create_per_rank_inputs(
+        kernel_input, cfg.KVDP, cfg.q_heads, cfg.d_head, B_attn, cfg.S_tkg, cfg.S_ctx, cfg.block_len
+    )
+
+    # Rename K_cache/V_cache keys to match NEFF input names (see _run_single_rank_test comment)
+    if cfg.update_cache:
+        original_per_rank = kernel_input
+
+        def aliased_generator(rank_id):
+            result = original_per_rank.for_rank(rank_id).copy()
+            result['K_cache.must_alias_input'] = result.pop('K_cache')
+            result['V_cache.must_alias_input'] = result.pop('V_cache')
+            return result
+
+        kernel_input = PerRankLazyInputGenerator(generator=aliased_generator)
+        kernel_input.base_input = original_per_rank.base_input
+
+    def create_golden_for_rank(rank_id):
+        # Inputs were generated with total_q_heads = KVDP * q_heads.
+        # Slice W_qkv, bias_qkv, W_out to this rank's q_heads for golden validation.
+        golden_input_copy = kernel_input.base_input.copy()
+        golden_input_copy['W_qkv'] = per_rank_cache['w_qkv'][rank_id]
+        golden_input_copy['bias_qkv'] = per_rank_cache['bias_qkv'][rank_id]
+        golden_input_copy['W_out'] = per_rank_cache['w_out'][rank_id]
+        # Golden needs mask with full batch and q_heads (not KVDP * q_heads)
+        golden_input_copy['attention_mask'] = per_rank_cache['golden_mask']
+        golden_input_copy['KVDP'] = 1  # Torch ref is single-rank; KVDP slicing is done here
+        # For block KV: the golden receives the full global cache and full kv_cache_update_idx
+        # (all B batches). The torch ref updates all B batches on the shared global cache.
+        # With block KV, physical blocks can be shared across ranks, so another rank's batch
+        # write can contaminate a block that this rank reads during _slice_golden_KV_cache_for_rank.
+        # Mask kv_cache_update_idx to skip updates for batches outside this rank.
+        if cfg.block_len > 0:
+            masked_idx = golden_input_copy['kv_cache_update_idx'].copy()
+            masked_idx[: rank_id * B_attn] = np.iinfo(np.uint32).max
+            masked_idx[(rank_id + 1) * B_attn :] = np.iinfo(np.uint32).max
+            golden_input_copy['kv_cache_update_idx'] = masked_idx
+        rank_golden = _golden_ref_via_torch(golden_input_copy, cfg.lnc)
+        rank_golden = _slice_golden_KV_cache_for_rank(
+            rank_golden,
+            rank_id,
+            B_attn,
+            cfg.block_len,
+            cfg.d_head,
+            cfg.S_ctx,
+            per_rank_cache,
+            cfg.update_cache,
         )
+        # When update_cache=True, the NEFF output names are K_cache/V_cache (due to
+        # must_alias_input aliasing), but the torch ref returns K_cache_updated/V_cache_updated.
+        # Rename to match the NEFF output names, same as _run_single_rank_test.
+        if cfg.update_cache:
+            rank_golden['K_cache'] = rank_golden.pop('K_cache_updated')
+            rank_golden['V_cache'] = rank_golden.pop('V_cache_updated')
+        return _make_cosine_validation(rank_golden, rtol, atol, cfg.kv_quant, name_prefix=f"rank{rank_id}:")
 
     test_manager.execute(
         KernelArgs(
             kernel_func=nki.jit(attention_block_tkg_kernel_test_wrapper),
-            compiler_input=CompilerArgs(logical_nc_config=lnc, enable_birsim=False, platform_target=platform_target),
+            compiler_input=CompilerArgs(
+                logical_nc_config=cfg.lnc, enable_birsim=False, platform_target=platform_target
+            ),
             kernel_input=kernel_input,
-            validation_args=validation_args,
-            inference_args=TKG_INFERENCE_ARGS,
+            validation_args=ValidationArgs(
+                golden_output=PerRankLazyGoldenGenerator(create_golden_for_rank),
+                relative_accuracy=rtol,
+                absolute_accuracy=atol,
+            ),
+            inference_args=replace(TKG_INFERENCE_ARGS, collective_ranks=cfg.KVDP, enable_determinism_check=False),
         )
     )
+
+
+@lru_cache(maxsize=1)
+def _get_attention_block_metadata():
+    return load_model_configs("test_attention_block")
 
 
 @pytest_test_metadata(
     name="Attention Block TKG",
     pytest_marks=["attention", "tkg", "experimental"],
-    tags=["model", "trn2", "trn3"],
+    tags=["model"],
 )
 @final
 class TestRangeAttnBlk:
     # fmt: off
-    @pytest.mark.parametrize(
-            "batch, num_heads,  d_head, H,      H_actual,   S_ctx,  S_max_ctx,  S_tkg,  block_len,  update_cache,   K_cache_transposed, rmsnorm_X,  skip_rope,  rope_contiguous_layout, rmsnorm_QK, qk_norm_post_rope,  qk_norm_post_rope_gamma,    dtype,   quantization_type,       lnc,    transposed_out, test_bias,  input_in_sb,    output_in_sb,   softmax_scale,  kv_quant",
-        [
+    @pytest.mark.parametrize("attn_blk_cfg", [
             # SBUF IO
-            (4,     8,          64,     6144,   2880,       11264,  11264,      1,      0,          True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE,  2,      False,          False,      False,          True,           None,           False),
-            (4,     8,          64,     6144,   2880,       11264,  11264,      1,      0,          True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE,  2,      True,           False,      False,          True,           None,           False),
-            (4,     8,          64,     6144,   2880,       11264,  11264,      2,      0,          False,          False,              False,      True,       True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE,  2,      False,          False,      True,           True,           None,           False),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                output_in_sb=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                transposed_out=True, output_in_sb=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=2,
+                                update_cache=False, rmsnorm_X=False, skip_rope=True, input_in_sb=True, output_in_sb=True),
             # HBM IO
-            (4,     8,          64,     6144,   2880,       11264,  11264,      1,      0,          True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           False),
-            (4,     8,          128,    6144,   2880,       11264,  11264,      1,      0,          True,           False,              True,       False,      True,                   True,       True,               True,                       nl.bfloat16,   QuantizationType.NONE,  2,      False,          True,       False,          False,          None,           False),
-            (4,     1,          128,     6144,   2880,       10240,  10240,      5,      0,         False,          False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           False),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=128, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                qk_norm_pre_rope=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=6144, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                update_cache=False),
             # GPT OSS RIV'25
-            # (8,     8,          64,     6144,   2880,       11264,  11264,      1,      0,          True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE,  2,      False,          True,       False,          False),     # FAIL (accuracy ~35% for hidden-out. Others valid)
-            (8,     8,          64,     3072,   2880,       11264,  11264,      5,      0,          True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (8,     8,          64,     3072,   2880,       10240,  10240,      5,      0,          True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (4,     8,          64,     3072,   None,       10240,  10240,      4,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (4,     8,          64,     3072,   2880,       10240,  10240,      4,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                test_bias=True),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=5,
+                                test_bias=True),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                                K_cache_transposed=True, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                                K_cache_transposed=True, test_bias=True),
             # Qwen3
-            (16,    1,          128,    4096,   None,       10240,  10240,      1,      0,          True,           False,              True,       False,      True,                   True,       False,              False,                      nl.bfloat16,   QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           False),
+            AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                qk_norm_pre_rope=True),
+            # Qwen3 with pre-rope gamma weights
+            AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+            # Gemma3 with pre-rope gamma weights
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+            AttnBlkTestConfig(batch=8, q_heads=4, d_head=128, H=5376, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=3,
+                                update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, test_bias=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=16, update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
             # New model, 2025-Jul
-            (32,    1,          64,     3072,   None,       8192,   8192,       1,      0,          True,           False,              False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (32,    1,          64,     3072,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (64,    1,          64,     3072,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (32,    1,          64,     3072,   None,       128,    128,        1,      0,          True,           False,              False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (32,    1,          64,     3072,   None,       128,    128,        1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (64,    1,          64,     3072,   None,       128,    128,        1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (1,     1,          64,     3072,   None,       128,    128,        1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (4,     8,          64,     3072,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (8,     8,          64,     3072,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (16,    8,          64,     3072,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          True,       False,          False,          None,           False),
-            (32,    1,          64,     3072,   None,       8192,   8192,       3,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      True,           True,       False,          False,          None,           False),
-            (4,     8,          64,     3072,   None,       8192,   8192,       2,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      True,           True,       False,          False,          None,           False),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=3,
+                                K_cache_transposed=True, rmsnorm_X=False, transposed_out=True, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=2,
+                                K_cache_transposed=True, rmsnorm_X=False, transposed_out=True, test_bias=True),
             # secret text
-            (1,     1,          128,    7168,   None,       256,    256,        1,      0,          True,           True,               True,       False,      True,                   False,      True,               True,                       nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=7168, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                                K_cache_transposed=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True),
             # llama
-            (1,     1,          128,    8192,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      True,                   False,      True,               False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (1,     1,          128,    8192,   None,       8192,   8192,       1,      0,          True,           True,               False,      True,       True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (1,     1,          128,    8192,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (1,     1,          128,    8192,   None,       8192,   8192,       1,      0,          True,           True,               False,      False,      False,                  False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (1,     1,          128,    5120,   None,       8192,   8192,       1,      0,          True,           True,               True,       False,      False,                  False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (1,     1,          128,    5120,   None,       8192,   8192,       1,      0,          True,           True,               True,       True,       False,                  False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (4,     1,          128,    8192,   None,       10240,  16384,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (4,     1,          128,    8192,   None,       10240,  10240,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (8,     2,          128,    16384,  None,       2048,   2048,       7,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            # (4,     2,          128,    8192,   None,       16384,  16640,      5,      0,          False,          False,              False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 1,      False,          False,      False,          False),     # FAIL (LNC=1 not yet supported)
-            (1,     16,         128,    16384,  None,       4096,   8192,       7,      0,          True,           False,              False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           False),
-            # (1,     16,         128,    16384,  None,       4096,   8192,       7,      0,          True,           False,              False,      False,      False,                  False,      False,              False,                      nl.bfloat16,  QuantizationType.NONE,  2,      False,          False,      False,          False),     # FAIL (accuracy ~35% for hidden-out. Others valid)
-            (8,     2,          128,    16384,  None,       2048,   2048,       7,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      True,           False,      False,          False,          None,           False),
-            # # Test vectors for block KV
-            (4,     1,          128,    8192,   None,       256,    256,        5,      16,         True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (4,     1,          128,    8192,   None,       8192,   8192,       5,      16,         True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (4,     1,          128,    8192,   None,       12288,  12288,      5,      16,         True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (4,     1,          128,    8192,   None,       10240,  10240,      5,      16,         True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            # Test vectors to verify functionality of different num_heads, d_head and H dimensions
-            (2,     1,          128,    2048,   None,       10240,  16384,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (2,     1,          64,     2048,   None,       10240,  16384,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (2,     2,          64,     3072,   None,       10240,  16384,      5,      0,          True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (2,     3,          64,     4096,   None,       10240,  16384,      5,      0,          False,          False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (2,     4,          128,    6144,   None,       10240,  16384,      5,      0,          False,          True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (2,     3,          128,    20480,  None,       10240,  16384,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
-            (4,     1,          128,    8192,   None,       10240,  10240,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          None,           False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, qk_norm_post_rope=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, skip_rope=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, skip_rope=True, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=8, q_heads=2, d_head=128, H=16384, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=7,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=1, q_heads=16, d_head=128, H=16384, H_actual=None, S_ctx=4096, S_max_ctx=8192, S_tkg=7,
+                                rmsnorm_X=False),
+            AttnBlkTestConfig(batch=1, q_heads=16, d_head=128, H=16384, H_actual=None, S_ctx=4096, S_max_ctx=8192, S_tkg=7,
+                                rmsnorm_X=False, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=8, q_heads=2, d_head=128, H=16384, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=7,
+                                K_cache_transposed=True, transposed_out=True),
+            # Test vectors for block KV
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=5,
+                                block_len=16),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=5,
+                                block_len=16),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=12288, S_max_ctx=12288, S_tkg=5,
+                                block_len=16),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                block_len=16),
+            # Test vectors to verify functionality of different q_heads, d_head and H dimensions
+            AttnBlkTestConfig(batch=2, q_heads=1, d_head=128, H=2048, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=2, q_heads=1, d_head=64, H=2048, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=2, q_heads=2, d_head=64, H=3072, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5),
+            AttnBlkTestConfig(batch=2, q_heads=3, d_head=64, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                update_cache=False),
+            AttnBlkTestConfig(batch=2, q_heads=4, d_head=128, H=6144, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                update_cache=False, K_cache_transposed=True),
+            AttnBlkTestConfig(batch=2, q_heads=3, d_head=128, H=20480, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                K_cache_transposed=True),
             # static quantization tests
             # TODO: random input causing numerical instability for quantized weights, more tests will be added
             # after better fp8 random generator is implemented
             # E2E inference tests shows good accuracy
-            (8,     1,          128,    8192,   None,       2048,  2048,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.STATIC,  2,      False,          False,      False,          False,          None,           False),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=5,
+                                K_cache_transposed=True, quantization_type=QuantizationType.STATIC),
             # softmax_scale tests (Gemma model support)
-            (4,     8,          64,     3072,   2880,       10240,  10240,      4,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,   QuantizationType.NONE, 2,      False,          True,       False,          False,          0.05,           False),
-            (1,     1,          128,    7168,   None,       256,    256,        1,      0,          True,           True,               True,       False,      True,                   False,      True,               True,                       nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          0.09,           False),
-            (1,     1,          128,    5120,   None,       8192,   8192,       1,      0,          True,           True,               True,       True,       False,                  False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          0.13,           False),
-            (4,     1,          128,    8192,   None,       8192,   8192,       5,      16,         True,           False,              True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          0.17,           False),
-            (4,     1,          128,    8192,   None,       10240,  10240,      5,      0,          True,           True,               True,       False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 2,      False,          False,      False,          False,          0.21,           False),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                                K_cache_transposed=True, test_bias=True, softmax_scale=0.05),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=7168, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                                K_cache_transposed=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, softmax_scale=0.09),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, skip_rope=True, rope_contiguous_layout=False, softmax_scale=0.13),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=5,
+                                block_len=16, softmax_scale=0.17),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                K_cache_transposed=True, softmax_scale=0.21),
             # llama FP8 KV Cache Tests
-            (2,     1,          128,    8192,   None,       8192,   8192,       1,      0,          True,            False,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
-            (37,    1,          128,    8192,   None,       8192,   8192,       1,      0,          True,            True,                False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
-            (96,    1,          128,    8192,   None,       8192,   8192,       1,      0,          True,            True,                False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
+            AttnBlkTestConfig(batch=2, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                rmsnorm_X=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=37, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=96, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
             # llama FP8 KV Cache Tests - batched cache update
-            (32,    1,          128,    8192,   None,       4096,   4096,       1,      0,          True,            False,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
-            (128,   1,          128,    8192,   None,       2048,   2048,       1,      0,          True,            False,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=4096, S_max_ctx=4096, S_tkg=1,
+                                rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=128, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
             # llama FP8 KV Cache Tests - block KV cache
-            (16,    1,          128,    8192,   None,       2048,   2048,       1,      16,         True,            False,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
-            (32,    1,          128,    8192,   None,       2048,   2048,       1,      16,         True,            False,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
-            (64,    1,          128,    8192,   None,       2048,   2048,       1,      16,         True,            False,               False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE,  2,      False,          False,      False,          False,          None,           True),
+            AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=16, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=16, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=16, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            # FP8 KV cache direct cast (kv_scale=1.0)
+            AttnBlkTestConfig(batch=1, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=5,
+                                block_len=32, kv_quant=True, kv_scale=1.0, enable_fa_s_prior_tiling=False),
+            # Long context tests (S_ctx >= 128k, slower)
+            # flat KV S_ctx=128k
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
+            # flat KV S_ctx=512k
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
+            # block KV S_ctx=128k, block_len=32
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True),
+            # block KV S_ctx=512k, block_len=32
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True),
+            # KVDP tests (KVDP=4, GPT-OSS-like)
+            # q_heads=1 means each rank has 1 q_head, total KVDP * q_heads across ranks
+            # flat KV S_ctx=1k B=8
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                test_bias=True, KVDP=4, kv_quant=True),
+            # update_cache=False for complete API coverage 
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                test_bias=True, KVDP=4, kv_quant=True, update_cache=False),
+            # q_heads=2 tests the general transpose path (q_heads>1)
+            AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                test_bias=True, KVDP=4, kv_quant=True),
+            # block KV S_ctx=1k B=8, block_len=32
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # block KV S_ctx=1k B=32, block_len=32
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # KVDP long context tests (S_ctx >= 128k, slower)
+            # flat KV S_ctx=512k
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # block KV S_ctx=512k, block_len=32
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # flat KV S_ctx=1M
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1048576, S_max_ctx=1048576, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # block KV S_ctx=1M, block_len=32
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1048576, S_max_ctx=1048576, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # KVDP B=64 tests
+            # block KV S_ctx=1k B=64, block_len=32
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # block KV S_ctx=128k B=64, block_len=32
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # flat KV S_ctx=128k B=64
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # Small S_ctx=128: sprior_n_prgs=1 (not sharded)
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                block_len=32, rope_contiguous_layout=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+            # Large batch + small S_ctx: batch-sharded so sprior_n_prgs=1
+            AttnBlkTestConfig(batch=256, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                block_len=32, rope_contiguous_layout=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+            # B=1 large block_len with FA tiling
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=32768, S_max_ctx=32768, S_tkg=1,
+                                block_len=128, rope_contiguous_layout=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+
+            # ===== Large batch coverage (B*S_tkg > 128) =====
+            ## Flat KV (block_len=0)
+            AttnBlkTestConfig(batch=255, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                                qk_norm_pre_rope=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, test_bias=True),
+            AttnBlkTestConfig(batch=255, q_heads=2, d_head=64, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3, 
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=384, q_heads=3, d_head=128, H=5120, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, transposed_out=True),
+            AttnBlkTestConfig(batch=384, q_heads=3, d_head=64, H=5120, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            ## Block KV
+            # FP8 KV quantization
+            AttnBlkTestConfig(batch=255, q_heads=3, d_head=128, H=5120, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=2,
+                                block_len=32, kv_quant=True, kv_scale=1.0),
+            # FP8 weight quantization
+            AttnBlkTestConfig(batch=255, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, quantization_type=QuantizationType.STATIC),
+            # d_head=64, q_heads>1
+            AttnBlkTestConfig(batch=255, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=32),
+            # No RoPE, update_cache=False, transposed_out, test_bias, softmax_scale
+            AttnBlkTestConfig(batch=255, q_heads=3, d_head=128, H=5120, H_actual=None, S_ctx=10240, S_max_ctx=12288, S_tkg=1,
+                                block_len=32, skip_rope=True, update_cache=False, transposed_out=True, test_bias=True, softmax_scale=0.05),
+            # B*S_tkg > 256 (multi-tile with S_tkg>1)
+            AttnBlkTestConfig(batch=128, q_heads=2, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                                block_len=32),
+            # QK norm post-RoPE, rmsnorm_X=False (no input norm)
+            AttnBlkTestConfig(batch=255, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, rmsnorm_X=False),
+            # rope_contiguous_layout=False with large tile_B * q_heads (exercises gemm_moving_fmax in RoPE)
+            AttnBlkTestConfig(batch=255, q_heads=8, d_head=64, H=8192, H_actual=None, S_ctx=32768, S_max_ctx=32768, S_tkg=5,
+                                block_len=128, rope_contiguous_layout=False),
+            # B=1024
+            AttnBlkTestConfig(batch=1024, q_heads=2, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+           AttnBlkTestConfig(batch=1024, q_heads=2, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                               block_len=32, rmsnorm_X=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True,
+                               quantization_type=QuantizationType.STATIC),
+            # Large batch + KVDP
+            AttnBlkTestConfig(batch=256, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                block_len=32, test_bias=True, KVDP=4),
+            AttnBlkTestConfig(batch=288, q_heads=2, d_head=128, H=5120, H_actual=4096, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, test_bias=True, KVDP=16),
+            AttnBlkTestConfig(batch=512, q_heads=4, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, KVDP=4),
+            AttnBlkTestConfig(batch=2048, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                block_len=128, KVDP=8, kv_quant=True),
         ],
+        ids=lambda p: p.test_id(),
     # fmt: on
     )
     def test_attn_blk_megakernel(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
-        batch: int,
-        num_heads: int,
-        d_head: int,
-        H: int,
-        H_actual: int,
-        S_ctx: int,
-        S_max_ctx: int,
-        S_tkg: int,
-        block_len: int,
-        update_cache: bool,
-        K_cache_transposed: bool,
-        rmsnorm_X: bool,
-        skip_rope: bool,
-        rope_contiguous_layout: bool,
-        rmsnorm_QK: bool,
-        qk_norm_post_rope: bool,
-        qk_norm_post_rope_gamma: bool,
-        dtype,
-        quantization_type: QuantizationType,
-        lnc: int,
-        transposed_out: bool,
-        test_bias: bool,
-        input_in_sb: bool,
-        output_in_sb: bool,
-        softmax_scale,
-        kv_quant: bool,
-        skip_output_projection: bool = False,
-        skip_attention: bool = False,
+        attn_blk_cfg: AttnBlkTestConfig
     ):
         _run_attention_block_test(
             test_manager=test_manager,
             platform_target=platform_target,
-            batch=batch,
-            num_heads=num_heads,
-            d_head=d_head,
-            H=H,
-            H_actual=H_actual,
-            S_ctx=S_ctx,
-            S_max_ctx=S_max_ctx,
-            S_tkg=S_tkg,
-            block_len=block_len,
-            update_cache=update_cache,
-            K_cache_transposed=K_cache_transposed,
-            rmsnorm_X=rmsnorm_X,
-            skip_rope=skip_rope,
-            rope_contiguous_layout=rope_contiguous_layout,
-            rmsnorm_QK=rmsnorm_QK,
-            qk_norm_post_rope=qk_norm_post_rope,
-            qk_norm_post_rope_gamma=qk_norm_post_rope_gamma,
-            dtype=dtype,
-            quantization_type=quantization_type,
-            lnc=lnc,
-            transposed_out=transposed_out,
-            test_bias=test_bias,
-            input_in_sb=input_in_sb,
-            output_in_sb=output_in_sb,
-            softmax_scale=softmax_scale,
-            kv_quant=kv_quant,
-            skip_output_projection=skip_output_projection,
-            skip_attention=skip_attention,
+            cfg=attn_blk_cfg,
         )
 
-    # Pre-generate test IDs with MODEL_WIP prefix for pytest -k filtering
-    ATTENTION_BLOCK_TKG_MODEL_TEST_IDS = [
-        f"{MODEL_TEST_TYPE}_" + "-".join(str(p.value) if hasattr(p, 'value') else str(p) for p in params)
-        for params in attention_block_tkg_model_configs
-    ]
+
+    # Pre-generate test IDs with MODEL_WIP_<type> prefix for pytest -k filtering
+    _MODEL_PARAMS, _MODEL_IDS = prepare_model_parametrize(
+        attention_block_tkg_model_configs,
+        id_formatter=lambda p: p.test_id(),
+    )
 
     @pytest.mark.parametrize(
-        "batch, num_heads, d_head, H, H_actual, S_ctx, S_max_ctx, S_tkg, block_len, update_cache, K_cache_transposed, rmsnorm_X, skip_rope, rope_contiguous_layout, rmsnorm_QK, qk_norm_post_rope, qk_norm_post_rope_gamma, dtype, quantization_type, lnc, transposed_out, test_bias, input_in_sb, output_in_sb, softmax_scale, kv_quant",
-        attention_block_tkg_model_configs,
-        ids=ATTENTION_BLOCK_TKG_MODEL_TEST_IDS,
+        "attn_blk_model_cfg",
+        _MODEL_PARAMS,
+        ids=_MODEL_IDS,
     )
     def test_attn_blk_model(
         self,
@@ -1135,75 +1585,24 @@ class TestRangeAttnBlk:
         collector: IMetricsCollector,
         platform_target: Platforms,
         request,
-        batch: int,
-        num_heads: int,
-        d_head: int,
-        H: int,
-        H_actual: int,
-        S_ctx: int,
-        S_max_ctx: int,
-        S_tkg: int,
-        block_len: int,
-        update_cache: bool,
-        K_cache_transposed: bool,
-        rmsnorm_X: bool,
-        skip_rope: bool,
-        rope_contiguous_layout: bool,
-        rmsnorm_QK: bool,
-        qk_norm_post_rope: bool,
-        qk_norm_post_rope_gamma: bool,
-        dtype,
-        quantization_type: QuantizationType,
-        lnc: int,
-        transposed_out: bool,
-        test_bias: bool,
-        input_in_sb: bool,
-        output_in_sb: bool,
-        softmax_scale,
-        kv_quant: bool,
+        attn_blk_model_cfg: AttnBlkTestConfig
     ):
         """Test Attention Block TKG kernel with model configurations (weekly regression)."""
-        attn_blk_metadata_list = load_model_configs("test_attention_block")
+        attn_blk_metadata_list = _get_attention_block_metadata()
 
-        # Apply xfail and add metadata dimensions for model coverage tracking
-        request.node.add_marker(pytest.mark.xfail(strict=False, reason="Model coverage test"))
+        # Add metadata dimensions for model coverage tracking
         test_metadata_key = {
-            BATCH_CFG: batch,
-            NUM_HEADS_CFG: num_heads,
-            D_HEAD_CFG: d_head,
-            H_CFG: H,
-            S_CTX_CFG: S_ctx,
-            S_TKG_CFG: S_tkg,
+            "batch": attn_blk_model_cfg.batch,
+            "num_heads": attn_blk_model_cfg.q_heads,
+            "d_head": attn_blk_model_cfg.d_head,
+            "H": attn_blk_model_cfg.H,
+            "S_ctx": attn_blk_model_cfg.S_ctx,
+            "S_tkg": attn_blk_model_cfg.S_tkg,
         }
         collector.match_and_add_metadata_dimensions(test_metadata_key, attn_blk_metadata_list)
 
         _run_attention_block_test(
             test_manager=test_manager,
             platform_target=platform_target,
-            batch=batch,
-            num_heads=num_heads,
-            d_head=d_head,
-            H=H,
-            H_actual=H_actual,
-            S_ctx=S_ctx,
-            S_max_ctx=S_max_ctx,
-            S_tkg=S_tkg,
-            block_len=block_len,
-            update_cache=update_cache,
-            K_cache_transposed=K_cache_transposed,
-            rmsnorm_X=rmsnorm_X,
-            skip_rope=skip_rope,
-            rope_contiguous_layout=rope_contiguous_layout,
-            rmsnorm_QK=rmsnorm_QK,
-            qk_norm_post_rope=qk_norm_post_rope,
-            qk_norm_post_rope_gamma=qk_norm_post_rope_gamma,
-            dtype=dtype,
-            quantization_type=quantization_type,
-            lnc=lnc,
-            transposed_out=transposed_out,
-            test_bias=test_bias,
-            input_in_sb=input_in_sb,
-            output_in_sb=output_in_sb,
-            softmax_scale=softmax_scale,
-            kv_quant=kv_quant,
+            cfg=attn_blk_model_cfg,
         )

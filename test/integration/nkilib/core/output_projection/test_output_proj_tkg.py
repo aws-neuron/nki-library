@@ -11,35 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import enum
 from test.integration.nkilib.utils.tensor_generators import (
+    FP8_E4M3_MAX,
     gaussian_tensor_generator,
     np_random_sample,
-    np_random_sample_static_quantize_inp,
+    static_cast,
 )
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
     CompilerArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    ValidationArgs,
 )
-from test.utils.metrics_collector import IMetricsCollector
+from test.utils.coverage_parametrized_tests import FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.ranged_test_harness import (
-    DimensionRangeConfig,
-    RangeManualGeneratorStrategy,
-    RangeMonotonicGeneratorStrategy,
-    RangeProductConstraintMonotonicStrategy,
-    RangeRandomGeneratorStrategy,
-    RangeTestCase,
-    RangeTestConfig,
-    TensorConfig,
-    TensorRangeConfig,
-    assert_negative_test_case,
-    range_test_config,
-)
 from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 import nki.language as nl
 import numpy as np
@@ -47,24 +35,15 @@ import pytest
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg import (
     output_projection_tkg,
 )
+from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import (
+    output_projection_tkg_torch_ref,
+)
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 
 # Hardware constants - must match values in output_projection_tkg.py
 F_MAX = 512  # Free dimension size for PSUM/GEMM operations
 P_MAX = 128  # Partition dimension size
-
-
-# Dimension names for test configuration
-DUMMY_TENSOR_NAME = "dummy"
-BATCH_DIM_NAME = "batch"
-NUM_HEADS_DIM_NAME = "n_heads"
-SEQUENCE_LEN_DIM_NAME = "S_tkg"
-ATTN_DIM_NAME = "d_head"
-HIDDEN_DIM_NAME = "H"
-TEST_BIAS_NAME = "test_bias"
-DO_TRANSPOSE_OUT_NAME = "transpose_out"
-QUANTIZATION_TYPE_NAME = "quantization_type"
 
 
 class TkgOutputProjClassification(enum.Enum):
@@ -88,60 +67,46 @@ class TkgOutputProjClassification(enum.Enum):
         return self.name
 
 
-def golden_output_proj_tkg(
-    inp_np,
-    dtype,
-    test_bias,
-    d_head,
-    B,
-    n_heads,
-    S_tkg,
-    quantization_type,
-    transpose_out,
-    lnc_degree,
-    H,
-):
-    # attn in initial shape: (d_head, B * n_heads * S_tkg)
-    attn = inp_np["attention"]
-    # Shuffle attn_out from dBnS to BSnd
-    attn_reshaped = attn.reshape(d_head, B, n_heads, S_tkg).transpose(1, 3, 2, 0)
-    attn_final = attn_reshaped.reshape(B * S_tkg, n_heads * d_head)
-    weight = inp_np["weight"]
-
-    if quantization_type == QuantizationType.STATIC:
-        weight_scale = inp_np["weight_scale"][0, 0].astype(np.float32)
-        input_scale = inp_np["input_scale"][0, 0].astype(np.float32)
-        attn_final /= input_scale
-        attn_final = attn_final.clip(-240, 240)
-    out = (attn_final @ weight).astype(dtype)  # -> (B*S_tkg, H)
-    if quantization_type == QuantizationType.STATIC:
-        out *= weight_scale * input_scale
-    if test_bias:
-        bias = inp_np["bias"]
-        out += bias
-
-    if transpose_out:
-        H0 = 128
-        out_reshaped = out.reshape(B * S_tkg, lnc_degree, H0, H // lnc_degree // H0).transpose((2, 1, 3, 0))
-        return {"out": out_reshaped}
-    else:
-        return {"out": out}
-
-
 def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantization_type, H, test_bias, transpose_out):
     dtype = nl.bfloat16
 
-    random_gen = np_random_sample()
-    attention = random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype)
     if quantization_type == QuantizationType.STATIC:
-        q_random_gen = np_random_sample_static_quantize_inp()
-        weight, weight_scale, input_scale = q_random_gen(shape=(d_head * n_heads, H), dtype=nl.float8_e4m3)
-        weight_scale = np.broadcast_to(weight_scale, (128, 1))
-        input_scale = np.broadcast_to(input_scale, (128, 1))
-    else:
-        weight = random_gen(shape=(d_head * n_heads, H), dtype=dtype)
+        random_gen = np_random_sample()
+
+        def convert_to_range(max_val, unif_tensor):
+            return (2 * max_val * unif_tensor - max_val).astype(unif_tensor.dtype)
+
+        attention = convert_to_range(1, random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention"))
+        # Compute input_scale from actual max with small perturbation (simulates calibration)
+        in_scale = (np.abs(attention).max() / FP8_E4M3_MAX) * np.random.uniform(0.995, 1.005)
+
+        weight_bf16 = convert_to_range(1, random_gen(shape=(d_head * n_heads, H), dtype=dtype, name="weight"))
+        w_scale = np.abs(weight_bf16).max() / FP8_E4M3_MAX
+        weight = static_cast(weight_bf16 / w_scale, nl.float8_e4m3)
+
+        weight_scale = np.broadcast_to(np.array([[w_scale]], dtype=np.float32), (128, 1))
+        input_scale = np.broadcast_to(np.array([[in_scale]], dtype=np.float32), (128, 1))
+    elif quantization_type == QuantizationType.ROW:
+        random_gen = np_random_sample()
+
+        def convert_to_range(max_val, unif_tensor):
+            return (2 * max_val * unif_tensor - max_val).astype(unif_tensor.dtype)
+
+        attention = convert_to_range(1, random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention"))
+
+        weight_bf16 = convert_to_range(1, random_gen(shape=(d_head * n_heads, H), dtype=dtype, name="weight"))
+        w_scale = np.abs(weight_bf16).max(axis=0, keepdims=True) / FP8_E4M3_MAX
+        weight = static_cast(weight_bf16 / w_scale, nl.float8_e4m3)
+
+        weight_scale = np.broadcast_to(w_scale.astype(np.float32), (128, H))
+        input_scale = None
+    else:  # QuantizationType.NONE
+        random_gen = gaussian_tensor_generator()
+        attention = random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention")
+        weight = random_gen(shape=(d_head * n_heads, H), dtype=dtype, name="weight")
         weight_scale = None
         input_scale = None
+
     bias = gaussian_tensor_generator(std=100)(shape=(1, H), dtype=dtype, name="bias") if test_bias else None
     if transpose_out:
         H0 = 128
@@ -166,6 +131,7 @@ def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantizat
 # Params in order:
 #    B, n_heads, S_tkg, d_head, H, quantization_type, test_bias, transpose_out
 OUTPUT_PROJ_TKG_TEST_CASES = (
+    [512, 8, 4, 32, 3072, QuantizationType.NONE, True, True],
     [4, 8, 4, 32, 3072, QuantizationType.NONE, True, True],
     [4, 8, 4, 64, 3072, QuantizationType.NONE, False, False],
     [4, 8, 4, 64, 5376, QuantizationType.NONE, False, False],
@@ -199,7 +165,84 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [192, 8, 3, 128, 3072, QuantizationType.NONE, True, False],
     [512, 8, 7, 128, 3072, QuantizationType.STATIC, True, False],
     [128, 8, 3, 128, 3072, QuantizationType.NONE, True, True],
+    # double_row STATIC quantization tests (even n_heads >= 4, B*S >= 64)
+    [32, 6, 3, 128, 3072, QuantizationType.STATIC, False, False],
+    # double_row + transpose_out=True coverage
+    [64, 8, 5, 128, 8192, QuantizationType.STATIC, False, True],  # no bias
+    [32, 6, 3, 128, 3072, QuantizationType.STATIC, False, True],  # n_heads=6
+    [128, 6, 1, 128, 3072, QuantizationType.STATIC, True, True],  # larger B, n_heads=6
+    [16, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
+    [16, 8, 1, 128, 3072, QuantizationType.ROW, False, False],
+    [16, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
+    [16, 8, 1, 128, 3072, QuantizationType.ROW, False, True],
+    [128, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
+    [128, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
+    [256, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
+    [256, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
+    [512, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
+    [1024, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
+    [1024, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
+    [64, 8, 1, 128, 8192, QuantizationType.ROW, True, False],
+    [64, 8, 1, 128, 8192, QuantizationType.ROW, True, True],
 )
+
+# Manual sweep cases: H=602 (not divisible by 128) for negative test coverage
+# Old framework: output_proj_tkg_sweep_manual_config() generated these 2 cases
+# with test_bias=True (default) and quantization_type=NONE (default)
+MANUAL_PARAM_NAMES = "B, n_heads, S_tkg, d_head, H, quantization_type, test_bias, transpose_out"
+MANUAL_TEST_CASES = [
+    (4, 10, 8, 128, 602, QuantizationType.NONE, True, False),
+    (4, 10, 8, 128, 602, QuantizationType.NONE, True, True),
+]
+
+PARAM_NAMES = "B, n_heads, S_tkg, d_head, H, quantization_type, test_bias, transpose_out"
+_ABBREVS = {
+    "n_heads": "nh",
+    "S_tkg": "S",
+    "d_head": "dh",
+    "quantization_type": "qt",
+    "test_bias": "bias",
+    "transpose_out": "tp",
+}
+
+
+def _filter_sweep_params(B, n_heads=None, S_tkg=None, d_head=None, H=None, transpose_out=None):
+    """Filter for coverage_parametrize sweep tests.
+
+    Replicates the old RangeProductConstraintMonotonicStrategy configs which used
+    separate strategies with most dims fixed. A combo is valid if it fits at least
+    one of the old strategies:
+
+    Random/Monotonic: B<=4, n_heads<=10, S_tkg<=8, d_head<=128, H mult 128
+    Strategy 1 (tp=F): S_tkg*B<=4096, B<=512, S_tkg<=8, n_heads<=10, d_head<=128, H mult 128
+    Strategy 2 (tp=F): n_heads*d_head<=4096, n_heads<=64, d_head<=128, B<=4, S_tkg<=8, H mult 128
+    Strategy 3 (tp=T): S_tkg*B<=512, B<=128, S_tkg<=8, n_heads<=10, d_head<=128, H mult 128
+    """
+    if any(v is None for v in [n_heads, S_tkg, d_head, H, transpose_out]):
+        return FilterResult.VALID
+
+    if H % 128 != 0:
+        return FilterResult.INVALID
+
+    # Random/Monotonic strategy: all dims small
+    if B <= 4 and n_heads <= 10:
+        return FilterResult.VALID
+
+    if not transpose_out:
+        # Strategy 1: sweep S*B, fix N<=10, D<=128
+        # Old config had D=128 fixed; we relax but require d_head >= 32 to avoid
+        # compiler issues with very small d_head at large B (never tested in old config)
+        if n_heads <= 10 and S_tkg * B <= 4096 and (B <= 4 or d_head >= 32):
+            return FilterResult.VALID
+        # Strategy 2: sweep N*D, fix B<=4, S<=8
+        if B <= 4 and n_heads * d_head <= 4096:
+            return FilterResult.VALID
+    else:
+        # Strategy 3: sweep S*B, fix N<=10, D<=128
+        if n_heads <= 10 and S_tkg * B <= 512 and (B <= 4 or d_head >= 32):
+            return FilterResult.VALID
+
+    return FilterResult.INVALID
 
 
 @pytest_test_metadata(
@@ -207,62 +250,10 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     pytest_marks=["output_projection", "tkg"],
 )
 class TestOutputProjTkgKernel:
-    def run_range_output_proj_tkg_test(
-        self,
-        test_manager: Orchestrator,
-        compiler_args: CompilerArgs,
-        test_options: RangeTestCase,
-        lnc_degree,
-        dtype,
-        collector: IMetricsCollector,
-    ):
-        dummy_tensor = test_options.tensors[DUMMY_TENSOR_NAME]
-
-        B = dummy_tensor[BATCH_DIM_NAME]
-        n_heads = dummy_tensor[NUM_HEADS_DIM_NAME]
-        S_tkg = dummy_tensor[SEQUENCE_LEN_DIM_NAME]
-        d_head = dummy_tensor[ATTN_DIM_NAME]
-        H = dummy_tensor[HIDDEN_DIM_NAME]
-        transpose_out = dummy_tensor[DO_TRANSPOSE_OUT_NAME] == 1
-        test_bias = dummy_tensor[TEST_BIAS_NAME] if TEST_BIAS_NAME in dummy_tensor else True
-        quantization_type = (
-            dummy_tensor[QUANTIZATION_TYPE_NAME] if QUANTIZATION_TYPE_NAME in dummy_tensor else QuantizationType.NONE
-        )
-        is_negative_test_case = test_options.is_negative_test_case
-
-        # When `transpose_out` is False, the tkg kernel requires H to be divisible by
-        # lnc_degree * nl.tile_size.gemm_moving_fmax. When `transpose_out` is True,
-        # the kernel requires divisibility by lnc_degree * P_MAX.
-        H_divis_requirement = P_MAX if transpose_out else 1
-        if H % (lnc_degree * H_divis_requirement) != 0:
-            is_negative_test_case = True
-
-        test_size_classification = TkgOutputProjClassification.classify(
-            B=B, n_heads=n_heads, S_tkg=S_tkg, d_head=d_head, H=H
-        )
-
-        with assert_negative_test_case(is_negative_test_case):
-            self.run_output_proj_tkg_test(
-                test_manager,
-                compiler_args,
-                collector,
-                B,
-                H,
-                S_tkg,
-                d_head,
-                quantization_type,
-                dtype,
-                lnc_degree,
-                n_heads,
-                test_bias,
-                transpose_out,
-            )
-
     def run_output_proj_tkg_test(
         self,
         test_manager: Orchestrator,
         compiler_args: CompilerArgs,
-        collector: IMetricsCollector,
         B: int,
         H: int,
         S_tkg: int,
@@ -273,310 +264,220 @@ class TestOutputProjTkgKernel:
         n_heads: int,
         test_bias: int | bool,
         transpose_out: bool,
+        is_negative_test: bool = False,
     ):
-        kernel_input = build_output_proj_tkg_input(
-            lnc_degree=lnc_degree,
-            d_head=d_head,
-            B=B,
-            n_heads=n_heads,
-            S_tkg=S_tkg,
-            quantization_type=quantization_type,
-            H=H,
-            test_bias=test_bias,
-            transpose_out=transpose_out,
-        )
-
-        # Create closure to capture all necessary variables for lazy golden generation
-        def create_lazy_golden():
-            return golden_output_proj_tkg(
-                inp_np=kernel_input,
-                dtype=dtype,
-                test_bias=test_bias,
+        def input_generator(test_config):
+            return build_output_proj_tkg_input(
+                lnc_degree=lnc_degree,
                 d_head=d_head,
                 B=B,
                 n_heads=n_heads,
                 S_tkg=S_tkg,
                 quantization_type=quantization_type,
-                transpose_out=transpose_out,
-                lnc_degree=lnc_degree,
                 H=H,
+                test_bias=test_bias,
+                transpose_out=transpose_out,
             )
 
-        # Create output tensor placeholder with correct shape and dtype for compiler tracing
-        # Shape depends on transpose_out flag
-        if transpose_out:
-            H0 = 128
-            output_shape = (H0, lnc_degree, H // lnc_degree // H0, B * S_tkg)
-        else:
-            output_shape = (B * S_tkg, H)
-        output_placeholder = {"out": np.zeros(output_shape, dtype=dtype)}
+        def output_tensors(kernel_input):
+            # Shape depends on transpose_out flag
+            if transpose_out:
+                H0 = 128
+                output_shape = (H0, lnc_degree, H // lnc_degree // H0, B * S_tkg)
+            else:
+                output_shape = (B * S_tkg, H)
+            return {"out": np.zeros(output_shape, dtype=dtype)}
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=output_projection_tkg,
-                compiler_input=compiler_args,
-                kernel_input=kernel_input,
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(
-                        lazy_golden_generator=create_lazy_golden,
-                        output_ndarray=output_placeholder,
-                    ),
-                    relative_accuracy=2e-2 if quantization_type == QuantizationType.NONE else 5e-2,
-                    absolute_accuracy=1e-5,
-                ),
-                inference_args=TKG_INFERENCE_ARGS,
-            ),
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_tkg,
+            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
         )
-
-    @staticmethod
-    def output_proj_tkg_unit_config() -> RangeTestConfig:
-        test_cases = []
-        for test_case in OUTPUT_PROJ_TKG_TEST_CASES:
-            batch, n_head, s_tkg, d_head, hidden, quantization_type, test_bias, transpose_out = test_case
-            test_cases.append(
-                {
-                    DUMMY_TENSOR_NAME: {
-                        BATCH_DIM_NAME: batch,
-                        NUM_HEADS_DIM_NAME: n_head,
-                        SEQUENCE_LEN_DIM_NAME: s_tkg,
-                        ATTN_DIM_NAME: d_head,
-                        HIDDEN_DIM_NAME: hidden,
-                        TEST_BIAS_NAME: test_bias,
-                        DO_TRANSPOSE_OUT_NAME: transpose_out,
-                        QUANTIZATION_TYPE_NAME: quantization_type,
-                    }
-                }
-            )
-
-        return RangeTestConfig(
-            additional_params={},
-            global_tensor_configs=TensorRangeConfig(
-                tensor_configs={},
-                monotonic_step_size=1,
-                custom_generators=[RangeManualGeneratorStrategy(test_cases=test_cases)],
-            ),
-        )
-
-    @staticmethod
-    def output_proj_tkg_sweep_config() -> RangeTestConfig:
-        """Generate sweep configuration for TKG output projection kernel"""
-        S = 8  # Matches Perf Card limits
-        H = 16384  # Matches Perf Card limits
-        B = 4  # Note: B up to 128 is handled by RangeProductConstraintMonotonicStrategy
-        D = 128  # Matches Perf Card limits
-        N = 10  # Note: N up to 64 is handled by RangeProductConstraintMonotonicStrategy
-
-        tc = TensorRangeConfig(
-            tensor_configs={
-                DUMMY_TENSOR_NAME: TensorConfig(
-                    [
-                        DimensionRangeConfig(max=D, name=ATTN_DIM_NAME),
-                        DimensionRangeConfig(max=B, name=BATCH_DIM_NAME),
-                        DimensionRangeConfig(max=N, name=NUM_HEADS_DIM_NAME),
-                        DimensionRangeConfig(max=S, name=SEQUENCE_LEN_DIM_NAME),
-                        DimensionRangeConfig(max=H, min=128, multiple_of=128, name=HIDDEN_DIM_NAME),
-                        DimensionRangeConfig(min=0, max=1, name=DO_TRANSPOSE_OUT_NAME),
-                    ]
-                )
-            },
-            random_sample_size=6,
-            monotonic_step_percent=10,
-        )
-
-        tc.custom_generators = [
-            RangeRandomGeneratorStrategy(
-                tc.random_sample_size,
-            ),
-            RangeMonotonicGeneratorStrategy(
-                tc.monotonic_step_size,
-                tc.monotonic_step_percent,
-            ),
-            RangeManualGeneratorStrategy(
-                test_cases=[
-                    {
-                        DUMMY_TENSOR_NAME: {
-                            ATTN_DIM_NAME: D,
-                            BATCH_DIM_NAME: B,
-                            NUM_HEADS_DIM_NAME: N,
-                            SEQUENCE_LEN_DIM_NAME: S,
-                            # Here we test for H not cleanly divisible:
-                            HIDDEN_DIM_NAME: 602,
-                            DO_TRANSPOSE_OUT_NAME: do_transpose,
-                        }
-                    }
-                    for do_transpose in [0, 1]
-                ]
-            ),
-            # transpose_out=False cases:
-            RangeProductConstraintMonotonicStrategy(
-                fixed_dims={
-                    DUMMY_TENSOR_NAME: {
-                        NUM_HEADS_DIM_NAME: N,
-                        ATTN_DIM_NAME: D,
-                        HIDDEN_DIM_NAME: H,
-                        DO_TRANSPOSE_OUT_NAME: 0,
-                    }
-                },
-                product_dims=(SEQUENCE_LEN_DIM_NAME, BATCH_DIM_NAME),
-                product_limit=4096,
-                step_percent=20,
-                dim_max={SEQUENCE_LEN_DIM_NAME: 8, BATCH_DIM_NAME: 512},
-            ),
-            RangeProductConstraintMonotonicStrategy(
-                fixed_dims={
-                    DUMMY_TENSOR_NAME: {
-                        BATCH_DIM_NAME: B,
-                        SEQUENCE_LEN_DIM_NAME: S,
-                        HIDDEN_DIM_NAME: H,
-                        DO_TRANSPOSE_OUT_NAME: 0,
-                    }
-                },
-                product_dims=(NUM_HEADS_DIM_NAME, ATTN_DIM_NAME),
-                product_limit=4096,  # N * D <= 4096
-                step_percent=20,
-                dim_max={NUM_HEADS_DIM_NAME: 64, ATTN_DIM_NAME: 128},
-            ),
-            # transpose_out=True cases
-            RangeProductConstraintMonotonicStrategy(
-                fixed_dims={
-                    DUMMY_TENSOR_NAME: {
-                        NUM_HEADS_DIM_NAME: N,
-                        ATTN_DIM_NAME: D,
-                        HIDDEN_DIM_NAME: H,
-                        DO_TRANSPOSE_OUT_NAME: 1,
-                    }
-                },
-                product_dims=(SEQUENCE_LEN_DIM_NAME, BATCH_DIM_NAME),
-                product_limit=512,
-                step_percent=20,
-                dim_max={SEQUENCE_LEN_DIM_NAME: 8, BATCH_DIM_NAME: 128},
-            ),
-        ]
-
-        return RangeTestConfig(
-            additional_params={},
-            global_tensor_configs=tc,
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2 if quantization_type == QuantizationType.NONE else 5e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
+            is_negative_test=is_negative_test,
         )
 
     @pytest.mark.fast
-    @range_test_config(output_proj_tkg_unit_config())
+    @pytest_parametrize(PARAM_NAMES, OUTPUT_PROJ_TKG_TEST_CASES, abbrevs=_ABBREVS)
     def test_output_proj_tkg_unit(
         self,
         test_manager: Orchestrator,
-        range_test_options: RangeTestCase,
-        collector: IMetricsCollector,
+        B: int,
+        n_heads: int,
+        S_tkg: int,
+        d_head: int,
+        H: int,
+        quantization_type: QuantizationType,
+        test_bias: bool,
+        transpose_out: bool,
     ):
         compiler_args = CompilerArgs()
-        self.run_range_output_proj_tkg_test(
+        self.run_output_proj_tkg_test(
             test_manager=test_manager,
-            dtype=nl.bfloat16,
-            test_options=range_test_options,
-            lnc_degree=compiler_args.logical_nc_config,
             compiler_args=compiler_args,
-            collector=collector,
-        )
-
-    @range_test_config(output_proj_tkg_sweep_config())
-    def test_output_proj_tkg_sweep(
-        self,
-        test_manager: Orchestrator,
-        range_test_options: RangeTestCase,
-        collector: IMetricsCollector,
-    ):
-        compiler_args = CompilerArgs()
-        self.run_range_output_proj_tkg_test(
-            test_manager=test_manager,
+            B=B,
+            H=H,
+            S_tkg=S_tkg,
+            d_head=d_head,
+            quantization_type=quantization_type,
             dtype=nl.bfloat16,
-            test_options=range_test_options,
             lnc_degree=compiler_args.logical_nc_config,
-            compiler_args=compiler_args,
-            collector=collector,
-        )
-
-    @range_test_config(output_proj_tkg_sweep_config())
-    def test_output_proj_tkg_fp8_sweep(
-        self,
-        test_manager: Orchestrator,
-        range_test_options: RangeTestCase,
-        collector: IMetricsCollector,
-    ):
-        compiler_args = CompilerArgs()
-        range_test_options.tensors[DUMMY_TENSOR_NAME][QUANTIZATION_TYPE_NAME] = QuantizationType.STATIC
-        self.run_range_output_proj_tkg_test(
-            test_manager=test_manager,
-            dtype=nl.bfloat16,
-            test_options=range_test_options,
-            lnc_degree=compiler_args.logical_nc_config,
-            compiler_args=compiler_args,
-            collector=collector,
-        )
-
-    @staticmethod
-    def output_proj_tkg_sweep_manual_config() -> RangeTestConfig:
-        """Generate manual-only sweep configuration for TKG output projection kernel.
-
-        This config extracts only the manual test cases from output_proj_tkg_sweep_config
-        for fast test execution.
-        """
-        S = 8
-        H = 16384
-        B = 4
-        D = 128
-        N = 10
-
-        tc = TensorRangeConfig(
-            tensor_configs={
-                DUMMY_TENSOR_NAME: TensorConfig(
-                    [
-                        DimensionRangeConfig(max=D, name=ATTN_DIM_NAME),
-                        DimensionRangeConfig(max=B, name=BATCH_DIM_NAME),
-                        DimensionRangeConfig(max=N, name=NUM_HEADS_DIM_NAME),
-                        DimensionRangeConfig(max=S, name=SEQUENCE_LEN_DIM_NAME),
-                        DimensionRangeConfig(max=H, min=128, multiple_of=128, name=HIDDEN_DIM_NAME),
-                        DimensionRangeConfig(min=0, max=1, name=DO_TRANSPOSE_OUT_NAME),
-                    ]
-                )
-            },
-            monotonic_step_size=1,
-            custom_generators=[
-                RangeManualGeneratorStrategy(
-                    test_cases=[
-                        {
-                            DUMMY_TENSOR_NAME: {
-                                ATTN_DIM_NAME: D,
-                                BATCH_DIM_NAME: B,
-                                NUM_HEADS_DIM_NAME: N,
-                                SEQUENCE_LEN_DIM_NAME: S,
-                                # Here we test for H not cleanly divisible:
-                                HIDDEN_DIM_NAME: 602,
-                                DO_TRANSPOSE_OUT_NAME: do_transpose,
-                            }
-                        }
-                        for do_transpose in [0, 1]
-                    ]
-                ),
-            ],
-        )
-
-        return RangeTestConfig(
-            additional_params={},
-            global_tensor_configs=tc,
+            n_heads=n_heads,
+            test_bias=test_bias,
+            transpose_out=transpose_out,
         )
 
     @pytest.mark.fast
-    @range_test_config(output_proj_tkg_sweep_manual_config())
+    @pytest_parametrize(MANUAL_PARAM_NAMES, MANUAL_TEST_CASES, abbrevs=_ABBREVS, prefix="manual")
     def test_output_proj_tkg_sweep_manual(
         self,
         test_manager: Orchestrator,
-        range_test_options: RangeTestCase,
-        collector: IMetricsCollector,
+        B: int,
+        n_heads: int,
+        S_tkg: int,
+        d_head: int,
+        H: int,
+        quantization_type: QuantizationType,
+        test_bias: bool,
+        transpose_out: bool,
     ):
         compiler_args = CompilerArgs()
-        self.run_range_output_proj_tkg_test(
+        lnc_degree = compiler_args.logical_nc_config
+
+        # H=602 is not divisible by 128*lnc_degree, so this is a negative test
+        # when transpose_out=True (requires H % (P_MAX * lnc_degree) == 0)
+        H_divis_requirement = P_MAX if transpose_out else 1
+        is_negative = H % (lnc_degree * H_divis_requirement) != 0
+
+        self.run_output_proj_tkg_test(
             test_manager=test_manager,
-            dtype=nl.bfloat16,
-            test_options=range_test_options,
-            lnc_degree=compiler_args.logical_nc_config,
             compiler_args=compiler_args,
-            collector=collector,
+            B=B,
+            H=H,
+            S_tkg=S_tkg,
+            d_head=d_head,
+            quantization_type=quantization_type,
+            dtype=nl.bfloat16,
+            lnc_degree=lnc_degree,
+            n_heads=n_heads,
+            test_bias=test_bias,
+            transpose_out=transpose_out,
+            is_negative_test=is_negative,
+        )
+
+    # Sweep test: replaces old RangeTestConfig with coverage_parametrize.
+    # Old config generated 195 cases (6 random + 128 monotonic + 2 manual + 59 product_monotonic).
+    # coverage_parametrize with "pairs" coverage generates deterministic 2-way interaction coverage
+    # over the same parameter space. The value lists below are supersets of the unique values
+    # from the old sweep generators.
+    #
+    # Old dimension ranges:
+    #   d_head: 1..128 (monotonic steps of ~13, product steps of ~26)
+    #   B:      1..512 (product constraint: B*S_tkg <= 4096 for tp=0, <= 512 for tp=1)
+    #   n_heads: 1..64 (product constraint: n_heads*d_head <= 4096)
+    #   S_tkg:  1..8
+    #   H:      128..16384 (multiple_of=128, plus 602 for negative test)
+    #   transpose_out: 0 or 1
+    # @IGNORE_FAST
+    @pytest.mark.coverage_parametrize(
+        B=[1, 4, 8, 16, 32, 64, 128, 192, 310, 413, 512],
+        n_heads=[1, 2, 4, 8, 10, 14, 27, 40, 53, 64],
+        S_tkg=[1, 2, 3, 4, 5, 6, 7, 8],
+        d_head=[1, 13, 26, 39, 52, 65, 78, 91, 104, 117, 128],
+        H=[128, 602, 1024, 3072, 5376, 7168, 8192, 10240, 12288, 14336, 16384],
+        transpose_out=[False, True],
+        filter=_filter_sweep_params,
+        coverage="pairs",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+    )
+    def test_output_proj_tkg_sweep(
+        self,
+        test_manager: Orchestrator,
+        B: int,
+        n_heads: int,
+        S_tkg: int,
+        d_head: int,
+        H: int,
+        transpose_out: bool,
+        is_negative_test_case: bool,
+    ):
+        compiler_args = CompilerArgs()
+        lnc_degree = compiler_args.logical_nc_config
+
+        # Additional negative test check: H divisibility by lnc_degree * P_MAX for transpose_out
+        H_divis_requirement = P_MAX if transpose_out else 1
+        if H % (lnc_degree * H_divis_requirement) != 0:
+            is_negative_test_case = True
+
+        self.run_output_proj_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            B=B,
+            H=H,
+            S_tkg=S_tkg,
+            d_head=d_head,
+            quantization_type=QuantizationType.NONE,
+            dtype=nl.bfloat16,
+            lnc_degree=lnc_degree,
+            n_heads=n_heads,
+            test_bias=True,
+            transpose_out=transpose_out,
+            is_negative_test=is_negative_test_case,
+        )
+
+    # FP8 sweep: same parameter space as sweep but with STATIC quantization.
+    # Old test_output_proj_tkg_fp8_sweep forced quantization_type=STATIC on the same sweep config.
+    # @IGNORE_FAST
+    @pytest.mark.coverage_parametrize(
+        B=[1, 4, 8, 16, 32, 64, 128, 192, 310, 413, 512],
+        n_heads=[1, 2, 4, 8, 10, 14, 27, 40, 53, 64],
+        S_tkg=[1, 2, 3, 4, 5, 6, 7, 8],
+        d_head=[1, 13, 26, 39, 52, 65, 78, 91, 104, 117, 128],
+        H=[128, 602, 1024, 3072, 5376, 7168, 8192, 10240, 12288, 14336, 16384],
+        transpose_out=[False, True],
+        filter=_filter_sweep_params,
+        coverage="pairs",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+    )
+    def test_output_proj_tkg_fp8_sweep(
+        self,
+        test_manager: Orchestrator,
+        B: int,
+        n_heads: int,
+        S_tkg: int,
+        d_head: int,
+        H: int,
+        transpose_out: bool,
+        is_negative_test_case: bool,
+    ):
+        compiler_args = CompilerArgs()
+        lnc_degree = compiler_args.logical_nc_config
+
+        H_divis_requirement = P_MAX if transpose_out else 1
+        if H % (lnc_degree * H_divis_requirement) != 0:
+            is_negative_test_case = True
+
+        self.run_output_proj_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            B=B,
+            H=H,
+            S_tkg=S_tkg,
+            d_head=d_head,
+            quantization_type=QuantizationType.STATIC,
+            dtype=nl.bfloat16,
+            lnc_degree=lnc_degree,
+            n_heads=n_heads,
+            test_bias=True,
+            transpose_out=transpose_out,
+            is_negative_test=is_negative_test_case,
         )

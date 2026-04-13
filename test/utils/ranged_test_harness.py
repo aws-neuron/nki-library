@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import collections
+import contextvars
 import logging
 import math
 import os
@@ -25,9 +26,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Iterable, Optional, Union, final
 
+from typing_extensions import override
+
+# Context variable to track if we're in a negative test case
+# This allows Orchestrator.execute() to automatically detect negative tests
+_is_negative_test_context: contextvars.ContextVar[bool] = contextvars.ContextVar('is_negative_test', default=False)
+
 developer_logging_format = '%(asctime)s %(levelname)s %(process)d [%(name)s]: %(message)s'
 logging_datefmt = '%Y-%m-%dT%H:%M:%SZ'
-from typing_extensions import override
 
 
 def not_empty(list_like, name):
@@ -268,11 +274,21 @@ def assert_kernel_validation_exception(expected_validation_error: Optional[str],
         assert actual_exception_message.__contains__(expected_validation_error)
 
 
+def is_in_negative_test_context() -> bool:
+    """Check if we're currently inside an assert_negative_test_case context.
+
+    This allows Orchestrator.execute() to automatically detect negative tests
+    without requiring tests to explicitly pass is_negative_test to KernelArgs.
+    """
+    return _is_negative_test_context.get()
+
+
 @contextmanager
 def assert_negative_test_case(
     is_negative_test_case: bool,
     expected_validation_error: Optional[str] = None,
 ):
+    token = _is_negative_test_context.set(is_negative_test_case)
     try:
         yield
     except Exception as e:
@@ -281,6 +297,8 @@ def assert_negative_test_case(
         assert_kernel_validation_exception(expected_validation_error, e)
     else:
         assert not is_negative_test_case, "Test case was expected to fail, but it hasn't!"
+    finally:
+        _is_negative_test_context.reset(token)
 
 
 RANGE_TEST_CONFIG_ATTR_KEY = "range_test_config"

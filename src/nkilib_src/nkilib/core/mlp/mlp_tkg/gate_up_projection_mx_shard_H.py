@@ -39,7 +39,6 @@ from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
     _pmax,
-    _psum_bmax,
     _psum_fmax,
     _q_height,
     _q_width,
@@ -280,28 +279,23 @@ def process_fused_gate_up_projection_mxfp4(
     n_I512_tile = div_ceil(dims.I, (_pmax * _q_width))
 
     # Allocate and load weight sbuf shared between gate and up projection
-    weight_sb = nl.ndarray((_pmax, 2, n_H512_tile_sharded, dims.I), dtype=gate_up_weights.dtype, buffer=nl.sbuf)
+    base_weight = gate_up_weights.base_tensor
+    weight_sb = nl.ndarray((_pmax, 2, n_H512_tile_sharded, dims.I), dtype=base_weight.dtype, buffer=nl.sbuf)
     if gate_up_weights_E_offset is None:
         nisa.dma_copy(
             dst=weight_sb,
-            src=gate_up_weights[:, :, shard_id : (shard_id + 1) * n_H512_tile_sharded, :],
+            src=base_weight[:, :, shard_id : (shard_id + 1) * n_H512_tile_sharded, :],
             dge_mode=nisa.dge_mode.swdge,
         )
     else:
-        nisa.dma_copy(
-            dst=weight_sb,
-            src=gate_up_weights.ap(
-                pattern=[
-                    [2 * n_H512_tiles * dims.I, _pmax],
-                    [n_H512_tiles * dims.I, 2],
-                    [dims.I, n_H512_tile_sharded],
-                    [1, dims.I],
-                ],
-                offset=shard_id * n_H512_tile_sharded * dims.I,
-                scalar_offset=gate_up_weights_E_offset,
-                indirect_dim=0,
-            ),
+        # gate_up_weights shape: (E, _pmax, 2, n_H512_tiles, I)
+        gate_up_weights_view = (
+            TensorView(base_weight)
+            .select(dim=0, index=gate_up_weights_E_offset)
+            .slice(dim=2, start=shard_id * n_H512_tile_sharded, end=(shard_id + 1) * n_H512_tile_sharded)
         )
+        nisa.dma_copy(dst=weight_sb, src=gate_up_weights_view.get_view())
+    weight_sb = weight_sb.view(gate_up_weights.dtype)
 
     # Alloc and load weight scale, which needs zero padding in sbuf
     scale_shape = gate_up_scale.shape

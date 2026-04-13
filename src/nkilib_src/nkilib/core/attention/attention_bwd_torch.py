@@ -24,142 +24,104 @@ PMAX = 128
 
 
 def attention_bwd_torch_ref(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dy: torch.Tensor,
-    norm_score: Optional[torch.Tensor],
-    use_causal_mask: bool,
-    mixed_precision: bool,
+    q_ref: torch.Tensor,
+    k_ref: torch.Tensor,
+    v_ref: torch.Tensor,
+    o_ref: torch.Tensor,
+    dy_ref: torch.Tensor,
+    lse_ref: torch.Tensor,
+    sinks_ref: Optional[torch.Tensor] = None,
+    bound_min: Optional[torch.Tensor] = None,
+    bound_max: Optional[torch.Tensor] = None,
+    use_causal_mask: bool = False,
+    mixed_precision: bool = False,
     softmax_scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
-    dropout_mask: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
-) -> Union[
-    Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-]:
+) -> dict:
     """
     PyTorch reference implementation of Flash Attention backward pass.
 
-    This is a reference implementation for testing the NKI attention_bwd kernel.
-    It implements the same mathematical operation using PyTorch operations.
+    Signature matches the attention_bwd kernel for consistency.
 
     Args:
-        q (torch.Tensor): Query tensor of shape (B, Hq, d, seqlen_q)
-        k (torch.Tensor): Key tensor of shape (B, Hkv, d, seqlen_k)
-        v (torch.Tensor): Value tensor of shape (B, Hkv, d, seqlen_k)
-        dy (torch.Tensor): Gradient of output of shape (B, Hq, d, seqlen_q)
-        norm_score (Optional[torch.Tensor]): Normalized attention scores of shape (B, Hq, seqlen_q, seqlen_k + sinks).
-        use_causal_mask (bool): Whether to apply causal masking (used if norm_score is None)
+        q_ref (torch.Tensor): Query tensor of shape (B, Hq, d, seqlen_q)
+        k_ref (torch.Tensor): Key tensor of shape (B, Hkv, d, seqlen_k)
+        v_ref (torch.Tensor): Value tensor of shape (B, Hkv, d, seqlen_k)
+        o_ref (torch.Tensor): Forward pass output (unused, needed for kernel signature match)
+        dy_ref (torch.Tensor): Gradient of output of shape (B, Hq, d, seqlen_q)
+        lse_ref (torch.Tensor): Log-sum-exp from forward pass (unused, needed for kernel signature match)
+        bound_min (Optional[torch.Tensor]): Shape (seqlen_q,). For sequence packing: K-index where
+            the sequence containing each Q token starts.
+        bound_max (Optional[torch.Tensor]): Shape (seqlen_q,). For sequence packing: K-index where
+            the sequence containing each Q token ends (exclusive).
+        sinks_ref (Optional[torch.Tensor]): Optional attention sinks of shape (B, Hq) or (B, Hq, num_sinks)
+        use_causal_mask (bool): Whether to apply causal masking
         mixed_precision (bool): Whether to use mixed precision for reductions
         softmax_scale (Optional[float]): Scale factor for softmax (default: 1/sqrt(d))
-        sliding_window (Optional[int]): Sliding window size (used if norm_score is None)
-        dropout_mask (Optional[torch.Tensor]): Optional dropout mask
-        sinks (Optional[torch.Tensor]): Optional attention sinks of shape (B, Hq) or (B, Hq, num_sinks)
+        sliding_window (Optional[int]): Sliding window size
 
     Returns:
-        Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-            If sinks is None: (dq, dk, dv)
-            If sinks is provided: (dq, dk, dv, dsinks)
-            - dq: Gradient w.r.t. q, shape (B, Hq, d, seqlen_q)
-            - dk: Gradient w.r.t. k, shape (B, Hkv, d, seqlen_k)
-            - dv: Gradient w.r.t. v, shape (B, Hkv, d, seqlen_k)
-            - dsinks: Optional gradient w.r.t. sinks, shape (B, Hq) or (B, Hq, num_sinks)
-
-    Note:
-        This implementation prioritizes clarity over performance.
-        Hardware-specific parameters from the NKI kernel are not included
-        as they don't affect the mathematical result.
+        dict with keys: out_dq_ref, out_dk_ref, out_dv_ref, and optionally out_dsinks_ref
     """
-    B, Hq, d, _ = q.shape
-    Hkv = k.shape[1]
-    k_expanded = expand_kv_heads(k, Hq)
-    v_expanded = expand_kv_heads(v, Hq)
+    B, Hq, d, _ = q_ref.shape
+    Hkv = k_ref.shape[1]
+    k_expanded = expand_kv_heads(k_ref, Hq)
+    v_expanded = expand_kv_heads(v_ref, Hq)
 
-    sliding_window = min(sliding_window or 0, k.shape[-1])
+    sliding_window = min(sliding_window or 0, k_ref.shape[-1])
     softmax_scale = softmax_scale or (1.0 / (d**0.5))
-    q_scaled = q * softmax_scale
+    q_scaled = q_ref * softmax_scale
 
-    if norm_score is None:
-        _, _, norm_score = compute_o_lse(
-            q, k, v, use_causal_mask, mixed_precision, sliding_window=sliding_window, sinks=sinks
-        )
+    _, _, norm_score = compute_o_lse(
+        q_ref,
+        k_ref,
+        v_ref,
+        use_causal_mask,
+        mixed_precision,
+        softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        bound_min=bound_min,
+        bound_max=bound_max,
+        sinks=sinks_ref,
+    )
 
-    """
-    Calculate softmax_dy = (dL/dy)^T @ V.
-    
-    Tensor shapes:
-        dy.permute: (B, Hq, seqlen_q, d)
-        v_expanded: (B, Hq, d, seqlen_k)
-        softmax_dy: (B, Hq, seqlen_q, seqlen_k)
-    """
-    softmax_dy_dropped = mixed_precision_matmul(dy.permute(0, 1, 3, 2), v_expanded)
-
-    if dropout_mask is not None:
-        softmax_dy = softmax_dy_dropped * dropout_mask
-    else:
-        softmax_dy = softmax_dy_dropped
+    softmax_dy = mixed_precision_matmul(dy_ref.permute(0, 1, 3, 2), v_expanded)
 
     # Calculate softmax_dx
-    if sinks is not None:
-        num_sinks = sinks.shape[-1] if len(sinks.shape) == 3 else 1
+    if sinks_ref is not None:
+        num_sinks = sinks_ref.shape[-1] if len(sinks_ref.shape) == 3 else 1
         softmax_dy_padded = torch.cat([softmax_dy, torch.zeros_like(norm_score[..., -num_sinks:])], axis=-1)
-        softmax_dx_sinks = softmax_dx(softmax_dy_padded, norm_score, dim=-1, mixed_precision=mixed_precision)
+        softmax_dx_golden = softmax_dx(softmax_dy_padded, norm_score, dim=-1, mixed_precision=mixed_precision)
         norm_score = norm_score[..., :-num_sinks]
 
         softmax_dx_golden, dsinks_golden = (
-            softmax_dx_sinks[..., :-num_sinks],
-            softmax_dx_sinks[..., -num_sinks:],
+            softmax_dx_golden[..., :-num_sinks],
+            softmax_dx_golden[..., -num_sinks:],
         )
         dsinks_golden = dsinks_golden.sum(dim=2)
     else:
         softmax_dx_golden = softmax_dx(softmax_dy, norm_score, dim=-1, mixed_precision=mixed_precision)
 
-    if dropout_mask is not None:
-        norm_score_dropped = norm_score * dropout_mask
-    else:
-        norm_score_dropped = norm_score
-
-    """
-    Calculate dv = (dL/dy) @ softmax_y.
-    
-    Tensor shapes:
-        dy: (B, Hq, d, seqlen_q)
-        norm_score_dropped: (B, Hq, seqlen_q, seqlen_k)
-        dv: (B, Hq, d, seqlen_k)
-    """
-    dv_golden = mixed_precision_matmul(dy, norm_score_dropped)
-
-    """
-    Calculate dq.
-    
-    Tensor shapes:
-        k_expanded: (B, Hq, d, seqlen_k)
-        softmax_dx_golden.permute: (B, Hq, seqlen_k, seqlen_q)
-        dq: (B, Hq, d, seqlen_q)
-    """
+    dv_golden = mixed_precision_matmul(dy_ref, norm_score)
     dq_golden = mixed_precision_matmul(k_expanded, softmax_dx_golden.permute(0, 1, 3, 2)) * softmax_scale
-
-    """
-    Calculate dk.
-    
-    Tensor shapes:
-        q_scaled: (B, Hq, d, seqlen_q)
-        softmax_dx_golden: (B, Hq, seqlen_q, seqlen_k)
-        dk: (B, Hq, d, seqlen_k)
-    """
     dk_golden = mixed_precision_matmul(q_scaled, softmax_dx_golden)
 
     # Reduce gradients for GQA
     dk_golden = reduce_kv_grad(dk_golden, Hkv, mixed_precision)
     dv_golden = reduce_kv_grad(dv_golden, Hkv, mixed_precision)
 
-    dq_golden = dq_golden.to(q.dtype)
-    dk_golden = dk_golden.to(k.dtype)
-    dv_golden = dv_golden.to(v.dtype)
-    if sinks is not None:
-        return dq_golden, dk_golden, dv_golden, dsinks_golden.to(sinks.dtype)
-    return dq_golden, dk_golden, dv_golden
+    dq_golden = dq_golden.to(q_ref.dtype)
+    dk_golden = dk_golden.to(k_ref.dtype)
+    dv_golden = dv_golden.to(v_ref.dtype)
+
+    result = {
+        "out_dq_ref": dq_golden,
+        "out_dk_ref": dk_golden,
+        "out_dv_ref": dv_golden,
+    }
+    if sinks_ref is not None:
+        result["out_dsinks_ref"] = dsinks_golden.to(sinks_ref.dtype)
+    return result
 
 
 def compute_o_lse(
@@ -173,6 +135,8 @@ def compute_o_lse(
     sliding_window: Optional[int] = None,
     dropout_mask: Optional[torch.Tensor] = None,
     sinks: Optional[torch.tensor] = None,
+    bound_min: Optional[torch.Tensor] = None,
+    bound_max: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute forward attention output, log-sum-exp, and normalized scores.
@@ -221,9 +185,12 @@ def compute_o_lse(
         q_pos = torch.arange(seqlen_q, device=q.device).unsqueeze(1)
         k_pos = torch.arange(seqlen_k, device=q.device).unsqueeze(0)
         mask |= k_pos < (q_pos - sliding_window + 1)
+    if bound_min is not None:
+        k_pos = torch.arange(seqlen_k, device=q.device, dtype=torch.float32)
+        mask |= (k_pos[None, :] < bound_min[:, None]) | (k_pos[None, :] >= bound_max[:, None])
 
     # Apply mask once with broadcasting (mask broadcasts from (seqlen_q, seqlen_k) to (B, Hq, seqlen_q, seqlen_k))
-    if use_causal_mask or sliding_window > 0:
+    if use_causal_mask or sliding_window > 0 or bound_min is not None:
         raw_score = raw_score.masked_fill(mask, -float("inf"))
 
     # Assume logit_bias can be broadcasted

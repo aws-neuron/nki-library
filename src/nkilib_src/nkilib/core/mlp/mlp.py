@@ -19,7 +19,9 @@ import nki
 import nki.language as nl
 
 # common utils
+from ..utils.allocator import BufferManager, SbufManager
 from ..utils.common_types import ActFnType, NormType, QuantizationType
+from ..utils.logging import Logger
 
 # MLP utils
 from .mlp_cte.mlp_cte import mlp_cte
@@ -30,6 +32,7 @@ from .mlp_parameters import (
     validate_mlp_arguments,
 )
 from .mlp_tkg.mlp_tkg import mlp_tkg
+from .mlp_tkg.mlp_tkg_mx import mlp_tkg_mx
 
 #
 # **********************
@@ -72,19 +75,21 @@ def mlp(
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     force_cte_mode: bool = False,
+    sbm: Optional[BufferManager] = None,
 ) -> list[nl.ndarray]:
     """
-    MLP(Multi-Layer Perceptron) Kernel implementation.
+    MLP (Multi-Layer Perceptron) Kernel implementation.
 
     Performs the standard MLP computation with support for both context encoding (CTE) and
     token generation (TKG) modes. Automatically selects the appropriate implementation based
-    on input dimensions and supports various optimizations
+    on input dimensions and supports various optimizations including FP8 and MXFP quantization.
 
     Supported input data types: bfloat16, float16, float32.
+    Supported quantization: FP8 (tensor-wise/row-wise), MXFP4, MXFP8.
 
     Computation flow:
         if fused_add is applied:
-        hidden_states = hidden_states + fused_add_tensor
+            hidden_states = hidden_states + fused_add_tensor
 
         if normalization is applied:
             hidden_states = normalization_type(hidden_states)
@@ -116,18 +121,33 @@ def mlp(
         activation_fn (ActFnType): Activation function type.
         normalization_type (NormType): Type of normalization.
         quantization_type (QuantizationType): Quantization type to use (default: QuantizationType.NONE).
-            Supported values are QuantizationType.STATIC and QuantizationType.ROW.
-            Quantization is only supported in TKG mode.
-        gate_w_scale (nl.ndarray, optional): FP8 dequantization scales for gate weights.
-            Shape is [128, I] for row-wise quantization, [128, 1] for static quantization. Defaults to None.
-        up_w_scale (nl.ndarray, optional): FP8 dequantization scales for up weights.
-            Shape is [128, I] for row-wise quantization, [128, 1] for static quantization. Defaults to None.
-        down_w_scale (nl.ndarray, optional): FP8 dequantization scales for down weights.
-            Shape is [128, I] for row-wise quantization, [128, 1] for static quantization. Defaults to None.
+            Supported values:
+            - QuantizationType.NONE: No quantization
+            - QuantizationType.STATIC: FP8 tensor-wise quantization with 2x perf mode (CTE and TKG)
+            - QuantizationType.STATIC_MX: FP8 tensor-wise quantization with 4x perf mode (CTE)
+                - If using STATIC_MX in CTE mode, the up and gate weights should be swizzled as follows:
+                    H, I = w.shape
+                    w.reshape(
+                        (2, ceil(H / 512), 128, 2, ceil(I / 512), 128, 4)
+                    ).transpose(2, 1, 4, 6, 5, 0, 3).reshape((H, I))
+                - It expects the down weights to be swizzled as follows:
+                    I, H = w.shape
+                    w.reshape((ceil(I / 512), 128, 4, H)).transpose(1, 0, 3, 2).reshape((I, H))
+            - QuantizationType.ROW: FP8 row-wise quantization (CTE and TKG)
+            - QuantizationType.MX: MXFP quantization (MXFP4/MXFP8, TKG only)
+        gate_w_scale (nl.ndarray, optional): Dequantization scales for gate weights.
+            - FP8: Shape [128, I] for row-wise, [128, 1] for tensor-wise quantization
+            - MXFP (TKG only): Scale factors for MXFP quantized weights
+        up_w_scale (nl.ndarray, optional): Dequantization scales for up weights.
+            - FP8: Shape [128, I] for row-wise, [128, 1] for tensor-wise quantization
+            - MXFP (TKG only): Scale factors for MXFP quantized weights
+        down_w_scale (nl.ndarray, optional): Dequantization scales for down weights.
+            - FP8: Shape [128, I] for row-wise, [128, 1] for tensor-wise quantization
+            - MXFP (TKG only): Scale factors for MXFP quantized weights
         gate_up_in_scale (nl.ndarray, optional): FP8 dequantization scales for gate and up input.
-            Used for static quantization with shape [128, 1]. Defaults to None.
+            Used for tensor-wise quantization with shape [128, 1]. Defaults to None.
         down_in_scale (nl.ndarray, optional): FP8 dequantization scales for down input.
-            Used for static quantization with shape [128, 1]. Defaults to None.
+            Used for tensor-wise quantization with shape [128, 1]. Defaults to None.
         quant_clipping_bound (float): Clipping boundary for context encoding FP8 row quantization (default: 0.0)
         output_dtype: Output tensor data type. Defaults to None; if None, the hidden tensor’s dtype is used.
         store_output_in_sbuf (bool): If True, stores the output in SBUF instead of HBM,
@@ -150,6 +170,7 @@ def mlp(
         up_clamp_upper_limit (float): upper bound value to clamp on up projection results, does not perform clamping if the value is set to None
         up_clamp_lower_limit (float): lower bound value to clamp on up projection results, does not perform clamping if the value is set to None
         force_cte_mode (bool): If True, forces the use of CTE mode. (default: False)
+        sbm (BufferManager): Optional BufferManager for HBM tensor allocation with consistent naming.
 
     Returns:
         list:
@@ -164,9 +185,19 @@ def mlp(
 
     Notes:
         Automatically dispatches to either CTE or TKG implementation based on batch size and
-        sequence length. Token generation mode (TKG) is used for small batch/sequence dimensions,
-        while context encoding (CTE) handles larger inputs. Column tiling and tensor layout
-        optimization (`use_down_proj_layout_optimization`) are valid only in TKG mode.
+        sequence length. Token generation mode (TKG) is used for small batch/sequence dimensions
+        (B×S ≤ 96), while context encoding (CTE) handles larger inputs.
+
+        TKG mode supports:
+        - FP8 quantization (tensor-wise and row-wise)
+        - MXFP quantization (MXFP4 and MXFP8) - TKG only
+        - Column tiling optimizations
+        - Tensor layout optimization for down projection
+        - Input in SBUF for kernel fusion
+
+        CTE mode supports:
+        - FP8 quantization (tensor-wise and row-wise)
+        - Standard matrix multiplication layouts
     """
 
     # If output_dtype is not provided, use the same dtype as the hidden tensor
@@ -212,11 +243,15 @@ def mlp(
     # Validate MLP arguments
     validate_mlp_arguments(mlp_params)
 
+    # Create local sbm if not provided
+    if sbm is None:
+        sbm = SbufManager(0, 200 * 1024, Logger("mlp"))
+        sbm.set_name_prefix("mlp_")
     # Allocate output tensor in shared HBM memory
     output_tensors = []
     out = None
     if not store_output_in_sbuf:
-        out = nl.ndarray(
+        out = sbm.alloc(
             (mlp_params.batch_size, mlp_params.sequence_len, mlp_params.hidden_size),
             dtype=mlp_params.output_dtype,
             buffer=nl.shared_hbm,
@@ -227,7 +262,7 @@ def mlp(
     # Optionally allocate an additional tensor to store fused addition results
     fused_add_out = None
     if mlpp_store_fused_add(mlp_params):
-        fused_add_out = nl.ndarray(
+        fused_add_out = sbm.alloc(
             (mlp_params.batch_size, mlp_params.sequence_len, mlp_params.hidden_size),
             dtype=mlp_params.output_dtype,
             buffer=nl.shared_hbm,
@@ -239,8 +274,13 @@ def mlp(
     # If batch size × sequence length <= TKG_BS_SEQLEN_THRESHOLD(currently at 96), the kernel runs in TKG mode.
     # TODO: update TKG_BS_SEQLEN_THRESHOLD to 128
     if is_mlp_tkg(mlp_params):
-        return mlp_tkg(mlp_params, out, fused_add_out)
+        if mlp_params.quant_params.is_dtype_mx():
+            # mlp_tkg_mx does not use sbm
+            return mlp_tkg_mx(mlp_params, out, fused_add_out)
+        else:
+            return mlp_tkg(mlp_params, out, fused_add_out, sbm=sbm)
     else:
+        # mlp_cte doesn't accept a passed-in SBM
         mlp_cte(mlp_params, out, fused_add_out)
         # Return all output tensors (mlp output and optionally fused add)
         return output_tensors

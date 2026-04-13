@@ -11,8 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# LEGACY SWEEP TEST FRAMEWORK - Uses @range_test_config / RangeTestHarness
+# New tests should use @pytest.mark.coverage_parametrize instead
 import enum
 import math
+from collections import OrderedDict
+from typing import final
 
 try:
     from test.integration.nkilib.core.mlp.test_mlp_tkg_model_config import (
@@ -21,6 +26,7 @@ try:
 except ImportError:
     mlp_tkg_model_configs = []
 
+from functools import lru_cache
 from test.integration.nkilib.core.mlp.test_mlp_common import (
     build_fused_norm_mlp,
     golden_mlp,
@@ -37,7 +43,12 @@ from test.utils.common_dataclasses import (
     CompilerArgs,
     KernelArgs,
     LazyGoldenGenerator,
+    Platforms,
+    SeparationPassMode,
     ValidationArgs,
+    _iter_model_configs,
+    is_model_test_type,
+    unpack_model_config,
 )
 from test.utils.metadata_loader import load_model_configs
 from test.utils.metrics_collector import IMetricsCollector
@@ -54,7 +65,6 @@ from test.utils.ranged_test_harness import (
     range_test_config,
 )
 from test.utils.test_orchestrator import Orchestrator
-from typing import final
 
 import nki.language as nl
 import numpy as np
@@ -236,6 +246,8 @@ nki_tkg_fused_norm_mlp_kernel_spmd_vnc2_params = [
     [2, 4, 8, 8192, 512, nl.bfloat16, None, QuantizationType.NONE, 109073163, NormType.RMS_NORM, True, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
     [2, 4, 1, 8192, 512, nl.bfloat16, None, QuantizationType.NONE, 82688204, NormType.LAYER_NORM, True, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
     [2, 4, 8, 8192, 512, nl.bfloat16, None, QuantizationType.NONE, 104209837, NormType.LAYER_NORM, True, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
+    # Gemma3
+    [2, 1, 1, 5376, 336, nl.bfloat16, None, QuantizationType.NONE, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
 ]
 
 nki_tkg_fused_norm_mlp_kernel_spmd_vnc1_params = [
@@ -250,6 +262,8 @@ nki_tkg_fused_norm_mlp_kernel_spmd_vnc1_params = [
     [1, 4, 2, 16384, 832, nl.bfloat16, None, QuantizationType.NONE, 242479621, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, True, True, False],
     # Bias test with larger BxS
   	[1, 32, 2, 8192, 512, nl.bfloat16, None, QuantizationType.NONE, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, True, True, False],
+    # small H test
+    [1, 1, 1, 256, 448, nl.bfloat16, None, QuantizationType.NONE, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
 ]
 
 nki_tkg_fused_norm_mlp_kernel_spmd_vnc2_swap_perms = [
@@ -400,7 +414,62 @@ nki_tkg_fused_norm_mlp_static_quant_kernel_layout_swap_perms = [
     # Functional Test I > 1024
     [2, 4, 1, 8192, 1560, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC, 132462293, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
 ]
+
+nki_tkg_fused_norm_mlp_mx_quant_kernel_params = [
+    # LNC1 functional test
+    [1, 2, 1, 3072, 384, nl.bfloat16, nl.float4_e2m1fn_x4, QuantizationType.MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    [1, 2, 1, 8192, 448, nl.bfloat16, nl.float8_e4m3fn_x4, QuantizationType.MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    
+    # mxfp4 test - using float4_e2m1fn_x4 dtype
+    [2, 4, 1, 3072, 384, nl.bfloat16, nl.float4_e2m1fn_x4, QuantizationType.MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False],
+    # llama 3.3 70B TP64
+    [2, 64, 1, 8192, 448, nl.bfloat16, nl.float4_e2m1fn_x4, QuantizationType.MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    [2, 64, 1, 8192, 448, nl.bfloat16, nl.float4_e2m1fn_x4, QuantizationType.MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    # llama 3.3 70B TP8
+    [2, 64, 1, 8192, 3584, nl.bfloat16, nl.float4_e2m1fn_x4, QuantizationType.MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    [2, 64, 1, 8192, 3584, nl.bfloat16, nl.float4_e2m1fn_x4, QuantizationType.MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    
+    # mxfp8 test - using float8_e4m3fn_x4, float8_e5m2_x4 dtype
+    [2, 4, 1, 3072, 384, nl.bfloat16, nl.float8_e4m3fn_x4, QuantizationType.MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False],
+    # llama 3.3 70B TP64
+    [2, 64, 1, 8192, 448, nl.bfloat16, nl.float8_e4m3fn_x4, QuantizationType.MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    [2, 64, 1, 8192, 448, nl.bfloat16, nl.float8_e5m2_x4, QuantizationType.MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    # llama 3.3 70B TP8
+    [2, 64, 1, 8192, 3584, nl.bfloat16, nl.float8_e4m3fn_x4, QuantizationType.MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+    [2, 64, 1, 8192, 3584, nl.bfloat16, nl.float8_e5m2_x4, QuantizationType.MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False],
+]
 # fmt: on
+
+
+# fmt: off
+# 4 representative vectors for separation pass perf analysis
+nki_tkg_fused_norm_mlp_kernel_separation_pass_params = [
+    # Llama3 1B - small
+    [2, 1, 1, 2048, 512, nl.bfloat16, None, QuantizationType.NONE, 42469100, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
+    # Llama3 8B - medium
+    [2, 1, 1, 4096, 896, nl.bfloat16, None, QuantizationType.NONE, 66799895, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
+    # Large hidden with fused_add + store_add
+    [2, 4, 5, 8192, 896, nl.bfloat16, None, QuantizationType.NONE, 122126476, NormType.RMS_NORM, True, True, ActFnType.SiLU, False, False, False, False, False, True, True, False],
+    # Llama3 470B - large
+    [2, 1, 5, 20480, 832, nl.bfloat16, None, QuantizationType.NONE, 179771386, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False],
+]
+# fmt: on
+
+
+def _iter_entries(test_vectors, test_type):
+    """Yield (effective_type, params) from test_vectors.
+
+    For dict configs (model), uses ModelTestType.test_id_prefix as effective_type.
+    For flat lists (manual/sweep), uses test_type as-is.
+    """
+    if isinstance(test_vectors, dict):
+        for model_type, params in _iter_model_configs(test_vectors):
+            yield model_type.test_id_prefix, params
+    else:
+        for entry in test_vectors:
+            model_type, params = unpack_model_config(entry)
+            effective_type = model_type.test_id_prefix if is_model_test_type(test_type) else test_type
+            yield effective_type, params
 
 
 def create_mlp_tkg_test_config(test_vectors, test_type: str = "manual"):
@@ -408,15 +477,18 @@ def create_mlp_tkg_test_config(test_vectors, test_type: str = "manual"):
     Utility function to create complete RangeTestConfig from list of MLP TKG config vectors.
 
     Args:
-        test_vectors: List of test config vectors
+        test_vectors: List or dict of test config vectors. Dict format {ModelTestType: [configs...]}
+                      is used for model configs; each entry can also be a (ModelTestType, params) tuple.
         test_type: Test type label for test names
 
     Returns:
         Complete RangeTestConfig ready to use with @range_test_config decorator
     """
-    test_cases = []
 
-    for test_params in test_vectors:
+    grouped_cases: OrderedDict[str, list] = OrderedDict()
+
+    for entry in _iter_entries(test_vectors, test_type):
+        effective_type, test_params = entry
         (
             vnc_degree,
             batch,
@@ -465,9 +537,11 @@ def create_mlp_tkg_test_config(test_vectors, test_type: str = "manual"):
                 USE_TKG_DOWN_PROJ_OPTIMIZED_LAYOUT_DIM_NAME: int(use_tkg_down_proj_optimized_layout),
             }
         }
-        test_cases.append(test_case)
+        grouped_cases.setdefault(effective_type, []).append(test_case)
 
-    generators = [RangeManualGeneratorStrategy(test_cases=test_cases, test_type=test_type)]
+    generators = [
+        RangeManualGeneratorStrategy(test_cases=cases, test_type=etype) for etype, cases in grouped_cases.items()
+    ]
 
     return RangeTestConfig(
         additional_params={},
@@ -480,7 +554,9 @@ def create_mlp_tkg_test_config(test_vectors, test_type: str = "manual"):
 
 
 # Load model metadata for matching test configs to model names
-mlp_tkg_metadata_list = load_model_configs("test_mlp_tkg")
+@lru_cache(maxsize=1)
+def _get_mlp_tkg_metadata():
+    return load_model_configs("test_mlp_tkg")
 
 
 @pytest_test_metadata(
@@ -518,7 +594,7 @@ class TestMlpTkgKernels:
         up_clamp_upper_limit=None,
     ):
         # Model configs should never be marked as negative test cases
-        is_model_config = test_options.test_type == MODEL_TEST_TYPE
+        is_model_config = is_model_test_type(test_options.test_type)
         is_negative_test_case = False if is_model_config else test_options.is_negative_test_case
 
         mlp_config = test_options.tensors[MLP_TKG_CONFIG]
@@ -555,6 +631,11 @@ class TestMlpTkgKernels:
         # CloudWatch metrics for kernel test outcome
         # ----------------------------------------------------
         test_size_classification = MLPTKGClassification.classify(batch, seqlen, hidden, intermediate)
+
+        # Safety check: model configs must never be marked as negative test cases
+        assert not (
+            is_model_config and is_negative_test_case
+        ), "Model configs must never be marked as negative test cases"
 
         # ----------------------------------------------------
         with assert_negative_test_case(is_negative_test_case):
@@ -679,7 +760,7 @@ class TestMlpTkgKernels:
             if quant_dtype is not None:
                 return golden_quant_mlp(
                     inp_np=kernel_input,
-                    fused_rmsnorm=(norm_type == NormType.RMS_NORM),
+                    norm_type=norm_type,
                     fused_add=fused_add,
                     store_add=store_add,
                     dtype=dtype,
@@ -712,6 +793,13 @@ class TestMlpTkgKernels:
                     up_clamp_upper_limit=up_clamp_upper_limit,
                 )
 
+        # MX quantization: Hidden tensors are generated using generate_stabilized_mx_data(),
+        # which produces FP/MX pairs that convert exactly without precision loss.
+        # However, RMSNorm destabilizes this property, increasing quantization error.
+        if quantization_type == QuantizationType.MX:
+            rel_accuracy = 5e-2
+        else:
+            rel_accuracy = 2e-2
         test_manager.execute(
             KernelArgs(
                 kernel_func=mlp,
@@ -722,7 +810,7 @@ class TestMlpTkgKernels:
                         lazy_golden_generator=create_lazy_golden,
                         output_ndarray=output_ndarrays,
                     ),
-                    relative_accuracy=2e-2,
+                    relative_accuracy=rel_accuracy,
                     absolute_accuracy=1e-5,
                 ),
                 inference_args=TKG_INFERENCE_ARGS,
@@ -746,6 +834,7 @@ class TestMlpTkgKernels:
             + nki_tkg_fused_norm_mlp_row_quant_kernel_layout_swap_perms
             + nki_tkg_fused_norm_mlp_static_quant_kernel_params
             + nki_tkg_fused_norm_mlp_static_quant_kernel_layout_swap_perms
+            + nki_tkg_fused_norm_mlp_mx_quant_kernel_params
         )
         # Create manual config with test_type="manual"
         manual_config = create_mlp_tkg_test_config(all_unit_test_params, test_type="manual")
@@ -896,13 +985,13 @@ class TestMlpTkgKernels:
         range_test_options: RangeTestCase,
         collector: IMetricsCollector,
         request,
+        platform_target: Platforms,
     ):
         # Get the tensor config
         mlp_config = range_test_options.tensors[MLP_TKG_CONFIG]
 
-        # Apply xfail for model configs and add metadata dimensions
-        if range_test_options.test_type == MODEL_TEST_TYPE:
-            request.node.add_marker(pytest.mark.xfail(strict=False, reason="Model coverage test"))
+        # Add metadata dimensions for model configs
+        if is_model_test_type(range_test_options.test_type):
             test_metadata_key = {
                 "vnc": mlp_config[VNC_DEGREE_DIM_NAME],
                 "b": mlp_config[BATCH_DIM_NAME],
@@ -910,10 +999,30 @@ class TestMlpTkgKernels:
                 "h": mlp_config[HIDDEN_DIM_NAME],
                 "i": mlp_config[INTERMEDIATE_DIM_NAME],
             }
-            collector.match_and_add_metadata_dimensions(test_metadata_key, mlp_tkg_metadata_list)
+            collector.match_and_add_metadata_dimensions(test_metadata_key, _get_mlp_tkg_metadata())
 
         lnc_count = mlp_config[VNC_DEGREE_DIM_NAME]
-        compiler_args = CompilerArgs(logical_nc_config=lnc_count)
+        quant_type = mlp_config[QUANTIZATION_TYPE_DIM_NAME]
+
+        if quant_type == QuantizationType.MX and platform_target is not Platforms.TRN3:
+            pytest.skip("MXFP4/8 is only supported on TRN3.")
+
+        H = mlp_config[HIDDEN_DIM_NAME]
+        if quant_type == QuantizationType.MX and H % 512 != 0:
+            pytest.skip("MX quantization requires H to be divisible by 512")
+
+        I = mlp_config[INTERMEDIATE_DIM_NAME]
+        if quant_type == QuantizationType.MX and not (I % 512 == 0 or (I < 512 and I % 32 == 0)):
+            pytest.skip("MX quantization requires I to be I % 512 == 0 or (I < 512 and I % 32 ==0)")
+
+        BxS = mlp_config[BATCH_DIM_NAME] * mlp_config[SEQUENCE_LEN_DIM_NAME]
+        if BxS > TKG_BS_SEQLEN_THRESHOLD:
+            pytest.skip(f"TKG mode requires B*S <= {TKG_BS_SEQLEN_THRESHOLD}, got {BxS}")
+
+        if quant_type in [QuantizationType.STATIC_MX, QuantizationType.ROW_MX]:
+            pytest.skip("MXFP + ROW/STATIC quantization are not supported yet")
+
+        compiler_args = CompilerArgs(logical_nc_config=lnc_count, platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=mlp_config[DTYPE_DIM_NAME],
@@ -955,8 +1064,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -998,8 +1108,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1039,6 +1150,7 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
         # If store_add is False, rmsnorm_tkg and layernorm_tkg should accept SBUF input
         force_fused_add = True
@@ -1046,7 +1158,7 @@ class TestMlpTkgKernels:
         # Bias is not relevant when checking fused_add=True, store_add=False configs
         force_bias = False
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1091,13 +1203,14 @@ class TestMlpTkgKernels:
         use_tkg_down_proj_column_tiling,
         skip_gate_proj,
         clamp,
+        platform_target: Platforms,
     ):
         gate_clamp_upper_limit = float(8.0) if clamp else None
         gate_clamp_lower_limit = float(-6.0) if clamp else None
         up_clamp_upper_limit = float(8.0) if clamp else None
         up_clamp_lower_limit = float(-6.0) if clamp else None
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=nl.bfloat16,
@@ -1142,8 +1255,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1184,8 +1298,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1226,8 +1341,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1268,8 +1384,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1290,5 +1407,47 @@ class TestMlpTkgKernels:
             use_tkg_gate_up_proj_column_tiling=config["use_tkg_gate_up_proj_column_tiling"],
             use_tkg_down_proj_column_tiling=config["use_tkg_down_proj_column_tiling"],
             use_tkg_down_proj_optimized_layout=config["use_tkg_down_proj_optimized_layout"],
+            collector=collector,
+        )
+
+    @staticmethod
+    def mlp_tkg_separation_pass_config():
+        return create_mlp_tkg_test_config(nki_tkg_fused_norm_mlp_kernel_separation_pass_params)
+
+    @range_test_config(mlp_tkg_separation_pass_config())
+    def test_mlp_tkg_separation_pass(
+        self,
+        test_manager: Orchestrator,
+        range_test_options: RangeTestCase,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+    ):
+        mlp_config = range_test_options.tensors[MLP_TKG_CONFIG]
+        lnc_count = mlp_config[VNC_DEGREE_DIM_NAME]
+        compiler_args = CompilerArgs(
+            logical_nc_config=lnc_count,
+            separation_pass_mode=SeparationPassMode.INDIRECT,
+            platform_target=platform_target,
+        )
+        self.run_range_mlp_tkg_test(
+            test_manager=test_manager,
+            dtype=mlp_config[DTYPE_DIM_NAME],
+            test_options=range_test_options,
+            lnc_degree=lnc_count,
+            compiler_args=compiler_args,
+            norm_type=NormType(mlp_config[NORM_TYPE_DIM_NAME]),
+            fused_add=bool(mlp_config[FUSED_ADD_DIM_NAME]),
+            store_add=bool(mlp_config[STORE_ADD_DIM_NAME]),
+            act_fn_type=ActFnType(mlp_config[ACT_FN_TYPE_DIM_NAME]),
+            gate_bias=bool(mlp_config[GATE_BIAS_DIM_NAME]),
+            up_bias=bool(mlp_config[UP_BIAS_DIM_NAME]),
+            down_bias=bool(mlp_config[DOWN_BIAS_DIM_NAME]),
+            norm_bias=bool(mlp_config[NORM_BIAS_DIM_NAME]),
+            quant_dtype=mlp_config[QUANTIZATION_DTYPE_DIM_NAME],
+            quantization_type=QuantizationType(mlp_config[QUANTIZATION_TYPE_DIM_NAME]),
+            skip_gate_proj=bool(mlp_config[SKIP_GATE_DIM_NAME]),
+            use_tkg_gate_up_proj_column_tiling=bool(mlp_config[USE_TKG_GATE_UP_PROJ_COLUMN_TILING_DIM_NAME]),
+            use_tkg_down_proj_column_tiling=bool(mlp_config[USE_TKG_DOWN_PROJ_COLUMN_TILING_DIM_NAME]),
+            use_tkg_down_proj_optimized_layout=bool(mlp_config[USE_TKG_DOWN_PROJ_OPTIMIZED_LAYOUT_DIM_NAME]),
             collector=collector,
         )

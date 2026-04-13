@@ -22,7 +22,7 @@ from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def depthwise_conv1d_implicit_gemm(
     img_ref: nl.ndarray,
     filter_ref: nl.ndarray,
@@ -152,7 +152,7 @@ def depthwise_conv1d_implicit_gemm(
 
     shard_id = nl.program_id(axis=0)
 
-    output = nl.ndarray((N, C, 1, Q), dtype=img_ref.dtype, buffer=nl.hbm)
+    output = nl.ndarray((N, C, 1, Q), dtype=img_ref.dtype, buffer=nl.shared_hbm)
 
     for batch_idx in nl.affine_range(N):
         for c_tile_idx in nl.affine_range(num_c_tiles):
@@ -255,6 +255,7 @@ def depthwise_conv1d_implicit_gemm(
                                         src=img_ref.ap(
                                             pattern=[[1, load_size], [1, 1]], offset=input_base_offset + input_pos
                                         ),
+                                        dge_mode=nisa.dge_mode.none,
                                     )
 
                         # Bulk load unaffected middle region (full columns with full rows)
@@ -266,6 +267,7 @@ def depthwise_conv1d_implicit_gemm(
                                 src=img_ref.ap(
                                     pattern=[[1, s_tile_size], [stride_w, q_bulk_count]], offset=input_offset
                                 ),
+                                dge_mode=nisa.dge_mode.none,
                             )
 
                         # Load columns after bulk region (each column may have partial rows)
@@ -282,6 +284,7 @@ def depthwise_conv1d_implicit_gemm(
                                         src=img_ref.ap(
                                             pattern=[[1, load_size], [1, 1]], offset=input_base_offset + input_pos
                                         ),
+                                        dge_mode=nisa.dge_mode.none,
                                     )
 
                         # Handle case where no full columns exist (entire tile affected)
@@ -298,6 +301,7 @@ def depthwise_conv1d_implicit_gemm(
                                         src=img_ref.ap(
                                             pattern=[[1, load_size], [1, 1]], offset=input_base_offset + input_pos
                                         ),
+                                        dge_mode=nisa.dge_mode.none,
                                     )
                     else:
                         """
@@ -315,6 +319,7 @@ def depthwise_conv1d_implicit_gemm(
                             nisa.dma_copy(
                                 dst=input_tile[0:s_tile_size, 0:Q],
                                 src=img_ref.ap(pattern=[[1, s_tile_size], [1, Q]], offset=input_offset),
+                                dge_mode=nisa.dge_mode.none,
                             )
                         else:
                             # Bulk load + strided copy for stride>1
@@ -326,6 +331,7 @@ def depthwise_conv1d_implicit_gemm(
                             nisa.dma_copy(
                                 dst=input_bulk[0:s_tile_size, 0:bulk_load_size],
                                 src=img_ref.ap(pattern=[[1, s_tile_size], [1, bulk_load_size]], offset=input_offset),
+                                dge_mode=nisa.dge_mode.none,
                             )
 
                             # Strided copy: extract every stride_w-th element

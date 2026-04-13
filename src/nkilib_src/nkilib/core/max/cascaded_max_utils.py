@@ -62,11 +62,13 @@ def predicated_folded_load(
     n_programs: int = 1,
     fill_value: float = -9948.0,
     data_sb: Optional[nl.ndarray] = None,
+    batch_start: Optional[int] = None,
+    batch_end: Optional[int] = None,
 ) -> Optional[nl.ndarray]:
     """
     Reshape and load HBM tensor with folding along free dimension into SBUF.
 
-    Loads a 2D HBM tensor [b, n] into SBUF with shape [b * fold_factor, n_folded]
+    Loads a 2D HBM tensor [b, n] into SBUF with shape [b_local * fold_factor, n_folded]
     where n_folded = ceil(n / fold_factor). Handles padding and LNC sharding.
 
     Args:
@@ -76,6 +78,9 @@ def predicated_folded_load(
         n_programs (int): Total number of programs (default: 1)
         fill_value (float): Value to use for padding (default: -9948.0)
         data_sb (Optional[nl.ndarray]): Pre-allocated SBUF buffer (default: None)
+        batch_start (Optional[int]): Start offset along batch dim of data_hbm (inclusive).
+            When provided with batch_end, overrides program_id/n_programs sharding.
+        batch_end (Optional[int]): End offset along batch dim of data_hbm (exclusive).
 
     Returns:
         Optional[nl.ndarray]: [b_local * fold_factor, n_folded], Folded tensor in SBUF
@@ -91,8 +96,11 @@ def predicated_folded_load(
     kernel_assert(len(data_hbm.shape) == 2, "Expected input tensor to have shape [B, N]")
     batch_size, n = data_hbm.shape
 
-    batch_size_sharded = (batch_size + n_programs - 1) // n_programs
-    batch_line_offset = program_id * batch_size_sharded
+    batch_start = batch_start if batch_start is not None else 0
+    batch_end = batch_end if batch_end is not None else batch_size
+    batch_size_in_range = batch_end - batch_start
+    batch_size_sharded = (batch_size_in_range + n_programs - 1) // n_programs
+    batch_line_offset = batch_start + program_id * batch_size_sharded
 
     P_MAX = nl.tile_size.pmax
     kernel_assert(
@@ -125,11 +133,6 @@ def predicated_folded_load(
 
     batch_size_sharded_bounded = min(batch_size_sharded, batch_size - batch_line_offset)
     for batch_line_idx in nl.affine_range(batch_size_sharded_bounded):
-        """
-        Split load into 2 rectangular loads:
-        - [fold_factor x (n % n_folded)]
-        - [fold_factor-1 x (n_folded - n % n_folded)]
-        """
         row_idx = batch_line_idx + batch_line_offset
         base_idx = row_idx * n
         remainder = n % n_folded
@@ -155,6 +158,10 @@ def unfolded_store(
     fold_factor: int,
     program_id: int = 0,
     n_programs: int = 1,
+    batch_start: Optional[int] = None,
+    batch_end: Optional[int] = None,
+    dst_batch_start: Optional[int] = None,
+    dst_batch_end: Optional[int] = None,
 ) -> None:
     """
     Store local SBUF tensor back to HBM, reversing predicated_folded_load.
@@ -168,23 +175,32 @@ def unfolded_store(
         fold_factor (int): Number of folds applied during load
         program_id (int): ID of current core/program (default: 0)
         n_programs (int): Total number of programs/cores (default: 1)
-
-    Notes:
-        - Reverses the folding operation from predicated_folded_load
-        - Uses fast path when n divisible by fold_factor
-        - Uses predicated store for non-divisible case
-        - Handles LNC sharding with proper offset calculation
+        batch_start (Optional[int]): Start offset along batch dim for SBUF sharding (inclusive).
+            Determines how many rows the SBUF holds. Defaults to 0.
+        batch_end (Optional[int]): End offset for SBUF sharding (exclusive). Defaults to B.
+        dst_batch_start (Optional[int]): Start offset along batch dim of data_hbm to write to.
+            Defaults to batch_start (same range as load).
+        dst_batch_end (Optional[int]): End offset along batch dim of data_hbm to write to.
+            Defaults to batch_end (same range as load).
     """
     kernel_assert(len(data_hbm.shape) == 2, "Expected HBM tensor shape [B, N]")
     batch_size, n = data_hbm.shape
     n_folded = sbuf.shape[1]
 
-    batch_size_sharded = (batch_size + n_programs - 1) // n_programs
-    batch_line_offset = program_id * batch_size_sharded
+    # SBUF sharding: determines how many rows per program the SBUF holds
+    batch_start = batch_start if batch_start is not None else 0
+    batch_end = batch_end if batch_end is not None else batch_size
+    batch_size_in_range = batch_end - batch_start
+    batch_size_sharded = (batch_size_in_range + n_programs - 1) // n_programs
+
+    # HBM destination: where to write in data_hbm
+    dst_batch_start = dst_batch_start if dst_batch_start is not None else batch_start
+    dst_batch_end = dst_batch_end if dst_batch_end is not None else batch_end
+    dst_batch_line_offset = dst_batch_start + program_id * batch_size_sharded
 
     if n == fold_factor * n_folded:
         reshaped_dst = data_hbm.reshape((batch_size * fold_factor, n_folded))
-        base_offset = batch_line_offset * fold_factor
+        base_offset = dst_batch_line_offset * fold_factor
         batch_bound = min(batch_size_sharded * fold_factor, batch_size * fold_factor - base_offset)
         ix, iy = nl.ds(0, batch_bound), nl.ds(0, n_folded)
         ix_dst = nl.ds(base_offset, batch_bound)
@@ -193,14 +209,9 @@ def unfolded_store(
 
     data_hbm_flat = data_hbm.reshape((batch_size * n,))
 
-    batch_size_sharded_bounded = min(batch_size_sharded, batch_size - batch_line_offset)
+    batch_size_sharded_bounded = min(batch_size_sharded, batch_size - dst_batch_line_offset)
     for batch_line_idx in nl.affine_range(batch_size_sharded_bounded):
-        """
-        Split save into 2 rectangular stores:
-        - [fold_factor x (n % n_folded)]
-        - [fold_factor-1 x (n_folded - n % n_folded)]
-        """
-        row_idx = batch_line_idx + batch_line_offset
+        row_idx = batch_line_idx + dst_batch_line_offset
         base_idx = row_idx * n
         remainder = n % n_folded
         ix_0_src, iy_0_src = nl.ds(batch_line_idx * fold_factor, fold_factor), nl.ds(0, remainder)

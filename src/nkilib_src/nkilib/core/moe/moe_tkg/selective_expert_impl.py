@@ -14,7 +14,6 @@
 
 """Selective-expert MoE token generation implementation that processes only top-K selected experts per token."""
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
 
@@ -25,7 +24,7 @@ from ...mlp.mlp_parameters import (
 )
 
 # MLP utils
-from ...mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstants, MLPTKGConstantsDimensionSizes
+from ...mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstants
 from ...mlp.mlp_tkg.mlp_tkg_down_projection import process_down_projection
 from ...mlp.mlp_tkg.mlp_tkg_gate_up_projection import process_gate_up_projection
 from ...mlp.mlp_tkg.mlp_tkg_utils import input_norm_load, transpose_store

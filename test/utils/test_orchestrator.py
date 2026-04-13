@@ -15,11 +15,13 @@ import logging
 import os
 import pathlib
 import pickle
+import re
 import shutil
 import subprocess
 import traceback
 from contextlib import closing
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -31,18 +33,22 @@ from .common_dataclasses import (
     KernelArgs,
     LazyGoldenGenerator,
     NeuronDeviceInfo,
-    PerRankLazyGoldenGenerator,
     PerRankLazyInputGenerator,
     Platforms,
+    SeparationPassMode,
     TraceMode,
+    normalize_golden_output,
 )
 from .determinism_checker import DeterminismChecker
 from .exceptions import CompilationException, InferenceException, TestStatus, ValidationException
-from .host_management import Host, HostManager, SshHost
+from .host_management import Host, HostManager
 from .metrics_collector import IMetricsCollector, MetricName
 from .metrics_emitter import IMetricsEmitter, OutputMode
 from .output_validator import OutputValidator
-from .profiler_utils import ProfilerCommands, extract_and_filter_output_files
+from .param_extractor import normalize_params_with_type_hints
+from .perf_analysis_private import analyze_trace
+from .profiler_utils import NEURON_RT_ENABLE_DGE_NOTIFICATIONS, ProfilerCommands, extract_and_filter_output_files
+from .ranged_test_harness import is_in_negative_test_context
 
 
 @dataclass
@@ -55,6 +61,44 @@ class FilesystemArgs:
     artifacts_output_directory_path: Optional[str] = None
 
 
+def run_separated_perf_analysis(test_dir: str, target_instance_family: str, profiled_file: str = "ntff_detailed.json"):
+    """Run performance analysis on separation pass trace files.
+
+    The separation pass splits a kernel's execution trace into distinct memory (DMA) and
+    compute sections. By analyzing these separately, we can determine whether a kernel is
+    memory-bounded or compute-bounded, quantify DMA bandwidth utilization vs compute
+    throughput (e.g. matmul initiation intervals) for each section, and estimate the
+    maximum achievable performance.
+
+    This function analyzes one trace per NeuronCore (nc00/nc01), correlating postscheduler
+    trace events with profiled runtime data from infer_result artifacts.
+
+    Args:
+        test_dir: Path to the test output directory containing trace files and infer_result/.
+        target_instance_family: Instance family (e.g. 'trn2', 'trn3') for DMA bandwidth selection.
+    """
+    test_dir = Path(test_dir)
+    try:
+        analyze_trace(
+            input_file=test_dir / "perf_sim_at_end_trace.nc00_sg00.sg0000.Block1.json",
+            profiled_file=test_dir / INF_ARTIFACT_DIR_NAME / profiled_file,
+            subgraph='sg00',
+            base_dir=test_dir,
+            output_filename='analysis_nc00.log',
+            target_instance_family=target_instance_family,
+        )
+        analyze_trace(
+            input_file=test_dir / "perf_sim_at_end_trace.nc01_sg00.sg0000.Block1.json",
+            profiled_file=test_dir / INF_ARTIFACT_DIR_NAME / profiled_file,
+            subgraph='sg01',
+            base_dir=test_dir,
+            output_filename='analysis_nc01.log',
+            target_instance_family=target_instance_family,
+        )
+    except Exception as e:
+        logging.exception(e)
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -62,6 +106,7 @@ class Orchestrator:
         trace_mode: TraceMode,
         host_manager: HostManager,
         emitter: IMetricsEmitter,
+        perf_analysis_enabled: bool = False,
     ):
         self.fs_config: FilesystemArgs = FilesystemArgs(
             base_output_directory_path=feature_flag_helper.resolve_base_output_directory(config),
@@ -72,19 +117,26 @@ class Orchestrator:
         self.trace_mode: TraceMode = trace_mode
         self.emitter = emitter
         self.kernel_under_test: Optional[KernelArgs] = None
+        self.perf_analysis_enabled: bool = perf_analysis_enabled
 
         self.profiler_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-profile")
         self.neuron_ls_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-ls")
         self.enable_kernel_debugging: bool = feature_flag_helper.get_feature_flag(config, "debug_kernels", False)
+        self.enable_dge_notifs: bool = feature_flag_helper.get_feature_flag(config, "enable_dge_notifs", False)
         self.enable_validation_histograms: bool = feature_flag_helper.get_feature_flag(
             config, "validation_histograms", False
         )
 
     def execute(self, kernel_under_test: KernelArgs):
-        kernel_under_test = kernel_under_test
         kernel_under_test.compiler_input.enable_debugging = self.enable_kernel_debugging
         # Assign current emitter to kernel_args
         kernel_under_test.emitter = self.emitter
+
+        # Inject perf sim backend option when perf analysis is enabled
+        if self.perf_analysis_enabled:
+            perf_sim_flag = "--internal-backend-options=--enable-perf-sim"
+            if perf_sim_flag not in kernel_under_test.compiler_input.additional_cmd_args:
+                kernel_under_test.compiler_input.additional_cmd_args.append(perf_sim_flag)
 
         self.__prepare_output_directory()
         assert self.fs_config.artifacts_output_directory_path
@@ -96,10 +148,13 @@ class Orchestrator:
         # Start timing right before compilation stage
         collector.start_test()
 
-        # Only set kernel params from explicit KernelArgs.params if not already auto-captured from pytest parametrize
-        # If neither exists, don't set params - test is likely not parametrized and shouldn't emit params
-        if not collector.get_kernel_params() and kernel_under_test.params:
-            collector.set_kernel_params(kernel_under_test.params)
+        # Normalize pytest-captured params using kernel function's type hints
+        # This converts integers to enum names for cleaner dashboard display
+        params = collector.get_kernel_params()
+        if params:
+            normalized_params = normalize_params_with_type_hints(params, kernel_under_test.kernel_func)
+            collector.set_kernel_params(normalized_params)
+
         status = TestStatus.SUCCESS
 
         try:
@@ -111,11 +166,24 @@ class Orchestrator:
                 return
 
             # Create inputs
-            input_file_paths = self.__dump_kernel_inputs__(
-                self.fs_config.artifacts_output_directory_path, kernel_under_test
-            )
+            with collector.timer(MetricName.INPUT_DUMP_TIME):
+                input_file_paths = self.__dump_kernel_inputs__(
+                    self.fs_config.artifacts_output_directory_path, kernel_under_test
+                )
             # Run Inference
             local_artifact_download_path = self._run_inference(kernel_under_test, input_file_paths)
+            self._rename_neff_outputs_to_python_names(local_artifact_download_path)
+
+            # Run performance analysis if perf analysis is enabled
+            if self.perf_analysis_enabled:
+                logging.info("Running performance analysis")
+                run_separated_perf_analysis(
+                    self.fs_config.artifacts_output_directory_path,
+                    kernel_under_test.compiler_input.platform_target.value,
+                )
+                if kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE:
+                    self._record_separation_pass_metrics(collector, self.fs_config.artifacts_output_directory_path)
+
             # Run validation
             self._run_validation(
                 kernel_under_test,
@@ -123,24 +191,27 @@ class Orchestrator:
             )
 
         except (CompilationException, InferenceException, ValidationException) as e:
-            # Get status directly from exception
-            status = e.status
+            # Use EXPECTED_FAILURE for negative tests, otherwise use actual failure status
+            status = TestStatus.EXPECTED_FAILURE if is_in_negative_test_context() else e.status
             raise
         finally:
             collector.add_dimension(
                 {
                     "TestName": test_name,
-                    "KernelName": kernel_under_test.kernel_func.__name__,
+                    # Use KERNEL_NAME env var (set by CI) if available, otherwise fall back to function name
+                    "KernelName": os.environ.get("KERNEL_NAME") or kernel_under_test.kernel_func.__name__,
                     "Target": kernel_under_test.compiler_input.platform_target.value,
                     "LNCCores": str(kernel_under_test.compiler_input.logical_nc_config),
                     "Status": status.value,
                     "IsSuccessful": "true" if status == TestStatus.SUCCESS else "false",
+                    "TraceMode": self.trace_mode.value,
                 }
             )
-            collector.parse_artifacts(
-                artifact_dir=self.fs_config.artifacts_output_directory_path,
-                inference_artifact_dir=INF_ARTIFACT_DIR_NAME,
-            )
+            with collector.timer(MetricName.ARTIFACT_PARSE_TIME):
+                collector.parse_artifacts(
+                    artifact_dir=self.fs_config.artifacts_output_directory_path,
+                    inference_artifact_dir=INF_ARTIFACT_DIR_NAME,
+                )
 
             # Record -1 for phases that didn't run (must happen AFTER parse_artifacts)
             self._record_missing_phase_metrics(collector)
@@ -160,16 +231,23 @@ class Orchestrator:
         """
         timing_metrics = [
             MetricName.HOST_LOCK_TIME,
-            MetricName.FILE_TRANSFER_TIME,
+            MetricName.FILE_TRANSFER_UPLOAD_TIME,
+            MetricName.FILE_TRANSFER_DOWNLOAD_TIME,
             MetricName.INFERENCE_TIME_TOTAL,
-            MetricName.FILE_TRANSFER_NETWORK_TIME,
-            MetricName.FILE_TRANSFER_COMPRESSION_TIME,
             MetricName.PROFILE_JSON_GENERATION_TIME,
             MetricName.NEURON_PROFILE_CAPTURE_TIME,
             MetricName.NEURON_PROFILE_SHOW_TIME,
             MetricName.CORE_ALLOCATION_TIME,
             MetricName.INFERENCE_TIME,
             MetricName.VALIDATION_TIME,
+            MetricName.SIMULATION_TIME,
+            MetricName.HOST_ARCH_VALIDATION_TIME,
+            MetricName.INPUT_DUMP_TIME,
+            MetricName.ARTIFACT_PARSE_TIME,
+            MetricName.DETERMINISM_CHECK_TIME,
+            MetricName.VALIDATION_OUTPUT_LOAD_TIME,
+            MetricName.VALIDATION_COMPARE_TIME,
+            MetricName.GOLDEN_COMPUTATION_TIME,
         ]
 
         for metric_name in timing_metrics:
@@ -178,6 +256,27 @@ class Orchestrator:
 
         if not collector.has_metric(MetricName.ACCURACY_HW):
             collector.record_metric(MetricName.ACCURACY_HW, -1.0, "None")
+
+    @staticmethod
+    def _record_separation_pass_metrics(collector: IMetricsCollector, test_dir: str) -> None:
+        """Parse analysis_nc*.log files and record max compute/memory time across cores."""
+        compute_times = []
+        memory_times = []
+        for log_name in ("analysis_nc00.log", "analysis_nc01.log"):
+            log_path = Path(test_dir) / log_name
+            if not log_path.exists():
+                continue
+            content = log_path.read_text()
+            m = re.search(r"Duration excluding overlap \(profiled\):\s+(\d+)", content)
+            if m:
+                compute_times.append(float(m.group(1)))
+            m = re.search(r"DMA duration.*?:\s+(\d+)", content)
+            if m:
+                memory_times.append(float(m.group(1)))
+        if compute_times:
+            collector.record_metric(MetricName.SEPARATED_COMPUTE_TIME, max(compute_times) / 1e9, "Seconds")
+        if memory_times:
+            collector.record_metric(MetricName.SEPARATED_MEMORY_TIME, max(memory_times) / 1e9, "Seconds")
 
     def _run_compilation(self, collector: IMetricsCollector, kernel_under_test: KernelArgs) -> None:
         """Run kernel compilation phase."""
@@ -196,10 +295,16 @@ class Orchestrator:
                     # Dump inputs and golden outputs early for debugging in birsim format
                     self._dump_birsim_artifacts(kernel_under_test)
 
-                trace_kernel(
+                output_names = None
+                if kernel_under_test.validation_args is not None:
+                    golden = normalize_golden_output(kernel_under_test.validation_args.golden_output)
+                    output_names = list(golden.keys())
+
+                self._compiled_kernel = trace_kernel(
                     kernel_under_test=kernel_under_test,
                     mode=self.trace_mode,
                     output_directory=self.fs_config.artifacts_output_directory_path,
+                    output_names=output_names,
                 )
         except Exception as e:
             # Print full exception details including stdout, stderr, and stacktrace
@@ -238,10 +343,11 @@ class Orchestrator:
                 for host_assignment_attempt in host_assignment_generator:
                     with host_assignment_attempt as execution_host:
                         with collector.timer(MetricName.INFERENCE_TIME_TOTAL):
-                            self.__confirm_host_arch__(
-                                execution_host,
-                                kernel_under_test.compiler_input.platform_target,
-                            )
+                            with collector.timer(MetricName.HOST_ARCH_VALIDATION_TIME):
+                                self.__confirm_host_arch__(
+                                    execution_host,
+                                    kernel_under_test.compiler_input.platform_target,
+                                )
 
                             with execution_host.prepare_host(
                                 target_directory=self.fs_config.artifacts_output_directory_path,
@@ -267,25 +373,55 @@ class Orchestrator:
         """Run neuron-profile on the prepared host."""
         kernel_input_args = self.__format_profiler_kernel_input_args__(kernel_under_test, input_file_paths)
 
+        env_vars: Optional[dict[str, str]] = kernel_under_test.inference_args.env_vars
+        separation_pass_enabled = kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE
+        if (
+            self.enable_kernel_debugging
+            or self.enable_dge_notifs
+            or separation_pass_enabled
+            or self.perf_analysis_enabled
+        ):
+            if env_vars is None:
+                env_vars = {}
+
+            if NEURON_RT_ENABLE_DGE_NOTIFICATIONS not in env_vars:
+                env_vars[NEURON_RT_ENABLE_DGE_NOTIFICATIONS] = "1"
+
+        if kernel_under_test.compiler_input.platform_target.value == "trn3_a0":
+            if env_vars is None:
+                env_vars = {}
+
+            env_vars["NEURON_RT_ALLOW_LEGACY_NEFF"] = 1
+
+        # Save and download all outputs when determinism check or profile all runs is enabled.
+        # Otherwise, only save/download the last execution's outputs.
+        save_all_outputs = (
+            kernel_under_test.inference_args.enable_determinism_check
+            or kernel_under_test.inference_args.profile_all_runs
+        )
+
+        force_clean_input_writes: bool = (
+            kernel_under_test.inference_args.num_runs > 1
+            if kernel_under_test.inference_args.num_runs is not None
+            else False
+        )
+
         profiler_cmds = ProfilerCommands(
             num_runs=kernel_under_test.inference_args.num_runs,
             profile_all_runs=kernel_under_test.inference_args.profile_all_runs,
             profiler_binary_path=self.profiler_binary_path,
             kernel_input_args=kernel_input_args,
-            metrics_enabled=self.emitter.get_metrics_enabled(),
+            metrics_enabled=self.emitter.get_metrics_enabled() or separation_pass_enabled,
             collective_ranks=kernel_under_test.inference_args.collective_ranks,
             profile_all_ranks=kernel_under_test.inference_args.profile_all_ranks,
-            env_vars=kernel_under_test.inference_args.env_vars,
+            env_vars=env_vars,
+            perf_analysis_enabled=self.perf_analysis_enabled,
+            save_all_outputs=save_all_outputs,
+            force_clean_input_writes=force_clean_input_writes,
         )
 
         def get_list_of_files_to_copy(stdout: str) -> list[str]:
-            # if determinism check or profile all runs is enabled, download all outputs
-            download_all = (
-                kernel_under_test.inference_args.enable_determinism_check
-                or kernel_under_test.inference_args.profile_all_runs
-            )
-
-            outputs_to_copy = extract_and_filter_output_files(stdout, download_all)
+            outputs_to_copy = extract_and_filter_output_files(stdout, save_all_outputs)
 
             # Build complete list of files to copy from remote host
             files_to_copy = []
@@ -293,6 +429,7 @@ class Orchestrator:
             files_to_copy.extend(profiler_cmds.expected_ntff_files)
             files_to_copy.append("log-infer.txt")
             files_to_copy.extend(profiler_cmds.expected_profiler_view_json_files)
+            files_to_copy.extend(profiler_cmds.expected_detailed_json_files)
             files_to_copy.extend(profiler_cmds.expected_show_session_json_files)
             files_to_copy.append("debug_output")
             return files_to_copy
@@ -320,13 +457,39 @@ class Orchestrator:
         """Run kernel using NkiCpuSimulator and dump outputs for validation."""
         from .simulation_setup import run_simulator_inference
 
+        collector = self.emitter.get_collector()
         try:
-            output_tensors = run_simulator_inference(kernel_under_test)
+            with collector.timer(MetricName.SIMULATION_TIME):
+                output_tensors = run_simulator_inference(kernel_under_test)
             if not output_tensors:
                 return None
             return self._dump_output_tensors(output_tensors)
         except Exception as e:
             raise InferenceException(str(e)) from e
+
+    def _rename_neff_outputs_to_python_names(self, artifact_path: str) -> None:
+        """Rename NEFF output files (output_N) to Python-level names.
+
+        When using neuron-profile with a CompiledKernel that has output_specs,
+        the NEFF uses generic names like output_0 but the validator expects
+        the Python-level names (e.g. 'y'). This renames the files to match.
+        """
+        # breakpoint()
+        if not self._compiled_kernel or not self._compiled_kernel.output_specs:
+            return
+
+        aliases = self._compiled_kernel.input_output_aliases or {}
+        for i, (python_name, _) in enumerate(self._compiled_kernel.output_specs):
+            neff_name = aliases[i] if i in aliases else python_name
+            if neff_name == python_name:
+                continue
+            src = os.path.join(artifact_path, neff_name)
+            dst = os.path.join(artifact_path, python_name)
+            if os.path.exists(src):
+                os.rename(src, dst)
+                logging.info(f"Renamed output {neff_name} -> {python_name}")
+            else:
+                logging.warning(f"Expected output file not found: {src}")
 
     def _run_validation(
         self,
@@ -339,8 +502,8 @@ class Orchestrator:
             return
 
         # Skip validation if separation pass is enabled (invalidates output)
-        if kernel_under_test.compiler_input.enable_separation_pass:
-            logging.info("Skipping output validation because enable_separation_pass is enabled")
+        if kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE:
+            logging.info("Skipping output validation because separation_pass_mode is enabled")
             return
 
         logging.info(f"Running validation for {self.fs_config.artifacts_output_directory_path=}")

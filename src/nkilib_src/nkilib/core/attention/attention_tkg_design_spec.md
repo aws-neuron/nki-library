@@ -87,8 +87,13 @@ Final sendrecv exchanges output between NCs (if out_in_sb) so both have full res
 
 ### Sequence Sharding (sprior_n_prgs=2, bs_n_prgs=1)
 
-Each NC processes different portions of s_prior. Cross-NC sendrecv needed during
-FA loop (for max/sum reduction) and at end (to combine partial outputs).
+Each NC processes different portions of s_prior. Cross-NC sendrecv for max/sum
+reduction is deferred to the LAST FA tile only (optimization). Sink contributions,
+when present, are also deferred and incorporated during this final gather/reduce step
+rather than requiring per-tile synchronization.
+
+This deferred synchronization optimization removes unnecessary sendrecvs during FA
+loop iterations, improving performance for longer sequence lengths.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -131,29 +136,43 @@ FA loop (for max/sum reduction) and at end (to combine partial outputs).
 │  ║  ┌───────────────────────────────────────────────────────────────┐    ║      │
 │  ║  │              _cascaded_max_reduce()                           │    ║      │
 │  ║  │  1. Compute local tile max                                    │    ║      │
-│  ║  │  2. ═══════════ SENDRECV (qk_max_buf) ═══════════             │    ║      │
-│  ║  │     NC0 ◄────────────────────────────────────────► NC1        │    ║      │
-│  ║  │         Exchange local max values                             │    ║      │
-│  ║  │  3. Reduce: global_max = max(local_max, recv_max)             │    ║      │
-│  ║  │  4. _fa_update_running_max() with global max                  │    ║      │
+│  ║  │                                                               │    ║      │
+│  ║  │  [sync_softmax_per_fa_tile=False (default for seq sharding)]: │    ║      │
+│  ║  │  2-3. SKIP sendrecv - accumulate LOCAL max only               │    ║      │
+│  ║  │       (global sync deferred to last FA tile)                  │    ║      │
+│  ║  │       Sink prep also deferred to last FA tile                 │    ║      │
+│  ║  │                                                               │    ║      │
+│  ║  │  4. _fa_update_running_max()                                  │    ║      │
+│  ║  │     - On LAST tile: calls                                     │    ║      │
+│  ║  │       _fa_gather_and_compute_global_running_max()             │    ║      │
+│  ║  │       which incorporates sink (if present) and does           │    ║      │
+│  ║  │       the deferred sendrecv                                   │    ║      │
 │  ║  └───────────────────────────────────────────────────────────────┘    ║      │
 │  ║              │                                   │                    ║      │
 │  ║              ▼                                   ▼                    ║      │
 │  ║  ┌─────────────────────────┐         ┌─────────────────────────┐      ║      │
 │  ║  │ _compute_exp_qk()       │         │ _compute_exp_qk()       │      ║      │
 │  ║  │ exp(QK - running_max)   │         │ exp(QK - running_max)   │      ║      │
-│  ║  │ (uses GLOBAL max)       │         │ (uses GLOBAL max)       │      ║      │
+│  ║  │ (uses LOCAL max until   │         │ (uses LOCAL max until   │      ║      │
+│  ║  │  last tile when global  │         │  last tile when global  │      ║      │
+│  ║  │  sync happens)          │         │  sync happens)          │      ║      │
 │  ║  └─────────────────────────┘         └─────────────────────────┘      ║      │
 │  ║              │                                   │                    ║      │
 │  ║              ▼                                   ▼                    ║      │
 │  ║  ┌───────────────────────────────────────────────────────────────┐    ║      │
 │  ║  │              _cascaded_sum_reduction()                        │    ║      │
 │  ║  │  1. Compute local tile sum                                    │    ║      │
-│  ║  │  2. ═══════════ SENDRECV (exp_sum) ═══════════                │    ║      │
-│  ║  │     NC0 ◄────────────────────────────────────────► NC1        │    ║      │
-│  ║  │         Exchange local sum values                             │    ║      │
-│  ║  │  3. Reduce: global_sum = local_sum + recv_sum                 │    ║      │
-│  ║  │  4. _fa_update_running_sum() with global sum                  │    ║      │
+│  ║  │                                                               │    ║      │
+│  ║  │  [sync_softmax_per_fa_tile=False (default for seq sharding)]: │    ║      │
+│  ║  │  2-3. SKIP sendrecv - accumulate LOCAL sum only               │    ║      │
+│  ║  │       (global sync deferred to last FA tile)                  │    ║      │
+│  ║  │                                                               │    ║      │
+│  ║  │  4. _fa_update_running_sum()                                  │    ║      │
+│  ║  │     - On LAST tile: calls                                     │    ║      │
+│  ║  │       _fa_gather_and_compute_global_running_sum()             │    ║      │
+│  ║  │       which does the deferred sendrecv, then                  │    ║      │
+│  ║  │       computes sink_exp and adds to global sum                │    ║      │
+│  ║  │       (if sink present)                                       │    ║      │
 │  ║  └───────────────────────────────────────────────────────────────┘    ║      │
 │  ║              │                                   │                    ║      │
 │  ║              ▼                                   ▼                    ║      │
@@ -191,10 +210,11 @@ FA loop (for max/sum reduction) and at end (to combine partial outputs).
 | Aspect | Batch Sharding | Sequence Sharding |
 |--------|----------------|-------------------|
 | Data split | Each NC has different batches | Each NC has different K,V portions |
-| FA loop sendrecv | None | Yes (max, sum each tile) |
-| Max reduction | Local only | Global via sendrecv |
-| Sum reduction | Local only | Global via sendrecv |
+| FA loop sendrecv | None | **Only on last tile** (deferred sync) |
+| Max reduction | Local only | Local until last tile, then global (incorporates sink if present) |
+| Sum reduction | Local only | Local until last tile, then global (incorporates sink_exp if present) |
 | PV accumulation | Local only | Local only |
+| Sink handling | First FA Tile | Deferred: sink loaded & incorporated during final gather on last FA tile |
 | Final combine | sendrecv for out_in_sb | sendrecv + add partial outputs |
 | Who stores | Both NCs (different batches) | NC0 only (combined result) |
 
@@ -217,15 +237,18 @@ attention_tkg()
 │   │
 │   ├── _cascaded_max_reduce()      # Step 2: Max reduction
 │   │   ├── _transpose_max_psum()
-│   │   ├── sendrecv()              # [SEQ SHARD ONLY]
+│   │   ├── _prep_sink()            # [SEQ SHARD: on last FA tile only]
+│   │   ├── sendrecv()              # [SEQ SHARD: deferred to last FA tile]
 │   │   └── _fa_update_running_max()
+│   │       └── _fa_gather_and_compute_global_running_max()  # [last tile: gather sink + remote max]
 │   │
 │   ├── _compute_exp_qk()           # Step 3: exp(QK - max)
 │   │
 │   ├── _cascaded_sum_reduction()   # Step 4: Sum reduction
 │   │   ├── _tile_sum_reduction()
-│   │   ├── sendrecv()              # [SEQ SHARD ONLY]
+│   │   ├── sendrecv()              # [SEQ SHARD: deferred to last FA tile]
 │   │   └── _fa_update_running_sum()
+│   │       └── _fa_gather_and_compute_global_running_sum()  # [last tile: gather remote sum + sink_exp]
 │   │
 │   ├── _compute_pv_matmul_and_store()  # Step 5: PV matmul
 │   │   └── _fa_accumulate_output()
@@ -237,4 +260,47 @@ attention_tkg()
     ├── fa_running_output *= sum_recip
     ├── sendrecv()                  # Combine partial outputs
     └── dma_copy() to out           # Store to HBM (or copy to SBUF)
+```
+## Batch tiling
+
+### Motivation
+
+The kernel's SBUF memory usage scales with `bs * q_head * s_active * fa_tile_s_prior`. For large batch sizes, the total SBUF allocation exceeds the hardware limit. The batch outer loop tiles the batch dimension so each tile fits within the SBUF budget.
+
+### Memory Budget
+
+```
+8 * tile_bs * q_head * s_active * fa_tile_s_prior <= 16MB
+```
+
+Where `tile_bs` is the per-tile batch size (per NC, after LNC sharding). The factor of 8 accounts for the combined size of batch-dependent SBUF buffers (QK, QK exp and mask).
+
+The 16MB budget is a simplified heuristic, not the actual SBM cost model. It is chosen so that when FA is active (`fa_tile_s_prior = 8K`), the effective BQS tile size is 256 (`= 16M / (8 * 8K)`), which is a clean multiple of P_MAX (128). This leaves enough SBUF headroom for K/V buffers during MM1/MM2 to achieve reasonable batch interleave degree.
+
+Trade-offs of the budget value:
+- **Too large**: QK/mask buffers consume most of SBUF, starving K/V loads during MM1/MM2. This reduces batch interleave degree and hurts performance, or may cause compilation failure if even a single batch's K/V doesn't fit.
+- **Too small**: More batch tiles than necessary, increasing loop overhead.
+- **Current assumption**: Supports `q_head * s_active <= 256`. Larger products would benefit from a more accurate model that queries actual SBM free space at allocation time.
+
+Batch tiling only activates when BQS (`bs * q_head * s_active`) per NC exceeds what the budget allows.
+
+### Loop Structure
+
+The batch outer loop wraps around the existing flash attention loop:
+
+```
+for batch_tile_idx in range(num_batch_tiles):       # NEW: batch outer loop
+    _update_atp_for_batch_tile(atp, tile_bs, TC)    # recompute batch-dependent fields
+    _allocate_fa_buffers(...)                        # sized for tile_bs
+
+    for fa_tile_idx in range(num_fa_tiles):          # existing FA loop (unchanged)
+        _allocate_qk_buffers(...)
+        _load_mask(...)
+        _compute_qk_matmul(...)                      # Steps 1-5
+        _cascaded_max_reduce(...)
+        _compute_exp_qk(...)
+        _cascaded_sum_reduction(...)
+        _compute_pv_matmul_and_store(...)
+
+    _fa_finalize_and_store(...)                      # per batch tile
 ```

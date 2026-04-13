@@ -32,11 +32,24 @@ from .tree_logger import TreeLogger
 def sizeinbytes(dtype):
     if str(dtype) == str(nl.float32):
         return 4
-    elif str(dtype) == str(nl.bfloat16) or str(dtype) == str(nl.float16) or str(dtype) == str(nl.uint16):
+    elif (
+        str(dtype) == str(nl.bfloat16)
+        or str(dtype) == str(nl.float16)
+        or str(dtype) == str(nl.uint16)
+        or str(dtype) == str(nl.int16)
+    ):
         return 2
-    elif str(dtype) == str(nl.int8) or str(dtype) == str(nl.uint8) or str(dtype) in ["float8e4", "float8_e4m3"]:
+    elif (
+        str(dtype) == str(nl.int8)
+        or str(dtype) == str(nl.uint8)
+        or str(dtype) in ["float8e4", "float8_e4m3", "float8_e4m3fn", "float8e5", "float8_e5m2"]
+    ):
         return 1
-    elif str(dtype) == str(nl.int32) or str(dtype) == str(nl.uint32) or str(dtype) == str(nl.float8_e4m3fn_x4):
+    elif str(dtype) == str(nl.int32) or str(dtype) == str(nl.uint32):
+        return 4
+    elif str(dtype) == str(nl.float4_e2m1fn_x4):
+        return 2
+    elif str(dtype) == str(nl.float8_e4m3fn_x4) or str(dtype) == str(nl.float8_e5m2_x4):
         return 4
     kernel_assert(False, f"dtype size unknown! {dtype}")
 
@@ -56,14 +69,99 @@ def num_elts(shape):
 @dataclass
 class Scope(nl.NKIObject):
     starting_addr: int
-    # number of independent sections in each stack frame,
-    # used for multibuffer
+    """
+    Starting address of this scope.
+    """
     num_sections: int
+    """
+    Number of independent sections in this scope.
+
+    The scope will avoid anti-dependencies between this many sections at a time. The scope tracks anti-dependencies
+    with sub-scopes of this scope.
+
+    WARNING: This does not guarantee no dependence between sections outisde of groups of size `num_sections`.
+    Care should be taken if sections with different sizes (except for the last one), are used.
+    """
     name: str
+    """
+    Name of this scope.
+    """
+
+    # Internal management
     cur_section_id: int = 0
+    """
+    Current section that allocations in this scope will happen in.
+
+    This values is maintained modulo `num_sections`. When it gets reset to 0, the stack pointer gets reset
+    to the `starting_addr` of this frame.
+    """
+    min_independent_addr: int | None = None
+    """
+    The minimum address that is outside the current section in this scope, including allocations in sub-scopes.
+
+    This is used to ensure that `num_sections` sections within this scope can use unique addresses. When a new,
+    non-zero section is started, it will use this value as the base address.
+
+    Thus, each scope keeps track of its own max address seen. This should change when:
+    1. An allocation happens in this scope, since this could push the stack pointer beyond previous independent addr.
+    2. When a direct child scope closes, since its `min_independent_addr` might have pushed the stack pointer
+       beyond previous min (at some point in its execution).
+    3. A direct child scope resets `cur_section_id` back to section 0, because this resets `min_independent_addr`.
+
+    Problem this solves -- consider the following simple example:
+    ```python
+    sbm.open_scope(interleave_degree=2)  # 2 sections for double-buffering
+    for i in range(2):
+        t1 = sbm.alloc_stack((128, 128))
+        sbm.open_scope()
+        t2 = sbm.alloc_stack((128, 128))
+        sbm.close_scope()
+        sbm.increment_section()
+    sbm.close_scope()
+    ```
+
+    Assuming the initial stack pointer was at 0, for i=0 t1 is allocated to [0,128), and t2 is allocated to [128, 256).
+    After the inner scope is closed, the stack pointer is moved back to 128. Now, if we don't track
+    `min_independent_addr`, i=1 starts with stack pointer at 128, so t1 gets allocated to [128, 256).
+    This creates an antidependency between t2@i=0 and t1@i=1. By using `min_independent_addr`, we instead start
+    section 2 from 256 which means t1@i=1 gets allocated to [256, 384), eliminating the antidependency.
+
+    ```
+    Memory Address:  0       128      256      384
+                     |--------|--------|--------|
+    ITERATION i=0:
+    ─────────────────────────────────────────────
+    1. alloc t1      [==t1@0=]                     stack_ptr = 128
+    2. open_scope                                  stack_ptr = 128
+    3. alloc t2               [==t2@0=]            stack_ptr = 256
+    4. close_scope                                 stack_ptr = 128  ← resets!
+    5. increment_section()                         stack_ptr = 128
+
+    ITERATION i=1:
+    ─────────────────────────────────────────────
+    6. alloc t1               [==t1@1=]            stack_ptr = 256
+                              ▲▲▲▲▲▲▲▲▲
+                              COLLISION!
+                              t1@1 overlaps t2@0
+
+    Final memory layout:
+            0       128      256
+            |--------|--------|
+            [==t1@0=][==t2@0=]  ← i=0 allocations
+                     [==t1@1=]  ← i=1 allocation OVERLAPS t2@0!
+    ```
+    """
+
+    def update_min_independent_addr(self, new_address):
+        """Update the current section's `min_independent_addr` given new address seen to the max of the two."""
+        self.min_independent_addr = max(self.min_independent_addr, new_address)
+
+    def __post_init__(self):
+        kernel_assert(self.min_independent_addr == None, "`min_independent_addr` should not be initialized")
+        self.min_independent_addr = self.starting_addr
 
 
-class SbufManager(nl.NKIObject):
+class BufferManager(nl.NKIObject):
     def __init__(
         self,
         sb_lower_bound: int,
@@ -93,7 +191,7 @@ class SbufManager(nl.NKIObject):
         self.logger = logger
         if self.logger == None:
             self.logger = get_logger("SBM")
-        self.scopes = []
+        self.scopes: list[Scope] = []
         self.heap = []
         self.heap_names = []
         self.tree_logger = TreeLogger("SBM", self.logger)
@@ -113,6 +211,12 @@ class SbufManager(nl.NKIObject):
             f"stack_start={sb_lower_bound}, heap_start={sb_upper_bound}"
         )
         self.prefix = ''
+
+    def _get_prefixed_name(self, name):
+        """Apply prefix to tensor name."""
+        if name is None:
+            return None
+        return f"{self.prefix}{name}"
 
     def _update_stats(self):
         stack_usage = self.stack_curr_addr - self.lower_bound
@@ -135,6 +239,9 @@ class SbufManager(nl.NKIObject):
 
     def is_auto_alloc(self):
         return self.use_auto_alloc
+
+    def set_auto_alloc(self, value: bool):
+        self.use_auto_alloc = value
 
     def is_default_stack_alloc(self):
         return self.default_stack_alloc
@@ -163,14 +270,18 @@ class SbufManager(nl.NKIObject):
         """
         Increment the section count in the current scope. If the current section count reached the
         interleave_degree of the current scope, the address is reset to the beginning address of
-        the current scope. Otherwise, continue allocate on the current address.
+        the current scope. Otherwise, continue to allocate from the minimum address that isn't
+        in any previous section.
 
         Example:
         sbm = SbufManager(0, 128*1024, get_logger())
         sbm.open_scope(interleave_degree=2)
 
         for i in range(4):
-          sbm.alloc_stack((128, 128), dtype=nl.bfloat16)
+          sbm.alloc_stack((128, 128), dtype=nl.uint8)
+          sbm.open_scope()
+          sbm.alloc_stack((128, 128), dtype=nl.uint8)
+          sbm.close_scope()
           sbm.increment_section()
         sbm.close_scope()
 
@@ -188,8 +299,16 @@ class SbufManager(nl.NKIObject):
         if top_scope.cur_section_id == top_scope.num_sections:
             top_scope.cur_section_id = 0
             self.stack_curr_addr = top_scope.starting_addr
+
+            # When reseting to section 0, we reset min_independent_addr, so need to update parent min_independent_addr
+            if len(self.scopes) >= 2:
+                self.scopes[-2].update_min_independent_addr(top_scope.min_independent_addr)
+            top_scope.min_independent_addr = top_scope.starting_addr
+
             self.tree_logger.log(f"↻ section: 0/{top_scope.num_sections} @ {self.stack_curr_addr}", len(self.scopes))
         else:
+            # Set the start of the section to the min_independent_addr
+            self.stack_curr_addr = self.scopes[-1].min_independent_addr
             self.tree_logger.log(
                 f"↳ section: {top_scope.cur_section_id}/{top_scope.num_sections} @ {self.stack_curr_addr}",
                 len(self.scopes),
@@ -205,25 +324,33 @@ class SbufManager(nl.NKIObject):
         self.scopes.pop()
         scope_name = f"'{closing_scope.name}'" if closing_scope.name else "(unnamed)"
         self.tree_logger.log(f"◀ END {scope_name} freed={freed_bytes} B", len(self.scopes), is_scope_boundary=True)
-        # Auto-flush when last scope is closed
+
         if not self.scopes:
+            # Auto-flush when last scope is closed
             self.tree_logger.flush()
             self._print_stats()
+        else:
+            # Update min_independent_addr for parent_scope
+            self.scopes[-1].update_min_independent_addr(closing_scope.min_independent_addr)
 
     def alloc(self, shape, dtype, buffer=nl.sbuf, name=None, base_partition=0, align=None):
         """
-        Allocate a tensor on the stack or the heap, depending on default allocation type.
+        Allocate a tensor. For HBM buffers, directly creates an ndarray.
+        For SBUF, allocates on the stack or the heap depending on default allocation type.
 
         :param shape: shape of the tensor to be allocated
         :param dtype: dtype of the tensor to be allocated
-        :param buffer: type of the buffer, currently only nl.sbuf is supported
+        :param buffer: type of the buffer (nl.sbuf, nl.shared_hbm, nl.hbm, etc.)
         :param name: name of the tensor. Must be unique in the kernel
         :param base_partition: The base partition of the allocation, default to 0
         :param align: Alignment requirement of the address.
-        :param is_stack: Whether to allocate on stack or heap.
 
-        :return: a sbuf tensor described above.
+        :return: an allocated tensor.
         """
+        if buffer in (nl.hbm, nl.shared_hbm, nl.private_hbm):
+            tensor_name = self._get_prefixed_name(name)
+            return nl.ndarray(shape, dtype=dtype, buffer=buffer, name=tensor_name)
+
         if self.default_stack_alloc:
             return self.alloc_stack(
                 shape,
@@ -280,7 +407,7 @@ class SbufManager(nl.NKIObject):
         if align == None:
             align = sizeinbytes(dtype)
         self.stack_curr_addr = align_to(self.stack_curr_addr, align)
-        tensor_name = f"{self.prefix}{name}" if name else None
+        tensor_name = self._get_prefixed_name(name)
         if self.use_auto_alloc:
             mloc = nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=tensor_name)
         else:
@@ -293,6 +420,8 @@ class SbufManager(nl.NKIObject):
             )
         addr_start = self.stack_curr_addr
         self.stack_curr_addr = self.stack_curr_addr + bytes_per_partition
+        self.scopes[-1].update_min_independent_addr(self.stack_curr_addr)  # New stack pointer may be new min
+
         self.total_stack_allocs = self.total_stack_allocs + 1
         self._update_stats()
         self.tree_logger.log(
@@ -337,12 +466,12 @@ class SbufManager(nl.NKIObject):
             kernel_assert(False, "Heap out of memory")
 
         if align != None:
-            self.heap_curr_addr = align_to(self.heap_curr_addr, align)
+            self.heap_curr_addr = align_to(self.heap_curr_addr - (align - 1), align)
         base_addr = self.heap_curr_addr - bytes_per_partition
         self.heap_curr_addr -= bytes_per_partition
         self.heap_curr_addr = align_to(self.heap_curr_addr - 3, 4)  # heap grows down, so should the align
 
-        tensor_name = f"{self.prefix}{name}" if name else None
+        tensor_name = self._get_prefixed_name(name)
         if self.use_auto_alloc:
             mloc = nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=tensor_name)
         else:
@@ -427,4 +556,8 @@ class SbufManager(nl.NKIObject):
 
 def create_auto_alloc_manager(logger: Optional[Logger] = None):
     """create a default auto allocated SBM initialized with total SBUF space"""
-    return SbufManager(0, nl.tile_size.total_available_sbuf_size, logger, use_auto_alloc=True)
+    return BufferManager(0, nl.tile_size.total_available_sbuf_size, logger, use_auto_alloc=True)
+
+
+# Backward compatibility alias
+SbufManager = BufferManager

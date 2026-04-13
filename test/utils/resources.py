@@ -161,7 +161,7 @@ class RemoteDirectory(ABC):
         local_archive_location = os.path.join(destination_dir_path, os.path.basename(remote_archive_location))
         download_exception = None
 
-        with collector.timer(MetricName.FILE_TRANSFER_NETWORK_TIME):
+        with collector.timer(MetricName.SFTP_DOWNLOAD_TIME):
             _ = self.connection.get(remote=remote_archive_location, local=local_archive_location)
 
         # Record compressed bytes
@@ -225,9 +225,10 @@ class RemoteDirectory(ABC):
 
         # Create archive on remote and upload to S3
         try:
-            result: fabric2.Result = self.connection.run(
-                create_archive_command(self.remote_path, remote_archive_location, list_of_files)
-            )
+            with collector.timer(MetricName.S3_DOWNLOAD_REMOTE_ARCHIVE_TIME):
+                result: fabric2.Result = self.connection.run(
+                    create_archive_command(self.remote_path, remote_archive_location, list_of_files)
+                )
             if result.failed:
                 raise RemoteExecutionException(
                     f"Unable to create tarball in {remote_archive_location} on remote",
@@ -239,7 +240,7 @@ class RemoteDirectory(ABC):
             upload_cmd = build_remote_s3_cli_command(
                 s3_config.bucket, s3_key, remote_archive_location, creds, S3TransferDirection.OUTPUTS
             )
-            with collector.timer(MetricName.FILE_TRANSFER_NETWORK_TIME):
+            with collector.timer(MetricName.S3_DOWNLOAD_REMOTE_TO_S3_TIME) as t_remote_to_s3:
                 result: fabric2.Result = self.connection.run(upload_cmd, hide=True)
             if result.failed:
                 raise RemoteExecutionException(f"Failed to upload to S3 from remote: {result.stderr}", result)
@@ -250,14 +251,23 @@ class RemoteDirectory(ABC):
             local_archive_location = os.path.join(destination_dir_path, archive_name)
             os.makedirs(destination_dir_path, exist_ok=True)
             self.logger.info(f"Downloading s3://{s3_config.bucket}/{s3_key} to local...")
-            with collector.timer(MetricName.FILE_TRANSFER_NETWORK_TIME):
+            with collector.timer(MetricName.S3_DOWNLOAD_S3_TO_LOCAL_TIME) as t_s3_to_local:
                 s3_client.download_file(s3_config.bucket, s3_key, local_archive_location)
             self.logger.info(f"Successfully downloaded to: {local_archive_location}")
+            download_bytes = os.path.getsize(local_archive_location)
+            collector.record_metric(MetricName.S3_DOWNLOAD_BYTES, download_bytes, "Bytes")
+            rate_remote_to_s3 = (
+                (download_bytes / 1024) / t_remote_to_s3.duration if t_remote_to_s3.duration > 0 else 1e9
+            )
+            collector.record_metric(MetricName.S3_DOWNLOAD_REMOTE_TO_S3_RATE, rate_remote_to_s3, "Kilobytes/Second")
+            rate_s3_to_local = (download_bytes / 1024) / t_s3_to_local.duration if t_s3_to_local.duration > 0 else 1e9
+            collector.record_metric(MetricName.S3_DOWNLOAD_S3_TO_LOCAL_RATE, rate_s3_to_local, "Kilobytes/Second")
 
             # Unpack locally
-            command_result = subprocess.run(
-                defalate_archive_command(local_archive_location, destination_dir_path).split(" ")
-            )
+            with collector.timer(MetricName.S3_DOWNLOAD_LOCAL_EXTRACT_TIME):
+                command_result = subprocess.run(
+                    defalate_archive_command(local_archive_location, destination_dir_path).split(" ")
+                )
             if command_result.returncode != 0:
                 raise LocalExecutionException(f"Unable to unarchive {local_archive_location}", command_result)
 
@@ -308,7 +318,7 @@ class RemoteDirectory(ABC):
         upload_exception = None
 
         # Time network transfer only
-        with collector.timer(MetricName.FILE_TRANSFER_NETWORK_TIME):
+        with collector.timer(MetricName.SFTP_UPLOAD_TIME):
             # Create with global permissions so any user can use the shared test directory
             _ = self.connection.run(f"mkdir -p -m 777 {self.remote_path}")
             _ = self.connection.put(remote=remote_archive_location, local=local_path)
@@ -368,7 +378,8 @@ class RemoteDirectory(ABC):
         local_archive_location = None
         if not is_archive(local_path):
             local_archive_location = to_archive_name_in_parent(local_path)
-            command_result = subprocess.run(create_archive_command(local_path, local_archive_location).split(" "))
+            with collector.timer(MetricName.S3_UPLOAD_LOCAL_ARCHIVE_TIME):
+                command_result = subprocess.run(create_archive_command(local_path, local_archive_location).split(" "))
             if command_result.returncode != 0:
                 raise LocalExecutionException(f"Unable to create tarball of {local_path}", command_result)
             local_path = local_archive_location
@@ -380,8 +391,12 @@ class RemoteDirectory(ABC):
 
         try:
             self.logger.info(f"Uploading {local_path} to s3://{s3_config.bucket}/{s3_key}...")
-            with collector.timer(MetricName.FILE_TRANSFER_NETWORK_TIME):
+            upload_bytes = os.path.getsize(local_path)
+            collector.record_metric(MetricName.S3_UPLOAD_BYTES, upload_bytes, "Bytes")
+            with collector.timer(MetricName.S3_UPLOAD_LOCAL_TO_S3_TIME) as t:
                 s3_client.upload_file(local_path, s3_config.bucket, s3_key)
+            rate = (upload_bytes / 1024) / t.duration if t.duration > 0 else 1e9
+            collector.record_metric(MetricName.S3_UPLOAD_LOCAL_TO_S3_RATE, rate, "Kilobytes/Second")
             self.logger.info(f"Successfully uploaded to s3://{s3_config.bucket}/{s3_key}")
         finally:
             if local_archive_location and os.path.exists(local_archive_location):
@@ -401,16 +416,19 @@ class RemoteDirectory(ABC):
             download_cmd = build_remote_s3_cli_command(
                 s3_config.bucket, s3_key, remote_archive_location, creds, S3TransferDirection.INPUTS
             )
-            with collector.timer(MetricName.FILE_TRANSFER_NETWORK_TIME):
+            with collector.timer(MetricName.S3_UPLOAD_S3_TO_REMOTE_TIME) as t:
                 result: fabric2.Result = self.connection.run(download_cmd, hide=True)
             if result.failed:
                 raise RemoteExecutionException(f"Failed to download from S3 on remote: {result.stderr}", result)
+            rate = (upload_bytes / 1024) / t.duration if t.duration > 0 else 1e9
+            collector.record_metric(MetricName.S3_UPLOAD_S3_TO_REMOTE_RATE, rate, "Kilobytes/Second")
             self.logger.info(f"Successfully downloaded to remote: {remote_archive_location}")
 
             # Deflate archive on remote
-            result: fabric2.Result = self.connection.run(
-                defalate_archive_command(remote_archive_location, self.remote_path)
-            )
+            with collector.timer(MetricName.S3_UPLOAD_REMOTE_EXTRACT_TIME):
+                result: fabric2.Result = self.connection.run(
+                    defalate_archive_command(remote_archive_location, self.remote_path)
+                )
             if result.failed:
                 deflate_exception = RemoteExecutionException(
                     f"Unable to deflate archive in {self.remote_path} on remote", result

@@ -150,6 +150,7 @@ def build_kernel_input(batch, seqlen, hidden, hidden_actual, in_dtype, out_dtype
 
 @pytest_test_metadata(name="RMSNorm Quantize MX TKG", pytest_marks=["rmsnorm", "quantize", "mx", "tkg"])
 @final
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 class TestRmsNormQuantizeMxTKGKernel:
     def run_test(
         self,
@@ -243,8 +244,6 @@ class TestRmsNormQuantizeMxTKGKernel:
         out_dtype,
         out_quant_dtype,
     ):
-        if platform_target is not Platforms.TRN3:
-            pytest.skip("MX quantization is only supported on TRN3.")
         compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
         self.run_test(
             test_manager,
@@ -286,8 +285,6 @@ class TestRmsNormQuantizeMxTKGKernel:
         out_dtype,
         out_quant_dtype,
     ):
-        if platform_target is not Platforms.TRN3:
-            pytest.skip("MX quantization is only supported on TRN3.")
         compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
         self.run_test(
             test_manager,

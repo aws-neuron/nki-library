@@ -25,13 +25,10 @@ from ..utils.kernel_helpers import get_verified_program_sharding_info
 from ..utils.logging import get_logger
 from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
-from .norm_tkg_utils import load_gamma_to_sbuf, load_input_to_sbuf, validate_shapes
+from .norm_tkg_utils import load_gamma_to_sbuf, load_input_to_sbuf, validate_shapes, validate_shapes_shard_on_h
 
 # Minimum BxS size to enable sharding (balances computation vs communication overhead)
 SHARDING_THRESHOLD = 18
-
-# Use STATIC DMA mode
-_DGE_MODE_NONE = 3
 
 # Tile size for BxS dimension processing
 BxS_FULL_TILE_SIZE = 512
@@ -45,6 +42,7 @@ def rmsnorm_tkg(
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = False,
     single_core_forced: bool = False,
+    shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[SbufManager] = None,
 ):
@@ -61,8 +59,11 @@ def rmsnorm_tkg(
         gamma (Union[TensorView, nl.ndarray]): [1, H], Gamma tensor used in normalization on HBM
         output (Union[TensorView, nl.ndarray]): [128, B×S, H//128], Output tensor
         eps (float): Epsilon to maintain numerical stability. Default is 1e-6
-        hidden_actual (Optional[int]): Actual hidden dimension size for mean calculation when input is padded. Default is None
+        hidden_actual (Optional[int]): Actual hidden dimension size for mean calculation
+            when input is padded. Default is None
         hidden_dim_tp (bool): If True, input H dimension view is (H/128, 128); if False, (128, H/128). Default is False
+        single_core_forced (bool): If True, force single-core execution. Default is False
+        shard_on_h (bool): If True, shard computation along H dimension instead of BxS. Default is False
         use_heap_memory (bool): Indicates whether to allocate memory on heap instead of stack. Default is False
         sbm (Optional[SbufManager]): Instance of SbufManager responsible for handling sbuf allocation. Default is None
 
@@ -70,11 +71,13 @@ def rmsnorm_tkg(
         output (nl.ndarray): [128, BxS, H//128], Output tensor with RMSNorm applied
 
     Notes:
-        - TODO: Specify intended usage range (e.g., sequence length, batch size)
-        - Output layout is specifically chosen to make subsequent sharded matmul efficient
+        - H must be divisible by 128 (partition dimension).
+        - When LNC=2 and BxS > SHARDING_THRESHOLD, computation is sharded across cores.
+        - Output layout is transposed for efficient downstream sharded matmul.
+        - shard_on_h=True requires LNC=2 and is incompatible with hidden_dim_tp and single_core_forced.
 
     Pseudocode:
-        result = norm_name2func[NormType.RMS_NORM](hidden, gamma, eps)
+        result = RMSNorm(hidden, gamma, eps)
         result = result.reshape((BxS, -1))
         t0 = result[:, 0:H//LNC_SIZE]
         t1 = result[:, H//LNC_SIZE:]
@@ -87,31 +90,84 @@ def rmsnorm_tkg(
     gamma_view = TensorView(gamma) if not isinstance(gamma, TensorView) else gamma
     output_view = TensorView(output) if not isinstance(output, TensorView) else output
 
-    BxS, H, H0, H1 = validate_shapes(input_view, gamma_view, output_view)
-
-    if not hidden_actual:
-        hidden_actual = H
-
     if not sbm:
-        # SBUF space calculation (excluding partition dimension H0):
-        max_tile_size = min(BxS, BxS_FULL_TILE_SIZE)
-        sbuf_size = (
-            BxS * H1  # output/input buffer
-            + H1  # gamma
-            + 1  # eps
-            + H0  # matmul const
-            + 2 * max_tile_size * H1  # rmsnorm_square + gamma_mult
-            + max_tile_size  # rmsnorm_reduced_square
-        ) * 4  # assume max 32B dtype
-        use_auto_alloc = True
         sbm = SbufManager(
             sb_lower_bound=0,
-            sb_upper_bound=min(sbuf_size, nl.tile_size.total_available_sbuf_size),
+            sb_upper_bound=nl.tile_size.total_available_sbuf_size,
             logger=get_logger("rmsnorm_tkg"),
-            use_auto_alloc=use_auto_alloc,
+            use_auto_alloc=True,
         )
 
     sbm.open_scope(name="rmsnorm_tkg")
+
+    if shard_on_h:
+        kernel_assert(not hidden_dim_tp, "hidden_dim_tp is not supported in shard on H implementation")
+        kernel_assert(not single_core_forced, "single_core_forced is not supported in shard on H implementation")
+        _rmsnorm_tkg_shard_on_h(
+            input_view=input_view,
+            gamma_view=gamma_view,
+            output_view=output_view,
+            eps=eps,
+            hidden_actual=hidden_actual,
+            hidden_dim_tp=False,
+            single_core_forced=False,
+            use_heap_memory=use_heap_memory,
+            sbm=sbm,
+        )
+    else:
+        _rmsnorm_tkg_shard_on_bxs(
+            input_view=input_view,
+            gamma_view=gamma_view,
+            output_view=output_view,
+            eps=eps,
+            hidden_actual=hidden_actual,
+            hidden_dim_tp=hidden_dim_tp,
+            single_core_forced=single_core_forced,
+            use_heap_memory=use_heap_memory,
+            sbm=sbm,
+        )
+
+    sbm.close_scope()
+
+    if isinstance(output, TensorView):
+        return output_view
+    else:
+        return output
+
+
+def _rmsnorm_tkg_shard_on_bxs(
+    input_view: TensorView,
+    gamma_view: TensorView,
+    output_view: TensorView,
+    eps: float = 1e-6,
+    hidden_actual: Optional[int] = None,
+    hidden_dim_tp: bool = False,
+    single_core_forced: bool = False,
+    use_heap_memory: bool = False,
+    sbm: Optional[SbufManager] = None,
+):
+    """
+    RMSNorm with sharding on the BxS dimension.
+
+    Distributes work across LNC cores by splitting the batch-sequence dimension.
+    Each core processes its shard independently, then results are exchanged if
+    the output is in SBUF.
+
+    Args:
+        input_view (TensorView): [B, S, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view.
+        gamma_view (TensorView): [1, H], Gamma tensor view.
+        output_view (TensorView): [H0, BxS, H1], Output tensor view.
+        eps (float): Epsilon for numerical stability.
+        hidden_actual (Optional[int]): Actual hidden dimension size for padded inputs.
+        hidden_dim_tp (bool): If True, use TP-sharded hidden dim layout.
+        single_core_forced (bool): If True, force single-core execution.
+        use_heap_memory (bool): If True, allocate on heap; otherwise on stack.
+        sbm (Optional[SbufManager]): SBUF memory manager instance.
+
+    Returns:
+        None: Results written to output_view.
+    """
+    BxS, H, H0, H1 = validate_shapes(input_view, gamma_view, output_view)
 
     if output_view.is_sbuf():
         output_sb_view = output_view
@@ -141,14 +197,15 @@ def rmsnorm_tkg(
 
     output_view_sharded = output_sb_view.slice(dim=1, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
 
-    rmsnorm_tkg_llama_impl(
+    _rmsnorm_tkg_llama_impl(
         input=input_view_sharded,
         gamma=gamma_view,
         output=output_view_sharded,
         num_H_shards=num_H_shards_in_output_H_dim,
-        hidden_actual=hidden_actual,
+        hidden_actual=H if not hidden_actual else hidden_actual,
         eps=eps,
         hidden_dim_tp=hidden_dim_tp,
+        shard_on_h=False,
         use_heap_memory=use_heap_memory,
         sbm=sbm,
     )
@@ -165,27 +222,88 @@ def rmsnorm_tkg(
                 recv_from_rank=1 - shard_id,
                 pipe_id=0,
             )
-
-        sbm.close_scope()
-
-        if isinstance(output, TensorView):
-            return output_sb_view.reshape((H0, BxS, H1))
-        else:
-            return output.reshape((H0, BxS, H1))
-
-    output_hbm_view_sharded = output_view.slice(dim=1, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
-
-    nisa.dma_copy(dst=output_hbm_view_sharded.get_view(), src=output_view_sharded.get_view())
-
-    if use_heap_memory:
-        sbm.pop_heap()
-
-    sbm.close_scope()
-
-    return output
+    else:
+        output_hbm_view_sharded = output_view.slice(dim=1, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
+        nisa.dma_copy(dst=output_hbm_view_sharded.get_view(), src=output_view_sharded.get_view())
+        if use_heap_memory:
+            sbm.pop_heap()  # dealloc output_sb
 
 
-def process_rmsnorm_tile(
+def _rmsnorm_tkg_shard_on_h(
+    input_view: TensorView,
+    gamma_view: TensorView,
+    output_view: TensorView,
+    eps: float = 1e-6,
+    hidden_actual: Optional[int] = None,
+    hidden_dim_tp: bool = False,
+    single_core_forced: bool = False,
+    use_heap_memory: bool = False,
+    sbm: Optional[SbufManager] = None,
+):
+    """
+    RMSNorm with sharding on the H (hidden) dimension.
+
+    Each LNC core processes a shard of the hidden dimension. Partial sums for
+    RMS are exchanged between cores via sendrecv to compute the full statistics
+    before normalization.
+
+    Args:
+        input_view (TensorView): [B, S, H] when in HBM or [H0, BxS, sharded_H1] when in SBUF, Input tensor view.
+        gamma_view (TensorView): [1, H], Gamma tensor view.
+        output_view (TensorView): [H0, BxS, H1] or [H0, BxS, sharded_H1] if in SBUF, Output tensor view.
+        eps (float): Epsilon for numerical stability.
+        hidden_actual (Optional[int]): Actual hidden dimension size for padded inputs.
+        hidden_dim_tp (bool): If True, use TP-sharded hidden dim layout.
+        single_core_forced (bool): If True, force single-core execution.
+        use_heap_memory (bool): If True, allocate on heap; otherwise on stack.
+        sbm (Optional[SbufManager]): SBUF memory manager instance.
+
+    Returns:
+        None: Results written to output_view.
+    """
+    BxS, H, H0, H1, shard_H, shard_H1 = validate_shapes_shard_on_h(input_view, gamma_view, output_view)
+
+    if output_view.is_sbuf():
+        output_sb_view = output_view
+    else:
+        alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
+        output_sb = alloc_tensor((H0, BxS, shard_H1), dtype=input_view.dtype, buffer=nl.sbuf, name="rmsnorm_output_sb")
+        output_sb_view = TensorView(output_sb)
+
+    _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
+
+    input_view_sharded = input_view
+    if not input_view.is_sbuf():
+        input_view_flat = input_view.flatten_dims(start_dim=0, end_dim=1)
+        input_view_sharded = input_view_flat.slice(dim=1, start=shard_id * shard_H, end=(shard_id + 1) * shard_H)
+
+    if not output_view.is_sbuf():
+        output_view_flat = output_view.flatten_dims(start_dim=0, end_dim=1)
+        output_view_sharded = output_view_flat.slice(dim=1, start=shard_id * shard_H, end=(shard_id + 1) * shard_H)
+
+    gamma_view = gamma_view.slice(dim=1, start=shard_id * shard_H, end=(shard_id + 1) * shard_H)
+
+    _rmsnorm_tkg_llama_impl(
+        input=input_view_sharded,
+        gamma=gamma_view,
+        output=output_sb_view,
+        num_H_shards=lnc,
+        hidden_actual=H if not hidden_actual else hidden_actual,
+        eps=eps,
+        hidden_dim_tp=hidden_dim_tp,
+        shard_on_h=True,
+        use_heap_memory=use_heap_memory,
+        sbm=sbm,
+    )
+
+    if output_view.is_sbuf():
+        output_view = output_sb_view
+    else:
+        output_hbm_view_sharded = output_view.slice(dim=2, start=shard_id * shard_H1, end=(shard_id + 1) * shard_H1)
+        nisa.dma_copy(dst=output_hbm_view_sharded.get_view(), src=output_sb_view.get_view())
+
+
+def _process_rmsnorm_tile(
     input_sb_view: TensorView,
     gamma_sb_view: TensorView,
     output_sb_view: TensorView,
@@ -193,6 +311,7 @@ def process_rmsnorm_tile(
     matmul_reduction_const_view: TensorView,
     bxs_tile: Tuple,
     hidden_actual: int,
+    shard_on_h: bool,
     use_heap_memory: bool = False,
     sbm: SbufManager = None,
 ):
@@ -207,6 +326,7 @@ def process_rmsnorm_tile(
         matmul_reduction_const_view (TensorView): [H0, H0], Constant matrix for reduction
         bxs_tile (Tuple): Tile information containing index and size
         hidden_actual (int): Actual hidden dimension size
+        shard_on_h (bool): If True, exchange partial sums between cores.
         use_heap_memory (bool): If True, allocate on heap; otherwise on stack
         sbm (SbufManager): SBUF memory manager instance
 
@@ -244,7 +364,33 @@ def process_rmsnorm_tile(
         name=f"rmsnorm_reduced_square_{bxs_tile.index}",
     )
     num_allocated_tensor += 1
-    nisa.tensor_reduce(rmsnorm_reduced_square[...], nl.add, rmsnorm_square[...], axis=1)
+    nisa.tensor_reduce(rmsnorm_reduced_square[...], nl.add, rmsnorm_square[...], axis=2)
+
+    if shard_on_h:
+        _, _, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
+        # Exchange partial sums with the other core via sendrecv
+        remote_reduced_square = alloc_tensor(
+            shape=(H0, BxS),
+            dtype=inter_dtype,
+            buffer=nl.sbuf,
+            name=f"rmsnorm_remote_reduced_square_{bxs_tile.index}",
+        )
+        num_allocated_tensor += 1
+        nisa.sendrecv(
+            dst=remote_reduced_square[...],
+            src=rmsnorm_reduced_square[...],
+            send_to_rank=1 - shard_id,
+            recv_from_rank=1 - shard_id,
+            pipe_id=0,
+        )
+
+        # Combine partial sums: full_sq = local_sq + remote_sq
+        nisa.tensor_tensor(
+            rmsnorm_reduced_square[...],
+            rmsnorm_reduced_square[...],
+            remote_reduced_square[...],
+            nl.add,
+        )
 
     # Apply gamma scaling: input * gamma
     gamma_mult = alloc_tensor(
@@ -296,7 +442,7 @@ def process_rmsnorm_tile(
     sbm.close_scope()
 
 
-def rmsnorm_tkg_llama_impl(
+def _rmsnorm_tkg_llama_impl(
     input: TensorView,
     gamma: TensorView,
     output: TensorView,
@@ -304,6 +450,7 @@ def rmsnorm_tkg_llama_impl(
     hidden_actual: Optional[int],
     eps: float,
     hidden_dim_tp: bool = False,
+    shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: SbufManager = None,
 ):
@@ -318,6 +465,7 @@ def rmsnorm_tkg_llama_impl(
         hidden_actual (Optional[int]): Actual hidden dimension size
         eps (float): Epsilon for numerical stability
         hidden_dim_tp (bool): If True, input H dimension view is (H/128, 128); if False, (128, H/128)
+        shard_on_h (bool): If True, exchange partial sums between cores.
         use_heap_memory (bool): If True, allocate on heap; otherwise on stack
         sbm (SbufManager): SBUF memory manager instance
 
@@ -353,7 +501,12 @@ def rmsnorm_tkg_llama_impl(
         input_sb_view = input
     else:
         input_sb_view = load_input_to_sbuf(
-            input_hbm=input, input_sb=output, num_H_shards=num_H_shards, hidden_dim_tp=hidden_dim_tp
+            input_hbm=input,
+            input_sb=output,
+            num_H_shards=num_H_shards,
+            hidden_dim_tp=hidden_dim_tp,
+            shard_on_h=shard_on_h,
+            sbm=sbm,
         )
 
     # Load gamma
@@ -362,7 +515,11 @@ def rmsnorm_tkg_llama_impl(
     gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, name="rmsnorm_gamma", align=gamma_align)
     num_allocated_tensor += 1
     gamma_sb_view = load_gamma_to_sbuf(
-        gamma_hbm=gamma, gamma_sb=TensorView(gamma_sb), num_H_shards=num_H_shards, hidden_dim_tp=hidden_dim_tp
+        gamma_hbm=gamma,
+        gamma_sb=TensorView(gamma_sb),
+        num_H_shards=num_H_shards,
+        hidden_dim_tp=hidden_dim_tp,
+        shard_on_h=shard_on_h,
     )
 
     # Load eps
@@ -385,7 +542,7 @@ def rmsnorm_tkg_llama_impl(
         output_sb_view_tile = output.slice(
             dim=1, start=bxs_tile.start_offset, end=bxs_tile.start_offset + bxs_tile.size
         )
-        process_rmsnorm_tile(
+        _process_rmsnorm_tile(
             input_sb_view=input_sb_view_tile,
             gamma_sb_view=gamma_sb_view_tile,
             output_sb_view=output_sb_view_tile,
@@ -393,6 +550,7 @@ def rmsnorm_tkg_llama_impl(
             matmul_reduction_const_view=TensorView(matmul_reduction_const),
             bxs_tile=bxs_tile,
             hidden_actual=hidden_actual,
+            shard_on_h=shard_on_h,
             use_heap_memory=use_heap_memory,
             sbm=sbm,
         )

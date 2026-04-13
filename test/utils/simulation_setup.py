@@ -44,7 +44,7 @@ except ImportError as e:
     _IMPORT_ERROR = e
 
 from .common_dataclasses import GoldenTensorDict, normalize_golden_output
-from .simulation_constants import SIMULATION_MODE_ENV_VAR, SIMULATION_RUN_ALL_ENV_VAR
+from .simulation_constants import SIMULATION_RUN_ALL_ENV_VAR
 
 # Patterns to identify tests with large shapes that are slow on CPU simulation
 _LARGE_SHAPE_PATTERNS = ("4096", "5120", "8192", "16384", "32768", "36864")
@@ -54,9 +54,6 @@ def setup_simulation_mode():
     """Setup simulation mode: alias nki modules and configure environment."""
     if not SIMULATOR_AVAILABLE:
         raise ImportError(f"NkiCpuSimulator not available: {_IMPORT_ERROR}")
-
-    # Set env var so pytest-xdist workers inherit it (workers don't inherit sys.argv)
-    os.environ[SIMULATION_MODE_ENV_VAR] = "1"
 
     # Limit BLAS threading in xdist workers to avoid contention
     if "PYTEST_XDIST_WORKER" in os.environ:
@@ -109,6 +106,7 @@ def run_simulator_inference(kernel_under_test) -> dict[str, np.ndarray]:
     """
     logging.info("Running kernel via NkiCpuSimulator")
 
+    os.environ["NKI_NC_VERSION"] = kernel_under_test.compiler_input.platform_target.get_nc_gen()
     kernel_outputs = simulate_kernel(
         kernel_under_test.kernel_func,
         kernel_under_test.kernel_input or {},

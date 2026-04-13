@@ -15,12 +15,13 @@
 Utility functions for neuron-profile command generation.
 """
 
-import pathlib
 import re
 from dataclasses import dataclass
 from typing import Optional
 
 from .host_management import SshHost
+
+NEURON_RT_ENABLE_DGE_NOTIFICATIONS: str = "NEURON_RT_ENABLE_DGE_NOTIFICATIONS"
 
 
 def extract_and_filter_output_files(stdout: str, download_all: bool) -> list[str]:
@@ -84,6 +85,9 @@ class ProfilerCommands:
         collective_ranks: int = 1,
         profile_all_ranks: bool = False,
         env_vars: Optional[dict[str, str]] = None,
+        perf_analysis_enabled: bool = False,
+        save_all_outputs: bool = False,
+        force_clean_input_writes: bool = False,
     ):
         """
         Build all neuron-profile commands for capture, show-session, and JSON generation.
@@ -99,10 +103,14 @@ class ProfilerCommands:
             collective_ranks: Number of collective ranks (each rank is a logical NeuronCore). Default 1 = no collectives
             profile_all_ranks: Whether to profile all ranks or just rank 0 (controls --collectives-profile-id)
             env_vars: Optional environment variables to set
+            save_all_outputs: Whether to save outputs from all executions or just the last (controls --save-nth-output)
+            force_clean_input_writes: Force neuron-profile to re-read all input tensors between N
+                executions, so that tensors from previous runs don't clobber subsequent executions.
+                Useful for kernels with aliased input tensors AND using tensor cache.
         """
         self.collective_ranks = collective_ranks
         self.expected_ntff_files = self._generate_expected_ntff_files(num_runs, profile_all_runs, profile_all_ranks)
-        profiler_exec_args = self._generate_profiler_exec_args(num_runs, profile_all_runs)
+        profiler_exec_args = self._generate_profiler_exec_args(num_runs, profile_all_runs, save_all_outputs)
         collective_args = self._generate_collective_args(collective_ranks, profile_all_ranks)
 
         # Timeout should be less than lock timeout to avoid hanging past lock expiration
@@ -116,6 +124,7 @@ class ProfilerCommands:
             "capture",
             "--save-output",
             "--neff file.neff",
+            "--write-tensors-per-exec alias" if force_clean_input_writes else "",
             profiler_exec_args,
             collective_args,
             kernel_input_args,
@@ -143,7 +152,8 @@ class ProfilerCommands:
             show_cmd_parts.append(f"({header} && {' '.join(show_parts)})")
         self.show_cmd = " && ".join(show_cmd_parts)
 
-        # Build JSON generation commands if metrics enabled (neuron-profile view)
+        # Build JSON generation commands if metrics enabled (neuron-profile view).
+        # Uses summary-json format which only outputs summary metrics
         self.expected_profiler_view_json_files = []
         json_cmd_parts = []
         if metrics_enabled:
@@ -162,11 +172,35 @@ class ProfilerCommands:
                     "view",
                     "-n file.neff",
                     f"-s {ntff_file}",
-                    "--output-format=json",
-                    f"--output-file={json_file}",
+                    "--output-format=summary-json",
+                    f"> {json_file}",
                 ]
                 json_cmd_parts.append(f"({' '.join(json_parts)})")
         self.json_generation_cmd = " && ".join(json_cmd_parts)
+
+        # Build detailed JSON generation commands for perf analysis (neuron-profile view --output-format=json)
+        # Use --output-file= to write directly to the target filename, avoiding clobbering
+        # the summary ntff.json produced by the metrics step.
+        self.expected_detailed_json_files = []
+        detailed_json_cmd_parts = []
+        if perf_analysis_enabled:
+            for i, ntff_file in enumerate(self.expected_ntff_files):
+                if len(self.expected_ntff_files) == 1:
+                    json_file = "ntff_detailed.json"
+                else:
+                    json_file = f"ntff_detailed_{i}.json"
+                self.expected_detailed_json_files.append(json_file)
+                json_parts = [
+                    f"TIMEFORMAT='PROFILE_DETAILED_JSON_GENERATION_TIME_RUN_{i}: %R'; time",
+                    profiler_binary_path,
+                    "view",
+                    "-n file.neff",
+                    f"-s {ntff_file}",
+                    "--output-format=json",
+                    f"--output-file={json_file}",
+                ]
+                detailed_json_cmd_parts.append(f"({' '.join(json_parts)})")
+        self.detailed_json_generation_cmd = " && ".join(detailed_json_cmd_parts)
 
         # Build environment variables command if env_vars is not None
         if env_vars:
@@ -183,7 +217,18 @@ class ProfilerCommands:
         Returns:
             Complete command string ready for shell execution
         """
-        return " && ".join(filter(None, [self.env_vars_cmd, self.capture_cmd, self.show_cmd, self.json_generation_cmd]))
+        return " && ".join(
+            filter(
+                None,
+                [
+                    self.env_vars_cmd,
+                    self.capture_cmd,
+                    self.show_cmd,
+                    self.json_generation_cmd,
+                    self.detailed_json_generation_cmd,
+                ],
+            )
+        )
 
     def _generate_expected_ntff_files(
         self, num_runs: int, profile_all_runs: bool, profile_all_ranks: bool
@@ -229,24 +274,29 @@ class ProfilerCommands:
 
         return ntff_files
 
-    def _generate_profiler_exec_args(self, num_runs: int, profile_all_runs: bool) -> str:
+    def _generate_profiler_exec_args(self, num_runs: int, profile_all_runs: bool, save_all_outputs: bool) -> str:
         """
         Generate neuron-profile execution arguments.
 
         Args:
             num_runs: Total number of kernel executions
             profile_all_runs: Whether to profile all executions or just the last
+            save_all_outputs: Whether to save all executions' outputs or just the last
 
         Returns:
             String of neuron-profile arguments (e.g., "--num-exec=3 --profile-nth-exec=3")
         """
 
-        if profile_all_runs:
-            # Profile all executions - no --profile-nth-exec needed
-            return f"--num-exec={num_runs}"
-        else:
+        args = f"--num-exec={num_runs}"
+
+        if not profile_all_runs:
             # Profile only the last execution
-            return f"--num-exec={num_runs} --profile-nth-exec={num_runs}"
+            args += f" --profile-nth-exec={num_runs}"
+
+        if not save_all_outputs:
+            args += f" --save-nth-output={num_runs}"
+
+        return args
 
     def _generate_collective_args(self, collective_ranks: int, profile_all_ranks: bool) -> str:
         """

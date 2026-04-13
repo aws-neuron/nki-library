@@ -276,9 +276,8 @@ def moe_block_tkg(
         expert_index=expert_index,
         act_fn=router_act_fn,
         k=dims.K,
-        x_hbm_layout=0,  # Since x_input_in_sbuf=True, this value is not used but required by function signature
+        x_hbm_layout=0,
         x_sb_layout=router_x_sb_layout,
-        output_in_sbuf=affinities_in_sbuf,
         router_pre_norm=router_pre_norm,
         norm_topk_prob=norm_topk_prob,
         use_column_tiling=True,
@@ -288,8 +287,6 @@ def moe_block_tkg(
         shard_on_tokens=is_mxfp_all_expert or (not expert_config.is_all_expert and dims.T > 1),
         skip_store_expert_index=skip_store_expert_index,
         skip_store_router_logits=skip_router_logits,
-        x_input_in_sbuf=True,
-        expert_affin_in_sb=affinities_in_sbuf,
     )
     router_logits, expert_index, expert_affinities = router_outputs[0], router_outputs[1], router_outputs[2]
     if not expert_config.is_all_expert and quant_config.is_moe_weight_mx:
@@ -329,7 +326,9 @@ def moe_block_tkg(
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
         hidden_input_scale=expert_mlp_in_scale,
-        mask_unselected_experts=router_pre_norm,
+        # Only mask when router_topk doesn't perform masking (router_pre_norm=True, norm_topk_prob=False).
+        # Otherwise, expert_affinities are already masked by router_topk's scatter operation.
+        mask_unselected_experts=router_pre_norm and not norm_topk_prob,
         expert_affinities_eager=expert_affinities_eager if not expert_config.is_all_expert else None,
         expert_affinities_scaling_mode=expert_affinities_scaling_mode,
         activation_fn=hidden_act_fn,

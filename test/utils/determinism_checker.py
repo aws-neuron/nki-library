@@ -177,7 +177,7 @@ class DeterminismChecker:
                 error_msg = (
                     f"✗ Determinism check FAILED!\n"
                     f"  Tensor: '{tensor_name}'\n"
-                    f"    Total mismatches: {num_mismatches} / {ref_tensor.numel()} ({100*num_mismatches/ref_tensor.numel():.2f}%)\n"
+                    f"    Total mismatches: {num_mismatches} / {ref_tensor.numel()} ({100 * num_mismatches / ref_tensor.numel():.2f}%)\n"
                     f"    First mismatch at byte offset {diff_idx}\n"
                     f"    Reference: 0x{ref_tensor[diff_idx]:02x} ({ref_tensor[diff_idx]}), "
                     f"Run {run_idx}: 0x{run_tensor[diff_idx]:02x} ({run_tensor[diff_idx]})"

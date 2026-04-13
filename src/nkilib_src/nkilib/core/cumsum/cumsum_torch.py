@@ -30,4 +30,4 @@ def cumsum_torch_ref(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
     Returns:
         Output tensor with cumulative sum along specified axis
     """
-    return torch.cumsum(x, dim=axis)
+    return {"output_0": torch.cumsum(x, dim=axis)}

@@ -16,18 +16,17 @@
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from tempfile import NamedTemporaryFile
 from typing import List, Optional, Tuple
 
-import nki
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 from scipy.linalg import circulant
 
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.kernel_helpers import div_ceil
 from ..utils.logging import get_logger
 
 logger = get_logger("topk")
@@ -43,7 +42,7 @@ def _get_dtype_min(dtype):
     return FLOAT32_MIN
 
 
-@dataclass
+@dataclass(frozen=True, eq=True)
 class TopkHardwareParams(nl.NKIObject):
     """
     Hardware parameters for top-k operations.
@@ -60,14 +59,11 @@ class TopkHardwareParams(nl.NKIObject):
     """
 
     dve_max_alus: int = 8
-    topk_per_stage: int = field(init=False)
+    topk_per_stage: int = 8
     index_dtype: type = nl.uint32
     num_sbuf_quadrants: int = 4
     fixed_dve_inst_overhead: int = 144
     max_free_dim: int = 2**14
-
-    def __post_init__(self):
-        self.topk_per_stage = self.dve_max_alus
 
 
 HW_PARAMS = TopkHardwareParams()
@@ -101,20 +97,13 @@ def reduce(op: str = 'mul', input_list: Optional[List] = None, initial_value=Non
     return initial_value
 
 
-@dataclass
+@dataclass(frozen=True, eq=True)
 class TopkConfig(nl.NKIObject):
     """
     Configuration class for top-k algorithm.
 
     Generic configuration for top-k algorithms that accept inputs [B, S, V] and
     perform top-k reduction along vocabulary dimension to produce [B, S, k].
-
-    Args:
-        inp_shape (Tuple): Shape of input tensor (2D or 3D)
-        inp_dtype (np.dtype): Data type of input tensor
-        k (int): Number of top elements to retrieve
-        sorted (bool): Whether to sort the output (default: True)
-        num_programs (int): Number of logical cores (default: 2)
 
     Attributes:
         inp_shape (Tuple): Input tensor shape
@@ -124,51 +113,25 @@ class TopkConfig(nl.NKIObject):
         index_dtype (np.dtype): Index data type (nl.uint32)
         BxS (int): Combined batch and sequence dimensions
         vocab_size (int): Vocabulary dimension size
-        out_shape (list): Output shape [B, S, k]
+        out_shape (tuple): Output shape (B, S, k)
         n_prgs (int): Number of logical cores
         prg_id (int): Program ID for SPMD grid
         per_lnc_BxS (int): Batch size per logical core
+        _pmax (int): Maximum partition size
     """
 
-    def __init__(
-        self, inp_shape: Tuple, inp_dtype: np.dtype, k: int, sorted: bool = True, num_programs: int = 2
-    ) -> None:
-        if nl.tile_size.pmax > 0:
-            self._pmax = nl.tile_size.pmax
-        else:
-            self._pmax = 128
-        self.inp_shape = inp_shape
-        self.k = k
-        self.sorted = sorted
-        self.inp_dtype = inp_dtype
-        self.index_dtype = HW_PARAMS.index_dtype
-
-        self.BxS = reduce('mul', self.inp_shape[:-1], 1)
-        self.vocab_size = inp_shape[-1]
-        self.out_shape = []
-        for dim_size in inp_shape[:-1]:
-            self.out_shape.append(dim_size)
-        self.out_shape.append(self.k)
-
-        # Handle LNC sharding configuration.
-        # Eventually hope to remove LNC info from config once NKI support allows
-        # for helper functions to be LNC agnostic.
-        shard_info = get_verified_program_sharding_info("topk", (0, 1), 2)
-        self.n_prgs = shard_info[1] or num_programs
-        self.prg_id = shard_info[2] or 0
-
-        if self.BxS == 1:
-            logger.info(f"Setting num_programs to 1 since {self.BxS}, user specified num_programs {self.n_prgs}")
-            self.prg_id = 0
-            self.n_prgs = 1
-
-        self.per_lnc_BxS = (self.BxS + self.n_prgs - 1) // self.n_prgs
-        kernel_assert(
-            self.per_lnc_BxS <= self._pmax,
-            f"topk expects BxS per worker <= max_pdim, got {self.per_lnc_BxS}, {self._pmax}",
-        )
-        kernel_assert(self.inp_shape_valid(), "topk expects input to be at least 2D")
-        kernel_assert(self.vocab_size_valid(), f"topk expects vocab_size ({self.vocab_size}) >= k ({self.k})")
+    inp_shape: Tuple
+    k: int
+    sorted: bool
+    inp_dtype: np.dtype
+    index_dtype: np.dtype
+    BxS: int
+    vocab_size: int
+    out_shape: tuple
+    n_prgs: int
+    prg_id: int
+    per_lnc_BxS: int
+    _pmax: int
 
     def inp_shape_valid(self) -> bool:
         return len(self.inp_shape) >= 2
@@ -194,7 +157,60 @@ class TopkConfig(nl.NKIObject):
             - Actual performance may vary based on memory access patterns
             - DVE instructions account for fixed DVE instruction overhead
         """
-        return math.ceil(self.k / HW_PARAMS.dve_max_alus) * 2 * (self.vocab_size + HW_PARAMS.fixed_dve_inst_overhead)
+        return div_ceil(self.k, HW_PARAMS.dve_max_alus) * 2 * (self.vocab_size + HW_PARAMS.fixed_dve_inst_overhead)
+
+
+def create_topk_config(
+    inp_shape: Tuple, inp_dtype: np.dtype, k: int, sorted: bool = True, num_programs: int = 2
+) -> TopkConfig:
+    """
+    Factory function to create a TopkConfig with all derived values pre-calculated.
+
+    Args:
+        inp_shape (Tuple): Shape of input tensor (2D or 3D)
+        inp_dtype (np.dtype): Data type of input tensor
+        k (int): Number of top elements to retrieve
+        sorted (bool): Whether to sort the output (default: True)
+        num_programs (int): Number of logical cores (default: 2)
+
+    Returns:
+        TopkConfig: Frozen, hashable configuration instance
+    """
+    pmax = 128
+    index_dtype = HW_PARAMS.index_dtype
+
+    BxS = reduce('mul', inp_shape[:-1], 1)
+    vocab_size = inp_shape[-1]
+    out_shape = tuple(list(inp_shape[:-1]) + [k])
+
+    # Use num_programs directly — actual shard info is queried inside the kernel
+    n_prgs = num_programs
+    prg_id = 0
+
+    if BxS == 1:
+        logger.info(f"Setting num_programs to 1 since {BxS}, user specified num_programs {n_prgs}")
+        prg_id = 0
+        n_prgs = 1
+
+    per_lnc_BxS = (BxS + n_prgs - 1) // n_prgs
+
+    config = TopkConfig(
+        inp_shape=inp_shape,
+        k=k,
+        sorted=sorted,
+        inp_dtype=inp_dtype,
+        index_dtype=index_dtype,
+        BxS=BxS,
+        vocab_size=vocab_size,
+        out_shape=out_shape,
+        n_prgs=n_prgs,
+        prg_id=prg_id,
+        per_lnc_BxS=per_lnc_BxS,
+        _pmax=pmax,
+    )
+    kernel_assert(config.inp_shape_valid(), "topk expects input to be at least 2D")
+    kernel_assert(config.vocab_size_valid(), f"topk expects vocab_size ({vocab_size}) >= k ({k})")
+    return config
 
 
 class RotationalConstants:
@@ -272,7 +288,7 @@ class RotationalConstants:
                 os.remove(file_path)
 
 
-@dataclass
+@dataclass(frozen=True, eq=True)
 class RotationalTopkConfig(nl.NKIObject):
     """
     Configuration class for rotational top-k algorithm.
@@ -281,9 +297,9 @@ class RotationalTopkConfig(nl.NKIObject):
     top-k reduction along vocabulary dimension. May use padded k for efficiency.
     Supports tiling over BxS dimension for BxS > 128.
 
-    Args:
-        inp_shape (Tuple): Shape of input tensor (must be 2D)
-        topk_config (TopkConfig): Base top-k configuration
+    This is a frozen (immutable) dataclass to ensure hashability when passed
+    as a parameter to @nki.jit kernels. Use create_rotational_topk_config()
+    factory function to construct instances.
 
     Attributes:
         inp_shape (Tuple): Input tensor shape
@@ -303,232 +319,81 @@ class RotationalTopkConfig(nl.NKIObject):
         sorted (bool): Whether to sort output (always True if padded_k != orig_k)
         tile_size (int): Optimal tile size for BxS dimension
         n_bxs_tiles (int): Number of tiles over BxS dimension
+        topk_config (TopkConfig): Base top-k configuration
+        _pmax (int): Maximum partition size
+        _shared_const_cache (dict): Cache of shared constant file paths
     """
 
-    _shared_const_cache: dict = None
+    inp_shape: Tuple
+    BxS: int
+    vocab_size: int
+    orig_k: int
+    padded_k: int
+    n_prgs: int
+    prg_id: int
+    per_lnc_BxS: int
+    inp_dtype: np.dtype
+    index_dtype: np.dtype
+    local_top_k_per_stage: int
+    n_stages: int
+    stage_free_size: int
+    padded_vocab_size: int
+    sorted: bool
+    tile_size: int
+    n_bxs_tiles: int
+    topk_config: TopkConfig
+    _pmax: int
+    _shared_const_cache: dict
 
-    def __init__(self, inp_shape: Tuple, topk_config: TopkConfig) -> None:
-        if nl.tile_size.pmax > 0:
-            self._pmax = nl.tile_size.pmax
-        else:
-            self._pmax = 128
-        self.inp_shape = inp_shape
-        kernel_assert(self.inp_shape_valid(), f"rotated topk expects input to be 2D, actual was {len(inp_shape)}")
-        self.BxS = inp_shape[0]
-        self.vocab_size = inp_shape[1]
-        kernel_assert(
-            self.BxS == topk_config.BxS, f"TopkConfig BxS dim {topk_config} does not match input BxS dim {self.BxS}"
-        )
-
-        self.topk_config = topk_config
-
-        self.orig_k = topk_config.k
-        self.n_prgs = topk_config.n_prgs
-        self.prg_id = topk_config.prg_id
-        self.per_lnc_BxS = topk_config.per_lnc_BxS
-        self.inp_dtype = topk_config.inp_dtype
-        self.index_dtype = topk_config.index_dtype
-
-        # Find optimal tile size if BxS > PMAX
-        if self.per_lnc_BxS > self._pmax:
-            self.tile_size = self._find_optimal_tile_size()
-            self.n_bxs_tiles = math.ceil(self.per_lnc_BxS / self.tile_size)
-        else:
-            self.tile_size = self.per_lnc_BxS
-            self.n_bxs_tiles = 1
-
-        const_info = self._calculate_rotational_constants(self.tile_size)
-        self.local_top_k_per_stage = const_info[0]
-        self.padded_k = const_info[1]
-        self.n_stages = const_info[2]
-        self.stage_free_size = const_info[3]
-        self.padded_vocab_size = const_info[4]
-        if self.orig_k != self.padded_k:
-            self.sorted = True
-        else:
-            self.sorted = topk_config.sorted
-
-    def _calculate_rotational_constants(self, BxS_tile: int) -> Tuple[int, int, int, int, int]:
-        """
-        Calculate rotational algorithm constants for given tile size.
-
-        Args:
-            BxS_tile: Tile size for BxS dimension
-
-        Returns:
-            Tuple[int, int, int, int, int]: (local_top_k_per_stage, padded_k, n_stages, chunk_size, padded_vocab_size)
-        """
-        P_MAX = self._pmax
-        MAX_FREE_DIM = 2**14
-
-        max_n_stages = math.floor(P_MAX // BxS_tile)
-        ideal_n_stages = math.ceil(min(self.orig_k, self.vocab_size) / HW_PARAMS.topk_per_stage)
-
-        # Enforce HW constraint: vocab_size / n_stages <= 2^14
-        min_n_stages_for_hw = math.ceil(self.vocab_size / MAX_FREE_DIM)
-
-        n_stages = min(max_n_stages, ideal_n_stages)
-        n_stages = max(n_stages, min_n_stages_for_hw)
-
-        # Verify we can satisfy HW constraint
-        kernel_assert(
-            n_stages <= max_n_stages,
-            f"Cannot satisfy HW constraint: need {min_n_stages_for_hw} stages but only {max_n_stages} fit with BxS_tile={BxS_tile}",
-        )
-
-        local_top_k_per_stage = get_ceil_aligned_size(math.ceil(self.orig_k / n_stages), HW_PARAMS.topk_per_stage)
-        padded_k = local_top_k_per_stage * n_stages
-
-        chunk_size = math.ceil(self.vocab_size / n_stages)
-        padded_vocab_size = chunk_size * n_stages
-
-        # Verify HW constraint
-        kernel_assert(
-            chunk_size <= HW_PARAMS.max_free_dim,
-            f"HW constraint violated: stage_free_size={chunk_size} > {HW_PARAMS.max_free_dim}",
-        )
-
-        return local_top_k_per_stage, padded_k, n_stages, chunk_size, padded_vocab_size
-
-    def _estimate_dve_cost(self, BxS_tile: int, n_stages: int) -> float:
-        """
-        Estimate DVE clock cycles for given tile size and n_stages.
-
-        Args:
-            BxS_tile: Batch size per tile
-            n_stages: Number of rotational stages
-
-        Returns:
-            Estimated DVE clock cycles (inf if HW constraint violated)
-        """
-        MAX_FREE_DIM = 2**14
-        stage_free_size = math.ceil(self.vocab_size / n_stages)
-
-        # HW constraint: stage_free_size must be <= 2^14
-        if stage_free_size > MAX_FREE_DIM:
-            return float('inf')
-
-        k_per_stage = get_ceil_aligned_size(math.ceil(self.orig_k / n_stages), HW_PARAMS.topk_per_stage)
-        padded_k = k_per_stage * n_stages
-
-        # Per-stage cost (repeated n_stages times)
-        per_stage_cost = math.ceil(k_per_stage / 8) * 2 * (stage_free_size + HW_PARAMS.fixed_dve_inst_overhead)
-        unsorted_cost = n_stages * per_stage_cost
-
-        # Final sort cost (if needed)
-        needs_sort = self.topk_config.sorted or padded_k != self.orig_k
-        if needs_sort:
-            base_sort_cost = (
-                math.ceil(padded_k / HW_PARAMS.dve_max_alus) * 2 * (padded_k + HW_PARAMS.fixed_dve_inst_overhead)
+    def __hash__(self):
+        # Custom hash that excludes the unhashable _shared_const_cache dict
+        return hash(
+            (
+                self.inp_shape,
+                self.BxS,
+                self.vocab_size,
+                self.orig_k,
+                self.padded_k,
+                self.n_prgs,
+                self.prg_id,
+                self.per_lnc_BxS,
+                self.inp_dtype,
+                self.index_dtype,
+                self.local_top_k_per_stage,
+                self.n_stages,
+                self.stage_free_size,
+                self.padded_vocab_size,
+                self.sorted,
+                self.tile_size,
+                self.n_bxs_tiles,
+                self.topk_config,
+                self._pmax,
             )
-            # Sort underutilization penalty: sort needs full 128 channels
-            sort_efficiency = BxS_tile / self._pmax
-            sorted_cost = base_sort_cost / sort_efficiency
-        else:
-            sorted_cost = 0
-
-        return unsorted_cost + sorted_cost
-
-    def _find_optimal_tile_size(self) -> int:
-        """
-        Find optimal tile size that minimizes total cost while respecting HW constraints.
-
-        Strategy:
-        - For large V, smaller tiles allow more n_stages, reducing stage_free_size
-        - CRITICAL HW constraints:
-            1. vocab_size/n_stages <= 2^14 (max8/match_replace8 limit)
-            2. Sort needs full 128 channels for efficiency
-        - Minimize: n_tiles × cost_per_tile
-
-        Cost model:
-            unsorted_cost ≈ (k×V)/(4×n_stages) + 36×k
-            sorted_cost ≈ [k²/4 + 36×k] × (128/BxS_tile)  # Underutilization penalty
-
-        Tradeoff:
-            - Smaller BxS_tile → more n_stages → lower unsorted_cost
-            - Smaller BxS_tile → worse sort efficiency → higher sorted_cost
-
-        Returns:
-            Optimal tile size
-        """
-        P_MAX = self._pmax
-
-        # Calculate minimum n_stages required by HW constraint
-        min_n_stages_for_hw = math.ceil(self.vocab_size / HW_PARAMS.max_free_dim)
-
-        # Try different tile sizes min batches per tile 2 to max 128
-        # in steps of 2
-        candidates = []
-        for tile_size in range(2, self._pmax, 2):  # 16, 32, 64, 128
-            if tile_size <= P_MAX:
-                candidates.append(tile_size)
-
-        best_tile_size = None
-        best_cost = float('inf')
-
-        for tile_size in candidates:
-            # Calculate n_stages for this tile size
-            max_n_stages = math.floor(P_MAX // tile_size)
-            ideal_n_stages = math.ceil(min(self.orig_k, self.vocab_size) / HW_PARAMS.topk_per_stage)
-            n_stages = min(max_n_stages, ideal_n_stages)
-            n_stages = max(n_stages, min_n_stages_for_hw)  # Enforce HW constraint
-
-            # Check if this configuration is feasible
-            if n_stages > max_n_stages:
-                continue
-
-            # Skip if only 1 stage (falls back to scanning anyway)
-            if n_stages <= 1:
-                continue
-
-            # Calculate cost per tile
-            cost_per_tile = self._estimate_dve_cost(tile_size, n_stages)
-
-            # Skip if HW constraint violated
-            if cost_per_tile == float('inf'):
-                continue
-
-            # Calculate number of tiles needed
-            n_tiles = math.ceil(self.per_lnc_BxS / tile_size)
-
-            # Total cost
-            total_cost = n_tiles * cost_per_tile
-
-            logger.info(
-                f"Tile size {tile_size}: n_stages={n_stages}, n_tiles={n_tiles}, cost_per_tile={int(cost_per_tile)}, total={int(total_cost)}"
-            )
-
-            if total_cost < best_cost:
-                best_cost = total_cost
-                best_tile_size = tile_size
-
-        # If no valid tile size found, use smallest possible that satisfies HW constraint
-        if best_tile_size is None:
-            best_tile_size = max(16, math.ceil(P_MAX / min_n_stages_for_hw))
-            logger.warning(f"No optimal tile size found, using {best_tile_size} to satisfy HW constraint")
-
-        logger.info(
-            f"Optimal tile size: {best_tile_size} (BxS={self.per_lnc_BxS}, V={self.vocab_size}, k={self.orig_k})"
         )
-        return best_tile_size
 
-    def update_shard_info(self):
-        """
-        Update sharding information from program context.
-
-        Returns:
-            None: Updates instance attributes n_prgs and prg_id
-        """
-        shard_info = get_verified_program_sharding_info("topk", (0, 1), 2)
-        kernel_assert(shard_info[1] == self.n_prgs or self.BxS == 1, "n_prgs mismatch")
-        if self.BxS > 1:
-            self.n_prgs = shard_info[1]
-            self.prg_id = shard_info[2]
-        else:
-            kernel_assert(self.n_prgs == 1, f"n_prgs mismatch, BxS {self.BxS}, n_programs {self.n_prgs}")
-
-        self.topk_config = TopkConfig(
-            inp_shape=self.topk_config.inp_shape, inp_dtype=self.inp_dtype, k=self.orig_k, sorted=self.sorted
+    def __eq__(self, other):
+        if not isinstance(other, RotationalTopkConfig):
+            return NotImplemented
+        return (
+            self.inp_shape == other.inp_shape
+            and self.BxS == other.BxS
+            and self.vocab_size == other.vocab_size
+            and self.orig_k == other.orig_k
+            and self.padded_k == other.padded_k
+            and self.n_prgs == other.n_prgs
+            and self.prg_id == other.prg_id
+            and self.per_lnc_BxS == other.per_lnc_BxS
+            and self.inp_dtype == other.inp_dtype
+            and self.index_dtype == other.index_dtype
+            and self.local_top_k_per_stage == other.local_top_k_per_stage
+            and self.n_stages == other.n_stages
+            and self.stage_free_size == other.stage_free_size
+            and self.padded_vocab_size == other.padded_vocab_size
+            and self.sorted == other.sorted
+            and self.tile_size == other.tile_size
+            and self.n_bxs_tiles == other.n_bxs_tiles
+            and self.topk_config == other.topk_config
+            and self._pmax == other._pmax
         )
 
     def inp_shape_valid(self) -> bool:
@@ -547,6 +412,289 @@ class RotationalTopkConfig(nl.NKIObject):
         kernel_assert(self.inp_shape_valid(), f"topk expects input to be at least 2D, got ({self.inp_shape})")
         kernel_assert(self.vocab_size_valid(), "topk expects vocab_size ({self.vocab_size}) >= k ({self.orig_k}),")
 
+    def log_strategy(self) -> None:
+        """Log the topk execution strategy before kernel launch."""
+        trivial = self.orig_k == self.vocab_size
+        scanning = self.n_stages == 1 and not trivial
+        method = "trivial" if trivial else "scanning" if scanning else "rotational"
+        tiled = self.n_bxs_tiles > 1
+
+        lines = [
+            "+" + "=" * 50 + "+",
+            "|          TopK Execution Strategy                 |",
+            "+" + "-" * 50 + "+",
+            f"| Method:       {method}",
+            f"| Input:        BxS={self.BxS}, vocab={self.vocab_size}, k={self.orig_k}",
+            f"| Sharding:     n_prgs={self.n_prgs}, per_lnc_BxS={self.per_lnc_BxS}",
+            "+" + "-" * 50 + "+",
+            f"| Tiling:       tile_size={self.tile_size}, n_tiles={self.n_bxs_tiles}, tiled={tiled}",
+            f"| Stages:       n_stages={self.n_stages}, stage_free={self.stage_free_size}",
+            f"| TopK:         local_k/stage={self.local_top_k_per_stage}, padded_k={self.padded_k}",
+            f"| Output:       sorted={self.sorted}",
+            "+" + "=" * 50 + "+",
+        ]
+        msg = "\n".join(lines)
+        print(msg)
+        logger.info(msg)
+
+
+def _calculate_rotational_constants(
+    orig_k: int, vocab_size: int, pmax: int, BxS_tile: int
+) -> Tuple[int, int, int, int, int]:
+    """
+    Calculate rotational algorithm constants for given tile size.
+
+    Args:
+        orig_k: Original number of top elements requested
+        vocab_size: Vocabulary dimension size
+        pmax: Maximum partition size
+        BxS_tile: Tile size for BxS dimension
+
+    Returns:
+        Tuple[int, int, int, int, int]: (local_top_k_per_stage, padded_k, n_stages, chunk_size, padded_vocab_size)
+    """
+    MAX_FREE_DIM = 2**14
+
+    max_n_stages = math.floor(pmax // BxS_tile)
+    ideal_n_stages = div_ceil(min(orig_k, vocab_size), HW_PARAMS.topk_per_stage)
+
+    # Enforce HW constraint: vocab_size / n_stages <= 2^14
+    min_n_stages_for_hw = div_ceil(vocab_size, MAX_FREE_DIM)
+
+    n_stages = min(max_n_stages, ideal_n_stages)
+    n_stages = max(n_stages, min_n_stages_for_hw)
+
+    # Verify we can satisfy HW constraint
+    kernel_assert(
+        n_stages <= max_n_stages,
+        f"Cannot satisfy HW constraint: need {min_n_stages_for_hw} stages but only {max_n_stages} fit with BxS_tile={BxS_tile}",
+    )
+
+    local_top_k_per_stage = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
+    padded_k = local_top_k_per_stage * n_stages
+
+    chunk_size = div_ceil(vocab_size, n_stages)
+    padded_vocab_size = chunk_size * n_stages
+
+    # Verify HW constraints
+    kernel_assert(
+        chunk_size <= HW_PARAMS.max_free_dim,
+        f"HW constraint violated: stage_free_size={chunk_size} > {HW_PARAMS.max_free_dim}",
+    )
+    concatenated_free = chunk_size + n_stages * local_top_k_per_stage
+    kernel_assert(
+        concatenated_free <= HW_PARAMS.max_free_dim,
+        f"HW constraint violated: concatenated_free_dim={concatenated_free} > {HW_PARAMS.max_free_dim}",
+    )
+
+    return local_top_k_per_stage, padded_k, n_stages, chunk_size, padded_vocab_size
+
+
+def _estimate_dve_cost(
+    orig_k: int, vocab_size: int, pmax: int, topk_sorted: bool, BxS_tile: int, n_stages: int
+) -> float:
+    """
+    Estimate DVE clock cycles for given tile size and n_stages.
+
+    Args:
+        orig_k: Original number of top elements requested
+        vocab_size: Vocabulary dimension size
+        pmax: Maximum partition size
+        topk_sorted: Whether the topk config requests sorted output
+        BxS_tile: Batch size per tile
+        n_stages: Number of rotational stages
+
+    Returns:
+        Estimated DVE clock cycles (inf if HW constraint violated)
+    """
+    MAX_FREE_DIM = 2**14
+    stage_free_size = div_ceil(vocab_size, n_stages)
+
+    # HW constraint: stage_free_size must be <= 2^14
+    if stage_free_size > MAX_FREE_DIM:
+        return float('inf')
+
+    k_per_stage = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
+
+    # HW constraint: concatenated free dim must fit
+    if stage_free_size + n_stages * k_per_stage > MAX_FREE_DIM:
+        return float('inf')
+
+    padded_k = k_per_stage * n_stages
+
+    # Per-stage cost (repeated n_stages times)
+    per_stage_cost = div_ceil(k_per_stage, 8) * 2 * (stage_free_size + HW_PARAMS.fixed_dve_inst_overhead)
+    unsorted_cost = n_stages * per_stage_cost
+
+    # Final sort cost (if needed)
+    needs_sort = topk_sorted or padded_k != orig_k
+    if needs_sort:
+        base_sort_cost = div_ceil(padded_k, HW_PARAMS.dve_max_alus) * 2 * (padded_k + HW_PARAMS.fixed_dve_inst_overhead)
+        # Sort underutilization penalty: sort needs full 128 channels
+        sort_efficiency = BxS_tile / pmax
+        sorted_cost = base_sort_cost / sort_efficiency
+    else:
+        sorted_cost = 0
+
+    return unsorted_cost + sorted_cost
+
+
+def _find_optimal_tile_size(orig_k: int, vocab_size: int, per_lnc_BxS: int, pmax: int, topk_sorted: bool) -> int:
+    """
+    Find optimal tile size that minimizes total cost while respecting HW constraints.
+
+    Strategy:
+    - For large V, smaller tiles allow more n_stages, reducing stage_free_size
+    - CRITICAL HW constraints:
+        1. vocab_size/n_stages <= 2^14 (max8/match_replace8 limit)
+        2. Sort needs full 128 channels for efficiency
+    - Minimize: n_tiles x cost_per_tile
+
+    Args:
+        orig_k: Original number of top elements requested
+        vocab_size: Vocabulary dimension size
+        per_lnc_BxS: Batch size per logical core
+        pmax: Maximum partition size
+        topk_sorted: Whether the topk config requests sorted output
+
+    Returns:
+        Optimal tile size
+    """
+    # Calculate minimum n_stages required by HW constraint
+    min_n_stages_for_hw = div_ceil(vocab_size, HW_PARAMS.max_free_dim)
+
+    # Try different tile sizes from 1 to PMAX
+    candidates = range(1, pmax + 1)
+
+    best_tile_size = None
+    best_cost = float('inf')
+
+    for tile_size in candidates:
+        # Calculate n_stages for this tile size
+        max_n_stages = math.floor(pmax // tile_size)
+        ideal_n_stages = div_ceil(min(orig_k, vocab_size), HW_PARAMS.topk_per_stage)
+        n_stages = min(max_n_stages, ideal_n_stages)
+        n_stages = max(n_stages, min_n_stages_for_hw)  # Enforce all constraints
+
+        # Check if this configuration is feasible
+        if n_stages > max_n_stages:
+            continue
+
+        # Skip if only 1 stage (falls back to scanning anyway)
+        if n_stages <= 1:
+            continue
+
+        # Calculate cost per tile
+        cost_per_tile = _estimate_dve_cost(orig_k, vocab_size, pmax, topk_sorted, tile_size, n_stages)
+
+        # Skip if HW constraint violated
+        if cost_per_tile == float('inf'):
+            continue
+
+        # Calculate number of tiles needed
+        n_tiles = div_ceil(per_lnc_BxS, tile_size)
+
+        # Total cost
+        total_cost = n_tiles * cost_per_tile
+
+        logger.debug(
+            f"Tile size {tile_size}: n_stages={n_stages}, n_tiles={n_tiles} cost_per_tile={int(cost_per_tile)}, total={int(total_cost)}"
+        )
+
+        if total_cost < best_cost:
+            best_cost = total_cost
+            best_tile_size = tile_size
+
+    # If no valid tile size found, use smallest possible that satisfies HW constraint
+    if best_tile_size is None:
+        best_tile_size = max(16, div_ceil(pmax, min_n_stages_for_hw))
+        logger.warn(
+            f"No optimal tile size found, using {best_tile_size} to satisfy HW constraint, fallback to naive_scaning"
+        )
+
+    logger.info(f"Optimal tile size: {best_tile_size} (BxS={per_lnc_BxS}, V={vocab_size}, k={orig_k})")
+    return best_tile_size
+
+
+def create_rotational_topk_config(
+    inp_shape: Tuple, topk_config: TopkConfig, shared_const_cache: Optional[dict] = None
+) -> RotationalTopkConfig:
+    """
+    Factory function to create a RotationalTopkConfig with all derived values pre-calculated.
+
+    All computation and validation is performed here before constructing the frozen
+    (immutable, hashable) dataclass instance.
+
+    Args:
+        inp_shape (Tuple): Shape of input tensor (must be 2D)
+        topk_config (TopkConfig): Base top-k configuration
+        shared_const_cache (Optional[dict]): Pre-computed shared constant cache.
+            If None, an empty dict is used.
+
+    Returns:
+        RotationalTopkConfig: Frozen, hashable configuration instance
+    """
+    pmax = 128
+
+    kernel_assert(len(inp_shape) == 2, f"rotated topk expects input to be 2D, actual was {len(inp_shape)}")
+
+    BxS = inp_shape[0]
+    vocab_size = inp_shape[1]
+    kernel_assert(BxS == topk_config.BxS, f"TopkConfig BxS dim {topk_config} does not match input BxS dim {BxS}")
+
+    orig_k = topk_config.k
+    n_prgs = topk_config.n_prgs
+    prg_id = topk_config.prg_id
+    per_lnc_BxS = topk_config.per_lnc_BxS
+    inp_dtype = topk_config.inp_dtype
+    index_dtype = topk_config.index_dtype
+
+    # Find optimal tile size if BxS > PMAX
+    if per_lnc_BxS > pmax:
+        tile_size = _find_optimal_tile_size(orig_k, vocab_size, per_lnc_BxS, pmax, topk_config.sorted)
+        n_bxs_tiles = div_ceil(per_lnc_BxS, tile_size)
+    else:
+        tile_size = per_lnc_BxS
+        n_bxs_tiles = 1
+
+    const_info = _calculate_rotational_constants(orig_k, vocab_size, pmax, tile_size)
+    local_top_k_per_stage = const_info[0]
+    padded_k = const_info[1]
+    n_stages = const_info[2]
+    stage_free_size = const_info[3]
+    padded_vocab_size = const_info[4]
+
+    if orig_k != padded_k:
+        sorted_flag = True
+    else:
+        sorted_flag = topk_config.sorted
+
+    if shared_const_cache is None:
+        shared_const_cache = {}
+
+    return RotationalTopkConfig(
+        inp_shape=inp_shape,
+        BxS=BxS,
+        vocab_size=vocab_size,
+        orig_k=orig_k,
+        padded_k=padded_k,
+        n_prgs=n_prgs,
+        prg_id=prg_id,
+        per_lnc_BxS=per_lnc_BxS,
+        inp_dtype=inp_dtype,
+        index_dtype=index_dtype,
+        local_top_k_per_stage=local_top_k_per_stage,
+        n_stages=n_stages,
+        stage_free_size=stage_free_size,
+        padded_vocab_size=padded_vocab_size,
+        sorted=sorted_flag,
+        tile_size=tile_size,
+        n_bxs_tiles=n_bxs_tiles,
+        topk_config=topk_config,
+        _pmax=pmax,
+        _shared_const_cache=shared_const_cache,
+    )
+
 
 def rotate(dst: nl.ndarray, tensor: nl.ndarray, rotation_matrix: nl.ndarray) -> nl.ndarray:
     """
@@ -560,7 +708,12 @@ def rotate(dst: nl.ndarray, tensor: nl.ndarray, rotation_matrix: nl.ndarray) -> 
     Returns:
         nl.ndarray: Rotated tensor (dst)
     """
-    nisa.nc_matmul(dst, rotation_matrix, tensor)
+    f_max = nl.tile_size.gemm_moving_fmax
+    free_size = tensor.shape[1]
+    n_tiles = div_ceil(free_size, f_max)
+    for i in nl.affine_range(n_tiles):
+        tile_slice = nl.ds(i * f_max, min(f_max, free_size - i * f_max))
+        nisa.nc_matmul(dst[:, tile_slice], rotation_matrix, tensor[:, tile_slice])
 
 
 def insert(tensor: nl.ndarray, values: nl.ndarray, offset: int = 0) -> None:
@@ -587,7 +740,7 @@ def validate_topk_input(inp: nl.ndarray, n_fold: int = 1, local_top_k_per_stage:
     """
     kernel_assert(len(inp.shape) == 2, f"input has {len(inp.shape)} dims, topk expects input to be 2D")
     kernel_assert(
-        math.ceil(inp.shape[1] / n_fold) + local_top_k_per_stage <= 2**14,
+        div_ceil(inp.shape[1], n_fold) + local_top_k_per_stage <= 2**14,
         f"topk tensor cannot have dim 1 > 16k * n_fold, got {inp.shape[1]} with n_fold={n_fold}",
     )
 
@@ -604,10 +757,6 @@ def validate_config(topk_config: TopkConfig) -> None:
         topk_config.vocab_size_valid(),
         f"topk expects vocab_size >= k, got vocab_size={topk_config.vocab_size}, k={topk_config.k}",
     )
-    kernel_assert(
-        topk_config.per_lnc_BxS <= P_MAX,
-        f"BxS dim of {topk_config.per_lnc_BxS} doesn't fit within partition dim of {P_MAX}",
-    )
 
 
 def naive_scanning_topk(inp: nl.ndarray, topk_config: TopkConfig) -> Tuple[nl.ndarray, nl.ndarray]:
@@ -615,7 +764,8 @@ def naive_scanning_topk(inp: nl.ndarray, topk_config: TopkConfig) -> Tuple[nl.nd
     Top-K kernel using scanning approach with DVE instructions.
 
     Implements top-k reduction using DVE max8 and nc_match_replace8 instructions,
-    sharded across multiple NeuronCores.
+    sharded across multiple NeuronCores. Supports tiling over BxS dimension when
+    per_lnc_BxS exceeds PMAX (128).
 
     Args:
         inp (nl.ndarray): [BxS, V], Input tensor in HBM
@@ -633,22 +783,32 @@ def naive_scanning_topk(inp: nl.ndarray, topk_config: TopkConfig) -> Tuple[nl.nd
     k = topk_config.k
     vocab_size = topk_config.vocab_size
     BxS = topk_config.BxS
+    P_MAX = topk_config._pmax
     n_programs, program_id = topk_config.n_prgs, topk_config.prg_id
 
-    inp_sbuf = nl.ndarray((per_lnc_BxS, vocab_size), dtype=inp.dtype, buffer=nl.sbuf)
-    if per_lnc_BxS * n_programs != BxS:
-        nisa.memset(inp_sbuf, value=_get_dtype_min(inp.dtype))
-
-    max_per_lnc_bxs = min(per_lnc_BxS, BxS - program_id * per_lnc_BxS)
-    hbm_slice = nl.ds(program_id * per_lnc_BxS, max_per_lnc_bxs)
-    sbuf_slice = nl.ds(0, max_per_lnc_bxs)
-    nisa.dma_copy(dst=inp_sbuf[sbuf_slice, :], src=inp[hbm_slice, :])
     topk_values = nl.ndarray((BxS, k), dtype=inp.dtype, buffer=nl.shared_hbm)
     topk_indices = nl.ndarray((BxS, k), dtype=HW_PARAMS.index_dtype, buffer=nl.shared_hbm)
 
-    sbuf_topk_values, sbuf_topk_indices = topk_core(data=inp_sbuf, k=topk_config.k)
-    nisa.dma_copy(dst=topk_values[hbm_slice, :], src=sbuf_topk_values[sbuf_slice, :])
-    nisa.dma_copy(dst=topk_indices[hbm_slice, :], src=sbuf_topk_indices[sbuf_slice, :])
+    tile_size = min(per_lnc_BxS, P_MAX)
+    n_tiles = div_ceil(per_lnc_BxS, tile_size)
+    lnc_batch_start = program_id * per_lnc_BxS
+
+    for tile_idx in nl.sequential_range(n_tiles):
+        tile_batch_start = lnc_batch_start + tile_idx * tile_size
+        tile_batch_end = min(tile_batch_start + tile_size, min(lnc_batch_start + per_lnc_BxS, BxS))
+        tile_bxs = tile_batch_end - tile_batch_start
+
+        inp_sbuf = nl.ndarray((tile_size, vocab_size), dtype=inp.dtype, buffer=nl.sbuf)
+        if tile_bxs < tile_size:
+            nisa.memset(inp_sbuf, value=_get_dtype_min(inp.dtype))
+
+        hbm_slice = nl.ds(tile_batch_start, tile_bxs)
+        sbuf_slice = nl.ds(0, tile_bxs)
+        nisa.dma_copy(dst=inp_sbuf[sbuf_slice, :], src=inp[hbm_slice, :])
+
+        sbuf_topk_values, sbuf_topk_indices = topk_core(data=inp_sbuf, k=k)
+        nisa.dma_copy(dst=topk_values[hbm_slice, :], src=sbuf_topk_values[sbuf_slice, :])
+        nisa.dma_copy(dst=topk_indices[hbm_slice, :], src=sbuf_topk_indices[sbuf_slice, :])
 
     return topk_values, topk_indices
 
@@ -670,7 +830,7 @@ def topk_core(data: nl.ndarray, k: int) -> Tuple[nl.ndarray, nl.ndarray]:
             - out_inds: [BxS, k], Indices of top-k elements in SBUF
     """
     BxS, vocab_size = data.shape
-    n_fold = math.ceil(k / HW_PARAMS.topk_per_stage)
+    n_fold = div_ceil(k, HW_PARAMS.topk_per_stage)
 
     out_vals = nl.ndarray((BxS, k), dtype=data.dtype, buffer=nl.sbuf)
     out_inds = nl.ndarray((BxS, k), dtype=HW_PARAMS.index_dtype, buffer=nl.sbuf)
@@ -723,12 +883,12 @@ def sort(data_sbuf: nl.ndarray, indices: Optional[nl.ndarray] = None) -> Tuple[n
             - sorted_indices: [m, n], Global or local indices corresponding to sorted elements
     """
     m, n = data_sbuf.shape
-    num_pass = math.ceil(n / HW_PARAMS.dve_max_alus)
+    num_pass = div_ceil(n, HW_PARAMS.dve_max_alus)
     kernel_assert(n % HW_PARAMS.dve_max_alus == 0, f"n {n} must be divisible by DVE_MAX_ALUS {HW_PARAMS.dve_max_alus}")
 
-    topk_val_buf = nl.ndarray((nl.par_dim(m), n), dtype=data_sbuf.dtype, name="val_buf", buffer=nl.sbuf)
-    topk_idx_buf = nl.ndarray((nl.par_dim(m), n), dtype=nl.uint32, name="id_buf", buffer=nl.sbuf)
-    global_topk_idx_buf = nl.ndarray((nl.par_dim(m), n), dtype=nl.uint32, name="global_id_buf", buffer=nl.sbuf)
+    topk_val_buf = nl.ndarray((m, n), dtype=data_sbuf.dtype, buffer=nl.sbuf)
+    topk_idx_buf = nl.ndarray((m, n), dtype=nl.uint32, buffer=nl.sbuf)
+    global_topk_idx_buf = nl.ndarray((m, n), dtype=nl.uint32, buffer=nl.sbuf)
 
     ix, iy = nl.ds(0, m), nl.ds(0, HW_PARAMS.dve_max_alus)
 

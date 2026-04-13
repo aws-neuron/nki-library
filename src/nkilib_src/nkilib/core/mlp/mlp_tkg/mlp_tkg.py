@@ -14,11 +14,13 @@
 
 """MLP TKG kernel implementation for token generation scenarios with optional normalization and fused add."""
 
+from typing import Optional
+
 import nki.isa as nisa
 import nki.language as nl
 
-from ...utils.allocator import SbufManager
-from ...utils.logging import get_logger
+from ...utils.allocator import BufferManager
+from ...utils.kernel_assert import kernel_assert
 from ..mlp_parameters import (
     MLPParameters,
     mlpp_has_fused_add,
@@ -40,6 +42,7 @@ def mlp_tkg(
     params: MLPParameters,
     output_tensor_hbm: nl.ndarray,
     output_stored_add_tensor_hbm: nl.ndarray,
+    sbm: Optional[BufferManager] = None,
 ) -> list[nl.ndarray]:
     """
     Allocated kernel that computes Norm(hidden) @ wMLP for token generation.
@@ -81,6 +84,7 @@ def mlp_tkg(
             - up_clamp_upper_limit: Upper clamp limit for up projection output
         output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM
         output_stored_add_tensor_hbm (nl.ndarray): [B, S, H], Optional fused add result storage
+        sbm (BufferManager): Optional BufferManager for SBUF allocation with consistent naming.
 
     Returns:
         list[nl.ndarray]: List containing:
@@ -90,7 +94,7 @@ def mlp_tkg(
     Notes:
         - Supports RMSNorm and LayerNorm normalization
         - Supports static and row-wise quantization
-        - Uses SbufManager for memory allocation
+        - Uses BufferManager for memory allocation
         - When skip_gate_proj=True, only up projection with activation is performed
         - Matmul projection modes:
             - Column tiling: hidden is stationary tensor, weight is moving tensor
@@ -117,12 +121,25 @@ def mlp_tkg(
         # Step 4: Down projection
         output = intermediate @ down_weight + down_bias
     """
+
     io_dtype = params.hidden_tensor.dtype
 
     # ---------------- Compute Kernel Dimensions & SBUF Manager ----------------
     dims = MLPTKGConstants.calculate_constants(params)
 
-    sbm = SbufManager(0, 200 * 1024, get_logger("mlp_tkg"))
+    # Always create internal BufferManager for SBUF allocations.
+    if sbm is None:
+        sbm = SbufManager(0, 200 * 1024, Logger("mlp_tkg"))
+        sbm.set_name_prefix("mlp_")
+    else:
+        kernel_assert(
+            not sbm.is_auto_alloc(),
+            "If the MLP kernel receives a SBM from the caller, that SBM must be manually allocated",
+        )
+        kernel_assert(
+            sbm.get_free_space() >= 200 * 1024,
+            f"If the MLP kernel receives a SBM from the caller, the SBM must have the free space of at least 200 * 1024 elements",
+        )
     sbm.open_scope()  # Start SBUF allocation scope
 
     # ---------------- Fused Add ----------------

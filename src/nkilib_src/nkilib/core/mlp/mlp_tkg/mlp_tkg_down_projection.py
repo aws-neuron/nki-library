@@ -14,16 +14,13 @@
 
 """Down projection sub-kernels for MLP TKG with column tiling and LHS/RHS swap modes."""
 
-import math
-
-import nki
 import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype
+from ...utils.kernel_helpers import div_ceil
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters, mlpp_has_down_projection_bias
@@ -116,29 +113,23 @@ def down_projection(
         )
 
     # ---------- Compute matmul  ----------
-    # Compute the H size that each column tile will process
-    column_tiled_hidden_tile_size = tiles.HTile // dims.column_tiling_factor
+    # compute the number of required PSUM banks per HTile
+    num_required_psums_per_HTile = div_ceil(tiles.HTile, dims._psum_fmax)
+    num_required_psum_after_column_tiling = div_ceil(num_required_psums_per_HTile, dims.column_tiling_factor)
 
-    # The number of required PSUM banks per HTile
-    num_required_psums_per_HTile = column_tiled_hidden_tile_size // dims._psum_fmax
-    kernel_assert(
-        column_tiled_hidden_tile_size % dims._psum_fmax == 0,
-        "column_tiled_hidden_tile_size must be a multiple of _psum_fmax (512).",
-    )
-
-    # Compute available PSUM groups
-    num_available_psum_group = dims._psum_bmax // num_required_psums_per_HTile
+    # Calculate how many HTiles can be computed in parallel
+    # Total PSUM banks (_psum_bmax=8) divided by PSUMs needed per HTile
+    # Each PSUM group processes one HTile independently
+    num_available_psum_group = dims._psum_bmax // num_required_psum_after_column_tiling
 
     for hidden_tiles in TiledRange(H, tiles.HTile):
         # Calculate start offset for H
         h_offset = hidden_tiles.start_offset
-        h1_tiles = hidden_tiles.size // dims._psum_fmax
-        res_h1_tile = hidden_tiles.size % dims._psum_fmax
 
         # Allocate PSUM
-        psum_offset = (hidden_tiles.index % num_available_psum_group) * num_required_psums_per_HTile
+        psum_offset = (hidden_tiles.index % num_available_psum_group) * num_required_psum_after_column_tiling
         result_psums = []
-        for psum_idx in range(num_required_psums_per_HTile):
+        for psum_idx in range(num_required_psum_after_column_tiling):
             result_psum = nl.ndarray(
                 shape=(dims._pmax, dims._psum_fmax),
                 dtype=nl.float32,
@@ -167,56 +158,40 @@ def down_projection(
             )
 
             # Matmult
-            for column_tile in TiledRange(h1_tiles, dims.column_tiling_factor):
-                for column_idx in range(column_tile.size):
-                    weight_offset = (column_tile.start_offset + column_idx) * dims._psum_fmax
-                    nisa.nc_matmul(
-                        dst=result_psums[column_tile.index][
-                            nl.ds(dims.column_tiling_dim * column_idx, T),
-                            0 : dims._psum_fmax,
-                        ],
-                        stationary=hidden[0 : i_tiles.size, i_tiles.index, 0:T],
-                        moving=weight_tiles[weight_idx][0 : i_tiles.size, nl.ds(weight_offset, dims._psum_fmax)],
-                        tile_position=(0, dims.column_tiling_dim * column_idx),
-                        tile_size=(I0, dims.column_tiling_dim),
-                    )
-
-            # remainder h1_tile, not a multipe of 512(_psum_fmax)
-            if res_h1_tile != 0:
-                weight_offset = h1_tiles * dims._psum_fmax
+            for compute_tile in TiledRange(hidden_tiles.size, dims._psum_fmax):
+                # Distribute tiles across columns and PSUM banks for optimal memory access
+                # Example: with column_tiling_factor=4, tiles 0-3 go to columns 0-3 in bank 0,
+                #          tiles 4-7 go to columns 0-3 in bank 1, etc.
+                column_tile_index = compute_tile.index % dims.column_tiling_factor
+                psum_bank_index = compute_tile.index // dims.column_tiling_factor
                 nisa.nc_matmul(
-                    dst=result_psums[h1_tiles][0:T, 0:res_h1_tile],
+                    dst=result_psums[psum_bank_index][
+                        nl.ds(dims.column_tiling_dim * column_tile_index, T),
+                        0 : compute_tile.size,
+                    ],
                     stationary=hidden[0 : i_tiles.size, i_tiles.index, 0:T],
-                    moving=weight_tiles[weight_idx][0 : i_tiles.size, nl.ds(weight_offset, res_h1_tile)],
-                    tile_position=(0, 0),
+                    moving=weight_tiles[weight_idx][
+                        0 : i_tiles.size, nl.ds(compute_tile.index * dims._psum_fmax, compute_tile.size)
+                    ],
+                    tile_position=(0, dims.column_tiling_dim * column_tile_index),
                     tile_size=(I0, dims.column_tiling_dim),
                 )
 
         # ---------- Accumulate partial PSUM output to SB and optionally apply dequant scale ----------
         dequant_tile_view = TensorView(dequant_tile) if params.quant_params.is_quant() else None
-        for column_tile in TiledRange(h1_tiles, dims.column_tiling_factor):
-            for column_idx in range(column_tile.size):
-                dst_offset = h_offset + (column_tile.index * dims.column_tiling_factor + column_idx) * dims._psum_fmax
-                interleave_copy(
-                    index=column_idx + column_tile.index * column_tile.size,
-                    dst=output_tile[0:T, nl.ds(dst_offset, dims._psum_fmax)],
-                    src=result_psums[column_tile.index][
-                        nl.ds(dims.column_tiling_dim * column_idx, T),
-                        0 : dims._psum_fmax,
-                    ],
-                    scale=dequant_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + dims._psum_fmax)
-                    if params.quant_params.is_quant_row()
-                    else dequant_tile_view,
-                    bias=None,
-                )
-
-        if res_h1_tile != 0:
-            dst_offset = h_offset + h1_tiles * dims._psum_fmax
+        for compute_tile in TiledRange(hidden_tiles.size, dims._psum_fmax):
+            # Read tiles across columns and PSUM banks
+            column_tile_index = compute_tile.index % dims.column_tiling_factor
+            psum_bank_index = compute_tile.index // dims.column_tiling_factor
+            dst_offset = h_offset + compute_tile.index * dims._psum_fmax
             interleave_copy(
-                index=0,
-                dst=output_tile[0:T, nl.ds(dst_offset, res_h1_tile)],
-                src=result_psums[h1_tiles][0:T, 0:res_h1_tile],
-                scale=dequant_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + res_h1_tile)
+                index=column_tile_index,
+                dst=output_tile[0:T, nl.ds(dst_offset, compute_tile.size)],
+                src=result_psums[psum_bank_index][
+                    nl.ds(dims.column_tiling_dim * column_tile_index, T),
+                    0 : compute_tile.size,
+                ],
+                scale=dequant_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size)
                 if params.quant_params.is_quant_row()
                 else dequant_tile_view,
                 bias=None,

@@ -13,28 +13,26 @@
 # limitations under the License.
 import math
 from collections import namedtuple
-from test.integration.nkilib.utils.dtype_helper import dt
 from test.integration.nkilib.utils.tensor_generators import (
     TensorTemplate,
     gaussian_tensor_generator,
     generate_stabilized_mx_data,
-    guess_tensor_dtype,
     update_func_str,
 )
 from test.integration.nkilib.utils.test_kernel_common import (
     act_fn_type2func,
+    is_dtype_mx,
     norm_name2func,
-    rms_norm,
 )
 from test.utils.mx_utils import nc_matmul_mx_golden
 from typing import Callable
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 from nkilib_src.nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
-    ExpertAffinityScaleMode,
     NormType,
     QuantizationType,
 )
@@ -71,38 +69,87 @@ def build_fused_norm_mlp(
     up_clamp_upper_limit=None,
     tensor_generator: Callable = gaussian_tensor_generator(),
 ):
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+
     if isinstance(norm_type, bool):
         norm_type = NormType.RMS_NORM if norm_type else NormType.NO_NORM
 
     fused_add_tensor = (
         tensor_generator(shape=(batch, seqlen, hidden), dtype=dtype, name="fused_add_tensor") if fused_add else None
     )
-    if is_input_quantized:
+
+    if quantization_type == QuantizationType.MX:
+        _pmax = 128
+        _q_width = 4
+        tokens = batch * seqlen
+        n_H512_tile = hidden // 512
+        n_I512_tile = math.ceil(intermediate / (_pmax * _q_width))
+
+        # Generate hidden_input as stabilized MX data
+        hidden_states, _, _ = generate_stabilized_mx_data(
+            mx_dtype=nl.float8_e4m3fn_x4, shape=(tokens * n_H512_tile * _pmax, _q_width), val_range=1.0
+        )
+        hidden_states = (
+            hidden_states.reshape(tokens, n_H512_tile, _pmax, _q_width).transpose(0, 3, 1, 2).reshape(tokens, hidden)
+        )
+        hidden_input = dt.static_cast(hidden_states, dtype).reshape(batch, seqlen, hidden)
+    elif is_input_quantized:
         if quantization_type == QuantizationType.ROW:
             hidden_input = tensor_generator(
                 shape=(batch, seqlen, hidden + 4), dtype=quant_dtype, name='hidden'
             )  # +4 to allow space for an fp32 dequant value
-        elif quantization_type == QuantizationType.STATIC:
+        elif quantization_type in [QuantizationType.STATIC, QuantizationType.STATIC_MX]:
             hidden_input = tensor_generator(shape=(batch, seqlen, hidden), dtype=quant_dtype, name='hidden')
     else:
         hidden_input = tensor_generator(shape=(batch, seqlen, hidden), dtype=dtype, name="hidden")
 
-    gamma = tensor_generator(shape=(1, hidden), dtype=dtype, name="gamma")
+    gamma = None
+    norm_b = None
+    if norm_type != NormType.NO_NORM and norm_type != NormType.RMS_NORM_SKIP_GAMMA:
+        gamma = dt.static_cast(rng.uniform(low=-0.1, high=0.1, size=(1, hidden)), dtype)
+        if quantization_type == QuantizationType.MX:
+            gamma = (
+                gamma.reshape(1, hidden // (_pmax * _q_width), _pmax, _q_width).transpose(0, 3, 1, 2).reshape(1, hidden)
+            )
+        if norm_bias:
+            norm_b = tensor_generator(shape=(1, hidden), dtype=dtype, name="norm_b")
 
-    norm_b = tensor_generator(shape=(1, hidden), dtype=dtype, name="norm_b") if norm_bias else None
-    if norm_type == NormType.RMS_NORM_SKIP_GAMMA:
-        gamma = None
+    # Pre-generate MX weights if using MX quantization
+    if quantization_type == QuantizationType.MX:
+        mx_weights = gen_mlp_mxfp_weights(hidden, intermediate, quant_dtype)
 
     weight_dtype = quant_dtype if quant_dtype is not None else dtype
-    gate_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="gate_w")
-    up_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="up_w")
-    down_w = tensor_generator(shape=(intermediate, hidden), dtype=weight_dtype, name="down_w")
 
-    gate_b = tensor_generator(shape=(1, intermediate), dtype=dtype, name="gate_b") if gate_bias else None
-    up_b = tensor_generator(shape=(1, intermediate), dtype=dtype, name="up_b") if up_bias else None
-    down_b = tensor_generator(shape=(1, hidden), dtype=dtype, name="down_b") if down_bias else None
+    # Use pre-generated MX weights or generate regular weights
+    if quantization_type == QuantizationType.MX:
+        gate_w = mx_weights.gate_w_qtz
+        up_w = mx_weights.up_w_qtz
+        down_w = mx_weights.down_w_qtz
+    else:
+        gate_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="gate_w")
+        up_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="up_w")
+        down_w = tensor_generator(shape=(intermediate, hidden), dtype=weight_dtype, name="down_w")
 
-    if quantization_type == QuantizationType.STATIC:
+    # Generate Bias
+    if quantization_type == QuantizationType.MX:
+        i_p = intermediate // 4 if intermediate <= 512 else _pmax
+        gate_b = tensor_generator(shape=(i_p, n_I512_tile, _q_width), dtype=dtype, name="gate_b") if gate_bias else None
+        up_b = tensor_generator(shape=(i_p, n_I512_tile, _q_width), dtype=dtype, name="up_b") if up_bias else None
+        down_b = tensor_generator(shape=(1, hidden), dtype=dtype, name="down_b") if down_bias else None
+    else:
+        gate_b = tensor_generator(shape=(1, intermediate), dtype=dtype, name="gate_b") if gate_bias else None
+        up_b = tensor_generator(shape=(1, intermediate), dtype=dtype, name="up_b") if up_bias else None
+        down_b = tensor_generator(shape=(1, hidden), dtype=dtype, name="down_b") if down_bias else None
+
+    if quantization_type == QuantizationType.MX:
+        # MX quantization uses uint8 scales
+        gate_w_scale = mx_weights.gate_w_scale
+        up_w_scale = mx_weights.up_w_scale
+        down_w_scale = mx_weights.down_w_scale
+        gate_up_in_scale = None
+        down_in_scale = None
+    elif quantization_type in [QuantizationType.STATIC, QuantizationType.STATIC_MX]:
         gate_w_scale = tensor_generator(shape=(128, 1), dtype=np.float32, name="gate_w_scale")
         up_w_scale = tensor_generator(shape=(128, 1), dtype=np.float32, name="up_w_scale")
         down_w_scale = tensor_generator(shape=(128, 1), dtype=np.float32, name="down_w_scale")
@@ -183,6 +230,71 @@ def get_float32_exp(float_data):
     return (float_data.astype(np.float32).view(np.uint32) >> man_nbits) & ((1 << exp_nbits) - 1)
 
 
+MlpMxWeights = namedtuple(
+    'MlpMxWeights',
+    [
+        'gate_w_qtz',
+        'gate_w_scale',
+        'up_w_qtz',
+        'up_w_scale',
+        'down_w_qtz',
+        'down_w_scale',
+    ],
+)
+
+
+def gen_mlp_mxfp_weights(hidden, intermediate, mx_dtype):
+    """Generate MX quantized weights and scales for MLP gate, up, and down projections.
+
+    Args:
+        hidden: Hidden dimension size (must be divisible by 512)
+        intermediate: Intermediate dimension size
+        mx_dtype: MX quantization dtype (float4_e2m1fn_x4 or float8_e4m3fn_x2)
+
+    Returns:
+        MlpMxWeights: Named tuple containing quantized weights and scales
+    """
+
+    def split_last_dim(X, extra_last_dim):
+        return X.reshape(*X.shape[:-1], -1, extra_last_dim)
+
+    n_H512_tile = hidden // 512
+    n_I512_tile = math.ceil(intermediate / 512)
+    p_I = (intermediate // 4) if intermediate < 512 else 128  # do not pad I's pdim if I<512
+
+    # Initialize tensors for gate projection
+    gate_w_qtz = np.zeros((128, n_H512_tile, intermediate), dtype=mx_dtype)
+    gate_w_scale = np.zeros((16, n_H512_tile, intermediate), dtype=np.uint8)
+
+    # Initialize tensors for up projection
+    up_w_qtz = np.zeros((128, n_H512_tile, intermediate), dtype=mx_dtype)
+    up_w_scale = np.zeros((16, n_H512_tile, intermediate), dtype=np.uint8)
+
+    # Initialize tensors for down projection
+    down_w_qtz = np.zeros((p_I, n_I512_tile, hidden), dtype=mx_dtype)
+    down_w_scale = np.zeros((p_I // 8, n_I512_tile, hidden), dtype=np.uint8)
+
+    # Generate gate projection weights
+    _, tmp_w_qtz, tmp_w_scale = generate_stabilized_mx_data(mx_dtype, (128, hidden // 128 * intermediate))
+    gate_w_qtz[:, :, :] = split_last_dim(tmp_w_qtz, intermediate)  # [128, n_H512_tile, intermediate]
+    gate_w_scale[:, :, :] = split_last_dim(tmp_w_scale, intermediate)  # [16, n_H512_tile, intermediate]
+
+    # Generate up projection weights
+    _, tmp_w_qtz, tmp_w_scale = generate_stabilized_mx_data(mx_dtype, (128, hidden // 128 * intermediate))
+    up_w_qtz[:, :, :] = split_last_dim(tmp_w_qtz, intermediate)  # [128, n_H512_tile, intermediate]
+    up_w_scale[:, :, :] = split_last_dim(tmp_w_scale, intermediate)  # [16, n_H512_tile, intermediate]
+
+    # Generate down projection weights
+    _, tmp_w_qtz, tmp_w_scale = generate_stabilized_mx_data(mx_dtype, (intermediate // 4, hidden * 4))
+    for i_I512_tile in range(n_I512_tile):
+        n_rows_qtz = min(128, intermediate // 4 - i_I512_tile * 128)  # every 512 tile has at most 512/4=128 x4 values
+        n_rows_scale = min(16, intermediate // 32 - i_I512_tile * 16)  # every 512 tile has at most 512/32=16 scales
+        down_w_qtz[:n_rows_qtz, i_I512_tile, :] = tmp_w_qtz[i_I512_tile * 128 : i_I512_tile * 128 + n_rows_qtz, :]
+        down_w_scale[:n_rows_scale, i_I512_tile, :] = tmp_w_scale[i_I512_tile * 16 : i_I512_tile * 16 + n_rows_scale, :]
+
+    return MlpMxWeights(gate_w_qtz, gate_w_scale, up_w_qtz, up_w_scale, down_w_qtz, down_w_scale)
+
+
 MxAllTokensWeights = namedtuple(
     'MxAllTokensWeights',
     [
@@ -211,11 +323,11 @@ def gen_moe_mx_weights(hidden, intermediate, expert, mx_dtype=float4_e2m1fn_x4):
 
     n_H512_tile = hidden // 512
     n_I512_tile = math.ceil(intermediate / 512)
-    p_I = (intermediate // x4_pack_size) if intermediate < 512 else 128
+    p_I = math.ceil(intermediate / x4_pack_size / 8) * 8 if intermediate < 512 else 128
     gate_up_w_qtz = np.zeros((expert, 128, 2, n_H512_tile, intermediate), dtype=mx_dtype)
     gate_up_w_scale = np.zeros((expert, 16, 2, n_H512_tile, intermediate), dtype=np.uint8)
     down_w_qtz = np.zeros((expert, p_I, n_I512_tile, hidden), dtype=mx_dtype)
-    down_w_scale = np.zeros((expert, p_I // 8, n_I512_tile, hidden), dtype=np.uint8)
+    down_w_scale = np.zeros((expert, math.ceil(p_I / 8), n_I512_tile, hidden), dtype=np.uint8)
 
     for e in range(expert):
         # Gen weight for gate and up proj
@@ -229,12 +341,15 @@ def gen_moe_mx_weights(hidden, intermediate, expert, mx_dtype=float4_e2m1fn_x4):
             )  # [128, n_H512_tile, intermediate]
 
         # Gen weight for down proj - generate logical shape, static_cast handles x4 packing
-        _, tmp_w_qtz, tmp_w_scale = generate_stabilized_mx_data(
-            mx_dtype, (intermediate // x4_pack_size, hidden * x4_pack_size)
-        )
+        # Pad to multiple of 8 if needed
+        I_p_actual = math.ceil(intermediate / x4_pack_size)
+        I_p_padded = math.ceil(I_p_actual / 8) * 8
+        _, tmp_w_qtz, tmp_w_scale = generate_stabilized_mx_data(mx_dtype, (I_p_padded, hidden * x4_pack_size))
+        tmp_w_qtz = tmp_w_qtz[:I_p_actual, :]
+        tmp_w_scale = tmp_w_scale[: math.ceil(I_p_actual / 8), :]
         for i_I512_tile in range(n_I512_tile):
             n_rows_qtz = min(128, intermediate // x4_pack_size - i_I512_tile * 128)
-            n_rows_scale = min(16, intermediate // 32 - i_I512_tile * 16)
+            n_rows_scale = min(16, math.ceil(intermediate / 32) - i_I512_tile * 16)
             down_w_qtz[e, :n_rows_qtz, i_I512_tile, :] = tmp_w_qtz[
                 i_I512_tile * 128 : i_I512_tile * 128 + n_rows_qtz, :
             ]
@@ -375,7 +490,10 @@ def norm_mlp_ref(
     for hidden in hiddens:
         hidden_sum += hidden
     sum_out = hidden_sum
-    hidden_sum = norm_name2func[norm_type](hidden_sum, gamma, norm_b=norm_b)
+    if norm_b is not None:
+        hidden_sum = norm_name2func[norm_type](hidden_sum, gamma, norm_b=norm_b)
+    else:
+        hidden_sum = norm_name2func[norm_type](hidden_sum, gamma)
 
     if is_matching_mxfp4:
         hidden_sum = dequantize_mx_golden(*quantize_mx_golden(hidden_sum.reshape(-1, 4), float8_e4m3fn_x4)).reshape(
@@ -463,10 +581,6 @@ def _gate_up_proj_golden_mx(hidden, hidden_scale, weight, weight_scale, bias, cf
     assert weight.shape == (_pmax, H // _pmax // _q_width, I)
     assert weight_scale.shape == (_pmax // _q_height, H // _pmax // _q_width, I)
 
-    if I < 512:  # Pad first dim to _pmax
-        bias = np.pad(bias, ((0, _pmax - I // _q_width), *((0, 0),) * (bias.ndim - 1)))
-    assert bias.shape == (_pmax, math.ceil(I / (_pmax * _q_width)), _q_width)
-
     # Transpose and quantize input hidden if needed:
     # [T, 4_H, H/512, 16_H, 8_H] -> [16_H * 8_H (P), H/512, T, 4_H]
     if do_hidden_quantization:
@@ -502,11 +616,17 @@ def _gate_up_proj_golden_mx(hidden, hidden_scale, weight, weight_scale, bias, cf
 
         # Fold and transpose the current tile and fill into res_shfl
         cur_tile = result[i * 512 : i * 512 + rows_filled, :]  # [rows_filled, BxS]
-        cur_tile = cur_tile.reshape(4, rows_filled // 4, BxS)
-        cur_tile = cur_tile.transpose(1, 2, 0)  # [rows_filled//4, BxS, 4]
-        res_shfl[: rows_filled // 4, i, :, :] = cur_tile
+        rows_padded = math.ceil(rows_filled / 8) * 8
+        if rows_padded > rows_filled:
+            cur_tile = np.pad(cur_tile, ((0, rows_padded - rows_filled), (0, 0)))
+        cur_tile = cur_tile.reshape(4, rows_padded // 4, BxS)
+        cur_tile = cur_tile.transpose(1, 2, 0)  # [rows_padded//4, BxS, 4]
+        res_shfl[: rows_padded // 4, i, :, :] = cur_tile
 
     if bias is not None:
+        if I < 512:  # Pad first dim to _pmax
+            bias = np.pad(bias, ((0, _pmax - bias.shape[0]), *((0, 0),) * (bias.ndim - 1)))
+        assert bias.shape == (_pmax, math.ceil(I / (_pmax * _q_width)), _q_width)
         res_shfl += bias[:, :, np.newaxis, :]
 
     return res_shfl
@@ -529,7 +649,7 @@ def _down_proj_golden_mx(inter_sb, weight, weight_scale, bias, cfg):
     """
     H, I, BxS = cfg.H, cfg.I, cfg.BxS
 
-    assert I % _q_width == 0
+    I_padded_q = math.ceil(I / _q_width)
 
     # Original weight shape is [128, ceil(I/512), H], scale shape is [16, ceil(I/512), H].
     # Both of them have zero filled values for last I tile. Reshape and truncate.
@@ -537,8 +657,20 @@ def _down_proj_golden_mx(inter_sb, weight, weight_scale, bias, cfg):
     weight_scale = weight_scale.transpose(1, 0, 2).reshape(-1, H)
 
     if I < 512:
-        inter_sb = inter_sb[: I // _q_width, :, :, :]
+        inter_sb = inter_sb[:I_padded_q, :, :, :]
     inter_sb = inter_sb.transpose(1, 0, 2, 3).reshape(-1, BxS * _q_width)
+
+    # Align partition dim to multiple of 8 for MX quantization block alignment.
+    P = inter_sb.shape[0]
+    SP = weight_scale.shape[0]
+    P_aligned = SP * _q_height
+    if P < P_aligned:
+        inter_sb = np.pad(inter_sb, ((0, P_aligned - P), (0, 0)))
+    if weight.shape[0] < P_aligned:
+        pad_rows = P_aligned - weight.shape[0]
+        weight = np.concatenate([weight, np.zeros((pad_rows, weight.shape[1]), dtype=weight.dtype)], axis=0)
+    else:
+        weight = weight[:P_aligned, :]
 
     # Quantize input to mxfp8.
     input_mx_data, input_mx_scale = quantize_mx_golden(inter_sb, float8_e4m3fn_x4)
@@ -579,14 +711,37 @@ def norm_mlp_ref_mx(
             self.I = I
             self.BxS = BxS
 
+    for hidden in hiddens:
+        if len(hiddens[0].shape) == 3:
+            B, S, H = hiddens[0].shape
+            hiddens[0] = hiddens[0].reshape((B * S, H))
     cfg = SimpleConfig(hiddens[0].shape[1], gate.shape[-1], hiddens[0].shape[0])
+
+    _pmax = 128
+    _q_width = 4
 
     hidden_sum = np.zeros(hiddens[0].shape)
     assert hidden_sum.shape == (cfg.BxS, cfg.H)
     for hidden in hiddens:
         hidden_sum += hidden
     sum_out = hidden_sum
-    hidden_sum = norm_name2func[norm_type](hidden_sum, gamma, norm_b=norm_b)
+
+    if gamma is not None:
+        hidden_sum = (
+            hidden_sum.reshape(cfg.BxS, _q_width, cfg.H // (_pmax * _q_width), _pmax)
+            .transpose(0, 2, 3, 1)
+            .reshape(cfg.BxS, cfg.H)
+        )
+        gamma = gamma.reshape(1, _q_width, cfg.H // (_pmax * _q_width), _pmax).transpose(0, 2, 3, 1).reshape(1, cfg.H)
+        if norm_b is not None:
+            hidden_sum = norm_name2func[norm_type](hidden_sum, gamma, norm_b=norm_b)
+        else:
+            hidden_sum = norm_name2func[norm_type](hidden_sum, gamma)
+        hidden_sum = (
+            hidden_sum.reshape(cfg.BxS, cfg.H // (_pmax * _q_width), _pmax, _q_width)
+            .transpose(0, 3, 1, 2)
+            .reshape(cfg.BxS, cfg.H)
+        )
 
     up_out = _gate_up_proj_golden_mx(
         hidden=hidden_sum,
@@ -693,7 +848,7 @@ def golden_mlp(
     return out_dict
 
 
-def rmsnorm_quant_mlp_ref(
+def norm_quant_mlp_ref(
     hiddens,
     gamma,
     gate,
@@ -708,7 +863,7 @@ def rmsnorm_quant_mlp_ref(
     down_in_scale,
     dtype,
     quant_dtype,
-    rmsnorm,
+    norm_type,
     store_add=False,
     clip=None,
     skip_gate=False,
@@ -783,6 +938,43 @@ def rmsnorm_quant_mlp_ref(
         else:
             return 0
 
+    is_static_quant = quantization_type in [QuantizationType.STATIC, QuantizationType.STATIC_MX]
+
+    def undo_mx_gate_up_w_reshape(weight):
+        H, I = weight.shape[0], weight.shape[1]
+        H_OVER_512 = H // 512
+        H_128 = (H // H_OVER_512) // 4
+        H_2 = 2
+        I_OVER_512 = I // 512
+        I_128 = (I // I_OVER_512) // 4
+        I_4 = 4
+        return (
+            weight.reshape(
+                (H_128, H_OVER_512, I_OVER_512, I_4, I_128, H_2, H_2),
+            )
+            .transpose(
+                # (H_2, H_OVER_512, H_128, H_2, I_OVER_512, I_128, I_4)
+                (5, 1, 0, 6, 2, 4, 3),
+            )
+            .reshape(H, I)
+        )
+
+    def undo_mx_down_w_reshape(weight):
+        I, H = weight.shape[0], weight.shape[1]
+        I_OVER_512 = I // 512
+        I_128 = (I // I_OVER_512) // 4
+        I_4 = 4
+        return (
+            weight.reshape(
+                (I_128, I_OVER_512, H, I_4),
+            )
+            .transpose(
+                # (I_OVER_512, I_128, I_4, H)
+                (1, 0, 3, 2),
+            )
+            .reshape(I, H)
+        )
+
     def perform_row_quant(input_tensor, clipping_boundary):
         abs_max = np.max(np.absolute(input_tensor), axis=-1, keepdims=True)
         if clipping_boundary is not None and clipping_boundary != 0:
@@ -802,7 +994,7 @@ def rmsnorm_quant_mlp_ref(
     def perform_tensor_quant(input_tensor, clipping_boundary, quant_scale):
         if quantization_type == QuantizationType.ROW:
             return perform_row_quant(input_tensor, clipping_boundary)
-        elif quantization_type == QuantizationType.STATIC:
+        elif is_static_quant:
             return perform_static_quant(input_tensor, quant_scale)
 
     def perform_projection(input, proj_w, proj_w_scale, static_in_scale, row_in_scale):
@@ -826,16 +1018,18 @@ def rmsnorm_quant_mlp_ref(
         # CTE: Input is quantized, apply both weight and input dequantization
         if quantization_type == QuantizationType.ROW:
             return scale_with_broadcast(scale_with_broadcast(input @ proj_w, proj_w_scale), row_in_scale)
-        elif quantization_type == QuantizationType.STATIC:
+        elif is_static_quant:
             return scale_with_broadcast(input @ proj_w, proj_w_scale * static_in_scale)
 
-    def perform_fused_add_rmsnorm(hiddens, gamma):
+    def perform_fused_add_norm(hiddens, gamma, norm_b=None):
         sum = np.zeros(hiddens[0].shape)
         for hidden in hiddens:
             sum += hidden
         sum_out = sum
-        if rmsnorm:
-            sum = rms_norm(sum, gamma)
+        if norm_b:
+            sum = norm_name2func[norm_type](sum, gamma, norm_b=norm_b)
+        else:
+            sum = norm_name2func[norm_type](sum, gamma)
         return sum, sum_out
 
     if down_proj_lhs_rhs_swap_optimized_layout:
@@ -844,6 +1038,11 @@ def rmsnorm_quant_mlp_ref(
         I, H = down.shape
         down = down.reshape((I, lnc, H // 128 // lnc, 128)).transpose((0, 1, 3, 2)).reshape((I, H))
 
+    if quantization_type == QuantizationType.STATIC_MX:
+        gate = undo_mx_gate_up_w_reshape(gate)
+        up = undo_mx_gate_up_w_reshape(up)
+        down = undo_mx_down_w_reshape(down)
+
     is_input_quantized = any(hidden.dtype == quant_dtype for hidden in hiddens)
     # Handle input quantization based on execution mode
     if quantize_activation:
@@ -851,7 +1050,7 @@ def rmsnorm_quant_mlp_ref(
         # - Input remains in original dtype (BF16/FP32)
         # - Only weights are quantized (FP8)
         # - Intermediate results (gate*up output) remain unquantized
-        input, sum_out = perform_fused_add_rmsnorm(hiddens, gamma)
+        input, sum_out = perform_fused_add_norm(hiddens, gamma)
         input_quant_scale = None
         gate_in_scale = up_in_scale = down_in_scale = None
     else:
@@ -869,13 +1068,13 @@ def rmsnorm_quant_mlp_ref(
                 input_quant_scale += hidden.astype(quant_dtype).view(np.float32)[..., -1, None]
             sum_out = input_quant_scale
         else:
-            rmsnorm_out, sum_out = perform_fused_add_rmsnorm(hiddens, gamma)
+            norm_out, sum_out = perform_fused_add_norm(hiddens, gamma)
             if is_input_quantized:
-                input = rmsnorm_out
+                input = norm_out
                 input_quant_scale = None
             else:
-                input, input_quant_scale = perform_tensor_quant(rmsnorm_out, clip, gate_in_scale)
-            assert quantization_type != QuantizationType.STATIC or gate_in_scale == up_in_scale
+                input, input_quant_scale = perform_tensor_quant(norm_out, clip, gate_in_scale)
+            assert not is_static_quant or np.all(gate_in_scale == up_in_scale)
 
     act_fn = act_fn_type2func[act_fn_type]
 
@@ -924,7 +1123,7 @@ def rmsnorm_quant_mlp_ref(
 
 def golden_quant_mlp(
     inp_np,
-    fused_rmsnorm,
+    norm_type,
     fused_add,
     store_add,
     dtype,
@@ -950,8 +1149,9 @@ def golden_quant_mlp(
     gate_b = inp_np["gate_proj_bias_tensor"] if "gate_proj_bias_tensor" in inp_np else None
     up_b = inp_np["up_proj_bias_tensor"] if "up_proj_bias_tensor" in inp_np else None
     down_b = inp_np["down_proj_bias_tensor"] if "down_proj_bias_tensor" in inp_np else None
+    norm_b = inp_np["norm_b"] if "norm_b" in inp_np else None
     gate_in_scale = up_in_scale = down_in_scale = None
-    if quantization_type == QuantizationType.STATIC:
+    if quantization_type in [QuantizationType.STATIC, QuantizationType.STATIC_MX]:
         if "gate_up_in_scale" in inp_np:
             gate_in_scale = inp_np["gate_up_in_scale"]
             up_in_scale = inp_np["gate_up_in_scale"]
@@ -964,36 +1164,62 @@ def golden_quant_mlp(
     down_w_scale = inp_np["down_w_scale"]
     hiddens = [fused_add_tensor, hidden] if fused_add else [hidden]
     store_add_valid = fused_add and store_add
-    mlp_out, add_out = rmsnorm_quant_mlp_ref(
-        hiddens,
-        gamma,
-        gate_w,
-        up_w,
-        down_w,
-        quantization_type,
-        gate_w_scale,
-        up_w_scale,
-        down_w_scale,
-        gate_in_scale,
-        up_in_scale,
-        down_in_scale,
-        dtype,
-        quant_dtype,
-        rmsnorm=fused_rmsnorm,
-        store_add=store_add_valid,
-        skip_gate=skip_gate,
-        act_fn_type=act_fn_type,
-        gate_b=gate_b,
-        up_b=up_b,
-        down_b=down_b,
-        down_proj_lhs_rhs_swap_optimized_layout=down_proj_lhs_rhs_swap_optimized_layout,
-        lnc=lnc,
-        gate_clamp_upper_limit=gate_clamp_upper_limit,
-        gate_clamp_lower_limit=gate_clamp_lower_limit,
-        up_clamp_upper_limit=up_clamp_upper_limit,
-        up_clamp_lower_limit=up_clamp_lower_limit,
-        quantize_activation=quantize_activation,
-    )
+
+    is_mx_quant = is_dtype_mx(quant_dtype) if quant_dtype is not None else False
+    if is_mx_quant:
+        mlp_out, add_out = norm_mlp_ref_mx(
+            hiddens,
+            gamma,
+            gate_w,
+            gate_w_scale,
+            up_w,
+            up_w_scale,
+            down_w,
+            down_w_scale,
+            dtype,
+            norm_type=norm_type,
+            skip_gate=skip_gate,
+            act_fn_type=act_fn_type,
+            gate_b=gate_b,
+            up_b=up_b,
+            down_b=down_b,
+            norm_b=norm_b,
+            gate_clamp_upper_limit=gate_clamp_upper_limit,
+            gate_clamp_lower_limit=gate_clamp_lower_limit,
+            up_clamp_upper_limit=up_clamp_upper_limit,
+            up_clamp_lower_limit=up_clamp_lower_limit,
+        )
+    else:
+        mlp_out, add_out = norm_quant_mlp_ref(
+            hiddens,
+            gamma,
+            gate_w,
+            up_w,
+            down_w,
+            quantization_type,
+            gate_w_scale,
+            up_w_scale,
+            down_w_scale,
+            gate_in_scale,
+            up_in_scale,
+            down_in_scale,
+            dtype,
+            quant_dtype,
+            norm_type=norm_type,
+            store_add=store_add_valid,
+            skip_gate=skip_gate,
+            act_fn_type=act_fn_type,
+            gate_b=gate_b,
+            up_b=up_b,
+            down_b=down_b,
+            down_proj_lhs_rhs_swap_optimized_layout=down_proj_lhs_rhs_swap_optimized_layout,
+            lnc=lnc,
+            gate_clamp_upper_limit=gate_clamp_upper_limit,
+            gate_clamp_lower_limit=gate_clamp_lower_limit,
+            up_clamp_upper_limit=up_clamp_upper_limit,
+            up_clamp_lower_limit=up_clamp_lower_limit,
+            quantize_activation=quantize_activation,
+        )
     out_dict = {"out": dt.static_cast(mlp_out, dtype)}
     if store_add_valid:
         out_dict["add_out"] = dt.static_cast(add_out, dtype)
@@ -1012,23 +1238,36 @@ def modify_down_proj_lhs_rhs_swap_unit_stride_layout(tensor_template, tensor, ln
     return tensor
 
 
-def modify_fp8_packed_hidden_scale(tensor_template, tensor, lnc):
+def modify_for_row_quant(tensor_template, tensor, lnc):
     rng = np.random.default_rng(0)
     if tensor_template.name == "hidden":
         B, S, H_PLUS_4 = tensor.shape
-        single_row = rng.uniform(0, 240, size=(1, 1, 1))
+        single_row = rng.normal(size=(1, 1, 1)) * 0.001
         single_row_split = single_row.astype(np.float32).view(nl.float8_e4m3).astype(tensor_template.dtype)
         while not np.isfinite(single_row_split).all():
-            single_row = rng.uniform(0, 240, size=(1, 1, 1))
+            single_row = rng.normal(size=(1, 1, 1)) * 0.001
             single_row_split = single_row.astype(np.float32).view(nl.float8_e4m3).astype(tensor_template.dtype)
         full_scale = single_row_split.repeat(B, axis=0).repeat(S, axis=1)
         tensor[:, :, -4:] = full_scale
+    elif "scale" in tensor_template.name:
+        P, F = tensor.shape
+        single_row = rng.normal(size=(1, F)) * 0.001
+        tensor = single_row.repeat(P, axis=0).astype(tensor_template.dtype)
     return tensor
+
+
+def modify_fp8_static_scale(tensor_template, tensor, lnc):
+    rng = np.random.default_rng(0)
+    if "scale" in tensor_template.name:
+        scale = rng.normal() * 0.5
+        return np.full(tensor_template.shape, scale, dtype=tensor_template.dtype)
+    else:
+        return tensor
 
 
 def random_lhs_and_random_bound_weight_tensor_generator(weight_lower, weight_upper, modifier_fn=None, lnc=None):
     # make tests generate stable tensors
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(42)
 
     @update_func_str()
     def tensor_generator(shape, dtype, name):
