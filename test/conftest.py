@@ -108,6 +108,13 @@ def pytest_addoption(parser):
         help="Automatically cleanup test output directory regardless of test outcome (useful for space-constrained devices)",
     )
     parser.addoption(
+        "--force-local-cleanup-keep",
+        nargs="+",
+        choices=["metrics"],
+        default=[],
+        help="Artifact types to preserve when using --force-local-cleanup (e.g., metrics)",
+    )
+    parser.addoption(
         "--debug-kernels",
         action="store_true",
         default=False,
@@ -621,7 +628,18 @@ def run_after_every_test(
         # Cleanup
         force_cleanup: bool = get_feature_flag(request.config, "force_local_cleanup")
         if force_cleanup:
-            shutil.rmtree(test_dir_full_path, ignore_errors=True)
+            preserve = set(get_feature_flag(request.config, "force_local_cleanup_keep") or [])
+            if preserve and os.path.isdir(test_dir_full_path):
+                # Selectively delete, preserving specified artifact types
+                for item in os.listdir(test_dir_full_path):
+                    if item not in preserve:
+                        item_path = os.path.join(test_dir_full_path, item)
+                        if os.path.isdir(item_path):
+                            shutil.rmtree(item_path, ignore_errors=True)
+                        else:
+                            os.remove(item_path)
+            else:
+                shutil.rmtree(test_dir_full_path, ignore_errors=True)
 
 
 # =========================

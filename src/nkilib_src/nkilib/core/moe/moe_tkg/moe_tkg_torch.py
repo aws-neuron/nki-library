@@ -16,6 +16,7 @@
 
 import math
 
+import nki.language as nl
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -26,7 +27,7 @@ from ...mlp.mlp_tkg.mlp_proj_mxfp4_torch import (
 )
 from ...utils.common_types import ActFnType
 from ...utils.mx_torch_common import (
-    quantize_to_mx_fp8,
+    quantize_to_mx,
     unpack_float4_x4,
     unpack_float8_e4m3fn_x4,
 )
@@ -363,7 +364,7 @@ def _moe_tkg_mx_ref(
         BxS = active_in.shape[0]
         # Quantize hidden to mxfp8 (float8_e4m3fn_x4)
         h = active_in.reshape(BxS, _q_width, n_H512, _pmax).transpose(3, 2, 0, 1).reshape(_pmax, -1)
-        hidden_mx, hidden_scale = quantize_to_mx_fp8(h)
+        hidden_mx, hidden_scale = quantize_to_mx(h, nl.float8_e4m3fn_x4)
         # Reshape to [_pmax, n_H512, BxS] matching gate_up_proj_mxfp4_torch_ref input
         hidden_mx = hidden_mx.reshape(_pmax, n_H512, BxS)
         hidden_scale_t = torch.from_numpy(hidden_scale.reshape(_pmax // 8, n_H512, BxS))
@@ -423,11 +424,11 @@ def _moe_tkg_mx_ref(
 
     if is_all_expert:
         for e in range(E):
-            for t in range(T):
-                token_out = _compute_one_expert(inp[t : t + 1], e).reshape(H)
-                if scale_mode == 1:
-                    token_out = token_out * affinities[t, e]
-                result[t] += token_out
+            # Batch all T tokens in a single call (BxS=T) instead of looping token-by-token
+            expert_out = _compute_one_expert(inp, e).reshape(T, H)
+            if scale_mode == 1:
+                expert_out = expert_out * affinities[:, e : e + 1]
+            result += expert_out
     else:
         T_idx, K = exp_idx.shape
         for t in range(T_idx):

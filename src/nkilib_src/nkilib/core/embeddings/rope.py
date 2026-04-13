@@ -18,7 +18,6 @@
 import nki
 import nki.isa as nisa
 import nki.language as nl
-import nki.tensor as ntensor
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
@@ -192,7 +191,6 @@ def RoPE_sbuf(
         sin_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - sine frequencies
         x_out_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - output buffer
         convert_from_interleaved (bool): convert from interleaved to contiguous layout
-            (only for small tensors: B*n_heads*S ≤ gemm_moving_fmax)
 
     Returns:
         nl.ndarray: x_out_sb with RoPE applied (modified in-place)
@@ -282,15 +280,8 @@ def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
     d_head, B, n_heads, S = x_sb.shape
     half_d = d_head // 2
     kernel_assert(d_head % 2 == 0, f'_compute_convert_to_interleaved_mat: d_head must be even, got {d_head}')
-    kernel_assert(
-        B * n_heads * S <= nl.tile_size.gemm_moving_fmax,
-        f'_compute_convert_to_interleaved_mat: B*n_heads*S={B * n_heads * S} '
-        f'exceeds gemm_moving_fmax={nl.tile_size.gemm_moving_fmax}',
-    )
 
-    identity_hbm = nl.shared_constant(ntensor.identity(d_head, nl.float32))
-    identity_sb = nl.ndarray((d_head, d_head), dtype=x_sb.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=identity_sb, src=identity_hbm)
+    identity_sb = nl.shared_identity_matrix(d_head, dtype=x_sb.dtype)
 
     """
     Extract permutation via strided access pattern.
@@ -325,21 +316,21 @@ def _convert_from_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.n
         nl.ndarray: [d_head, B, n_heads, S] @ SBUF, Output in contiguous layout
 
     Notes:
-        - Only supports tensors where B*n_heads*S ≤ gemm_moving_fmax
         - Returns new buffer (does not modify input)
     """
     d_head, B, n_heads, S = x_sb.shape
     kernel_assert(x_sb.buffer == nl.sbuf, '_convert_from_interleaved: input must be in SBUF')
-    kernel_assert(
-        B * n_heads * S <= nl.tile_size.gemm_moving_fmax,
-        f'_convert_from_interleaved: B*n_heads*S={B * n_heads * S} '
-        f'exceeds gemm_moving_fmax={nl.tile_size.gemm_moving_fmax}',
-    )
 
+    total_free_dim = B * n_heads * S
+    fmax = nl.tile_size.gemm_moving_fmax
     x_converted_sb = nl.ndarray(x_sb.shape, dtype=x_sb.dtype, buffer=nl.sbuf)
-    x_psum = nl.ndarray((d_head, B * n_heads * S), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=x_psum, stationary=convert_to_interleaved_mat, moving=x_sb.reshape((d_head, B * n_heads * S)))
-    nisa.activation(dst=x_converted_sb, op=nl.copy, data=x_psum.reshape((d_head, B, n_heads, S)))
+    x_flat = x_sb.reshape((d_head, total_free_dim))
+    x_out_flat = x_converted_sb.reshape((d_head, total_free_dim))
+    for t_start in range(0, total_free_dim, fmax):
+        t_size = min(fmax, total_free_dim - t_start)
+        x_psum = nl.ndarray((d_head, t_size), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=x_psum, stationary=convert_to_interleaved_mat, moving=x_flat[:, nl.ds(t_start, t_size)])
+        nisa.activation(dst=x_out_flat[:, nl.ds(t_start, t_size)], op=nl.copy, data=x_psum)
     return x_converted_sb
 
 
@@ -357,17 +348,11 @@ def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.nda
         nl.ndarray: [d_head, B, n_heads, S] @ SBUF, Output in interleaved layout
 
     Notes:
-        - Only supports tensors where B*n_heads*S ≤ gemm_moving_fmax
         - Pre-transposes matrix to compensate for nc_matmul's implicit transpose
         - Modifies input buffer in-place
     """
     d_head, B, n_heads, S = x_sb.shape
     kernel_assert(x_sb.buffer == nl.sbuf, '_convert_to_interleaved: input must be in SBUF')
-    kernel_assert(
-        B * n_heads * S <= nl.tile_size.gemm_moving_fmax,
-        f'_convert_to_interleaved: B*n_heads*S={B * n_heads * S} '
-        f'exceeds gemm_moving_fmax={nl.tile_size.gemm_moving_fmax}',
-    )
 
     # Pre-transpose to compensate for nc_matmul's implicit transpose
     convert_from_interleaved_sb = nl.ndarray((d_head, d_head), dtype=convert_to_interleaved_mat.dtype, buffer=nl.sbuf)
@@ -375,9 +360,14 @@ def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.nda
     nisa.nc_transpose(dst=convert_from_interleaved_psum, data=convert_to_interleaved_mat)
     nisa.tensor_copy(dst=convert_from_interleaved_sb, src=convert_from_interleaved_psum, engine=nisa.scalar_engine)
 
-    x_psum = nl.ndarray((d_head, B * n_heads * S), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=x_psum, stationary=convert_from_interleaved_sb, moving=x_sb.reshape((d_head, B * n_heads * S)))
-    nisa.tensor_copy(dst=x_sb, src=x_psum.reshape((d_head, B, n_heads, S)), engine=nisa.scalar_engine)
+    total_free_dim = B * n_heads * S
+    fmax = nl.tile_size.gemm_moving_fmax
+    x_flat = x_sb.reshape((d_head, total_free_dim))
+    for t_start in range(0, total_free_dim, fmax):
+        t_size = min(fmax, total_free_dim - t_start)
+        x_psum = nl.ndarray((d_head, t_size), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=x_psum, stationary=convert_from_interleaved_sb, moving=x_flat[:, nl.ds(t_start, t_size)])
+        nisa.tensor_copy(dst=x_flat[:, nl.ds(t_start, t_size)], src=x_psum, engine=nisa.scalar_engine)
     return x_sb
 
 

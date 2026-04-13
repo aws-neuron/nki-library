@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -207,9 +208,6 @@ class MLPQuantizationParameters(NKIObject):
                 f"Unsupported down_w_scale shape: got {self.down_w_scale.shape}, expected (128, {H}).",
             )
 
-    def is_no_quant(self):
-        return self.quantization_type == QuantizationType.NONE
-
     def is_quant(self):
         return self.quantization_type != QuantizationType.NONE
 
@@ -224,6 +222,12 @@ class MLPQuantizationParameters(NKIObject):
 
     def is_quant_static_mx(self):
         return self.quantization_type == QuantizationType.STATIC_MX
+
+    def is_quant_row_mx(self):
+        return self.quantization_type == QuantizationType.ROW_MX
+
+    def is_dtype_mx(self):
+        return self.is_quant_mx() or self.is_quant_static_mx() or self.is_quant_row_mx()
 
     def has_clipping_bound(self):
         return self.clipping_bound > 0.0
@@ -565,10 +569,6 @@ def mlpp_has_normalization_weights(params: MLPParameters) -> bool:
     return mlpp_has_normalization(params) and normalization_uses_weights(params.norm_params.normalization_type)
 
 
-def mlpp_has_gate_projection(params: MLPParameters) -> bool:
-    return params.gate_proj_weights_tensor != None
-
-
 def mlpp_has_gate_projection_bias(params: MLPParameters) -> bool:
     return params.bias_params.gate_proj_bias_tensor != None
 
@@ -644,10 +644,15 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
     # Determine if we are in token-generation (TKG) mode
     is_tkg = is_mlp_tkg(params)
 
-    if is_tkg and params.quant_params.is_quant_mx():
+    if params.quant_params.is_dtype_mx():
         kernel_assert(
             H % 512 == 0,
-            f"MX quantization (mxfp4) requires H to be divisible by 512, got H={H}. "
+            f"MX quantization (mxfp) requires H to be divisible by 512, got H={H}. "
+            f"This ensures proper alignment for quantization groups (128 * 4).",
+        )
+        kernel_assert(
+            I % 512 == 0 or (I < 512 and I % 32 == 0),
+            f"MX quantization (mxfp) requires I to be I % 512 == 0 or (I < 512 and I % 32 ==0), got I={I}. "
             f"This ensures proper alignment for quantization groups (128 * 4).",
         )
 
@@ -655,10 +660,6 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
     kernel_assert(BxS > 0, f'Unsupported batch by sequence dimension {BxS}; expected BxS to be positive.')
     kernel_assert(H > 0, f'Unsupported hidden dimension {H}; expected H to be positive.')
     kernel_assert(I > 0, f'Unsupported intermediate dimension {I}; expected I to be positive.')
-
-    if params.quant_params.is_quant_static_mx():
-        kernel_assert(H % 512 == 0, f"Unsupported hidden dimension {H} for STATIC_MX; expected H % 512 == 0.")
-        kernel_assert(I % 512 == 0, f"Unsupported hidden dimension {I} for STATIC_MX; expected I % 512 == 0.")
 
     if mlpp_has_gate_projection_bias(params):
         expected = (i_p, n_I512_tile, _q_width) if params.quant_params.is_quant_mx() else (1, I)
@@ -745,25 +746,25 @@ def _validate_mlp_arguments_restrictions(params: MLPParameters):
                 "Storing fused_add_result is not supported when input is in SBUF",
             )
 
-        if params.quant_params.is_quant_mx():
+        kernel_assert(
+            not params.quant_params.is_quant_static_mx(),
+            "STATIC MX quantization (mxfp) is not supported in TKG mode",
+        )
+
+        if params.quant_params.is_dtype_mx():
             kernel_assert(
                 not params.use_tkg_gate_up_proj_column_tiling,
-                "MX quantization (mxfp4) does not use column tiling - set use_tkg_gate_up_proj_column_tiling=False",
+                "MX quantization (mxfp) does not use column tiling - set use_tkg_gate_up_proj_column_tiling=False",
             )
 
             kernel_assert(
                 not params.use_tkg_down_proj_column_tiling,
-                "MX quantization (mxfp4) does not use column tiling - set use_tkg_down_proj_column_tiling=False",
+                "MX quantization (mxfp) does not use column tiling - set use_tkg_down_proj_column_tiling=False",
             )
 
             kernel_assert(not mlpp_has_fused_add(params), "Fused add not supported in MX quantization path")
 
     else:  # CTE mode
-        kernel_assert(
-            not params.skip_gate_proj,
-            "Skipping gate projection is only supported in TKG mode.",
-        )
-
         kernel_assert(
             params.gate_clamp_lower_limit is None and params.gate_clamp_upper_limit is None,
             "Gate projection clamp is only supported in TKG mode.",

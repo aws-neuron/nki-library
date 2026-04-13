@@ -1,7 +1,7 @@
 # NKI Library Test Framework
 
 Documentation and tools for testing NKI Library kernels.
-## Set up 
+## Set up
 
 ```bash
 # 1. Initialize Python virtual environment
@@ -19,14 +19,14 @@ make install
 make install_wheelhouse
 
 # 6. Now you can run regular make targets
-make test 
+make test
 ```
 
 ## Directory Structure
 
 ```
 test/
-├── integration/nkilib/core/        # Core kernel tests 
+├── integration/nkilib/core/        # Core kernel tests
 │   ├── attention/                  # Attention kernel tests
 │   ├── mlp/                        # MLP kernel tests
 │   ├── moe/                        # Mixture of Experts tests
@@ -86,6 +86,7 @@ make test ARGS="test/integration -k 'test_name' --target-host <hostname>"
 | `--output-directory` | Base directory for test artifacts | `neuron_test_output` |
 | `--debug-kernels` | Dump additional debug output for kernel debugging | `False` |
 | `--force-local-cleanup` | Auto-cleanup test output directory after tests | `False` |
+| `--force-local-cleanup-keep` | Artifact types to preserve when using `--force-local-cleanup` (e.g., `metrics`) | `[]` |
 | `--metric-output` | Enable metrics collection: `file`, `stdout`, `stderr` | `file` |
 | `--coverage` | Default coverage strategy: `singles`, `pairs`, `full` | `singles` |
 | `--validation-histograms` | Dump validation reports with histograms | `False` |
@@ -269,11 +270,9 @@ done
 
 The CSV contains: `TestName`, `TpbSgCyclesSum` (cycles), `MbuEstimatedPercent` (memory bandwidth utilization), `ProfilerMFU`, `InferenceTime`.
 
-**Note:** Do not use `--force-local-cleanup` when collecting metrics, as metrics are stored in the local artifact directory.
+**Note:** If you just need the resulting metrics file and none of the other test artifacts, you can conserve disk space by using `--force-local-cleanup` along with `--force-local-cleanup-keep metrics`.
 
 ### Tips
 
 - **Always rebuild before testing** - Tests run against built artifacts
-- **Redirect output for analysis:** `brazil-build integration-test ... > /tmp/test.txt 2>&1`
 - **Use parallelism** (`-n auto --dist worksteal`) - Always use unless <20 test configs
-- **Use timeouts** for long runs: `timeout 300 brazil-build integration-test ...`

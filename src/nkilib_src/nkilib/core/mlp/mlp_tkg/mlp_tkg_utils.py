@@ -19,6 +19,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...subkernels.layernorm_tkg import layernorm_tkg
+from ...subkernels.norm_tkg_utils import _CONTIGUOUS_LOAD_H_THRESHOLD, contiguous_load_transpose
 from ...subkernels.rmsnorm_tkg import rmsnorm_tkg
 from ...utils.allocator import SbufManager
 from ...utils.common_types import NormType
@@ -298,7 +299,7 @@ def input_fused_add(
         # ---------------- Load fused_add_tensor ----------------
         fused_add_tensor_buf = sbm.alloc_heap(load_shape, dtype=fused_add_tensor.dtype, buffer=nl.sbuf)
 
-        # Transform input: (B,S,H) -> (B,S,num_shards,H0,H1_shard) -> (BxS,num_shards,H0,H1_shard) -> (H0,BxS,num_shards,H1_shard)
+        # Transform: (B,S,H) -> (H0,BxS,num_shards,H1_shard)
         fused_add_tensor_view = (
             TensorView(fused_add_tensor)
             .reshape_dim(dim=2, shape=[num_shards, H0, H1_shard])
@@ -413,30 +414,53 @@ def input_norm_load(
 
     # --------------------------- No-Norm Path ----------------------------
     else:
-        # Transform input: (B,S,H) -> (B,S,num_shards,H0,H1_shard) -> (BxS,num_shards,H0,H1_shard) -> (H0,BxS,num_shards,H1_shard)
         input_view = TensorView(input)
         if len(input_view.shape) == 3:
-            # (B, S, H)
             input_view = input_view.flatten_dims(start_dim=0, end_dim=1)
-        # Expecting (T_total, H) otherwise
 
-        # Apply T_offset slicing for T-tiling
-        if T_offset > 0 or T < input_view.shape[0]:
-            input_view = input_view.slice(dim=0, start=T_offset, end=T_offset + T)
+        # Use contiguous load + on-chip transpose for small H
+        if dims.H_per_shard <= _CONTIGUOUS_LOAD_H_THRESHOLD:
+            kernel_assert(
+                dims.H % H0 == 0,
+                f"H ({dims.H}) must be divisible by {H0}",
+            )
+            # Apply T_offset slicing for T-tiling
+            if T_offset > 0 or T < input_view.shape[0]:
+                input_view = input_view.slice(dim=0, start=T_offset, end=T_offset + T)
+            # [T, H] -> [T, H_per_shard]
+            input_view = input_view.slice(
+                dim=1, start=shard_id * dims.H_per_shard, end=(shard_id + 1) * dims.H_per_shard
+            )
+            # [T, H_per_shard] -> [H0, T, H1_shard]
+            prev_prefix = sbm.get_name_prefix()
+            sbm.set_name_prefix(f"{prev_prefix}nonorm_t{T_offset}_")
+            contiguous_load_transpose(input_view, TensorView(output), 1, sbm)
+            sbm.set_name_prefix(prev_prefix)
+        else:
+            # Transform input: (B,S,H) -> (B,S,num_shards,H0,H1_shard) -> (BxS,num_shards,H0,H1_shard) -> (H0,BxS,num_shards,H1_shard)
+            input_view = TensorView(input)
+            if len(input_view.shape) == 3:
+                # (B, S, H)
+                input_view = input_view.flatten_dims(start_dim=0, end_dim=1)
+            # Expecting (T_total, H) otherwise
 
-        input_view = (
-            input_view.reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])  # T, num_shards, H0:128, H1_shard
-            .permute(dims=[2, 0, 1, 3])  # 128, T, num_shards, H1_shard
-            .slice(dim=2, start=shard_id, end=shard_id + 1)  # 128, T, H1_shard
-            .squeeze_dim(dim=2)
-        )
+            # Apply T_offset slicing for T-tiling
+            if T_offset > 0 or T < input_view.shape[0]:
+                input_view = input_view.slice(dim=0, start=T_offset, end=T_offset + T)
 
-        # Load input[T, H] to [H0, T, H1_shard]
-        nisa.dma_copy(
-            src=input_view.get_view(),
-            dst=output[0:H0, 0:T, 0:H1_shard],
-            dge_mode=_DGE_MODE_NONE,
-        )
+            input_view = (
+                input_view.reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])  # T, num_shards, H0:128, H1_shard
+                .permute(dims=[2, 0, 1, 3])  # 128, T, num_shards, H1_shard
+                .slice(dim=2, start=shard_id, end=shard_id + 1)  # 128, T, H1_shard
+                .squeeze_dim(dim=2)
+            )
+
+            # Load input[T, H] to [H0, T, H1_shard]
+            nisa.dma_copy(
+                src=input_view.get_view(),
+                dst=output[0:H0, 0:T, 0:H1_shard],
+                dge_mode=_DGE_MODE_NONE,
+            )
 
     return output
 

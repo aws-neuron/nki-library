@@ -29,6 +29,7 @@ from ...mlp.mlp_tkg.projection_mx_constants import (
 )
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil
+from ...utils.tensor_view import TensorView
 from .all_expert_mx_utils import (
     _NONZERO_WITH_COUNT_PAD_VAL,
     _NUM_H4_FOLDS_PER_COLUMN,
@@ -40,11 +41,11 @@ from .all_expert_mx_utils import (
     init_all_expert_mx_configs,
     validate_all_expert_mx_inputs,
 )
-from .down_projection_mx_shard_I import (
-    down_projection_mx_shard_I,
+from .down_projection_mx import (
+    down_projection_mx,
     load_broadcast_down_weight_scale_bias,
 )
-from .gate_up_projection_mx_shard_I import (
+from .gate_up_projection_mx import (
     gate_up_projection_mx_shard_I,
     load_gate_up_weight_scale_bias,
 )
@@ -143,7 +144,11 @@ def _all_expert_moe_tkg_mx(
             dynamism_cfg=dynamism_cfg,
         )
     else:
-        _all_expert_mx_static(input_tensors=input_tensors, kernel_cfg=kernel_cfg, dims=dims)
+        _all_expert_mx_static(
+            input_tensors=input_tensors,
+            kernel_cfg=kernel_cfg,
+            dims=dims,
+        )
 
     return output
 
@@ -158,7 +163,12 @@ def _all_expert_mx_static(
     Static all-expert MoE computation without dynamic loop on chip (DLoC).
 
     Processes all experts sequentially, computing MLP(all tokens) for each expert
-    before moving to the next. This is optimal when DLoC overhead exceeds benefits.
+    before moving to the next. This is preferred for small batch sizes where
+    dynamic control flow overhead (nonzero_with_count, indirect DMAs, and dynamic
+    branch checking) would exceed the potential savings from skipping unrouted blocks.
+    For reference, with GPT-OSS and EP-only sharding, the crossover is around
+    T=128-256, but the optimal threshold is model-dependent and should be tuned
+    for peak performance.
 
     Args:
         input_tensors (AllExpertMXInputTensors): Tensor parameters.
@@ -170,14 +180,9 @@ def _all_expert_mx_static(
     """
 
     # Step 1: Process inputs
-    # Step 1.2: Optional load + swizzle + QMX hidden states
+    # Step 1.1: Optional load + swizzle + QMX hidden states
     if kernel_cfg.input_in_sbuf:
-        # Input must be swizzled + MX quantized upstream when it is already in SBUF
-        kernel_assert(
-            input_tensors.hidden_input_scale != None,
-            f"Expected pre-quantized input when input is in SBUF, "
-            f"got {input_tensors.hidden_input.dtype=} {input_tensors.hidden_input_scale=}",
-        )
+        # Input is already swizzled + MX quantized upstream (validated by _validate_all_expert_mx_inputs)
         if dims.shard_on_T:
             input_quant_sb = input_tensors.hidden_input[:, :, nl.ds(dims.T_offset, dims.T_local)]
             input_scale_sb = input_tensors.hidden_input_scale[:, :, nl.ds(dims.T_offset, dims.T_local)]
@@ -248,7 +253,10 @@ def _all_expert_mx_dynamic(
     When a block contains routed tokens, we compute MLP(block tokens).
     A portion of the blocks for each expert are dynamically skipped at runtime if none
     of the tokens in a dynamic block are routed to the expert.
-    Dynamism can provide performance improvements relative to _all_expert_mx_static when T is large.
+    Dynamism can provide performance improvements relative to _all_expert_mx_static
+    when T is large. For reference, with GPT-OSS and EP-only sharding, benefits start
+    around T=128-256, but the optimal threshold is model-dependent and should be tuned
+    for peak performance.
 
     Args:
         input_tensors (AllExpertMXInputTensors): Tensor parameters.
@@ -341,12 +349,6 @@ def _all_expert_mx_dynamic(
                 dst=compute_next_dynamic_block,
             )
 
-    # FIXME: the following code block avoids a NKI failure when no ops follow
-    # a dynamic control flow block; remove when NKI fixes bug
-    rng_seeds_sb = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.memset(rng_seeds_sb, 0.0)
-    nisa.set_rng_seed(rng_seeds_sb)
-
     return input_tensors.output
 
 
@@ -375,7 +377,7 @@ def _find_expert_routed_tokens(input_tensors, dims, dynamism_cfg, expert_idx):
     count_nonzero_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
 
     # DMA transpose pre-sliced expert affinities from [T, E_L] -> [1, T] for index calculation
-    # nonzero_with_count requires 32bit input (s32 or f32)
+    # Extracts column expert_idx and transposes for nonzero_with_count input (accepts s32 or f32)
     needs_cast = input_tensors.expert_affinities_masked.dtype != nl.float32
     if needs_cast:
         expert_affinities_masked_T_sb = nl.ndarray(
@@ -383,16 +385,15 @@ def _find_expert_routed_tokens(input_tensors, dims, dynamism_cfg, expert_idx):
         )
     load_dst = expert_affinities_masked_T_sb if needs_cast else expert_affinities_masked_T_f32_sb
     # TODO: support loading multiple experts' affinities into every 16th partition for consumption by nonzero_with_count
-    nisa.dma_transpose(
-        src=input_tensors.expert_affinities_masked.ap(
-            pattern=[[dims.E_L, dims.T], [1, 1], [1, 1], [1, 1]],
-            offset=expert_idx,
-        ),
-        dst=load_dst.ap(
-            pattern=[[dims.T, 1], [1, 1], [1, 1], [1, dims.T]],
-            offset=0,
-        ),
+    src_view = (
+        TensorView(input_tensors.expert_affinities_masked)
+        .select(dim=1, index=expert_idx)
+        .expand_dim(dim=1)
+        .expand_dim(dim=1)
+        .expand_dim(dim=1)
     )
+    dst_view = TensorView(load_dst).expand_dim(dim=1).expand_dim(dim=1)
+    nisa.dma_transpose(src=src_view.get_view(), dst=dst_view.get_view())
     if needs_cast:
         nisa.tensor_copy(
             src=expert_affinities_masked_T_sb[...],
@@ -884,7 +885,7 @@ def _compute_expert_mlp(
     )
 
     # Step 3: Compute down projection, expert affinity scaling, expert add, LNC reduction, and SB->HBM spill
-    down_projection_mx_shard_I(
+    down_projection_mx(
         act_sb=act_quant_sb[...],
         act_scale_sb=act_scale_sb[...],
         weight_sb=weights.down_weight_sb,

@@ -17,7 +17,6 @@
 import nki
 import nki.isa as nisa
 import nki.language as nl
-import nki.tensor as ntensor
 from nki.isa import constants as nisa_constants
 
 from ..utils.kernel_assert import kernel_assert
@@ -135,9 +134,7 @@ def find_nonzero_indices(
     n_column_rounds = div_ceil(C_per_shard, _NUM_GPSIMD_CORES)
 
     # Identity matrix for nc_matmul transpose
-    identity_hbm = nl.shared_constant(ntensor.identity(P_MAX, nl.int8))
-    identity_sb = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf, name="identity_sb")
-    nisa.dma_copy(dst=identity_sb, src=identity_hbm)
+    identity_sb = nl.shared_identity_matrix(P_MAX, dtype=nl.float32)
 
     for column_round_idx in range(n_column_rounds):
         n_columns_this_round = min(_NUM_GPSIMD_CORES, C_per_shard - _NUM_GPSIMD_CORES * column_round_idx)

@@ -244,8 +244,7 @@ def test_relative_imports():
 
         error_lines = [
             f"\n{'=' * 70}",
-            f"Relative import check failed: {len(all_violations)} violation(s) "
-            f"in {len(violations_by_file)} file(s)",
+            f"Relative import check failed: {len(all_violations)} violation(s) in {len(violations_by_file)} file(s)",
             f"{'=' * 70}\n",
         ]
 

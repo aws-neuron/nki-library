@@ -94,7 +94,9 @@ def _down_proj_prep_inter_and_weights(
 
         kernel_assert(weight.shape == (p_I, cfg.n_total_I512_tile, H), "Incorrect weight shape")
         nisa.dma_copy(
-            src=weight[:, :, prg_id * H_sharded : (prg_id + 1) * H_sharded], dst=weight_qtz[:p_I, :, :], dge_mode=2
+            src=weight[:, :, prg_id * H_sharded : (prg_id + 1) * H_sharded],
+            dst=weight_qtz[:p_I, :, :],
+            dge_mode=nisa.dge_mode.hwdge,
         )
 
     # Check if weight scale is already in SBUF or needs to be loaded from HBM
@@ -126,7 +128,7 @@ def _down_proj_prep_inter_and_weights(
                         dst=weight_qtz_scale[
                             i_quad * SBUF_QUADRANT_SIZE + i_4 : i_quad * SBUF_QUADRANT_SIZE + i_4 + 1, :, :
                         ],
-                        dge_mode=2,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
 
     return inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale

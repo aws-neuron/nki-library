@@ -402,7 +402,9 @@ def apply_source_projection_activation(
                         dst=dst_tile,
                         op=nl.multiply,
                         data1=proj_data,
-                        data2=src_weight_row_scales_sbuf[: bxs_subtile.size, : int_tile.size],
+                        data2=src_weight_row_scales_sbuf[
+                            : bxs_subtile.size, nl.ds(int_tile.index * int_dim_tile.tile_size, int_tile.size)
+                        ],
                     )
                     nisa.activation(
                         dst=dst_tile,
@@ -411,7 +413,7 @@ def apply_source_projection_activation(
                         scale=hidden_scales_sbuf_list[bxs_subtile.index][: bxs_subtile.size, 0:1],
                         bias=bias_vector[: bxs_subtile.size, 0:1],
                     )
-                elif mlp_params.quant_params.is_no_quant():
+                elif not mlp_params.quant_params.is_quant():
                     nisa.activation(
                         dst=dst_tile,
                         op=get_nl_act_fn_from_type(mlp_params.activation_fn),

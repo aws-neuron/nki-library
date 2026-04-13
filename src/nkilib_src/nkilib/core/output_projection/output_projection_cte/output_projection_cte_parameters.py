@@ -262,6 +262,18 @@ def _calculate_h_block_size(
         - Last block may be smaller (handled by TiledDimInfo).
     """
     dtype_size = _get_dtype_size(weight_dtype)
+
+    # Double row matmul requires the h_block_size (which becomes the stride for the
+    # middle dimension in [d_size, 2, h_block_size] tensors) to be a multiple of 16.
+    _H_ALIGNMENT = 16
+
+    # If h_sharded_size fits in SBUF, use it directly (no blocking needed)
+    aligned_h_sharded_size = ((h_sharded_size + _H_ALIGNMENT - 1) // _H_ALIGNMENT) * _H_ALIGNMENT
+    full_sbuf_bytes = n_size * d_size * aligned_h_sharded_size * dtype_size
+    if full_sbuf_bytes <= max_sbuf_bytes:
+        return aligned_h_sharded_size, 1
+
+    # Otherwise, calculate blocked size to fit within SBUF budget
     bytes_per_h_element = n_size * d_size * dtype_size
     max_h_block_size = max_sbuf_bytes // bytes_per_h_element
     max_h_block_size = (max_h_block_size // F_MAX) * F_MAX

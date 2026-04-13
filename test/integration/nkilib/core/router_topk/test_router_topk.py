@@ -23,6 +23,7 @@ from test.integration.nkilib.core.router_topk.test_router_topk_common import (
 )
 from test.utils.common_dataclasses import CompilerArgs
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -107,6 +108,8 @@ def _generate_test_cases():
         # llama4_scout
         (2,    5120, 16,  1, RouterActFnType.SOFTMAX, False,    False,           False,          False,             False,                    False,                   False,           False),
         (2,    5120, 16,  1, RouterActFnType.SOFTMAX, False,    True,            False,          False,             True,                     False,                   False,           False),
+        # use_column_tiling=True with small T, sigmoid, indirect DMA scatter
+        (32,   256,  128, 4, RouterActFnType.SIGMOID, True,     False,           False,          True,              True,                     False,                   False,           False),
         # shard_on_tokens with output_in_sbuf (T<=128 required)
         (2,    512,  128, 4, RouterActFnType.SOFTMAX, False,    False,           False,          False,             False,                    False,                   True,            True),
         (4,    512,  128, 4, RouterActFnType.SOFTMAX, False,    False,           False,          False,             False,                    False,                   True,            True),
@@ -137,6 +140,20 @@ def _generate_test_cases():
 
 
 ROUTER_TOPK_PARAMS, ROUTER_TOPK_TEST_CASES = _generate_test_cases()
+
+_ABBREVS = {
+    "has_bias": "bias",
+    "router_pre_norm": "prenorm",
+    "norm_topk_prob": "normprob",
+    "use_column_tiling": "coltile",
+    "use_indirect_dma_scatter": "scatter",
+    "use_PE_broadcast_w_bias": "pebias",
+    "shard_on_tokens": "shardt",
+    "output_in_sbuf": "outsb",
+    "x_input_in_sb": "xsb",
+    "x_hbm_layout": "xhbm",
+    "x_sb_layout": "xsbl",
+}
 
 
 def filter_illegal_combinations(
@@ -185,8 +202,9 @@ def filter_illegal_combinations(
     Returns:
         FilterResult: VALID, INVALID, or REDUNDANT
     """
-    # Invalid: SIGMOID requires indirect DMA scatter
-    if act_fn == RouterActFnType.SIGMOID and not use_indirect_dma_scatter:
+    # Invalid: SIGMOID with use_indirect_dma_scatter=False requires router_pre_norm=True
+    # (the one-hot scatter ACT2 path doesn't support SIGMOID)
+    if act_fn == RouterActFnType.SIGMOID and not use_indirect_dma_scatter and not router_pre_norm:
         return FilterResult.INVALID
 
     # Redundant: norm_topk_prob requires router_pre_norm
@@ -212,7 +230,7 @@ class TestRouterTopkKernel:
     """Test class for router_topk using UnitTestFramework."""
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(ROUTER_TOPK_PARAMS, ROUTER_TOPK_TEST_CASES)
+    @pytest_parametrize(ROUTER_TOPK_PARAMS, ROUTER_TOPK_TEST_CASES, abbrevs=_ABBREVS)
     def test_router_topk(
         self,
         test_manager: Orchestrator,
@@ -292,7 +310,7 @@ class TestRouterTopkKernel:
         T=BoundedRange(random.sample(range(4, 1024), 20), boundary_values=[]),
         H=[3072, 8192],
         E=BoundedRange([128, 256], boundary_values=[513]),
-        k=[1, 4, 8],
+        k=BoundedRange([1, 4, 8], boundary_values=[9]),
         act_fn=[RouterActFnType.SOFTMAX, RouterActFnType.SIGMOID],
         has_bias=[True, False],
         router_pre_norm=[True, False],

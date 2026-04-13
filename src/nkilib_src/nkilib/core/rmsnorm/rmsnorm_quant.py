@@ -38,7 +38,7 @@ from .rmsnorm_quant_tile_info import (
 )
 
 
-@dataclass()
+@dataclass(frozen=True)
 class RmsNormQuantKernelArgs(nl.NKIObject):
     """
     RMS Norm Quantization Kernel arguments.

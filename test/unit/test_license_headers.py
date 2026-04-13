@@ -165,14 +165,14 @@ def test_license_headers():
     if failures:
         failure_report = "\n".join(failures)
         error_message = (
-            f"\n{'='*70}\n"
+            f"\n{'=' * 70}\n"
             f"License header check failed for {len(failures)} file(s):\n"
-            f"{'='*70}\n\n"
+            f"{'=' * 70}\n\n"
             f"{failure_report}\n\n"
-            f"{'='*70}\n"
+            f"{'=' * 70}\n"
             f"All Python files must include the Apache 2.0 license header\n"
             f"at the top of the file.\n"
-            f"{'='*70}\n"
+            f"{'=' * 70}\n"
         )
         assert False, error_message
 

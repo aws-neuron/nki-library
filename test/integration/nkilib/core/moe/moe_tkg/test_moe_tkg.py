@@ -14,7 +14,8 @@
 
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_utils import build_moe_tkg, get_expert_affinity_dtype
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_wrapper import moe_tkg_sbuf_io_wrapper
-from test.utils.common_dataclasses import TKG_INFERENCE_ARGS, CompilerArgs, Platforms
+from test.utils.common_dataclasses import MODEL_TEST_TYPE, TKG_INFERENCE_ARGS, CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import (
@@ -41,20 +42,72 @@ except ImportError:
 moe_tkg_ref = torch_ref_wrapper(moe_tkg_torch_ref)
 
 
+def _resolve_dtype(d):
+    """Convert string dtype back to nki dtype (pytest parametrize serializes custom dtypes)."""
+    if isinstance(d, str):
+        return getattr(nl, d, np.dtype(d))
+    return d
+
+
 def _run_moe_tkg_test(
     test_manager: Orchestrator,
     vnc: int,
-    build_kwargs,
-    rtol: float = 2e-2,
+    tokens: int,
+    hidden: int,
+    intermediate: int,
+    expert: int,
+    top_k,
+    act_fn: ActFnType,
+    scale_mode: ExpertAffinityScaleMode,
+    all_expert: bool,
+    clamp: bool,
+    bias: bool,
     platform_target: Platforms = Platforms.TRN2,
+    rtol: float = 2e-2,
     is_negative: bool = False,
+    # optional params — present in some test variants
+    q_dtype=None,
+    q_type=None,
+    dtype=None,
+    in_dtype=None,
+    out_dtype=None,
+    is_all_expert_dynamic: bool = False,
+    routed_token_ratio: float | None = None,
+    block_size: int | None = None,
+    **_ignored,
 ):
     """Common test runner for moe_tkg kernel tests."""
+    resolved_in = _resolve_dtype(in_dtype if in_dtype is not None else dtype)
+    resolved_out = _resolve_dtype(out_dtype if out_dtype is not None else dtype)
+    build_kw = dict(
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        expert=expert,
+        top_k=top_k,
+        act_fn=act_fn,
+        expert_affinities_scaling_mode=scale_mode,
+        is_all_expert=all_expert,
+        expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
+        in_dtype=resolved_in,
+        out_dtype=resolved_out,
+        bias=bias,
+        clamp=clamp,
+    )
+    if q_dtype is not None:
+        build_kw["quant_dtype"] = _resolve_dtype(q_dtype)
+    if q_type is not None:
+        build_kw["quant_type"] = q_type
+    if is_all_expert_dynamic:
+        build_kw["is_all_expert_dynamic"] = True
+        build_kw["routed_token_ratio"] = routed_token_ratio
+        build_kw["block_size"] = block_size
+
     framework = UnitTestFramework(
         test_manager=test_manager,
         kernel_entry=moe_tkg,
         torch_ref=moe_tkg_ref,
-        kernel_input_generator=lambda _: build_moe_tkg(**build_kwargs),
+        kernel_input_generator=lambda _: build_moe_tkg(**build_kw),
         output_tensor_descriptor=lambda ki: {"out": np.zeros(ki["hidden_input"].shape, dtype=ki["output_dtype"])},
     )
     compiler_args = CompilerArgs(logical_nc_config=vnc, platform_target=platform_target)
@@ -71,6 +124,28 @@ def _run_moe_tkg_test(
 # =============================================================================
 # MoE TKG Tests
 # =============================================================================
+
+# Abbreviation mappings for keyword-prefixed test IDs
+_ABBREVS = {
+    "vnc": "vnc",
+    "tokens": "t",
+    "hidden": "h",
+    "intermediate": "i",
+    "expert": "e",
+    "top_k": "k",
+    "act_fn": "act",
+    "scale_mode": "scaling",
+    "all_expert": "all_expert",
+    "q_dtype": "quant_dtype",
+    "q_type": "quant_type",
+    "dtype": "dtype",
+    "clamp": "clamp",
+    "bias": "bias",
+    "routed_token_ratio": "rr",
+    "block_size": "bs",
+    "in_dtype": "in_dtype",
+    "out_dtype": "out_dtype",
+}
 
 # fmt: off
 MOE_TKG_PARAM_NAMES = \
@@ -155,11 +230,6 @@ MOE_TKG_TEST_PARAMS = [
 ]
 # fmt: on
 
-
-# =============================================================================
-# MX Quantization Tests
-# =============================================================================
-
 # fmt: off
 MOE_TKG_MX_PARAMS = [
     # vnc, tokens, hidden, intermediate, expert, top_k, act_fn, scale_mode,               all_expert, q_dtype,        q_type,              dtype,       clamp, bias
@@ -196,11 +266,6 @@ MOE_TKG_MX_PARAMS = [
 ]
 # fmt: on
 
-
-# =============================================================================
-# MX + Dynamic All-Expert Tests
-# =============================================================================
-
 # fmt: off
 MOE_TKG_DYNAMIC_PARAM_NAMES = (
     "vnc, tokens, hidden, intermediate, expert, top_k, act_fn, scale_mode, "
@@ -230,10 +295,7 @@ MOE_TKG_DYNAMIC_PARAMS = [
     (2, 256,  4096, 3072, 1, None, ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0, 64),
 ]
 # fmt: on
-
-
-# =============================================================================
-# SBUF I/O Tests
+# fmt: on
 # =============================================================================
 
 # fmt: off
@@ -258,10 +320,6 @@ MOE_TKG_SBUF_IO_PARAMS = [
 
 ]
 # fmt: on
-
-
-# =============================================================================
-# IO Dtype Tests (TRN3)
 # =============================================================================
 
 # fmt: off
@@ -270,7 +328,6 @@ MOE_TKG_IO_DTYPE_PARAMS = [
     (2, 32, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.float16, nl.bfloat16, True, True),
 ]
 # fmt: on
-
 MOE_TKG_IO_DTYPE_PARAM_NAMES = (
     "vnc, tokens, hidden, intermediate, expert, top_k, act_fn, scale_mode, "
     "all_expert, q_dtype, q_type, in_dtype, out_dtype, clamp, bias"
@@ -392,7 +449,7 @@ MOE_TKG_MODEL_PARAMS = [tuple(cfg) for cfg in moe_tkg_model_configs]
 )
 class TestMoeTkgKernel:
     @pytest.mark.fast
-    @pytest.mark.parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_TEST_PARAMS)
+    @pytest_parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_TEST_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_bfloat16(
         self,
         test_manager: Orchestrator,
@@ -412,33 +469,13 @@ class TestMoeTkgKernel:
         bias: bool,
         platform_target,
     ):
-        _run_moe_tkg_test(
-            test_manager,
-            vnc,
-            build_kwargs=dict(
-                tokens=tokens,
-                hidden=hidden,
-                intermediate=intermediate,
-                expert=expert,
-                top_k=top_k,
-                act_fn=act_fn,
-                expert_affinities_scaling_mode=scale_mode,
-                is_all_expert=all_expert,
-                expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-                quant_dtype=_resolve_dtype(q_dtype),
-                quant_type=q_type,
-                in_dtype=_resolve_dtype(dtype),
-                out_dtype=_resolve_dtype(dtype),
-                bias=bias,
-                clamp=clamp,
-            ),
-            is_negative=_is_negative_test(vnc, hidden, all_expert, tokens),
-            platform_target=platform_target,
-        )
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs["is_negative"] = _is_negative_test(vnc, hidden, all_expert, tokens)
+        _run_moe_tkg_test(**kwargs)
 
     @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest.mark.parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_MX_PARAMS)
+    @pytest_parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_MX_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_mx(
         self,
         test_manager: Orchestrator,
@@ -458,33 +495,13 @@ class TestMoeTkgKernel:
         bias: bool,
         platform_target,
     ):
-        _run_moe_tkg_test(
-            test_manager,
-            vnc,
-            build_kwargs=dict(
-                tokens=tokens,
-                hidden=hidden,
-                intermediate=intermediate,
-                expert=expert,
-                top_k=top_k,
-                act_fn=act_fn,
-                expert_affinities_scaling_mode=scale_mode,
-                is_all_expert=all_expert,
-                expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-                quant_dtype=_resolve_dtype(q_dtype),
-                quant_type=q_type,
-                in_dtype=_resolve_dtype(dtype),
-                out_dtype=_resolve_dtype(dtype),
-                bias=bias,
-                clamp=clamp,
-            ),
-            rtol=5e-2,
-            platform_target=platform_target,
-        )
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs["rtol"] = 5e-2
+        _run_moe_tkg_test(**kwargs)
 
     @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest.mark.parametrize(MOE_TKG_DYNAMIC_PARAM_NAMES, MOE_TKG_DYNAMIC_PARAMS)
+    @pytest_parametrize(MOE_TKG_DYNAMIC_PARAM_NAMES, MOE_TKG_DYNAMIC_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_dynamic(
         self,
         test_manager: Orchestrator,
@@ -506,35 +523,13 @@ class TestMoeTkgKernel:
         block_size: int,
         platform_target,
     ):
-        _run_moe_tkg_test(
-            test_manager,
-            vnc,
-            build_kwargs=dict(
-                tokens=tokens,
-                hidden=hidden,
-                intermediate=intermediate,
-                expert=expert,
-                top_k=top_k,
-                act_fn=act_fn,
-                expert_affinities_scaling_mode=scale_mode,
-                is_all_expert=all_expert,
-                expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-                quant_dtype=_resolve_dtype(q_dtype),
-                quant_type=q_type,
-                in_dtype=_resolve_dtype(dtype),
-                out_dtype=_resolve_dtype(dtype),
-                bias=bias,
-                clamp=clamp,
-                is_all_expert_dynamic=True,
-                routed_token_ratio=routed_token_ratio,
-                block_size=block_size,
-            ),
-            rtol=5e-2,
-            platform_target=platform_target,
-        )
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs["is_all_expert_dynamic"] = True
+        kwargs["rtol"] = 5e-2
+        _run_moe_tkg_test(**kwargs)
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(MOE_TKG_SBUF_IO_PARAM_NAMES, MOE_TKG_SBUF_IO_PARAMS)
+    @pytest_parametrize(MOE_TKG_SBUF_IO_PARAM_NAMES, MOE_TKG_SBUF_IO_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_sbuf_io(
         self,
         test_manager: Orchestrator,
@@ -648,7 +643,7 @@ class TestMoeTkgKernel:
 
     @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest.mark.parametrize(MOE_TKG_IO_DTYPE_PARAM_NAMES, MOE_TKG_IO_DTYPE_PARAMS)
+    @pytest_parametrize(MOE_TKG_IO_DTYPE_PARAM_NAMES, MOE_TKG_IO_DTYPE_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_mx_io_dtype(
         self,
         test_manager: Orchestrator,
@@ -669,31 +664,11 @@ class TestMoeTkgKernel:
         bias: bool,
         platform_target,
     ):
-        _run_moe_tkg_test(
-            test_manager,
-            vnc,
-            build_kwargs=dict(
-                tokens=tokens,
-                hidden=hidden,
-                intermediate=intermediate,
-                expert=expert,
-                top_k=top_k,
-                act_fn=act_fn,
-                expert_affinities_scaling_mode=scale_mode,
-                is_all_expert=all_expert,
-                expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-                quant_dtype=_resolve_dtype(q_dtype),
-                quant_type=q_type,
-                in_dtype=_resolve_dtype(in_dtype),
-                out_dtype=_resolve_dtype(out_dtype),
-                bias=bias,
-                clamp=clamp,
-            ),
-            rtol=5e-2,
-            platform_target=platform_target,
-        )
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs["rtol"] = 5e-2
+        _run_moe_tkg_test(**kwargs)
 
-    @pytest.mark.parametrize(MOE_TKG_SWEEP_PARAM_NAMES, MOE_TKG_SWEEP_PARAMS)
+    @pytest_parametrize(MOE_TKG_SWEEP_PARAM_NAMES, MOE_TKG_SWEEP_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_sweep(
         self,
         test_manager: Orchestrator,
@@ -714,31 +689,13 @@ class TestMoeTkgKernel:
         # xfail selective_expert I=960 topk=4: failing determinism check
         if not all_expert and intermediate == 960 and top_k == 4:
             pytest.xfail("failing determinism check")
-        _run_moe_tkg_test(
-            test_manager,
-            vnc,
-            build_kwargs=dict(
-                tokens=tokens,
-                hidden=hidden,
-                intermediate=intermediate,
-                expert=expert,
-                top_k=top_k,
-                act_fn=act_fn,
-                expert_affinities_scaling_mode=scale_mode,
-                is_all_expert=all_expert,
-                expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-                in_dtype=_resolve_dtype(dtype),
-                out_dtype=_resolve_dtype(dtype),
-                bias=bias,
-                clamp=clamp,
-            ),
-            rtol=2e-2 if dtype != nl.bfloat16 else 3e-2,
-            is_negative=_is_negative_test(vnc, hidden, all_expert, tokens),
-            platform_target=platform_target,
-        )
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs["rtol"] = 2e-2 if dtype != nl.bfloat16 else 3e-2
+        kwargs["is_negative"] = _is_negative_test(vnc, hidden, all_expert, tokens)
+        _run_moe_tkg_test(**kwargs)
 
     @pytest.mark.xfail(strict=False, reason="Model coverage test")
-    @pytest.mark.parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_MODEL_PARAMS)
+    @pytest_parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_MODEL_PARAMS, abbrevs=_ABBREVS, prefix=MODEL_TEST_TYPE)
     def test_moe_tkg_model(
         self,
         test_manager: Orchestrator,
@@ -760,35 +717,8 @@ class TestMoeTkgKernel:
     ):
         is_negative = _is_negative_test(vnc, hidden, all_expert, tokens)
         assert not is_negative, "Model configs must never be marked as negative test cases"
-        _run_moe_tkg_test(
-            test_manager,
-            vnc,
-            build_kwargs=dict(
-                tokens=tokens,
-                hidden=hidden,
-                intermediate=intermediate,
-                expert=expert,
-                top_k=top_k,
-                act_fn=act_fn,
-                expert_affinities_scaling_mode=scale_mode,
-                is_all_expert=all_expert,
-                expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-                quant_dtype=_resolve_dtype(q_dtype),
-                quant_type=q_type,
-                in_dtype=_resolve_dtype(dtype),
-                out_dtype=_resolve_dtype(dtype),
-                bias=bias,
-                clamp=clamp,
-            ),
-            platform_target=platform_target,
-        )
-
-
-def _resolve_dtype(d):
-    """Convert string dtype back to nki dtype (pytest parametrize serializes custom dtypes)."""
-    if isinstance(d, str):
-        return getattr(nl, d, np.dtype(d))
-    return d
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        _run_moe_tkg_test(**kwargs)
 
 
 def _is_negative_test(vnc: int, hidden: int, is_all_expert: bool, tokens: int) -> bool:

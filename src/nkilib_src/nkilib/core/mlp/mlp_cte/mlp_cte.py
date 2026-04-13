@@ -363,7 +363,7 @@ def _mlp_cte_single_shard(
             mlp_params.quant_params.gate_w_scale,
             heap_alloc,
         )
-        if mlp_params.quant_params.is_quant_row()
+        if mlp_params.quant_params.is_quant_row() and not mlp_params.skip_gate_proj
         else None
     )
     up_proj_row_weight_scales_sbuf = (
@@ -377,6 +377,11 @@ def _mlp_cte_single_shard(
         else None
     )
     # Load all static quantization scales. Multiply weight scales by input scales
+    gate_up_proj_static_input_scales_sbuf = None
+    down_proj_static_input_scales_sbuf = None
+    gate_proj_static_weight_scales_sbuf = None
+    up_proj_static_weight_scales_sbuf = None
+    down_proj_static_weight_scales_sbuf = None
     if mlp_params.quant_params.is_quant_static() or mlp_params.quant_params.is_quant_static_mx():
         gate_up_proj_static_input_scales_sbuf = heap_alloc(
             (nl.tile_size.pmax, 1),
@@ -388,11 +393,12 @@ def _mlp_cte_single_shard(
             dtype=nl.float32,
             name=f'down_proj_static_input_scales__shard{shard_idx}__prog{program_id}',
         )
-        gate_proj_static_weight_scales_sbuf = heap_alloc(
-            (nl.tile_size.pmax, 1),
-            dtype=nl.float32,
-            name=f'gate_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
-        )
+        if not mlp_params.skip_gate_proj:
+            gate_proj_static_weight_scales_sbuf = heap_alloc(
+                (nl.tile_size.pmax, 1),
+                dtype=nl.float32,
+                name=f'gate_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
+            )
         up_proj_static_weight_scales_sbuf = heap_alloc(
             (nl.tile_size.pmax, 1),
             dtype=nl.float32,
@@ -412,12 +418,6 @@ def _mlp_cte_single_shard(
             up_proj_static_weight_scales_sbuf,
             down_proj_static_weight_scales_sbuf,
         )
-    else:
-        gate_up_proj_static_input_scales_sbuf = None
-        down_proj_static_input_scales_sbuf = None
-        gate_proj_static_weight_scales_sbuf = None
-        up_proj_static_weight_scales_sbuf = None
-        down_proj_static_weight_scales_sbuf = None
 
     # Load normalization weights and bias if necessary
     norm_weights_tensor_sbuf = (

@@ -13,13 +13,17 @@
 # limitations under the License.
 
 """
-Down projection sub-kernels with LNC sharding on I (intermediate) dimension.
+Down projection sub-kernels with LNC sharding support.
 
-LNC Sharding Strategy: I dimension
-- When LNC=2, weights and scales are sharded on I dimension
-- Bias is sharded on H dimension (NC0 loads first half, NC1 loads second half)
+Supports multiple LNC sharding strategies (mutually exclusive):
+- no sharding: Both shard_on_I and shard_on_T are False. Used when running without LNC.
+- shard_on_I: Shard on I (intermediate) dimension. Default for most workloads.
+- shard_on_T: Shard on T (token) dimension. Useful when T is large.
+- TODO: shard_on_E: Shard on E (expert) dimension. When E_L is divisible by 2 and T is large,
+  better to shard on E than I because we can support higher TP and get better DMA throughput
+  by loading larger packets.
 
-These sub-kernels can be used by any algorithm that requires I-sharded down projection,
+These sub-kernels can be used by any algorithm that requires LNC-sharded down projection,
 including all-expert, selective-load, or custom MoE implementations.
 """
 
@@ -93,35 +97,37 @@ def load_broadcast_down_weight_scale_bias(
     """
 
     # Calculate shapes / tiling
-    _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx_shard_I", (0, 1))
+    _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx", (0, 1))
     weight_sb_shape = (tile_I, n_I512_tiles, H)
     bias_sb_shape = (tile_T, H)
 
     # Allocate buffers
-    weight_sb = nl.ndarray(weight_sb_shape, dtype=weight.dtype, buffer=nl.sbuf)
+    base_weight = weight.base_tensor
+    weight_sb = nl.ndarray(weight_sb_shape, dtype=base_weight.dtype, buffer=nl.sbuf)
     scale_sb = nl.ndarray(weight_sb_shape, dtype=scale.dtype, buffer=nl.sbuf)
     bias_sb: Optional[nl.ndarray] = None
 
     actual_prg_offset = tile_offset
-    I_p_in_hbm = weight.shape[1]
+    I_p_in_hbm = base_weight.shape[1]
 
     # Load weight: index expert, then slice I/512 tiles
     # Shape: [E_L, I_p, I/512, H] -> [I_p, n_I512_tiles, H] -> padded to [128_I, n_I512_tiles, H]
     if I_p_in_hbm < tile_I:
-        nisa.memset(dst=weight_sb[...], value=0.0)
+        nisa.memset(dst=weight_sb[...], value=0)
         weight_view = (
-            TensorView(weight)
+            TensorView(base_weight)
             .select(dim=0, index=expert_idx)
             .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
         )
         nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[:I_p_in_hbm, :, :])
     else:
         weight_view = (
-            TensorView(weight)
+            TensorView(base_weight)
             .select(dim=0, index=expert_idx)
             .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
         )
         nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[...])
+    weight_sb = weight_sb.view(weight.dtype)
 
     """
     Load scale: index expert, then slice I/512 tiles.
@@ -220,7 +226,7 @@ def load_broadcast_down_weight_scale_bias(
 
 
 @nki.jit
-def down_projection_mx_shard_I(
+def down_projection_mx(
     act_sb: nl.ndarray,
     act_scale_sb: nl.ndarray,
     weight_sb: nl.ndarray,
@@ -241,12 +247,11 @@ def down_projection_mx_shard_I(
 ) -> nl.ndarray:
     """
     Computes down projection, expert affinity scaling, expert add, LNC reduction, and SB->HBM spill.
-    When executed with LNC=2, inputs are expected to be sharded on I dimension, and compute will be
-    sharded on I dimension for matrix multiplication and H dimension for bias add.
+    Supports multiple LNC sharding strategies (no sharding, shard_on_I, shard_on_T) - at most one may be active.
 
     Usage:
         Tuned for: mx all-expert MoE algorithm
-        Applicable to: any algorithm requiring mx I-sharded down projection
+        Applicable to: any algorithm requiring mx LNC-sharded down projection
 
     Args:
         act_sb (nl.ndarray): [16_I * 8_I, I/512, T], Activation tensor in SBUF (4_I packed in x4 dtype).
@@ -276,6 +281,12 @@ def down_projection_mx_shard_I(
         out_sb (nl.ndarray): [min(T, 128), ⌈T/128⌉, H], Output tensor in SBUF with accumulated results.
     """
 
+    # Validate sharding strategy (mutually exclusive)
+    kernel_assert(
+        not (shard_on_I and shard_on_T),
+        f"Only one LNC sharding strategy allowed, got {shard_on_I=}, {shard_on_T=}",
+    )
+
     # Extract / validate shapes
     TILE_I, n_I512_tiles, T = act_sb.shape
     TILE_I_, n_I512_tiles_, H = weight_sb.shape
@@ -298,7 +309,7 @@ def down_projection_mx_shard_I(
     )
 
     # LNC config
-    _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx_shard_I", (0, 1))
+    _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx", (0, 1))
 
     # When not sharding on I, treat as single-program for LNC reduction purposes
     effective_n_prgs = n_prgs if shard_on_I else 1

@@ -18,7 +18,7 @@ This kernel implements QKV (Query, Key, Value) projection optimized for Context 
 
 # Standard Library
 import math
-from typing import List, Optional, Tuple, cast
+from typing import List, Optional, Tuple
 
 import nki
 import nki.isa as nisa
@@ -30,6 +30,7 @@ from ..utils.allocator import Logger, SbufManager, sizeinbytes
 
 # NKI Library
 from ..utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
+from ..utils.kernel_helpers import get_verified_program_sharding_info
 from ..utils.logging import get_logger
 
 # QKV CTE
@@ -331,16 +332,21 @@ def qkv_cte(
         output_dtype = input.dtype
 
     if cfg.use_kv_quantization:
-        q_tensor_hbm = nl.ndarray((dims.B_orig, dims.S_orig, dims.q_dim), dtype=input.dtype, buffer=nl.shared_hbm)
+        q_tensor_hbm = nl.ndarray(
+            (dims.B_orig, dims.S_orig, dims.q_dim), dtype=input.dtype, buffer=nl.shared_hbm, name="qkv_cte_output_hbm"
+        )
         output_hbm = None
     elif cfg.output_layout == QKVOutputLayout.BSD:
-        output_hbm = nl.ndarray((dims.B_orig, dims.S_orig, dims.I), dtype=output_dtype, buffer=nl.shared_hbm)
+        output_hbm = nl.ndarray(
+            (dims.B_orig, dims.S_orig, dims.I), dtype=output_dtype, buffer=nl.shared_hbm, name="qkv_cte_output_hbm"
+        )
         q_tensor_hbm = None
     else:  # QKVOutputLayout.NBSd
         output_hbm = nl.ndarray(
             (dims.num_heads, dims.B_orig, dims.S_orig, dims.d_head),
             dtype=output_dtype,
             buffer=nl.shared_hbm,
+            name="qkv_cte_output_hbm",
         )
         q_tensor_hbm = None
 
@@ -437,6 +443,13 @@ def qkv_cte(
 
     if cfg.use_kv_quantization:
         return q_tensor_hbm, k_cache, v_cache
+
+    # Barrier: ensure both NCs finish writing output_hbm before any consumer reads it.
+    # This is required when qkv_cte is called by the attention_block_tkg kernel
+    _, _n_prgs, _ = get_verified_program_sharding_info("qkv_cte_barrier", (0, 1), 2)
+    if _n_prgs == 2:
+        nisa.core_barrier(output_hbm, (0, 1))
+
     return output_hbm
 
 
@@ -1635,7 +1648,7 @@ def _qkv_cte_impl(
                     )
 
             else:  # NBSd = [heads, B, S, head_dim], I = heads * head_dim
-                d_head = cast(int, dims.d_head)  # Safe due to validation
+                d_head = int(dims.d_head)  # Safe due to validation
                 for i_head in range(dims.num_heads):
                     for i_tile_S in range(num_S_tiles_in_block):
                         s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * nl.tile_size.pmax
@@ -2378,7 +2391,7 @@ def _qkv_cte_mx_impl(
                         dge_mode=dge_mode.swdge,
                     )
             else:  # NBSd = [heads, B, S, head_dim]
-                d_head = cast(int, dims.d_head)
+                d_head = int(dims.d_head)
                 for i_head in range(dims.num_heads):
                     for i_tile_S in range(num_output_s_tiles):
                         s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX

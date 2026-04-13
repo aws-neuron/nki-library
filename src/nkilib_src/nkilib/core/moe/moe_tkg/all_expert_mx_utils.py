@@ -82,7 +82,7 @@ class AllExpertMXDimensions(nl.NKIObject):
         """Derive tiling strategy from tensor dimensions."""
         # Hardware and sharding constants
         self.pmax = nl.tile_size.pmax
-        _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx_shard_I", (0, 1))
+        _, n_prgs, prg_id = get_verified_program_sharding_info("_all_expert_moe_tkg_mx", (0, 1))
         self.n_prgs = n_prgs
         self.prg_id = prg_id
 
@@ -283,6 +283,11 @@ def init_all_expert_mx_configs(
     return input_tensors, kernel_cfg, dims, dynamism_cfg
 
 
+# =============================================================================
+# Validation helpers
+# =============================================================================
+
+
 def validate_all_expert_mx_inputs(
     input_tensors: AllExpertMXInputTensors,
     kernel_cfg: AllExpertMXKernelConfig,
@@ -290,7 +295,7 @@ def validate_all_expert_mx_inputs(
     dynamism_cfg: AllExpertMXDynamismConfig,
 ) -> None:
     """
-    Validate input input_tensors and configuration for all-expert MX kernel.
+    Validate input tensors and configuration for all-expert MX kernel.
 
     Args:
         input_tensors (AllExpertMXInputTensors): Tensor parameters.
@@ -325,15 +330,14 @@ def validate_all_expert_mx_inputs(
         if dims.shard_on_T:
             kernel_assert(
                 dims.T_local % 32 == 0,
-                f"Expected T_local divisible by 32 for shard_on_T with HBM input, " f"got T_local={dims.T_local}.",
+                f"Expected T_local divisible by 32 for shard_on_T with HBM input, got T_local={dims.T_local}.",
             )
     else:
         kernel_assert(dims.T % 4 == 0, f"Expected T divisible by 4, got T={dims.T}")
         if dims.shard_on_T:
             kernel_assert(
                 dims.T_local % 4 == 0,
-                f"Expected T_local divisible by 4 for shard_on_T with pre-quantized input, "
-                f"got T_local={dims.T_local}.",
+                f"Expected T_local divisible by 4 for shard_on_T with pre-quantized input, got T_local={dims.T_local}.",
             )
 
     # Validate expert affinities shape
@@ -347,6 +351,14 @@ def validate_all_expert_mx_inputs(
         not kernel_cfg.output_in_sbuf,
         f"All-expert MX kernel does not yet support SBUF output, got {kernel_cfg.output_in_sbuf=}",
     )
+
+    # Validate input_in_sbuf requires pre-quantized input
+    if kernel_cfg.input_in_sbuf:
+        kernel_assert(
+            input_tensors.hidden_input_scale != None,
+            f"Expected pre-quantized input when input is in SBUF, "
+            f"got {input_tensors.hidden_input.dtype=} {input_tensors.hidden_input_scale=}",
+        )
 
     # Algorithm-specific constraints
     if dynamism_cfg.is_all_expert_dynamic:
@@ -366,13 +378,20 @@ def validate_all_expert_mx_inputs(
         )
 
 
-def _is_valid_block_size(T, block_size):
+def _is_valid_block_size(T: int, block_size: int) -> bool:
     """
-    Helper function to validate that block_size is valid for a given T. Block size is expected to:
-    - Be nonzero
-    - Evenly divide T
-    - Be at max T/2, resulting in at least 2 blocks
-    - Be one of <32 and divisible by 8, <128 and divisible by 32, or divisible by 128
+    Validate that block_size is valid for a given T.
+
+    Block size must be nonzero, evenly divide T, be at most T/2 (resulting in at least 2 blocks),
+    and satisfy: block_size<32 and divisible by 8, block_size<128 and divisible by 32, or
+    block_size divisible by 128.
+
+    Args:
+        T (int): Total number of tokens.
+        block_size (int): Block size to validate.
+
+    Returns:
+        bool: True if block_size is valid, False otherwise.
     """
     if block_size == 0:
         return False

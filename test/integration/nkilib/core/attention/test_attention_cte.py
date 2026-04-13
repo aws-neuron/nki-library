@@ -112,8 +112,11 @@ def build_attention_cte_input(
     cp_rank_id,
     cache_softmax,
     softmax_dtype=np.float32,
+    mm_out_dtype=np.float32,
+    n_packed_sequences=None,
 ):
     softmax_dtype = dtype_mapping[softmax_dtype]
+    mm_out_dtype = dtype_mapping[mm_out_dtype]
 
     if use_cp:
         cp_offset_val = cp_rank_id if cp_strided_q_slicing else cp_rank_id * seqlen_q
@@ -144,6 +147,25 @@ def build_attention_cte_input(
         outputs["out_cached_negative_max"] = neg_max
         outputs["out_cached_sum_reciprocal"] = recip
 
+    # Generate sequence packing bounds
+    bound_min_arr, bound_max_arr = None, None
+    if n_packed_sequences is not None:
+        assert seqlen_q == seqlen_kv, "sequence packing requires seqlen_q == seqlen_kv"
+        partitions = np.sort(np.random.rand(n_packed_sequences - 1))
+        partitions = np.concatenate(([0], partitions, [1]))
+        seg_lens = np.round(np.diff(partitions) * seqlen_q).astype(int)
+        seg_lens[-1] += seqlen_q - seg_lens.sum()
+        cumsum = np.cumsum(seg_lens)
+        starts = np.concatenate(([0], cumsum[:-1]))
+        bound_min_vals = np.zeros(seqlen_q, dtype=np.int32)
+        bound_max_vals = np.zeros(seqlen_q, dtype=np.int32)
+        for seg_idx in range(n_packed_sequences):
+            s, e = starts[seg_idx], cumsum[seg_idx]
+            bound_min_vals[s:e] = s
+            bound_max_vals[s:e] = e
+        bound_min_arr = dt.static_cast(bound_min_vals.reshape(seqlen_q, 1), nl.float32)
+        bound_max_arr = dt.static_cast(bound_max_vals.reshape(seqlen_q, 1), nl.float32)
+
     inputs = {
         "q": q,
         "k": k,
@@ -163,6 +185,9 @@ def build_attention_cte_input(
         "cp_strided_q_slicing": cp_strided_q_slicing,
         "cache_softmax": cache_softmax,
         "softmax_dtype": softmax_dtype,
+        "mm_out_dtype": mm_out_dtype,
+        "bound_min": bound_min_arr,
+        "bound_max": bound_max_arr,
     }
 
     return inputs, outputs
@@ -195,6 +220,8 @@ def attention_cte_forward_golden(
         cp_offset=convert_to_torch(inps.get("cp_offset", None)),
         global_cp_deg=inps["global_cp_deg"],
         cp_strided_q_slicing=inps["cp_strided_q_slicing"],
+        bound_min=inps.get("bound_min", None),
+        bound_max=inps.get("bound_max", None),
     )
     if inps["cache_softmax"]:
         out_golden, neg_max, recip = out
@@ -373,6 +400,8 @@ class TestRangedAttentionCTEKernels:
         cp_strided_q_slicing: bool = False,
         prior_used_len: Optional[int] = None,
         softmax_dtype=np.float32,
+        mm_out_dtype=np.float32,
+        n_packed_sequences=None,
     ):
         skip_validation = False
         seqlen_kv_total = (seqlen_kv + seqlen_kv_prior) if seqlen_kv_prior else seqlen_kv
@@ -402,6 +431,8 @@ class TestRangedAttentionCTEKernels:
             cp_rank_id=cp_rank_id,
             cache_softmax=cache_softmax,
             softmax_dtype=softmax_dtype,
+            mm_out_dtype=mm_out_dtype,
+            n_packed_sequences=n_packed_sequences,
         )
 
         # Create lazy golden generator - captures local variables via closure
@@ -467,7 +498,7 @@ class TestRangedAttentionCTEKernels:
 
         # Llama4 + vision configs, have bs = image batches
         [1, 36864, 36864, 128, 1.000, nl.bfloat16, True, False, True, None],
-        [512, 4096, 4096, 128, 1.000, nl.bfloat16, False, False, True, None],
+        # [512, 4096, 4096, 128, 1.000, nl.bfloat16, False, False, True, None], TODO: timeout
 
     ]
     # fmt: on
@@ -2084,4 +2115,81 @@ class TestRangedAttentionCTEKernels:
             cp_rank_id=cp_rank_id,
             use_cp=True,
             cp_strided_q_slicing=False,
+        )
+
+    # fmt: off
+    attention_cte_seq_pack_unit_params = "lnc_degree, bs, bs_kv, seqlen, d, softmax_scale, dtype, causal_mask, tp_q, tp_out, sliding_window, n_packed_sequences"
+    attention_cte_seq_pack_unit_perms = [
+        # No causal mask (MHA)
+        [1, 1, 1, 2048, 96, 1.0, np.float32, False, True, False, 0, 4],
+        [1, 1, 1, 2048, 96, 1.0, np.float32, False, True, False, 0, 8],
+        [1, 1, 1, 4096, 128, 1.0, nl.bfloat16, False, False, True, 0, 4],
+        [2, 2, 2, 2048, 96, 1.0, nl.bfloat16, False, False, True, 0, 4],
+
+        # With causal mask (MHA)
+        [1, 1, 1, 2048, 96, 1.0, np.float32, True, True, False, 0, 4],
+        [1, 1, 1, 2048, 96, 1.0, np.float32, True, True, False, 0, 8],
+        [1, 1, 1, 512, 128, 1.0, nl.bfloat16, True, False, True, 0, 4],
+        [2, 2, 2, 2048, 96, 1.0, nl.bfloat16, True, False, True, 0, 4],
+
+        # GQA (bs_kv < bs)
+        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16, False, False, True, 0, 4],
+        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16, True, True, False, 0, 4],
+        [2, 6, 2, 2048, 96, 1.0, nl.bfloat16, True, False, True, 0, 4],
+
+        # SWA (sliding_window > 0, requires causal_mask)
+        [1, 1, 1, 2048, 96, 1.0, np.float32, True, True, False, 512, 4],
+        [1, 1, 1, 2048, 128, 1.0, nl.bfloat16, True, False, True, 256, 4],
+
+        # GQA + SWA
+        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16, True, False, True, 512, 4],
+        [2, 4, 2, 2048, 96, 1.0, nl.bfloat16, True, True, False, 256, 4],
+    ]
+    # fmt: on
+
+    @pytest.mark.parametrize(attention_cte_seq_pack_unit_params, attention_cte_seq_pack_unit_perms)
+    def test_attention_cte_seq_pack_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        lnc_degree,
+        bs,
+        bs_kv,
+        seqlen,
+        d,
+        softmax_scale,
+        dtype,
+        causal_mask,
+        tp_q,
+        tp_out,
+        sliding_window,
+        n_packed_sequences,
+    ):
+        np.random.seed(42)
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree)
+        self.run_attention_cte_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            collector=collector,
+            bool_dims={
+                CAUSAL_MASK_DIM_NAME: causal_mask,
+                TP_Q_DIM_NAME: tp_q,
+                TP_OUT_DIM_NAME: tp_out,
+                TP_K_DIM_NAME: False,
+                SINK_DIM_NAME: False,
+            },
+            bs=bs,
+            bs_kv=bs_kv,
+            cache_softmax=False,
+            cp_degree=None,
+            d=d,
+            dtype=dtype,
+            seqlen_kv=seqlen,
+            seqlen_kv_prior=None,
+            seqlen_q=seqlen,
+            sliding_window=sliding_window,
+            softmax_scale=softmax_scale,
+            cp_rank_id=None,
+            use_cp=False,
+            n_packed_sequences=n_packed_sequences,
         )

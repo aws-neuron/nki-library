@@ -18,8 +18,6 @@
 """
 Comprehensive tests for Cross Entropy loss kernel.
 
-Based on the test grid from: https://quip-amazon.com/AnOFAD11m20n/Cross-Entropy-Test-Grid
-
 Tests the cross_entropy_forward_kernel with hardcoded optimal PB (positions_per_batch)
 and CS (chunk_size) parameters. The PB/CS values were determined through optimization
 analysis to maximize performance while respecting hardware constraints.

@@ -29,7 +29,14 @@ from paramiko import SSHException
 from typing_extensions import override
 
 from .common_dataclasses import INF_ARTIFACT_DIR_NAME, NeuronDeviceInfo, Platforms, TargetHost
-from .core_lock_manager import check_infra_locking_version
+from .core_lock_client import get_host_locking_version
+from .core_lock_manager import (
+    CoreAllocation,
+    CoreLockManager,
+    LockAcquisitionError,
+    LockVersionError,
+    check_lock_version,
+)
 from .exceptions import (
     InferenceException,
     LocalExecutionException,
@@ -43,27 +50,15 @@ from .resources import RemoteDirectory
 from .s3_utils import S3ArtifactUploadConfig
 
 
-@dataclass
-class CoreAllocation:
-    """Represents an allocation of logical cores on a host.
-
-    Logical cores are what the runtime sees via NEURON_RT_VISIBLE_CORES.
-    The underlying locking mechanism uses physical cores to prevent conflicts
-    between LNC1 and LNC2 tests running in parallel.
-
-    Attributes:
-        host_id: Identifier for the host where cores are allocated
-        logical_core_ids: List of logical core IDs for NEURON_RT_VISIBLE_CORES
-        lnc_config: LNC configuration (1 or 2) - physical cores per logical core
-    """
-
-    host_id: str
-    logical_core_ids: list[int]
-    lnc_config: int
-
-    def get_core_list_str(self) -> str:
-        """Get comma-separated logical core IDs for NEURON_RT_VISIBLE_CORES."""
-        return ",".join(str(core_id) for core_id in self.logical_core_ids)
+@contextlib.contextmanager
+def temporary_random_seed(seed: int) -> Generator[None, None, None]:
+    """Temporarily reseed the global RNG, restoring the original state on exit."""
+    state = random.getstate()
+    random.seed(seed)
+    try:
+        yield
+    finally:
+        random.setstate(state)
 
 
 class Host(ABC):
@@ -223,6 +218,9 @@ class SshHost(Host):
         self.core_allocation_file: str = os.path.join(test_base_path, f"{self.ssh_alias}_core_allocation.json")
         self.remote_lock_dir: str = "/tmp/neuronx-cc/core_locks"
         self._lock_system_initialized: bool = False
+        # New locking system (v2+)
+        self._core_lock_manager: CoreLockManager | None = None
+        self._total_physical_cores: int | None = None
 
         self.neuron_ls_path: str = os.path.join(remote_neuron_install_dir, "neuron-ls")
 
@@ -412,7 +410,7 @@ class SshHost(Host):
             raise RemoteExecutionException(f"Failed to create remote lock directory {self.remote_lock_dir}", result)
 
         # Check infrastructure version compatibility before any locking operations
-        check_infra_locking_version(self.connection)
+        check_lock_version(self.connection)
 
         self.__cleanup_stale_remote_locks__()
 
@@ -488,10 +486,12 @@ class SshHost(Host):
             if [ -d "{self.remote_lock_dir}/legacy_lock_all_timeout_1m" ]; then
                 echo LEGACY_EXISTS
             else
-                {" && ".join(
-                    f"mkdir -m 777 {self.remote_lock_dir}/core_{i}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m && echo C{i}"
-                    for i in range(total_physical_cores)
-                )} && mkdir -m 777 {self.remote_lock_dir}/legacy_lock_all_timeout_1m && echo LEGACY_CREATED
+                {
+            " && ".join(
+                f"mkdir -m 777 {self.remote_lock_dir}/core_{i}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m && echo C{i}"
+                for i in range(total_physical_cores)
+            )
+        } && mkdir -m 777 {self.remote_lock_dir}/legacy_lock_all_timeout_1m && echo LEGACY_CREATED
             fi
         """
         stdout = self.__temp_flock_run__(script)
@@ -779,6 +779,80 @@ class SshHost(Host):
         Physical cores are locked to prevent conflicts between LNC1 and LNC2 tests.
         Logical core IDs are returned for use with NEURON_RT_VISIBLE_CORES.
         """
+        # Get locking version from host (creates infra_version.json with default if missing)
+        locking_version = get_host_locking_version(self.connection)
+        logging.info(f"[{self.ssh_alias}] Using locking protocol v{locking_version}")
+
+        if locking_version >= 2:
+            yield from self._get_core_allocation_v2(
+                collector, collective_ranks, lnc_config, timeout_seconds, poll_period_seconds
+            )
+            return
+
+        yield from self._get_core_allocation_v1(
+            collector, collective_ranks, lnc_config, timeout_seconds, poll_period_seconds
+        )
+
+    def _get_core_allocation_v2(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int,
+        lnc_config: int,
+        timeout_seconds: int,
+        poll_period_seconds: int,
+    ) -> Generator[CoreAllocation, None, None]:
+        """New locking path using CoreLockManager (flock + JSON state)."""
+        # Lazy initialize CoreLockManager (outside timer to avoid skewing metrics)
+        if self._core_lock_manager is None:
+            # Get total physical cores from device info
+            if self._total_physical_cores is None:
+                devices = self.get_neuron_device_info()
+                self._total_physical_cores = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
+            self._core_lock_manager = CoreLockManager(self.connection, self._total_physical_cores, collector)
+            self._core_lock_manager.initialize()
+
+        with collector.timer(MetricName.CORE_ALLOCATION_TIME):
+            logging.info(
+                f"[{self.ssh_alias}] Trying to acquire {collective_ranks} logical cores (lnc_config={lnc_config})"
+            )
+
+            # Poll until we get cores or timeout
+            start_time = time.time()
+            result = None
+            while time.time() - start_time < timeout_seconds:
+                try:
+                    result = self._core_lock_manager.acquire(collective_ranks, lnc_config)
+                    if result:
+                        break
+                except (LockAcquisitionError, LockVersionError) as e:
+                    logging.warning(f"[{self.ssh_alias}] Lock error (retryable={e.retryable}): {e}")
+                    raise
+                jitter = random.uniform(0, 0.5)
+                time.sleep(poll_period_seconds + jitter)
+
+            if not result:
+                raise TimeoutException(
+                    f"[{self.ssh_alias}] Unable to allocate {collective_ranks} logical cores within {timeout_seconds}s"
+                )
+
+            logical_cores, physical_cores = result
+            self._core_lock_manager.record_contention_metrics()
+            logging.info(f"[{self.ssh_alias}] Allocated logical cores {logical_cores} (physical: {physical_cores})")
+
+        try:
+            yield CoreAllocation(host_id=self.ssh_alias, logical_core_ids=logical_cores, lnc_config=lnc_config)
+        finally:
+            self._core_lock_manager.release(physical_cores)
+
+    def _get_core_allocation_v1(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int,
+        lnc_config: int,
+        timeout_seconds: int,
+        poll_period_seconds: int,
+    ) -> Generator[CoreAllocation, None, None]:
+        """Old locking path using mkdir-based locks (protocol version 1)."""
         with collector.timer(MetricName.CORE_ALLOCATION_TIME):
             # Initialize lock system if needed
             if not self._lock_system_initialized:
@@ -1035,7 +1109,8 @@ class HostManager:
 
             # Pick randomly from top 3 hosts with lowest queue depth
             top_n = min(3, len(asc_host_infos))
-            selected_host_info = random.choice(asc_host_infos[:top_n])
+            with temporary_random_seed(time.time_ns()):
+                selected_host_info = random.choice(asc_host_infos[:top_n])
 
             selected_host_info.work_queue_depth += 1
             host = self.target_hosts[selected_host_info.host_alias]

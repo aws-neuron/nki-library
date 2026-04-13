@@ -16,6 +16,7 @@
 # New tests should use @pytest.mark.coverage_parametrize instead
 import enum
 import math
+from collections import OrderedDict
 from typing import final
 
 try:
@@ -45,6 +46,9 @@ from test.utils.common_dataclasses import (
     Platforms,
     SeparationPassMode,
     ValidationArgs,
+    _iter_model_configs,
+    is_model_test_type,
+    unpack_model_config,
 )
 from test.utils.metadata_loader import load_model_configs
 from test.utils.metrics_collector import IMetricsCollector
@@ -452,20 +456,39 @@ nki_tkg_fused_norm_mlp_kernel_separation_pass_params = [
 # fmt: on
 
 
+def _iter_entries(test_vectors, test_type):
+    """Yield (effective_type, params) from test_vectors.
+
+    For dict configs (model), uses ModelTestType.test_id_prefix as effective_type.
+    For flat lists (manual/sweep), uses test_type as-is.
+    """
+    if isinstance(test_vectors, dict):
+        for model_type, params in _iter_model_configs(test_vectors):
+            yield model_type.test_id_prefix, params
+    else:
+        for entry in test_vectors:
+            model_type, params = unpack_model_config(entry)
+            effective_type = model_type.test_id_prefix if is_model_test_type(test_type) else test_type
+            yield effective_type, params
+
+
 def create_mlp_tkg_test_config(test_vectors, test_type: str = "manual"):
     """
     Utility function to create complete RangeTestConfig from list of MLP TKG config vectors.
 
     Args:
-        test_vectors: List of test config vectors
+        test_vectors: List or dict of test config vectors. Dict format {ModelTestType: [configs...]}
+                      is used for model configs; each entry can also be a (ModelTestType, params) tuple.
         test_type: Test type label for test names
 
     Returns:
         Complete RangeTestConfig ready to use with @range_test_config decorator
     """
-    test_cases = []
 
-    for test_params in test_vectors:
+    grouped_cases: OrderedDict[str, list] = OrderedDict()
+
+    for entry in _iter_entries(test_vectors, test_type):
+        effective_type, test_params = entry
         (
             vnc_degree,
             batch,
@@ -514,9 +537,11 @@ def create_mlp_tkg_test_config(test_vectors, test_type: str = "manual"):
                 USE_TKG_DOWN_PROJ_OPTIMIZED_LAYOUT_DIM_NAME: int(use_tkg_down_proj_optimized_layout),
             }
         }
-        test_cases.append(test_case)
+        grouped_cases.setdefault(effective_type, []).append(test_case)
 
-    generators = [RangeManualGeneratorStrategy(test_cases=test_cases, test_type=test_type)]
+    generators = [
+        RangeManualGeneratorStrategy(test_cases=cases, test_type=etype) for etype, cases in grouped_cases.items()
+    ]
 
     return RangeTestConfig(
         additional_params={},
@@ -569,7 +594,7 @@ class TestMlpTkgKernels:
         up_clamp_upper_limit=None,
     ):
         # Model configs should never be marked as negative test cases
-        is_model_config = test_options.test_type == MODEL_TEST_TYPE
+        is_model_config = is_model_test_type(test_options.test_type)
         is_negative_test_case = False if is_model_config else test_options.is_negative_test_case
 
         mlp_config = test_options.tensors[MLP_TKG_CONFIG]
@@ -966,7 +991,7 @@ class TestMlpTkgKernels:
         mlp_config = range_test_options.tensors[MLP_TKG_CONFIG]
 
         # Add metadata dimensions for model configs
-        if range_test_options.test_type == MODEL_TEST_TYPE:
+        if is_model_test_type(range_test_options.test_type):
             test_metadata_key = {
                 "vnc": mlp_config[VNC_DEGREE_DIM_NAME],
                 "b": mlp_config[BATCH_DIM_NAME],
@@ -981,6 +1006,21 @@ class TestMlpTkgKernels:
 
         if quant_type == QuantizationType.MX and platform_target is not Platforms.TRN3:
             pytest.skip("MXFP4/8 is only supported on TRN3.")
+
+        H = mlp_config[HIDDEN_DIM_NAME]
+        if quant_type == QuantizationType.MX and H % 512 != 0:
+            pytest.skip("MX quantization requires H to be divisible by 512")
+
+        I = mlp_config[INTERMEDIATE_DIM_NAME]
+        if quant_type == QuantizationType.MX and not (I % 512 == 0 or (I < 512 and I % 32 == 0)):
+            pytest.skip("MX quantization requires I to be I % 512 == 0 or (I < 512 and I % 32 ==0)")
+
+        BxS = mlp_config[BATCH_DIM_NAME] * mlp_config[SEQUENCE_LEN_DIM_NAME]
+        if BxS > TKG_BS_SEQLEN_THRESHOLD:
+            pytest.skip(f"TKG mode requires B*S <= {TKG_BS_SEQLEN_THRESHOLD}, got {BxS}")
+
+        if quant_type in [QuantizationType.STATIC_MX, QuantizationType.ROW_MX]:
+            pytest.skip("MXFP + ROW/STATIC quantization are not supported yet")
 
         compiler_args = CompilerArgs(logical_nc_config=lnc_count, platform_target=platform_target)
         self.run_range_mlp_tkg_test(
@@ -1024,8 +1064,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1067,8 +1108,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1108,6 +1150,7 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
         # If store_add is False, rmsnorm_tkg and layernorm_tkg should accept SBUF input
         force_fused_add = True
@@ -1115,7 +1158,7 @@ class TestMlpTkgKernels:
         # Bias is not relevant when checking fused_add=True, store_add=False configs
         force_bias = False
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1160,13 +1203,14 @@ class TestMlpTkgKernels:
         use_tkg_down_proj_column_tiling,
         skip_gate_proj,
         clamp,
+        platform_target: Platforms,
     ):
         gate_clamp_upper_limit = float(8.0) if clamp else None
         gate_clamp_lower_limit = float(-6.0) if clamp else None
         up_clamp_upper_limit = float(8.0) if clamp else None
         up_clamp_lower_limit = float(-6.0) if clamp else None
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=nl.bfloat16,
@@ -1211,8 +1255,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1253,8 +1298,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1295,8 +1341,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1337,8 +1384,9 @@ class TestMlpTkgKernels:
         collector: IMetricsCollector,
         config_name,
         config,
+        platform_target: Platforms,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=config["dtype"],
@@ -1372,10 +1420,15 @@ class TestMlpTkgKernels:
         test_manager: Orchestrator,
         range_test_options: RangeTestCase,
         collector: IMetricsCollector,
+        platform_target: Platforms,
     ):
         mlp_config = range_test_options.tensors[MLP_TKG_CONFIG]
         lnc_count = mlp_config[VNC_DEGREE_DIM_NAME]
-        compiler_args = CompilerArgs(logical_nc_config=lnc_count, separation_pass_mode=SeparationPassMode.INDIRECT)
+        compiler_args = CompilerArgs(
+            logical_nc_config=lnc_count,
+            separation_pass_mode=SeparationPassMode.INDIRECT,
+            platform_target=platform_target,
+        )
         self.run_range_mlp_tkg_test(
             test_manager=test_manager,
             dtype=mlp_config[DTYPE_DIM_NAME],

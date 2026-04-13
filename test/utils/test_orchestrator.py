@@ -37,6 +37,7 @@ from .common_dataclasses import (
     Platforms,
     SeparationPassMode,
     TraceMode,
+    normalize_golden_output,
 )
 from .determinism_checker import DeterminismChecker
 from .exceptions import CompilationException, InferenceException, TestStatus, ValidationException
@@ -171,6 +172,7 @@ class Orchestrator:
                 )
             # Run Inference
             local_artifact_download_path = self._run_inference(kernel_under_test, input_file_paths)
+            self._rename_neff_outputs_to_python_names(local_artifact_download_path)
 
             # Run performance analysis if perf analysis is enabled
             if self.perf_analysis_enabled:
@@ -293,10 +295,16 @@ class Orchestrator:
                     # Dump inputs and golden outputs early for debugging in birsim format
                     self._dump_birsim_artifacts(kernel_under_test)
 
-                trace_kernel(
+                output_names = None
+                if kernel_under_test.validation_args is not None:
+                    golden = normalize_golden_output(kernel_under_test.validation_args.golden_output)
+                    output_names = list(golden.keys())
+
+                self._compiled_kernel = trace_kernel(
                     kernel_under_test=kernel_under_test,
                     mode=self.trace_mode,
                     output_directory=self.fs_config.artifacts_output_directory_path,
+                    output_names=output_names,
                 )
         except Exception as e:
             # Print full exception details including stdout, stderr, and stacktrace
@@ -379,6 +387,25 @@ class Orchestrator:
             if NEURON_RT_ENABLE_DGE_NOTIFICATIONS not in env_vars:
                 env_vars[NEURON_RT_ENABLE_DGE_NOTIFICATIONS] = "1"
 
+        if kernel_under_test.compiler_input.platform_target.value == "trn3_a0":
+            if env_vars is None:
+                env_vars = {}
+
+            env_vars["NEURON_RT_ALLOW_LEGACY_NEFF"] = 1
+
+        # Save and download all outputs when determinism check or profile all runs is enabled.
+        # Otherwise, only save/download the last execution's outputs.
+        save_all_outputs = (
+            kernel_under_test.inference_args.enable_determinism_check
+            or kernel_under_test.inference_args.profile_all_runs
+        )
+
+        force_clean_input_writes: bool = (
+            kernel_under_test.inference_args.num_runs > 1
+            if kernel_under_test.inference_args.num_runs is not None
+            else False
+        )
+
         profiler_cmds = ProfilerCommands(
             num_runs=kernel_under_test.inference_args.num_runs,
             profile_all_runs=kernel_under_test.inference_args.profile_all_runs,
@@ -389,16 +416,12 @@ class Orchestrator:
             profile_all_ranks=kernel_under_test.inference_args.profile_all_ranks,
             env_vars=env_vars,
             perf_analysis_enabled=self.perf_analysis_enabled,
+            save_all_outputs=save_all_outputs,
+            force_clean_input_writes=force_clean_input_writes,
         )
 
         def get_list_of_files_to_copy(stdout: str) -> list[str]:
-            # if determinism check or profile all runs is enabled, download all outputs
-            download_all = (
-                kernel_under_test.inference_args.enable_determinism_check
-                or kernel_under_test.inference_args.profile_all_runs
-            )
-
-            outputs_to_copy = extract_and_filter_output_files(stdout, download_all)
+            outputs_to_copy = extract_and_filter_output_files(stdout, save_all_outputs)
 
             # Build complete list of files to copy from remote host
             files_to_copy = []
@@ -443,6 +466,30 @@ class Orchestrator:
             return self._dump_output_tensors(output_tensors)
         except Exception as e:
             raise InferenceException(str(e)) from e
+
+    def _rename_neff_outputs_to_python_names(self, artifact_path: str) -> None:
+        """Rename NEFF output files (output_N) to Python-level names.
+
+        When using neuron-profile with a CompiledKernel that has output_specs,
+        the NEFF uses generic names like output_0 but the validator expects
+        the Python-level names (e.g. 'y'). This renames the files to match.
+        """
+        # breakpoint()
+        if not self._compiled_kernel or not self._compiled_kernel.output_specs:
+            return
+
+        aliases = self._compiled_kernel.input_output_aliases or {}
+        for i, (python_name, _) in enumerate(self._compiled_kernel.output_specs):
+            neff_name = aliases[i] if i in aliases else python_name
+            if neff_name == python_name:
+                continue
+            src = os.path.join(artifact_path, neff_name)
+            dst = os.path.join(artifact_path, python_name)
+            if os.path.exists(src):
+                os.rename(src, dst)
+                logging.info(f"Renamed output {neff_name} -> {python_name}")
+            else:
+                logging.warning(f"Expected output file not found: {src}")
 
     def _run_validation(
         self,

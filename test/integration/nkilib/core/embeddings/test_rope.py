@@ -15,6 +15,7 @@
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -169,7 +170,9 @@ class TestRopeKernel:
             is_negative_test=is_negative_test_case,
         )
 
-    @pytest.mark.parametrize(
+    _ROPE_ABBREVS = {"d_head": "dh", "contiguous_layout": "contig", "relayout_in_sbuf": "relayout"}
+
+    @pytest_parametrize(
         "d_head,B,n_heads,S,contiguous_layout,relayout_in_sbuf",
         [
             (128, 8192, 1, 8, True, False),
@@ -186,7 +189,13 @@ class TestRopeKernel:
             (128, 4, 8, 1024, True, False),
             (128, 2, 128, 256, True, False),
             (64, 2, 128, 256, True, False),
+            # non-contiguous layout large BnS
+            (128, 255, 2, 8, False, False),
+            (64, 255, 8, 6, False, False),
+            (128, 128, 4, 4, False, False),
+            (128, 64, 8, 2, False, False),
         ],
+        abbrevs=_ROPE_ABBREVS,
     )
     def test_rope_manual(self, test_manager: Orchestrator, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf):
         """Manual test cases for QoR tracking and deterministic pipeline runs."""

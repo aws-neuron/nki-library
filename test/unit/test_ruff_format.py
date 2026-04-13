@@ -28,14 +28,14 @@ def test_ruff_format_check():
     project_root = test_file_path.parent.parent.parent
 
     result = subprocess.run(
-        ["ruff", "format", "--check", "."],
+        ["ruff", "format", "--check", ".", "--exclude", "wheelhouse"],
         cwd=project_root,
         capture_output=True,
         text=True,
     )
 
     ruff_diff = subprocess.run(
-        ["ruff", "format", "--diff", "."],
+        ["ruff", "format", "--diff", ".", "--exclude", "wheelhouse"],
         cwd=project_root,
         capture_output=True,
         text=True,
@@ -68,7 +68,7 @@ def test_ruff_check():
     project_root = test_file_path.parent.parent.parent
 
     result = subprocess.run(
-        ["ruff", "check", "."],
+        ["ruff", "check", ".", "--exclude", "wheelhouse"],
         cwd=project_root,
         capture_output=True,
         text=True,

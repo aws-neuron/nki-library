@@ -192,9 +192,7 @@ class BundledSimulator:
                     )
                 else:
                     (src_nkilib / "__init__.py").write_text(
-                        '"""Standalone nkilib."""\n'
-                        'STANDALONE = True\n'
-                        '__standalone_marker__ = "standalone_active"\n'
+                        '"""Standalone nkilib."""\nSTANDALONE = True\n__standalone_marker__ = "standalone_active"\n'
                     )
 
                 # Create core submodule only if not missing submodules

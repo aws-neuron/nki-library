@@ -67,7 +67,7 @@ USE_DMA_TRANSPOSE = False
 logger = get_logger("bwmm_shard_on_block_mx")
 
 
-@nki.jit(platform_target="trn3")
+@nki.jit
 def bwmm_shard_on_block_mx(
     hidden_states,
     expert_affinities_masked,
@@ -262,10 +262,10 @@ def bwmm_shard_on_block_mx(
     nisa.memset(dst=p_down_idx_vector, value=-1.0)
 
     gup_scales_sb = nl.ndarray((_pmax, 2, prj_cfg.n_H512_tile_sharded, dims.I), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.memset(gup_scales_sb, value=0.0)
+    nisa.memset(gup_scales_sb, value=0)
 
     activation_bias = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(activation_bias, value=0.0)
+    nisa.memset(activation_bias, value=0)
 
     inps = InputTensors(
         hidden_states=hidden_states.reshape((T, _q_width, prj_cfg.n_H512_tile, _pmax)),
@@ -376,7 +376,9 @@ def bwmm_shard_on_block_mx(
             nisa.memset(block_old[0:_pmax, n, 0:H], value=0)
 
     down_weight_qtz = nl.ndarray(
-        (_pmax, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), dtype=inps.down_proj_weight.dtype, buffer=nl.sbuf
+        (_pmax, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded),
+        dtype=inps.down_proj_weight.base_tensor.dtype,
+        buffer=nl.sbuf,
     )
     # Memset weight if input weight HBM does not pad on par dim
     if dims.p_I != _pmax:
@@ -385,6 +387,10 @@ def bwmm_shard_on_block_mx(
     down_scale_sb = nl.ndarray(
         (_pmax, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), dtype=inps.down_proj_scale.dtype, buffer=nl.sbuf
     )
+
+    # Memset weight scale if input weight scale HBM does not pad on par dim
+    if dims.p_I != _pmax:
+        nisa.memset(down_scale_sb[:, prj_cfg.n_total_I512_tile - 1, :], value=0)
 
     # init counters
     # in shard-on-block we can move independently
@@ -418,6 +424,7 @@ def bwmm_shard_on_block_mx(
             n_dynamic_blocks = dims.N - configs.n_static_blocks
             n_dynamic_blocks = n_dynamic_blocks + 1 if n_dynamic_blocks % 2 == 1 else n_dynamic_blocks
             n_static_blocks = dims.N - n_dynamic_blocks
+            n_dynamic_blocks_local = n_dynamic_blocks
         else:
             # If invalid n_dynamic_blocks is passed, auto-calculate best case combination
             if conditions is not None and (n_dynamic_blocks < 0 or n_dynamic_blocks > dims.N):
@@ -439,16 +446,17 @@ def bwmm_shard_on_block_mx(
         nisa.memset(dst=buffers.index[0, 0], value=n_static_blocks)
 
         logger.info(f"Processing {n_static_blocks} static blocks, {n_dynamic_blocks_local} dynamic blocks")
-        process_static_blocks(
-            dims=dims,
-            configs=configs,
-            prj_cfg=prj_cfg,
-            inps=inps,
-            outs=outs,
-            dbg_tensors=dbg_tensors,
-            buffers=buffers,
-            num_static_blocks=n_static_blocks,
-        )
+        if n_static_blocks > 0:
+            process_static_blocks(
+                dims=dims,
+                configs=configs,
+                prj_cfg=prj_cfg,
+                inps=inps,
+                outs=outs,
+                dbg_tensors=dbg_tensors,
+                buffers=buffers,
+                num_static_blocks=n_static_blocks,
+            )
         if n_dynamic_blocks_local > 0:
             process_dynamic_blocks(
                 dims=dims,
@@ -678,14 +686,18 @@ def load_gup_weights_scales_mx(
         return gup_weights_qtz_sb, gup_scales_sb, gup_bias_sb
     """
     gup_weights_qtz_sb = nl.ndarray(
-        (_pmax, 2, prj_cfg.n_H512_tile_sharded, dims.I), dtype=inps.gate_up_proj_weight.dtype, buffer=nl.sbuf
+        (_pmax, 2, prj_cfg.n_H512_tile_sharded, dims.I),
+        dtype=inps.gate_up_proj_weight.base_tensor.dtype,
+        buffer=nl.sbuf,
     )
     # gate_up_proj_weight shape: (E, 128, 2, n_H512_tile, I)
     # We want to load expert[block_expert] -> shape (128, 2, n_H512_tile_sharded, I)
     # select expert -> (128, 2, n_H512_tile, I)
     # slice H512 tiles -> (128, 2, n_H512_tile_sharded, I)
-    gup_weight_view = inps.gate_up_proj_weight.select(dim=0, index=block_expert).slice(
-        dim=2, start=0, end=prj_cfg.n_H512_tile_sharded
+    gup_weight_view = (
+        TensorView(inps.gate_up_proj_weight.base_tensor)
+        .select(dim=0, index=block_expert)
+        .slice(dim=2, start=0, end=prj_cfg.n_H512_tile_sharded)
     )
     nisa.dma_copy(
         dst=gup_weights_qtz_sb,
@@ -693,6 +705,7 @@ def load_gup_weights_scales_mx(
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
     )
+    gup_weights_qtz_sb = gup_weights_qtz_sb.view(inps.gate_up_proj_weight.dtype)
 
     """
     GATE UP SCALES
@@ -867,8 +880,10 @@ def load_down_proj_weights_mx(
     # down_proj_weight shape: (E, p_I, n_total_I512_tile, H)
     # select expert -> (p_I, n_total_I512_tile, H)
     # slice H for sharding -> (p_I, n_total_I512_tile, H_sharded)
-    down_weight_view = inps.down_proj_weight.select(dim=0, index=block_expert).slice(
-        dim=2, start=prj_cfg.prg_id * prj_cfg.H_sharded, end=(prj_cfg.prg_id + 1) * prj_cfg.H_sharded
+    down_weight_view = (
+        TensorView(inps.down_proj_weight.base_tensor)
+        .select(dim=0, index=block_expert)
+        .slice(dim=2, start=prj_cfg.prg_id * prj_cfg.H_sharded, end=(prj_cfg.prg_id + 1) * prj_cfg.H_sharded)
     )
     nisa.dma_copy(
         src=down_weight_view.get_view(),
@@ -889,9 +904,7 @@ def load_down_proj_weights_mx(
         down_scale_sb = nl.ndarray(
             (_pmax, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), dtype=inps.down_proj_scale.dtype, buffer=nl.sbuf
         )  # original nl.uint8
-    # Memset weight scale if input weight scale HBM does not pad on par dim
-    if dims.p_I != _pmax:
-        nisa.memset(dst=down_scale_sb[:, prj_cfg.n_total_I512_tile - 1, :], value=0)
+
     kernel_assert(
         down_scale_sb.shape == (128, prj_cfg.n_total_I512_tile, prj_cfg.H_sharded), f"Got {down_scale_sb.shape}"
     )
@@ -926,18 +939,18 @@ def load_down_proj_weights_mx(
     # accumulated shape to right of dim 0: n_total_I512_tile * H
     down_scale_stride_dim0 = prj_cfg.n_total_I512_tile * dims.H
 
-    # # Use AP for dst to match src pattern and avoid issues with dynamic blocks
+    # Copy only p_I valid partitions (padding partitions already zeroed by memset outside loop)
     nisa.dma_copy(
         src=down_scale_view.ap(
-            pattern=[[down_scale_stride_dim0, _pmax], [dims.H, prj_cfg.n_total_I512_tile], [1, prj_cfg.H_sharded]],
+            pattern=[[down_scale_stride_dim0, dims.p_I], [dims.H, prj_cfg.n_total_I512_tile], [1, prj_cfg.H_sharded]],
             offset=prj_cfg.prg_id * prj_cfg.H_sharded,
             vector_offset=token_indices_on_p.ap(
-                [[1, _pmax], [1, 1]],
+                [[1, dims.p_I], [1, 1]],
                 offset=0,
             ),
             indirect_dim=0,
         ),
-        dst=down_scale_sb[:128, : prj_cfg.n_total_I512_tile, : prj_cfg.H_sharded],
+        dst=down_scale_sb[: dims.p_I, : prj_cfg.n_total_I512_tile, : prj_cfg.H_sharded],
         oob_mode=oob_mode.skip,
     )
 
@@ -1053,13 +1066,27 @@ def compute_one_block(
     if DBG_KERNEL and block_idx == 0:
         nisa.dma_copy(dst=dbg_tensors.hidden_states[:128, :, :, :], src=buffers.block_hidden_states_T[:128, :, :, :])
 
-    if next_block_idx is not None:
-        compute_hidden_index_vector(
-            inps, buffers, next_block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic=is_dynamic
+    if is_dynamic:
+        # For dynamic blocks, load hidden states fresh each iteration to avoid
+        # cross-iteration SBUF dependency issues with the compiler's while-loop handling.
+        # FIXME: We should reenable pre-load once this ticket is resolved: https://aws-neuron.atlassian.net/browse/NKI-1582
+        load_and_quantize_hidden_states(
+            inps,
+            block_idx,
+            buffers,
+            dims,
+            kernel_cfg,
+            prj_cfg,
+            is_block_idx_dynamic=True,
+            use_dma_transpose=USE_DMA_TRANSPOSE,
         )
-    # quantize prefetched data. Note that online quantize can only quantize to fp8
-    # only quantize here if it is a static block. for dynamic block we quantize immediately after fetching
-    if not is_dynamic:
+    else:
+        if next_block_idx is not None:
+            compute_hidden_index_vector(
+                inps, buffers, next_block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic=is_dynamic
+            )
+        # quantize prefetched data. Note that online quantize can only quantize to fp8
+        # only quantize here if it is a static block. for dynamic block we quantize immediately after fetching
         quantize_block_hidden_state_T(buffers, prj_cfg, dims)
 
     buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B))
@@ -1080,6 +1107,7 @@ def compute_one_block(
         gup_n_quadrants_needed,
         dst_scale=buffers.down_scale_sb,
     )
+    down_weight_qtz_viewed = buffers.down_weight_qtz.view(inps.down_proj_weight.dtype)
     # TensorView handles broadcast in down_proj_mxfp4
     flatten_free_dim = prj_cfg.n_total_I512_tile * dims.B * _q_width
 
@@ -1188,9 +1216,10 @@ def compute_one_block(
     if DBG_KERNEL and block_idx == 0:
         nisa.dma_copy(dst=dbg_tensors.up_proj[:_pmax, :flatten_free_dim], src=up_proj_out_sb[:_pmax, :flatten_free_dim])
 
-    if next_block_idx is not None:
+    if next_block_idx is not None and not is_dynamic:
         """
-        LOAD, TRANSPOSE, AND QUANTIZE BLOCK HIDDEN STATES
+        LOAD, TRANSPOSE BLOCK HIDDEN STATES (static loops only)
+        FIXME: We should re-enable pre-load for dynamic loops as well once this ticket is resolved: https://aws-neuron.atlassian.net/browse/NKI-1582
         """
         if USE_DMA_TRANSPOSE:
             load_hidden_states_mx(
@@ -1214,10 +1243,6 @@ def compute_one_block(
 
         buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
         buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
-
-        if is_dynamic:
-            # quantize after fetching for dynamic blocks
-            quantize_block_hidden_state_T(buffers, prj_cfg, dims)
 
     else:
         buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
@@ -1258,7 +1283,7 @@ def compute_one_block(
 
     block_new = down_projection_mx_shard_H(
         inter_sb=intermediate_state_sb,
-        weight=buffers.down_weight_qtz,
+        weight=down_weight_qtz_viewed,
         weight_scale=down_scale_sb,
         bias_sb=down_bias_sb,
         cfg=prj_cfg,
@@ -1555,12 +1580,6 @@ def process_dynamic_blocks(
     )
 
     logger.info(f"Start looping over dynamic blocks {num_static_blocks} to {dims.cond_vec_len} - 1")
-
-    logger.info("Prefetch first block for each core")
-    first_block_idx = num_static_blocks + dims.shard_id
-    load_and_quantize_hidden_states(
-        inps, first_block_idx, buffers, dims, configs, prj_cfg, use_dma_transpose=USE_DMA_TRANSPOSE
-    )
 
     reg = nisa.register_alloc()
     nisa.register_load(reg, buffers.cond)

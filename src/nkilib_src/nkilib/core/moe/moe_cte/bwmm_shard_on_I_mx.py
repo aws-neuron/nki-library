@@ -92,7 +92,7 @@ MAX_BLOCK_SIZE = 1024
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@nki.jit(mode="trace", platform_target="trn3")
+@nki.jit(mode="trace")
 def blockwise_mm_shard_intermediate_mx(
     hidden_states: nl.ndarray,
     expert_affinities_masked: nl.ndarray,
@@ -252,10 +252,10 @@ def blockwise_mm_shard_intermediate_mx(
     nisa.memset(dst=p_down_idx_vector, value=-1.0)
 
     gup_scales_sb = nl.ndarray((_pmax, 2, prj_cfg.n_H512_tile, dims.I_lnc_sharded), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.memset(gup_scales_sb, value=0.0)
+    nisa.memset(gup_scales_sb, value=0)
 
     activation_bias = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(activation_bias, value=0.0)
+    nisa.memset(activation_bias, value=0)
     # Create input tensor container
     inps = InputTensors(
         hidden_states=hidden_states.reshape((T, _q_width, prj_cfg.n_H512_tile, _pmax)),
@@ -397,7 +397,7 @@ def blockwise_mm_shard_intermediate_mx(
     return output
 
 
-@nki.jit(mode="trace", platform_target="trn3")
+@nki.jit(mode="trace")
 def blockwise_mm_shard_intermediate_mx_hybrid(
     conditions: nl.ndarray,
     hidden_states: nl.ndarray,
@@ -562,10 +562,10 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
     nisa.memset(dst=p_down_idx_vector, value=-1.0)
 
     gup_scales_sb = nl.ndarray((_pmax, 2, prj_cfg.n_H512_tile, dims.I_lnc_sharded), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.memset(gup_scales_sb, value=0.0)
+    nisa.memset(gup_scales_sb, value=0)
 
     activation_bias = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(activation_bias, value=0.0)
+    nisa.memset(activation_bias, value=0)
 
     # Create input tensor container
     inps = InputTensors(
@@ -727,11 +727,6 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
     # Block index for dynamic loop (stored in SBUF for dynamic indexing)
     block_idx_sbuf = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32)
     nisa.memset(block_idx_sbuf, value=NUM_STATIC_BLOCKS)
-    first_block_idx = NUM_STATIC_BLOCKS
-    # Prefetch first dynamic block's hidden states if there are any
-    load_and_quantize_hidden_states(
-        inps, first_block_idx, buffers, dims, configs, prj_cfg, use_dma_transpose=USE_DMA_TRANSPOSE
-    )
     # Dynamic loop over remaining blocks
     for _ in nl.dynamic_range(NUM_STATIC_BLOCKS, cond_reg):
         next_block_idx_sbuf = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
@@ -858,15 +853,28 @@ def compute_one_block_mx(
         token_indices = load_token_indices(inps.token_position_to_id, block_idx, dims.B, dims.n_B128_tiles)
         block_expert = load_block_expert(inps.block_to_expert, block_idx)
 
-    # Step 2: Prefetch next block's hidden state indices (overlapped with compute)
-    if next_block_idx is not None:
-        compute_hidden_index_vector(
-            inps, buffers, next_block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic=is_dynamic
+    # Step 2 & 3: Prefetch and quantize hidden states
+    if is_dynamic:
+        # For dynamic blocks, load hidden states fresh each iteration to avoid
+        # cross-iteration SBUF dependency issues with the compiler's while-loop handling.
+        # FIXME: We should reenable pre-load once this ticket is resolved: https://aws-neuron.atlassian.net/browse/NKI-1582
+        load_and_quantize_hidden_states(
+            inps,
+            block_idx,
+            buffers,
+            dims,
+            kernel_cfg,
+            prj_cfg,
+            is_block_idx_dynamic=True,
+            use_dma_transpose=USE_DMA_TRANSPOSE,
         )
-
-    # Step 3: Quantize current block's hidden states to FP8
-    # For static blocks, quantize here; for dynamic blocks, quantize after fetching
-    if not is_dynamic:
+    else:
+        if next_block_idx is not None:
+            compute_hidden_index_vector(
+                inps, buffers, next_block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic=is_dynamic
+            )
+        # quantize prefetched data. Note that online quantize can only quantize to fp8
+        # only quantize here if it is a static block. for dynamic block we quantize immediately after fetching
         quantize_block_hidden_state_T(buffers, prj_cfg, dims)
 
     buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B))
@@ -959,9 +967,10 @@ def compute_one_block_mx(
         kernel_cfg.up_clamp_upper_limit,
         kernel_cfg.up_clamp_lower_limit,
     )
-    if next_block_idx is not None:
+    if next_block_idx is not None and not is_dynamic:
         """
-        LOAD, TRANSPOSE, AND QUANTIZE BLOCK HIDDEN STATES
+        LOAD, TRANSPOSE HIDDEN STATES (static loops only)
+        FIXME: We should re-enable pre-load for dynamic loops as well once this ticket is resolved: https://aws-neuron.atlassian.net/browse/NKI-1582
         """
         if USE_DMA_TRANSPOSE:
             load_hidden_states_mx(
@@ -989,10 +998,6 @@ def compute_one_block_mx(
 
         buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
         buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
-
-        if is_dynamic:
-            # quantize after fetching for dynamic blocks
-            quantize_block_hidden_state_T(buffers, prj_cfg, dims)
 
     else:
         # TODO: Consider using PE broadcast instead of stream_shuffle_broadcast for better performance
@@ -1960,7 +1965,7 @@ def _down_proj_prep_inter_and_weights(
             nisa.memset(dst=weight_qtz[:, cfg.n_total_I512_tile_lnc_sharded - 1, :], value=0.0)
 
         kernel_assert(weight.shape == (p_I, cfg.n_total_I512_tile_lnc_sharded, H), "Incorrect weight shape")
-        nisa.dma_copy(src=weight[:, :, 0:H], dst=weight_qtz[:p_I, :, :], dge_mode=2)
+        nisa.dma_copy(src=weight[:, :, 0:H], dst=weight_qtz[:p_I, :, :], dge_mode=dge_mode.hwdge)
 
     # Check if weight scale is already in SBUF or needs to be loaded from HBM
     weight_qtz_scale = None
@@ -1995,7 +2000,7 @@ def _down_proj_prep_inter_and_weights(
                             :,
                             :,
                         ],
-                        dge_mode=2,
+                        dge_mode=dge_mode.hwdge,
                     )
 
     return inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale

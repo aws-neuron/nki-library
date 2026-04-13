@@ -58,6 +58,7 @@ def layernorm_tkg_torch_ref_lnc1(
     output: torch.Tensor,
     beta: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
+    shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[object] = None,
 ) -> dict[str, torch.Tensor]:
@@ -72,6 +73,7 @@ def layernorm_tkg_torch_ref_lnc1(
         output (torch.Tensor): [128, B*S, H//128] output buffer. Unused, present for interface compatibility.
         beta (torch.Tensor or None): [1, H] LayerNorm bias vector.
         eps (float): Epsilon for numerical stability.
+        shard_on_h (bool): Unused, present for interface compatibility.
         use_heap_memory (bool): Unused, present for interface compatibility.
         sbm: Unused, present for interface compatibility.
 
@@ -99,6 +101,7 @@ def layernorm_tkg_torch_ref(
     output: torch.Tensor,
     beta: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
+    shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[object] = None,
 ) -> dict[str, torch.Tensor]:
@@ -114,6 +117,7 @@ def layernorm_tkg_torch_ref(
         output (torch.Tensor): [128, B*S, H//128] output buffer. Unused, present for interface compatibility.
         beta (torch.Tensor or None): [1, H] LayerNorm bias vector.
         eps (float): Epsilon for numerical stability.
+        shard_on_h (bool): Unused, present for interface compatibility.
         use_heap_memory (bool): Unused, present for interface compatibility.
         sbm: Unused, present for interface compatibility.
 

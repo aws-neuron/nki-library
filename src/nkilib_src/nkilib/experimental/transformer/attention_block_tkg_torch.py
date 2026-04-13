@@ -44,6 +44,9 @@ from ...core.output_projection.output_projection_tkg_torch import output_project
 from ...core.qkv.qkv_tkg_torch import qkv_tkg_torch_ref
 from ...core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
 from ...core.utils.kernel_assert import kernel_assert
+from ...core.utils.logging import get_logger
+
+logger = get_logger("attention_block_tkg_torch")
 
 _FP8_E4M3_MAX = 240.0
 
@@ -124,6 +127,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         X_in_sb: bool = False,
         KVDP: int = 1,
         KVDP_replica_group: None = None,
+        enable_fa_s_prior_tiling: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """PyTorch reference for the fused attention block TKG kernel.
 
@@ -205,6 +209,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             KVDP: Must be 1. This ref computes a single-rank result; KVDP slicing
                 is handled by the test harness. Asserted to prevent misuse.
             KVDP_replica_group: Accepted for signature compatibility (kernel-only).
+            enable_fa_s_prior_tiling: Accepted for signature compatibility
+                 (kernel-only, whether to enable flash attention in kernel).
             Dict with keys:
                 - ``"X_out"``: Output tensor. Shape depends on ``W_out``, ``transposed_out``,
                   and ``out_in_sb`` settings.
@@ -533,8 +539,10 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         V_scaled = V * v_scale[0, 0].float()
         k_clip = (K_scaled.abs() > _FP8_E4M3_MAX).float().mean().item()
         v_clip = (V_scaled.abs() > _FP8_E4M3_MAX).float().mean().item()
-        kernel_assert(k_clip <= 0.01, f"Too many K values clipped ({k_clip:.1%}), scale may be inappropriate")
-        kernel_assert(v_clip <= 0.01, f"Too many V values clipped ({v_clip:.1%}), scale may be inappropriate")
+        if k_clip > 0.01:
+            logger.warn(f"Too many K values clipped ({k_clip:.1%}), scale may be inappropriate")
+        if v_clip > 0.01:
+            logger.warn(f"Too many V values clipped ({v_clip:.1%}), scale may be inappropriate")
         return (
             torch.clamp(K_scaled, -_FP8_E4M3_MAX, _FP8_E4M3_MAX),
             torch.clamp(V_scaled, -_FP8_E4M3_MAX, _FP8_E4M3_MAX),

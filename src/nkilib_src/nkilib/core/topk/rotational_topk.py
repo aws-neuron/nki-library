@@ -24,10 +24,13 @@ import numpy as np
 
 from ..max.cascaded_max_utils import predicated_folded_load, unfolded_store
 from ..utils.kernel_assert import kernel_assert
+from ..utils.kernel_helpers import get_verified_program_sharding_info
 from .rotational_topk_utils import (
     RotationalConstants,
     RotationalTopkConfig,
     TopkConfig,
+    create_rotational_topk_config,
+    create_topk_config,
     insert,
     naive_scanning_topk,
     reshape_with_dma,
@@ -105,10 +108,21 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
 
         return topk_values, topk_indices
     """
-    config.update_shard_info()
-
     validate_topk_input(inp, n_fold=config.n_stages, local_top_k_per_stage=config.local_top_k_per_stage)
     validate_config(config.topk_config)
+
+    # Query runtime shard info (replaces the old config.update_shard_info() call).
+    # prg_id and n_prgs must come from the NKI runtime context inside the kernel,
+    # not from config construction time outside the kernel.
+    shard_info = get_verified_program_sharding_info("topk", (0, 1), 2)
+    kernel_assert(shard_info[1] == config.n_prgs or config.BxS == 1, "n_prgs mismatch")
+    if config.BxS > 1:
+        n_prgs = shard_info[1]
+        prg_id = shard_info[2]
+    else:
+        kernel_assert(config.n_prgs == 1, f"n_prgs mismatch, BxS {config.BxS}, n_programs {config.n_prgs}")
+        n_prgs = config.n_prgs
+        prg_id = config.prg_id
 
     BxS = config.BxS
     true_k = config.orig_k
@@ -138,7 +152,23 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
 
     # Handle single-stage case (falls back to scanning)
     if config.n_stages == 1:
-        topk_values, topk_indices = naive_scanning_topk(inp=inp, topk_config=config.topk_config)
+        # Create a runtime-corrected TopkConfig with the actual prg_id/n_prgs
+        # (the original update_shard_info() did this by reconstructing topk_config)
+        runtime_topk_config = TopkConfig(
+            inp_shape=config.topk_config.inp_shape,
+            k=config.orig_k,
+            sorted=config.sorted,
+            inp_dtype=config.inp_dtype,
+            index_dtype=config.index_dtype,
+            BxS=config.topk_config.BxS,
+            vocab_size=config.topk_config.vocab_size,
+            out_shape=config.topk_config.out_shape,
+            n_prgs=n_prgs,
+            prg_id=prg_id,
+            per_lnc_BxS=config.topk_config.per_lnc_BxS,
+            _pmax=config.topk_config._pmax,
+        )
+        topk_values, topk_indices = naive_scanning_topk(inp=inp, topk_config=runtime_topk_config)
         return topk_values, topk_indices
 
     topk_values = nl.ndarray(output_shape, dtype=inp.dtype, buffer=nl.shared_hbm)
@@ -146,7 +176,7 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
 
     tile_size = config.tile_size
     n_bxs_tiles = config.n_bxs_tiles
-    lnc_batch_start = config.prg_id * config.per_lnc_BxS
+    lnc_batch_start = prg_id * config.per_lnc_BxS
 
     for tile_idx in nl.sequential_range(n_bxs_tiles):
         tile_batch_start = lnc_batch_start + tile_idx * tile_size
@@ -305,7 +335,7 @@ def _topk_rotated_core(
 
     # Create float32 rotation matrix for indices when input is not float32
     rotation_f32 = nl.ndarray(rotate_hbm.shape, dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=rotation_f32, src=rotation, dtype=nl.float32)
+    nisa.tensor_copy(dst=rotation_f32, src=rotation)
 
     local_index = nl.ndarray(
         shape=(total_partition_dim, local_top_k_per_stage), dtype=config.index_dtype, buffer=nl.sbuf
@@ -428,7 +458,7 @@ def topk(
     if method not in SupportedTopkMethods:
         raise ValueError(f"Unsupported method '{method}'. Supported methods are: {list(SupportedTopkMethods)}")
 
-    topk_config = TopkConfig(
+    topk_config = create_topk_config(
         inp_shape=inp.shape,
         inp_dtype=getattr(nl, str(inp.dtype).split(".")[-1]),
         k=k,
@@ -443,8 +473,8 @@ def topk(
     inp = inp.reshape((topk_config.BxS, topk_config.vocab_size))
     selected_topk_method = SUPPORTED_TOPK_METHOD_MAPPING[method]
 
-    config = RotationalTopkConfig(inp_shape=inp.shape, topk_config=topk_config)
-    prepare_rotational_constants(config)
+    config = create_rotational_topk_config(inp_shape=inp.shape, topk_config=topk_config)
+    config = prepare_rotational_constants(config)
     config.log_strategy()
     grid = config.n_prgs
     topk_values, topk_indices = selected_topk_method[grid](inp=inp, config=config)
@@ -456,11 +486,18 @@ def topk(
     return topk_values, topk_indices
 
 
-def prepare_rotational_constants(config: RotationalTopkConfig) -> None:
-    """Prepare rotational constants for topk kernel execution.
+def prepare_rotational_constants(config: RotationalTopkConfig) -> RotationalTopkConfig:
+    """Prepare rotational constants and return the config with the shared cache populated.
+
+    Since RotationalTopkConfig is frozen, this uses object.__setattr__ to set the
+    _shared_const_cache field directly. This is safe because _shared_const_cache is
+    excluded from __hash__ and __eq__.
 
     Args:
         config: RotationalTopkConfig with kernel parameters
+
+    Returns:
+        RotationalTopkConfig: Same config with _shared_const_cache populated
     """
     # Use float32 for constants - indices need precision for large values
     const_dtype = np.float32
@@ -472,7 +509,10 @@ def prepare_rotational_constants(config: RotationalTopkConfig) -> None:
         config.padded_vocab_size,
         const_dtype,
     )
-    config._shared_const_cache = RotationalConstants._shared_const_cache
+    # Set the cache directly on the frozen instance — safe because this field
+    # is excluded from __hash__ and __eq__
+    object.__setattr__(config, '_shared_const_cache', dict(RotationalConstants._shared_const_cache))
+    return config
 
 
 def cleanup_rotational_constants() -> None:

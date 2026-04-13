@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import typing
 from enum import Enum
 
@@ -48,6 +49,10 @@ def normalize_param_value(value):
     # Convert type objects to their name (e.g., nl.bfloat16 -> "bfloat16")
     if isinstance(value, type):
         return value.__name__
+    # Stringify lists/tuples to avoid dynamic mapping conflicts from mixed-type
+    # arrays (e.g., n_chain containing both integers and booleans)
+    if isinstance(value, (list, tuple)):
+        return json.dumps(value)
     # Handle other non-serializable types (objects with __dict__)
     if hasattr(value, "__dict__") and not isinstance(value, type):
         return str(value)

@@ -18,7 +18,6 @@ from dataclasses import dataclass
 
 import nki.isa as nisa
 import nki.language as nl
-import nki.tensor as ntensor
 
 from ...mlp.mlp_parameters import (
     MLPBiasParameters,
@@ -178,9 +177,7 @@ def _all_expert_moe_tkg(
     memory_safe_degree = 2 if t_cfg.tile_T * dims.H * dims.I <= 32 * 3072 * 1024 else 1
 
     # Pre-load identity matrix (reused across all experts)
-    identity_hbm = nl.shared_constant(ntensor.identity(t_cfg.tile_T, nl.int8))
-    identity_sb = allocator((t_cfg.tile_T, t_cfg.tile_T), dtype=io_dtype, buffer=nl.sbuf, name="identity_sb")
-    nisa.dma_copy(dst=identity_sb, src=identity_hbm)
+    identity_sb = nl.shared_identity_matrix(t_cfg.tile_T, dtype=io_dtype)
 
     # Pre-load all input tiles (reused across all experts, avoids redundant DMA per expert)
     if hidden_in_sbuf:

@@ -24,6 +24,8 @@ because torch_ref_wrapper cannot convert them. The unpack functions convert them
 to torch immediately. All other inputs are torch tensors.
 """
 
+import neuron_dtypes as dt
+import nki.language as nl
 import numpy as np
 import torch
 
@@ -152,28 +154,130 @@ def mx_matmul(stationary, moving, stationary_scale, moving_scale):
     return torch.einsum("kiq,kjq->ij", stationary, moving)
 
 
-def quantize_to_mx_fp8(data_f32):
-    """Quantize float32 numpy [P, F] to mxfp8 x4 format. P%8==0, F%4==0 required.
+def quantize_to_mx(data, out_x4_dtype):
+    """Quantize numpy [P, F] to MX x4 format. P%8==0, F%4==0 required.
 
-    Returns: (x4_packed numpy, scale uint8 numpy [P//8, F//4])
+    Accepts any numeric dtype (bf16, fp16, fp32, etc.) and casts to float32
+    internally. Uses numpy because dt.static_cast (the only available packing
+    function for MX x4 dtypes) operates on numpy arrays.
+
+    Supports nl.float8_e4m3fn_x4, nl.float8_e5m2_x4, and nl.float4_e2m1fn_x4.
+
+    Args:
+        data (np.ndarray): Input array of shape [P, F] in any numeric dtype.
+        out_x4_dtype: Target MX x4 dtype (nl.dtype).
+
+    Returns:
+        (x4_packed numpy [P, F//4], scale uint8 numpy [P//8, F//4])
+
+    Notes:
+        Scale is returned in dense logical layout [P//8, F//4] (one row per
+        8-row block), NOT in hardware quadrant layout [P, F//4].
+        Use quantize_mx_golden to get scale in hardware quadrant layout.
     """
+    # Cast to float32 if needed (exponent extraction requires IEEE 754 float32)
+    data_f32 = dt.static_cast(data, np.float32) if data.dtype != np.float32 else data
+
+    # Resolve dtype: numpy custom dtypes (.dtype from array) are numpy.dtype objects,
+    # not nl.* objects. Convert via str(dtype) to match against known names.
+    _STR_TO_NL_DTYPE = {
+        'float8_e5m2_x4': nl.float8_e5m2_x4,
+        'float8_e4m3fn_x4': nl.float8_e4m3fn_x4,
+        'float4_e2m1fn_x4': nl.float4_e2m1fn_x4,
+    }
+    dtype_str = str(out_x4_dtype)
+    if dtype_str in _STR_TO_NL_DTYPE:
+        out_x4_dtype = _STR_TO_NL_DTYPE[dtype_str]
+
+    # max exponent and max representable value per MX dtype
+    # float8_e5m2:   max_exp=15, max_val=57344
+    # float8_e4m3fn: max_exp=8,  max_val=448
+    # float4_e2m1fn: max_exp=2,  max_val=6
+    _MX_DTYPE_PARAMS = {
+        nl.float8_e5m2_x4: (15, 57344.0),
+        nl.float8_e4m3fn_x4: (8, 448.0),
+        nl.float4_e2m1fn_x4: (2, 6.0),
+    }
+
+    if out_x4_dtype not in _MX_DTYPE_PARAMS:
+        raise ValueError(f"Unsupported out_x4_dtype: {out_x4_dtype}. Must be one of {list(_MX_DTYPE_PARAMS.keys())}")
+
+    max_exp, max_val = _MX_DTYPE_PARAMS[out_x4_dtype]
+
     P, F = data_f32.shape
     if P % 8 != 0 or F % 4 != 0:
         raise ValueError(f"Shape ({P}, {F}) must be divisible by (8, 4) for MX block quantization")
 
-    max_exp_fp8 = 8
-    max_val = 448.0
-
     exp_field = ((data_f32.view(np.uint32) >> 23) & 0xFF).astype(np.uint8)
     block_max_exp = exp_field.reshape(P // 8, 8, F // 4, 4).max(axis=(1, 3))
-    scale_uint8 = (block_max_exp.astype(np.int32) - max_exp_fp8).clip(0, 255).astype(np.uint8)
+    scale_uint8 = (block_max_exp.astype(np.int32) - max_exp).clip(0, 255).astype(np.uint8)
 
-    scale_factors = np.power(2.0, block_max_exp.astype(np.float64) - max_exp_fp8 - 127)
+    scale_factors = np.power(2.0, block_max_exp.astype(np.float64) - max_exp - 127)
     scale_expanded = np.repeat(np.repeat(scale_factors, 8, axis=0), 4, axis=1)
     clipped = np.clip(
         data_f32.astype(np.float64) / np.where(scale_expanded == 0, 1.0, scale_expanded), -max_val, max_val
     )
 
-    from neuronxcc.starfish.support.dtype import float8_e4m3fn_x4, static_cast
+    return dt.static_cast(clipped.astype(np.float32), out_x4_dtype), scale_uint8
 
-    return static_cast(clipped.astype(np.float32), float8_e4m3fn_x4), scale_uint8
+
+def quantize_mx_golden(src_hbm, out_data_hbm, out_scale_hbm):
+    """Golden reference matching nisa.quantize_mx hardware behavior.
+
+    Calls quantize_to_mx (which returns dense scale [P//8, F//4]) and
+    converts the scale to hardware quadrant layout [P, F//4] so it can
+    be compared against nisa.quantize_mx output.
+
+    Scale layout conversion:
+
+        quantize_to_mx          →  hardware layout
+        [P//8, F//4] dense         [P, F//4] sparse
+
+        ┌────────┐                ┌────────┐
+        │ s0     │                │ s0     │  ← partition 0
+        │ s1     │                │ s1     │  ← partition 1
+        │ s2     │  ──convert──►  │ s2     │  ← partition 2
+        │ s3     │                │ s3     │  ← partition 3
+        │ s4     │                │ 0      │  ← partitions 4-31 (zero padding)
+        │ ...    │                │ ...    │
+        └────────┘                │ s4     │  ← partition 32 (next quadrant)
+                                  │ s5     │
+                                  │ ...    │
+                                  └────────┘
+
+    Args:
+        src_hbm: Input tensor (torch or numpy), any numeric dtype.
+        out_data_hbm: Output data tensor (dtype determines MX format).
+        out_scale_hbm: Output scale tensor (uint8).
+
+    Returns:
+        dict with 'out_data_hbm' (packed x4 numpy) and 'out_scale_hbm' (uint8 numpy [P, F//4]).
+    """
+    src_np = src_hbm.numpy() if hasattr(src_hbm, 'numpy') else src_hbm
+    out_x4_dtype = out_data_hbm.dtype
+
+    if out_x4_dtype == nl.float4_e2m1fn_x4:
+        raise ValueError(
+            "float4_e2m1fn_x4 is not supported by nisa.quantize_mx. Use float8_e4m3fn_x4 or float8_e5m2_x4 instead."
+        )
+
+    packed, scale_block = quantize_to_mx(src_np, out_x4_dtype)
+
+    # Convert [P//8, F//4] block scale to hardware layout [P, F//4]:
+    # 4 valid scale rows per 32-partition quadrant, rest zero.
+    P = src_np.shape[0]
+    _QUADRANT_SIZE = 32
+    _SCALE_PER_QUADRANT = 4
+    num_quadrants = P // _QUADRANT_SIZE
+    scale_hw = np.zeros((P, scale_block.shape[1]), dtype=np.uint8)
+    for quadrant_idx in range(num_quadrants):
+        block_start = quadrant_idx * _SCALE_PER_QUADRANT
+        hw_start = quadrant_idx * _QUADRANT_SIZE
+        scale_hw[hw_start : hw_start + _SCALE_PER_QUADRANT, :] = scale_block[
+            block_start : block_start + _SCALE_PER_QUADRANT, :
+        ]
+
+    return {
+        "out_data_hbm": packed,
+        "out_scale_hbm": scale_hw,
+    }

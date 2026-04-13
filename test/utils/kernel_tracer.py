@@ -11,17 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+import os
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any, List, Optional
 
 import numpy as np
-from neuronxcc.nki_standalone import (
-    NKI_IR_VERSION,
-    _compile_nki_ir_to_tensorizer_ir,
-    _write_tensorizer_ir,
-    compile_nki_ir_kernel_to_neff,
-)
+from nki.compiler.frontend import NKIFrontend, ParserFrontend
 
+# from neuronxcc.nki_standalone import (
+#     NKI_IR_VERSION,
+#     _compile_nki_ir_to_tensorizer_ir,
+#     _write_tensorizer_ir,
+#     compile_nki_ir_kernel_to_neff,
+# )
 from .common_dataclasses import (
     CompilerArgs,
     CustomValidatorWithOutputTensorData,
@@ -160,21 +163,96 @@ def compile_kernel_to_neff(kernel_under_test: KernelArgs, output_directory: str)
         output_directory,
         NKI_IR_VERSION.beta2,
         additional_compiler_args,
+        kernel_under_test.compiler_input.enable_device_dump,
     )
+
+
+# def trace_kernel(
+#     kernel_under_test: KernelArgs,
+#     mode: TraceMode,
+#     output_directory,
+# ):
+#     if mode == TraceMode.TraceOnly:
+#         trace_kernel_only(kernel_under_test, output_directory)
+#     elif mode in (TraceMode.CompileOnly, TraceMode.CompileAndInfer):
+#         compile_kernel_to_neff(kernel_under_test, output_directory)
+#     else:  # Simulator
+#         assert (
+#             False
+#         ), f"Simulator mode not yet supported. Please use {TraceMode.CompileOnly} or {TraceMode.CompileAndInfer}"
+#         # kwargs.update(kernel_input)
+#         # return simulate_kernel(kernel_func, **kwargs)
 
 
 def trace_kernel(
     kernel_under_test: KernelArgs,
     mode: TraceMode,
     output_directory,
-):
-    if mode == TraceMode.TraceOnly:
-        trace_kernel_only(kernel_under_test, output_directory)
-    elif mode in (TraceMode.CompileOnly, TraceMode.CompileAndInfer):
-        compile_kernel_to_neff(kernel_under_test, output_directory)
-    else:  # Simulator
-        assert (
-            False
-        ), f"Simulator mode not yet supported. Please use {TraceMode.CompileOnly} or {TraceMode.CompileAndInfer}"
-        # kwargs.update(kernel_input)
-        # return simulate_kernel(kernel_func, **kwargs)
+    *,
+    frontend: NKIFrontend = ParserFrontend(),
+    dump_python_ast: bool = False,
+    output_names: list[str] | None = None,
+) -> Optional[object]:
+    """Compile NKI kernel to MLIR, and optionally to NEFF.
+
+    Uses the given frontend (ParserFrontend or TracerFrontend) for
+    Python → MLIR compilation. The frontend handles _unwrap_kernel
+    internally, so @nki.jit-decorated kernels work transparently.
+
+    Returns a CompiledKernel for CompileAndInfer mode, None otherwise.
+    """
+    assert isinstance(frontend, ParserFrontend), "must use ParserFrontend for now!"
+
+    # Build cleaned input dict (strip .must_alias_input suffixes)
+    cleaned_input = {}
+    if kernel_under_test.kernel_input is not None:
+        if isinstance(kernel_under_test.kernel_input, PerRankLazyInputGenerator):
+            raw_input = kernel_under_test.kernel_input.for_rank(0)
+        else:
+            raw_input = kernel_under_test.kernel_input
+        cleaned_input = {k.removesuffix(".must_alias_input"): v for k, v in raw_input.items()}
+
+    platform_target = str(kernel_under_test.compiler_input.platform_target.get_compile_target())
+    grid = kernel_under_test.compiler_input.logical_nc_config
+
+    # Python → MLIR via NKIFrontend.compile()
+    result = frontend.compile(
+        kernel_under_test.kernel_func,
+        inputs=cleaned_input,
+        target=platform_target,
+        lnc=grid,
+        artifacts_dir=output_directory,
+        dump_python_ast=dump_python_ast,
+        output_names=output_names,
+    )
+
+    # Write MLIR artifact in debug mode
+    if kernel_under_test.compiler_input.enable_debugging:
+        mlir_path = os.path.join(output_directory, "module.mlir")
+        with open(mlir_path, "w") as f:
+            result.module.operation.print(file=f, enable_debug_info=True, use_local_scope=True)
+
+    if mode not in (TraceMode.CompileOnly, TraceMode.CompileAndInfer):
+        return None
+
+    # MLIR → NEFF via CompiledKernel.from_frontend()
+    from nki.compiler.ncc_driver import CompiledKernel, CompileOptions
+
+    logging.info("Compiling MLIR to NEFF for hardware execution")
+
+    test_additional_cmd_args = kernel_under_test.compiler_input.additional_cmd_args
+    compile_opts = CompileOptions(
+        target=platform_target,
+        lnc=grid,
+        output_path=os.path.join(output_directory, "file.neff"),
+        artifacts_dir=os.path.join(output_directory, "artifacts"),
+        neuronx_cc_args=tuple(test_additional_cmd_args),
+    )
+    compile_opts = compile_opts.disable_backend_optimizations()
+
+    compiled = CompiledKernel.from_frontend(result, compile_opts)
+
+    if not os.path.exists(compiled.neff_path):
+        raise RuntimeError(f"NEFF file not found at {compiled.neff_path}")
+
+    return compiled

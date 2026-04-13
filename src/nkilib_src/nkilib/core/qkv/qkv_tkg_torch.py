@@ -115,6 +115,8 @@ def qkv_tkg_torch_ref(
     if quantization_type == QuantizationType.STATIC:
         qkv_w_scale = qkv_w_scale[0, :].to(torch.float32) if qkv_w_scale is not None else None
         qkv_in_scale = qkv_in_scale[0, 0].to(torch.float32) if qkv_in_scale is not None else None
+    elif quantization_type == QuantizationType.ROW:
+        qkv_w_scale = qkv_w_scale[0, :].to(torch.float32) if qkv_w_scale is not None else None
 
     if fused_add:
         if mlp_prev is None:
@@ -145,8 +147,7 @@ def qkv_tkg_torch_ref(
             raise ValueError("qkv_in_scale required for STATIC quantization")
         hidden /= qkv_in_scale
         hidden = hidden.clip(-FP8_CLIP_VALUE, FP8_CLIP_VALUE)
-    elif quantization_type == QuantizationType.ROW:
-        raise NotImplementedError("ROW quantization not supported")
+    # ROW quantization does not quantize inputs
 
     # Main qkv matmul.
     qkv_out = hidden @ qkv_w
@@ -161,6 +162,8 @@ def qkv_tkg_torch_ref(
         qkv_out[:, :, q_end_idx:k_end_idx] *= qkv_w_scale[1]
         qkv_out[:, :, k_end_idx:v_end_idx] *= qkv_w_scale[2]
         qkv_out *= qkv_in_scale
+    elif quantization_type == QuantizationType.ROW:
+        qkv_out = qkv_out * qkv_w_scale
 
     if qkv_bias is not None:
         qkv_out += qkv_bias

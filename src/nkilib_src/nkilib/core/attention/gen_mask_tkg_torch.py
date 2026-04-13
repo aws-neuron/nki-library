@@ -28,7 +28,16 @@ from typing import Optional, Protocol
 import torch
 
 from ..utils.lnc_subscriptable import LncSubscriptable
-from .attention_tkg_utils import resize_cache_block_len_for_attention_tkg_kernel
+from .attention_tkg_utils import (
+    AttnTKGConfig,
+    resize_cache_block_len_for_attention_tkg_kernel,
+)
+from .attention_tkg_utils import (
+    is_batch_sharded as is_batch_sharded_fn,
+)
+from .attention_tkg_utils import (
+    is_s_prior_sharded as is_s_prior_sharded_fn,
+)
 
 P_MAX = 128
 
@@ -245,12 +254,22 @@ def build_full_attention_mask(
     block_len: int = 0,
     include_active_mask: bool = False,
     transposed: bool = False,
+    enable_fa_s_prior_tiling: bool = True,
+    KVDP: int = 1,
 ) -> torch.Tensor:
     """Convenience wrapper: generates causal active mask, calls build_attention_mask,
     then applies block KV reshaping and transpose.
 
+    Args:
+        enable_fa_s_prior_tiling: Whether flash attention tiling is enabled. Must match
+            the value passed to attention_tkg / attention_block_tkg. Default: True.
+        KVDP: KV data parallelism factor. When > 1, the kernel runs per-rank with
+            batch // KVDP, so sharding decisions use that reduced batch size. Default: 1.
+
     Returns [batch, num_heads, s_active, s_ctx] or transposed [s_ctx, batch, num_heads, s_active].
     """
+    kernel_bs = batch // KVDP
+
     # Optionally generate causal active mask (lower triangular)
     active_mask = None
     if include_active_mask:
@@ -265,18 +284,24 @@ def build_full_attention_mask(
         active_mask=active_mask,
     )
 
-    # Block KV reshaping
-    if block_len > 0:
+    # Block KV reshaping: reorder to [num_folds, block_len, P_MAX] so that
+    # the flat s_ctx dimension is in [n_sprior_tile, P_MAX] row-major order
+    # (n_sprior_tile-major), matching the layout produced by gen_mask_tkg_hbm.
+    if block_len > 0 and mask.numel() > 0:
+        sprior_n_prgs = lnc if lnc > 1 and is_s_prior_sharded_fn(kernel_bs, num_heads, s_active, s_ctx, P_MAX) else 1
         reduced_block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
             s_ctx // block_len,
             block_len,
             lnc,
             P_MAX,
+            kernel_bs,
+            num_heads,
+            s_active,
+            enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
         )
-        mask = mask.reshape(
-            batch, num_heads, s_active, lnc, s_ctx // (lnc * P_MAX * reduced_block_len), P_MAX, reduced_block_len
-        )
-        mask = mask.transpose(-1, -2)
+        mask = mask.reshape(batch, num_heads, s_active, sprior_n_prgs, -1, P_MAX, reduced_block_len)
+        # Permute to (..., num_folds, block_len, P_MAX) then flatten
+        mask = mask.permute(0, 1, 2, 3, 4, 6, 5)
         mask = mask.reshape(batch, num_heads, s_active, s_ctx)
 
     if transposed:
@@ -372,3 +397,170 @@ class _GenMaskTkgTorchRefFn(Protocol):
 
 
 gen_mask_tkg_torch_ref = LncSubscriptable(_gen_mask_tkg_torch_ref_impl, _GenMaskTkgTorchRefFn)
+
+
+# ---------------------------------------------------------------------------
+# HBM wrapper torch reference
+# ---------------------------------------------------------------------------
+
+gen_mask_tkg_hbm_torch_ref: "LncSubscriptable[_GenMaskTkgHbmTorchRefFn]"
+"""
+PyTorch reference for NKI kernel gen_mask_tkg_hbm.
+
+Usage:
+    gen_mask_tkg_hbm_torch_ref[lnc](pos_ids_hbm=..., bs=..., ...)
+
+Args:
+    pos_ids_hbm: [1, bs * s_active] position IDs.
+    bs: Batch size.
+    q_head: Number of query heads.
+    s_active: Active sequence length.
+    s_prior: Total prior sequence length (must be divisible by P_MAX).
+    start_pos_hbm: Optional [1, bs * s_active] SWA start positions.
+    block_len: Block length for block KV cache (0 = flat). Default: 0.
+    active_mask: Optional [s_active, bs, q_head, s_active] active mask.
+
+Returns:
+    [s_prior, bs, q_head, s_active] generated mask.
+"""
+
+
+def _gen_mask_tkg_hbm_torch_ref_impl(
+    pos_ids_hbm: torch.Tensor,
+    bs: int,
+    q_head: int,
+    s_active: int,
+    s_prior: int,
+    start_pos_hbm: Optional[torch.Tensor] = None,
+    block_len: int = 0,
+    active_mask: Optional[torch.Tensor] = None,
+    enable_fa_s_prior_tiling: bool = True,
+) -> torch.Tensor:
+    """Generate mask matching gen_mask_tkg_hbm kernel output format.
+
+    Builds the full mask over all s_prior positions, reshapes to the kernel's
+    5D tiled layout, then handles batch-sharded LNC by zeroing non-owned
+    batch slices.
+    """
+    lnc = gen_mask_tkg_hbm_torch_ref.lnc
+
+    strided_mm1 = block_len == 0
+
+    # LNC sharding decision (mirrors gen_mask_tkg_hbm kernel logic)
+    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior)
+
+    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+        batch_sharded = False
+    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+        batch_sharded = True
+    else:
+        batch_sharded = False
+
+    # Adjust block_len for hardware constraints
+    if block_len > 0:
+        num_blocks_per_batch = s_prior // block_len
+        block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
+            num_blocks_per_batch,
+            block_len,
+            lnc,
+            P_MAX,
+            bs,
+            q_head,
+            s_active,
+            enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+        )
+
+    n_sprior_tile = s_prior // P_MAX
+
+    # Build full mask over all s_prior positions per batch element.
+    # Active mask placement at the tail of s_prior is handled by
+    # build_attention_mask / build_swa_attention_mask.
+    active_standard = None
+    if active_mask is not None:
+        # [s_active, bs, q_head, s_active] → [bs, q_head, s_active, s_active]
+        active_standard = active_mask[:, :bs, :, :].permute(1, 2, 3, 0).float()
+
+    if start_pos_hbm is not None:
+        start_vals = start_pos_hbm[0, : bs * s_active].to(torch.float32)
+        end_vals = pos_ids_hbm[0, : bs * s_active].to(torch.float32)
+        full_mask = build_swa_attention_mask(
+            start_vals=start_vals,
+            end_vals=end_vals,
+            batch=bs,
+            num_heads=q_head,
+            s_active=s_active,
+            s_ctx=s_prior,
+            active_mask=active_standard,
+        )
+    else:
+        cache_lens = pos_ids_hbm[0, ::s_active][:bs].to(torch.float32)
+        full_mask = build_attention_mask(
+            cache_lens=cache_lens,
+            batch=bs,
+            num_heads=q_head,
+            s_active=s_active,
+            s_ctx=s_prior,
+            active_mask=active_standard,
+        )
+    # full_mask: [bs, q_head, s_active, s_prior]
+
+    # Reshape to 5D tiled kernel format using the global tile count
+    full_mask_5d = _reshape_to_kernel_format(full_mask, bs, q_head, s_active, n_sprior_tile, block_len, strided_mm1)
+    # full_mask_5d: [P_MAX, n_sprior_tile, bs, q_head, s_active]
+
+    # For batch-sharded LNC=2, each shard only writes its own batch slice;
+    # the other slice stays zero. Combine both shards' contributions.
+    if batch_sharded:
+        bs_per_shard = bs // lnc
+        combined = torch.zeros_like(full_mask_5d)
+        for shard_id in range(lnc):
+            b_start = shard_id * bs_per_shard
+            b_end = b_start + bs_per_shard
+            combined[:, :, b_start:b_end, :, :] = full_mask_5d[:, :, b_start:b_end, :, :]
+        full_mask_5d = combined
+
+    # Transpose to n_sprior_tile-major: [n_sprior_tile, P_MAX, bs, q_head, s_active]
+    # The kernel stores in n_sprior_tile-major order (row width = P_MAX) so that
+    # flat slicing at multiples of P_MAX always lands on row boundaries.
+    full_mask_5d = full_mask_5d.permute(1, 0, 2, 3, 4).contiguous()
+
+    # Flatten to HBM output format: [s_prior, bs, q_head, s_active]
+    return full_mask_5d.reshape(s_prior, bs, q_head, s_active)
+
+
+class _GenMaskTkgHbmTorchRefFn(Protocol):
+    def __call__(
+        self,
+        pos_ids_hbm: torch.Tensor,
+        bs: int,
+        q_head: int,
+        s_active: int,
+        s_prior: int,
+        start_pos_hbm: Optional[torch.Tensor] = None,
+        block_len: int = 0,
+        active_mask: Optional[torch.Tensor] = None,
+        enable_fa_s_prior_tiling: bool = True,
+    ) -> torch.Tensor:
+        """
+        PyTorch reference for NKI kernel gen_mask_tkg_hbm.
+
+        Usage:
+            gen_mask_tkg_hbm_torch_ref[lnc](pos_ids_hbm=..., bs=..., ...)
+
+        Args:
+            pos_ids_hbm: [1, bs * s_active] position IDs.
+            bs: Batch size.
+            q_head: Number of query heads.
+            s_active: Active sequence length.
+            s_prior: Total prior sequence length (must be divisible by P_MAX).
+            start_pos_hbm: Optional [1, bs * s_active] SWA start positions.
+            block_len: Block length for block KV cache (0 = flat). Default: 0.
+            active_mask: Optional [s_active, bs, q_head, s_active] active mask.
+
+        Returns:
+            [s_prior, bs, q_head, s_active] generated mask.
+        """
+        ...
+
+
+gen_mask_tkg_hbm_torch_ref = LncSubscriptable(_gen_mask_tkg_hbm_torch_ref_impl, _GenMaskTkgHbmTorchRefFn)

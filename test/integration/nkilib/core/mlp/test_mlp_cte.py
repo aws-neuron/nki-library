@@ -47,6 +47,8 @@ from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.ranged_test_harness import (
     DimensionRangeConfig,
     RangeManualGeneratorStrategy,
+    RangeMonotonicGeneratorStrategy,
+    RangeRandomGeneratorStrategy,
     RangeTestCase,
     RangeTestConfig,
     TensorConfig,
@@ -657,6 +659,10 @@ class TestMlpCteKernel:
                     ),
                 },
                 monotonic_step_percent=75,
+                custom_generators=[
+                    RangeRandomGeneratorStrategy(num_of_samples=1),
+                    RangeMonotonicGeneratorStrategy(step_percent=75),
+                ],
             ),
         )
 
@@ -685,6 +691,10 @@ class TestMlpCteKernel:
                     ),
                 },
                 monotonic_step_percent=50,
+                custom_generators=[
+                    RangeRandomGeneratorStrategy(num_of_samples=1),
+                    RangeMonotonicGeneratorStrategy(step_percent=50),
+                ],
             ),
         )
 
@@ -707,10 +717,6 @@ class TestMlpCteKernel:
             # Pass entire config dict - all params used for metadata matching
             collector.match_and_add_metadata_dimensions(config, mlp_cte_metadata_list)
 
-        skip_gate_bias = bool(config[SKIP_GATE_DIM_NAME])
-        if skip_gate_bias:
-            pytest.skip("Skipping skip gate tests for now")
-
         lnc_count = config.get(VNC_DEGREE_DIM_NAME, None)
         compiler_args = CompilerArgs(logical_nc_config=lnc_count, platform_target=platform_target)
         self.run_range_mlp_cte_test(
@@ -723,7 +729,7 @@ class TestMlpCteKernel:
             quant_type=QuantizationType(config[QUANT_TYPE_DIM_NAME]),
             fused_add=bool(config[FUSED_ADD_DIM_NAME]),
             store_add=bool(config[STORE_ADD_DIM_NAME]),
-            skip_gate=skip_gate_bias,
+            skip_gate=bool(config[SKIP_GATE_DIM_NAME]),
             act_fn_type=ActFnType(config[ACT_FN_TYPE_DIM_NAME]),
             gate_bias=bool(config[GATE_BIAS_DIM_NAME]),
             up_bias=bool(config[UP_BIAS_DIM_NAME]),

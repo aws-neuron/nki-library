@@ -30,46 +30,6 @@ _FA_TILE_SIZE = 8 * 1024  # 8K - serves as both threshold and tile size
 _BATCH_TILE_SBUF_BUDGET = 16 * 1024 * 1024
 
 
-def uses_flash_attention(s_prior: int) -> Tuple[bool, int]:
-    """
-    Return True if flash attention is used for the given s_prior (per NC).
-    Also returns the tile size.
-    """
-    return (s_prior > _FA_TILE_SIZE, _FA_TILE_SIZE)
-
-
-def uses_batch_tiling(bs_per_nc: int, q_head: int, s_active: int, fa_tile_s_prior: int) -> Tuple[bool, int]:
-    """
-    Determine if batch tiling is needed and compute the batch tile size.
-
-    Batch tiling is used when the full per-NC batch exceeds the SBUF memory budget.
-
-    Returns (use_batch_tiling, batch_tile_size) where batch_tile_size <= bs_per_nc.
-    """
-    per_batch_cost = 8 * q_head * s_active * fa_tile_s_prior
-    if per_batch_cost == 0:
-        return (False, bs_per_nc)
-    max_tile_bs = _BATCH_TILE_SBUF_BUDGET // per_batch_cost
-    kernel_assert(
-        max_tile_bs >= 1,
-        f"Cannot fit even a single batch in SBUF. "
-        f"q_head={q_head}, s_active={s_active}, fa_tile_s_prior={fa_tile_s_prior} "
-        f"requires {per_batch_cost} bytes per batch, exceeding budget of {_BATCH_TILE_SBUF_BUDGET}.",
-    )
-    max_tile_bs = min(bs_per_nc, max_tile_bs)
-    return (max_tile_bs < bs_per_nc, max_tile_bs)
-
-
-def is_fp8_e4m3(dtype) -> bool:
-    """Check if dtype is FP8 E4M3 (handles both numpy dtype and compiler internal name)."""
-    return dtype == nl.float8_e4m3 or str(dtype) == "float8e4"
-
-
-def is_fp8_e5m2(dtype) -> bool:
-    """Check if dtype is FP8 E5M2 (handles both numpy dtype and compiler internal name)."""
-    return dtype == nl.float8_e5m2 or str(dtype) == "float8e5"
-
-
 @dataclass
 class AttnTKGConfig(nl.NKIObject):
     """Configuration for token-generation attention kernel.
@@ -129,6 +89,10 @@ class AttnTKGConfig(nl.NKIObject):
     out_in_sb: bool = False
     """Output attention tensor should remain in SBUF instead of being stored to HBM."""
 
+    enable_fa_s_prior_tiling: bool = True
+    """Whether to enable Flash Attention (FA) with s_prior tiling.
+    When enabled, tiles the attention computation across s_prior to reduce peak memory usage."""
+
 
 ### Constants
 @dataclass
@@ -165,13 +129,58 @@ class TileConstants(nl.NKIObject):
         )
 
 
-def is_batch_sharded(cfg: AttnTKGConfig, p_max: int):
+def uses_flash_attention(cfg_flag: bool, s_prior: int) -> Tuple[bool, int]:
+    """
+    Returns if flash attention should be enabled, also returns the tile size.
+    """
+
+    should_enable = cfg_flag if not cfg_flag else s_prior > _FA_TILE_SIZE
+
+    return (should_enable, _FA_TILE_SIZE)
+
+
+def uses_batch_tiling(bs_per_nc: int, q_head: int, s_active: int, fa_tile_s_prior: int) -> Tuple[bool, int]:
+    """
+    Determine if batch tiling is needed and compute the batch tile size.
+
+    Batch tiling is used when the full per-NC batch exceeds the SBUF memory budget.
+
+    Returns (use_batch_tiling, batch_tile_size) where batch_tile_size <= bs_per_nc.
+    """
+    per_batch_cost = 8 * q_head * s_active * fa_tile_s_prior
+    if per_batch_cost == 0:
+        return (False, bs_per_nc)
+    max_tile_bs = _BATCH_TILE_SBUF_BUDGET // per_batch_cost
+    kernel_assert(
+        max_tile_bs >= 1,
+        f"Cannot fit even a single batch in SBUF. "
+        f"q_head={q_head}, s_active={s_active}, fa_tile_s_prior={fa_tile_s_prior} "
+        f"requires {per_batch_cost} bytes per batch, exceeding budget of {_BATCH_TILE_SBUF_BUDGET}.",
+    )
+    max_tile_bs = min(bs_per_nc, max_tile_bs)
+    return (max_tile_bs < bs_per_nc, max_tile_bs)
+
+
+def is_fp8_e4m3(dtype) -> bool:
+    """Check if dtype is FP8 E4M3 (handles both numpy dtype and compiler internal name)."""
+    return dtype == nl.float8_e4m3 or str(dtype) == "float8e4"
+
+
+def is_fp8_e5m2(dtype) -> bool:
+    """Check if dtype is FP8 E5M2 (handles both numpy dtype and compiler internal name)."""
+    return dtype == nl.float8_e5m2 or str(dtype) == "float8e5"
+
+
+def is_batch_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_max: int):
     """
     Returns true if for lnc=2, batch should be sharded given the configuration.
 
     Args:
-      cfg: Attention kernel's configuration
-      p_max: Number of parittions in the SBUF
+      bs: Batch size.
+      q_head: Number of query heads.
+      s_active: Active sequence length.
+      curr_sprior: Current prior sequence length.
+      p_max: Number of partitions in the SBUF.
 
     NOTE: this function is used both at trace time and also for testing infrastructure.
           Thus, it needs to take p_max as an argument.
@@ -180,10 +189,10 @@ def is_batch_sharded(cfg: AttnTKGConfig, p_max: int):
     # Batch sharding is needed if:
     # - BQS is large, to reduce the number of BQS tiles, or
     # - s_prior is too small to shard
-    return (cfg.bs % LNC == 0) and (cfg.bs * cfg.q_head * cfg.s_active > p_max or cfg.curr_sprior < 256)
+    return (bs % LNC == 0) and (bs * q_head * s_active > p_max or curr_sprior < 256)
 
 
-def is_s_prior_sharded(cfg: AttnTKGConfig, p_max: int):
+def is_s_prior_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_max: int):
     """
     Returns true if for lnc=2, s_prior should be sharded given the configuration.
 
@@ -192,8 +201,11 @@ def is_s_prior_sharded(cfg: AttnTKGConfig, p_max: int):
     - s_prior is large enough to shard (>= 2 * p_max)
 
     Args:
-      cfg: Attention kernel's configuration
-      p_max: Number of partitions in the SBUF
+      bs: Batch size.
+      q_head: Number of query heads.
+      s_active: Active sequence length.
+      curr_sprior: Current prior sequence length.
+      p_max: Number of partitions in the SBUF.
 
     NOTE: this function is used both at trace time and also for testing infrastructure.
           Thus, it needs to take p_max as an argument.
@@ -201,57 +213,101 @@ def is_s_prior_sharded(cfg: AttnTKGConfig, p_max: int):
     # s_prior sharding requires:
     # 1. Batch is not sharded (batch sharding takes priority)
     # 2. s_prior is large enough to shard across 2 cores
-    return not is_batch_sharded(cfg, p_max) and cfg.curr_sprior >= 2 * p_max
+    return not is_batch_sharded(bs, q_head, s_active, curr_sprior, p_max) and curr_sprior >= 2 * p_max
 
 
-def get_total_n_prgs(cfg: AttnTKGConfig, lnc: int, p_max: int) -> int:
+def get_total_n_prgs(bs: int, q_head: int, s_active: int, curr_sprior: int, lnc: int, p_max: int) -> int:
     """Compute the total number of programs (NCs) used, matching the kernel's sharding logic.
 
     Returns lnc if either batch or s_prior sharding is active, otherwise 1.
 
     Args:
-        cfg: Attention kernel's configuration.
+        bs: Batch size.
+        q_head: Number of query heads.
+        s_active: Active sequence length.
+        curr_sprior: Current prior sequence length.
         lnc: Number of logical neuron cores (1 or 2).
         p_max: Number of partitions in the SBUF.
     """
     if lnc <= 1:
         return 1
-    if is_batch_sharded(cfg, p_max) or is_s_prior_sharded(cfg, p_max):
+    _args = (bs, q_head, s_active, curr_sprior, p_max)
+    if is_batch_sharded(*_args) or is_s_prior_sharded(*_args):
         return lnc
     return 1
 
 
 ### Block KV
 def resize_cache_block_len_for_attention_tkg_kernel(
-    num_blocks_per_batch: int, block_len: int, n_prgs: int, p_max: int, full_sprior: int = 0
+    num_blocks_per_batch: int,
+    block_len: int,
+    lnc: int,
+    p_max: int,
+    bs: int,
+    q_head: int,
+    s_active: int,
+    full_sprior: int = 0,
+    enable_fa_s_prior_tiling: bool = True,
 ):
     """
-    Block KV in token gen attention requires number of blocks per batch to be a multiple of (lnc * p_max).
-    This allows loading p_max blocks onto SBUF partitions in parallel.
-    If the block count is not divisible by (lnc * p_max), we will reduce block_len to increase num_blocks_per_batch.
-    As long as the bucket_len is divisible by lnc * p_max, there is always a block_len (min. 1) that satisfies the requirement.
+    Block KV in token gen attention loads p_max blocks per fold onto SBUF partitions in parallel.
+    The s_prior dimension is sharded across sprior_n_prgs NCs, so the block count per shard must
+    be a multiple of p_max. If not, we reduce block_len to increase num_blocks_per_batch.
+
+    Resize block_len so that:
+      1. num_blocks_per_batch (after resize) is a multiple of (sprior_n_prgs * p_max).
+      2. If flash attention is active, fa_tile_size and the last FA tile remainder are both
+         divisible by (reduced_block_len * p_max).
+
 
     Args:
       num_blocks_per_batch: Number of blocks in each batch. Generally the second dimension of the active blocks table.
       block_len: The size of each block.
-      n_prgs: Sharding level.
+      lnc: Number of logical neuron cores (1 or 2).
       p_max: Maximum number of partitions.
+      bs: Batch size. Used to determine sharding mode.
+      q_head: Number of query heads. Used to determine sharding mode.
+      s_active: Active sequence length. Used to determine sharding mode.
       full_sprior: Maximum KV cache capacity (bucket size). Used for warning suggestions.
+      enable_fa_s_prior_tiling: Whether flash attention tiling is enabled. Must match the value
+          passed to attention_tkg / attention_block_tkg. Default True.
 
     NOTE: This function is used both at trace time and by testing infrastructure. Thus, it needs to take p_max as an argument.
     """
     bucket_len = num_blocks_per_batch * block_len
-    min_multiple = n_prgs * p_max
+    sprior_n_prgs = lnc if lnc > 1 and is_s_prior_sharded(bs, q_head, s_active, bucket_len, p_max) else 1
+    min_multiple = sprior_n_prgs * p_max
     kernel_assert(
         bucket_len % min_multiple == 0,
         (
-            "Cannot resize cache blocks for block KV. Number of blocks per batch must be a multiple of (lnc_size * p_max)."
-            "Consider changing the bucket length (num_blocks_per_batch * block_len) to at least a multiple of (lnc_size * p_max)."
+            "Cannot resize cache blocks for block KV. Number of blocks per batch must be a multiple of (sprior_n_prgs * p_max). "
+            "Consider changing the bucket length (num_blocks_per_batch * block_len) to at least a multiple of (sprior_n_prgs * p_max)."
         ),
     )
 
-    # Find the greates multiple of block_len that also divides the maximum block length.
-    reduced_blk_len = math.gcd(block_len, bucket_len // min_multiple)
+    # reduced_blk_len must divide all of these (expressed as multiples of p_max):
+    #   - bucket_len // (sprior_n_prgs * p_max)  [block count divisibility]
+    #   - fa_tile_size // p_max                   [FA tile divisibility, if FA active]
+    #   - last_fa_tile // p_max                   [last FA tile remainder, if partial]
+    divisor = bucket_len // min_multiple
+
+    s_prior_per_shard = bucket_len // sprior_n_prgs
+    use_fa, fa_tile_size = uses_flash_attention(enable_fa_s_prior_tiling, s_prior_per_shard)
+    if use_fa:
+        kernel_assert(
+            fa_tile_size % p_max == 0,
+            f"FA tile size must be divisible by p_max, got fa_tile_size={fa_tile_size}, p_max={p_max}",
+        )
+        divisor = math.gcd(divisor, fa_tile_size // p_max)
+        last_tile = s_prior_per_shard % fa_tile_size
+        if last_tile > 0:
+            kernel_assert(
+                last_tile % p_max == 0,
+                f"Last FA tile must be divisible by p_max, got last_tile={last_tile}, p_max={p_max}",
+            )
+            divisor = math.gcd(divisor, last_tile // p_max)
+
+    reduced_blk_len = math.gcd(block_len, divisor)
     resize_factor = block_len // reduced_blk_len
 
     if resize_factor != 1:

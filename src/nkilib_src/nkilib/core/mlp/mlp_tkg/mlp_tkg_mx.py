@@ -113,8 +113,8 @@ def mlp_tkg_mx(
 
     # Validate inputs
     kernel_assert(
-        params.quant_params.is_quant_mx(),
-        "mlp_tkg_mx requires MXFP quantization (QuantizationType.MX)",
+        params.quant_params.is_dtype_mx(),
+        "mlp_tkg_mx requires MXFP quantization",
     )
     kernel_assert(
         not mlpp_has_normalization(params) or mlpp_has_rms_normalization(params),

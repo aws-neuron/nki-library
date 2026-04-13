@@ -35,6 +35,7 @@ import nki.language as nl
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil
+from ..utils.tensor_view import TensorView
 
 _FLOAT32_MIN: float = -3.4028235e38  # Value for masked attention positions
 
@@ -48,6 +49,8 @@ def attention_bwd(
     dy_ref: nl.ndarray,
     lse_ref: nl.ndarray,
     sinks_ref: Optional[nl.ndarray] = None,
+    bound_min: Optional[nl.ndarray] = None,
+    bound_max: Optional[nl.ndarray] = None,
     use_causal_mask: bool = False,
     mixed_precision: bool = False,
     softmax_scale: Optional[float] = None,
@@ -77,6 +80,16 @@ def attention_bwd(
         lse_ref (nl.ndarray): [bs, nheads, tile_size, seq_len_q // tile_size],
             Log-sum-exp from forward pass in HBM
         sinks_ref (Optional[nl.ndarray]): [bs, nheads] or [bs, nheads, num_sinks], Attention sinks tensor in HBM.
+        bound_min (Optional[nl.ndarray]): [seq_len_q], float32. For sequence packing: K-index where
+            the sequence containing each Q token starts. Pre-expanded from cu_seqlens on CPU.
+        bound_max (Optional[nl.ndarray]): [seq_len_q], float32. For sequence packing: K-index where
+            the sequence containing each Q token ends (exclusive). Must span the full packed sequence
+            length to avoid nan in output. For causal masking, clamped to min(bound_max[i], i+1) on device.
+
+            Example: 3 packed sequences of lengths 2, 3, 2 (total_q = 7):
+                cu_seqlens = [0, 2, 5, 7]
+                bound_min  = [0, 0, 2, 2, 2, 5, 5]  # K-start of each token's sequence
+                bound_max  = [2, 2, 5, 5, 5, 7, 7]  # K-end (exclusive) of each token's sequence
         use_causal_mask (bool): If True, apply causal masking
         mixed_precision (bool): If True, use float32 for intermediate computations
         softmax_scale (Optional[float]): Scaling factor for attention scores. Defaults to 1/sqrt(head_dim).
@@ -93,6 +106,8 @@ def attention_bwd(
         - Causal masking requires seq_len_q == seq_len_k
         - Sliding window is only supported with causal masking
         - All input tensors must have the same dtype
+        - bound_min and bound_max must both be provided together for sequence packing
+        - Sequence packing can be combined with causal masking and/or sliding window
 
     Pseudocode:
         # Step 1: Compute D = rowsum(dO ◦ O) (pointwise multiply)
@@ -129,7 +144,9 @@ def attention_bwd(
     _, nheads_kv, _, seqlen_k = k_ref.shape
     sliding_window = sliding_window or 0
 
-    validate_inputs(q_ref, k_ref, v_ref, o_ref, dy_ref, lse_ref, sinks_ref, use_causal_mask, sliding_window)
+    validate_inputs(
+        q_ref, k_ref, v_ref, o_ref, dy_ref, lse_ref, sinks_ref, bound_min, bound_max, use_causal_mask, sliding_window
+    )
 
     # Softmax scaling factor, multiplied onto Q
     softmax_scale = softmax_scale or 1.0 / float(d_head**0.5)
@@ -155,6 +172,8 @@ def attention_bwd(
         dy_ref,
         lse_ref,
         sinks_ref,
+        bound_min,
+        bound_max,
         use_causal_mask,
         mixed_precision,
         softmax_scale,
@@ -174,6 +193,8 @@ def validate_inputs(
     dy_ref: nl.ndarray,
     lse_ref: nl.ndarray,
     sinks_ref: Optional[nl.ndarray],
+    bound_min: Optional[nl.ndarray],
+    bound_max: Optional[nl.ndarray],
     use_causal_mask: bool,
     sliding_window: int,
 ) -> None:
@@ -235,6 +256,22 @@ def validate_inputs(
             f"Attention sinks may need to be replicated along batch dim, required shape {sinks_shape}, got {sinks_ref.shape}",
         )
     kernel_assert(sliding_window <= 0 or use_causal_mask, "Sliding window is supported for causal attention only")
+    kernel_assert(
+        (bound_min is None) == (bound_max is None),
+        "bound_min and bound_max must both be provided (for sequence packing) or both be None",
+    )
+    if bound_min is not None:
+        bs, nheads, d_head, seqlen_q = q_ref.shape
+        kernel_assert(
+            tuple(bound_min.shape) == (seqlen_q,),
+            f"bound_min must have shape (seqlen_q,)=({seqlen_q},), got {bound_min.shape}",
+        )
+        kernel_assert(
+            tuple(bound_max.shape) == (seqlen_q,),
+            f"bound_max must have shape (seqlen_q,)=({seqlen_q},), got {bound_max.shape}",
+        )
+        kernel_assert(bound_min.dtype == nl.float32, f"bound_min must be float32, got {bound_min.dtype}")
+        kernel_assert(bound_max.dtype == nl.float32, f"bound_max must be float32, got {bound_max.dtype}")
 
 
 @dataclass
@@ -313,12 +350,16 @@ class AttentionBwdConfig(nl.NKIObject):
     offset_sinks_bs: int
     offset_sinks_head: int
 
+    # sequence packing
+    use_sequence_packing: bool
+
 
 def setup_config(
     q_ref: nl.ndarray,
     k_ref: nl.ndarray,
     sinks_ref: Optional[nl.ndarray],
     mixed_precision: bool,
+    use_sequence_packing: bool = False,
     q_seq_tile_size: int = nl.tile_size.pmax,
     k_seq_tile_size: int = nl.tile_size.psum_fmax,
     k_seq_tile_size_backward: int = nl.tile_size.pmax,
@@ -435,6 +476,8 @@ def setup_config(
         num_sinks=num_sinks,
         offset_sinks_bs=offset_sinks_bs,
         offset_sinks_head=offset_sinks_head,
+        # Sequence packing
+        use_sequence_packing=use_sequence_packing,
     )
 
 
@@ -816,6 +859,8 @@ def recompute_qk_softmax(
     local_i_q_seq_tile: int,
     local_i_k_seq_tile: int,
     global_k_seq_offset: int = 0,
+    bound_min_sbuf: Optional[nl.ndarray] = None,
+    bound_max_sbuf: Optional[nl.ndarray] = None,
 ) -> None:
     """
     Compute Q @ K^T and apply softmax (recomputation for backward pass).
@@ -841,6 +886,10 @@ def recompute_qk_softmax(
         local_i_q_seq_tile (int): Current Q sequence tile index.
         local_i_k_seq_tile (int): Current K sequence tile index.
         global_k_seq_offset (int): Global offset for K sequence (for tiled impl).
+        bound_min_sbuf (Optional[nl.ndarray]): Sequence packing lower bounds in SBUF,
+            shape (q_seq_tile_size, q_seq_n_tiles). None if not using sequence_packing.
+        bound_max_sbuf (Optional[nl.ndarray]): Sequence packing upper bounds in SBUF (clamped for causal),
+            shape (q_seq_tile_size, q_seq_n_tiles). None if not using sequence_packing.
 
     Returns:
         None
@@ -848,6 +897,9 @@ def recompute_qk_softmax(
     q_seq_tile_size = cfg.q_seq_tile_size
     k_seq_tile_size = cfg.k_seq_tile_size
     d_head_n_tiles = cfg.d_head_n_tiles
+    use_sequence_packing = cfg.use_sequence_packing
+
+    k_tile_start_pos = global_k_seq_offset + local_i_k_seq_tile * k_seq_tile_size
 
     qk_res_buf = ndarray((q_tile_group_size,), (q_seq_tile_size, k_seq_tile_size), nl.float32)
     for i_q_tile_group_size in range(q_tile_group_size):
@@ -864,18 +916,34 @@ def recompute_qk_softmax(
                 moving=k_local[i_d_head_tile],
                 dst=qk_psum,
             )
-        nisa.tensor_copy(qk_res_buf[i_q_tile_group_size], qk_psum)
+
+        grp_idx = local_i_q_seq_tile + i_q_tile_group_size
+        if use_sequence_packing:
+            # Fuse PSUM->SBUF copy and masking in one range_select instruction.
+            # bound_max_sbuf is already clamped to min(bound_max, q+1) for causal (done in flash_attn_bwd).
+            nisa.range_select(
+                dst=qk_res_buf[i_q_tile_group_size],
+                on_true_tile=qk_psum,
+                on_false_value=_FLOAT32_MIN,
+                comp_op0=nl.greater_equal,  # k_idx >= bound_min[q_idx]
+                comp_op1=nl.less,  # k_idx < bound_max[q_idx]
+                bound0=bound_min_sbuf[:, grp_idx : grp_idx + 1],
+                bound1=bound_max_sbuf[:, grp_idx : grp_idx + 1],
+                range_start=k_tile_start_pos,
+            )
+        else:
+            nisa.tensor_copy(qk_res_buf[i_q_tile_group_size], qk_psum)
 
     for i_q_tile_group_size in range(q_tile_group_size):
         if not tile_required[i_q_tile_group_size]:
             continue
 
-        if use_causal_mask:
+        grp_idx = local_i_q_seq_tile + i_q_tile_group_size
+        if not use_sequence_packing and use_causal_mask:
             nisa.affine_select(
                 qk_res_buf[i_q_tile_group_size],
                 pattern=[[-1, k_seq_tile_size]],
-                offset=(local_i_q_seq_tile + i_q_tile_group_size) * q_seq_tile_size
-                - (global_k_seq_offset + local_i_k_seq_tile * k_seq_tile_size),
+                offset=grp_idx * q_seq_tile_size - k_tile_start_pos,
                 channel_multiplier=1,
                 cmp_op=nl.greater_equal,
                 on_true_tile=qk_res_buf[i_q_tile_group_size],
@@ -886,8 +954,7 @@ def recompute_qk_softmax(
                 nisa.affine_select(
                     qk_res_buf[i_q_tile_group_size],
                     pattern=[[1, k_seq_tile_size]],
-                    offset=(global_k_seq_offset + local_i_k_seq_tile * k_seq_tile_size)
-                    - ((local_i_q_seq_tile + i_q_tile_group_size) * q_seq_tile_size - sliding_window + 1),
+                    offset=k_tile_start_pos - (grp_idx * q_seq_tile_size - sliding_window + 1),
                     channel_multiplier=-1,
                     cmp_op=nl.greater_equal,
                     on_true_tile=qk_res_buf[i_q_tile_group_size],
@@ -981,6 +1048,8 @@ def flash_attn_bwd(
     dy_ref: nl.ndarray,
     lse_ref: nl.ndarray,
     sinks_ref: Optional[nl.ndarray],
+    bound_min: Optional[nl.ndarray],
+    bound_max: Optional[nl.ndarray],
     use_causal_mask: bool,
     mixed_precision: bool,
     softmax_scale: float,
@@ -1015,7 +1084,7 @@ def flash_attn_bwd(
         Parallelization is across batch * nheads_kv dimension.
         dQ is written incrementally and reloaded for each K section.
     """
-    cfg = setup_config(q_ref, k_ref, sinks_ref, mixed_precision)
+    cfg = setup_config(q_ref, k_ref, sinks_ref, mixed_precision, use_sequence_packing=bound_min is not None)
 
     # Common variables
     bs = cfg.bs
@@ -1032,6 +1101,34 @@ def flash_attn_bwd(
 
     kernel_dtype = cfg.kernel_dtype
     mixed_dtype = cfg.mixed_dtype
+
+    # Load sequence_packing bound vectors from HBM into SBUF once (shape: (q_seq_tile_size, q_seq_n_tiles))
+    # For causal, bound_max is clamped to min(bound_max[q], q+1) so range_select handles both cases uniformly.
+    bound_min_sbuf = None
+    bound_max_sbuf = None
+    if cfg.use_sequence_packing:
+        bound_min_sbuf = nl.ndarray((q_seq_tile_size, q_seq_n_tiles), dtype=nl.float32, buffer=nl.sbuf)
+        bound_max_sbuf = nl.ndarray((q_seq_tile_size, q_seq_n_tiles), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=bound_min_sbuf,
+            src=TensorView(bound_min).reshape((q_seq_n_tiles, q_seq_tile_size)).permute((1, 0)).get_view(),
+        )
+        nisa.dma_copy(
+            dst=bound_max_sbuf,
+            src=TensorView(bound_max).reshape((q_seq_n_tiles, q_seq_tile_size)).permute((1, 0)).get_view(),
+        )
+        if use_causal_mask:
+            # Clamp bound_max to causal upper bound: effective_ub[q] = min(bound_max[q], q+1)
+            causal_ub = nl.ndarray((q_seq_tile_size, q_seq_n_tiles), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.iota(causal_ub, pattern=[[q_seq_tile_size, q_seq_n_tiles]], offset=1, channel_multiplier=1)
+            nisa.tensor_tensor(bound_max_sbuf, bound_max_sbuf, causal_ub, op=nl.minimum)
+        if sliding_window > 0:
+            # Clamp bound_min to SWA lower bound: effective_lb[q] = max(bound_min[q], q - sliding_window + 1)
+            swa_lb = nl.ndarray((q_seq_tile_size, q_seq_n_tiles), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.iota(
+                swa_lb, pattern=[[q_seq_tile_size, q_seq_n_tiles]], offset=-(sliding_window - 1), channel_multiplier=1
+            )
+            nisa.tensor_tensor(bound_min_sbuf, bound_min_sbuf, swa_lb, op=nl.maximum)
 
     # Calculate start and end indices for sharded input
     if nl.program_ndim() == 0:
@@ -1221,6 +1318,8 @@ def flash_attn_bwd(
                                 tile_required=tile_required,
                                 q_tile_group_size=cur_q_tile_group_size,
                                 global_k_seq_offset=k_seq_start,
+                                bound_min_sbuf=bound_min_sbuf,
+                                bound_max_sbuf=bound_max_sbuf,
                             )
 
                     # Write dq
@@ -1327,6 +1426,8 @@ def _flash_attn_bwd_core(
     tile_required: List[bool],
     q_tile_group_size: int = 1,
     global_k_seq_offset: int = 0,
+    bound_min_sbuf: Optional[nl.ndarray] = None,
+    bound_max_sbuf: Optional[nl.ndarray] = None,
 ) -> None:
     """
     Core backward pass computation for flash attention.
@@ -1376,6 +1477,8 @@ def _flash_attn_bwd_core(
         local_i_q_seq_tile,
         local_i_k_seq_tile,
         global_k_seq_offset=global_k_seq_offset,
+        bound_min_sbuf=bound_min_sbuf,
+        bound_max_sbuf=bound_max_sbuf,
     )
 
     # Step 4: Calculate the softmax backward gradients dL/dx, where y=softmax(x).

@@ -18,7 +18,7 @@
 """Unified tests for moe_cte entry point covering all implementations."""
 
 import math
-from test.integration.nkilib.core.moe.moe_cte.test_moe_cte import (
+from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     ACT_FN_DIM_NAME,
     BIAS_DIM_NAME,
     BLOCK_SIZE_DIM_NAME,

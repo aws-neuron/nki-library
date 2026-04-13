@@ -12,10 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Loss function kernels for NKI Library."""
-
-from .cross_entropy import cross_entropy_forward
-
-__all__ = [
-    "cross_entropy_forward",
-]
+"""Integration tests for dynamic_shapes experimental kernels."""

@@ -17,13 +17,14 @@
 import math
 from typing import Optional
 
+import nki.language as nl
 import numpy as np
 import torch
 
 from ...utils.common_types import QuantizationType
 from ...utils.mx_torch_common import (
     mx_matmul,
-    quantize_to_mx_fp8,
+    quantize_to_mx,
     unpack_float4_x4,
     unpack_float8_e4m3fn_x4,
 )
@@ -268,11 +269,11 @@ def output_projection_cte_mx_torch_ref(
             inp_unpacked = unpack_float8_e4m3fn_x4(inp_packed)
             inp_scale = torch.from_numpy(input_scales[b].reshape(-1, seqlen)).float()
         else:
-            # bf16 [N, D, S] -> float32 [N*D//4, 4, S] -> [N*D//4, S*4] -> quantize
-            attn_b = attention[b].astype(np.float32)
+            # bf16 [N, D, S] -> [N*D//4, 4, S] -> [N*D//4, S*4] -> quantize
+            attn_b = attention[b]
             attn_b = attn_b.reshape(n_head * d_head // 4, 4, seqlen)
             attn_b = np.transpose(attn_b, (0, 2, 1)).reshape(-1, seqlen * 4)
-            inp_packed, inp_scale_np = quantize_to_mx_fp8(attn_b)
+            inp_packed, inp_scale_np = quantize_to_mx(attn_b, nl.float8_e4m3fn_x4)
             inp_unpacked = unpack_float8_e4m3fn_x4(inp_packed)
             inp_scale = torch.from_numpy(inp_scale_np).float()
 

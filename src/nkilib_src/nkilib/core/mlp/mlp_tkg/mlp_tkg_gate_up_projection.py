@@ -101,6 +101,7 @@ def gate_up_projection(
     I = shard_dim_intr[1] - shard_dim_intr[0]
     i_offset = shard_dim_intr[0]
     num_allocated_w_tile = tiles.num_allocated_w_tile
+    is_up_proj = "up" in op_name
 
     # Sanity checks for sharding
     kernel_assert(
@@ -113,19 +114,19 @@ def gate_up_projection(
     )
 
     # For 'up' projection, offset weight index to avoid anti-dependencies with gate weights.
-    # The kernel shares weight tiles for gate and up projection
-    # this treats them as a ring buffer so up weights load after gate weights for efficient reuse.
-    weight_base_idx = tiles.num_HTiles % num_allocated_w_tile if op_name == "up" else 0
+    # The kernel shares weight tiles as a ring buffer so up weights load after gate weights.
+    weight_base_idx = tiles.num_HTiles % num_allocated_w_tile if is_up_proj else 0
 
     # ---------- Allocate PSUM buffers ----------
     result_psums = []
     for psum_idx in range(tiles.num_allocated_psums):
+        psum_bank = psum_idx + tiles.up_psum_base_bank if is_up_proj else psum_idx
         result_psum = nl.ndarray(
             (dims._pmax, dims._psum_fmax),
             dtype=nl.float32,
-            name=f"{op_name}_{sbm.get_name_prefix()}_psum_ishard_{i_offset}_{psum_idx}",
+            name=f"{op_name}_{sbm.get_name_prefix()}_psum_{i_offset}_{psum_bank}",
             buffer=nl.psum,
-            address=None if sbm.is_auto_alloc() else (0, psum_idx * dims._psum_fmax * 4),
+            address=None if sbm.is_auto_alloc() else (0, psum_bank * dims._psum_fmax * 4),
         )
         result_psums.append(result_psum)
 
@@ -334,31 +335,29 @@ def gate_up_projection_lhs_rhs_swap(
 
             else:
                 # WA for dynamic access not supported by dma_transpose, issue: NKI-415
+                # Using dma_copy + PE transpose on tensor_engine
                 bias_tile_sbuf = sbm.alloc_stack(
                     shape=(num_128_I_tiles, I0),
                     dtype=bias.dtype,
                     buffer=nl.sbuf,
                     name=f"{op_name}_{sbm.get_name_prefix()}_ishard_{i_offset}_bias_tile_sbuf",
                 )
-                nisa.dma_copy(src=bias_view.get_view(), dst=bias_tile_sbuf)
-                stream_tile_size = 32
-                for stream_tile_i in range(I0 // stream_tile_size):
-                    nisa.nc_transpose(
-                        dst=bias_tile.ap(
-                            pattern=[
-                                [num_total_128_I_tiles, stream_tile_size],
-                                [1, num_128_I_tiles],
-                            ],
-                            offset=stream_tile_i * 32 * num_total_128_I_tiles,
-                        ),
-                        data=bias_tile_sbuf.ap(
-                            pattern=[
-                                [I0, num_128_I_tiles],
-                                [1, stream_tile_size],
-                            ],
-                            offset=stream_tile_i * stream_tile_size,
-                        ),
-                    )
+                bias_tile_psum = nl.ndarray((I0, num_128_I_tiles), dtype=bias.dtype, buffer=nl.psum)
+                nisa.dma_copy(
+                    src=bias_view.base_tensor.ap(
+                        pattern=[[I0, num_128_I_tiles], [1, I0]],
+                        offset=bias_view.offset,
+                        indirect_dim=bias_view.indirect_dim,
+                        scalar_offset=bias_view.scalar_offset,
+                    ),
+                    dst=bias_tile_sbuf.ap(
+                        pattern=[[I0, num_128_I_tiles], [1, I0]],
+                        offset=0,
+                    ),
+                    dge_mode=adaptive_dge_mode(bias_view),
+                )
+                nisa.nc_transpose(dst=bias_tile_psum, data=bias_tile_sbuf)
+                nisa.tensor_copy(dst=bias_tile[0:I0, 0:num_128_I_tiles], src=bias_tile_psum)
 
         if res_128_I_tiles > 0:
             bias_view = bias.slice(
@@ -471,7 +470,7 @@ def gate_up_projection_lhs_rhs_swap(
         nisa.dma_copy(
             dst=weight_tiles[weight_idx][0:H0, 0:h1_size, 0:shared_I],
             src=weight_view.get_view(),
-            dge_mode=adaptive_dge_mode(weight_view),
+            dge_mode=nisa.dge_mode.hwdge,
         )
 
         # Matmult
@@ -592,22 +591,54 @@ def process_gate_up_projection(
     # Note: intermediate tiles are fp32 for better numerical accuracy
     bias_tile = None
     bias_size = 0
+
+    # Fused gate+up sendrecv optimization: use a single sendrecv instead of two when LNC > 1.
+    # Allocates a combined gate+up buffer and a 2X receive buffer to perform one sendrecv for
+    # both projections, reducing inter-core communication overhead. Currently enabled by default
+    # for column tiling mode.
+    use_fused_gate_up_sendrecv = (
+        dims.num_shards > 1 and not params.skip_gate_proj and params.use_tkg_gate_up_proj_column_tiling
+    )
     if params.use_tkg_gate_up_proj_column_tiling:
         if not params.skip_gate_proj:
-            gate_sb_fp32 = sbm.alloc_stack(
+            if use_fused_gate_up_sendrecv:
+                # Allocate a single combined gate+up buffer with 2X the I dimension
+                gate_up_sb_fp32 = sbm.alloc_stack(
+                    (dims.T, 2 * dims.I),
+                    dtype=nl.float32,
+                    name="gate_up_sbuf_fp32",
+                    buffer=nl.sbuf,
+                    align=4,
+                )
+                gate_up_tv = TensorView(gate_up_sb_fp32)
+                gate_sb_view = gate_up_tv.slice(dim=1, start=0, end=dims.I)
+                up_sb_view = gate_up_tv.slice(dim=1, start=dims.I, end=2 * dims.I)
+            else:
+                gate_sb_fp32 = sbm.alloc_stack(
+                    (dims.T, dims.I),
+                    dtype=nl.float32,
+                    name="gate_sbuf_fp32",
+                    buffer=nl.sbuf,
+                    align=4,
+                )
+                up_sb_fp32 = sbm.alloc_stack(
+                    (dims.T, dims.I),
+                    dtype=nl.float32,
+                    name="up_sbuf_fp32",
+                    buffer=nl.sbuf,
+                    align=4,
+                )
+                gate_sb_view = TensorView(gate_sb_fp32)
+                up_sb_view = TensorView(up_sb_fp32)
+        else:
+            up_sb_fp32 = sbm.alloc_stack(
                 (dims.T, dims.I),
                 dtype=nl.float32,
-                name="gate_sbuf_fp32",
+                name="up_sbuf_fp32",
                 buffer=nl.sbuf,
                 align=4,
             )
-        up_sb_fp32 = sbm.alloc_stack(
-            (dims.T, dims.I),
-            dtype=nl.float32,
-            name="up_sbuf_fp32",
-            buffer=nl.sbuf,
-            align=4,
-        )
+            up_sb_view = TensorView(up_sb_fp32)
         if mlpp_has_gate_projection_bias(params) or mlpp_has_up_projection_bias(params):
             bias_tile = sbm.alloc_stack(
                 (dims.T, dims.max_I_shard_size),
@@ -617,20 +648,47 @@ def process_gate_up_projection(
             )
     else:
         if not params.skip_gate_proj:
-            gate_sb_fp32 = sbm.alloc_stack(
+            if use_fused_gate_up_sendrecv:
+                # Allocate a single combined gate+up buffer with 2X the I tile dimension
+                gate_up_sb_fp32 = sbm.alloc_stack(
+                    (dims.I0, 2 * dims.num_total_128_tiles_per_I, dims.T),
+                    dtype=nl.float32,
+                    name="gate_up_sbuf_fp32",
+                    buffer=nl.sbuf,
+                    align=4,
+                )
+                gate_up_tv = TensorView(gate_up_sb_fp32)
+                gate_sb_view = gate_up_tv.slice(dim=1, start=0, end=dims.num_total_128_tiles_per_I)
+                up_sb_view = gate_up_tv.slice(
+                    dim=1, start=dims.num_total_128_tiles_per_I, end=2 * dims.num_total_128_tiles_per_I
+                )
+            else:
+                gate_sb_fp32 = sbm.alloc_stack(
+                    (dims.I0, dims.num_total_128_tiles_per_I, dims.T),
+                    dtype=nl.float32,
+                    name="gate_sbuf_fp32",
+                    buffer=nl.sbuf,
+                    align=4,
+                )
+                up_sb_fp32 = sbm.alloc_stack(
+                    (dims.I0, dims.num_total_128_tiles_per_I, dims.T),
+                    dtype=nl.float32,
+                    name="up_sbuf_fp32",
+                    buffer=nl.sbuf,
+                    align=4,
+                )
+                gate_sb_view = TensorView(gate_sb_fp32)
+                up_sb_view = TensorView(up_sb_fp32)
+        else:
+            up_sb_fp32 = sbm.alloc_stack(
                 (dims.I0, dims.num_total_128_tiles_per_I, dims.T),
                 dtype=nl.float32,
-                name="gate_sbuf_fp32",
+                name="up_sbuf_fp32",
                 buffer=nl.sbuf,
                 align=4,
             )
-        up_sb_fp32 = sbm.alloc_stack(
-            (dims.I0, dims.num_total_128_tiles_per_I, dims.T),
-            dtype=nl.float32,
-            name="up_sbuf_fp32",
-            buffer=nl.sbuf,
-            align=4,
-        )
+            up_sb_view = TensorView(up_sb_fp32)
+            gate_sb_view = None
         # Allocate the bias/dequant tile inside the loop due to the DMA transpose 32-byte address alignment requirement.
         if mlpp_has_gate_projection_bias(params) or mlpp_has_up_projection_bias(params):
             bias_size = dims.num_total_128_tiles_per_I * sizeinbytes(gate_b.dtype)
@@ -681,6 +739,13 @@ def process_gate_up_projection(
                 buffer=nl.sbuf,
                 align=4,
             )
+            up_dequant_tile = sbm.alloc_stack(
+                gate_dequant_tile.shape,
+                dtype=up_w_scale.dtype,
+                name=f"up_w_scale_sb",
+                buffer=nl.sbuf,
+                align=4,
+            )
         else:
             gate_dequant_tile = sbm.alloc_stack(
                 (dims.I0, min(dims.max_I_shard_size // dims.I0, dims.num_total_128_tiles_per_I)),
@@ -689,17 +754,32 @@ def process_gate_up_projection(
                 buffer=nl.sbuf,
                 align=32,
             )
-        up_dequant_tile = gate_dequant_tile
+            up_dequant_tile = sbm.alloc_stack(
+                gate_dequant_tile.shape,
+                dtype=up_w_scale.dtype,
+                name=f"up_w_scale_sb",
+                buffer=nl.sbuf,
+                align=32,
+            )
 
     # ---------------- Allocate Receive Buffer for LNC > 1 ----------------
     gate_up_recv = None
     if dims.num_shards > 1:
-        gate_up_recv = sbm.alloc_stack(
-            up_sb_fp32.shape,
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-            name="gate_up_recv_buffer_fp32",
-        )
+        if use_fused_gate_up_sendrecv:
+            # 2X receive buffer to receive both gate and up projections in a single sendrecv
+            gate_up_recv = sbm.alloc_stack(
+                gate_up_sb_fp32.shape,
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+                name="gate_up_recv_buffer_fp32",
+            )
+        else:
+            gate_up_recv = sbm.alloc_stack(
+                up_sb_fp32.shape,
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+                name="gate_up_recv_buffer_fp32",
+            )
 
     # ---------------- Allocate Weight Tiles ----------------
     # By calculating the remaining SBUF space, we allocate as many weight tiles as possible
@@ -737,7 +817,7 @@ def process_gate_up_projection(
                     shard_dim_intr=(I_start, I_end),
                     bias=gate_b,
                     dequant_scale=gate_w_scale,
-                    output_tile=gate_sb_fp32,
+                    output_tile=gate_sb_view.get_view(),
                     weight_tiles=weight_tiles,
                     bias_tile=bias_tile,
                     dequant_tile=gate_dequant_tile,
@@ -756,7 +836,7 @@ def process_gate_up_projection(
                 shard_dim_intr=(I_start, I_end),
                 bias=up_b,
                 dequant_scale=up_w_scale,
-                output_tile=up_sb_fp32,
+                output_tile=up_sb_view.get_view(),
                 weight_tiles=weight_tiles,
                 bias_tile=bias_tile,
                 dequant_tile=up_dequant_tile,
@@ -776,7 +856,7 @@ def process_gate_up_projection(
             if mlpp_has_gate_projection_bias(params) or mlpp_has_up_projection_bias(params):
                 bias_tile = sbm.alloc_stack(
                     (dims.I0, num_total_128_I_tiles),
-                    dtype=gate_b.dtype,
+                    dtype=nl.float32 if gate_b.has_dynamic_access() else gate_b.dtype,
                     name=f"gate_up_bias_{i_tiles.index}",
                     buffer=nl.sbuf,
                     align=32,
@@ -791,7 +871,7 @@ def process_gate_up_projection(
                     shard_dim_intr=(I_start, I_end),
                     bias=gate_b,
                     dequant_scale=gate_w_scale,
-                    output_tile=gate_sb_fp32,
+                    output_tile=gate_sb_view.get_view(),
                     weight_tiles=weight_tiles,
                     bias_tile=bias_tile,
                     dequant_tile=gate_dequant_tile,
@@ -811,7 +891,7 @@ def process_gate_up_projection(
                 shard_dim_intr=(I_start, I_end),
                 bias=up_b,
                 dequant_scale=up_w_scale,
-                output_tile=up_sb_fp32,
+                output_tile=up_sb_view.get_view(),
                 weight_tiles=weight_tiles,
                 bias_tile=bias_tile,
                 dequant_tile=up_dequant_tile,
@@ -854,59 +934,90 @@ def process_gate_up_projection(
             nisa.tensor_copy(dst=output, src=up_sb_fp32, engine=nki.isa.vector_engine)
 
     else:
-        # ---------------- Gate Projection Multi-Shard Communication ----------------
-        # Receive gate projection output from the other neuron core when LNC > 1
+        # ---------------- Gate/Up Projection Multi-Shard Communication ----------------
         if dims.num_shards > 1:
-            nisa.sendrecv(
-                src=gate_sb_fp32,
-                dst=gate_up_recv,
-                send_to_rank=(1 - dims.shard_id),
-                recv_from_rank=(1 - dims.shard_id),
-                pipe_id=0,
-            )
-            nisa.tensor_tensor(dst=gate_sb_fp32, data1=gate_sb_fp32, data2=gate_up_recv, op=nl.add)
+            if use_fused_gate_up_sendrecv:
+                # Single sendrecv for both gate and up projections using the combined buffer
+                nisa.sendrecv(
+                    src=gate_up_sb_fp32,
+                    dst=gate_up_recv,
+                    send_to_rank=(1 - dims.shard_id),
+                    recv_from_rank=(1 - dims.shard_id),
+                    pipe_id=0,
+                )
+                nisa.tensor_tensor(dst=gate_up_sb_fp32, data1=gate_up_sb_fp32, data2=gate_up_recv, op=nl.add)
+            else:
+                # Separate sendrecv for gate projection
+                nisa.sendrecv(
+                    src=gate_sb_view.get_view(),
+                    dst=gate_up_recv,
+                    send_to_rank=(1 - dims.shard_id),
+                    recv_from_rank=(1 - dims.shard_id),
+                    pipe_id=0,
+                )
+                nisa.tensor_tensor(
+                    dst=gate_sb_view.get_view(), data1=gate_sb_view.get_view(), data2=gate_up_recv, op=nl.add
+                )
+
+                # Separate sendrecv for up projection
+                nisa.sendrecv(
+                    src=up_sb_view.get_view(),
+                    dst=gate_up_recv,
+                    send_to_rank=(1 - dims.shard_id),
+                    recv_from_rank=(1 - dims.shard_id),
+                    pipe_id=0,
+                )
+                nisa.tensor_tensor(
+                    dst=up_sb_view.get_view(), data1=up_sb_view.get_view(), data2=gate_up_recv, op=nl.add
+                )
 
         #  ---------------- Optionally perform clamping on gate projection results  ----------------
         if params.gate_clamp_upper_limit is not None:
             nisa.tensor_scalar(
-                data=gate_sb_fp32, dst=gate_sb_fp32, op0=nl.minimum, operand0=params.gate_clamp_upper_limit
+                data=gate_sb_view.get_view(),
+                dst=gate_sb_view.get_view(),
+                op0=nl.minimum,
+                operand0=params.gate_clamp_upper_limit,
             )
         if params.gate_clamp_lower_limit is not None:
             nisa.tensor_scalar(
-                data=gate_sb_fp32, dst=gate_sb_fp32, op0=nl.maximum, operand0=params.gate_clamp_lower_limit
+                data=gate_sb_view.get_view(),
+                dst=gate_sb_view.get_view(),
+                op0=nl.maximum,
+                operand0=params.gate_clamp_lower_limit,
             )
 
         # ---------------- Gate Activation ----------------
         nisa.activation(
-            dst=gate_sb_fp32[:, :],
+            dst=gate_sb_view.get_view(),
             op=get_nl_act_fn_from_type(params.activation_fn),
-            data=gate_sb_fp32,
+            data=gate_sb_view.get_view(),
             scale=1.0,
         )
 
-        # ---------------- Up Projection Multi-Shard Communication ----------------
-        # Receive up projection output from the other neuron core when LNC > 1
-        if dims.num_shards > 1:
-            nisa.sendrecv(
-                src=up_sb_fp32,
-                dst=gate_up_recv,
-                send_to_rank=(1 - dims.shard_id),
-                recv_from_rank=(1 - dims.shard_id),
-                pipe_id=0,
-            )
-            nisa.tensor_tensor(dst=up_sb_fp32, data1=up_sb_fp32, data2=gate_up_recv, op=nl.add)
-
         #  ---------------- Optionally perform clamping on up projection results  ----------------
         if params.up_clamp_upper_limit is not None:
-            nisa.tensor_scalar(data=up_sb_fp32, dst=up_sb_fp32, op0=nl.minimum, operand0=params.up_clamp_upper_limit)
+            nisa.tensor_scalar(
+                data=up_sb_view.get_view(),
+                dst=up_sb_view.get_view(),
+                op0=nl.minimum,
+                operand0=params.up_clamp_upper_limit,
+            )
         if params.up_clamp_lower_limit is not None:
-            nisa.tensor_scalar(data=up_sb_fp32, dst=up_sb_fp32, op0=nl.maximum, operand0=params.up_clamp_lower_limit)
+            nisa.tensor_scalar(
+                data=up_sb_view.get_view(),
+                dst=up_sb_view.get_view(),
+                op0=nl.maximum,
+                operand0=params.up_clamp_lower_limit,
+            )
 
         # ---------------- Multiply Gate and Up Outputs ----------------
         if params.use_tkg_gate_up_proj_column_tiling:
-            nisa.tensor_tensor(dst=up_sb_fp32, data1=gate_sb_fp32, data2=up_sb_fp32, op=nl.multiply)
+            nisa.tensor_tensor(
+                dst=up_sb_view.get_view(), data1=gate_sb_view.get_view(), data2=up_sb_view.get_view(), op=nl.multiply
+            )
         else:
-            nisa.tensor_tensor(dst=output, data1=gate_sb_fp32, data2=up_sb_fp32, op=nl.multiply)
+            nisa.tensor_tensor(dst=output, data1=gate_sb_view.get_view(), data2=up_sb_view.get_view(), op=nl.multiply)
 
     # ---------- Transpose hidden if column tiling is enabled ----------
     if params.use_tkg_gate_up_proj_column_tiling:
@@ -915,14 +1026,16 @@ def process_gate_up_projection(
             psum_idx = i_tile.index % dims._psum_bmax
             tp_psum = nl.ndarray(
                 (i_tile.size, dims.T),
-                dtype=up_sb_fp32.dtype,
+                dtype=up_sb_view.dtype,
                 buffer=nl.psum,
-                name=f"transpose_psum_{i_tile.index}",
-                address=(0, psum_idx * dims._psum_fmax * 4),
+                name=f"{sbm.get_name_prefix()}transpose_psum_{i_tile.index}",
+                address=None if sbm.is_auto_alloc() else (0, psum_idx * dims._psum_fmax * 4),
             )
             nisa.nc_transpose(
                 dst=tp_psum,
-                data=up_sb_fp32[0 : dims.T, nl.ds(i_tile.index * dims.I0, i_tile.size)],
+                data=up_sb_view.slice(dim=0, start=0, end=dims.T)
+                .slice(dim=1, start=i_tile.index * dims.I0, end=i_tile.index * dims.I0 + i_tile.size)
+                .get_view(),
             )
             nisa.tensor_copy(dst=output[0 : i_tile.size, i_tile.index, 0 : dims.T], src=tp_psum)
 

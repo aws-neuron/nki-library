@@ -86,6 +86,8 @@ class ProfilerCommands:
         profile_all_ranks: bool = False,
         env_vars: Optional[dict[str, str]] = None,
         perf_analysis_enabled: bool = False,
+        save_all_outputs: bool = False,
+        force_clean_input_writes: bool = False,
     ):
         """
         Build all neuron-profile commands for capture, show-session, and JSON generation.
@@ -101,10 +103,14 @@ class ProfilerCommands:
             collective_ranks: Number of collective ranks (each rank is a logical NeuronCore). Default 1 = no collectives
             profile_all_ranks: Whether to profile all ranks or just rank 0 (controls --collectives-profile-id)
             env_vars: Optional environment variables to set
+            save_all_outputs: Whether to save outputs from all executions or just the last (controls --save-nth-output)
+            force_clean_input_writes: Force neuron-profile to re-read all input tensors between N
+                executions, so that tensors from previous runs don't clobber subsequent executions.
+                Useful for kernels with aliased input tensors AND using tensor cache.
         """
         self.collective_ranks = collective_ranks
         self.expected_ntff_files = self._generate_expected_ntff_files(num_runs, profile_all_runs, profile_all_ranks)
-        profiler_exec_args = self._generate_profiler_exec_args(num_runs, profile_all_runs)
+        profiler_exec_args = self._generate_profiler_exec_args(num_runs, profile_all_runs, save_all_outputs)
         collective_args = self._generate_collective_args(collective_ranks, profile_all_ranks)
 
         # Timeout should be less than lock timeout to avoid hanging past lock expiration
@@ -118,6 +124,7 @@ class ProfilerCommands:
             "capture",
             "--save-output",
             "--neff file.neff",
+            "--write-tensors-per-exec alias" if force_clean_input_writes else "",
             profiler_exec_args,
             collective_args,
             kernel_input_args,
@@ -267,24 +274,29 @@ class ProfilerCommands:
 
         return ntff_files
 
-    def _generate_profiler_exec_args(self, num_runs: int, profile_all_runs: bool) -> str:
+    def _generate_profiler_exec_args(self, num_runs: int, profile_all_runs: bool, save_all_outputs: bool) -> str:
         """
         Generate neuron-profile execution arguments.
 
         Args:
             num_runs: Total number of kernel executions
             profile_all_runs: Whether to profile all executions or just the last
+            save_all_outputs: Whether to save all executions' outputs or just the last
 
         Returns:
             String of neuron-profile arguments (e.g., "--num-exec=3 --profile-nth-exec=3")
         """
 
-        if profile_all_runs:
-            # Profile all executions - no --profile-nth-exec needed
-            return f"--num-exec={num_runs}"
-        else:
+        args = f"--num-exec={num_runs}"
+
+        if not profile_all_runs:
             # Profile only the last execution
-            return f"--num-exec={num_runs} --profile-nth-exec={num_runs} --enable-dge-notifs"
+            args += f" --profile-nth-exec={num_runs}"
+
+        if not save_all_outputs:
+            args += f" --save-nth-output={num_runs}"
+
+        return args
 
     def _generate_collective_args(self, collective_ranks: int, profile_all_ranks: bool) -> str:
         """

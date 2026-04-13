@@ -128,16 +128,29 @@ def _attention_tkg_torch_ref_impl(
         v_prior = v_prior.unsqueeze(1)
 
         reduced_blk_len, resize_factor = resize_cache_block_len_for_attention_tkg_kernel(
-            s_prior // block_len, block_len, get_total_n_prgs(cfg, LNC, P_MAX), P_MAX, s_prior_full
+            s_prior // block_len,
+            block_len,
+            LNC,
+            P_MAX,
+            cfg.bs,
+            cfg.q_head,
+            cfg.s_active,
+            full_sprior=s_prior_full,
+            enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
         )
 
         # Only reshape mask if NOT using use_pos_id (i.e., pre-computed full cache mask)
         # When use_pos_id=True, the mask is a small active mask that will be expanded in _attention_tkg_fwd_ref
         if not cfg.use_pos_id:
+            # The pre-generated mask is in n_sprior_tile-major HBM layout:
+            # flat index i -> (f = i // P_MAX, p = i % P_MAX)
+            # where fold = f // block_len, blk_offset = f % block_len
+            # token = fold * P_MAX * block_len + p * block_len + blk_offset
+            # Unshuffle back to linear token order.
             active_mask = (
                 active_mask.permute(1, 2, 3, 0)
                 .reshape((-1, reduced_blk_len, P_MAX))
-                .swapaxes(-1, -2)
+                .permute(0, 2, 1)
                 .reshape((batch, q_head, s_active, s_prior))
                 .permute(3, 0, 1, 2)
             )
@@ -186,7 +199,7 @@ def _attention_tkg_torch_ref_impl(
         k_out.copy_(attn_k_out)
 
     if DBG_TENSORS:
-        n_prgs = get_total_n_prgs(cfg, LNC, P_MAX)
+        n_prgs = get_total_n_prgs(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, LNC, P_MAX)
         DBG_QK = _reshape_debug_tensor(DBG_QK, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
         DBG_QK_EXP = _reshape_debug_tensor(DBG_QK_EXP, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
 
@@ -416,8 +429,8 @@ def _reshape_debug_tensor(
     reduced_blk_len: int = None,
 ):
     batch, q_head, s_prior, s_active = cfg.bs, cfg.q_head, cfg.curr_sprior, cfg.s_active
-    batch_sharded = is_batch_sharded(cfg, p_max)
-    sprior_n_prgs = n_prgs if is_s_prior_sharded(cfg, p_max) else 1
+    batch_sharded = is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max)
+    sprior_n_prgs = n_prgs if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max) else 1
     if is_block_kv:
         kernel_assert(reduced_blk_len is not None, "reduced_blk_len must be provided for block KV")
         return tensor.reshape(

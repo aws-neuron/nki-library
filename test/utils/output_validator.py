@@ -22,6 +22,13 @@ from typing import Any, Union
 import numpy as np
 import numpy.typing as npt
 
+# Unpack functions for packed x4 MX dtypes → float32 numpy arrays for histogram visualization
+from nkilib_src.nkilib.core.utils.mx_torch_common import (
+    unpack_float4_x4,
+    unpack_float8_e4m3fn_x4,
+    unpack_float8_e5m2_x4,
+)
+
 from .common_dataclasses import (
     CustomValidatorWithOutputTensorData,
     KernelArgs,
@@ -30,6 +37,12 @@ from .common_dataclasses import (
 )
 from .metrics_collector import IMetricsCollector, MetricName
 from .tensor_histogram import TensorHistogram
+
+_X4_UNPACKERS = {
+    "float8_e4m3fn_x4": unpack_float8_e4m3fn_x4,
+    "float8_e5m2_x4": unpack_float8_e5m2_x4,
+    "float4_e2m1fn_x4": unpack_float4_x4,
+}
 
 
 def load_output_tensor_as_bytes(filepath: Union[str, pathlib.Path]) -> npt.NDArray[np.uint8]:
@@ -91,13 +104,12 @@ class OutputValidator:
                 if collective_ranks > 1:
                     self.LOGGER.info(f"Validating rank {rank_id}")
                     if logfile:
-                        print(f"\n{'='*60}\nValidating rank {rank_id}\n{'='*60}", file=logfile)
+                        print(f"\n{'=' * 60}\nValidating rank {rank_id}\n{'=' * 60}", file=logfile)
                     rank_dir = f"output_worker_{rank_id}/"
                     rank_files = [f for f in self.output_file_list if rank_dir in f]
                     assert rank_files, f"No output files found for rank {rank_id}"
                 else:
                     rank_files = self.output_file_list
-
                 with metrics_collector.timer(MetricName.VALIDATION_OUTPUT_LOAD_TIME):
                     actual_outputs = self.__read_all_output_tensors__(rank_files, golden_output, dtype_source)
                 with metrics_collector.timer(MetricName.VALIDATION_COMPARE_TIME):
@@ -135,15 +147,76 @@ class OutputValidator:
             dtype when loading output tensors, and may be None if not available.
         """
         if isinstance(params.golden_output, PerRankLazyGoldenGenerator):
-            return params.golden_output.for_rank(rank_id), None
+            golden = params.golden_output.for_rank(rank_id)
+            if rank_id in params.golden_output.computation_times:
+                metrics_collector.record_timer(
+                    MetricName.GOLDEN_COMPUTATION_TIME, params.golden_output.computation_times[rank_id]
+                )
+            return golden, None
         elif isinstance(params.golden_output, LazyGoldenGenerator):
-            assert params.golden_output.golden
-            with metrics_collector.timer(MetricName.GOLDEN_COMPUTATION_TIME):
-                return params.golden_output.golden, params.golden_output.output_ndarray
+            golden = params.golden_output.golden
+            assert golden
+            if params.golden_output.computation_time is not None:
+                metrics_collector.record_timer(
+                    MetricName.GOLDEN_COMPUTATION_TIME, params.golden_output.computation_time
+                )
+            return golden, params.golden_output.output_ndarray
         elif isinstance(params.golden_output, dict):
             return params.golden_output, None
         else:
             assert False, f"Unknown golden generator/validator found"
+
+    def _compare_raw_byte(
+        self,
+        actual: npt.NDArray[Any],
+        expected: npt.NDArray[Any],
+        label: str,
+        dtype_name: str,
+        metrics_collector: IMetricsCollector,
+        logfile,
+        failed_keys: list[str],
+        output_key: str,
+        logfile_path: str | None = None,
+    ) -> None:
+        """Compare two arrays as raw bytes when float casting is not possible.
+
+        Appends output_key to failed_keys and saves golden on failure.
+
+        Args:
+            actual: Actual output array (any dtype).
+            expected: Expected golden array (any dtype).
+            label: Display label for log messages (e.g. "rank0:output_0").
+            dtype_name: String name of the original dtype for logging.
+            metrics_collector: Metrics collector to record accuracy.
+            logfile: Optional open file handle for writing results.
+            failed_keys: List to append output_key to on failure.
+            output_key: Key name for this output tensor.
+            logfile_path: Path to logfile directory for saving golden on failure.
+        """
+        actual_raw = actual.view(np.uint8)
+        expected_raw = expected.view(np.uint8)
+        passed = np.array_equal(actual_raw, expected_raw)
+        mismatches = int(np.count_nonzero(actual_raw != expected_raw))
+        msg = (
+            f"Results for {label} "
+            f"(raw byte comparison, dtype={dtype_name}): "
+            f"{'PASSED' if passed else f'FAILED ({mismatches} byte mismatches)'}"
+        )
+        self.LOGGER.info(msg)
+        if logfile:
+            print(msg, file=logfile)
+        metrics_collector.record_metric(
+            MetricName.ACCURACY_HW,
+            0.0 if passed else -1.0,
+            "None",
+        )
+        if not passed:
+            failed_keys.append(output_key)
+            if logfile_path:
+                golden_dir = os.path.dirname(logfile_path)
+                golden_path = os.path.join(golden_dir, f"golden-{label}.bin")
+                expected.tofile(golden_path)
+                self.LOGGER.info(f"Golden output saved to: {golden_path}")
 
     def _compare_outputs(
         self,
@@ -157,11 +230,9 @@ class OutputValidator:
         logfile_path: str | None = None,
     ) -> list[str]:
         """Compare actual outputs against golden, return list of failed keys."""
-        # Initialize visualizer
         visualizer = TensorHistogram()
         failed_keys = []
         rank_prefix = f"rank{rank_id}:" if rank_id is not None else ""
-
         for output_key, expected_value in golden_output.items():
             assert (
                 output_key in actual_outputs
@@ -173,9 +244,39 @@ class OutputValidator:
                 if not comparison_passed:
                     failed_keys.append(output_key)
             else:
-                # Convert both arrays to float32 to avoid NumPy dtype promotion issues
-                actual_output = actual_outputs[output_key].astype(np.float32)
-                expected_output = expected_value.astype(np.float32)
+                """
+                Convert both arrays to float32 to avoid NumPy dtype promotion issues.
+                Packed x4 dtypes (e.g. float8_e4m3fn_x4) cannot be cast to float32;
+                those are handled via _compare_x4_dtype which unpacks or falls back
+                to raw byte comparison.
+                """
+                try:
+                    actual_output = actual_outputs[output_key].astype(np.float32)
+                    expected_output = expected_value.astype(np.float32)
+                except TypeError:
+                    dtype_name = str(actual_outputs[output_key].dtype)
+                    label = f"{rank_prefix}{output_key}"
+                    unpacker = _X4_UNPACKERS.get(dtype_name)
+                    if unpacker is None:
+                        if enable_histograms:
+                            self.LOGGER.info(
+                                f"Histogram skipped for {label}: no unpacker available for dtype '{dtype_name}'"
+                            )
+                        self._compare_raw_byte(
+                            actual_outputs[output_key],
+                            expected_value,
+                            label,
+                            dtype_name,
+                            metrics_collector,
+                            logfile,
+                            failed_keys,
+                            output_key,
+                            logfile_path,
+                        )
+                        continue
+
+                    actual_output = unpacker(actual_outputs[output_key]).numpy().astype(np.float32)
+                    expected_output = unpacker(expected_value).numpy().astype(np.float32)
 
                 largest_abs_diff = get_largest_abs_diff(actual_output, expected_output, atol=params.absolute_accuracy)
 

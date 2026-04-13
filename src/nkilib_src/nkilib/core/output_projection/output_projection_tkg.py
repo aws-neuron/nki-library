@@ -38,7 +38,7 @@ inter-core collective operations, as each core produces part of the output tenso
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import nki
 import nki.isa as nisa
@@ -46,6 +46,7 @@ import nki.language as nl
 from nki.isa.constants import matmul_perf_mode
 from nki.language import affine_range, static_range
 
+from ..utils.allocator import BufferManager, create_auto_alloc_manager
 from ..utils.common_types import QuantizationType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_program_sharding_info
@@ -71,6 +72,7 @@ def output_projection_tkg(
     input_scale: Optional[nl.ndarray] = None,
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
+    sbm: Optional[BufferManager] = None,
 ) -> nl.ndarray:
     """
     Output Projection Kernel
@@ -93,18 +95,26 @@ def output_projection_tkg(
         attention (nl.ndarray): Input tensor in HBM or SBUF, typically the scores output from an attention block.
             Shape:    [D, B, N, S]
             Indexing: [d, b, n, s]
+            Dtype:    nl.float32, nl.float16, or nl.bfloat16
         weight (nl.ndarray): Weight tensor in HBM
             Shape:    [N * D,     H]
             Indexing: [n * D + d, h]
+            Dtype:
+                - QuantizationType.NONE: nl.float32, nl.float16, or nl.bfloat16
+                - QuantizationType.STATIC: nl.float8_e4m3
+                - QuantizationType.ROW: nl.float8_e4m3
         bias (Optional[nl.ndarray]): Optional bias tensor in HBM
             Shape:    [1, H]
             Indexing: [1, h]
-        quantization_type (QuantizationType): Type of quantization to apply (NONE, STATIC).
+            Dtype:    nl.float32, nl.float16, or nl.bfloat16
+        quantization_type (QuantizationType): Type of quantization to apply (NONE, STATIC, ROW).
             Default: QuantizationType.NONE.
-        weight_scale (Optional[nl.ndarray]): Optional weight scale tensor for quantization in HBM
-            Shape:    [P_MAX, 1] when quantization_type is STATIC
-        input_scale (Optional[nl.ndarray]): Optional input scale tensor for quantization in HBM
-            Shape:    [P_MAX, 1] when quantization_type is STATIC
+        weight_scale (Optional[nl.ndarray]): Weight dequantization scale tensor in HBM
+            Shape:    [P_MAX, 1] for STATIC, [P_MAX, H] for ROW (all P_MAX rows identical)
+            Dtype:    nl.float32
+        input_scale (Optional[nl.ndarray]): Input dequantization scale tensor in HBM
+            Shape:    [P_MAX, 1] for STATIC (not used for ROW)
+            Dtype:    nl.float32
         TRANSPOSE_OUT (bool): Whether to store the output in transposed shape.
             If False, the output tensor has the following shape and indexing:
               Shape:    [B * S,     H]
@@ -119,6 +129,7 @@ def output_projection_tkg(
               H_2 = H // H_0 // H_1,
             such that h = h_0 * H_1 * H_2 + h_1 * H_2 + h_2.
         OUT_IN_SB (bool): If True, output is in SBUF. Else, it is written out to HBM.
+        sbm (BufferManager): Optional BufferManager for tensor allocation with consistent naming.
 
     Returns:
         out (nl.ndarray): Output tensor in HBM. Shape depends on `TRANSPOSE_OUT` parameter.
@@ -128,8 +139,7 @@ def output_projection_tkg(
           However, for nl.float32, large inputs may not fit in SBUF.
         - The product B * S must not exceed 128.
         - Head dimension D must not exceed 128.
-        - When TRANSPOSE_OUT is False: H must be divisible by 512 * LNC,
-          where LNC is the logical neuron core count (1 or 2).
+        - When TRANSPOSE_OUT is False: H must be divisible by LNC.
         - When TRANSPOSE_OUT is True: H must be divisible by 128 * LNC.
         - When TRANSPOSE_OUT is True with float32 dtype: N * H must not exceed 81920.
         - When TRANSPOSE_OUT is True with float16/bfloat16 dtype: N * H must not exceed 163840.
@@ -167,18 +177,33 @@ def output_projection_tkg(
         out_in_sb=OUT_IN_SB,
     )
 
+    # Create local sbm if not provided
+    if sbm == None:
+        sbm = create_auto_alloc_manager()
+
     # Load quantization scales
-    weight_scale_sb = None
-    input_scale_sb = None
     if quantization_type == QuantizationType.STATIC:
-        weight_scale_sb = nl.ndarray(
+        weight_scale_sb = sbm.alloc_heap(
             weight_scale.shape, dtype=weight_scale.dtype, buffer=nl.sbuf, name="weight_scale_sb"
         )
-        input_scale_sb = nl.ndarray(weight_scale.shape, dtype=weight_scale.dtype, buffer=nl.sbuf, name="input_scale_sb")
+        input_scale_sb = sbm.alloc_heap(
+            weight_scale.shape, dtype=weight_scale.dtype, buffer=nl.sbuf, name="input_scale_sb"
+        )
         nisa.dma_copy(dst=weight_scale_sb, src=weight_scale)
         nisa.dma_copy(dst=input_scale_sb, src=input_scale)
-        # pre-apply input scales onto the weight scaling
-        nisa.activation(dst=weight_scale_sb, op=nl.copy, data=weight_scale_sb, scale=input_scale_sb)
+        # Pre-apply input scales onto the weight scaling to get combined dequant scale
+        combined_scale_sb = sbm.alloc_heap(
+            weight_scale.shape, dtype=weight_scale.dtype, buffer=nl.sbuf, name="combined_scale_sb"
+        )
+        nisa.dma_copy(dst=combined_scale_sb, src=weight_scale)
+        nisa.activation(dst=combined_scale_sb, op=nl.copy, data=combined_scale_sb, scale=input_scale_sb)
+        quant_config = StaticQuantConfig(combined_scale_sb=combined_scale_sb)
+    elif quantization_type == QuantizationType.ROW:
+        quant_config = RowQuantConfig(weight_scale_hbm=weight_scale)
+        input_scale_sb = None
+    else:
+        input_scale_sb = None
+        quant_config = None
 
     attn_shuffled = _load_and_shuffle_attn(
         attention=attention,
@@ -190,7 +215,7 @@ def output_projection_tkg(
 
     if not cfg.transpose_out:
         out = (
-            nl.ndarray(
+            sbm.alloc(
                 (cfg.b_size * cfg.s_size, cfg.h_size),
                 dtype=cfg.io_dtype,
                 buffer=nl.shared_hbm,
@@ -204,7 +229,7 @@ def output_projection_tkg(
             out_hbm_buffer=out,
             bias=bias,
             w_reshaped=w_reshaped,
-            weight_scale_sb=weight_scale_sb,
+            quant_config=quant_config,
             attn_shuffled=attn_shuffled,
             cfg=cfg,
         )
@@ -221,7 +246,7 @@ def output_projection_tkg(
         """
         kernel_assert(cfg.h_size == cfg.h_0_size * cfg.h_1_size * cfg.h_2_size, "")
         out = (
-            nl.ndarray(
+            sbm.alloc(
                 (cfg.h_1_size, cfg.h_0_size, cfg.h_2_size, cfg.b_size * cfg.s_size),
                 dtype=cfg.io_dtype,
                 buffer=nl.shared_hbm,
@@ -234,10 +259,30 @@ def output_projection_tkg(
             out_hbm_buffer=out,
             bias=bias,
             w_reshaped=w_reshaped,
-            weight_scale_sb=weight_scale_sb,
+            quant_config=quant_config,
             attn_shuffled=attn_shuffled,
             cfg=cfg,
         )
+
+
+@dataclass()
+class StaticQuantConfig(nl.NKIObject):
+    """Configuration for STATIC quantization.
+
+    Holds pre-computed combined scale (weight_scale * input_scale) in SBUF.
+    """
+
+    combined_scale_sb: nl.ndarray  # [P_MAX, 1], pre-computed in SBUF
+
+
+@dataclass()
+class RowQuantConfig(nl.NKIObject):
+    """Configuration for ROW (per-output-channel) quantization.
+
+    Holds weight scale tensor in HBM to be loaded inside impl functions.
+    """
+
+    weight_scale_hbm: nl.ndarray  # [P_MAX, H], in HBM
 
 
 @dataclass()
@@ -258,6 +303,7 @@ class OutputProjectionTkgConfig(nl.NKIObject):
     # Kernel options
     transpose_out: bool
     out_in_sb: bool
+    is_quantized: bool
     quantization_type: QuantizationType
     use_double_row: bool
 
@@ -300,9 +346,9 @@ def _validate_and_create_config(
         attention (nl.ndarray): [D, B, N, S], Input attention tensor.
         weight (nl.ndarray): [N*D, H], Weight tensor.
         bias (Optional[nl.ndarray]): [1, H], Optional bias tensor.
-        quantization_type (QuantizationType): Quantization mode (NONE or STATIC).
-        weight_scale (Optional[nl.ndarray]): [P_MAX, 1], Weight scale for quantization.
-        input_scale (Optional[nl.ndarray]): [P_MAX, 1], Input scale for quantization.
+        quantization_type (QuantizationType): Quantization mode (NONE, STATIC, or ROW).
+        weight_scale (Optional[nl.ndarray]): [P_MAX, 1] for STATIC, [P_MAX, H] for ROW.
+        input_scale (Optional[nl.ndarray]): [P_MAX, 1] for STATIC (not used for ROW).
         transpose_out (bool): Whether to produce transposed output layout.
         out_in_sb (bool): Whether output stays in SBUF.
 
@@ -340,8 +386,10 @@ def _validate_and_create_config(
 
     # Validate quantization type
     kernel_assert(
-        quantization_type == QuantizationType.NONE or quantization_type == QuantizationType.STATIC,
-        f"Only QuantizationType.NONE and QuantizationType.STATIC are supported, but got {quantization_type}",
+        quantization_type == QuantizationType.NONE
+        or quantization_type == QuantizationType.STATIC
+        or quantization_type == QuantizationType.ROW,
+        f"Only QuantizationType.NONE, QuantizationType.STATIC, and QuantizationType.ROW are supported, but got {quantization_type}",
     )
 
     # Validate quantization scale shapes
@@ -355,6 +403,12 @@ def _validate_and_create_config(
         kernel_assert(
             input_scale.shape == (P_MAX, 1),
             f"Incorrect shape for input scale for static per tensor quantization, expected ({P_MAX}, 1), got {input_scale.shape}",
+        )
+    elif quantization_type == QuantizationType.ROW:
+        kernel_assert(weight_scale != None, f"Weight scale must be provided for quantization type {quantization_type}")
+        kernel_assert(
+            weight_scale.shape == (P_MAX, h_size),
+            f"Incorrect shape for weight scale for row quantization, expected ({P_MAX}, {h_size}), got {weight_scale.shape}",
         )
 
     # Kernel shape validation
@@ -418,6 +472,8 @@ def _validate_and_create_config(
         h_1_size = -1
         h_2_size = -1
 
+    is_quantized = quantization_type == QuantizationType.STATIC or quantization_type == QuantizationType.ROW
+
     # TODO: support padding for odd number of heads
     # n_heads // 2 * batch needs to be multiple of 16 for double row stride access
     use_double_row = (
@@ -437,6 +493,7 @@ def _validate_and_create_config(
         prg_id=prg_id,
         transpose_out=transpose_out,
         out_in_sb=out_in_sb,
+        is_quantized=is_quantized,
         quantization_type=quantization_type,
         use_double_row=use_double_row,
         has_bias=bias != None,
@@ -463,9 +520,9 @@ def _load_and_shuffle_attn(
     Load attention tensor to SBUF, optionally quantize, and shuffle to optimized layout.
 
     Transforms attention from [d_original_size, B, n_original_size, S] to [D, N * B * S] or
-    [D, 2, N//2 * B * S] for efficient matrix multiplication. When group_size > 1, multiple
-    heads are packed into the partition dimension D (head packing optimization). Applies
-    static quantization if specified.
+    [D, 2, N//2 * B * S] for efficient matrix multiplication. When group_size > 1, multiple heads
+    are packed into the partition dimension D (head packing optimization). For STATIC quantization,
+    applies input scaling and quantizes activations to FP8. ROW quantization does not quantize activations.
 
     Args:
         attention (nl.ndarray): [d_original_size, B, n_original_size, S], Input attention tensor.
@@ -571,7 +628,7 @@ def _output_projection_tkg_impl(
     out_hbm_buffer: Optional[nl.ndarray],
     bias: Optional[nl.ndarray],
     w_reshaped: nl.ndarray,
-    weight_scale_sb: Optional[nl.ndarray],
+    quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]],
     attn_shuffled: nl.ndarray,
     cfg: OutputProjectionTkgConfig,
 ) -> nl.ndarray:
@@ -585,7 +642,7 @@ def _output_projection_tkg_impl(
         out_hbm_buffer (Optional[nl.ndarray]): Output buffer in HBM or None if output in SBUF.
         bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
         w_reshaped (nl.ndarray): [N, D, H], Weight tensor reshaped.
-        weight_scale_sb (Optional[nl.ndarray]): [P_MAX, 1], Weight scale tensor in SBUF for quantization.
+        quant_config (Optional[Union[StaticQuantConfig, RowQuantConfig]]): Quantization config.
         attn_shuffled (nl.ndarray): [D, N*B*S], Shuffled attention tensor in SBUF.
         cfg (OutputProjectionTkgConfig): Kernel configuration containing dimensions and options.
 
@@ -616,6 +673,20 @@ def _output_projection_tkg_impl(
     h_block_size = 2048 if cfg.h_sharded % 2048 == 0 else cfg.h_sharded
     num_h_blocks_per_prg = cfg.h_sharded // h_block_size
     kernel_assert(num_h_blocks_per_prg * h_block_size * cfg.num_prgs == cfg.h_size, "")
+
+    if cfg.quantization_type == QuantizationType.STATIC:
+        weight_scale_sb = quant_config.combined_scale_sb
+    elif cfg.quantization_type == QuantizationType.ROW:
+        weight_scale_hbm = quant_config.weight_scale_hbm
+        weight_scale_blocks = []
+        for h_block_idx in affine_range(num_h_blocks_per_prg):
+            scale_tensor = nl.ndarray((P_MAX, h_block_size), dtype=weight_scale_hbm.dtype, buffer=nl.sbuf)
+            h_offset = (cfg.prg_id * num_h_blocks_per_prg + h_block_idx) * h_block_size
+            nisa.dma_copy(
+                src=weight_scale_hbm[:, nl.ds(h_offset, h_block_size)],
+                dst=scale_tensor,
+            )
+            weight_scale_blocks.append(scale_tensor)
 
     """
     By loading into separate sbuf tensors, we give the compiler finer control over pre-fetching.
@@ -660,6 +731,7 @@ def _output_projection_tkg_impl(
         w_sbuf_blocks.append(w_row)
 
     # Compute and write out attention @ weight (+ bias) blocks
+    matmul_idx = 0  # for load balancing tensor_copy
     for bxs_block in TiledRange(bxs_size, P_MAX):
         out_sb = nl.ndarray(
             (bxs_block.size, cfg.h_sharded),
@@ -669,6 +741,7 @@ def _output_projection_tkg_impl(
 
         for h_block_idx in affine_range(num_h_blocks_per_prg):
             for h_block_f_tile in TiledRange(h_block_size, F_MAX):
+                matmul_idx += 1
                 res_psum = nl.ndarray((bxs_block.size, h_block_f_tile.size), dtype=nl.float32, buffer=nl.psum)
 
                 # Accumulate (B*S, F_MAX) tiled attn @ weight blocks for all cfg.n_size heads
@@ -682,7 +755,7 @@ def _output_projection_tkg_impl(
                         ]
                         nisa.nc_matmul(res_psum, stationary, moving)
                 else:
-                    # for double row we use the leading free dimension of 2 and double the data per matmul
+                    # For double row we use the leading free dimension of 2 and double the data per matmul
                     for head_idx in affine_range(cfg.n_size // 2):
                         stationary = attn_shuffled[
                             :, :, nl.ds(head_idx * bxs_size + bxs_block.start_offset, bxs_block.size)
@@ -692,33 +765,42 @@ def _output_projection_tkg_impl(
                         ]
                         nisa.nc_matmul(res_psum, stationary, moving, perf_mode=matmul_perf_mode.double_row)
 
-                # Read out from psum, possibly adding bias if present.
                 h_offset = h_block_idx * h_block_size + h_block_f_tile.start_offset
                 out_sb_slice = out_sb[:, nl.ds(h_offset, h_block_f_tile.size)]
                 res_psum_slice = res_psum[:, : h_block_f_tile.size]
-                if cfg.quantization_type == QuantizationType.STATIC:
+
+                # Apply dequant
+                if cfg.quantization_type == QuantizationType.ROW:
+                    nisa.tensor_tensor(
+                        dst=out_sb_slice,
+                        data1=res_psum_slice,
+                        data2=weight_scale_blocks[h_block_idx][
+                            : bxs_block.size, nl.ds(h_block_f_tile.start_offset, h_block_f_tile.size)
+                        ],
+                        op=nl.multiply,
+                    )
+                elif cfg.quantization_type == QuantizationType.STATIC:
                     nisa.activation(
                         dst=out_sb_slice,
                         data=res_psum_slice,
                         op=nl.copy,
                         scale=weight_scale_sb[: bxs_block.size, :],
                     )
-                    if cfg.has_bias:
-                        nisa.tensor_tensor(
-                            dst=out_sb_slice,
-                            data1=out_sb_slice,
-                            data2=bias_sb[: bxs_block.size, nl.ds(h_offset, h_block_f_tile.size)],
-                            op=nl.add,
-                        )
-                elif cfg.has_bias:
+
+                # Apply bias
+                res_slice = out_sb_slice if cfg.is_quantized else res_psum_slice
+                if cfg.has_bias:
                     nisa.tensor_tensor(
                         dst=out_sb_slice,
-                        data1=res_psum_slice,
+                        data1=res_slice,
                         data2=bias_sb[: bxs_block.size, nl.ds(h_offset, h_block_f_tile.size)],
                         op=nl.add,
                     )
                 else:
-                    nisa.tensor_copy(dst=out_sb_slice, src=res_psum_slice)
+                    if matmul_idx % 2 == 0:
+                        nisa.tensor_copy(dst=out_sb_slice, src=res_slice, engine=nisa.scalar_engine)
+                    else:
+                        nisa.tensor_copy(dst=out_sb_slice, src=res_slice, engine=nisa.vector_engine)
 
         if out_hbm_buffer != None:
             nisa.dma_copy(
@@ -729,6 +811,7 @@ def _output_projection_tkg_impl(
             )
         else:
             return out_sb
+
     return out_hbm_buffer
 
 
@@ -736,7 +819,7 @@ def _output_projection_tkg_transpose_out_impl(
     out_hbm_buffer: Optional[nl.ndarray],
     bias: Optional[nl.ndarray],
     w_reshaped: nl.ndarray,
-    weight_scale_sb: Optional[nl.ndarray],
+    quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]],
     attn_shuffled: nl.ndarray,
     cfg: OutputProjectionTkgConfig,
 ) -> nl.ndarray:
@@ -751,7 +834,7 @@ def _output_projection_tkg_transpose_out_impl(
         out_hbm_buffer (Optional[nl.ndarray]): Output buffer in HBM or None if output in SBUF.
         bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
         w_reshaped (nl.ndarray): [N, D, H], Weight tensor reshaped.
-        weight_scale_sb (Optional[nl.ndarray]): [P_MAX, 1], Weight scale tensor in SBUF for quantization.
+        quant_config (Optional[Union[StaticQuantConfig, RowQuantConfig]]): Quantization config.
         attn_shuffled (nl.ndarray): [D, N*B*S], Shuffled attention tensor in SBUF.
         cfg (OutputProjectionTkgConfig): Kernel configuration containing dimensions and options.
 
@@ -770,6 +853,21 @@ def _output_projection_tkg_transpose_out_impl(
         nisa.dma_copy(
             dst=bias_sb,
             src=bias.ap(
+                pattern=[[cfg.h_2_size, cfg.h_1_size], [1, cfg.h_2_size]],
+                offset=cfg.prg_id * cfg.h_1_size * cfg.h_2_size,
+            ),
+        )
+
+    if cfg.quantization_type == QuantizationType.STATIC:
+        weight_scale_sb = quant_config.combined_scale_sb
+    elif cfg.quantization_type == QuantizationType.ROW:
+        weight_scale_hbm = quant_config.weight_scale_hbm
+        weight_scale_sb = nl.ndarray(
+            (cfg.h_1_size, cfg.h_2_size), dtype=weight_scale_hbm.dtype, buffer=nl.sbuf, name="weight_scale_sb"
+        )
+        nisa.dma_copy(
+            dst=weight_scale_sb,
+            src=weight_scale_hbm.ap(
                 pattern=[[cfg.h_2_size, cfg.h_1_size], [1, cfg.h_2_size]],
                 offset=cfg.prg_id * cfg.h_1_size * cfg.h_2_size,
             ),
@@ -879,7 +977,6 @@ def _output_projection_tkg_transpose_out_impl(
         # Last psum tile may be "incomplete" if cfg.h_2_size is not divisible by NUM_BS_PER_PSUM_BANK
         num_BS_for_current_psum_tile = min(NUM_BS_PER_PSUM_BANK, cfg.h_2_size - h_2_base)
 
-        # Read out from psum, possibly adding bias if present.
         dst_sb_access_pattern = [
             [cfg.h_2_size * bxs_size, cfg.h_1_size],
             [bxs_size, num_BS_for_current_psum_tile] if bxs_size <= F_MAX else [1, bxs_tile_size],
@@ -897,7 +994,29 @@ def _output_projection_tkg_transpose_out_impl(
             [0, bxs_tile_size],
         ]
         bias_access_offset = h_2_base
-        if cfg.quantization_type == QuantizationType.STATIC:
+
+        # Apply dequant
+        if cfg.quantization_type == QuantizationType.ROW:
+            # Access pattern for row scale: [h_1_size, h_2_size] -> broadcast across B*S
+            weight_scale_access_pattern = [
+                [cfg.h_2_size, cfg.h_1_size],
+                [1, num_BS_for_current_psum_tile],
+                [0, bxs_tile_size],
+            ]
+            weight_scale_access_offset = bias_access_offset
+            nisa.tensor_tensor(
+                dst=out_sb.ap(
+                    pattern=dst_sb_access_pattern,
+                    offset=dst_sb_access_offset,
+                ),
+                data1=res_psum.ap(pattern=psum_access_pattern),
+                data2=weight_scale_sb.ap(
+                    pattern=weight_scale_access_pattern,
+                    offset=weight_scale_access_offset,
+                ),
+                op=nl.multiply,
+            )
+        elif cfg.quantization_type == QuantizationType.STATIC:
             nisa.activation(
                 dst=out_sb.ap(
                     pattern=dst_sb_access_pattern,
@@ -907,29 +1026,20 @@ def _output_projection_tkg_transpose_out_impl(
                 data=res_psum.ap(pattern=psum_access_pattern),
                 scale=weight_scale_sb[: cfg.h_1_size, :],
             )
-            if bias != None:
-                nisa.tensor_tensor(
-                    dst=out_sb.ap(
-                        pattern=dst_sb_access_pattern,
-                        offset=dst_sb_access_offset,
-                    ),
-                    data1=out_sb.ap(
-                        pattern=dst_sb_access_pattern,
-                        offset=dst_sb_access_offset,
-                    ),
-                    data2=bias_sb.ap(
-                        pattern=bias_access_pattern,
-                        offset=bias_access_offset,
-                    ),
-                    op=nl.add,
-                )
-        elif cfg.has_bias:
+
+        # Apply bias
+        res_slice = (
+            out_sb.ap(pattern=dst_sb_access_pattern, offset=dst_sb_access_offset)
+            if cfg.is_quantized
+            else res_psum.ap(pattern=psum_access_pattern)
+        )
+        if cfg.has_bias:
             nisa.tensor_tensor(
                 dst=out_sb.ap(
                     pattern=dst_sb_access_pattern,
                     offset=dst_sb_access_offset,
                 ),
-                data1=res_psum.ap(pattern=psum_access_pattern),
+                data1=res_slice,
                 data2=bias_sb.ap(
                     pattern=bias_access_pattern,
                     offset=bias_access_offset,
@@ -942,7 +1052,7 @@ def _output_projection_tkg_transpose_out_impl(
                     pattern=dst_sb_access_pattern,
                     offset=dst_sb_access_offset,
                 ),
-                src=res_psum.ap(pattern=psum_access_pattern),
+                src=res_slice,
             )
 
     # Store out as transposed.

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Integration tests for gen_mask_tkg standalone mask generation kernel.
+Integration tests for gen_mask_tkg standalone mask generation kernel and
+gen_mask_tkg_hbm HBM wrapper.
 
 This test suite validates the mask generation algorithm used by attention_tkg,
 covering all code paths:
@@ -20,12 +21,21 @@ covering all code paths:
 - Block KV cache (block_len>0) with shuffled index generation
 - LNC sharding configurations (lnc=1 and lnc=2)
 - Sliding window attention (SWA) mask generation
+- HBM wrapper with SBUF allocation, P_MAX broadcast, LNC sharding, and tiling
 
 The golden function uses gen_mask_tkg_torch_ref from gen_mask_tkg_torch.py.
 """
 
 from test.integration.nkilib.core.attention.test_attention_tkg import build_active_attention_mask, build_swa_positions
-from test.utils.common_dataclasses import CompilerArgs
+from test.utils.common_dataclasses import (
+    TKG_INFERENCE_ARGS,
+    CompilerArgs,
+    KernelArgs,
+    LazyGoldenGenerator,
+    ValidationArgs,
+)
+from test.utils.metrics_collector import MetricsCollector
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -44,14 +54,29 @@ from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
 from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
     is_batch_sharded as is_batch_sharded_fn,
 )
-from nkilib_src.nkilib.core.attention.gen_mask_tkg import gen_mask_tkg
-from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import gen_mask_tkg_torch_ref
+from nkilib_src.nkilib.core.attention.gen_mask_tkg import gen_mask_tkg, gen_mask_tkg_hbm
+from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import gen_mask_tkg_hbm_torch_ref, gen_mask_tkg_torch_ref
 from nkilib_src.nkilib.core.utils.allocator import SbufManager
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib_src.nkilib.core.utils.logging import Logger
 
 # Hardware constants
 P_MAX = 128
+
+_ABBREVS = {
+    "batch": "b",
+    "q_head": "qh",
+    "s_ctx": "sc",
+    "s_active": "sa",
+    "block_len": "bl",
+    "sliding_window": "sw",
+    "strided_mm1": "smm1",
+    "s_prior_offset": "spo",
+    "fa_tile_size": "fa",
+    "lnc": "lnc",
+    "batch_offset": "bo",
+    "bs_full": "bsf",
+}
 
 
 def gen_mask_tkg_wrapper(
@@ -265,10 +290,9 @@ def generate_gen_mask_inputs(
     """Build kernel inputs for gen_mask_tkg test, compatible with UnitTestFramework.
 
     Returns dict with keys matching gen_mask_tkg_wrapper signature.
-    mask_out_hbm uses .must_alias_input suffix for mutable output.
     """
     cfg = AttnTKGConfig(bs=batch, q_head=q_head, s_active=s_active, curr_sprior=s_ctx)
-    sprior_sharded = is_s_prior_sharded(cfg, P_MAX) if lnc > 1 else False
+    sprior_sharded = is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX) if lnc > 1 else False
 
     if sprior_sharded:
         s_prior_per_shard = s_ctx // lnc
@@ -286,7 +310,16 @@ def generate_gen_mask_inputs(
     adjusted_block_len = block_len
     if block_len > 0:
         num_blocks_total = s_ctx // block_len
-        adjusted_block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(num_blocks_total, block_len, lnc, P_MAX)
+        adjusted_block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
+            num_blocks_total,
+            block_len,
+            lnc,
+            P_MAX,
+            batch,
+            q_head,
+            s_active,
+            enable_fa_s_prior_tiling=fa_tile_size > 0,
+        )
         if fa_tile_size > 0:
             fold_size = adjusted_block_len * P_MAX
             assert (
@@ -342,7 +375,9 @@ def generate_gen_mask_inputs(
         result["start_pos_hbm"] = start_pos_data
 
     if include_active_mask:
-        batch_sharded = is_batch_sharded_fn(cfg, P_MAX) if lnc > 1 else False
+        batch_sharded = (
+            is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX) if lnc > 1 else False
+        )
 
         if fa_tile_size > 0:
             tile_end = s_prior_offset + fa_tile_size
@@ -384,7 +419,7 @@ class TestGenMaskTkg:
     @staticmethod
     def _run_test(test_manager, lnc, input_generator):
         def output_tensors(kernel_input):
-            return {"golden_mask": kernel_input["mask_out_hbm.must_alias_input"]}
+            return {"golden_mask": kernel_input["mask_out_hbm"]}
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -425,7 +460,7 @@ class TestGenMaskTkg:
     # fmt: on
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(flat_kv_strided_test_params, flat_kv_strided_test_perms)
+    @pytest_parametrize(flat_kv_strided_test_params, flat_kv_strided_test_perms, abbrevs=_ABBREVS)
     def test_flat_kv_strided_mask_generation(
         self,
         test_manager: Orchestrator,
@@ -479,7 +514,7 @@ class TestGenMaskTkg:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(flat_kv_nonstrided_test_params, flat_kv_nonstrided_test_perms)
+    @pytest_parametrize(flat_kv_nonstrided_test_params, flat_kv_nonstrided_test_perms, abbrevs=_ABBREVS)
     def test_flat_kv_nonstrided_mask_generation(
         self,
         test_manager: Orchestrator,
@@ -537,7 +572,7 @@ class TestGenMaskTkg:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(block_kv_test_params, block_kv_test_perms)
+    @pytest_parametrize(block_kv_test_params, block_kv_test_perms, abbrevs=_ABBREVS)
     def test_block_kv_mask_generation(
         self,
         test_manager: Orchestrator,
@@ -622,7 +657,7 @@ class TestGenMaskTkg:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(swa_test_params, swa_test_perms)
+    @pytest_parametrize(swa_test_params, swa_test_perms, abbrevs=_ABBREVS)
     def test_swa_mask_generation(
         self,
         test_manager: Orchestrator,
@@ -763,7 +798,7 @@ class TestGenMaskTkg:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(active_mask_test_params, active_mask_test_perms)
+    @pytest_parametrize(active_mask_test_params, active_mask_test_perms, abbrevs=_ABBREVS)
     def test_flat_kv_with_active_mask(
         self,
         test_manager: Orchestrator,
@@ -853,7 +888,7 @@ class TestGenMaskTkg:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(block_kv_active_mask_test_params, block_kv_active_mask_test_perms)
+    @pytest_parametrize(block_kv_active_mask_test_params, block_kv_active_mask_test_perms, abbrevs=_ABBREVS)
     def test_block_kv_with_active_mask(
         self,
         test_manager: Orchestrator,
@@ -895,3 +930,532 @@ class TestGenMaskTkg:
             )
 
         self._run_test(test_manager, lnc, input_generator)
+
+
+# ============================================================================
+# HBM WRAPPER TESTS
+# ============================================================================
+
+
+@pytest_test_metadata(
+    name="Gen Mask TKG HBM",
+    pytest_marks=["attention", "tkg", "subkernel"],
+)
+class TestGenMaskTkgHbm:
+    """
+    Integration test suite for gen_mask_tkg_hbm HBM wrapper kernel.
+
+    Tests run the actual NKI kernel on Neuron hardware and compare output
+    against the torch reference implementation. The HBM wrapper handles
+    SBUF allocation, P_MAX broadcast, LNC sharding, and FA tile looping
+    internally, so tests only need to provide HBM-level inputs.
+    """
+
+    def run_test(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        strided_mm1: bool,  # Can be None for auto-select tests
+        lnc: int = 1,
+        sliding_window: int = 0,
+        include_active_mask: bool = False,
+        dtype=np.float32,
+    ):
+        # Generate SBUF-level inputs (lnc=1) to get pos_ids and optional SWA/active data
+        resolved_strided_mm1 = strided_mm1 if strided_mm1 is not None else (block_len == 0)
+
+        sbuf_inp = generate_gen_mask_inputs(
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            lnc=1,
+            strided_mm1=resolved_strided_mm1,
+            sliding_window=sliding_window,
+            include_active_mask=include_active_mask,
+            dtype=dtype,
+        )
+
+        # Build HBM-level kernel input from SBUF inputs
+        kernel_input = {
+            "pos_ids_hbm": sbuf_inp["pos_ids_hbm"][:1, :].copy(),
+            "bs": batch,
+            "q_head": q_head,
+            "s_active": s_active,
+            "s_prior": sbuf_inp["s_prior_per_shard"],  # lnc=1, no sharding
+            "block_len": block_len,
+        }
+
+        if "start_pos_hbm" in sbuf_inp:
+            kernel_input["start_pos_hbm"] = sbuf_inp["start_pos_hbm"][:1, :].copy()
+
+        if "active_mask_hbm" in sbuf_inp:
+            kernel_input["active_mask"] = sbuf_inp["active_mask_hbm"]
+
+        s_prior = kernel_input["s_prior"]
+        output_placeholder = {"mask_out_hbm": np.zeros((s_prior, batch, q_head, s_active), dtype=dtype)}
+
+        def create_lazy_golden() -> dict[str, np.ndarray]:
+            golden_input = {
+                "pos_ids_hbm": torch.from_numpy(kernel_input["pos_ids_hbm"]).float(),
+                "bs": batch,
+                "q_head": q_head,
+                "s_active": s_active,
+                "s_prior": s_prior,
+                "block_len": block_len,
+            }
+            if "start_pos_hbm" in kernel_input:
+                golden_input["start_pos_hbm"] = torch.from_numpy(kernel_input["start_pos_hbm"]).float()
+            if "active_mask" in kernel_input:
+                golden_input["active_mask"] = torch.from_numpy(kernel_input["active_mask"]).float()
+
+            golden_mask = gen_mask_tkg_hbm_torch_ref[lnc](**golden_input)
+            return {"mask_out_hbm": golden_mask.numpy().astype(dtype)}
+
+        test_manager.execute(
+            KernelArgs(
+                kernel_func=gen_mask_tkg_hbm,
+                compiler_input=CompilerArgs(logical_nc_config=lnc),
+                kernel_input=kernel_input,
+                validation_args=ValidationArgs(
+                    golden_output=LazyGoldenGenerator(
+                        output_ndarray=output_placeholder,
+                        lazy_golden_generator=create_lazy_golden,
+                    ),
+                    relative_accuracy=0,
+                    absolute_accuracy=0,
+                ),
+                inference_args=TKG_INFERENCE_ARGS,
+            )
+        )
+
+    # ========================================================================
+    # FLAT KV CACHE TESTS (block_len = 0)
+    # ========================================================================
+
+    # fmt: off
+    flat_kv_test_params = "batch, q_head, s_ctx, s_active, strided_mm1, lnc"
+    flat_kv_test_perms = [
+        # Strided MM1, LNC=1
+        (4, 1, 256, 1, True, 1),
+        (4, 1, 1024, 5, True, 1),
+        (4, 2, 2048, 7, True, 1),
+        (16, 4, 4096, 5, True, 1),
+        # Non-strided MM1, LNC=1
+        (4, 1, 256, 1, False, 1),
+        (4, 1, 1024, 5, False, 1),
+        (8, 2, 4096, 7, False, 1),
+        # LNC=2 s_prior-sharded (BQS <= 128)
+        (4, 1, 4096, 5, True, 2),      # BQS=20
+        (4, 2, 16384, 7, True, 2),     # BQS=56
+        (4, 1, 4096, 5, False, 2),     # Non-strided, s_prior-sharded
+        # LNC=2 batch-sharded (BQS > 128)
+        (8, 8, 4096, 5, True, 2),      # BQS=320
+        (8, 8, 4096, 5, False, 2),     # Non-strided, batch-sharded
+    ]
+    # fmt: on
+
+    @pytest.mark.fast
+    @pytest_parametrize(flat_kv_test_params, flat_kv_test_perms, abbrevs=_ABBREVS)
+    def test_flat_kv(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        strided_mm1: bool,
+        lnc: int,
+    ):
+        """Test flat KV cache mask generation (block_len=0)."""
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=0,
+            strided_mm1=strided_mm1,
+            lnc=lnc,
+        )
+
+    # ========================================================================
+    # BLOCK KV CACHE TESTS (block_len > 0)
+    # ========================================================================
+
+    # fmt: off
+    block_kv_test_params = "batch, q_head, s_ctx, s_active, block_len, lnc"
+    block_kv_test_perms = [
+        # LNC=1
+        (4, 1, 256, 5, 16, 1),
+        (4, 1, 2048, 5, 32, 1),
+        (8, 2, 4096, 7, 16, 1),
+        (4, 1, 4096, 5, 128, 1),       # block_len=128, resizes to 32
+        (4, 1, 32768, 5, 128, 1),      # block_len=128, no resize, multi-fold
+        # LNC=2 s_prior-sharded
+        (4, 1, 8192, 5, 16, 2),
+        (4, 1, 8192, 5, 128, 2),       # block_len=128, resizes to 32
+        (4, 1, 32768, 5, 128, 2),      # block_len=128, no resize, multi-fold, sprior-sharded
+        # LNC=2 batch-sharded
+        (8, 8, 4096, 5, 16, 2),        # BQS=320
+        (8, 8, 4096, 5, 128, 2),       # block_len=128, resizes to 16
+        (8, 8, 32768, 5, 128, 2),      # block_len=128, no resize, multi-fold, batch-sharded
+    ]
+    # fmt: on
+
+    @pytest_parametrize(block_kv_test_params, block_kv_test_perms, abbrevs=_ABBREVS)
+    def test_block_kv(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        lnc: int,
+    ):
+        """Test block KV cache mask generation (block_len>0)."""
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=False,
+            lnc=lnc,
+        )
+
+    # ========================================================================
+    # ACTIVE MASK TESTS
+    # ========================================================================
+
+    # fmt: off
+    hbm_active_mask_test_params = "batch, q_head, s_ctx, s_active, block_len, strided_mm1, lnc"
+    hbm_active_mask_test_perms = [
+        # Flat KV, LNC=1
+        (4, 1, 256, 5, 0, True, 1),
+        (4, 2, 512, 5, 0, True, 1),
+        (4, 1, 256, 5, 0, False, 1),
+        (4, 1, 256, 1, 0, True, 1),     # s_active=1
+        # Block KV with active mask, LNC=1
+        (4, 1, 2048, 5, 16, False, 1),
+        (4, 2, 4096, 5, 16, False, 1),
+        (4, 1, 4096, 5, 128, False, 1),
+        (4, 1, 32768, 5, 128, False, 1),  # block_len=128, no resize, multi-fold
+        # Larger batch / s_ctx
+        (16, 4, 4096, 5, 0, True, 1),
+        (8, 2, 4096, 7, 16, False, 1),
+        # LNC=2 s_prior-sharded
+        (4, 2, 4096, 5, 0, True, 2),    # BQS=40
+        (4, 1, 8192, 5, 16, False, 2),
+        (4, 1, 8192, 5, 128, False, 2),
+        (4, 1, 32768, 5, 128, False, 2),  # block_len=128, no resize, multi-fold, sprior-sharded
+        # LNC=2 batch-sharded
+        (8, 8, 256, 5, 0, True, 2),     # BQS=320
+        (8, 8, 4096, 5, 16, False, 2),
+        (8, 8, 4096, 5, 128, False, 2),
+        (8, 8, 32768, 5, 128, False, 2),  # block_len=128, no resize, multi-fold, batch-sharded
+    ]
+    # fmt: on
+
+    @pytest_parametrize(hbm_active_mask_test_params, hbm_active_mask_test_perms, abbrevs=_ABBREVS)
+    def test_active_mask(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        strided_mm1: bool,
+        lnc: int,
+    ):
+        """Test mask generation with active_mask (cascaded attention)."""
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            lnc=lnc,
+            include_active_mask=True,
+        )
+
+    # ========================================================================
+    # SWA (SLIDING WINDOW ATTENTION) TESTS
+    # ========================================================================
+
+    # fmt: off
+    hbm_swa_test_params = "batch, q_head, s_ctx, s_active, sliding_window, block_len, strided_mm1, lnc"
+    hbm_swa_test_perms = [
+        # Flat KV strided, LNC=1
+        (4, 1, 1024, 5, 128, 0, True, 1),
+        (4, 1, 1024, 5, 256, 0, True, 1),
+        (4, 2, 2048, 7, 512, 0, True, 1),
+        # Flat KV non-strided, LNC=1
+        (4, 1, 1024, 5, 128, 0, False, 1),
+        (4, 2, 2048, 7, 256, 0, False, 1),
+        # Block KV with SWA, LNC=1
+        (4, 1, 2048, 5, 128, 16, False, 1),
+        (4, 1, 2048, 5, 256, 16, False, 1),
+        (4, 1, 4096, 5, 256, 128, False, 1),   # block_len=128 + SWA
+        # LNC=2 s_prior-sharded
+        (4, 1, 4096, 5, 128, 0, True, 2),
+        (4, 1, 8192, 5, 256, 128, False, 2),   # block_len=128 + SWA, sprior-sharded
+        # LNC=2 batch-sharded
+        (8, 8, 4096, 5, 128, 0, True, 2),
+        (8, 8, 4096, 5, 256, 128, False, 2),   # block_len=128 + SWA, batch-sharded
+    ]
+    # fmt: on
+
+    @pytest_parametrize(hbm_swa_test_params, hbm_swa_test_perms, abbrevs=_ABBREVS)
+    def test_swa(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        sliding_window: int,
+        block_len: int,
+        strided_mm1: bool,
+        lnc: int,
+    ):
+        """Test SWA (sliding window attention) mask generation."""
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            lnc=lnc,
+            sliding_window=sliding_window,
+        )
+
+    # ========================================================================
+    # FA TILING TESTS (large configs triggering multiple tiles)
+    # ========================================================================
+
+    # fmt: off
+    fa_tiling_test_params = "batch, q_head, s_ctx, s_active, block_len, strided_mm1, lnc"
+    fa_tiling_test_perms = [
+        # LNC=1 (strided uses batch tiling, non-strided uses s_prior tiling)
+        (8, 8, 8192, 5, 0, True, 1),
+        (8, 8, 8192, 7, 0, True, 1),      # last tile reduced
+        (8, 8, 8192, 5, 0, False, 1),
+        (8, 8, 8192, 5, 16, False, 1),    # block KV tiling
+        (8, 8, 8192, 5, 128, False, 1),   # block_len=128 + tiling (resize to 64, batch tiling)
+        (8, 8, 32768, 5, 128, False, 1),  # block_len=128, no resize, s_prior tiling
+        # LNC=2 + tiling
+        (8, 8, 8192, 5, 0, True, 2),      # batch-sharded + batch tiling
+        (4, 4, 32768, 7, 0, True, 2),     # s_prior-sharded + batch tiling
+        (4, 1, 32768, 5, 128, False, 2),  # block_len=128, no resize, sprior-sharded (single tile)
+        (4, 4, 65536, 5, 128, False, 2),  # block_len=128, no resize, sprior-sharded + actual tiling
+        (8, 8, 32768, 5, 128, False, 2),  # block_len=128, no resize, batch-sharded + tiling
+    ]
+    # fmt: on
+
+    @pytest_parametrize(fa_tiling_test_params, fa_tiling_test_perms, abbrevs=_ABBREVS)
+    def test_fa_tiling(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        strided_mm1: bool,
+        lnc: int,
+    ):
+        """Test FA tiling with large configs that trigger multiple tiles."""
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            lnc=lnc,
+        )
+
+    # ========================================================================
+    # FA TILING + ACTIVE MASK TESTS
+    # ========================================================================
+
+    # fmt: off
+    fa_tiling_active_mask_test_params = "batch, q_head, s_ctx, s_active, block_len, strided_mm1, lnc"
+    fa_tiling_active_mask_test_perms = [
+        # LNC=1 — active mask at end of s_prior, only last tile loads it
+        (8, 8, 8192, 5, 0, True, 1),
+        (8, 8, 8192, 5, 0, False, 1),
+        (8, 8, 8192, 5, 16, False, 1),     # block KV
+        (8, 8, 8192, 5, 128, False, 1),    # block_len=128 + tiling + active mask
+        (8, 8, 32768, 5, 128, False, 1),   # block_len=128, no resize + tiling + active mask
+        # LNC=2 batch-sharded + tiling
+        (8, 8, 8192, 5, 0, True, 2),
+        (8, 8, 32768, 5, 128, False, 2),   # block_len=128, no resize, batch-sharded + tiling + active mask
+        # LNC=2 s_prior-sharded + tiling
+        (4, 4, 32768, 7, 0, True, 2),
+        (4, 4, 65536, 5, 128, False, 2),   # block_len=128, no resize, sprior-sharded + tiling + active mask
+    ]
+    # fmt: on
+
+    @pytest_parametrize(fa_tiling_active_mask_test_params, fa_tiling_active_mask_test_perms, abbrevs=_ABBREVS)
+    def test_fa_tiling_with_active_mask(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        strided_mm1: bool,
+        lnc: int,
+    ):
+        """Test FA tiling combined with active_mask."""
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            lnc=lnc,
+            include_active_mask=True,
+        )
+
+    # ========================================================================
+    # SWA + ACTIVE MASK TESTS
+    # ========================================================================
+
+    # fmt: off
+    swa_active_mask_test_params = "batch, q_head, s_ctx, s_active, sliding_window, block_len, strided_mm1, lnc"
+    swa_active_mask_test_perms = [
+        (4, 2, 1024, 5, 256, 0, True, 1),
+        (4, 1, 1024, 5, 128, 0, False, 1),
+        (4, 1, 4096, 5, 256, 128, False, 1),   # block_len=128 + SWA + active mask
+        (4, 2, 4096, 5, 128, 0, True, 2),
+        (4, 1, 8192, 5, 256, 128, False, 2),   # block_len=128 + SWA + active mask, sprior-sharded
+    ]
+    # fmt: on
+
+    @pytest_parametrize(swa_active_mask_test_params, swa_active_mask_test_perms, abbrevs=_ABBREVS)
+    def test_swa_with_active_mask(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        sliding_window: int,
+        block_len: int,
+        strided_mm1: bool,
+        lnc: int,
+    ):
+        """Test SWA mask generation combined with active_mask."""
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            lnc=lnc,
+            sliding_window=sliding_window,
+            include_active_mask=True,
+        )
+
+    # ========================================================================
+    # LNC SWEEP TESTS
+    # ========================================================================
+    # These tests verify that gen_mask_tkg_hbm produces correct masks at both
+    # LNC=1 and LNC=2 by parametrizing lnc as a grid dimension and delegating
+    # to run_test (which compares kernel output against the torch reference).
+    #
+    # This catches the P_MAX-major HBM layout bug: when the mask was stored as
+    # [P_MAX, n_sprior_tile, ...], LNC=2 shard boundaries did not align with
+    # row boundaries, producing wrong mask bits after reshape.
+
+    # fmt: off
+    lnc_sweep_test_params = "batch, q_head, s_ctx, s_active, block_len, strided_mm1, sliding_window"
+    lnc_sweep_test_perms = [
+        # Flat KV, strided
+        (4, 1, 4096, 5, 0, True, 0),
+        (4, 2, 16384, 7, 0, True, 0),
+        # Flat KV, non-strided
+        (4, 1, 4096, 5, 0, False, 0),
+        # Block KV — the primary bug scenario
+        (4, 1, 8192, 5, 16, False, 0),
+        (4, 1, 12288, 5, 16, False, 0),
+        (8, 8, 4096, 5, 16, False, 0),
+        (4, 1, 8192, 5, 128, False, 0),
+        # Block KV + SWA
+        (4, 1, 8192, 5, 16, False, 128),
+        (4, 1, 12288, 5, 16, False, 128),
+        # Flat KV + SWA
+        (4, 1, 4096, 5, 0, True, 128),
+        (4, 2, 4096, 7, 0, True, 256),
+    ]
+    # fmt: on
+
+    @pytest.mark.parametrize("lnc", [1, 2])
+    @pytest_parametrize(lnc_sweep_test_params, lnc_sweep_test_perms, abbrevs=_ABBREVS)
+    def test_gen_mask_hbm_lnc_sweep(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        strided_mm1: bool,
+        sliding_window: int,
+        lnc: int,
+    ):
+        """Test gen_mask_tkg_hbm at both LNC=1 and LNC=2 against torch reference.
+
+        Regression test for the P_MAX-major HBM layout bug. Each (config, lnc)
+        pair is validated independently against the torch reference, so any
+        shard-boundary misalignment shows up as a mismatch.
+        """
+        self.run_test(
+            test_manager=test_manager,
+            collector=collector,
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            lnc=lnc,
+            sliding_window=sliding_window,
+        )

@@ -32,6 +32,7 @@ def output_projection_tkg_torch_ref(
     input_scale: Optional[torch.Tensor] = None,
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
+    sbm=None,
 ) -> dict:
     """PyTorch reference implementation of output projection for TKG (token generation).
 
@@ -48,8 +49,9 @@ def output_projection_tkg_torch_ref(
         attention: [D, B, N, S] input tensor from attention block.
         weight: [N*D, H] weight tensor.
         bias: [1, H] optional bias tensor.
-        quantization_type: Type of quantization (NONE, STATIC).
-        weight_scale: [128, 1] weight quantization scale (for STATIC).
+        quantization_type: Type of quantization (NONE, STATIC, ROW).
+        weight_scale: [128, 1] weight quantization scale (for STATIC),
+                      [128, H] weight quantization scale (for ROW).
         input_scale: [128, 1] input quantization scale (for STATIC).
         TRANSPOSE_OUT: Whether to produce transposed output layout.
         OUT_IN_SB: Whether output is in SBUF (does not affect math).
@@ -72,11 +74,15 @@ def output_projection_tkg_torch_ref(
         ws = weight_scale[0, 0].float()
         ins = input_scale[0, 0].float()
         attn = torch.clamp(attn / ins, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+    elif quantization_type == QuantizationType.ROW:
+        ws = weight_scale[0, :].float()
 
     out = attn @ weight
 
     if quantization_type == QuantizationType.STATIC:
         out = out * (ws * ins)
+    elif quantization_type == QuantizationType.ROW:
+        out = out * ws
 
     if bias is not None:
         out = out + bias.float()

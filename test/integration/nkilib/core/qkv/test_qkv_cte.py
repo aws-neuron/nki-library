@@ -252,6 +252,10 @@ def golden_func_fused_add_qkv(
         if qkv_in_scale is not None:
             qkv_in_scale = qkv_in_scale[0, 0].astype(np.float32)
 
+    elif quantization_type == QuantizationType.ROW:
+        w = inp_np["fused_qkv_weights"]
+        qkv_w_scale = inp_np.get("qkv_w_scale")
+
     elif quantization_type == QuantizationType.MX:
         w = inp_np["fused_qkv_weights"]
         qkv_w_scale = inp_np["qkv_w_scale"]
@@ -263,7 +267,7 @@ def golden_func_fused_add_qkv(
 
     cos_cache = inp_np["cos_cache"].astype(guessed_type) if inp_np["cos_cache"] is not None else None
     sin_cache = inp_np["sin_cache"].astype(guessed_type) if inp_np["sin_cache"] is not None else None
-    is_input_swizzled = inp_np["is_input_swizzled"]
+    is_h_dim_4h_transposed = inp_np["is_h_dim_4h_transposed"]
 
     if quantization_type == QuantizationType.MX:
         qkv_out = norm_qkv_ref_mx(
@@ -276,7 +280,7 @@ def golden_func_fused_add_qkv(
             bias=bias_t,
             norm_b=norm_b,
             hidden_actual=hidden_actual,
-            is_input_swizzled=is_input_swizzled,
+            is_h_dim_4h_transposed=is_h_dim_4h_transposed,
         )
     else:
         qkv_out = norm_qkv_ref(
@@ -457,7 +461,7 @@ class TestQkvCteKernel:
         num_blocks: int | None = None,
         block_size: int | None = None,
         slot_mapping: np.ndarray | None = None,
-        is_input_swizzled: bool = False,
+        is_h_dim_4h_transposed: bool = False,
         threshold: tuple[float, float] = (2e-2, 1e-5),
         qkv_in_scale_for_mx: np.ndarray | None = None,
         qkv_w_scale_for_mx: np.ndarray | None = None,
@@ -493,9 +497,17 @@ class TestQkvCteKernel:
             num_blocks=num_blocks,
             block_size=block_size,
             slot_mapping=slot_mapping,
-            is_input_swizzled=is_input_swizzled,
+            is_h_dim_4h_transposed=is_h_dim_4h_transposed,
         )
-        kernel_input["is_input_swizzled"] = is_input_swizzled
+        kernel_input["is_h_dim_4h_transposed"] = is_h_dim_4h_transposed
+
+        golden_input = kernel_input
+
+        # Pass MX static dequant scales to kernel
+        if qkv_in_scale_for_mx is not None:
+            kernel_input["qkv_in_scale"] = qkv_in_scale_for_mx
+        if qkv_w_scale_for_mx is not None:
+            kernel_input["qkv_w_scale"] = qkv_w_scale_for_mx
 
         golden_input = kernel_input
 
@@ -1089,7 +1101,7 @@ class TestQkvCteKernel:
     ####################################################################################################################
     # fmt: off
     qkv_cte_kernel_fused_rope_test_params = \
-        "vnc_degree, batch, seqlen, hidden_dim, n_q_heads, n_kv_heads, d_head, norm_type, fused_add, add_bias, norm_bias, output_layout, eps, fused_rope, is_input_swizzled"
+        "vnc_degree, batch, seqlen, hidden_dim, n_q_heads, n_kv_heads, d_head, norm_type, fused_add, add_bias, norm_bias, output_layout, eps, fused_rope, is_h_dim_4h_transposed"
     qkv_cte_kernel_fused_rope_test_perms = [
         [2, 1, 124, 512, 2, 1, 128, NormType.RMS_NORM, True, False, False, QKVOutputLayout.BSD, 1e-6, False, False],
         [2, 1, 128, 512, 2, 1, 128, NormType.RMS_NORM, True, False, False, QKVOutputLayout.BSD, 1e-6, False, False],
@@ -1159,7 +1171,7 @@ class TestQkvCteKernel:
         output_layout,
         eps,
         fused_rope,
-        is_input_swizzled,
+        is_h_dim_4h_transposed,
     ):
         compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
         fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
@@ -1185,7 +1197,7 @@ class TestQkvCteKernel:
             n_kv_heads=n_kv_heads,
             d_head=d_head,
             tensor_gen=rope_gaussian_tensor_generator(),
-            is_input_swizzled=is_input_swizzled,
+            is_h_dim_4h_transposed=is_h_dim_4h_transposed,
             threshold=(5e-2, 1e-2),
         )
 
@@ -1355,7 +1367,7 @@ class TestQkvCteKernel:
             "sbm": None,
             "use_auto_allocation": False,
             "load_input_with_DMA_transpose": True,
-            "is_input_swizzled": False,
+            "is_h_dim_4h_transposed": False,
             "weight_layout": QKVWeightLayout.MX_INTERLEAVED,
         }
 
@@ -1539,7 +1551,7 @@ class TestQkvCteKernel:
             "sbm": None,
             "use_auto_allocation": False,
             "load_input_with_DMA_transpose": True,
-            "is_input_swizzled": False,
+            "is_h_dim_4h_transposed": False,
             "weight_layout": QKVWeightLayout.MX_INTERLEAVED,
             "qkv_in_scale": np.full(in_scale_shape, in_scale_val, dtype=np.float32),
             "qkv_w_scale": (np.broadcast_to(w_scale_val.reshape(1, 3), w_scale_shape).astype(np.float32).copy()),

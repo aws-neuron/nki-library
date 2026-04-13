@@ -275,9 +275,9 @@ def _selective_expert_moe_tkg_mxfp4(
     gate_up_scale_sb = nl.ndarray(
         (_pmax, 2, n_H512_tile_sharded, dims.I), dtype=nl.uint8, buffer=nl.sbuf, name='gate_up_w_scale_sb'
     )
-    nisa.memset(dst=gate_up_scale_sb, value=0.0)
+    nisa.memset(dst=gate_up_scale_sb, value=0)
     down_scale_sb = nl.ndarray((_pmax, n_I512_tile, dims.H_shard), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.memset(dst=down_scale_sb, value=0.0)
+    nisa.memset(dst=down_scale_sb, value=0)
 
     for i_T_tile in range(n_T_tile):
         # For down proj with [T, H] layout, all four (at most) token outputs will write to the same output_temp on each of the four quadrants,
@@ -290,7 +290,7 @@ def _selective_expert_moe_tkg_mxfp4(
             if i_t < dims.T:
                 inp_qtz_cur_t = nl.ndarray((_pmax, n_H512_tile_sharded, 4), dtype=inp_qtz.dtype, buffer=nl.sbuf)
                 inp_scale_cur_t = nl.ndarray((_pmax, n_H512_tile_sharded, 4), dtype=inp_scale.dtype, buffer=nl.sbuf)
-                nisa.memset(dst=inp_scale_cur_t, value=0.0)
+                nisa.memset(dst=inp_scale_cur_t, value=0)
                 nisa.tensor_copy(
                     dst=inp_qtz_cur_t.ap(
                         pattern=[[n_H512_tile_sharded * 4, _pmax], [4, n_H512_tile_sharded]], offset=0, dtype=nl.float32
@@ -357,11 +357,13 @@ def _selective_expert_moe_tkg_mxfp4(
 
                     # Load down proj weights into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mx_x4 (packed I)
                     down_weight_qtz_sb = nl.ndarray(
-                        (_pmax, n_I512_tile, dims.H_shard), dtype=params.down_proj_weights_tensor.dtype, buffer=nl.sbuf
+                        (_pmax, n_I512_tile, dims.H_shard),
+                        dtype=params.down_proj_weights_tensor.base_tensor.dtype,
+                        buffer=nl.sbuf,
                     )
                     # Memset weight if input weight HBM does not pad on par dim
                     if p_I != _pmax:
-                        nisa.memset(dst=down_weight_qtz_sb[:, n_I512_tile - 1, :], value=0.0)
+                        nisa.memset(dst=down_weight_qtz_sb[:, n_I512_tile - 1, :], value=0)
 
                     # down_proj_weights_tensor shape: (E, p_I, n_I512_tile, H)
                     H_offset = 0 if shard_on_K else (dims.shard_id * dims.H_shard)
@@ -372,15 +374,16 @@ def _selective_expert_moe_tkg_mxfp4(
                         .get_view()
                     )
                     down_weights_view = (
-                        TensorView(params.down_proj_weights_tensor)
+                        TensorView(params.down_proj_weights_tensor.base_tensor)
                         .select(dim=0, index=expert_scalar)
                         .slice(dim=2, start=H_offset, end=H_offset + dims.H_shard)
                     )
                     nisa.dma_copy(
                         dst=down_weight_qtz_sb[:p_I, :, :],
                         src=down_weights_view.get_view(),
-                        dge_mode=2,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
+                    down_weight_qtz_sb = down_weight_qtz_sb.view(params.down_proj_weights_tensor.dtype)
 
                     # Call down proj with out_p_offset (to ensure the data in cur_down_out is on the same partition as output_temp)
                     down_cfg = ProjConfig(

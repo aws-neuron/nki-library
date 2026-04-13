@@ -21,6 +21,7 @@ with LNC2 sharding on the H (hidden) dimension.
 
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
 from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -271,9 +272,11 @@ MXFP4_PROJ_LNC2_TEST_VECTORS = [
 ]
 
 GATE_UP_PARAM_NAMES = "BxS, H, I"
+_GATE_UP_ABBREVS = {"BxS": "bs"}
 GATE_UP_TEST_PARAMS = [tuple(v) for v in MXFP4_PROJ_LNC2_TEST_VECTORS]
 
 DOWN_PARAM_NAMES = "BxS, H, I, use_stream_shuffle_broadcast"
+_DOWN_ABBREVS = {"BxS": "bs", "use_stream_shuffle_broadcast": "ssb"}
 DOWN_TEST_PARAMS = [(BxS, H, I, use_ssb) for BxS, H, I in MXFP4_PROJ_LNC2_TEST_VECTORS for use_ssb in [True, False]]
 
 
@@ -292,7 +295,7 @@ class TestMlpProjMxfp4Kernel:
     """Test suite for MXFP4 MLP projection kernels."""
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(GATE_UP_PARAM_NAMES, GATE_UP_TEST_PARAMS)
+    @pytest_parametrize(GATE_UP_PARAM_NAMES, GATE_UP_TEST_PARAMS, abbrevs=_GATE_UP_ABBREVS)
     def test_mxfp4_gate_up_proj_unit(
         self,
         test_manager: Orchestrator,
@@ -323,7 +326,7 @@ class TestMlpProjMxfp4Kernel:
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(DOWN_PARAM_NAMES, DOWN_TEST_PARAMS)
+    @pytest_parametrize(DOWN_PARAM_NAMES, DOWN_TEST_PARAMS, abbrevs=_DOWN_ABBREVS)
     def test_mxfp4_down_proj_unit(
         self,
         test_manager: Orchestrator,

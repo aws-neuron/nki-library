@@ -41,6 +41,8 @@ def attention_cte_torch_ref(
     cp_offset: torch.tensor = None,
     global_cp_deg: int = None,
     cp_strided_q_slicing: bool = False,
+    bound_min=None,
+    bound_max=None,
 ):
     """PyTorch reference implementation for attention_cte NKI kernel.
 
@@ -142,6 +144,14 @@ def attention_cte_torch_ref(
         mask += torch.where(pos_diff > 0, minus_inf_t, zero_t)
     if sliding_window > 0:
         mask += torch.where(pos_diff <= -sliding_window, minus_inf_t, zero_t)
+
+    # Sequence packing mask: each query only attends to KV positions in [bound_min, bound_max)
+    if bound_min is not None and bound_max is not None:
+        bound_min_t = torch.tensor(bound_min, dtype=torch.int32).reshape(seqlen_q, 1)
+        bound_max_t = torch.tensor(bound_max, dtype=torch.int32).reshape(seqlen_q, 1)
+        kv_idx = torch.arange(prior_used_len + seqlen_k, dtype=torch.int32).unsqueeze(0)
+        seq_pack_mask = (kv_idx < bound_min_t) | (kv_idx >= bound_max_t)
+        mask = mask.masked_fill(seq_pack_mask, float("-inf"))
 
     # Compute QK, apply mask
     qk = q @ k  # [bs, seqlen_q, prior_used_len + seqlen_k]

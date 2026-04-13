@@ -22,7 +22,7 @@ from nki.collectives import ReplicaGroup
 from ...core.utils.kernel_assert import kernel_assert
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def allgather_sb2sb(
     inp: nl.ndarray,
     replica_groups: ReplicaGroup,
@@ -91,7 +91,7 @@ def allgather_sb2sb(
     return out
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def allgather_sb2sb_tiled(
     inp: nl.ndarray,
     replica_groups: ReplicaGroup,

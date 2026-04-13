@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 from test.integration.nkilib.core.mlp.test_mlp_common import gen_moe_mx_weights
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_utils import (
@@ -27,9 +28,9 @@ from test.integration.nkilib.utils.test_kernel_common import (
     is_dtype_mx,
 )
 from test.utils.common_dataclasses import (
-    MODEL_TEST_TYPE,
     CompilerArgs,
     Platforms,
+    prepare_model_parametrize,
 )
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_test_metadata
@@ -38,12 +39,218 @@ from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
 import neuron_dtypes as dt
+import nki
 import nki.language as nl
 import numpy as np
 import pytest
 from nkilib_src.nkilib.core.moe_block.moe_block_tkg import moe_block_tkg as moe_block_tkg_kernel
 from nkilib_src.nkilib.core.moe_block.moe_block_tkg_torch import moe_block_tkg_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, RouterActFnType
+from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+
+# Mapping from MX x4 dtype to the NKI unsigned integer dtype with matching bit-width.
+# mxfp4_x4: 4 bits × 4 = 16 bits → uint16
+# mxfp8_x4: 8 bits × 4 = 32 bits → uint32
+# NKI dtypes (nl.uint16/nl.uint32) must be used instead of numpy dtypes (np.uint16/np.uint32)
+# because the NKI compiler rejects numpy dtypes during kernel specialization.
+_MX_TO_UINT_DTYPE = {
+    nl.float4_e2m1fn_x4: nl.uint16,
+    nl.float8_e4m3fn_x4: nl.uint32,
+    nl.float8_e5m2_x4: nl.uint32,
+}
+
+# Reverse mapping: NKI unsigned integer dtype → MX x4 dtype for reinterpret_cast
+_UINT_TO_MX_DTYPE = {
+    nl.uint16: nl.float4_e2m1fn_x4,
+    nl.uint32: nl.float8_e4m3fn_x4,
+}
+
+def generate_inputs(
+    batch: int,
+    seqlen: int,
+    hidden: int,
+    hidden_actual: int | None,
+    intermediate: int,
+    num_global_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    router_fn: RouterActFnType,
+    hidden_act_fn: ActFnType,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+    moe_weight_dtype,
+    input_dtype,
+    has_bias: bool,
+    has_clamp: bool,
+    router_act_first: bool,
+    norm_topk_prob: bool,
+    skip_router_logits: bool,
+    router_mm_dtype,
+    is_all_expert: bool,
+) -> dict:
+    """Build input tensors for moe_block_tkg kernel tests. Returns dict of numpy arrays."""
+    is_mx_weight = is_dtype_mx(moe_weight_dtype)
+
+def convert_mx_weights_to_uint(kernel_input: dict, moe_weight_dtype) -> dict:
+    """Convert MX weights to unsigned integer dtype to simulate NxD behavior.
+
+    NxD passes MX weights as raw unsigned integer tensors (uint16 for mxfp4_x4,
+    uint32 for mxfp8_x4) that need to be reinterpreted inside the kernel.
+    """
+    uint_dtype = _MX_TO_UINT_DTYPE[moe_weight_dtype]
+    result = kernel_input.copy()
+    for key in ['expert_gate_up_weights', 'expert_down_weights']:
+        if key in result and result[key] is not None:
+            result[key] = result[key].view(uint_dtype)
+    return result
+
+
+@nki.jit
+def mx_moe_block_tkg_wrapper(
+    inp,
+    gamma,
+    router_weights,
+    expert_gate_up_weights,
+    expert_down_weights,
+    shared_expert_gate_w=None,
+    shared_expert_up_w=None,
+    shared_expert_down_w=None,
+    expert_gate_up_weights_scale=None,
+    expert_down_weights_scale=None,
+    router_bias=None,
+    expert_gate_up_bias=None,
+    expert_down_bias=None,
+    shared_expert_gate_bias=None,
+    shared_expert_up_bias=None,
+    shared_expert_down_bias=None,
+    eps=1e-6,
+    top_k=1,
+    router_act_fn=None,
+    router_pre_norm=True,
+    norm_topk_prob=False,
+    expert_affinities_scaling_mode=None,
+    hidden_act_fn=None,
+    hidden_act_scale_factor=None,
+    hidden_act_bias=None,
+    gate_clamp_upper_limit=None,
+    gate_clamp_lower_limit=None,
+    up_clamp_upper_limit=None,
+    up_clamp_lower_limit=None,
+    router_mm_dtype=None,
+    hidden_actual=None,
+    skip_router_logits=False,
+    is_all_expert=False,
+    rank_id=None,
+    residual=None,
+):
+    """Wrapper that bitcasts unsigned integer weights to MX x4 dtype before calling the kernel.
+
+    Simulates how NxD passes MX weights — as raw uint16/uint32 tensors that need to be
+    reinterpreted as float4_e2m1fn_x4 or float8_e4m3fn_x4 dtype.
+    """
+    mx_dtype = _UINT_TO_MX_DTYPE[expert_gate_up_weights.dtype]
+    gate_up_view = TensorView(expert_gate_up_weights).reinterpret_cast(mx_dtype)
+    down_view = TensorView(expert_down_weights).reinterpret_cast(mx_dtype)
+
+    return moe_block_tkg_kernel(
+        inp=inp,
+        gamma=gamma,
+        router_weights=router_weights,
+        expert_gate_up_weights=gate_up_view,
+        expert_down_weights=down_view,
+        shared_expert_gate_w=shared_expert_gate_w,
+        shared_expert_up_w=shared_expert_up_w,
+        shared_expert_down_w=shared_expert_down_w,
+        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
+        expert_down_weights_scale=expert_down_weights_scale,
+        router_bias=router_bias,
+        expert_gate_up_bias=expert_gate_up_bias,
+        expert_down_bias=expert_down_bias,
+        shared_expert_gate_bias=shared_expert_gate_bias,
+        shared_expert_up_bias=shared_expert_up_bias,
+        shared_expert_down_bias=shared_expert_down_bias,
+        eps=eps,
+        top_k=top_k,
+        router_act_fn=router_act_fn,
+        router_pre_norm=router_pre_norm,
+        norm_topk_prob=norm_topk_prob,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        hidden_act_fn=hidden_act_fn,
+        hidden_act_scale_factor=hidden_act_scale_factor,
+        hidden_act_bias=hidden_act_bias,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+        router_mm_dtype=router_mm_dtype,
+        hidden_actual=hidden_actual,
+        skip_router_logits=skip_router_logits,
+        is_all_expert=is_all_expert,
+        rank_id=rank_id,
+        residual=residual,
+    )
+
+    # Expert weights
+    if is_mx_weight:
+        intermediate_p = math.ceil(intermediate / 4 / 8) * 8 if intermediate < 512 else _pmax
+        n_H512_tile = hidden // (_pmax * _q_width)
+        n_I512_tile = math.ceil(intermediate / (_pmax * _q_width))
+        inputs["expert_gate_up_weights"] = mx_weights.gate_up_w_qtz
+        inputs["expert_down_weights"] = mx_weights.down_w_qtz
+        inputs["expert_gate_up_weights_scale"] = mx_weights.gate_up_w_scale
+        inputs["expert_down_weights_scale"] = mx_weights.down_w_scale
+    else:
+        inputs["expert_gate_up_weights"] = rng.normal(size=(num_local_experts, hidden, 2, intermediate)).astype(
+            weight_dtype
+        )
+        inputs["expert_down_weights"] = rng.normal(size=(num_local_experts, intermediate, hidden)).astype(weight_dtype)
+        inputs["expert_gate_up_weights_scale"] = None
+        inputs["expert_down_weights_scale"] = None
+
+    # Bias
+    inputs["router_bias"] = (
+        dt.static_cast(rng.uniform(low=-0.1, high=0.1, size=(1, num_global_experts)), router_mm_dtype)
+        if has_bias
+        else None
+    )
+    if has_bias:
+        if is_mx_weight:
+            expert_gate_up_bias_shape = (num_local_experts, intermediate_p, 2, n_I512_tile, _q_width)
+        else:
+            expert_gate_up_bias_shape = (num_local_experts, 2, intermediate)
+        inputs["expert_gate_up_bias"] = rng.normal(size=expert_gate_up_bias_shape).astype(hidden_dtype)
+        inputs["expert_down_bias"] = rng.normal(size=(num_local_experts, hidden)).astype(hidden_dtype)
+    else:
+        inputs["expert_gate_up_bias"] = None
+        inputs["expert_down_bias"] = None
+
+    # Scalar / enum params
+    inputs["top_k"] = top_k
+    inputs["router_act_fn"] = router_fn
+    inputs["router_pre_norm"] = router_act_first
+    inputs["norm_topk_prob"] = norm_topk_prob
+    inputs["expert_affinities_scaling_mode"] = expert_affinities_scaling_mode
+    inputs["hidden_act_fn"] = hidden_act_fn
+
+    clamp_limit = _get_clamp_limits(has_clamp)
+    inputs["gate_clamp_upper_limit"] = clamp_limit[0]
+    inputs["gate_clamp_lower_limit"] = clamp_limit[1]
+    inputs["up_clamp_upper_limit"] = clamp_limit[2]
+    inputs["up_clamp_lower_limit"] = clamp_limit[3]
+
+    inputs["router_mm_dtype"] = router_mm_dtype
+    inputs["hidden_actual"] = hidden_actual
+    inputs["skip_router_logits"] = skip_router_logits
+    inputs["is_all_expert"] = is_all_expert
+
+    # rank_id for all-expert mode
+    if is_all_expert:
+        num_ranks = num_global_experts // num_local_experts
+        rank_id_val = np.random.RandomState(42).randint(0, num_ranks)
+        inputs["rank_id"] = np.array([[rank_id_val]], dtype=np.uint32)
+    else:
+        inputs["rank_id"] = None
+
+    return inputs
 
 
 def generate_inputs(
@@ -162,12 +369,14 @@ MANUAL_PARAMS = [
     # Selective-load tests (num_global_experts == num_local_experts)
     # GPT-OSS 120B
     [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
+    [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      4,          3072,       2880,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      1,          3072,       None,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      4,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      4,          3072,       2880,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      1,          3072,       None,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
+    [2,     False,          1,      1,          3072,       None,           576,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      4,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          1,      5,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     False,          4,      1,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
@@ -197,6 +406,7 @@ MANUAL_PARAMS = [
     # All-expert MXFP4 tests (T must be divisible by 4)
     # GPT-OSS 120B
     [2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
+    [2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     True,           32,     5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     True,           64,     4,          3072,       None,           3072,           128,                2,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     True,           64,     5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
@@ -204,6 +414,11 @@ MANUAL_PARAMS = [
     [2,     True,           128,    5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     True,           256,    3,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
     [2,     True,           512,    2,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
+    # E/EP>1, T<128 tests
+    [2,     True,           4,      1,          3072,       2880,           3072,           128,                16,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
+    [2,     True,           8,      1,          3072,       2880,           3072,           128,                8,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
+    [2,     True,           16,     1,          3072,       2880,           3072,           128,                4,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
+    [2,     True,           32,     1,          3072,       2880,           3072,           128,                2,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              False,                  nl.float16],
 ]
 # fmt: on
 
@@ -223,7 +438,7 @@ def _make_id(params):
 
 
 MANUAL_PARAM_IDS = [_make_id(p) for p in MANUAL_PARAMS]
-MODEL_PARAM_IDS = [f"{MODEL_TEST_TYPE}_{_make_id(p)}" for p in moe_block_tkg_model_configs]
+MODEL_PARAMS, MODEL_PARAM_IDS = prepare_model_parametrize(moe_block_tkg_model_configs, id_formatter=_make_id)
 
 
 @pytest_test_metadata(
@@ -289,19 +504,44 @@ class TestMoEBlockTkgKernel:
         )
         tokens = batch * seqlen
 
-        def input_generator(test_config, input_tensor_def=None):
-            return kernel_input
+        # For MX dtypes, convert weights to uint and use the wrapper to simulate NxD behavior.
+        # Keep original kernel_input (with MX-typed weights) for the torch ref, and create
+        # a separate copy with uint-typed weights for the NKI kernel.
+        is_mx = is_dtype_mx(moe_weight_dtype)
+        if is_mx:
+            kernel_input_for_nki = convert_mx_weights_to_uint(kernel_input, moe_weight_dtype)
+            kernel_func = mx_moe_block_tkg_wrapper
+        else:
+            kernel_input_for_nki = kernel_input
+            kernel_func = moe_block_tkg_kernel
 
-        def output_tensors(kernel_input):
+        def input_generator(test_config, input_tensor_def=None):
+            return kernel_input_for_nki
+
+        def output_tensors(ki):
             out = {"out": np.zeros((tokens, hidden), dtype=input_dtype)}
             if not skip_router_logits:
                 out["router_logits"] = np.zeros((tokens, num_global_experts), dtype=input_dtype)
             return out
 
+        # Wrap torch ref to use original MX-typed weights for golden computation
+        if is_mx:
+            original_torch_ref = torch_ref_wrapper(moe_block_tkg_torch_ref)
+
+            @functools.wraps(original_torch_ref)
+            def mx_torch_ref(**kwargs):
+                kwargs['expert_gate_up_weights'] = kernel_input['expert_gate_up_weights']
+                kwargs['expert_down_weights'] = kernel_input['expert_down_weights']
+                return original_torch_ref(**kwargs)
+
+            torch_ref_fn = mx_torch_ref
+        else:
+            torch_ref_fn = torch_ref_wrapper(moe_block_tkg_torch_ref)
+
         framework = UnitTestFramework(
             test_manager=test_manager,
-            kernel_entry=moe_block_tkg_kernel,
-            torch_ref=torch_ref_wrapper(moe_block_tkg_torch_ref),
+            kernel_entry=kernel_func,
+            torch_ref=torch_ref_fn,
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
             collector=collector,
@@ -344,13 +584,10 @@ class TestMoEBlockTkgKernel:
         router_mm_dtype,
         platform_target: Platforms,
     ):
-        if not is_all_expert and intermediate == 192 and (batch * seqlen) == 1 and not is_dtype_mx(moe_weight_dtype):
-            pytest.xfail("failing determinism check")
-
         kwargs = {k: v for k, v in locals().items() if k != "self"}
         self._run_moe_block_test(**kwargs)
 
-    @pytest.mark.parametrize(PARAM_NAMES, moe_block_tkg_model_configs, ids=MODEL_PARAM_IDS)
+    @pytest.mark.parametrize(PARAM_NAMES, MODEL_PARAMS, ids=MODEL_PARAM_IDS)
     def test_moe_block_kernel_model(
         self,
         test_manager: Orchestrator,

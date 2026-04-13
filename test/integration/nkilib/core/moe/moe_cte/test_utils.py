@@ -26,7 +26,7 @@ from test.integration.nkilib.core.mlp.test_mlp_common import (
     _down_proj_golden_mx,
     _gate_up_proj_golden_mx,
 )
-from test.integration.nkilib.core.moe.moe_cte.test_moe_cte import (
+from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     generate_token_position_to_id_and_experts,
     get_n_blocks,
     map_skip_mode,
@@ -241,6 +241,7 @@ def build_moe_bwmm_mx_cte(
     alpha: Optional[float] = None,
     use_cache: bool = False,
     is_shard_on_I: bool = False,
+    n_static_blocks: Optional[int] = None,
 ) -> dict:
     """
     Build input tensors for MoE BWMM MXFP4/MXFP8 CTE kernel testing.
@@ -408,6 +409,11 @@ def build_moe_bwmm_mx_cte(
 
     if is_dynamic and not is_shard_on_I:
         kernel_input['n_dynamic_blocks'] = n_dynamic_blocks
+    if n_static_blocks is not None:
+        if is_shard_on_I:
+            kernel_input['num_static_block'] = n_static_blocks
+        else:
+            kernel_input['n_static_blocks'] = n_static_blocks
     # Add clamp limits only if they have non-None values
     if gate_clamp_upper_limit is not None:
         kernel_input['gate_clamp_upper_limit'] = gate_clamp_upper_limit

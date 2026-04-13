@@ -91,7 +91,7 @@ def test_all_nkilib_directories_have_init_files():
 
     # Assert that no directories are missing __init__.py files
     if missing_init_files:
-        error_message = f"Found {len(missing_init_files)} directories " f"missing __init__.py files:\n"
+        error_message = f"Found {len(missing_init_files)} directories missing __init__.py files:\n"
         for path in sorted(missing_init_files):
             error_message += f"  - {path}\n"
         error_message += (

@@ -200,6 +200,7 @@ def kernel_test_view_ops(
         kernel_assert(t.shape[i] == expected_shape[i], f"shape[{i}]")
         kernel_assert(t.strides[i] == expected_strides[i], f"strides[{i}]")
     kernel_assert(t.offset == expected_offset, "offset")
+    return dummy_out
 
 
 # =============================================================================
@@ -522,7 +523,7 @@ def kernel_dynamic_ops(input_tensor, dynamic_idx, vector_offsets_hbm, ops: tuple
     sbuf = nl.ndarray(shape=out_shape, dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=sbuf, src=t.get_view())
 
-    output = nl.ndarray(shape=out_shape, dtype=nl.float32, buffer=nl.hbm)
+    output = nl.ndarray(shape=out_shape, dtype=nl.float32, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=output, src=sbuf)
     return output
 
@@ -582,7 +583,7 @@ def generate_dynamic_ops_inputs(input_shape, ops):
 
 
 @final
-@pytest_test_metadata(name="DynamicTensorView", pytest_marks=["tensor_view"])
+@pytest_test_metadata(name="TensorView", pytest_marks=["tensor_view"])
 class TestDynamicTensorView:
     """Tests for TensorView with dynamic indexing - requires full compilation."""
 
@@ -656,6 +657,7 @@ def kernel_test_reinterpret_cast(dummy_out, shape: tuple):
     # Dtype should change
     kernel_assert(tv2.dtype == nl.uint16, "dtype not changed")
     kernel_assert(tv1.dtype == nl.float16, "original dtype changed")
+    return dummy_out
 
 
 @nki.jit
@@ -664,6 +666,7 @@ def kernel_test_reinterpret_cast_mxfp4(dummy_out, shape: tuple):
     base = nl.ndarray(shape, nl.uint16, nl.hbm)
     tv = TensorView(base).reinterpret_cast(nl.float4_e2m1fn_x4)
     kernel_assert(tv.dtype == nl.float4_e2m1fn_x4, "dtype mismatch")
+    return dummy_out
 
 
 @nki.jit
@@ -672,6 +675,7 @@ def kernel_test_reinterpret_cast_mxfp8(dummy_out, shape: tuple):
     base = nl.ndarray(shape, nl.uint32, nl.hbm)
     tv = TensorView(base).reinterpret_cast(nl.float8_e4m3fn_x4)
     kernel_assert(tv.dtype == nl.float8_e4m3fn_x4, "dtype mismatch")
+    return dummy_out
 
 
 @nki.jit
@@ -684,6 +688,7 @@ def kernel_test_reinterpret_cast_bf16_fp16(dummy_out, shape: tuple):
     base_fp16 = nl.ndarray(shape, nl.float16, nl.hbm)
     tv_bf16 = TensorView(base_fp16).reinterpret_cast(nl.bfloat16)
     kernel_assert(tv_bf16.dtype == nl.bfloat16, "fp16->bf16 failed")
+    return dummy_out
 
 
 @nki.jit
@@ -694,6 +699,7 @@ def kernel_test_reinterpret_cast_cross_size_indirect(dummy_out, shape: tuple):
     # Manually set indirect_dim to simulate post-dynamic-select state
     tv1.indirect_dim = 0
     tv1.reinterpret_cast(nl.uint8)  # cross-size with indirect_dim - should fail
+    return dummy_out
 
 
 @nki.jit
@@ -708,6 +714,7 @@ def kernel_test_tensorview_from_tensorview(dummy_out, shape: tuple):
     kernel_assert(tv2.strides == tv1.strides, "strides mismatch")
     kernel_assert(tv2.offset == tv1.offset, "offset mismatch")
     kernel_assert(tv2.base_tensor is tv1.base_tensor, "base_tensor mismatch")
+    return dummy_out
 
 
 @nki.jit
@@ -718,10 +725,11 @@ def kernel_test_chained_ops_on_tensorview_input(dummy_out, shape: tuple):
     tv2 = TensorView(tv1).slice(dim=1, start=0, end=16)  # Chain on TensorView input
 
     kernel_assert(tv2.shape[1] == 16, "chained slice failed")
+    return dummy_out
 
 
 @final
-@pytest_test_metadata(name="TensorViewConstructor", pytest_marks=["tensor_view"])
+@pytest_test_metadata(name="TensorView", pytest_marks=["tensor_view"])
 class TestTensorViewConstructor:
     """Tests for TensorView constructor accepting TensorView as input."""
 
@@ -765,7 +773,7 @@ class TestTensorViewConstructor:
 
 
 @final
-@pytest_test_metadata(name="TensorViewReinterpretCast", pytest_marks=["tensor_view"])
+@pytest_test_metadata(name="TensorView", pytest_marks=["tensor_view"])
 class TestTensorViewReinterpretCast:
     """Tests for TensorView.reinterpret_cast method."""
 

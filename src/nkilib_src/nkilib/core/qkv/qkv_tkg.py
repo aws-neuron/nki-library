@@ -27,7 +27,7 @@ Multiple output layouts (BSD, NBSd) are supported to match downstream kernel req
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import nki.isa as nisa
 import nki.language as nl
@@ -49,7 +49,8 @@ from ..utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, g
 from ..utils.logging import get_logger
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ..utils.tensor_view import TensorView
-from ..utils.tiled_range import TiledRange
+from ..utils.tiled_range import TiledRange, TiledRangeIterator
+from .qkv_tkg_mx_impl import _qkv_tkg_mx_impl
 
 P_MAX = 128
 F_MAX = 512
@@ -81,6 +82,7 @@ def qkv_tkg(
     eps: float = 1e-6,
     norm_type: NormType = NormType.RMS_NORM,
     quantization_type: QuantizationType = QuantizationType.NONE,
+    is_h_dim_4h_transposed: bool = False,
     qkv_w_scale: Optional[nl.ndarray] = None,
     qkv_in_scale: Optional[nl.ndarray] = None,
     output_in_sbuf: bool = False,
@@ -121,20 +123,28 @@ def qkv_tkg(
             Shape:
                 [B, S, H]         when in HBM
                 [H0=128, BxS, H1] when in SBUF
+            Dtype: nl.float32, nl.float16, or nl.bfloat16
         qkv_w (nl.ndarray):
             QKV projection weight tensor in HBM.
             Shape:    [H, I]
+            Dtype:
+                - QuantizationType.NONE: nl.float32, nl.float16, or nl.bfloat16
+                - QuantizationType.STATIC: nl.float8_e4m3
+                - QuantizationType.ROW: nl.float8_e4m3
         norm_w (nl.ndarray, optional):
             Normalization weight tensor in HBM. Required when norm_type is RMS_NORM or LAYER_NORM.
             Shape:    [1, H]
+            Dtype: nl.float32, nl.float16, or nl.bfloat16
         fused_add (bool):
             Enable fused residual addition (hidden + attn_prev + mlp_prev). Default: False.
         mlp_prev (nl.ndarray, optional):
             Previous MLP residual tensor in HBM. Required when fused_add is True.
             Shape:    [B, S, H]
+            Dtype: nl.float32, nl.float16, or nl.bfloat16
         attn_prev (nl.ndarray, optional):
             Previous attention residual tensor in HBM. Required when fused_add is True.
             Shape:    [B, S, H]
+            Dtype: nl.float32, nl.float16, or nl.bfloat16
         d_head (int, optional):
             Head dimension size D. Required for static quantization and NBSd and NBdS output layouts.
         num_q_heads : Optional[int], default=None
@@ -149,21 +159,37 @@ def qkv_tkg(
             Type of normalization to apply (NO_NORM, RMS_NORM, or LAYER_NORM). Default: NormType.RMS_NORM.
         quantization_type (QuantizationType):
             Type of quantization to apply (NONE, ROW, STATIC). Default: QuantizationType.NONE.
+        is_h_dim_4h_transposed: bool, default=False
+            Whether the H-dim (in input and gamma) has been pre-transposed by 4 (only applicable with MX Quantization).
+            If is_h_dim_4h_transposed = False,
+                * input has typical shape [B, S, H], viewed as [B, S, H//512, 128_H, 4_H].
+            If is_h_dim_4h_transposed = True,
+                * input has shape [B, S, H] but is pre-shuffled from
+                  [B, S, H//512, 128_H, 4_H] -> [B, S, 4_H, H//512, 128_H] and flattened to [B, S, H].
+                * IMPORTANT: H-dim in both input and gamma weights (for RMSNorm) must be pre-shuffled.
+                    * For input, this is achieved by offline pre-shuffling weights of upstream projection (in real model).
+                    * For gamma, this is achieved by offline pre-shuffling of gamma tensor.
+                Purpose: More efficent for obtaining the required swizzled layout for quantize_mx instruction.
         qkv_w_scale (nl.ndarray, optional):
-            QKV weight scale tensor in HBM for QKV projection.
-            Shape:    [1, I] or [128, I] if row quantization, [1, 3] or [128, 3] if static quantization
+            Weight dequantization scale tensor in HBM.
+                - QuantizationType.STATIC: [1, 3] or [P_MAX, 3] pre-broadcasted
+                - QuantizationType.ROW: [1, I] or [P_MAX, I] pre-broadcasted
+                - QuantizationType.MX: [H//32, I]
+            Dtype: nl.float32
         qkv_in_scale (nl.ndarray, optional):
-            QKV input scale tensor in HBM for QKV projection. Only required for static quantization.
-            Shape:    [1, 1] or [128, 1]
+            Input quantization and dequantization scale tensor in HBM. Only required for STATIC quantization.
+            Shape:    [1, 1] or [P_MAX, 1] pre-broadcasted
+            Dtype: nl.float32
         output_in_sbuf (bool):
             If True, output is kept in SBUF; otherwise stored to HBM. Default: False.
-            Only supports single I-block when True.
         qkv_bias (nl.ndarray, optional):
             Bias tensor in HBM for QKV projection.
             Shape:    [1, I]
+            Dtype: nl.float32, nl.float16, or nl.bfloat16
         norm_bias (nl.ndarray, optional):
             LayerNorm beta parameter tensor in HBM. Required when norm_type is LAYER_NORM.
             Shape:    [1, H]
+            Dtype: nl.float32, nl.float16, or nl.bfloat16
         hidden_actual (int, optional):
             Actual hidden dimension for padded input tensors. If specified, normalization
             uses this value instead of H for mean calculation.
@@ -181,7 +207,6 @@ def qkv_tkg(
     Notes:
         - H must be divisible by 128 (nl.tile_size.pmax).
         - H1 (H//128) must be divisible by number of shards for multi-core execution.
-        - output_in_sbuf only supports single I-block (I < 4096).
 
     Pseudocode:
         # Optional fused residual add
@@ -200,13 +225,32 @@ def qkv_tkg(
             output[:, i_block:i_block+I_BLOCK_SIZE] += qkv_bias[i_block:i_block+I_BLOCK_SIZE]
     """
 
+    if quantization_type == QuantizationType.MX:
+        return _qkv_tkg_mx_impl(
+            hidden=hidden,
+            weights_qtz_hbm=qkv_w,
+            norm_w=norm_w,
+            fused_add=fused_add,
+            mlp_prev=mlp_prev,
+            attn_prev=attn_prev,
+            d_head=d_head,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            output_layout=output_layout,
+            eps=eps,
+            norm_type=norm_type,
+            quantization_type=quantization_type,
+            is_h_dim_4h_transposed=is_h_dim_4h_transposed,
+            weight_scales_hbm=qkv_w_scale,
+            output_in_sbuf=output_in_sbuf,
+            qkv_bias=qkv_bias,
+            norm_bias=norm_bias,
+            hidden_actual=hidden_actual,
+            sbm=sbm,
+        )
+
     if not sbm:
         sbm = create_auto_alloc_manager()
-
-    kernel_assert(
-        sbm.is_auto_alloc(),
-        "QKV TKG only supports auto allocation but got non-auto allocation SBM",
-    )
 
     sbm.open_scope(name="qkv_tkg")
 
@@ -243,7 +287,6 @@ def qkv_tkg(
         )
 
     # Load quantization scales
-    w_scale_tile, in_scale_tile = None, None
     if quantization_type == QuantizationType.STATIC:
         w_scale_tile = sbm.alloc_stack(shape=(P_MAX, 3), dtype=qkv_w_scale.dtype, name="qkv_w_scale_sb", buffer=nl.sbuf)
         if qkv_w_scale.shape[0] == 1:
@@ -259,6 +302,11 @@ def qkv_tkg(
         else:
             nisa.dma_copy(dst=in_scale_tile, src=qkv_in_scale, dge_mode=_DGE_MODE_NONE)
         nisa.activation(dst=w_scale_tile, op=nl.copy, data=w_scale_tile, scale=in_scale_tile)
+        quant_config = StaticQuantConfig(combined_scale_sb=w_scale_tile, in_scale_tile=in_scale_tile)
+    elif quantization_type == QuantizationType.ROW:
+        quant_config = RowQuantConfig(weight_scale_hbm=qkv_w_scale)
+    else:
+        quant_config = None
 
     # Perform optional fused norm and load
     hidden_sb = _fused_norm_and_load(
@@ -271,7 +319,7 @@ def qkv_tkg(
         cfg=cfg,
         sbm=sbm,
         quantization_type=quantization_type,
-        in_scale_tile=in_scale_tile,
+        quant_config=quant_config,
         quant_dtype=quant_dtype,
     )
 
@@ -292,7 +340,7 @@ def qkv_tkg(
             sbm=sbm,
             io_dtype=io_dtype,
             quantization_type=quantization_type,
-            w_scale_tile=w_scale_tile,
+            quant_config=quant_config,
         )
     else:
         output = _qkv_projection_hbm_output(
@@ -302,9 +350,9 @@ def qkv_tkg(
             cfg=cfg,
             output_layout=output_layout,
             sbm=sbm,
-            quantization_type=quantization_type,
-            w_scale_tile=w_scale_tile,
             io_dtype=io_dtype,
+            quantization_type=quantization_type,
+            quant_config=quant_config,
         )
 
     sbm.close_scope()
@@ -313,6 +361,27 @@ def qkv_tkg(
         return output, hidden
     else:
         return output
+
+
+@dataclass
+class StaticQuantConfig(nl.NKIObject):
+    """Configuration for STATIC quantization.
+
+    Holds pre-computed combined scale (weight_scale * input_scale) in SBUF.
+    """
+
+    combined_scale_sb: nl.ndarray  # [P_MAX, 3], pre-computed in SBUF
+    in_scale_tile: nl.ndarray  # [P_MAX, 1], input scale in SBUF (for norm quantization)
+
+
+@dataclass
+class RowQuantConfig(nl.NKIObject):
+    """Configuration for ROW quantization.
+
+    Holds weight scale tensor in HBM to be loaded inside impl functions.
+    """
+
+    weight_scale_hbm: nl.ndarray  # [1, I] or [P_MAX, I], in HBM
 
 
 @dataclass
@@ -447,7 +516,12 @@ def _validate_and_create_config(
     )
 
     # Validate quantization inputs
-    kernel_assert(quantization_type != QuantizationType.ROW, f"QuantizationType ROW in not supported")
+    kernel_assert(
+        quantization_type == QuantizationType.NONE
+        or quantization_type == QuantizationType.STATIC
+        or quantization_type == QuantizationType.ROW,
+        f"Only QuantizationType.NONE, QuantizationType.STATIC, and QuantizationType.ROW are supported, got {quantization_type}",
+    )
     if quantization_type == QuantizationType.STATIC:
         kernel_assert(qkv_w_scale != None, "qkv_w_scales must be provided when quantization_type is STATIC")
         kernel_assert(qkv_in_scale != None, "qkv_in_scales must be provided when quantization_type is STATIC")
@@ -473,19 +547,23 @@ def _validate_and_create_config(
             d_head != None and num_kv_heads != None and num_q_heads != None,
             f"d_head, num_q_heads, num_kv_heads must be provided when quant_type is STATIC, got d_head={d_head}, num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}",
         )
+    elif quantization_type == QuantizationType.ROW:
+        kernel_assert(qkv_w_scale != None, "qkv_w_scale must be provided when quantization_type is ROW")
+        if qkv_w_scale.shape[0] == 1:
+            logger.warn(
+                f"For row quantization, recommend to pre-broadcast scales to ({nl.tile_size.pmax}, {I}) for better performance"
+            )
+        else:
+            kernel_assert(
+                qkv_w_scale.shape == (nl.tile_size.pmax, I),
+                f"Incorrect shape for qkv weight scale for row quantization, expected ({nl.tile_size.pmax}, {I}), got {qkv_w_scale.shape}",
+            )
 
     # Explicit Enum checks
     if norm_type != NormType.NO_NORM and norm_type != NormType.RMS_NORM and norm_type != NormType.LAYER_NORM:
         kernel_assert(False, f"NormType {norm_type} is not supported")
     if output_layout != QKVOutputLayout.BSD and output_layout != QKVOutputLayout.NBSd:
         kernel_assert(False, f"OutputLayout {output_layout} is not supported")
-
-    # Validate output_in_sbuf constraint
-    if output_in_sbuf:
-        kernel_assert(
-            I <= I_BLOCK_SIZE,
-            f"output_in_sbuf=True requires I < {I_BLOCK_SIZE}, got I={I}",
-        )
 
     # Validate HBM output requirements
     if not output_in_sbuf:
@@ -614,7 +692,7 @@ def _fused_residual_add_hbm2hbm(
             name="fused_hidden_shared_hbm",
         )
     else:
-        fused_hidden = nl.ndarray((BxS, H), dtype=hidden_hbm.dtype, buffer=nl.hbm, name="fused_hidden_hbm")
+        fused_hidden = nl.ndarray((BxS, H), dtype=hidden_hbm.dtype, buffer=nl.shared_hbm, name="fused_hidden_hbm")
 
     # To prevent non-determinism, a different access pattern is needed for offloaded FMA instruction
     if num_shards > 1 and norm_type == NormType.NO_NORM:
@@ -676,7 +754,7 @@ def _fused_norm_and_load(
     cfg: QkvTkgConfig,
     sbm: SbufManager,
     quantization_type: QuantizationType,
-    in_scale_tile: Optional[nl.ndarray],
+    quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]],
     quant_dtype=None,
 ) -> TensorView:
     """
@@ -701,6 +779,8 @@ def _fused_norm_and_load(
         hidden_actual: Actual hidden dimension for padded tensors
         cfg: QKV TKG config
         sbm: SbufManager object for SBUF allocation
+        quantization_type: Type of quantization
+        quant_config: Quantization config (StaticQuantConfig or RowQuantConfig)
 
     Returns:
         TensorView wrapping hidden states in SBUF:
@@ -768,6 +848,7 @@ def _fused_norm_and_load(
 
     # optionally quantize the inputs
     if quantization_type == QuantizationType.STATIC:
+        in_scale_tile = quant_config.in_scale_tile
         nisa.reciprocal(dst=in_scale_tile, data=in_scale_tile)
         nisa.activation(dst=hidden_sb.get_view(), op=nl.copy, data=hidden_sb.get_view(), scale=in_scale_tile[:H0, :])
         max_pos_val = get_max_positive_value_for_dtype(quant_dtype)
@@ -906,74 +987,128 @@ def _static_dequantize(
     return output_sb
 
 
-def _qkv_projection_sbuf_output(
+def _row_dequantize(
+    output_sb: nl.ndarray,
+    weight_scale: TensorView,
+    cfg: QkvTkgConfig,
+    sbm: SbufManager,
+) -> None:
+    """
+    Apply row dequantization to QKV projection output.
+
+    Loads weight scale from HBM, broadcasts if needed, and applies element-wise multiply.
+
+    Args:
+        output_sb: QKV projection output in SBUF. Shape: (BxS, i_size)
+        weight_scale: Pre-sliced weight scale TensorView in HBM. Shape: (P_MAX, i_size) or (1, i_size)
+        cfg: QKV TKG config
+        sbm: SbufManager for allocation
+    """
+    BxS = cfg.BxS
+    i_size = output_sb.shape[1]
+
+    weight_scale_sb = sbm.alloc_heap((P_MAX, i_size), dtype=weight_scale.dtype, buffer=nl.sbuf)
+    if weight_scale.shape[0] == 1:
+        nisa.dma_copy(dst=weight_scale_sb[0:1, :], src=weight_scale.get_view())
+        stream_shuffle_broadcast(weight_scale_sb, weight_scale_sb)
+    else:
+        nisa.dma_copy(dst=weight_scale_sb, src=weight_scale.get_view())
+    nisa.tensor_tensor(dst=output_sb, data1=output_sb, data2=weight_scale_sb[:BxS, :], op=nl.multiply)
+    sbm.pop_heap()  # weight_scale_sb
+
+
+def _apply_bias(
+    output_sb: nl.ndarray,
+    qkv_bias: TensorView,
+    sbm: SbufManager,
+) -> None:
+    """
+    Apply bias to QKV projection output.
+
+    Loads bias from HBM, broadcasts to all BxS partitions, and adds to output.
+
+    Args:
+        output_sb: QKV projection output in SBUF. Shape: (BxS, i_size)
+        qkv_bias: Pre-sliced bias TensorView in HBM. Shape: (1, i_size)
+        sbm: SbufManager for allocation
+    """
+    qkv_bias_sb = sbm.alloc_heap(output_sb.shape, dtype=qkv_bias.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(qkv_bias_sb[0:1, :], qkv_bias.get_view())
+    stream_shuffle_broadcast(qkv_bias_sb, qkv_bias_sb)
+    nisa.tensor_tensor(dst=output_sb, data1=output_sb, data2=qkv_bias_sb, op=nl.add)
+    sbm.pop_heap()  # qkv_bias_sb
+
+
+def _compute_qkv_i_block(
     hidden_sb: TensorView,
     qkv_w: TensorView,
     qkv_bias: nl.ndarray,
+    qkv_out_sb: nl.ndarray,
+    i_block: TiledRangeIterator,
     cfg: QkvTkgConfig,
     sbm: SbufManager,
-    io_dtype,
-    quantization_type: QuantizationType = QuantizationType.NONE,
-    w_scale_tile: Optional[nl.ndarray] = None,
+    quantization_type: QuantizationType,
+    quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]],
 ) -> nl.ndarray:
     """
-    QKV projection with SBUF output (output_in_sbuf=True path).
-
-    Computes single I-block (I < I_BLOCK_SIZE) with output kept in SBUF.
-    Includes neuron core cross-communication when sharded.
+    Compute a single I-block of QKV projection: bias init, matmul, optional dequant, and cross-core reduce.
 
     Args:
         hidden_sb: Input hidden states in SBUF (TensorView). Shape: (H0, BxS, H1_sharded)
         qkv_w: QKV projection weights (TensorView). Shape: (H0, H1_sharded, I)
-        qkv_bias: Optional bias in HBM. Shape: (1, I)
+        qkv_bias: Optional bias in HBM. Shape: (1, I) or None
+        qkv_out_sb: Pre-allocated SBUF output for this I-block. Shape: (BxS, i_block.size)
         cfg: QKV TKG config
+        i_block: Current I-block from TiledRange
         sbm: SbufManager for SBUF allocation
+        quantization_type: Quantization mode
+        quant_config: Quantization config (StaticQuantConfig or RowQuantConfig)
 
     Returns:
-        QKV projection output in SBUF. Shape: (BxS, I)
+        Computed output in SBUF. Shape: (BxS, i_block.size)
     """
-
-    BxS, I = cfg.BxS, cfg.I
     num_shards, shard_id = cfg.num_shards, cfg.shard_id
 
-    # Allocate qkv_out_sb in heap for now, in future pass in from top level
-    qkv_out_sb = sbm.alloc_heap((BxS, I), dtype=io_dtype, buffer=nl.sbuf)
+    # Create bias slice for this I block if bias exists
+    if qkv_bias != None and quantization_type == QuantizationType.NONE:
+        qkv_bias_block = qkv_bias[:, i_block.start_offset : i_block.end_offset]
+    else:
+        qkv_bias_block = None
 
-    _initialize_qkv_out_with_bias(
-        qkv_out_sb,
-        # if quantized, then we need to apply bias after dequantize
-        # and cannot pre-apply bias here
-        qkv_bias if quantization_type == QuantizationType.NONE else None,
-        cfg,
-        0,
-        sbm,
-    )
+    _initialize_qkv_out_with_bias(qkv_out_sb, qkv_bias_block, cfg, i_block.index, sbm)
 
-    # output_sb: (BxS, I)
+    # Slice qkv_w for this I block
+    qkv_w_block = qkv_w.slice(dim=2, start=i_block.start_offset, end=i_block.end_offset)
+
+    # Perform QKV projection for this I block
+    # output_sb: (BxS, i_block.size)
     output_sb = _qkv_projection(
         hidden_sb=hidden_sb,
-        qkv_w_hbm=qkv_w,
+        qkv_w_hbm=qkv_w_block,
         qkv_out_sb=qkv_out_sb,
         cfg=cfg,
-        i_block_idx=0,
+        i_block_idx=i_block.index,
         sbm=sbm,
     )
 
     if quantization_type == QuantizationType.STATIC:
-        output_sb = _static_dequantize(output_sb, w_scale_tile, cfg)
-        # optionally add bias
+        output_sb = _static_dequantize(output_sb, quant_config.combined_scale_sb, cfg, I_start=i_block.start_offset)
         if qkv_bias != None and cfg.shard_id == 0:
-            qkv_bias_sb = sbm.alloc_heap(output_sb.shape, dtype=qkv_bias.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(qkv_bias_sb[0:1, :], qkv_bias)
-            # Broadcast bias to all BxS partitions
-            stream_shuffle_broadcast(qkv_bias_sb, qkv_bias_sb)
-            nisa.tensor_tensor(dst=output_sb, data1=output_sb, data2=qkv_bias_sb, op=nl.add)
-            sbm.pop_heap()  # qkv_bias_sb
+            qkv_bias_block = TensorView(qkv_bias).slice(dim=1, start=i_block.start_offset, end=i_block.end_offset)
+            _apply_bias(output_sb, qkv_bias_block, sbm)
+    elif quantization_type == QuantizationType.ROW:
+        weight_scale_block = TensorView(quant_config.weight_scale_hbm).slice(
+            dim=1, start=i_block.start_offset, end=i_block.end_offset
+        )
+        _row_dequantize(output_sb, weight_scale_block, cfg, sbm)
+        if qkv_bias != None and cfg.shard_id == 0:
+            qkv_bias_block = TensorView(qkv_bias).slice(dim=1, start=i_block.start_offset, end=i_block.end_offset)
+            _apply_bias(output_sb, qkv_bias_block, sbm)
 
     # Receive qkv projection output from the other neuron core when LNC > 1
     if num_shards > 1:
-        sbm.open_scope(name="output_store_sendrecv")
-        qkv_recv = sbm.alloc_stack((BxS, I), dtype=io_dtype, buffer=nl.sbuf)
+        sbm.open_scope(name=f"output_store_sendrecv_block_{i_block.index}")
+        qkv_recv = sbm.alloc_stack((cfg.BxS, i_block.size), dtype=output_sb.dtype, buffer=nl.sbuf)
         other_core = 1 - shard_id
         nisa.sendrecv(
             src=output_sb,
@@ -988,6 +1123,57 @@ def _qkv_projection_sbuf_output(
     return output_sb
 
 
+def _qkv_projection_sbuf_output(
+    hidden_sb: TensorView,
+    qkv_w: TensorView,
+    qkv_bias: nl.ndarray,
+    cfg: QkvTkgConfig,
+    sbm: SbufManager,
+    io_dtype,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]] = None,
+) -> nl.ndarray:
+    """
+    QKV projection with SBUF output (output_in_sbuf=True path).
+
+    Loops over I-blocks (each up to I_BLOCK_SIZE) with output kept in SBUF.
+    Includes neuron core cross-communication when sharded.
+
+    Args:
+        hidden_sb: Input hidden states in SBUF (TensorView). Shape: (H0, BxS, H1_sharded)
+        qkv_w: QKV projection weights (TensorView). Shape: (H0, H1_sharded, I)
+        qkv_bias: Optional bias in HBM. Shape: (1, I)
+        cfg: QKV TKG config
+        sbm: SbufManager for SBUF allocation
+        io_dtype: Data type for input/output tensors
+        quantization_type: Quantization mode
+        quant_config: Quantization config (StaticQuantConfig or RowQuantConfig)
+
+    Returns:
+        QKV projection output in SBUF. Shape: (BxS, I)
+    """
+
+    BxS, I = cfg.BxS, cfg.I
+
+    # Allocate full (BxS, I) output on heap — persists for caller
+    qkv_out_sb = sbm.alloc_heap((BxS, I), dtype=io_dtype, buffer=nl.sbuf)
+
+    # Process each I-block
+    for i_block in TiledRange(I, I_BLOCK_SIZE):
+        sbm.open_scope(name=f"qkv_sbuf_output_i_block_{i_block.index}")
+
+        # Output slice for this I-block
+        output_slice = qkv_out_sb[:, i_block.start_offset : i_block.end_offset]
+
+        _compute_qkv_i_block(
+            hidden_sb, qkv_w, qkv_bias, output_slice, i_block, cfg, sbm, quantization_type, quant_config
+        )
+
+        sbm.close_scope()
+
+    return qkv_out_sb
+
+
 def _qkv_projection_hbm_output(
     hidden_sb: TensorView,
     qkv_w: TensorView,
@@ -997,7 +1183,7 @@ def _qkv_projection_hbm_output(
     sbm: SbufManager,
     io_dtype,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    w_scale_tile: Optional[nl.ndarray] = None,
+    quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]] = None,
 ) -> nl.ndarray:
     """
     QKV projection with HBM output (output_in_sbuf=False path).
@@ -1014,6 +1200,7 @@ def _qkv_projection_hbm_output(
         output_layout: Target layout (BSD or NBSd)
         sbm: SbufManager for SBUF allocation
         io_dtype: Dtype of the input hidden, which should also be the output dtype
+        quant_config: Quantization config (StaticQuantConfig or RowQuantConfig)
 
     Returns:
         QKV projection output tensor. Shape depends on output_layout:
@@ -1022,14 +1209,17 @@ def _qkv_projection_hbm_output(
     """
 
     B, S, BxS, I = cfg.B, cfg.S, cfg.BxS, cfg.I
-    num_shards, shard_id = cfg.num_shards, cfg.shard_id
 
     # Allocate output tensor with layout-specific shape
     if output_layout == QKVOutputLayout.BSD:
-        output = nl.ndarray((BxS, I), dtype=io_dtype, buffer=nl.shared_hbm, name="qkv_output_bsd")
+        output = nl.ndarray(
+            (BxS, I), dtype=io_dtype, buffer=nl.shared_hbm, name=f"{sbm.get_name_prefix()}qkv_output_bsd"
+        )
     elif output_layout == QKVOutputLayout.NBSd:
         nh = I // cfg.d_head
-        output = nl.ndarray((nh, BxS, cfg.d_head), dtype=io_dtype, buffer=nl.shared_hbm, name="qkv_output_nbsd")
+        output = nl.ndarray(
+            (nh, BxS, cfg.d_head), dtype=io_dtype, buffer=nl.shared_hbm, name=f"{sbm.get_name_prefix()}qkv_output_nbsd"
+        )
 
     # Process each I block
     for i_block in TiledRange(I, I_BLOCK_SIZE):
@@ -1038,54 +1228,9 @@ def _qkv_projection_hbm_output(
         # Allocate output SB that gets accumulated in HBM
         qkv_out_sb = sbm.alloc_stack((BxS, i_block.size), dtype=io_dtype, buffer=nl.sbuf)
 
-        # Create bias slice for this I block if bias exists
-        if qkv_bias != None and quantization_type == QuantizationType.NONE:
-            qkv_bias_block = qkv_bias[:, i_block.start_offset : i_block.end_offset]
-        else:
-            qkv_bias_block = None
-
-        _initialize_qkv_out_with_bias(qkv_out_sb, qkv_bias_block, cfg, i_block.index, sbm)
-
-        # Slice qkv_w for this I block
-        qkv_w_block = qkv_w.slice(dim=2, start=i_block.start_offset, end=i_block.end_offset)
-
-        # Perform QKV projection for this I block
-        # output_sb: (BxS, i_block.size)
-        output_sb = _qkv_projection(
-            hidden_sb=hidden_sb,
-            qkv_w_hbm=qkv_w_block,
-            qkv_out_sb=qkv_out_sb,
-            cfg=cfg,
-            i_block_idx=i_block.index,
-            sbm=sbm,
+        output_sb = _compute_qkv_i_block(
+            hidden_sb, qkv_w, qkv_bias, qkv_out_sb, i_block, cfg, sbm, quantization_type, quant_config
         )
-
-        if quantization_type == QuantizationType.STATIC:
-            output_sb = _static_dequantize(output_sb, w_scale_tile, cfg, I_start=i_block.start_offset)
-            # optionally add bias
-            if qkv_bias != None and cfg.shard_id == 0:
-                qkv_bias_block = qkv_bias[:, i_block.start_offset : i_block.end_offset]
-                qkv_bias_sb = sbm.alloc_heap(shape=output_sb.shape, dtype=qkv_bias_block.dtype, buffer=nl.sbuf)
-                nisa.dma_copy(qkv_bias_sb[0:1, :], qkv_bias_block)
-                # Broadcast bias to all BxS partitions
-                stream_shuffle_broadcast(qkv_bias_sb, qkv_bias_sb)
-                nisa.tensor_tensor(dst=output_sb, data1=output_sb, data2=qkv_bias_sb, op=nl.add)
-                sbm.pop_heap()  # qkv_bias_sb
-
-        # Receive qkv projection output from the other neuron core when LNC > 1
-        if num_shards > 1:
-            sbm.open_scope(name=f"output_store_sendrecv_block_{i_block.index}")
-            qkv_recv = sbm.alloc_stack((BxS, i_block.size), dtype=io_dtype, buffer=nl.sbuf)
-            other_core = 1 - shard_id
-            nisa.sendrecv(
-                src=output_sb,
-                dst=qkv_recv,
-                send_to_rank=other_core,
-                recv_from_rank=other_core,
-                pipe_id=0,
-            )
-            nisa.tensor_tensor(output_sb, output_sb, qkv_recv, op=nl.add)
-            sbm.close_scope()
 
         # Store to HBM with layout-specific transformation
         _store_qkv_output_to_hbm(
@@ -1172,6 +1317,7 @@ def _qkv_projection(
     # Allocate all temp buffers: weights, PSUMs
     qkv_w_sb, num_w_blocks, result_psum = _allocate_qkv_buffers(
         I=I,
+        qkv_out_shape=qkv_out_sb.shape,
         output_dtype=output_dtype,
         weight_dtype=weight_dtype,
         cfg=cfg,
@@ -1209,6 +1355,7 @@ def _qkv_projection(
 
 def _allocate_qkv_buffers(
     I: int,
+    qkv_out_shape: Tuple[int, ...],
     output_dtype,
     weight_dtype,
     cfg: QkvTkgConfig,
@@ -1224,6 +1371,8 @@ def _allocate_qkv_buffers(
 
     Args:
         I: I-block size (from tensor shape)
+        qkv_out_shape: Shape of the output slice, used to reserve space for post-projection
+            buffers (bias broadcast, sendrecv) that coexist at the same scope level
         output_dtype: Data type for output tensor
         weight_dtype: Data type for weight tensor
         cfg: QKV TKG config
@@ -1237,8 +1386,15 @@ def _allocate_qkv_buffers(
         - result_psum: List of PSUM tiles
     """
 
-    # Calculate number of weight tiles that fit in remaining space
-    remaining_space = sbm.get_free_space()
+    # Reserve space for post-projection buffers (bias broadcast, sendrecv) that will be
+    # allocated at the same scope level after the projection scope closes.
+    # get_free_space() already accounts for all prior allocations (stack and heap),
+    # but not for these future sibling-scope allocations.
+    extra_space_needed = sizeinbytes(output_dtype)
+    for i in range(len(qkv_out_shape)):
+        extra_space_needed *= qkv_out_shape[i]
+
+    remaining_space = sbm.get_free_space() - extra_space_needed
     size_of_qkv_w_block = I * NUM_TILES_PER_H_BLOCK * sizeinbytes(weight_dtype)
     num_available_w_blocks = remaining_space // size_of_qkv_w_block
     num_H_blocks = div_ceil(cfg.H_shard, H_BLOCK_SIZE)
@@ -1264,12 +1420,19 @@ def _allocate_qkv_buffers(
     # Allocate PSUM tiles - one per I tile in this I-block
     n_psum = div_ceil(I, I_TILE_SIZE)
     result_psum = []
+    prefix = sbm.get_name_prefix()
     for psum_idx in range(n_psum):
         psum_tensor = nl.ndarray(
             (128, I_TILE_SIZE),
             dtype=nl.float32,
-            name=f"batch_result_psum_{i_block_idx}_{psum_idx}",
+            name=f"{prefix}batch_result_psum_{i_block_idx}_{psum_idx}",
             buffer=nl.psum,
+            address=None
+            if sbm.is_auto_alloc()
+            else (
+                0,
+                (psum_idx % NUM_PSUM_BANKS) * (F_MAX * sizeinbytes(nl.float32)),
+            ),
         )
         result_psum.append(psum_tensor)
 

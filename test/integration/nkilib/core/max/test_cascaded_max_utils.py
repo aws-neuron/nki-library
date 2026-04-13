@@ -18,6 +18,7 @@ Test suite for predicated_folded_load and unfolded_store utilities using UnitTes
 
 import math
 from test.utils.common_dataclasses import CompilerArgs
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -78,6 +79,14 @@ def folded_load_store_dst_kernel(
     b, n = input_tensor.shape
     output_tensor = nl.ndarray((dst_batch_end, n), dtype=input_tensor.dtype, buffer=nl.shared_hbm)
 
+    # Zero-initialize output via SBUF→HBM DMA so unwritten rows are deterministic
+    P_MAX = nl.tile_size.pmax
+    zero_sb = nl.ndarray((P_MAX, n), dtype=input_tensor.dtype, buffer=nl.sbuf)
+    nisa.memset(zero_sb, 0)
+    for i in nl.affine_range(math.ceil(dst_batch_end / P_MAX)):
+        row_count = min(P_MAX, dst_batch_end - i * P_MAX)
+        nisa.dma_copy(dst=output_tensor[nl.ds(i * P_MAX, row_count), :], src=zero_sb[nl.ds(0, row_count), :])
+
     data_sb = predicated_folded_load(
         input_tensor,
         fold_factor=fold_factor,
@@ -130,7 +139,7 @@ def folded_load_oversized_sb_kernel(
         batch_end=batch_end,
     )
 
-    output_tensor = nl.ndarray((sb_rows * n_prgs, sb_cols), dtype=input_tensor.dtype, buffer=nl.shared_hbm)
+    output_tensor = nl.ndarray((b_range * fold_factor, sb_cols), dtype=input_tensor.dtype, buffer=nl.shared_hbm)
     rows_bound = min(b_range - prg_id * batch_size_sharded, batch_size_sharded) * fold_factor
     ix_dst = nl.ds(prg_id * sb_rows, rows_bound)
     ix_src = nl.ds(0, rows_bound)
@@ -195,6 +204,7 @@ def folded_load_oversized_sb_torch_ref(
 class TestCascadedMaxUtils:
     # fmt: off
     full_batch_params = "lnc_degree, b, n, fold_factor"
+    _full_batch_abbrevs = {"lnc_degree": "lnc", "fold_factor": "ff"}
     full_batch_perms = [
         [1, 8, 256, 1], [2, 8, 256, 2], [1, 4, 1024, 4], [2, 16, 512, 8],
         [1, 1, 3168, 4], [2, 8, 4058, 8], [1, 4, 3999, 16], [1, 1, 25600, 32],
@@ -222,7 +232,7 @@ class TestCascadedMaxUtils:
         return {"output_tensor": np.zeros((b_range, n), dtype=np.float32)}
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(full_batch_params, full_batch_perms)
+    @pytest_parametrize(full_batch_params, full_batch_perms, abbrevs=_full_batch_abbrevs)
     def test_folded_load_store_full_batch(
         self, test_manager: Orchestrator, lnc_degree: int, b: int, n: int, fold_factor: int
     ):
@@ -240,6 +250,7 @@ class TestCascadedMaxUtils:
 
     # fmt: off
     partial_batch_params = "lnc_degree, b, n, fold_factor, batch_start, batch_end"
+    _partial_batch_abbrevs = {"lnc_degree": "lnc", "fold_factor": "ff", "batch_start": "bs", "batch_end": "be"}
     partial_batch_perms = [
         [1, 16, 256, 2, 0, 8], [1, 16, 256, 2, 4, 12], [1, 16, 256, 2, 8, 16],
         [2, 32, 512, 4, 0, 16], [2, 32, 512, 4, 16, 32],
@@ -251,7 +262,7 @@ class TestCascadedMaxUtils:
     # fmt: on
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(partial_batch_params, partial_batch_perms)
+    @pytest_parametrize(partial_batch_params, partial_batch_perms, abbrevs=_partial_batch_abbrevs)
     def test_folded_load_store_partial_batch(
         self,
         test_manager: Orchestrator,
@@ -276,6 +287,7 @@ class TestCascadedMaxUtils:
 
     # fmt: off
     dst_batch_params = "lnc_degree, b, n, fold_factor, src_start, src_end, dst_start, dst_end"
+    _dst_batch_abbrevs = {"lnc_degree": "lnc", "fold_factor": "ff", "src_start": "ss", "src_end": "se", "dst_start": "ds", "dst_end": "de"}
     dst_batch_perms = [
         [1, 16, 256, 2, 0, 8, 0, 8], [1, 16, 256, 2, 0, 8, 8, 16], [2, 16, 512, 4, 0, 8, 8, 16],
         [1, 16, 3168, 4, 0, 8, 8, 16], [2, 32, 4058, 8, 0, 8, 16, 24],
@@ -302,7 +314,7 @@ class TestCascadedMaxUtils:
         return {"output_tensor": np.zeros((dst_end, n), dtype=np.float32)}
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(dst_batch_params, dst_batch_perms)
+    @pytest_parametrize(dst_batch_params, dst_batch_perms, abbrevs=_dst_batch_abbrevs)
     def test_folded_load_store_dst_batch(
         self,
         test_manager: Orchestrator,
@@ -329,6 +341,7 @@ class TestCascadedMaxUtils:
 
     # fmt: off
     oversized_sb_params = "lnc_degree, b, n, fold_factor, batch_start, batch_end, sb_extra_cols"
+    _oversized_sb_abbrevs = {"lnc_degree": "lnc", "fold_factor": "ff", "batch_start": "bs", "batch_end": "be", "sb_extra_cols": "ec"}
     oversized_sb_perms = [
         [1, 8, 256, 2, 0, 8, 16], [2, 8, 512, 4, 0, 8, 32],
         [1, 4, 3168, 4, 0, 4, 8], [2, 8, 4058, 8, 0, 8, 16],
@@ -362,7 +375,7 @@ class TestCascadedMaxUtils:
         return {"output_tensor": np.zeros((sb_rows, sb_cols), dtype=np.float32)}
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(oversized_sb_params, oversized_sb_perms)
+    @pytest_parametrize(oversized_sb_params, oversized_sb_perms, abbrevs=_oversized_sb_abbrevs)
     def test_folded_load_oversized_sb(
         self,
         test_manager: Orchestrator,

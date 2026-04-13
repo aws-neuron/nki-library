@@ -29,6 +29,7 @@ Test Coverage:
 
 from test.utils.common_dataclasses import CompilerArgs
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -63,6 +64,7 @@ class TestCascadedMaxKernel:
 
     # fmt: off
     cascaded_max_unit_params = "lnc_degree, batch, seqlen, vocab_size, dtype"
+    _ABBREVS = {"lnc_degree": "lnc", "batch": "b", "seqlen": "s", "vocab_size": "v", "dtype": "dt"}
     cascaded_max_unit_perms = [
         # Llama 3 76B before global gather
         [1, 8, 5, 4058, nl.float32],
@@ -110,7 +112,7 @@ class TestCascadedMaxKernel:
     # fmt: on
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(cascaded_max_unit_params, cascaded_max_unit_perms)
+    @pytest_parametrize(cascaded_max_unit_params, cascaded_max_unit_perms, abbrevs=_ABBREVS)
     def test_cascaded_max_unit(
         self,
         test_manager: Orchestrator,

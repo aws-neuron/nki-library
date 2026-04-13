@@ -16,6 +16,7 @@
 
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -90,6 +91,11 @@ CONV1D_PARAM_NAMES = (
     "batch, in_channels, out_channels, sequence_length, filter_size, stride, "
     "pad_left, pad_right, dilation, use_bias, activation_fn, lnc_shard, dtype"
 )
+_ABBREVS = {
+    "batch": "b", "in_channels": "ic", "out_channels": "oc", "sequence_length": "sl",
+    "filter_size": "fs", "stride": "st", "pad_left": "pl", "pad_right": "pr",
+    "dilation": "dil", "use_bias": "bias", "activation_fn": "act", "lnc_shard": "lnc", "dtype": "dt",
+}
 
 # Basic test parameters
 CONV1D_BASIC_PARAMS = [
@@ -169,7 +175,7 @@ class TestConv1DKernel:
     """Test class for Conv1D kernel validation using UnitTestFramework."""
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(CONV1D_PARAM_NAMES, CONV1D_BASIC_PARAMS)
+    @pytest_parametrize(CONV1D_PARAM_NAMES, CONV1D_BASIC_PARAMS, abbrevs=_ABBREVS)
     def test_conv1d_basic(
         self,
         test_manager: Orchestrator,
@@ -206,7 +212,7 @@ class TestConv1DKernel:
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(CONV1D_PARAM_NAMES, CONV1D_WHISPER_PARAMS)
+    @pytest_parametrize(CONV1D_PARAM_NAMES, CONV1D_WHISPER_PARAMS, abbrevs=_ABBREVS)
     def test_conv1d_whisper(
         self,
         test_manager: Orchestrator,
@@ -242,7 +248,7 @@ class TestConv1DKernel:
             dtype=dtype,
         )
 
-    @pytest.mark.parametrize(CONV1D_PARAM_NAMES, CONV1D_ALL_PARAMS)
+    @pytest_parametrize(CONV1D_PARAM_NAMES, CONV1D_ALL_PARAMS, abbrevs=_ABBREVS)
     def test_conv1d_all(
         self,
         test_manager: Orchestrator,

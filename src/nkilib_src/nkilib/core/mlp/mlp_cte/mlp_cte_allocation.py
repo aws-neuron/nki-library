@@ -128,7 +128,7 @@ def allocate_down_projection_weights(
             tile_info.down_proj_intermediate_dim_tile.tile_size,
             2 * tile_info.down_proj_hidden_dim_tile.tile_size,
         )
-    elif mlp_params.quant_params.is_no_quant():
+    elif not mlp_params.quant_params.is_quant():
         buffer_shape = (
             tile_info.down_proj_intermediate_dim_tile.tile_size,
             tile_info.down_proj_hidden_dim_tile.tile_size,

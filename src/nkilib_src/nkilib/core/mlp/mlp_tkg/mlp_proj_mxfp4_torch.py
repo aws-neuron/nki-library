@@ -27,12 +27,13 @@ to torch immediately. All other inputs are torch tensors.
 
 import math
 
+import nki.language as nl
 import numpy as np
 import torch
 
 from ...utils.mx_torch_common import (
     mx_matmul,
-    quantize_to_mx_fp8,
+    quantize_to_mx,
     unpack_float4_x4,
     unpack_float8_e4m3fn_x4,
     unpack_float8_e5m2_x4,
@@ -171,7 +172,7 @@ def down_proj_mxfp4_torch_ref(
         weight_np = weight_np[:P_aligned]
 
     # Quantize intermediate to mxfp8, unpack both, then MX matmul
-    inter_mx_np, inter_scale_np = quantize_to_mx_fp8(inter_flat)
+    inter_mx_np, inter_scale_np = quantize_to_mx(inter_flat, nl.float8_e4m3fn_x4)
     unpack_w = weight_unpack_fn or unpack_float4_x4
     result = mx_matmul(
         unpack_float8_e4m3fn_x4(inter_mx_np),

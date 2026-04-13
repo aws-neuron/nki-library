@@ -15,11 +15,12 @@
 
 import json
 import os
+import random
 import tempfile
 from contextlib import closing
 from test.utils.common_dataclasses import Platforms, TargetHost
 from test.utils.exceptions import InferenceException
-from test.utils.host_management import HostManager
+from test.utils.host_management import HostManager, temporary_random_seed
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -184,3 +185,43 @@ class TestHostManagerRetryErrorReporting:
         assert "TimeoutError" in error_message
         assert "SSH connection timed out during inference" in error_message
         assert "Errors from previous host attempts:" in error_message
+
+
+class TestTemporaryRandomSeed:
+    """Tests for the temporary_random_seed context manager."""
+
+    def setup_method(self) -> None:
+        """Set a deterministic seed before each test."""
+        random.seed(42)
+
+    def teardown_method(self) -> None:
+        """Reseed from system entropy so tests don't leak deterministic state."""
+        random.seed()
+
+    def test_restores_original_state(self) -> None:
+        """RNG state before and after the context manager should be identical."""
+        state_before = random.getstate()
+        with temporary_random_seed(999):
+            random.random()
+        assert random.getstate() == state_before
+
+    def test_choice_deterministic_with_same_seed(self) -> None:
+        """Same temporary seed produces the same random.choice result."""
+        items = ["host_a", "host_b", "host_c"]
+
+        with temporary_random_seed(123):
+            first = random.choice(items)
+
+        with temporary_random_seed(123):
+            second = random.choice(items)
+
+        assert first == second
+
+    def test_outer_sequence_unchanged_with_choice(self) -> None:
+        """random.choice inside the context manager should not alter the outer RNG sequence."""
+        expected_next = random.choice(["a", "b", "c"])
+
+        random.seed(42)
+        with temporary_random_seed(999):
+            random.choice(["a", "b", "c"])
+        assert random.choice(["a", "b", "c"]) == expected_next

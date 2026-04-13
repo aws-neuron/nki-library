@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -32,11 +33,84 @@ INF_ARTIFACT_DIR_NAME = "infer_result"
 MODEL_TEST_TYPE = "MODEL_WIP"
 
 
+class ModelTestType(Enum):
+    """Classification for MODEL_WIP test configs.
+
+    Model config files use a dict keyed by ModelTestType:
+        model_configs = {
+            ModelTestType.BROAD: [ [param1, ...], ... ],
+            ModelTestType.GENERALITY: [ [param1, ...], ... ],
+        }
+    """
+
+    GENERALITY = "GENERALITY"
+    OPTIMAL = "OPTIMAL"
+    BROAD = "BROAD"
+
+    @property
+    def test_id_prefix(self) -> str:
+        """Return the prefix used in pytest test IDs, e.g. 'MODEL_WIP_BROAD'."""
+        return f"{MODEL_TEST_TYPE}_{self.value}"
+
+
+def is_model_test_type(test_type: str) -> bool:
+    """Check if a test_type string represents any MODEL_WIP variant."""
+    return test_type.startswith(MODEL_TEST_TYPE)
+
+
+def _iter_model_configs(configs):
+    """Iterate over model configs yielding (ModelTestType, params) pairs.
+
+    Supports both dict format {ModelTestType: [configs...]} and legacy flat list format.
+    """
+    if isinstance(configs, dict):
+        for model_type, entries in configs.items():
+            for entry in entries:
+                yield model_type, entry
+    else:
+        for entry in configs:
+            yield ModelTestType.BROAD, entry
+
+
+def prepare_model_parametrize(configs, id_formatter=None):
+    """Produce (params_list, ids_list) for pytest.mark.parametrize from model configs.
+
+    Args:
+        configs: Dict {ModelTestType: [configs...]} or legacy flat list.
+        id_formatter: Optional callable(params) -> str for the param portion of the ID.
+                      Defaults to joining str(p) with '-'.
+
+    Returns:
+        (params_list, ids_list) tuple ready for @pytest.mark.parametrize(..., params_list, ids=ids_list).
+    """
+    if id_formatter is None:
+        id_formatter = lambda params: "-".join(str(p.value) if hasattr(p, "value") else str(p) for p in params)
+
+    params_list = []
+    ids_list = []
+    for model_type, params in _iter_model_configs(configs):
+        params_list.append(params)
+        ids_list.append(f"{model_type.test_id_prefix}_{id_formatter(params)}")
+    return params_list, ids_list
+
+
+def unpack_model_config(entry):
+    """Unpack a model config entry that may be a (ModelTestType, params) tuple or raw params.
+
+    Returns (ModelTestType, params). Raw params default to ModelTestType.BROAD.
+    """
+    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[0], ModelTestType):
+        return entry[0], entry[1]
+    return ModelTestType.BROAD, entry
+
+
 class TraceMode(Enum):
     CompileAndInfer = "compile_and_infer"
     CompileOnly = "compile_only"
     TraceOnly = "trace_only"
     Simulator = "simulation"
+    NkiStandaloneTracer = "nki_standalone_tracer"
+    NkiStandaloneParser = "nki_standalone_parser"
 
     @staticmethod
     def create(mode: str):
@@ -47,6 +121,12 @@ class SeparationPassMode(Enum):
     NONE = "none"
     DIRECT = "direct"
     INDIRECT = "indirect"
+
+
+class CleanupPreserve(Enum):
+    """Artifact types to preserve when using --force-local-cleanup."""
+
+    METRICS = "metrics"
 
 
 class CustomValidator(ABC):
@@ -91,6 +171,7 @@ class LazyGoldenGenerator:
     lazy_golden_generator: Callable[[], dict[str, npt.NDArray[Any]]] | None = None
 
     __cached_golden__: dict[str, npt.NDArray[Any]] | None = field(init=False, default=None)
+    computation_time: float | None = field(init=False, default=None)
 
     @property
     def golden(self) -> dict[str, npt.NDArray[Any]] | None:
@@ -98,7 +179,9 @@ class LazyGoldenGenerator:
             return None
 
         if self.__cached_golden__ is None:
+            start = time.perf_counter()
             self.__cached_golden__ = self.lazy_golden_generator()
+            self.computation_time = time.perf_counter() - start
 
         return self.__cached_golden__
 
@@ -109,9 +192,11 @@ class PerRankLazyGenerator:
 
     generator: Callable[[int], dict[str, Any]]
     __cache__: dict[int, dict[str, Any]] = field(init=False, default_factory=dict)
+    computation_times: dict[int, float] = field(init=False, default_factory=dict)
 
     def for_rank(self, rank_id: int) -> dict[str, Any]:
         if rank_id not in self.__cache__:
+            start = time.perf_counter()
             try:
                 self.__cache__[rank_id] = self.generator(rank_id=rank_id)
             except TypeError as e:
@@ -123,6 +208,7 @@ class PerRankLazyGenerator:
                         location = f" at {code.co_filename}:{code.co_firstlineno}"
                     raise TypeError(f"Generator{location} must use 'rank_id' as parameter name") from e
                 raise
+            self.computation_times[rank_id] = time.perf_counter() - start
         return self.__cache__[rank_id]
 
 
@@ -186,13 +272,13 @@ class ValidationArgs:
     accuracy_buffer_percent: int | None = 0
 
     def __post_init__(self):
-        error_message: str = f"ValidationArgs only supports LazyGoldenGenerator, PerRankLazyGoldenGenerator, or dict[str, CustomValidatorWithOutputTensorData], but got {self.golden_output}"
         if isinstance(self.golden_output, (LazyGoldenGenerator, PerRankLazyGoldenGenerator)):
             pass
         elif isinstance(self.golden_output, dict):
             for key, value in self.golden_output.items():
                 assert isinstance(key, str) and isinstance(value, CustomValidatorWithOutputTensorData), error_message
         else:
+            error_message: str = f"ValidationArgs only supports LazyGoldenGenerator, PerRankLazyGoldenGenerator, or dict[str, CustomValidatorWithOutputTensorData], but got {type(self.golden_output)}"
             assert False, error_message
 
 
@@ -242,6 +328,7 @@ class CompilerArgs:
     enable_birsim: bool
     dump_after_lowering: bool
     separation_pass_mode: SeparationPassMode
+    enable_device_dump: bool  # Inserts a device_print after each ISA instruction to dump intermediate tensors. WARNING: Local debug only. High disk/perf impact.
 
     def __init__(
         self,
@@ -252,6 +339,7 @@ class CompilerArgs:
         enable_birsim: bool = False,
         dump_after_lowering: bool = False,
         separation_pass_mode: SeparationPassMode = SeparationPassMode.NONE,
+        enable_device_dump: bool = False,
     ):
         self.platform_target = platform_target
         self.additional_cmd_args = additional_cmd_args
@@ -259,6 +347,7 @@ class CompilerArgs:
         self.enable_birsim = enable_birsim
         self.dump_after_lowering = dump_after_lowering
         self.separation_pass_mode = separation_pass_mode
+        self.enable_device_dump = enable_device_dump
         if os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS"):
             self.separation_pass_mode = SeparationPassMode.INDIRECT
         if logical_nc_config is None:

@@ -59,6 +59,7 @@ class QuantizationType(Enum):
     ROW = 2
     MX = 3
     STATIC_MX = 4
+    ROW_MX = 5
 
 
 class QKVWeightLayout(Enum):

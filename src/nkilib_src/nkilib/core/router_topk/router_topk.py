@@ -222,16 +222,21 @@ def router_topk(
         T_local = T_first_shard if prg_id == 0 else T_second_shard
         T_offset = 0 if prg_id == 0 else T_first_shard
         other_T_local = T_second_shard if prg_id == 0 else T_first_shard
+        # Beta 3: sendrecv requires src and dst to have matching partition dims.
+        # Use max of T_local and other_T_local for sendrecv buffer allocation.
+        T_sendrecv_size = max(T_local, other_T_local)
     else:  # If not sharding, process the full T on this core.
         T_local = T
         T_offset = 0
         other_T_local = T_local
+        T_sendrecv_size = T_local
 
     # Validate when indirect-DMA scatter must be used
-    # If using sigmoid, only support indirect-DMA scatter. TODO: this could be supported, however.
+    # SIGMOID with router_pre_norm=False requires indirect-DMA scatter as one-hot scatter ACT2 path doesn't support SIGMOID
+    # TODO: this could be supported, however.
     kernel_assert(
-        not (act_fn == common_types.RouterActFnType.SIGMOID and not use_indirect_dma_scatter),
-        f"SIGMOID activation requires use_indirect_dma_scatter=True, got {use_indirect_dma_scatter}",
+        not (act_fn == common_types.RouterActFnType.SIGMOID and not use_indirect_dma_scatter and not router_pre_norm),
+        f"SIGMOID activation with router_pre_norm=False requires use_indirect_dma_scatter=True",
     )
 
     # If using indirect-DMA, T must be a multiple of 128
@@ -249,6 +254,16 @@ def router_topk(
     # E is expected to be less than max moving free-dim
     kernel_assert(E <= F_MAX, f"E ({E}) must be <= gemm_moving_fmax ({F_MAX})")
 
+    # skip_store_router_logits is not yet supported due to a compiler limitation:
+    # the compiler requires every mutable_tensor to have at least one store operation,
+    # but router_logits is always returned as a mutable_tensor output.
+    kernel_assert(
+        not skip_store_router_logits,
+        "skip_store_router_logits=True is not currently supported due to a compiler limitation "
+        "(NCC_IGCA090: mutable_tensor must have at least one store). "
+        "Set skip_store_router_logits=False as a workaround.",
+    )
+
     # Check 'w_bias'
     has_bias = w_bias != None
     if has_bias:
@@ -259,6 +274,7 @@ def router_topk(
     # And we tile on T.
     kernel_assert(H % P_MAX == 0, f"H ({H}) must be a multiple of pmax ({P_MAX})")
     num_h_tiles = H // P_MAX
+    num_t_tiles_total = kernel_helpers.div_ceil(T, ST_F_MAX)
 
     num_t_tiles = kernel_helpers.div_ceil(
         T_local, ST_F_MAX
@@ -449,7 +465,10 @@ def router_topk(
             )
 
         # Accumulate the remaining tile results. This loop does not execute if use_column_tiling==false (i.e. num_pe_array_column_tiles==1)
-        for column_tile_idx in range(1, num_pe_array_column_tiles):
+        # Only accumulate column tiles that received matmul data. When num_h_tiles < num_pe_array_column_tiles,
+        # some column tile slots are empty (never written by a matmul), so we must not accumulate them.
+        num_active_column_tiles = min(num_h_tiles, num_pe_array_column_tiles)
+        for column_tile_idx in range(1, num_active_column_tiles):
             current_column_tile_column_offset = column_tile_idx * pe_array_column_tiling_size
             nisa.tensor_tensor(
                 dst=router_logits_sb[:t_tile_size_actual, t_tile_idx, :],
@@ -617,57 +636,76 @@ def router_topk(
 
     if expert_index_in_sb and not skip_store_expert_index:
         if shard_on_tokens:
-            # With shard_on_tokens, each core computes T_local tokens
-            kernel_assert(
-                T <= PE_COLUMN_TILE_128,
-                "If expert_index_in_sb with shard_on_tokens, then T must be <=128",
-            )
-            expert_index_send = nl.ndarray((T_local, k), dtype=nl.uint32, buffer=nl.sbuf)
-            expert_index_recv = nl.ndarray((other_T_local, k), dtype=nl.uint32, buffer=nl.sbuf)
-            nisa.tensor_copy(src=router_indexes_topk_sb[:T_local, 0, :], dst=expert_index_send)
-            nisa.sendrecv(
-                dst=expert_index_recv,
-                src=expert_index_send,
-                send_to_rank=1 - prg_id,
-                recv_from_rank=1 - prg_id,
-                pipe_id=0,
-            )
-            other_offset = T_first_shard if prg_id == 0 else 0
-            # Core 0: T_offset=0, other_offset=T_first_shard → write local first
-            # Core 1: T_offset=T_first_shard, other_offset=0 → write recv first
-            if T_offset == 0:
-                cross_partition_copy.cross_partition_copy(
+            if T <= PE_COLUMN_TILE_128:
+                expert_index_send = nl.ndarray((T_sendrecv_size, k), dtype=nl.uint32, buffer=nl.sbuf)
+                expert_index_recv = nl.ndarray((T_sendrecv_size, k), dtype=nl.uint32, buffer=nl.sbuf)
+                nisa.tensor_copy(src=router_indexes_topk_sb[:T_local, 0, :], dst=expert_index_send[:T_local, :])
+                nisa.sendrecv(
+                    dst=expert_index_recv,
                     src=expert_index_send,
-                    dst=expert_index,
-                    src_start_partition=0,
-                    dst_start_partition=0,
-                    num_partitions_to_copy=T_local,
-                    free_dim_size=k,
+                    send_to_rank=1 - prg_id,
+                    recv_from_rank=1 - prg_id,
+                    pipe_id=0,
                 )
-                cross_partition_copy.cross_partition_copy(
-                    src=expert_index_recv,
-                    dst=expert_index,
-                    src_start_partition=0,
-                    dst_start_partition=other_offset,
-                    num_partitions_to_copy=other_T_local,
-                    free_dim_size=k,
-                )
+                other_offset = T_first_shard if prg_id == 0 else 0
+                # Core 0: T_offset=0, other_offset=T_first_shard → write local first
+                # Core 1: T_offset=T_first_shard, other_offset=0 → write recv first
+                if T_offset == 0:
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_send,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=0,
+                        num_partitions_to_copy=T_local,
+                        free_dim_size=k,
+                    )
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_recv,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=other_offset,
+                        num_partitions_to_copy=other_T_local,
+                        free_dim_size=k,
+                    )
+                else:
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_recv,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=0,
+                        num_partitions_to_copy=other_T_local,
+                        free_dim_size=k,
+                    )
+                    cross_partition_copy.cross_partition_copy(
+                        src=expert_index_send,
+                        dst=expert_index,
+                        src_start_partition=0,
+                        dst_start_partition=T_offset,
+                        num_partitions_to_copy=T_local,
+                        free_dim_size=k,
+                    )
             else:
-                cross_partition_copy.cross_partition_copy(
-                    src=expert_index_recv,
-                    dst=expert_index,
-                    src_start_partition=0,
-                    dst_start_partition=0,
-                    num_partitions_to_copy=other_T_local,
-                    free_dim_size=k,
+                # Tile-based sendrecv requires T to be a multiple of 128 for correct alignment
+                kernel_assert(
+                    T % PE_COLUMN_TILE_128 == 0,
+                    f"T ({T}) must be a multiple of 128 when T > 128 with shard_on_tokens and expert_index in SBUF",
                 )
-                cross_partition_copy.cross_partition_copy(
-                    src=expert_index_send,
-                    dst=expert_index,
-                    src_start_partition=0,
-                    dst_start_partition=T_offset,
-                    num_partitions_to_copy=T_local,
-                    free_dim_size=k,
+                other_num_t_tiles = num_t_tiles_total - num_t_tiles
+                t_local_slice = nl.ds(0, num_t_tiles) if prg_id == 0 else nl.ds(other_num_t_tiles, num_t_tiles)
+                t_remote_slice = nl.ds(num_t_tiles, other_num_t_tiles) if prg_id == 0 else nl.ds(0, other_num_t_tiles)
+
+                # Copy local results to expert_index
+                nisa.tensor_copy(
+                    src=router_indexes_topk_sb[:, :, :],
+                    dst=expert_index[:t_p_dim, t_local_slice, :],
+                )
+                # Exchange data between cores via sendrecv on tile dimension
+                nisa.sendrecv(
+                    dst=expert_index[:t_p_dim, t_remote_slice, :],
+                    src=expert_index[:t_p_dim, t_local_slice, :],
+                    send_to_rank=1 - prg_id,
+                    recv_from_rank=1 - prg_id,
+                    pipe_id=0,
                 )
         else:
             # For SBUF output, copy router_indexes_topk_sb to expert_index
@@ -1037,12 +1075,11 @@ def router_topk(
 
         # When expert_affin_in_sb and shard_on_tokens, exchange data between cores via sendrecv
         if expert_affin_in_sb and shard_on_tokens and (not use_indirect_dma_scatter):
-            # Send buffer has T_local elements, recv buffer has other_T_local elements
-            expert_affin_send = nl.ndarray((T_local, E), dtype=nl.float32, buffer=nl.sbuf)
-            expert_affin_recv = nl.ndarray((other_T_local, E), dtype=nl.float32, buffer=nl.sbuf)
+            expert_affin_send = nl.ndarray((T_sendrecv_size, E), dtype=nl.float32, buffer=nl.sbuf)
+            expert_affin_recv = nl.ndarray((T_sendrecv_size, E), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(
                 src=expert_affinities_one_hot_scattered_sb[:T_local, 0, :],
-                dst=expert_affin_send,
+                dst=expert_affin_send[:T_local, :],
             )
             nisa.sendrecv(
                 dst=expert_affin_recv,
@@ -1098,9 +1135,9 @@ def router_topk(
                 "If return_eager_affi with shard_on_tokens, then T must be <=128",
             )
             expert_affinities_topk_full = nl.ndarray((T, k), dtype=nl.float32, buffer=nl.sbuf)
-            eager_affi_send = nl.ndarray((T_local, k), dtype=nl.float32, buffer=nl.sbuf)
-            eager_affi_recv = nl.ndarray((other_T_local, k), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(src=expert_affinities_topk_sb[:T_local, 0, :], dst=eager_affi_send)
+            eager_affi_send = nl.ndarray((T_sendrecv_size, k), dtype=nl.float32, buffer=nl.sbuf)
+            eager_affi_recv = nl.ndarray((T_sendrecv_size, k), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(src=expert_affinities_topk_sb[:T_local, 0, :], dst=eager_affi_send[:T_local, :])
             nisa.sendrecv(
                 dst=eager_affi_recv,
                 src=eager_affi_send,
@@ -1774,7 +1811,12 @@ def compute_activation(
             data=input_tensor[:t_tile_size, t_tile_idx : t_tile_idx + 1, :],
             bias=local_negmax_sb[:t_tile_size, t_tile_idx : t_tile_idx + 1],
             reduce_op=nl.add,
-            reduce_res=(tensor_view.TensorView(local_exp_sum_sb).select(dim=1, index=t_tile_idx).get_view()),
+            reduce_res=(
+                tensor_view.TensorView(local_exp_sum_sb)
+                .slice(dim=0, start=0, end=t_tile_size)
+                .select(dim=1, index=t_tile_idx)
+                .get_view()
+            ),
             reduce_cmd=reduce_cmd.reset_reduce,
         )
 

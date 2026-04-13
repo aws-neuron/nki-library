@@ -59,7 +59,14 @@ FEATURES:
 5. Sink Tokens (sink provided):
    - Add additional sink token to softmax denominator
 
-6. Grouped Query Attention (GQA, batch_size_kv < batch_size):
+6. Sequence Packing (bound_min/bound_max provided):
+   - Multiple independent sequences are packed into a single tensor
+   - Each query position has a [bound_min, bound_max) range defining which KV positions it attends to
+   - Positions outside the range are masked with -inf, preventing cross-sequence attention
+   - Compatible with causal masking (both masks are applied simultaneously)
+   - Not compatible with prefix caching or context parallelism
+
+7. Grouped Query Attention (GQA, batch_size_kv < batch_size):
    - Kernel handles GQA natively without explicit K/V replication
 
 7. Support for training:
@@ -114,6 +121,7 @@ from typing import Any, Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from nki.isa import reduce_cmd
 
 from ..utils.allocator import align_to
 from ..utils.kernel_assert import assert_shape, kernel_assert
@@ -174,9 +182,12 @@ def attention_cte(
     tp_out: bool = False,
     cache_softmax: bool = False,
     softmax_dtype=nl.float32,
+    mm_out_dtype=nl.float32,
     cp_offset: Optional[nl.ndarray] = None,
     global_cp_deg: int = None,
     cp_strided_q_slicing: bool = False,
+    bound_min: Optional[nl.ndarray] = None,
+    bound_max: Optional[nl.ndarray] = None,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
 
@@ -211,6 +222,12 @@ def attention_cte(
       cp_offset (nt.tensor, optional): Context parallel offset tensor with shape (1, 1)
       global_cp_deg (int, optional): Global context parallel degree
       cp_strided_q_slicing (bool, optional): Whether Q is strided for load balancing (default False)
+      bound_min (nt.tensor, optional): (Sequence packing) Per-query lower bound (inclusive) of the KV range
+                     to attend to, with shape (seqlen_q, 1). Query position i attends only to KV positions j
+                     where bound_min[i] <= j < bound_max[i]. Must be provided together with bound_max.
+                     Not compatible with prefix caching or context parallelism.
+      bound_max (nt.tensor, optional): (Sequence packing) Per-query upper bound (exclusive) of the KV range
+                     to attend to, with shape (seqlen_q, 1). Must be provided together with bound_min.
 
     Returns:
       Output tensor with attention results. Shape depends on tp_out parameter.
@@ -314,6 +331,12 @@ def attention_cte(
         kernel_assert(v_prior is None, "k_prior is None but v_prior is not None.")
         kernel_assert(prior_used_len is None, "k_prior is None but prior_used_len is not None.")
 
+    kernel_assert(
+        (bound_min is None) == (bound_max is None), "bound_min and bound_max must both be set or both be None"
+    )
+    # Sequence packing is active when per-query KV bounds are provided
+    is_sequence_packed = bound_min is not None
+
     seqlen_q, seqlen_k_active, seqlen_k_prior, d, out_shape, softmax_shape = _check_input_and_return_shape(
         q,
         k,
@@ -327,6 +350,20 @@ def attention_cte(
         tp_out,
         cache_softmax,
     )
+    if is_sequence_packed:
+        kernel_assert(
+            bound_min.shape == (seqlen_q, 1),
+            f"bound_min shape must be (seqlen_q, 1)=({seqlen_q}, 1), got {bound_min.shape}",
+        )
+        kernel_assert(
+            bound_max.shape == (seqlen_q, 1),
+            f"bound_max shape must be (seqlen_q, 1)=({seqlen_q}, 1), got {bound_max.shape}",
+        )
+        kernel_assert(not is_prefix_caching, "is_sequence_packed is not supported with prefix caching")
+        kernel_assert(
+            global_cp_deg is None or global_cp_deg <= 1, "is_sequence_packed is not supported with context parallelism"
+        )
+
     result = nl.ndarray(shape=out_shape, dtype=q.dtype, buffer=nl.shared_hbm)
 
     out_sum_recip, out_neg_max = None, None
@@ -377,6 +414,14 @@ def attention_cte(
         f"we do not support head_dim > {_MAX_HEAD_DIM}, got head dim {d}",
     )
 
+    # mm_out_dtype
+    kernel_assert(
+        (str(mm_out_dtype) == str(nl.float32))
+        or (str(mm_out_dtype) == str(nl.bfloat16) and (nisa.get_nc_version() >= nisa.nc_version.gen4)),
+        f"mm_out_dtype (psum) should be in [float32, bfloat16], and 2-byte dtype is only allows in gen4+ (Trn3+),"
+        f"but got dtype {mm_out_dtype} in hw version {nisa.get_nc_version()}.",
+    )
+
     # Context parallel
     if global_cp_deg:
         kernel_assert(
@@ -405,6 +450,8 @@ def attention_cte(
         cache_softmax=cache_softmax,
         dtype=q.dtype,
         softmax_dtype=softmax_dtype,
+        mm_out_dtype=mm_out_dtype,
+        is_sequence_packed=is_sequence_packed,
     )
 
     grid_ndim, num_shard, shard_id = get_verified_program_sharding_info("attention_cte", max_sharding=2)
@@ -429,6 +476,8 @@ def attention_cte(
             out_neg_max=out_neg_max,
             out_sum_recip=out_sum_recip,
             cp_offset=cp_offset,
+            bound_min=bound_min,
+            bound_max=bound_max,
         )
 
     has_remainder = (bs % num_shard) != 0
@@ -476,6 +525,8 @@ def attention_cte(
                 shard_seqlen_q_start=shard_id * batch_0_grp,
                 shard_seqlen_q_length=batch_length,
                 cp_offset=cp_offset,
+                bound_min=bound_min,
+                bound_max=bound_max,
             )
         else:
             # Have core 0 do all the work
@@ -495,6 +546,8 @@ def attention_cte(
                     out_neg_max=out_neg_max,
                     out_sum_recip=out_sum_recip,
                     cp_offset=cp_offset,
+                    bound_min=bound_min,
+                    bound_max=bound_max,
                 )
 
     if cache_softmax:
@@ -539,6 +592,10 @@ class AttnConfig(nl.NKIObject):
     cache_softmax: bool = None
     dtype: Any = None
     softmax_dtype: Any = None
+    mm_out_dtype: Any = None
+
+    # sequence packing
+    is_sequence_packed: bool = None
 
 
 def _attention_cte_impl(
@@ -558,6 +615,8 @@ def _attention_cte_impl(
     shard_seqlen_q_start=-1,
     shard_seqlen_q_length=-1,
     cp_offset: Any = None,
+    bound_min: Any = None,
+    bound_max: Any = None,
 ):
     """
     Internal implementation function for attention computation.
@@ -625,7 +684,7 @@ def _attention_cte_impl(
         stream_shuffle_broadcast(src=bufs.sink_sb, dst=bufs.sink_sb)
 
     # Setup range select bounds for dynamic masking (used in CP/SWA/Prefix caching)
-    _setup_range_select_bounds(ac, atp, bufs, allocator, cp_offset, prior_used_len)
+    _setup_range_select_bounds(ac, atp, bufs, allocator, cp_offset, prior_used_len, bound_min, bound_max)
 
     # Allocate running statistics (persistent across sections)
     bufs.mm1_running_max = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
@@ -729,24 +788,24 @@ def _attention_cte_impl(
             _pv_impl(shard_seqlen_q_end - 1, ac, atp, sp, bufs)
             _write_back_impl(shard_seqlen_q_end - 1, ac, atp, sp, bufs, o, batch_id)
 
-        # If used with training, we need to also return the softmax intermediates
-        # num_grps is total number of groups, shard_seqlen_q_length is current shard
-        # write from [0:128, shard_seqlen_q_start:shard_seqlen_q_start+shard_seqlen_q_length]
-        # to [batch_id, 0:128, shard_seqlen_q_start:shard_seqlen_q_start+shard_seqlen_q_length]
-        dst_ap = [[atp.num_grps, atp.sb_p], [1, shard_seqlen_q_length]]
-        dst_offset = batch_id * atp.sb_p * atp.num_grps + shard_seqlen_q_start
-        src_ap = [[atp.num_grps, atp.sb_p], [1, shard_seqlen_q_length]]
-        src_offset = shard_seqlen_q_start
-        if out_neg_max is not None:
-            nisa.dma_copy(
-                out_neg_max.ap(pattern=dst_ap, offset=dst_offset),
-                src=bufs.mm1_running_max.ap(pattern=src_ap, offset=src_offset),
-            )
-        if out_sum_recip is not None:
-            nisa.dma_copy(
-                out_sum_recip.ap(pattern=dst_ap, offset=dst_offset),
-                src=bufs.exp_sum_reciprocal.ap(pattern=src_ap, offset=src_offset),
-            )
+    # If used with training, we need to also return the softmax intermediates
+    # num_grps is total number of groups, shard_seqlen_q_length is current shard
+    # write from [0:128, shard_seqlen_q_start:shard_seqlen_q_start+shard_seqlen_q_length]
+    # to [batch_id, 0:128, shard_seqlen_q_start:shard_seqlen_q_start+shard_seqlen_q_length]
+    dst_ap = [[atp.num_grps, atp.sb_p], [1, shard_seqlen_q_length]]
+    dst_offset = batch_id * atp.sb_p * atp.num_grps + shard_seqlen_q_start
+    src_ap = [[atp.num_grps, atp.sb_p], [1, shard_seqlen_q_length]]
+    src_offset = shard_seqlen_q_start
+    if out_neg_max is not None:
+        nisa.dma_copy(
+            out_neg_max.ap(pattern=dst_ap, offset=dst_offset),
+            src=bufs.mm1_running_max.ap(pattern=src_ap, offset=src_offset),
+        )
+    if out_sum_recip is not None:
+        nisa.dma_copy(
+            out_sum_recip.ap(pattern=dst_ap, offset=dst_offset),
+            src=bufs.exp_sum_reciprocal.ap(pattern=src_ap, offset=src_offset),
+        )
 
 
 @dataclass
@@ -799,8 +858,8 @@ class AttnInternalBuffers(nl.NKIObject):
     # Shared/utility tensors
     zero_bias_tensor = None  # zeros, used for initialization/fallback in multiple places
     sink_sb = None  # sink loaded to SBUF
-    range_sel_lbs = None  # lower bound for range_select for CP/SWA/Prefix caching
-    range_sel_ubs = None  # upper bound for range_select for CP/SWA/Prefix caching
+    range_sel_lbs = None  # lower bound for range_select for CP/SWA/Sequence Packing/Prefix caching
+    range_sel_ubs = None  # upper bound for range_select for CP/SWA/Sequence Packing/Prefix caching
     range_sel_lbs_prior = None  # lower bound for range_select for Prefix caching
     range_sel_ubs_prior = None  # upper bound for range_select for Prefix caching
     k_offset_sb_u32 = None  # used for dynamic load for only required k/v for CP+SWA
@@ -900,7 +959,8 @@ def _compute_tile_parameters(
         if not ac.cp_strided_q_slicing:
             atp.is_causal = False
         atp.dynamic_sel_mask = True
-
+    if ac.is_sequence_packed:
+        atp.dynamic_sel_mask = True
     atp.seqlen_k_active_updated = ac.seqlen_k_active
     atp.use_swa_optimized_allocation = (
         False  # whether to allocate more q groups and fewer k tiles for exp and transpose
@@ -1016,6 +1076,8 @@ def _setup_range_select_bounds(
     allocator: ModularAllocator,
     cp_offset: Any,
     prior_used_len: Any,
+    bound_min: Any,
+    bound_max: Any,
 ) -> tuple:
     """
     Set up range select bounds for dynamic masking (CP/SWA/prefix caching).
@@ -1052,10 +1114,12 @@ def _setup_range_select_bounds(
                 channel_multiplier=ac.global_cp_deg,
             )
         else:
+            seq_packed_non_causal = ac.is_sequence_packed and not atp.is_causal
             nisa.iota(
                 bufs.range_sel_ubs[...],
                 pattern=[[atp.sb_p, atp.num_grps]],
-                channel_multiplier=1,
+                channel_multiplier=0 if seq_packed_non_causal else 1,
+                offset=ac.seqlen_k_active if seq_packed_non_causal else 0,
             )
 
         if ac.use_cp:
@@ -1065,18 +1129,43 @@ def _setup_range_select_bounds(
                 op0=nl.add,
                 operand0=cp_offset_sb,
             )
-
-        # Create range select lower bounds for sliding window
-        if ac.use_swa:
+        if ac.is_sequence_packed:
             bufs.range_sel_lbs = allocator.alloc_sbuf_tensor(
                 shape=bufs.range_sel_ubs.shape, dtype=bufs.range_sel_ubs.dtype
             )
-            nisa.tensor_scalar(
-                bufs.range_sel_lbs,
-                bufs.range_sel_ubs,
-                op0=nl.add,
-                operand0=-(ac.sliding_window - 1.0),
+            local_allocator = ModularAllocator(allocator._current_address)
+            tmp_buffer = local_allocator.alloc_sbuf_tensor(
+                shape=bufs.range_sel_ubs.shape, dtype=bufs.range_sel_ubs.dtype
             )
+            bound_min_reshaped = bound_min.reshape((atp.sb_p, atp.num_grps))
+            bound_max_reshaped = bound_max.reshape((atp.sb_p, atp.num_grps))
+            nisa.dma_copy(
+                dst=bufs.range_sel_lbs[...], src=bound_min_reshaped.ap([[1, atp.sb_p], [atp.sb_p, atp.num_grps]])
+            )
+            nisa.dma_copy(dst=tmp_buffer[...], src=bound_max_reshaped.ap([[1, atp.sb_p], [atp.sb_p, atp.num_grps]]))
+            nisa.tensor_tensor(dst=bufs.range_sel_ubs, data1=bufs.range_sel_ubs, data2=tmp_buffer, op=nl.minimum)
+
+        # Create range select lower bounds for sliding window
+        if ac.use_swa:
+            if ac.is_sequence_packed:
+                nisa.scalar_tensor_tensor(
+                    dst=bufs.range_sel_lbs,
+                    data=bufs.range_sel_ubs,
+                    op0=nl.add,
+                    operand0=-(ac.sliding_window - 1.0),
+                    op1=nl.maximum,
+                    operand1=bufs.range_sel_lbs,
+                )
+            else:
+                bufs.range_sel_lbs = allocator.alloc_sbuf_tensor(
+                    shape=bufs.range_sel_ubs.shape, dtype=bufs.range_sel_ubs.dtype
+                )
+                nisa.tensor_scalar(
+                    bufs.range_sel_lbs,
+                    bufs.range_sel_ubs,
+                    op0=nl.add,
+                    operand0=-(ac.sliding_window - 1.0),
+                )
 
     # Setup prefix caching bounds
     if ac.is_prefix_caching:
@@ -1266,14 +1355,14 @@ def _allocate_attention_buffers(
     if ac.tp_out:
         bufs.mm2_prev_output = allocator.alloc_sbuf_tensor(
             shape=(ac.d, atp.sb_p),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps],
             num_free_tiles=[2],
         )
     else:
         bufs.mm2_prev_output = allocator.alloc_sbuf_tensor(
             shape=(atp.sb_p, ac.d),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps],
             num_free_tiles=[2],
         )
@@ -1337,14 +1426,14 @@ def _allocate_attention_buffers(
     if ac.tp_out:
         bufs.mm2_final = allocator.alloc_sbuf_tensor(
             shape=(ac.d, atp.sb_p),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps],
             num_free_tiles=[2],
         )
     else:
         bufs.mm2_final = allocator.alloc_sbuf_tensor(
             shape=(atp.sb_p, ac.d),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps],
             num_free_tiles=[2],
         )
@@ -1352,14 +1441,14 @@ def _allocate_attention_buffers(
     if ac.tp_out:
         bufs.mm2_sb = allocator.alloc_sbuf_tensor(
             shape=(mm2_n, mm2_p),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps],
             num_free_tiles=[2],
         )
     else:
         bufs.mm2_sb = allocator.alloc_sbuf_tensor(
             shape=(mm2_p, mm2_n),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps],
             num_free_tiles=[2],
         )
@@ -1387,7 +1476,7 @@ def _allocate_attention_buffers(
             for k_tile_idx in range(4):
                 mm1_psum_tile = nl.ndarray(
                     (mm1_p, mm1_n),
-                    dtype=nl.float32,
+                    dtype=ac.mm_out_dtype,
                     buffer=nl.psum,
                     address=(0, (k_tile_idx % 4) * PSUM_BANK_SIZE),
                 )
@@ -1398,14 +1487,14 @@ def _allocate_attention_buffers(
     if not atp.dynamic_sel_mask:
         bufs.mm1_copy_sb = allocator.alloc_sbuf_tensor(
             shape=(mm1_p, mm1_n),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps, atp.num_large_tiles_per_section, 4],
             num_free_tiles=[1, 1, 2],
         )
 
         bufs.mm1_affine_select_output = allocator.alloc_sbuf_tensor(
             shape=(mm1_p, mm1_n),
-            dtype=nl.float32,
+            dtype=ac.mm_out_dtype,
             block_dim=[atp.num_grps, atp.num_large_tiles_per_section, 4],
             num_free_tiles=[1, 1, 2],
         )
@@ -1434,14 +1523,14 @@ def _allocate_attention_buffers(
             if ac.tp_out:
                 mm2_psum_tile = nl.ndarray(
                     (mm2_n, mm2_p),
-                    dtype=nl.float32,
+                    dtype=ac.mm_out_dtype,
                     buffer=nl.psum,
                     address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
                 )
             else:
                 mm2_psum_tile = nl.ndarray(
                     (mm2_p, mm2_n),
-                    dtype=nl.float32,
+                    dtype=ac.mm_out_dtype,
                     buffer=nl.psum,
                     address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
                 )
@@ -2636,6 +2725,10 @@ def _qk_and_max_large_tile_impl(
                     bound0 = bufs.range_sel_lbs_prior[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
                     bound1 = bufs.range_sel_ubs_prior[:num_p, qkmax_grp]
                     comp_op1 = nl.less  # k < prior_used_len
+                elif ac.is_sequence_packed:
+                    bound0 = bufs.range_sel_lbs[:num_p, nl.ds(qkmax_grp, 1)]
+                    bound1 = bufs.range_sel_ubs[:num_p, nl.ds(qkmax_grp, 1)]
+                    comp_op1 = nl.less_equal if atp.is_causal else nl.less
                 else:
                     bound0 = bufs.range_sel_lbs[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
                     bound1 = bufs.range_sel_ubs[:num_p, qkmax_grp]
@@ -2648,10 +2741,11 @@ def _qk_and_max_large_tile_impl(
                     on_false_value=_FLOAT32_MIN,
                     comp_op0=nl.greater_equal,
                     comp_op1=comp_op1,
-                    bound0=bound0,
-                    bound1=bound1,
+                    bound0=bound0[:num_p, :1],
+                    bound1=bound1[:num_p, :1],
                     reduce_op=nl.maximum,
                     reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+                    reduce_cmd=reduce_cmd.reset_reduce,
                     range_start=k_start_pos,
                 )
 

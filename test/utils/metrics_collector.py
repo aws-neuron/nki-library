@@ -35,6 +35,7 @@ from aws_embedded_metrics.logger.metrics_context import MetricsContext
 from typing_extensions import override
 
 from ..utils.exceptions import UnimplementedException
+from .metadata_loader import match_model_config_id
 
 
 class MetricName:
@@ -63,6 +64,14 @@ class MetricName:
     HOST_LOCK_TIME = "HostLockTime"
     HOST_ARCH_VALIDATION_TIME = "HostArchValidationTime"
     CORE_ALLOCATION_TIME = "CoreAllocationTime"
+    # Core allocation sub-metrics (breakdown of CORE_ALLOCATION_TIME)
+    CORE_LOCK_INIT_TIME = "CoreLockInitTime"
+    CORE_LOCK_DEPLOY_TIME = "CoreLockDeployTime"
+    CORE_LOCK_ACQUIRE_TIME = "CoreLockAcquireTime"
+    CORE_LOCK_VERSION_CHECK_TIME = "CoreLockVersionCheckTime"
+    # Core lock contention metrics
+    CORE_LOCK_NO_CORES_COUNT = "CoreLockNoCoresCount"
+    CORE_LOCK_CONTENTION_WAIT_TIME = "CoreLockContentionWaitTime"
     FAILED_HOSTS_COUNT = "FailedHostsCount"
 
     # ==========================================================================
@@ -384,19 +393,15 @@ class MetricsCollector(IMetricsCollector):
         """
         Match test configuration to metadata and add model dimensions.
 
-        Searches metadata_list for entries where test_settings matches test_metadata_key.
-        Adds all keys from matched model_settings as dimensions
+        Searches metadata_list for entries where all keys in test_metadata_key
+        match test_settings. On match, computes a ModelConfigId (SHA256 hash)
+        for association.
         """
-        for entry in metadata_list:
-            test_settings = entry.get("test_settings", {})
-            # Check if all keys in test_metadata_key match test_settings
-            if all(test_settings.get(k) == v for k, v in test_metadata_key.items()):
-                model_settings = entry.get("model_settings", {})
-                # Add all model_settings as dimensions
-                for key, value in model_settings.items():
-                    if value is not None:
-                        self.add_dimension({key: str(value)})
-                return  # Found match, stop searching
+        config_id = match_model_config_id(test_metadata_key, metadata_list)
+        if config_id:
+            self.add_dimension({"ModelConfigId": config_id})
+        else:
+            self.logger.warning(f"No model config match found in {len(metadata_list)} entries")
 
     @override
     def has_metric(self, name: str) -> bool:

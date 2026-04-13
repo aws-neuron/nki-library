@@ -90,7 +90,7 @@ def qkv(
     # ----------------------------------------
     load_input_with_DMA_transpose: bool = True,
     # ----------------------------------------
-    is_input_swizzled: bool = False,
+    is_h_dim_4h_transposed: bool = False,
     weight_layout: QKVWeightLayout = QKVWeightLayout.CONTIGUOUS,
 ) -> nl.ndarray:
     """
@@ -185,8 +185,17 @@ def qkv(
         If 'sbm' is provided by user, user has the responsibility to set use_auto_allocation=True in the provided SbufManager.
     load_input_with_DMA_transpose : bool, default=True
         Whether to use DMA transpose optimization.
-    is_input_swizzled: bool, default=False
-        Whether the input tensor is swizzled (only applicable with MX Quantization).
+    is_h_dim_4h_transposed: bool, default=False
+            Whether the H-dim (in input and gamma) has been pre-transposed by 4 (only applicable with MX Quantization).
+            If is_h_dim_4h_transposed = False,
+                * input has typical shape [B, S, H], viewed as [B, S, H//512, 128_H, 4_H].
+            If is_h_dim_4h_transposed = True,
+                * input has shape [B, S, H] but is pre-shuffled from
+                  [B, S, H//512, 128_H, 4_H] -> [B, S, 4_H, H//512, 128_H] and flattened to [B, S, H].
+                * IMPORTANT: H-dim in both input and gamma weights (for RMSNorm) must be pre-shuffled.
+                    * For input, this is achieved by offline pre-shuffling weights of upstream projection (in real model).
+                    * For gamma, this is achieved by offline pre-shuffling of gamma tensor.
+                Purpose: More efficent for obtaining the required swizzled layout for quantize_mx instruction.
     weight_layout : QKVWeightLayout, default=QKVWeightLayout.CONTIGUOUS
         Layout of fused_qkv_weights. See QKVWeightLayout docstring for packing instructions.
     Returns:
@@ -232,9 +241,11 @@ def qkv(
 
     input_in_sbuf = input.buffer == nl.sbuf
     if not input_in_sbuf:
-        _, S, _ = input.shape
+        B, S, _ = input.shape
         is_input_config_only_available_in_qkv_cte_kernel = (
-            is_input_config_only_available_in_qkv_cte_kernel or S > SEQLEN_THRESHOLD_FOR_QKV_CTE
+            is_input_config_only_available_in_qkv_cte_kernel
+            or S > SEQLEN_THRESHOLD_FOR_QKV_CTE
+            or B * S > nl.tile_size.pmax  # Large batch: qkv_tkg requires B*S <= pmax for SBUF output
         )
     else:
         _, BxS, _ = input.shape
@@ -283,7 +294,7 @@ def qkv(
             quantization_type=quantization_type,
             qkv_w_scale=qkv_w_scale,
             qkv_in_scale=qkv_in_scale,
-            is_input_swizzled=is_input_swizzled,
+            is_input_swizzled=is_h_dim_4h_transposed,
             weight_layout=weight_layout,
         )
 
@@ -299,6 +310,7 @@ def qkv(
             norm_w=gamma_norm_weights,
             norm_bias=layer_norm_bias,
             quantization_type=quantization_type,
+            is_h_dim_4h_transposed=is_h_dim_4h_transposed,
             qkv_w_scale=qkv_w_scale,
             qkv_in_scale=qkv_in_scale,
             eps=norm_eps,

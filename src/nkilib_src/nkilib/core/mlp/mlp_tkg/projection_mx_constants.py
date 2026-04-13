@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Shared constants and configuration for MX projection sub-kernels.
-
-These constants and ProjConfig are used by both H-sharding and I-sharding projection implementations.
-"""
+"""Shared constants and configuration for MX projection sub-kernels."""
 
 from dataclasses import dataclass
 
@@ -45,9 +41,18 @@ ALLOWED_P_SCALE_IDX_OFFSETS = [
     8,
     12,
 ]  # Can fit 4x scales of width 4 in P into partitions 0:16 in each SBUF quadrant
-# QuantizeMx can accept P in [32, 64, 128], corresponding to unpacked P [128, 256, 512]
-ALLOWED_QMX_P_DIM = [32, 64, 128]
-ALLOWED_QMX_UNPACKED_P_DIM = [128, 256, 512]
+# QuantizeMx can accept P in [32, 64, 96, 128], corresponding to unpacked P [128, 256, 384, 512]
+ALLOWED_QMX_P_DIM = (32, 64, 96, 128)
+ALLOWED_QMX_UNPACKED_P_DIM = [128, 256, 384, 512]
+
+
+def pad_to_valid_qmx_partitions(n: int) -> int:
+    """Pad partition count to nearest valid quantize_mx size {32, 64, 96, 128}."""
+    for valid in ALLOWED_QMX_P_DIM:
+        if valid >= n:
+            return valid
+    return 128
+
 
 # MMULMX config
 MIN_MATMULT_MX_P_DIM = 8  # Must have at least 1x [8P, 4F] block

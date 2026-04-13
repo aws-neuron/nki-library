@@ -86,9 +86,17 @@ class TestNormalizeParamValue:
         obj = CustomObj()
         assert normalize_param_value(obj) == "CustomObj(123)"
 
-    def test_list_passes_through(self):
-        """Lists pass through unchanged."""
-        assert normalize_param_value([1, 2, 3]) == [1, 2, 3]
+    def test_list_stringified(self):
+        """Lists are JSON-stringified to avoid dynamic mapping conflicts."""
+        assert normalize_param_value([1, 2, 3]) == "[1, 2, 3]"
+
+    def test_tuple_stringified(self):
+        """Tuples are JSON-stringified to avoid dynamic mapping conflicts."""
+        assert normalize_param_value((8000, 512, 4, 4, False)) == "[8000, 512, 4, 4, false]"
+
+    def test_empty_list_stringified(self):
+        """Empty lists are JSON-stringified."""
+        assert normalize_param_value([]) == "[]"
 
 
 class TestUnwrapKernelFunc:

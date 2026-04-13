@@ -109,6 +109,8 @@ def _KVDP_attention_input_collectives(
         - Batch selection uses reshape to (KVDP, rest) + dynamic select with rank_id
     """
     dtype = Q_tkg_sb.dtype
+    kv_dtype = K_tkg_sb.dtype
+    kernel_assert(K_tkg_sb.dtype == V_tkg_hbm.dtype, f"K/V dtype mismatch: {K_tkg_sb.dtype} != {V_tkg_hbm.dtype}")
 
     # Shape assertions
     kernel_assert(
@@ -162,10 +164,6 @@ def _KVDP_attention_input_collectives(
         # Transpose Q to HBM: (d_head, B*q_heads*S) -> (q_heads, B, S_tkg, d_head)
         # Need q_heads on dim=0 for all_gather on Q heads
         kernel_assert(d_head <= nl.tile_size.pmax, f"d_head must be <= {nl.tile_size.pmax}, got {d_head}")
-        kernel_assert(
-            q_heads * B * S_tkg <= nl.tile_size.psum_fmax,
-            f"B * q_heads * S_tkg must be <= {nl.tile_size.psum_fmax}, got {B} * {q_heads} * {S_tkg} = {q_heads * B * S_tkg}",
-        )
         # Rearrange q_heads to first dim of free dim before transpose:
         #   (d_head, B, q_heads, S) -> (d_head, q_heads, B, S)
         Q_tkg_sb_rearranged = nl.ndarray((d_head, q_heads * B * S_tkg), dtype=dtype, buffer=nl.sbuf)
@@ -173,15 +171,20 @@ def _KVDP_attention_input_collectives(
             ("d", "B", "H", "S"), ("d", "H", "B", "S"), {}
         )
         nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view.get_view())
-        # Transpose: (d_head, q_heads*B*S) -> (q_heads*B*S, d_head)
-        Q_psum = nl.ndarray((q_heads * B * S_tkg, d_head), dtype=dtype, buffer=nl.psum)
-        nisa.nc_transpose(Q_psum, Q_tkg_sb_rearranged)
-        # Copy PSUM -> SBUF
-        Q_transposed = nl.ndarray((q_heads * B * S_tkg, d_head), dtype=dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(Q_transposed, Q_psum)
-        # SBUF -> HBM with target shape (q_heads, B, S_tkg, d_head) for collectives
+        # Tiled transpose: (d_head, q_heads*B*S) -> (q_heads*B*S, d_head) -> HBM
+        total_free = q_heads * B * S_tkg
+        tile_sz = nl.tile_size.pmax
         Q_hbm = nl.ndarray((q_heads, B, S_tkg, d_head), dtype=dtype, buffer=nl.shared_hbm, name="Q_hbm")
-        nisa.dma_copy(Q_hbm.reshape((q_heads * B * S_tkg, d_head)), Q_transposed)
+        Q_hbm_flat = Q_hbm.reshape((total_free, d_head))
+        for t_start in range(0, total_free, tile_sz):
+            t_size = min(tile_sz, total_free - t_start)
+            Q_psum = nl.ndarray((t_size, d_head), dtype=dtype, buffer=nl.psum)
+            nisa.nc_transpose(Q_psum, Q_tkg_sb_rearranged[:, nl.ds(t_start, t_size)])
+            # Copy PSUM -> SBUF
+            Q_tile_sb = nl.ndarray((t_size, d_head), dtype=dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(Q_tile_sb, Q_psum)
+            # SBUF -> HBM with target shape (q_heads, B, S_tkg, d_head) for collectives
+            nisa.dma_copy(Q_hbm_flat[nl.ds(t_start, t_size), :], Q_tile_sb)
 
         # all_gather Q on head dim: (q_heads, B, S_tkg, d_head) -> (KVDP*q_heads, B, S_tkg, d_head)
         Q_gathered_hbm = nl.ndarray(
@@ -217,31 +220,38 @@ def _KVDP_attention_input_collectives(
 
         # Load Q to SBUF and transpose: (q_heads_attn, B_attn, S_tkg, d_head) -> (d_head, B_attn*q_heads_attn*S_tkg)
         Q_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        # HBM -> SBUF: flatten to (H*B*S, d) for transpose
-        Q_load = nl.ndarray((q_heads_attn * B_attn * S_tkg, d_head), dtype=dtype, buffer=nl.sbuf)
-        nisa.dma_copy(Q_load, Q_sliced_hbm.reshape((q_heads_attn * B_attn * S_tkg, d_head)))
-        # Transpose: (q_heads_attn*B_attn*S_tkg, d_head) -> (d_head, q_heads_attn*B_attn*S_tkg)
-        # Note: q_heads_attn * B_attn * S_tkg <= psum_fmax due to assertion above, so single transpose works
-        Q_psum = nl.ndarray((d_head, q_heads_attn * B_attn * S_tkg), dtype=dtype, buffer=nl.psum)
-        nisa.nc_transpose(Q_psum, Q_load)
-        # PSUM -> SBUF: (d_head, q_heads_attn, B_attn, S_tkg) -> (d_head, B_attn, q_heads_attn, S_tkg)
-        Q_psum_view = TensorView(Q_psum.reshape((d_head, q_heads_attn, B_attn, S_tkg))).rearrange(
+        # Tiled transpose: (q_heads_attn*B_attn*S_tkg, d_head) -> (d_head, q_heads_attn*B_attn*S_tkg)
+        total_p = q_heads_attn * B_attn * S_tkg
+        tile_sz = nl.tile_size.pmax
+        Q_sliced_flat = Q_sliced_hbm.reshape((total_p, d_head))
+        for t_start in range(0, total_p, tile_sz):
+            t_size = min(tile_sz, total_p - t_start)
+            Q_tile_sb = nl.ndarray((t_size, d_head), dtype=dtype, buffer=nl.sbuf)
+            nisa.dma_copy(Q_tile_sb, Q_sliced_flat[nl.ds(t_start, t_size), :])
+            Q_psum = nl.ndarray((d_head, t_size), dtype=dtype, buffer=nl.psum)
+            nisa.nc_transpose(Q_psum, Q_tile_sb)
+            # PSUM -> SBUF
+            nisa.tensor_copy(Q_tkg_sb_out[:, nl.ds(t_start, t_size)], Q_psum)
+        # Rearrange: (d_head, q_heads_attn, B_attn, S_tkg) -> (d_head, B_attn, q_heads_attn, S_tkg)
+        Q_tkg_sb_rearranged_out = sbm.alloc_stack((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
+        Q_out_view = TensorView(Q_tkg_sb_out.reshape((d_head, q_heads_attn, B_attn, S_tkg))).rearrange(
             ('d', 'H', 'B', 'S'), ('d', 'B', 'H', 'S'), {}
         )
-        nisa.tensor_copy(Q_tkg_sb_out, Q_psum_view.get_view())
+        nisa.tensor_copy(Q_tkg_sb_rearranged_out, Q_out_view.get_view())
+        Q_tkg_sb_out = Q_tkg_sb_rearranged_out
 
     # ========== K: slice batch ==========
     # Dynamic DMA only supports DRAM (HBM), so: SBUF -> HBM -> slice -> SBUF
-    K_full = nl.ndarray((d_head, B * S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="K_full")
+    K_full = nl.ndarray((d_head, B * S_tkg), dtype=kv_dtype, buffer=nl.shared_hbm, name="K_full")
     nisa.dma_copy(K_full, K_tkg_sb)
 
     # Slice K batch: (d_head, B*S_tkg) -> (d_head, KVDP, B_attn*S_tkg) -> select -> (d_head, B_attn*S_tkg)
     K_full_view = TensorView(K_full.reshape((d_head, KVDP, B_attn * S_tkg))).select(dim=1, index=dynamic_rank_id)
-    K_local = nl.ndarray(K_full_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="K_local")
+    K_local = nl.ndarray(K_full_view.shape, dtype=kv_dtype, buffer=nl.shared_hbm, name="K_local")
     nisa.dma_copy(dst=K_local, src=K_full_view.get_view())
 
     # DMA back to SBUF
-    K_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
+    K_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * S_tkg), dtype=kv_dtype, buffer=nl.sbuf)
     nisa.dma_copy(K_tkg_sb_out, K_local)
 
     # ========== V: slice batch ==========
@@ -250,7 +260,7 @@ def _KVDP_attention_input_collectives(
         dim=0, index=dynamic_rank_id
     )
     V_tkg_hbm_out = nl.ndarray(
-        V_tkg_hbm_batch_slice_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="V_tkg_hbm_out"
+        V_tkg_hbm_batch_slice_view.shape, dtype=kv_dtype, buffer=nl.shared_hbm, name="V_tkg_hbm_out"
     )
     nisa.dma_copy(dst=V_tkg_hbm_out, src=V_tkg_hbm_batch_slice_view.get_view())
 
@@ -343,18 +353,19 @@ def _KVDP_attention_output_collectives(
     # Transpose attn to HBM: (d_head, B_attn, q_heads_attn, S_tkg) -> (B_attn, q_heads_attn, d_head, S_tkg)
     # Need B_attn on dim=0 for all_gather on batch dimension
     # TODO: If B_attn==1, can skip transpose (same trick as q_heads==1 in input_collectives)
-    kernel_assert(
-        B_attn * q_heads_attn * S_tkg <= nl.tile_size.psum_fmax,
-        f"B * q_heads * S_tkg must be <= {nl.tile_size.psum_fmax}, got {B} * {q_heads} * {S_tkg} = {B * q_heads * S_tkg}",
-    )
-    attn_transposed = nl.ndarray((B_attn * q_heads_attn * S_tkg, d_head), dtype=dtype, buffer=nl.sbuf)
-    psum_t = nl.ndarray((B_attn * q_heads_attn * S_tkg, d_head), dtype=dtype, buffer=nl.psum)
-    nisa.nc_transpose(psum_t, attn_sb)
-    nisa.tensor_copy(attn_transposed, psum_t)
+    total_free = B_attn * q_heads_attn * S_tkg
+    tile_sz = nl.tile_size.pmax
     attn_hbm = nl.ndarray(
         (B_attn, q_heads_attn, d_head, S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="attn_pre_gather"
     )
-    nisa.dma_copy(attn_hbm.reshape((B_attn * q_heads_attn * S_tkg, d_head)), attn_transposed)
+    attn_hbm_flat = attn_hbm.reshape((total_free, d_head))
+    for t_start in range(0, total_free, tile_sz):
+        t_size = min(tile_sz, total_free - t_start)
+        psum_t = nl.ndarray((t_size, d_head), dtype=dtype, buffer=nl.psum)
+        nisa.nc_transpose(psum_t, attn_sb[:, nl.ds(t_start, t_size)])
+        attn_tile_sb = nl.ndarray((t_size, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(attn_tile_sb, psum_t)
+        nisa.dma_copy(attn_hbm_flat[nl.ds(t_start, t_size), :], attn_tile_sb)
 
     # all_gather on batch dim: (B_attn, q_heads_attn, d_head, S_tkg) -> (B, q_heads_attn, d_head, S_tkg)
     attn_gathered = nl.ndarray(
@@ -371,17 +382,25 @@ def _KVDP_attention_output_collectives(
     attn_sliced = nl.ndarray(attn_gathered_head_slice_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="attn_sliced")
     nisa.dma_copy(dst=attn_sliced, src=attn_gathered_head_slice_view.get_view())
 
-    # Transpose back to SBUF: (B, q_heads, d_head, S_tkg) -> (d_head, B*q_heads*S_tkg)
-    # B * q_heads * S_tkg = B_attn * q_heads_attn * S_tkg <= psum_fmax (same assertion as above)
-    attn_final_sb = sbm.alloc_stack((d_head, B * q_heads * S_tkg), dtype=dtype, buffer=nl.sbuf)
-    attn_load = nl.ndarray((B * q_heads * S_tkg, d_head), dtype=dtype, buffer=nl.sbuf)
-    nisa.dma_copy(attn_load, attn_sliced.reshape((B * q_heads * S_tkg, d_head)))
-    psum = nl.ndarray((d_head, B * q_heads * S_tkg), dtype=dtype, buffer=nl.psum)
-    nisa.nc_transpose(psum, attn_load)
-    nisa.tensor_copy(attn_final_sb, psum)
+    # Tiled transpose back to SBUF: (B, q_heads, d_head, S_tkg) -> (d_head, B*q_heads*S_tkg)
+    total_p = B * q_heads * S_tkg
+    tile_sz = nl.tile_size.pmax
+    attn_final_sb = sbm.alloc_stack((d_head, total_p), dtype=dtype, buffer=nl.sbuf)
+    attn_sliced_flat = attn_sliced.reshape((total_p, d_head))
+    for t_start in range(0, total_p, tile_sz):
+        t_size = min(tile_sz, total_p - t_start)
+        attn_tile = nl.ndarray((t_size, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.dma_copy(attn_tile, attn_sliced_flat[nl.ds(t_start, t_size), :])
+        psum = nl.ndarray((d_head, t_size), dtype=dtype, buffer=nl.psum)
+        nisa.nc_transpose(psum, attn_tile)
+        nisa.tensor_copy(attn_final_sb[:, nl.ds(t_start, t_size)], psum)
 
     # ========== V: copy from HBM to SBUF for KV cache update ==========
-    V_tkg_sb = nl.ndarray((B_attn * S_tkg, d_head), dtype=V_tkg_hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(V_tkg_sb, V_tkg_hbm.reshape((B_attn * S_tkg, d_head)))
+    # When B_attn*S_tkg > pmax, V stays on HBM (cache update handles this via V_tkg_hbm)
+    if B_attn * S_tkg <= nl.tile_size.pmax:
+        V_tkg_sb = nl.ndarray((B_attn * S_tkg, d_head), dtype=V_tkg_hbm.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(V_tkg_sb, V_tkg_hbm.reshape((B_attn * S_tkg, d_head)))
+    else:
+        V_tkg_sb = None
 
     return attn_final_sb, V_tkg_sb

@@ -69,9 +69,16 @@ from nkilib_src.nkilib.core.subkernels.layernorm_tkg import (
 from nkilib_src.nkilib.core.subkernels.rmsnorm_tkg import (
     SHARDING_THRESHOLD as rmsnorm_sharding_threshold,
 )
-from nkilib_src.nkilib.core.utils.allocator import SbufManager, create_auto_alloc_manager
-from nkilib_src.nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from nkilib_src.nkilib.core.utils.allocator import SbufManager
+from nkilib_src.nkilib.core.utils.common_types import (
+    NormType,
+    QKVOutputLayout,
+    QKVWeightLayout,
+    QuantizationType,
+)
+from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib_src.nkilib.core.utils.logging import Logger
+from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from typing_extensions import override
 
 
@@ -195,6 +202,10 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     use_auto_allocation: bool = False,
     # ----------------------------------------
     load_input_with_DMA_transpose: bool = True,
+    # ----------------------------------------
+    is_h_dim_4h_transposed: bool = False,
+    # ----------------------------------------
+    weight_layout: QKVWeightLayout = QKVWeightLayout.CONTIGUOUS,
 ) -> nl.ndarray:
     # construct qkv_tkg inputs
     hidden = input
@@ -221,26 +232,39 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     H1 = H // H0
     _, I = qkv_w.shape
 
-    sbm = create_auto_alloc_manager(logger=Logger("qkv-tkg-sb2sb-wrapper"))
-    assert hidden.buffer == nl.hbm
+    sbm = SbufManager(
+        0,
+        # Leave 16KB for compiler dynamic scratch buffer usage
+        # Compilation fails for some tests without this extra space
+        nl.tile_size.total_available_sbuf_size - 16 * 1024,
+        logger=Logger("qkv-tkg-sb2sb-wrapper"),
+        use_auto_alloc=False,
+    )
+    assert hidden.buffer == nl.hbm or hidden.buffer == nl.shared_hbm
 
     sbm.open_scope()
-    hidden_hbm = hidden.reshape((BxS, H0, H1))
-    hidden_sb = sbm.alloc_stack(
+
+    # Load input from HBM to SBUF: (B, S, H) -> (H0, BxS, H1)
+    # For LNC>1, H must be interleaved as [num_shards, H0, H1_shard] to match physical memory layout
+    _, num_shards, _ = get_verified_program_sharding_info()
+    H1_shard = H1 // num_shards
+    hidden_sb = sbm.alloc_heap(
         shape=(H0, BxS, H1),
         dtype=hidden.dtype,
         buffer=nl.sbuf,
         name="hidden_sb",
     )
-    hidden_hbm = hidden_hbm.reshape((BxS, H0, H1))
-    hidden_hbm_pattern = [[H1, H0], [H, BxS], [1, H1]]
-    hidden_hbm_offset = 0
-    nisa.dma_copy(
-        hidden_sb,
-        hidden_hbm.ap(pattern=hidden_hbm_pattern, offset=hidden_hbm_offset),
+    input_view = (
+        TensorView(hidden)
+        .flatten_dims(start_dim=0, end_dim=1)  # (BxS, H)
+        .reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])  # (BxS, num_shards, H0, H1_shard)
+        .permute(dims=[2, 0, 1, 3])  # (H0, BxS, num_shards, H1_shard)
     )
-
-    hidden_sb = hidden
+    dst_view = TensorView(hidden_sb).reshape_dim(dim=2, shape=[num_shards, H1_shard])  # (H0, BxS, num_shards, H1_shard)
+    nisa.dma_copy(
+        dst=dst_view.get_view(),
+        src=input_view.get_view(),
+    )
 
     output_sb = qkv_tkg(
         hidden=hidden_sb,
@@ -484,6 +508,17 @@ class TestQkvTkgKernel:
         [2, 1, 5, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 16384, None, 3200, 15, 5, 128, NormType.NO_NORM, QuantizationType.STATIC, False, True, 1e-6, QKVOutputLayout.NBSd],
         [1, 1, 1, 8192, None, 1408, 7, 2, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, True, 1e-6, QKVOutputLayout.NBSd],
+        # Large I (I > 4096) tests — multi I-block sbuf output
+        [1, 1, 4, 8192, None, 4608, 34, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, False, False, 1e-6, QKVOutputLayout.BSD],
+        [1, 4, 1, 8192, None, 8192, 56, 4, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, 1e-6, QKVOutputLayout.BSD],
+        [1, 1, 1, 16384, None, 7168, 48, 4, 128, NormType.RMS_NORM, QuantizationType.NONE, False, True, 1e-6, QKVOutputLayout.NBSd],
+        [2, 1, 1, 16384, None, 4608, 34, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, False, False, 1e-6, QKVOutputLayout.BSD],
+        [1, 1, 4, 8192, None, 5120, 32, 4, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, False, 1e-6, QKVOutputLayout.BSD],
+    ]
+    # ROW quantization tests
+    qkv_tkg_sb2sb_kernel_accuracy_test_perms += [
+        [2, 1, 5, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 1, 1, 8192, None, 1408, 7, 2, 128, NormType.NO_NORM, QuantizationType.ROW, False, True, 1e-6, QKVOutputLayout.NBSd],
     ]
     # fmt: on
 
@@ -551,6 +586,7 @@ class TestQkvTkgKernel:
         norm_bias: bool = False,
         output_layout: QKVOutputLayout = QKVOutputLayout.BSD,
         quantization_type: QuantizationType = QuantizationType.NONE,
+        is_h_dim_4h_transposed: bool = False,
         qkv_bias: bool = False,
         hidden_actual: int | None = None,
         n_kv_heads: int | None = None,
@@ -575,8 +611,34 @@ class TestQkvTkgKernel:
             qkv_bias=qkv_bias,
             num_q_heads=n_q_heads,
             num_kv_heads=n_kv_heads,
+            is_h_dim_4h_transposed=is_h_dim_4h_transposed,
         )
+        kernel_input["is_h_dim_4h_transposed"] = is_h_dim_4h_transposed
 
+        from ..qkv.test_qkv_cte import golden_func_fused_add_qkv as golden_func_fused_add_qkv_CTE
+
+        # NOTE: Imported golden from CTE version as MXFP tests are set-up, to be reverted once the feature is added in torch reference.
+        def create_lazy_golden():
+            return golden_func_fused_add_qkv_CTE(
+                inp_np=kernel_input,
+                dtype=dtype,
+                fused_add=fused_add,
+                norm_type=norm_type,
+                eps=eps,
+                head_dim=d_head,
+                output_layout=output_layout,
+                hidden_actual=hidden_actual,
+                num_kv_heads=n_kv_heads,
+                num_q_heads=n_q_heads,
+                quantization_type=quantization_type,
+            )
+            torch_output["out"] = convert_to_numpy(torch_output["out"], dtype)
+            if "fused_hidden" in torch_output:
+                torch_output["fused_hidden"] = convert_to_numpy(torch_output["fused_hidden"], dtype)
+            return torch_output
+
+        # NOTE: To be uncommeted soon after the MXFP golden is adjusted.
+        ''''
         # Create lazy golden generator with closure to capture all parameters
         def create_lazy_golden():
             torch_output = qkv_tkg_torch_ref(
@@ -604,6 +666,7 @@ class TestQkvTkgKernel:
             if "fused_hidden" in torch_output:
                 torch_output["fused_hidden"] = convert_to_numpy(torch_output["fused_hidden"], dtype)
             return torch_output
+        '''
 
         # Create output tensor placeholders for shape/dtype
         # Shape: (B, S, fused_qkv_dim) based on build_qkv_input
@@ -666,6 +729,15 @@ class TestQkvTkgKernel:
         [2, 1, 5, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 16384, None, 4352, 24, 5, 128, NormType.NO_NORM, QuantizationType.STATIC, False, False, True, 1e-6, QKVOutputLayout.NBSd],
         [1, 1, 1, 8192, None, 5120, 32, 4, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, False, False, 1e-6, QKVOutputLayout.NBSd],      
+    ]
+    # ROW quantization tests
+    qkv_tkg_kernel_accuracy_test_perms += [
+        [2, 1, 5, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 4, 1, 16384, None, 4352, 24, 5, 128, NormType.NO_NORM, QuantizationType.ROW, False, False, True, 1e-6, QKVOutputLayout.NBSd],
+        [1, 1, 1, 8192, None, 5120, 32, 4, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.NBSd],
+        [2, 1, 3, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.ROW, True, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 2, 1, 16384, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 1, 1, 8192, None, 10240, 64, 8, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.BSD],
     ]
     # fmt: on
 
@@ -817,6 +889,90 @@ class TestQkvTkgKernel:
             quantization_type=quantization_type,
             output_layout=output_layout,
             qkv_bias=qkv_bias,
+        )
+
+    # fmt: off
+    qkv_tkg_kernel_mxfp_test_params = \
+        "lnc_degree, batch, seqlen, hidden_dim, hidden_actual, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type, quantization_type, is_h_dim_4h_transposed, fused_add, norm_bias, qkv_bias, eps, output_layout"
+    qkv_tkg_kernel_mxfp_test_perms = [
+   
+        # is_h_dim_4h_transposed = True required for now.
+        # NO_NORM, 
+        [2, 12, 1, 512, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 12, 1, 1024, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 12, 1, 2048, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 8, 1, 2048, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 8, 1, 2048*2, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 8, 1, 2048*8, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+        [2, 4, 1, 1024, None, (2 +2*5)*128, 2, 5, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+        [2, 4, 1, 1024, None, (6 +2*3)*128, 6, 3, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+        [2, 4, 1, 1024, None, (2 +2*8)*128, 2, 8, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+        
+        # RMS_NORM
+        [2, 12, 1, 512, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 12, 1, 1024, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 12, 1, 2048, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],       
+        [2, 8, 1, 2048, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 8, 1, 2048*2, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],   
+        [2, 8, 1, 2048*8, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+        [2, 4, 1, 1024, None, (2 +2*5)*128, 2, 5, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+        [2, 4, 1, 1024, None, (6 +2*3)*128, 6, 3, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+        [2, 4, 1, 1024, None, (2 +2*8)*128, 2, 8, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],   
+         
+    ]
+    # fmt: on
+    @pytest.mark.fast
+    @pytest.mark.parametrize(
+        qkv_tkg_kernel_mxfp_test_params,
+        qkv_tkg_kernel_mxfp_test_perms,
+    )
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    def test_qkv_tkg_mxfp_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        hidden_dim,
+        hidden_actual,
+        fused_qkv_dim,
+        n_q_heads,
+        n_kv_heads,
+        d_head,
+        norm_type,
+        quantization_type,
+        is_h_dim_4h_transposed,
+        fused_add,
+        norm_bias,
+        qkv_bias,
+        eps,
+        output_layout,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        self.run_qkv_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            collector=collector,
+            B=batch,
+            H=hidden_dim,
+            S=seqlen,
+            dtype=nl.bfloat16,
+            eps=eps,
+            fused_add=fused_add,
+            fused_qkv_dim=fused_qkv_dim,
+            lnc_degree=compiler_args.logical_nc_config,
+            norm_bias=norm_bias,
+            norm_type=norm_type,
+            quantization_type=quantization_type,
+            is_h_dim_4h_transposed=is_h_dim_4h_transposed,
+            output_layout=output_layout,
+            qkv_bias=qkv_bias,
+            hidden_actual=hidden_actual,
+            n_kv_heads=n_kv_heads,
+            n_q_heads=n_q_heads,
+            d_head=d_head,
         )
 
     @staticmethod

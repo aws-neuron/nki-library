@@ -26,6 +26,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from neuron_dtypes import bfloat16 as np_bfloat16
+from neuron_dtypes import static_cast as np_static_cast
 
 
 class TestValidateTorchRefSignature:
@@ -160,14 +162,13 @@ class TestTorchRefWrapper:
 
     def test_bfloat16_to_float32_conversion(self):
         """Wrapper should convert bfloat16 to float32 (torch.from_numpy doesn't support bfloat16)."""
-        from neuron_dtypes import bfloat16
 
         @torch_ref_wrapper
         def ref_func(x):
             assert x.dtype == torch.float32  # Should be converted from bfloat16
             return x
 
-        bf16_array = np.array([1.0, 2.0]).astype(bfloat16)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
         result = ref_func(x=bf16_array)
         assert result["out"].dtype == np.float32
 
@@ -556,3 +557,131 @@ class TestUnitTestFramework:
             compiler_args=MagicMock(),
         )
         mock_collector.match_and_add_metadata_dimensions.assert_not_called()
+
+
+class TestTorchRefWrapperPreserveLowerPrecision:
+    """Tests for torch_ref_wrapper with preserve_lower_precision=True."""
+
+    def test_bfloat16_input_preserved_as_torch_bfloat16(self):
+        """With preserve_lower_precision, bfloat16 inputs should arrive as torch.bfloat16."""
+
+        @torch_ref_wrapper
+        def ref_default(x):
+            assert x.dtype == torch.float32, "Default should promote to float32"
+            return x
+
+        wrapped_preserve = torch_ref_wrapper(
+            lambda x: (setattr(wrapped_preserve, '_seen_dtype', x.dtype), x)[1],
+            preserve_lower_precision=True,
+        )
+
+        # Need proper signature for the lambda
+        def ref_preserve(x):
+            assert x.dtype == torch.bfloat16, f"Expected bfloat16, got {x.dtype}"
+            return x
+
+        wrapped = torch_ref_wrapper(ref_preserve, preserve_lower_precision=True)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        wrapped(x=bf16_array)  # Should not raise
+
+    def test_bfloat16_output_cast_back(self):
+        """With preserve_lower_precision, output should be cast back to bfloat16 numpy."""
+
+        def ref_func(x):
+            return x * 2  # bfloat16 in, bfloat16 out
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array)
+        assert str(result["out"].dtype) == "bfloat16"
+
+    def test_bfloat16_default_returns_float32(self):
+        """Without preserve_lower_precision, bfloat16 output should be float32."""
+
+        def ref_func(x):
+            return x * 2
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=False)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array)
+        assert result["out"].dtype == np.float32
+
+    def test_bfloat16_intermediate_truncation_matches_numpy(self):
+        """preserve_lower_precision should produce bit-identical results to numpy bfloat16 arithmetic."""
+
+        np.random.seed(123)
+        a = np_static_cast(np.random.randn(64), np_bfloat16)
+        b = np_static_cast(np.random.randn(64), np_bfloat16)
+
+        # Numpy bfloat16 arithmetic (truncates intermediates)
+        expected = np_static_cast(a * b + a, np_bfloat16)
+
+        # Torch ref with preserve_lower_precision
+        def ref_func(x, y):
+            return {"out": x * y + x}
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        result = wrapped(x=a, y=b)
+
+        assert np.array_equal(
+            expected.view(np.uint16), result["out"].view(np.uint16)
+        ), "Should be bit-identical to numpy bfloat16 arithmetic"
+
+    def test_float32_input_unaffected(self):
+        """preserve_lower_precision should not affect float32 inputs/outputs."""
+
+        def ref_func(x):
+            return x * 2
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        f32_array = np.array([1.5, 2.5], dtype=np.float32)
+        result = wrapped(x=f32_array)
+        assert result["out"].dtype == np.float32
+        np.testing.assert_array_equal(result["out"], [3.0, 5.0])
+
+    def test_dict_output_all_keys_cast_back(self):
+        """With preserve_lower_precision, all dict output tensors should be cast back."""
+
+        def ref_func(x):
+            return {"a": x, "b": x * 2}
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        bf16_array = np.array([1.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array)
+        assert str(result["a"].dtype) == "bfloat16"
+        assert str(result["b"].dtype) == "bfloat16"
+
+    def test_non_tensor_values_in_dict_unaffected(self):
+        """Non-tensor values in dict output should pass through unchanged."""
+
+        def ref_func(x):
+            return {"out": x, "count": 42}
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        bf16_array = np.array([1.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array)
+        assert str(result["out"].dtype) == "bfloat16"
+        assert result["count"] == 42
+
+    def test_scalar_passthrough_with_bfloat16(self):
+        """Scalar kwargs should pass through even with bfloat16 inputs."""
+
+        def ref_func(x, backward=False):
+            assert backward is True
+            return x
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        bf16_array = np.array([1.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array, backward=True)
+        assert str(result["out"].dtype) == "bfloat16"
+
+    def test_single_tensor_return_with_preserve(self):
+        """preserve_lower_precision should work with single tensor return (not dict)."""
+
+        def ref_func(x):
+            return x * 2  # Returns a single tensor, not a dict
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        bf16_array = np.array([1.0, 3.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array)
+        assert str(result["out"].dtype) == "bfloat16"

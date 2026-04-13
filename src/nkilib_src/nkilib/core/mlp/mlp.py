@@ -19,7 +19,9 @@ import nki
 import nki.language as nl
 
 # common utils
+from ..utils.allocator import BufferManager, SbufManager
 from ..utils.common_types import ActFnType, NormType, QuantizationType
+from ..utils.logging import Logger
 
 # MLP utils
 from .mlp_cte.mlp_cte import mlp_cte
@@ -73,6 +75,7 @@ def mlp(
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     force_cte_mode: bool = False,
+    sbm: Optional[BufferManager] = None,
 ) -> list[nl.ndarray]:
     """
     MLP (Multi-Layer Perceptron) Kernel implementation.
@@ -167,6 +170,7 @@ def mlp(
         up_clamp_upper_limit (float): upper bound value to clamp on up projection results, does not perform clamping if the value is set to None
         up_clamp_lower_limit (float): lower bound value to clamp on up projection results, does not perform clamping if the value is set to None
         force_cte_mode (bool): If True, forces the use of CTE mode. (default: False)
+        sbm (BufferManager): Optional BufferManager for HBM tensor allocation with consistent naming.
 
     Returns:
         list:
@@ -183,6 +187,18 @@ def mlp(
         Automatically dispatches to either CTE or TKG implementation based on batch size and
         sequence length. Token generation mode (TKG) is used for small batch/sequence dimensions
         (B×S ≤ 96), while context encoding (CTE) handles larger inputs.
+
+        TKG mode supports:
+        - FP8 quantization (tensor-wise and row-wise)
+        - MXFP quantization (MXFP4 and MXFP8) - TKG only
+        - Column tiling optimizations
+        - Tensor layout optimization for down projection
+        - Input in SBUF for kernel fusion
+
+        CTE mode supports:
+        - FP8 quantization (tensor-wise and row-wise)
+        - Standard matrix multiplication layouts
+    """
 
         TKG mode supports:
         - FP8 quantization (tensor-wise and row-wise)
@@ -235,11 +251,15 @@ def mlp(
     # Validate MLP arguments
     validate_mlp_arguments(mlp_params)
 
+    # Create local sbm if not provided
+    if sbm is None:
+        sbm = SbufManager(0, 200 * 1024, Logger("mlp"))
+        sbm.set_name_prefix("mlp_")
     # Allocate output tensor in shared HBM memory
     output_tensors = []
     out = None
     if not store_output_in_sbuf:
-        out = nl.ndarray(
+        out = sbm.alloc(
             (mlp_params.batch_size, mlp_params.sequence_len, mlp_params.hidden_size),
             dtype=mlp_params.output_dtype,
             buffer=nl.shared_hbm,
@@ -250,7 +270,7 @@ def mlp(
     # Optionally allocate an additional tensor to store fused addition results
     fused_add_out = None
     if mlpp_store_fused_add(mlp_params):
-        fused_add_out = nl.ndarray(
+        fused_add_out = sbm.alloc(
             (mlp_params.batch_size, mlp_params.sequence_len, mlp_params.hidden_size),
             dtype=mlp_params.output_dtype,
             buffer=nl.shared_hbm,
@@ -262,11 +282,13 @@ def mlp(
     # If batch size × sequence length <= TKG_BS_SEQLEN_THRESHOLD(currently at 96), the kernel runs in TKG mode.
     # TODO: update TKG_BS_SEQLEN_THRESHOLD to 128
     if is_mlp_tkg(mlp_params):
-        if mlp_params.quant_params.is_quant_mx():
+        if mlp_params.quant_params.is_dtype_mx():
+            # mlp_tkg_mx does not use sbm
             return mlp_tkg_mx(mlp_params, out, fused_add_out)
         else:
-            return mlp_tkg(mlp_params, out, fused_add_out)
+            return mlp_tkg(mlp_params, out, fused_add_out, sbm=sbm)
     else:
+        # mlp_cte doesn't accept a passed-in SBM
         mlp_cte(mlp_params, out, fused_add_out)
         # Return all output tensors (mlp output and optionally fused add)
         return output_tensors

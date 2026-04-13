@@ -50,6 +50,7 @@ from test.utils.metrics_collector import IMetricsCollector
 from test.utils.test_orchestrator import Orchestrator
 from typing import Callable, Optional
 
+import neuron_dtypes as ndt
 import numpy as np
 
 
@@ -269,7 +270,7 @@ def check_unused_parameters(func: Callable) -> None:
         )
 
 
-def torch_ref_wrapper(torch_ref_func: Callable) -> Callable:
+def torch_ref_wrapper(torch_ref_func: Callable, preserve_lower_precision: bool = False) -> Callable:
     """Wrap a torch reference function to handle numpy<->torch conversion.
 
     Converts numpy arrays to torch tensors (float16->float32 for CPU compatibility),
@@ -277,6 +278,10 @@ def torch_ref_wrapper(torch_ref_func: Callable) -> Callable:
 
     Args:
         torch_ref_func: Torch reference function that takes torch tensors as kwargs
+        preserve_lower_precision: If True, cast output tensors back to the original
+            input dtype (e.g., bfloat16) using neuron_dtypes.static_cast. This matches
+            the kernel's output precision, enabling tighter validation tolerances.
+            Computation still happens in float32 for numerical stability.
 
     Returns:
         Wrapped function that takes numpy arrays and returns numpy arrays
@@ -297,6 +302,7 @@ def torch_ref_wrapper(torch_ref_func: Callable) -> Callable:
     def wrapped(**kwargs):
         # Convert numpy arrays to torch tensors (float16/bfloat16->float32 for CPU)
         torch_kwargs = {}
+        original_dtype = None
         for key, value in kwargs.items():
             if isinstance(value, np.ndarray):
                 dtype_str = str(value.dtype)
@@ -304,19 +310,25 @@ def torch_ref_wrapper(torch_ref_func: Callable) -> Callable:
                 if 'x4' in dtype_str:
                     torch_kwargs[key] = value
                     continue
+                # Track original dtype for output cast-back
+                if original_dtype is None and (
+                    'bfloat16' in dtype_str or 'float8' in dtype_str or 'float16' in dtype_str
+                ):
+                    original_dtype = dtype_str
                 # Handle uint32 by converting to int32 (torch doesn't support uint32)
                 if value.dtype == np.uint32:
                     value = value.astype(np.int32)
-                # Handle bfloat16 by converting to float32 (torch.from_numpy doesn't support bfloat16)
-                elif 'bfloat16' in dtype_str:
-                    value = value.astype(np.float32)
-                # Handle float8 types by converting to float32 (torch.from_numpy doesn't support float8)
-                elif 'float8' in dtype_str:
+                # Handle bfloat16/float8 by converting to float32 (torch.from_numpy doesn't support these)
+                elif 'bfloat16' in dtype_str or 'float8' in dtype_str:
                     value = value.astype(np.float32)
                 tensor = torch.from_numpy(value)
                 # Convert float16 to float32 for CPU compatibility
                 if tensor.dtype == torch.float16:
                     tensor = tensor.float()
+                # Restore bfloat16 if requested (torch supports bfloat16 on CPU natively).
+                # This preserves intermediate truncation behavior matching numpy bfloat16 arithmetic.
+                elif preserve_lower_precision and 'bfloat16' in dtype_str:
+                    tensor = tensor.to(torch.bfloat16)
                 torch_kwargs[key] = tensor
             else:
                 torch_kwargs[key] = value
@@ -325,20 +337,20 @@ def torch_ref_wrapper(torch_ref_func: Callable) -> Callable:
         result = torch_ref_func(**torch_kwargs)
 
         # Convert result back to numpy
+        def _tensor_to_numpy(t):
+            if isinstance(t, torch.Tensor):
+                if t.dtype == torch.bfloat16:
+                    t = t.float()
+                np_val = t.numpy()
+                if preserve_lower_precision and original_dtype is not None:
+                    np_val = ndt.static_cast(np_val, original_dtype)
+                return np_val
+            return t
+
         if isinstance(result, torch.Tensor):
-            if result.dtype == torch.bfloat16:
-                result = result.float()
-            return {"out": result.numpy()}
+            return {"out": _tensor_to_numpy(result)}
         elif isinstance(result, dict):
-            out = {}
-            for k, v in result.items():
-                if isinstance(v, torch.Tensor):
-                    if v.dtype == torch.bfloat16:
-                        v = v.float()
-                    out[k] = v.numpy()
-                else:
-                    out[k] = v
-            return out
+            return {k: _tensor_to_numpy(v) for k, v in result.items()}
         else:
             return result
 

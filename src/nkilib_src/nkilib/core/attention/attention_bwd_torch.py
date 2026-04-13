@@ -31,6 +31,8 @@ def attention_bwd_torch_ref(
     dy_ref: torch.Tensor,
     lse_ref: torch.Tensor,
     sinks_ref: Optional[torch.Tensor] = None,
+    bound_min: Optional[torch.Tensor] = None,
+    bound_max: Optional[torch.Tensor] = None,
     use_causal_mask: bool = False,
     mixed_precision: bool = False,
     softmax_scale: Optional[float] = None,
@@ -48,6 +50,10 @@ def attention_bwd_torch_ref(
         o_ref (torch.Tensor): Forward pass output (unused, needed for kernel signature match)
         dy_ref (torch.Tensor): Gradient of output of shape (B, Hq, d, seqlen_q)
         lse_ref (torch.Tensor): Log-sum-exp from forward pass (unused, needed for kernel signature match)
+        bound_min (Optional[torch.Tensor]): Shape (seqlen_q,). For sequence packing: K-index where
+            the sequence containing each Q token starts.
+        bound_max (Optional[torch.Tensor]): Shape (seqlen_q,). For sequence packing: K-index where
+            the sequence containing each Q token ends (exclusive).
         sinks_ref (Optional[torch.Tensor]): Optional attention sinks of shape (B, Hq) or (B, Hq, num_sinks)
         use_causal_mask (bool): Whether to apply causal masking
         mixed_precision (bool): Whether to use mixed precision for reductions
@@ -74,6 +80,8 @@ def attention_bwd_torch_ref(
         mixed_precision,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
+        bound_min=bound_min,
+        bound_max=bound_max,
         sinks=sinks_ref,
     )
 
@@ -127,6 +135,8 @@ def compute_o_lse(
     sliding_window: Optional[int] = None,
     dropout_mask: Optional[torch.Tensor] = None,
     sinks: Optional[torch.tensor] = None,
+    bound_min: Optional[torch.Tensor] = None,
+    bound_max: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute forward attention output, log-sum-exp, and normalized scores.
@@ -175,9 +185,12 @@ def compute_o_lse(
         q_pos = torch.arange(seqlen_q, device=q.device).unsqueeze(1)
         k_pos = torch.arange(seqlen_k, device=q.device).unsqueeze(0)
         mask |= k_pos < (q_pos - sliding_window + 1)
+    if bound_min is not None:
+        k_pos = torch.arange(seqlen_k, device=q.device, dtype=torch.float32)
+        mask |= (k_pos[None, :] < bound_min[:, None]) | (k_pos[None, :] >= bound_max[:, None])
 
     # Apply mask once with broadcasting (mask broadcasts from (seqlen_q, seqlen_k) to (B, Hq, seqlen_q, seqlen_k))
-    if use_causal_mask or sliding_window > 0:
+    if use_causal_mask or sliding_window > 0 or bound_min is not None:
         raw_score = raw_score.masked_fill(mask, -float("inf"))
 
     # Assume logit_bias can be broadcasted

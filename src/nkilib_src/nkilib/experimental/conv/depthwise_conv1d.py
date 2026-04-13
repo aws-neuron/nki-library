@@ -22,7 +22,7 @@ from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def depthwise_conv1d_implicit_gemm(
     img_ref: nl.ndarray,
     filter_ref: nl.ndarray,
@@ -152,7 +152,7 @@ def depthwise_conv1d_implicit_gemm(
 
     shard_id = nl.program_id(axis=0)
 
-    output = nl.ndarray((N, C, 1, Q), dtype=img_ref.dtype, buffer=nl.hbm)
+    output = nl.ndarray((N, C, 1, Q), dtype=img_ref.dtype, buffer=nl.shared_hbm)
 
     for batch_idx in nl.affine_range(N):
         for c_tile_idx in nl.affine_range(num_c_tiles):

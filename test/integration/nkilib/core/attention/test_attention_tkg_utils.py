@@ -99,7 +99,7 @@ def gen_deterministic_active_block_table(batch, S_ctx, S_tkg, pos_id, block_len,
 
 
 def get_bqs_tile_parameters(p_max: int, cfg: AttnTKGConfig, lnc: int):
-    bs_n_prgs = lnc if is_batch_sharded(cfg, p_max) else 1
+    bs_n_prgs = lnc if is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max) else 1
     bqs_size = cfg.bs // bs_n_prgs * cfg.q_head * cfg.s_active
     bqs_tiles = div_ceil(bqs_size, p_max)
     bqs_tile_size = p_max if bqs_tiles > 1 else bqs_size
@@ -174,7 +174,7 @@ def print_test_config(attn_cfg, test_cfg):
                     in_str = in_str.replace(f", {field.name}={val}", "", 1)
         return in_str
 
-    def procces_test_cfg_str(cfg: AttnTKGTestParams):
+    def proccess_test_cfg_str(cfg: AttnTKGTestParams):
         in_str = repr(cfg)
         for field in fields(cfg):
             val = getattr(cfg, field.name)
@@ -193,7 +193,7 @@ def print_test_config(attn_cfg, test_cfg):
     out = "["
     out += process_attn_cfg_str(attn_cfg)
     out += ", "
-    out += procces_test_cfg_str(test_cfg)
+    out += proccess_test_cfg_str(test_cfg)
 
     out += "]"
     return out

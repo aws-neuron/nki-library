@@ -63,6 +63,25 @@ def cross_partition_copy(
     """
     dst_end = dst_start_partition + num_partitions_to_copy
 
+    # tensor_copy requires both src and dst partition offsets to be quadrant-aligned
+    # move src_start_partition if it is not aligned
+    if src_start_partition % QUADRANT != 0:
+        temp_size = ((num_partitions_to_copy + QUADRANT - 1) // QUADRANT) * QUADRANT
+        temp_size = max(temp_size, QUADRANT)
+        aligned_src = nl.ndarray((temp_size, free_dim_size), dtype=src.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=aligned_src, value=0.0)
+
+        copied = 0
+        remaining_src = src_start_partition
+        while copied < num_partitions_to_copy:
+            chunk = min(QUADRANT, num_partitions_to_copy - copied)
+            _aligned_copy_from_unaligned_src(src, aligned_src, remaining_src, copied, chunk, free_dim_size)
+            remaining_src += chunk
+            copied += chunk
+
+        src = aligned_src
+        src_start_partition = 0
+
     # Case 1: destination is aligned to 32-partition boundary, tensor_copy directly
     if dst_start_partition % QUADRANT == 0:
         nisa.tensor_copy(

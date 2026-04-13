@@ -1242,17 +1242,17 @@ def modify_for_row_quant(tensor_template, tensor, lnc):
     rng = np.random.default_rng(0)
     if tensor_template.name == "hidden":
         B, S, H_PLUS_4 = tensor.shape
-        single_row = rng.normal(size=(1, 1, 1)) * 10.0
+        single_row = rng.normal(size=(1, 1, 1)) * 0.001
         single_row_split = single_row.astype(np.float32).view(nl.float8_e4m3).astype(tensor_template.dtype)
         while not np.isfinite(single_row_split).all():
-            single_row = rng.normal(size=(1, 1, 1)) * 10.0
+            single_row = rng.normal(size=(1, 1, 1)) * 0.001
             single_row_split = single_row.astype(np.float32).view(nl.float8_e4m3).astype(tensor_template.dtype)
         full_scale = single_row_split.repeat(B, axis=0).repeat(S, axis=1)
         tensor[:, :, -4:] = full_scale
     elif "scale" in tensor_template.name:
         P, F = tensor.shape
-        single_row = rng.normal(size=(1, 1)) * 10.0
-        tensor = single_row.repeat(P, axis=0).repeat(F, axis=1).astype(tensor_template.dtype)
+        single_row = rng.normal(size=(1, F)) * 0.001
+        tensor = single_row.repeat(P, axis=0).astype(tensor_template.dtype)
     return tensor
 
 

@@ -120,8 +120,8 @@ def load_fused_hidden_tensor_tile(
                     hidden_tensor_hbm_view.ap([[H, p_bxs_size], [1, H]], offset=bxs_offset * H),
                     fused_add_tensor_hbm_view.ap([[H, p_bxs_size], [1, H]], offset=bxs_offset * H),
                 ],
-                [1.0, 1.0],
-                nl.add,
+                scales=[1.0, 1.0],
+                reduce_op=nl.add,
             )
 
 
@@ -397,12 +397,13 @@ def prepare_static_scales(
         dst=down_proj_static_input_scales_sbuf[0 : nl.tile_size.pmax, 0:1],
         src=mlp_params.quant_params.down_in_scale[0 : nl.tile_size.pmax, 0:1],
     )
-    load_and_multiply_static_weight_scales(
-        constants,
-        mlp_params.quant_params.gate_w_scale,
-        gate_up_proj_static_input_scales_sbuf,
-        gate_proj_static_weight_scales_sbuf,
-    )
+    if not mlp_params.skip_gate_proj:
+        load_and_multiply_static_weight_scales(
+            constants,
+            mlp_params.quant_params.gate_w_scale,
+            gate_up_proj_static_input_scales_sbuf,
+            gate_proj_static_weight_scales_sbuf,
+        )
     load_and_multiply_static_weight_scales(
         constants,
         mlp_params.quant_params.up_w_scale,

@@ -4,8 +4,8 @@ Masking logic for the attention TKG kernel: cache structure, mask generation,
 sliding window attention (SWA), and LNC2 sharding.
 
 References:
-- [Attention TKG Kernel Integration Alignment](https://quip-amazon.com/55tBAbKmae3a)
-- [APC BIR-NKI migration + feature addition](https://quip-amazon.com/jzScAbS78ryr) — SWA mask geometry diagrams
+- Attention TKG Kernel Integration Alignment
+- APC BIR-NKI migration + feature addition — SWA mask geometry diagrams
 
 ---
 
@@ -36,17 +36,19 @@ caller-provided bounds.
 ### 2A. Standard Attention (start_pos=None)
 
 All prior positions where `iota < pos_ids[b, i]` are valid. Active region uses causal triangle.
+Positions beyond the actual cached range (cols 14–15) are masked even though the buffer
+holds 16 prior slots — those slots contain no valid KV data.
 
 ```
-pos_id=16, s_prior=16, s_active=4.  # = attend, · = masked
+pos_id=16, s_prior=14, s_active=4.  # = attend, · = masked
 
               k/v_prior (cols 0–15)                      │ k/v_active
          0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 │ 16 17 18 19
         ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┼──┬──┬──┬──┐
-   q0   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ ·│
-   q1   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│
-   q2   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│
-   q3   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│
+   q0   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ ·│ ·│ ·│
+   q1   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ ·│ ·│
+   q2   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ ·│
+   q3   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ #│
         └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
 ```
 
@@ -61,7 +63,7 @@ Per-query positions: rope_pos_ids[b,i] = pos_id[b] + i
   end_pos[b,i]   = rope_pos_ids[b,i]           (exclusive via < comparison)
 ```
 
-#### Small window (W=8, s_prior=16, s_active=4, pos_id=16)
+#### Small window (W=8, s_prior=14, s_active=4, pos_id=16)
 
 ```
               k/v_prior (cols 0–15)                      │ k/v_active
@@ -74,13 +76,13 @@ Per-query positions: rope_pos_ids[b,i] = pos_id[b] + i
         └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
 ```
 
-#### Wrap-around (W=8, s_prior=16, s_active=4, pos_id=3 — early positions, window wraps)
+#### Wrap-around (W=8, s_prior=14, s_active=4, pos_id=3 — early positions, window wraps)
 
 ```
-  q0: sp=12, pos_ids=3 → sp>pos_ids → wrap (OR) → [12,16)∪[0,3)
-  q1: sp=13, pos_ids=4 → sp>pos_ids → wrap (OR) → [13,16)∪[0,4)
-  q2: sp=14, pos_ids=5 → sp>pos_ids → wrap (OR) → [14,16)∪[0,5)
-  q3: sp=15, pos_ids=6 → sp>pos_ids → wrap (OR) → [15,16)∪[0,6)
+  q0: sp=12, pos_ids=3 → sp>pos_ids → wrap (OR) → [12,16)∪[0,3) → {0,1,2,12,13,14,15}
+  q1: sp=13, pos_ids=4 → sp>pos_ids → wrap (OR) → [13,16)∪[0,4) → {0,1,2,3,13,14,15}
+  q2: sp=14, pos_ids=5 → sp>pos_ids → wrap (OR) → [14,16)∪[0,5) → {0,1,2,3,4,14,15}
+  q3: sp=15, pos_ids=6 → sp>pos_ids → wrap (OR) → [15,16)∪[0,6) → {0,1,2,3,4,5,15}
 
               k/v_prior (cols 0–15)                      │ k/v_active
          0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 │ 16 17 18 19

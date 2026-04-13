@@ -16,6 +16,7 @@
 
 from test.utils.common_dataclasses import CompilerArgs
 from test.utils.coverage_parametrized_tests import FilterResult, assert_negative_test_case
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -30,7 +31,7 @@ from nkilib_src.nkilib.core.subkernels.layernorm_torch import (
 )
 
 
-def generate_inputs(batch: int, seqlen: int, hidden: int, dtype: np.dtype) -> dict:
+def generate_inputs(batch: int, seqlen: int, hidden: int, shard_on_h: bool, dtype: np.dtype) -> dict:
     """
     Generate input tensors for layernorm_tkg test.
 
@@ -38,10 +39,11 @@ def generate_inputs(batch: int, seqlen: int, hidden: int, dtype: np.dtype) -> di
         batch: Batch size
         seqlen: Sequence length
         hidden: Hidden dimension size
+        shard_on_h: Whether to shard on H dimension
         dtype: Data type for tensors
 
     Returns:
-        dict: Dictionary containing input, gamma, output, and beta tensors
+        dict: Dictionary containing input, gamma, output, beta, and shard_on_h tensors
     """
     np.random.seed(42)
     H0 = 128  # Partition dimension (nl.tile_size.pmax)
@@ -50,27 +52,43 @@ def generate_inputs(batch: int, seqlen: int, hidden: int, dtype: np.dtype) -> di
         "gamma": np.random.randn(1, hidden).astype(dtype),
         "output.must_alias_input": np.zeros((H0, batch * seqlen, hidden // H0), dtype=dtype),
         "beta": np.random.randn(1, hidden).astype(dtype),
+        "shard_on_h": shard_on_h,
     }
 
 
 # fmt: off
-LAYERNORM_TKG_PARAMS = "lnc_degree, batch, seqlen, hidden, dtype"
+LAYERNORM_TKG_PARAMS = "lnc_degree, batch, seqlen, hidden, shard_on_h, dtype"
+_ABBREVS = {
+    "lnc_degree": "lnc", "batch": "b", "seqlen": "s", "hidden": "h",
+    "shard_on_h": "sh", "dtype": "dt",
+}
 LAYERNORM_TKG_TEST_CASES = [
     # LNC1 / Trn1
-    (1, 1, 1, 8192, np.float16),
-    (1, 1, 8, 8192, np.float16),
+    (1, 1, 1, 8192, False, np.float16),
+    (1, 1, 8, 8192, False, np.float16),
     # LNC2 batch 1
-    (2, 1, 1, 5120, np.float16),
-    (2, 1, 1, 8192, np.float16),
+    (2, 1, 1, 5120, False, np.float16),
+    (2, 1, 1, 8192, False, np.float16),
     # LNC2 higher batch
-    (2, 2, 8, 8192, np.float16),
-    (2, 4, 8, 8192, np.float16),
-    (2, 128, 1, 8192, np.float16),
-    (2, 4, 1, 5120, np.float16),
+    (2, 2, 8, 8192, False, np.float16),
+    (2, 4, 8, 8192, False, np.float16),
+    (2, 128, 1, 8192, False, np.float16),
+    (2, 128, 1, 8192, True, np.float16),
+    (2, 4, 1, 5120, False, np.float16),
+    # LNC2 BxS tiling
+    (2, 128, 5, 3072, False, np.float16),
+    (2, 256, 5, 3072, False, np.float16),
+    (2, 63, 32, 3072, False, np.float16),
     # LNC2 higher hidden
-    (2, 1, 1, 16384, np.float16),
+    (2, 1, 1, 16384, False, np.float16),
     # Sharding threshold
-    (2, 2, 5, 16384, np.float16),
+    (2, 2, 5, 16384, False, np.float16),
+    # Shard on H
+    (2, 1, 1, 8192, True, np.float16),
+    (2, 2, 8, 8192, True, np.float16),
+    (2, 1, 1, 5120, True, np.float16),
+    (2, 4, 1, 3072, True, np.float16),
+    (2, 1, 1, 16384, True, np.float16),
 ]
 # fmt: on
 
@@ -81,19 +99,20 @@ def _run_layernorm_tkg_test(
     batch: int,
     seqlen: int,
     hidden: int,
+    shard_on_h: bool,
     dtype: np.dtype,
     is_negative_test: bool = False,
 ) -> None:
     """Run layernorm_tkg test with given parameters."""
 
     def input_generator(test_config, input_tensor_def=None):
-        return generate_inputs(batch, seqlen, hidden, dtype)
+        return generate_inputs(batch, seqlen, hidden, shard_on_h, dtype)
 
     def output_tensors(kernel_input):
         H0 = 128  # Partition dimension
         return {"out": np.zeros((H0, batch * seqlen, hidden // H0), dtype=dtype)}
 
-    torch_ref = layernorm_tkg_torch_ref if lnc_degree == 2 else layernorm_tkg_torch_ref_lnc1
+    torch_ref = layernorm_tkg_torch_ref if lnc_degree == 2 or shard_on_h else layernorm_tkg_torch_ref_lnc1
 
     framework = UnitTestFramework(
         test_manager=test_manager,
@@ -111,13 +130,16 @@ def _run_layernorm_tkg_test(
     )
 
 
-def filter_layernorm_tkg_combinations(lnc_degree, batch=None, seqlen=None, hidden=None, dtype=None):
+def filter_layernorm_tkg_combinations(lnc_degree, batch=None, seqlen=None, hidden=None, shard_on_h=None, dtype=None):
     """Filter invalid LayerNorm TKG parameter combinations."""
     # H must be divisible by 128 (H0 = nl.tile_size.pmax)
     if hidden is not None and hidden % 128 != 0:
         return FilterResult.INVALID
     # H1 = H // 128 must be divisible by lnc_degree (for LNC sharding: H2 = H1 // lnc)
     if hidden is not None and (hidden // 128) % lnc_degree != 0:
+        return FilterResult.INVALID
+    # shard_on_h requires LNC2
+    if shard_on_h is not None and shard_on_h and lnc_degree != 2:
         return FilterResult.INVALID
     return FilterResult.VALID
 
@@ -130,7 +152,7 @@ class TestLayerNormTKGKernel:
     """Test class for LayerNorm TKG kernel using UnitTestFramework."""
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(LAYERNORM_TKG_PARAMS, LAYERNORM_TKG_TEST_CASES)
+    @pytest_parametrize(LAYERNORM_TKG_PARAMS, LAYERNORM_TKG_TEST_CASES, abbrevs=_ABBREVS)
     def test_layernorm_tkg_unit(
         self,
         test_manager: Orchestrator,
@@ -138,16 +160,18 @@ class TestLayerNormTKGKernel:
         batch: int,
         seqlen: int,
         hidden: int,
+        shard_on_h: bool,
         dtype,
     ):
         """Test layernorm_tkg using UnitTestFramework."""
-        _run_layernorm_tkg_test(test_manager, lnc_degree, batch, seqlen, hidden, dtype)
+        _run_layernorm_tkg_test(test_manager, lnc_degree, batch, seqlen, hidden, shard_on_h, dtype)
 
     @pytest.mark.coverage_parametrize(
         lnc_degree=[1, 2],
         batch=[1, 2, 4, 8, 16, 32, 64],
         seqlen=[1, 2],
         hidden=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+        shard_on_h=[False],
         dtype=[nl.float16, nl.bfloat16, nl.float32],
         filter=filter_layernorm_tkg_combinations,
         coverage="pairs",
@@ -161,13 +185,21 @@ class TestLayerNormTKGKernel:
         batch: int,
         seqlen: int,
         hidden: int,
+        shard_on_h: bool,
         dtype,
         is_negative_test_case,
     ):
         """Run LayerNorm TKG sweep test across multiple dimension configurations."""
         with assert_negative_test_case(is_negative_test_case):
             _run_layernorm_tkg_test(
-                test_manager, lnc_degree, batch, seqlen, hidden, dtype, is_negative_test=is_negative_test_case
+                test_manager,
+                lnc_degree,
+                batch,
+                seqlen,
+                hidden,
+                shard_on_h,
+                dtype,
+                is_negative_test=is_negative_test_case,
             )
 
     @pytest.mark.coverage_parametrize(
@@ -175,6 +207,7 @@ class TestLayerNormTKGKernel:
         batch=[128, 256, 384, 512, 640],
         seqlen=[1],
         hidden=[3072, 4096, 6144, 8192],
+        shard_on_h=[False],
         dtype=[nl.float16],
         filter=filter_layernorm_tkg_combinations,
         coverage="pairs",
@@ -188,11 +221,55 @@ class TestLayerNormTKGKernel:
         batch: int,
         seqlen: int,
         hidden: int,
+        shard_on_h: bool,
         dtype,
         is_negative_test_case,
     ):
         """Run LayerNorm TKG sweep test with large batch configurations."""
         with assert_negative_test_case(is_negative_test_case):
             _run_layernorm_tkg_test(
-                test_manager, lnc_degree, batch, seqlen, hidden, dtype, is_negative_test=is_negative_test_case
+                test_manager,
+                lnc_degree,
+                batch,
+                seqlen,
+                hidden,
+                shard_on_h,
+                dtype,
+                is_negative_test=is_negative_test_case,
+            )
+
+    @pytest.mark.coverage_parametrize(
+        lnc_degree=[2],
+        batch=[1, 2, 4, 8, 16, 32, 64],
+        seqlen=[1, 2],
+        hidden=[3072, 4096, 5120, 8192, 16384],
+        shard_on_h=[True],
+        dtype=[nl.float16, nl.bfloat16],
+        filter=filter_layernorm_tkg_combinations,
+        coverage="pairs",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+    )
+    def test_layernorm_tkg_sweep_shard_on_h(
+        self,
+        test_manager: Orchestrator,
+        lnc_degree: int,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        shard_on_h: bool,
+        dtype,
+        is_negative_test_case,
+    ):
+        """Run LayerNorm TKG sweep test with shard-on-H configurations."""
+        with assert_negative_test_case(is_negative_test_case):
+            _run_layernorm_tkg_test(
+                test_manager,
+                lnc_degree,
+                batch,
+                seqlen,
+                hidden,
+                shard_on_h,
+                dtype,
+                is_negative_test=is_negative_test_case,
             )

@@ -61,6 +61,7 @@ def rmsnorm_tkg_torch_ref_lnc1(
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = False,
     single_core_forced: bool = False,
+    shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[object] = None,
 ) -> dict[str, torch.Tensor]:
@@ -77,6 +78,7 @@ def rmsnorm_tkg_torch_ref_lnc1(
         hidden_actual (int or None): Actual hidden dim size if padded.
         hidden_dim_tp (bool): If True, use TP-sharded hidden dim layout.
         single_core_forced (bool): Unused, present for interface compatibility.
+        shard_on_h (bool): Unused, present for interface compatibility.
         use_heap_memory (bool): Unused, present for interface compatibility.
         sbm: Unused, present for interface compatibility.
 
@@ -111,6 +113,7 @@ def rmsnorm_tkg_torch_ref(
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = False,
     single_core_forced: bool = False,
+    shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[object] = None,
 ) -> dict[str, torch.Tensor]:
@@ -128,6 +131,7 @@ def rmsnorm_tkg_torch_ref(
         hidden_actual (int or None): Actual hidden dim size if padded.
         hidden_dim_tp (bool): If True, use TP-sharded hidden dim layout.
         single_core_forced (bool): Unused, present for interface compatibility.
+        shard_on_h (bool): Unused, present for interface compatibility.
         use_heap_memory (bool): Unused, present for interface compatibility.
         sbm: Unused, present for interface compatibility.
 

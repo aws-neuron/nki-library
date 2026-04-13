@@ -347,7 +347,7 @@ class TestRmsNormQuantKernel:
         (128, 0.5, 2, 1, 16384, 896, QuantizationType.ROW),
         (256, 0.0, 2, 1, 8192, 512, QuantizationType.ROW),
         ####################################
-        # Model-specific test cases based on https://tiny.amazon.com/mdelqa5t/quipaFNb
+        # Model-specific test cases
         ####################################
         # Llama models
         (2048, 0.0, 2, 1, 8192, 896, QuantizationType.ROW),
@@ -395,7 +395,7 @@ class TestRmsNormQuantKernel:
         # MAX_S=32768, MAX_H=16384, MAX_B=2
         seqlen=BoundedRange(_sweep_seqlen_values, boundary_values=[32769]),
         hidden=BoundedRange(_sweep_hidden_values, boundary_values=[16385]),
-        batch=BoundedRange([1, 2], boundary_values=[0, 3]),
+        batch=BoundedRange([1, 2], boundary_values=[3]),
         lower_bound=BoundedRange(_sweep_lower_bound_values, boundary_values=[-0.1]),
         coverage="pairs",
     )

@@ -14,6 +14,7 @@
 
 """This file implements blockwise matrix multiplication for MoE layers with block-level sharding strategies. The kernel processes tokens through expert-specific projections using static and dynamic loop structures for optimal performance."""
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import nki
@@ -46,8 +47,11 @@ from .moe_cte_utils import (
 BLOCK_PARALLEL_FACTOR = 3
 GUP_LOAD_COALESCE_FACTOR = 2
 GUP_PROJ_DIM = 2
+_CHUNKED_I_TP_THRESHOLD = 1024  # I_TP sizes above this use chunked tiling to reduce SBUF pressure
+_I_TP_CHUNK_SIZE = 512  # Maximum chunk size for I_TP tiling in the chunked path
 
 
+@dataclass
 class DimensionSizes(NKIObject):
     B: int  # Block size (tokens per block)
     H: int  # Hidden dimension size
@@ -183,7 +187,10 @@ def bwmm_shard_on_block(
     kernel_assert(
         block_sharding_strategy == BlockShardStrategy.PING_PONG, "Currently only support PING-PONG sharding strategy"
     )
-
+    kernel_assert(
+        expert_affinities_scaling_mode != common_types.ExpertAffinityScaleMode.PRE_SCALE_DELAYED,
+        "Currently ExpertAffinityScaleMode PRE_SCALE_DELAYED is not support ",
+    )
     # Infer configurations from the input shapes
     T, H = hidden_states.shape
     B = block_size
@@ -253,7 +260,7 @@ def bwmm_shard_on_block(
     nisa.tensor_copy(dst=all_block_expert_real, src=all_block_expert_broadcasted_per_shard)
 
     if skip_dma.skip_weight:
-        # Convert multi-dimensional ndarray with nl.par_dim to list of ndarrays
+        # Convert multi-dimensional ndarray to list of ndarrays
         gup_weights_load_dst_lst = []
         for h_tile_idx in range(dims.h_tile_count):
             inner_lst = []
@@ -296,7 +303,7 @@ def bwmm_shard_on_block(
         inner_lst = []
         for _ in range(NUM_TILES):
             tmp = nl.ndarray((TILE_SIZE, H), dtype=compute_dtype, buffer=nl.sbuf)
-            nisa.memset(dst=tmp, value=0)
+            nisa.memset(dst=tmp, value=0.0)
             inner_lst.append(tmp)
         block_hidden_states_lst.append(inner_lst)
 
@@ -372,7 +379,7 @@ def bwmm_shard_on_block(
 
                         expert_affinity_dtype = nl.ndarray((TILE_SIZE, 1), dtype=compute_dtype, buffer=nl.sbuf)
                         if skip_dma.skip_token:
-                            nisa.memset(value=0.0, dst=expert_affinity_dtype)
+                            nisa.memset(value=0, dst=expert_affinity_dtype)
 
                         # nl.load with indirect indexing -> nisa.dma_copy with .ap()
                         num_cols = expert_affinities_masked.shape[1]
@@ -519,14 +526,6 @@ def bwmm_shard_on_block(
                 real_expert = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=real_expert, src=all_block_expert_real[0:1, linear_idx : linear_idx + 1])
 
-                gup_weights = load_gate_up_proj_weights(
-                    gate_up_proj_weight, block_expert, weights_dtype, skip_dma, load_dst=gup_weights_load_dst_lst
-                )
-
-                dp_weights = load_down_proj_weight(
-                    down_proj_weight, block_expert, weights_dtype, skip_dma, load_dst=down_weights_load_dst_lst
-                )
-
                 # load bias
                 if cfg.linear_bias:
                     gate_up_bias_T = load_and_transpose_gup_bias(inps, dims, cfg, real_expert, skip_dma)
@@ -548,102 +547,56 @@ def bwmm_shard_on_block(
                     block_old = []
                     for alloc_idx in range(NUM_TILES):
                         tmp = nl.ndarray((TILE_SIZE, H), dtype=compute_dtype, buffer=nl.sbuf)
-                        nisa.memset(tmp, value=0)
+                        nisa.memset(tmp, value=0.0)
                         block_old.append(tmp)
 
                 free_size = block_hidden_states_T_lst[0][0][0].shape[-1]
-                gate_and_up_proj_states_lst_psum = []
-                gate_and_up_proj_states_lst_sbuf = []
-                for _ in range(GUP_PROJ_DIM):
-                    n_psum_lst = []
-                    n_sbuf_lst = []
-                    for _ in range(dims.n_psum_tile_count):
-                        gup_psum_lst = []
-                        gup_sbuf_lst = []
-                        for _ in range(dims.gup_tile_count):
-                            gup_psum_lst.append(nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum))
-                            gup_sbuf_lst.append(nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.sbuf))
-                        n_psum_lst.append(gup_psum_lst)
-                        n_sbuf_lst.append(gup_sbuf_lst)
-                    gate_and_up_proj_states_lst_psum.append(n_psum_lst)
-                    gate_and_up_proj_states_lst_sbuf.append(n_sbuf_lst)
 
-                for h_tile_idx in range(dims.h_tile_count):
-                    for h_subtile_idx in range(dims.h_subtile_count_gup):
-                        for op_idx in range(GUP_LOAD_COALESCE_FACTOR):
-                            is_last_accumulation = (
-                                h_tile_idx == dims.h_tile_count - 1
-                                and h_subtile_idx == dims.h_subtile_count_gup - 1
-                                and op_idx == 1
-                            )
+                # Use original tiling for small I_TP, chunked for large I_TP
+                USE_CHUNKED_I_TP = I_TP > _CHUNKED_I_TP_THRESHOLD
 
-                            if not is_last_accumulation:
-                                # ───────────────────────────────────────────────────────────────
-                                # NORMAL PATH: Just matmuls, no copies yet
-                                # ───────────────────────────────────────────────────────────────
-                                for i_tile_idx in range(dims.gup_tile_count):
-                                    num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * i_tile_idx)
+                if not USE_CHUNKED_I_TP:
+                    gup_weights = load_gate_up_proj_weights(
+                        gate_up_proj_weight, block_expert, weights_dtype, skip_dma, load_dst=gup_weights_load_dst_lst
+                    )
 
-                                    for projection_idx in range(GUP_PROJ_DIM):
-                                        for batch_tile_idx in range(dims.n_psum_tile_count):
-                                            nisa.nc_matmul(
-                                                dst=gate_and_up_proj_states_lst_psum[projection_idx][batch_tile_idx][
-                                                    i_tile_idx
-                                                ][0:num_valid_k, nl.ds(0, free_size)],
-                                                stationary=gup_weights[h_tile_idx][h_subtile_idx][
-                                                    nl.ds(0, TILE_SIZE),
-                                                    op_idx,
-                                                    projection_idx,
-                                                    nl.ds(TILE_SIZE * i_tile_idx, num_valid_k),
-                                                ],
-                                                moving=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][
-                                                    h_subtile_idx * GUP_LOAD_COALESCE_FACTOR + op_idx
-                                                ][0:TILE_SIZE, batch_tile_idx, nl.ds(0, free_size)],
-                                            )
-                            else:
-                                # ───────────────────────────────────────────────────────────────
-                                # LAST ACCUMULATION: Pipeline matmul with copy of previous tile
-                                # ───────────────────────────────────────────────────────────────
-                                for i_tile_idx in range(dims.gup_tile_count + 1):
-                                    # COPY: Previous i_tile (accumulation complete after last matmul)
-                                    if i_tile_idx > 0:
-                                        prev_tile = i_tile_idx - 1
-                                        num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * prev_tile)
-                                        for projection_idx in range(2):
-                                            for batch_tile_idx in range(dims.n_psum_tile_count):
-                                                nisa.tensor_copy(
-                                                    dst=gate_and_up_proj_states_lst_sbuf[projection_idx][
-                                                        batch_tile_idx
-                                                    ][prev_tile][0:num_valid_k, nl.ds(0, free_size)],
-                                                    src=gate_and_up_proj_states_lst_psum[projection_idx][
-                                                        batch_tile_idx
-                                                    ][prev_tile][0:num_valid_k, nl.ds(0, free_size)],
-                                                    engine=nisa.scalar_engine,
-                                                )
-                                                # add bias
-                                                if cfg.linear_bias:
-                                                    nisa.tensor_tensor(
-                                                        dst=gate_and_up_proj_states_lst_sbuf[projection_idx][
-                                                            batch_tile_idx
-                                                        ][prev_tile][0:TILE_SIZE, nl.ds(0, free_size)],
-                                                        data1=gate_and_up_proj_states_lst_sbuf[projection_idx][
-                                                            batch_tile_idx
-                                                        ][prev_tile][0:TILE_SIZE, nl.ds(0, free_size)],
-                                                        data2=gate_up_bias_T.ap(
-                                                            pattern=[
-                                                                [2 * dims.gup_tile_count, TILE_SIZE],
-                                                                [0, free_size],
-                                                            ],
-                                                            offset=prev_tile * 2 + projection_idx,
-                                                        ),
-                                                        op=nl.add,
-                                                    )
+                    dp_weights = load_down_proj_weight(
+                        down_proj_weight, block_expert, weights_dtype, skip_dma, load_dst=down_weights_load_dst_lst
+                    )
 
-                                    # MATMUL: Current i_tile
-                                    if i_tile_idx < dims.gup_tile_count:
+                    gate_and_up_proj_states_lst_psum = []
+                    gate_and_up_proj_states_lst_sbuf = []
+                    for _ in range(GUP_PROJ_DIM):
+                        n_psum_lst = []
+                        n_sbuf_lst = []
+                        for _ in range(dims.n_psum_tile_count):
+                            gup_psum_lst = []
+                            gup_sbuf_lst = []
+                            for _ in range(dims.gup_tile_count):
+                                gup_psum_lst.append(
+                                    nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum)
+                                )
+                                gup_sbuf_lst.append(
+                                    nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.sbuf)
+                                )
+                            n_psum_lst.append(gup_psum_lst)
+                            n_sbuf_lst.append(gup_sbuf_lst)
+                        gate_and_up_proj_states_lst_psum.append(n_psum_lst)
+                        gate_and_up_proj_states_lst_sbuf.append(n_sbuf_lst)
+
+                    for h_tile_idx in range(dims.h_tile_count):
+                        for h_subtile_idx in range(dims.h_subtile_count_gup):
+                            for op_idx in range(GUP_LOAD_COALESCE_FACTOR):
+                                is_last_accumulation = (
+                                    h_tile_idx == dims.h_tile_count - 1
+                                    and h_subtile_idx == dims.h_subtile_count_gup - 1
+                                    and op_idx == 1
+                                )
+
+                                if not is_last_accumulation:
+                                    for i_tile_idx in range(dims.gup_tile_count):
                                         num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * i_tile_idx)
-
-                                        for projection_idx in range(2):
+                                        for projection_idx in range(GUP_PROJ_DIM):
                                             for batch_tile_idx in range(dims.n_psum_tile_count):
                                                 nisa.nc_matmul(
                                                     dst=gate_and_up_proj_states_lst_psum[projection_idx][
@@ -656,222 +609,397 @@ def bwmm_shard_on_block(
                                                         nl.ds(TILE_SIZE * i_tile_idx, num_valid_k),
                                                     ],
                                                     moving=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][
-                                                        h_subtile_idx * 2 + op_idx
+                                                        h_subtile_idx * GUP_LOAD_COALESCE_FACTOR + op_idx
+                                                    ][0:TILE_SIZE, batch_tile_idx, nl.ds(0, free_size)],
+                                                )
+                                else:
+                                    for i_tile_idx in range(dims.gup_tile_count + 1):
+                                        if i_tile_idx > 0:
+                                            prev_tile = i_tile_idx - 1
+                                            num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * prev_tile)
+                                            for projection_idx in range(GUP_PROJ_DIM):
+                                                for batch_tile_idx in range(dims.n_psum_tile_count):
+                                                    nisa.tensor_copy(
+                                                        dst=gate_and_up_proj_states_lst_sbuf[projection_idx][
+                                                            batch_tile_idx
+                                                        ][prev_tile][0:num_valid_k, nl.ds(0, free_size)],
+                                                        src=gate_and_up_proj_states_lst_psum[projection_idx][
+                                                            batch_tile_idx
+                                                        ][prev_tile][0:num_valid_k, nl.ds(0, free_size)],
+                                                        engine=nisa.scalar_engine,
+                                                    )
+                                                    if cfg.linear_bias:
+                                                        nisa.tensor_tensor(
+                                                            dst=gate_and_up_proj_states_lst_sbuf[projection_idx][
+                                                                batch_tile_idx
+                                                            ][prev_tile][0:TILE_SIZE, nl.ds(0, free_size)],
+                                                            data1=gate_and_up_proj_states_lst_sbuf[projection_idx][
+                                                                batch_tile_idx
+                                                            ][prev_tile][0:TILE_SIZE, nl.ds(0, free_size)],
+                                                            data2=gate_up_bias_T.ap(
+                                                                pattern=[
+                                                                    [2 * dims.gup_tile_count, TILE_SIZE],
+                                                                    [0, free_size],
+                                                                ],
+                                                                offset=prev_tile * 2 + projection_idx,
+                                                            ),
+                                                            op=nl.add,
+                                                        )
+
+                                        if i_tile_idx < dims.gup_tile_count:
+                                            num_valid_k = min(TILE_SIZE, I_TP - TILE_SIZE * i_tile_idx)
+                                            for projection_idx in range(GUP_PROJ_DIM):
+                                                for batch_tile_idx in range(dims.n_psum_tile_count):
+                                                    nisa.nc_matmul(
+                                                        dst=gate_and_up_proj_states_lst_psum[projection_idx][
+                                                            batch_tile_idx
+                                                        ][i_tile_idx][0:num_valid_k, nl.ds(0, free_size)],
+                                                        stationary=gup_weights[h_tile_idx][h_subtile_idx][
+                                                            nl.ds(0, TILE_SIZE),
+                                                            op_idx,
+                                                            projection_idx,
+                                                            nl.ds(TILE_SIZE * i_tile_idx, num_valid_k),
+                                                        ],
+                                                        moving=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][
+                                                            h_subtile_idx * 2 + op_idx
+                                                        ][0:TILE_SIZE, batch_tile_idx, nl.ds(0, free_size)],
+                                                    )
+
+                    _clip_gate_up_projections(gate_and_up_proj_states_lst_sbuf, dims, cfg, free_size)
+
+                    # TODO: PRE_SCALE_DELAYED support is still under development
+                    expert_affinity_T_broadcasted = None
+
+                    intermediate_states = compute_intermediate_states(
+                        gate_and_up_proj_states_lst_sbuf,
+                        B,
+                        I_TP,
+                        compute_dtype,
+                        activation_function=activation_function,
+                        expert_affinity_T_broadcasted=expert_affinity_T_broadcasted,
+                        gup_scale=gup_scale,
+                    )
+
+                    expert_affinity_f32 = (
+                        calculate_expert_affinities(
+                            expert_affinities_masked,
+                            token_indices_lst[inner_block_iter],
+                            real_expert,
+                            E,
+                            NUM_TILES,
+                            compute_dtype,
+                            skip_dma,
+                        )
+                        if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.POST_SCALE
+                        else None
+                    )
+                    down_activations = None
+
+                    if cfg.linear_bias:
+                        down_bias_broadcasted = load_and_broadcast_down_bias(inps, dims, cfg, real_expert, skip_dma)
+                    else:
+                        down_bias_broadcasted = None
+
+                    block_new_lst = compute_block_output(
+                        intermediate_states,
+                        dp_weights,
+                        expert_affinity_f32,
+                        block_old,
+                        down_activations,
+                        local_block_idx,
+                        H,
+                        I_TP,
+                        NUM_TILES,
+                        output_dtype=output.dtype,
+                        down_bias_broadcasted=down_bias_broadcasted,
+                        is_tensor_update_accumulating=is_tensor_update_accumulating,
+                        down_scale=down_scale,
+                    )
+
+                else:
+                    # ═══════════════════════════════════════════════════════════
+                    # CHUNKED PATH: load weights per I_TP chunk, fused down_proj
+                    # ═══════════════════════════════════════════════════════════
+                    I_TP_CHUNK = min(_I_TP_CHUNK_SIZE, I_TP)
+                    I_TP_CHUNK_TILES = div_ceil(I_TP_CHUNK, TILE_SIZE)
+                    N_I_CHUNKS = div_ceil(I_TP, I_TP_CHUNK)
+
+                    gate_and_up_proj_states_lst_sbuf = []
+                    for _ in range(GUP_PROJ_DIM):
+                        n_sbuf_lst = []
+                        for _ in range(dims.n_psum_tile_count):
+                            gup_sbuf_lst = []
+                            for _ in range(dims.gup_tile_count):
+                                gup_sbuf_lst.append(
+                                    nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.sbuf)
+                                )
+                            n_sbuf_lst.append(gup_sbuf_lst)
+                        gate_and_up_proj_states_lst_sbuf.append(n_sbuf_lst)
+
+                    for projection_idx in range(GUP_PROJ_DIM):
+                        for i_chunk_idx in range(N_I_CHUNKS):
+                            i_chunk_start = i_chunk_idx * I_TP_CHUNK
+                            i_chunk_end = min(i_chunk_start + I_TP_CHUNK, I_TP)
+                            chunk_i_tp = i_chunk_end - i_chunk_start
+                            chunk_n_tiles = div_ceil(chunk_i_tp, TILE_SIZE)
+
+                            # Load weights for this I_TP chunk: [h_outer][h_inner] each (TILE_SIZE, chunk_i_tp)
+                            chunk_weights = []
+                            for h_tile_idx in range(dims.h_tile_count):
+                                h_inner_lst = []
+                                for h_subtile_idx in range(dims.h_subtile_count_gup):
+                                    for op_idx in range(GUP_LOAD_COALESCE_FACTOR):
+                                        h_inner_lst.append(
+                                            nl.ndarray(
+                                                (TILE_SIZE, chunk_i_tp),
+                                                dtype=gate_up_proj_weight.dtype,
+                                                buffer=nl.sbuf,
+                                            )
+                                        )
+                                chunk_weights.append(h_inner_lst)
+
+                            _, H_w, _, I_TP_w = gate_up_proj_weight.shape
+                            for h_tile_idx in range(dims.h_tile_count):
+                                for h_subtile_idx in range(dims.h_subtile_count_gup):
+                                    for op_idx in range(GUP_LOAD_COALESCE_FACTOR):
+                                        h_offset = (
+                                            PSUM_SIZE * h_tile_idx
+                                            + GUP_LOAD_COALESCE_FACTOR * TILE_SIZE * h_subtile_idx
+                                            + TILE_SIZE * op_idx
+                                        )
+                                        num_h = min(TILE_SIZE, H - h_offset)
+                                        w_idx = h_subtile_idx * GUP_LOAD_COALESCE_FACTOR + op_idx
+
+                                        if num_h < TILE_SIZE:
+                                            nisa.memset(dst=chunk_weights[h_tile_idx][w_idx], value=0.0)
+
+                                        # gate_up_proj_weight: [E, H, 2, I_TP]
+                                        # Access: [expert, h_offset:h_offset+num_h, projection_idx, i_chunk_start:i_chunk_end]
+                                        offset = h_offset * (2 * I_TP_w) + projection_idx * I_TP_w + i_chunk_start
+
+                                        nisa.dma_copy(
+                                            dst=chunk_weights[h_tile_idx][w_idx][0:num_h, 0:chunk_i_tp],
+                                            src=gate_up_proj_weight.ap(
+                                                pattern=[
+                                                    [2 * I_TP_w, num_h],
+                                                    [1, chunk_i_tp],
+                                                ],
+                                                offset=offset,
+                                                scalar_offset=block_expert,
+                                            ),
+                                            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+                                        )
+
+                            # Allocate psum for this chunk's i_tiles
+                            chunk_psum = []
+                            for _ in range(dims.n_psum_tile_count):
+                                tile_lst = []
+                                for _ in range(chunk_n_tiles):
+                                    tile_lst.append(
+                                        nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum)
+                                    )
+                                chunk_psum.append(tile_lst)
+
+                            # i_tile outer, H inner — psum accumulates across H
+                            for local_i_idx in range(chunk_n_tiles):
+                                i_start = TILE_SIZE * local_i_idx
+                                num_i = min(TILE_SIZE, chunk_i_tp - i_start)
+
+                                for h_tile_idx in range(dims.h_tile_count):
+                                    for h_subtile_idx in range(dims.h_subtile_count_gup):
+                                        for op_idx in range(GUP_LOAD_COALESCE_FACTOR):
+                                            w_idx = h_subtile_idx * GUP_LOAD_COALESCE_FACTOR + op_idx
+                                            for batch_tile_idx in range(dims.n_psum_tile_count):
+                                                nisa.nc_matmul(
+                                                    dst=chunk_psum[batch_tile_idx][local_i_idx][
+                                                        0:num_i, nl.ds(0, free_size)
+                                                    ],
+                                                    stationary=chunk_weights[h_tile_idx][w_idx][
+                                                        nl.ds(0, TILE_SIZE),
+                                                        nl.ds(i_start, num_i),
+                                                    ],
+                                                    moving=block_hidden_states_T_lst[inner_block_iter][h_tile_idx][
+                                                        h_subtile_idx * GUP_LOAD_COALESCE_FACTOR + op_idx
                                                     ][0:TILE_SIZE, batch_tile_idx, nl.ds(0, free_size)],
                                                 )
 
-                # Clipping the projections
-                if (
-                    cfg.gate_clamp_upper_limit is not None
-                    or cfg.gate_clamp_lower_limit is not None
-                    or cfg.up_clamp_lower_limit is not None
-                    or cfg.up_clamp_upper_limit is not None
-                ):
-                    for token_tile_idx in range(dims.n_psum_tile_count):
-                        for i_tile_idx in range(dims.gup_tile_count):
-                            # Clipping GATE projection
-                            # have both lower and upper limit for gate projection
-                            if cfg.gate_clamp_lower_limit is not None and cfg.gate_clamp_upper_limit is not None:
-                                nisa.tensor_scalar(
-                                    dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
-                                        0:TILE_SIZE, nl.ds(0, free_size)
-                                    ],
-                                    data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
-                                        0:TILE_SIZE, nl.ds(0, free_size)
-                                    ],
-                                    op0=nl.minimum,
-                                    operand0=cfg.gate_clamp_upper_limit,
-                                    op1=nl.maximum,
-                                    operand1=cfg.gate_clamp_lower_limit,
-                                )
-                            else:
-                                if cfg.gate_clamp_upper_limit is not None:
-                                    nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        op0=nl.minimum,
-                                        operand0=cfg.gate_clamp_upper_limit,
-                                    )
-                                if cfg.gate_clamp_lower_limit is not None:
-                                    nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        op0=nl.maximum,
-                                        operand0=cfg.gate_clamp_lower_limit,
-                                    )
+                            # Copy psum → sbuf (+ optional bias)
+                            for local_i_idx in range(chunk_n_tiles):
+                                global_i_idx = i_chunk_idx * I_TP_CHUNK_TILES + local_i_idx
+                                num_i = min(TILE_SIZE, chunk_i_tp - TILE_SIZE * local_i_idx)
+                                for batch_tile_idx in range(dims.n_psum_tile_count):
+                                    if cfg.linear_bias:
+                                        nisa.tensor_tensor(
+                                            dst=gate_and_up_proj_states_lst_sbuf[projection_idx][batch_tile_idx][
+                                                global_i_idx
+                                            ][0:num_i, nl.ds(0, free_size)],
+                                            data1=chunk_psum[batch_tile_idx][local_i_idx][0:num_i, nl.ds(0, free_size)],
+                                            data2=gate_up_bias_T.ap(
+                                                pattern=[
+                                                    [2 * dims.gup_tile_count, num_i],
+                                                    [0, free_size],
+                                                ],
+                                                offset=global_i_idx * 2 + projection_idx,
+                                            ),
+                                            op=nl.add,
+                                        )
+                                    else:
+                                        nisa.tensor_copy(
+                                            dst=gate_and_up_proj_states_lst_sbuf[projection_idx][batch_tile_idx][
+                                                global_i_idx
+                                            ][0:num_i, nl.ds(0, free_size)],
+                                            src=chunk_psum[batch_tile_idx][local_i_idx][0:num_i, nl.ds(0, free_size)],
+                                        )
 
-                            # Clipping UP projection
-                            # have both lower and upper limit for up projection
-                            if cfg.up_clamp_upper_limit is not None and cfg.up_clamp_lower_limit is not None:
-                                nisa.tensor_scalar(
-                                    dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
-                                        0:TILE_SIZE, nl.ds(0, free_size)
-                                    ],
-                                    data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
-                                        0:TILE_SIZE, nl.ds(0, free_size)
-                                    ],
-                                    op0=nl.minimum,
-                                    operand0=cfg.up_clamp_upper_limit,
-                                    op1=nl.maximum,
-                                    operand1=cfg.up_clamp_lower_limit,
-                                )
-                            else:
-                                if cfg.up_clamp_upper_limit is not None:
-                                    nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        op0=nl.minimum,
-                                        operand0=cfg.up_clamp_upper_limit,
-                                    )
-                                if cfg.up_clamp_lower_limit is not None:
-                                    nisa.tensor_scalar(
-                                        dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
-                                            0:TILE_SIZE, nl.ds(0, free_size)
-                                        ],
-                                        op0=nl.maximum,
-                                        operand0=cfg.up_clamp_lower_limit,
-                                    )
+                    _clip_gate_up_projections(gate_and_up_proj_states_lst_sbuf, dims, cfg, free_size)
 
-                expert_affinity_T_broadcasted = (
-                    nl.ndarray((TILE_SIZE, free_size), dtype=compute_dtype, buffer=nl.sbuf)
-                    if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.PRE_SCALE_DELAYED
-                    else None
-                )
+                    # TODO: PRE_SCALE_DELAYED support is still under development
+                    expert_affinity_T_broadcasted = None
 
-                # for prescale, load affinities into [B/128, 128, 1] tensor, transpose each [128, 1] tile to [1, 128] B/128 times
-                # and then broadcast this [1, B] result into [128, B]. Finally, do a tensor-tensor mul after each gate/up mm
-                if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.PRE_SCALE_DELAYED:
-                    v_expert = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    block_expert = load_block_expert(block_to_expert, local_block_idx)
-                    shuffle_mask = [0] * DVE_CHANNELS_PER_BANK
-                    for channel_idx in range(4):
-                        nisa.nc_stream_shuffle(
-                            dst=v_expert[
-                                DVE_CHANNELS_PER_BANK * channel_idx : DVE_CHANNELS_PER_BANK * (channel_idx + 1), 0:1
-                            ],
-                            src=block_expert.ap(pattern=[[1, 1], [1, 1]], offset=0),
-                            shuffle_mask=shuffle_mask,
+                    # ───────────────────────────────────────────────────────────────
+                    # Fused per-chunk: activation + down_proj
+                    # ───────────────────────────────────────────────────────────────
+                    expert_affinity_f32 = (
+                        calculate_expert_affinities(
+                            expert_affinities_masked,
+                            token_indices_lst[inner_block_iter],
+                            real_expert,
+                            E,
+                            NUM_TILES,
+                            compute_dtype,
+                            skip_dma,
                         )
-
-                    expert_affinity_T = nl.ndarray((1, free_size), dtype=compute_dtype, buffer=nl.psum)
-
-                    expert_affinity_lst = []
-                    for _ in range(NUM_TILES):
-                        expert_affinity_lst.append(nl.ndarray((TILE_SIZE, 1), dtype=compute_dtype, buffer=nl.sbuf))
-
-                    for token_tile_idx in range(NUM_TILES):
-                        addr = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-                        nisa.tensor_scalar(
-                            dst=addr,
-                            data=token_indices_lst[inner_block_iter][0:TILE_SIZE, token_tile_idx],
-                            op0=nl.multiply,
-                            operand0=E,
-                        )
-
-                        addr_fin = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-                        nisa.tensor_tensor(dst=addr_fin, data1=addr, data2=v_expert, op=nl.add)
-
-                        if skip_dma.skip_token:
-                            nisa.tensor_scalar(dst=addr_fin, data=addr_fin, op0=nl.maximum, operand0=-1)
-
-                        if skip_dma.skip_token:
-                            nisa.memset(value=0.0, dst=expert_affinity_lst[token_tile_idx])
-
-                        # nl.load with indirect indexing -> nisa.dma_copy with .ap()
-                        num_cols = expert_affinities_masked.shape[1]
-                        addr_fin_reshaped = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-                        nisa.tensor_copy(dst=addr_fin_reshaped, src=addr_fin[0:TILE_SIZE, 0:1])
-
-                        nisa.dma_copy(
-                            dst=expert_affinity_lst[token_tile_idx][0:TILE_SIZE, 0:1],
-                            src=expert_affinities_masked.ap(
-                                pattern=[[num_cols, TILE_SIZE], [1, 1]],
-                                offset=0,
-                                vector_offset=addr_fin_reshaped,
-                                indirect_dim=0,
-                            ),
-                            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-                        )
-
-                        # Calculate actual num_f for this tile
-                        num_f = min(TILE_SIZE, free_size - token_tile_idx * TILE_SIZE)
-                        nisa.nc_transpose(
-                            dst=expert_affinity_T[0:1, token_tile_idx * TILE_SIZE : token_tile_idx * TILE_SIZE + num_f],
-                            data=expert_affinity_lst[token_tile_idx][0:num_f, 0:1],
-                            name=f"waqar_{token_tile_idx}",
-                        )
-
-                    # broadcast
-                    shuffle_mask_broadcast = [0] * DVE_CHANNELS_PER_BANK
-                    for channel_idx in range(4):
-                        nisa.nc_stream_shuffle(
-                            dst=expert_affinity_T_broadcasted[
-                                channel_idx * DVE_CHANNELS_PER_BANK : (channel_idx + 1) * DVE_CHANNELS_PER_BANK,
-                                0:free_size,
-                            ],
-                            src=expert_affinity_T,
-                            shuffle_mask=shuffle_mask_broadcast,
-                        )
-
-                intermediate_states = compute_intermediate_states(
-                    gate_and_up_proj_states_lst_sbuf,
-                    B,
-                    I_TP,
-                    compute_dtype,
-                    activation_function=activation_function,
-                    expert_affinity_T_broadcasted=expert_affinity_T_broadcasted,
-                    gup_scale=gup_scale,
-                )
-
-                expert_affinity_f32 = (
-                    calculate_expert_affinities(
-                        expert_affinities_masked,
-                        token_indices_lst[inner_block_iter],
-                        real_expert,
-                        E,
-                        NUM_TILES,
-                        compute_dtype,
-                        skip_dma,
+                        if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.POST_SCALE
+                        else None
                     )
-                    if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.POST_SCALE
-                    else None
-                )
-                down_activations = None
+                    down_activations = None
 
-                if cfg.linear_bias:
-                    down_bias_broadcasted = load_and_broadcast_down_bias(inps, dims, cfg, real_expert, skip_dma)
-                else:
-                    down_bias_broadcasted = None
-                block_new_lst = compute_block_output(
-                    intermediate_states,
-                    dp_weights,
-                    expert_affinity_f32,
-                    block_old,
-                    down_activations,
-                    local_block_idx,
-                    H,
-                    I_TP,
-                    NUM_TILES,
-                    output_dtype=output.dtype,
-                    down_bias_broadcasted=down_bias_broadcasted,
-                    is_tensor_update_accumulating=is_tensor_update_accumulating,
-                    down_scale=down_scale,
-                )
+                    if cfg.linear_bias:
+                        down_bias_broadcasted = load_and_broadcast_down_bias(inps, dims, cfg, real_expert, skip_dma)
+                    else:
+                        down_bias_broadcasted = None
+
+                    _, I_TP_w_dp, H_dp = down_proj_weight.shape
+
+                    # Save original block_old; start chunk accumulation from zeros
+                    original_block_old = block_old
+                    block_old_zero = []
+                    for alloc_idx in range(NUM_TILES):
+                        tmp = nl.ndarray((TILE_SIZE, H), dtype=compute_dtype, buffer=nl.sbuf)
+                        nisa.memset(tmp, value=0.0)
+                        block_old_zero.append(tmp)
+                    block_old = block_old_zero
+
+                    for i_chunk_idx in range(N_I_CHUNKS):
+                        i_chunk_start = i_chunk_idx * I_TP_CHUNK
+                        i_chunk_end = min(i_chunk_start + I_TP_CHUNK, I_TP)
+                        chunk_i_tp = i_chunk_end - i_chunk_start
+                        chunk_n_tiles = div_ceil(chunk_i_tp, TILE_SIZE)
+
+                        # Build chunk-sized gate_and_up_proj view
+                        chunk_gup_sbuf = []
+                        for proj_idx in range(GUP_PROJ_DIM):
+                            n_lst = []
+                            for batch_tile_idx in range(dims.n_psum_tile_count):
+                                i_lst = []
+                                for local_i in range(chunk_n_tiles):
+                                    global_i = i_chunk_idx * I_TP_CHUNK_TILES + local_i
+                                    i_lst.append(gate_and_up_proj_states_lst_sbuf[proj_idx][batch_tile_idx][global_i])
+                                n_lst.append(i_lst)
+                            chunk_gup_sbuf.append(n_lst)
+
+                        chunk_intermediate = compute_intermediate_states(
+                            chunk_gup_sbuf,
+                            B,
+                            chunk_i_tp,
+                            compute_dtype,
+                            activation_function=activation_function,
+                            expert_affinity_T_broadcasted=expert_affinity_T_broadcasted,
+                            gup_scale=gup_scale,
+                        )
+
+                        # Load down_proj weights for this chunk
+                        chunk_dp_weights = []
+                        for local_i in range(chunk_n_tiles):
+                            chunk_dp_weights.append(
+                                nl.ndarray((TILE_SIZE, H), dtype=down_proj_weight.dtype, buffer=nl.sbuf)
+                            )
+                        for local_i in range(chunk_n_tiles):
+                            global_i_start = i_chunk_start + TILE_SIZE * local_i
+                            num_i = min(TILE_SIZE, I_TP - global_i_start)
+                            if num_i < TILE_SIZE:
+                                nisa.memset(dst=chunk_dp_weights[local_i], value=0.0)
+                            offset_dp = global_i_start * H_dp
+                            nisa.dma_copy(
+                                dst=chunk_dp_weights[local_i][0:num_i, 0:H],
+                                src=down_proj_weight.ap(
+                                    pattern=[[H_dp, num_i], [1, H_dp]],
+                                    offset=offset_dp,
+                                    scalar_offset=block_expert,
+                                ),
+                                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+                            )
+
+                        # Down projection for this chunk — plain accumulation (no affinity/bias yet)
+                        block_new_lst = compute_block_output(
+                            chunk_intermediate,
+                            chunk_dp_weights,
+                            None,
+                            block_old,
+                            down_activations,
+                            local_block_idx,
+                            H,
+                            chunk_i_tp,
+                            NUM_TILES,
+                            output_dtype=output.dtype,
+                            down_bias_broadcasted=None,
+                            is_tensor_update_accumulating=True,
+                            down_scale=down_scale,
+                        )
+                        # Use accumulated result as block_old for next chunk
+                        block_old = block_new_lst
+
+                    # After all chunks: block_new_lst = sum(chunk_down_proj)
+                    # Apply bias, then affinity scaling, then add original block_old
+                    if down_bias_broadcasted is not None:
+                        for token_tile_idx in range(NUM_TILES):
+                            nisa.tensor_tensor(
+                                dst=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                data1=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                data2=down_bias_broadcasted[0:TILE_SIZE, 0:H],
+                                op=nl.add,
+                            )
+
+                    if expert_affinity_f32 is not None:
+                        if is_tensor_update_accumulating and original_block_old is not None:
+                            # final = down_result * affinity + original_block_old
+                            for token_tile_idx in range(NUM_TILES):
+                                nisa.scalar_tensor_tensor(
+                                    dst=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                    data=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                    op0=nl.multiply,
+                                    operand0=expert_affinity_f32[token_tile_idx][0:TILE_SIZE, 0],
+                                    op1=nl.add,
+                                    operand1=original_block_old[token_tile_idx][0:TILE_SIZE, 0:H],
+                                )
+                        else:
+                            for token_tile_idx in range(NUM_TILES):
+                                nisa.tensor_scalar(
+                                    dst=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                    data=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                    op0=nl.multiply,
+                                    operand0=expert_affinity_f32[token_tile_idx][0:TILE_SIZE, 0],
+                                )
+                    else:
+                        # No affinity: just add original block_old if accumulating
+                        if is_tensor_update_accumulating and original_block_old is not None:
+                            for token_tile_idx in range(NUM_TILES):
+                                nisa.tensor_tensor(
+                                    dst=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                    data1=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
+                                    data2=original_block_old[token_tile_idx][0:TILE_SIZE, 0:H],
+                                    op=nl.add,
+                                )
 
                 # Placeholder for TopK > 1 case, need to add full implementation
                 if is_tensor_update_accumulating:
@@ -1202,7 +1330,7 @@ def load_down_proj_weight(
         # Initialize with zeros for masked-out elements
         if num_i < TILE_SIZE:
             if not skip_dma.skip_weight:
-                nisa.memset(dst=load_dst[i_tile_idx], value=0)
+                nisa.memset(dst=load_dst[i_tile_idx], value=0.0)
 
         # Use .ap() with scalar_offset for dynamic expert indexing
         # down_proj_weight shape: [E, I_TP, H]
@@ -1224,7 +1352,7 @@ def load_down_proj_weight(
         if down_proj_weight.dtype != compute_dtype:
             # Initialize with zeros for masked-out elements
             if num_i < TILE_SIZE:
-                nisa.memset(dst=dp_weights[i_tile_idx], value=0)
+                nisa.memset(dst=dp_weights[i_tile_idx], value=0.0)
 
             nisa.tensor_copy(dst=dp_weights[i_tile_idx][0:num_i, 0:H], src=load_dst[i_tile_idx][0:num_i, 0:H])
 
@@ -1299,7 +1427,7 @@ def load_gate_up_proj_weights(
             # Initialize with zeros for partial tiles
             if num_h < TILE_SIZE:
                 if not skip_dma.skip_weight:
-                    nisa.memset(dst=load_dst[h_tile_idx][h_subtile_idx], value=0)
+                    nisa.memset(dst=load_dst[h_tile_idx][h_subtile_idx], value=0.0)
 
             # Use .ap() with scalar_offset for dynamic expert indexing
             # gate_up_proj_weight shape: [E, H, 2, I_TP]
@@ -1331,7 +1459,7 @@ def load_gate_up_proj_weights(
                 # Initialize with zeros for partial tiles
                 if num_h < TILE_SIZE:
                     if not skip_dma.skip_weight:
-                        nisa.memset(dst=gup_weights[h_tile_idx][h_subtile_idx], value=0)
+                        nisa.memset(dst=gup_weights[h_tile_idx][h_subtile_idx], value=0.0)
 
                 nisa.tensor_copy(
                     dst=gup_weights[h_tile_idx][h_subtile_idx][
@@ -1557,8 +1685,8 @@ def reduce_outputs(
     """Synchronize across axis=0 in output by performing FMA reduce and store.
 
     Args:
-        output (nl.ndarray): Output tensor, size [2, T, H]
-        zeros (nl.ndarray): Zero tensor, size [reduce_tile_size, H]
+        output (nl.ndarray): Output tensor, size [T, 2, H]
+        zeros (nl.ndarray): Zero tensor, size [reduce_tile_size, 1, H]
         num_tiles (int): Number of tiles (iterations)
         reduce_tile_size (int): Size of tile size on partition dimension
         offset (int): Output read/write offset on row
@@ -1744,7 +1872,7 @@ def bwmm_load_old_block(
 
     for token_tile_idx in range(NUM_TILES):
         if skip_dma.skip_token:
-            nisa.memset(value=0, dst=block_old_lst[token_tile_idx][0:TILE_SIZE, 0:H])
+            nisa.memset(value=0.0, dst=block_old_lst[token_tile_idx][0:TILE_SIZE, 0:H])
 
         block_token_mapping = nl.ndarray((TILE_SIZE, 1), dtype=token_indices.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(
@@ -1791,3 +1919,99 @@ def bwmm_load_old_block(
             )
 
     return block_old_lst
+
+
+def _clip_gate_up_projections(gate_and_up_proj_states_lst_sbuf, dims, cfg, free_size):
+    """Apply optional clamping to gate and up projection states in-place.
+
+    Args:
+        gate_and_up_proj_states_lst_sbuf (list): [GUP_PROJ_DIM][n_psum_tile_count][gup_tile_count] SBUF tensors
+        dims (DimensionSizes): Dimension configuration
+        cfg (Configs): Kernel configuration with clamp limits
+        free_size (int): Free dimension size of each tile
+    """
+    if not (
+        cfg.gate_clamp_upper_limit is not None
+        or cfg.gate_clamp_lower_limit is not None
+        or cfg.up_clamp_lower_limit is not None
+        or cfg.up_clamp_upper_limit is not None
+    ):
+        return
+
+    for token_tile_idx in range(dims.n_psum_tile_count):
+        for i_tile_idx in range(dims.gup_tile_count):
+            # Clip gate projection (index 0)
+            if cfg.gate_clamp_lower_limit is not None and cfg.gate_clamp_upper_limit is not None:
+                nisa.tensor_scalar(
+                    dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
+                        0:TILE_SIZE, nl.ds(0, free_size)
+                    ],
+                    data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
+                        0:TILE_SIZE, nl.ds(0, free_size)
+                    ],
+                    op0=nl.minimum,
+                    operand0=cfg.gate_clamp_upper_limit,
+                    op1=nl.maximum,
+                    operand1=cfg.gate_clamp_lower_limit,
+                )
+            else:
+                if cfg.gate_clamp_upper_limit is not None:
+                    nisa.tensor_scalar(
+                        dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        op0=nl.minimum,
+                        operand0=cfg.gate_clamp_upper_limit,
+                    )
+                if cfg.gate_clamp_lower_limit is not None:
+                    nisa.tensor_scalar(
+                        dst=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        data=gate_and_up_proj_states_lst_sbuf[0][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        op0=nl.maximum,
+                        operand0=cfg.gate_clamp_lower_limit,
+                    )
+
+            # Clip up projection (index 1)
+            if cfg.up_clamp_upper_limit is not None and cfg.up_clamp_lower_limit is not None:
+                nisa.tensor_scalar(
+                    dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
+                        0:TILE_SIZE, nl.ds(0, free_size)
+                    ],
+                    data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
+                        0:TILE_SIZE, nl.ds(0, free_size)
+                    ],
+                    op0=nl.minimum,
+                    operand0=cfg.up_clamp_upper_limit,
+                    op1=nl.maximum,
+                    operand1=cfg.up_clamp_lower_limit,
+                )
+            else:
+                if cfg.up_clamp_upper_limit is not None:
+                    nisa.tensor_scalar(
+                        dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        op0=nl.minimum,
+                        operand0=cfg.up_clamp_upper_limit,
+                    )
+                if cfg.up_clamp_lower_limit is not None:
+                    nisa.tensor_scalar(
+                        dst=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        data=gate_and_up_proj_states_lst_sbuf[1][token_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, nl.ds(0, free_size)
+                        ],
+                        op0=nl.maximum,
+                        operand0=cfg.up_clamp_lower_limit,
+                    )

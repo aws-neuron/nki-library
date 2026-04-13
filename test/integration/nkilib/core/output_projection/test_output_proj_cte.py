@@ -29,6 +29,7 @@ from test.utils.common_dataclasses import (
 )
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
 from test.utils.metrics_collector import IMetricsCollector
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -206,6 +207,10 @@ OUTPUT_PROJ_CTE_UNIT_CASES = [
 ]
 
 OUTPUT_PROJ_CTE_UNIT_PARAMS = "batch, seqlen, hidden, n_head, d_head, test_bias"
+_ABBREVS = {"batch": "b", "seqlen": "s", "hidden": "h", "n_head": "nh", "d_head": "dh", "test_bias": "bias"}
+
+# Combined unit + model configs (deduplicated)
+OUTPUT_PROJ_CTE_UNIT_AND_MODEL_CASES = list(dict.fromkeys(OUTPUT_PROJ_CTE_UNIT_CASES + OUTPUT_PROJ_CTE_MODEL_CONFIGS))
 
 # Combined unit + model configs (deduplicated)
 OUTPUT_PROJ_CTE_UNIT_AND_MODEL_CASES = list(dict.fromkeys(OUTPUT_PROJ_CTE_UNIT_CASES + OUTPUT_PROJ_CTE_MODEL_CONFIGS))
@@ -220,9 +225,23 @@ _MAX_D = 128
 _MAX_BxS_VALIDATE = 64 * 1024
 _MAX_H_VALIDATE = 16384
 
+_INT32_MAX = 2**31 - 1
+
+
+def _exceeds_int32_tensor_elements(batch, seqlen, hidden, n_head, d_head):
+    """Check if any tensor would exceed int32 element count, causing compiler overflow."""
+    if batch * n_head * d_head * seqlen > _INT32_MAX:
+        return True
+    if batch * seqlen * hidden > _INT32_MAX:
+        return True
+    return False
+
 
 def filter_output_proj_combinations(batch, seqlen, hidden, n_head, d_head, test_bias=None):
     """Filter out invalid parameter combinations for output projection kernel."""
+    # Skip configs that overflow compiler int32 limits — can't even run as negative tests
+    if _exceeds_int32_tensor_elements(batch, seqlen, hidden, n_head, d_head):
+        return FilterResult.REDUNDANT
     if batch * seqlen > _MAX_B_TIMES_S:
         return FilterResult.INVALID
     return FilterResult.VALID
@@ -230,6 +249,9 @@ def filter_output_proj_combinations(batch, seqlen, hidden, n_head, d_head, test_
 
 def filter_output_proj_mx_combinations(batch, seqlen, hidden, n_head, d_head, test_bias=None):
     """Filter out invalid parameter combinations for MX output projection kernel."""
+    # Skip configs that overflow compiler int32 limits — can't even run as negative tests
+    if _exceeds_int32_tensor_elements(batch, seqlen, hidden, n_head, d_head):
+        return FilterResult.REDUNDANT
     if batch * seqlen > _MAX_B_TIMES_S:
         return FilterResult.INVALID
     if (n_head * d_head < 128) or (n_head * d_head % 128 != 0):
@@ -279,7 +301,7 @@ class TestOutputProjCteKernel:
     # ============================================================================
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
     def test_output_proj_cte_bf16_unit(
         self,
         test_manager: Orchestrator,
@@ -321,7 +343,7 @@ class TestOutputProjCteKernel:
     # ============================================================================
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
     def test_output_proj_cte_static_fp8_unit(
         self,
         test_manager: Orchestrator,
@@ -479,7 +501,7 @@ class TestOutputProjCteKernel:
     # ============================================================================
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     def test_output_proj_cte_mxfp4_unit(
         self,
@@ -574,7 +596,7 @@ class TestOutputProjCteKernel:
     # ============================================================================
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     def test_output_proj_cte_mxfp4_prequantized_unit(
         self,
@@ -622,7 +644,7 @@ class TestOutputProjCteKernel:
 
     @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest.mark.parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_MODEL_CONFIGS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_MODEL_CONFIGS, abbrevs=_ABBREVS)
     def test_output_proj_cte_static_mxfp8_unit(
         self,
         test_manager: Orchestrator,

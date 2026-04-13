@@ -22,6 +22,8 @@ This kernel generates attention masks with support for:
 - Cascaded attention with active mask loading
 
 The mask generation matches the K cache layout used by attention_tkg kernel.
+
+Design spec: gen_mask_tkg_design_spec.md
 """
 
 from typing import Optional
@@ -32,9 +34,20 @@ from nki.isa import dge_mode
 
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
+from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ..utils.tensor_view import TensorView
+from .attention_tkg_utils import (
+    AttnTKGConfig,
+    resize_cache_block_len_for_attention_tkg_kernel,
+)
+from .attention_tkg_utils import (
+    is_batch_sharded as is_batch_sharded_fn,
+)
+from .attention_tkg_utils import (
+    is_s_prior_sharded as is_s_prior_sharded_fn,
+)
 
 
 def gen_mask_tkg(
@@ -53,6 +66,7 @@ def gen_mask_tkg(
     sbm: Optional[SbufManager] = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
+    n_sprior_tile_total: int = 0,
 ) -> nl.ndarray:
     """
     Generate attention mask for TKG kernel.
@@ -102,6 +116,8 @@ def gen_mask_tkg(
             Added on top of the NC sharding offset (analogous to s_prior_offset for the
             sequence dimension). Used for batch tiling when the full per-NC batch is
             processed in multiple tiles.
+        n_sprior_tile_total (int): Total s_prior tiles across all FA tiles (for strided
+            iota channel_multiplier). 0 = use n_sprior_tile (no FA tiling). Default: 0.
 
     Returns:
         mask_out (nl.ndarray): [P_MAX, n_sprior_tile, bs, q_head, s_active], Generated mask tensor.
@@ -164,6 +180,12 @@ def gen_mask_tkg(
         f"Allocate or reshape to a 5D tensor. Got shape {mask_out.shape}",
     )
 
+    kernel_assert(
+        not (strided_mm1 and block_len > 0),
+        f"strided_mm1=True is incompatible with block KV cache (block_len={block_len}). "
+        "Block KV always uses non-strided layout.",
+    )
+
     # Extract and validate dimensions from mask_out shape
     _, n_sprior_tile, _bs, _q_head, _s_active = mask_out.shape
     s_active_qh = q_head * s_active
@@ -176,7 +198,7 @@ def gen_mask_tkg(
 
     # Create index tensor
     tmp_iota = sbm.alloc_stack(
-        (P_MAX, n_sprior_tile), dtype=pos_ids.dtype, buffer=nl.sbuf, name=f"tmp_iota_{s_prior_offset}"
+        (P_MAX, n_sprior_tile), dtype=pos_ids.dtype, buffer=nl.sbuf, name=f"tmp_iota_{s_prior_offset}_{batch_offset}"
     )
     nisa.memset(tmp_iota, value=0)
 
@@ -189,13 +211,13 @@ def gen_mask_tkg(
         s_prior_offset=s_prior_offset,
         block_len=block_len,
         strided_mm1=strided_mm1,
+        n_sprior_tile_total=n_sprior_tile_total,
     )
 
     # Step 2: Create prior masks by per-batch comparison
     # Trace-time routing: SWA path when start_pos is provided, standard path otherwise
     if start_pos is not None:
-        # SWA path: use tmp_iota directly (no .ap() replication needed,
-        # each query is processed one at a time)
+        # SWA path: each query is processed one at a time, no replication needed
         _create_batch_masks_swa(
             iota=tmp_iota,
             mask_out=mask_out,
@@ -214,20 +236,15 @@ def gen_mask_tkg(
             (P_MAX, n_sprior_tile * s_active_qh),
             dtype=tmp_iota.dtype,
             buffer=nl.sbuf,
-            name=f"mask_iota_{s_prior_offset}",
+            name=f"mask_iota_{s_prior_offset}_{batch_offset}",
         )
+        # dst: reshape flat free dim into [n_sprior_tile, s_active_qh]
+        dst_view = TensorView(mask_iota).reshape_dim(1, (n_sprior_tile, s_active_qh)).get_view()
+        # src: expand + broadcast n_sprior_tile across s_active_qh copies
+        src_view = TensorView(tmp_iota).expand_dim(2).broadcast(2, s_active_qh).get_view()
         nisa.tensor_copy(
-            dst=mask_iota.ap(
-                pattern=[
-                    [n_sprior_tile * s_active_qh, P_MAX],
-                    [s_active_qh, n_sprior_tile],
-                    [1, s_active_qh],
-                ]
-            ),
-            src=tmp_iota.ap(
-                pattern=[[n_sprior_tile, P_MAX], [1, n_sprior_tile], [0, s_active_qh]],
-                offset=0,
-            ),
+            dst=dst_view,
+            src=src_view,
             engine=nisa.scalar_engine,
         )
         _create_batch_masks(
@@ -240,10 +257,13 @@ def gen_mask_tkg(
             n_sprior_tile=n_sprior_tile,
             s_prior_offset=s_prior_offset,
             sbm=sbm,
+            batch_offset=batch_offset,
         )
 
-    # Step 3: Optionally load active mask onto the last section of mask_out
-    if active_mask is not None:
+    # Step 3: Optionally load active mask onto the last section of mask_out.
+    # Skip if this FA tile doesn't reach the active region (last s_active positions).
+    tile_end = s_prior_offset + n_sprior_tile * P_MAX
+    if active_mask is not None and (s_prior_per_shard <= 0 or tile_end > s_prior_per_shard - s_active):
         _load_active_mask(
             mask_out=mask_out,
             active_mask=active_mask,
@@ -258,6 +278,7 @@ def gen_mask_tkg(
             s_prior_offset=s_prior_offset,
             s_prior_per_shard=s_prior_per_shard,
             batch_offset=batch_offset,
+            n_sprior_tile_total=n_sprior_tile_total,
         )
 
     sbm.close_scope()
@@ -278,6 +299,7 @@ def _generate_iota_tensor(
     s_prior_offset: int,
     block_len: int,
     strided_mm1: bool,
+    n_sprior_tile_total: int = 0,
 ) -> None:
     """
     Generate index tensor based on cache layout.
@@ -296,6 +318,8 @@ def _generate_iota_tensor(
         s_prior_offset: Offset within current shard (for flash attention tiling).
         block_len: Block length for block KV cache (0 = flat cache).
         strided_mm1: Whether to use strided MM1 layout.
+        n_sprior_tile_total: Total s_prior tiles across all FA tiles (for strided
+            iota channel_multiplier). 0 = use n_sprior_tile (no FA tiling). Default: 0.
     """
     P_MAX = nl.tile_size.pmax
     iota_base = sprior_prg_id * s_prior_per_shard + s_prior_offset
@@ -323,9 +347,16 @@ def _generate_iota_tensor(
                 channel_multiplier=block_len,
             )
     else:
-        # Flat KV cache
+        # Flat KV cache: for FA-tiled strided layout, channel_multiplier uses
+        # the global tile count and iota_base is in tile-index space.
+        iota_ch_mul = n_sprior_tile
+        if strided_mm1 and n_sprior_tile_total > 0:
+            iota_ch_mul = n_sprior_tile_total
+            iota_base = sprior_prg_id * (s_prior_per_shard // P_MAX) + s_prior_offset // P_MAX
+
         iota_pattern = [[1, n_sprior_tile]] if strided_mm1 else [[P_MAX, n_sprior_tile]]
-        iota_multiplier = n_sprior_tile if strided_mm1 else 1
+        iota_multiplier = iota_ch_mul if strided_mm1 else 1
+
         nisa.iota(
             dst=tmp_iota[...],
             pattern=iota_pattern,
@@ -344,6 +375,7 @@ def _create_batch_masks(
     n_sprior_tile: int,
     s_prior_offset: int,
     sbm: SbufManager,
+    batch_offset: int = 0,
 ) -> None:
     """
     Create prior masks by per-batch comparison with position IDs.
@@ -362,12 +394,16 @@ def _create_batch_masks(
         n_sprior_tile: Number of s_prior tiles.
         s_prior_offset (int): Offset within current shard (for flash attention tiling, used here for tensor naming). Default: 0.
         sbm: SBUF memory manager.
+        batch_offset (int): Batch offset for tensor naming uniqueness. Default: 0.
     """
     P_MAX = nl.tile_size.pmax
 
     for batch_idx in range(bs):
         cur_mask = sbm.alloc_stack(
-            mask_iota.shape, dtype=mask_out.dtype, buffer=nl.sbuf, name=f"cur_mask_{batch_idx}_{s_prior_offset}"
+            mask_iota.shape,
+            dtype=mask_out.dtype,
+            buffer=nl.sbuf,
+            name=f"cur_mask_{batch_idx}_{s_prior_offset}_{batch_offset}",
         )
         nisa.tensor_scalar(
             dst=cur_mask[...],
@@ -410,8 +446,8 @@ def _create_batch_masks_swa(
 
     Processes each (batch, sa_idx) independently using n_sprior_tile-sized
     scratch buffers, then copies the result directly to mask_out for each
-    q_head. Uses the raw iota tensor directly (no .ap() replication needed
-    since each query is processed one at a time).
+    q_head. Uses the raw iota tensor directly since each query is processed
+    one at a time.
 
     Args:
         iota: Raw index tensor. Shape [P_MAX, n_sprior_tile].
@@ -527,6 +563,7 @@ def _load_active_mask(
     s_prior_offset: int = 0,
     s_prior_per_shard: int = 0,
     batch_offset: int = 0,
+    n_sprior_tile_total: int = 0,
 ) -> None:
     """
     Load active mask onto the last section of mask_out.
@@ -535,6 +572,9 @@ def _load_active_mask(
     1. Block KV: Load active mask with shuffled block layout.
     2. Strided MM1: Load active mask in strided manner across partitions.
     3. Non-strided: Load to bottom right chunk of mask_out.
+
+    Callers must ensure the current tile overlaps the active region before
+    calling this function.
 
     Batch offset logic:
     - batch_offset specifies a shard-local offset into the batch dimension.
@@ -545,8 +585,7 @@ def _load_active_mask(
     - Shard 0 processes s_prior positions [0, s_prior/2)
     - Shard 1 processes s_prior positions [s_prior/2, s_prior)
     Both shards load the active mask into the last s_active positions of their
-    own tile space (the tile_end <= active_start early return handles skipping
-    tiles that don't overlap the active region).
+    own tile space.
 
     Args:
         mask_out: Output mask buffer. Shape [P_MAX, n_sprior_tile, bs, q_head, s_active].
@@ -562,6 +601,8 @@ def _load_active_mask(
         s_prior_offset: Offset within current shard (for FA tiling). Default: 0.
         s_prior_per_shard: Total s_prior per shard. Default: 0.
         batch_offset: Shard-local batch offset into active_mask. Default: 0.
+        n_sprior_tile_total: Total s_prior tiles across all FA tiles (for strided
+            partition mapping). 0 = use n_sprior_tile. Default: 0.
     """
     P_MAX = nl.tile_size.pmax
 
@@ -570,7 +611,6 @@ def _load_active_mask(
     # Use active_mask.shape[1] to derive the per-NC size (bs may be a smaller batch tile).
     nc_batch_offset = shard_id * (active_mask.shape[1] // 2) if is_batch_sharded else 0
     batch_start = nc_batch_offset + batch_offset
-    s_active_bqh = bs * q_head * s_active
 
     if block_len > 0:
         _load_active_mask_block_kv(
@@ -586,76 +626,44 @@ def _load_active_mask(
             s_prior_per_shard=s_prior_per_shard,
         )
     elif strided_mm1:
-        # Strided MM1: load active mask in strided manner.
-        # When batch-sharded, active_mask has more rows in the batch dim than this tile,
-        # so the DMA source stride differs from the destination stride.
+        # Strided MM1: load active mask using per-position coordinate mapping.
+        # For strided layout, position pos maps to (p=pos//N, f=pos%N) where
+        # N is the total tile count.  When FA-tiled, n_sprior_tile is the
+        # tile-local count but coordinates must use the global count so
+        # that active positions land at the correct (p, f) coordinates.
+        n_tile_for_stride = n_sprior_tile_total if n_sprior_tile_total > 0 else n_sprior_tile
 
-        load1_nrows = s_active % n_sprior_tile
-        load2_nrows = s_active - load1_nrows
+        # Active positions occupy the last s_active slots of the strided space.
+        # Use n_tile_for_stride * P_MAX (the full strided capacity) so that
+        # p stays within [0, P_MAX) and f_global spans the tile columns.
+        active_start = n_tile_for_stride * P_MAX - s_active
 
-        # Offset into the correct batch portion of active_mask
-        src_batch_offset = batch_start * q_head * s_active
+        for k_idx in range(s_active):
+            linear_pos = active_start + k_idx
+            p = linear_pos // n_tile_for_stride
+            f_global = linear_pos % n_tile_for_stride
 
-        bs_full = active_mask.shape[1]
-        s_active_bqh_full = bs_full * q_head * s_active  # stride between active_mask rows
+            # When FA-tiled, skip positions outside this tile's range
+            if n_sprior_tile_total > 0 and (
+                f_global < s_prior_offset // P_MAX or f_global >= s_prior_offset // P_MAX + n_sprior_tile
+            ):
+                continue
 
-        # Load first portion (partial partition)
-        if load1_nrows > 0:
-            load1_pidx = P_MAX - (load2_nrows // n_sprior_tile) - 1
+            f_local = f_global - s_prior_offset // P_MAX if n_sprior_tile_total > 0 else f_global
 
-            dst_offset = load1_pidx * (n_sprior_tile * s_active_bqh) + (n_sprior_tile - load1_nrows) * s_active_bqh
-            nisa.dma_copy(
-                dst=mask_out.ap(
-                    pattern=[
-                        [n_sprior_tile * s_active_bqh, 1],
-                        [s_active_bqh, load1_nrows],
-                        [1, s_active_bqh],
-                    ],
-                    offset=dst_offset,
-                ),
-                src=active_mask.ap(
-                    pattern=[
-                        [n_sprior_tile * s_active_bqh_full, 1],
-                        [s_active_bqh_full, load1_nrows],
-                        [1, s_active_bqh],
-                    ],
-                    offset=src_batch_offset,
-                ),
-                dge_mode=dge_mode.none,
-                name=f"active_mask_strided_load_partial_bo{batch_offset}",
+            active_mask_view = (
+                TensorView(active_mask)
+                .select(0, k_idx)  # [bs_full, q_head, s_active]
+                .slice(0, batch_start, batch_start + bs)  # [bs, q_head, s_active]
+                .expand_dim(0)  # [1, bs, q_head, s_active]
+                .expand_dim(0)  # [1, 1, bs, q_head, s_active]
+                .get_view()
             )
-
-        # Load remaining active mask (full partitions)
-        if load2_nrows > 0:
-            load2_pidx = P_MAX - (load2_nrows // n_sprior_tile)
-
-            dst_offset = load2_pidx * s_active_bqh * n_sprior_tile
-            src_offset = src_batch_offset + load1_nrows * s_active_bqh_full
             nisa.dma_copy(
-                mask_out.ap(
-                    pattern=[
-                        [
-                            n_sprior_tile * s_active_bqh,
-                            load2_nrows // n_sprior_tile,
-                        ],
-                        [s_active_bqh, n_sprior_tile],
-                        [1, s_active_bqh],
-                    ],
-                    offset=dst_offset,
-                ),
-                active_mask.ap(
-                    pattern=[
-                        [
-                            n_sprior_tile * s_active_bqh_full,
-                            load2_nrows // n_sprior_tile,
-                        ],
-                        [s_active_bqh_full, n_sprior_tile],
-                        [1, s_active_bqh],
-                    ],
-                    offset=src_offset,
-                ),
+                mask_out[p : p + 1, f_local : f_local + 1, :, :, :],
+                active_mask_view,
                 dge_mode=dge_mode.none,
-                name=f"active_mask_strided_load_remaining_bo{batch_offset}",
+                name=f"active_mask_strided_{k_idx}_bo{batch_offset}_sp{s_prior_offset}",
             )
     else:
         # Non-strided: load to bottom-right chunk of size [s_active, 1, bs, q_head, s_active]
@@ -669,7 +677,7 @@ def _load_active_mask(
             mask_out[P_MAX - s_active :, n_sprior_tile - 1 : n_sprior_tile, :, :, :],
             active_mask_view,
             dge_mode=dge_mode.none,
-            name=f"active_mask_sequential_bo{batch_offset}",
+            name=f"active_mask_sequential_bo{batch_offset}_sp{s_prior_offset}",
         )
 
 
@@ -717,10 +725,6 @@ def _load_active_mask_block_kv(
     # Active positions are at the END of s_prior_per_shard
     active_start_linear = s_prior_per_shard - s_active
 
-    # Only load if this tile contains any active positions
-    if tile_end <= active_start_linear:
-        return
-
     # Load each active position that falls within this tile (s_active is typically 1-8)
     for k_idx in range(s_active):
         linear_pos = active_start_linear + k_idx
@@ -749,5 +753,365 @@ def _load_active_mask_block_kv(
             mask_out[p : p + 1, f : f + 1, :, :, :],
             active_mask_view,
             dge_mode=dge_mode.none,
-            name=f"active_mask_block_kv_{k_idx}_bo{batch_start}",
+            name=f"active_mask_block_kv_{k_idx}_bo{batch_start}_sp{s_prior_offset}",
         )
+
+
+# ============================================================================
+# HBM Wrapper
+# ============================================================================
+
+
+def _load_active_mask_hbm(
+    mask_out: nl.ndarray,
+    active_mask: nl.ndarray,
+    bs: int,
+    q_head: int,
+    s_active: int,
+    n_sprior_tile: int,
+    block_len: int,
+    strided_mm1: bool,
+    shard_id: int,
+    s_prior_offset: int,
+    s_prior_per_shard: int,
+    batch_start: int,
+    n_sprior_tile_total: int,
+) -> None:
+    """Load active mask from HBM into the SBUF tile for the HBM wrapper.
+
+    Active positions occupy the last ``s_active`` positions of the full
+    s_prior.  For s_prior-sharded configs only the owning shard loads them.
+    Strided layouts use per-position coordinate mapping; non-strided and
+    block-KV layouts delegate to ``_load_active_mask``.
+
+    Callers must ensure the current tile overlaps the active region before
+    calling this function.
+    """
+    P_MAX = nl.tile_size.pmax
+    n_sprior_tile_per_shard = s_prior_per_shard // P_MAX
+    is_sprior_sharded = n_sprior_tile_per_shard < n_sprior_tile_total
+
+    if strided_mm1 and block_len == 0:
+        # Strided layout: map each active position to (p, f_global) and load
+        # only those falling within this FA tile's range.
+        n_tile_for_stride = n_sprior_tile_total if n_sprior_tile_total > 0 else n_sprior_tile
+
+        if is_sprior_sharded:
+            shard_tile_base = shard_id * n_sprior_tile_per_shard
+            fa_tile_base = shard_tile_base + s_prior_offset // P_MAX
+            active_start = n_sprior_tile_total * P_MAX - s_active
+        else:
+            fa_tile_base = s_prior_offset // P_MAX
+            active_start = s_prior_per_shard - s_active if s_prior_per_shard > 0 else n_sprior_tile * P_MAX - s_active
+
+        for k_idx in range(s_active):
+            linear_pos = active_start + k_idx
+            p = linear_pos // n_tile_for_stride
+            f_global = linear_pos % n_tile_for_stride
+
+            if f_global < fa_tile_base or f_global >= fa_tile_base + n_sprior_tile:
+                continue
+
+            f_local = f_global - fa_tile_base
+
+            active_mask_view = (
+                TensorView(active_mask)
+                .select(0, k_idx)
+                .slice(0, batch_start, batch_start + bs)
+                .expand_dim(0)
+                .expand_dim(0)
+                .get_view()
+            )
+            nisa.dma_copy(
+                mask_out[p : p + 1, f_local : f_local + 1, :, :, :],
+                active_mask_view,
+                dge_mode=dge_mode.none,
+                name=f"active_mask_hbm_strided_{k_idx}_sp{s_prior_offset}_b{batch_start}",
+            )
+    else:
+        # Non-strided / block-KV: delegate to _load_active_mask.
+        # With s_prior sharding, only the last shard owns active positions.
+        if is_sprior_sharded:
+            is_last_shard = (shard_id + 1) * n_sprior_tile_per_shard >= n_sprior_tile_total
+            if not is_last_shard:
+                return
+            fa_n_tile_total = 0
+        else:
+            fa_n_tile_total = n_sprior_tile_total if n_sprior_tile < n_sprior_tile_total else 0
+
+        _load_active_mask(
+            mask_out=mask_out,
+            active_mask=active_mask,
+            bs=bs,
+            q_head=q_head,
+            s_active=s_active,
+            n_sprior_tile=n_sprior_tile,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            shard_id=shard_id,
+            is_batch_sharded=False,
+            s_prior_offset=s_prior_offset,
+            s_prior_per_shard=s_prior_per_shard,
+            batch_offset=batch_start,
+            n_sprior_tile_total=fa_n_tile_total,
+        )
+
+
+def gen_mask_tkg_hbm(
+    pos_ids_hbm: nl.ndarray,
+    bs: int,
+    q_head: int,
+    s_active: int,
+    s_prior: int,
+    start_pos_hbm: Optional[nl.ndarray] = None,
+    block_len: int = 0,
+    active_mask: Optional[nl.ndarray] = None,
+    enable_fa_s_prior_tiling: bool = True,
+) -> nl.ndarray:
+    """HBM wrapper for gen_mask_tkg.
+
+    Accepts HBM-resident tensors, manages SBUF allocation, DMA transfers,
+    P_MAX broadcast, LNC sharding, and tiling internally.
+
+    Tiles over s_prior and batch to stay within SBUF capacity.  The tiling
+    is orthogonal to layout (strided / block KV) — the inner kernel handles
+    all layout complexity.
+
+    Args:
+        pos_ids_hbm: [1, bs * s_active] position IDs in HBM.
+        bs: Batch size.
+        q_head: Number of query heads.
+        s_active: Active sequence length.
+        s_prior: Total prior sequence length (must be divisible by P_MAX).
+        start_pos_hbm: Optional [1, bs * s_active] SWA start positions in HBM.
+        block_len: Block length for block KV cache (0 = flat). Default: 0.
+        active_mask: Optional [s_active, bs, q_head, s_active] active mask in HBM.
+        enable_fa_s_prior_tiling: Whether flash attention tiling is enabled. Must match
+            the value passed to attention_tkg / attention_block_tkg. Default: True.
+
+    Returns:
+        mask_out_hbm: [s_prior, bs, q_head, s_active] generated mask in HBM.
+    """
+    P_MAX = nl.tile_size.pmax
+
+    strided_mm1 = block_len == 0
+
+    # LNC sharding
+    _, lnc, nc_id = get_verified_program_sharding_info("gen_mask_tkg_hbm", (0, 1))
+
+    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior)
+
+    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+        sprior_sharded = True
+        batch_sharded = False
+        s_prior_per_shard = s_prior // lnc
+    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+        sprior_sharded = False
+        batch_sharded = True
+        s_prior_per_shard = s_prior
+    else:
+        sprior_sharded = False
+        batch_sharded = False
+        s_prior_per_shard = s_prior
+
+    # Adjust block_len for hardware constraints (same resize the attention
+    # kernel applies).
+    if block_len > 0:
+        num_blocks_per_batch = s_prior // block_len
+        block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
+            num_blocks_per_batch,
+            block_len,
+            lnc,
+            P_MAX,
+            bs,
+            q_head,
+            s_active,
+            enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+        )
+
+    n_sprior_tile_total = s_prior // P_MAX
+    n_sprior_tile_per_shard = s_prior_per_shard // P_MAX
+    elem_size = 8
+
+    # Tile sizes for s_prior and batch dimensions
+    SBUF_BUDGET = 16 * 1024 * 1024
+
+    per_sprior_tile_per_batch = P_MAX * q_head * s_active * elem_size
+
+    # Block KV: each tile must hold at least one full fold (block_len tiles).
+    min_sprior_tiles = block_len if block_len > 0 else 1
+
+    max_sprior_tiles = max(min_sprior_tiles, SBUF_BUDGET // (per_sprior_tile_per_batch * bs))
+
+    # Block KV alignment: tile must be divisible by block_len
+    if block_len > 0 and max_sprior_tiles >= block_len:
+        max_sprior_tiles = (max_sprior_tiles // block_len) * block_len
+    if block_len > 0 and 0 < max_sprior_tiles < n_sprior_tile_per_shard:
+        while n_sprior_tile_per_shard % max_sprior_tiles != 0:
+            max_sprior_tiles -= 1
+            while max_sprior_tiles > min_sprior_tiles and max_sprior_tiles % block_len != 0:
+                max_sprior_tiles -= 1
+
+    if max_sprior_tiles > n_sprior_tile_per_shard:
+        max_sprior_tiles = n_sprior_tile_per_shard
+
+    # Even-tile adjustment: all tiles same shape for trace reuse.
+    if 0 < max_sprior_tiles < n_sprior_tile_per_shard:
+        while n_sprior_tile_per_shard % max_sprior_tiles != 0 and max_sprior_tiles > min_sprior_tiles:
+            max_sprior_tiles -= 1
+
+    tile_mask_size = P_MAX * max_sprior_tiles * q_head * s_active * elem_size
+    max_bs_tile = max(1, SBUF_BUDGET // tile_mask_size)
+    if max_bs_tile > bs:
+        max_bs_tile = bs
+
+    n_sprior_tiles = div_ceil(n_sprior_tile_per_shard, max_sprior_tiles)
+    n_batch_tiles = div_ceil(bs, max_bs_tile)
+
+    # SbufManager budget
+    mask_buf_size = P_MAX * max_sprior_tiles * max_bs_tile * q_head * s_active * elem_size
+    input_buf_size = P_MAX * bs * s_active * elem_size
+    if start_pos_hbm is not None:
+        input_buf_size *= 2
+    sbm_budget = mask_buf_size + input_buf_size
+    sbm = SbufManager(0, sbm_budget, get_logger("gen_mask_tkg_hbm"), use_auto_alloc=True)
+    sbm.open_scope(name="gen_mask_tkg_hbm")
+
+    # nisa.tensor_scalar requires fp32 operands (hardware constraint).
+    # Cast to fp32 if the caller passes integer pos_ids.
+    compute_dtype = nl.float32
+
+    # Allocate HBM output.
+    # Layout: [n_sprior_tile_total, P_MAX, bs, q_head, s_active] (n_sprior_tile-major).
+    # Row width = P_MAX = 128, so both LNC shard boundaries (multiples of
+    # s_prior_per_shard = n_sprior_tile_per_shard * P_MAX) and FA tile boundaries
+    # (multiples of fa_tile_size = fa_tile_n_sprior * P_MAX) land on row boundaries.
+    # The attention kernel loads with reshape_dim(0, [n_sprior_tile, P_MAX]).permute([1,0,...]).
+    mask_out_result = nl.ndarray(
+        (n_sprior_tile_total, P_MAX, bs, q_head, s_active),
+        dtype=compute_dtype,
+        buffer=nl.shared_hbm,
+        name="mask_out_result",
+    )
+
+    # Load pos_ids into SBUF with P_MAX broadcast (cast to fp32 if needed)
+    pos_ids_sbuf = sbm.alloc_stack((P_MAX, bs * s_active), dtype=compute_dtype, buffer=nl.sbuf, name="pos_ids_sbuf")
+    nisa.dma_copy(dst=pos_ids_sbuf[0:1, :], src=pos_ids_hbm)
+    stream_shuffle_broadcast(src=pos_ids_sbuf[0:1, :], dst=pos_ids_sbuf)
+
+    start_pos_sbuf = None
+    if start_pos_hbm is not None:
+        start_pos_sbuf = sbm.alloc_stack(
+            (P_MAX, bs * s_active), dtype=compute_dtype, buffer=nl.sbuf, name="start_pos_sbuf"
+        )
+        nisa.dma_copy(dst=start_pos_sbuf[0:1, :], src=start_pos_hbm)
+        stream_shuffle_broadcast(src=start_pos_sbuf[0:1, :], dst=start_pos_sbuf)
+
+    # Tile loop
+    hbm_shard_base = nc_id * n_sprior_tile_per_shard if sprior_sharded else 0
+
+    nc_batch_start = 0
+    if batch_sharded:
+        bs_per_nc = bs // lnc
+        nc_batch_start = nc_id * bs_per_nc
+
+    for sp_idx in range(n_sprior_tiles):
+        sp_offset = sp_idx * max_sprior_tiles * P_MAX
+        cur_sprior_tiles = min(max_sprior_tiles, n_sprior_tile_per_shard - sp_idx * max_sprior_tiles)
+        hbm_sp_offset = hbm_shard_base + sp_idx * max_sprior_tiles
+
+        for bt_idx in range(n_batch_tiles):
+            b_start = bt_idx * max_bs_tile
+            bs_tile = min(max_bs_tile, bs - b_start)
+
+            sbm.open_scope(name=f"tile_sp{sp_idx}_bt{bt_idx}")
+
+            mask_out_sbuf = sbm.alloc_stack(
+                (P_MAX, cur_sprior_tiles, bs_tile, q_head, s_active),
+                dtype=compute_dtype,
+                buffer=nl.sbuf,
+                name=f"mask_out_sbuf_sp{sp_idx}_bt{bt_idx}",
+            )
+
+            pos_ids_tile = pos_ids_sbuf[:, b_start * s_active : (b_start + bs_tile) * s_active]
+            start_pos_tile = None
+            if start_pos_sbuf is not None:
+                start_pos_tile = start_pos_sbuf[:, b_start * s_active : (b_start + bs_tile) * s_active]
+
+            gen_mask_tkg(
+                pos_ids=pos_ids_tile,
+                mask_out=mask_out_sbuf,
+                bs=bs_tile,
+                q_head=q_head,
+                s_active=s_active,
+                is_s_prior_sharded=sprior_sharded,
+                s_prior_per_shard=s_prior_per_shard,
+                start_pos=start_pos_tile,
+                s_prior_offset=sp_offset,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+                active_mask=None,
+                sbm=sbm,
+                is_batch_sharded=False,
+                batch_offset=b_start,
+                n_sprior_tile_total=n_sprior_tile_total if strided_mm1 and block_len == 0 else 0,
+            )
+
+            # Batch-sharded overlap: only the shard's portion is valid.
+            if batch_sharded:
+                tile_batch_end = b_start + bs_tile
+                overlap_start = max(b_start, nc_batch_start)
+                overlap_end = min(tile_batch_end, nc_batch_start + bs_per_nc)
+                has_overlap = overlap_start < overlap_end
+                overlap_local = overlap_start - b_start
+                overlap_bs = overlap_end - overlap_start if has_overlap else 0
+            else:
+                has_overlap = True
+                overlap_start = b_start
+                overlap_local = 0
+                overlap_bs = bs_tile
+
+            # Active mask (wrapper handles offsets; inner kernel path bypassed)
+            sp_tile_end = sp_offset + cur_sprior_tiles * P_MAX
+            if (
+                active_mask is not None
+                and has_overlap
+                and (s_prior_per_shard <= 0 or sp_tile_end > s_prior_per_shard - s_active)
+            ):
+                _load_active_mask_hbm(
+                    mask_out=mask_out_sbuf[:, :, overlap_local : overlap_local + overlap_bs, :, :],
+                    active_mask=active_mask,
+                    bs=overlap_bs,
+                    q_head=q_head,
+                    s_active=s_active,
+                    n_sprior_tile=cur_sprior_tiles,
+                    block_len=block_len,
+                    strided_mm1=strided_mm1,
+                    shard_id=nc_id,
+                    s_prior_offset=sp_offset,
+                    s_prior_per_shard=s_prior_per_shard,
+                    batch_start=overlap_start,
+                    n_sprior_tile_total=n_sprior_tile_total,
+                )
+
+            # DMA store to HBM (n_sprior_tile-major layout)
+            # SBUF: [P_MAX, cur_sprior_tiles, bs_tile, q_head, s_active]
+            # HBM:  [n_sprior_tile_total, P_MAX, bs, q_head, s_active]
+            # Use TensorView to permute then slice for the DMA store.
+            if has_overlap:
+                dst_view = (
+                    TensorView(mask_out_result)
+                    .permute([1, 0, 2, 3, 4])
+                    .slice(dim=1, start=hbm_sp_offset, end=hbm_sp_offset + cur_sprior_tiles)
+                    .slice(dim=2, start=overlap_start, end=overlap_start + overlap_bs)
+                )
+                nisa.dma_copy(
+                    dst=dst_view.get_view(),
+                    src=mask_out_sbuf[:, :, overlap_local : overlap_local + overlap_bs, :, :],
+                )
+
+            sbm.close_scope()
+
+    sbm.close_scope()
+
+    return mask_out_result.reshape((s_prior, bs, q_head, s_active))

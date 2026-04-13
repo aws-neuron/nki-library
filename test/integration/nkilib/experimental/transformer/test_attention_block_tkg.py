@@ -11,21 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import enum
 import os
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import lru_cache
 from inspect import signature
 from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_model_config import (
     attention_block_tkg_model_configs,
+)
+from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_utils import (
+    AttnBlkTestConfig,
+    KVScaleTest,
 )
 from test.integration.nkilib.utils.comparators import maxAllClose
 from test.integration.nkilib.utils.tensor_generators import (
     np_random_sample_static_quantize_inp,
 )
 from test.utils.common_dataclasses import (
-    MODEL_TEST_TYPE,
     TKG_INFERENCE_ARGS,
     CompilerArgs,
     CustomValidator,
@@ -34,14 +35,16 @@ from test.utils.common_dataclasses import (
     PerRankLazyGoldenGenerator,
     PerRankLazyInputGenerator,
     Platforms,
+    TraceMode,
     ValidationArgs,
+    prepare_model_parametrize,
 )
 from test.utils.metadata_loader import load_model_configs
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-from typing import Any, Optional, Union, final
+from typing import Any, Optional, final
 
 import neuron_dtypes as dt
 import nki
@@ -62,54 +65,6 @@ from nkilib_src.nkilib.experimental.transformer.attention_block_tkg_torch import
     AttentionBlockTkgTorchRef,
 )
 from typing_extensions import override
-
-
-class KVScaleTest(enum.Enum):
-    """KV cache quantization scale for FP8 test configs.
-
-    Use DEFAULT for standard test scale (240/2.3), or pass a float
-    literal. Only used when kv_quant=True.
-    """
-
-    DEFAULT = "default"
-
-
-@dataclass
-class AttnBlkTestConfig:
-    """Test configuration for attention block TKG kernel."""
-
-    batch: int
-    num_heads: int
-    d_head: int
-    H: int
-    H_actual: Optional[int]
-    S_ctx: int
-    S_max_ctx: int
-    S_tkg: int
-    block_len: int
-    update_cache: bool
-    K_cache_transposed: bool
-    rmsnorm_X: bool
-    skip_rope: bool
-    rope_contiguous_layout: bool
-    qk_norm_pre_rope: bool
-    qk_norm_pre_rope_gamma: bool
-    qk_norm_post_rope: bool
-    qk_norm_post_rope_gamma: bool
-    dtype: Any
-    quantization_type: QuantizationType
-    lnc: int
-    skip_output_projection: bool
-    transposed_out: bool
-    test_bias: bool
-    out_in_sbuf: bool
-    input_in_sbuf: bool
-    softmax_scale: Optional[float]
-    kv_quant: bool
-    kv_scale: Optional[Union[KVScaleTest, float]] = None
-    KVDP: int = 1
-    skip_attention: bool = False
-
 
 # Maximum memory (GB) for test tensor allocation. Tests exceeding this are skipped.
 # Override via environment variable TEST_ATTN_BLK_TKG_MAX_MEMORY_GB.
@@ -203,7 +158,7 @@ def _slice_block_kv_for_all_ranks(
         # Remap kv_cache_update_idx (block_idx * block_len + offset)
         rank_kv_idx = full_kv_cache_update_idx[rank_idx * B_attn : (rank_idx + 1) * B_attn].copy()
         for batch_idx in range(B_attn):
-            if rank_kv_idx[batch_idx, 0] != np.uint32(-1):
+            if rank_kv_idx[batch_idx, 0] != np.iinfo(np.uint32).max:
                 old_block, offset = divmod(int(rank_kv_idx[batch_idx, 0]), block_len)
                 rank_kv_idx[batch_idx, 0] = block_map.get(old_block, old_block) * block_len + offset
 
@@ -343,26 +298,45 @@ def _create_per_rank_inputs(
 
 
 def _slice_golden_KV_cache_for_rank(
-    rank_golden: dict, rank_id: int, B_attn: int, block_len: int, d_head: int, S_ctx: int, per_rank_cache: dict
+    rank_golden: dict,
+    rank_id: int,
+    B_attn: int,
+    block_len: int,
+    d_head: int,
+    S_ctx: int,
+    per_rank_cache: dict,
+    update_cache: bool,
 ) -> dict:
     """Slice golden K/V cache output for a specific rank.
 
-    Golden computes with full batch B, so K/V_cache_updated has shape [B, ...].
+    Golden computes with full batch B, so K/V outputs have shape [B, ...].
     This function slices to [B/KVDP, ...] to match the kernel's per-rank output.
     X_out is returned unchanged (already has correct shape from golden).
 
+    When update_cache is False, the torch ref returns K_tkg/V_tkg (raw projected
+    K/V) instead of K_cache_updated/V_cache_updated
+
     Args:
-        rank_golden (dict): Full golden output with 'X_out', 'K_cache_updated', 'V_cache_updated'
+        rank_golden (dict): Full golden output with 'X_out' and either
+            'K_cache_updated'/'V_cache_updated' (update_cache=True) or
+            'K_tkg'/'V_tkg' (update_cache=False)
         rank_id (int): Rank index to slice for
         B_attn (int): Batch size of KV cache per rank (B/KVDP)
         block_len (int): Block length for block KV cache (0 for flat cache)
         d_head (int): Head dimension
         S_ctx (int): Context sequence length
         per_rank_cache (dict): Pre-computed slicing info including 'full_active_blocks_table'
+        update_cache (bool): Whether cache update is enabled
 
     Returns:
-        dict: Golden output with X_out unchanged, K/V_cache sliced to [B/KVDP, ...]
+        dict: Golden output with X_out unchanged, K/V sliced to per-rank batch size
     """
+    if not update_cache:
+        # K_tkg shape: [D, B, S_tkg], V_tkg shape: [B, S_tkg, D]
+        golden_k = rank_golden['K_tkg'][:, rank_id * B_attn : (rank_id + 1) * B_attn, :]
+        golden_v = rank_golden['V_tkg'][rank_id * B_attn : (rank_id + 1) * B_attn, :, :]
+        return {'X_out': rank_golden['X_out'], 'K_tkg': golden_k, 'V_tkg': golden_v}
+
     if block_len > 0:
         blocks_per_rank = B_attn * S_ctx // block_len
         full_active_blocks_table = per_rank_cache['full_active_blocks_table']
@@ -387,7 +361,7 @@ def estimate_test_memory_bytes(cfg: AttnBlkTestConfig) -> int:
     Computes the sum of all tensor sizes created during the test.
     """
     batch = cfg.batch
-    num_heads = cfg.num_heads
+    num_heads = cfg.q_heads
     d_head = cfg.d_head
     H = cfg.H
     S_ctx = cfg.S_ctx
@@ -489,7 +463,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     batch, d_head, H = cfg.batch, cfg.d_head, cfg.H
     S_ctx, S_max_ctx, S_tkg = cfg.S_ctx, cfg.S_max_ctx, cfg.S_tkg
     H_actual = cfg.H_actual if cfg.H_actual is not None else H
-    num_q_heads = cfg.num_heads
+    num_q_heads = cfg.q_heads
     num_kv_heads = 1
 
     eps = 1e-5 if dtype == np.float32 else 1e-3
@@ -656,13 +630,15 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     attention_mask = build_full_attention_mask(
         cache_lens=cache_lens_torch,
         batch=batch,
-        num_heads=cfg.num_heads,
+        num_heads=cfg.q_heads,
         s_active=S_tkg,
         s_ctx=S_ctx,
         lnc=cfg.lnc,
         block_len=cfg.block_len,
         include_active_mask=True,
         transposed=True,
+        enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+        KVDP=cfg.KVDP,
     ).numpy()  # mask: (S_ctx, batch, num_heads, S_tkg)
     attention_mask = dt.static_cast(np.ascontiguousarray(attention_mask), dtype=np.uint8)
 
@@ -699,10 +675,10 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     elif cfg.quantization_type == QuantizationType.NONE:
         # W_out: projection from attention output → H. After softmax, probs@V has low std.
         # Use std=0.5 to scale output back up so bias is meaningful (not at noise level).
-        W_out = gaussian((cfg.num_heads * d_head, H), dtype, std=0.5)
+        W_out = gaussian((cfg.q_heads * d_head, H), dtype, std=0.5)
     else:
         W_out, weight_dequant_scale_out, input_dequant_scale_out = generate_quant_tensor(
-            shape=(cfg.num_heads * d_head, H), dtype=nl.float8_e4m3
+            shape=(cfg.q_heads * d_head, H), dtype=nl.float8_e4m3
         )
         weight_dequant_scale_out = np.broadcast_to(weight_dequant_scale_out, (128, 1))
         input_dequant_scale_out = np.broadcast_to(input_dequant_scale_out, (128, 1))
@@ -713,7 +689,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     return {
         # -- input
         "X": X,
-        "X_in_sb": cfg.input_in_sbuf,
+        "X_in_sb": cfg.input_in_sb,
         "X_hidden_dim_actual": H_actual,
         # -- rmsnorm X
         "rmsnorm_X_enabled": cfg.rmsnorm_X,
@@ -748,6 +724,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
         "attention_mask": attention_mask,
         "sink": None,
         "softmax_scale": cfg.softmax_scale,
+        "enable_fa_s_prior_tiling": cfg.enable_fa_s_prior_tiling,
         # -- FP8 KV cache quantization
         "k_scale": k_scale,
         "v_scale": v_scale,
@@ -762,7 +739,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
         "input_dequant_scale_out": input_dequant_scale_out,
         # -- output
         "transposed_out": cfg.transposed_out,
-        "out_in_sb": cfg.out_in_sbuf,
+        "out_in_sb": cfg.output_in_sb,
         # -- KV data parallelism
         "KVDP": cfg.KVDP,
         "KVDP_replica_group": None,
@@ -773,7 +750,6 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
 def attention_block_tkg_kernel_test_wrapper(
     # -- input
     X: nl.ndarray,
-    *,
     X_in_sb: bool,
     X_hidden_dim_actual: Optional[int],
     # -- rmsnorm X
@@ -809,6 +785,7 @@ def attention_block_tkg_kernel_test_wrapper(
     attention_mask: nl.ndarray,
     sink: Optional[nl.ndarray],
     softmax_scale: Optional[float],
+    enable_fa_s_prior_tiling: bool,
     # -- FP8 KV cache quantization
     k_scale: Optional[nl.ndarray],
     v_scale: Optional[nl.ndarray],
@@ -890,6 +867,7 @@ def attention_block_tkg_kernel_test_wrapper(
         attention_mask=attention_mask,
         sink=sink,
         softmax_scale=softmax_scale,
+        enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
         update_cache=update_cache,
         kv_cache_update_idx=kv_cache_update_idx,
         k_scale=k_scale,
@@ -1039,40 +1017,36 @@ def _get_tolerances(kv_quant: bool, quantization_type: QuantizationType):
     return 0.015, 1e-5
 
 
+def _make_cosine_validation(
+    golden_outputs: dict, rtol: float, atol: float, kv_quant: bool, name_prefix: str = ""
+) -> dict:
+    """Build per-output cosine similarity + allclose validators.
+
+    Pass rate:
+      - Non-quantized (bf16): 100% of elements within rtol. The worst-case
+      - FP8 kv_quant X_out: 99% pass rate. FP8 has coarser quantization
+    """
+    min_pass_rate_x_out = 0.99 if kv_quant else 1.0
+    return {
+        name: CustomValidatorWithOutputTensorData(
+            validator=make_cosine_similarity_validator(
+                golden,
+                rtol=rtol,
+                atol=atol,
+                min_cosine_similarity=0.99,
+                min_pass_rate=min_pass_rate_x_out if name == 'X_out' else 1.0,
+                name=f"{name_prefix}{name}",
+            ),
+            output_ndarray=golden,
+        )
+        for name, golden in golden_outputs.items()
+    }
+
+
 def _run_attention_block_test(
     test_manager: Orchestrator,
     platform_target: Platforms,
-    batch: int,
-    q_heads: int,
-    d_head: int,
-    H: int,
-    H_actual: int,
-    S_ctx: int,
-    S_max_ctx: int,
-    S_tkg: int,
-    block_len: int,
-    update_cache: bool,
-    K_cache_transposed: bool,
-    rmsnorm_X: bool,
-    skip_rope: bool,
-    rope_contiguous_layout: bool,
-    qk_norm_pre_rope: bool,
-    qk_norm_pre_rope_gamma: bool,
-    qk_norm_post_rope: bool,
-    qk_norm_post_rope_gamma: bool,
-    dtype,
-    quantization_type: QuantizationType,
-    lnc: int,
-    transposed_out: bool,
-    test_bias: bool,
-    input_in_sb: bool,
-    output_in_sb: bool,
-    softmax_scale,
-    kv_quant: bool,
-    kv_scale: Optional[Union[KVScaleTest, float]] = None,
-    KVDP: int = 1,
-    skip_output_projection: bool = False,
-    skip_attention: bool = False,
+    cfg: AttnBlkTestConfig,
 ):
     """Shared test execution logic for attention block TKG kernel.
 
@@ -1111,40 +1085,6 @@ def _run_attention_block_test(
         Note: For block KV indices (active_blocks_table and kv_cache_update_idx)
         we remap global block indices to per-rank local indices in _slice_block_kv_for_all_ranks()
     """
-    cfg = AttnBlkTestConfig(
-        batch=batch,
-        num_heads=q_heads,
-        d_head=d_head,
-        H=H,
-        H_actual=H_actual,
-        S_ctx=S_ctx,
-        S_max_ctx=S_max_ctx,
-        S_tkg=S_tkg,
-        block_len=block_len,
-        update_cache=update_cache,
-        K_cache_transposed=K_cache_transposed,
-        rmsnorm_X=rmsnorm_X,
-        skip_rope=skip_rope,
-        rope_contiguous_layout=rope_contiguous_layout,
-        qk_norm_pre_rope=qk_norm_pre_rope,
-        qk_norm_pre_rope_gamma=qk_norm_pre_rope_gamma,
-        qk_norm_post_rope=qk_norm_post_rope,
-        qk_norm_post_rope_gamma=qk_norm_post_rope_gamma,
-        dtype=dtype,
-        quantization_type=quantization_type,
-        lnc=lnc,
-        skip_output_projection=skip_output_projection,
-        transposed_out=transposed_out,
-        test_bias=test_bias,
-        out_in_sbuf=output_in_sb,
-        input_in_sbuf=input_in_sb,
-        softmax_scale=softmax_scale,
-        kv_quant=kv_quant,
-        kv_scale=kv_scale,
-        KVDP=KVDP,
-        skip_attention=skip_attention,
-    )
-
     estimated_bytes = estimate_test_memory_bytes(cfg)
     if estimated_bytes > _MAX_MEMORY_BYTES:
         pytest.skip(
@@ -1153,7 +1093,26 @@ def _run_attention_block_test(
             f"(set TEST_ATTN_BLK_TKG_MAX_MEMORY_GB to override)"
         )
 
-    rtol, atol = _get_tolerances(kv_quant, quantization_type)
+    # Shared-fleet instances (trn2.3xlarge) have 4 NeuronCores; demote to compile-only
+    # when the test needs more ranks than available.
+    # Set TEST_ATTN_BLK_TKG_FORCE_INFER=1 to override and run on hardware anyway.
+    _MAX_SHARED_FLEET_RANKS = 4
+    if (
+        not os.environ.get("TEST_ATTN_BLK_TKG_FORCE_INFER")
+        and test_manager.trace_mode == TraceMode.CompileAndInfer
+        and (cfg.KVDP > _MAX_SHARED_FLEET_RANKS or cfg.DCP > _MAX_SHARED_FLEET_RANKS)
+    ):
+        import warnings
+
+        warnings.warn(
+            f"Demoting to compile-only: KVDP={cfg.KVDP}, DCP={cfg.DCP} exceeds shared-fleet limit "
+            f"of {_MAX_SHARED_FLEET_RANKS} NeuronCores. "
+            f"Set TEST_ATTN_BLK_TKG_FORCE_INFER=1 to override.",
+            stacklevel=2,
+        )
+        test_manager.trace_mode = TraceMode.CompileOnly
+
+    rtol, atol = _get_tolerances(cfg.kv_quant, cfg.quantization_type)
 
     if cfg.KVDP > 1:
         _run_kvdp_test(test_manager, platform_target, cfg, rtol, atol)
@@ -1170,46 +1129,46 @@ def _run_single_rank_test(
 ):
     """Run single-rank test using UnitTestFramework with cosine similarity validation."""
 
-    def input_generator(test_config):
-        return generate_kernel_inputs(cfg)
-
     kernel_input = generate_kernel_inputs(cfg)
     golden_outputs = _golden_ref_via_torch(kernel_input, cfg.lnc)
 
-    # Pass rate:
-    #   - Non-quantized (bf16): 100% of elements within rtol. The worst-case
-    #   - FP8 kv_quant X_out: 99% pass rate. FP8 has coarser quantization
-    min_pass_rate_x_out = 0.99 if cfg.kv_quant else 1.0
-    custom_validation = ValidationArgs(
-        golden_output={
-            name: CustomValidatorWithOutputTensorData(
-                validator=make_cosine_similarity_validator(
-                    golden,
-                    rtol=rtol,
-                    atol=atol,
-                    min_cosine_similarity=0.99,
-                    min_pass_rate=min_pass_rate_x_out if name == 'X_out' else 1.0,
-                    name=name,
-                ),
-                output_ndarray=golden,
-            )
-            for name, golden in golden_outputs.items()
-        }
-    )
+    # When update_cache=True, the kernel returns K_cache/V_cache in-place, causing:
+    # 1. The NKI compiler renames these inputs to K_cache.must_alias_input / V_cache.must_alias_input
+    #    in the NEFF. Rename input keys so the neuron-profile command uses the NEFF names.
+    # 2. The NEFF output files are named K_cache/V_cache (matching the aliased inputs), not
+    #    K_cache_updated/V_cache_updated (the torch ref names). Rename golden keys to match.
+    # The test framework handles the .must_alias_input suffix throughout
+    # (kernel_tracer strips it for compilation, unit_test_framework for validation).
+    if cfg.update_cache:
+        kernel_input['K_cache.must_alias_input'] = kernel_input.pop('K_cache')
+        kernel_input['V_cache.must_alias_input'] = kernel_input.pop('V_cache')
+        golden_outputs['K_cache'] = golden_outputs.pop('K_cache_updated')
+        golden_outputs['V_cache'] = golden_outputs.pop('V_cache_updated')
+
+    def input_generator(test_config):
+        return kernel_input
+
+    custom_validation = ValidationArgs(golden_output=_make_cosine_validation(golden_outputs, rtol, atol, cfg.kv_quant))
 
     framework = UnitTestFramework(
         test_manager=test_manager,
         kernel_entry=nki.jit(attention_block_tkg_kernel_test_wrapper),
         torch_ref=torch_ref_wrapper(AttentionBlockTkgTorchRef(cfg.lnc)),
         kernel_input_generator=input_generator,
-        output_tensor_descriptor=lambda ki: _infer_output_shapes_and_dtypes(ki, cfg.lnc),
+        output_tensor_descriptor=lambda ki: _infer_output_shapes_and_dtypes(
+            {k.removesuffix(".must_alias_input"): v for k, v in ki.items()}, cfg.lnc
+        ),
     )
     framework.run_test(
         test_config=None,
         compiler_args=CompilerArgs(logical_nc_config=cfg.lnc, enable_birsim=False, platform_target=platform_target),
         rtol=rtol,
         atol=atol,
-        inference_args=replace(TKG_INFERENCE_ARGS, collective_ranks=1, enable_determinism_check=False),
+        inference_args=replace(
+            TKG_INFERENCE_ARGS,
+            collective_ranks=1,
+            enable_determinism_check=False,
+        ),
         custom_validation_args=custom_validation,
     )
 
@@ -1227,16 +1186,38 @@ def _run_kvdp_test(
     PerRankLazyGoldenGenerator, which are needed for per-rank input slicing
     and per-rank golden computation. So we call test_manager.execute() directly.
     """
-    assert not cfg.kv_quant, "KVDP + kv_quant combination not yet implemented"
-    kvdp_cfg = replace(cfg, num_heads=cfg.KVDP * cfg.num_heads)
+
+    # Block KV with S_tkg > 1 and KVDP: _slice_block_kv_for_all_ranks remaps kv_cache_update_idx
+    # per starting block only. When S_tkg > 1 crosses a block boundary, the kernel writes to
+    # consecutive local blocks, but the remapping doesn't guarantee global block N and N+1 map
+    # to adjacent local blocks. This is an issue with the kernel interface but KVDP exposes
+    # the issue (in other cases golden and kernel behave in the same way).
+    # NKILIB-693 to fix the core issue.
+    assert not (
+        cfg.block_len > 0 and cfg.S_tkg > 1
+    ), "KVDP + block KV + S_tkg > 1 not supported (exposes potential kernel bug with S_ctx > 1)"
+    kvdp_cfg = replace(cfg, q_heads=cfg.KVDP * cfg.q_heads)
     kernel_input = generate_kernel_inputs(kvdp_cfg)
 
     # For KV data parallelism with KVDP ranks, each rank has q_heads, so total = KVDP * q_heads.
     # Generate inputs once with total heads, then slice per-rank.
     B_attn = cfg.batch // cfg.KVDP
     kernel_input, per_rank_cache = _create_per_rank_inputs(
-        kernel_input, cfg.KVDP, cfg.num_heads, cfg.d_head, B_attn, cfg.S_tkg, cfg.S_ctx, cfg.block_len
+        kernel_input, cfg.KVDP, cfg.q_heads, cfg.d_head, B_attn, cfg.S_tkg, cfg.S_ctx, cfg.block_len
     )
+
+    # Rename K_cache/V_cache keys to match NEFF input names (see _run_single_rank_test comment)
+    if cfg.update_cache:
+        original_per_rank = kernel_input
+
+        def aliased_generator(rank_id):
+            result = original_per_rank.for_rank(rank_id).copy()
+            result['K_cache.must_alias_input'] = result.pop('K_cache')
+            result['V_cache.must_alias_input'] = result.pop('V_cache')
+            return result
+
+        kernel_input = PerRankLazyInputGenerator(generator=aliased_generator)
+        kernel_input.base_input = original_per_rank.base_input
 
     def create_golden_for_rank(rank_id):
         # Inputs were generated with total_q_heads = KVDP * q_heads.
@@ -1248,10 +1229,34 @@ def _run_kvdp_test(
         # Golden needs mask with full batch and q_heads (not KVDP * q_heads)
         golden_input_copy['attention_mask'] = per_rank_cache['golden_mask']
         golden_input_copy['KVDP'] = 1  # Torch ref is single-rank; KVDP slicing is done here
+        # For block KV: the golden receives the full global cache and full kv_cache_update_idx
+        # (all B batches). The torch ref updates all B batches on the shared global cache.
+        # With block KV, physical blocks can be shared across ranks, so another rank's batch
+        # write can contaminate a block that this rank reads during _slice_golden_KV_cache_for_rank.
+        # Mask kv_cache_update_idx to skip updates for batches outside this rank.
+        if cfg.block_len > 0:
+            masked_idx = golden_input_copy['kv_cache_update_idx'].copy()
+            masked_idx[: rank_id * B_attn] = np.iinfo(np.uint32).max
+            masked_idx[(rank_id + 1) * B_attn :] = np.iinfo(np.uint32).max
+            golden_input_copy['kv_cache_update_idx'] = masked_idx
         rank_golden = _golden_ref_via_torch(golden_input_copy, cfg.lnc)
-        return _slice_golden_KV_cache_for_rank(
-            rank_golden, rank_id, B_attn, cfg.block_len, cfg.d_head, cfg.S_ctx, per_rank_cache
+        rank_golden = _slice_golden_KV_cache_for_rank(
+            rank_golden,
+            rank_id,
+            B_attn,
+            cfg.block_len,
+            cfg.d_head,
+            cfg.S_ctx,
+            per_rank_cache,
+            cfg.update_cache,
         )
+        # When update_cache=True, the NEFF output names are K_cache/V_cache (due to
+        # must_alias_input aliasing), but the torch ref returns K_cache_updated/V_cache_updated.
+        # Rename to match the NEFF output names, same as _run_single_rank_test.
+        if cfg.update_cache:
+            rank_golden['K_cache'] = rank_golden.pop('K_cache_updated')
+            rank_golden['V_cache'] = rank_golden.pop('V_cache_updated')
+        return _make_cosine_validation(rank_golden, rtol, atol, cfg.kv_quant, name_prefix=f"rank{rank_id}:")
 
     test_manager.execute(
         KernelArgs(
@@ -1283,221 +1288,296 @@ def _get_attention_block_metadata():
 @final
 class TestRangeAttnBlk:
     # fmt: off
-    @pytest.mark.parametrize(
-            "batch, q_heads, d_head, H    , H_actual, S_ctx  , S_max_ctx, S_tkg, block_len, update_cache, K_cache_transposed, rmsnorm_X, skip_rope, rope_contiguous_layout, qk_norm_pre_rope, qk_norm_pre_rope_gamma, qk_norm_post_rope, qk_norm_post_rope_gamma, dtype      , quantization_type      , lnc, transposed_out, test_bias, input_in_sb, output_in_sb, softmax_scale, kv_quant, kv_scale, KVDP",
-        [
+    @pytest.mark.parametrize("attn_blk_cfg", [
             # SBUF IO
-            (4    , 8      , 64    , 6144 , 2880    , 11264  , 11264    , 1    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , True        , None         , False   , None            , 1),
-            (4    , 8      , 64    , 6144 , 2880    , 11264  , 11264    , 1    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , True          , False    , False      , True        , None         , False   , None            , 1),
-            (4    , 8      , 64    , 6144 , 2880    , 11264  , 11264    , 2    , 0        , False       , False             , False    , True     , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , True       , True        , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                output_in_sb=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                transposed_out=True, output_in_sb=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=2,
+                                update_cache=False, rmsnorm_X=False, skip_rope=True, input_in_sb=True, output_in_sb=True),
             # HBM IO
-            (4    , 8      , 64    , 6144 , 2880    , 11264  , 11264    , 1    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (4    , 8      , 128   , 6144 , 2880    , 11264  , 11264    , 1    , 0        , True        , False             , True     , False    , True                  , True            , False                 , True             , True                   , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (4    , 1      , 128   , 6144 , 2880    , 10240  , 10240    , 5    , 0        , False       , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=128, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                qk_norm_pre_rope=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=6144, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                update_cache=False),
             # GPT OSS RIV'25
-            (8    , 8      , 64    , 6144 , 2880    , 11264  , 11264    , 1    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (8    , 8      , 64    , 3072 , 2880    , 11264  , 11264    , 5    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (8    , 8      , 64    , 3072 , 2880    , 10240  , 10240    , 5    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (4    , 8      , 64    , 3072 , None    , 10240  , 10240    , 4    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (4    , 8      , 64    , 3072 , 2880    , 10240  , 10240    , 4    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=6144, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=1,
+                                test_bias=True),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=11264, S_max_ctx=11264, S_tkg=5,
+                                test_bias=True),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                                K_cache_transposed=True, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                                K_cache_transposed=True, test_bias=True),
             # Qwen3
-            (16   , 1      , 128   , 4096 , None    , 10240  , 10240    , 1    , 0        , True        , False             , True     , False    , True                  , True            , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                qk_norm_pre_rope=True),
             # Qwen3 with pre-rope gamma weights
-            (16   , 1      , 128   , 4096 , None    , 10240  , 10240    , 1    , 0        , False        , False             , True     , False   , True                  , True            , True                  , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
             # Gemma3 with pre-rope gamma weights
-            (1    , 1      , 128   , 5376 , None    , 1024   , 1024     , 1    , 0        , False        , False             , True     , False    , True                  , True            , True                  , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (8    , 4      , 128   , 5376 , None    , 10240  , 10240    , 3    , 0        , False        , False             , True     , False   , True                  , True            , True                  , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (1    , 1      , 128   , 5376 , None    , 1024   , 1024     , 1    , 16       , False        , False             , True     , False    , True                  , True            , True                  , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+            AttnBlkTestConfig(batch=8, q_heads=4, d_head=128, H=5376, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=3,
+                                update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, test_bias=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=16, update_cache=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
             # New model, 2025-Jul
-            (32   , 1      , 64    , 3072 , None    , 8192   , 8192     , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (32   , 1      , 64    , 3072 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (64   , 1      , 64    , 3072 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (32   , 1      , 64    , 3072 , None    , 128    , 128      , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (32   , 1      , 64    , 3072 , None    , 128    , 128      , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (64   , 1      , 64    , 3072 , None    , 128    , 128      , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (1    , 1      , 64    , 3072 , None    , 128    , 128      , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (4    , 8      , 64    , 3072 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (8    , 8      , 64    , 3072 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (16   , 8      , 64    , 3072 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-            (32   , 1      , 64    , 3072 , None    , 8192   , 8192     , 3    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , True          , True     , False      , False       , None         , False   , None            , 1),
-            (4    , 8      , 64    , 3072 , None    , 8192   , 8192     , 2    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , True          , True     , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, test_bias=True),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=3,
+                                K_cache_transposed=True, rmsnorm_X=False, transposed_out=True, test_bias=True),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=2,
+                                K_cache_transposed=True, rmsnorm_X=False, transposed_out=True, test_bias=True),
             # secret text
-            (1    , 1      , 128   , 7168 , None    , 256    , 256      , 1    , 0        , True        , True              , True     , False    , True                  , False           , False                 , True             , True                   , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=7168, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                                K_cache_transposed=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True),
             # llama
-            (1    , 1      , 128   , 8192 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , True             , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (1    , 1      , 128   , 8192 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , True     , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (1    , 1      , 128   , 8192 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (1    , 1      , 128   , 8192 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , False                 , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (1    , 1      , 128   , 5120 , None    , 8192   , 8192     , 1    , 0        , True        , True              , True     , False    , False                 , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (1    , 1      , 128   , 5120 , None    , 8192   , 8192     , 1    , 0        , True        , True              , True     , True     , False                 , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 10240  , 16384    , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 10240  , 10240    , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (8    , 2      , 128   , 16384, None    , 2048   , 2048     , 7    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            # (4,     2,          128,    8192,   None,       16384,  16640,      5,      0,          False,          False,              False,      False,      True,                   False,      False,              False,                      nl.bfloat16,    QuantizationType.NONE, 1,      False,          False,      False,          False,          1, 1),     # FAIL (LNC=1 not yet supported)
-            (1    , 16     , 128   , 16384, None    , 4096   , 8192     , 7    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (1    , 16     , 128   , 16384, None    , 4096   , 8192     , 7    , 0        , True        , False             , False    , False    , False                 , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (8    , 2      , 128   , 16384, None    , 2048   , 2048     , 7    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , True          , False    , False      , False       , None         , False   , None            , 1),
-            # # Test vectors for block KV
-            (4    , 1      , 128   , 8192 , None    , 256    , 256      , 5    , 16       , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 8192   , 8192     , 5    , 16       , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 12288  , 12288    , 5    , 16       , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 10240  , 10240    , 5    , 16       , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, qk_norm_post_rope=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, skip_rope=True),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, skip_rope=True, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=8, q_heads=2, d_head=128, H=16384, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=7,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=1, q_heads=16, d_head=128, H=16384, H_actual=None, S_ctx=4096, S_max_ctx=8192, S_tkg=7,
+                                rmsnorm_X=False),
+            AttnBlkTestConfig(batch=1, q_heads=16, d_head=128, H=16384, H_actual=None, S_ctx=4096, S_max_ctx=8192, S_tkg=7,
+                                rmsnorm_X=False, rope_contiguous_layout=False),
+            AttnBlkTestConfig(batch=8, q_heads=2, d_head=128, H=16384, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=7,
+                                K_cache_transposed=True, transposed_out=True),
+            # Test vectors for block KV
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=5,
+                                block_len=16),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=5,
+                                block_len=16),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=12288, S_max_ctx=12288, S_tkg=5,
+                                block_len=16),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                block_len=16),
             # Test vectors to verify functionality of different q_heads, d_head and H dimensions
-            (2    , 1      , 128   , 2048 , None    , 10240  , 16384    , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (2    , 1      , 64    , 2048 , None    , 10240  , 16384    , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (2    , 2      , 64    , 3072 , None    , 10240  , 16384    , 5    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (2    , 3      , 64    , 4096 , None    , 10240  , 16384    , 5    , 0        , False       , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (2    , 4      , 128   , 6144 , None    , 10240  , 16384    , 5    , 0        , False       , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (2    , 3      , 128   , 20480, None    , 10240  , 16384    , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 10240  , 10240    , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-            # static quantization tests 
+            AttnBlkTestConfig(batch=2, q_heads=1, d_head=128, H=2048, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=2, q_heads=1, d_head=64, H=2048, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=2, q_heads=2, d_head=64, H=3072, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5),
+            AttnBlkTestConfig(batch=2, q_heads=3, d_head=64, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                update_cache=False),
+            AttnBlkTestConfig(batch=2, q_heads=4, d_head=128, H=6144, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                update_cache=False, K_cache_transposed=True),
+            AttnBlkTestConfig(batch=2, q_heads=3, d_head=128, H=20480, H_actual=None, S_ctx=10240, S_max_ctx=16384, S_tkg=5,
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                K_cache_transposed=True),
+            # static quantization tests
             # TODO: random input causing numerical instability for quantized weights, more tests will be added
             # after better fp8 random generator is implemented
             # E2E inference tests shows good accuracy
-            (8    , 1      , 128   , 8192 , None    , 2048   , 2048     , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.STATIC, 2  , False         , False    , False      , False       , None         , False   , None            , 1),
-
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=5,
+                                K_cache_transposed=True, quantization_type=QuantizationType.STATIC),
             # softmax_scale tests (Gemma model support)
-            (4    , 8      , 64    , 3072 , 2880    , 10240  , 10240    , 4    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , 0.05         , False   , None            , 1),
-            (1    , 1      , 128   , 7168 , None    , 256    , 256      , 1    , 0        , True        , True              , True     , False    , True                  , False           , False                 , True             , True                   , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , 0.09         , False   , None            , 1),
-            (1    , 1      , 128   , 5120 , None    , 8192   , 8192     , 1    , 0        , True        , True              , True     , True     , False                 , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , 0.13         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 8192   , 8192     , 5    , 16       , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , 0.17         , False   , None            , 1),
-            (4    , 1      , 128   , 8192 , None    , 10240  , 10240    , 5    , 0        , True        , True              , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , 0.21         , False   , None            , 1),
+            AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                                K_cache_transposed=True, test_bias=True, softmax_scale=0.05),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=7168, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                                K_cache_transposed=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, softmax_scale=0.09),
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, skip_rope=True, rope_contiguous_layout=False, softmax_scale=0.13),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=5,
+                                block_len=16, softmax_scale=0.17),
+            AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
+                                K_cache_transposed=True, softmax_scale=0.21),
             # llama FP8 KV Cache Tests
-            (2    , 1      , 128   , 8192 , None    , 8192   , 8192     , 1    , 0        , True        , False             , False    , False    , True                  , True           , True                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
-            (37   , 1      , 128   , 8192 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
-            (96   , 1      , 128   , 8192 , None    , 8192   , 8192     , 1    , 0        , True        , True              , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
+            AttnBlkTestConfig(batch=2, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                rmsnorm_X=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=37, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=96, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
             # llama FP8 KV Cache Tests - batched cache update
-            (32   , 1      , 128   , 8192 , None    , 4096   , 4096     , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
-            (128  , 1      , 128   , 8192 , None    , 2048   , 2048     , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=4096, S_max_ctx=4096, S_tkg=1,
+                                rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=128, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
             # llama FP8 KV Cache Tests - block KV cache
-            (16   , 1      , 128   , 8192 , None    , 2048   , 2048     , 1    , 16       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
-            (32   , 1      , 128   , 8192 , None    , 2048   , 2048     , 1    , 16       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
-            (64   , 1      , 128   , 8192 , None    , 2048   , 2048     , 1    , 16       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , KVScaleTest.DEFAULT, 1),
+            AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=16, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=16, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=16, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
             # FP8 KV cache direct cast (kv_scale=1.0)
-            (1    , 2      , 128   , 8192 , None    , 26624  , 36896    , 5    , 32       , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , False    , False      , False       , None         , True    , 1.0                , 1),
+            AttnBlkTestConfig(batch=1, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=5,
+                                block_len=32, kv_quant=True, kv_scale=1.0, enable_fa_s_prior_tiling=False),
             # Long context tests (S_ctx >= 128k, slower)
             # flat KV S_ctx=128k
-            (8    , 1      , 64    , 3072 , 2880    , 131072 , 131072   , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
             # flat KV S_ctx=512k
-            (8    , 1      , 64    , 3072 , 2880    , 524288 , 524288   , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True),
             # block KV S_ctx=128k, block_len=32
-            (8    , 1      , 64    , 3072 , 2880    , 131072 , 131072   , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True),
             # block KV S_ctx=512k, block_len=32
-            (8    , 1      , 64    , 3072 , 2880    , 524288 , 524288   , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 1),
-
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True),
             # KVDP tests (KVDP=4, GPT-OSS-like)
             # q_heads=1 means each rank has 1 q_head, total KVDP * q_heads across ranks
             # flat KV S_ctx=1k B=8
-            (8    , 1      , 64    , 3072 , 2880    , 1024   , 1024     , 1    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                test_bias=True, KVDP=4, kv_quant=True),
+            # update_cache=False for complete API coverage 
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                test_bias=True, KVDP=4, kv_quant=True, update_cache=False),
             # q_heads=2 tests the general transpose path (q_heads>1)
-            (8    , 2      , 64    , 3072 , 2880    , 1024   , 1024     , 1    , 0        , True        , False             , True     , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                test_bias=True, KVDP=4, kv_quant=True),
             # block KV S_ctx=1k B=8, block_len=32
-            (8    , 1      , 64    , 3072 , 2880    , 1024   , 1024     , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # block KV S_ctx=1k B=32, block_len=32
-            (32   , 1      , 64    , 3072 , 2880    , 1024   , 1024     , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
-
+            AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # KVDP long context tests (S_ctx >= 128k, slower)
             # flat KV S_ctx=512k
-            (8    , 1      , 64    , 3072 , 2880    , 524288 , 524288   , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # block KV S_ctx=512k, block_len=32
-            (8    , 1      , 64    , 3072 , 2880    , 524288 , 524288   , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # flat KV S_ctx=1M
-            (8    , 1      , 64    , 3072 , 2880    , 1048576, 1048576  , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1048576, S_max_ctx=1048576, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # block KV S_ctx=1M, block_len=32
-            (8    , 1      , 64    , 3072 , 2880    , 1048576, 1048576  , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
-
+            AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1048576, S_max_ctx=1048576, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # KVDP B=64 tests
             # block KV S_ctx=1k B=64, block_len=32
-            (64   , 1      , 64    , 3072 , 2880    , 1024   , 1024     , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # block KV S_ctx=128k B=64, block_len=32
-            (64   , 1      , 64    , 3072 , 2880    , 131072 , 131072   , 1    , 32       , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                block_len=32, rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
             # flat KV S_ctx=128k B=64
-            (64   , 1      , 64    , 3072 , 2880    , 131072 , 131072   , 1    , 0        , True        , False             , False    , False    , True                  , False           , False                 , False            , False                  , nl.bfloat16, QuantizationType.NONE  , 2  , False         , True     , False      , False       , None         , False   , None            , 4),
+            AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                                rmsnorm_X=False, test_bias=True, KVDP=4, kv_quant=True),
+            # Small S_ctx=128: sprior_n_prgs=1 (not sharded)
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                block_len=32, rope_contiguous_layout=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+            # Large batch + small S_ctx: batch-sharded so sprior_n_prgs=1
+            AttnBlkTestConfig(batch=256, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                                block_len=32, rope_contiguous_layout=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+            # B=1 large block_len with FA tiling
+            AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=32768, S_max_ctx=32768, S_tkg=1,
+                                block_len=128, rope_contiguous_layout=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+
+            # ===== Large batch coverage (B*S_tkg > 128) =====
+            ## Flat KV (block_len=0)
+            AttnBlkTestConfig(batch=255, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                                qk_norm_pre_rope=True, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, test_bias=True),
+            AttnBlkTestConfig(batch=255, q_heads=2, d_head=64, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3, 
+                                K_cache_transposed=True),
+            AttnBlkTestConfig(batch=384, q_heads=3, d_head=128, H=5120, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, transposed_out=True),
+            AttnBlkTestConfig(batch=384, q_heads=3, d_head=64, H=5120, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                K_cache_transposed=True, rmsnorm_X=False, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+            ## Block KV
+            # FP8 KV quantization
+            AttnBlkTestConfig(batch=255, q_heads=3, d_head=128, H=5120, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=2,
+                                block_len=32, kv_quant=True, kv_scale=1.0),
+            # FP8 weight quantization
+            AttnBlkTestConfig(batch=255, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, quantization_type=QuantizationType.STATIC),
+            # d_head=64, q_heads>1
+            AttnBlkTestConfig(batch=255, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                                block_len=32),
+            # No RoPE, update_cache=False, transposed_out, test_bias, softmax_scale
+            AttnBlkTestConfig(batch=255, q_heads=3, d_head=128, H=5120, H_actual=None, S_ctx=10240, S_max_ctx=12288, S_tkg=1,
+                                block_len=32, skip_rope=True, update_cache=False, transposed_out=True, test_bias=True, softmax_scale=0.05),
+            # B*S_tkg > 256 (multi-tile with S_tkg>1)
+            AttnBlkTestConfig(batch=128, q_heads=2, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                                block_len=32),
+            # QK norm post-RoPE, rmsnorm_X=False (no input norm)
+            AttnBlkTestConfig(batch=255, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, qk_norm_post_rope=True, qk_norm_post_rope_gamma=True, rmsnorm_X=False),
+            # rope_contiguous_layout=False with large tile_B * q_heads (exercises gemm_moving_fmax in RoPE)
+            AttnBlkTestConfig(batch=255, q_heads=8, d_head=64, H=8192, H_actual=None, S_ctx=32768, S_max_ctx=32768, S_tkg=5,
+                                block_len=128, rope_contiguous_layout=False),
+            # B=1024
+            AttnBlkTestConfig(batch=1024, q_heads=2, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+           AttnBlkTestConfig(batch=1024, q_heads=2, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                               block_len=32, rmsnorm_X=False, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True,
+                               quantization_type=QuantizationType.STATIC),
+            # Large batch + KVDP
+            AttnBlkTestConfig(batch=256, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                block_len=32, test_bias=True, KVDP=4),
+            AttnBlkTestConfig(batch=288, q_heads=2, d_head=128, H=5120, H_actual=4096, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, test_bias=True, KVDP=16),
+            AttnBlkTestConfig(batch=512, q_heads=4, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                                block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, KVDP=4),
+            AttnBlkTestConfig(batch=2048, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                                block_len=128, KVDP=8, kv_quant=True),
         ],
+        ids=lambda p: p.test_id(),
     # fmt: on
     )
     def test_attn_blk_megakernel(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
-        batch: int,
-        q_heads: int,
-        d_head: int,
-        H: int,
-        H_actual: int,
-        S_ctx: int,
-        S_max_ctx: int,
-        S_tkg: int,
-        block_len: int,
-        update_cache: bool,
-        K_cache_transposed: bool,
-        rmsnorm_X: bool,
-        skip_rope: bool,
-        rope_contiguous_layout: bool,
-        qk_norm_pre_rope: bool,
-        qk_norm_pre_rope_gamma: bool,
-        qk_norm_post_rope: bool,
-        qk_norm_post_rope_gamma: bool,
-        dtype,
-        quantization_type: QuantizationType,
-        lnc: int,
-        transposed_out: bool,
-        test_bias: bool,
-        input_in_sb: bool,
-        output_in_sb: bool,
-        softmax_scale,
-        kv_quant: bool,
-        kv_scale: Optional[Union[KVScaleTest, float]],
-        KVDP: int,
-        skip_output_projection: bool = False,
-        skip_attention: bool = False,
+        attn_blk_cfg: AttnBlkTestConfig
     ):
         _run_attention_block_test(
             test_manager=test_manager,
             platform_target=platform_target,
-            batch=batch,
-            q_heads=q_heads,
-            d_head=d_head,
-            H=H,
-            H_actual=H_actual,
-            S_ctx=S_ctx,
-            S_max_ctx=S_max_ctx,
-            S_tkg=S_tkg,
-            block_len=block_len,
-            update_cache=update_cache,
-            K_cache_transposed=K_cache_transposed,
-            rmsnorm_X=rmsnorm_X,
-            skip_rope=skip_rope,
-            rope_contiguous_layout=rope_contiguous_layout,
-            qk_norm_pre_rope=qk_norm_pre_rope,
-            qk_norm_pre_rope_gamma=qk_norm_pre_rope_gamma,
-            qk_norm_post_rope=qk_norm_post_rope,
-            qk_norm_post_rope_gamma=qk_norm_post_rope_gamma,
-            dtype=dtype,
-            quantization_type=quantization_type,
-            lnc=lnc,
-            transposed_out=transposed_out,
-            test_bias=test_bias,
-            input_in_sb=input_in_sb,
-            output_in_sb=output_in_sb,
-            softmax_scale=softmax_scale,
-            kv_quant=kv_quant,
-            kv_scale=kv_scale,
-            KVDP=KVDP,
-            skip_output_projection=skip_output_projection,
-            skip_attention=skip_attention,
+            cfg=attn_blk_cfg,
         )
 
-    # Pre-generate test IDs with MODEL_WIP prefix for pytest -k filtering
-    ATTENTION_BLOCK_TKG_MODEL_TEST_IDS = [
-        f"{MODEL_TEST_TYPE}_" + "-".join(str(p.value) if hasattr(p, 'value') else str(p) for p in params)
-        for params in attention_block_tkg_model_configs
-    ]
+
+    # Pre-generate test IDs with MODEL_WIP_<type> prefix for pytest -k filtering
+    _MODEL_PARAMS, _MODEL_IDS = prepare_model_parametrize(
+        attention_block_tkg_model_configs,
+        id_formatter=lambda p: p.test_id(),
+    )
 
     @pytest.mark.parametrize(
-        "batch, num_heads, d_head, H, H_actual, S_ctx, S_max_ctx, S_tkg, block_len, update_cache, K_cache_transposed, rmsnorm_X, skip_rope, rope_contiguous_layout, qk_norm_pre_rope, qk_norm_pre_rope_gamma, qk_norm_post_rope, qk_norm_post_rope_gamma, dtype, quantization_type, lnc, transposed_out, test_bias, input_in_sb, output_in_sb, softmax_scale, kv_quant, KVDP",
-        attention_block_tkg_model_configs,
-        ids=ATTENTION_BLOCK_TKG_MODEL_TEST_IDS,
+        "attn_blk_model_cfg",
+        _MODEL_PARAMS,
+        ids=_MODEL_IDS,
     )
     def test_attn_blk_model(
         self,
@@ -1505,78 +1585,24 @@ class TestRangeAttnBlk:
         collector: IMetricsCollector,
         platform_target: Platforms,
         request,
-        batch: int,
-        num_heads: int,
-        d_head: int,
-        H: int,
-        H_actual: int,
-        S_ctx: int,
-        S_max_ctx: int,
-        S_tkg: int,
-        block_len: int,
-        update_cache: bool,
-        K_cache_transposed: bool,
-        rmsnorm_X: bool,
-        skip_rope: bool,
-        rope_contiguous_layout: bool,
-        qk_norm_pre_rope: bool,
-        qk_norm_pre_rope_gamma: bool,
-        qk_norm_post_rope: bool,
-        qk_norm_post_rope_gamma: bool,
-        dtype,
-        quantization_type: QuantizationType,
-        lnc: int,
-        transposed_out: bool,
-        test_bias: bool,
-        input_in_sb: bool,
-        output_in_sb: bool,
-        softmax_scale,
-        kv_quant: bool,
-        KVDP: int,
+        attn_blk_model_cfg: AttnBlkTestConfig
     ):
         """Test Attention Block TKG kernel with model configurations (weekly regression)."""
         attn_blk_metadata_list = _get_attention_block_metadata()
 
         # Add metadata dimensions for model coverage tracking
         test_metadata_key = {
-            "batch": batch,
-            "num_heads": num_heads,
-            "d_head": d_head,
-            "H": H,
-            "S_ctx": S_ctx,
-            "S_tkg": S_tkg,
+            "batch": attn_blk_model_cfg.batch,
+            "num_heads": attn_blk_model_cfg.q_heads,
+            "d_head": attn_blk_model_cfg.d_head,
+            "H": attn_blk_model_cfg.H,
+            "S_ctx": attn_blk_model_cfg.S_ctx,
+            "S_tkg": attn_blk_model_cfg.S_tkg,
         }
         collector.match_and_add_metadata_dimensions(test_metadata_key, attn_blk_metadata_list)
 
         _run_attention_block_test(
             test_manager=test_manager,
             platform_target=platform_target,
-            batch=batch,
-            q_heads=num_heads,
-            d_head=d_head,
-            H=H,
-            H_actual=H_actual,
-            S_ctx=S_ctx,
-            S_max_ctx=S_max_ctx,
-            S_tkg=S_tkg,
-            block_len=block_len,
-            update_cache=update_cache,
-            K_cache_transposed=K_cache_transposed,
-            rmsnorm_X=rmsnorm_X,
-            skip_rope=skip_rope,
-            rope_contiguous_layout=rope_contiguous_layout,
-            qk_norm_pre_rope=qk_norm_pre_rope,
-            qk_norm_pre_rope_gamma=qk_norm_pre_rope_gamma,
-            qk_norm_post_rope=qk_norm_post_rope,
-            qk_norm_post_rope_gamma=qk_norm_post_rope_gamma,
-            dtype=dtype,
-            quantization_type=quantization_type,
-            lnc=lnc,
-            transposed_out=transposed_out,
-            test_bias=test_bias,
-            input_in_sb=input_in_sb,
-            output_in_sb=output_in_sb,
-            softmax_scale=softmax_scale,
-            kv_quant=kv_quant,
-            KVDP=KVDP,
+            cfg=attn_blk_model_cfg,
         )

@@ -11,3 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Backward-compatible import aliases for subkernels moved to core."""
+
+from ...core.subkernels.find_nonzero_indices import find_nonzero_indices
+from ...core.subkernels.indexed_flatten import indexed_flatten
+
+__all__ = [
+    "find_nonzero_indices",
+    "indexed_flatten",
+]

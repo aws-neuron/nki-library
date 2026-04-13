@@ -1253,7 +1253,7 @@ def conv1d(
     y_out = nl.ndarray(
         shape=(cfg.B, cfg.C_out, cfg.L_out),
         dtype=x_in.dtype,
-        buffer=nl.shared_hbm if cfg.lnc_shard else nl.hbm,
+        buffer=nl.shared_hbm,
     )
 
     # Track PSUM bank for round-robin scheduling

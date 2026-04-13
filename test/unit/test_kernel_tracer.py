@@ -52,4 +52,4 @@ class TestKernelTracerFailsOnAssert:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(Exception, match="This kernel should fail"):
-                trace_kernel(kernel_args, mode=TraceMode.TraceOnly, output_directory=tmpdir)
+                trace_kernel(kernel_args, mode=TraceMode.CompileOnly, output_directory=tmpdir)

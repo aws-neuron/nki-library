@@ -485,6 +485,51 @@ def test_setting_env_vars():
     assert cmds1.env_vars_cmd == ""
 
 
+def test_save_nth_output():
+    """Test --save-nth-output flag across save_all_outputs and profile_all_runs combinations."""
+    # Default (save_all_outputs=False) adds --save-nth-output={num_runs}
+    cmds_default = ProfilerCommands(
+        num_runs=10,
+        profile_all_runs=False,
+        profiler_binary_path="neuron-profile",
+        kernel_input_args="--arg1 val1",
+        metrics_enabled=False,
+    )
+    assert "--save-nth-output=10" in cmds_default.capture_cmd
+
+    # save_all_outputs=True omits --save-nth-output (e.g., determinism check)
+    cmds_save_all = ProfilerCommands(
+        num_runs=10,
+        profile_all_runs=False,
+        profiler_binary_path="neuron-profile",
+        kernel_input_args="--arg1 val1",
+        metrics_enabled=False,
+        save_all_outputs=True,
+    )
+    assert "--save-nth-output" not in cmds_save_all.capture_cmd
+
+    # profile_all_runs=True still adds --save-nth-output when save_all_outputs=False
+    cmds_profile_all = ProfilerCommands(
+        num_runs=5,
+        profile_all_runs=True,
+        profiler_binary_path="neuron-profile",
+        kernel_input_args="--arg1 val1",
+        metrics_enabled=False,
+    )
+    assert "--save-nth-output=5" in cmds_profile_all.capture_cmd
+
+    # Both profile_all_runs and save_all_outputs=True: no --save-nth-output
+    cmds_both = ProfilerCommands(
+        num_runs=5,
+        profile_all_runs=True,
+        profiler_binary_path="neuron-profile",
+        kernel_input_args="--arg1 val1",
+        metrics_enabled=False,
+        save_all_outputs=True,
+    )
+    assert "--save-nth-output" not in cmds_both.capture_cmd
+
+
 def test_perf_analysis_uses_output_file_flag():
     """Perf analysis detailed JSON uses --output-file= to avoid clobbering summary ntff.json."""
     cmds = ProfilerCommands(

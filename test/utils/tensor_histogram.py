@@ -351,7 +351,7 @@ class TensorHistogram:
         self._print_and_log("\n" + table.render(), logfile)
 
         # Print tolerance info
-        tolerance_info = f"Tolerance: atol={atol:.2e}, rtol={rtol:.2e} ({rtol*100:.4g}%)"
+        tolerance_info = f"Tolerance: atol={atol:.2e}, rtol={rtol:.2e} ({rtol * 100:.4g}%)"
         self._print_and_log(tolerance_info, logfile)
 
         return close

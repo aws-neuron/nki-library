@@ -22,39 +22,42 @@ import nki.isa as nisa
 import nki.language as nl
 
 from .kernel_assert import kernel_assert
+from .tensor_view import TensorView
 
 
 def tp_broadcast(src, dst, src_offset, psum_address=None):
     """
-    Transposes then broadcasts src[0:1, :] onto all partitions of dst
-    Using a single transpose instruction (on PE) and repeated input access to broadcast src to dst
-    Each partition of dst will become a transposed version of src.
+    Transposes src[:, src_offset], then broadcasts onto all partitions of dst
 
-    WARNING: This function will always broadcast src[0:1], it will throw error if
-    a slice is passed in.
+    Uses a single transpose instruction (on PE) with repeated input access to broadcast src to dst.
 
     All inputs and outputs to this function are assumed to be in sbuf.
-    This requires 2D src [P, 1] and dst [broad_cast_dim, P]
-    where the first dim of src must match the second dim of dst.
-    Uses a psum bank for the transpose
+    Uses a psum bank for the transpose, location can be specified `psum_address`.
+
+    Dimensions:
+        P: Parition dimension of source (free dimension of dst)
+        F: Free dimension of source
+        B: Broadcast count in destination (parition dimension)
 
     Args:
-        src: 2D input tensor. Shape: [P, F]
-        dst: 2D output tensor. Shape: [B, P]
-        src_offset: Specify the offset in F to take the column from
+        src: 2D input sbuf tensor or TensorView. Shape: [P, F]
+        dst: 2D output sbuf tensor or TensorView. Shape: [B, P]
+        src_offset: Specify the column in F to take the data from
+        psum_address: Optional psum address to use for location of intermediate transpose
     """
-    p_dim, f_dim = src.shape
-    broadcast_dim, tp_dim = dst.shape
+    src_tv = TensorView(src)
+    dst_tv = TensorView(dst)
+    p_dim, _ = src_tv.shape
+    broadcast_dim, tp_dim = dst_tv.shape
 
+    kernel_assert(src_tv.is_sbuf(), "Source must be in sbuf")
+    kernel_assert(dst_tv.is_sbuf(), "Destination must be in sbuf")
     kernel_assert(tp_dim == p_dim, "Transposed dim didn't match")
 
     # Transpose and broadcast into intermediate psum buffer
     tp_psum = nl.ndarray((broadcast_dim, tp_dim), nl.float32, buffer=nl.psum, address=psum_address)
 
-    # FIXME: This always broadcast src[0:1, :] due to limitation of nested indexing
-    nisa.nc_transpose(
-        tp_psum[...], src.ap([[f_dim, p_dim], [0, broadcast_dim]], offset=src_offset)
-    )  # Use repeated access to broadcast
+    nisa.nc_transpose(tp_psum, src_tv.slice(1, src_offset, src_offset + 1).broadcast(1, broadcast_dim).get_view())
 
     # Copy back to sbuf
-    nisa.tensor_copy(dst[0:broadcast_dim, 0:tp_dim], src=tp_psum)
+    nisa.tensor_copy(dst_tv.get_view(), src=tp_psum)

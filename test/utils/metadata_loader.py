@@ -18,12 +18,20 @@ Loads JSON metadata files that map test configurations to model settings.
 """
 
 import functools
+import hashlib
 import json
 import logging
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def compute_config_version_id(config: dict) -> str:
+    """Compute stable version ID from config content (SHA256 hash)."""
+    content = json.dumps(config, sort_keys=True)
+    return hashlib.sha256(content.encode()).hexdigest()
 
 
 @functools.lru_cache(maxsize=None)
@@ -80,3 +88,48 @@ def load_model_configs(test_key: str) -> list[dict[str, Any]]:
 
     logger.info(f"Total: {len(all_metadata)} metadata entries for {test_key}")
     return all_metadata
+
+
+def _coerce_json_value(json_val: Any, test_val: Any) -> Any:
+    """Convert a JSON-stored value to the Python type of test_val for comparison.
+
+    Handles:
+      - Enum: "RouterActFnType.SOFTMAX" -> RouterActFnType.SOFTMAX (via type(test_val)[name])
+      - neuronlib dtype: "nl.bfloat16" -> "bfloat16" (strip prefix to match str(dtype))
+    """
+    if json_val == test_val:
+        return json_val
+    if isinstance(test_val, Enum) and isinstance(json_val, str) and "." in json_val:
+        member_name = json_val.rsplit(".", 1)[1]
+        try:
+            return type(test_val)[member_name]
+        except KeyError:
+            return json_val
+    if isinstance(json_val, str) and json_val.startswith("nl."):
+        return json_val[3:]
+    return json_val
+
+
+def match_model_config_id(test_metadata_key: dict[str, Any], metadata_list: list[dict[str, Any]]) -> str | None:
+    """Match test params against metadata entries and return the ModelConfigId hash.
+
+    Args:
+        test_metadata_key: Dict of abbreviated param names to Python values.
+        metadata_list: List of metadata entries from load_model_configs().
+
+    Returns:
+        SHA256 hash of the matched entry, or None if no match found.
+    """
+    mismatches = None
+    for entry in metadata_list:
+        test_settings = entry.get("test_settings", {})
+        mismatches = {
+            k: (v, test_settings.get(k))
+            for k, v in test_metadata_key.items()
+            if _coerce_json_value(test_settings.get(k), v) != v
+        }
+        if not mismatches:
+            return compute_config_version_id(entry)
+    if mismatches:
+        logger.info(f"No model config match found. Last entry mismatches: {mismatches}")
+    return None

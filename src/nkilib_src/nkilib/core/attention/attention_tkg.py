@@ -24,7 +24,7 @@ from typing import Optional, Tuple
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
-from nki.isa import dge_mode, oob_mode
+from nki.isa import dge_mode, dma_engine, oob_mode
 
 from ..utils.allocator import SbufManager, sizeinbytes
 from ..utils.kernel_assert import kernel_assert
@@ -844,7 +844,7 @@ def _compute_tile_params(
 
     # Flash attention parameters
     # Enable FA when s_prior exceeds the tile size threshold
-    use_fa, fa_tile_size = uses_flash_attention(atp.s_prior)
+    use_fa, fa_tile_size = uses_flash_attention(cfg.enable_fa_s_prior_tiling, atp.s_prior)
     atp.use_fa = use_fa
     if atp.use_fa:
         atp.num_fa_tiles = div_ceil(atp.s_prior, fa_tile_size)
@@ -926,12 +926,17 @@ def _setup_block_kv_cache(
 
     # For block cache support, the kernel requires the number of blocks per batch to be a multiple of 128.
     # When S_ctx is small and blocks per batch < 128, we will "resize" blocks to make blocks per batch a multiple of 128.
+    n_prgs = nl.num_programs(0)
     block_len, blk_cache_resize_factor = resize_cache_block_len_for_attention_tkg_kernel(
         num_blocks_per_batch=active_blocks_table.shape[1],
         block_len=cfg.block_len,
-        n_prgs=atp.n_prgs,
+        lnc=n_prgs,
         p_max=TC.p_max,
+        bs=cfg.bs,
+        q_head=cfg.q_head,
+        s_active=cfg.s_active,
         full_sprior=cfg.full_sprior,
+        enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
     )
 
     # dma_transpose overhead outweighs benefits for small block lengths
@@ -1358,7 +1363,10 @@ def _fa_finalize_and_store(
         op=nl.multiply,
     )
     sbm.close_scope()
-    _gather_and_store_output(out, bufs.fa_running_output, atp, cfg, sbm, btc)
+    exp_v_sendrecv_gpsimd = (
+        cfg.use_gpsimd_sb2sb and atp.sprior_n_prgs > 1 and atp.bs * atp.s_active_qh <= 128 and cfg.d_head % 16 == 0
+    )
+    _gather_and_store_output(out, bufs.fa_running_output, exp_v_sendrecv_gpsimd, atp, cfg, sbm, btc)
 
 
 def _load_and_broadcast_pos_ids(pos_ids, atp, cfg, TC, sbm, name):
@@ -1434,8 +1442,16 @@ def _load_mask(
             .slice(dim=1, start=bqh_offset, end=bqh_offset + atp.s_active_bqh)
         )
 
-        # The mask load needs to be strided *unless* mm1 is strided
-        if cfg.strided_mm1:
+        # gen_mask_tkg_hbm stores in n_sprior_tile-major layout:
+        # [n_sprior_tile, P_MAX, ...]. After flatten to [s_prior, ...], the
+        # load must undo the tiling to recover [P_MAX, n_sprior_tile] in SBUF.
+        #
+        # TODO: The strided_mm1 flat-KV branch below uses reshape_dim(0,
+        # [P_MAX, n_sprior_tile]) which assumes P_MAX-major order. This is
+        # inconsistent with the n_sprior_tile-major HBM layout and should
+        # use the else path (reshape + permute) like all other cases.
+        # Kept as-is pending end-to-end validation; tracked for follow-up.
+        if cfg.strided_mm1 and not atp.is_block_kv:
             mask_hbm_view = mask_hbm_view.reshape_dim(0, [TC.p_max, fa_tile_n_sprior])
         else:
             mask_hbm_view = mask_hbm_view.reshape_dim(0, [fa_tile_n_sprior, TC.p_max]).permute([1, 0, 2])
@@ -1445,7 +1461,7 @@ def _load_mask(
             dst=mask_sb_view.get_view(),
             src=mask_hbm_view.get_view(),
             dge_mode=dge_mode.none,
-            name=f"mask_load_pregenerated_fa{fa_ctx.fa_tile_idx}_bt{btc.batch_tile_idx}",
+            name=f"{sbm.get_name_prefix()}mask_load_pregenerated_fa{fa_ctx.fa_tile_idx}_bt{btc.batch_tile_idx}",
         )
     else:
         # In-kernel mask generation supports both flat and block KV cache
@@ -1576,18 +1592,25 @@ def _compute_qk_matmul(
 
     # Use per-tile s_prior for batch interleave calculation
     # For block KV with PE transpose path, each batch also accumulates k_loaded buffers across folds.
-    # k_loaded is not interleaved (only one batch's fold loop is active at a time), so we subtract
-    # it from available space rather than adding it to the per-batch cost.
-    mm1_extra_per_batch = 0
-    if atp.is_block_kv and not atp.use_dma_transpose:
+    sbuf_usage_per_batch = fa_tile_s_prior * sizeinbytes(k_prior.dtype)
+    if atp.is_block_kv:
+        # For FA, compute which folds correspond to this tile
+        # Each fold covers block_len * 128 elements of s_prior
         fold_s_prior = atp.block_len * TC.p_max
-        num_folds_this_tile = div_ceil(fa_tile_s_prior, fold_s_prior)
-        mm1_extra_per_batch = num_folds_this_tile * atp.block_len * cfg.d_head * sizeinbytes(atp.k_prior_load_type)
+        fold_start = fa_tile_offset // fold_s_prior
+        fold_end = div_ceil(fa_tile_offset + fa_tile_s_prior, fold_s_prior)
+        num_folds_this_tile = fold_end - fold_start
+
+        if not atp.use_dma_transpose:
+            sbuf_usage_per_batch += (
+                num_folds_this_tile * atp.block_len * cfg.d_head * sizeinbytes(atp.k_prior_load_type)
+            )
+    elif cfg.tp_k_prior and atp.is_fp8_kv:
+        sbuf_usage_per_batch += TC.psum_b_max * cfg.d_head * sizeinbytes(atp.k_prior_load_type)
     batch_interleave_degree_safe = _get_safe_batch_interleave_degree(
-        fa_tile_s_prior * sizeinbytes(k_prior.dtype),
-        atp,
+        sbuf_usage_per_batch,
+        atp.batch_interleave_degree,
         sbm,
-        extra_space=mm1_extra_per_batch,
     )
 
     # Maximum multi-buffer degree inside a batch is 8 (banks) // bs (multi-buffer degree on the current scope)
@@ -1597,13 +1620,6 @@ def _compute_qk_matmul(
         # Load entire K_prior for current batch into sbuf (tile portion for FA)
         k_sb = sbm.alloc_stack((cfg.d_head, fa_tile_s_prior), dtype=k_prior.dtype, buffer=nl.sbuf, align=32)
         if atp.is_block_kv:
-            # For FA, compute which folds correspond to this tile
-            # Each fold covers block_len * 128 elements of s_prior
-            fold_s_prior = atp.block_len * TC.p_max
-            fold_start = fa_tile_offset // fold_s_prior
-            fold_end = div_ceil(fa_tile_offset + fa_tile_s_prior, fold_s_prior)
-            num_folds_this_tile = fold_end - fold_start
-
             # Pre-compute for dma_transpose path
             if atp.use_dma_transpose:
                 k_prior_4d = bufs.k_prior_reshaped.reshape(
@@ -1730,7 +1746,7 @@ def _compute_qk_matmul(
                 k_sb,
                 k_prior_view.get_view(),
                 dge_mode=dge_mode.none,
-                name=f"k_prior_flat_load_transposed_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
+                name=f"{sbm.get_name_prefix()}k_prior_flat_load_transposed_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
             )
         else:
             kernel_assert(
@@ -1764,6 +1780,7 @@ def _compute_qk_matmul(
                     )
                     nisa.nc_transpose(tp_psum[:, :tile_size], k_loaded[:tile_size, :])
                     nisa.tensor_copy(k_sb[:, nl.ds(tile_start, tile_size)], tp_psum[:, :tile_size])
+                    sbm.increment_section()
                 sbm.close_scope()
 
             else:
@@ -2060,7 +2077,7 @@ def _cascaded_max_reduce(
     # This is small (e.g. if n=2, s_a=6, s_p=8192, then free dim is 64*12=768), reasonable to be done with one inst
     qk_view = TensorView(bufs.qk).reshape_dim(1, [fa_tile_n_sprior, atp.s_active_bqh]).permute([0, 2, 1])
     nisa.tensor_reduce(
-        dst=bufs.qk_max, op=nl.maximum, data=qk_view.get_view(), axis=[4], keepdims=False
+        dst=bufs.qk_max, op=nl.maximum, data=qk_view.get_view(), axis=[2], keepdims=False
     )  # The axis is modified here
 
     # If we're not using fa or if we're not sharded on s_prior, we need to sync softmax values for every fa tile
@@ -2112,7 +2129,7 @@ def _cascaded_max_reduce(
             send_to_rank=(1 - atp.sprior_prg_id),
             recv_from_rank=(1 - atp.sprior_prg_id),
             pipe_id=0,
-            use_gpsimd_dma=cfg.use_gpsimd_sb2sb,
+            dma_engine=dma_engine.gpsimd_dma if cfg.use_gpsimd_sb2sb else dma_engine.dma,
         )
     # Step 2.3.2  If there is sink, load with the right layout.
     if should_prep_sink:
@@ -2424,6 +2441,7 @@ def _cascaded_sum_reduction(
             send_to_rank=(1 - atp.sprior_prg_id),
             recv_from_rank=(1 - atp.sprior_prg_id),
             pipe_id=0,
+            dma_engine=dma_engine.gpsimd_dma if cfg.use_gpsimd_sb2sb else dma_engine.dma,
         )
 
     if sink is not None and atp.sync_softmax_per_fa_tile and fa_ctx.fa_tile_idx == 0:
@@ -2647,7 +2665,7 @@ def _compute_pv_matmul_and_store(
     fa_tile_offset = fa_ctx.tile_offset
     is_last_fa_tile = fa_ctx.is_last_fa_tile
 
-    exp_v_sendrecv_gpsimd = cfg.use_gpsimd_sb2sb and atp.sprior_n_prgs > 1 and atp.bs * atp.s_active_qh <= 256
+    exp_v_sendrecv_gpsimd = cfg.use_gpsimd_sb2sb and atp.sprior_n_prgs > 1 and atp.bs * atp.s_active_qh <= 128
     if exp_v_sendrecv_gpsimd:
         # Extended instructions require input/output tensors have multiple of 16 partitions
         padded_exp_v_pdim = pad_partitions_for_ext_inst(cfg.d_head)
@@ -2660,7 +2678,7 @@ def _compute_pv_matmul_and_store(
     )
 
     batch_interleave_degree_safe = _get_safe_batch_interleave_degree(
-        cfg.d_head * fa_tile_n_sprior * sizeinbytes(v_prior.dtype), atp, sbm
+        cfg.d_head * fa_tile_n_sprior * sizeinbytes(v_prior.dtype), atp.batch_interleave_degree, sbm
     )
 
     """
@@ -2741,7 +2759,7 @@ def _compute_pv_matmul_and_store(
                 v_sb_view.get_view(),
                 v_prior_view.get_view(),
                 dge_mode=dge_mode.none,
-                name=f"v_prior_load_strided_mm1_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
+                name=f"{sbm.get_name_prefix()}v_prior_load_strided_mm1_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
             )
         else:
             s_prior_pos = atp.sprior_prg_id * atp.s_prior + fa_tile_offset
@@ -2757,7 +2775,7 @@ def _compute_pv_matmul_and_store(
                 dst=v_sb_view.get_view(),
                 src=v_prior_view.get_view(),
                 dge_mode=dge_mode.none,
-                name=f"v_prior_load_sequential_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
+                name=f"{sbm.get_name_prefix()}v_prior_load_sequential_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
             )
 
         # Load V_active to the last portion if needed (only on last FA tile)
@@ -2878,7 +2896,7 @@ def _compute_pv_matmul_and_store(
                         v_sb_view.get_view(),
                         v_active_view.get_view(),
                         dge_mode=dge_mode.none,
-                        name=f"v_active_strided_load_partial_b{i_b}_bt{btc.batch_tile_idx}",
+                        name=f"{sbm.get_name_prefix()}v_active_strided_load_partial_b{i_b}_bt{btc.batch_tile_idx}",
                     )
 
                 # Load 2. Load the remaining rows
@@ -2903,7 +2921,7 @@ def _compute_pv_matmul_and_store(
                         v_sb_view.get_view(),
                         v_active_view.get_view(),
                         dge_mode=dge_mode.none,
-                        name=f"v_active_strided_load_remaining_b{i_b}_bt{btc.batch_tile_idx}",
+                        name=f"{sbm.get_name_prefix()}v_active_strided_load_remaining_b{i_b}_bt{btc.batch_tile_idx}",
                     )
             else:
                 v_active_view = TensorView(v_active).select(0, btc.global_batch_offset + i_b).squeeze_dim(0)
@@ -2960,12 +2978,13 @@ def _compute_pv_matmul_and_store(
     if atp.use_fa:
         _fa_accumulate_output(atp, cfg, TC, sbm, bufs, fa_ctx)
     else:
-        _gather_and_store_output(out, bufs.exp_v, atp, cfg, sbm, btc)
+        _gather_and_store_output(out, bufs.exp_v, exp_v_sendrecv_gpsimd, atp, cfg, sbm, btc)
 
 
 def _gather_and_store_output(
     out: nl.ndarray,
     res: nl.ndarray,
+    exp_v_sendrecv_gpsimd: bool,
     atp: AttnTileParams,
     cfg: AttnTKGConfig,
     sbm: SbufManager,
@@ -2988,6 +3007,7 @@ def _gather_and_store_output(
             send_to_rank=(1 - atp.sprior_prg_id),
             recv_from_rank=(1 - atp.sprior_prg_id),
             pipe_id=0,
+            dma_engine=dma_engine.gpsimd_dma if exp_v_sendrecv_gpsimd else dma_engine.dma,
         )
         # Only NC0 adds partial results, unless we have out_in_sb then both cores will obtain the result
         if cfg.out_in_sb or (atp.sprior_prg_id == 0):
@@ -3008,14 +3028,14 @@ def _gather_and_store_output(
                 send_to_rank=(1 - atp.bs_prg_id),
                 recv_from_rank=(1 - atp.bs_prg_id),
                 pipe_id=0,
+                dma_engine=dma_engine.gpsimd_dma if exp_v_sendrecv_gpsimd else dma_engine.dma,
             )
     else:
-        # Save exp_v (output) into DRAM, only NC0 needs to do this
+        # Save exp_v (output) into DRAM (each NC writes its own batches in case of batch sharded)
         # This needs to be strided save due to different layout in SBUF and DRAM:
         #   SBUF: [d_head, s_active * n_qhead_per_kvhead]
         #   DRAM: [n_qhead_per_kvhead, d_head, s_active]
         if atp.sprior_prg_id == 0:
-            # assert bs_prg_id == 0, "invalid assumption hit, update the outpat offset"
             res_reshaped = res.reshape((cfg.d_head, atp.bs, cfg.q_head, cfg.s_active))
             batch_pos = btc.global_batch_offset
             out_view = (
@@ -3051,9 +3071,11 @@ def _get_lnc_sharding(cfg: AttnTKGConfig) -> Tuple[int, int, int, int]:
     sprior_n_prgs, sprior_prg_id, bs_n_prgs, bs_prg_id = (1, 0, 1, 0)
     if n_prgs > 1:
         TILE_CONSTANTS = TileConstants.get_tile_constants()
-        if is_batch_sharded(cfg, TILE_CONSTANTS.p_max):
+        if is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, TILE_CONSTANTS.p_max):
             bs_n_prgs, bs_prg_id = (n_prgs, prg_id)
-        elif is_s_prior_sharded(cfg, TILE_CONSTANTS.p_max):  # If s_prior is small, and batch is not divisible by lnc
+        elif is_s_prior_sharded(
+            cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, TILE_CONSTANTS.p_max
+        ):  # If s_prior is small, and batch is not divisible by lnc
             sprior_n_prgs, sprior_prg_id = (n_prgs, prg_id)
 
     return sprior_n_prgs, sprior_prg_id, bs_n_prgs, bs_prg_id
@@ -3456,60 +3478,71 @@ def _load_and_reshape_active_blk_table(
         )
 
         sbm.open_scope()
-        active_blk_pre_reshape = sbm.alloc_stack(
-            (batch_size, orig_blks_this_tile), dtype=active_blk_table.dtype, buffer=nl.sbuf
-        )
-        nisa.dma_copy(
-            dst=active_blk_pre_reshape,
-            src=active_blk_table[
-                nl.ds(batch_start, batch_size),
-                nl.ds(prg_id * blks_per_prg + orig_blk_start, orig_blks_this_tile),
-            ],
-            dge_mode=dge_mode.none,
-            name=f"active_blk_table_load_pre_reshape_fa{fa_ctx.fa_tile_idx}_bt{btc.batch_tile_idx}",
-        )
+        # Process in batch chunks of p_max to keep partition dim <= p_max
+        batch_chunk = min(batch_size, TC.p_max)
+        for batch_offset in range(0, batch_size, batch_chunk):
+            cur_batch_chunk_sz = min(batch_chunk, batch_size - batch_offset)
 
-        # Now update the active blocks table with.  New active blocks table will be:
-        #   old_blk_idx * resize_factor + arange(resize_factor)
-        reshape_arange = sbm.alloc_stack((batch_size, resize_factor), dtype=active_blk_table.dtype, buffer=nl.sbuf)
-        nisa.iota(dst=reshape_arange, pattern=[[1, resize_factor]], offset=0)
-
-        active_blk_reshaped = sbm.alloc_stack(
-            (batch_size, orig_blks_this_tile, resize_factor), dtype=nl.float32, buffer=nl.sbuf
-        )
-        active_blk_pre_reshape_view = TensorView(active_blk_pre_reshape).expand_dim(2).broadcast(2, size=resize_factor)
-        reshape_arange_view = TensorView(reshape_arange).expand_dim(1).broadcast(1, size=orig_blks_this_tile)
-        nisa.scalar_tensor_tensor(
-            dst=active_blk_reshaped,
-            data=active_blk_pre_reshape_view.get_view(),
-            op0=nl.multiply,
-            operand0=float(resize_factor),
-            op1=nl.add,
-            operand1=reshape_arange_view.get_view(),
-        )
-
-        # Reshaped to flat sub-blocks: num_folds_this_tile * P_MAX sub-blocks
-        active_blk_reshaped = active_blk_reshaped.reshape((batch_size, num_folds_this_tile * TC.p_max))
-
-        # Transpose each fold into the output
-        sbm.open_scope()
-        for fold_rel_idx in range(num_folds_this_tile):
-            active_blk_transposed = nl.ndarray(
-                (TC.p_max, batch_size),
-                dtype=active_blk_reshaped.dtype,
-                buffer=nl.psum,
-                address=None if sbm.is_auto_alloc() else (0, (fold_rel_idx % TC.psum_b_max) * TC.psum_f_max_bytes),
+            active_blk_pre_reshape = sbm.alloc_stack(
+                (cur_batch_chunk_sz, orig_blks_this_tile), dtype=active_blk_table.dtype, buffer=nl.sbuf
             )
-            nisa.nc_transpose(
-                active_blk_transposed,
-                active_blk_reshaped[:, nl.ds(fold_rel_idx * TC.p_max, TC.p_max)],
+            active_blk_table_slice = (
+                TensorView(active_blk_table)
+                .slice(0, start=batch_start + batch_offset, end=batch_start + batch_offset + cur_batch_chunk_sz)
+                .slice(1, start=prg_id * blks_per_prg + orig_blk_start, end=prg_id * blks_per_prg + orig_blk_end)
             )
-            nisa.tensor_copy(
-                active_blk_table_sb[:, nl.ds(fold_rel_idx * batch_size, batch_size)],
-                src=active_blk_transposed,
-                engine=nisa.vector_engine,
+            nisa.dma_copy(
+                dst=active_blk_pre_reshape,
+                src=active_blk_table_slice.get_view(),
+                dge_mode=dge_mode.none,
+                name=f"active_blk_table_load_pre_reshape_fa{fa_ctx.fa_tile_idx}_bt{btc.batch_tile_idx}_b{batch_offset}",
             )
-        sbm.close_scope()
+
+            # Now update the active blocks table with.  New active blocks table will be:
+            #   old_blk_idx * resize_factor + arange(resize_factor)
+            reshape_arange = sbm.alloc_stack(
+                (cur_batch_chunk_sz, resize_factor), dtype=active_blk_table.dtype, buffer=nl.sbuf
+            )
+            nisa.iota(dst=reshape_arange, pattern=[[1, resize_factor]], offset=0)
+
+            active_blk_reshaped = sbm.alloc_stack(
+                (cur_batch_chunk_sz, orig_blks_this_tile, resize_factor), dtype=nl.float32, buffer=nl.sbuf
+            )
+            active_blk_pre_reshape_view = (
+                TensorView(active_blk_pre_reshape).expand_dim(2).broadcast(2, size=resize_factor)
+            )
+            reshape_arange_view = TensorView(reshape_arange).expand_dim(1).broadcast(1, size=orig_blks_this_tile)
+            nisa.scalar_tensor_tensor(
+                dst=active_blk_reshaped,
+                data=active_blk_pre_reshape_view.get_view(),
+                op0=nl.multiply,
+                operand0=float(resize_factor),
+                op1=nl.add,
+                operand1=reshape_arange_view.get_view(),
+            )
+
+            # Reshaped to flat sub-blocks: num_folds_this_tile * P_MAX sub-blocks
+            active_blk_reshaped = active_blk_reshaped.reshape((cur_batch_chunk_sz, num_folds_this_tile * TC.p_max))
+
+            # Transpose each fold into the output
+            sbm.open_scope()
+            for fold_rel_idx in range(num_folds_this_tile):
+                active_blk_transposed = nl.ndarray(
+                    (TC.p_max, cur_batch_chunk_sz),
+                    dtype=active_blk_reshaped.dtype,
+                    buffer=nl.psum,
+                    address=None if sbm.is_auto_alloc() else (0, (fold_rel_idx % TC.psum_b_max) * TC.psum_f_max_bytes),
+                )
+                nisa.nc_transpose(
+                    active_blk_transposed,
+                    active_blk_reshaped[:, nl.ds(fold_rel_idx * TC.p_max, TC.p_max)],
+                )
+                nisa.tensor_copy(
+                    active_blk_table_sb[:, nl.ds(fold_rel_idx * batch_size + batch_offset, cur_batch_chunk_sz)],
+                    src=active_blk_transposed,
+                    engine=nisa.vector_engine,
+                )
+            sbm.close_scope()
         sbm.close_scope()
 
     bufs.active_blocks_sb = active_blk_table_sb
@@ -3540,18 +3573,20 @@ def _should_sync_softmax_at_end(atp, fa_ctx) -> bool:
     return atp.sprior_n_prgs > 1 and atp.use_fa and fa_ctx.is_last_fa_tile
 
 
-def _get_safe_batch_interleave_degree(
-    space_needed_per_batch, atp: AttnTileParams, sbm: SbufManager, extra_space: int = 0
-):
+def _get_safe_batch_interleave_degree(space_needed_per_batch: int, max_batch_interleave_degree: int, sbm: SbufManager):
     """
     Compute the batch interleave degree that will not overflow memory given the current memory available.
     space_needed_per_batch is in bytes (interleaved across batches).
-    extra_space is non-interleaved overhead in bytes (e.g., k_loaded accumulation for one batch).
-    """
-    kernel_assert(atp.batch_interleave_degree > 0, "batch_interleave_degree must be greater than 0")
-    space_available = sbm.get_free_space() - extra_space
 
-    result = min(atp.batch_interleave_degree, space_available // space_needed_per_batch)
+    For auto_alloc sbm, return 1 (interleave degree is ignored in this case).
+    """
+    if sbm.is_auto_alloc():
+        return 1
+    # use 1 if auto alloc since otherwise it can fail despite enough space available
+    space_available = sbm.get_free_space()
+    kernel_assert(max_batch_interleave_degree > 0, "batch_interleave_degree must be greater than 0")
+
+    result = min(max_batch_interleave_degree, space_available // space_needed_per_batch)
 
     kernel_assert(
         result > 0,

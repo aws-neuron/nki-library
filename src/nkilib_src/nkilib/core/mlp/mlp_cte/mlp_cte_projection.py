@@ -25,7 +25,6 @@ from ...utils.kernel_helpers import PSUM_BANK_SIZE
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
     MLPParameters,
-    mlpp_has_gate_projection,
     mlpp_has_gate_projection_bias,
     mlpp_has_up_projection_bias,
 )
@@ -699,7 +698,7 @@ def perform_gate_projection_if_necessary(
     Intended Usage:
         Called to perform gate projection in gated MLP architectures
     """
-    if mlpp_has_gate_projection(mlp_params):
+    if not mlp_params.skip_gate_proj:
         # Perform gate projection
         gate_proj_psum_list = []
         for bank in range(constants.required_src_proj_psum_bank_count):
@@ -800,7 +799,7 @@ def perform_up_projection(
         Called to perform up projection in gated MLP architectures
     """
     alloc_stack = sbm.alloc_stack if sbm else nl.ndarray
-    if mlpp_has_gate_projection(mlp_params):
+    if not mlp_params.skip_gate_proj:
         # Create space in PSUM for up projection results
         up_proj_psum_list = []
         for bank in range(constants.required_src_proj_psum_bank_count):
@@ -925,6 +924,7 @@ def perform_up_projection(
                 proj_results_sbuf,
                 None,
                 None,
+                None,
                 proj_results_sbuf,
                 data_is_psum=False,
             )
@@ -935,8 +935,9 @@ def perform_up_projection(
                 constants,
                 indices.bxs_tile_idx,
                 up_proj_psum_list,
-                up_scales_sbuf,
-                hidden_scales_sbuf,
+                up_weight_row_scales_sbuf,
+                up_static_scales_sbuf,
+                hidden_scales_sbuf_list,
                 proj_results_sbuf,
                 data_is_psum=True,
             )

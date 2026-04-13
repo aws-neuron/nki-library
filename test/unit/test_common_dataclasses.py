@@ -42,3 +42,98 @@ class TestPlatformsGetCompileTarget:
     )
     def test_get_compile_target(self, platform, expected):
         assert platform.get_compile_target() == expected
+
+
+from test.utils.common_dataclasses import (
+    ModelTestType,
+    _iter_model_configs,
+    is_model_test_type,
+    prepare_model_parametrize,
+)
+
+
+class TestModelTestType:
+    def test_test_id_prefix(self):
+        assert ModelTestType.BROAD.test_id_prefix == "MODEL_WIP_BROAD"
+        assert ModelTestType.GENERALITY.test_id_prefix == "MODEL_WIP_GENERALITY"
+        assert ModelTestType.OPTIMAL.test_id_prefix == "MODEL_WIP_OPTIMAL"
+
+
+class TestIsModelTestType:
+    @pytest.mark.parametrize(
+        "test_type,expected",
+        [
+            ("MODEL_WIP", True),
+            ("MODEL_WIP_BROAD", True),
+            ("MODEL_WIP_GENERALITY", True),
+            ("MODEL_WIP_OPTIMAL", True),
+            ("manual", False),
+            ("random", False),
+        ],
+    )
+    def test_is_model_test_type(self, test_type, expected):
+        assert is_model_test_type(test_type) == expected
+
+
+class TestIterModelConfigs:
+    def test_dict_format(self):
+        configs = {
+            ModelTestType.BROAD: [[1, 2], [3, 4]],
+            ModelTestType.OPTIMAL: [[5, 6]],
+        }
+        result = list(_iter_model_configs(configs))
+        assert result == [
+            (ModelTestType.BROAD, [1, 2]),
+            (ModelTestType.BROAD, [3, 4]),
+            (ModelTestType.OPTIMAL, [5, 6]),
+        ]
+
+    def test_flat_list_format(self):
+        configs = [[1, 2], [3, 4]]
+        result = list(_iter_model_configs(configs))
+        assert result == [
+            (ModelTestType.BROAD, [1, 2]),
+            (ModelTestType.BROAD, [3, 4]),
+        ]
+
+
+class TestPrepareModelParametrize:
+    def test_dict_format(self):
+        configs = {
+            ModelTestType.BROAD: [[1, 2]],
+            ModelTestType.GENERALITY: [[3, 4]],
+        }
+        params, ids = prepare_model_parametrize(configs)
+        assert params == [[1, 2], [3, 4]]
+        assert ids == ["MODEL_WIP_BROAD_1-2", "MODEL_WIP_GENERALITY_3-4"]
+
+    def test_flat_list_format(self):
+        configs = [[1, 2], [3, 4]]
+        params, ids = prepare_model_parametrize(configs)
+        assert params == [[1, 2], [3, 4]]
+        assert ids == ["MODEL_WIP_BROAD_1-2", "MODEL_WIP_BROAD_3-4"]
+
+    def test_custom_id_formatter(self):
+        configs = {ModelTestType.OPTIMAL: [[10, 20]]}
+        params, ids = prepare_model_parametrize(configs, id_formatter=lambda p: f"x{p[0]}")
+        assert ids == ["MODEL_WIP_OPTIMAL_x10"]
+
+    def test_empty_dict(self):
+        params, ids = prepare_model_parametrize({})
+        assert params == []
+        assert ids == []
+
+
+from test.utils.common_dataclasses import unpack_model_config
+
+
+class TestUnpackModelConfig:
+    def test_tuple_entry(self):
+        mt, params = unpack_model_config((ModelTestType.GENERALITY, [1, 2, 3]))
+        assert mt == ModelTestType.GENERALITY
+        assert params == [1, 2, 3]
+
+    def test_raw_list_defaults_to_broad(self):
+        mt, params = unpack_model_config([1, 2, 3])
+        assert mt == ModelTestType.BROAD
+        assert params == [1, 2, 3]

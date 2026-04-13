@@ -492,7 +492,7 @@ class TensorView(nl.NKIObject):
         for i in range(start_dim, end_dim):
             kernel_assert(
                 self.strides[i] == self.shape[i + 1] * self.strides[i + 1],
-                f"Dimensions {i} and {i+1} are not contiguous in memory",
+                f"Dimensions {i} and {i + 1} are not contiguous in memory",
             )
 
         # Calculate total size of flattened dimension
