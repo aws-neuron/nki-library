@@ -28,6 +28,10 @@ import numpy as np
 import pytest
 import torch
 
+from test.utils.pseudo_rng import NKITestsPseudoRNG
+
+_rng = NKITestsPseudoRNG(seed=42)
+
 from nkilib_src.nkilib.core.moe.moe_tkg.moe_tkg_torch import moe_tkg_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEAllToAllVStrategy
 
@@ -57,7 +61,7 @@ def _seed():
 def _bf16(shape):
     # Use float16 (not bfloat16) — the installed moe_tkg_torch_ref calls
     # hidden_input.numpy().dtype which fails for bfloat16 on CPU.
-    return torch.randn(shape, dtype=torch.float16)
+    return _rng.randn(*shape, dtype=torch.float16)
 
 
 def _make_inline_weights():
@@ -97,19 +101,19 @@ def _make_mx_weights():
 
 
 def _make_affinities(t=T, e=E):
-    return torch.softmax(torch.randn(t, e), dim=-1).float()
+    return torch.softmax(_rng.randn(t, e), dim=-1).float()
 
 
 def _make_expert_index(t=T, k=K, e=E):
-    return torch.stack([torch.randperm(e)[:k] for _ in range(t)]).to(torch.int64)
+    return torch.stack([_rng.randperm(e)[:k] for _ in range(t)]).to(torch.int64)
 
 
 def _make_mx_bias():
     """MX-layout bias: gate_up [E, I_p, 2, n_I512, 4], down [E, H]."""
     n_I512 = math.ceil(I / (_PMAX * _Q_WIDTH))
     I_p = math.ceil(I / 4 / 8) * 8 if I < 512 else _PMAX
-    gu_bias = torch.randn(E, I_p, 2, n_I512, _Q_WIDTH, dtype=torch.float32)
-    dw_bias = torch.randn(E, H, dtype=torch.float32)
+    gu_bias = _rng.randn(E, I_p, 2, n_I512, _Q_WIDTH)
+    dw_bias = _rng.randn(E, H)
     return gu_bias, dw_bias
 
 
@@ -908,11 +912,11 @@ class TestAllToAllV:
         H_concat = H + H // 4 + 2 * E + 4
 
         # Create random FP8 packed tensor
-        raw = torch.randint(0, 255, (T, H_concat), dtype=torch.uint8)
+        raw = _rng.randint(0, 255, (T, H_concat), dtype=torch.uint8)
 
         # Embed affinities as bfloat16 in the correct slot
         affinities_offset = H + H // 4
-        affinities_bf16 = torch.softmax(torch.randn(T, E), dim=-1).to(torch.bfloat16)
+        affinities_bf16 = torch.softmax(_rng.randn(T, E), dim=-1).to(torch.bfloat16)
         raw[:, affinities_offset : affinities_offset + 2 * E] = affinities_bf16.view(torch.uint8)
 
         # Embed token indices as int32 in the last 4 bytes

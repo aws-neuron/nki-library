@@ -20,6 +20,10 @@ import nki.language as nl
 import numpy as np
 import torch
 
+from test.utils.pseudo_rng import NKITestsPseudoRNG
+
+_rng = NKITestsPseudoRNG(seed=42)
+
 from nkilib_src.nkilib.core.router_topk.router_topk import (
     XHBMLayout_T_H__1,
     router_topk,
@@ -41,12 +45,10 @@ def router_topk_tensor_gen(name: str, shape, dtype):
         numpy.ndarray: Generated tensor with uniform random values in [-0.1, 0.1]
 
     Notes:
-        - Uses thread-safe Generator for reproducibility
         - Range chosen because x.T @ w may go into sigmoid activation
     """
-    generator = torch.Generator()
-    generator.manual_seed(0)
-    tensor = torch.empty(shape, dtype=torch.float32).uniform_(-0.1, 0.1, generator=generator)
+    tensor = torch.empty(shape, dtype=torch.float32)
+    _rng.tensor_uniform_(tensor, -0.1, 0.1)
     return dt.static_cast(tensor.numpy(), dtype)
 
 

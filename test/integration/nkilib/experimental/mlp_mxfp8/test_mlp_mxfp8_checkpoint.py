@@ -47,8 +47,11 @@ from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_uti
     generate_golden_packed_scales,
 )
 from test.utils import common_dataclasses, coverage_parametrized_tests, test_orchestrator
+from test.utils.pseudo_rng import NKITestsPseudoRNG
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.unit_test_framework import UnitTestFramework
+
+_rng = NKITestsPseudoRNG(seed=42)
 
 # ============================================================================
 # Correctness thresholds — for MXFP8 kernel vs FP32 golden comparison.
@@ -436,7 +439,6 @@ def generate_inputs(S: int, H: int, I: int, seed: int = DEFAULT_SEED) -> tuple:
     """
     import torch
 
-    torch.manual_seed(seed)
     try:
         import ml_dtypes
 
@@ -444,9 +446,9 @@ def generate_inputs(S: int, H: int, I: int, seed: int = DEFAULT_SEED) -> tuple:
     except ImportError:
         bf16 = np.float16
 
-    hidden = torch.nn.init.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
-    gate_up = torch.nn.init.kaiming_normal_(torch.empty(2 * I, H)).numpy().astype(bf16)
-    down = torch.nn.init.kaiming_normal_(torch.empty(H, I)).numpy().astype(bf16)
+    hidden = _rng.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
+    gate_up = _rng.kaiming_normal_(torch.empty(2 * I, H)).numpy().astype(bf16)
+    down = _rng.kaiming_normal_(torch.empty(H, I)).numpy().astype(bf16)
     return hidden, gate_up, down
 
 
@@ -473,8 +475,7 @@ def compute_bwd_golden(
     import torch
 
     bf16 = hidden_np.dtype
-    torch.manual_seed(BWD_GOLDEN_SEED)
-    output_grad = torch.nn.init.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
+    output_grad = _rng.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
     og32 = output_grad.astype(np.float32)
     W_gate = gate_up_np[:I, :].astype(np.float32)
     W_up = gate_up_np[I:, :].astype(np.float32)
