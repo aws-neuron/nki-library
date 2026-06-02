@@ -52,6 +52,7 @@ from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.unit_test_framework import UnitTestFramework
 
 _rng = NKITestsPseudoRNG(seed=42)
+_bwd_rng = NKITestsPseudoRNG(seed=123)
 
 # ============================================================================
 # Correctness thresholds — for MXFP8 kernel vs FP32 golden comparison.
@@ -475,7 +476,7 @@ def compute_bwd_golden(
     import torch
 
     bf16 = hidden_np.dtype
-    output_grad = _rng.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
+    output_grad = _bwd_rng.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
     og32 = output_grad.astype(np.float32)
     W_gate = gate_up_np[:I, :].astype(np.float32)
     W_up = gate_up_np[I:, :].astype(np.float32)
