@@ -11,9 +11,8 @@ requires-python = ">=3.12"
 keywords = ["NKI", "Neuron", "Kernels", "High-Performance", "Hardware", "AWS", "Amazon"]
 license = "Apache-2.0"
 dependencies = [
-    "neuronx-cc>=0.0.0a0",
-    "neuronx-cc-stubs>=0.0.0a0",
-    "nki>=0.0.0a0",
+    "neuronx-cc>=2.26.0",
+    "nki>=0.5.0",
 ]
 
 

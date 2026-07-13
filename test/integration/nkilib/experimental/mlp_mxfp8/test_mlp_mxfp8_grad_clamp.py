@@ -25,12 +25,6 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 from neuronxcc.nki._private.private_api import float8_e4m3fn_x4
-from nkilib_testing.common_dataclasses import (
-    CompilerArgs,
-    CustomValidator,
-    CustomValidatorWithOutputTensorData,
-    Platforms,
-)
 from typing_extensions import override
 
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
@@ -50,6 +44,12 @@ from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils i
 )
 from test.integration.nkilib.experimental.mlp_mxfp8.test_mlp_mxfp8_bwd_checkpoint import (
     build_bwd_kernel_input,
+)
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    CustomValidator,
+    CustomValidatorWithOutputTensorData,
+    Platforms,
 )
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.rng import NKITestsRNG

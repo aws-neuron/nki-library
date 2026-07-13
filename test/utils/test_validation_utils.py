@@ -256,17 +256,20 @@ class IntegrationFileCollector:
         Get the repository root.
 
         Searches upward from this file's location for a directory containing
-        both ``setup.cfg`` and a ``test/`` subdirectory.  Falls back to
-        searching from the current working directory when the module is loaded
-        from an installed package (site-packages) rather than the source tree.
+        a project marker file (``pyproject.toml`` or ``setup.cfg``) and a
+        ``test/`` subdirectory.  Falls back to searching from the current
+        working directory when the module is loaded from an installed package
+        (site-packages) rather than the source tree.
         """
+        marker_files = ("pyproject.toml", "setup.cfg", "setup.py")
         for start in (Path(__file__).resolve().parent, Path.cwd()):
             candidate = start
             while candidate != candidate.parent:
-                if (candidate / "setup.cfg").is_file() and (candidate / "test").is_dir():
+                has_marker = any((candidate / m).is_file() for m in marker_files)
+                if has_marker and (candidate / "test").is_dir():
                     return candidate
                 candidate = candidate.parent
-        raise RuntimeError("Could not find repository root (looked for setup.cfg + test/)")
+        raise RuntimeError("Could not find repository root (looked for pyproject.toml/setup.cfg/setup.py + test/)")
 
     @staticmethod
     def get_integration_core_dir() -> Path:
