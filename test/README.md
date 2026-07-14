@@ -13,12 +13,14 @@ source .venv/bin/activate
 # 3. Install nki-library + all dependencies
 make install
 
+# 4. run below to install latest supported versions
+make install_neuron
+# OR
 # 4. Download the Neuron compiler, Neuron Kernel Interface (NKI) wheels into `wheelhouse` directory
-
-# 5. Install the compiler and NKI wheels
+# 4.a Install the compiler and NKI wheels
 make install_wheelhouse
 
-# 6. Now you can run regular make targets
+# 5. Now you can run regular make targets
 make test
 ```
 
