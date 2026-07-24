@@ -36,12 +36,20 @@ class Activation(nl.NKIObject):
 
     Supports operations like copy (cast), silu, exp, sin, rsqrt, etc.
 
-    Scale can be:
-    - None: no scaling (defaults to 1.0)
-    - float: scalar scale applied to all elements
-    - nl.ndarray: raw tensor, used directly with nisa.activation
-    - TensorView: tensor view, get_view() called for nisa.activation
-    - TileStream: must be single tile, broadcasts (P, 1) -> (P, F)
+    Scale and bias are handled symmetrically; each can be:
+    - None: no term (scale defaults to 1.0; bias omitted)
+    - float: a scalar applied to all elements
+    - nl.ndarray / TensorView: a per-partition (P, 1) vector; normalized internally
+      into a TileStream so it resolves to the 2D (P, 1) view nisa.activation needs
+    - TileStream: a (P, 1) per-partition vector
+
+    A (P, 1) vector scale/bias is broadcast (P, 1) -> (P, F) by nisa.activation itself
+    (each partition's single value is applied across that partition's whole row). Vector
+    scale/bias tiles along the partition loop in lockstep with dst/src, so P > pmax
+    (multi-tile) is supported.
+
+    One hardware asymmetry (enforced by nisa.activation): a vector `scale` must be float32,
+    whereas a vector `bias` may be any supported dtype.
     """
 
     def __init__(
@@ -50,64 +58,77 @@ class Activation(nl.NKIObject):
         src: TileStream,
         op=nl.copy,
         scale: Optional[Union[float, nl.ndarray, TensorView, TileStream]] = None,
-        bias: Optional[TileStream] = None,
+        bias: Optional[Union[float, nl.ndarray, TensorView, TileStream]] = None,
     ) -> None:
         self._name = f"Activation(dst={dst.get_name()}, src={src.get_name()}, op={op})"
         self._dst = dst
         self._src = src
         self._op = op
-        self._scale = scale
-        self._bias = bias
         self._num_tiles = dst.get_num_tiles()
 
-        if isinstance(scale, TileStream):
-            kernel_assert(
-                scale.get_num_tiles() == 1,
-                f"Activation scale TileStream must be single tile, got {scale.get_num_tiles()}",
-            )
+        # scale and bias are handled symmetrically: each may be None, a scalar, a (P, 1)
+        # vector tensor/TensorView, or a TileStream. Normalize + validate both the same way.
+        self._scale = self._normalize_term("scale", scale)
+        self._bias = self._normalize_term("bias", bias)
 
-    def _get_scale_value(self):
-        """Resolve scale to a value usable by nisa.activation."""
-        if self._scale is None:
-            return 1.0
-        elif isinstance(self._scale, (int, float)):
-            return self._scale
-        elif isinstance(self._scale, TileStream):
-            self._scale.reset_cur_tile()
-            return self._scale.get_tile().get_view()
-        elif isinstance(self._scale, TensorView):
-            return self._scale.get_view()
-        else:
-            # Assume raw nl.ndarray
-            return self._scale
+    def _normalize_term(self, name, term):
+        """Normalize a scale/bias term to None / scalar / single-per-tile-shape TileStream,
+        and validate a vector term is a (P, 1) per-partition vector matching dst.
+
+        A raw tensor / TensorView from alloc_logical is a 3D container (pdim, n_p_tiles, F);
+        nisa.activation wants a 2D per-tile (P, 1) view, so wrap it into a TileStream (whose
+        get_tile() resolves that view). A vector term must be (P, 1) with partition size and
+        tile count matching dst so it advances in lockstep across the tile loop -- validate
+        here rather than let a mis-shaped tensor produce a cryptic downstream nisa error."""
+        if term is None or isinstance(term, (int, float)):
+            return term
+        if not isinstance(term, TileStream):
+            term = tile_stream.tile(term, get_logical_shape(term), iter_order=RowMajor())
+
+        dst_p = self._dst.get_tile_shape()[0]
+        t_shape = term.get_tile_shape()
+        kernel_assert(
+            len(t_shape) == 2 and t_shape[0] == dst_p and t_shape[1] == 1,
+            f"Activation '{self._name}': {name} must be a (P, 1) vector with P == dst "
+            f"partition {dst_p}, got tile shape {t_shape}",
+        )
+        kernel_assert(
+            term.get_num_tiles() == self._num_tiles,
+            f"Activation '{self._name}': {name} tile count {term.get_num_tiles()} must "
+            f"match dst tile count {self._num_tiles}",
+        )
+        return term
+
+    def _term_value(self, term, default):
+        """Resolve a normalized term for the current tile: `default` (None -> scale 1.0 /
+        no bias) for None, the scalar itself, else the current tile's (P, 1) view. Called
+        inside the loop so a (P, 1) vector advances with the partition loop."""
+        if term is None:
+            return default
+        if isinstance(term, (int, float)):
+            return term
+        return term.get_tile().get_view()  # TileStream
 
     def execute(self) -> None:
-        self._dst.reset_cur_tile()
-        self._src.reset_cur_tile()
-        if self._bias is not None:
-            self._bias.reset_cur_tile()
-
-        scale_val = self._get_scale_value()
+        for stream in (self._dst, self._src, self._scale, self._bias):
+            if isinstance(stream, TileStream):
+                stream.reset_cur_tile()
 
         for _ in range(self._num_tiles):
             dst_tile = self._dst.get_tile()
             src_tile = self._src.get_tile()
-            bias_tile = self._bias.get_tile() if self._bias is not None else None
 
             nisa.activation(
                 dst=dst_tile.get_view(),
                 op=self._op,
                 data=src_tile.get_view(),
-                scale=scale_val,
-                bias=bias_tile.get_view() if bias_tile is not None else None,
+                scale=self._term_value(self._scale, 1.0),
+                bias=self._term_value(self._bias, None),
             )
 
-        self._dst.reset_cur_tile()
-        self._src.reset_cur_tile()
-        if self._bias is not None:
-            self._bias.reset_cur_tile()
-        if isinstance(self._scale, TileStream):
-            self._scale.reset_cur_tile()
+        for stream in (self._dst, self._src, self._scale, self._bias):
+            if isinstance(stream, TileStream):
+                stream.reset_cur_tile()
 
 
 def activation(
@@ -115,17 +136,17 @@ def activation(
     src: Union[TensorView, nl.ndarray] = None,
     op=nl.copy,
     scale: Optional[Union[float, TensorView, nl.ndarray]] = None,
-    bias: Optional[Union[TensorView, nl.ndarray]] = None,
+    bias: Optional[Union[float, TensorView, nl.ndarray]] = None,
 ) -> None:
     """Compact activation: dst = op(src * scale + bias). Whole tensor, no tiling.
 
-    If src is None, operates in-place (src = dst).
+    scale and bias may each be a scalar, a (P, 1) vector tensor, or None. If src is None,
+    operates in-place (src = dst).
     """
     if src is None:
         src = dst
     logical_shape = get_logical_shape(dst)
     dst_ts = tile_stream.tile(dst, logical_shape, iter_order=RowMajor())
     src_ts = tile_stream.tile(src, logical_shape, iter_order=RowMajor())
-    # Scale as raw tensor/float, bias as TileStream if provided
-    bias_ts = tile_stream.tile(bias, get_logical_shape(bias), iter_order=RowMajor()) if bias is not None else None
-    Activation(dst=dst_ts, src=src_ts, op=op, scale=scale, bias=bias_ts).execute()
+    # scale and bias (scalar or (P, 1) tensor) are normalized by Activation.
+    Activation(dst=dst_ts, src=src_ts, op=op, scale=scale, bias=bias).execute()
