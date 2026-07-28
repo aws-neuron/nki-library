@@ -32,7 +32,7 @@ _D_TILE_FACTOR = 4
 
 
 @nki.jit
-def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray) -> nl.ndarray:
+def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray, unique_indices: bool = True) -> nl.ndarray:
     """
     Scatter-add from src into input based on indices using gather-accumulate-scatter pattern.
 
@@ -51,6 +51,10 @@ def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray)
         dim (int): Dimension along which to scatter (must be 0)
         index (nl.ndarray): [K], 1D tensor of row indices into input
         src (nl.ndarray): [K, D], Source values to scatter-add
+        unique_indices (bool): If True (default), assume destination indices are unique
+            within each 128-row tile and use the fast tile-wide gather/scatter path.
+            If False, process one index per tile so repeated indices accumulate
+            correctly (slower; needed for embedding-gradient-style scatters).
 
     Returns:
         input (nl.ndarray): [N, D], The input tensor with scattered values added
@@ -59,7 +63,8 @@ def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray)
         - Input and src tensors must be 2D
         - Index tensor must be 1D
         - dim must be 0
-        - Indices within a tile of 128 rows should be unique for correctness
+        - With unique_indices=True (default) indices within a 128-row tile must be unique;
+          duplicates are silently dropped. Pass unique_indices=False when they may repeat.
 
     Pseudocode:
         for k_tile in tiles(K):
@@ -76,7 +81,10 @@ def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray)
 
     _validate_scatter_add_inputs(input, dim, index, src, num_shards)
 
-    k_tile_size = nl.tile_size.pmax
+    # When indices may repeat within a 128-row tile, a tile-wide gather/scatter is
+    # last-write-wins and silently drops duplicate contributions. k_tile_size=1 makes
+    # each index its own sequential tile, so nl.sequential_range accumulates dups correctly.
+    k_tile_size = nl.tile_size.pmax if unique_indices else 1
     d_tile_size = nl.tile_size.psum_fmax * _D_TILE_FACTOR
     num_k_tiles = div_ceil(k_size, k_tile_size)
 

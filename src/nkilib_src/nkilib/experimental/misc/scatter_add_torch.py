@@ -22,6 +22,7 @@ def scatter_add_torch_ref(
     dim: int,
     index: torch.Tensor,
     src: torch.Tensor,
+    unique_indices: bool = True,
 ) -> dict[str, torch.Tensor]:
     """
     PyTorch reference implementation of the scatter_add kernel.
