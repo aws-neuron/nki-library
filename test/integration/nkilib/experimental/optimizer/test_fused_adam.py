@@ -17,12 +17,12 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.optimizer.fused_adam import adam_kernel, adamw_kernel
 from nkilib_src.nkilib.experimental.optimizer.fused_adam_torch import (
-    adam_kernel_torch_ref_matched,
-    adamw_kernel_torch_ref_matched,
+    adam_torch_ref,
+    adamw_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
@@ -36,8 +36,8 @@ BETA2 = 0.999
 EPS = 1e-8
 WEIGHT_DECAY = 0.01
 
-_adamw_torch_ref = torch_ref_wrapper(adamw_kernel_torch_ref_matched)
-_adam_torch_ref = torch_ref_wrapper(adam_kernel_torch_ref_matched)
+_adamw_torch_ref = torch_ref_wrapper(adamw_torch_ref)
+_adam_torch_ref = torch_ref_wrapper(adam_torch_ref)
 
 
 def _generate_inputs(numel, dtype, decoupled_wd, amsgrad=True):

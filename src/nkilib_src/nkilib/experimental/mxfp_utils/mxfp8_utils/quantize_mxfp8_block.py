@@ -137,7 +137,7 @@ def quantize_mxfp8_block(
 
     if quantized_scales == None:
         quantized_scales = sbm.alloc_stack(
-            shape=(TILE_K, NUM_TILES_K, F // INTERLEAVE_FACTOR), dtype=nl.uint8, buffer=nl.sbuf
+            shape=(TILE_K, NUM_TILES_K, F // INTERLEAVE_FACTOR), dtype=nl.float8_e8m0fnu, buffer=nl.sbuf
         )
 
     NUM_TILES_F = F // TILE_F

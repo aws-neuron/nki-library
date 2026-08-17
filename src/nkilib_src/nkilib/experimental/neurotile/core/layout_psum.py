@@ -13,7 +13,7 @@
 # limitations under the License.
 import nki.language as nl
 
-from ._helpers import contiguous_ap_pattern, contiguous_strides, product, remove_at
+from ._helpers import contiguous_strides, physical_row_width, product, reachable_dim_extent, remove_at
 from .axis import IndirectKind, IndirectOffset
 
 
@@ -25,9 +25,19 @@ class PSUMLayout(nl.NKIObject):
     to the flat index (``offset = sum(grid_idx[d] * tile_strides[d])``).
     Mirrors :class:`SBUFLayout`'s public surface.
 
+    Two independent address axes:
+      - ``offset`` selects which tile (``tile_arrays[offset]``); tile / bank
+        navigation (``psums[i, j]``) moves it.
+      - ``free_offset`` addresses within the active tile's partition row; an
+        in-tile free-dim ``.slice()`` (after ``reshape_dim``) advances it.
+    Keeping them separate is what lets a strided W-padded sub-region be
+    expressed without disturbing tile selection.
+
     Attributes:
         tile_arrays (tuple): One ``nl.ndarray`` per grid tile.
         offset (int): Flat tile index of the active tile.
+        free_offset (int): Element offset along the free axis within the
+            active tile (0 unless an in-tile free-dim slice advanced it).
         alloc_tile_size (tuple[int, int]): Per-tile (P, F) span.
         bank_axis (int | None): Which Grid dim spreads tiles across PSUM
             banks. ``None`` means "every tile on its own bank" or
@@ -57,6 +67,7 @@ class PSUMLayout(nl.NKIObject):
         indirect=None,
         root_source=None,
         transform_strides=None,
+        free_offset=0,
     ):
         self.tile_arrays = tuple(tile_arrays)
         self.alloc_tile_size = tuple(alloc_tile_size)
@@ -68,6 +79,7 @@ class PSUMLayout(nl.NKIObject):
         self.ap_strides = transform_strides
 
         self.offset = offset
+        self.free_offset = free_offset
         if tile_strides is not None:
             self.tile_strides = tuple(tile_strides)
         else:
@@ -191,6 +203,32 @@ class PSUMLayout(nl.NKIObject):
             indirect=self.indirect,
             root_source=self.root_source,
             transform_strides=new_strides,
+            free_offset=self.free_offset,
+        )
+
+    def narrow_free(self, dim, start, element_shape):
+        """In-tile free-dim slice: advance the free offset by ``start`` along
+        ``dim`` (using the element strides), leaving tile selection untouched.
+
+        ``dim`` is a free axis (>= 1); ``element_shape`` is the pre-slice
+        element shape (so the stride for ``dim`` is read from the transform /
+        contiguous strides). Returns a new PSUMLayout with the advanced
+        ``free_offset``; the caller narrows the Grid counts.
+        """
+        strides = self.ap_strides if self.ap_strides is not None else contiguous_strides(tuple(element_shape))
+        return PSUMLayout(
+            tile_arrays=self.tile_arrays,
+            offset=self.offset,
+            alloc_tile_size=self.alloc_tile_size,
+            bank_axis=self.bank_axis,
+            slots_per_bank=self.slots_per_bank,
+            tile_strides=self.tile_strides,
+            dtype=self.dtype,
+            buffer_type=self.buffer_type,
+            indirect=self.indirect,
+            root_source=self.root_source,
+            transform_strides=self.ap_strides,
+            free_offset=self.free_offset + start * strides[dim],
         )
 
     # ================================================================
@@ -216,6 +254,7 @@ class PSUMLayout(nl.NKIObject):
             indirect=self.indirect,
             root_source=self.root_source,
             transform_strides=self.ap_strides,
+            free_offset=self.free_offset,
         )
 
     def set_indirect(self, kind, value, dim):
@@ -231,6 +270,7 @@ class PSUMLayout(nl.NKIObject):
             indirect=IndirectOffset(kind=kind, value=value, dim=dim),
             root_source=self.root_source,
             transform_strides=self.ap_strides,
+            free_offset=self.free_offset,
         )
 
     def drop_dim(self, dim):
@@ -255,6 +295,7 @@ class PSUMLayout(nl.NKIObject):
             indirect=self.indirect,
             root_source=self.root_source,
             transform_strides=self.ap_strides,
+            free_offset=self.free_offset,
         )
 
     def drop_dims(self, dims):
@@ -280,6 +321,14 @@ class PSUMLayout(nl.NKIObject):
         dim_count = max(1, (element_shape[dim] + ts - 1) // ts) if element_shape[dim] > 0 else 1
         return ((self.offset // stride) % dim_count) * ts
 
+    def dim_addressable(self, dim, grid):
+        """Source elements reachable on `dim` before walking off the source.
+
+        See :func:`reachable_dim_extent` for the shared offset-clamp rule;
+        this is the PSUM-layout entry point into it.
+        """
+        return reachable_dim_extent(grid, self, dim)
+
     def is_remainder(self, grid):
         if self.indirect is not None:
             return True
@@ -291,15 +340,29 @@ class PSUMLayout(nl.NKIObject):
     # AP construction
     # ================================================================
 
+    def _partition_row_stride(self):
+        """Physical free width of the active tile (the AP's level-0 stride).
+
+        Read from the underlying ndarray's storage shape, which survives
+        ``[:, slice]`` so a sub-width view of a wider bank reports the bank's
+        true row width.
+        """
+        return physical_row_width(self.tile_data())
+
     def ap(self, grid):
+        """AP over the active tile; counts clamped to ``grid.remaining`` for a
+        partial trailing tile. Level-0 stride is the physical row width (so a
+        sub-width slice of a wider bank threads a valid partition stride, as the
+        compiler requires); inner levels use the transform or contiguous strides.
+        ``free_offset`` is the in-tile column offset from a free-dim slice (the
+        AP starts there, e.g. a W-padded strided sub-region)."""
         data = self.tile_data()
-        if self.ap_strides is not None and grid is not None:
-            remaining = grid.remaining
-            pattern = []
-            for d in range(len(remaining)):
-                pattern.append([self.ap_strides[d], remaining[d]])
-            return data.ap(pattern=pattern, offset=0)
-        return data.ap(pattern=contiguous_ap_pattern(tuple(data.shape)), offset=0)
+        counts = grid.remaining if grid is not None else tuple(data.shape)
+        inner_strides = self.ap_strides if self.ap_strides is not None else contiguous_strides(tuple(counts))
+        pattern = [[self._partition_row_stride(), counts[0]]]
+        for d in range(1, len(counts)):
+            pattern.append([inner_strides[d], counts[d]])
+        return data.ap(pattern=pattern, offset=self.free_offset)
 
     # ================================================================
     # Repr

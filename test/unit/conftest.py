@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from test.utils.relevant_test_finder import RelevantTestFinder
+from test.utils.relevant_test_selection.finder import RelevantTestFinder
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 

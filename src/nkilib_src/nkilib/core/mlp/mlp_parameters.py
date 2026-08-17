@@ -34,7 +34,6 @@ from ..utils.common_types import (
 )
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import is_rms_normalization, normalization_uses_weights, resolve_dtype_to_nki
-from ..utils.tensor_view import TensorView
 
 SUPPORTED_DTYPES = [
     nl.bfloat16,
@@ -59,7 +58,7 @@ SUPPORTED_QUANT_TYPES = [
 ]
 
 
-def get_T_from_hidden_input(hidden_input: nl.ndarray, hidden_input_scale: Optional[nl.ndarray] = None) -> int:
+def get_T_from_hidden_input(hidden_input: nl.NkiTensor, hidden_input_scale: Optional[nl.NkiTensor] = None) -> int:
     """
     Extract T (number of tokens) from hidden_input tensor based on its layout.
 
@@ -105,24 +104,24 @@ _Q_HEIGHT = 8  # Quantization height (elements per quantization group on partiti
 @dataclass
 class MLPQuantizationParameters(NKIObject):
     quantization_type: QuantizationType
-    gate_w_scale: Optional[nl.ndarray]
-    up_w_scale: Optional[nl.ndarray]
-    down_w_scale: Optional[nl.ndarray]
-    gate_up_in_scale: Optional[nl.ndarray]
-    down_in_scale: Optional[nl.ndarray]
+    gate_w_scale: Optional[nl.NkiTensor]
+    up_w_scale: Optional[nl.NkiTensor]
+    down_w_scale: Optional[nl.NkiTensor]
+    gate_up_in_scale: Optional[nl.NkiTensor]
+    down_in_scale: Optional[nl.NkiTensor]
     clipping_bound: float
-    mx_dummy_scale_hbm: Optional[nl.ndarray]
+    mx_dummy_scale_hbm: Optional[nl.NkiTensor]
 
     def __init__(
         self,
         quantization_type: QuantizationType,
-        gate_w_scale: Optional[nl.ndarray],
-        up_w_scale: Optional[nl.ndarray],
-        down_w_scale: Optional[nl.ndarray],
-        gate_up_in_scale: Optional[nl.ndarray],
-        down_in_scale: Optional[nl.ndarray],
+        gate_w_scale: Optional[nl.NkiTensor],
+        up_w_scale: Optional[nl.NkiTensor],
+        down_w_scale: Optional[nl.NkiTensor],
+        gate_up_in_scale: Optional[nl.NkiTensor],
+        down_in_scale: Optional[nl.NkiTensor],
         clipping_bound: float,
-        mx_dummy_scale_hbm: Optional[nl.ndarray] = None,
+        mx_dummy_scale_hbm: Optional[nl.NkiTensor] = None,
     ):
         self.quantization_type = quantization_type
         self.gate_w_scale = gate_w_scale
@@ -196,10 +195,9 @@ class MLPQuantizationParameters(NKIObject):
             )
 
     def _validate_shapes(self, params):
-        # Extract H and I from weight tensor shapes.
-        # shape[-1] works for both regular [H, I] and MX-packed [_pmax, n_H512_tile, I] layouts.
-        H = params.down_proj_weights_tensor.shape[-1]
-        I = params.up_proj_weights_tensor.shape[-1]
+        # Use already-derived dimensions (handles 4D/6D MX layouts correctly).
+        H = params.hidden_size
+        I = params.intermediate_size
         if self.quantization_type == QuantizationType.STATIC or self.quantization_type == QuantizationType.STATIC_MX:
             kernel_assert(
                 self.gate_up_in_scale != None and self.gate_up_in_scale.shape == (128, 1),
@@ -241,20 +239,35 @@ class MLPQuantizationParameters(NKIObject):
             #   gate/up: [_PMAX, n_I512 * _Q_WIDTH] where n_I512 = ceil(I / (_PMAX * _Q_WIDTH))
             #   down:    [_PMAX, H // _PMAX]
             n_I512 = math.ceil(I / (_PMAX * _Q_WIDTH))
-            expected_gate_up_cols = n_I512 * _Q_WIDTH
-            expected_down_cols = H // _PMAX
-            kernel_assert(
-                self.gate_w_scale == None or self.gate_w_scale.shape == (_PMAX, expected_gate_up_cols),
-                f"Unsupported gate_w_scale shape: got {self.gate_w_scale.shape}, expected ({_PMAX}, {expected_gate_up_cols}).",
-            )
-            kernel_assert(
-                self.up_w_scale == None or self.up_w_scale.shape == (_PMAX, expected_gate_up_cols),
-                f"Unsupported up_w_scale shape: got {self.up_w_scale.shape}, expected ({_PMAX}, {expected_gate_up_cols}).",
-            )
-            kernel_assert(
-                self.down_w_scale == None or self.down_w_scale.shape == (_PMAX, expected_down_cols),
-                f"Unsupported down_w_scale shape: got {self.down_w_scale.shape}, expected ({_PMAX}, {expected_down_cols}).",
-            )
+            # TODO: Align these two scale layouts
+            if is_mlp_tkg(params):
+                expected_gate_up_cols = n_I512 * _Q_WIDTH
+                expected_down_cols = H // _PMAX
+                kernel_assert(
+                    self.gate_w_scale == None or self.gate_w_scale.shape == (_PMAX, expected_gate_up_cols),
+                    f"Unsupported gate_w_scale shape: got {self.gate_w_scale.shape}, expected ({_PMAX}, {expected_gate_up_cols}).",
+                )
+                kernel_assert(
+                    self.up_w_scale == None or self.up_w_scale.shape == (_PMAX, expected_gate_up_cols),
+                    f"Unsupported up_w_scale shape: got {self.up_w_scale.shape}, expected ({_PMAX}, {expected_gate_up_cols}).",
+                )
+                kernel_assert(
+                    self.down_w_scale == None or self.down_w_scale.shape == (_PMAX, expected_down_cols),
+                    f"Unsupported down_w_scale shape: got {self.down_w_scale.shape}, expected ({_PMAX}, {expected_down_cols}).",
+                )
+            else:
+                kernel_assert(
+                    self.gate_w_scale == None or self.gate_w_scale.shape == (_PMAX, n_I512, _Q_WIDTH),
+                    f"Unsupported gate_w_scale shape: got {self.gate_w_scale.shape}, expected ({_PMAX}, {n_I512}, {_Q_WIDTH}).",
+                )
+                kernel_assert(
+                    self.up_w_scale == None or self.up_w_scale.shape == (_PMAX, n_I512, _Q_WIDTH),
+                    f"Unsupported up_w_scale shape: got {self.up_w_scale.shape}, expected ({_PMAX}, {n_I512}, {_Q_WIDTH}).",
+                )
+                kernel_assert(
+                    self.down_w_scale == None or self.down_w_scale.shape == (_PMAX, H),
+                    f"Unsupported down_w_scale shape: got {self.down_w_scale.shape}, expected ({_PMAX}, {H}).",
+                )
 
     def is_quant(self):
         return self.quantization_type != QuantizationType.NONE
@@ -274,23 +287,17 @@ class MLPQuantizationParameters(NKIObject):
     def is_quant_row_mx(self):
         return self.quantization_type == QuantizationType.ROW_MX
 
+    def is_logical_quant_row(self):
+        return self.quantization_type.is_logical_row()
+
+    def is_logical_quant_static(self):
+        return self.quantization_type.is_logical_static()
+
     def is_dtype_mx(self):
-        return self.is_quant_mx() or self.is_quant_static_mx() or self.is_quant_row_mx()
+        return self.quantization_type.is_mx()
 
     def has_clipping_bound(self):
         return self.clipping_bound > 0.0
-
-    def convert_to_view(self):
-        if self.gate_w_scale is not None:
-            self.gate_w_scale = TensorView(self.gate_w_scale)
-        if self.up_w_scale is not None:
-            self.up_w_scale = TensorView(self.up_w_scale)
-        if self.down_w_scale is not None:
-            self.down_w_scale = TensorView(self.down_w_scale)
-        if self.gate_up_in_scale is not None:
-            self.gate_up_in_scale = TensorView(self.gate_up_in_scale)
-        if self.down_in_scale is not None:
-            self.down_in_scale = TensorView(self.down_in_scale)
 
 
 #
@@ -303,10 +310,10 @@ class MLPQuantizationParameters(NKIObject):
 
 @dataclass
 class MLPFusedAddParameters(NKIObject):
-    fused_add_tensor: Optional[nl.ndarray]
+    fused_add_tensor: Optional[nl.NkiTensor]
     store_fused_add_result: bool
 
-    def __init__(self, fused_add_tensor: Optional[nl.ndarray], store_fused_add_result: bool):
+    def __init__(self, fused_add_tensor: Optional[nl.NkiTensor], store_fused_add_result: bool):
         self.fused_add_tensor = fused_add_tensor if fused_add_tensor != None else None
         self.store_fused_add_result = store_fused_add_result
 
@@ -317,11 +324,6 @@ class MLPFusedAddParameters(NKIObject):
                 f"Unsupported fused_add_tensor dtype: got {self.fused_add_tensor.dtype}, "
                 f"expected one of {SUPPORTED_DTYPES}.",
             )
-
-    def convert_to_view(self):
-        """Convert fused add tensor to TensorView in-place."""
-        if self.fused_add_tensor is not None:
-            self.fused_add_tensor = TensorView(self.fused_add_tensor)
 
 
 #
@@ -334,14 +336,14 @@ class MLPFusedAddParameters(NKIObject):
 @dataclass
 class MLPNormalizationParameters(NKIObject):
     normalization_type: NormType
-    normalization_weights_tensor: Optional[nl.ndarray]
-    normalization_bias_tensor: Optional[nl.ndarray]
+    normalization_weights_tensor: Optional[nl.NkiTensor]
+    normalization_bias_tensor: Optional[nl.NkiTensor]
 
     def __init__(
         self,
         normalization_type: NormType,
-        normalization_weights_tensor: Optional[nl.ndarray],
-        normalization_bias_tensor: Optional[nl.ndarray],
+        normalization_weights_tensor: Optional[nl.NkiTensor],
+        normalization_bias_tensor: Optional[nl.NkiTensor],
     ):
         # If NO_NORM, set all fields to None
         if normalization_type == NormType.NO_NORM:
@@ -370,9 +372,9 @@ class MLPNormalizationParameters(NKIObject):
 
 @dataclass
 class MLPExpertParameters(NKIObject):
-    expert_affinities: nl.ndarray
-    expert_index: nl.ndarray
-    expert_affinities_eager: Optional[nl.ndarray]
+    expert_affinities: nl.NkiTensor
+    expert_index: nl.NkiTensor
+    expert_affinities_eager: Optional[nl.NkiTensor]
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE
     is_all_expert_dynamic: bool = False
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED
@@ -388,15 +390,15 @@ class MLPExpertParameters(NKIObject):
 
 @dataclass
 class MLPBiasParameters(NKIObject):
-    gate_proj_bias_tensor: Optional[nl.ndarray]
-    up_proj_bias_tensor: Optional[nl.ndarray]
-    down_proj_bias_tensor: Optional[nl.ndarray]
+    gate_proj_bias_tensor: Optional[nl.NkiTensor]
+    up_proj_bias_tensor: Optional[nl.NkiTensor]
+    down_proj_bias_tensor: Optional[nl.NkiTensor]
 
     def __init__(
         self,
-        gate_proj_bias_tensor: Optional[nl.ndarray],
-        up_proj_bias_tensor: Optional[nl.ndarray],
-        down_proj_bias_tensor: Optional[nl.ndarray],
+        gate_proj_bias_tensor: Optional[nl.NkiTensor],
+        up_proj_bias_tensor: Optional[nl.NkiTensor],
+        down_proj_bias_tensor: Optional[nl.NkiTensor],
     ):
         self.gate_proj_bias_tensor = gate_proj_bias_tensor
         self.up_proj_bias_tensor = up_proj_bias_tensor
@@ -422,15 +424,6 @@ class MLPBiasParameters(NKIObject):
                 f"expected one of {SUPPORTED_DTYPES}.",
             )
 
-    def convert_to_view(self):
-        """Convert bias tensors to TensorView in-place."""
-        if self.gate_proj_bias_tensor is not None:
-            self.gate_proj_bias_tensor = TensorView(self.gate_proj_bias_tensor)
-        if self.up_proj_bias_tensor is not None:
-            self.up_proj_bias_tensor = TensorView(self.up_proj_bias_tensor)
-        if self.down_proj_bias_tensor is not None:
-            self.down_proj_bias_tensor = TensorView(self.down_proj_bias_tensor)
-
 
 #
 # ***********************
@@ -441,10 +434,10 @@ class MLPBiasParameters(NKIObject):
 
 @dataclass
 class MLPParameters(NKIObject):
-    hidden_tensor: nl.ndarray
-    gate_proj_weights_tensor: nl.ndarray
-    up_proj_weights_tensor: nl.ndarray
-    down_proj_weights_tensor: nl.ndarray
+    hidden_tensor: nl.NkiTensor
+    gate_proj_weights_tensor: nl.NkiTensor
+    up_proj_weights_tensor: nl.NkiTensor
+    down_proj_weights_tensor: nl.NkiTensor
     activation_fn: ActFnType
     output_dtype: Optional[np.dtype]
     fused_add_params: Optional[MLPFusedAddParameters]
@@ -458,8 +451,8 @@ class MLPParameters(NKIObject):
     hidden_size: int
     intermediate_size: int
     input_in_sbuf: bool
-    hidden_input_scale: Optional[nl.ndarray]
-    input_dequant_scale: Optional[nl.ndarray]
+    hidden_input_scale: Optional[nl.NkiTensor]
+    input_dequant_scale: Optional[nl.NkiTensor]
     store_output_in_sbuf: bool
     skip_gate_proj: bool
     use_tkg_gate_up_proj_column_tiling: bool
@@ -482,25 +475,25 @@ class MLPParameters(NKIObject):
 
     def __init__(
         self,
-        hidden_tensor: nl.ndarray,
-        gate_proj_weights_tensor: nl.ndarray,
-        up_proj_weights_tensor: nl.ndarray,
-        down_proj_weights_tensor: nl.ndarray,
-        normalization_weights_tensor: Optional[nl.ndarray] = None,
-        gate_proj_bias_tensor: Optional[nl.ndarray] = None,
-        up_proj_bias_tensor: Optional[nl.ndarray] = None,
-        down_proj_bias_tensor: Optional[nl.ndarray] = None,
-        normalization_bias_tensor: Optional[nl.ndarray] = None,
-        fused_add_tensor: Optional[nl.ndarray] = None,
+        hidden_tensor: nl.NkiTensor,
+        gate_proj_weights_tensor: nl.NkiTensor,
+        up_proj_weights_tensor: nl.NkiTensor,
+        down_proj_weights_tensor: nl.NkiTensor,
+        normalization_weights_tensor: Optional[nl.NkiTensor] = None,
+        gate_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+        up_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+        down_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+        normalization_bias_tensor: Optional[nl.NkiTensor] = None,
+        fused_add_tensor: Optional[nl.NkiTensor] = None,
         store_fused_add_result: bool = False,
         activation_fn: ActFnType = ActFnType.SiLU,
         normalization_type: NormType = NormType.NO_NORM,
         quantization_type: QuantizationType = QuantizationType.NONE,
-        gate_w_scale: Optional[nl.ndarray] = None,
-        up_w_scale: Optional[nl.ndarray] = None,
-        down_w_scale: Optional[nl.ndarray] = None,
-        gate_up_in_scale: Optional[nl.ndarray] = None,
-        down_in_scale: Optional[nl.ndarray] = None,
+        gate_w_scale: Optional[nl.NkiTensor] = None,
+        up_w_scale: Optional[nl.NkiTensor] = None,
+        down_w_scale: Optional[nl.NkiTensor] = None,
+        gate_up_in_scale: Optional[nl.NkiTensor] = None,
+        down_in_scale: Optional[nl.NkiTensor] = None,
         quant_clipping_bound: float = 0.0,
         output_dtype: Optional[np.dtype] = None,
         store_output_in_sbuf: bool = False,
@@ -516,10 +509,10 @@ class MLPParameters(NKIObject):
         up_clamp_lower_limit: Optional[float] = None,
         up_clamp_upper_limit: Optional[float] = None,
         expert_params: Optional[MLPExpertParameters] = None,
-        hidden_input_scale: Optional[nl.ndarray] = None,
-        input_dequant_scale: Optional[nl.ndarray] = None,
+        hidden_input_scale: Optional[nl.NkiTensor] = None,
+        input_dequant_scale: Optional[nl.NkiTensor] = None,
         force_cte_mode: bool = False,
-        mx_dummy_scale_hbm: Optional[nl.ndarray] = None,
+        mx_dummy_scale_hbm: Optional[nl.NkiTensor] = None,
         mode: ComputationMode = ComputationMode.AUTO,
         transposed_in: bool = False,
         transposed_out: bool = False,
@@ -575,7 +568,9 @@ class MLPParameters(NKIObject):
         self.use_tkg_gate_up_proj_column_tiling = use_tkg_gate_up_proj_column_tiling
         self.use_tkg_down_proj_column_tiling = use_tkg_down_proj_column_tiling
         self.use_tkg_down_proj_optimized_layout = use_tkg_down_proj_optimized_layout
-        self.use_contiguous_x4_gate_up = use_contiguous_x4_gate_up
+        self.use_contiguous_x4_gate_up = (
+            use_contiguous_x4_gate_up or gate_up_w_layout == MLPGateUpWeightLayout.H_X4_INNERMOST
+        )
         self.shard_on_h_disabled = shard_on_h_disabled
         self.gate_clamp_lower_limit = gate_clamp_lower_limit
         self.gate_clamp_upper_limit = gate_clamp_upper_limit
@@ -609,29 +604,31 @@ class MLPParameters(NKIObject):
         )
 
         if gate_up_w_layout == MLPGateUpWeightLayout.CONTIGUOUS:
-            # gate_proj_weights_tensor is [H, I]
-            kernel_assert(
-                len(up_proj_weights_tensor.shape) == 2,
-                f"MLPGateUpWeightLayout.CONTIGUOUS expects up weight to have two dimensions. "
-                f"Got {len(up_proj_weights_tensor.shape)}",
-            )
-            self.intermediate_size = up_proj_weights_tensor.shape[1]
-        else:  # gate_up_w_layout in [H_X4_INNERMOST, H_X4_MIDDLE]
-            if len(gate_proj_weights_tensor.shape) == 3:
-                # gate_proj_weights_tensor is fp8x4[128, H/512, I]
-                # TODO: remove this case once TKG support MLPGateUpWeightLayout style weights
+            if self.quant_params.is_quant_mx():
+                # Legacy MX path: 3D x4-packed weights [128, n_H512, I]
                 self.intermediate_size = gate_proj_weights_tensor.shape[-1]
             else:
-                # gate_proj_weights_tensor is fp8[128, H/512, I/512, 4, 128, 4]
+                # gate_proj_weights_tensor is [H, I]
                 kernel_assert(
-                    len(up_proj_weights_tensor.shape) == 6,
-                    f"{gate_up_w_layout} expects up weight to have six dimensions. "
+                    len(up_proj_weights_tensor.shape) == 2,
+                    f"MLPGateUpWeightLayout.CONTIGUOUS expects up weight to have two dimensions. "
                     f"Got {len(up_proj_weights_tensor.shape)}",
                 )
+                self.intermediate_size = up_proj_weights_tensor.shape[1]
+        else:  # gate_up_w_layout in [H_X4_INNERMOST, H_X4_MIDDLE]
+            # gate_proj_weights_tensor is fp8[128, H/512, ceil(I/512), 4, 128, 4]
+            kernel_assert(
+                len(up_proj_weights_tensor.shape) == 6,
+                f"{gate_up_w_layout} expects up weight to have six dimensions. Got {len(up_proj_weights_tensor.shape)}",
+            )
+            # Derive real I from down weight (not padded gate/up which uses ceil(I/512)).
+            # down: [p_I, n_I512, H, 4] where p_I = I//4 if I<512 else 128
+            p_I = down_proj_weights_tensor.shape[0]
+            if p_I < _PMAX:
+                self.intermediate_size = p_I * _Q_WIDTH
+            else:
                 self.intermediate_size = (
-                    up_proj_weights_tensor.shape[2]  # I/512
-                    * up_proj_weights_tensor.shape[3]  # 4
-                    * up_proj_weights_tensor.shape[4]  # 128
+                    up_proj_weights_tensor.shape[2] * up_proj_weights_tensor.shape[3] * up_proj_weights_tensor.shape[4]
                 )
 
 
@@ -658,7 +655,25 @@ def mlpp_has_quantized_input(params: MLPParameters) -> bool:
 
 
 def mlpp_input_has_packed_scale(params: MLPParameters) -> bool:
-    return mlpp_has_quantized_input(params) and params.quant_params.is_quant_row()
+    return mlpp_has_quantized_input(params) and (
+        params.quant_params.is_logical_quant_row() or params.quant_params.is_quant_mx()
+    )
+
+
+def mlpp_input_has_mx_block_scale(params: MLPParameters) -> bool:
+    """True when hidden_tensor carries full MX per-block scales (rmsnorm_mx_prefill packed output).
+
+    Discriminated from the ROW-scale path by the scale region size: the ROW path appends only
+    4 fp8 bytes (1 fp32 scalar per token), while the MX block-scale path appends
+    ceil(n_H512/4)*128 bytes (>= 128 for any H >= 512).
+    """
+    if not mlpp_has_quantized_input(params) or not params.quant_params.is_quant_mx():
+        return False
+    n_H512 = params.hidden_size // 512
+    n_packed = math.ceil(n_H512 / 4)
+    expected_scale_region = n_packed * 128
+    actual_tail = params.hidden_tensor.shape[-1] - params.hidden_size
+    return actual_tail >= expected_scale_region
 
 
 def mlpp_has_fused_add(params: MLPParameters) -> bool:
@@ -745,10 +760,12 @@ def _validate_mlp_gate_up_weight_layout(params: MLPParameters):
             shape == [H, I], f"MLPGateUpWeightLayout.CONTIGUOUS expects up proj weight to have shape [H, I].Got {shape}"
         )
     elif params.gate_up_w_layout in [MLPGateUpWeightLayout.H_X4_INNERMOST, MLPGateUpWeightLayout.H_X4_MIDDLE]:
-        expected_shape = [min(H // 4, 128), H // 512, I // 512, 4, min(I // 4, 128), 4]
+        # I is padded to nearest 512 in the 6D layout, so inner dims are always full (128, 4)
+        n_I512 = math.ceil(I / 512)
+        expected_shape = [min(H // 4, 128), H // 512, n_I512, 4, 128, 4]
         kernel_assert(
             shape == expected_shape,
-            "MLPGateUpWeightLayout.H_X4_MIDDLE expects up proj weight to have shape "
+            f"{params.gate_up_w_layout} expects up proj weight to have shape "
             f"{expected_shape} when H = {H} and I = {I}. Got {shape}.",
         )
 
@@ -764,7 +781,7 @@ def _validate_mlp_down_weight_layout(params: MLPParameters):
             f"{params.quant_params.quantization_type} expects down proj weight to have shape [I, H]",
         )
     else:  # quantization_type in [MX, ROW_MX, STATIC_MX]
-        expected_shape = [min(I // 4, 128), I // 512, H, 4]
+        expected_shape = [min(I // 4, 128), math.ceil(I / 512), H, 4]
         kernel_assert(
             shape == expected_shape,
             f"{params.quant_params.quantization_type} expects down proj weight to have shape "
@@ -797,7 +814,7 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
     n_I512_tile = math.ceil(I / (128 * _q_width))
     i_p = I // 4 if I <= 512 else 128
 
-    if params.quant_params.is_dtype_mx():
+    if params.quant_params.is_dtype_mx() and not params.quant_params.is_quant_mx():
         kernel_assert(
             params.gate_up_w_layout in [MLPGateUpWeightLayout.H_X4_INNERMOST, MLPGateUpWeightLayout.H_X4_MIDDLE],
             "MX quantization (mxfp) requires gate_up_w_layout to be one of H_X4_INNERMOST or H_X4_MIDDLE",
@@ -819,8 +836,8 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
     kernel_assert(H > 0, f'Unsupported hidden dimension {H}; expected H to be positive.')
     kernel_assert(I > 0, f'Unsupported intermediate dimension {I}; expected I to be positive.')
 
-    # TODO: Remove this condition once TKG uses non-x4 fp8 weights
-    if not is_mlp_tkg(params):
+    # Skip layout validation for QuantizationType.MX (legacy 3D x4 path predates MLPGateUpWeightLayout)
+    if not params.quant_params.is_quant_mx():
         _validate_mlp_gate_up_weight_layout(params)
         _validate_mlp_down_weight_layout(params)
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Tests for factory functions: tiles(), blocks(), tensor_view().
+Tests for factory functions: tiles(), blocks().
 
 Full pipeline: factory -> __getitem__ -> tolist -> verify offsets.
 Pure Python -- no NKI, no tracer, no device required.
@@ -21,43 +21,17 @@ Pure Python -- no NKI, no tracer, no device required.
 
 import nki.language as nl
 import pytest
-
+from nkilib_src.nkilib.experimental.neurotile.core._helpers import buffer_space
 from nkilib_src.nkilib.experimental.neurotile.core.factories import (
     NDSlice,
     alloc_blocks,
     alloc_tiles,
     blocks,
-    tensor_view,
     tiles,
 )
+
+from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
-
-# ============================================================================
-# Mock source tensor (replaces NKI tensor for pure-Python testing)
-# ============================================================================
-
-
-class MockTensor:
-    """Minimal mock with .shape and .dtype for factory testing."""
-
-    def __init__(self, *shape, dtype="float32"):
-        self.shape = shape
-        self.dtype = dtype
-
-
-class MockSlice:
-    """Mock sliced tensor with .shape, .dtype, and .offset."""
-
-    def __init__(self, shape, dtype="float32", offset=0):
-        self.shape = shape
-        self.dtype = dtype
-        self.offset = offset
-
-
-# ============================================================================
-# Mock sharding spec
-# ============================================================================
-
 
 # ============================================================================
 # tiles() -- basic construction
@@ -75,8 +49,8 @@ class TestTilesBasic:
         assert v.element_shape == (512, 2048)
         assert v.tile_size == (128, 512)
         assert v.ndim == 2
-        assert v.offset == 0
-        assert v.source is src
+        assert v._offset == 0
+        assert v._source is src
 
     def test_3d_tiles_with_iteration_dim(self):
         """2D tile on 3D tensor -> dim 0 is the batch dim."""
@@ -87,18 +61,18 @@ class TestTilesBasic:
         assert v.shape == (1, 1)
         # tile_size_of: dim 0 leaf has count == element_shape[0] (batch).
         assert v.tile_size == (8, 128, 64)
-        assert v.grid.n_batch_dims == 1
-        assert v.grid.outer_axis(0).count == 8
+        assert v._grid.n_batch_dims == 1
+        assert v._grid.outer_axis(0).count == 8
 
     def test_4d_tiles_with_2_iteration_dims(self):
         """2D tile on 4D tensor -> dims 0,1 are batch."""
         src = MockTensor(4, 8, 128, 64)
         v = tiles(src, tile_size=(128, 64))
         assert v.ndim == 4
-        assert v.grid.n_batch_dims == 2
+        assert v._grid.n_batch_dims == 2
         assert v.shape == (1, 1)
-        assert v.grid.outer_axis(0).count == 4
-        assert v.grid.outer_axis(1).count == 8
+        assert v._grid.outer_axis(0).count == 4
+        assert v._grid.outer_axis(1).count == 8
 
 
 # ============================================================================
@@ -112,117 +86,55 @@ class TestTilesStrides:
     def test_contiguous_strides(self):
         src = MockTensor(512, 2048)
         v = tiles(src, tile_size=(128, 512))
-        assert v.strides == (2048, 1)
-
-    def test_root_parameter(self):
-        """root= uses root tensor for strides, source for element_shape."""
-        root = MockTensor(1024, 2048)
-        sliced = MockSlice(shape=(256, 2048), offset=512 * 2048)
-        v = tiles(sliced, tile_size=(128, 512), root=root)
-        assert v.source is root
-        assert v.strides == (2048, 1)  # from root.shape
-        assert v.offset == 512 * 2048  # from sliced.offset
-        assert v.element_shape == (256, 2048)
+        assert v._strides == (2048, 1)
 
 
 # ============================================================================
-# HBM source validation -- sliced-view detection and root= enforcement
+# HBM source validation -- a sliced source self-addresses
 # ============================================================================
-
-
-class _SlicedFakeTensor:
-    """Mock NkiTensor whose `_pattern` marks it as a sliced view.
-
-    Exposes `get_pattern()` so `physical_strides()` can read parent strides,
-    mirroring what NkiTensor does for `src[:, a:b]`.
-    """
-
-    def __init__(self, shape, pattern, dtype="float32", offset=0):
-        self.shape = tuple(shape)
-        self.dtype = dtype
-        self.offset = offset
-        self._pattern = pattern
-
-    def get_pattern(self):
-        return self._pattern
-
-
-class _TopLevelFakeTensor:
-    """Mock NkiTensor without slicing -- `_pattern is None`, contiguous."""
-
-    def __init__(self, shape, dtype="float32"):
-        self.shape = tuple(shape)
-        self.dtype = dtype
-        self._pattern = None
-        self.offset = 0
-
-    def get_pattern(self):
-        # Build a contiguous pattern for this shape
-        result = []
-        stride = 1
-        for d in range(len(self.shape) - 1, -1, -1):
-            result.append([stride, self.shape[d]])
-            stride *= self.shape[d]
-        result.reverse()
-        return result
 
 
 @pytest_marks(["neurotile"])
 class TestHbmSourceValidation:
-    """_validate_hbm_source rejects sliced HBM sources without root=."""
+    """A sliced source tiles directly from its own self-describing layout."""
 
     @pytest.mark.fast
-    def test_sliced_source_without_root_rejects(self):
-        import pytest
-
-        sliced = _SlicedFakeTensor(
-            shape=(8192, 128),
+    def test_sliced_source_self_addresses(self):
+        """A sliced source tiles directly: strides from its own pattern, offset
+        from the slice itself (not double-applied)."""
+        sliced = MockTensor(
+            (8192, 128),
             pattern=[[1152, 8192], [1, 128]],  # parent row stride 1152
             offset=1024,
         )
-        with pytest.raises(AssertionError, match="sliced view"):
-            tiles(sliced, tile_size=(128, 128))
+        v = tiles(sliced, tile_size=(128, 128))
+        assert v._source is sliced
+        assert v._strides == (1152, 1)  # from the slice's own get_pattern()
+        assert v._offset == 0  # slice self-addresses; offset is NOT re-applied
 
-    def test_sliced_source_without_root_rejects_blocks(self):
-        import pytest
-
-        sliced = _SlicedFakeTensor(
-            shape=(8192, 128),
+    def test_sliced_source_blocks_self_addresses(self):
+        sliced = MockTensor(
+            (8192, 128),
             pattern=[[1152, 8192], [1, 128]],
             offset=1024,
         )
-        with pytest.raises(AssertionError, match="sliced view"):
-            blocks(sliced, tile_size=(128, 128), block_size=(8, 1))
+        v = blocks(sliced, tile_size=(128, 128), block_size=(8, 1))
+        assert v._source is sliced
+        assert v._strides == (1152, 1)
+        assert v._offset == 0
 
-    def test_sliced_source_with_sliced_root_rejects(self):
-        """root= itself must be a top-level tensor, not a slice."""
-        import pytest
-
-        sliced = _SlicedFakeTensor(
-            shape=(8192, 128),
-            pattern=[[1152, 8192], [1, 128]],
-            offset=1024,
-        )
-        sliced_root = _SlicedFakeTensor(
-            shape=(8192, 256),
-            pattern=[[1152, 8192], [1, 256]],
-            offset=512,
-        )
-        with pytest.raises(AssertionError, match="top-level"):
-            tiles(sliced, tile_size=(128, 128), root=sliced_root)
-
-    def test_top_level_source_without_root_passes(self):
-        src = _TopLevelFakeTensor(shape=(1024, 128))
+    def test_top_level_source_passes(self):
+        src = MockTensor((1024, 128))
         v = tiles(src, tile_size=(128, 128))
-        assert v.source is src
+        assert v._source is src
         # Contiguous: stride 0 = inner product = 128
-        assert v.strides == (128, 1)
+        assert v._strides == (128, 1)
 
-    def test_non_nki_source_skips_validation(self):
-        """MockTensor (no _pattern) bypasses the sliced-view check."""
-        src = MockTensor(1024, 128)  # no `_pattern` attr
+    def test_non_nki_source_is_native(self):
+        """A contiguous offset-0 MockTensor tiles directly."""
+        src = MockTensor(1024, 128)
         v = tiles(src, tile_size=(128, 128))
-        assert v.source is src
+        assert v._source is src
 
 
 @pytest_marks(["neurotile"])
@@ -231,35 +143,33 @@ class TestPhysicalStrides:
 
     @pytest.mark.fast
     def test_reads_parent_strides_from_sliced_view(self):
-        """Sliced view's get_pattern() reports parent row stride."""
-        sliced = _SlicedFakeTensor(
-            shape=(8192, 128),
-            pattern=[[1152, 8192], [1, 128]],  # parent is (_, 1152)
+        """A sliced view's get_pattern() reports the parent row stride, so it
+        self-addresses: strides come from the slice itself, offset stays 0."""
+        sliced = MockTensor(
+            (8192, 128),
+            pattern=[[1152, 8192], [1, 128]],  # parent row stride 1152
             offset=1024,
         )
-        root = _TopLevelFakeTensor(shape=(8192, 1152))
-        # With root= -> strides come from root.get_pattern() = (1152, 1)
-        v = tiles(sliced, tile_size=(128, 128), root=root)
-        assert v.source is root
-        assert v.strides == (1152, 1)
-        assert v.offset == 1024  # from sliced.offset
+        v = tiles(sliced, tile_size=(128, 128))
+        assert v._source is sliced
+        assert v._strides == (1152, 1)  # from the slice's own get_pattern()
+        assert v._offset == 0  # slice self-addresses; offset not re-applied
 
     def test_multi_p_tile_block_from_sliced_source(self):
         """Regression: multi-P-tile block load on a column-sliced source.
 
-        Before the fix, block would derive strides from the slice's logical
-        shape (128, 1), not the parent's (1152, 1), silently producing wrong
-        APs. Exercises the attention_cte kv_producer shape.
+        Before the self-addressing fix, block would derive strides from the
+        slice's logical shape (128, 1), not the parent's (1152, 1), silently
+        producing wrong APs. Exercises the attention_cte kv_producer shape.
         """
-        root = _TopLevelFakeTensor(shape=(8192, 1152))
-        sliced = _SlicedFakeTensor(
-            shape=(8192, 128),
+        sliced = MockTensor(
+            (8192, 128),
             pattern=[[1152, 8192], [1, 128]],
             offset=1024,
         )
-        v = blocks(sliced, tile_size=(128, 128), block_size=(8, 1), root=root)
-        assert v.strides == (1152, 1)
-        assert v.offset == 1024
+        v = blocks(sliced, tile_size=(128, 128), block_size=(8, 1))
+        assert v._strides == (1152, 1)
+        assert v._offset == 0
         # 8 P-tiles x 128 rows each, 1 F-tile x 128 cols
         assert v.shape == (8, 1)
 
@@ -276,7 +186,7 @@ class TestTilesRemainder:
         src = MockTensor(300, 512)
         v = tiles(src, tile_size=(128, 512))
         # Source extent is (300, 512); the iteration walk is ceil(300/128)*128 = 384.
-        assert v.grid.element_shape == (300, 512)
+        assert v._grid.element_shape == (300, 512)
         assert v.is_remainder is True
         assert v.shape == (3, 1)  # ceil(300/128)=3
 
@@ -311,119 +221,86 @@ class TestBlocks:
         v = blocks(src, tile_size=(128, 512), block_size=(2, 2))
         # Per dim: 3 axes -- block + tile + leaf.
         for d in (0, 1):
-            axes = v.grid.axes_for(d)
+            axes = v._grid.axes_for(d)
             assert len(axes) == 3
             assert axes[0].label == AxisLabel.BLOCK
             assert axes[1].label == AxisLabel.TILE
         # Block step on dim 0 = block_size * tile_size = 2 * 128 = 256.
-        assert v.grid.axes_for(0)[0].step == 256
+        assert v._grid.axes_for(0)[0].step == 256
         # Block step on dim 1 = 2 * 512 = 1024.
-        assert v.grid.axes_for(1)[0].step == 1024
+        assert v._grid.axes_for(1)[0].step == 1024
 
     def test_blocks_with_iteration_dim(self):
         """3D tensor with 2D tile + blocks: dim 0 is the batch dim."""
         src = MockTensor(8, 512, 2048)
         v = blocks(src, tile_size=(128, 512), block_size=(2, 2))
         assert v.ndim == 3
-        assert v.grid.n_batch_dims == 1
+        assert v._grid.n_batch_dims == 1
         # Batch dim has a single elem axis.
-        assert len(v.grid.axes_for(0)) == 1
-        assert v.grid.axes_for(0)[0].count == 8
+        assert len(v._grid.axes_for(0)) == 1
+        assert v._grid.axes_for(0)[0].count == 8
         # Tile dims have block+tile+leaf.
-        assert len(v.grid.axes_for(1)) == 3
+        assert len(v._grid.axes_for(1)) == 3
 
+    @pytest.mark.fast
+    def test_partial_block_clamps_when_descended_to_tiles(self):
+        """A partial trailing block clamps its remainder at TILE granularity,
+        not at the block as a whole.
 
-# ============================================================================
-# tensor_view()
-# ============================================================================
+        N=1792 with a 2-tile (2*512=1024 wide) N-block yields ceil(1792/1024)
+        = 2 N-blocks. Block 1 spans columns [1024, 2048) nominally but the
+        source ends at 1792, so only 768 columns (one full 512 tile + a 256
+        partial) exist. The neurotile contract is: load a coalesced block,
+        then descend to a tile-grid (``nt.tiles(block)``) for compute/store --
+        a block view itself is iterate-next, not addressable as a monolith.
+
+        The descent is where the remainder resolves: the trailing tile must
+        auto-clamp to its real 256 width while full tiles stay 512. This is
+        what lets a single matmul kernel handle remainder N without any
+        special-casing -- the per-tile store walks only the real extent.
+        """
+        src = MockTensor(512, 1792)
+        block_view = blocks(src, tile_size=(128, 512), block_size=(2, 2))
+        # 2 M-blocks (512/256), 2 N-blocks (ceil(1792/1024)); dim 1 is partial.
+        assert block_view.shape == (2, 2)
+
+        # Descend the trailing N-block to its tile-grid (no re-tile: inherits
+        # the block's (128, 512) tiling).
+        trailing_tiles = tiles(block_view[0, 1])
+        assert trailing_tiles.shape == (2, 2)  # 2 P-tiles x 2 F-tiles
+
+        # Full F-tile keeps the nominal 512; partial F-tile clamps to 256 and
+        # is flagged a remainder.
+        full_tile = trailing_tiles[0, 0]
+        assert full_tile.element_shape == (128, 512)
+        assert full_tile._grid.is_remainder is False
+
+        partial_tile = trailing_tiles[0, 1]
+        assert partial_tile.element_shape == (128, 256)
+        assert partial_tile._grid.is_remainder is True
 
 
 @pytest_marks(["neurotile"])
-class TestTensorView:
-    @pytest.mark.fast
-    def test_basic(self):
-        src = MockTensor(256, 512)
-        v = tensor_view(src)
-        assert v.shape == (256, 512)
-        # Untiled: each dim has a single elem axis with count == element_shape[d].
-        assert v.tile_size == (256, 512)
-        assert v.grid.is_tiled() is False
-        assert v.ndim == 2
-        assert v.is_remainder is False
-
-    def test_untiled_indexing(self):
-        """Int index on untiled view -> element drop."""
-        src = MockTensor(256, 512)
-        v = tensor_view(src)
-        r = v[42]
-        # dim 0 exhausted (steps=(1,), descend -> exhaust)
-        # But untiled: tile_size is None -> no min 2D
-        assert r.ndim == 1
-        assert r.offset == 42 * 512
-
-
-@pytest_marks(["neurotile"])
-class TestTensorViewMisuseGuards:
-    """tensor_view rejects NDSlice sources, invalid buffer_type, and AP misuse."""
+class TestBufferSpace:
+    """``buffer_space`` reads the source's memory space from ``source.buffer``.
+    A source without ``.buffer`` (test mock / numpy) is HBM by definition."""
 
     @pytest.mark.fast
-    def test_ndslice_source_rejected(self):
-        src = MockTensor(512, 1024)
-        v = tiles(src, tile_size=(128, 256))
-        with pytest.raises(AssertionError, match="tensor_view is a constructor over a raw tensor"):
-            tensor_view(v)
+    def test_detects_sbuf_from_source(self):
+        assert buffer_space(MockTensor(128, 512, buffer=nl.sbuf)) == nl.sbuf
 
-    def test_buffer_type_psum_rejected(self):
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match="buffer_type=nl.psum is not supported"):
-            tensor_view(src, buffer_type=nl.psum)
+    @pytest.mark.fast
+    def test_detects_psum_from_source(self):
+        assert buffer_space(MockTensor(128, 512, buffer=nl.psum)) == nl.psum
 
-    def test_buffer_type_string_rejected(self):
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match="must be None or an nl.MemoryRegion"):
-            tensor_view(src, buffer_type="sbuf")
+    @pytest.mark.fast
+    def test_hbm_source_resolves_hbm(self):
+        assert buffer_space(MockTensor(128, 512, buffer=nl.shared_hbm)) == nl.shared_hbm
 
-    def test_buffer_type_shared_hbm_accepted(self):
-        src = MockTensor(512, 1024)
-        v = tensor_view(src, buffer_type=nl.shared_hbm)
-        assert v.shape == (512, 1024)
-
-    def test_buffer_type_private_hbm_accepted(self):
-        src = MockTensor(512, 1024)
-        v = tensor_view(src, buffer_type=nl.private_hbm)
-        assert v.shape == (512, 1024)
-
-    def test_ap_higher_rank_than_source_accepted(self):
-        # AP rank is independent of source rank: a 3-level AP on a 2-D
-        # source produces a 3-D logical view. The AP defines the view.
-        src = MockTensor(512, 1024)
-        v = tensor_view(
-            src,
-            access_pattern=[[1024, 512], [1, 2], [2, 512]],
-        )
-        assert v.element_shape == (512, 2, 512)
-
-    def test_ap_addresses_past_source_rejected(self):
-        # max addressed offset = (1024-1)*1024 + (1024-1)*1 = 1048575
-        # > source extent 512 * 1024 = 524288 -> rejected.
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match=r"access_pattern addresses element offset"):
-            tensor_view(src, access_pattern=[[1024, 1024], [1, 1024]])
-
-    def test_ap_stride_zero_rejected(self):
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match="stride.*must be > 0"):
-            tensor_view(src, access_pattern=[[0, 512], [1, 1024]])
-
-    def test_ap_count_zero_rejected(self):
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match="count.*must be > 0"):
-            tensor_view(src, access_pattern=[[1024, 0], [1, 1024]])
-
-    def test_ap_malformed_level(self):
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match=r"access_pattern\[0\] must be \[stride, count\]"):
-            tensor_view(src, access_pattern=[[1024], [1, 1024]])
+    @pytest.mark.fast
+    def test_no_buffer_attr_defaults_hbm(self):
+        # MockTensor has no .buffer -> HBM (keeps mock / numpy sources working).
+        assert buffer_space(MockTensor(128, 512)) == nl.shared_hbm
 
 
 @pytest_marks(["neurotile"])
@@ -460,7 +337,7 @@ class TestAllocTilesMisuseGuards:
             alloc_tiles(tile_size=(128, 256), buffer_type=nl.psum, dtype="float32")
 
     def test_buffer_type_string_rejected(self):
-        with pytest.raises(AssertionError, match="must be None or an nl.MemoryRegion"):
+        with pytest.raises(AssertionError, match="buffer_type= must be an nl.MemoryRegion"):
             alloc_tiles(tile_size=(128, 256), buffer_type="sbuf", dtype="float32")
 
     # grid xor element_shape.
@@ -622,8 +499,8 @@ class TestSliceSharding:
         src = MockTensor(512, 2048)
         # 4 tiles on dim 0; num_shards=2 -> 2 owned per core; rank 0 owns tiles 0-1.
         v = tiles(src, tile_size=(128, 512))[block_range(rank=0, num_shards=2, total=4), :]
-        assert v.grid.remaining[0] == 256  # 2 * 128
-        assert v.offset == 0
+        assert v._grid.remaining[0] == 256  # 2 * 128
+        assert v._offset == 0
 
     def test_concrete_block_shard_second_rank(self):
         from nkilib_src.nkilib.experimental.neurotile.core.shard_helpers import block_range
@@ -631,8 +508,8 @@ class TestSliceSharding:
         src = MockTensor(512, 2048)
         # rank 1 owns tiles [2, 3] -> offset = 2 * 128 * stride[0] = 2 * 128 * 2048.
         v = tiles(src, tile_size=(128, 512))[block_range(rank=1, num_shards=2, total=4), :]
-        assert v.grid.remaining[0] == 256
-        assert v.offset == 2 * 128 * 2048
+        assert v._grid.remaining[0] == 256
+        assert v._offset == 2 * 128 * 2048
 
     # Runtime-rank slice paths require CExpr-style operands (program_id);
     # they're exercised end-to-end by the device tests in
@@ -648,8 +525,8 @@ class TestSliceSharding:
             block_range(rank=0, num_shards=2, total=4),
         ]
         # Each rank owns 2 tiles on each dim.
-        assert v.grid.remaining[0] == 256
-        assert v.grid.remaining[1] == 1024
+        assert v._grid.remaining[0] == 256
+        assert v._grid.remaining[1] == 1024
 
 
 # ============================================================================
@@ -692,10 +569,14 @@ class TestInputValidation:
         with pytest.raises(AssertionError, match="tile_size must not exceed the view's rank"):
             tiles(src, tile_size=(128, 256, 512, 1024))
 
-    def test_size_cannot_exceed_source_extent(self):
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match=r"tile_size\[0\]=2048 exceeds source extent 512"):
-            tiles(src, tile_size=(2048, 256))
+    def test_size_exceeding_source_extent_is_single_partial_tile(self):
+        # tile_size larger than the source extent on a dim is allowed: the grid
+        # is a single partial tile there, with tile_size clamped to the extent.
+        src = MockTensor(128, 64)
+        v = tiles(src, tile_size=(128, 128))
+        assert v.shape == (1, 1)  # ceil(64/128) == 1
+        assert v.element_shape == (128, 64)
+        assert v.tile_size == (128, 64)  # clamped to source extent on dim 1
 
     def test_remainder_invalid_string(self):
         src = MockTensor(512, 1024)
@@ -739,11 +620,29 @@ class TestInputValidation:
         assert v.element_shape == (512, 2, 512)
         assert v.tile_size == (512, 2, 512)
 
-    def test_buffer_type_must_be_enum(self):
-        src = MockTensor(512, 1024)
-        # Pass a string sentinel -- validator should reject non-MemoryRegion values.
-        with pytest.raises(AssertionError, match="buffer_type= must be None or an nl.MemoryRegion"):
-            tiles(src, tile_size=(128, 256), buffer_type="sbuf")
+    def test_indirect_handle_source_rejected(self):
+        # A handle that already carries a runtime (gather / dynamic-select)
+        # offset must NOT be tiled directly: _resolve_source reads only the
+        # compile-time .offset and .ap() drops the runtime offset, so the DMA
+        # would silently read from the base (wrong data, no error). The
+        # supported idiom is nt.tiles(base)[k]. Guards a real gap left when the
+        # _pattern-keyed sliced-source check went dead on the NkiTensor migration.
+        src = MockTensor(512, 1024, indirect=True)
+        with pytest.raises(AssertionError, match="runtime"):
+            tiles(src, tile_size=(128, 256))
+
+    def test_indirect_handle_source_rejected_blocks(self):
+        src = MockTensor(512, 1024, indirect=True)
+        with pytest.raises(AssertionError, match="runtime"):
+            blocks(src, tile_size=(128, 256), block_size=(2, 2))
+
+    def test_non_indirect_handle_accepted(self):
+        # The companion to the reject above: a plain (non-indirect) handle is
+        # accepted, so the guard cannot regress into over-rejecting normal
+        # sources. is_indirect() exists but returns False.
+        src = MockTensor(512, 1024, indirect=False)
+        v = tiles(src, tile_size=(128, 256))
+        assert v.shape == (4, 4)
 
 
 @pytest_marks(["neurotile"])
@@ -751,21 +650,7 @@ class TestMisuseGuards:
     """Reject argument combinations that are silently dropped or produce
     corrupted state. Each guard maps to a specific misuse pattern."""
 
-    # Guards 1-3: NDSlice source rejects raw-source-only kwargs.
-
-    @pytest.mark.fast
-    def test_ndslice_source_rejects_buffer_type(self):
-        src = MockTensor(512, 1024)
-        v = tiles(src, tile_size=(128, 256))
-        with pytest.raises(AssertionError, match="buffer_type= is only for raw sources"):
-            tiles(v, tile_size=(128, 256), buffer_type=nl.sbuf)
-
-    def test_ndslice_source_rejects_root(self):
-        src = MockTensor(512, 1024)
-        other = MockTensor(1024, 2048)
-        v = tiles(src, tile_size=(128, 256))
-        with pytest.raises(AssertionError, match="root= is only for raw sources"):
-            tiles(v, tile_size=(128, 256), root=other)
+    # Guard: NDSlice source rejects raw-source-only kwargs.
 
     def test_ndslice_source_rejects_remainder(self):
         src = MockTensor(512, 1024)
@@ -773,23 +658,54 @@ class TestMisuseGuards:
         with pytest.raises(AssertionError, match="remainder= applies at construct time only"):
             tiles(v, tile_size=(128, 256), remainder="skip")
 
-    # Guard 4: buffer_type=nl.psum rejected; sbuf / shared_hbm / private_hbm OK.
+    # Guard: memory space is detected from the source -- SBUF builds an
+    # SBUFLayout, PSUM is rejected (use psum_pool; operate on a bank's .data).
 
-    def test_buffer_type_psum_rejected(self):
-        src = MockTensor(512, 1024)
-        with pytest.raises(AssertionError, match="buffer_type=nl.psum is not supported"):
-            tiles(src, tile_size=(128, 256), buffer_type=nl.psum)
+    @pytest.mark.fast
+    def test_sbuf_source_builds_sbuf_layout(self):
+        from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
 
-    def test_buffer_type_shared_hbm_accepted(self):
-        # shared_hbm on a raw HBM tensor is a no-op (default is HBM); accept.
-        src = MockTensor(512, 1024)
-        v = tiles(src, tile_size=(128, 256), buffer_type=nl.shared_hbm)
+        src = MockTensor((512, 1024), buffer=nl.sbuf)
+        v = tiles(src, tile_size=(128, 256))
+        assert isinstance(v._layout, SBUFLayout)
         assert v.shape == (4, 4)
 
-    def test_buffer_type_private_hbm_accepted(self):
-        src = MockTensor(512, 1024)
-        v = tiles(src, tile_size=(128, 256), buffer_type=nl.private_hbm)
+    def test_psum_source_rejected(self):
+        src = MockTensor((128, 512), buffer=nl.psum)
+        with pytest.raises(AssertionError, match="PSUM sources are not supported"):
+            tiles(src, tile_size=(128, 256))
+
+    def test_hbm_source_builds_hbm_layout(self):
+        from nkilib_src.nkilib.experimental.neurotile.core.layout_hbm import HBMLayout
+
+        src = MockTensor((512, 1024))  # no .buffer -> HBM
+        v = tiles(src, tile_size=(128, 256))
+        assert isinstance(v._layout, HBMLayout)
         assert v.shape == (4, 4)
+
+    # Guard: bad source type -> named error, not a downstream AttributeError.
+
+    @pytest.mark.fast
+    def test_source_none_rejected(self):
+        with pytest.raises(AssertionError, match="source is required"):
+            tiles(None, tile_size=(128, 256))
+
+    def test_source_scalar_rejected(self):
+        with pytest.raises(AssertionError, match=r"must be a tensor-like object with a .shape"):
+            tiles(5, tile_size=(128, 256))
+
+    def test_blocks_source_none_rejected(self):
+        with pytest.raises(AssertionError, match="source is required"):
+            blocks(None, tile_size=(128, 256), block_size=(2, 2))
+
+    # Guard: access_pattern= on an SBUF source would silently drop the AP's
+    # strides (the on-chip layout recomputes strides from the tile grid).
+
+    @pytest.mark.fast
+    def test_sbuf_source_rejects_access_pattern(self):
+        src = MockTensor((128, 1024), buffer=nl.sbuf)
+        with pytest.raises(AssertionError, match="access_pattern= is not supported for SBUF sources"):
+            tiles(src, tile_size=(128, 256), access_pattern=[[1024, 128], [1, 1024]])
 
     # Guard 5+: spec-based sharding validation removed with the spec class.
     # Slice-based sharding validates through validate_index_key
@@ -823,7 +739,7 @@ class TestAccessPattern:
         # is orthogonal and must be passed explicitly.
         src = MockTensor(512, 2048)
         v = tiles(src, access_pattern=[[2048, 512], [1, 2048]], tile_size=(128, 512))
-        assert v.strides == (2048, 1)
+        assert v._strides == (2048, 1)
         assert v.tile_size == (128, 512)
         assert v.shape == (4, 4)
 
@@ -880,7 +796,7 @@ class TestAccessPattern:
         assert v.element_shape == (512, 2, 512)
         assert v.tile_size == (512, 2, 512)
         # Strides reflect the 3-level walk (no rank conflation).
-        assert v.strides == (1024, 1, 2)
+        assert v._strides == (1024, 1, 2)
 
     def test_ap_higher_rank_than_source_multi_tile_rejected(self):
         """Higher-rank AP with multi-tile grid is rejected (TODO).
@@ -917,7 +833,7 @@ class TestAccessPattern:
         assert v.element_shape == (512, 512)
         assert v.tile_size == (128, 256)
         assert v.shape == (4, 2)
-        assert v.strides == (512, 1)
+        assert v._strides == (512, 1)
 
 
 # ============================================================================
@@ -936,7 +852,7 @@ class TestNDSliceSource:
         # Same shape, same element_shape, same strides -- just fresh Grid
         assert v2.shape == v.shape
         assert v2.element_shape == v.element_shape
-        assert v2.strides == v.strides
+        assert v2._strides == v._strides
 
     def test_pass_through_strips_blocks(self):
         """tiles(block_view) strips block level -> tile iteration."""
@@ -961,8 +877,8 @@ class TestNDSliceSource:
         src = MockTensor(512, 2048)
         v = tiles(src, tile_size=(128, 512))
         v2 = tiles(v)[block_range(rank=1, num_shards=2, total=4), :]
-        assert v2.grid.remaining[0] == 256
-        assert v2.offset == 2 * 128 * 2048
+        assert v2._grid.remaining[0] == 256
+        assert v2._offset == 2 * 128 * 2048
 
 
 # ============================================================================
@@ -981,14 +897,14 @@ class TestRetileOnShardedSource:
 
         src = MockTensor(512, 2048)
         v = tiles(src, tile_size=(128, 512))[block_range(rank=1, num_shards=2, total=4), :]
-        assert v.grid.remaining[0] == 256
-        assert v.offset == 2 * 128 * 2048
+        assert v._grid.remaining[0] == 256
+        assert v._offset == 2 * 128 * 2048
 
         # Re-tile to 64-row tiles within that shard.
         v2 = tiles(v, tile_size=(64, 512))
         assert v2.tile_size == (64, 512)
-        assert v2.grid.remaining[0] == 256
-        assert v2.offset == 2 * 128 * 2048
+        assert v2._grid.remaining[0] == 256
+        assert v2._offset == 2 * 128 * 2048
         assert v2.shape == (4, 4)
 
 
@@ -1004,8 +920,8 @@ class TestBlocksWithSlicedSharding:
         # 2 blocks on dim 0 (block_size=2).
         v = blocks(src, tile_size=(128, 512), block_size=(2, 2))[block_range(rank=1, num_shards=2, total=2), :]
         # rank 1 owns 1 block starting at block index 1.
-        assert v.grid.remaining[0] == 256
-        assert v.offset == 2 * 128 * 2048
+        assert v._grid.remaining[0] == 256
+        assert v._offset == 2 * 128 * 2048
 
 
 @pytest_marks(["neurotile"])
@@ -1023,18 +939,18 @@ class TestRetileBlockShardSubdivide:
         v = self._sliced()
         v2 = tiles(v, tile_size=(64, 512))
         assert v2.tile_size == (64, 512)
-        assert v2.shape[0] == v.grid.remaining[0] // 64
+        assert v2.shape[0] == v._grid.remaining[0] // 64
 
     def test_quarter_tile_size(self):
         v = self._sliced()
         v2 = tiles(v, tile_size=(32, 512))
-        assert v2.shape[0] == v.grid.remaining[0] // 32
+        assert v2.shape[0] == v._grid.remaining[0] // 32
 
     def test_equal_tile_size_noop(self):
         v = self._sliced()
         v2 = tiles(v, tile_size=(128, 512))
-        assert v2.grid.remaining == v.grid.remaining
-        assert v2.offset == v.offset
+        assert v2._grid.remaining == v._grid.remaining
+        assert v2._offset == v._offset
 
 
 @pytest_marks(["neurotile"])
@@ -1070,7 +986,7 @@ class TestFullPipeline:
 
         tile = v[1, 1]
         # Offset: 1 * 128 * 1024 + 1 * 512 * 1 = 131072 + 512
-        assert tile.offset == 131072 + 512
+        assert tile._offset == 131072 + 512
         assert tile.element_shape == (128, 512)
 
     def test_blocks_index_and_offset(self):
@@ -1080,11 +996,11 @@ class TestFullPipeline:
         # strides = (2048, 1)
 
         block = v[1, 0]  # block (1, 0): step=256, offset=1*256*2048
-        assert block.offset == 1 * 256 * 2048
+        assert block._offset == 1 * 256 * 2048
         assert block.element_shape == (256, 1024)
 
         tile = block[0, 1]  # tile (0, 1) within block: step=128, offset += 1*512*1
-        assert tile.offset == 1 * 256 * 2048 + 1 * 512 * 1
+        assert tile._offset == 1 * 256 * 2048 + 1 * 512 * 1
 
     def test_iterate_all_tiles(self):
         """Enumerate all tiles -- verify count and offset progression."""
@@ -1099,10 +1015,10 @@ class TestFullPipeline:
 
         assert len(all_tiles) == 4
         # Offsets: (0,0)=0, (0,1)=512, (1,0)=128*1024, (1,1)=128*1024+512
-        assert all_tiles[0].offset == 0
-        assert all_tiles[1].offset == 512
-        assert all_tiles[2].offset == 128 * 1024
-        assert all_tiles[3].offset == 128 * 1024 + 512
+        assert all_tiles[0]._offset == 0
+        assert all_tiles[1]._offset == 512
+        assert all_tiles[2]._offset == 128 * 1024
+        assert all_tiles[3]._offset == 128 * 1024 + 512
 
     def test_iteration_dim_enumerate(self):
         """3D tensor: explicit-dim iterate the batch dim."""
@@ -1113,7 +1029,7 @@ class TestFullPipeline:
         children = v.tolist(dim=0)
         assert len(children) == 4
         for i, child in enumerate(children):
-            assert child.offset == i * 128 * 64
+            assert child._offset == i * 128 * 64
 
     def test_blocks_enumerate_full(self):
         """Enumerate blocks, verify each block's scope and offset."""
@@ -1127,10 +1043,10 @@ class TestFullPipeline:
 
         assert len(block_list) == 4  # 2x2 blocks
         # Block (0,0): offset=0, remaining=(256, 1024)
-        assert block_list[0].offset == 0
+        assert block_list[0]._offset == 0
         assert block_list[0].element_shape == (256, 1024)
         # Block (1,1): offset = 1*256*2048 + 1*1024*1 = 525312
-        assert block_list[3].offset == 256 * 2048 + 1024
+        assert block_list[3]._offset == 256 * 2048 + 1024
 
     def test_tolist_dim_provides_items(self):
         """view.tolist(dim=d) materializes sub-views along dim d."""
@@ -1141,8 +1057,8 @@ class TestFullPipeline:
         assert len(items) == 2
         assert items[0].element_shape[0] == 128
         assert items[1].element_shape[0] == 128
-        assert items[0].offset == 0
-        assert items[1].offset == 128 * 1024
+        assert items[0]._offset == 0
+        assert items[1]._offset == 128 * 1024
 
     def test_remainder_present_at_parent(self):
         """Parent view's is_remainder flag is True for partial trailing tile."""
@@ -1169,7 +1085,7 @@ class TestFullPipeline:
         reshaped = tile.reshape_dim(1, (8, 64))
         assert reshaped.element_shape == (128, 8, 64)
         assert reshaped.tile_size == (128, 8, 64)  # single tile covering new shape
-        assert reshaped.offset == 0
+        assert reshaped._offset == 0
 
 
 # ============================================================================
@@ -1181,20 +1097,17 @@ class TestFullPipeline:
 class TestSBUFBlocks:
     @pytest.mark.fast
     def test_blocks_sbuf_basic(self):
-        """blocks(sbuf, tile_size, block_size, buffer_type) creates block-level Grid."""
-        import numpy as np
-
+        """blocks(sbuf, tile_size, block_size) on an SBUF source creates block-level Grid."""
         from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
 
-        sbuf = np.zeros((128, 1024), dtype=np.float32)
-        sbuf.dtype = "float32"
-        v = blocks(sbuf, tile_size=(128, 512), block_size=(1, 2), buffer_type=nl.sbuf)
+        sbuf = MockTensor((128, 1024), buffer=nl.sbuf)
+        v = blocks(sbuf, tile_size=(128, 512), block_size=(1, 2))
         # 1024 / 512 = 2 tiles in F, block_size (1,2) = 1 block.
         assert v.shape == (1, 1)
-        assert isinstance(v.layout, SBUFLayout)
+        assert isinstance(v._layout, SBUFLayout)
         # Per-dim layout: dim 1 has block + tile + leaf.
-        assert len(v.grid.axes_for(1)) == 3
-        assert v.grid.is_blocked(1)
+        assert len(v._grid.axes_for(1)) == 3
+        assert v._grid.is_blocked(1)
 
 
 # ============================================================================
@@ -1251,38 +1164,34 @@ class TestSBUFTilesRemainder:
     """
 
     def _make_sbuf(self, shape):
-        import numpy as np
-
-        sbuf = np.zeros(shape, dtype=np.float32)
-        sbuf.dtype = "float32"
-        return sbuf
+        return MockTensor(shape, buffer=nl.sbuf)
 
     @pytest.mark.fast
     def test_sbuf_tiles_exact_fit(self):
         """No remainder: 1024 / 512 = 2 tiles exactly."""
         sbuf = self._make_sbuf((128, 1024))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
+        v = tiles(sbuf, tile_size=(128, 512))
         assert v.shape == (1, 2)
         assert v.is_remainder is False
 
     def test_sbuf_tiles_f_remainder(self):
         """F-remainder: 1792 / 512 = 3 full + 1 remainder (256)."""
         sbuf = self._make_sbuf((128, 1792))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
+        v = tiles(sbuf, tile_size=(128, 512))
         assert v.shape == (1, 4)
         assert v.is_remainder is True
 
     def test_sbuf_tiles_small_remainder(self):
         """Small F-remainder: 640 / 512 = 1 full + 1 remainder (128)."""
         sbuf = self._make_sbuf((128, 640))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
+        v = tiles(sbuf, tile_size=(128, 512))
         assert v.shape == (1, 2)
         assert v.is_remainder is True
 
     def test_sbuf_tiles_p_remainder(self):
         """P-remainder: 300 / 128 = 2 full + 1 remainder (44)."""
         sbuf = self._make_sbuf((300, 512))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
+        v = tiles(sbuf, tile_size=(128, 512))
         assert v.shape == (3, 1)
         assert v.is_remainder is True
 
@@ -1291,32 +1200,23 @@ class TestSBUFTilesRemainder:
         from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
 
         sbuf = self._make_sbuf((128, 2048))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
-        assert isinstance(v.layout, SBUFLayout)
-        assert v.layout.strides == (2048, 512)
+        v = tiles(sbuf, tile_size=(128, 512))
+        assert isinstance(v._layout, SBUFLayout)
+        assert v._layout.strides == (2048, 512)
 
     def test_sbuf_stride_with_remainder(self):
         """Remainder strides: d=0 uses actual remaining[1], not padded."""
         from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
 
         sbuf = self._make_sbuf((128, 1792))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
-        assert isinstance(v.layout, SBUFLayout)
-        assert v.layout.strides == (1792, 512)
+        v = tiles(sbuf, tile_size=(128, 512))
+        assert isinstance(v._layout, SBUFLayout)
+        assert v._layout.strides == (1792, 512)
 
 
 # ============================================================================
 # nt.blocks() full contract (PR 1): NDSlice dispatch + rejections
 # ============================================================================
-
-
-class _SBUFNdarray:
-    """Mock raw SBUF ndarray with .shape, .dtype, ._pattern=None (identity)."""
-
-    def __init__(self, shape, dtype="float32"):
-        self.shape = shape
-        self.dtype = dtype
-        self._pattern = None
 
 
 @pytest_marks(["neurotile"])
@@ -1336,9 +1236,9 @@ class TestBlocksRequiresBlockSize:
             blocks(v)
 
     def test_raw_sbuf_no_block_size_rejects(self):
-        sbuf = _SBUFNdarray((128, 1024))
+        sbuf = MockTensor((128, 1024), buffer=nl.sbuf)
         with pytest.raises(TypeError, match="block_size"):
-            blocks(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
+            blocks(sbuf, tile_size=(128, 512))
 
     def test_explicit_none_block_size_rejects(self):
         src = MockTensor(512, 2048)
@@ -1422,15 +1322,15 @@ class TestBlocksNDSlicePromoteHBM:
         assert b.element_shape == (512, 2048)
         # Each dim now has block + tile + leaf.
         for d in (0, 1):
-            assert len(b.grid.axes_for(d)) == 3
-        assert b.grid.block_size == (2, 2)
+            assert len(b._grid.axes_for(d)) == 3
+        assert b._grid.block_size == (2, 2)
 
     def test_promote_already_blocked_view(self):
         """Row 1 + pre-blocked input: strip existing block level, then re-block."""
         src = MockTensor(512, 2048)
         b1 = blocks(src, tile_size=(128, 512), block_size=(2, 2))
         b2 = blocks(b1, block_size=(4, 2))
-        assert b2.grid.block_size == (4, 2)
+        assert b2._grid.block_size == (4, 2)
         assert b2.tile_size == (128, 512)
 
 
@@ -1445,7 +1345,7 @@ class TestBlocksNDSliceRetilePromoteHBM:
         b = blocks(v, tile_size=(64, 512), block_size=(2, 2))
         assert b.tile_size == (64, 512)
         # block + tile + leaf on dim 0.
-        assert len(b.grid.axes_for(0)) == 3
+        assert len(b._grid.axes_for(0)) == 3
 
 
 @pytest_marks(["neurotile"])
@@ -1454,8 +1354,8 @@ class TestBlocksNDSlicePromoteSBUF:
 
     def _make_sbuf_tiles(self, shape=(128, 1024), tile_size=(128, 512)):
         """Construct an unsharded SBUF tile-level view."""
-        sbuf = _SBUFNdarray(shape)
-        return tiles(sbuf, tile_size=tile_size, buffer_type=nl.sbuf)
+        sbuf = MockTensor(shape, buffer=nl.sbuf)
+        return tiles(sbuf, tile_size=tile_size)
 
     @pytest.mark.fast
     def test_promote_unsharded_sbuf(self):
@@ -1463,11 +1363,11 @@ class TestBlocksNDSlicePromoteSBUF:
 
         v = self._make_sbuf_tiles()
         b = blocks(v, block_size=(1, 2))
-        assert isinstance(b.layout, SBUFLayout)
-        assert b.grid.block_size == (1, 2)
+        assert isinstance(b._layout, SBUFLayout)
+        assert b._grid.block_size == (1, 2)
         # Same source, same offset -- no Layout rebuild
-        assert b.layout.source is v.layout.source
-        assert b.layout.offset == v.layout.offset
+        assert b._layout.source is v._layout.source
+        assert b._layout.offset == v._layout.offset
 
     def test_retile_and_promote_unsharded_sbuf(self):
         """Row 3 extended: re-tile on unsharded SBUF + promote."""
@@ -1475,9 +1375,9 @@ class TestBlocksNDSlicePromoteSBUF:
 
         v = self._make_sbuf_tiles()
         b = blocks(v, tile_size=(128, 256), block_size=(1, 2))
-        assert isinstance(b.layout, SBUFLayout)
+        assert isinstance(b._layout, SBUFLayout)
         assert b.tile_size == (128, 256)
-        assert b.grid.block_size == (1, 2)
+        assert b._grid.block_size == (1, 2)
 
 
 @pytest_marks(["neurotile"])
@@ -1493,9 +1393,9 @@ class TestBlocksOnSlicedHBM:
         v = tiles(src, tile_size=(128, 512))[block_range(rank=1, num_shards=2, total=4), :]
         b = blocks(v, block_size=(2, 2))
         # block_size triple on each dim.
-        assert len(b.grid.axes_for(0)) == 3
-        assert b.offset == 2 * 128 * 2048
-        assert b.grid.remaining[0] == 256
+        assert len(b._grid.axes_for(0)) == 3
+        assert b._offset == 2 * 128 * 2048
+        assert b._grid.remaining[0] == 256
 
     def test_blocks_with_retile_then_slice(self):
         """Re-tile + promote + slice on the resulting view."""
@@ -1508,31 +1408,21 @@ class TestBlocksOnSlicedHBM:
             :,
         ]
         assert b.tile_size == (64, 512)
-        assert b.grid.remaining[0] == 256
+        assert b._grid.remaining[0] == 256
 
 
 @pytest_marks(["neurotile"])
 class TestBlocksNDSliceRawOnlyParams:
-    """Row 9: raw-source-only params (root=, access_pattern=, buffer_type=) rejected on NDSlice."""
+    """raw-source-only params (access_pattern=) rejected on an NDSlice source."""
 
     def _view(self):
         return tiles(MockTensor(512, 2048), tile_size=(128, 512))
 
     @pytest.mark.fast
-    def test_reject_root(self):
-        v = self._view()
-        with pytest.raises(AssertionError, match="root= is only for raw sources"):
-            blocks(v, root=MockTensor(512, 2048), block_size=(2, 2))
-
     def test_reject_access_pattern(self):
         v = self._view()
         with pytest.raises(AssertionError, match="access_pattern= is only for raw sources"):
             blocks(v, access_pattern=[[2048, 1], [1, 2048]], block_size=(2, 2))
-
-    def test_reject_buffer_type(self):
-        v = self._view()
-        with pytest.raises(AssertionError, match="buffer_type= is only for raw sources"):
-            blocks(v, buffer_type=nl.sbuf, block_size=(2, 2))
 
 
 @pytest_marks(["neurotile"])
@@ -1546,31 +1436,31 @@ class TestBlocksEquivalence:
         b_construct = blocks(src, tile_size=(128, 512), block_size=(2, 2))
         b_promote = blocks(tiles(src, tile_size=(128, 512)), block_size=(2, 2))
         # Both produce equivalent block-level views.
-        assert _axis_tuples_equal(b_construct.grid.axes, b_promote.grid.axes)
+        assert _axis_tuples_equal(b_construct._grid.axes, b_promote._grid.axes)
         assert b_construct.element_shape == b_promote.element_shape
-        assert b_construct.offset == b_promote.offset
-        assert b_construct.grid.block_size == b_promote.grid.block_size
+        assert b_construct._offset == b_promote._offset
+        assert b_construct._grid.block_size == b_promote._grid.block_size
 
 
 def _axis_tuples_equal(a, b):
     """Structural equality on axis tuples (NKIObject lacks __eq__)."""
     if len(a) != len(b):
         return False
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=True):
         if (x.count, x.step, x.dim, x.label) != (y.count, y.step, y.dim, y.label):
             return False
     return True
 
     def test_promote_matches_construct_sbuf(self):
-        sbuf = _SBUFNdarray((128, 1024))
-        b_construct = blocks(sbuf, tile_size=(128, 512), block_size=(1, 2), buffer_type=nl.sbuf)
-        v_tiles = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
+        sbuf = MockTensor((128, 1024), buffer=nl.sbuf)
+        b_construct = blocks(sbuf, tile_size=(128, 512), block_size=(1, 2))
+        v_tiles = tiles(sbuf, tile_size=(128, 512))
         b_promote = blocks(v_tiles, block_size=(1, 2))
         # Both paths produce equivalent block-level views: same tile_size,
         # same element_shape, same offset.
         assert b_construct.tile_size == b_promote.tile_size
         assert b_construct.element_shape == b_promote.element_shape
-        assert b_construct.layout.offset == b_promote.layout.offset
+        assert b_construct._layout.offset == b_promote._layout.offset
 
 
 @pytest_marks(["neurotile"])
@@ -1580,12 +1470,12 @@ class TestSBUFRetileUnsharded:
     @pytest.mark.fast
     def test_retile_unsharded_sbuf_still_works(self):
         """Regression: re-tile on a plain unsharded SBUF view."""
-        sbuf = _SBUFNdarray((128, 1024))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
+        sbuf = MockTensor((128, 1024), buffer=nl.sbuf)
+        v = tiles(sbuf, tile_size=(128, 512))
         v2 = tiles(v, tile_size=(128, 256))
         assert v2.tile_size == (128, 256)
-        assert not v2.grid.is_sharded(0)
-        assert not v2.grid.is_sharded(1)
+        assert not v2._grid.is_sharded(0)
+        assert not v2._grid.is_sharded(1)
 
 
 @pytest_marks(["neurotile"])
@@ -1596,15 +1486,15 @@ class TestSBUFLayoutRetile:
     def test_retile_rebuilds_strides(self):
         from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
 
-        sbuf = _SBUFNdarray((128, 1024))
-        v = tiles(sbuf, tile_size=(128, 512), buffer_type=nl.sbuf)
-        old_strides = v.layout.strides
-        new_layout = v.layout.retile((128, 256), (128, 1024))
+        sbuf = MockTensor((128, 1024), buffer=nl.sbuf)
+        v = tiles(sbuf, tile_size=(128, 512))
+        old_strides = v._layout.strides
+        new_layout = v._layout.retile((128, 256), (128, 1024))
         assert isinstance(new_layout, SBUFLayout)
         assert new_layout.alloc_tile_size == (128, 256)
         # Source + offset preserved
-        assert new_layout.source is v.layout.source
-        assert new_layout.offset == v.layout.offset
+        assert new_layout.source is v._layout.source
+        assert new_layout.offset == v._layout.offset
         # Strides recomputed (different tile_size -> different F-strides)
         assert new_layout.strides != old_strides
 
@@ -1632,11 +1522,6 @@ class TestShapeLevelAttributes:
         assert v.is_tiled is True
         assert v.is_blocked is True
 
-    def test_tensor_view_neither_tiled_nor_blocked(self):
-        v = tensor_view(MockTensor(512, 2048))
-        assert v.is_tiled is False
-        assert v.is_blocked is False
-
     # --- tile_shape ---
 
     def test_tiles_tile_shape_2d(self):
@@ -1660,10 +1545,6 @@ class TestShapeLevelAttributes:
         # tile_shape ignores block grouping -- it's element_shape / tile_size
         assert v.tile_shape == (8, 4)
 
-    def test_tensor_view_tile_shape_is_none(self):
-        v = tensor_view(MockTensor(512, 2048))
-        assert v.tile_shape is None
-
     # --- block_shape ---
 
     def test_blocks_block_shape_2d(self):
@@ -1680,10 +1561,6 @@ class TestShapeLevelAttributes:
 
     def test_tiles_block_shape_is_none(self):
         v = tiles(MockTensor(512, 2048), tile_size=(128, 512))
-        assert v.block_shape is None
-
-    def test_tensor_view_block_shape_is_none(self):
-        v = tensor_view(MockTensor(512, 2048))
         assert v.block_shape is None
 
     # --- consume stability: tile_shape survives indexing past outer axes ---

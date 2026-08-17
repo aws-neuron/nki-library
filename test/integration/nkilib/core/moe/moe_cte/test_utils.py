@@ -27,7 +27,6 @@ from typing import Optional
 
 import nki.language as nl
 import numpy as np
-
 from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_utils import SkipMode
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
@@ -35,12 +34,14 @@ from nkilib_src.nkilib.core.utils.common_types import (
     QuantizationType,
 )
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     generate_token_position_to_id_and_experts,
     get_n_blocks,
     map_skip_mode,
 )
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
+from test.utils.mx_utils import dequantize_mx_golden
 
 # MXFP4 quantization block dimensions
 _q_width = 4  # quantization width
@@ -62,6 +63,123 @@ SLOTS_PER_PACKED_BUFFER = (QUADRANT_SIZE // 2) // ROWS_PER_SLOT  # 4 tiles per p
 def n_packed_buffers_for(n_tiles: int) -> int:
     """Number of packed buffers needed to hold n_tiles scale tiles."""
     return (n_tiles + SLOTS_PER_PACKED_BUFFER - 1) // SLOTS_PER_PACKED_BUFFER
+
+
+def build_prequantized_hidden_concat(hidden_T: int, n_H512_tile: int, H: int, expert_affinities=None):
+    """Build the pre-quantized fp8 hidden-state concat tensor for the fp8-hidden kernel path.
+
+    Mirrors the packed layout rmsnorm_mx_prefill produces: each token row is
+        [ hidden_quant (H fp8 bytes) | hidden_scale (packed scale_region uint8 MX-scale bytes) ]
+    where scale_region = ceil(n_H512_tile/4)*128. The uint8 scales are folded 4-of-32 per quadrant
+    AND 4 H512 tiles per 128-wide block (tile k at within-quadrant offset (k%4)*4 in pack k//4),
+    matching the kernel's packed transpose_fp8_hidden_states + is_packed_moving_scale matmul.
+
+    When expert_affinities ([hidden_T, E] bf16) is given, the dense affinity vector is appended after
+    the scale region as bf16 reinterpreted into fp8 columns, and the whole row is padded to a multiple
+    of 4 fp8 columns (the kernel's hidden fp32-reinterpret transpose requires it) -- exactly the
+    rmsnorm_mx_prefill pack_affinities layout. The kernel then extracts each block's expert column
+    on-chip instead of a separate affinity gather.
+
+    Returns:
+        hidden_concat (np.ndarray): [hidden_T, H + scale_region (+ affin tail)] viewed as fp8_e4m3fn.
+        hidden_fp32 (np.ndarray): [hidden_T, H] dequantized fp32 hidden (for the torch reference,
+            so kernel and golden compare the same numbers).
+    """
+    mx_unpacked_dtype = nl.float8_e4m3fn
+
+    # Same generator the bf16 path uses; we keep BOTH the fp8 data + uint8 scales this time.
+    hidden_fp32_blk, hidden_quant, hidden_scale_tmp = generate_stabilized_mx_data(
+        mx_dtype=nl.float8_e4m3fn_x4,
+        shape=(hidden_T * n_H512_tile * _pmax, _q_width),
+        val_range=5,
+    )
+
+    # Dequantized fp32 hidden in the natural [hidden_T, H] layout for the reference.
+    hidden_fp32 = (
+        dequantize_mx_golden(hidden_quant, hidden_scale_tmp)
+        .reshape(hidden_T, n_H512_tile, _pmax, _q_width)
+        .transpose(0, 3, 1, 2)
+        .reshape(hidden_T, H)
+        .astype(np.float32)
+    )
+
+    # fp8 quant region: [hidden_T, n_H512_tile * 128_H] bytes (= H fp8 bytes per row).
+    hidden_quant = hidden_quant.reshape(hidden_T, n_H512_tile * _pmax).view(mx_unpacked_dtype)
+
+    # uint8 scale region (PACKED): fold 4 H512 tiles into one 128-wide block. Tile k lives in pack
+    # k//4 at within-quadrant offset (k%4)*4 (4 valid rows per 32-col quadrant). scale_region =
+    # n_packed * 128. hidden_scale_tmp is [hidden_T * n_H512_tile * 16, 1] -> [16, n_H512_tile, T].
+    n_packed = n_packed_buffers_for(n_H512_tile)
+    hidden_scale_tmp = (
+        hidden_scale_tmp.reshape(hidden_T, n_H512_tile, _pmax // _q_height).transpose(2, 1, 0)  # [16, n_H512_tile, T]
+    )
+    hidden_scale = np.zeros((_pmax, n_packed, hidden_T), dtype=np.uint8)  # [128, n_packed, T]
+    for tile_idx in range(n_H512_tile):
+        pack_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+        slot_idx = tile_idx % SLOTS_PER_PACKED_BUFFER
+        for quadrant in range(N_QUADRANTS):
+            dst = QUADRANT_SIZE * quadrant + slot_idx * ROWS_PER_SLOT
+            src = quadrant * ROWS_PER_SLOT
+            hidden_scale[dst : dst + ROWS_PER_SLOT, pack_idx, :] = hidden_scale_tmp[
+                src : src + ROWS_PER_SLOT, tile_idx, :
+            ]
+    hidden_scale = hidden_scale.transpose(2, 1, 0).reshape(hidden_T, n_packed * _pmax).view(mx_unpacked_dtype)
+
+    hidden_concat = np.concatenate((hidden_quant, hidden_scale), axis=1)
+
+    if expert_affinities is not None:
+        # Append the dense [hidden_T, E] affinities as bf16 reinterpreted into fp8 columns, then pad
+        # the whole row to a multiple of 4 fp8 cols (matches rmsnorm_mx_prefill pack_affinities).
+        affin_fp8 = expert_affinities.astype(nl.bfloat16).view(mx_unpacked_dtype)  # [hidden_T, E*2]
+        row = np.concatenate((hidden_concat, affin_fp8), axis=1)
+        pad = (-row.shape[1]) % 4
+        if pad:
+            row = np.concatenate((row, np.zeros((hidden_T, pad), dtype=mx_unpacked_dtype)), axis=1)
+        hidden_concat = row
+
+    return hidden_concat, hidden_fp32
+
+
+def dequant_prequantized_hidden_concat(hidden_concat, H: int):
+    """Inverse of build_prequantized_hidden_concat: recover fp32 [T, H] hidden for the reference.
+
+    Splits the concat [T, H + scale_region] back into the fp8 quant region and the PACKED uint8
+    scale region (scale_region = ceil(n_H512_tile/4)*128), reverses the 4-tiles-per-128-block +
+    4-of-32 quadrant fold, and dequantizes via dequantize_mx_golden so the torch reference sees the
+    exact same numbers the kernel's matmul consumes.
+    """
+    hidden_T = hidden_concat.shape[0]
+    n_H512_tile = H // (_pmax * _q_width)
+    n_packed = n_packed_buffers_for(n_H512_tile)
+    scale_region = n_packed * _pmax
+
+    # fp8 quant region [T, H] -> x4 [T*n_H512*128, 1].
+    quant_region = hidden_concat[:, :H]
+    hidden_quant_x4 = quant_region.view(nl.float8_e4m3fn_x4).reshape(hidden_T * n_H512_tile * _pmax, 1)
+
+    # PACKED uint8 scale region [T, scale_region] -> reverse the fold -> [T*n_H512*16, 1].
+    scale_bytes = hidden_concat[:, H : H + scale_region].view(np.uint8)
+    scale_packed = scale_bytes.reshape(hidden_T, n_packed, _pmax).transpose(2, 1, 0)  # [128, n_packed, T]
+    scale_unpacked = np.zeros((_pmax // _q_height, n_H512_tile, hidden_T), dtype=np.uint8)  # [16, n_H512, T]
+    for tile_idx in range(n_H512_tile):
+        pack_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+        slot_idx = tile_idx % SLOTS_PER_PACKED_BUFFER
+        for quadrant in range(N_QUADRANTS):
+            src = QUADRANT_SIZE * quadrant + slot_idx * ROWS_PER_SLOT
+            dst = quadrant * ROWS_PER_SLOT
+            scale_unpacked[dst : dst + ROWS_PER_SLOT, tile_idx, :] = scale_packed[
+                src : src + ROWS_PER_SLOT, pack_idx, :
+            ]
+    hidden_scale = scale_unpacked.transpose(2, 1, 0).reshape(hidden_T * n_H512_tile * (_pmax // _q_height), 1)
+
+    hidden_fp32 = (
+        dequantize_mx_golden(hidden_quant_x4, hidden_scale)
+        .reshape(hidden_T, n_H512_tile, _pmax, _q_width)
+        .transpose(0, 3, 1, 2)
+        .reshape(hidden_T, H)
+        .astype(np.float32)
+    )
+    return hidden_fp32
 
 
 def _scatter_to_packed_gate_up(scale_std: np.ndarray) -> np.ndarray:
@@ -187,6 +305,80 @@ def _scatter_to_packed_down(scale_std: np.ndarray) -> np.ndarray:
     return packed
 
 
+# --- Block-128 (DeepSeek ue8m0) scale helpers ------------------------------
+# Block-128 packs one uint8 per 128(K) x 128(N) weight block. The kernel
+# materializes it into the same SBUF layout the native MX path produces, where
+# each 32-partition quadrant = 128 contiguous K-elements = one block-128 K-row,
+# and each scale repeats across 128 N-columns. The native-layout HBM scale has
+# P_SCALE=16 K-rows (4 per quadrant); block-128 collapses those 4 rows into one
+# per quadrant, hence 4 block-rows total.
+SCALE_BLOCK = 128
+
+
+def native_to_block128_gate_up(scale_std: np.ndarray) -> np.ndarray:
+    """Subsample native gate/up scale into compact block-128 layout.
+
+    Args:
+        scale_std: uint8[E, P_SCALE=16, 2, n_H512_tile, I]
+    Returns:
+        uint8[E, N_QUADRANTS=4, 2, n_H512_tile, ceil(I/128)]
+    Picks one representative scale per 128(K) x 128(N) block: native K-row
+    ``4*q`` (first row of quadrant q) and native N-column ``nb*128``.
+    """
+    E, p_scale, two, n_H512_tile, I = scale_std.shape
+    assert p_scale == P_SCALE and two == 2, f"unexpected shape {scale_std.shape}"
+    n_blocks = (I + SCALE_BLOCK - 1) // SCALE_BLOCK
+    out = np.zeros((E, N_QUADRANTS, 2, n_H512_tile, n_blocks), dtype=np.uint8)
+    for q in range(N_QUADRANTS):
+        for nb in range(n_blocks):
+            out[:, q, :, :, nb] = scale_std[:, q * ROWS_PER_SLOT, :, :, nb * SCALE_BLOCK]
+    return out
+
+
+def block128_to_native_gate_up(scale_blk: np.ndarray, n_H512_tile: int, I: int) -> np.ndarray:
+    """Expand compact block-128 gate/up scale to the native [E,16,2,n_H512,I] layout
+    that the kernel materializes (each block-row repeated across its 4 quadrant
+    K-rows, each block scale repeated across 128 N-columns)."""
+    E, n_q, two, _, n_blocks = scale_blk.shape
+    assert n_q == N_QUADRANTS and two == 2, f"unexpected block128 shape {scale_blk.shape}"
+    out = np.zeros((E, P_SCALE, 2, n_H512_tile, I), dtype=np.uint8)
+    for row in range(P_SCALE):
+        q = row // ROWS_PER_SLOT
+        for n in range(I):
+            out[:, row, :, :, n] = scale_blk[:, q, :, :, n // SCALE_BLOCK]
+    return out
+
+
+def native_to_block128_down(scale_std: np.ndarray) -> np.ndarray:
+    """Subsample native down scale into compact block-128 layout.
+
+    Args:
+        scale_std: uint8[E, p_scale, n_I512_tile, H]  (p_scale = I_TP_par_dim//8)
+    Returns:
+        uint8[E, N_QUADRANTS=4, n_I512_tile, ceil(H/128)]
+    """
+    E, p_scale, n_I512_tile, H = scale_std.shape
+    n_quadrants_filled = p_scale // ROWS_PER_SLOT
+    n_blocks = (H + SCALE_BLOCK - 1) // SCALE_BLOCK
+    out = np.zeros((E, N_QUADRANTS, n_I512_tile, n_blocks), dtype=np.uint8)
+    for q in range(n_quadrants_filled):
+        for nb in range(n_blocks):
+            out[:, q, :, nb] = scale_std[:, q * ROWS_PER_SLOT, :, nb * SCALE_BLOCK]
+    return out
+
+
+def block128_to_native_down(scale_blk: np.ndarray, n_I512_tile: int, H: int, p_scale: int = P_SCALE) -> np.ndarray:
+    """Expand compact block-128 down scale to native [E, p_scale, n_I512_tile, H]."""
+    E, n_q, _, n_blocks = scale_blk.shape
+    assert n_q == N_QUADRANTS, f"unexpected block128 down shape {scale_blk.shape}"
+    out = np.zeros((E, p_scale, n_I512_tile, H), dtype=np.uint8)
+    for row in range(p_scale):
+        q = row // ROWS_PER_SLOT
+        for n in range(H):
+            out[:, row, :, n] = scale_blk[:, q, :, n // SCALE_BLOCK]
+    return out
+
+
 # Explicit parameter ordering per kernel variant, matching kernel function signatures.
 # From bwmm_shard_on_block_mx.py::bwmm_shard_on_block_mx
 _SHARD_ON_BLOCK_MX_ORDER = [
@@ -245,6 +437,7 @@ _SHARD_ON_I_MX_ORDER = [
     'gate_clamp_lower_limit',
     'up_clamp_lower_limit',
     'up_clamp_upper_limit',
+    'use_block128_scales',
 ]
 
 # From bwmm_shard_on_I_mx.py::blockwise_mm_shard_intermediate_mx_hybrid
@@ -272,6 +465,7 @@ _SHARD_ON_I_MX_HYBRID_ORDER = [
     'gate_clamp_lower_limit',
     'up_clamp_lower_limit',
     'up_clamp_upper_limit',
+    'use_block128_scales',
 ]
 
 _KERNEL_INPUT_ORDER = {
@@ -574,7 +768,10 @@ def build_moe_bwmm_mx_cte(
     is_shard_on_I: bool = False,
     n_static_blocks: Optional[int] = None,
     use_packed_scales: bool = False,
+    use_block128_scales: bool = False,
     quantization_type: QuantizationType = QuantizationType.MX,
+    use_prequant_hidden: bool = False,
+    pack_affinities_into_hidden: bool = False,
 ) -> dict:
     """
     Build input tensors for MoE BWMM MXFP4/MXFP8 CTE kernel testing.
@@ -684,7 +881,10 @@ def build_moe_bwmm_mx_cte(
         up_clamp_upper_limit=up_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
         use_packed_scales=use_packed_scales,
+        use_block128_scales=use_block128_scales,
         quantization_type=quantization_type,
+        use_prequant_hidden=use_prequant_hidden,
+        pack_affinities_into_hidden=pack_affinities_into_hidden,
     )
 
     # Cache the generated inputs for future reuse
@@ -728,7 +928,10 @@ def _build_kernel_input_from_routing(
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     use_packed_scales: bool = False,
+    use_block128_scales: bool = False,
     quantization_type: QuantizationType = QuantizationType.MX,
+    use_prequant_hidden: bool = False,
+    pack_affinities_into_hidden: bool = False,
 ) -> dict:
     """Build kernel input tensors and dict from pre-computed routing assignments.
 
@@ -767,23 +970,8 @@ def _build_kernel_input_from_routing(
     else:
         hidden_T = T + 1  # Include padding token
 
-    hidden_states_fp32, _, _ = generate_stabilized_mx_data(
-        mx_dtype=nl.float8_e4m3fn_x4,
-        shape=(hidden_T * n_H512_tile * _pmax, _q_width),
-        val_range=5,
-    )
-    hidden_states = (
-        hidden_states_fp32.reshape(hidden_T, n_H512_tile, _pmax, _q_width)
-        .transpose(0, 3, 1, 2)
-        .reshape(hidden_T, H)
-        .astype(dtype)
-    )
-
-    # Zero out padding token (only when not skipping tokens)
-    if not dma_skip.skip_token:
-        hidden_states[T, :] = 0
-
-    # Generate expert affinities
+    # Generate expert affinities first: the packed-affinity prequant path folds them into the hidden
+    # concat row, so they must exist before build_prequantized_hidden_concat.
     if dma_skip.skip_token:
         expert_affinities_masked = np.random.random_sample([T, E]).astype(dtype)
         expert_affinities_masked = (expert_affinities_masked * expert_masks).astype(dtype)
@@ -791,6 +979,40 @@ def _build_kernel_input_from_routing(
         expert_affinities_masked = np.random.random_sample([T + 1, E]).astype(dtype)
         expert_affinities_masked[:T] = (expert_affinities_masked[:T] * expert_masks).astype(dtype)
         expert_affinities_masked[T] = 0  # Zero padding token affinities
+
+    kernel_assert(
+        not (pack_affinities_into_hidden and not use_prequant_hidden),
+        "pack_affinities_into_hidden requires use_prequant_hidden",
+    )
+
+    hidden_states_ref_fp32 = None
+    if use_prequant_hidden:
+        # Pre-quantized fp8 hidden (real MX): kernel gets the concat [T, H + scale_region (+ affinity
+        # tail)] fp8 tensor; the reference gets the dequantized fp32 hidden (same numbers the kernel's
+        # matmul sees). When pack_affinities_into_hidden, the dense affinities ride the row tail.
+        _packed_affin = expert_affinities_masked if pack_affinities_into_hidden else None
+        hidden_states, hidden_states_ref_fp32 = build_prequantized_hidden_concat(
+            hidden_T, n_H512_tile, H, expert_affinities=_packed_affin
+        )
+        if not dma_skip.skip_token:
+            hidden_states[T, :] = 0
+            hidden_states_ref_fp32[T, :] = 0
+    else:
+        hidden_states_fp32, _, _ = generate_stabilized_mx_data(
+            mx_dtype=nl.float8_e4m3fn_x4,
+            shape=(hidden_T * n_H512_tile * _pmax, _q_width),
+            val_range=5,
+        )
+        hidden_states = (
+            hidden_states_fp32.reshape(hidden_T, n_H512_tile, _pmax, _q_width)
+            .transpose(0, 3, 1, 2)
+            .reshape(hidden_T, H)
+            .astype(dtype)
+        )
+
+        # Zero out padding token (only when not skipping tokens)
+        if not dma_skip.skip_token:
+            hidden_states[T, :] = 0
 
     # Generate MXFP4 gate/up projection weights
     gate_up_proj_weights_fp32, gate_up_proj_weights, gate_up_proj_scale = generate_stabilized_mx_data(
@@ -824,7 +1046,7 @@ def _build_kernel_input_from_routing(
         down_proj_weights[:, n_par_r:, -1, :] = 0
         down_proj_scale[:, n_par_r // _q_height :, -1, :] = 0
 
-    # Build kernel input dictionary in exact KLIR test order
+    # Build kernel input dictionary in exact compiler test order
     # Order must match build_blockwise_mm input_list:
     # [hidden_states, expert_affinities, gate_and_up_proj_weights, down_proj_weights,
     #  token_position_to_id, block_to_expert]
@@ -887,21 +1109,29 @@ def _build_kernel_input_from_routing(
     # Add scale tensors AFTER bias (matches build_blockwise_mm order).
     # If packing is requested, hand the kernel the packed copies. The torch
     # reference inverts the packing via gather_from_packed_* in the wrapper.
+    assert not (use_packed_scales and use_block128_scales), "packed and block-128 scales are mutually exclusive"
     if use_packed_scales:
         # Both gate/up (always P_SCALE=16 source rows) and down (p_scale =
         # I_TP_par_dim // _q_height, may be ≤ 16) are supported. For down,
         # quadrants beyond what the source covers stay zero-padded.
         kernel_input['gate_up_proj_scale'] = _scatter_to_packed_gate_up(gate_up_proj_scale)
         kernel_input['down_proj_scale'] = _scatter_to_packed_down(down_proj_scale)
+    elif use_block128_scales:
+        # Subsample the fine-grained MX scales into compact block-128 layout for
+        # the kernel. The torch reference expands the SAME compact array back to
+        # the (coarse) native layout in the wrapper, so kernel and ref agree.
+        kernel_input['gate_up_proj_scale'] = native_to_block128_gate_up(gate_up_proj_scale)
+        kernel_input['down_proj_scale'] = native_to_block128_down(down_proj_scale)
     else:
         kernel_input['gate_up_proj_scale'] = gate_up_proj_scale
         kernel_input['down_proj_scale'] = down_proj_scale
 
-    # Forward the packed-scale flag to the kernel — only emit when packing is
-    # requested so kernel variants that don't accept the kwarg (e.g. shard-on-I)
-    # aren't broken by an unrecognized key.
+    # Forward the scale-format flag to the kernel — only emit when requested so
+    # kernel variants that don't accept the kwarg aren't broken by an unknown key.
     if use_packed_scales:
         kernel_input['use_packed_scales'] = True
+    if use_block128_scales:
+        kernel_input['use_block128_scales'] = True
 
     # ── STATIC_MX support ──
     # STATIC_MX reuses the existing weight-scale tensors instead of adding new params:
@@ -953,6 +1183,8 @@ def _build_kernel_input_from_routing(
         'I_TP_par_dim': I_TP_par_dim,
         'use_packed_scales': use_packed_scales,
         'quantization_type': quantization_type,
+        'use_prequant_hidden': use_prequant_hidden,
+        'hidden_states_ref_fp32': hidden_states_ref_fp32,
     }
 
     return kernel_input

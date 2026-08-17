@@ -161,7 +161,7 @@ _FLOAT32_MIN = -3.4028235e38  # used for initialization and masking
 Kernel constraints (based on tested range, values outside range might work in practice)
 """
 _MAX_BS = 512  # max tested batch size
-_MAX_SEQLEN = 131072  # max allowed seqlen
+_MAX_SEQLEN = 131072  # seqlen above this logs a warning (kernel handles arbitrary seqlen via tiling)
 _MAX_BS_TIMES_SEQLEN_QK = 32.0 * 36864 * 36864  # max tested bs*seqlen_q*seqlen_k
 _MAX_HEAD_DIM = 512  # max supported head dim (d)
 _MIN_GLOBAL_CP_DEGREE = 1  # minimum context parallel degree
@@ -192,15 +192,15 @@ _SWA_ALLOCATION_STRATEGY_THRESHOLD = (
 
 @nki.jit
 def attention_cte(
-    q: nl.ndarray,
-    k: nl.ndarray,
-    v: nl.ndarray,
+    q: nl.NkiTensor,
+    k: nl.NkiTensor,
+    v: nl.NkiTensor,
     scale: float = 1.0,
     causal_mask: bool = True,
-    k_prior: Optional[nl.ndarray] = None,
-    v_prior: Optional[nl.ndarray] = None,
-    prior_used_len: Optional[nl.ndarray] = None,
-    sink: Optional[nl.ndarray] = None,
+    k_prior: Optional[nl.NkiTensor] = None,
+    v_prior: Optional[nl.NkiTensor] = None,
+    prior_used_len: Optional[nl.NkiTensor] = None,
+    sink: Optional[nl.NkiTensor] = None,
     sliding_window: Optional[int] = None,
     tp_q: bool = True,
     tp_k: bool = False,
@@ -208,14 +208,14 @@ def attention_cte(
     cache_softmax: bool = False,
     softmax_dtype=nl.float32,
     mm_out_dtype=nl.float32,
-    cp_offset: Optional[nl.ndarray] = None,
+    cp_offset: Optional[nl.NkiTensor] = None,
     global_cp_deg: int = None,
     cp_strided_q_slicing: bool = False,
-    bound_min: Optional[nl.ndarray] = None,
-    bound_max: Optional[nl.ndarray] = None,
+    bound_min: Optional[nl.NkiTensor] = None,
+    bound_max: Optional[nl.NkiTensor] = None,
     cp_striped_input: bool = False,
     skip_output_normalization: bool = False,
-    position_bias: Optional[nl.ndarray] = None,
+    position_bias: Optional[nl.NkiTensor] = None,
     bias_layout: str = "dense",
     bias_band_params: Optional[dict] = None,
 ):
@@ -439,15 +439,15 @@ def attention_cte(
 
 
 def _attention_cte(
-    q: nl.ndarray,
-    k: Optional[nl.ndarray] = None,
-    v: Optional[nl.ndarray] = None,
+    q: nl.NkiTensor,
+    k: Optional[nl.NkiTensor] = None,
+    v: Optional[nl.NkiTensor] = None,
     scale: float = 1.0,
     causal_mask: bool = True,
-    k_prior: Optional[nl.ndarray] = None,
-    v_prior: Optional[nl.ndarray] = None,
-    prior_used_len: Optional[nl.ndarray] = None,
-    sink: Optional[nl.ndarray] = None,
+    k_prior: Optional[nl.NkiTensor] = None,
+    v_prior: Optional[nl.NkiTensor] = None,
+    prior_used_len: Optional[nl.NkiTensor] = None,
+    sink: Optional[nl.NkiTensor] = None,
     sliding_window: Optional[int] = None,
     tp_q: bool = True,
     tp_k: bool = False,
@@ -455,26 +455,26 @@ def _attention_cte(
     cache_softmax: bool = False,
     softmax_dtype=nl.float32,
     mm_out_dtype=nl.float32,
-    cp_offset: Optional[nl.ndarray] = None,
+    cp_offset: Optional[nl.NkiTensor] = None,
     global_cp_deg: int = None,
     cp_strided_q_slicing: bool = False,
-    bound_min: Optional[nl.ndarray] = None,
-    bound_max: Optional[nl.ndarray] = None,
+    bound_min: Optional[nl.NkiTensor] = None,
+    bound_max: Optional[nl.NkiTensor] = None,
     cp_striped_input: bool = False,
     skip_output_normalization: bool = False,
-    k_cache_sbuf: Optional[List[nl.ndarray]] = None,
-    v_cache_sbuf: Optional[List[nl.ndarray]] = None,
-    k_prior_sbuf: Optional[List[nl.ndarray]] = None,
-    v_prior_sbuf: Optional[List[nl.ndarray]] = None,
+    k_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
+    v_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
+    k_prior_sbuf: Optional[List[nl.NkiTensor]] = None,
+    v_prior_sbuf: Optional[List[nl.NkiTensor]] = None,
     out_o_hbm=None,
     out_neg_max_hbm=None,
     out_sum_hbm=None,
     init_sbuf_addr: int = 0,
-    position_bias: Optional[nl.ndarray] = None,
+    position_bias: Optional[nl.NkiTensor] = None,
     bias_layout: str = "dense",
     bias_band_params: Optional[dict] = None,
     k_scale_sb=None,
-    kv_used_len: Optional[nl.ndarray] = None,
+    kv_used_len: Optional[nl.NkiTensor] = None,
     block_size: int = 0,
     kvp_rank_id=None,
     kvp_group_size: int = 0,
@@ -492,10 +492,10 @@ def _attention_cte(
     See attention_cte() for documentation of shared parameters.
 
     Additional internal parameters:
-      k_cache_sbuf: List[nl.ndarray]: List of k cache tiles, shape (batch_size_kv, d, k_tile_sz), k_tile_sz = 512
-      v_cache_sbuf: List[nl.ndarray]: List of v cache tiles, shape (batch_size_kv, v_tile_sz, d), v_tile_sz = 128
-      k_prior_sbuf: List[nl.ndarray]: (Segmented attention) List of k prior tiles in SBUF, shape (d, 512) per tile
-      v_prior_sbuf: List[nl.ndarray]: (Segmented attention) List of v prior tiles in SBUF, shape (128, d) per tile
+      k_cache_sbuf: List[nl.NkiTensor]: List of k cache tiles, shape (batch_size_kv, d, k_tile_sz), k_tile_sz = 512
+      v_cache_sbuf: List[nl.NkiTensor]: List of v cache tiles, shape (batch_size_kv, v_tile_sz, d), v_tile_sz = 128
+      k_prior_sbuf: List[nl.NkiTensor]: (Segmented attention) List of k prior tiles in SBUF, shape (d, 512) per tile
+      v_prior_sbuf: List[nl.NkiTensor]: (Segmented attention) List of v prior tiles in SBUF, shape (128, d) per tile
       init_sbuf_addr: the address where the sbuf allocation should start
       k_scale_sb: Optional SBUF tensor (pmax, 1) for delayed fp8 K dequantization. When provided,
                   Q is scaled by k_scale_sb in SBUF instead of scaling all K tiles, avoiding redundant
@@ -507,9 +507,9 @@ def _attention_cte(
                   the active segment and the prior segment, enabling support
                   for large prior_seg_size in the segmented kernel.
       block_size: int: KV cache block size for round-robin KV distribution.
-      kvp_rank_id: Optional[nl.ndarray]: (1,1) HBM int32, this rank's index within the KV-parallel group.
+      kvp_rank_id: Optional[nl.NkiTensor]: (1,1) HBM int32, this rank's index within the KV-parallel group.
       kvp_group_size: int: Number of ranks in the KV-parallel group (0 = disabled).
-      kvp_seg_block_offset: Optional[nl.ndarray]: (1,1) HBM int32, segment starting local block
+      kvp_seg_block_offset: Optional[nl.NkiTensor]: (1,1) HBM int32, segment starting local block
           index. Used to compute the runtime offset for static mask bounds adjustment.
       kvp_cp_offset_int: int: Compile-time Q global offset for tile_fully_visible check.
       kvp_k_threshold_sb: Optional SBUF tensor with pre-generated static K-position threshold pattern.
@@ -628,6 +628,7 @@ def _attention_cte(
         v_cache_sbuf,
         k_prior_sbuf,
         v_prior_sbuf,
+        skip_output_normalization=skip_output_normalization,
     )
     if is_sequence_packed:
         batch_size = out_shape[0]
@@ -695,25 +696,26 @@ def _attention_cte(
         f"Q batch size must be a multiple of KV batch size, got {bs=}, {bs_kv=}",
     )
 
-    # Sequence length checks
+    # Sequence length checks (warnings, not assertions — the kernel handles
+    # arbitrary seqlen via 8K flash-attention tiling internally)
     seqlen_k_total = seqlen_k_active + seqlen_k_prior if seqlen_k_prior else seqlen_k_active
-    kernel_assert(
-        seqlen_q <= _MAX_SEQLEN,
-        f"attention_cte kernel is not tested for seqlen above {_MAX_SEQLEN}, got {seqlen_q=}.",
-    )
-    kernel_assert(
-        seqlen_k_total <= _MAX_SEQLEN,
-        f"attention_cte kernel is not tested for seqlen above {_MAX_SEQLEN}, got {seqlen_k_total=}.",
-    )
+    if seqlen_q > _MAX_SEQLEN:
+        logger.warn(
+            f"attention_cte kernel is not tested for seqlen above {_MAX_SEQLEN}, got {seqlen_q=}.",
+        )
+    if seqlen_k_total > _MAX_SEQLEN:
+        logger.warn(
+            f"attention_cte kernel is not tested for seqlen above {_MAX_SEQLEN}, got {seqlen_k_total=}.",
+        )
     bs_seqlen_qk_product = float(bs * seqlen_q) * seqlen_k_total  # use float to avoid overflow
     if bs_seqlen_qk_product > _MAX_BS_TIMES_SEQLEN_QK:
         logger.warn(
             f"attention_cte kernel is not tested for batch size x seqlen_q x seqlen_k above {_MAX_BS_TIMES_SEQLEN_QK}, got {bs_seqlen_qk_product=}.",
         )
-    kernel_assert(
-        sliding_window <= _MAX_SEQLEN,
-        f"attention_cte kernel is not tested for sliding window above {_MAX_SEQLEN}, got {sliding_window=}.",
-    )
+    if sliding_window > _MAX_SEQLEN:
+        logger.warn(
+            f"attention_cte kernel is not tested for sliding window above {_MAX_SEQLEN}, got {sliding_window=}.",
+        )
     kernel_assert(sliding_window >= 0, f"sliding_window must be >= 0, got {sliding_window=}.")
 
     # head dim
@@ -784,10 +786,10 @@ def _attention_cte(
                 bias_band_params is not None,
                 "bias_band_params is required when bias_layout='banded'",
             )
-            for _k in ("prior_band_width", "active_offset", "active_band_width", "active_origin"):
+            for _key in ("prior_band_width", "active_offset", "active_band_width", "active_origin"):
                 kernel_assert(
-                    _k in bias_band_params,
-                    f"bias_band_params missing key {_k!r}",
+                    _key in bias_band_params,
+                    f"bias_band_params missing key {_key!r}",
                 )
             _pbw = int(bias_band_params["prior_band_width"])
             _aoff = int(bias_band_params["active_offset"])
@@ -1091,16 +1093,16 @@ def _attention_cte_impl(
     cp_offset: Any = None,
     bound_min: Any = None,
     bound_max: Any = None,
-    k_cache_sbuf: Optional[List[nl.ndarray]] = None,
-    v_cache_sbuf: Optional[List[nl.ndarray]] = None,
-    k_prior_sbuf: Optional[List[nl.ndarray]] = None,
-    v_prior_sbuf: Optional[List[nl.ndarray]] = None,
+    k_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
+    v_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
+    k_prior_sbuf: Optional[List[nl.NkiTensor]] = None,
+    v_prior_sbuf: Optional[List[nl.NkiTensor]] = None,
     init_sbuf_addr: int = 0,
-    position_bias: Optional[nl.ndarray] = None,
+    position_bias: Optional[nl.NkiTensor] = None,
     bias_layout: str = "dense",
     bias_band_params: Optional[dict] = None,
     k_scale_sb=None,
-    kv_used_len: Optional[nl.ndarray] = None,
+    kv_used_len: Optional[nl.NkiTensor] = None,
 ):
     """
     Internal implementation function for attention computation.
@@ -1598,7 +1600,8 @@ def _compute_tile_parameters(
         False  # whether to allocate more q groups and fewer k tiles for exp and transpose
     )
 
-    # Handle sliding window attention, in which case only at most (seqlen_q + sliding_window - 1) KV slice is loaded (when CP)
+    # Handle sliding window attention, in which case only at most (seqlen_q + sliding_window - 1)
+    # KV slice is loaded (when CP)
     if ac.use_swa:
         # When using SWA+CP (dynamic sbuf CP offsets), we (1) do dynamic masking with range_selects and (2) load reduced KV
         # When not using CP, we apply both upper (causal) and lower (sliding window) triangular compute skipping;
@@ -1840,7 +1843,7 @@ def _setup_range_select_bounds(
         # explicit broadcast ap needed
         nisa.tensor_scalar(
             bufs.range_sel_ubs_prior[...],
-            bufs.zero_bias_tensor.ap(pattern=[[1, atp.sb_p], [0, atp.num_grps]], offset=0),
+            bufs.zero_bias_tensor[0 : atp.sb_p, 0:1].broadcast(dim=1, size=atp.num_grps),
             op0=nl.add,
             operand0=prior_used_len_sb,
         )
@@ -1903,7 +1906,7 @@ def _setup_range_select_bounds(
         bufs.range_sel_ubs = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
         nisa.tensor_scalar(
             bufs.range_sel_ubs[...],
-            bufs.zero_bias_tensor.ap(pattern=[[1, atp.sb_p], [0, atp.num_grps]], offset=0),
+            bufs.zero_bias_tensor[0 : atp.sb_p, 0:1].broadcast(dim=1, size=atp.num_grps),
             op0=nl.add,
             operand0=kv_used_len_sb,
             op1=nl.add,
@@ -1947,8 +1950,8 @@ def _allocate_attention_buffers(
     atp: AttnTileParams,
     bufs: AttnInternalBuffers,
     sink: Any,
-    k_cache_sbuf: Optional[List[nl.ndarray]] = None,
-    v_cache_sbuf: Optional[List[nl.ndarray]] = None,
+    k_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
+    v_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
 ):
     """
     Allocate all SBUF and PSUM buffers needed for attention computation.
@@ -2296,6 +2299,7 @@ def _check_input_and_return_shape(
     v_cache_sbuf=None,
     k_prior_sbuf=None,
     v_prior_sbuf=None,
+    skip_output_normalization=False,
 ) -> tuple:
     """Validate input tensor shapes and compute output shapes.
 
@@ -2377,8 +2381,12 @@ def _check_input_and_return_shape(
 
     # compute the shape for cached softmax tensors, negative max and recipriocal sum
     cache_softmax_tile_size = 128
-    if cache_softmax:
-        # Current testing/golden does not account for the padded portion properly
+    if cache_softmax and not skip_output_normalization:
+        # The normalized softmax-cache path (and its golden) does not account for the
+        # padded portion of the final (partial) Q group. The unnormalized path
+        # (skip_output_normalization=True, used by ring attention) writes deterministic
+        # init values into the padding rows of the stats and the caller ignores them,
+        # so arbitrary seqlen_q is safe there.
         kernel_assert(
             seqlen_q % cache_softmax_tile_size == 0,
             f"For cache softmax, attention_cte currently expects seqlen_q multiple of {cache_softmax_tile_size}, got {seqlen_q=}",
@@ -2770,6 +2778,16 @@ def _load_v_tile(
 
     kernel_assert(str(load_dtype) == str(out[0][0].dtype), "load dtype mismatch")
 
+    # All tiles share the same dynamic base load_offset_active; hold it in ONE
+    # GpSimd register instead of a per-tile scalar_offset tile (which would burn
+    # one register per tile and overflow on large context-parallel shapes). The
+    # compile-time per-tile seqlen_offset is folded into the DMA static offset
+    # below, so this is numerically identical.
+    shared_offset_reg = None
+    if load_offset_active is not None:
+        shared_offset_reg = nisa.register_alloc()
+        nisa.register_load(shared_offset_reg, load_offset_active)
+
     for tile in range(num_tiles):
         v, seqlen, seqlen_offset, load_offset = _get_kv_tile_apc(
             is_prefix_caching,
@@ -2782,9 +2800,6 @@ def _load_v_tile(
         )
         num_p = min(seqlen - seqlen_offset, p)
         if num_p > 0:
-            if load_offset is not None:
-                ind_offset = local_allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
-                nisa.tensor_scalar(ind_offset, load_offset, nl.add, seqlen_offset)
             for d_tile in range(num_d_tiles):
                 d = min(d_tile_size, actual_d - d_tile * d_tile_size)
                 d_offset = d_tile * d_tile_size
@@ -2792,8 +2807,8 @@ def _load_v_tile(
                 if load_offset is not None:
                     v_src_pat = v.ap(
                         pattern=[[actual_d, num_p], [1, d]],
-                        scalar_offset=ind_offset,
-                        offset=batch_id * seqlen * actual_d + d_offset,
+                        scalar_offset=shared_offset_reg,
+                        offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
                         indirect_dim=1,
                     )
                 else:
@@ -3248,7 +3263,7 @@ def _write_back_impl(
                         bufs.tp_flash_attn_correction_factor_psum[grp_i][d_tile].ap(
                             pattern=[[atp.sb_p, d], [1, atp.sb_p]], offset=0
                         ),
-                        bufs.flash_attn_correction_factor[grp_i].ap(pattern=[[1, atp.sb_p], [0, d]], offset=0),
+                        bufs.flash_attn_correction_factor[grp_i][0 : atp.sb_p, 0:1].broadcast(dim=1, size=d),
                     )
                     nisa.tensor_copy(
                         bufs.tp_flash_attn_correction_factor_sb[grp_i][d_tile][:d, :num_f],

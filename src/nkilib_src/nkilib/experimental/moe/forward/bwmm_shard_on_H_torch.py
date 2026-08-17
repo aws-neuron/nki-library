@@ -26,7 +26,7 @@ def _silu(x):
     return x * torch.sigmoid(x)
 
 
-def bwmm_shard_h_torch_ref(
+def blockwise_mm_baseline_shard_hidden_torch_ref(
     hidden_states,
     expert_affinities_masked,
     gate_up_proj_weight,
@@ -40,6 +40,8 @@ def bwmm_shard_h_torch_ref(
     compute_dtype=nl.bfloat16,
     is_tensor_update_accumulating=True,
     expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+    activation_dtype=nl.bfloat16,
+    accum_dtype=nl.bfloat16,
 ):
     """Torch reference for blockwise_mm_baseline_shard_hidden."""
     T, H = hidden_states.shape

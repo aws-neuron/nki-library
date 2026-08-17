@@ -19,11 +19,11 @@ from typing import Any, final
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_bwd_mxfp8.mlp_bwd_mxfp8_kernel import (
     mlp_backward_mxfp8_nki,
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils import (
     ALL_CHECKPOINT_COMBOS,
     ALL_CHECKPOINTS_ENABLED,
@@ -40,7 +40,10 @@ from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils i
 )
 from test.utils import common_dataclasses, coverage_parametrized_tests, test_orchestrator
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.rng import NKITestsRNG
 from test.utils.unit_test_framework import UnitTestFramework
+
+_bwd_rng = NKITestsRNG(seed=BWD_GOLDEN_SEED)
 
 # ============================================================================
 # Custom comparator for MXFP8 backward validation
@@ -100,8 +103,8 @@ def compute_bwd_golden(
     import torch
 
     bf16 = hidden_np.dtype
-    torch.manual_seed(BWD_GOLDEN_SEED)
-    output_grad = torch.nn.init.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
+    _bwd_rng.reset()
+    output_grad = _bwd_rng.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
     og32 = output_grad.astype(np.float32)
     W_gate = gate_up_np[:I, :].astype(np.float32)
     W_up = gate_up_np[I:, :].astype(np.float32)

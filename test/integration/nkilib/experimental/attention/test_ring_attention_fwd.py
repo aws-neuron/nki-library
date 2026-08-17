@@ -19,9 +19,9 @@ from typing import List, Optional
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.attention.ring_attention_fwd import ring_attention_spmd_fwd
 from nkilib_src.nkilib.experimental.attention.ring_attention_fwd_torch import ring_attention_spmd_fwd_torch_ref
+
 from test.integration.nkilib.utils.sequence_packing_helpers import (
     cu_seqlens_to_striped_bounds,
 )
@@ -102,6 +102,16 @@ class TestRingAttentionFwd:
                 [0, 2048, 8192, 12288, 20480, 24576, 30720, 32768],
                 id="causal_striped_s32768_packed_cp4_lnc2",
             ),
+            # ──── Ragged seqlen (not a multiple of 128) ────
+            pytest.param(1, 1, 1, 4160, 128, 2, 1, False, False, None, id="nocausal_ragged_cp2_lnc1"),
+            pytest.param(1, 2, 2, 4160, 128, 2, 2, False, False, None, id="nocausal_ragged_cp2_lnc2_even"),
+            pytest.param(1, 1, 1, 4160, 128, 2, 2, False, False, None, id="nocausal_ragged_cp2_lnc2_odd_seqshard"),
+            pytest.param(1, 1, 1, 576, 128, 2, 2, False, False, None, id="nocausal_ragged_cp2_lnc2_odd_singlecore"),
+            pytest.param(1, 1, 1, 4160, 128, 2, 1, True, False, None, id="causal_contig_ragged_cp2_lnc1"),
+            pytest.param(1, 2, 2, 4160, 128, 2, 2, True, False, None, id="causal_contig_ragged_cp2_lnc2_even"),
+            pytest.param(1, 1, 1, 4160, 128, 2, 2, True, False, None, id="causal_contig_ragged_cp2_lnc2_odd"),
+            pytest.param(1, 1, 1, 4160, 128, 2, 1, True, True, None, id="causal_striped_ragged_cp2_lnc1"),
+            pytest.param(1, 2, 2, 4160, 128, 2, 2, True, True, None, id="causal_striped_ragged_cp2_lnc2_even"),
         ],
         # fmt: on
     )
@@ -240,6 +250,107 @@ class TestRingAttentionFwd:
                 inputs["bound_min"] = bmin_3d
                 inputs["bound_max"] = bmax_3d
             return inputs
+
+        env_vars = {"NEURON_RT_ULTRASERVER_MODE": "4"} if (platform_target.is_trn3() and cp_degree > 1) else None
+        framework = CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=ring_attention_spmd_fwd,
+            torch_ref=ring_attention_spmd_fwd_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=cp_degree,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            inference_args=InferenceArgs(collective_ranks=cp_degree, env_vars=env_vars),
+            output_keys=["out_o", "out_lse"],
+            atol=1e-3,
+        )
+
+    @pytest.mark.parametrize(
+        "bs, nheads, seqlen_per_rank, d, cp_degree, lnc, causal, striped",
+        # fmt: off
+        [
+            # ──── Causal contiguous with high cp_degree: ranks 0..cp-2 have fully-masked
+            #      rows because their Q positions are before the K/V they receive from
+            #      higher-numbered ranks. This is the config that triggered the nan-grad
+            #      bug in torchtitan (small per-rank seqlen + high cp_degree + causal).
+            pytest.param(1, 2, 512, 128, 4, 2, True, False, id="causal_contig_fullymask_cp4_lnc2"),
+            pytest.param(1, 2, 256, 128, 4, 2, True, False, id="causal_contig_fullymask_cp4_spr256_lnc2"),
+            # ──── Small head_dim (head_dim=16 case from the bug report) ────
+            pytest.param(1, 2, 512, 16, 4, 2, True, False, id="causal_contig_fullymask_d16_cp4_lnc2"),
+            # ──── Causal striped (also produces fully-masked rows for rank < cp_degree-1) ────
+            pytest.param(1, 2, 512, 128, 4, 2, True, True, id="causal_striped_fullymask_cp4_lnc2"),
+        ],
+        # fmt: on
+    )
+    def test_ring_attention_fwd_fully_masked_rows(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        bs: int,
+        nheads: int,
+        seqlen_per_rank: int,
+        d: int,
+        cp_degree: int,
+        lnc: int,
+        causal: bool,
+        striped: bool,
+    ):
+        """Test ring attention forward LSE is finite for configs with fully-masked rows.
+
+        Regression test for the nan-grad bug: under causal ring attention, ranks whose
+        Q positions are all before the incoming K/V block have fully-masked rows. Before
+        the fix, these rows' LSE was the sentinel (-3.4e38), causing the backward to
+        produce inf/nan gradients. After the fix, fully-masked rows get LSE=0.0.
+
+        This test verifies:
+        1. Output o is finite (no nan/inf).
+        2. LSE is finite (no nan/inf) — the sentinel (-3.4e38) is neutralized.
+        3. Output o and LSE match a reference that correctly zeros fully-masked rows.
+        """
+        np.random.seed(42)
+        scale = 1.0 / math.sqrt(d)
+
+        if striped:
+            seqlen = seqlen_per_rank * cp_degree
+            q_global = np.random.randn(bs * nheads, seqlen, d).astype(np.float32)
+            k_global = np.random.randn(bs * nheads, seqlen, d).astype(np.float32)
+            v_global = np.random.randn(bs * nheads, seqlen, d).astype(np.float32)
+            q_per_rank = [q_global[:, r::cp_degree, :] for r in range(cp_degree)]
+            k_per_rank = [k_global[:, r::cp_degree, :] for r in range(cp_degree)]
+            v_per_rank = [v_global[:, r::cp_degree, :] for r in range(cp_degree)]
+        else:
+            q_per_rank = [np.random.randn(bs * nheads, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+            k_per_rank = [np.random.randn(bs * nheads, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+            v_per_rank = [np.random.randn(bs * nheads, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+
+        replica_groups = (tuple(range(cp_degree)),)
+
+        def create_inputs(rank_id: int):
+            q_arr = q_per_rank[rank_id]  # (bs*nheads, spr, d)
+            q_4d = q_arr.reshape(bs, nheads, seqlen_per_rank, d).transpose(0, 1, 3, 2)  # (bs, nh, d, spr)
+            k_4d = k_per_rank[rank_id].reshape(bs, nheads, seqlen_per_rank, d).transpose(0, 1, 3, 2)
+            v_4d = v_per_rank[rank_id].reshape(bs, nheads, seqlen_per_rank, d)
+
+            kernel_scale = scale
+            if causal:
+                q_4d = (q_4d.astype(np.float32) * scale).astype(np.float16)
+                kernel_scale = 1.0
+            else:
+                q_4d = q_4d.astype(np.float16)
+
+            return {
+                "q": q_4d.astype(ml_dtypes.bfloat16),
+                "k": k_4d.astype(ml_dtypes.bfloat16),
+                "v": v_4d.astype(ml_dtypes.bfloat16),
+                "replica_groups": replica_groups,
+                "num_workers": cp_degree,
+                "softmax_scale": kernel_scale,
+                "use_causal_mask": causal,
+                "striped_input": striped,
+                "training": True,
+            }
 
         env_vars = {"NEURON_RT_ULTRASERVER_MODE": "4"} if (platform_target.is_trn3() and cp_degree > 1) else None
         framework = CollectiveUnitTestFramework(

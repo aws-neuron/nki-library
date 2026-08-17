@@ -21,9 +21,9 @@ import neuron_dtypes as ndtype
 import numpy as np
 import numpy.typing as npt
 from neuronxcc.nki._private.test import mx_util
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
 from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import DGT_MIN_K
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.integration.nkilib.experimental.matmul_mxfp8.utils import (
     resize_scales_compact_to_oversized_2d,
@@ -32,6 +32,9 @@ from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_uti
     Q_TILE_K,
     generate_golden_packed_scales,
 )
+from test.utils.rng import NKITestsRNG
+
+_rng = NKITestsRNG()
 
 # ============================================================================
 # Correctness thresholds — for MXFP8 kernel vs FP32 golden comparison.
@@ -85,13 +88,13 @@ MODEL_CONFIGS = [
 
 # Randomly generated configs with S, H, I divisible by DGT_MIN_K
 NUM_RANDOM_SHAPES = 10
-_rng = np.random.default_rng(seed=DEFAULT_SEED)
+_shape_rng = np.random.default_rng(seed=DEFAULT_SEED)
 RANDOM_MODEL_CONFIGS = [
     ModelConfig(
         f"random_{i}",
-        int(_rng.integers(1, 64) * DGT_MIN_K),
-        int(_rng.integers(1, 64) * DGT_MIN_K),
-        int(_rng.integers(1, 64) * DGT_MIN_K),
+        int(_shape_rng.integers(1, 64) * DGT_MIN_K),
+        int(_shape_rng.integers(1, 64) * DGT_MIN_K),
+        int(_shape_rng.integers(1, 64) * DGT_MIN_K),
     )
     for i in range(NUM_RANDOM_SHAPES)
 ]
@@ -249,7 +252,7 @@ def generate_inputs(S: int, H: int, I: int, seed: int = DEFAULT_SEED) -> tuple:
     """
     import torch
 
-    torch.manual_seed(seed)
+    _rng.reset()
     try:
         import ml_dtypes
 
@@ -257,9 +260,9 @@ def generate_inputs(S: int, H: int, I: int, seed: int = DEFAULT_SEED) -> tuple:
     except ImportError:
         bf16 = np.float16
 
-    hidden = torch.nn.init.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
-    gate_up = torch.nn.init.kaiming_normal_(torch.empty(2 * I, H)).numpy().astype(bf16)
-    down = torch.nn.init.kaiming_normal_(torch.empty(H, I)).numpy().astype(bf16)
+    hidden = _rng.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
+    gate_up = _rng.kaiming_normal_(torch.empty(2 * I, H)).numpy().astype(bf16)
+    down = _rng.kaiming_normal_(torch.empty(H, I)).numpy().astype(bf16)
     return hidden, gate_up, down
 
 

@@ -24,9 +24,9 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.core.max.cascaded_max_utils import predicated_folded_load, unfolded_store
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_program_sharding_info
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -153,7 +153,6 @@ def folded_load_oversized_sb_kernel(
 
 def folded_load_store_torch_ref(input_tensor: torch.Tensor, fold_factor: int, batch_start: int, batch_end: int) -> dict:
     """Torch reference for folded_load_store_kernel."""
-    b_range = batch_end - batch_start
     return {"output_tensor": input_tensor[batch_start:batch_end].clone()}
 
 
@@ -233,7 +232,6 @@ class TestCascadedMaxUtils:
         n = kernel_input["input_tensor"].shape[1]
         return {"output_tensor": np.zeros((b_range, n), dtype=np.float32)}
 
-    @pytest.mark.fast
     @pytest_parametrize(full_batch_params, full_batch_perms, abbrevs=_full_batch_abbrevs)
     def test_folded_load_store_full_batch(
         self,
@@ -265,13 +263,12 @@ class TestCascadedMaxUtils:
         [1, 16, 256, 2, 0, 8], [1, 16, 256, 2, 4, 12], [1, 16, 256, 2, 8, 16],
         [2, 32, 512, 4, 0, 16], [2, 32, 512, 4, 16, 32],
         [1, 16, 3168, 4, 0, 8], [1, 16, 3168, 4, 4, 12],
-        [2, 32, 4058, 8, 0, 16], [2, 32, 4058, 8, 8, 24],
+        [2, 32, 4058, 8, 0, 16], pytest.param(2, 32, 4058, 8, 8, 24, marks=pytest.mark.fast),
         [1, 8, 256, 2, 3, 4], [1, 8, 3168, 4, 5, 6],
         [2, 16, 256, 2, 0, 7], [2, 32, 3168, 4, 4, 15],
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest_parametrize(partial_batch_params, partial_batch_perms, abbrevs=_partial_batch_abbrevs)
     def test_folded_load_store_partial_batch(
         self,
@@ -304,7 +301,7 @@ class TestCascadedMaxUtils:
     dst_batch_perms = [
         [1, 16, 256, 2, 0, 8, 0, 8], [1, 16, 256, 2, 0, 8, 8, 16], [2, 16, 512, 4, 0, 8, 8, 16],
         [1, 16, 3168, 4, 0, 8, 8, 16], [2, 32, 4058, 8, 0, 8, 16, 24],
-        [1, 16, 256, 2, 4, 8, 0, 4], [1, 16, 3168, 4, 8, 12, 0, 4],
+        [1, 16, 256, 2, 4, 8, 0, 4], pytest.param(1, 16, 3168, 4, 8, 12, 0, 4, marks=pytest.mark.fast),
     ]
     # fmt: on
 
@@ -326,7 +323,6 @@ class TestCascadedMaxUtils:
         n = kernel_input["input_tensor"].shape[1]
         return {"output_tensor": np.zeros((dst_end, n), dtype=np.float32)}
 
-    @pytest.mark.fast
     @pytest_parametrize(dst_batch_params, dst_batch_perms, abbrevs=_dst_batch_abbrevs)
     def test_folded_load_store_dst_batch(
         self,
@@ -360,9 +356,9 @@ class TestCascadedMaxUtils:
     _oversized_sb_abbrevs = {"lnc_degree": "lnc", "fold_factor": "ff", "batch_start": "bs", "batch_end": "be", "sb_extra_cols": "ec"}
     oversized_sb_perms = [
         [1, 8, 256, 2, 0, 8, 16], [2, 8, 512, 4, 0, 8, 32],
-        [1, 4, 3168, 4, 0, 4, 8], [2, 8, 4058, 8, 0, 8, 16],
+        [1, 4, 3168, 4, 0, 4, 8], pytest.param(2, 8, 4058, 8, 0, 8, 16, marks=pytest.mark.fast),
         [1, 16, 256, 2, 4, 12, 10], [2, 32, 3168, 4, 8, 24, 20],
-        [2, 5, 512, 4, 0, 5, 12],
+        pytest.param(2, 5, 512, 4, 0, 5, 12, marks=pytest.mark.fast),
     ]
     # fmt: on
 
@@ -390,7 +386,6 @@ class TestCascadedMaxUtils:
         sb_cols = n_folded + sb_extra_cols
         return {"output_tensor": np.zeros((sb_rows, sb_cols), dtype=np.float32)}
 
-    @pytest.mark.fast
     @pytest_parametrize(oversized_sb_params, oversized_sb_perms, abbrevs=_oversized_sb_abbrevs)
     def test_folded_load_oversized_sb(
         self,

@@ -18,8 +18,8 @@ from typing import final
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     BWMMFunc,
     generate_moe_cte_inputs,
@@ -64,6 +64,9 @@ BWMM_LNC2_TEST_CASES = [
     (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE, None,          None,          None,        None,        True, None, False, False),
     (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
     (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish,  ExpertAffinityScaleMode.PRE_SCALE, None,          None,          None,        None,        True, None, False, False),
+    # SquaredReLU activation
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       1024,   512,    2,      256,        2,     512,          nl.bfloat16, 0,   True,  False,    None,            ActFnType.SquaredReLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       1024,   512,    2,      256,        2,     512,          nl.bfloat16, 0,   True,  False,    None,            ActFnType.SquaredReLU,  ExpertAffinityScaleMode.PRE_SCALE, None,          None,          None,        None,        True, None, False, False),
     # Incoming branch cases
     (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    False, False,    None,     ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
     (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    True,  False,    None,     ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
@@ -190,27 +193,19 @@ BWMM_LNC2_SLOW_CASES = [pytest.param(*case, marks=pytest.mark.slow_simulation) f
 # fmt: on
 
 
-# (hidden, tokens, expert, block_size, top_k, intermediate) keys for full-only tests (excluded from fast suite)
-_FULL_ONLY_KEYS = {
-    (3072, 1024, 64, 512, 8, 2048),
-    (3072, 1024, 64, 512, 8, 3072),
-    (3072, 1024, 8, 256, 4, 3072),
-    (3072, 10240, 8, 256, 4, 384),
-    (3072, 10240, 8, 256, 4, 1536),
-    (3072, 10240, 8, 256, 4, 3072),
-    (3072, 10240, 8, 512, 1, 192),
-    (3072, 10240, 8, 512, 4, 192),
-    (3072, 10240, 8, 512, 4, 256),
-    (3072, 10240, 8, 512, 4, 768),
-    (3072, 10240, 8, 512, 4, 1536),
-    (3072, 10240, 8, 512, 4, 3072),
-    (3072, 10240, 128, 256, 4, 192),
-    (4096, 10240, 4, 512, 8, 768),
-    # Qwen3-235B-A22B FP8: heavy NEFF compile+cleanup exceeds --cpu-timeout in fast suite.
-    (4096, 2048, 2, 512, 8, 1536),
-    (7168, 10240, 1, 512, 1, 2048),
-    (7168, 10240, 64, 512, 8, 2048),
-}
+# (hidden, tokens, expert, block_size, top_k, intermediate) keys for fast tests.
+_FAST_LNC2_KEYS = frozenset(
+    {
+        (3072, 1024, 8, 512, 4, 192),  # SHARD_ON_BLOCK skip=3 / skip=1
+        (3072, 1024, 8, 512, 4, 720),  # SHARD_ON_INTERMEDIATE_HW
+        (2048, 2048, 2, 1024, 2, 8192),  # SHARD_ON_INTERMEDIATE_DROPPING
+        (3072, 1024, 8, 512, 4, 768),  # SHARD_ON_INTERMEDIATE_HW (non-clamped + clamped variants)
+        (3072, 1024, 8, 512, 4, 1536),  # SHARD_ON_BLOCK
+        (3072, 1024, 8, 512, 4, 2048),  # SHARD_ON_INTERMEDIATE (skip=0 and skip=1)
+        (4096, 4096, 2, 2048, 8, 1536),  # SHARD_ON_INTERMEDIATE_DROPPING
+        (4864, 1024, 8, 512, 4, 1216),  # SHARD_ON_INTERMEDIATE_HW
+    }
+)
 
 
 @pytest_test_metadata(name="MoE BWMM BF16 CTE", tags=["model"])
@@ -227,7 +222,7 @@ class TestMoeBlockwiseMatMulLnc2:
     """
 
     ALL_PARAMS = [
-        pytest.param(*c, marks=pytest.mark.fast) if tuple(c[1:7]) not in _FULL_ONLY_KEYS else c
+        pytest.param(*c, marks=pytest.mark.fast) if tuple(c[1:7]) in _FAST_LNC2_KEYS else pytest.param(*c)
         for c in BWMM_LNC2_TEST_CASES
     ] + BWMM_LNC2_SLOW_CASES
 
@@ -621,3 +616,125 @@ class TestMoeCteModel:
     ):
         """GENERALITY: Broader model coverage configs."""
         self._run_model_test(**{k: v for k, v in locals().items() if k != "self"})
+
+
+SKIP_GATE_PROJ_PARAMS = [
+    pytest.param(
+        ActFnType.SquaredReLU,
+        ExpertAffinityScaleMode.POST_SCALE,
+        512,
+        1024,
+        512,
+        2,
+        256,
+        2,
+        id="SquaredReLU-POST_SCALE",
+    ),
+    pytest.param(
+        ActFnType.SquaredReLU,
+        ExpertAffinityScaleMode.PRE_SCALE,
+        512,
+        1024,
+        512,
+        2,
+        256,
+        2,
+        id="SquaredReLU-PRE_SCALE",
+    ),
+    pytest.param(
+        ActFnType.SiLU,
+        ExpertAffinityScaleMode.POST_SCALE,
+        512,
+        1024,
+        512,
+        2,
+        256,
+        2,
+        id="SiLU-POST_SCALE",
+    ),
+    pytest.param(
+        ActFnType.SquaredReLU,
+        ExpertAffinityScaleMode.POST_SCALE,
+        2048,
+        2048,
+        1024,
+        64,
+        256,
+        8,
+        id="SquaredReLU-POST_SCALE-e64-k8",
+    ),
+]
+
+
+class TestMoeBwmmSkipGateProj:
+    """Test skip_gate_proj=True for non-gated MLP in BWMM shard-on-I."""
+
+    @pytest.mark.parametrize(
+        "act_fn, scaling_mode, tokens, hidden, intermediate, expert, block_size, top_k",
+        SKIP_GATE_PROJ_PARAMS,
+    )
+    def test_bwmm_shard_I_skip_gate_proj(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        act_fn: ActFnType,
+        scaling_mode: ExpertAffinityScaleMode,
+        tokens: int,
+        hidden: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        platform_target: Platforms,
+    ):
+        def input_generator(test_config):
+            return generate_moe_cte_inputs(
+                bwmm_func_enum=BWMMFunc.SHARD_ON_INTERMEDIATE,
+                tokens=tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                dtype=nl.bfloat16,
+                skip=0,
+                bias=False,
+                training=False,
+                quantize=None,
+                activation_function=act_fn,
+                expert_affinities_scaling_mode=scaling_mode,
+                expert_affinity_multiply_on_I=True,
+                skip_gate_proj=True,
+            )
+
+        def output_tensors(kernel_input):
+            return moe_cte_output_tensors(
+                kernel_input=kernel_input,
+                tokens=tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                dtype=nl.bfloat16,
+                bwmm_func_enum=BWMMFunc.SHARD_ON_INTERMEDIATE,
+                training=False,
+                expert_affinity_multiply_on_I=True,
+                lnc_degree=2,
+            )
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=moe_cte_kernel_wrapper,
+            torch_ref=torch_ref_wrapper(moe_cte_torch_wrapper),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+            check_unused_params=True,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            rtol=2e-2,
+            atol=1e-5,
+        )

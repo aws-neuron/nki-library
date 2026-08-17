@@ -46,7 +46,7 @@ def tensor_add_single_core(a, b):
             a_tile = A_tiles[i, j].load()  # tile: [128, 512]
             b_tile = B_tiles[i, j].load()
             nisa.tensor_tensor(a_tile.data, a_tile.data, b_tile.data, op=nl.add)
-            C_tiles[i, j].store(a_tile.ap())
+            C_tiles[i, j].store(a_tile.data)
 
     return c
 
@@ -76,7 +76,7 @@ def tensor_add_block_sharded(a, b):
             a_tile = A_tiles[i, j].load()
             b_tile = B_tiles[i, j].load()
             nisa.tensor_tensor(a_tile.data, a_tile.data, b_tile.data, op=nl.add)
-            C_tiles[i, j].store(a_tile.ap())
+            C_tiles[i, j].store(a_tile.data)
 
     return c
 
@@ -103,7 +103,7 @@ def tensor_add_interleaved(a, b):
             a_tile = A_tiles[i, j].load()
             b_tile = B_tiles[i, j].load()
             nisa.tensor_tensor(a_tile.data, a_tile.data, b_tile.data, op=nl.add)
-            C_tiles[i, j].store(a_tile.ap())
+            C_tiles[i, j].store(a_tile.data)
 
     return c
 

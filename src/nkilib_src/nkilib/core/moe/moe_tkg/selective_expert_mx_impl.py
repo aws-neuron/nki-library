@@ -23,7 +23,6 @@ from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil
 from ...utils.lnc_sendrecv import lnc_sendrecv
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
 from .down_projection_mx_shard_H import (
     ProjConfig,
     _alloc_down_scale_sb,
@@ -63,11 +62,11 @@ def _prefetch_gate_up_data(
     gate_up_weight_sb_bufs: list,
     gate_up_scale_sb_bufs: list,
     gate_up_bias_sb_bufs,
-    gate_proj_weights_tensor: nl.ndarray,
-    gate_w_scale: nl.ndarray,
+    gate_proj_weights_tensor: nl.NkiTensor,
+    gate_w_scale: nl.NkiTensor,
     gate_proj_bias_tensor,
-    expert_idx: nl.ndarray,
-    p_idx_vector_gup: nl.ndarray,
+    expert_idx: nl.NkiTensor,
+    p_idx_vector_gup: nl.NkiTensor,
     shard_id: int,
     K_sharded: int,
     shard_on_K: bool,
@@ -118,10 +117,10 @@ def _prefetch_down_data(
     i_k: int,
     down_weight_sb_bufs: list,
     down_scale_sb_bufs: list,
-    down_proj_weights_tensor: nl.ndarray,
-    down_w_scale: nl.ndarray,
-    expert_idx: nl.ndarray,
-    p_idx_vector_down: nl.ndarray,
+    down_proj_weights_tensor: nl.NkiTensor,
+    down_w_scale: nl.NkiTensor,
+    expert_idx: nl.NkiTensor,
+    p_idx_vector_down: nl.NkiTensor,
     shard_id: int,
     K_sharded: int,
     shard_on_K: bool,
@@ -134,12 +133,7 @@ def _prefetch_down_data(
     i_k_lnc = (i_k + shard_id * K_sharded) if shard_on_K else i_k
     H_offset = 0 if shard_on_K else (dims.shard_id * dims.H_shard)
 
-    expert_scalar = (
-        TensorView(expert_idx)
-        .slice(dim=0, start=i_t, end=i_t + 1)
-        .slice(dim=1, start=i_k_lnc, end=i_k_lnc + 1)
-        .get_view()
-    )
+    expert_scalar = expert_idx.slice(dim=0, start=i_t, end=i_t + 1).slice(dim=1, start=i_k_lnc, end=i_k_lnc + 1)
     _load_down_weight(
         weight_sb=down_weight_sb_bufs[buf_idx],
         down_weights=down_proj_weights_tensor,
@@ -161,10 +155,126 @@ def _prefetch_down_data(
         )
 
 
+def _static_quantize_pre_gup_by_expert(
+    input_sb_shfl: nl.NkiTensor,
+    expert_scalar: nl.NkiTensor,
+    gate_up_in_scale: nl.NkiTensor,
+    inp_qtz_cur_t: nl.NkiTensor,
+    i_t: int,
+    n_H512_tile_sharded: int,
+    T_padded: int,
+) -> nl.NkiTensor:
+    """STATIC_MX: load per-expert gate_up_in_scale and quantize one token's input for gate/up projection.
+
+    Loads the correct expert's gate_up_in_scale via HWDGE, extracts token i_t from
+    input_sb_shfl, quantizes it with static_quantization, casts to fp8, and packs
+    into inp_qtz_cur_t (mutated in-place) at position 0 of the 4-padded token dim.
+
+    Returns the per-expert dequant scale (passthrough from static_quantization).
+    """
+    # Load per-expert gate_up_in_scale
+    expert_gate_up_in_scale_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+    expert_gate_up_in_view = (
+        gate_up_in_scale.select(dim=0, index=expert_scalar)
+        .broadcast(dim=0, size=_pmax)
+        .reshape_dim(dim=0, shape=(_pmax, 1))
+    )
+    nisa.dma_copy(
+        dst=expert_gate_up_in_scale_sb,
+        src=expert_gate_up_in_view,
+        dge_mode=nisa.dge_mode.hwdge,
+    )
+    # Extract token i_t from input_sb_shfl and flatten to [_pmax, n_H512_tile_sharded * _q_width]
+    input_cur_t_flat = input_sb_shfl.reshape((_pmax, n_H512_tile_sharded, T_padded, _q_width))
+    input_cur_t_slice = nl.ndarray(
+        (_pmax, n_H512_tile_sharded * _q_width), dtype=input_cur_t_flat.dtype, buffer=nl.sbuf
+    )
+    for i_tile in nl.affine_range(n_H512_tile_sharded):
+        nisa.tensor_copy(
+            dst=input_cur_t_slice[:, i_tile * _q_width : (i_tile + 1) * _q_width],
+            src=input_cur_t_flat[:, i_tile, i_t, :],
+        )
+    # Quantize with per-expert scale
+    quantized_input, cur_expert_dequant_scale = static_quantization(input_cur_t_slice, expert_gate_up_in_scale_sb)
+    # Cast to fp8 and pack into inp_qtz_cur_t at position 0
+    quantized_fp8_cur = nl.ndarray(quantized_input.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=quantized_fp8_cur, src=quantized_input)
+    nisa.memset(dst=inp_qtz_cur_t, value=0)
+    inp_qtz_cur_t_u32 = inp_qtz_cur_t.view(nl.uint32)
+    quantized_fp8_u32 = quantized_fp8_cur.view(nl.uint32)
+    for i_tile in nl.affine_range(n_H512_tile_sharded):
+        nisa.tensor_copy(
+            dst=inp_qtz_cur_t_u32[:, i_tile, 0],
+            src=quantized_fp8_u32[:, i_tile],
+            engine=nisa.vector_engine,
+        )
+    return cur_expert_dequant_scale
+
+
+def _static_quantize_pre_interm_by_expert(
+    intermediate_state_sb: nl.NkiTensor,
+    expert_scalar: nl.NkiTensor,
+    down_in_scale: nl.NkiTensor,
+    down_w_scale: nl.NkiTensor,
+    n_I512_tile: int,
+):
+    """STATIC_MX: load per-expert down_in/down_w scales, static-quantize intermediate, pack as fp8_x4.
+
+    Applies static_quantization (divide by down_in_scale, clip to FP8 range) on the
+    intermediate before the down-projection matmul, matching the MLP TKG pattern.
+
+    Returns (inter_for_down, inter_scale_for_down, down_combined_dequant):
+        - inter_for_down: fp8_x4[_pmax, n_I512_tile, T_inter] quantized intermediate
+        - inter_scale_for_down: uint8[_pmax, n_I512_tile, T_inter] dummy 127 scale
+        - down_combined_dequant: fp32[_pmax, 1] = down_in_scale * down_w_scale
+    """
+    # Load per-expert down_in_scale
+    expert_down_in_scale_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+    down_in_view = (
+        down_in_scale.select(dim=0, index=expert_scalar)
+        .broadcast(dim=0, size=_pmax)
+        .reshape_dim(dim=0, shape=(_pmax, 1))
+    )
+    nisa.dma_copy(
+        dst=expert_down_in_scale_sb,
+        src=down_in_view,
+        dge_mode=nisa.dge_mode.hwdge,
+    )
+    # Load per-expert down_w_scale
+    down_w_dequant_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+    down_w_view = (
+        down_w_scale.select(dim=0, index=expert_scalar)
+        .broadcast(dim=0, size=_pmax)
+        .reshape_dim(dim=0, shape=(_pmax, 1))
+    )
+    nisa.dma_copy(
+        dst=down_w_dequant_sb,
+        src=down_w_view,
+        dge_mode=nisa.dge_mode.hwdge,
+    )
+    # static_quantization: divide intermediate by down_in_scale, clip to FP8 range
+    T_inter = intermediate_state_sb.shape[2]
+    inter_flat = intermediate_state_sb.reshape((_pmax, n_I512_tile * T_inter * _q_width))
+    quantized_inter, _ = static_quantization(inter_flat, expert_down_in_scale_sb)
+    # Cast to fp8 and pack as fp8_x4
+    quantized_fp8 = nl.ndarray(quantized_inter.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=quantized_fp8, src=quantized_inter)
+    total_x4 = n_I512_tile * T_inter
+    inter_x4 = nl.ndarray((_pmax, total_x4), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=inter_x4.view(nl.uint32), src=quantized_fp8.view(nl.uint32), engine=nisa.vector_engine)
+    inter_for_down = inter_x4.reshape((_pmax, n_I512_tile, T_inter))
+    # Dummy 127 MX scale for pre_quantized path
+    static_mx_dummy_inter_scale = nl.ndarray((_pmax, n_I512_tile, T_inter), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.memset(dst=static_mx_dummy_inter_scale, value=127)
+    # Pre-combine dequant: down_in_scale * down_w_scale
+    down_combined_dequant = pre_combine_dequant_scales(expert_down_in_scale_sb, down_w_dequant_sb)
+    return inter_for_down, static_mx_dummy_inter_scale, down_combined_dequant
+
+
 def _selective_expert_moe_tkg_mxfp4(
     params: MLPParameters,
-    output: nl.ndarray,
-) -> nl.ndarray:
+    output: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     Perform selective-expert MoE MLP token generation with MXFP4 quantization.
 
@@ -172,10 +282,10 @@ def _selective_expert_moe_tkg_mxfp4(
 
     Args:
         params (MLPParameters): MLPParameters containing all input tensors and configuration.
-        output (nl.ndarray): [T, H], Output tensor in HBM.
+        output (nl.NkiTensor): [T, H], Output tensor in HBM.
 
     Returns:
-        output (nl.ndarray): [T, H], Output tensor with MoE computation results in HBM.
+        output (nl.NkiTensor): [T, H], Output tensor with MoE computation results in HBM.
 
     Notes:
         - This kernel only supports gate/up and down proj both swapped
@@ -280,17 +390,8 @@ def _selective_expert_moe_tkg_mxfp4(
         nisa.tensor_copy(dst=inp_qtz.view(nl.uint32), src=quantized_fp8.view(nl.uint32), engine=nisa.vector_engine)
         nisa.memset(dst=inp_scale, value=127)
     elif is_static_quant:
-        # Software static quantization with dummy MX scales (127 = 1.0)
-        gate_up_in_scale_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        gate_up_in_view = (
-            TensorView(params.quant_params.gate_up_in_scale).slice(dim=0, start=0, end=1).broadcast(dim=0, size=_pmax)
-        )
-        nisa.dma_copy(dst=gate_up_in_scale_sb, src=gate_up_in_view.get_view())
-        quantized_input, input_dequant_scale = static_quantization(input_flat, gate_up_in_scale_sb)
-        # Cast bf16 → fp8, then reinterpret as fp8_x4
-        quantized_fp8 = nl.ndarray(quantized_input.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=quantized_fp8, src=quantized_input)
-        nisa.tensor_copy(dst=inp_qtz.view(nl.uint32), src=quantized_fp8.view(nl.uint32), engine=nisa.vector_engine)
+        # STATIC_MX: quantization is deferred to per-(token, expert) inside the loop
+        # because each expert has a different gate_up_in_scale. We only set dummy MX scales here.
         nisa.memset(dst=inp_scale, value=127)
     else:
         # Hardware MX quantization
@@ -451,12 +552,6 @@ def _selective_expert_moe_tkg_mxfp4(
                 nisa.memset(
                     dst=down_scale_sb_bufs[buf_i][q_start : q_start + SCALE_P_ELEM_PER_QUADRANT, :, :], value=127
                 )
-        if is_static_quant:
-            down_in_scale_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-            down_in_view = (
-                TensorView(params.quant_params.down_in_scale).slice(dim=0, start=0, end=1).broadcast(dim=0, size=_pmax)
-            )
-            nisa.dma_copy(dst=down_in_scale_sb, src=down_in_view.get_view())
     else:
         for buf_i in range(2):
             nisa.memset(dst=gate_up_scale_sb_bufs[buf_i], value=0)
@@ -548,53 +643,59 @@ def _selective_expert_moe_tkg_mxfp4(
                 for i_k in range(K_sharded):
                     i_k_lnc_adjusted = (i_k + shard_id * K_sharded) if shard_on_K else i_k
 
-                    # STATIC_MX: combined dequant scales for gate/up
+                    # STATIC_MX: per-expert quantization and combined dequant scales for gate/up
                     gate_combined_dequant = None
                     up_combined_dequant = None
                     cur_token_input_dequant = None
                     if is_static_quant:
                         gate_w_dequant_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
                         up_w_dequant_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-                        expert_scalar = (
-                            TensorView(expert_idx)
-                            .slice(dim=0, start=i_t, end=i_t + 1)
-                            .slice(dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1)
-                            .get_view()
+                        expert_scalar = expert_idx.slice(dim=0, start=i_t, end=i_t + 1).slice(
+                            dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1
                         )
-                        gate_w_view = TensorView(params.quant_params.gate_w_scale).select(dim=0, index=expert_scalar)
+                        # Load per-expert gate_up_in_scale and quantize token
+                        cur_expert_dequant_scale = _static_quantize_pre_gup_by_expert(
+                            input_sb_shfl,
+                            expert_scalar,
+                            params.quant_params.gate_up_in_scale,
+                            inp_qtz_cur_t,
+                            i_t,
+                            n_H512_tile_sharded,
+                            T_padded,
+                        )
+                        # Load weight dequant scales
+                        gate_w_view = params.quant_params.gate_w_scale.select(dim=0, index=expert_scalar)
                         nisa.dma_copy(
                             dst=gate_w_dequant_sb,
-                            src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=_pmax).get_view(),
+                            src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=_pmax),
                             dge_mode=nisa.dge_mode.hwdge,
                         )
                         nisa.dma_copy(
                             dst=up_w_dequant_sb,
-                            src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=_pmax).get_view(),
+                            src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=_pmax),
                             dge_mode=nisa.dge_mode.hwdge,
                         )
-                        gate_combined_dequant = pre_combine_dequant_scales(input_dequant_scale, gate_w_dequant_sb)
-                        up_combined_dequant = pre_combine_dequant_scales(input_dequant_scale, up_w_dequant_sb)
+                        # Combined dequant uses correct per-expert input scale
+                        gate_combined_dequant = pre_combine_dequant_scales(cur_expert_dequant_scale, gate_w_dequant_sb)
+                        up_combined_dequant = pre_combine_dequant_scales(cur_expert_dequant_scale, up_w_dequant_sb)
                     elif is_row_quant:
                         gate_up_scale_cols = params.quant_params.gate_w_scale.shape[2]
                         gate_combined_dequant = nl.ndarray(
                             (_pmax, gate_up_scale_cols), dtype=nl.float32, buffer=nl.sbuf
                         )
                         up_combined_dequant = nl.ndarray((_pmax, gate_up_scale_cols), dtype=nl.float32, buffer=nl.sbuf)
-                        expert_scalar = (
-                            TensorView(expert_idx)
-                            .slice(dim=0, start=i_t, end=i_t + 1)
-                            .slice(dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1)
-                            .get_view()
+                        expert_scalar = expert_idx.slice(dim=0, start=i_t, end=i_t + 1).slice(
+                            dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1
                         )
-                        gate_w_view = TensorView(params.quant_params.gate_w_scale).select(dim=0, index=expert_scalar)
+                        gate_w_view = params.quant_params.gate_w_scale.select(dim=0, index=expert_scalar)
                         nisa.dma_copy(
                             dst=gate_combined_dequant,
-                            src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=_pmax).get_view(),
+                            src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=_pmax),
                             dge_mode=nisa.dge_mode.hwdge,
                         )
                         nisa.dma_copy(
                             dst=up_combined_dequant,
-                            src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=_pmax).get_view(),
+                            src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=_pmax),
                             dge_mode=nisa.dge_mode.hwdge,
                         )
                         cur_token_input_dequant = nl.ndarray((_pmax, 4, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -678,6 +779,22 @@ def _selective_expert_moe_tkg_mxfp4(
                     inter_scale_for_down = down_scale_sb_bufs[cur_buf]
                     inter_down_dequant_scale = None
                     use_pre_quantized = False
+                    if is_static_quant:
+                        # STATIC_MX: static_quantize intermediate with per-expert down_in_scale,
+                        # pack as fp8_x4, use pre_quantized=True path (matches MLP TKG pattern).
+                        expert_scalar = expert_idx.slice(dim=0, start=i_t, end=i_t + 1).slice(
+                            dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1
+                        )
+                        inter_for_down, inter_scale_for_down, down_combined_dequant = (
+                            _static_quantize_pre_interm_by_expert(
+                                intermediate_state_sb,
+                                expert_scalar,
+                                params.quant_params.down_in_scale,
+                                params.quant_params.down_w_scale,
+                                n_I512_tile,
+                            )
+                        )
+                        use_pre_quantized = True
                     if is_row_quant:
                         T_inter = intermediate_state_sb.shape[2]
                         inter_permuted = nl.ndarray(
@@ -716,21 +833,17 @@ def _selective_expert_moe_tkg_mxfp4(
                     if is_row_quant:
                         down_scale_cols = params.quant_params.down_w_scale.shape[1]
                         down_row_w_dequant = nl.ndarray((_pmax, down_scale_cols), dtype=nl.float32, buffer=nl.sbuf)
-                        expert_scalar = (
-                            TensorView(expert_idx)
-                            .slice(dim=0, start=i_t, end=i_t + 1)
-                            .slice(dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1)
-                            .get_view()
+                        expert_scalar = expert_idx.slice(dim=0, start=i_t, end=i_t + 1).slice(
+                            dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1
                         )
                         down_w_view = (
-                            TensorView(params.quant_params.down_w_scale)
-                            .select(dim=0, index=expert_scalar)
+                            params.quant_params.down_w_scale.select(dim=0, index=expert_scalar)
                             .reshape_dim(dim=0, shape=(1, down_scale_cols))
                             .broadcast(dim=0, size=_pmax)
                         )
                         nisa.dma_copy(
                             dst=down_row_w_dequant,
-                            src=down_w_view.get_view(),
+                            src=down_w_view,
                             dge_mode=nisa.dge_mode.hwdge,
                         )
 
@@ -758,27 +871,8 @@ def _selective_expert_moe_tkg_mxfp4(
                     # cur_down_out has shape [H0, H1_shard, 4], slice out the part that has value, shape [H0, H1]
                     cur_down_out_view = cur_down_out[:, :, 0]
 
-                    # STATIC_MX: dequant (down_out *= down_in_scale * down_w_dequant)
+                    # STATIC_MX: apply combined dequant externally (avoids SBUF collision in function)
                     if is_static_quant:
-                        down_w_dequant_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-                        expert_scalar = (
-                            TensorView(expert_idx)
-                            .slice(dim=0, start=i_t, end=i_t + 1)
-                            .slice(dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1)
-                            .get_view()
-                        )
-                        down_w_view = (
-                            TensorView(params.quant_params.down_w_scale)
-                            .select(dim=0, index=expert_scalar)
-                            .broadcast(dim=0, size=_pmax)
-                            .reshape_dim(dim=0, shape=(_pmax, 1))
-                        )
-                        nisa.dma_copy(
-                            dst=down_w_dequant_sb,
-                            src=down_w_view.get_view(),
-                            dge_mode=nisa.dge_mode.hwdge,
-                        )
-                        down_combined_dequant = pre_combine_dequant_scales(down_in_scale_sb, down_w_dequant_sb)
                         nisa.activation(
                             dst=cur_down_out_view, op=nl.copy, data=cur_down_out_view, scale=down_combined_dequant
                         )

@@ -23,10 +23,10 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
-
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType, RouterActFnType
 from nkilib_src.nkilib.experimental.moe_block.rmsnorm_router_topk_tkg import rmsnorm_router_topk_tkg
 from nkilib_src.nkilib.experimental.moe_block.rmsnorm_router_topk_tkg_torch import rmsnorm_router_topk_tkg_torch_ref
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,
@@ -201,7 +201,7 @@ def _format_value(val):
 
 def _make_test_id(params):
     values = params.values if hasattr(params, "values") else params
-    return "_".join(f"{_ABBREVS[name]}-{_format_value(val)}" for name, val in zip(_PARAM_NAMES, values))
+    return "_".join(f"{_ABBREVS[name]}-{_format_value(val)}" for name, val in zip(_PARAM_NAMES, values, strict=True))
 
 # NONE: T must be a multiple of 256 (DLoC tiling); H must be divisible by 128.
 # MX:   T can be small (>=1); H must be divisible by 512 (MX block size).

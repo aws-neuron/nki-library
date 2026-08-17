@@ -19,14 +19,14 @@ from typing import Any, final
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_fwd_mxfp8.config import (
     get_config_for_shape as get_fwd_config,
 )
 from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_fwd_mxfp8.mlp_fwd_mxfp8_kernel import (
     mlp_forward_mxfp8_nki,
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils import (
     _INPUT_MODES,
     ALL_CHECKPOINT_COMBOS,

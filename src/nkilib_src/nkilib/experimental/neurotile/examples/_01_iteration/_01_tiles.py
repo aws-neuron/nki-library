@@ -41,7 +41,7 @@ def basic_tile_copy(src):
     for i in range(src_tiles.shape[0]):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 
@@ -71,7 +71,7 @@ def scale_kernel(src, factor=2.0):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()
             nisa.tensor_scalar(tile.data, tile.data, nl.multiply, factor)
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 
@@ -94,7 +94,7 @@ def load_tile_row(src):
         row = src_tiles[i].load()
         for j in range(row.shape[0]):
             nisa.tensor_scalar(row[j].data, row[j].data, nl.multiply, 2.0)
-        dst_tiles[i].store(row.ap())
+        dst_tiles[i].store(row.data)
 
     return dst
 
@@ -111,7 +111,7 @@ def load_tile_column(src):
         col = src_tiles[:, j].load()
         for i in range(col.shape[0]):
             nisa.tensor_scalar(col[i].data, col[i].data, nl.multiply, 3.0)
-        dst_tiles[:, j].store(col.ap())
+        dst_tiles[:, j].store(col.data)
 
     return dst
 
@@ -129,14 +129,14 @@ def load_subgrid(src):
     for i in range(src_tiles.shape[0]):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     # Overwrite the inner 2x2 sub-grid (rows 1..2, cols 1..2) scaled by 4x.
     sub = src_tiles[1:3, 1:3].load()
     for i in range(sub.shape[0]):
         for j in range(sub.shape[1]):
             nisa.tensor_scalar(sub[i, j].data, sub[i, j].data, nl.multiply, 4.0)
-    dst_tiles[1:3, 1:3].store(sub.ap())
+    dst_tiles[1:3, 1:3].store(sub.data)
 
     return dst
 
@@ -152,7 +152,7 @@ def load_negative_index(src):
     last_row = src_tiles[-1].load()
     for j in range(last_row.shape[0]):
         nisa.tensor_scalar(last_row[j].data, last_row[j].data, nl.multiply, 2.0)
-    dst_tiles[0].store(last_row.ap())
+    dst_tiles[0].store(last_row.data)
 
     return dst
 
@@ -173,7 +173,7 @@ def load_strided_rows(src):
         row = even[i].load()
         for j in range(row.shape[0]):
             nisa.tensor_scalar(row[j].data, row[j].data, nl.multiply, 2.0)
-        dst_tiles[i].store(row.ap())
+        dst_tiles[i].store(row.data)
 
     return dst
 
@@ -198,7 +198,7 @@ def batched_tile_iteration(src):
             for j in range(N // TILE_F):
                 tile = src_tiles[b, i, j].load()  # tile: [128, 128]
                 nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-                dst_tiles[b, i, j].store(tile.ap())
+                dst_tiles[b, i, j].store(tile.data)
 
     return dst
 
@@ -222,7 +222,7 @@ def higher_rank_tile(src):
                 slice1 = tile[:, 1, :]  # [128, 1, 32]
                 nisa.tensor_scalar(slice0.data, slice0.data, nl.multiply, 2.0)
                 nisa.tensor_scalar(slice1.data, slice1.data, nl.multiply, 3.0)
-                dst_tiles[i, j, k].store(tile.ap())
+                dst_tiles[i, j, k].store(tile.data)
 
     return dst
 
@@ -240,7 +240,7 @@ def partition_tile(src):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()  # tile: [128, 1]
             nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 
@@ -258,7 +258,7 @@ def column_tile(src):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()  # tile: [1, 128]
             nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 

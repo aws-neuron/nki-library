@@ -155,20 +155,13 @@ def qkv_tkg_torch_ref(
     is_row_mx = quantization_type == QuantizationType.ROW_MX
     is_static = quantization_type == QuantizationType.STATIC
 
-    # STATIC_MX / ROW_MX: unpack fp8_x4 weights to float32 [H, I]
+    # STATIC_MX / ROW_MX: weights are unpacked fp8 [H//4, I, 4] -> float32 [H, I]
     if is_static_mx or is_row_mx:
-        from ..utils.mx_torch_common import unpack_float8_e4m3fn_x4
-
         weights_np = qkv_w if isinstance(qkv_w, np.ndarray) else qkv_w.numpy()
-        w_unpacked_np = unpack_float8_e4m3fn_x4(weights_np).numpy()
+        # weights_np is [H//4, I, 4] unpacked fp8
         H_quarter = weights_np.shape[0]
-        I = w_unpacked_np.shape[1] // _Q_WIDTH
-        qkv_w = torch.from_numpy(
-            w_unpacked_np.reshape(H_quarter, I, _Q_WIDTH)
-            .transpose(0, 2, 1)
-            .reshape(H_quarter * _Q_WIDTH, I)
-            .astype(np.float32)
-        )
+        I = weights_np.shape[1]
+        qkv_w = torch.from_numpy(weights_np.transpose(0, 2, 1).reshape(H_quarter * _Q_WIDTH, I).astype(np.float32))
     else:
         qkv_w = qkv_w.to(torch.float32)
 
@@ -281,7 +274,7 @@ def qkv_tkg_torch_ref(
 
 def _qkv_tkg_mx_torch_ref(
     hidden: torch.Tensor,
-    qkv_w,  # numpy fp8_x4
+    qkv_w,  # numpy fp8 [H//4, I, 4]
     norm_w: Optional[torch.Tensor],
     fused_add: bool,
     mlp_prev: Optional[torch.Tensor],
@@ -332,7 +325,8 @@ def _qkv_tkg_mx_torch_ref(
 
     # MX block quantization of input
     weights_np = qkv_w if isinstance(qkv_w, np.ndarray) else qkv_w.numpy()
-    _, I = weights_np.shape
+    # weights_np is [H//4, I, 4] unpacked fp8
+    H_quarter, I, _pack = weights_np.shape
 
     hidden_np = hidden.reshape(B * S, H).T.numpy()  # [H, B*S]
     hidden_np = (
@@ -343,8 +337,8 @@ def _qkv_tkg_mx_torch_ref(
     )
     hidden_mx, hidden_scale = quantize_to_mx(hidden_np, nl.float8_e4m3fn_x4)
 
-    # Unpack weights and hidden from x4 packed format
-    weights_unpacked = unpack_float8_e4m3fn_x4(weights_np)
+    # Unpack hidden from x4 packed format; weights are already unpacked [H//4, I, 4]
+    weights_unpacked = torch.from_numpy(weights_np.reshape(H_quarter, I * _Q_WIDTH).astype(np.float32))
     hidden_mx_torch = unpack_float8_e4m3fn_x4(hidden_mx)
 
     # Prepare scales

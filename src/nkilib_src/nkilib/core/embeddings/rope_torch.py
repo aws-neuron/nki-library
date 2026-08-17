@@ -33,8 +33,10 @@ def RoPE_torch_ref(
     """
     d_head, B, n_heads, S = x_in.shape
 
-    if d_head not in (64, 128):
-        raise ValueError(f"[NCC_INKI016] Kernel validation exception: d_head must be 64 or 128, got {d_head}")
+    if d_head not in (64, 128, 256, 512):
+        raise ValueError(
+            f"[NCC_INKI016] Kernel validation exception: d_head must be 64, 128, 256, or 512, got {d_head}"
+        )
 
     x_out = torch.empty_like(x_in)
     for b in range(B):
@@ -45,28 +47,41 @@ def RoPE_torch_ref(
 
 
 def _rope_single_head(x_in, cos, sin, contiguous_layout):
-    """Apply RoPE to single head: [d_head, S]."""
+    """Apply RoPE to single head: [d_head, S]. Supports partial rotary."""
     d_head = x_in.shape[0]
+    rotary_half = cos.shape[0]
+    rotary_dim = rotary_half * 2
     x = x_in.T  # [d_head, S] -> [S, d_head]
 
+    # Split into rotary and pass-through portions
+    x_rot = x[:, :rotary_dim]
+    x_pass = x[:, rotary_dim:]
+
     if contiguous_layout:
-        new_x = torch.empty_like(x)
-        new_x[:, ::2] = x[:, : d_head // 2]
-        new_x[:, 1::2] = x[:, d_head // 2 :]
-        x = new_x
+        # Contiguous layout: first half = even indices, second half = odd indices
+        # Convert to interleaved for RoPE computation
+        new_x = torch.empty_like(x_rot)
+        new_x[:, ::2] = x_rot[:, :rotary_half]
+        new_x[:, 1::2] = x_rot[:, rotary_half:]
+        x_rot = new_x
 
     freqs_cos = cos.T  # [half_d, S] -> [S, half_d]
     freqs_sin = sin.T
 
-    xri = x.reshape(x.shape[:-1] + (-1, 2))
+    xri = x_rot.reshape(x_rot.shape[:-1] + (-1, 2))
     x_r, x_i = xri[..., 0], xri[..., 1]
 
     x_out_r = x_r * freqs_cos - x_i * freqs_sin
     x_out_i = x_r * freqs_sin + x_i * freqs_cos
 
-    x_out = torch.stack([x_out_r, x_out_i], dim=-1).reshape(x.shape)
+    x_rot_out = torch.stack([x_out_r, x_out_i], dim=-1).reshape(x_rot.shape)
 
     if contiguous_layout:
-        x_out = torch.cat((x_out[:, 0::2], x_out[:, 1::2]), dim=1)
+        # Convert back to contiguous layout
+        result = torch.empty_like(x_rot_out)
+        result[:, :rotary_half] = x_rot_out[:, 0::2]
+        result[:, rotary_half:] = x_rot_out[:, 1::2]
+        x_rot_out = result
 
+    x_out = torch.cat([x_rot_out, x_pass], dim=-1)
     return x_out.T  # [S, d_head] -> [d_head, S]

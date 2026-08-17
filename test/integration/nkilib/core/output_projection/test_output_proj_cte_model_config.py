@@ -32,6 +32,7 @@ from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 MODELS = {
     "llama3_70b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "hidden": 8192, "bias": False},
     "qwen3_32b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "hidden": 5120, "bias": False},
+    "qwen3_vl_32b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "hidden": 5120, "bias": False},
     "qwen3_235b": {"n_q_heads": 64, "n_kv_heads": 4, "d_head": 128, "hidden": 4096, "bias": False},
     "gemma3_27b": {"n_q_heads": 32, "n_kv_heads": 16, "d_head": 128, "hidden": 5376, "bias": False},
     "gptoss_120b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 64, "hidden": 3072, "bias": True},
@@ -93,6 +94,14 @@ def get_output_proj_config(model_name, tp, cp, seqlen, quant_type):
 OPTIMAL_CONFIGS = {
     "llama3_70b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS, "QUANT_TYPES": DEFAULT_QUANT_TYPES},
     "qwen3_32b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS, "QUANT_TYPES": DEFAULT_QUANT_TYPES},
+    "qwen3_vl_32b": {
+        "TP_CP_CONFIGS": [(64, 64, 1), (32, 32, 1), (16, 16, 1), (8, 8, 1), (4, 4, 1)],
+        "SEQLENS": [4096, 8192],
+        "QUANT_TYPES": DEFAULT_QUANT_TYPES + [QuantizationType.MX],
+        # Online-MX (QuantizationType.MX) weights are native FP8 for this model, not FP4.
+        # Read by the test harness to pick the weight dtype for MX rows; "fp4" is the default.
+        "MX_WEIGHT_DTYPE": "fp8",
+    },
     "gemma3_27b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS, "QUANT_TYPES": DEFAULT_QUANT_TYPES},
     "gptoss_120b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS, "QUANT_TYPES": DEFAULT_QUANT_TYPES},
     "qwen3_235b": {
@@ -118,6 +127,21 @@ def generate_output_proj_configs(configs=None):
                     d = get_output_proj_config(model_name, tp, cp, orig_seqlen, qt)
                     results.append((d['batch'], d['seqlen'], d['hidden'], d['n_head'], d['d_head'], d['test_bias'], qt))
     return results
+
+
+def get_mx_weight_dtype(configs=None):
+    """Weight dtype token ("fp4"/"fp8") used for online-MX (QuantizationType.MX) rows.
+
+    Online MX rows only originate from a model whose QUANT_TYPES includes
+    QuantizationType.MX (only qwen3_vl_32b today), so a single token suffices.
+    Defaults to "fp4"; a model opts into native FP8 weights via MX_WEIGHT_DTYPE.
+    """
+    if configs is None:
+        configs = OPTIMAL_CONFIGS
+    for c in configs.values():
+        if QuantizationType.MX in c.get('QUANT_TYPES', DEFAULT_QUANT_TYPES):
+            return c.get('MX_WEIGHT_DTYPE', 'fp4')
+    return 'fp4'
 
 
 from test.utils.common_dataclasses import ModelTestType

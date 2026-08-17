@@ -30,7 +30,6 @@ import neuron_dtypes as ndtype
 import nki.language as nl
 import numpy as np
 from neuronxcc.nki._private.test import mx_util
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ActFnType,
@@ -39,6 +38,7 @@ from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ShardOption,
     SkipMode,
 )
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.integration.nkilib.experimental.matmul_mxfp8.utils import (
     resize_scales_compact_to_oversized_2d,

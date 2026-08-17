@@ -14,12 +14,11 @@
 
 """TensorScalar primitive for nkiprimitives."""
 
-from typing import Optional, Union
+from typing import Optional
 
 import nki.isa as nisa
 import nki.language as nl
 
-from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import TileStream, get_logical_shape
@@ -64,8 +63,8 @@ class TensorScalar(nl.NKIObject):
 
             if self._op1 is not None:
                 nisa.tensor_scalar(
-                    dst=dst_tile.get_view(),
-                    data=src_tile.get_view(),
+                    dst=dst_tile,
+                    data=src_tile,
                     op0=self._op0,
                     operand0=self._operand0,
                     op1=self._op1,
@@ -73,8 +72,8 @@ class TensorScalar(nl.NKIObject):
                 )
             else:
                 nisa.tensor_scalar(
-                    dst=dst_tile.get_view(),
-                    data=src_tile.get_view(),
+                    dst=dst_tile,
+                    data=src_tile,
                     op0=self._op0,
                     operand0=self._operand0,
                 )
@@ -84,8 +83,8 @@ class TensorScalar(nl.NKIObject):
 
 
 def tensor_scalar(
-    dst: Union[TensorView, nl.ndarray],
-    src: Union[TensorView, nl.ndarray] = None,
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor = None,
     op0=None,
     operand0: float = 0.0,
     op1=None,

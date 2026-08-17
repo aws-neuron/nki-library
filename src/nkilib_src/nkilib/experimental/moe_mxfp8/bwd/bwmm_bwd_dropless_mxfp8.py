@@ -55,7 +55,7 @@ from ...moe.bwd.bwmm_bwd_dropless import (
 )
 from ...moe.bwd.moe_bwd_parameters import AffinityOption, ClampLimits
 from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
-from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm
+from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
 from .moe_bwd_mxfp8_config import MXFP8MOEBwdConfig
 
 # Total SBUF available minus reserved regions
@@ -1524,6 +1524,7 @@ def _set_expert_offset_on_td(
 # Main Kernel Implementation
 
 
+@with_active_sbm
 def blockwise_mm_bwd_dropless_mxfp8(
     # --- Input TensorDescriptors (passed flat — NKI does not allow tensor-bearing
     #     dataclasses to cross function boundaries inside a traced kernel). ---
@@ -1782,7 +1783,7 @@ def blockwise_mm_bwd_dropless_mxfp8(
 
         """
         TODO: current version of compiler/nki is giving issues when TILES_IN_LOAD_M!=4, hence we cannot use:
-        load_tile_bf16_PE_transpose currently.
+        load_tile_PE_swizzle_wrapX currently.
         Instead of indirect DMA inside Phase 1, gather here and pass as
         a plain F-by-K tensor so Phase 1 uses the conventional DGT path.
         """

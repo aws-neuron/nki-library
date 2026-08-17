@@ -223,6 +223,10 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
             raise error
     """
     kernel_assert(isinstance(act_fn, ActFnType), f"Unsupported activation function type: {act_fn}")
+    kernel_assert(
+        act_fn != ActFnType.SquaredReLU,
+        "SquaredReLU requires two instructions; use apply_activation() instead of get_nl_act_fn_from_type()",
+    )
     if act_fn == ActFnType.SiLU:
         return nl.silu
     elif act_fn == ActFnType.GELU:
@@ -233,6 +237,49 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
         return nl.gelu_apprx_sigmoid
     elif act_fn == ActFnType.ReLU:
         return nl.relu
+
+
+def apply_activation(dst, data, act_fn: ActFnType, scale=1.0):
+    """
+    Apply activation function to data, writing result to dst.
+
+    Handles both single-instruction activations and multi-instruction
+    activations (e.g., SquaredReLU = relu then square).
+
+    Args:
+        dst: Destination SBUF tensor slice.
+        data: Source tensor slice (SBUF or PSUM).
+        act_fn (ActFnType): Activation function type.
+        scale (float): Pre-activation scale factor.
+    """
+    if act_fn == ActFnType.SquaredReLU:
+        nisa.activation(dst=dst, data=data, op=nl.relu, scale=scale)
+        nisa.activation(dst=dst, data=dst, op=nl.square)
+    else:
+        nl_op = get_nl_act_fn_from_type(act_fn)
+        nisa.activation(dst=dst, data=data, op=nl_op, scale=scale)
+
+
+def apply_activation_dx(dst, data, act_fn: ActFnType):
+    """
+    Apply activation derivative to data, writing result to dst.
+
+    For SquaredReLU (relu(x)^2), the derivative is 2*relu(x), which is
+    a single fused ScalarE instruction (relu with scale=2.0).
+
+    Args:
+        dst: Destination SBUF tensor slice.
+        data: Source tensor slice (SBUF).
+        act_fn (ActFnType): Forward activation function type (derivative is inferred).
+    """
+    if act_fn == ActFnType.SquaredReLU:
+        nisa.activation(dst=dst, data=data, op=nl.relu, scale=2.0)
+    elif act_fn == ActFnType.SiLU:
+        nisa.activation(dst=dst, data=data, op=nl.silu_dx)
+    elif act_fn == ActFnType.Swish:
+        nisa.activation(dst=dst, data=data, op=nl.gelu_apprx_sigmoid_dx)
+    else:
+        kernel_assert(False, f"apply_activation_dx: unsupported activation type {act_fn}")
 
 
 def is_launched_as_spmd() -> bool:
@@ -581,3 +628,13 @@ def _psum_alloc(shape, dtype, sbm, address_offset=0):
             address=(0, address_offset),
         )
     return nl.ndarray(shape, dtype=dtype, buffer=nl.psum)
+
+
+def is_trn3_b1() -> bool:
+    """Check if running on Trn3 B1 silicon (NeuronCore-v4 sub-version 1).
+
+    Returns True when the target is trn3 (GA/B1), which supports additional
+    instructions like nisa.exponential. Returns False for trn3pre (A0) and
+    all earlier generations.
+    """
+    return nisa.get_nc_version() == nisa.nc_version.gen4 and nisa.get_nc_sub_version() == 1

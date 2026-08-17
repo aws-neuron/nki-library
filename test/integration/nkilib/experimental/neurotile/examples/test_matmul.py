@@ -16,7 +16,6 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._02_matmul import (
     _01_matmul_patterns as patterns_mod,
 )
@@ -29,6 +28,7 @@ from nkilib_src.nkilib.experimental.neurotile.examples._02_matmul import (
 from nkilib_src.nkilib.experimental.neurotile.examples._02_matmul import (
     _02_matmul_coalesced_torch as coalesced_refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -115,4 +115,60 @@ class TestNeurotileMatmulCoalesced:
             compiler_args=CompilerArgs(platform_target=platform_target),
             rtol=1e-2,
             atol=1e-2,
+        )
+
+
+# K-streamed coalesced variant: block span is TILES_IN_BLOCK_M*128 on M and
+# TILES_IN_BLOCK_N*512 on N. The "remainder" shape (M=384, N=1792) is not a
+# multiple of either span, so the trailing M-block holds one 128-row tile and
+# the trailing N-block holds one 512 tile + a 256 partial.
+_STREAMED_BLOCK = {"TILES_IN_BLOCK_M": 2, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 4}
+_STREAMED_SHAPES = {
+    "aligned": (512, 1024, 2048),
+    "remainder": (384, 1024, 1792),
+}
+
+
+def _streamed_input_generator(shape):
+    def _gen(_):
+        m, k, n = shape
+        np.random.seed(42)
+        return {
+            "lhsT": np.random.rand(k, m).astype(ml_dtypes.bfloat16),
+            "rhs": np.random.rand(k, n).astype(ml_dtypes.bfloat16),
+            **_STREAMED_BLOCK,
+        }
+
+    return _gen
+
+
+def _streamed_output_descriptor(shape):
+    def _desc(_kernel_input):
+        m, _k, n = shape
+        return {"out": np.zeros((m, n), dtype=ml_dtypes.bfloat16)}
+
+    return _desc
+
+
+@pytest_marks(["neurotile"])
+class TestNeurotileMatmulCoalescedStreamed:
+    """K-streamed coalesced matmul (matmul_coalesced_streamed), block-aligned
+    and remainder (non-block-aligned M and N) shapes."""
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("variant", ["aligned", "remainder"])
+    def test_matmul_coalesced_streamed(self, test_manager, platform_target, variant):
+        shape = _STREAMED_SHAPES[variant]
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=coalesced_mod.matmul_coalesced_streamed,
+            torch_ref=torch_ref_wrapper(coalesced_refs.matmul_coalesced_torch_ref),
+            kernel_input_generator=_streamed_input_generator(shape),
+            output_tensor_descriptor=_streamed_output_descriptor(shape),
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=2e-2,
+            atol=2.5,
         )

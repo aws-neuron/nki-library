@@ -18,12 +18,11 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import nkilib_src.nkilib.experimental.collectives.distributed_adapter as adapter_mod
 import numpy as np
 import torch
 import torch.distributed as dist
 from nki.collectives import ReplicaGroup
-
-import nkilib_src.nkilib.experimental.collectives.distributed_adapter as adapter_mod
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import (
     SimDistAdapter,
     TorchDistAdapter,
@@ -32,6 +31,7 @@ from nkilib_src.nkilib.experimental.collectives.distributed_adapter import (
     get_rank,
     set_adapter,
 )
+
 from test.utils.unit_test_collective_framework import SimDistRunner
 
 
@@ -174,7 +174,7 @@ class TestDistributedAdapterThreadSafety:
         runner = SimDistRunner(num_ranks=num_ranks, replica_groups=[rg])
 
         def torch_ref(data=None, replica_groups=None):
-            rank = get_rank()
+            get_rank()
             pg = get_pg(replica_groups)
             t = torch.from_numpy(data.astype(np.float32))
             gathered = [torch.zeros_like(t) for _ in range(num_ranks)]
@@ -237,7 +237,7 @@ class TestDistributedAdapterThreadSafety:
 
     def test_write_write_same_thread_last_wins(self):
         """If set_adapter is called twice on same thread, last write wins."""
-        rg = ReplicaGroup([[0, 1, 2, 3]])
+        ReplicaGroup([[0, 1, 2, 3]])
 
         # Manually test that overwriting adapter on same thread works correctly
         results = {}

@@ -25,8 +25,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -36,7 +36,7 @@ from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 @nki.jit
 def _kernel_expert_select_3key(weights, expert_ids):
     """3D expert select: w_iter[eid, 0, f] with 3 keys."""
-    E, P, F = weights.shape[0], weights.shape[1], weights.shape[2]
+    _, P, F = weights.shape[0], weights.shape[1], weights.shape[2]
     T_F = 128
     N = expert_ids.shape[0]
     out = nl.ndarray((N, P, F), dtype=weights.dtype, buffer=nl.shared_hbm)
@@ -50,7 +50,7 @@ def _kernel_expert_select_3key(weights, expert_ids):
         eid_tile = eid_iter[t, 0].load()
         for f in range(n_f):
             data = w_iter[eid_tile, 0, f].load()
-            out_iter[t, 0, f].store(data.ap())
+            out_iter[t, 0, f].store(data.data)
     return out
 
 
@@ -68,7 +68,7 @@ def _kernel_kv_cache_load(kv_cache, seq_offsets):
     for b in range(B):
         seq_tile = seq_iter[b, 0].load()
         kv_data = kv_iter[b, seq_tile, 0].load()
-        out_iter[b, 0, 0].store(kv_data.ap())
+        out_iter[b, 0, 0].store(kv_data.data)
     return out
 
 

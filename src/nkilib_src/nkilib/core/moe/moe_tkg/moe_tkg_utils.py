@@ -21,17 +21,16 @@ from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from .mlp_tkg_constants import MLPTKGConstantsDimensionSizes
 
 
 def gather_expert_affinities(
-    expert_affinities_sb: nl.ndarray,
-    expert_idx: nl.ndarray,
+    expert_affinities_sb: nl.NkiTensor,
+    expert_idx: nl.NkiTensor,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Gathers expert affinities based on expert indices using local_gather operation.
 
@@ -40,13 +39,13 @@ def gather_expert_affinities(
     and local gather operations to prepare affinities for broadcasting.
 
     Args:
-        expert_affinities_sb (nl.ndarray): [_pmax, E], Tensor containing expert affinities in SBUF.
-        expert_idx (nl.ndarray): [T, K], Expert indices for each token.
+        expert_affinities_sb (nl.NkiTensor): [_pmax, E], Tensor containing expert affinities in SBUF.
+        expert_idx (nl.NkiTensor): [T, K], Expert indices for each token.
         dims (MLPTKGConstantsDimensionSizes): Dimension sizes object containing T, K, _pmax and other constants.
         sbm (SbufManager): SBUF memory manager for allocation.
 
     Returns:
-        gathered_affinities (nl.ndarray): [_pmax, PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
+        gathered_affinities (nl.NkiTensor): [_pmax, PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
             Gathered affinities tensor.
 
     Notes:
@@ -122,6 +121,7 @@ def gather_expert_affinities(
                     ],
                     offset=channel_idx * PARTITIONS_PER_GPSIMD_CORE * PARTITIONS_PER_GPSIMD_CORE,
                 ),
+                dge_mode=nisa.dge_mode.none,
             )
 
     # Perform local gather to collect affinities based on indices
@@ -147,12 +147,12 @@ def gather_expert_affinities(
 
 
 def broadcast_token_affinity(
-    dst: nl.ndarray,
-    gathered_affinities_sb: nl.ndarray,
+    dst: nl.NkiTensor,
+    gathered_affinities_sb: nl.NkiTensor,
     token_index: int,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Broadcasts expert affinities for a specific token across partitions.
 
@@ -160,15 +160,15 @@ def broadcast_token_affinity(
     token across all partitions, ensuring proper alignment with hardware constraints.
 
     Args:
-        dst (nl.ndarray): Destination tensor for broadcasted affinities.
-        gathered_affinities_sb (nl.ndarray): [_pmax, PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
+        dst (nl.NkiTensor): Destination tensor for broadcasted affinities.
+        gathered_affinities_sb (nl.NkiTensor): [_pmax, PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
             Gathered affinities tensor.
         token_index (int): Index of the current token being processed (i_t).
         dims (MLPTKGConstantsDimensionSizes): Dimension sizes object containing K, _pmax and other constants.
         sbm (SbufManager): SBUF memory manager for allocation.
 
     Returns:
-        broadcasted_affinities (nl.ndarray): [_pmax, K], Broadcasted token affinities ready for computation.
+        broadcasted_affinities (nl.NkiTensor): [_pmax, K], Broadcasted token affinities ready for computation.
 
     Notes:
         - PARTITIONS_PER_GPSIMD_CORE = 16 (partitions per GPSIMD core)
@@ -205,41 +205,20 @@ def broadcast_token_affinity(
     stream_shuffle_broadcast(src=token_affinities_partition_aligned[quadrant_start:quadrant_end, : dims.K], dst=dst)
 
 
-def reshape_scale_for_mlp(scale_tensor: TensorView):
+def reshape_scale_for_mlp(scale_tensor: nl.NkiTensor):
     """
     Reshapes scale tensor for MLP operations by expanding and broadcasting.
 
     Args:
-        scale_tensor (TensorView): Scale tensor to reshape.
+        scale_tensor (NkiTensor): Scale tensor to reshape.
 
     Returns:
-        TensorView: Reshaped scale tensor with expanded dimension 0 and broadcasted to size 128.
+        NkiTensor: Reshaped scale tensor with expanded dimension 0 and broadcasted to size 128.
 
     Notes:
         - Expands dimension 0 and broadcasts to partition size (128)
     """
     return scale_tensor.expand_dim(dim=0).broadcast(dim=0, size=128)
-
-
-def safe_tensor_view(tensor):
-    """
-    Creates a TensorView wrapper for a tensor if it is not None.
-
-    Args:
-        tensor (nl.ndarray | TensorView | None): Tensor to wrap, or None.
-
-    Returns:
-        TensorView or None: TensorView wrapper if tensor != None, otherwise None.
-
-    Notes:
-        - Safe wrapper to handle optional tensor inputs
-        - If tensor is already a TensorView, returns it as-is without double-wrapping
-    """
-    if tensor is None:
-        return None
-    if isinstance(tensor, TensorView):
-        return tensor
-    return TensorView(tensor)
 
 
 def load_all_expert_affinities(expert_affinities, expert_affinities_in_sbuf, T_total, dims, allocator):

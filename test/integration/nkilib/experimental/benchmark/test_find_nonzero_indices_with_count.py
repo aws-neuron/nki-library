@@ -15,7 +15,6 @@
 """Integration tests for find_nonzero_indices_with_count kernel."""
 
 import numpy as np
-
 from nkilib_src.nkilib.experimental.benchmark.find_nonzero_indices_with_count import (
     PADDING_VALUE,
     find_nonzero_indices_with_count,
@@ -23,6 +22,7 @@ from nkilib_src.nkilib.experimental.benchmark.find_nonzero_indices_with_count im
 from nkilib_src.nkilib.experimental.benchmark.find_nonzero_indices_with_count_torch import (
     find_nonzero_indices_with_count_torch_ref,
 )
+
 from test.integration.nkilib.utils.tensor_generators import sparse_nonzero_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize

@@ -16,7 +16,6 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
     _01_reshape_permute as reshape_mod,
 )
@@ -35,13 +34,20 @@ from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
 from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
     _03_tensor_view_torch as view_refs,
 )
+from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
+    _04_transpose as transpose_mod,
+)
+from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
+    _04_transpose_torch as transpose_refs,
+)
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
-def _run(test_manager, platform_target, kernel, ref, inputs, outputs, rtol=1e-2, atol=1e-2):
+def _run(test_manager, platform_target, kernel, ref, inputs, outputs, rtol=1e-2, atol=1e-2, logical_nc_config=None):
     framework = UnitTestFramework(
         test_manager=test_manager,
         kernel_entry=kernel,
@@ -51,7 +57,7 @@ def _run(test_manager, platform_target, kernel, ref, inputs, outputs, rtol=1e-2,
     )
     framework.run_test(
         test_config=None,
-        compiler_args=CompilerArgs(platform_target=platform_target),
+        compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=logical_nc_config),
         rtol=rtol,
         atol=atol,
     )
@@ -274,3 +280,196 @@ class TestNeurotileTensorView:
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def _xpose_in(p, f, seed=42):
+    def _gen(_):
+        np.random.seed(seed)
+        return {"src": np.random.randn(p, f).astype(ml_dtypes.bfloat16)}
+
+    return _gen
+
+
+def _xpose_out(p, f):
+    return lambda _: {"out": np.zeros((f, p), dtype=ml_dtypes.bfloat16)}
+
+
+def _gather_in(*dims, seed=42):
+    def _gen(_):
+        np.random.seed(seed)
+        rows = dims[0]
+        data = np.random.randn(*dims).astype(ml_dtypes.bfloat16)
+        indices = np.random.permutation(rows).astype(np.uint32).reshape(rows, 1)
+        return {"data": data, "indices": indices}
+
+    return _gen
+
+
+@pytest_marks(["neurotile"])
+class TestNeurotileTranspose:
+    """Tutorials in _04_transpose.py -- every way to express a DMA transpose."""
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize(
+        "m,n",
+        [
+            (128, 64),  # direct: a single tile, F<=128
+            (256, 512),  # multi-tile: 2x4 tile grid
+            (128, 400),  # remainder: trailing column tile is narrower (400=3*128+16)
+        ],
+    )
+    def test_transpose_tiled(self, test_manager: Orchestrator, platform_target: Platforms, m, n):
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_tiled,
+            transpose_refs.transpose_tiled_torch_ref,
+            _xpose_in(m, n),
+            _xpose_out(m, n),
+            logical_nc_config=1,
+        )
+
+    @pytest.mark.fast
+    def test_transpose_coalesced(self, test_manager, platform_target):
+        # One transpose DMA per (128, N) row-block, then carve per-tile stores.
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_coalesced,
+            transpose_refs.transpose_coalesced_torch_ref,
+            _xpose_in(256, 512),
+            _xpose_out(256, 512),
+            logical_nc_config=1,
+        )
+
+    @pytest.mark.fast
+    def test_transpose_coalesced_single_store(self, test_manager, platform_target):
+        # One transpose DMA per tile-row AND one store DMA per row via rearrange scatter.
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_coalesced_single_store,
+            transpose_refs.transpose_coalesced_single_store_torch_ref,
+            _xpose_in(256, 512),
+            _xpose_out(256, 512),
+            logical_nc_config=1,
+        )
+
+    @pytest.mark.fast
+    def test_transpose_into_dst(self, test_manager, platform_target):
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_into_dst,
+            transpose_refs.transpose_into_dst_torch_ref,
+            _xpose_in(256, 512),
+            _xpose_out(256, 512),
+            logical_nc_config=1,
+        )
+
+    @pytest.mark.fast
+    def test_transpose_into_dst_partial(self, test_manager, platform_target):
+        # dst= sized to a non-128-square transposed shape (gaps doc 4.6#5).
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_into_dst_partial,
+            transpose_refs.transpose_into_dst_partial_torch_ref,
+            _xpose_in(128, 100),
+            _xpose_out(128, 100),
+            logical_nc_config=1,
+        )
+
+    def test_transpose_streamed(self, test_manager, platform_target):
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_streamed,
+            transpose_refs.transpose_streamed_torch_ref,
+            _xpose_in(256, 512, seed=7),
+            _xpose_out(256, 512),
+            logical_nc_config=1,
+        )
+
+    def test_transpose_block_streamed(self, test_manager, platform_target):
+        # Contiguous block-stream: 6 seq-tiles, blocks of 2, one transpose DMA per block.
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_block_streamed,
+            transpose_refs.transpose_block_streamed_torch_ref,
+            _xpose_in(128 * 6, 96, seed=7),
+            _xpose_out(128 * 6, 96),
+            logical_nc_config=1,
+        )
+
+    def test_transpose_block_streamed_sharded(self, test_manager, platform_target):
+        # Tile-sharded 2-D grid (8x4 tiles), shard 0 of 2 owns even M-tiles;
+        # iterate block-cols, stream block-rows, per-owned-tile transpose.
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.transpose_block_streamed_sharded,
+            transpose_refs.transpose_block_streamed_sharded_torch_ref,
+            _xpose_in(128 * 8, 128 * 4, seed=7),
+            lambda _: {"out": np.zeros((128 * 4, 4 * 128), dtype=ml_dtypes.bfloat16)},
+            logical_nc_config=1,
+        )
+
+    def test_gather_transpose(self, test_manager, platform_target):
+        n, d = 16, 64
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.gather_transpose,
+            transpose_refs.gather_transpose_torch_ref,
+            _gather_in(n, d),
+            lambda _: {"out": np.zeros((d, n), dtype=ml_dtypes.bfloat16)},
+            logical_nc_config=1,
+        )
+
+    # Two shapes each to de-risk N-D AP orientation (gaps doc App.D: hardware-only
+    # verifiable). rows % 16 == 0, rows in [16, 128], free dim <= 128.
+    @pytest.mark.parametrize("rows,n_tiles,tile", [(16, 4, 64), (32, 2, 128)])
+    def test_gather_transpose_3d(self, test_manager, platform_target, rows, n_tiles, tile):
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.gather_transpose_3d,
+            transpose_refs.gather_transpose_3d_torch_ref,
+            _gather_in(rows, n_tiles, tile),
+            lambda _: {"out": np.zeros((tile, n_tiles, rows), dtype=ml_dtypes.bfloat16)},
+            logical_nc_config=1,
+        )
+
+    @pytest.mark.parametrize("rows,f_tiles,p", [(16, 8, 128), (32, 3, 128)])
+    def test_gather_transpose_4d(self, test_manager, platform_target, rows, f_tiles, p):
+        _run(
+            test_manager,
+            platform_target,
+            transpose_mod.gather_transpose_4d,
+            transpose_refs.gather_transpose_4d_torch_ref,
+            _gather_in(rows, f_tiles, p),
+            lambda _: {"out": np.zeros((p, 1, f_tiles, rows), dtype=ml_dtypes.bfloat16)},
+            logical_nc_config=1,
+        )
+
+    @pytest.mark.fast
+    def test_transpose_multi_dma_rejected(self):
+        """A transposed free dim >128 and not a multiple of 128 would need 2 DMAs;
+        the single-DMA contract must reject it at trace time and point at the split."""
+        import nki
+        import nki.language as nl
+        from nkilib_src.nkilib.experimental import neurotile as nt
+
+        @nki.jit
+        def bad(src):  # src [128, 200] -> transposed F=200 (>128, not mult of 128)
+            t = nt.tiles(src, tile_size=(128, 200))
+            xposed = t[0, 0].load(transpose=True)
+            out = nl.ndarray((200, 128), dtype=src.dtype, buffer=nl.shared_hbm)
+            nt.tiles(out, tile_size=(200, 128))[0, 0].store(xposed.data)
+            return out
+
+        src = np.random.RandomState(42).randn(128, 200).astype(ml_dtypes.bfloat16)
+        with pytest.raises(AssertionError, match="single-DMA contract"):
+            nki.simulate(bad)(src)

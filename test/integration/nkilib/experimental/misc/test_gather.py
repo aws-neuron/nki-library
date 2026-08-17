@@ -17,9 +17,9 @@
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.misc.gather import gather
 from nkilib_src.nkilib.experimental.misc.gather_torch import gather_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata

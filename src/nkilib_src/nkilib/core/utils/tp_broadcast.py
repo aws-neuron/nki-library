@@ -22,7 +22,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from .kernel_assert import kernel_assert
-from .tensor_view import TensorView
 
 
 def tp_broadcast(src, dst, src_offset, psum_address=None):
@@ -40,24 +39,22 @@ def tp_broadcast(src, dst, src_offset, psum_address=None):
         B: Broadcast count in destination (parition dimension)
 
     Args:
-        src: 2D input sbuf tensor or TensorView. Shape: [P, F]
-        dst: 2D output sbuf tensor or TensorView. Shape: [B, P]
+        src: 2D input sbuf tensor. Shape: [P, F]
+        dst: 2D output sbuf tensor. Shape: [B, P]
         src_offset: Specify the column in F to take the data from
         psum_address: Optional psum address to use for location of intermediate transpose
     """
-    src_tv = TensorView(src)
-    dst_tv = TensorView(dst)
-    p_dim, _ = src_tv.shape
-    broadcast_dim, tp_dim = dst_tv.shape
+    p_dim, _ = src.shape
+    broadcast_dim, tp_dim = dst.shape
 
-    kernel_assert(src_tv.is_sbuf(), "Source must be in sbuf")
-    kernel_assert(dst_tv.is_sbuf(), "Destination must be in sbuf")
+    kernel_assert((src.buffer == nl.sbuf), "Source must be in sbuf")
+    kernel_assert((dst.buffer == nl.sbuf), "Destination must be in sbuf")
     kernel_assert(tp_dim == p_dim, "Transposed dim didn't match")
 
     # Transpose and broadcast into intermediate psum buffer
     tp_psum = nl.ndarray((broadcast_dim, tp_dim), nl.float32, buffer=nl.psum, address=psum_address)
 
-    nisa.nc_transpose(tp_psum, src_tv.slice(1, src_offset, src_offset + 1).broadcast(1, broadcast_dim).get_view())
+    nisa.nc_transpose(tp_psum, src.slice(1, src_offset, src_offset + 1).broadcast(1, broadcast_dim))
 
     # Copy back to sbuf
-    nisa.tensor_copy(dst_tv.get_view(), src=tp_psum)
+    nisa.tensor_copy(dst, src=tp_psum)

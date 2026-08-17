@@ -19,13 +19,13 @@ from typing import List, Optional
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental.attention.ring_attention_bwd import ring_attention_spmd_bwd
 from nkilib_src.nkilib.experimental.attention.ring_attention_bwd_torch import (
+    _ring_attention_spmd_bwd_full,
     compute_per_rank_o_lse,
-    ring_attention_spmd_bwd_per_rank_torch_ref,
     ring_attention_spmd_bwd_torch_ref,
 )
+
 from test.integration.nkilib.utils.sequence_packing_helpers import (
     cu_seqlens_to_striped_bounds,
     stripe_tensor,
@@ -165,7 +165,7 @@ class TestRingAttentionBwd:
     ):
         """Test ring attention backward pass against reference.
 
-        When cu_seqlens_g is None -> dense path (uses ring_attention_spmd_bwd_torch_ref).
+        When cu_seqlens_g is None -> dense path (uses _ring_attention_spmd_bwd_full).
         When cu_seqlens_g is provided -> sequence-packing path: full-sequence torch
         autograd reference, bounds derived from cu_seqlens and replicated per rank.
         Sequence packing requires causal=True and striped=True.
@@ -208,9 +208,6 @@ class TestRingAttentionBwd:
             )
             o_per_rank = [stripe_tensor(o_full, r, cp_degree, seq_axis=1) for r in range(cp_degree)]
             lse_per_rank = [lse_full[:, r::cp_degree] for r in range(cp_degree)]
-            dq_golden = [stripe_tensor(dq_full, r, cp_degree, seq_axis=1) for r in range(cp_degree)]
-            dk_golden = [stripe_tensor(dk_full, r, cp_degree, seq_axis=1) for r in range(cp_degree)]
-            dv_golden = [stripe_tensor(dv_full, r, cp_degree, seq_axis=1) for r in range(cp_degree)]
 
             # Bounds per rank: shape (bs_flat, seqlen_per_rank) fp32 — identical across ranks.
             bmin_2d = (
@@ -228,7 +225,7 @@ class TestRingAttentionBwd:
             k_torch = [torch.from_numpy(k) for k in k_all]
             v_torch = [torch.from_numpy(v) for v in v_all]
             dy_torch = [torch.from_numpy(dy) for dy in dy_all]
-            dq_golden_t, dk_golden_t, dv_golden_t = ring_attention_spmd_bwd_torch_ref(
+            _ring_attention_spmd_bwd_full(
                 q_torch,
                 k_torch,
                 v_torch,
@@ -238,9 +235,6 @@ class TestRingAttentionBwd:
                 causal=causal,
                 striped=striped,
             )
-            dq_golden = [dq.numpy() for dq in dq_golden_t]
-            dk_golden = [dk.numpy() for dk in dk_golden_t]
-            dv_golden = [dv.numpy() for dv in dv_golden_t]
             o_per_rank, lse_per_rank = compute_per_rank_o_lse(
                 q_torch,
                 k_torch,
@@ -252,7 +246,7 @@ class TestRingAttentionBwd:
             )
             # compute_per_rank_o_lse returns numpy-like arrays; normalize to numpy for uniform handling below
             o_per_rank = [np.asarray(o) for o in o_per_rank]
-            lse_per_rank = [np.asarray(l) for l in lse_per_rank]
+            lse_per_rank = [np.asarray(lse) for lse in lse_per_rank]
 
         replica_groups = (tuple(range(cp_degree)),)
 
@@ -301,7 +295,7 @@ class TestRingAttentionBwd:
         framework = CollectiveUnitTestFramework(
             test_manager=test_manager,
             kernel_entry=ring_attention_spmd_bwd,
-            torch_ref=ring_attention_spmd_bwd_per_rank_torch_ref,
+            torch_ref=ring_attention_spmd_bwd_torch_ref,
             per_rank_input_generator=create_inputs,
             collective_ranks=cp_degree,
         )

@@ -18,13 +18,13 @@ from typing import final
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.moe.moe_cte import (
     MoECTEImplementation,
     moe_cte,
 )
-from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_torch import moe_cte_unified_torch_ref
+from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_torch import moe_cte_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     _shard_on_block_mx_output_validator,
     _shard_on_block_output_validator,
@@ -48,14 +48,14 @@ UNIFIED_PARAM_NAMES = \
 # =============================================================================
 NON_MX_TEST_CASES = [
     # SHARD_ON_INTERMEDIATE_HW tests
-    (MoECTEImplementation.shard_on_i_hybrid,            3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False,                         None,                   False, False, False, 1, QuantizationType.NONE),
+    pytest.param(MoECTEImplementation.shard_on_i_hybrid,            3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False,                         None,                   False, False, False, 1, QuantizationType.NONE, marks=pytest.mark.fast),
     # SHARD_ON_INTERMEDIATE tests
-    (MoECTEImplementation.shard_on_i,                   3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False,                         None,                   False, False, False, 1, QuantizationType.NONE),
+    pytest.param(MoECTEImplementation.shard_on_i,                   3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False,                         None,                   False, False, False, 1, QuantizationType.NONE, marks=pytest.mark.fast),
     # SHARD_ON_BLOCK tests (skip=3: skip_token=True, skip_weight=True)
-    (MoECTEImplementation.shard_on_block,               3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 3,    True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False,                         None,                   False, True,  False, 1, QuantizationType.NONE),
-    (MoECTEImplementation.shard_on_block,               3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 3,    True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False,                         None,                   False, False, False, 1, QuantizationType.NONE),
+    pytest.param(MoECTEImplementation.shard_on_block,               3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 3,    True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False,                         None,                   False, True,  False, 1, QuantizationType.NONE, marks=pytest.mark.fast),
+    pytest.param(MoECTEImplementation.shard_on_block,               3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 3,    True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False,                         None,                   False, False, False, 1, QuantizationType.NONE, marks=pytest.mark.fast),
     # Dropping kernel tests
-    (MoECTEImplementation.shard_on_i_dropping,          1536,   8192,   2,      4096,       2,     6144,         nl.bfloat16, 0,    False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True,                          None,                   False, False, False, 1, QuantizationType.NONE),
+    pytest.param(MoECTEImplementation.shard_on_i_dropping,          1536,   8192,   2,      4096,       2,     6144,         nl.bfloat16, 0,    False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True,                          None,                   False, False, False, 1, QuantizationType.NONE, marks=pytest.mark.fast),
 ]
 
 # =============================================================================
@@ -67,13 +67,13 @@ MX_BLOCK_TEST_CASES = [
     # MXFP4 + standard scales
     (MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float4_e2m1fn_x4,    False, False, False, 1, QuantizationType.MX),
     # MXFP4 + packed scales
-    (MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float4_e2m1fn_x4,    False, False, True,  1, QuantizationType.MX),
+    pytest.param(MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float4_e2m1fn_x4,    False, False, True,  1, QuantizationType.MX, marks=pytest.mark.fast),
     # MXFP8 (e4m3) + standard scales
     (MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float8_e4m3fn_x4,    False, False, False, 1, QuantizationType.MX),
     # MXFP8 (e4m3) + packed scales
     (MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float8_e4m3fn_x4,    False, False, True,  1, QuantizationType.MX),
     # STATIC_MX (MXFP8 e4m3), dynamic loop
-    (MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False,                         nl.float8_e4m3fn_x4,    True,  False, False, 8, QuantizationType.STATIC_MX),
+    pytest.param(MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False,                         nl.float8_e4m3fn_x4,    True,  False, False, 8, QuantizationType.STATIC_MX, marks=pytest.mark.fast),
 ]
 
 # =============================================================================
@@ -100,7 +100,6 @@ class TestMoeCTEUnified:
     - 3: SkipMode(True, True)   - skip both
     """
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(UNIFIED_PARAM_NAMES, ALL_TEST_CASES)
     def test_moe_cte_unified(
         self,
@@ -211,7 +210,7 @@ class TestMoeCTEUnified:
             kernel_input = input_generator(None)
             dma_skip = kernel_input["skip_dma"]
             T_out = tokens if dma_skip.skip_token else tokens + 1
-            torch_ref = torch_ref_wrapper(moe_cte_unified_torch_ref)
+            torch_ref = torch_ref_wrapper(moe_cte_torch_ref)
             ref_input = {k: v for k, v in kernel_input.items() if k in signature(torch_ref).parameters}
 
             validator_cls = _shard_on_block_output_validator(
@@ -230,7 +229,7 @@ class TestMoeCTEUnified:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=moe_cte,
-            torch_ref=torch_ref_wrapper(moe_cte_unified_torch_ref),
+            torch_ref=torch_ref_wrapper(moe_cte_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
             collector=collector,

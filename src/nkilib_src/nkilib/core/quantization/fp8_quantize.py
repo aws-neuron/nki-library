@@ -30,7 +30,6 @@ from ..utils.allocator import BufferManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ..utils.tensor_view import TensorView
 from .constants import MINVAL
 
 
@@ -326,11 +325,11 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
 
     # ── Phase 3: Vectorized quantize via broadcast scale ──
     """
-    Use TensorView.broadcast to create a stride-0 view of quant_scale that
+    Use NkiTensor.broadcast to create a stride-0 view of quant_scale that
     expands [P0, BxS, 1] → [P0, BxS, F0] without materializing the expansion.
     This eliminates the F0-copy loop + permute + tensor_copy.
     """
-    quant_scale_3d = TensorView(quant_scale_all.reshape((P0, BxS, 1))).broadcast(dim=2, size=F0)
+    quant_scale_3d = quant_scale_all.reshape((P0, BxS, 1)).broadcast(2, F0)
     # Work in 3D [P0, BxS, F0] to avoid reshape on non-contiguous broadcast view.
     input_3d = hidden_state  # already [P0, BxS, F0]
 
@@ -339,7 +338,7 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
         nisa.tensor_tensor(
             dst=scaled_3d,
             data1=input_3d,
-            data2=quant_scale_3d.get_view(),
+            data2=quant_scale_3d,
             op=nl.multiply,
         )
         if quantized == None:
@@ -358,7 +357,7 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
         nisa.tensor_tensor(
             dst=quantized,
             data1=input_3d,
-            data2=quant_scale_3d.get_view(),
+            data2=quant_scale_3d,
             op=nl.multiply,
         )
 

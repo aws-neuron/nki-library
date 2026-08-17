@@ -45,7 +45,7 @@ def expert_select(weights, expert_id_tensor):
     expert_data = w_iter[eid_tile].load()  # tile: [P, F]
 
     out_iter = nt.tiles(out, tile_size=(P, F))
-    out_iter[0, 0].store(expert_data.ap())
+    out_iter[0, 0].store(expert_data.data)
     return out
 
 

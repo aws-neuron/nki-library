@@ -17,7 +17,6 @@ import nki.language as nl
 import numpy as np
 import pytest
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.experimental.collectives.sb2sb_allgather import (
     allgather_sb2sb,
     allgather_sb2sb_tiled,
@@ -26,29 +25,35 @@ from nkilib_src.nkilib.experimental.collectives.sb2sb_allgather_torch import (
     allgather_sb2sb_tiled_torch_ref,
     allgather_sb2sb_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
 
 SB2SB_PARAM_NAMES = "m, k, dtype, tp_degree"
+# These run at lnc=1, so physical cores == tp_degree. tp_degree > 8 needs more
+# than a 3xl host's 8 cores, so those configs are marked high_rank to route them
+# to 48xl hosts; tp_degree <= 8 stays in the default lane.
 SB2SB_TEST_PARAMS = [
     # Basic tests
     (128, 512, nl.bfloat16, 8),
     (64, 1024, nl.bfloat16, 8),
     (128, 2048, nl.bfloat16, 8),
-    (96, 512, nl.bfloat16, 16),
+    pytest.param(96, 512, nl.bfloat16, 16, marks=pytest.mark.high_rank),
     # dtype variations
     (128, 512, np.float32, 8),
     (64, 1024, np.float16, 8),
     # Different TP degrees
-    (128, 256, nl.bfloat16, 64),
-    (128, 256, nl.bfloat16, 32),
+    pytest.param(128, 256, nl.bfloat16, 64, marks=pytest.mark.high_rank),
+    pytest.param(128, 256, nl.bfloat16, 32, marks=pytest.mark.high_rank),
     # Non-power-of-2 k
-    (128, 384, nl.bfloat16, 16),
+    pytest.param(128, 384, nl.bfloat16, 16, marks=pytest.mark.high_rank),
 ]
 
 TILED_PARAM_NAMES = "m, k, dtype, tp_degree, lnc"
+# Physical cores == tp_degree * lnc. Configs needing > 8 cores are marked
+# high_rank to route them to 48xl hosts; the rest stay in the default lane.
 TILED_TEST_PARAMS = [
     # Single tile cases (m <= 128)
     (128, 512, nl.bfloat16, 4, 2),
@@ -57,11 +62,11 @@ TILED_TEST_PARAMS = [
     (256, 512, nl.bfloat16, 8, 1),
     (256, 512, nl.bfloat16, 4, 2),
     (512, 1024, nl.bfloat16, 8, 1),
-    (512, 1024, nl.bfloat16, 8, 2),
+    pytest.param(512, 1024, nl.bfloat16, 8, 2, marks=pytest.mark.high_rank),
     # dtype variations
     (256, 512, np.float32, 8, 1),
     (512, 1024, np.float16, 4, 2),
-    (256, 512, nl.bfloat16, 8, 2),
+    pytest.param(256, 512, nl.bfloat16, 8, 2, marks=pytest.mark.high_rank),
 ]
 _ABBREVS = {"tp_degree": "tp"}
 

@@ -24,13 +24,12 @@ import nki.language as nl
 
 from ...core.utils.kernel_helpers import div_ceil
 from ...core.utils.logging import get_logger
-from ...core.utils.tensor_view import TensorView
 from .pad_params import PadParams
 from .pad_tiling import compute_tiling_strategy
 
 _logger = get_logger("pad_kernel")
 
-ShardResult = Tuple[Optional[TensorView], Optional[TensorView], Optional[PadParams]]
+ShardResult = Tuple[Optional[nl.NkiTensor], Optional[nl.NkiTensor], Optional[PadParams]]
 
 
 def _shard_utilization(n_tiles: int, num_cores: int) -> float:
@@ -41,7 +40,7 @@ def _shard_utilization(n_tiles: int, num_cores: int) -> float:
     return n_tiles / slots
 
 
-def _choose_shard_dim(x_4d: TensorView, params: PadParams, mode: str, dtype) -> int:
+def _choose_shard_dim(x_4d: nl.NkiTensor, params: PadParams, mode: str, dtype) -> int:
     """Choose which dimension to shard across LNC cores.
 
     Returns spatial dim index (0=D, 1=H, 2=W) or -1 for NC.
@@ -77,8 +76,8 @@ def _choose_shard_dim(x_4d: TensorView, params: PadParams, mode: str, dtype) -> 
 
 
 def _split_nc(
-    x_4d: TensorView,
-    out_4d: TensorView,
+    x_4d: nl.NkiTensor,
+    out_4d: nl.NkiTensor,
     params: PadParams,
     core_id: int,
     num_cores: int,
@@ -94,8 +93,8 @@ def _split_nc(
 
 
 def _split_spatial(
-    x_4d: TensorView,
-    out_4d: TensorView,
+    x_4d: nl.NkiTensor,
+    out_4d: nl.NkiTensor,
     params: PadParams,
     dim: int,
     core_id: int,
@@ -125,8 +124,8 @@ def _split_spatial(
 
 
 def shard_operation(
-    x_4d: TensorView,
-    out_4d: TensorView,
+    x_4d: nl.NkiTensor,
+    out_4d: nl.NkiTensor,
     params: PadParams,
     mode: str,
     dtype,

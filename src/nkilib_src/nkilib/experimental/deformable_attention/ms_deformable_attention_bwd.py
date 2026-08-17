@@ -29,22 +29,21 @@ import nki.language as nl
 from ...core.utils.allocator import SbufManager
 from ...core.utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...core.utils.logging import get_logger
-from ...core.utils.tensor_view import TensorView
 
 
 @nki.jit
 def ms_deformable_attention_bwd(
-    grad_output: nl.ndarray,
-    value: nl.ndarray,
+    grad_output: nl.NkiTensor,
+    value: nl.NkiTensor,
     spatial_shapes: tuple,
     level_start_index: tuple,
-    sampling_locations: nl.ndarray,
-    attention_weights: nl.ndarray,
+    sampling_locations: nl.NkiTensor,
+    attention_weights: nl.NkiTensor,
     value_layout: str = "BLNC",
     sampling_locations_layout: str = "BQHLP2",
     align_corners: bool = False,
     padding_mode: str = "zeros",
-) -> Tuple[nl.ndarray, nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     Multi-scale deformable attention backward pass kernel.
 
@@ -63,25 +62,25 @@ def ms_deformable_attention_bwd(
         W_i: Width of feature map at level i
 
     Args:
-        grad_output (nl.ndarray): Gradient from downstream in HBM, shape (B, N_q, N_h * C_h)
-        value (nl.ndarray): Value tensor in HBM. Shape depends on value_layout:
+        grad_output (nl.NkiTensor): Gradient from downstream in HBM, shape (B, N_q, N_h * C_h)
+        value (nl.NkiTensor): Value tensor in HBM. Shape depends on value_layout:
             - If value_layout="BLNC": (B, L, N_h, C_h)
             - If value_layout="BNLC": (B, N_h, L, C_h)
         spatial_shapes (tuple): Tuple of (H_i, W_i) tuples specifying spatial dimensions for each level
         level_start_index (tuple): Tuple of start indices for each level in the flattened L dimension
-        sampling_locations (nl.ndarray): Normalized sampling coordinates in HBM. Shape depends on layout:
+        sampling_locations (nl.NkiTensor): Normalized sampling coordinates in HBM. Shape depends on layout:
             - If sampling_locations_layout="BQHLP2": (B, N_q, N_h, N_l, N_p, 2)
             - If sampling_locations_layout="B2QHLP": (B, 2, N_q, N_h, N_l, N_p)
-        attention_weights (nl.ndarray): Attention weights in HBM, shape (B, N_q, N_h, N_l, N_p)
+        attention_weights (nl.NkiTensor): Attention weights in HBM, shape (B, N_q, N_h, N_l, N_p)
         value_layout (str): Layout of value tensor, either "BLNC" or "BNLC". Default: "BLNC"
         sampling_locations_layout (str): Layout of sampling_locations, either "BQHLP2" or "B2QHLP". Default: "BQHLP2"
         align_corners (bool): If True, coordinates map [0,1] to [0, H-1]. If False, map to [-0.5, H-0.5]. Default: False
         padding_mode (str): Padding mode for out-of-bounds coordinates, either "zeros" or "border". Default: "zeros"
 
     Returns:
-        grad_value (nl.ndarray): Gradient w.r.t. value in HBM, same shape and layout as input value
-        grad_sampling_locations (nl.ndarray): Gradient w.r.t. sampling_locations in HBM, same shape and layout as input
-        grad_attention_weights (nl.ndarray): Gradient w.r.t. attention_weights in HBM, shape (B, N_q, N_h, N_l, N_p)
+        grad_value (nl.NkiTensor): Gradient w.r.t. value in HBM, same shape and layout as input value
+        grad_sampling_locations (nl.NkiTensor): Gradient w.r.t. sampling_locations in HBM, same shape and layout as input
+        grad_attention_weights (nl.NkiTensor): Gradient w.r.t. attention_weights in HBM, shape (B, N_q, N_h, N_l, N_p)
 
     Notes:
         - Computes actual gradients using bilinear interpolation derivatives
@@ -1187,12 +1186,10 @@ def ms_deformable_attention_bwd(
 
                                 nisa.tensor_copy(
                                     dst=flat_idx_all_scaled[:, col_start:col_end],
-                                    src=TensorView(flat_idx_all_corners)
-                                    .select(dim=1, index=h)
+                                    src=flat_idx_all_corners.select(dim=1, index=h)
                                     .select(dim=1, index=l)
                                     .slice(dim=1, start=p_start, end=p_end)
-                                    .reshape((q_actual, p_actual * 4))
-                                    .get_view(),
+                                    .reshape((q_actual, p_actual * 4)),
                                 )
 
                             # Scale indirect indicies
@@ -1535,12 +1532,10 @@ def ms_deformable_attention_bwd(
 
                                 nisa.tensor_copy(
                                     dst=flat_idx_scaled[:, col_start:col_end],
-                                    src=TensorView(flat_idx_shifted_reshaped)
-                                    .select(dim=1, index=h)
+                                    src=flat_idx_shifted_reshaped.select(dim=1, index=h)
                                     .select(dim=1, index=l)
                                     .slice(dim=1, start=p_start, end=p_end)
-                                    .reshape((q_actual, p_actual * 2))
-                                    .get_view(),
+                                    .reshape((q_actual, p_actual * 2)),
                                 )
 
                             # Scale indices by K-buffer stride
@@ -1761,12 +1756,10 @@ def ms_deformable_attention_bwd(
                 if cfg.sampling_locations_layout == "BQHLP2":
                     grad_sampling_loc_local_2d = grad_sampling_loc_local.reshape((q_actual, h_actual, N_l, N_p * 2))
                     nisa.dma_copy(
-                        dst=TensorView(grad_sampling_locations)
-                        .select(dim=0, index=batch_idx)
+                        dst=grad_sampling_locations.select(dim=0, index=batch_idx)
                         .slice(dim=0, start=q_start, end=q_end, step=1)
                         .slice(dim=1, start=h_start, end=h_end, step=1)
-                        .reshape((q_actual, h_actual, N_l, N_p * 2))
-                        .get_view(),
+                        .reshape((q_actual, h_actual, N_l, N_p * 2)),
                         src=grad_sampling_loc_local_2d,
                     )
                 else:  # B2QHLP
@@ -1881,11 +1874,11 @@ class MSDeformAttnBwdConfig(nl.NKIObject):
 
 
 def _build_config(
-    value: nl.ndarray,
+    value: nl.NkiTensor,
     spatial_shapes: tuple,
     level_start_index: tuple,
-    sampling_locations: nl.ndarray,
-    attention_weights: nl.ndarray,
+    sampling_locations: nl.NkiTensor,
+    attention_weights: nl.NkiTensor,
     value_layout: str = "BLNC",
     sampling_locations_layout: str = "BQHLP2",
     padding_mode: str = "zeros",

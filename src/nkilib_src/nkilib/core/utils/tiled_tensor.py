@@ -17,17 +17,28 @@
 
 This module provides a zero-cost abstraction for tiling tensors, where each
 element of the TiledTensor represents a tile in the base tensor. TiledTensor
-is fully interoperable with TensorView.
+is fully interoperable with NkiTensor.
 """
 
 from typing import Tuple
 
 import nki.language as nl
 
+
+def _trivial_strides(shape, base_stride: int = 1):
+    """Row-major (C-style) strides for a shape; innermost stride = base_stride."""
+    strides = [base_stride]
+    for i in range(1, len(shape)):
+        strides.append(strides[i - 1] * shape[len(shape) - i])
+    ret = []
+    for i in range(len(shape)):
+        ret.append(strides[len(shape) - i - 1])
+    return tuple(ret)
+
+
 from .allocator import sizeinbytes
 from .kernel_assert import kernel_assert
 from .logging import Logger
-from .tensor_view import TensorView
 
 logger = Logger("TiledTensor")
 
@@ -40,16 +51,16 @@ class TiledTensor(nl.NKIObject):
     enabling zero-cost grid manipulations (select, slice, reshape_dim, etc.)
     without generating any instructions.
 
-    The source tensor can be either an nl.ndarray or a TensorView. When a
-    TensorView is passed, tiling operates on its logical shape.
+    The source tensor can be either an nl.ndarray or a NkiTensor. When a
+    NkiTensor is passed, tiling operates on its logical shape.
 
     Attributes:
         shape: The tile grid dimensions (number of tiles per dimension).
         tile_size: The tile size for each source dimension.
     """
 
-    # The source tensor wrapped as a TensorView for uniform handling
-    _source_view: TensorView
+    # The source tensor wrapped as a NkiTensor for uniform handling
+    _source_view: nl.NkiTensor
     # The logical shape of the source tensor (used for tile boundary clipping)
     _source_shape: Tuple[int, ...]
     # The tile size for each source dimension (one entry per source dim)
@@ -59,7 +70,7 @@ class TiledTensor(nl.NKIObject):
     _full_grid_shape: Tuple[int, ...]
     # The current grid shape after select/slice/reshape_dim/etc. operations
     _grid_shape: Tuple[int, ...]
-    # Strides in flat tile-index space, mirroring TensorView's stride model;
+    # Strides in flat tile-index space, mirroring NkiTensor's stride model;
     # grid_strides[i] is the flat-index step when advancing one position in grid dim i
     _grid_strides: Tuple[int, ...]
     # Offset into the flat tile-index space (the flat index of the first selected tile)
@@ -74,7 +85,7 @@ class TiledTensor(nl.NKIObject):
         """Construct a TiledTensor by tiling a source tensor.
 
         Args:
-            source: The base tensor (nl.ndarray) or TensorView to tile.
+            source: The base tensor (nl.ndarray) or NkiTensor to tile.
             tile_size: Size of each tile per dimension. Must have the same
                 number of dimensions as the source.
 
@@ -82,14 +93,9 @@ class TiledTensor(nl.NKIObject):
             AssertionError: If tile_size has wrong number of dimensions,
                 contains zero or negative values.
         """
-        if isinstance(source, TensorView):
-            self._source_view = source
-            self._source_shape = source.shape
-            self._dtype = source.dtype
-        else:
-            self._source_view = TensorView(source)
-            self._source_shape = tuple(source.shape)
-            self._dtype = source.dtype
+        self._source_view = source
+        self._source_shape = tuple(source.shape)
+        self._dtype = source.dtype
 
         kernel_assert(
             len(tile_size) == len(self._source_shape),
@@ -105,7 +111,7 @@ class TiledTensor(nl.NKIObject):
             grid_shape.append((self._source_shape[d] + self._tile_size[d] - 1) // self._tile_size[d])
         self._full_grid_shape = tuple(grid_shape)
         self._grid_shape = tuple(grid_shape)
-        self._grid_strides = TensorView.get_trivial_strides(self._grid_shape)
+        self._grid_strides = _trivial_strides(self._grid_shape)
         self._grid_offset = 0
 
         dim_map = []
@@ -199,7 +205,7 @@ class TiledTensor(nl.NKIObject):
         return tuple(coords)
 
     def _get_single_tile_view(self, flat_tile_idx, keep_dim=True):
-        """Get the TensorView for a single tile given its flat index in the original grid.
+        """Get the NkiTensor for a single tile given its flat index in the original grid.
 
         Args:
             flat_tile_idx: Flat index into the full grid.
@@ -207,7 +213,7 @@ class TiledTensor(nl.NKIObject):
                       If False, size-1 tile dims are removed via select.
         """
         coords = self._unravel(flat_tile_idx, self._full_grid_shape)
-        view = TensorView(self._source_view)
+        view = self._source_view
         if keep_dim:
             for d in range(len(self._source_shape)):
                 start = coords[d] * self._tile_size[d]
@@ -286,7 +292,7 @@ class TiledTensor(nl.NKIObject):
                       If True, all dims are kept.
 
         Returns:
-            TensorView for the specified tile.
+            NkiTensor for the specified tile.
         """
         kernel_assert(
             len(indices) == self._get_ndim(),
@@ -326,7 +332,7 @@ class TiledTensor(nl.NKIObject):
         )
 
         new_grid_shape = self._grid_shape[:dim] + tuple(shape) + self._grid_shape[dim + 1 :]
-        reshaped_strides = TensorView.get_trivial_strides(shape, base_stride=self._grid_strides[dim])
+        reshaped_strides = _trivial_strides(shape, base_stride=self._grid_strides[dim])
         new_grid_strides = self._grid_strides[:dim] + reshaped_strides + self._grid_strides[dim + 1 :]
         src_dim = self._dim_map[dim]
         new_dim_map_list = []
@@ -462,13 +468,13 @@ class TiledTensor(nl.NKIObject):
             f"Cannot reshape grid from {self._grid_shape} (total {old_total}) to {new_shape} (total {new_total})",
         )
 
-        expected_strides = TensorView.get_trivial_strides(self._grid_shape)
+        expected_strides = _trivial_strides(self._grid_shape)
         kernel_assert(
             self._grid_strides == expected_strides,
             f"Cannot reshape non-contiguous grid. Grid strides {self._grid_strides} are not trivial {expected_strides}",
         )
 
-        new_strides = TensorView.get_trivial_strides(new_shape)
+        new_strides = _trivial_strides(new_shape)
         new_dim_map_list = []
         for _ in range(len(new_shape)):
             new_dim_map_list.append(-1)
@@ -516,7 +522,7 @@ class TiledTensor(nl.NKIObject):
         new_tile_size = self._tile_size[:last_dim] + (new_tile_last,)
         new_source_shape = self._source_shape[:last_dim] + (new_source_last,)
 
-        new_source_view = self._source_view.reinterpret_cast(new_dtype)
+        new_source_view = self._source_view.view(new_dtype)
 
         return self._make_copy(
             tile_size=new_tile_size,
@@ -526,31 +532,31 @@ class TiledTensor(nl.NKIObject):
         )
 
     def get_view(self):
-        """Return a TensorView covering all currently selected tiles.
+        """Return a NkiTensor covering all currently selected tiles.
 
         Performs a contiguity check to verify that the selected tiles form a
         single contiguous rectangular block in the source tensor. If not,
         raises an error directing the user to use force_get_view() instead.
 
         Returns:
-            A TensorView representing the coalesced tile region.
+            A NkiTensor representing the coalesced tile region.
         """
         return self._build_view(True)
 
     def force_get_view(self):
-        """Return a TensorView without performing contiguity checks.
+        """Return a NkiTensor without performing contiguity checks.
 
-        When tiles are non-contiguous, the returned TensorView may have a
+        When tiles are non-contiguous, the returned NkiTensor may have a
         higher rank than the tile_size, with extra dimensions representing
         the tile groups.
 
         Returns:
-            A TensorView representing the tile region.
+            A NkiTensor representing the tile region.
         """
         return self._build_view(False)
 
     def _build_contiguous_view(self):
-        """Build a TensorView for contiguous tile selections.
+        """Build a NkiTensor for contiguous tile selections.
 
         Used by get_view() after contiguity has been verified.
         Computes tile starts and counts per source dim using min/max unravel,
@@ -558,7 +564,7 @@ class TiledTensor(nl.NKIObject):
         """
         ndim = self._get_ndim()
         source_ndim = len(self._source_shape)
-        view = TensorView(self._source_view)
+        view = self._source_view
 
         # Compute min and max flat tile indices
         min_flat = self._grid_offset
@@ -578,12 +584,12 @@ class TiledTensor(nl.NKIObject):
         return view
 
     def _build_force_view(self):
-        """Build a TensorView for potentially non-contiguous tile selections.
+        """Build a NkiTensor for potentially non-contiguous tile selections.
 
         Each grid dimension becomes one or more view dimensions. When a grid
         dimension has a stride larger than what contiguous tiling would produce,
         extra view dimensions are introduced to represent the strided access,
-        resulting in a higher-rank TensorView.
+        resulting in a higher-rank NkiTensor.
 
         For example, selecting every-other tile row from a (4,4) grid where
          each tile is (128, 256) produces
@@ -592,7 +598,7 @@ class TiledTensor(nl.NKIObject):
         step = 2*128 = 256, yielding a view of shape (2, 128, 1024).
         """
         groups = self._build_dim_groups()
-        view = TensorView(self._source_view)
+        view = self._source_view
 
         full_coords = self._unravel(self._grid_offset, self._full_grid_shape)
 
@@ -692,7 +698,7 @@ class TiledTensor(nl.NKIObject):
         return view
 
     def _build_view(self, check_contiguity):
-        """Internal method to build a TensorView from the current grid state."""
+        """Internal method to build a NkiTensor from the current grid state."""
         ndim = self._get_ndim()
 
         if ndim == 0:
@@ -783,9 +789,9 @@ class TiledTensor(nl.NKIObject):
     _num_banks = None
 
     def __getitem__(self, idx):
-        """Access a tile by (i, j) index. Returns the raw tensor or TensorView.
+        """Access a tile by (i, j) index. Returns the raw tensor or NkiTensor.
 
-        For contiguous-source TiledTensors, delegates to get_tile().get_view().
+        For contiguous-source TiledTensors, delegates to get_tile().
         For list-backed TiledTensors, returns the tile directly with rotation/bank logic.
         """
         if isinstance(idx, tuple):
@@ -817,7 +823,7 @@ class TiledTensor(nl.NKIObject):
                     stride = stride * self._grid_shape[d]
             return self._tiles[flat]
 
-        return self.get_tile(indices).get_view()
+        return self.get_tile(indices)
 
     def permute(self, perm):
         """Permute dimensions within each tile. Returns a new TiledTensor."""
@@ -828,7 +834,7 @@ class TiledTensor(nl.NKIObject):
         if self._tiles is not None:
             new_tiles = []
             for t in self._tiles:
-                new_tiles.append(TensorView(t).permute(perm).get_view())
+                new_tiles.append(t.permute(perm))
             result = TiledTensor._make_tile_list(
                 new_tiles,
                 self._grid_shape,
@@ -839,7 +845,7 @@ class TiledTensor(nl.NKIObject):
             )
             return result
         # View-backed: permute the source and adjust tile_size
-        new_source = TensorView(self._source_view).permute(perm)
+        new_source = self._source_view.permute(perm)
         return TiledTensor(new_source, new_tile_size)
 
     def broadcast(self, dim, size):
@@ -847,7 +853,7 @@ class TiledTensor(nl.NKIObject):
         if self._tiles is not None:
             new_tiles = []
             for t in self._tiles:
-                new_tiles.append(TensorView(t).broadcast(dim=dim, size=size).get_view())
+                new_tiles.append(t.broadcast(dim=dim, size=size))
             new_tile_size = list(self._tile_size)
             new_tile_size[dim] = size
             return TiledTensor._make_tile_list(
@@ -858,7 +864,7 @@ class TiledTensor(nl.NKIObject):
                 rotate_dim=self._rotate_dim if self._rotate_dim is not None else None,
                 rotate_count=self._rotate_count if self._rotate_count is not None else None,
             )
-        new_source = TensorView(self._source_view).broadcast(dim=dim, size=size * self._grid_shape[dim])
+        new_source = self._source_view.broadcast(dim=dim, size=size * self._grid_shape[dim])
         new_tile_size = list(self._tile_size)
         new_tile_size[dim] = size
         return TiledTensor(new_source, tuple(new_tile_size))
@@ -988,9 +994,7 @@ class TiledTensor(nl.NKIObject):
 
         for t_idx in range(num_orig_tiles):
             tile = (
-                self._tiles[t_idx]
-                if self._tiles is not None
-                else self._get_single_tile_view(self._grid_offset + t_idx).get_view()
+                self._tiles[t_idx] if self._tiles is not None else self._get_single_tile_view(self._grid_offset + t_idx)
             )
             for s in range(num_sub):
                 start = s * size

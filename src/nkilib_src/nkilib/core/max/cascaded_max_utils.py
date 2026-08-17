@@ -128,7 +128,7 @@ def predicated_folded_load(
         batch_bound = min(batch_size_sharded * fold_factor, batch_size * fold_factor - base_offset)
         ix, iy = nl.ds(0, batch_bound), nl.ds(0, n_folded)
         ix_src = nl.ds(base_offset, batch_bound)
-        nisa.dma_copy(src=src_hbm_reshape[ix_src, iy], dst=data_sb[ix, iy])
+        nisa.dma_copy(src=src_hbm_reshape[ix_src, iy], dst=data_sb[ix, iy], dge_mode=nisa.dge_mode.hwdge)
         if return_out:
             return data_sb
         else:

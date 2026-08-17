@@ -43,19 +43,27 @@ The static last tile always executes (handles K_active append and LNC2 sync).
 
 ┌─────────────────────────────────────────────────────┐
 │ Dynamic FA loop (max_context_len provided)          │
-│   for _ in nl.dynamic_range(0, num_non_last_tiles): │
-│       _execute_fa_tile_body(...)                    │
+│   def body(i): _execute_fa_tile_body(...)           │
+│   nl.fori_loop(0, num_non_last_tiles, body)         │
 │   # Static last tile (always runs)                  │
 │   _execute_fa_tile_body(..., is_last_fa_tile=True)  │
 └─────────────────────────────────────────────────────┘
 ```
 
+> **`nl.fori_loop` semantics.** `nl.fori_loop` follows Pallas `fori_loop`: the
+> loop body is a function called once per iteration with the loop index. **Loop-carried
+> dependencies are not supported yet** — a value cannot be threaded from one iteration's
+> output into the next. All cross-iteration state (running max/sum/output, tile offsets)
+> is therefore kept in SBUF and mutated in place, which is exactly why the identity
+> initialization and SBUF offset counters described below are required.
+
 ## Key Design Decisions
 
 ### Identity-initialized FA buffers (dynamic path)
 
-The dynamic loop cannot branch on `fa_tile_idx == 0` (runtime iteration index unknown).
-Instead, FA running buffers are initialized to identity values:
+The dynamic loop cannot branch on `fa_tile_idx == 0` (runtime iteration index unknown),
+and `fori_loop` carries no per-iteration state. Instead, FA running buffers are
+initialized to identity values (and updated in place in SBUF each iteration):
 
 | Buffer | Identity value | Effect on first tile |
 |--------|---------------|---------------------|
@@ -89,16 +97,17 @@ across the free dimension.
 
 ### DMA op naming
 
-All DMA ops inside `nl.dynamic_range` must have unique names. Since the loop body
+All DMA ops inside the `nl.fori_loop` body must have unique names. Since the loop body
 is traced once, `fa_tile_idx` (a compile-time constant per call site) differentiates
 ops. The static last tile uses `fa_tile_idx = num_fa_tiles - 1`.
 
 ## Constraints
 
-- `nl.dynamic_range` inserts scheduling barriers at iteration boundaries (~9 µs/iter)
+- `nl.fori_loop` inserts scheduling barriers at iteration boundaries (~9 µs/iter)
+- No loop-carried dependencies (Pallas `fori_loop` semantics) — cross-iteration state must live in SBUF
 - No cross-iteration prefetching by the compiler
 - SBUF addresses must be compile-time constants (no runtime buffer indexing)
-- `dge_mode.none` not allowed inside `nl.dynamic_range` — must use `hwdge`
+- `dge_mode.none` not allowed inside `nl.fori_loop` — must use `hwdge`
 - LNC2 requires both NCs to execute the same number of iterations (`sendrecv` sync)
 
 ## Future: Double-Buffered Pipelining

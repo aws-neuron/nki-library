@@ -20,10 +20,10 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
+from ...utils.allocator import sizeinbytes
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEAllToAllVStrategy, MoELNCShardingStrategy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
-from ...utils.tensor_view import TensorView
 from .mlp_parameters import MLPParameters
 from .projection_mx_constants import (
     MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM,
@@ -71,20 +71,20 @@ SUPPORTED_MOE_SHARDING_STRATEGIES = [
 class AllExpertMXInputTensors(nl.NKIObject):
     """Input tensors for all-expert MX kernel."""
 
-    hidden_input: nl.ndarray
-    gate_up_weights: nl.ndarray
-    down_weights: nl.ndarray
-    output: nl.ndarray
-    expert_affinities_masked: nl.ndarray
-    gate_up_weights_scale: nl.ndarray
-    down_weights_scale: nl.ndarray
-    hidden_input_scale: nl.ndarray
-    gate_up_weights_bias: nl.ndarray
-    down_weights_bias: nl.ndarray
+    hidden_input: nl.NkiTensor
+    gate_up_weights: nl.NkiTensor
+    down_weights: nl.NkiTensor
+    output: nl.NkiTensor
+    expert_affinities_masked: nl.NkiTensor
+    gate_up_weights_scale: nl.NkiTensor
+    down_weights_scale: nl.NkiTensor
+    hidden_input_scale: nl.NkiTensor
+    gate_up_weights_bias: nl.NkiTensor
+    down_weights_bias: nl.NkiTensor
     # STATIC_MX: per-tensor FP8 dequant scales for activations (float32)
-    gate_up_in_scale: nl.ndarray = None  # [E_L, 1] or [1, 1]
-    down_in_scale: nl.ndarray = None  # [E_L, 1] or [1, 1]
-    input_dequant_scale: nl.ndarray = None  # [pmax, 1] in SBUF, broadcast input dequant scale
+    gate_up_in_scale: nl.NkiTensor = None  # [E_L, 1] or [1, 1]
+    down_in_scale: nl.NkiTensor = None  # [E_L, 1] or [1, 1]
+    input_dequant_scale: nl.NkiTensor = None  # [pmax, 1] in SBUF, broadcast input dequant scale
 
 
 @dataclass
@@ -248,20 +248,20 @@ class AllExpertMXDynamismConfig(nl.NKIObject):
 class ExpertWeightsSBUF(nl.NKIObject):
     """Expert weights, scales, and biases loaded in SBUF for one expert."""
 
-    gate_weight_sb: nl.ndarray
-    up_weight_sb: nl.ndarray
-    down_weight_sb: nl.ndarray
-    gate_weight_scale_sb: nl.ndarray
-    up_weight_scale_sb: nl.ndarray
-    down_weight_scale_sb: nl.ndarray
-    gate_bias_sb: nl.ndarray
-    up_bias_sb: nl.ndarray
-    down_bias_sb: nl.ndarray
+    gate_weight_sb: nl.NkiTensor
+    up_weight_sb: nl.NkiTensor
+    down_weight_sb: nl.NkiTensor
+    gate_weight_scale_sb: nl.NkiTensor
+    up_weight_scale_sb: nl.NkiTensor
+    down_weight_scale_sb: nl.NkiTensor
+    gate_bias_sb: nl.NkiTensor
+    up_bias_sb: nl.NkiTensor
+    down_bias_sb: nl.NkiTensor
     # STATIC_MX: per-expert combined dequant scales (input_scale * weight_scale)
-    gate_dequant_scale_sb: nl.ndarray = None
-    up_dequant_scale_sb: nl.ndarray = None
-    down_dequant_scale_sb: nl.ndarray = None
-    dummy_scale_tile_sb: nl.ndarray = None  # SW quant: shared 2D [128, F] dummy scale (all-127)
+    gate_dequant_scale_sb: nl.NkiTensor = None
+    up_dequant_scale_sb: nl.NkiTensor = None
+    down_dequant_scale_sb: nl.NkiTensor = None
+    dummy_scale_tile_sb: nl.NkiTensor = None  # SW quant: shared 2D [128, F] dummy scale (all-127)
 
 
 def alloc_dummy_scale_tile(_pmax=128, free_dim=512):
@@ -278,7 +278,7 @@ def alloc_dummy_scale_tile(_pmax=128, free_dim=512):
         free_dim (int): Free dimension of the returned tile (default 512).
 
     Returns:
-        nl.ndarray: uint8 tensor of shape [_pmax, free_dim].
+        nl.NkiTensor: uint8 tensor of shape [_pmax, free_dim].
     """
     n_u32 = free_dim // _q_width
     n_part = _pmax
@@ -289,7 +289,7 @@ def alloc_dummy_scale_tile(_pmax=128, free_dim=512):
 
 def init_all_expert_mx_configs(
     mlp_params: MLPParameters,
-    output: nl.ndarray,
+    output: nl.NkiTensor,
     activation_compute_dtype: nki.dtype = nl.bfloat16,
     sharding_strategy: MoELNCShardingStrategy = None,
 ) -> tuple[AllExpertMXInputTensors, AllExpertMXKernelConfig, AllExpertMXDimensions, AllExpertMXDynamismConfig]:
@@ -298,7 +298,7 @@ def init_all_expert_mx_configs(
 
     Args:
         mlp_params (MLPParameters): Source parameters.
-        output (nl.ndarray): Output tensor.
+        output (nl.NkiTensor): Output tensor.
         activation_compute_dtype: Compute dtype for activations.
 
     Returns:
@@ -330,7 +330,7 @@ def init_all_expert_mx_configs(
     effective_block_size = mlp_params.expert_params.block_size if mlp_params.expert_params.block_size != None else T
 
     # Derive output_in_sbuf from output buffer location
-    output_in_sbuf = output.is_sbuf() if isinstance(output, TensorView) else output.buffer == nl.sbuf
+    output_in_sbuf = output.buffer == nl.sbuf
 
     is_static_quant = mlp_params.quant_params.is_quant_static_mx()
     is_row_quant = mlp_params.quant_params.is_quant_row_mx()
@@ -351,8 +351,8 @@ def init_all_expert_mx_configs(
         gate_up_weights_scale=mlp_params.quant_params.gate_w_scale,
         down_weights_scale=mlp_params.quant_params.down_w_scale,
         hidden_input_scale=hidden_input_scale,
-        gate_up_weights_bias=(mlp_params.bias_params.gate_proj_bias_tensor if mlp_params.bias_params else None),
-        down_weights_bias=(mlp_params.bias_params.down_proj_bias_tensor if mlp_params.bias_params else None),
+        gate_up_weights_bias=mlp_params.bias_params.gate_proj_bias_tensor if mlp_params.bias_params else None,
+        down_weights_bias=mlp_params.bias_params.down_proj_bias_tensor if mlp_params.bias_params else None,
         gate_up_in_scale=mlp_params.quant_params.gate_up_in_scale if is_static_quant else None,
         down_in_scale=mlp_params.quant_params.down_in_scale if is_static_quant else None,
         input_dequant_scale=mlp_params.input_dequant_scale,
@@ -437,8 +437,19 @@ def validate_all_expert_mx_inputs(
             f"Expected quantized input dtype in {MX_UNPACKED_DTYPES} with all_to_all_v_strategy!=DISABLED, got {input_tensors.hidden_input.dtype=}, {dynamism_cfg.all_to_all_v_strategy=}",
         )
 
-    # Validate T size based on input state
-    if input_tensors.hidden_input_scale == None:
+    # Validate T size based on quantization.
+    # When quantized, T can be divisible by 4; otherwise T must be divisible by 32. When using SHARD_T, these constraints double.
+    is_quantized = sizeinbytes(input_tensors.hidden_input.dtype) < 2 or input_tensors.hidden_input_scale is not None
+    is_static_mx = kernel_cfg.is_static_quant
+    if is_quantized:
+        kernel_assert(dims.T % 4 == 0, f"Expected T divisible by 4 with quantized input, got T={dims.T}")
+        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
+            kernel_assert(
+                dims.T_local % 4 == 0,
+                f"Expected T_local divisible by 4 for SHARD_T with sub-2-byte input, got T_local={dims.T_local}.",
+            )
+    # all-expert STATIC_MX expects non pre-quantized inputs
+    elif not is_static_mx:
         kernel_assert(
             dims.T_physical % 32 == 0,
             f"Expected T divisible by 32, got T={dims.T}. "
@@ -448,12 +459,6 @@ def validate_all_expert_mx_inputs(
             kernel_assert(
                 dims.T_local % 32 == 0,
                 f"Expected T_local divisible by 32 for SHARD_T with HBM input, got T_local={dims.T_local}.",
-            )
-    else:
-        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
-            kernel_assert(
-                dims.T_local % 4 == 0,
-                f"Expected T_local divisible by 4 for SHARD_T with pre-quantized input, got T_local={dims.T_local}.",
             )
 
     # Validate expert affinities shape (affinities are packed when using all_to_all_v)
@@ -469,8 +474,8 @@ def validate_all_expert_mx_inputs(
         f"All-expert MX kernel does not yet support SBUF output, got {kernel_cfg.output_in_sbuf=}",
     )
 
-    # Validate input_in_sbuf requires pre-quantized input
-    if kernel_cfg.input_in_sbuf:
+    # Validate input_in_sbuf requires pre-quantized input (except STATIC_MX which receives bf16 for per-expert quantization)
+    if kernel_cfg.input_in_sbuf and not kernel_cfg.is_static_quant:
         kernel_assert(
             input_tensors.hidden_input_scale != None,
             f"Expected pre-quantized input when input is in SBUF, "
@@ -487,9 +492,10 @@ def validate_all_expert_mx_inputs(
         kernel_assert(
             dynamism_cfg.block_size != None and _is_valid_block_size(dims.T, dynamism_cfg.block_size),
             f"Invalid block_size: expected (1) nonzero block_size (2) block_size that evenly divides T, (3) block_size at most T/2, "
-            f"and (4) block_size<32 and divisible by 8, block_size<128 and divisible by 32, or block_size divisible by 128; "
+            f"and (4) block_size≤32 and divisible by 4, block_size≤128 and divisible by 32, or block_size divisible by 128; "
             f"but got {dynamism_cfg.block_size=}, {dims.T=}",
         )
+
     # all_to_all_v requires is_all_expert_dynamic
     else:
         kernel_assert(
@@ -518,7 +524,7 @@ def _is_valid_block_size(T: int, block_size: int) -> bool:
     Validate that block_size is valid for a given T.
 
     Block size must be nonzero, evenly divide T, be at most T/2 (resulting in at least 2 blocks),
-    and satisfy: block_size<32 and divisible by 8, block_size<128 and divisible by 32, or
+    and satisfy: block_size≤32 and divisible by 4, block_size≤128 and divisible by 32, or
     block_size divisible by 128.
 
     Args:
@@ -534,8 +540,8 @@ def _is_valid_block_size(T: int, block_size: int) -> bool:
         return False
     if block_size > T // 2:
         return False
-    if block_size < 32:
-        return block_size % 8 == 0
-    elif block_size < 128:
+    if block_size <= 32:
+        return block_size % 4 == 0
+    elif block_size <= 128:
         return block_size % 32 == 0
     return block_size % 128 == 0

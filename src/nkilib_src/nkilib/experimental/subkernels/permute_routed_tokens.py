@@ -21,7 +21,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.tensor_view import TensorView
 from .argsort_unstable import argsort_unstable
 
 _SUPPORTED_K = [1, 2, 4, 8]
@@ -42,9 +41,9 @@ _TOKEN_INDEX_COLS = {
 
 @nki.jit
 def permute_routed_tokens(
-    hidden_input: nl.ndarray,
-    expert_index: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
+    hidden_input: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
 ):
     """
     Sort tokens by expert and pack hidden states, affinities, and token indices into a [T*K, n_output_cols] buffer.
@@ -62,14 +61,14 @@ def permute_routed_tokens(
         E: Total number of experts.
 
     Args:
-        hidden_input (nl.ndarray): [T, n_input_cols], bf16 or fp8 HBM tensor of hidden states.
+        hidden_input (nl.NkiTensor): [T, n_input_cols], bf16 or fp8 HBM tensor of hidden states.
             When hidden states are fp8, each row contains packed scales.
-        expert_index (nl.ndarray): [T, K], int32 HBM tensor of top-K expert indices per token.
-        expert_affinities_masked (nl.ndarray): [T, E], bf16 HBM tensor of expert affinities,
+        expert_index (nl.NkiTensor): [T, K], int32 HBM tensor of top-K expert indices per token.
+        expert_affinities_masked (nl.NkiTensor): [T, E], bf16 HBM tensor of expert affinities,
             with zeros for non-routed token/expert pairs.
 
     Returns:
-        output (nl.ndarray): [T*K, n_output_cols], bf16 or fp8 HBM tensor where each row is
+        output (nl.NkiTensor): [T*K, n_output_cols], bf16 or fp8 HBM tensor where each row is
             [hidden_state, affinity, token_index] sorted by expert index.
 
     Notes:
@@ -104,9 +103,7 @@ def permute_routed_tokens(
     argsort_expert_index_F_sb = argsort_unstable(data=expert_index_flattened_sb, descending=False, output_in_sbuf=True)
 
     # Step 2.2: Transpose argsort indices, bitcasting to avoid u32->f32->u32 casts (PE doesn't support u32 transpose)
-    nisa.nc_transpose(
-        argsort_expert_index_psum, TensorView(argsort_expert_index_F_sb).reinterpret_cast(nl.float32).get_view()
-    )
+    nisa.nc_transpose(argsort_expert_index_psum, argsort_expert_index_F_sb.view(nl.float32))
     nisa.tensor_copy(argsort_expert_index_sb, argsort_expert_index_psum)
     argsort_expert_index_sb = argsort_expert_index_sb.view(argsort_expert_index_F_sb.dtype)
 
@@ -188,7 +185,7 @@ def permute_routed_tokens(
 
     # Step 5: Pack token index, with bitcast to hidden_input dtype
     nisa.tensor_copy(
-        src=TensorView(argsort_broadcast_token_indices_sb).reinterpret_cast(hidden_input.dtype).get_view(),
+        src=argsort_broadcast_token_indices_sb.view(hidden_input.dtype),
         dst=grouped_tokens_affinities_indices_sb[:, H + _EXPERT_AFFINITY_COLS[hidden_input.dtype] :],
     )
 

@@ -67,3 +67,23 @@ def generate_random_torch_ref(output: torch.Tensor, n_elements: int) -> dict:
     """
     result = torch.randint(low=-(2**31), high=2**31 - 1, size=(1, n_elements), dtype=torch.int32)
     return {"output_0": result}
+
+
+def generate_random_fast_torch_ref(output: torch.Tensor, n_elements: int) -> dict:
+    """
+    PyTorch reference for generate_random_fast.
+
+    Generates random int32 values for shape validation. Values will differ from the NKI
+    kernel output since different RNG engines are used (and generate_random_fast uses 128
+    interleaved GPSIMD streams), so this only validates shape/dtype and statistical
+    uniformity, not the exact stream.
+
+    Args:
+        output (torch.Tensor): [1, n_elements], dtype int32, reference output tensor.
+        n_elements (int): Number of random int32 values to generate.
+
+    Returns:
+        dict: {"output_0": result} with n_elements random int32s.
+    """
+    result = torch.randint(low=-(2**31), high=2**31 - 1, size=(1, n_elements), dtype=torch.int32)
+    return {"output_0": result}

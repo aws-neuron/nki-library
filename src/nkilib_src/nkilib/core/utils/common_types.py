@@ -40,6 +40,7 @@ class ActFnType(Enum):
     GELU_Tanh_Approx = 2
     Swish = 3
     ReLU = 4
+    SquaredReLU = 5
 
 
 class RouterActFnType(Enum):
@@ -47,6 +48,7 @@ class RouterActFnType(Enum):
 
     SIGMOID = 0
     SOFTMAX = 1
+    NOAUX_TC = 2
 
     def __str__(self):
         return self.name.lower()
@@ -73,6 +75,14 @@ class QuantizationType(Enum):
     def is_mx(self) -> bool:
         """Whether this quantization type uses the MXFP hardware format (TRN3)."""
         return self in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
+
+    def is_logical_static(self) -> bool:
+        """Whether this quantization type implements static per-tensor quantization."""
+        return self in (QuantizationType.STATIC, QuantizationType.STATIC_MX)
+
+    def is_logical_row(self) -> bool:
+        """Whether this quantization type implements dynamic per-channel quantization."""
+        return self in (QuantizationType.ROW, QuantizationType.ROW_MX)
 
 
 class DtypeMode(Enum):

@@ -21,11 +21,10 @@ import nki.language as nl
 from ...core.utils.allocator import BufferManager
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
-from ...core.utils.tensor_view import TensorView
 from .iter_order import IterOrder, RowMajor
 from .view_spec import Broadcast, Permute, ReshapeDim, Select, Slice, ViewSpec
 
-Tensor = Union[nl.ndarray, TensorView]
+Tensor = Union[nl.NkiTensor, nl.NkiTensor]
 
 
 def get_logical_shape(tensor: Tensor) -> Tuple[int, ...]:
@@ -34,7 +33,7 @@ def get_logical_shape(tensor: Tensor) -> Tuple[int, ...]:
     Container shape from alloc_logical is (pdim, n_p_tiles, *F).
     Logical shape is (pdim * n_p_tiles, *F).
     """
-    view = TensorView(tensor)
+    view = tensor
     container_shape = tuple(view.shape)
     if len(container_shape) >= 2:
         return (container_shape[0] * container_shape[1],) + container_shape[2:]
@@ -62,10 +61,10 @@ class TileStream(nl.NKIObject):
         virtual_grid: Tuple[int, ...] = None,
         logical_p: Optional[int] = None,
     ):
-        self._tensor = TensorView(tensor)
+        self._tensor = tensor
         self._tile_shape = tile_shape
         self._iter_order = iter_order if iter_order != None else RowMajor()
-        self._name = self._tensor.base_tensor.name + "_tiled"
+        self._name = self._tensor.name + "_tiled"
         self._tile_view = tile_view
 
         # Virtual grid: outer iteration dims that don't allocate SBUF (data reuse)
@@ -301,8 +300,8 @@ class TileStream(nl.NKIObject):
             total = total * g
         return total
 
-    def get_container(self) -> TensorView:
-        """Get the underlying container TensorView."""
+    def get_container(self) -> nl.NkiTensor:
+        """Get the underlying container nl.NkiTensor."""
         return self._tensor
 
     def reset_cur_tile(self) -> None:
@@ -311,7 +310,7 @@ class TileStream(nl.NKIObject):
             self._cur_tile[i] = 0
         self._iter_order.reset()
 
-    def get_logical_tile_at_index(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def get_logical_tile_at_index(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Get tile at grid position with p_tile dim always preserved.
 
         Returns a view with container structure intact: (pdim, n_p_tiles, *F_sliced).
@@ -322,21 +321,21 @@ class TileStream(nl.NKIObject):
             grid_pos: Tile indices in logical grid coordinates.
 
         Returns:
-            TensorView with p_tile dim preserved (no tile_view).
+            nl.NkiTensor with p_tile dim preserved (no tile_view).
         """
         if self._num_virtual > 0:
             grid_pos = grid_pos[self._num_virtual :]
         return self._get_tile_impl(grid_pos)
 
-    def ltile_at(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def ltile_at(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Short alias for get_logical_tile_at_index."""
         return self.get_logical_tile_at_index(grid_pos)
 
-    def tile_at(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def tile_at(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Short alias for get_tile_at_index."""
         return self.get_tile_at_index(grid_pos)
 
-    def get_tile_at_index(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def get_tile_at_index(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Get tile at grid position (p_tile dim collapsed, tile_view applied).
 
         Existing behavior for primitive consumption (Matmul, Load, etc).
@@ -345,14 +344,14 @@ class TileStream(nl.NKIObject):
             grid_pos: Tile indices in logical grid coordinates.
 
         Returns:
-            TensorView for this tile (with tile_view transforms applied).
+            nl.NkiTensor for this tile (with tile_view transforms applied).
         """
         view = self.get_logical_tile_at_index(grid_pos)
         if self._n_p_tiles == 1:
             view = view.select(1, 0)
         return self._apply_tile_view(view)
 
-    def _get_tile_impl(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def _get_tile_impl(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Core tile slicing — always preserves p_tile dim via slice.
 
         Returns (pdim, n_p_tiles_needed, *F_sliced) with batch_dim_offset always 2.
@@ -392,13 +391,13 @@ class TileStream(nl.NKIObject):
 
         return view
 
-    def _apply_tile_view(self, tile: TensorView) -> TensorView:
+    def _apply_tile_view(self, tile: nl.NkiTensor) -> nl.NkiTensor:
         """Apply tile_view transformations to a physical tile.
 
         With (P, *F) layout, logical == physical, so dim conversion is just normalization.
 
         Args:
-            tile: The physical tile as TensorView in (P, *F) order
+            tile: The physical tile as nl.NkiTensor in (P, *F) order
 
         Returns:
             Transformed tile with tile_view operations applied
@@ -437,12 +436,12 @@ class TileStream(nl.NKIObject):
 
         return result
 
-    def get_tile(self) -> TensorView:
+    def get_tile(self) -> nl.NkiTensor:
         """
         Get current tile and advance. Collapses p_tile dim, applies tile_view.
 
         Returns:
-            TensorView for the current tile (with tile_view transforms applied),
+            nl.NkiTensor for the current tile (with tile_view transforms applied),
             or None if the current position is filtered by a split dim.
         """
         # Check if exhausted
@@ -464,14 +463,14 @@ class TileStream(nl.NKIObject):
 
         return tile
 
-    def get_logical_tile(self) -> TensorView:
+    def get_logical_tile(self) -> nl.NkiTensor:
         """Get current tile with p_tile dim preserved, then advance.
 
         Returns (pdim, n_p_tiles, *F_sliced) with no tile_view applied.
         Use for nesting with inner tile_stream.tile().
 
         Returns:
-            TensorView with p_tile dim preserved.
+            nl.NkiTensor with p_tile dim preserved.
         """
         kernel_assert(
             self._cur_tile[0] < self._iter_grid[0],
@@ -497,7 +496,7 @@ def alloc_logical(
     collapse_trivial_p_tile: bool = False,
     buffer=nl.sbuf,
     align: Optional[int] = None,
-) -> TensorView:
+) -> nl.NkiTensor:
     """Helper to allocate a logical shape with pdim tiled.
 
     Logical shape is (P, *F) where P is partition dimension.
@@ -531,7 +530,7 @@ def alloc_logical(
     else:
         container = nl.ndarray(container_shape, dtype=dtype, buffer=buffer, name=name)
 
-    return TensorView(container)
+    return container
 
 
 class HBMStream(nl.NKIObject):
@@ -555,19 +554,19 @@ class HBMStream(nl.NKIObject):
     ) -> None:
         """
         Args:
-            tensor: HBM tensor or TensorView
+            tensor: HBM tensor or nl.NkiTensor
             tile_shape: Shape of each tile. Length determines how many dims are tiled.
             iter_order: Iteration order (RowMajor, ColMajor, DimOrder). Defaults to RowMajor.
             tile_dims: Which dims to tile. If None, defaults to trailing rightmost dims.
         """
-        if isinstance(tensor, TensorView):
+        if isinstance(tensor, nl.NkiTensor):
             self._tensor = tensor
         else:
-            self._tensor = TensorView(tensor)
+            self._tensor = tensor
 
         self._tile_shape = tile_shape
         self._iter_order = iter_order if iter_order is not None else RowMajor()
-        self._name = self._tensor.base_tensor.name + "_hbm_tiled"
+        self._name = self._tensor.name + "_hbm_tiled"
 
         shape = tuple(self._tensor.shape)
         ndim = len(shape)
@@ -628,7 +627,7 @@ class HBMStream(nl.NKIObject):
                 grid.append(div_ceil(shape[dim], self._tile_sizes[dim]))
         return tuple(grid)
 
-    def get_tile(self) -> TensorView:
+    def get_tile(self) -> nl.NkiTensor:
         kernel_assert(
             self._cur_tile[0] < self._iter_grid[0],
             f"HBMStream '{self._name}' tile grid exhausted",
@@ -643,7 +642,7 @@ class HBMStream(nl.NKIObject):
         self._iter_order.advance(self._cur_tile, self._iter_grid)
         return tile
 
-    def get_tile_at_index(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def get_tile_at_index(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         shape = self._tensor.shape
         ndim = len(shape)
         view = self._tensor
@@ -661,11 +660,11 @@ class HBMStream(nl.NKIObject):
 
         return view
 
-    def tile_at(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def tile_at(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Get tile at grid position."""
         return self.get_tile_at_index(grid_pos)
 
-    def ltile_at(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def ltile_at(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Alias for tile_at (HBM has no p_tile distinction)."""
         return self.get_tile_at_index(grid_pos)
 
@@ -695,7 +694,7 @@ class HBMStream(nl.NKIObject):
             self._cur_tile[i] = 0
         self._iter_order.reset()
 
-    def get_container(self) -> TensorView:
+    def get_container(self) -> nl.NkiTensor:
         return self._tensor
 
     def get_dtype(self):
@@ -768,14 +767,14 @@ def tile(
         ts = tile_stream.tile(buf, tile_shape=(p_tile, f_tile))
 
         # HBM
-        hbm_view = TensorView(hbm_tensor).reshape_dim(...)
+        hbm_view = hbm_tensor.reshape_dim(...)
         ts = tile_stream.tile(hbm_view, tile_shape=(1, 1, H, 128), tile_dims=(0, 1))
     """
     # Allow None passthrough for conditional tiling
     if tensor == None:
         return None
 
-    tensor = TensorView(tensor)
+    tensor = tensor
 
     # HBM path: no partition dimension
     if tensor.is_hbm():

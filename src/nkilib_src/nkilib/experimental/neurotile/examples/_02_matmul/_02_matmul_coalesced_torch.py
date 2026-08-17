@@ -16,3 +16,7 @@
 
 def matmul_coalesced_torch_ref(lhsT, rhs, TILES_IN_BLOCK_M=4, TILES_IN_BLOCK_N=2, TILES_IN_BLOCK_K=4):
     return lhsT.T @ rhs
+
+
+def matmul_coalesced_streamed_torch_ref(lhsT, rhs, TILES_IN_BLOCK_M=2, TILES_IN_BLOCK_N=2, TILES_IN_BLOCK_K=4):
+    return lhsT.T @ rhs

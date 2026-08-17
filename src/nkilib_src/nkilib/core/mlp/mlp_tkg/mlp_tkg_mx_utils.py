@@ -18,7 +18,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.kernel_helpers import div_ceil
-from ...utils.tensor_view import TensorView
 
 # Dummy MX scale value: uint32 representation of 4 × uint8(127) = 0x7F7F7F7F
 _DUMMY_SCALE_U32 = 2139062143
@@ -40,7 +39,7 @@ def alloc_dummy_scale(sbm, p_dim, d1, d2):
     """
     u32_buf = sbm.alloc_stack((p_dim, d1, d2), dtype=nl.uint32, buffer=nl.sbuf, align=32)
     nisa.memset(dst=u32_buf, value=_DUMMY_SCALE_U32)
-    return TensorView(u32_buf).reinterpret_cast(nl.uint8).get_view()
+    return u32_buf.view(nl.uint8)
 
 
 def alloc_dummy_scale_tile(sbm, _pmax=128):
@@ -60,7 +59,7 @@ def alloc_dummy_scale_tile(sbm, _pmax=128):
     """
     u32_buf = sbm.alloc_stack((_pmax, 32), dtype=nl.uint32, buffer=nl.sbuf, align=32)
     nisa.memset(dst=u32_buf, value=_DUMMY_SCALE_U32)
-    return TensorView(u32_buf).reinterpret_cast(nl.uint8).get_view()
+    return u32_buf.view(nl.uint8)
 
 
 def load_gate_up_weight(sbm, w_hbm, i_tile, n_H512_tile_sharded, num_shards, shard_id, _pmax):
@@ -82,20 +81,39 @@ def load_gate_up_weight(sbm, w_hbm, i_tile, n_H512_tile_sharded, num_shards, sha
     Returns:
         SBUF tensor ``[_pmax, n_H512_tile_sharded, i_tile.size]``.
     """
-    w_sb = sbm.alloc_stack((_pmax, n_H512_tile_sharded, i_tile.size), dtype=w_hbm.dtype, buffer=nl.sbuf, align=32)
-    if num_shards > 1:
-        nisa.dma_copy(
-            dst=w_sb,
-            src=w_hbm[
-                :,
-                shard_id * n_H512_tile_sharded : (shard_id + 1) * n_H512_tile_sharded,
-                i_tile.start_offset : i_tile.end_offset,
-            ],
-            dge_mode=nisa.dge_mode.hwdge,
-        )
+    _q_width = 4
+    is_scalar_fp8 = w_hbm.dtype in (nl.float8_e4m3, nl.float8_e4m3fn)
+
+    if is_scalar_fp8:
+        # Scalar fp8: HBM has I*4 elements on last dim. Load slice, then reinterpret to x4.
+        load_size = i_tile.size * _q_width
+        i_start = i_tile.start_offset * _q_width
+        i_end = i_tile.end_offset * _q_width
+        w_sb = sbm.alloc_stack((_pmax, n_H512_tile_sharded, load_size), dtype=w_hbm.dtype, buffer=nl.sbuf, align=32)
+        if num_shards > 1:
+            nisa.dma_copy(
+                dst=w_sb,
+                src=w_hbm[:, shard_id * n_H512_tile_sharded : (shard_id + 1) * n_H512_tile_sharded, i_start:i_end],
+            )
+        else:
+            nisa.dma_copy(dst=w_sb, src=w_hbm[:, :, i_start:i_end])
+        return w_sb.view(nl.float8_e4m3fn_x4)
+
     else:
-        nisa.dma_copy(dst=w_sb, src=w_hbm[:, :, i_tile.start_offset : i_tile.end_offset])
-    return w_sb
+        w_sb = sbm.alloc_stack((_pmax, n_H512_tile_sharded, i_tile.size), dtype=w_hbm.dtype, buffer=nl.sbuf, align=32)
+        if num_shards > 1:
+            nisa.dma_copy(
+                dst=w_sb,
+                src=w_hbm[
+                    :,
+                    shard_id * n_H512_tile_sharded : (shard_id + 1) * n_H512_tile_sharded,
+                    i_tile.start_offset : i_tile.end_offset,
+                ],
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+        else:
+            nisa.dma_copy(dst=w_sb, src=w_hbm[:, :, i_tile.start_offset : i_tile.end_offset])
+        return w_sb
 
 
 def load_down_weight(sbm, down_w_hbm, i_tile, H_sharded, num_shards, shard_id, original_I, _pmax, _q_width):
@@ -121,10 +139,13 @@ def load_down_weight(sbm, down_w_hbm, i_tile, H_sharded, num_shards, shard_id, o
     Returns:
         SBUF tensor ``[_pmax, n_I512_cur, H_sharded]``.
     """
+    is_scalar_fp8 = down_w_hbm.dtype in (nl.float8_e4m3, nl.float8_e4m3fn)
+    H_sharded_load = H_sharded * _q_width if is_scalar_fp8 else H_sharded
+
     n_I512_cur = div_ceil(i_tile.size, _pmax * _q_width)
     i512_start = i_tile.start_offset // (_pmax * _q_width)
     i512_end = i512_start + n_I512_cur
-    down_w_sb = sbm.alloc_stack((_pmax, n_I512_cur, H_sharded), dtype=down_w_hbm.dtype, buffer=nl.sbuf, align=32)
+    down_w_sb = sbm.alloc_stack((_pmax, n_I512_cur, H_sharded_load), dtype=down_w_hbm.dtype, buffer=nl.sbuf, align=32)
     p_I_full = _pmax if original_I > 512 else original_I // _q_width
     last_i512_size = i_tile.size - (n_I512_cur - 1) * (_pmax * _q_width)
     p_I_last = _pmax if last_i512_size >= _pmax * _q_width else last_i512_size // _q_width
@@ -135,7 +156,9 @@ def load_down_weight(sbm, down_w_hbm, i_tile, H_sharded, num_shards, shard_id, o
             if num_shards > 1:
                 nisa.dma_copy(
                     src=down_w_hbm[
-                        :p_I_full, i512_start : i512_end - 1, shard_id * H_sharded : (shard_id + 1) * H_sharded
+                        :p_I_full,
+                        i512_start : i512_end - 1,
+                        shard_id * H_sharded_load : (shard_id + 1) * H_sharded_load,
                     ],
                     dst=down_w_sb[:p_I_full, : n_I512_cur - 1, :],
                     dge_mode=nisa.dge_mode.hwdge,
@@ -147,7 +170,9 @@ def load_down_weight(sbm, down_w_hbm, i_tile, H_sharded, num_shards, shard_id, o
                 )
         if num_shards > 1:
             nisa.dma_copy(
-                src=down_w_hbm[:p_I_last, i512_end - 1 : i512_end, shard_id * H_sharded : (shard_id + 1) * H_sharded],
+                src=down_w_hbm[
+                    :p_I_last, i512_end - 1 : i512_end, shard_id * H_sharded_load : (shard_id + 1) * H_sharded_load
+                ],
                 dst=down_w_sb[:p_I_last, n_I512_cur - 1 : n_I512_cur, :],
                 dge_mode=nisa.dge_mode.hwdge,
             )
@@ -159,12 +184,17 @@ def load_down_weight(sbm, down_w_hbm, i_tile, H_sharded, num_shards, shard_id, o
     else:
         if num_shards > 1:
             nisa.dma_copy(
-                src=down_w_hbm[:p_I_full, i512_start:i512_end, shard_id * H_sharded : (shard_id + 1) * H_sharded],
+                src=down_w_hbm[
+                    :p_I_full, i512_start:i512_end, shard_id * H_sharded_load : (shard_id + 1) * H_sharded_load
+                ],
                 dst=down_w_sb[:p_I_full, :, :],
                 dge_mode=nisa.dge_mode.hwdge,
             )
         else:
             nisa.dma_copy(dst=down_w_sb[:p_I_full, :, :], src=down_w_hbm[:p_I_full, i512_start:i512_end, :])
+
+    if is_scalar_fp8:
+        return down_w_sb.view(nl.float8_e4m3fn_x4)
 
     return down_w_sb
 
@@ -214,13 +244,13 @@ def load_down_bias_mx(bias_hbm, num_shards, H1_shard, H0, shard_id):
     if bias_hbm == None:
         return None
     bias_reshaped = bias_hbm.reshape((num_shards, H1_shard, H0))
-    sharded_view = TensorView(bias_reshaped).select(dim=0, index=shard_id)
+    sharded_view = bias_reshaped.select(dim=0, index=shard_id)
     bias_sb = nl.ndarray((H0, H1_shard), dtype=nl.bfloat16, buffer=nl.sbuf)
-    bias_sb_view = TensorView(bias_sb)
+    bias_sb_view = bias_sb
     # dma_transpose requires 4D access patterns
-    while sharded_view.get_dim() < 4:
+    while sharded_view.ndim < 4:
         sharded_view = sharded_view.expand_dim(1)
-    while bias_sb_view.get_dim() < 4:
+    while bias_sb_view.ndim < 4:
         bias_sb_view = bias_sb_view.expand_dim(1)
-    nisa.dma_transpose(dst=bias_sb_view.get_view(), src=sharded_view.get_view())
+    nisa.dma_transpose(dst=bias_sb_view, src=sharded_view)
     return bias_sb

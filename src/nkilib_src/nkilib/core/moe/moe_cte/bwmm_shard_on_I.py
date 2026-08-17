@@ -127,6 +127,7 @@ def blockwise_mm_baseline_shard_intermediate(
     checkpoint_activation=False,
     expert_affinity_multiply_on_I=False,
     accumulation_dtype=None,
+    skip_gate_proj: bool = False,
 ):
     """
     Blockwise matrix multiplication kernel for Mixture of Experts (MoE) with intermediate dimension sharding.
@@ -330,13 +331,14 @@ def blockwise_mm_baseline_shard_intermediate(
         linear_bias=(gate_and_up_proj_bias != None and down_proj_bias != None),
         activation_function=activation_function,
         is_quant=_is_quant,
-        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded <= FUSE_GATE_WEIGHT_SIZE),
+        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded <= FUSE_GATE_WEIGHT_SIZE) and not skip_gate_proj,
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         checkpoint_activation=checkpoint_activation,
         expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+        skip_gate_proj=skip_gate_proj,
         quant_activation_mode=_quant_activation_mode,
         quant_is_per_tensor=is_per_tensor,
         is_block_quant=is_block_quant,
@@ -417,6 +419,7 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
+    accumulation_dtype=None,
 ):
     """
     Blockwise matrix multiplication kernel for MoE with hybrid static/dynamic loop control.
@@ -603,6 +606,7 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
         quant_activation_mode=ActivationQuantMode.NONE,
         quant_is_per_tensor=False,
         is_block_quant=False,
+        accumulation_dtype=accumulation_dtype if accumulation_dtype is not None else hidden_states.dtype,
     )
 
     check_blockwise_mm_shard_I_kernel_compatibility(dims, configs)
@@ -638,11 +642,14 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
     nisa.register_load(cond_reg, cond_sbuf)
     block_idx = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32)
     nisa.memset(block_idx, value=NUM_STATIC_BLOCKS)
-    for i in nl.dynamic_range(NUM_STATIC_BLOCKS, cond_reg):
+
+    def _dynamic_block_body(i):
         compute_one_block(block_idx, dims, inps, outs, configs, SHARD_ID)
         nisa.core_barrier(output, (0, 1))
         nisa.tensor_scalar(dst=block_idx, data=block_idx, op0=nl.add, operand0=1)
         nisa.core_barrier(block_idx, (0, 1))
+
+    nl.fori_loop(NUM_STATIC_BLOCKS, cond_reg, _dynamic_block_body)
     return output
 
 
@@ -969,6 +976,9 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
             # Per-tensor quant: scale shape [E, 2, 1] — one scalar per expert per projection
             gup_scale_per_tensor = []
             for gate_or_up in range(2):
+                if cfg.skip_gate_proj and gate_or_up == 0:
+                    gup_scale_per_tensor.append(None)
+                    continue
                 s = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(
                     dst=s[0:1, 0:1],
@@ -1000,6 +1010,8 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
 
             for gup_tile_idx in range(dims.GUP_N_TILES):
                 for gate_or_up in range(2):
+                    if cfg.skip_gate_proj and gate_or_up == 0:
+                        continue
                     elem_offset = TILE_SIZE * gup_tile_idx + shard_id * dims.I_TP_sharded
                     num_elems = min(TILE_SIZE, dims.I_TP - elem_offset)
 
@@ -1045,6 +1057,8 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
         # Multiply each gup_scale entry by the activation scale
         # Note: for per-tensor, all i_tiles share the same tensor, so only multiply once
         for gate_or_up in range(2):
+            if cfg.skip_gate_proj and gate_or_up == 0:
+                continue
             act_s = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(
                 dst=act_s[0:1, 0:1],
@@ -1154,6 +1168,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
         expert_affinity_T_broadcasted=expert_affinity_T_broadcasted,
         gup_scale=None,
         expert_affinity_multiply_on_I=cfg.expert_affinity_multiply_on_I,
+        skip_gate_proj=cfg.skip_gate_proj,
     )
 
     expert_affinity = None
@@ -1268,6 +1283,8 @@ def compute_gate_and_up_projections_shard_on_intermediate(
         _, _, I_TP_total = inps.gate_and_up_proj_bias.shape
 
         for gate_or_up in range(2):
+            if cfg.skip_gate_proj and gate_or_up == 0:
+                continue
             # Calculate offset for this gate_or_up position and shard
             offset = gate_or_up * I_TP_total + shard_id * dims.I_TP_sharded
 
@@ -1303,6 +1320,8 @@ def compute_gate_and_up_projections_shard_on_intermediate(
         )
 
     for gate_or_up in range(2):
+        if cfg.skip_gate_proj and gate_or_up == 0:
+            continue
         if not cfg.fuse_gate_and_up_load:
             gup_weights = load_gate_up_proj_weights_shard_intermediate(
                 gate_or_up, inps.gate_up_proj_weight, block_expert, cfg, dims.NUM_SHARDS, shard_id, None
@@ -1517,7 +1536,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
         for psum_tile_idx in range(N_PSUM_TILE):
             for i_tile_idx in range(GUP_N_TILES):
                 num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
-                if cfg.gate_clamp_lower_limit != None and cfg.gate_clamp_upper_limit != None:
+                if not cfg.skip_gate_proj and cfg.gate_clamp_lower_limit != None and cfg.gate_clamp_upper_limit != None:
                     nisa.tensor_scalar(
                         data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                         op0=nl.minimum,
@@ -1526,7 +1545,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                         operand1=cfg.gate_clamp_lower_limit,
                         dst=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                     )
-                else:
+                elif not cfg.skip_gate_proj:
                     if cfg.gate_clamp_upper_limit != None:
                         nisa.tensor_scalar(
                             data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
@@ -1577,6 +1596,8 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                 num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
 
                 for gate_or_up in range(2):
+                    if cfg.skip_gate_proj and gate_or_up == 0:
+                        continue
                     offset = (
                         block_idx * (2 * activation_I_TP * activation_B)
                         + gate_or_up * (activation_I_TP * activation_B)

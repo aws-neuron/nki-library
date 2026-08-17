@@ -14,12 +14,9 @@
 
 """Broadcast primitive: replicate partition rows."""
 
-from typing import Union
-
 import nki.isa as nisa
 import nki.language as nl
 
-from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import TileStream, get_logical_shape
@@ -54,8 +51,8 @@ class Broadcast(nl.NKIObject):
             for i in range((dst_npar + 31) // 32):
                 cur_npar = min(32, dst_npar - i * 32)
                 nisa.nc_stream_shuffle(
-                    src=src_tile.slice(dim=0, start=self._src_partition, end=self._src_partition + 1).get_view(),
-                    dst=dst_tile.slice(dim=0, start=i * 32, end=i * 32 + cur_npar).get_view(),
+                    src=src_tile.slice(dim=0, start=self._src_partition, end=self._src_partition + 1),
+                    dst=dst_tile.slice(dim=0, start=i * 32, end=i * 32 + cur_npar),
                     shuffle_mask=shuffle_mask,
                 )
 
@@ -64,8 +61,8 @@ class Broadcast(nl.NKIObject):
 
 
 def broadcast(
-    dst: Union[TensorView, nl.ndarray],
-    src: Union[TensorView, nl.ndarray],
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor,
     src_partition: int = 0,
 ) -> None:
     """Compact broadcast: replicate partition row to all rows. Whole tensor, no tiling.

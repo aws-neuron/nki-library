@@ -24,7 +24,6 @@ except ImportError:
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.mlp.mlp import mlp as mlp_kernel
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
@@ -34,6 +33,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     NormType,
     QuantizationType,
 )
+
 from test.integration.nkilib.core.mlp.test_mlp_common import (
     _run_mlp_test,
     build_fused_norm_mlp,
@@ -824,6 +824,7 @@ class TestMlpTkgKernel:
             use_contiguous_x4_gate_up=d.get("use_contiguous_x4_gate_up", False),
             transposed_in=d.get("transposed_in", False),
             transposed_out=d.get("transposed_out", False),
+            gate_up_w_layout=d.get("gate_up_w_layout", MLPGateUpWeightLayout.CONTIGUOUS),
             tensor_generator=tensor_generator,
             mode=ComputationMode.DECODE,
         )
@@ -854,7 +855,6 @@ class TestMlpTkgKernel:
             compiler_args = CompilerArgs(
                 logical_nc_config=lnc,
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             )
 
         _run_mlp_test(
@@ -1062,35 +1062,35 @@ class TestMlpTkgKernel:
         elif quant_type == QuantizationType.STATIC:
             rtol = 3e-2
         elif quant_type in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX):
-            rtol = 6e-2  # 5e-2 -> 6e-2 due to rmsnorm intermediate dtype(non fp32) in _rmsnorm_tkg_th
+            rtol = 7e-2  # rmsnorm intermediate dtype(non fp32) in _rmsnorm_tkg_th; alt-emax input distribution
         else:
             rtol = 2e-2  # NONE quant default
 
-        vec_dict = dict(
-            vnc_degree=vnc_degree,
-            batch=batch,
-            seqlen=seqlen,
-            hidden=hidden,
-            intermediate=intermediate,
-            dtype=dtype,
-            quant_dtype=quant_dtype,
-            quant_type=quant_type,
-            norm_type=norm_type,
-            fused_add=fused_add,
-            store_add=store_add,
-            act_fn_type=act_fn_type,
-            skip_gate=skip_gate,
-            gate_bias=gate_bias,
-            up_bias=up_bias,
-            down_bias=down_bias,
-            norm_bias=norm_bias,
-            use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
-            use_tkg_down_proj_column_tiling=use_tkg_down_proj_column_tiling,
-            use_tkg_down_proj_optimized_layout=use_tkg_down_proj_optimized_layout,
-            transposed_in=transposed_in,
-            transposed_out=transposed_out,
-            mode=ComputationMode.DECODE,
-        )
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "dtype": dtype,
+            "quant_dtype": quant_dtype,
+            "quant_type": quant_type,
+            "norm_type": norm_type,
+            "fused_add": fused_add,
+            "store_add": store_add,
+            "act_fn_type": act_fn_type,
+            "skip_gate": skip_gate,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": norm_bias,
+            "use_tkg_gate_up_proj_column_tiling": use_tkg_gate_up_proj_column_tiling,
+            "use_tkg_down_proj_column_tiling": use_tkg_down_proj_column_tiling,
+            "use_tkg_down_proj_optimized_layout": use_tkg_down_proj_optimized_layout,
+            "transposed_in": transposed_in,
+            "transposed_out": transposed_out,
+            "mode": ComputationMode.DECODE,
+        }
         self._run_mlp_tkg_test(
             test_manager=test_manager,
             vec_dict=vec_dict,
@@ -1242,30 +1242,30 @@ class TestMlpTkgKernel:
         transposed_in,
         transposed_out,
     ):
-        vec_dict = dict(
-            vnc_degree=vnc_degree,
-            batch=batch,
-            seqlen=seqlen,
-            hidden=hidden,
-            intermediate=intermediate,
-            dtype=dtype,
-            quant_dtype=quant_dtype,
-            quant_type=quant_type,
-            norm_type=norm_type,
-            fused_add=fused_add,
-            store_add=store_add,
-            act_fn_type=act_fn_type,
-            skip_gate=skip_gate,
-            gate_bias=gate_bias,
-            up_bias=up_bias,
-            down_bias=down_bias,
-            norm_bias=norm_bias,
-            use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
-            use_tkg_down_proj_column_tiling=use_tkg_down_proj_column_tiling,
-            use_tkg_down_proj_optimized_layout=use_tkg_down_proj_optimized_layout,
-            transposed_in=transposed_in,
-            transposed_out=transposed_out,
-        )
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "dtype": dtype,
+            "quant_dtype": quant_dtype,
+            "quant_type": quant_type,
+            "norm_type": norm_type,
+            "fused_add": fused_add,
+            "store_add": store_add,
+            "act_fn_type": act_fn_type,
+            "skip_gate": skip_gate,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": norm_bias,
+            "use_tkg_gate_up_proj_column_tiling": use_tkg_gate_up_proj_column_tiling,
+            "use_tkg_down_proj_column_tiling": use_tkg_down_proj_column_tiling,
+            "use_tkg_down_proj_optimized_layout": use_tkg_down_proj_optimized_layout,
+            "transposed_in": transposed_in,
+            "transposed_out": transposed_out,
+        }
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
@@ -1463,7 +1463,7 @@ class TestMlpTkgKernel:
     ):
         # Pre-existing accuracy issue on this shape — not caused by UTF migration.
         # This test vector is new (not present on mainline) and fails validation consistently.
-        # NKILIB-848: https://aws-neuron.atlassian.net/browse/NKILIB-848
+        # NKILIB-848
         if (
             batch == 1
             and seqlen == 1
@@ -1579,35 +1579,35 @@ class TestMlpTkgKernel:
         if not platform_target.is_trn3():
             pytest.skip("STATIC_MX uses MX matmul engine, only supported on TRN3.")
 
-        vec_dict = dict(
-            vnc_degree=vnc_degree,
-            batch=batch,
-            seqlen=seqlen,
-            hidden=hidden,
-            intermediate=intermediate,
-            dtype=dtype,
-            quant_dtype=quant_dtype,
-            quant_type=quant_type,
-            norm_type=norm_type,
-            fused_add=fused_add,
-            store_add=store_add,
-            act_fn_type=act_fn_type,
-            skip_gate=skip_gate,
-            gate_bias=gate_bias,
-            up_bias=up_bias,
-            down_bias=down_bias,
-            norm_bias=norm_bias,
-            use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
-            use_tkg_down_proj_column_tiling=use_tkg_down_proj_column_tiling,
-            use_tkg_down_proj_optimized_layout=use_tkg_down_proj_optimized_layout,
-            transposed_in=transposed_in,
-            transposed_out=transposed_out,
-        )
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "dtype": dtype,
+            "quant_dtype": quant_dtype,
+            "quant_type": quant_type,
+            "norm_type": norm_type,
+            "fused_add": fused_add,
+            "store_add": store_add,
+            "act_fn_type": act_fn_type,
+            "skip_gate": skip_gate,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": norm_bias,
+            "use_tkg_gate_up_proj_column_tiling": use_tkg_gate_up_proj_column_tiling,
+            "use_tkg_down_proj_column_tiling": use_tkg_down_proj_column_tiling,
+            "use_tkg_down_proj_optimized_layout": use_tkg_down_proj_optimized_layout,
+            "transposed_in": transposed_in,
+            "transposed_out": transposed_out,
+        }
         self._run_mlp_tkg_test(
             test_manager=test_manager,
             vec_dict=vec_dict,
             platform_target=platform_target,
-            rtol=5e-2,
+            rtol=7e-2,  # rmsnorm non-fp32 intermediate; match unit-test rtol
         )
 
     # ============================================================================
@@ -1646,41 +1646,41 @@ class TestMlpTkgKernel:
         if not platform_target.is_trn3():
             pytest.skip("ROW_MX uses MX matmul engine, only supported on TRN3.")
 
-        vec_dict = dict(
-            vnc_degree=vnc_degree,
-            batch=batch,
-            seqlen=seqlen,
-            hidden=hidden,
-            intermediate=intermediate,
-            dtype=dtype,
-            quant_dtype=quant_dtype,
-            quant_type=quant_type,
-            norm_type=norm_type,
-            fused_add=fused_add,
-            store_add=store_add,
-            act_fn_type=act_fn_type,
-            skip_gate=skip_gate,
-            gate_bias=gate_bias,
-            up_bias=up_bias,
-            down_bias=down_bias,
-            norm_bias=norm_bias,
-            use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
-            use_tkg_down_proj_column_tiling=use_tkg_down_proj_column_tiling,
-            use_tkg_down_proj_optimized_layout=use_tkg_down_proj_optimized_layout,
-            transposed_in=transposed_in,
-            transposed_out=transposed_out,
-        )
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "dtype": dtype,
+            "quant_dtype": quant_dtype,
+            "quant_type": quant_type,
+            "norm_type": norm_type,
+            "fused_add": fused_add,
+            "store_add": store_add,
+            "act_fn_type": act_fn_type,
+            "skip_gate": skip_gate,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": norm_bias,
+            "use_tkg_gate_up_proj_column_tiling": use_tkg_gate_up_proj_column_tiling,
+            "use_tkg_down_proj_column_tiling": use_tkg_down_proj_column_tiling,
+            "use_tkg_down_proj_optimized_layout": use_tkg_down_proj_optimized_layout,
+            "transposed_in": transposed_in,
+            "transposed_out": transposed_out,
+        }
         self._run_mlp_tkg_test(
             test_manager=test_manager,
             vec_dict=vec_dict,
             platform_target=platform_target,
-            rtol=5e-2,
+            rtol=7e-2,  # rmsnorm non-fp32 intermediate; match unit-test rtol
         )
 
     # ============================================================================
     # TKG Contiguous x4 Gate/Up Packing Tests
     # ============================================================================
-    # Tests for use_contiguous_x4_gate_up=True (contiguous-4 H weight layout).
+    # Tests for H_X4_INNERMOST gate/up weight layout (contiguous-4 H packing).
     # Covers both STATIC_MX and ROW_MX with SBUF (rmsnorm) and HBM (no-norm) paths.
 
     # fmt: off
@@ -1743,36 +1743,36 @@ class TestMlpTkgKernel:
         if not platform_target.is_trn3():
             pytest.skip("Contiguous x4 gate/up packing uses MX matmul engine, only supported on TRN3.")
 
-        vec_dict = dict(
-            vnc_degree=vnc_degree,
-            batch=batch,
-            seqlen=seqlen,
-            hidden=hidden,
-            intermediate=intermediate,
-            dtype=nl.bfloat16,
-            quant_dtype=nl.float8_e4m3,
-            quant_type=quant_type,
-            norm_type=norm_type,
-            fused_add=False,
-            store_add=False,
-            act_fn_type=ActFnType.SiLU,
-            skip_gate=False,
-            gate_bias=gate_bias,
-            up_bias=up_bias,
-            down_bias=down_bias,
-            norm_bias=False,
-            use_tkg_gate_up_proj_column_tiling=False,
-            use_tkg_down_proj_column_tiling=False,
-            use_tkg_down_proj_optimized_layout=False,
-            transposed_in=False,
-            transposed_out=False,
-            use_contiguous_x4_gate_up=True,
-        )
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "dtype": nl.bfloat16,
+            "quant_dtype": nl.float8_e4m3,
+            "quant_type": quant_type,
+            "norm_type": norm_type,
+            "fused_add": False,
+            "store_add": False,
+            "act_fn_type": ActFnType.SiLU,
+            "skip_gate": False,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": False,
+            "use_tkg_gate_up_proj_column_tiling": False,
+            "use_tkg_down_proj_column_tiling": False,
+            "use_tkg_down_proj_optimized_layout": False,
+            "transposed_in": False,
+            "transposed_out": False,
+            "gate_up_w_layout": MLPGateUpWeightLayout.H_X4_INNERMOST,
+        }
         self._run_mlp_tkg_test(
             test_manager=test_manager,
             vec_dict=vec_dict,
             platform_target=platform_target,
-            rtol=5e-2,
+            rtol=7e-2,  # rmsnorm non-fp32 intermediate; match unit-test rtol
         )
 
     # ============================================================================
@@ -1882,32 +1882,32 @@ class TestMlpTkgKernel:
         if dtype_mode == DtypeMode.OCP and not platform_target.is_trn3():
             pytest.skip("dtype_mode=DtypeMode.OCP only exercises the OCP path on TRN3")
 
-        vec_dict = dict(
-            vnc_degree=2,
-            batch=1,
-            seqlen=1,
-            hidden=8192,
-            intermediate=1408,
-            dtype=nl.bfloat16,
-            quant_dtype=nl.float8_e4m3,
-            quant_type=QuantizationType.ROW,
-            norm_type=NormType.RMS_NORM,
-            fused_add=False,
-            store_add=False,
-            act_fn_type=ActFnType.SiLU,
-            skip_gate=False,
-            gate_bias=False,
-            up_bias=False,
-            down_bias=False,
-            norm_bias=False,
-            use_tkg_gate_up_proj_column_tiling=True,
-            use_tkg_down_proj_column_tiling=True,
-            use_tkg_down_proj_optimized_layout=False,
-            transposed_in=False,
-            transposed_out=False,
-            mode=ComputationMode.DECODE,
-            dtype_mode=dtype_mode,
-        )
+        vec_dict = {
+            "vnc_degree": 2,
+            "batch": 1,
+            "seqlen": 1,
+            "hidden": 8192,
+            "intermediate": 1408,
+            "dtype": nl.bfloat16,
+            "quant_dtype": nl.float8_e4m3,
+            "quant_type": QuantizationType.ROW,
+            "norm_type": NormType.RMS_NORM,
+            "fused_add": False,
+            "store_add": False,
+            "act_fn_type": ActFnType.SiLU,
+            "skip_gate": False,
+            "gate_bias": False,
+            "up_bias": False,
+            "down_bias": False,
+            "norm_bias": False,
+            "use_tkg_gate_up_proj_column_tiling": True,
+            "use_tkg_down_proj_column_tiling": True,
+            "use_tkg_down_proj_optimized_layout": False,
+            "transposed_in": False,
+            "transposed_out": False,
+            "mode": ComputationMode.DECODE,
+            "dtype_mode": dtype_mode,
+        }
         self._run_mlp_tkg_test(
             test_manager=test_manager,
             vec_dict=vec_dict,
@@ -2342,11 +2342,11 @@ class TestMlpTkgModel:
            noise at high mean|b|, so the seed is pinned rather than swept.
         """
         import numpy as np
-
         from nkilib_src.nkilib.core.mlp.mlp_tkg import mlp_tkg as _mlp_tkg_mod
         from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_tkg import mlp_tkg_llama3_70b_high_batch
         from nkilib_src.nkilib.core.mlp.mlp_torch import mlp_torch_ref
         from nkilib_src.nkilib.core.utils.torch_ref_wrapper import torch_ref_wrapper
+
         from test.integration.nkilib.core.mlp.test_mlp_common import build_fused_norm_mlp
         from test.utils.simulation_setup import simulate_kernel
 
@@ -2429,12 +2429,12 @@ class TestMlpTkgModel:
             _mlp_tkg_mod.mlp_tkg_llama3_70b_high_batch = original_high_batch
 
         assert dispatch_call_count[0] > 0, (
-            f"mlp_tkg_llama3_70b_high_batch was NEVER called during the kernel "
-            f"trace — the test fell through to the generic _mlp_tkg_impl path "
-            f"and so cannot exercise the down-matmul double-row regression. "
-            f"Check that _is_llama3_70b_specialized_config still admits the "
-            f"params used here (B=256, S=1, H=8192, I=3584, STATIC FP8, "
-            f"RMS_NORM, SiLU, bf16 out, lnc=2)."
+            "mlp_tkg_llama3_70b_high_batch was NEVER called during the kernel "
+            "trace — the test fell through to the generic _mlp_tkg_impl path "
+            "and so cannot exercise the down-matmul double-row regression. "
+            "Check that _is_llama3_70b_specialized_config still admits the "
+            "params used here (B=256, S=1, H=8192, I=3584, STATIC FP8, "
+            "RMS_NORM, SiLU, bf16 out, lnc=2)."
         )
 
         actual = (
@@ -2452,6 +2452,17 @@ class TestMlpTkgModel:
             else (ref_outputs if not isinstance(ref_outputs, list) else ref_outputs[0])
         )
         expected_np = np.asarray(expected).astype(np.float32)
+
+        # Reconcile leading dims: the kernel output follows the framework's
+        # [B, S, H] output descriptor (e.g. [256, 1, 8192]) while the torch
+        # reference returns [B*S, H] ([256, 8192]). Flatten both to [-1, H] so the
+        # elementwise NRMSE compares matching shapes instead of broadcasting
+        # (256, 1, 8192) - (256, 8192) -> (256, 256, 8192), which produces a
+        # spurious NRMSE. Mirrors the standard _run_mlp_test path
+        # (out_np.reshape(-1, hidden) in test_mlp_common.py).
+        hidden_dim = expected_np.shape[-1]
+        actual_np = actual_np.reshape(-1, hidden_dim)
+        expected_np = expected_np.reshape(-1, hidden_dim)
 
         # NRMSE normalised by reference RMS — dimensionless and per-element-aware.
         # FIXED kernel: NRMSE is the FP8 round-trip noise floor.

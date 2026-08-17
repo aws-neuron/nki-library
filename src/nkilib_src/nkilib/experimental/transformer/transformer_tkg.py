@@ -25,7 +25,6 @@ from ...core.utils.allocator import BufferManager
 from ...core.utils.common_types import ActFnType, DtypeMode, NormType, QuantizationType
 from ...core.utils.kernel_helpers import get_verified_program_sharding_info
 from ...core.utils.logging import get_logger
-from ...core.utils.tensor_view import TensorView
 from .attention_block_tkg import attention_block_tkg
 
 _SBM_SIZE_BYTES = 200 * 1024  # Buffer manager size in bytes
@@ -35,13 +34,13 @@ _SBM_SIZE_BYTES = 200 * 1024  # Buffer manager size in bytes
 
 def _load_input_to_sbuf(dst_sb, src_hbm, BxS: int, H0: int, H1: int, H1_shard: int, n_prgs: int):
     """Load [B, S_tkg, H] HBM tensor to [H0, BxS*H1] SBUF layout."""
-    src_view = TensorView(src_hbm.reshape((BxS, H0 * H1))).rearrange(
+    src_view = (src_hbm.reshape((BxS, H0 * H1))).rearrange(
         ('bs', ('lnc', 'h0', 'h1')), ('h0', 'bs', 'lnc', 'h1'), {'lnc': n_prgs, 'h0': H0}
     )
     dst_reshaped = dst_sb.reshape((H0, BxS, n_prgs, H1_shard))
     for lnc_idx in nl.static_range(n_prgs):
         nisa.dma_copy(
-            src=src_view.slice(dim=2, start=lnc_idx, end=lnc_idx + 1).get_view(),
+            src=src_view.slice(dim=2, start=lnc_idx, end=lnc_idx + 1),
             dst=dst_reshaped[:, :, lnc_idx : lnc_idx + 1, :],
         )
 
@@ -49,13 +48,13 @@ def _load_input_to_sbuf(dst_sb, src_hbm, BxS: int, H0: int, H1: int, H1_shard: i
 def _store_output_to_hbm(out_hbm, in_sb, BxS: int, H0: int, H1: int, H1_shard: int, n_prgs: int):
     """Store [H0, BxS*H1] SBUF tensor to [B, S_tkg, H] HBM layout."""
     src_reshaped = in_sb.reshape((H0, BxS, n_prgs, H1_shard))
-    dst_view = TensorView(out_hbm.reshape((BxS, H0 * H1))).rearrange(
+    dst_view = (out_hbm.reshape((BxS, H0 * H1))).rearrange(
         ('bs', ('lnc', 'h0', 'h1')), ('h0', 'bs', 'lnc', 'h1'), {'lnc': n_prgs, 'h0': H0}
     )
     for lnc_idx in nl.static_range(n_prgs):
         nisa.dma_copy(
             src=src_reshaped[:, :, lnc_idx : lnc_idx + 1, :],
-            dst=dst_view.slice(dim=2, start=lnc_idx, end=lnc_idx + 1).get_view(),
+            dst=dst_view.slice(dim=2, start=lnc_idx, end=lnc_idx + 1),
         )
 
 
@@ -82,28 +81,28 @@ def _sb2sb_all_reduce_gather(
         )
 
     output_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf)
-    src_view = TensorView(gathered_sb).rearrange(('h0', ('h1', 'bs')), ('h0', 'bs', 'h1'), {'h1': H1})
-    nisa.tensor_copy(dst=output_sb.reshape((H0, BxS, H1)), src=src_view.get_view())
+    src_view = gathered_sb.rearrange(('h0', ('h1', 'bs')), ('h0', 'bs', 'h1'), {'h1': H1})
+    nisa.tensor_copy(dst=output_sb.reshape((H0, BxS, H1)), src=src_view)
 
     return output_sb, sharded_AR_sb
 
 
 # @nki.jit  # Commented out - use nki.jit() at call site to avoid double-jit stack overflow
 def transformer_tkg(
-    X: nl.ndarray,
-    W_qkvs: List[nl.ndarray],
-    W_outs: List[nl.ndarray],
-    W_gates: List[nl.ndarray],
-    W_ups: List[nl.ndarray],
-    W_downs: List[nl.ndarray],
-    W_gamma_qkvs: List[nl.ndarray],
-    W_gamma_mlps: List[nl.ndarray],
-    K_caches: List[nl.ndarray],
-    V_caches: List[nl.ndarray],
-    RoPE_cos: nl.ndarray,
-    RoPE_sin: nl.ndarray,
-    attention_mask: nl.ndarray,
-    position_ids: Optional[nl.ndarray],
+    X: nl.NkiTensor,
+    W_qkvs: List[nl.NkiTensor],
+    W_outs: List[nl.NkiTensor],
+    W_gates: List[nl.NkiTensor],
+    W_ups: List[nl.NkiTensor],
+    W_downs: List[nl.NkiTensor],
+    W_gamma_qkvs: List[nl.NkiTensor],
+    W_gamma_mlps: List[nl.NkiTensor],
+    K_caches: List[nl.NkiTensor],
+    V_caches: List[nl.NkiTensor],
+    RoPE_cos: nl.NkiTensor,
+    RoPE_sin: nl.NkiTensor,
+    attention_mask: nl.NkiTensor,
+    position_ids: Optional[nl.NkiTensor],
     # Config parameters (replacing dataclass)
     num_layers: int,
     eps: float = 1e-6,
@@ -111,9 +110,9 @@ def transformer_tkg(
     sbuf_residual_and_cc: bool = False,
     clamp_bound: float = 0.0,
     # FP8 scales (optional, per layer)
-    W_gate_scales: Optional[List[nl.ndarray]] = None,
-    W_up_scales: Optional[List[nl.ndarray]] = None,
-    W_down_scales: Optional[List[nl.ndarray]] = None,
+    W_gate_scales: Optional[List[nl.NkiTensor]] = None,
+    W_up_scales: Optional[List[nl.NkiTensor]] = None,
+    W_down_scales: Optional[List[nl.NkiTensor]] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ):
     """
@@ -132,28 +131,28 @@ def transformer_tkg(
         H1_shard: H1 // n_prgs (per-core shard of hidden dimension)
 
     Args:
-        X (nl.ndarray): [B, S_tkg, H], Input hidden states on HBM
-        W_qkvs (List[nl.ndarray]): Per-layer QKV projection weights
-        W_outs (List[nl.ndarray]): Per-layer output projection weights
-        W_gates (List[nl.ndarray]): Per-layer MLP gate projection weights
-        W_ups (List[nl.ndarray]): Per-layer MLP up projection weights
-        W_downs (List[nl.ndarray]): Per-layer MLP down projection weights
-        W_gamma_qkvs (List[nl.ndarray]): Per-layer RMSNorm gamma for QKV
-        W_gamma_mlps (List[nl.ndarray]): Per-layer RMSNorm gamma for MLP
-        K_caches (List[nl.ndarray]): Per-layer K caches on HBM
-        V_caches (List[nl.ndarray]): Per-layer V caches on HBM
-        RoPE_cos (nl.ndarray): [d_head//2, B, S_tkg], RoPE cosine embeddings
-        RoPE_sin (nl.ndarray): [d_head//2, B, S_tkg], RoPE sine embeddings
-        attention_mask (nl.ndarray): Attention mask (includes cache and active portions)
-        position_ids (Optional[nl.ndarray]): [B, S_tkg], Per-token KV cache write positions (None = skip cache update)
+        X (nl.NkiTensor): [B, S_tkg, H], Input hidden states on HBM
+        W_qkvs (List[nl.NkiTensor]): Per-layer QKV projection weights
+        W_outs (List[nl.NkiTensor]): Per-layer output projection weights
+        W_gates (List[nl.NkiTensor]): Per-layer MLP gate projection weights
+        W_ups (List[nl.NkiTensor]): Per-layer MLP up projection weights
+        W_downs (List[nl.NkiTensor]): Per-layer MLP down projection weights
+        W_gamma_qkvs (List[nl.NkiTensor]): Per-layer RMSNorm gamma for QKV
+        W_gamma_mlps (List[nl.NkiTensor]): Per-layer RMSNorm gamma for MLP
+        K_caches (List[nl.NkiTensor]): Per-layer K caches on HBM
+        V_caches (List[nl.NkiTensor]): Per-layer V caches on HBM
+        RoPE_cos (nl.NkiTensor): [d_head//2, B, S_tkg], RoPE cosine embeddings
+        RoPE_sin (nl.NkiTensor): [d_head//2, B, S_tkg], RoPE sine embeddings
+        attention_mask (nl.NkiTensor): Attention mask (includes cache and active portions)
+        position_ids (Optional[nl.NkiTensor]): [B, S_tkg], Per-token KV cache write positions (None = skip cache update)
         num_layers (int): Number of transformer layers to execute
         eps (float): RMSNorm epsilon (default 1e-6)
         replica_groups (Optional[List[List[int]]]): Replica groups for collective communication
         sbuf_residual_and_cc (bool): Use SBUF residual path with SB2SB all-reduce (default False)
         clamp_bound (float): FP8 quantization clipping boundary (default 0.0, 0 = no clipping)
-        W_gate_scales (Optional[List[nl.ndarray]]): Per-layer FP8 gate weight scales
-        W_up_scales (Optional[List[nl.ndarray]]): Per-layer FP8 up weight scales
-        W_down_scales (Optional[List[nl.ndarray]]): Per-layer FP8 down weight scales
+        W_gate_scales (Optional[List[nl.NkiTensor]]): Per-layer FP8 gate weight scales
+        W_up_scales (Optional[List[nl.NkiTensor]]): Per-layer FP8 up weight scales
+        W_down_scales (Optional[List[nl.NkiTensor]]): Per-layer FP8 down weight scales
         dtype_mode (DtypeMode): Quantization dtype policy forwarded to every
             attention block and MLP call. Compiler enforces a single E4M3
             variant per traced module (``EOCP001``); pick one variant for the
@@ -163,7 +162,7 @@ def transformer_tkg(
             - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
 
     Returns:
-        output (nl.ndarray): [B, S_tkg, H], Final hidden states after all transformer layers
+        output (nl.NkiTensor): [B, S_tkg, H], Final hidden states after all transformer layers
 
     Pseudocode:
         current = X

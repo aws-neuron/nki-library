@@ -20,7 +20,7 @@ Each mode class implements three methods:
 - ``fill_deferred(dst, src)``: fill a deferred padding slice via DMA.
 - ``map_idx(dim, pad_idx)``: map a padding index to a source index.
 
-All tensor arguments are TensorViews.
+All tensor arguments are NkiTensors.
 """
 
 from typing import Union
@@ -29,7 +29,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.tensor_view import TensorView
 
 # Type alias for any pad mode class
 PadMode = Union["ConstantPad", "ReplicatePad", "ReflectPad", "CircularPad"]
@@ -38,46 +37,46 @@ PadMode = Union["ConstantPad", "ReplicatePad", "ReflectPad", "CircularPad"]
 class ConstantPad(nl.NKIObject):
     """Constant padding: fill with a fixed value (default 0)."""
 
-    def __init__(self, hbm_src: TensorView, value: float = 0):
+    def __init__(self, hbm_src: nl.NkiTensor, value: float = 0):
         self._hbm = hbm_src
         self._value = value
 
     def map_idx(self, dim: int, pad_idx: int) -> int:
         return 0
 
-    def fill(self, dst: TensorView, interior: TensorView, dim: int, pad_idx: int) -> None:
-        nisa.memset(dst.get_view(), self._value)
+    def fill(self, dst: nl.NkiTensor, interior: nl.NkiTensor, dim: int, pad_idx: int) -> None:
+        nisa.memset(dst, self._value)
 
-    def fill_deferred(self, dst: TensorView, src: TensorView) -> None:
+    def fill_deferred(self, dst: nl.NkiTensor, src: nl.NkiTensor) -> None:
         """For constant mode, fill via SBUF memset + DMA store."""
         tmp = nl.ndarray(dst.shape, dtype=dst.dtype, buffer=nl.sbuf)
         nisa.memset(tmp, self._value)
-        nisa.dma_copy(dst=dst.get_view(), src=tmp)
+        nisa.dma_copy(dst=dst, src=tmp)
 
 
 class ReplicatePad(nl.NKIObject):
     """Replicate padding: clamp to the nearest edge element."""
 
-    def __init__(self, hbm_src: TensorView):
+    def __init__(self, hbm_src: nl.NkiTensor):
         self._hbm = hbm_src
 
     def map_idx(self, dim: int, pad_idx: int) -> int:
         """Clamp to nearest edge."""
         return 0 if pad_idx < 0 else self._hbm.shape[dim + 1] - 1
 
-    def fill(self, dst: TensorView, interior: TensorView, dim: int, pad_idx: int) -> None:
+    def fill(self, dst: nl.NkiTensor, interior: nl.NkiTensor, dim: int, pad_idx: int) -> None:
         axis = dim + 1
         src_idx = 0 if pad_idx < 0 else interior.shape[axis] - 1
-        nisa.tensor_copy(dst=dst.get_view(), src=interior.select(axis, src_idx).get_view())
+        nisa.tensor_copy(dst=dst, src=interior.select(axis, src_idx))
 
-    def fill_deferred(self, dst: TensorView, src: TensorView) -> None:
-        nisa.dma_copy(dst=dst.get_view(), src=src.get_view())
+    def fill_deferred(self, dst: nl.NkiTensor, src: nl.NkiTensor) -> None:
+        nisa.dma_copy(dst=dst, src=src)
 
 
 class ReflectPad(nl.NKIObject):
     """Reflect padding: bounce at boundaries (PyTorch ``reflect`` semantics)."""
 
-    def __init__(self, hbm_src: TensorView):
+    def __init__(self, hbm_src: nl.NkiTensor):
         self._hbm = hbm_src
 
     def map_idx(self, dim: int, pad_idx: int) -> int:
@@ -85,18 +84,18 @@ class ReflectPad(nl.NKIObject):
         src_size = self._hbm.shape[dim + 1]
         return -pad_idx if pad_idx < 0 else src_size - 2 - pad_idx
 
-    def fill(self, dst: TensorView, interior: TensorView, dim: int, pad_idx: int) -> None:
+    def fill(self, dst: nl.NkiTensor, interior: nl.NkiTensor, dim: int, pad_idx: int) -> None:
         axis = dim + 1
-        nisa.tensor_copy(dst=dst.get_view(), src=interior.select(axis, self.map_idx(dim, pad_idx)).get_view())
+        nisa.tensor_copy(dst=dst, src=interior.select(axis, self.map_idx(dim, pad_idx)))
 
-    def fill_deferred(self, dst: TensorView, src: TensorView) -> None:
-        nisa.dma_copy(dst=dst.get_view(), src=src.get_view())
+    def fill_deferred(self, dst: nl.NkiTensor, src: nl.NkiTensor) -> None:
+        nisa.dma_copy(dst=dst, src=src)
 
 
 class CircularPad(nl.NKIObject):
     """Circular padding: wrap around (PyTorch ``circular`` semantics)."""
 
-    def __init__(self, hbm_src: TensorView):
+    def __init__(self, hbm_src: nl.NkiTensor):
         self._hbm = hbm_src
 
     def map_idx(self, dim: int, pad_idx: int) -> int:
@@ -104,12 +103,12 @@ class CircularPad(nl.NKIObject):
         src_size = self._hbm.shape[dim + 1]
         return (src_size + pad_idx) % src_size if pad_idx < 0 else pad_idx % src_size
 
-    def fill(self, dst: TensorView, interior: TensorView, dim: int, pad_idx: int) -> None:
+    def fill(self, dst: nl.NkiTensor, interior: nl.NkiTensor, dim: int, pad_idx: int) -> None:
         axis = dim + 1
-        nisa.tensor_copy(dst=dst.get_view(), src=interior.select(axis, self.map_idx(dim, pad_idx)).get_view())
+        nisa.tensor_copy(dst=dst, src=interior.select(axis, self.map_idx(dim, pad_idx)))
 
-    def fill_deferred(self, dst: TensorView, src: TensorView) -> None:
-        nisa.dma_copy(dst=dst.get_view(), src=src.get_view())
+    def fill_deferred(self, dst: nl.NkiTensor, src: nl.NkiTensor) -> None:
+        nisa.dma_copy(dst=dst, src=src)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +116,7 @@ class CircularPad(nl.NKIObject):
 # ---------------------------------------------------------------------------
 
 
-def make_pad_mode(mode_str: str, hbm_src: TensorView, value: float = 0) -> PadMode:
+def make_pad_mode(mode_str: str, hbm_src: nl.NkiTensor, value: float = 0) -> PadMode:
     """Create a PadMode instance for the given mode string."""
     if mode_str == "constant":
         return ConstantPad(hbm_src, value=value)

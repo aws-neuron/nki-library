@@ -38,8 +38,8 @@ _SHUFFLE_IDENTITY = 255  # nc_stream_shuffle identity value (no shuffle for this
 
 @nki.jit
 def find_nonzero_indices(
-    input_tensor: nl.ndarray,
-    col_start_id: nl.ndarray = None,
+    input_tensor: nl.NkiTensor,
+    col_start_id: nl.NkiTensor = None,
     n_cols: int = None,
     chunk_size: int = None,
     index_dtype: nki.dtype = nl.int32,
@@ -59,9 +59,9 @@ def find_nonzero_indices(
         C_per_shard: Columns processed per LNC shard (C // NUM Shards)
 
     Args:
-        input_tensor (nl.ndarray): [T, C], Input tensor on HBM. Nonzero elements are found
+        input_tensor (nl.NkiTensor): [T, C], Input tensor on HBM. Nonzero elements are found
             along the T dimension for each column.
-        col_start_id (nl.ndarray): [1], Optional HBM tensor containing the starting column
+        col_start_id (nl.NkiTensor): [1], Optional HBM tensor containing the starting column
             index in the C dimension. If specified, only n_cols Columns starting from col_start_id are processed.
             If None, all C Columns are processed.
         n_cols (int): Number of columns (in C dimension) to process. Required when
@@ -71,10 +71,10 @@ def find_nonzero_indices(
         index_dtype (nki.dtype): Data type for output indices tensor. Default is nl.int32.
 
     Returns:
-        indices (nl.ndarray): [C, T] or [n_cols, T], Tensor containing nonzero indices.
+        indices (nl.NkiTensor): [C, T] or [n_cols, T], Tensor containing nonzero indices.
             For each column c, the first N values are the T-indices of nonzero elements,
             followed by -1 padding values.
-        nonzero_counts (nl.ndarray): [C] or [n_cols], Count of nonzero elements per column.
+        nonzero_counts (nl.NkiTensor): [C] or [n_cols], Count of nonzero elements per column.
 
     Notes:
         - Requires LNC2 configuration (2 NeuronCores)
@@ -495,10 +495,12 @@ def _process_chunk_single(
         else:
             nisa.dma_copy(
                 dst=input_sbuf[:, 0:tiles_this_group, 0:n_columns_this_round],
-                src=input_tensor.ap(
-                    pattern=[[C_DIM, T_TILE_SIZE], [C_DIM * T_TILE_SIZE, tiles_this_group], [1, n_columns_this_round]],
-                    offset=column_start_offset + (t_group_start * C_DIM),
-                ),
+                src=input_tensor[
+                    t_group_start : t_group_start + tiles_this_group * T_TILE_SIZE,
+                    column_start_offset : column_start_offset + n_columns_this_round,
+                ]
+                .reshape_dim(0, (tiles_this_group, T_TILE_SIZE))
+                .permute((1, 0, 2)),
             )
 
         for column_idx in range(n_columns_this_round):
@@ -632,8 +634,10 @@ def _dma_load_chunk(
     else:
         nisa.dma_copy(
             dst=dst[:, 0:CHUNK_T_TILES, 0:n_columns_this_round],
-            src=input_tensor.ap(
-                pattern=[[C_DIM, P_MAX], [C_DIM * P_MAX, CHUNK_T_TILES], [1, n_columns_this_round]],
-                offset=column_start_offset + (t_chunk_start * C_DIM),
-            ),
+            src=input_tensor[
+                t_chunk_start : t_chunk_start + CHUNK_T_TILES * P_MAX,
+                column_start_offset : column_start_offset + n_columns_this_round,
+            ]
+            .reshape_dim(0, (CHUNK_T_TILES, P_MAX))
+            .permute((1, 0, 2)),
         )

@@ -31,6 +31,7 @@ EXCLUDED_DIR_PATTERNS = {
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
+    ".ruff_cache",
     ".venv",
     "build",
 }
@@ -98,4 +99,4 @@ def test_all_nkilib_directories_have_init_files():
             "\nEach directory containing Python files or subdirectories "
             "must have an __init__.py file to be treated as a Python package."
         )
-        assert False, error_message
+        raise AssertionError(error_message)

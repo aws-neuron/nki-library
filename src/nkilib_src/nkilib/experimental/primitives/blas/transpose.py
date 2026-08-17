@@ -19,14 +19,11 @@ PE-based transpose using nc_transpose (SBUF → PSUM → SBUF).
 For DMA-based transpose during load/store, use dma.Load/Store with layout parameter.
 """
 
-from typing import Union
-
 import nki.isa as nisa
 import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.logging import get_logger
-from ....core.utils.tensor_view import TensorView
 from ..iter_order import RowMajor
 from ..tile_stream import TileStream, get_logical_shape, tile
 
@@ -125,7 +122,7 @@ class Transpose(nl.NKIObject):
                     # Use access pattern to repeat the single F value B times
                     nisa.nc_transpose(
                         dst=psum_tmp,
-                        data=src_tile.get_view().ap(
+                        data=src_tile.ap(
                             pattern=[[self._src_P, self._src_F], [0, self._broadcast_P]],
                             offset=0,
                         ),
@@ -135,20 +132,20 @@ class Transpose(nl.NKIObject):
                     # Use access pattern to repeat the single P value B times
                     nisa.nc_transpose(
                         dst=psum_tmp,
-                        data=src_tile.get_view().ap(
+                        data=src_tile.ap(
                             pattern=[[self._src_P, self._src_F], [self._broadcast_F, 0]],
                             offset=0,
                         ),
                     )
             else:
                 # Standard transpose
-                nisa.nc_transpose(dst=psum_tmp, data=src_tile.get_view())
+                nisa.nc_transpose(dst=psum_tmp, data=src_tile)
 
             # Copy from PSUM to SBUF dst (with cast if dtypes differ)
             if self._needs_cast:
-                nisa.activation(dst=dst_tile.get_view(), op=nl.copy, data=psum_tmp)
+                nisa.activation(dst=dst_tile, op=nl.copy, data=psum_tmp)
             else:
-                nisa.tensor_copy(dst=dst_tile.get_view(), src=psum_tmp)
+                nisa.tensor_copy(dst=dst_tile, src=psum_tmp)
 
         self._src.reset_cur_tile()
         self._dst.reset_cur_tile()
@@ -158,8 +155,8 @@ class Transpose(nl.NKIObject):
 
 
 def transpose(
-    dst: Union[TensorView, nl.ndarray],
-    src: Union[TensorView, nl.ndarray],
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor,
     src_has_p_tile_dim: bool = True,
     dst_has_p_tile_dim: bool = True,
 ) -> None:
@@ -171,12 +168,12 @@ def transpose(
         dst: Destination tensor in SBUF (P', F') where P'=src_F, F'=src_P
         src: Source tensor in SBUF (P, F)
         src_has_p_tile_dim: If True (default), src is an alloc_logical container.
-            If False, src is a raw nl.ndarray without p_tile dim.
+            If False, src is a raw nl.NkiTensor without p_tile dim.
         dst_has_p_tile_dim: If True (default), dst is an alloc_logical container.
-            If False, dst is a raw nl.ndarray without p_tile dim.
+            If False, dst is a raw nl.NkiTensor without p_tile dim.
     """
-    src_shape = get_logical_shape(src) if src_has_p_tile_dim else tuple(TensorView(src).shape)
-    dst_shape = get_logical_shape(dst) if dst_has_p_tile_dim else tuple(TensorView(dst).shape)
+    src_shape = get_logical_shape(src) if src_has_p_tile_dim else tuple(src.shape)
+    dst_shape = get_logical_shape(dst) if dst_has_p_tile_dim else tuple(dst.shape)
     src_ts = tile(src, src_shape, iter_order=RowMajor(), has_p_tile_dim=src_has_p_tile_dim)
     dst_ts = tile(dst, dst_shape, iter_order=RowMajor(), has_p_tile_dim=dst_has_p_tile_dim)
     Transpose(dst=dst_ts, src=src_ts).execute()

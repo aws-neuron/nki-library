@@ -21,11 +21,11 @@ import nki.isa as nisa
 import nki.language as nl
 from nki.isa import dge_mode, oob_mode
 
-from ...quantization.fp8_quantize import pre_combine_dequant_scales, row_quantization
+from ...moe_block.moe_block_tkg_utils import _SBUF_USABLE_PER_PARTITION, _dtype_size
+from ...quantization.fp8_quantize import pre_combine_dequant_scales, row_quantization, static_quantization
 from ...utils.common_types import MoEAllToAllVStrategy, MoELNCShardingStrategy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
-from ...utils.tensor_view import TensorView
 from .all_expert_mx_utils import (
     BF16_PER_FP32,
     BF16_PER_INT32,
@@ -68,9 +68,9 @@ from .projection_mx_constants import (
 @nki.jit
 def _all_expert_moe_tkg_mx(
     mlp_params: MLPParameters,
-    output: nl.ndarray,
+    output: nl.NkiTensor,
     output_t_offset: int = 0,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Perform all-expert MoE MLP on input using microscaling format (MX) weights.
 
@@ -86,10 +86,10 @@ def _all_expert_moe_tkg_mx(
 
     Args:
         mlp_params (MLPParameters): MLPParameters containing all input tensors and configuration, including:
-        output (nl.ndarray): [min(T, 128), ⌈T/128⌉, H] in SBUF or [T, H] in HBM output tensor.
+        output (nl.NkiTensor): [min(T, 128), ⌈T/128⌉, H] in SBUF or [T, H] in HBM output tensor.
 
     Returns:
-        output (nl.ndarray): [T, H] in HBM or [min(T, 128), ⌈T/128⌉, H] in SBUF, Output tensor with MoE results.
+        output (nl.NkiTensor): [T, H] in HBM or [min(T, 128), ⌈T/128⌉, H] in SBUF, Output tensor with MoE results.
 
     Pseudocode:
         # Step 1: Load and quantize input (skipped if hidden_input_scale provided)
@@ -146,8 +146,8 @@ def _all_expert_moe_tkg_mx(
         kernel_assert(not kernel_cfg.is_static_quant, "STATIC_MX is not supported with dynamic all-expert mode")
         kernel_assert(not kernel_cfg.is_row_quant, "ROW_MX is not supported with dynamic all-expert mode")
         """
-        The DLoC currently have the restriction that both PNC in LNC=2 must 
-        execute the same control flow logic. 
+        The DLoC currently have the restriction that both PNC in LNC=2 must
+        execute the same control flow logic.
 
         When shard on I, we would need to pay the DLoC overhead for each expert, while
         shard on E, we would need to pay the DLoC overhead E_L // 2, half that of shard-on-I.
@@ -155,10 +155,11 @@ def _all_expert_moe_tkg_mx(
 
         The DLoC loop's overhead is around 15us at the moment, making shard on E more efficient.
         """
-        if dims.E_L == 2 or dims.E_L == 4:
-            # Force reinitialize with SHARD_T
+
+        if (dims.E_L % 2 == 0) and dims.T >= 128:
+            # Force reinitialize with SHARD_E
             input_tensors, kernel_cfg, dims, dynamism_cfg = init_all_expert_mx_configs(
-                mlp_params=mlp_params, output=output, sharding_strategy=MoELNCShardingStrategy.SHARD_T
+                mlp_params=mlp_params, output=output, sharding_strategy=MoELNCShardingStrategy.SHARD_E
             )
             _all_expert_mx_dynamic_shard_on_E(
                 input_tensors=input_tensors,
@@ -173,8 +174,31 @@ def _all_expert_moe_tkg_mx(
                 dims=dims,
                 dynamism_cfg=dynamism_cfg,
             )
+    elif kernel_cfg.is_static_quant:
+        # STATIC_MX keeps bf16 in SBUF, per-expert quantization in the loop (no pre-quantization).
+        # TODO: For E_L=1, optimize by using pre-quantization.
+
+        # If T is too large for SHARD_I, force SHARD_T.
+        needs_shard_on_T = _static_mx_needs_shard_t(
+            dims.T,
+            dims.H,
+            dims.E_L,
+            dims.I,
+            input_tensors.gate_up_weights.dtype,
+            input_tensors.hidden_input.dtype,
+        )
+        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_I and needs_shard_on_T:
+            input_tensors, kernel_cfg, dims, _ = init_all_expert_mx_configs(
+                mlp_params=mlp_params, output=output, sharding_strategy=MoELNCShardingStrategy.SHARD_T
+            )
+        _all_expert_static_mx(
+            input_tensors=input_tensors,
+            kernel_cfg=kernel_cfg,
+            dims=dims,
+            output_t_offset=output_t_offset,
+        )
     else:
-        _all_expert_mx_static(
+        _all_expert_mx_and_row_mx(
             input_tensors=input_tensors,
             kernel_cfg=kernel_cfg,
             dims=dims,
@@ -184,12 +208,12 @@ def _all_expert_moe_tkg_mx(
     return output
 
 
-def _all_expert_mx_static(
+def _all_expert_mx_and_row_mx(
     input_tensors: AllExpertMXInputTensors,
     kernel_cfg: AllExpertMXKernelConfig,
     dims: AllExpertMXDimensions,
     output_t_offset: int = 0,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Static all-expert MoE computation without dynamic loop on chip (DLoC).
 
@@ -207,7 +231,7 @@ def _all_expert_mx_static(
         dims (AllExpertMXDimensions): Dimension parameters.
 
     Returns:
-        nl.ndarray: Output tensor with MoE computation results.
+        nl.NkiTensor: Output tensor with MoE computation results.
     """
 
     # Step 1: Process inputs
@@ -269,11 +293,10 @@ def _all_expert_mx_static(
             dims=dims,
         )
 
-    # SW quant: hoist a single 2D dummy scale tile [128, free_dim] outside the expert loop
+    # ROW_MX: hoist a single 2D dummy scale tile [128, free_dim] outside the expert loop
     # instead of allocating per-expert 3D scale buffers [P, n_tiles, F]
-    is_software_quant = kernel_cfg.is_static_quant or kernel_cfg.is_row_quant
     scale_sb = None
-    if is_software_quant:
+    if kernel_cfg.is_row_quant:
         scale_sb = alloc_dummy_scale_tile(free_dim=nl.tile_size.psum_fmax * 2)
 
     # Step 1.2: View expert_affinities_masked and output_hbm based on sharding decision
@@ -324,9 +347,9 @@ def _all_expert_mx_static(
             expert_idx=expert_idx,
         )
 
-        # SW quant: override per-expert 3D scale tensors with the shared 2D dummy tile [128, F].
+        # ROW_MX: override per-expert 3D scale tensors with the shared 2D dummy tile [128, F].
         # matmul callers index as [:, :F] instead of [:, tile_h, slice].
-        if is_software_quant:
+        if kernel_cfg.is_row_quant:
             weights.gate_weight_scale_sb = scale_sb
             weights.up_weight_scale_sb = scale_sb
             weights.down_weight_scale_sb = scale_sb
@@ -347,8 +370,219 @@ def _all_expert_mx_static(
             sharding_strategy=dims.sharding_strategy,
             input_dequant_scale_sb=input_tensors.input_dequant_scale,
             output_t_offset=hbm_t_offset_for_down_proj,
-            is_software_quant=is_software_quant,
+            is_software_quant=kernel_cfg.is_row_quant,
             T_physical=dims.T_physical if dims.T_physical < dims.T else None,
+        )
+
+    return input_tensors.output
+
+
+def _all_expert_static_mx(
+    input_tensors: AllExpertMXInputTensors,
+    kernel_cfg: AllExpertMXKernelConfig,
+    dims: AllExpertMXDimensions,
+    output_t_offset: int = 0,
+) -> nl.ndarray:
+    """
+    Static all-expert MoE computation with per-expert STATIC_MX quantization.
+
+    Unlike _all_expert_mx_static which receives pre-quantized fp8_x4 input,
+    this function receives bf16 input and performs swizzle + static_quantization
+    per expert inside the loop using that expert's gate_up_in_scale.
+
+    Args:
+        input_tensors (AllExpertMXInputTensors): Tensor parameters.
+            hidden_input is bf16 [pmax, T, H_free] in SBUF (not pre-quantized).
+        kernel_cfg (AllExpertMXKernelConfig): Scalar parameters.
+        dims (AllExpertMXDimensions): Dimension parameters.
+        output_t_offset (int): T offset for output writes (used in tiling).
+
+    Returns:
+        nl.ndarray: Output tensor with MoE computation results.
+    """
+    # Compute dimensions for swizzle
+    pmax = dims.pmax
+    H_free = dims.H // pmax
+    n_H512_tiles = dims.H // (pmax * _q_width)
+
+    # Step 1: Load bf16 input into SBUF [pmax, T_load, H_free]
+    # Input arrives as bf16 [pmax, T, H_free] in SBUF or [T, H] in HBM
+    if input_tensors.hidden_input.buffer == nl.sbuf:
+        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
+            T_load = dims.T_local
+            input_bf16_sb = input_tensors.hidden_input[:, nl.ds(dims.T_offset, T_load), :]
+        else:
+            T_load = dims.T
+            if dims.T_physical < dims.T:
+                input_bf16_sb = nl.ndarray(
+                    (pmax, dims.T, H_free), dtype=input_tensors.hidden_input.dtype, buffer=nl.sbuf
+                )
+                nisa.tensor_copy(dst=input_bf16_sb[:, : dims.T_physical, :], src=input_tensors.hidden_input)
+                nisa.memset(dst=input_bf16_sb[:, dims.T_physical :, :], value=0)
+            else:
+                input_bf16_sb = input_tensors.hidden_input
+    else:
+        # HBM input [T, H]: DMA copy to SBUF as [pmax, T_load, H_free]
+        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
+            T_load = dims.T_local
+            input_bf16_sb = nl.ndarray((pmax, T_load, H_free), dtype=input_tensors.hidden_input.dtype, buffer=nl.sbuf)
+            # dst[p, t, f] = hidden[t, f*pmax + p]
+            nisa.dma_copy(
+                dst=input_bf16_sb,
+                src=input_tensors.hidden_input.ap(
+                    pattern=[[1, pmax], [dims.H, T_load], [pmax, H_free]],
+                    offset=dims.T_offset * dims.H,  # start at the T-shard
+                ),
+            )
+        else:
+            T_load = dims.T
+            input_bf16_sb = nl.ndarray((pmax, dims.T, H_free), dtype=input_tensors.hidden_input.dtype, buffer=nl.sbuf)
+            # dst[p, t, f] = hidden[t, f*pmax + p]
+            nisa.dma_copy(
+                dst=input_bf16_sb[:, : dims.T_physical, :],
+                src=input_tensors.hidden_input.ap(
+                    pattern=[[1, pmax], [dims.H, dims.T_physical], [pmax, H_free]],
+                    offset=0,
+                ),
+            )
+            if dims.T_physical < dims.T:
+                nisa.memset(dst=input_bf16_sb[:, dims.T_physical :, :], value=0)
+
+    # Hoist a single 2D dummy scale tile [128, free_dim] outside the expert loop
+    scale_sb = alloc_dummy_scale_tile(free_dim=nl.tile_size.psum_fmax * 2)
+
+    # Step 1.2: View expert_affinities_masked and output_hbm based on sharding decision
+    hbm_t_offset_for_down_proj = output_t_offset
+    if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
+        T_eff = dims.T_local
+        T_hbm_offset = dims.T_offset
+        if output_t_offset > 0:
+            output_hbm_view = input_tensors.output
+            hbm_t_offset_for_down_proj = output_t_offset + dims.T_offset
+        else:
+            output_hbm_view = input_tensors.output[nl.ds(dims.T_offset, dims.T_local), :]
+        if len(input_tensors.expert_affinities_masked.shape) == 3:
+            tile_start = T_hbm_offset // dims.pmax
+            n_local_tiles = div_ceil(T_eff, dims.pmax)
+            expert_affinities_masked_sb = input_tensors.expert_affinities_masked[:, nl.ds(tile_start, n_local_tiles), :]
+        else:
+            expert_affinities_masked_sb = input_tensors.expert_affinities_masked[nl.ds(T_hbm_offset, T_eff), :]
+    else:
+        output_hbm_view = input_tensors.output
+        if dims.T_physical < dims.T:
+            affinities_padded = nl.ndarray(
+                (dims.T, input_tensors.expert_affinities_masked.shape[1]),
+                dtype=input_tensors.expert_affinities_masked.dtype,
+                buffer=nl.sbuf,
+            )
+            nisa.memset(affinities_padded, 0)
+            nisa.dma_copy(dst=affinities_padded[: dims.T_physical, :], src=input_tensors.expert_affinities_masked)
+            expert_affinities_masked_sb = affinities_padded
+        else:
+            expert_affinities_masked_sb = input_tensors.expert_affinities_masked
+
+    # Step 2: Allocate output
+    output_shape = (dims.tile_T, dims.n_tiles_in_T, dims.H)
+    output_sb = nl.ndarray(output_shape, dtype=kernel_cfg.activation_compute_dtype, buffer=nl.sbuf)
+
+    # Step 3: Compute expert MLPs sequentially
+    for expert_idx in nl.sequential_range(dims.E_L):
+        # Step 3.1: Load weights for this expert
+        weights = _load_expert(
+            input_tensors=input_tensors,
+            kernel_cfg=kernel_cfg,
+            dims=dims,
+            expert_idx=expert_idx,
+        )
+
+        # Override per-expert 3D scale tensors with the shared 2D dummy tile [128, F]
+        weights.gate_weight_scale_sb = scale_sb
+        weights.up_weight_scale_sb = scale_sb
+        weights.down_weight_scale_sb = scale_sb
+        weights.dummy_scale_tile_sb = scale_sb
+
+        # Step 3.2: Swizzle bf16 input from [pmax, T_load, H_free] → [pmax, n_H512, T_load, q_width]
+        swizzled_sb = nl.ndarray((pmax, n_H512_tiles, T_load, _q_width), dtype=input_bf16_sb.dtype, buffer=nl.sbuf)
+        for h512_tile_idx in nl.affine_range(n_H512_tiles):
+            for q_idx in nl.affine_range(_q_width):
+                nisa.tensor_copy(
+                    dst=swizzled_sb[:, h512_tile_idx, :, q_idx],
+                    src=input_bf16_sb[:, :, q_idx * n_H512_tiles + h512_tile_idx],
+                )
+
+        # Step 3.3: Load per-expert gate_up_in_scale and quantize
+        gate_up_in_scale_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        gate_up_in_view = (
+            input_tensors.gate_up_in_scale.select(dim=0, index=expert_idx)
+            .broadcast(dim=0, size=pmax)
+            .reshape_dim(dim=0, shape=(pmax, 1))
+        )
+        nisa.dma_copy(dst=gate_up_in_scale_sb, src=gate_up_in_view)
+
+        # Flatten swizzled bf16 and apply static_quantization (modifies in-place)
+        total_free = n_H512_tiles * T_load * _q_width
+        swizzled_flat = swizzled_sb.reshape((pmax, total_free))
+        quantized_flat, input_dequant_scale = static_quantization(swizzled_flat, gate_up_in_scale_sb)
+
+        # Cast bf16 → fp8, then reinterpret as fp8_x4
+        quantized_fp8 = nl.ndarray(quantized_flat.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=quantized_fp8, src=quantized_flat)
+        total_x4 = n_H512_tiles * T_load
+        input_quant_sb = nl.ndarray((pmax, total_x4), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=input_quant_sb.view(nl.uint32), src=quantized_fp8.view(nl.uint32), engine=nisa.vector_engine
+        )
+        input_quant_sb = input_quant_sb.reshape((pmax, n_H512_tiles, T_load))
+
+        # Dummy 127 MX scales
+        input_scale_sb = nl.ndarray((pmax, n_H512_tiles, T_load), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.memset(dst=input_scale_sb, value=127)
+
+        # Step 3.4: Compute combined dequant scales (input_dequant * weight_dequant)
+        gate_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        up_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        down_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        gate_w_view = input_tensors.gate_up_weights_scale.select(dim=0, index=expert_idx)
+        nisa.dma_copy(dst=gate_w_dequant_sb, src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=pmax))
+        nisa.dma_copy(dst=up_w_dequant_sb, src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=pmax))
+        down_w_view = (
+            input_tensors.down_weights_scale.select(dim=0, index=expert_idx)
+            .broadcast(dim=0, size=pmax)
+            .reshape_dim(dim=0, shape=(pmax, 1))
+        )
+        nisa.dma_copy(dst=down_w_dequant_sb, src=down_w_view)
+
+        weights.gate_dequant_scale_sb = pre_combine_dequant_scales(input_dequant_scale, gate_w_dequant_sb)
+        weights.up_dequant_scale_sb = pre_combine_dequant_scales(input_dequant_scale, up_w_dequant_sb)
+
+        # down: down_in_scale[expert_idx] * down_w_dequant
+        down_in_scale_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        down_in_view = (
+            input_tensors.down_in_scale.select(dim=0, index=expert_idx)
+            .broadcast(dim=0, size=pmax)
+            .reshape_dim(dim=0, shape=(pmax, 1))
+        )
+        nisa.dma_copy(dst=down_in_scale_sb, src=down_in_view)
+        weights.down_dequant_scale_sb = pre_combine_dequant_scales(down_in_scale_sb, down_w_dequant_sb)
+
+        # Step 3.5: Compute MLP for this expert
+        _compute_expert_mlp(
+            input_quant=input_quant_sb,
+            input_scale=input_scale_sb,
+            weights=weights,
+            kernel_cfg=kernel_cfg,
+            expert_affinities_masked=expert_affinities_masked_sb,
+            output_sb=output_sb[...],
+            output_hbm=output_hbm_view if (not kernel_cfg.output_in_sbuf) else None,
+            expert_idx=expert_idx,
+            is_first_expert=(expert_idx == 0),
+            is_last_expert=(expert_idx == dims.E_L - 1),
+            sharding_strategy=dims.sharding_strategy,
+            input_dequant_scale_sb=input_dequant_scale,
+            output_t_offset=hbm_t_offset_for_down_proj,
+            is_software_quant=True,
+            T_physical=dims.T_physical if dims.T_physical < dims.T else None,
+            down_in_scale_sb=down_in_scale_sb,
         )
 
     return input_tensors.output
@@ -359,7 +593,7 @@ def _all_expert_mx_dynamic_shard_on_I(
     kernel_cfg: AllExpertMXKernelConfig,
     dims: AllExpertMXDimensions,
     dynamism_cfg: AllExpertMXDynamismConfig,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     All-expert MoE computation with dynamic control flow (DLoC), shard on I dimension.
 
@@ -382,19 +616,13 @@ def _all_expert_mx_dynamic_shard_on_I(
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
 
     Returns:
-        nl.ndarray: Output tensor with MoE computation results.
+        nl.NkiTensor: Output tensor with MoE computation results.
     """
 
     # Step 1: Prepare buffers shared across all experts
-    # Step 1.1: Allocate shared HBM output buffer for NC1 (NC0 uses input_tensors.output directly)
-    # FIXME: we only need to do this when we have E_L>1 or K>1. When we have K=1 or E_L=1, we do not need to reduce across K, and we can do an on-chip reduction with SB2SB and spill directly into the output.
+    # Step 1.1: Memset output to 0, using u32 memset for 2x perf
+    # FIXME[perf]: When we have K=1 or E_L=1, we can skip K reduction and reduce I on-chip.
     _, n_prgs, prg_id = get_verified_program_sharding_info()
-    output_shared_nc1 = nl.ndarray(
-        (dims.T, dims.H), dtype=input_tensors.output.dtype, buffer=nl.shared_hbm, name="output_shared_nc1"
-    )
-    output_local = input_tensors.output if prg_id == 0 else output_shared_nc1
-
-    # Memset this NC's shared buffer to 0, using u32 memset for 2x perf
     zero_sb = nl.ndarray((dims.tile_T, dims.H // BF16_PER_INT32), dtype=nl.uint32, buffer=nl.sbuf)
     nisa.memset(zero_sb, 0, engine=nisa.vector_engine)
     # On the profile, the dma_copy is being moved around, causing ineffiency,
@@ -404,7 +632,7 @@ def _all_expert_mx_dynamic_shard_on_I(
             tile_T_actual = min(dims.tile_T, dims.T_local - dims.tile_T * t_tile)
             nisa.dma_copy(
                 src=zero_sb[:tile_T_actual, :],
-                dst=output_local.ap(
+                dst=input_tensors.output.ap(
                     [[dims.H // 2, tile_T_actual], [1, dims.H // 2]],
                     offset=t_tile * dims.tile_T * (dims.H // 2),
                     dtype=nl.uint32,
@@ -429,19 +657,16 @@ def _all_expert_mx_dynamic_shard_on_I(
         T_offset = dims.prg_id * T_local
         num_input_fp8_cols = input_tensors.hidden_input.shape[1]
         input_int32_view = (
-            TensorView(input_tensors.hidden_input)
-            .slice(dim=0, start=T_offset, end=T_offset + T_local)
+            input_tensors.hidden_input.slice(dim=0, start=T_offset, end=T_offset + T_local)
             .slice(dim=1, start=num_input_fp8_cols - FP8_PER_INT32, end=num_input_fp8_cols)
-            .reinterpret_cast(nl.bfloat16)
+            .view(nl.bfloat16)
         )
-        output_int32_view = (
-            TensorView(input_tensors.output)
-            .slice(dim=0, start=T_offset, end=T_offset + T_local)
-            .slice(dim=1, start=dims.H, end=dims.H + BF16_PER_INT32)
+        output_int32_view = input_tensors.output.slice(dim=0, start=T_offset, end=T_offset + T_local).slice(
+            dim=1, start=dims.H, end=dims.H + BF16_PER_INT32
         )
         nisa.dma_copy(
-            src=input_int32_view.get_view(),
-            dst=output_int32_view.get_view(),
+            src=input_int32_view,
+            dst=output_int32_view,
             dge_mode=dge_mode.none,
         )
         output_indices_hbm = None
@@ -481,7 +706,7 @@ def _all_expert_mx_dynamic_shard_on_I(
                     dims=dims,
                     dynamism_cfg=dynamism_cfg,
                     weights=weights,
-                    output_local=output_local,
+                    output_local=input_tensors.output,
                     routed_token_indices=local_routed_token_indices_with_count_sb,
                     arange_4H=arange_4H,
                     expert_idx=expert_idx,
@@ -516,14 +741,14 @@ def _all_expert_mx_dynamic_shard_on_I(
             nisa.memset(dynamic_block_idx, 0)
 
             # Step 2.4.3: Dynamic loop over dynamic blocks
-            while compute_next_dynamic_block:
+            def _dynamic_block_body(compute_next_dynamic_block):
                 _compute_block(
                     input_tensors=input_tensors,
                     kernel_cfg=kernel_cfg,
                     dims=dims,
                     dynamism_cfg=dynamism_cfg,
                     weights=weights,
-                    output_local=output_local,
+                    output_local=input_tensors.output,
                     routed_token_indices=dynamic_block_token_indices_hbm,
                     arange_4H=arange_4H,
                     expert_idx=expert_idx,
@@ -545,6 +770,9 @@ def _all_expert_mx_dynamic_shard_on_I(
                     dst=next_decision_sb,
                 )
                 nisa.register_load(src=next_decision_sb, dst=compute_next_dynamic_block)
+                return compute_next_dynamic_block
+
+            nl.while_loop(compute_next_dynamic_block, _dynamic_block_body)
 
     return input_tensors.output
 
@@ -554,7 +782,7 @@ def _all_expert_mx_dynamic_shard_on_E(
     kernel_cfg: AllExpertMXKernelConfig,
     dims: AllExpertMXDimensions,
     dynamism_cfg: AllExpertMXDynamismConfig,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     All-expert MoE computation with dynamic control flow (DLoC), shard on expert
     to reduce the number of DLoC loops are invoked to E_L // 2.
@@ -578,38 +806,34 @@ def _all_expert_mx_dynamic_shard_on_E(
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
 
     Returns:
-        nl.ndarray: Output tensor with MoE computation results.
+        nl.NkiTensor: Output tensor with MoE computation results.
     """
-    # [FIXME]: Only works for E_L=2 or E_L=4.
-    kernel_assert(dims.E_L == 2 or dims.E_L == 4, "DLoC shard-on-E only works for 2 or 4 experts")
+    kernel_assert(dims.E_L % 2 == 0, "DLoC shard-on-E requires even number of experts")
     kernel_assert(
-        dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T,
-        "LOGIC FAULT: sharding config is not set to shard_T while shard T config is invoked",
+        dims.sharding_strategy == MoELNCShardingStrategy.SHARD_E,
+        "LOGIC FAULT: sharding config is not set to shard_E while shard_on_E is invoked",
     )
 
     # Step 1: Prepare buffers shared across all experts
+    # Step 1.1: Memset output to 0, using u32 memset for 2x perf
     _, n_prgs, prg_id = get_verified_program_sharding_info()
-    output_local = input_tensors.output
-
-    # Memset this NC's shared buffer to 0, using u32 memset for 2x perf
-    zero_sb = nl.ndarray((dims.tile_T, dims.H // (2 * BF16_PER_INT32)), dtype=nl.uint32, buffer=nl.sbuf)
+    # FIXME[perf]: the following buffer zeroing is a conservative, unsharded zeroing for correctness,
+    # we might want to shard this to 2 LNC cores if necessary.
+    zero_sb = nl.ndarray((dims.tile_T, dims.H // BF16_PER_INT32), dtype=nl.uint32, buffer=nl.sbuf)
     nisa.memset(zero_sb, 0, engine=nisa.vector_engine)
-    # On the profile, the dma_copy is being moved around, causing ineffiency,
-    # might need to remove this when running E2E.
-    local_tiles = dims.n_tiles_in_T // 2
     with nl.no_reorder():
-        for t_tile in nl.sequential_range(local_tiles):
-            t_tile = prg_id * local_tiles + t_tile
+        for t_tile in nl.sequential_range(dims.n_tiles_in_T):
             tile_T_actual = min(dims.tile_T, dims.T_local - dims.tile_T * t_tile)
             nisa.dma_copy(
                 src=zero_sb[:tile_T_actual, :],
-                dst=output_local.ap(
-                    [[dims.H // 4, tile_T_actual], [1, dims.H // 4]],
-                    offset=t_tile * dims.tile_T * (dims.H // 4),
+                dst=input_tensors.output.ap(
+                    [[dims.H // 2, tile_T_actual], [1, dims.H // 2]],
+                    offset=t_tile * dims.tile_T * (dims.H // 2),
                     dtype=nl.uint32,
                 ),
                 dge_mode=dge_mode.none,
             )
+    nisa.core_barrier(input_tensors.output, cores=[0, 1])
 
     # Step 1.2: Arange [0, 1, 2, 3] for token indices broadcast, when input is not prequantized
     if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
@@ -628,19 +852,16 @@ def _all_expert_mx_dynamic_shard_on_E(
         T_offset = dims.prg_id * T_local
         num_input_fp8_cols = input_tensors.hidden_input.shape[1]
         input_int32_view = (
-            TensorView(input_tensors.hidden_input)
-            .slice(dim=0, start=T_offset, end=T_offset + T_local)
+            input_tensors.hidden_input.slice(dim=0, start=T_offset, end=T_offset + T_local)
             .slice(dim=1, start=num_input_fp8_cols - FP8_PER_INT32, end=num_input_fp8_cols)
-            .reinterpret_cast(nl.bfloat16)
+            .view(nl.bfloat16)
         )
-        output_int32_view = (
-            TensorView(input_tensors.output)
-            .slice(dim=0, start=T_offset, end=T_offset + T_local)
-            .slice(dim=1, start=dims.H, end=dims.H + BF16_PER_INT32)
+        output_int32_view = input_tensors.output.slice(dim=0, start=T_offset, end=T_offset + T_local).slice(
+            dim=1, start=dims.H, end=dims.H + BF16_PER_INT32
         )
         nisa.dma_copy(
-            src=input_int32_view.get_view(),
-            dst=output_int32_view.get_view(),
+            src=input_int32_view,
+            dst=output_int32_view,
             dge_mode=dge_mode.none,
         )
         output_indices_hbm = None
@@ -701,7 +922,7 @@ def _all_expert_mx_dynamic_shard_on_E(
                     dims=dims,
                     dynamism_cfg=dynamism_cfg,
                     weights=weights,
-                    output_local=output_local,
+                    output_local=input_tensors.output,
                     routed_token_indices=local_routed_token_indices_with_count_sb,
                     arange_4H=arange_4H,
                     expert_idx=global_expert_idx,
@@ -735,14 +956,14 @@ def _all_expert_mx_dynamic_shard_on_E(
             nisa.register_load(src=dynamic_iteration_count_sb[expert_lnc_grp * 64, 0], dst=dynamic_iteration_count_reg)
 
             # Step 2.4.3: Dynamic loop over dynamic blocks
-            for dynamic_block_idx in nl.dynamic_range(dynamic_iteration_count_reg):
+            def _dynamic_block_body(dynamic_block_idx):
                 _compute_block(
                     input_tensors=input_tensors,
                     kernel_cfg=kernel_cfg,
                     dims=dims,
                     dynamism_cfg=dynamism_cfg,
                     weights=weights,
-                    output_local=output_local,
+                    output_local=input_tensors.output,
                     routed_token_indices=dynamic_block_token_indices_hbm,
                     arange_4H=arange_4H,
                     expert_idx=global_expert_idx,
@@ -752,6 +973,8 @@ def _all_expert_mx_dynamic_shard_on_E(
                     is_first_expert=(global_expert_idx == 0),
                     is_last_expert=((global_expert_idx // n_prgs) == (dims.E_L // 2 - 1)),
                 )
+
+            nl.fori_loop(0, dynamic_iteration_count_reg, _dynamic_block_body)
     return input_tensors.output
 
 
@@ -765,7 +988,7 @@ def _build_output_indices(input_tensors, dims, dynamism_cfg):
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
 
     Returns:
-        output_indices_hbm (nl.ndarray): [T, 1], Maps input_position -> unpermuted output position.
+        output_indices_hbm (nl.NkiTensor): [T, 1], Maps input_position -> unpermuted output position.
     """
 
     # Step 1: Allocations
@@ -777,15 +1000,21 @@ def _build_output_indices(input_tensors, dims, dynamism_cfg):
     output_indices_hbm = nl.ndarray((dims.T, 1), dtype=nl.int32, buffer=nl.private_hbm)
 
     # Step 2: Find indices of routed tokens
-    # Step 2.1: Load token_idx from end of input buffer: bitcast fp8[T,4] -> int32[T,1] -> reshape [1,T]
+    # Step 2.1: Load token_idx from end of input buffer: bitcast fp8[T,4] -> bf1632[T,2] -> reshape [1, T, 2]
+    # NOTE: we use bf16 reinterpret because input is not always 4B aligned
     token_idx_col_offset_fp8 = dims.H + dims.H // _q_width + dims.E_L * FP8_PER_BF16
-    token_idx_view = (
-        TensorView(input_tensors.hidden_input)
-        .slice(dim=1, start=token_idx_col_offset_fp8, end=token_idx_col_offset_fp8 + FP8_PER_INT32)
-        .reinterpret_cast(nl.int32)
-        .reshape((1, dims.T))
-    )
-    nisa.dma_copy(src=token_idx_view.get_view(), dst=token_indices_sb[0, :], dge_mode=dge_mode.none)
+    token_idx_col_offset_bf16 = token_idx_col_offset_fp8 // FP8_PER_BF16
+    src_view = (
+        input_tensors.hidden_input.view(nl.bfloat16)
+        .slice(dim=1, start=token_idx_col_offset_bf16, end=token_idx_col_offset_bf16 + BF16_PER_INT32)
+        .expand_dim(dim=0)
+    )  # shape (1, T, BF16_PER_INT32) bf16
+    dst_view = (
+        token_indices_sb.view(nl.bfloat16)
+        .reshape_dim(dim=1, shape=(dims.T, BF16_PER_INT32))
+        .slice(dim=0, start=0, end=1)
+    )  # shape (1, T, BF16_PER_INT32) bf16
+    nisa.dma_copy(src=src_view, dst=dst_view, dge_mode=dge_mode.none)
 
     # Step 2.2: Find routed token indices using NonzeroWithCount
     nisa.nonzero_with_count(
@@ -881,11 +1110,11 @@ def _find_expert_routed_tokens(input_tensors, kernel_cfg, dims, dynamism_cfg, ex
         expert_4_tile_idx (int): Index of the tile of the expert to find routed tokens for.
 
     Returns:
-        routed_token_indices_with_count_sb (nl.ndarray): [pmax, T+1], Output from nonzero_with_count in SBUF.
+        routed_token_indices_with_count_sb (nl.NkiTensor): [pmax, T+1], Output from nonzero_with_count in SBUF.
             Partition 0  contains routed token indices with count in final element for expert 0.
             Partition 32 contains routed token indices with count in final element for expert 1.
             Partition 64 and 96 contain results for experts 2 and 3 respectively.
-        dynamic_conditions_sb (nl.ndarray): [pmax, n_dynamic_blocks+1], Decision vector indicating
+        dynamic_conditions_sb (nl.NkiTensor): [pmax, n_dynamic_blocks+1], Decision vector indicating
             which dynamic blocks need computation. Expert e_id's decision is at partition e_id*32.
     """
 
@@ -909,26 +1138,23 @@ def _find_expert_routed_tokens(input_tensors, kernel_cfg, dims, dynamism_cfg, ex
     # Load expert affinities from [T, E_L] -> [1, T] with cast to fp32
     if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
         for e_id in range(actual_iteration):
-            affinity_view = (
-                TensorView(input_tensors.expert_affinities_masked)
-                .slice(dim=1, start=expert_4_tile_idx * 4 + e_id, end=expert_4_tile_idx * 4 + e_id + 1)
-                .reshape((1, dims.T))
-            )
+            affinity_view = input_tensors.expert_affinities_masked.slice(
+                dim=1, start=expert_4_tile_idx * 4 + e_id, end=expert_4_tile_idx * 4 + e_id + 1
+            ).reshape((1, dims.T))
             # Load with cast to fp32
-            nisa.dma_copy(src=affinity_view.get_view(), dst=expert_affinities_masked_T_f32_sb[nl.ds(e_id * 32, 1), :])
+            nisa.dma_copy(src=affinity_view, dst=expert_affinities_masked_T_f32_sb[nl.ds(e_id * 32, 1), :])
     else:
         # A2A-v: expert affinities are bitcast as fp8 and located at col offset H + H/4
         # performance note: it is not faster to write a strided access pattern in this case because the stride is too large.
         for e_id in range(actual_iteration):
             affinities_col_offset_bf16 = (dims.H + dims.H // _q_width) // FP8_PER_BF16 + expert_4_tile_idx * 4 + e_id
             affinity_view = (
-                TensorView(input_tensors.hidden_input)
-                .reinterpret_cast(kernel_cfg.expert_affinities_dtype)
+                input_tensors.hidden_input.view(kernel_cfg.expert_affinities_dtype)
                 .slice(dim=1, start=affinities_col_offset_bf16, end=affinities_col_offset_bf16 + 1)
                 .reshape((1, dims.T))
             )
             # Load with cast to fp32
-            nisa.dma_copy(src=affinity_view.get_view(), dst=expert_affinities_masked_T_f32_sb[nl.ds(e_id * 32, 1), :])
+            nisa.dma_copy(src=affinity_view, dst=expert_affinities_masked_T_f32_sb[nl.ds(e_id * 32, 1), :])
 
     # Find nonzero indices, with count
     # NOTE: partitions 1, ..., pmax are padding from nonzero_with_count output shape requirement
@@ -976,17 +1202,17 @@ def _get_block_token_position_to_id(
 
     Args:
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
-        routed_token_indices (nl.ndarray): Token indices from nonzero_with_count. Shape depends on context:
+        routed_token_indices (nl.NkiTensor): Token indices from nonzero_with_count. Shape depends on context:
             - Static blocks: [pmax, T+1] in SBUF, with count in final element
             - Dynamic blocks: [n_dynamic_blocks, block_size] in HBM
-        arange_4H (nl.ndarray): [1, 4], Arange vector for 4_H broadcast.
+        arange_4H (nl.NkiTensor): [1, 4], Arange vector for 4_H broadcast.
         block_idx: Block index. Static: int literal. Dynamic: [1, 1] SBUF tensor.
         is_dynamic_block (bool): Whether this is a dynamic block (affects indexing pattern).
 
     Returns:
-        token_position_to_id_4_H_T_sb (nl.ndarray): [blk_tile_T_x4, blk_n_T_x4_tiles], Transposed indices
+        token_position_to_id_4_H_T_sb (nl.NkiTensor): [blk_tile_T_x4, blk_n_T_x4_tiles], Transposed indices
             with 4_H broadcast for hidden state loading.
-        token_position_to_id_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles], Transposed indices
+        token_position_to_id_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles], Transposed indices
             for expert affinity loading and output spilling.
     """
 
@@ -1107,12 +1333,12 @@ def _get_block_token_position_to_id_a2av(
 
     Args:
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
-        routed_token_indices (nl.ndarray): Token indices from nonzero_with_count.
+        routed_token_indices (nl.NkiTensor): Token indices from nonzero_with_count.
         block_idx: Block index. Static: int literal. Dynamic: [1, 1] SBUF tensor.
         is_dynamic_block (bool): Whether this is a dynamic block.
 
     Returns:
-        token_position_to_id_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles], Transposed indices
+        token_position_to_id_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles], Transposed indices
             for indirect loading and output spilling.
     """
     # Token position to id (load + spill)
@@ -1158,27 +1384,27 @@ def _get_block_token_position_to_id_a2av(
 
 
 def _layout_adapter_qmx_hbm(
-    input: nl.ndarray,
+    input: nl.NkiTensor,
     dims: AllExpertMXDimensions,
     dynamism_cfg: AllExpertMXDynamismConfig = None,
-    input_indices_T_sb: nl.ndarray = None,
+    input_indices_T_sb: nl.NkiTensor = None,
     output_dtype: nki.dtype = nl.float8_e4m3fn_x4,
-) -> tuple[nl.ndarray, nl.ndarray]:
+) -> tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Load input from HBM, transform tensor into swizzled layout, and perform quantization to MXFP8.
 
     Args:
-        input (nl.ndarray): [T, 4_H * H/512 * 16_H * 8_H], Input tensor in HBM.
+        input (nl.NkiTensor): [T, 4_H * H/512 * 16_H * 8_H], Input tensor in HBM.
         dims (AllExpertMXDimensions): Dimension parameters. Uses full-T tiling when input_indices_T_sb is None,
             otherwise uses per-block tiling. Uses dims.t32_tile_offset for T-sharding.
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters. Required when input_indices_T_sb is provided.
-        input_indices_T_sb (nl.ndarray): [32_T * 4_H, T/32] Optional indices for indirect load from HBM.
+        input_indices_T_sb (nl.NkiTensor): [32_T * 4_H, T/32] Optional indices for indirect load from HBM.
         output_dtype (nki.dtype): MXFP8 dtype to quantize to.
 
     Returns:
-        output_quant_sb (nl.ndarray): [16_H * 8_H, H/512, T], Quantized output in SBUF
+        output_quant_sb (nl.NkiTensor): [16_H * 8_H, H/512, T], Quantized output in SBUF
             (4_H packed in x4 dtype).
-        output_scale_sb (nl.ndarray): [16_H * 8_H, H/512, T], Scales in SBUF
+        output_scale_sb (nl.NkiTensor): [16_H * 8_H, H/512, T], Scales in SBUF
             (located in leading 4P of each SBUF quadrant).
     """
 
@@ -1259,8 +1485,8 @@ def _layout_adapter_a2av_hbm(
     kernel_cfg: AllExpertMXKernelConfig,
     dims: AllExpertMXDimensions,
     dynamism_cfg: AllExpertMXDynamismConfig,
-    input_indices_T_sb: nl.ndarray,
-    expert_idx: Optional[Union[int, nl.ndarray]],
+    input_indices_T_sb: nl.NkiTensor,
+    expert_idx: Optional[Union[int, nl.NkiTensor]],
 ):
     """
     Load concatenated A2A-v input from HBM, unpack into separate SBUF tensors for expert MLP.
@@ -1273,13 +1499,13 @@ def _layout_adapter_a2av_hbm(
         kernel_cfg (AllExpertMXKernelConfig): Kernel configuration (expert_affinities_dtype).
         dims (AllExpertMXDimensions): Dimension parameters (H, H_concat, E_L, tile_H, n_H512_tiles).
         dynamism_cfg (AllExpertMXDynamismConfig): Block tiling parameters (blk_tile_T, blk_n_T_tiles, block_size).
-        input_indices_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles], Token indices for indirect DMA gather.
-        expert_idx (int or nl.ndarray): Index of the current expert for affinity extraction.
+        input_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles], Token indices for indirect DMA gather.
+        expert_idx (int or nl.NkiTensor): Index of the current expert for affinity extraction.
 
     Returns:
-        input_quant_sb (nl.ndarray): [128_H, H/512, T], Quantized hidden states in SBUF (4_H packed in x4 dtype).
-        input_scale_sb (nl.ndarray): [128_H, H/512, T], MX scales in SBUF (uint8).
-        expert_affinities_masked_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles, 1], Per-token expert affinities in fp32.
+        input_quant_sb (nl.NkiTensor): [128_H, H/512, T], Quantized hidden states in SBUF (4_H packed in x4 dtype).
+        input_scale_sb (nl.NkiTensor): [128_H, H/512, T], MX scales in SBUF (uint8).
+        expert_affinities_masked_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles, 1], Per-token expert affinities in fp32.
     """
     # Step 1: shapes, allocations
     input_quant_x4_dtype = MXFP8_UNPACKED_PACKED_MAP[input_tensors.hidden_input.dtype]
@@ -1314,7 +1540,7 @@ def _layout_adapter_a2av_hbm(
         )
         nisa.dma_copy(
             src=input_tensors.hidden_input.ap(
-                pattern=[[dims.H_concat, dynamism_cfg.blk_tile_T], [1, H_concat_without_indices]],
+                pattern=[[dims.H_concat, dynamism_cfg.blk_tile_T], [1, H_concat_4B_aligned]],
                 offset=0,
                 vector_offset=input_indices_T_sb.ap(
                     pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
@@ -1322,8 +1548,7 @@ def _layout_adapter_a2av_hbm(
                 ),
                 indirect_dim=0,
             ),
-            # NOTE: if H_concat is not 4B aligned, the final 1-3 columns will have garbage data
-            dst=input_concat_tile_sb[:, :H_concat_without_indices],
+            dst=input_concat_tile_sb,
             # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
             oob_mode=oob_mode.skip,
             dge_mode=nisa.dge_mode.swdge,
@@ -1420,11 +1645,11 @@ def _load_block_expert_affinities(input_tensors, dims, dynamism_cfg, token_posit
         input_tensors (AllExpertMXInputTensors): Tensor parameters.
         dims (AllExpertMXDimensions): Dimension parameters.
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
-        token_position_to_id_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles], Token position-to-ID mapping.
+        token_position_to_id_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles], Token position-to-ID mapping.
         expert_idx (int): Index of the expert to load affinities for.
 
     Returns:
-        expert_affinities_masked_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles, 1], Expert affinities
+        expert_affinities_masked_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles, 1], Expert affinities
             for the block's tokens in SBUF.
     """
     # Allocation
@@ -1530,47 +1755,11 @@ def _load_expert(
         skip_scale_load=is_software_quant,
     )
 
-    # STATIC_MX / ROW_MX: compute dequant scales per expert
+    # ROW_MX: compute dequant scales per expert
     gate_dequant_scale_sb = None
     up_dequant_scale_sb = None
     down_dequant_scale_sb = None
-    if kernel_cfg.is_static_quant:
-        pmax = nl.tile_size.pmax
-        gate_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        up_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        down_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-
-        # Load gate/up weight dequant scales from [E_L, 2, 1] with partition-dim broadcast
-        gate_w_view = TensorView(input_tensors.gate_up_weights_scale).select(dim=0, index=expert_idx)
-        nisa.dma_copy(
-            dst=gate_w_dequant_sb,
-            src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=pmax).get_view(),
-        )
-        nisa.dma_copy(
-            dst=up_w_dequant_sb,
-            src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=pmax).get_view(),
-        )
-
-        # Load down weight dequant scale from [E_L, 1] with partition-dim broadcast
-        down_w_view = (
-            TensorView(input_tensors.down_weights_scale)
-            .select(dim=0, index=expert_idx)
-            .broadcast(dim=0, size=pmax)
-            .reshape_dim(dim=0, shape=(pmax, 1))
-        )
-        nisa.dma_copy(dst=down_w_dequant_sb, src=down_w_view.get_view())
-
-        # combined = input_dequant * weight_dequant
-        gate_dequant_scale_sb = pre_combine_dequant_scales(input_tensors.input_dequant_scale, gate_w_dequant_sb)
-        up_dequant_scale_sb = pre_combine_dequant_scales(input_tensors.input_dequant_scale, up_w_dequant_sb)
-
-        # down: down_in_scale * down_w_dequant (static, no expert indexing)
-        down_in_scale_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        down_in_view = TensorView(input_tensors.down_in_scale).slice(dim=0, start=0, end=1).broadcast(dim=0, size=pmax)
-        nisa.dma_copy(dst=down_in_scale_sb, src=down_in_view.get_view())
-        down_dequant_scale_sb = pre_combine_dequant_scales(down_in_scale_sb, down_w_dequant_sb)
-
-    elif kernel_cfg.is_row_quant:
+    if kernel_cfg.is_row_quant:
         # ROW_MX: load per-row weight dequant scales per expert
         # Reuse gate_dequant_scale_sb/up_dequant_scale_sb for weight scales (dispatch on shape downstream)
         pmax = nl.tile_size.pmax
@@ -1581,26 +1770,25 @@ def _load_expert(
         up_dequant_scale_sb = nl.ndarray((pmax, gate_up_scale_cols), dtype=nl.float32, buffer=nl.sbuf)
 
         # Load gate/up weight dequant scales with partition-dim broadcast
-        gate_up_w_view = TensorView(input_tensors.gate_up_weights_scale).select(dim=0, index=expert_idx)
+        gate_up_w_view = input_tensors.gate_up_weights_scale.select(dim=0, index=expert_idx)
         nisa.dma_copy(
             dst=gate_dequant_scale_sb,
-            src=gate_up_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=pmax).get_view(),
+            src=gate_up_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=pmax),
         )
         nisa.dma_copy(
             dst=up_dequant_scale_sb,
-            src=gate_up_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=pmax).get_view(),
+            src=gate_up_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=pmax),
         )
 
         # Load down weight scale with partition-dim broadcast from [E_L, H//_pmax]
         down_scale_cols = input_tensors.down_weights_scale.shape[1]
         down_dequant_scale_sb = nl.ndarray((dims.tile_T, down_scale_cols), dtype=nl.float32, buffer=nl.sbuf)
         down_w_view = (
-            TensorView(input_tensors.down_weights_scale)
-            .select(dim=0, index=expert_idx)  # [down_scale_cols]
+            input_tensors.down_weights_scale.select(dim=0, index=expert_idx)  # [down_scale_cols]
             .reshape_dim(dim=0, shape=(1, down_scale_cols))  # [1, down_scale_cols]
             .broadcast(dim=0, size=dims.tile_T)  # [tile_T, down_scale_cols]
         )
-        nisa.dma_copy(dst=down_dequant_scale_sb, src=down_w_view.get_view())
+        nisa.dma_copy(dst=down_dequant_scale_sb, src=down_w_view)
 
     return ExpertWeightsSBUF(
         gate_weight_sb=gate_weight_sb,
@@ -1619,42 +1807,43 @@ def _load_expert(
 
 
 def _compute_expert_mlp(
-    input_quant: nl.ndarray,
-    input_scale: nl.ndarray,
+    input_quant: nl.NkiTensor,
+    input_scale: nl.NkiTensor,
     weights: ExpertWeightsSBUF,
     kernel_cfg: AllExpertMXKernelConfig,
-    expert_affinities_masked: nl.ndarray,
-    output_sb: nl.ndarray,
-    output_hbm: nl.ndarray,
+    expert_affinities_masked: nl.NkiTensor,
+    output_sb: nl.NkiTensor,
+    output_hbm: nl.NkiTensor,
     expert_idx: int,
     is_first_expert: bool,
     is_last_expert: bool,
     sharding_strategy: MoELNCShardingStrategy = MoELNCShardingStrategy.SHARD_I,
     T_offset: int = 0,
-    token_position_to_id_T: nl.ndarray = None,
-    input_dequant_scale_sb: nl.ndarray = None,
+    token_position_to_id_T: nl.NkiTensor = None,
+    input_dequant_scale_sb: nl.NkiTensor = None,
     output_t_offset: int = 0,
     is_software_quant: bool = False,
     T_physical: int = None,
+    down_in_scale_sb: nl.ndarray = None,
 ) -> nl.ndarray:
     """
     Compute expert MLP for one block of input.
 
     Args:
-        input_quant (nl.ndarray): Quantized input tensor.
-        input_scale (nl.ndarray): Input scale tensor.
+        input_quant (nl.NkiTensor): Quantized input tensor.
+        input_scale (nl.NkiTensor): Input scale tensor.
         weights (ExpertWeightsSBUF): Expert weights, scales, and biases in SBUF.
         kernel_cfg (AllExpertMXKernelConfig): Kernel config parameters.
-        expert_affinities_masked (nl.ndarray): Masked expert affinities.
-        output_sb (nl.ndarray): Output tensor in SBUF.
-        output_hbm (nl.ndarray): Output tensor in HBM.
+        expert_affinities_masked (nl.NkiTensor): Masked expert affinities.
+        output_sb (nl.NkiTensor): Output tensor in SBUF.
+        output_hbm (nl.NkiTensor): Output tensor in HBM.
         expert_idx (int): Expert index.
         is_first_expert (bool): Whether the current expert is the first expert.
         is_last_expert (bool): Whether the current expert is the last expert.
         sharding_strategy (MoELNCShardingStrategy): LNC sharding strategy.
         T_offset (int): Offset for T dimension in HBM output.
-        token_position_to_id_T (nl.ndarray): Token position to ID mapping for blockwise DMA.
-        input_dequant_scale_sb (nl.ndarray): Optional input dequantization scales for ROW_MX mode.
+        token_position_to_id_T (nl.NkiTensor): Token position to ID mapping for blockwise DMA.
+        input_dequant_scale_sb (nl.NkiTensor): Optional input dequantization scales for ROW_MX mode.
         is_software_quant (bool): When True, weight scales are 2D [128, F] dummy tiles indexed
             as [:, :slice] instead of the normal 3D [:, tile_idx, slice].
     Returns:
@@ -1662,6 +1851,7 @@ def _compute_expert_mlp(
     """
 
     is_row_quant = kernel_cfg.is_row_quant
+    is_static_mx = kernel_cfg.is_static_quant
 
     # Step 1: Compute gate/up projection, projection clamping, activation function, and QMX
     act_quant_sb, act_scale_sb = gate_up_projection_mx(
@@ -1746,6 +1936,30 @@ def _compute_expert_mlp(
         # SW quant: reuse the hoisted 2D dummy scale [128, F] instead of per-tile 3D scale
         act_scale_sb = weights.dummy_scale_tile_sb
 
+    # Step 2 (STATIC_MX only): static-quantize intermediate with down_in_scale before down projection
+    elif is_static_mx:
+        # act_quant_sb is bf16 [TILE_I, n_I512_tiles, T, I_4] from gate_up_projection_mx
+        TILE_I = act_quant_sb.shape[0]
+        n_I512_tiles = act_quant_sb.shape[1]
+        T_act = act_quant_sb.shape[2]
+        I_4 = act_quant_sb.shape[3]
+
+        # Flatten and apply static_quantization (divides by down_in_scale, clips to FP8 range)
+        total_free = n_I512_tiles * T_act * I_4
+        act_flat = act_quant_sb.reshape((TILE_I, total_free))
+        quantized_flat, _ = static_quantization(act_flat, down_in_scale_sb)
+
+        # Cast bf16 to fp8, then reinterpret as fp8_x4
+        quantized_fp8 = nl.ndarray(quantized_flat.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=quantized_fp8, src=quantized_flat)
+        total_x4 = n_I512_tiles * T_act
+        temp_quant = nl.ndarray((TILE_I, total_x4), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=temp_quant.view(nl.uint32), src=quantized_fp8.view(nl.uint32), engine=nisa.vector_engine)
+        act_quant_sb = temp_quant.reshape((TILE_I, n_I512_tiles, T_act))
+
+        # Dummy 127 MX scales
+        act_scale_sb = weights.dummy_scale_tile_sb
+
     # Step 3: Compute down projection, expert affinity scaling, expert add, LNC reduction, and SB->HBM spill
     down_projection_mx(
         act_sb=act_quant_sb[...],
@@ -1768,7 +1982,6 @@ def _compute_expert_mlp(
         down_input_dequant_scale=inter_dequant_scale if is_row_quant else None,
         output_t_offset=output_t_offset,
         is_software_quant=is_software_quant,
-        is_row_quant=is_row_quant,
         T_physical=T_physical,
     )
 
@@ -1802,10 +2015,10 @@ def _compute_block(
         dims (AllExpertMXDimensions): Dimension parameters.
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
         weights (ExpertWeightsSBUF): Expert weights, scales, and biases in SBUF.
-        routed_token_indices (nl.ndarray): Token indices from nonzero_with_count.
+        routed_token_indices (nl.NkiTensor): Token indices from nonzero_with_count.
             - Static blocks: [pmax, T+1] in SBUF, with count in final element
             - Dynamic blocks: [n_dynamic_blocks, block_size] in HBM
-        arange_4H (nl.ndarray): [1, 4], Arange vector for 4_H broadcast.
+        arange_4H (nl.NkiTensor): [1, 4], Arange vector for 4_H broadcast.
         expert_idx (int): Index of the current expert.
         block_idx: Block index. Static: int literal. Dynamic: [1, 1] SBUF tensor.
         is_dynamic_block (bool): Whether this is a dynamic block (affects indexing pattern).
@@ -1907,10 +2120,55 @@ def _compute_block(
         kernel_cfg=kernel_cfg,
         expert_affinities_masked=expert_affinities_masked_sb,
         output_sb=output_sb,
-        output_hbm=output_local if (not kernel_cfg.output_in_sbuf) else None,
+        output_hbm=input_tensors.output if (not kernel_cfg.output_in_sbuf) else None,
         expert_idx=expert_idx,
         is_first_expert=is_first_expert,
         is_last_expert=is_last_expert,
         sharding_strategy=dims.sharding_strategy,
         token_position_to_id_T=token_position_to_id_T_sb,
     )
+
+
+def _static_mx_needs_shard_t(
+    T: int, H: int, E_L: int, I: int, weight_dtype: "nki.dtype", input_dtype: "nki.dtype"
+) -> bool:
+    """Check if STATIC_MX all-expert bf16 input exceeds SBUF capacity with SHARD_I.
+
+    STATIC_MX keeps bf16 input in SBUF for per-expert quantization. When T is large,
+    the bf16 footprint (input + swizzled copy) may exceed SBUF capacity alongside
+    weights and output. Returns True if SHARD_T is needed to halve T_local.
+
+    Args:
+        T: Total number of tokens (padded to multiple of 4).
+        H: Hidden dimension size.
+        E_L: Number of local experts.
+        I: Intermediate dimension size.
+        weight_dtype: Expert weight dtype (e.g., nl.float8_e4m3fn_x4).
+        input_dtype: Input/activation dtype (e.g., nl.bfloat16).
+
+    Returns:
+        True if the estimated SBUF footprint exceeds capacity and SHARD_T is needed.
+    """
+    pmax = nl.tile_size.pmax
+    H_free = H // pmax
+    input_bytes = _dtype_size(input_dtype)
+    # STATIC_MX requires trn3 (MX matmul engine), so use trn3 capacity
+    sbuf_capacity = _SBUF_USABLE_PER_PARTITION["trn3"]
+
+    # Weight footprint (same as _get_tile_size)
+    n_I512 = div_ceil(I, 512)
+    n_I512_local = div_ceil(n_I512, 2)  # LNC-2 sharding
+    weight_bytes = _dtype_size(weight_dtype)
+    weight_per_part = n_I512_local * H * weight_bytes + n_I512_local * H
+
+    # bf16 input + swizzled copy (both live simultaneously during static_quantization)
+    _NUM_CONCURRENT_INPUT_BUFFERS = 2
+    input_per_part = T * H_free * input_bytes * _NUM_CONCURRENT_INPUT_BUFFERS
+
+    # Affinities (float32) + output accumulator
+    n_T128 = div_ceil(T, pmax)
+    affinities_per_part = n_T128 * E_L * _dtype_size(nl.float32)
+    output_per_part = n_T128 * H * input_bytes
+
+    total_required_mem = weight_per_part + input_per_part + affinities_per_part + output_per_part
+    return total_required_mem > sbuf_capacity

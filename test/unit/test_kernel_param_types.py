@@ -43,7 +43,7 @@ def _get_framework_ready_kernels():
 
     Uses the same logic as generate_api_report.py to identify framework-ready kernels.
     """
-    proven_names = set(proof.name for proof in HBM_SAFE_PROOF)
+    proven_names = {proof.name for proof in HBM_SAFE_PROOF}
     framework_ready = get_nki_framework_kernels(proven_names)
 
     result = []

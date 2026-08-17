@@ -20,9 +20,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-from typing_extensions import override
-
-from nkilib_src.nkilib.core.qkv.qkv import qkv
 from nkilib_src.nkilib.core.qkv.qkv_tkg import qkv_tkg
 from nkilib_src.nkilib.core.qkv.qkv_torch import qkv_torch_ref
 from nkilib_src.nkilib.core.subkernels.layernorm_tkg import (
@@ -41,7 +38,8 @@ from nkilib_src.nkilib.core.utils.common_types import (
 )
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib_src.nkilib.core.utils.logging import Logger
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+from typing_extensions import override
+
 from test.integration.nkilib.core.qkv.test_qkv_common import build_qkv_input, run_qkv_test
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
@@ -149,6 +147,10 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     # --- Strided Input / Output (unused, accepted for signature match with qkv / qkv_torch_ref)
     strided_input_config=None,
     output_hbm: Optional[nl.ndarray] = None,
+    # --- Squared-sum outputs (unused here; accepted for signature match with qkv / qkv_torch_ref)
+    q_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
+    k_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
+    v_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
     # Signature parity with qkv_torch_ref; unused in wrapper (qkv_tkg is dtype-passing).
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001
 ) -> nl.ndarray:
@@ -199,15 +201,14 @@ def qkv_tkg_sb2sb_wrapper_kernel(
         name="hidden_sb",
     )
     input_view = (
-        TensorView(hidden)
-        .flatten_dims(start_dim=0, end_dim=1)  # (BxS, H)
+        hidden.flatten_dims(start_dim=0, end_dim=1)  # (BxS, H)
         .reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])  # (BxS, num_shards, H0, H1_shard)
         .permute(dims=[2, 0, 1, 3])  # (H0, BxS, num_shards, H1_shard)
     )
-    dst_view = TensorView(hidden_sb).reshape_dim(dim=2, shape=[num_shards, H1_shard])  # (H0, BxS, num_shards, H1_shard)
+    dst_view = hidden_sb.reshape_dim(dim=2, shape=[num_shards, H1_shard])  # (H0, BxS, num_shards, H1_shard)
     nisa.dma_copy(
-        dst=dst_view.get_view(),
-        src=input_view.get_view(),
+        dst=dst_view,
+        src=input_view,
     )
 
     output_sb = qkv_tkg(
@@ -925,106 +926,6 @@ class TestQkvTkgKernel:
             d_head=d_head,
         )
 
-    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    def test_qkv_tkg_static_mxfp_uint32_input_repro(
-        self,
-        test_manager: Orchestrator,
-        platform_target: Platforms,
-    ):
-        """STATIC_MX QKV TKG accepts uint32-typed weight HBM operand.
-
-        Companion to ``test_qkv_cte_mxfp8_static_dequant_uint32_input_repro``
-        in ``test_qkv_cte.py``. Same motivation: ``vllm-neuron`` parameter-
-        stores the x4-packed FP8 weights as ``torch.uint32`` (the only
-        torch dtype that matches the byte width of
-        ``nl.float8_e4m3fn_x4`` — torch has no native MXFP dtype). When
-        torch-XLA lowers the parameter, the MLIR memref operand is
-        ``memref<...xui32>``. HWDGE ``nisa.dma_copy`` requires source and
-        destination memref element types to match, so the kernel allocates
-        the weight SBUF tile using the source HBM dtype and exposes a
-        view-cast alias to ``nl.float8_e4m3fn_x4`` for the downstream
-        ``nc_matmul_mx`` consumer (mirrors the QKV CTE fix).
-
-        This test guards the TKG path: the byte layout is identical to
-        the canonical ``test_qkv_tkg_static_mxfp_unit`` STATIC_MX inputs
-        (built via ``build_qkv_input`` with native ``nl.float8_e4m3fn_x4``
-        dtype), but the weight dtype label is flipped to ``np.uint32``.
-        Numerical accuracy must match within the same tolerances.
-        """
-        if not platform_target.is_trn3():
-            pytest.skip("MX Quantization is only supported on TRN3.")
-
-        # Smallest STATIC_MX TKG config from ``qkv_tkg_kernel_static_mxfp_test_perms``.
-        # ``B*S=12`` satisfies the kernel's ``BxS % 4 == 0`` MXFP requirement,
-        # and ``H=512`` satisfies ``H % 512 == 0``.
-        lnc_degree = 2
-        B, S, H = 12, 1, 512
-        n_q_heads, n_kv_heads, d_head = 2, 1, 128
-        fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
-        norm_type = NormType.NO_NORM
-
-        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
-
-        # Build canonical STATIC_MX inputs (weights pre-packed as
-        # ``nl.float8_e4m3fn_x4``, MX_CONTIGUOUS layout, scalar input/weight
-        # scales).
-        kernel_input = build_qkv_input(
-            batch=B,
-            seqlen=S,
-            hidden_dim=H,
-            fused_qkv_dim=fused_qkv_dim,
-            dtype=nl.bfloat16,
-            d_head=d_head,
-            eps=1e-6,
-            norm_type=norm_type,
-            quantization_type=QuantizationType.STATIC_MX,
-            fused_add=False,
-            output_layout=QKVOutputLayout.BSD,
-            lnc_degree=lnc_degree,
-            num_q_heads=n_q_heads,
-            num_kv_heads=n_kv_heads,
-            is_h_dim_4h_transposed=True,
-        )
-        kernel_input["is_h_dim_4h_transposed"] = True
-
-        # ── The line that differs from the canonical TKG STATIC_MX test ──
-        # Same byte layout (already packed by ``build_qkv_input`` as
-        # ``nl.float8_e4m3fn_x4``), but flip the dtype label to
-        # ``np.uint32``. Both dtypes are 4 bytes per element so a numpy
-        # ``.view(np.uint32)`` only relabels the type tag; no byte
-        # rearrangement. This mimics what torch-XLA produces when lowering
-        # a ``torch.uint32`` nn.Parameter (the path vllm-neuron is forced
-        # to take because torch has no ``float8_e4m3fn_x4`` dtype).
-        kernel_input["fused_qkv_weights"] = kernel_input["fused_qkv_weights"].view(np.uint32)
-        # ─────────────────────────────────────────────────────────────────
-
-        def input_generator(test_config):
-            return kernel_input
-
-        def output_tensor_descriptor(_kernel_input):
-            return {"out": np.zeros((B, S, fused_qkv_dim), dtype=nl.bfloat16)}
-
-        framework = UnitTestFramework(
-            test_manager=test_manager,
-            kernel_entry=qkv,
-            torch_ref=torch_ref_wrapper(qkv_torch_ref),
-            kernel_input_generator=input_generator,
-            output_tensor_descriptor=output_tensor_descriptor,
-            check_unused_params=True,
-        )
-
-        # After the kernel patch (alloc SBUF as alt-dtype + matmul-side
-        # view-cast alias), the TKG kernel should accept ``nl.uint32`` weight
-        # HBM input and produce numerically equivalent output to the
-        # canonical ``test_qkv_tkg_static_mxfp_unit`` STATIC_MX path.
-        framework.run_test(
-            test_config=None,
-            compiler_args=compiler_args,
-            rtol=4e-2,
-            atol=1e-5,
-            inference_args=TKG_INFERENCE_ARGS,
-        )
-
     # fmt: off
     qkv_tkg_kernel_row_mxfp_test_params = \
         "lnc_degree, batch, seqlen, hidden_dim, hidden_actual, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type, quantization_type, is_h_dim_4h_transposed, fused_add, norm_bias, qkv_bias, eps, output_layout"
@@ -1137,12 +1038,12 @@ class TestQkvTkgKernel:
     ):
         # Pre-existing kernel bug: fused_hidden output is incorrect when
         # fused_add=True + NO_NORM + STATIC quantization.
-        # Tracked in https://aws-neuron.atlassian.net/browse/NKILIB-561
+        # Tracked in NKILIB-561
         if fused_add and norm_type is NormType.NO_NORM and quantization_type is QuantizationType.STATIC:
             pytest.xfail("Known kernel bug: fused_hidden accuracy with fused_add+NO_NORM+STATIC quantization")
 
         # Pre-existing hardware non-determinism on large hidden_dim=32768 with LAYER_NORM + STATIC quantization.
-        # Tracked in https://aws-neuron.atlassian.net/browse/NKILIB-849
+        # Tracked in NKILIB-849
         if H == 32768 and norm_type is NormType.LAYER_NORM and quantization_type is QuantizationType.STATIC:
             pytest.xfail("Hardware non-determinism on large hidden_dim=32768 with LAYER_NORM+STATIC (NKILIB-849)")
 
@@ -1172,20 +1073,20 @@ class TestQkvTkgKernel:
     # FP8 quant mode canary for QKV TKG.
     # Tests NON_OCP, OCP, AUTO across STATIC and ROW.
     ####################################################################################################################
-    _QKV_TKG_BY_DTYPE_MODE_CONFIG = dict(
-        B=1,
-        H=8192,
-        S=1,
-        dtype=nl.bfloat16,
-        eps=1e-6,
-        fused_add=False,
-        lnc_degree=2,
-        norm_type=NormType.RMS_NORM,
-        output_layout=QKVOutputLayout.BSD,
-        n_q_heads=8,
-        n_kv_heads=1,
-        d_head=128,
-    )
+    _QKV_TKG_BY_DTYPE_MODE_CONFIG = {
+        "B": 1,
+        "H": 8192,
+        "S": 1,
+        "dtype": nl.bfloat16,
+        "eps": 1e-6,
+        "fused_add": False,
+        "lnc_degree": 2,
+        "norm_type": NormType.RMS_NORM,
+        "output_layout": QKVOutputLayout.BSD,
+        "n_q_heads": 8,
+        "n_kv_heads": 1,
+        "d_head": 128,
+    }
 
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
     @pytest.mark.parametrize(

@@ -30,9 +30,45 @@ import nki.isa as nisa
 import nki.language as nl
 from nki.collectives import ReplicaGroup
 
+from ...core.attention.attention_tkg import _s_active_bqh_tile_transpose_broadcast
 from ...core.utils.allocator import SbufManager
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.tensor_view import TensorView
+from ...core.utils.kernel_helpers import div_ceil
+
+
+class CPCollectiveMode(Enum):
+    """Collective operation mode for CP output redistribution.
+
+    ALL_TO_ALL: all_to_all on heads + local sum (default, requires ≥4 ranks lnc2 or ≥8 ranks lnc1)
+    REDUCE_SCATTER: reduce_scatter on heads (sum + head slice in one collective)
+    """
+
+    ALL_TO_ALL = 0
+    REDUCE_SCATTER = 1
+
+
+class _BroadcastParams(nl.NKIObject):
+    """Lightweight stand-in for atp fields used by _s_active_bqh_tile_transpose_broadcast."""
+
+    s_active_bqh: int
+    s_active_bqh_tile: int
+    s_active_bqh_remainder: int
+    n_bsq_full_tiles: int
+    n_bsq_tiles: int
+
+    @staticmethod
+    def from_bqs(bqs, p_max):
+        remainder = bqs % p_max
+        n_full = bqs // p_max
+        n_tiles = n_full + (remainder > 0)
+        tile_size = p_max if n_tiles > 1 else bqs
+        return _BroadcastParams(
+            s_active_bqh=bqs,
+            s_active_bqh_tile=tile_size,
+            s_active_bqh_remainder=remainder,
+            n_bsq_full_tiles=n_full,
+            n_bsq_tiles=n_tiles,
+        )
 
 
 class KVDPCollectiveMode(Enum):
@@ -47,9 +83,9 @@ class KVDPCollectiveMode(Enum):
 
 
 def _KVDP_attention_input_collectives(
-    Q_tkg_sb: nl.ndarray,
-    K_tkg_sb: nl.ndarray,
-    V_tkg_hbm: nl.ndarray,
+    Q_tkg_sb: nl.NkiTensor,
+    K_tkg_sb: nl.NkiTensor,
+    V_tkg_hbm: nl.NkiTensor,
     q_heads: int,
     kv_heads: int,
     d_head: int,
@@ -60,7 +96,7 @@ def _KVDP_attention_input_collectives(
     replica_group: ReplicaGroup,
     sbm: SbufManager,
     collective_mode: KVDPCollectiveMode,
-    dynamic_KVDP_rank_sb: nl.ndarray,
+    dynamic_KVDP_rank_sb: nl.NkiTensor,
 ):
     """Input collectives for KV data parallelism.
 
@@ -79,9 +115,9 @@ def _KVDP_attention_input_collectives(
         - Each rank now has 8 Q heads for 2 batches for 1 K head (TP8)
 
     Args:
-        Q_tkg_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF - Q after RoPE
-        K_tkg_sb (nl.ndarray): [d_head, B * S_tkg] @ SBUF - K after RoPE
-        V_tkg_hbm (nl.ndarray): [B, kv_heads=1, S_tkg, d_head] @ HBM - V from QKV extraction
+        Q_tkg_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF - Q after RoPE
+        K_tkg_sb (nl.NkiTensor): [d_head, B * S_tkg] @ SBUF - K after RoPE
+        V_tkg_hbm (nl.NkiTensor): [B, kv_heads=1, S_tkg, d_head] @ HBM - V from QKV extraction
         q_heads (int): Number of query heads per rank (before gather)
         kv_heads (int): Number of KV heads
         d_head (int): Head dimension
@@ -91,12 +127,12 @@ def _KVDP_attention_input_collectives(
         S_tkg (int): Token generation sequence length
         replica_group (ReplicaGroup): Replica group for collective ops
         sbm: SBUF memory manager
-        dynamic_KVDP_rank_sb (nl.ndarray): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
 
     Returns:
-        Q_tkg_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - gathered Q
-        K_tkg_sb (nl.ndarray): [d_head, B_attn * S_tkg] @ SBUF - sliced K
-        V_tkg_hbm (nl.ndarray): [B_attn, kv_heads, S_tkg, d_head] @ HBM - sliced V for attention_tkg
+        Q_tkg_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - gathered Q
+        K_tkg_sb (nl.NkiTensor): [d_head, B_attn * S_tkg] @ SBUF - sliced K
+        V_tkg_hbm (nl.NkiTensor): [B_attn, kv_heads, S_tkg, d_head] @ HBM - sliced V for attention_tkg
 
     Notes:
         - V is returned in HBM because attention_tkg loads V tile-by-tile during P*V matmul
@@ -112,8 +148,8 @@ def _KVDP_attention_input_collectives(
         f"Q_tkg_sb shape mismatch: {Q_tkg_sb.shape} != {(d_head, B * q_heads * S_tkg)}",
     )
     kernel_assert(
-        K_tkg_sb.shape == (d_head, B * S_tkg),
-        f"K_tkg_sb shape mismatch: {K_tkg_sb.shape} != {(d_head, B * S_tkg)}",
+        K_tkg_sb.shape == (d_head, B * kv_heads * S_tkg),
+        f"K_tkg_sb shape mismatch: {K_tkg_sb.shape} != {(d_head, B * kv_heads * S_tkg)}",
     )
     kernel_assert(
         V_tkg_hbm.shape == (B, kv_heads, S_tkg, d_head),
@@ -153,30 +189,30 @@ def _KVDP_attention_input_collectives(
     # ========== K: slice batch ==========
     # Compiler restriction (NCC_ILDM008): dynamic-AP DMA can only access DRAM, so route
     # through HBM. Stage K to HBM once, then do a single dynamic-AP DMA from the strided
-    # HBM view directly into SBUF
-    K_full = nl.ndarray((d_head, B * S_tkg), dtype=kv_dtype, buffer=nl.shared_hbm, name="K_full")
+    # HBM view directly into SBUF.
+    K_full = nl.ndarray((d_head, B * kv_heads * S_tkg), dtype=kv_dtype, buffer=nl.shared_hbm, name="K_full")
     nisa.dma_copy(K_full, K_tkg_sb)
 
-    K_full_view = TensorView(K_full.reshape((d_head, KVDP, B_attn * S_tkg))).select(dim=1, index=dynamic_KVDP_rank_sb)
-    K_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * S_tkg), dtype=kv_dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=K_tkg_sb_out, src=K_full_view.get_view())
+    K_full_view = (K_full.reshape((d_head, KVDP, B_attn * kv_heads * S_tkg))).select(dim=1, index=dynamic_KVDP_rank_sb)
+    K_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * kv_heads * S_tkg), dtype=kv_dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=K_tkg_sb_out, src=K_full_view)
 
     # ========== V: slice batch ==========
     # (B, kv_heads=1, S_tkg, d_head) -> (KVDP, B_attn, kv_heads=1, S_tkg, d_head) -> select -> (B_attn, kv_heads=1, S_tkg, d_head)
-    V_tkg_hbm_batch_slice_view = TensorView(V_tkg_hbm.reshape((KVDP, B_attn, kv_heads, S_tkg, d_head))).select(
+    V_tkg_hbm_batch_slice_view = (V_tkg_hbm.reshape((KVDP, B_attn, kv_heads, S_tkg, d_head))).select(
         dim=0, index=dynamic_KVDP_rank_sb
     )
     V_tkg_hbm_out = nl.ndarray(
         V_tkg_hbm_batch_slice_view.shape, dtype=kv_dtype, buffer=nl.shared_hbm, name="V_tkg_hbm_out"
     )
-    nisa.dma_copy(dst=V_tkg_hbm_out, src=V_tkg_hbm_batch_slice_view.get_view())
+    nisa.dma_copy(dst=V_tkg_hbm_out, src=V_tkg_hbm_batch_slice_view)
 
     return Q_tkg_sb_out, K_tkg_sb_out, V_tkg_hbm_out
 
 
 def _KVDP_attention_output_collectives(
-    attn_sb: nl.ndarray,
-    V_tkg_hbm: nl.ndarray,
+    attn_sb: nl.NkiTensor,
+    V_tkg_hbm: nl.NkiTensor,
     KVDP: int,
     B_attn: int,
     q_heads: int,
@@ -185,7 +221,7 @@ def _KVDP_attention_output_collectives(
     replica_group: ReplicaGroup,
     sbm: SbufManager,
     collective_mode: KVDPCollectiveMode,
-    dynamic_KVDP_rank_sb: nl.ndarray,
+    dynamic_KVDP_rank_sb: nl.NkiTensor,
 ):
     """Output collectives for KV data parallelism.
 
@@ -199,8 +235,8 @@ def _KVDP_attention_output_collectives(
 
     Args:
 
-        attn_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - attention output
-        V_tkg_hbm (nl.ndarray): [B_attn, kv_heads=1, S_tkg, d_head] @ HBM - V for this rank's batch slice
+        attn_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - attention output
+        V_tkg_hbm (nl.NkiTensor): [B_attn, kv_heads=1, S_tkg, d_head] @ HBM - V for this rank's batch slice
         KVDP (int): KV data parallelism degree (number of ranks)
         B_attn (int): Batch size per rank for attention (B / KVDP)
         q_heads (int): Number of query heads per rank (after slice)
@@ -208,12 +244,13 @@ def _KVDP_attention_output_collectives(
         S_tkg (int): Token generation sequence length
         replica_group (ReplicaGroup): Replica group for collective ops
         sbm: SBUF memory manager
-        dynamic_KVDP_rank_sb (nl.ndarray): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
             Unused when collective_mode is ALL_TO_ALL.
 
     Returns:
-        attn_out (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF - gathered attention output
-        V_tkg_sb (nl.ndarray): [B_attn * S_tkg, d_head] @ SBUF - V for KV cache update
+        attn_out (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF - gathered attention output
+        V_tkg_sb (nl.NkiTensor | None): [B_attn * S_tkg, d_head] @ SBUF - V for KV cache update.
+            None when B_attn * kv_heads * S_tkg > pmax (V stays in HBM; cache update uses V_tkg_hbm).
 
     Notes:
         - V is copied back to SBUF for KV cache update which requires SBUF input
@@ -259,11 +296,10 @@ def _KVDP_attention_output_collectives(
         )
 
     # ========== V: copy from HBM to SBUF for KV cache update ==========
-    # When B_attn*S_tkg > pmax, V stays on HBM (cache update handles this via V_tkg_hbm)
-    if B_attn * S_tkg <= nl.tile_size.pmax:
-        V_tkg_sb = nl.ndarray((B_attn * S_tkg, d_head), dtype=V_tkg_hbm.dtype, buffer=nl.sbuf)
-        kernel_assert(kv_heads == 1, f"kv_heads must be 1 for V reshape, got {kv_heads}")
-        nisa.dma_copy(V_tkg_sb, V_tkg_hbm.reshape((B_attn * S_tkg, d_head)))
+    # When B_attn*kv_heads*S_tkg > pmax, V stays on HBM (cache update handles this via V_tkg_hbm).
+    if B_attn * kv_heads * S_tkg <= nl.tile_size.pmax:
+        V_tkg_sb = nl.ndarray((B_attn * kv_heads * S_tkg, d_head), dtype=V_tkg_hbm.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(V_tkg_sb, V_tkg_hbm.reshape((B_attn * kv_heads * S_tkg, d_head)))
     else:
         V_tkg_sb = None
 
@@ -294,10 +330,10 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
     dma_copy to HBM, dma_copy rearrange in HBM, all_to_all, dma_copy rearrange to SBUF.
 
     Args:
-        Q_tkg_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
+        Q_tkg_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
 
     Returns:
-        Q_tkg_sb_out (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        Q_tkg_sb_out (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -312,10 +348,8 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
         # Rearrange: (d, B, q, S) -> (d, KVDP, q, B_attn, S)
         # tensor_copy materializes the rearranged view into contiguous SBUF memory for nc_transpose
         Q_tkg_sb_rearranged = nl.ndarray((d_head, q_heads * B * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        Q_tkg_sb_view = TensorView(Q_tkg_sb.reshape((d_head, KVDP, B_attn, q_heads, S_tkg))).rearrange(
-            ("d", "KVDP", "B", "n", "S"), ("d", "KVDP", "n", "B", "S"), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view.get_view())
+        Q_tkg_sb_view = Q_tkg_sb.reshape((d_head, KVDP, B_attn, q_heads, S_tkg)).permute((0, 1, 3, 2, 4))
+        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view)
         # Tiled transpose + dma_copy: (d, KVDP*q*B_attn*S) -> (KVDP*q*B_attn*S, d) -> HBM
         tile_sz = nl.tile_size.pmax
         Q_src_hbm_flat = Q_src_hbm.reshape((nBS, d_head))
@@ -330,11 +364,7 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
 
     # Step 3: dma_copy SBUF -> HBM (q_heads == 1 only; q>1 fused in tiled loop above)
     if q_heads == 1:
-        Q_src_hbm_view = (
-            TensorView(Q_src_hbm.reshape((KVDP, d_head, B_attn * S_tkg)))
-            .rearrange(("KVDP", "d", "B"), ("d", "KVDP", "B"), {})
-            .get_view()
-        )
+        Q_src_hbm_view = Q_src_hbm.reshape((KVDP, d_head, B_attn * S_tkg)).permute((1, 0, 2))
         nisa.dma_copy(Q_src_hbm_view, Q_tkg_sb.reshape((d_head, KVDP, B_attn * S_tkg)))
 
     # Step 4: all_to_all
@@ -347,18 +377,10 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
         # B_attn is innermost-contiguous on both sides, then rearrange in SBUF to
         # the (d, B_attn, q_attn, S) layout the downstream kernel expects.
         Q_tkg_sb_qBS = sbm.alloc_stack((d_head, nBS), dtype=dtype, buffer=nl.sbuf)
-        Q_hbm_native = (
-            TensorView(Q_dst_hbm.reshape((q_heads_attn, d_head, B_attn, S_tkg)))
-            .rearrange(("n", "d", "B", "S"), ("d", "n", "B", "S"), {})
-            .get_view()
-        )
+        Q_hbm_native = Q_dst_hbm.reshape((q_heads_attn, d_head, B_attn, S_tkg)).permute((1, 0, 2, 3))
         nisa.dma_copy(Q_tkg_sb_qBS.reshape((d_head, q_heads_attn, B_attn, S_tkg)), Q_hbm_native)
 
-        Q_sbuf_rearranged = (
-            TensorView(Q_tkg_sb_qBS.reshape((d_head, q_heads_attn, B_attn, S_tkg)))
-            .rearrange(("d", "n", "B", "S"), ("d", "B", "n", "S"), {})
-            .get_view()
-        )
+        Q_sbuf_rearranged = Q_tkg_sb_qBS.reshape((d_head, q_heads_attn, B_attn, S_tkg)).permute((0, 2, 1, 3))
         nisa.tensor_copy(Q_tkg_sb_out, Q_sbuf_rearranged)
     else:
         # Step 6-7: dma_copy + tiled transpose + rearrange (q_heads > 1)
@@ -373,10 +395,8 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
             nisa.nc_transpose(Q_psum, Q_tile_sb)
             nisa.tensor_copy(Q_transposed[:, nl.ds(t_start, t_size)], Q_psum)
         # Rearrange: (d, q_attn, B_attn, S) -> (d, B_attn, q_attn, S)
-        Q_view = TensorView(Q_transposed.reshape((d_head, q_heads_attn, B_attn, S_tkg))).rearrange(
-            ('d', 'n', 'B', 'S'), ('d', 'B', 'n', 'S'), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_out, Q_view.get_view())
+        Q_view = Q_transposed.reshape((d_head, q_heads_attn, B_attn, S_tkg)).permute((0, 2, 1, 3))
+        nisa.tensor_copy(Q_tkg_sb_out, Q_view)
 
     return Q_tkg_sb_out
 
@@ -405,11 +425,11 @@ def _KVDP_Q_input_all_gather_slice(
     dma_copy to HBM, all_gather on d dim, dma_copy KVDP_rank slice, dma_copy rearrange to SBUF.
 
     Args:
-        Q_tkg_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
-        dynamic_KVDP_rank_sb (nl.ndarray): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
+        Q_tkg_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
 
     Returns:
-        Q_tkg_sb_out (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        Q_tkg_sb_out (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -428,12 +448,12 @@ def _KVDP_Q_input_all_gather_slice(
         # (q_heads_attn, d_head, KVDP, B_attn, S_tkg) -> select(dim=2) -> (q_heads_attn, d_head, B_attn, S_tkg)
         #                                                                  -> rearrange -> (d_head, B_attn, q_heads_attn, S_tkg)
         Q_gathered_view = (
-            TensorView(Q_gathered_hbm.reshape((q_heads_attn, d_head, KVDP, B_attn, S_tkg)))
+            (Q_gathered_hbm.reshape((q_heads_attn, d_head, KVDP, B_attn, S_tkg)))
             .select(dim=2, index=dynamic_KVDP_rank_sb)
-            .rearrange(("n", "d", "B", "S"), ("d", "B", "n", "S"), {})
+            .permute((1, 2, 0, 3))
         )
         Q_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        nisa.dma_copy(Q_tkg_sb_out.reshape((d_head, B_attn, q_heads_attn, S_tkg)), Q_gathered_view.get_view())
+        nisa.dma_copy(Q_tkg_sb_out.reshape((d_head, B_attn, q_heads_attn, S_tkg)), Q_gathered_view)
     else:
         # General path: transpose to get q_heads on dim=0 for all_gather
         # Transpose Q to HBM: (d_head, B*q_heads*S) -> (q_heads, B, S_tkg, d_head)
@@ -442,10 +462,8 @@ def _KVDP_Q_input_all_gather_slice(
         # Rearrange q_heads to first dim of free dim before transpose:
         #   (d_head, B, q_heads, S) -> (d_head, q_heads, B, S)
         Q_tkg_sb_rearranged = nl.ndarray((d_head, q_heads * B * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        Q_tkg_sb_view = TensorView(Q_tkg_sb.reshape((d_head, B, q_heads, S_tkg))).rearrange(
-            ("d", "B", "n", "S"), ("d", "n", "B", "S"), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view.get_view())
+        Q_tkg_sb_view = Q_tkg_sb.reshape((d_head, B, q_heads, S_tkg)).permute((0, 2, 1, 3))
+        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view)
         # Tiled transpose + dma_copy: (d_head, q_heads*B*S) -> (q_heads*B*S, d_head) -> HBM
         tile_sz = nl.tile_size.pmax
         Q_hbm = nl.ndarray((q_heads, B, S_tkg, d_head), dtype=dtype, buffer=nl.shared_hbm, name="Q_hbm")
@@ -484,13 +502,13 @@ def _KVDP_Q_input_all_gather_slice(
         # We can't flatten this non-contiguous view to 2D for SBUF load.
         # Additionally, dynamic DMA requires src/dst to have same number of dimensions (4D view -> 2D SBUF fails).
         # The DMA to Q_sliced_hbm materializes the slice into contiguous memory, enabling the reshape in step 5.
-        Q_gathered_hbm_batch_slice_view = TensorView(
-            Q_gathered_hbm.reshape((q_heads_attn, KVDP, B_attn, S_tkg, d_head))
-        ).select(dim=1, index=dynamic_KVDP_rank_sb)
+        Q_gathered_hbm_batch_slice_view = (Q_gathered_hbm.reshape((q_heads_attn, KVDP, B_attn, S_tkg, d_head))).select(
+            dim=1, index=dynamic_KVDP_rank_sb
+        )
         Q_sliced_hbm = nl.ndarray(
             Q_gathered_hbm_batch_slice_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="Q_sliced_hbm"
         )
-        nisa.dma_copy(dst=Q_sliced_hbm, src=Q_gathered_hbm_batch_slice_view.get_view())
+        nisa.dma_copy(dst=Q_sliced_hbm, src=Q_gathered_hbm_batch_slice_view)
 
         # dma_copy + tiled transpose: (q_heads_attn, B_attn, S_tkg, d_head) -> (d_head, B_attn*q_heads_attn*S_tkg)
         tile_sz = nl.tile_size.pmax
@@ -506,10 +524,8 @@ def _KVDP_Q_input_all_gather_slice(
             nisa.tensor_copy(Q_tkg_sb_out[:, nl.ds(t_start, t_size)], Q_psum)
         # Rearrange: (d_head, q_heads_attn, B_attn, S_tkg) -> (d_head, B_attn, q_heads_attn, S_tkg)
         Q_tkg_sb_rearranged_out = sbm.alloc_stack((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        Q_out_view = TensorView(Q_tkg_sb_out.reshape((d_head, q_heads_attn, B_attn, S_tkg))).rearrange(
-            ('d', 'n', 'B', 'S'), ('d', 'B', 'n', 'S'), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_rearranged_out, Q_out_view.get_view())
+        Q_out_view = Q_tkg_sb_out.reshape((d_head, q_heads_attn, B_attn, S_tkg)).permute((0, 2, 1, 3))
+        nisa.tensor_copy(Q_tkg_sb_rearranged_out, Q_out_view)
         Q_tkg_sb_out = Q_tkg_sb_rearranged_out
 
     return Q_tkg_sb_out
@@ -529,10 +545,10 @@ def _KVDP_attn_output_all_to_all(attn_sb, q_heads, d_head, KVDP, B_attn, S_tkg, 
         7. tensor_copy rearrange: (d, KVDP, q, B_attn, S) @SBUF -> (d, B, q, S) @SBUF
 
     Args:
-        attn_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        attn_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
 
     Returns:
-        attn_final_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
+        attn_final_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -542,10 +558,8 @@ def _KVDP_attn_output_all_to_all(attn_sb, q_heads, d_head, KVDP, B_attn, S_tkg, 
     kernel_assert(KVDP >= 4, f"ALL_TO_ALL requires KVDP >= 4, got {KVDP}")
     # Rearrange in SBUF: (d, B_attn, q_heads_attn, S) -> (d, q_heads_attn, B_attn, S)
     attn_sb_rearranged = nl.ndarray((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
-    attn_sb_view = TensorView(attn_sb.reshape((d_head, B_attn, q_heads_attn, S_tkg))).rearrange(
-        ("d", "B", "n", "S"), ("d", "n", "B", "S"), {}
-    )
-    nisa.tensor_copy(attn_sb_rearranged, attn_sb_view.get_view())
+    attn_sb_view = attn_sb.reshape((d_head, B_attn, q_heads_attn, S_tkg)).permute((0, 2, 1, 3))
+    nisa.tensor_copy(attn_sb_rearranged, attn_sb_view)
 
     # Tiled transpose + dma_copy to HBM: (d, q_attn*B_attn*S) -> (q_attn*B_attn*S, d) -> HBM
     tile_sz = nl.tile_size.pmax
@@ -576,10 +590,8 @@ def _KVDP_attn_output_all_to_all(attn_sb, q_heads, d_head, KVDP, B_attn, S_tkg, 
 
     # Rearrange: (d, KVDP, q_heads, B_attn, S) -> (d, KVDP, B_attn, q_heads, S) = (d, B, q_heads, S)
     attn_final_sb = nl.ndarray((d_head, nBS), dtype=dtype, buffer=nl.sbuf)
-    attn_view = TensorView(attn_transposed_back.reshape((d_head, KVDP, q_heads, B_attn, S_tkg))).rearrange(
-        ('d', 'KVDP', 'n', 'B', 'S'), ('d', 'KVDP', 'B', 'n', 'S'), {}
-    )
-    nisa.tensor_copy(attn_final_sb, attn_view.get_view())
+    attn_view = attn_transposed_back.reshape((d_head, KVDP, q_heads, B_attn, S_tkg)).permute((0, 1, 3, 2, 4))
+    nisa.tensor_copy(attn_final_sb, attn_view)
     return attn_final_sb
 
 
@@ -606,11 +618,11 @@ def _KVDP_attn_output_all_gather_slice(
         6. Tiled nc_transpose: (B, q, d, S) @SBUF -> (d, B*q*S) @SBUF
 
     Args:
-        attn_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
-        dynamic_KVDP_rank_sb (nl.ndarray): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
+        attn_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
 
     Returns:
-        attn_final_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
+        attn_final_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -637,11 +649,11 @@ def _KVDP_attn_output_all_gather_slice(
     ncc.all_gather(dsts=[attn_gathered], srcs=[attn_hbm], replica_group=replica_group, collective_dim=0)
 
     # Slice heads with dynamic_KVDP_rank_sb
-    attn_gathered_head_slice_view = TensorView(attn_gathered.reshape((B, KVDP, q_heads, d_head, S_tkg))).select(
+    attn_gathered_head_slice_view = (attn_gathered.reshape((B, KVDP, q_heads, d_head, S_tkg))).select(
         dim=1, index=dynamic_KVDP_rank_sb
     )
     attn_sliced = nl.ndarray(attn_gathered_head_slice_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="attn_sliced")
-    nisa.dma_copy(dst=attn_sliced, src=attn_gathered_head_slice_view.get_view())
+    nisa.dma_copy(dst=attn_sliced, src=attn_gathered_head_slice_view)
 
     # dma_copy + tiled transpose back to SBUF: (B*q*S, d) -> (d, B*q*S)
     attn_final_sb = sbm.alloc_stack((d_head, nBS), dtype=dtype, buffer=nl.sbuf)
@@ -653,4 +665,552 @@ def _KVDP_attn_output_all_gather_slice(
         psum = nl.ndarray((d_head, t_size), dtype=dtype, buffer=nl.psum)
         nisa.nc_transpose(psum, attn_tile)
         nisa.tensor_copy(attn_final_sb[:, nl.ds(t_start, t_size)], psum)
+
+    return attn_final_sb
+
+
+# ========== Context Parallelism (CP) helpers ==========
+# CP partitions the KV cache across ranks along the sequence dimension. Each rank holds
+# s_prior/CP of the KV cache for all batches. Before attention: all_gather Q heads.
+# After attention: all_gather softmax stats, apply correction, then redistribute output
+# (all_to_all + local sum, or reduce_scatter) and slice heads.
+
+
+def _CP_attention_input_collectives(
+    Q_tkg_sb: nl.ndarray,
+    q_heads: int,
+    d_head: int,
+    CP: int,
+    B: int,
+    S_tkg: int,
+    replica_group: ReplicaGroup,
+    sbm,
+):
+    """Input collectives for context parallelism.
+
+    Gathers Q heads across CP ranks. K/V are not modified — each rank already has its
+    local s_prior/CP shard.
+
+    Args:
+        Q_tkg_sb: [d_head, B * q_heads * S_tkg] @ SBUF
+        q_heads: Number of query heads per rank (before gather)
+        d_head: Head dimension
+        CP: Context parallelism degree
+        B: Batch size
+        S_tkg: Token generation sequence length
+        replica_group: Replica group for collective ops
+        sbm: SBUF memory manager
+
+    Returns:
+        Q_tkg_sb: [d_head, B * q_heads * CP * S_tkg] @ SBUF - gathered Q
+    """
+    dtype = Q_tkg_sb.dtype
+    q_heads_attn = q_heads * CP
+
+    kernel_assert(
+        Q_tkg_sb.shape == (d_head, B * q_heads * S_tkg),
+        f"Q_tkg_sb shape mismatch: {Q_tkg_sb.shape} != {(d_head, B * q_heads * S_tkg)}",
+    )
+
+    if q_heads == 1:
+        # Optimized path: no transpose needed, all_gather on d_head dim
+        Q_hbm = nl.ndarray((d_head, B * S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="Q_hbm_cp")
+        nisa.dma_copy(Q_hbm, Q_tkg_sb)
+        Q_gathered_hbm = nl.ndarray(
+            (q_heads_attn * d_head, B * S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="Q_gathered_hbm_cp"
+        )
+        ncc.all_gather(dsts=[Q_gathered_hbm], srcs=[Q_hbm], replica_group=replica_group, collective_dim=0)
+
+        # Rearrange (q_heads_attn, d_head, B, S_tkg) -> (d_head, B, q_heads_attn, S_tkg) for SBUF
+        Q_tkg_sb_out = sbm.alloc_stack((d_head, B * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
+        Q_gathered_view = Q_gathered_hbm.reshape((q_heads_attn, d_head, B, S_tkg)).rearrange(
+            ("H", "d", "B", "S"), ("d", "B", "H", "S"), {}
+        )
+        nisa.dma_copy(Q_tkg_sb_out.reshape((d_head, B, q_heads_attn, S_tkg)), Q_gathered_view)
+    else:
+        # General path: transpose to get q_heads on dim=0 for all_gather
+        kernel_assert(d_head <= nl.tile_size.pmax, f"d_head must be <= {nl.tile_size.pmax}, got {d_head}")
+        kernel_assert(
+            q_heads * B * S_tkg <= nl.tile_size.psum_fmax,
+            f"q_heads * B * S_tkg must be <= {nl.tile_size.psum_fmax}, got {q_heads * B * S_tkg}",
+        )
+        # Rearrange q_heads to first dim of free dim: (d, B, H, S) -> (d, H, B, S)
+        Q_rearranged = nl.ndarray((d_head, q_heads * B * S_tkg), dtype=dtype, buffer=nl.sbuf)
+        Q_view = Q_tkg_sb.reshape((d_head, B, q_heads, S_tkg)).rearrange(("d", "B", "H", "S"), ("d", "H", "B", "S"), {})
+        nisa.tensor_copy(Q_rearranged, Q_view)
+        # Transpose: (d, H*B*S) -> (H*B*S, d)
+        Q_psum = nl.ndarray((q_heads * B * S_tkg, d_head), dtype=dtype, buffer=nl.psum)
+        nisa.nc_transpose(Q_psum, Q_rearranged)
+        Q_transposed = nl.ndarray((q_heads * B * S_tkg, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(Q_transposed, Q_psum)
+        # SBUF -> HBM for all_gather
+        Q_hbm = nl.ndarray((q_heads, B, S_tkg, d_head), dtype=dtype, buffer=nl.shared_hbm, name="Q_hbm_cp")
+        nisa.dma_copy(Q_hbm.reshape((q_heads * B * S_tkg, d_head)), Q_transposed)
+
+        # all_gather on head dim
+        Q_gathered_hbm = nl.ndarray(
+            (q_heads_attn, B, S_tkg, d_head), dtype=dtype, buffer=nl.shared_hbm, name="Q_gathered_hbm_cp"
+        )
+        ncc.all_gather(dsts=[Q_gathered_hbm], srcs=[Q_hbm], replica_group=replica_group, collective_dim=0)
+
+        # Load back to SBUF with transpose: (H*B*S, d) -> (d, B*H*S)
+        Q_tkg_sb_out = sbm.alloc_stack((d_head, B * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
+        Q_load = nl.ndarray((q_heads_attn * B * S_tkg, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.dma_copy(Q_load, Q_gathered_hbm.reshape((q_heads_attn * B * S_tkg, d_head)))
+        Q_psum2 = nl.ndarray((d_head, q_heads_attn * B * S_tkg), dtype=dtype, buffer=nl.psum)
+        nisa.nc_transpose(Q_psum2, Q_load)
+        # Rearrange (d, H, B, S) -> (d, B, H, S)
+        Q_psum_view = Q_psum2.reshape((d_head, q_heads_attn, B, S_tkg)).rearrange(
+            ('d', 'H', 'B', 'S'), ('d', 'B', 'H', 'S'), {}
+        )
+        nisa.tensor_copy(Q_tkg_sb_out, Q_psum_view)
+
+    return Q_tkg_sb_out
+
+
+def _CP_attention_output_collectives(
+    attn_sb: nl.ndarray,
+    softmax_max: nl.ndarray,
+    softmax_sum: nl.ndarray,
+    CP: int,
+    B: int,
+    q_heads: int,
+    d_head: int,
+    S_tkg: int,
+    replica_group: ReplicaGroup,
+    sbm,
+    max_negated: bool = True,
+    atp=None,
+    TC=None,
+    collective_mode: CPCollectiveMode = CPCollectiveMode.ALL_TO_ALL,
+):
+    """Output collectives for context parallelism.
+
+    Performs distributed softmax correction across CP ranks.
+
+    Both modes issue two collectives: a stats all_gather (shared by both) plus one output
+    collective. They differ only in how the scaled per-rank partials are combined.
+    - ALL_TO_ALL (default): all_gather stats, correct + scale locally, then all_to_all
+      redistributes heads across ranks, followed by a local sum over the CP chunks.
+    - REDUCE_SCATTER: all_gather stats, correct + scale locally, then reduce_scatter
+      sums across ranks and slices heads in one collective (no local sum needed).
+    Both use compact tile layout for the stats to minimize the all_gather data size.
+
+    Args:
+        attn_sb: [d_head, BQS] @ SBUF - unnormalized attention output
+        softmax_max: [s_active_bqh_tile, n_bsq_tiles] @ SBUF - softmax max
+        softmax_sum: [s_active_bqh_tile, n_bsq_tiles] @ SBUF - softmax sum
+        CP: Context parallelism degree
+        B: Batch size
+        q_heads: Number of query heads per rank (after head slice)
+        d_head: Head dimension
+        S_tkg: Token generation sequence length
+        replica_group: Replica group for collective ops
+        sbm: SBUF memory manager
+        max_negated: Whether softmax_max values are negated
+        atp: Attention tile parameters (for broadcast in REDUCE_SCATTER mode)
+        TC: Tile constants (for broadcast in REDUCE_SCATTER mode)
+        collective_mode: REDUCE_SCATTER or ALL_TO_ALL
+
+    Returns:
+        attn_out: [d_head, B * q_heads * S_tkg] @ SBUF - corrected and normalized output
+    """
+    q_heads_attn = q_heads * CP
+    dtype = attn_sb.dtype
+    BQS = B * q_heads_attn * S_tkg
+    BQS_out = B * q_heads * S_tkg
+
+    # With LNC batch sharding, each NC processes B/bs_n_prgs batches.
+    # Use atp.s_active_bqh which reflects the per-NC batch size.
+    BQS_local = atp.s_active_bqh if atp is not None else BQS
+    B_local = BQS_local // (q_heads_attn * S_tkg)
+    bs_prg_id = atp.bs_prg_id if atp is not None else 0
+
+    if collective_mode == CPCollectiveMode.ALL_TO_ALL:
+        return _cp_output_all_to_all(
+            attn_sb,
+            softmax_max,
+            softmax_sum,
+            CP,
+            B,
+            q_heads,
+            q_heads_attn,
+            d_head,
+            S_tkg,
+            BQS,
+            BQS_local,
+            BQS_out,
+            dtype,
+            replica_group,
+            sbm,
+            max_negated,
+            atp,
+            TC,
+            B_local,
+            bs_prg_id,
+        )
+
+    return _cp_output_reduce_scatter(
+        attn_sb,
+        softmax_max,
+        softmax_sum,
+        CP,
+        B,
+        q_heads,
+        q_heads_attn,
+        d_head,
+        S_tkg,
+        BQS,
+        BQS_local,
+        BQS_out,
+        dtype,
+        replica_group,
+        sbm,
+        max_negated,
+        atp,
+        TC,
+        B_local,
+        bs_prg_id,
+    )
+
+
+def _cp_gather_correct_and_scale_to_hbm(
+    attn_sb,
+    softmax_max,
+    softmax_sum,
+    CP,
+    B,
+    q_heads_attn,
+    d_head,
+    S_tkg,
+    BQS,
+    BQS_local,
+    dtype,
+    replica_group,
+    sbm,
+    max_negated,
+    atp,
+    TC,
+    B_local,
+    bs_prg_id,
+):
+    """Shared steps 1-3 for CP output: stats all_gather, correction, scale, pack to HBM.
+
+    1. All_gather softmax stats (max, sum) across CP ranks in compact tile layout.
+    2. Compute global max, correction factors, and combined scale = correction / global_sum.
+    3. Broadcast scale to (d_head, BQS_local), multiply local output, pack to shared HBM.
+
+    Returns:
+        attn_scaled_hbm: (q_heads_attn, B, d_head, S_tkg) @ shared_hbm — scaled output ready for collective.
+    """
+    stats_shape = softmax_max.shape
+    s_active_bqh_tile, n_bsq_tiles = stats_shape
+
+    # With LNC batch sharding, each NC has stats for B/2 batches.
+    # Override n_bsq_tiles and stats_shape to reflect per-NC size.
+    n_bsq_tiles_full = div_ceil(BQS, TC.p_max)
+    is_batch_sharded = BQS_local < BQS
+    if is_batch_sharded:
+        n_bsq_tiles_per_nc = div_ceil(BQS_local, TC.p_max)
+        n_bsq_tiles_full = n_bsq_tiles_per_nc * (BQS // BQS_local)  # total tiles across all NCs
+        # The kernel only filled n_bsq_tiles_per_nc tiles per NC
+        n_bsq_tiles = n_bsq_tiles_per_nc
+        stats_shape = (s_active_bqh_tile, n_bsq_tiles)
+
+    # ========== 1. Fused all_gather of stats across CP ranks (tile layout) ==========
+    # Concatenate max and sum on free dim for a single collective
+    local_stats_sb = sbm.alloc_stack((s_active_bqh_tile, 2 * n_bsq_tiles), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(local_stats_sb[:, :n_bsq_tiles], softmax_max)
+    nisa.tensor_copy(local_stats_sb[:, n_bsq_tiles:], softmax_sum)
+
+    local_stats_hbm = nl.ndarray(
+        (1, s_active_bqh_tile, 2 * n_bsq_tiles_full), dtype=nl.float32, buffer=nl.shared_hbm, name="cp_local_stats"
+    )
+    if is_batch_sharded:
+        """
+        Each NC writes only its own stats to its own offset in shared HBM.
+        NC0 writes to columns [0, n_bsq_tiles_full] and NC1 to [n_bsq_tiles, n_bsq_tiles_full+n_bsq_tiles].
+        No sendrecv needed — no overlap between NCs' write regions.
+        The all_gather synchronizes both NCs before reading.
+        """
+        own_offset = atp.bs_prg_id * n_bsq_tiles
+        nisa.dma_copy(local_stats_hbm[0, :, nl.ds(own_offset, n_bsq_tiles)], local_stats_sb[:, :n_bsq_tiles])
+        nisa.dma_copy(
+            local_stats_hbm[0, :, nl.ds(n_bsq_tiles_full + own_offset, n_bsq_tiles)], local_stats_sb[:, n_bsq_tiles:]
+        )
+    else:
+        nisa.dma_copy(local_stats_hbm[0], local_stats_sb)
+
+    all_stats_hbm = nl.ndarray(
+        (CP, s_active_bqh_tile, 2 * n_bsq_tiles_full), dtype=nl.float32, buffer=nl.shared_hbm, name="cp_all_stats"
+    )
+    ncc.all_gather(dsts=[all_stats_hbm], srcs=[local_stats_hbm], replica_group=replica_group, collective_dim=0)
+
+    # ========== 2. Compute global max and correction (tile layout) ==========
+    sbm.open_scope()
+
+    # Each NC only needs stats for its own B/2 batches from each rank.
+    # With batch sharding, the NC's tiles are at offset nc_offset in the full buffer.
+    nc_offset = atp.bs_prg_id * n_bsq_tiles if is_batch_sharded else 0
+
+    global_max_reduce_op = nl.minimum if max_negated else nl.maximum
+    global_max_sb = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(global_max_sb, all_stats_hbm[0, :, nc_offset : nc_offset + n_bsq_tiles])
+    for rank_idx in nl.static_range(1, CP):
+        rank_max = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(rank_max, all_stats_hbm[rank_idx, :, nc_offset : nc_offset + n_bsq_tiles])
+        nisa.tensor_tensor(dst=global_max_sb, data1=global_max_sb, data2=rank_max, op=global_max_reduce_op)
+
+    # Local correction: exp(local_max - global_max)
+    local_correction = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+    if max_negated:
+        nisa.tensor_tensor(dst=local_correction, data1=global_max_sb, data2=softmax_max, op=nl.subtract)
+    else:
+        nisa.tensor_tensor(dst=local_correction, data1=softmax_max, data2=global_max_sb, op=nl.subtract)
+    nisa.activation(dst=local_correction, op=nl.exp, data=local_correction, scale=1.0)
+
+    """
+    Global sum = sum_i(local_sum_i * correction_i)
+
+    Note: rank_max is re-loaded from HBM here (not cached from the max loop above)
+    because NKI doesn't support loop-variable-indexed SBUF arrays. The stats tensor
+    is small (tile layout), so the extra DMA is negligible vs collective latency.
+    """
+    global_sum_sb = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(global_sum_sb, value=0.0)
+    for rank_idx in nl.static_range(CP):
+        rank_sum = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+        rank_max = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(
+            rank_sum,
+            all_stats_hbm[rank_idx, :, n_bsq_tiles_full + nc_offset : n_bsq_tiles_full + nc_offset + n_bsq_tiles],
+        )
+        nisa.dma_copy(rank_max, all_stats_hbm[rank_idx, :, nc_offset : nc_offset + n_bsq_tiles])
+        rank_correction = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+        if max_negated:
+            nisa.tensor_tensor(dst=rank_correction, data1=global_max_sb, data2=rank_max, op=nl.subtract)
+        else:
+            nisa.tensor_tensor(dst=rank_correction, data1=rank_max, data2=global_max_sb, op=nl.subtract)
+        nisa.activation(dst=rank_correction, op=nl.exp, data=rank_correction, scale=1.0)
+        corrected_sum = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=corrected_sum, data1=rank_sum, data2=rank_correction, op=nl.multiply)
+        nisa.tensor_tensor(dst=global_sum_sb, data1=global_sum_sb, data2=corrected_sum, op=nl.add)
+
+    # scale = local_correction / global_sum (tile layout)
+    global_sum_recip = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.reciprocal(global_sum_recip, global_sum_sb)
+    scale_factor_tiles = sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=scale_factor_tiles, data1=local_correction, data2=global_sum_recip, op=nl.multiply)
+
+    # ========== 3. Broadcast scale factor and scale local output ==========
+    # Broadcast from [s_active_bqh_tile, n_bsq_tiles] to [d_head, BQS_local] (per-NC)
+    broadcast_atp = _BroadcastParams.from_bqs(BQS_local, TC.p_max) if BQS_local != atp.s_active_bqh else atp
+    scale_factor = sbm.alloc_stack((d_head, BQS_local), dtype=nl.float32, buffer=nl.sbuf)
+    _s_active_bqh_tile_transpose_broadcast(scale_factor_tiles, scale_factor, broadcast_atp, TC)
+
+    attn_scaled = sbm.alloc_stack((d_head, BQS_local), dtype=dtype, buffer=nl.sbuf)
+    if BQS_local < BQS:
+        sb_offset = bs_prg_id * BQS_local
+        attn_sb_local = attn_sb[:, sb_offset : sb_offset + BQS_local]
+    else:
+        attn_sb_local = attn_sb
+    nisa.tensor_tensor(dst=attn_scaled, data1=attn_sb_local, data2=scale_factor, op=nl.multiply)
+
+    # ========== Pack scaled output to shared HBM ==========
+    """
+    Each NC writes its B_local batches to its offset in shared (q_heads_attn, B, d, S) HBM.
+    Direct DMA from SBUF to shared HBM with rearrange — no intermediate HBM buffer
+    to avoid the race condition where both NCs share the intermediate.
+    """
+    attn_src_reshaped = attn_scaled.reshape((d_head, B_local, q_heads_attn, S_tkg))
+
+    sbm.close_scope()
+
+    attn_scaled_hbm = nl.ndarray(
+        (q_heads_attn, B, d_head, S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="cp_attn_scaled"
+    )
+    b_offset = bs_prg_id * B_local
+    attn_dst_view = attn_scaled_hbm.slice(1, start=b_offset, end=b_offset + B_local).permute((2, 1, 0, 3))
+    nisa.dma_copy(dst=attn_dst_view, src=attn_src_reshaped)
+
+    return attn_scaled_hbm
+
+
+def _cp_output_reduce_scatter(
+    attn_sb,
+    softmax_max,
+    softmax_sum,
+    CP,
+    B,
+    q_heads,
+    q_heads_attn,
+    d_head,
+    S_tkg,
+    BQS,
+    BQS_local,
+    BQS_out,
+    dtype,
+    replica_group,
+    sbm,
+    max_negated,
+    atp,
+    TC,
+    B_local,
+    bs_prg_id,
+):
+    """CP output via stats all_gather + correction + reduce_scatter."""
+    attn_scaled_hbm = _cp_gather_correct_and_scale_to_hbm(
+        attn_sb,
+        softmax_max,
+        softmax_sum,
+        CP,
+        B,
+        q_heads_attn,
+        d_head,
+        S_tkg,
+        BQS,
+        BQS_local,
+        dtype,
+        replica_group,
+        sbm,
+        max_negated,
+        atp,
+        TC,
+        B_local,
+        bs_prg_id,
+    )
+
+    # ========== 4. reduce_scatter: sum + head slice in one collective ==========
+    # reduce_scatter on dim=0: (q_heads_attn, B, d, S) -> (q_heads, B, d, S) per rank
+    BQS_out = B * q_heads * S_tkg
+    attn_scattered_hbm = nl.ndarray(
+        (q_heads, B, d_head, S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="cp_attn_scattered"
+    )
+    ncc.reduce_scatter(
+        dsts=[attn_scattered_hbm],
+        srcs=[attn_scaled_hbm],
+        op=nl.add,
+        replica_group=replica_group,
+        collective_dim=0,
+    )
+
+    # Transpose back to SBUF: (q_heads, B, d, S) -> (d, B, q_heads, S)
+    attn_final_sb = sbm.alloc_stack((d_head, BQS_out), dtype=dtype, buffer=nl.sbuf)
+    sbm.open_scope()
+    if q_heads == 1:
+        attn_load = nl.ndarray((BQS_out, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.dma_copy(attn_load, attn_scattered_hbm.reshape((BQS_out, d_head)))
+    else:
+        # Rearrange in HBM: (H, B, d, S) -> (B, H, d, S)
+        attn_bhds = nl.ndarray((B, q_heads, d_head, S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="cp_attn_bhds")
+        attn_scattered_view = attn_scattered_hbm.rearrange(("H", "B", "d", "S"), ("B", "H", "d", "S"), {})
+        nisa.dma_copy(attn_bhds, attn_scattered_view)
+        attn_load = nl.ndarray((BQS_out, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.dma_copy(attn_load, attn_bhds.reshape((BQS_out, d_head)))
+    psum = nl.ndarray((d_head, BQS_out), dtype=dtype, buffer=nl.psum)
+    nisa.nc_transpose(psum, attn_load)
+    nisa.tensor_copy(attn_final_sb, psum)
+    sbm.close_scope()
+
+    return attn_final_sb
+
+
+def _cp_output_all_to_all(
+    attn_sb,
+    softmax_max,
+    softmax_sum,
+    CP,
+    B,
+    q_heads,
+    q_heads_attn,
+    d_head,
+    S_tkg,
+    BQS,
+    BQS_local,
+    BQS_out,
+    dtype,
+    replica_group,
+    sbm,
+    max_negated,
+    atp,
+    TC,
+    B_local,
+    bs_prg_id,
+):
+    """CP output via all_to_all for attn + all_gather for stats.
+
+    Uses all_to_all to redistribute attention output across heads, and
+    all_gather to share softmax stats across ranks. Stats stay in fp32
+    tile layout (no bitcast) for accuracy.
+
+    TODO: coalesced a2a would let us pass attn+stats as separate
+    tensors in a single all_to_all, eliminating the separate stats all_gather.
+
+    With LNC batch sharding (B_local < B), each NC packs its B_local batches
+    into its offset in the shared HBM tensor before the collective.
+    """
+    attn_scaled_hbm = _cp_gather_correct_and_scale_to_hbm(
+        attn_sb,
+        softmax_max,
+        softmax_sum,
+        CP,
+        B,
+        q_heads_attn,
+        d_head,
+        S_tkg,
+        BQS,
+        BQS_local,
+        dtype,
+        replica_group,
+        sbm,
+        max_negated,
+        atp,
+        TC,
+        B_local,
+        bs_prg_id,
+    )
+
+    # ========== 4. all_to_all: redistribute heads across ranks ==========
+    a2a_dst = nl.ndarray((q_heads_attn, B, d_head, S_tkg), dtype=dtype, buffer=nl.shared_hbm, name="cp_a2a_dst")
+    ncc.all_to_all(dsts=[a2a_dst], srcs=[attn_scaled_hbm], replica_group=replica_group, collective_dim=0)
+
+    # ========== 5. Sum across ranks and rearrange to output ==========
+    """
+    After all_to_all: (CP, q_heads, B, d, S) — chunk i has rank i's scaled partial output for our heads.
+    BQS_out = B * q_heads * S_tkg. With q_heads=1 and S_tkg=1, BQS_out = B which fits in SBUF
+    even when B=64 (no batch sharding needed for post-collective processing).
+    """
+    a2a_4d = a2a_dst.reshape((CP, q_heads, B, d_head, S_tkg))
+
+    sbm.open_scope()
+    attn_accum = sbm.alloc_stack((d_head, BQS_out), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(attn_accum, value=0.0)
+
+    for rank_idx in nl.static_range(CP):
+        rank_chunk = a2a_4d.select(0, rank_idx)
+        rank_attn_bf16 = sbm.alloc_stack((d_head, BQS_out), dtype=dtype, buffer=nl.sbuf)
+        if q_heads == 1:
+            nisa.dma_copy(
+                dst=rank_attn_bf16,
+                src=rank_chunk.reshape((B, d_head, S_tkg)).rearrange(("B", "d", "S"), ("d", "B", "S"), {}),
+            )
+        else:
+            rank_rearranged = rank_chunk.rearrange(("H", "B", "d", "S"), ("d", "H", "B", "S"), {})
+            nisa.dma_copy(dst=rank_attn_bf16.reshape((d_head, q_heads, B, S_tkg)), src=rank_rearranged)
+        rank_attn = sbm.alloc_stack((d_head, BQS_out), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(rank_attn, rank_attn_bf16)
+        nisa.tensor_tensor(dst=attn_accum, data1=attn_accum, data2=rank_attn, op=nl.add)
+
+    sbm.close_scope()
+
+    # Rearrange to output layout: (d, H, B, S) -> (d, B, H, S)
+    attn_final_sb = sbm.alloc_stack((d_head, BQS_out), dtype=dtype, buffer=nl.sbuf)
+    if q_heads == 1:
+        nisa.tensor_copy(attn_final_sb, attn_accum)
+    else:
+        rearranged = attn_accum.reshape((d_head, q_heads, B, S_tkg)).rearrange(
+            ("d", "H", "B", "S"), ("d", "B", "H", "S"), {}
+        )
+        nisa.tensor_copy(attn_final_sb, rearranged)
+
     return attn_final_sb

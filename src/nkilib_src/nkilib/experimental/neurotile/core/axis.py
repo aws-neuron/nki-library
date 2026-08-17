@@ -464,12 +464,13 @@ class Axis(nl.NKIObject):
 
 class IndirectOffset(nl.NKIObject):
     """
-    Runtime offset attached to a Layout for indirect / vector indexing.
+    Runtime source-element offset attached to a Layout for indirect / vector indexing.
 
     Layouts carry a compile-time ``offset`` (folded at trace time) plus,
     optionally, a single ``IndirectOffset`` for the cases where indexing
-    must resolve at runtime: a scalar LoopVar (e.g. ``view[k]`` inside a
-    sequential loop) or a vector gather (e.g. ``view[idx_tensor]``).
+    must resolve at runtime: a scalar source-element offset (e.g.
+    ``view[nt.element_offset(offset)]`` or a logical index already lowered
+    to element units) or a vector gather (e.g. ``view[idx_tensor]``).
     When set, NKI's DMA path routes through ``scalar_offset=`` /
     ``vector_offset=`` on the AP instead of folding the offset into the
     pattern.
@@ -489,9 +490,9 @@ class IndirectOffset(nl.NKIObject):
     Attributes:
         kind (IndirectKind): ``SCALAR`` for single-int runtime offset,
             ``VECTOR`` for gather. See :class:`IndirectKind`.
-        value (Any): For ``SCALAR``, a runtime expression (LoopVar or
-            SBUF tensor of shape (1,)). For ``VECTOR``, an SBUF ndarray
-            of integer indices.
+        value (Any): For ``SCALAR``, a runtime expression or SBUF tensor
+            in source-element offset units. For ``VECTOR``, an SBUF
+            ndarray of integer indices.
         dim (int): Absolute source-tensor dim id that the offset
             addresses. The id is ABSOLUTE (it never shifts when a batch
             dim drops out of the Grid) because runtime offsets address

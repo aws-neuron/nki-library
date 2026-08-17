@@ -95,6 +95,9 @@ def qkv_torch_ref(
     # --- Output
     output_hbm: Optional[torch.Tensor] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    q_squared_sum_out: Optional[torch.Tensor] = None,
+    k_squared_sum_out: Optional[torch.Tensor] = None,
+    v_squared_sum_out: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Torch reference matching the qkv() kernel entry signature.
 
@@ -248,6 +251,9 @@ def qkv_torch_ref(
             output_hbm=output_hbm,
             strided_input_config=strided_input_config,
             dtype_mode=dtype_mode,
+            q_squared_sum_out=q_squared_sum_out,
+            k_squared_sum_out=k_squared_sum_out,
+            v_squared_sum_out=v_squared_sum_out,
         )
 
     return qkv_tkg_torch_ref(

@@ -60,7 +60,7 @@ def quantize_mx_x4_wrapper(dst_data, dst_scale, src_sbuf, P: int = None, F: int 
 
     Args:
             dst_data: Pre-allocated SBUF tensor or BIR AP view for quantized data
-            dst_scale: Pre-allocated SBUF scale tensor or BIR AP view in UINT8
+            dst_scale: Pre-allocated SBUF scale tensor or BIR AP view in FLOAT8_E8M0FNU
             src_sbuf: Input SBUF tensor or BIR AP view in BF16
             P: Partition dimension size (required when using BIR AP views)
             F: Free dimension size (required when using BIR AP views)
@@ -161,7 +161,7 @@ def mx_quantize_and_matmul_x4(matrices_a, matrices_b, out, m: int, n: int, k: in
     """
     sbm = get_active_sbm()
 
-    scale_dtype = nl.uint8
+    scale_dtype = nl.float8_e8m0fnu
 
     stationary_sbuf = sbm.alloc_stack(shape=(k // 4, m * 4), dtype=matrices_a.dtype, buffer=nl.sbuf)
     moving_sbuf = sbm.alloc_stack(shape=(k // 4, n * 4), dtype=matrices_b.dtype, buffer=nl.sbuf)
@@ -210,7 +210,7 @@ def mx_quantize_and_matmul_x4_packed_scale(
     """
     sbm = get_active_sbm()
 
-    scale_dtype = nl.uint8
+    scale_dtype = nl.float8_e8m0fnu
 
     stationary_sbuf = sbm.alloc_stack(shape=(k // 4, m * 4), dtype=matrices_a.dtype, buffer=nl.sbuf)
     moving_sbuf = sbm.alloc_stack(shape=(k // 4, n * 4), dtype=matrices_b.dtype, buffer=nl.sbuf)

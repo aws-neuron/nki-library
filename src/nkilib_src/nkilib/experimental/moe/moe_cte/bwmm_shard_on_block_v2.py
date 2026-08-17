@@ -44,7 +44,6 @@ from ....core.utils.allocator import SbufManager, sizeinbytes
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import get_program_sharding_info
 from ....core.utils.logging import get_logger
-from ....core.utils.tensor_view import TensorView
 
 BLOCK_PARALLEL_FACTOR = 1
 FUSE_AFFINITY_INTO_OUTPUT = (
@@ -200,15 +199,9 @@ def _store_block_output(
                 src=token_indices[0:TILE_SIZE, token_tile_idx : token_tile_idx + 1],
                 engine=nisa.scalar_engine,
             )
-            _out_tv = (
-                TensorView(output)
-                .slice(1, shard_id, shard_id + 1)
-                .squeeze_dim(1)
-                .slice(1, 0, H)
-                .vector_select(0, token_idx)
-            )
+            _out_tv = output.slice(1, shard_id, shard_id + 1).squeeze_dim(1).slice(1, 0, H).vector_select(0, token_idx)
             nisa.dma_copy(
-                dst=_out_tv.get_view(),
+                dst=_out_tv,
                 src=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
                 oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
             )
@@ -217,9 +210,9 @@ def _store_block_output(
                 dst=token_idx,
                 src=token_indices[0:TILE_SIZE, token_tile_idx : token_tile_idx + 1],
             )
-            _out_tv = TensorView(output).vector_select(0, token_idx)
+            _out_tv = output.vector_select(0, token_idx)
             nisa.dma_copy(
-                dst=_out_tv.get_view(),
+                dst=_out_tv,
                 src=block_new_lst[token_tile_idx][0:TILE_SIZE, 0:H],
                 oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
             )
@@ -227,18 +220,18 @@ def _store_block_output(
 
 @nki.jit
 def bwmm_shard_on_block(
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
     block_size: int,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    gate_and_up_proj_bias: Optional[nl.ndarray] = None,
-    down_proj_bias: Optional[nl.ndarray] = None,
-    gate_up_proj_scale: Optional[nl.ndarray] = None,
-    down_proj_scale: Optional[nl.ndarray] = None,
-    down_activations: Optional[nl.ndarray] = None,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    gate_and_up_proj_bias: Optional[nl.NkiTensor] = None,
+    down_proj_bias: Optional[nl.NkiTensor] = None,
+    gate_up_proj_scale: Optional[nl.NkiTensor] = None,
+    down_proj_scale: Optional[nl.NkiTensor] = None,
+    down_activations: Optional[nl.NkiTensor] = None,
     activation_function: common_types.ActFnType = common_types.ActFnType.SiLU,
     skip_dma: SkipMode = SkipMode(False, False),
     compute_dtype: Any = nl.bfloat16,
@@ -276,18 +269,18 @@ def bwmm_shard_on_block(
         I_TP: Intermediate size divided by tensor parallelism degree
 
     Args:
-        hidden_states (nl.ndarray): [T, H], Input token embeddings in HBM
-        expert_affinities_masked (nl.ndarray): [(T+1)*E, 1], Expert routing weights for token assignments in HBM
-        gate_up_proj_weight (nl.ndarray): [E, H, 2, I_TP], Combined gate and up projection weights in HBM
-        down_proj_weight (nl.ndarray): [E, I_TP, H], Down projection weights in HBM
+        hidden_states (nl.NkiTensor): [T, H], Input token embeddings in HBM
+        expert_affinities_masked (nl.NkiTensor): [(T+1)*E, 1], Expert routing weights for token assignments in HBM
+        gate_up_proj_weight (nl.NkiTensor): [E, H, 2, I_TP], Combined gate and up projection weights in HBM
+        down_proj_weight (nl.NkiTensor): [E, I_TP, H], Down projection weights in HBM
         block_size (int): Number of tokens processed per block
-        token_position_to_id (nl.ndarray): [N*B], Mapping from block positions to token IDs in HBM
-        block_to_expert (nl.ndarray): [N, 1], Expert assignment for each block in HBM
-        gate_and_up_proj_bias (nl.ndarray, optional): [E, 2, I_TP], Bias terms for gate/up projections in HBM
-        down_proj_bias (nl.ndarray, optional): [E, 1, H], Bias terms for down projection in HBM
-        gate_up_proj_scale (nl.ndarray, optional): [E, 1, 2*I_TP], Dequantization scales for gate/up weights in HBM
-        down_proj_scale (nl.ndarray, optional): [E, 1, H], Dequantization scales for down weights in HBM
-        down_activations (nl.ndarray, optional): [N, B, H], Storage for intermediate activations in HBM
+        token_position_to_id (nl.NkiTensor): [N*B], Mapping from block positions to token IDs in HBM
+        block_to_expert (nl.NkiTensor): [N, 1], Expert assignment for each block in HBM
+        gate_and_up_proj_bias (nl.NkiTensor, optional): [E, 2, I_TP], Bias terms for gate/up projections in HBM
+        down_proj_bias (nl.NkiTensor, optional): [E, 1, H], Bias terms for down projection in HBM
+        gate_up_proj_scale (nl.NkiTensor, optional): [E, 1, 2*I_TP], Dequantization scales for gate/up weights in HBM
+        down_proj_scale (nl.NkiTensor, optional): [E, 1, H], Dequantization scales for down weights in HBM
+        down_activations (nl.NkiTensor, optional): [N, B, H], Storage for intermediate activations in HBM
         activation_function (ActFnType): Activation function type (SiLU, GELU, etc.)
         skip_dma (SkipMode): DMA skip configuration for memory optimization
         compute_dtype (nki.dtype): Data type for internal computations (default: bfloat16)
@@ -309,7 +302,7 @@ def bwmm_shard_on_block(
             across shards (e.g., HI_LO strategy with sequence-level sharding). Default: False.
 
     Returns:
-        output (nl.ndarray): Expert-processed token representations in HBM. Shape depends on accumulation mode:
+        output (nl.NkiTensor): Expert-processed token representations in HBM. Shape depends on accumulation mode:
             - Single expert (is_tensor_update_accumulating=False): [T, H]
             - Multiple experts (is_tensor_update_accumulating=True): [T, 2, H] for cross-core accumulation
 
@@ -613,7 +606,7 @@ def bwmm_shard_on_block(
 
                         nisa.dma_copy(
                             dst=expert_affinity_dtype[0:TILE_SIZE, 0:1],
-                            src=TensorView(expert_affinities_masked).vector_select(0, addr_fin_reshaped).get_view(),
+                            src=expert_affinities_masked.vector_select(0, addr_fin_reshaped),
                             oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
                         )
 
@@ -625,15 +618,13 @@ def bwmm_shard_on_block(
 
                 if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.PRE_SCALE:
                     for token_tile_idx in range(NUM_TILES):
-                        block_token_mapping = (
-                            TensorView(token_indices_lst[inner_block_iter])
-                            .slice(1, token_tile_idx, token_tile_idx + 1)
-                            .get_view()
+                        block_token_mapping = (token_indices_lst[inner_block_iter]).slice(
+                            1, token_tile_idx, token_tile_idx + 1
                         )
-                        _hs_tv = TensorView(hidden_states).vector_select(0, block_token_mapping)
+                        _hs_tv = hidden_states.vector_select(0, block_token_mapping)
                         nisa.dma_copy(
                             dst=block_hidden_states_lst[inner_block_iter][token_tile_idx][0:TILE_SIZE, nl.ds(0, H)],
-                            src=_hs_tv.get_view(),
+                            src=_hs_tv,
                             oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
                         )
                         nisa.tensor_scalar(
@@ -691,7 +682,7 @@ def bwmm_shard_on_block(
                     src=all_block_expert_broadcasted_per_shard[0:1, linear_idx : linear_idx + 1],
                     engine=nisa.scalar_engine,
                 )
-                real_expert = TensorView(all_block_expert_real).slice(1, linear_idx, linear_idx + 1).get_view()
+                real_expert = all_block_expert_real.slice(1, linear_idx, linear_idx + 1)
                 nisa.tensor_copy(
                     dst=real_expert,
                     src=all_block_expert_real[0:1, linear_idx : linear_idx + 1],
@@ -773,8 +764,8 @@ def bwmm_shard_on_block(
                         _aff_tile = sbm.alloc_stack(
                             (TILE_SIZE, 1), dtype=compute_dtype, name=f"aff_from_old_t{_tile_idx}", align=32
                         )
-                        _aff_tv = TensorView(block_old[_tile_idx]).select(dim=1, index=real_expert_u32).expand_dim(1)
-                        nisa.tensor_copy(dst=_aff_tile, src=_aff_tv.get_view(), engine=nisa.scalar_engine)
+                        _aff_tv = (block_old[_tile_idx]).select(dim=1, index=real_expert_u32).expand_dim(1)
+                        nisa.tensor_copy(dst=_aff_tile, src=_aff_tv, engine=nisa.scalar_engine)
                         expert_affinity_f32.append(_aff_tile)
                 elif expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.POST_SCALE:
                     expert_affinity_f32 = calculate_expert_affinities(
@@ -843,13 +834,11 @@ def bwmm_shard_on_block(
                             nisa.memset(value=0.0, dst=expert_affinity_lst[token_tile_idx])
 
                         num_cols = expert_affinities_masked.shape[1]
-                        addr_fin_tv = TensorView(addr_fin).slice(1, 0, 1)
+                        addr_fin_tv = addr_fin.slice(1, 0, 1)
 
                         nisa.dma_copy(
                             dst=expert_affinity_lst[token_tile_idx][0:TILE_SIZE, 0:1],
-                            src=TensorView(expert_affinities_masked)
-                            .vector_select(0, addr_fin_tv.get_view())
-                            .get_view(),
+                            src=expert_affinities_masked.vector_select(0, addr_fin_tv),
                             oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
                         )
 
@@ -1208,19 +1197,19 @@ def bwmm_shard_on_block(
 
 @nki.jit
 def bwmm_shard_on_block_hybrid(
-    conditions: nl.ndarray,
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
+    conditions: nl.NkiTensor,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
     block_size: int,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    gate_and_up_proj_bias: Optional[nl.ndarray] = None,
-    down_proj_bias: Optional[nl.ndarray] = None,
-    gate_up_proj_scale: Optional[nl.ndarray] = None,
-    down_proj_scale: Optional[nl.ndarray] = None,
-    down_activations: Optional[nl.ndarray] = None,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    gate_and_up_proj_bias: Optional[nl.NkiTensor] = None,
+    down_proj_bias: Optional[nl.NkiTensor] = None,
+    gate_up_proj_scale: Optional[nl.NkiTensor] = None,
+    down_proj_scale: Optional[nl.NkiTensor] = None,
+    down_activations: Optional[nl.NkiTensor] = None,
     activation_function: common_types.ActFnType = common_types.ActFnType.SiLU,
     skip_dma: SkipMode = SkipMode(False, False),
     compute_dtype: Any = nl.bfloat16,
@@ -1242,7 +1231,7 @@ def bwmm_shard_on_block_hybrid(
     Dynamic loop handles remaining E blocks with early-exit for padded blocks.
 
     Args:
-        conditions (nl.ndarray): [ceil(N/num_shards)+1] per-shard condition vector.
+        conditions (nl.NkiTensor): [ceil(N/num_shards)+1] per-shard condition vector.
             1=active, 0=padded. Last entry must be 0 for loop termination.
         All other args: same as bwmm_shard_on_block.
     """
@@ -1420,7 +1409,8 @@ def bwmm_shard_on_block_hybrid(
     # I_TP chunking parameters (shared by Phase 2 and Phase 3)
     DYN_I_TILE = min(I_TP, TILE_SIZE * 4)  # 512 max per chunk
     DYN_I_CHUNK_COUNT = div_ceil(I_TP, DYN_I_TILE)
-    for _phase2_i in nl.dynamic_range(0, dyn_reg):
+
+    def _phase2_process_chunk(_phase2_i):
         local_block_idx = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32)
         if shard_strat == BlockShardStrategy.HI_LO:
             nisa.tensor_scalar(
@@ -1493,8 +1483,8 @@ def bwmm_shard_on_block_hybrid(
                 expert_affinity_f32 = []
                 for tile_idx in range(NUM_TILES):
                     _aff = nl.ndarray((TILE_SIZE, 1), dtype=compute_dtype, buffer=nl.sbuf)
-                    _aff_tv = TensorView(block_old[tile_idx]).select(dim=1, index=real_expert_u32).expand_dim(1)
-                    nisa.tensor_copy(dst=_aff, src=_aff_tv.get_view(), engine=nisa.scalar_engine)
+                    _aff_tv = (block_old[tile_idx]).select(dim=1, index=real_expert_u32).expand_dim(1)
+                    nisa.tensor_copy(dst=_aff, src=_aff_tv, engine=nisa.scalar_engine)
                     expert_affinity_f32.append(_aff)
             else:
                 expert_affinity_f32 = calculate_expert_affinities(
@@ -1714,6 +1704,8 @@ def bwmm_shard_on_block_hybrid(
         nisa.tensor_scalar(dst=shard_local_idx, data=shard_local_idx, op0=nl.add, operand0=1)
         core_barrier(output, (0, 1))
 
+    nl.fori_loop(0, dyn_reg, _phase2_process_chunk)
+
     # Phase 3: Block-split for imbalanced workload
     # active_local = n_static_shard_blocks + min_count (where the active shard left off)
     active_local_idx = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32)
@@ -1726,7 +1718,7 @@ def bwmm_shard_on_block_hybrid(
 
     nisa.register_load(dyn_reg, remaining)
 
-    for _phase3_i in nl.dynamic_range(0, dyn_reg):
+    def _phase3_process_chunk(_phase3_i):
         # Compute global block index for the active shard's block
         phase3_global = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32)
         # For HI_LO with active_sid=0: phase3_global = active_local_idx
@@ -1809,8 +1801,8 @@ def bwmm_shard_on_block_hybrid(
             expert_affinity_h = []
             for tile_idx in range(NUM_TILES_HALF):
                 _aff = nl.ndarray((TILE_SIZE, 1), dtype=compute_dtype, buffer=nl.sbuf)
-                _aff_tv = TensorView(block_old_h[tile_idx]).select(dim=1, index=real_expert_u32).expand_dim(1)
-                nisa.tensor_copy(dst=_aff, src=_aff_tv.get_view(), engine=nisa.scalar_engine)
+                _aff_tv = (block_old_h[tile_idx]).select(dim=1, index=real_expert_u32).expand_dim(1)
+                nisa.tensor_copy(dst=_aff, src=_aff_tv, engine=nisa.scalar_engine)
                 expert_affinity_h.append(_aff)
 
         down_bias_raw_h = None
@@ -2020,18 +2012,20 @@ def bwmm_shard_on_block_hybrid(
         nisa.tensor_scalar(dst=active_local_idx, data=active_local_idx, op0=nl.add, operand0=1)
         core_barrier(output, (0, 1))
 
+    nl.fori_loop(0, dyn_reg, _phase3_process_chunk)
+
     core_barrier(output, (0, 1))
     return output
 
 
 def compute_same_weights_block_parallel_hbm(
     N: int,
-    block_to_expert: nl.ndarray,
+    block_to_expert: nl.NkiTensor,
     num_shards: int,
     shard_id: int,
     shard_strat: BlockShardStrategy,
     sbm: Optional[SbufManager] = None,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Compute weight reuse mask for block-parallel execution.
 
@@ -2040,13 +2034,13 @@ def compute_same_weights_block_parallel_hbm(
 
     Args:
         N (int): Total number of blocks
-        block_to_expert (nl.ndarray): Expert assignment for each block
+        block_to_expert (nl.NkiTensor): Expert assignment for each block
         num_shards (int): Number of shards for parallel execution
         shard_id (int): Current shard identifier
         shard_strat (BlockShardStrategy): Block distribution strategy
 
     Returns:
-        nl.ndarray: Boolean mask indicating weight reuse opportunities
+        nl.NkiTensor: Boolean mask indicating weight reuse opportunities
     """
     kernel_assert(
         shard_strat == BlockShardStrategy.PING_PONG or shard_strat == BlockShardStrategy.HI_LO,
@@ -2266,8 +2260,8 @@ def compute_same_weights_block_parallel_hbm(
 
 
 def load_down_proj_weight(
-    down_proj_weight: nl.ndarray,
-    block_expert: nl.ndarray,
+    down_proj_weight: nl.NkiTensor,
+    block_expert: nl.NkiTensor,
     compute_dtype,
     skip_dma: SkipMode = SkipMode(),
     load_dst: Optional[list] = None,
@@ -2352,8 +2346,8 @@ def load_down_proj_weight(
 
 
 def load_gate_up_proj_weights(
-    gate_up_proj_weight: nl.ndarray,
-    block_expert: nl.ndarray,
+    gate_up_proj_weight: nl.NkiTensor,
+    block_expert: nl.NkiTensor,
     compute_dtype,
     skip_dma: SkipMode = SkipMode(),
     load_dst: Optional[list] = None,
@@ -2522,7 +2516,7 @@ def compute_block_output(
         dp_weights (list): Down projection weights [gup_tile_count][TILE_SIZE, H]
         expert_affinity (list, optional): Expert affinities [NUM_TILES][TILE_SIZE, 1]
         block_old (list, optional): Previous block outputs for accumulation [NUM_TILES][TILE_SIZE, H]
-        down_activations (nl.ndarray, optional): Storage for intermediate activations
+        down_activations (nl.NkiTensor, optional): Storage for intermediate activations
         block_idx (int): Current block index
         H (int): Hidden dimension size
         I_TP (int): Intermediate dimension size
@@ -2530,9 +2524,9 @@ def compute_block_output(
         output_dtype (nki.dtype): Output data type
         compute_dtype (nki.dtype): Computation data type
         is_tensor_update_accumulating (bool): Enable accumulation mode
-        down_bias_broadcasted (nl.ndarray, optional): Broadcasted bias [TILE_SIZE, H]
+        down_bias_broadcasted (nl.NkiTensor, optional): Broadcasted bias [TILE_SIZE, H]
         allocate (bool): Unused parameter
-        down_scale (nl.ndarray, optional): Dequantization scales
+        down_scale (nl.NkiTensor, optional): Dequantization scales
 
     Returns:
         list: Block output tensors [NUM_TILES][TILE_SIZE, H]
@@ -2742,7 +2736,7 @@ def compute_block_output(
 
 
 def reduce_outputs(
-    output: nl.ndarray,
+    output: nl.NkiTensor,
     num_tiles: int,
     reduce_tile_size: int,
     offset: int,
@@ -2752,7 +2746,7 @@ def reduce_outputs(
     """Synchronize across axis=0 in output by performing FMA reduce and store.
 
     Args:
-        output (nl.ndarray): Output tensor, size [T, 2, H]
+        output (nl.NkiTensor): Output tensor, size [T, 2, H]
         num_tiles (int): Number of tiles (iterations)
         reduce_tile_size (int): Size of tile size on partition dimension
         offset (int): Output read/write offset on row
@@ -2802,12 +2796,12 @@ def load_and_transpose_gup_bias(
         inps (InputTensors): Input tensor container
         dims (DimensionSizes): Dimension configuration
         cfg (Configs): Kernel configuration
-        block_expert (nl.ndarray): Expert index for current block [1, 1]
+        block_expert (nl.NkiTensor): Expert index for current block [1, 1]
         skip_dma: DMA skip configuration
         sbm (Optional[SbufManager]): Optional SBUF manager for allocation.
 
     Returns:
-        nl.ndarray: Transposed bias tensor [TILE_SIZE, 2*gup_tile_count] in SBUF
+        nl.NkiTensor: Transposed bias tensor [TILE_SIZE, 2*gup_tile_count] in SBUF
     """
     if sbm is not None:
         gate_up_bias = sbm.alloc_stack((2, dims.I_TP), dtype=cfg.compute_dtype, name="gup_bias_load")
@@ -2905,13 +2899,13 @@ def load_and_broadcast_down_bias(
         inps (InputTensors): Input tensor container
         dims (DimensionSizes): Dimension configuration
         cfg (Configs): Kernel configuration
-        block_expert (nl.ndarray): Expert index for current block
+        block_expert (nl.NkiTensor): Expert index for current block
         skip_dma: DMA skip configuration
         sbm (Optional[SbufManager]): Optional SBUF manager for allocation.
         use_pe_broadcast (bool): Use PE matmul broadcast instead of DVE StreamShuffle.
 
     Returns:
-        nl.ndarray: Broadcasted bias tensor with shape [128, H]
+        nl.NkiTensor: Broadcasted bias tensor with shape [128, H]
     """
     if sbm is not None:
         down_bias = sbm.alloc_stack((1, dims.H), dtype=cfg.compute_dtype, name="down_bias_load")
@@ -3063,24 +3057,20 @@ def bwmm_load_old_block(
             nisa.tensor_copy(dst=block_old_lst[token_tile_idx], src=block_old_lst[0], engine=nisa.scalar_engine)
 
     for token_tile_idx in range(NUM_TILES):
-        block_token_mapping = TensorView(token_indices).slice(
+        block_token_mapping = token_indices.slice(
             1, token_indices_offset + token_tile_idx, token_indices_offset + token_tile_idx + 1
         )
 
         if shard_id != None and len(output.shape) > 2:
             nisa.dma_copy(
                 dst=block_old_lst[token_tile_idx][0:TILE_SIZE, 0:H],
-                src=TensorView(output)
-                .slice(1, shard_id, shard_id + 1)
-                .squeeze_dim(1)
-                .vector_select(0, block_token_mapping.get_view())
-                .get_view(),
+                src=output.slice(1, shard_id, shard_id + 1).squeeze_dim(1).vector_select(0, block_token_mapping),
                 oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
             )
         else:
             nisa.dma_copy(
                 dst=block_old_lst[token_tile_idx][0:TILE_SIZE, 0:H],
-                src=TensorView(output).vector_select(0, block_token_mapping.get_view()).get_view(),
+                src=output.vector_select(0, block_token_mapping),
                 oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
             )
 

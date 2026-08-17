@@ -54,7 +54,7 @@ def block_level_scale(src):
                         nl.multiply,
                         2.0,
                     )
-            dst_blocks[bi, bj].store(block.ap())
+            dst_blocks[bi, bj].store(block.data)
 
     return dst
 
@@ -81,7 +81,7 @@ def load_block_row(src):
                         nl.multiply,
                         2.0,
                     )
-        dst_blocks[bi].store(block_row.ap())
+        dst_blocks[bi].store(block_row.data)
 
     return dst
 
@@ -100,7 +100,7 @@ def load_block_subgrid(src):
     for bi in range(src_blocks.shape[0]):
         for bj in range(src_blocks.shape[1]):
             block = src_blocks[bi, bj].load()
-            dst_blocks[bi, bj].store(block.ap())
+            dst_blocks[bi, bj].store(block.data)
 
     # Overwrite the inner block sub-grid (block-rows 1..2, block-cols 0..1).
     sub = src_blocks[1:3, 0:2].load()
@@ -115,7 +115,7 @@ def load_block_subgrid(src):
                         nl.multiply,
                         4.0,
                     )
-    dst_blocks[1:3, 0:2].store(sub.ap())
+    dst_blocks[1:3, 0:2].store(sub.data)
 
     return dst
 
@@ -149,7 +149,7 @@ def promote_tile_to_block_view(src):
                         nl.multiply,
                         2.0,
                     )
-            dst_blocks[bi, bj].store(block.ap())
+            dst_blocks[bi, bj].store(block.data)
 
     return dst
 
@@ -171,7 +171,7 @@ def descend_block_to_tile_view(src):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()
             nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 
@@ -192,7 +192,7 @@ def retile_block_view(src):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()  # tile: [128, 64]
             nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 

@@ -17,7 +17,6 @@ from typing import Literal, Optional
 import nki.dtype as nt
 import nki.language as nl
 import numpy as np
-
 from nkilib_src.nkilib.core.qkv.qkv import qkv
 from nkilib_src.nkilib.core.qkv.qkv_torch import qkv_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import (
@@ -29,6 +28,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     QuantizationType,
 )
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_max_positive_value_for_dtype
+
 from test.integration.nkilib.utils.tensor_generators import (
     gaussian_tensor_generator,
     generate_stabilized_mx_data,
@@ -36,6 +36,10 @@ from test.integration.nkilib.utils.tensor_generators import (
 )
 from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+
+# Constructed once at module load and shared across all callers that rely on the default,
+# matching the previous behavior where the default argument expression was evaluated once.
+_DEFAULT_TENSOR_GEN = gaussian_tensor_generator()
 
 DUMMY_TENSOR_NAME = "dummy"
 
@@ -104,7 +108,7 @@ def build_qkv_input(
     fused_rope: Optional[bool] = False,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
-    tensor_gen=gaussian_tensor_generator(),
+    tensor_gen=_DEFAULT_TENSOR_GEN,
     fp8_kv_cache: bool = False,
     bf16_kv_cache: bool = False,
     transpose_k_cache: bool = False,
@@ -130,15 +134,10 @@ def build_qkv_input(
         dequant_weights, fused_qkv_weights_x4, qkv_w_scale = generate_stabilized_mx_data(
             nl.float8_e4m3fn_x4, (hidden_dim // _q_width, fused_qkv_dim * _q_width), val_range=5
         )
-        # TODO: remove is_cte once tkg supports unpacked weights
-        is_cte = fused_rope or (fp8_kv_cache or bf16_kv_cache) or seqlen > 96 or batch * seqlen > p_max
-        if is_cte:
-            # Convert x4-packed [H//4, I] to unpacked fp8 [H//4, I, 4]
-            fused_qkv_weights = fused_qkv_weights_x4.view(nl.float8_e4m3fn).reshape(
-                hidden_dim // _q_width, fused_qkv_dim, _q_width
-            )
-        else:
-            fused_qkv_weights = fused_qkv_weights_x4
+        # Convert x4-packed [H//4, I] to unpacked fp8 [H//4, I, 4]
+        fused_qkv_weights = fused_qkv_weights_x4.view(nl.float8_e4m3fn).reshape(
+            hidden_dim // _q_width, fused_qkv_dim, _q_width
+        )
 
         if quantization_type == QuantizationType.STATIC_MX:
             # STATIC_MX: per-Q/K/V weight dequant scale, single input scale
@@ -241,12 +240,16 @@ def build_qkv_input(
             v_scale = np.full((128, 1), v_scale_val, dtype=np.float32)
         if use_block_kv:
             if fp8_packed:
-                k_cache = np.zeros((num_blocks, block_size // 2, kv_dim, 2), dtype=cache_np_dtype)
+                k_cache = np.zeros((num_blocks, num_kv_heads, block_size // 2, d_head, 2), dtype=cache_np_dtype)
             elif transpose_k_cache:
                 k_cache = np.zeros((num_blocks * num_kv_heads, d_head, block_size), dtype=cache_np_dtype)
             else:
                 k_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_np_dtype)
-            v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_np_dtype)
+            if fp8_packed:
+                # Head-split V cache: [num_blocks, num_kv_heads, block_size, d_head].
+                v_cache = np.zeros((num_blocks, num_kv_heads, block_size, d_head), dtype=cache_np_dtype)
+            else:
+                v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_np_dtype)
         else:
             if transpose_k_cache:
                 k_cache = np.zeros((batch, kv_dim, max_seq_len), dtype=cache_np_dtype)
@@ -761,15 +764,19 @@ def run_qkv_test(
             cache_dtype = nl.bfloat16 if bf16_kv_cache else nl.float8_e4m3
             if use_block_kv:
                 if fp8_packed:
-                    k_cache = np.zeros((num_blocks, block_size // 2, kv_dim, 2), dtype=cache_dtype)
+                    k_cache = np.zeros((num_blocks, n_kv_heads, block_size // 2, d_head, 2), dtype=cache_dtype)
                 elif not transpose_k_cache:
                     k_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_dtype)
                 else:
                     k_cache = np.zeros((num_blocks * n_kv_heads, d_head, block_size), dtype=cache_dtype)
+                if fp8_packed:
+                    v_cache = np.zeros((num_blocks, n_kv_heads, block_size, d_head), dtype=cache_dtype)
+                else:
+                    v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_dtype)
                 return {
                     "q_tensor_hbm": np.zeros((B, S, q_dim), dtype=dtype),
                     "k_cache": k_cache,
-                    "v_cache": np.zeros((num_blocks, block_size, kv_dim), dtype=cache_dtype),
+                    "v_cache": v_cache,
                 }
             else:
                 if not transpose_k_cache:
@@ -781,14 +788,26 @@ def run_qkv_test(
                     "k_cache": k_cache,
                     "v_cache": np.zeros((B, max_seq_len, kv_dim), dtype=cache_dtype),
                 }
-        result = {"out": np.zeros((B * S, fused_qkv_dim) if transposed_in else (B, S, fused_qkv_dim), dtype=dtype)}
+        output_dtype = nl.bfloat16 if dtype in (nl.float8_e4m3, nl.float8_e4m3fn) else dtype
+        result = {
+            "out": np.zeros((B * S, fused_qkv_dim) if transposed_in else (B, S, fused_qkv_dim), dtype=output_dtype)
+        }
         if fused_add and expect_fused_hidden_output:
-            result["fused_hidden"] = np.zeros((B, S, H), dtype=dtype)
+            result["fused_hidden"] = np.zeros((B, S, H), dtype=output_dtype)
         return result
+
+    _is_fp8_dtype = dtype in (nl.float8_e4m3, nl.float8_e4m3fn)
 
     @functools.wraps(qkv_torch_ref)
     def _qkv_torch_ref_with_resolved_dtype_mode(**kwargs):
         kwargs["dtype_mode"] = torch_ref_dtype_mode
+        if _is_fp8_dtype and quantization_type == QuantizationType.STATIC:
+            # FP8 input is already quantized. The torch ref will divide by in_scale,
+            # so pre-multiply input to compensate: hidden * in_scale / in_scale = hidden.
+            in_scale = kwargs["qkv_in_scale"]
+            if in_scale is not None:
+                scale_scalar = float(in_scale.flatten()[0])
+                kwargs["input"] = kwargs["input"] * scale_scalar
         return qkv_torch_ref(**kwargs)
 
     framework = UnitTestFramework(

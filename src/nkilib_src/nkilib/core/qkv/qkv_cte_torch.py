@@ -128,6 +128,9 @@ def qkv_cte_torch_ref(
     output_hbm: Any = None,  # noqa: ARG001
     strided_input_config: Any = None,  # noqa: ARG001
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    q_squared_sum_out: Any = None,
+    k_squared_sum_out: Any = None,
+    v_squared_sum_out: Any = None,
 ) -> Dict[str, torch.Tensor]:
     """PyTorch reference implementation for the QKV CTE (Context Encoding) kernel.
 
@@ -564,20 +567,25 @@ def qkv_cte_torch_ref(
         cache_shape = k_cache.shape
         if use_block_kv:
             if fp8_packed:
-                # FP8 packed layout: [num_blocks, block_size//2, kv_dim, 2] fp8
+                # FP8 packed layout: [num_blocks, num_kv_heads, block_size//2, d_head, 2] fp8
                 # where [:,:,:,0] = even seq positions, [:,:,:,1] = odd seq positions.
                 num_blocks_actual = k_cache.shape[0]
-                k_fp8_full = np.zeros((num_blocks_actual, block_size, kv_dim), dtype=kv_dtype)
+                k_fp8_full = np.zeros((num_blocks_actual, num_kv_heads, block_size, d_head), dtype=kv_dtype)
                 v_cache_out = np.zeros(v_cache.shape, dtype=kv_dtype)
                 for b in range(B):
                     for s in range(S):
                         slot = slot_mapping[b, s].item()
                         block_idx = slot // block_size
                         pos_in_block = slot % block_size
-                        k_fp8_full[block_idx, pos_in_block, :] = k_processed[b, s, :]
-                        v_cache_out[block_idx, pos_in_block, :] = v_processed[b, s, :]
-                # Reshape to [nb, block_size//2, 2, kv_dim] then transpose to [nb, block_size//2, kv_dim, 2]
-                k_cache_out = k_fp8_full.reshape(num_blocks_actual, block_size // 2, 2, kv_dim).transpose(0, 1, 3, 2)
+                        for h in range(num_kv_heads):
+                            k_fp8_full[block_idx, h, pos_in_block, :] = k_processed[b, s, h * d_head : (h + 1) * d_head]
+                            v_cache_out[block_idx, h, pos_in_block, :] = v_processed[
+                                b, s, h * d_head : (h + 1) * d_head
+                            ]
+                # Reshape to [nb, num_kv_heads, block_size//2, 2, d_head] then transpose to [nb, num_kv_heads, block_size//2, d_head, 2]
+                k_cache_out = k_fp8_full.reshape(num_blocks_actual, num_kv_heads, block_size // 2, 2, d_head).transpose(
+                    0, 1, 2, 4, 3
+                )
             elif transpose_k_cache:
                 k_cache_out = np.zeros(k_cache.shape, dtype=kv_dtype)
                 v_cache_out = np.zeros(v_cache.shape, dtype=kv_dtype)
@@ -633,6 +641,23 @@ def qkv_cte_torch_ref(
     # Reshape output per output_layout
     B, S, I = qkv_out.shape
 
+    # Optional per-segment sum of squares over the head dimension, computed from
+    # the [B, S, I] projection output before it is reshaped to the requested
+    # output layout, while the Q/K/V segments are still contiguous along the
+    # last dimension.
+    squared_sums: Dict[str, torch.Tensor] = {}
+    if q_squared_sum_out is not None or k_squared_sum_out is not None or v_squared_sum_out is not None:
+        q_dim = num_q_heads * d_head
+        kv_dim = num_kv_heads * d_head
+        if q_squared_sum_out is not None:
+            squared_sums["q_squared_sum_out"] = torch.sum(qkv_out[:, :, :q_dim] ** 2, dim=-1, keepdim=True)
+        if k_squared_sum_out is not None:
+            squared_sums["k_squared_sum_out"] = torch.sum(
+                qkv_out[:, :, q_dim : q_dim + kv_dim] ** 2, dim=-1, keepdim=True
+            )
+        if v_squared_sum_out is not None:
+            squared_sums["v_squared_sum_out"] = torch.sum(qkv_out[:, :, q_dim + kv_dim :] ** 2, dim=-1, keepdim=True)
+
     if output_layout in (QKVOutputLayout.NBSd, QKVOutputLayout.NBdS):
         if d_head is None:
             raise ValueError(f"d_head required for {output_layout} output layout")
@@ -645,4 +670,6 @@ def qkv_cte_torch_ref(
         qkv_out = qkv_out.reshape(B, S, num_heads, d_head)
         qkv_out = qkv_out.permute(2, 0, 3, 1)
 
-    return {"out": qkv_out}
+    result = {"out": qkv_out}
+    result.update(squared_sums)
+    return result

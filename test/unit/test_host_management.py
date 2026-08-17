@@ -16,22 +16,61 @@
 import contextlib
 import json
 import os
-import random
 import subprocess
 import tempfile
 from contextlib import closing
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from paramiko import SSHException
 
-from test.utils.common_dataclasses import Platforms, TargetHost
-from test.utils.exceptions import InferenceException, LocalExecutionException
-from test.utils.host_management import Host, HostManager, LocalHost, detect_local_neuron_devices, temporary_random_seed
+from test.utils.common_dataclasses import Platforms, ResolvedHost, TargetHost
+from test.utils.core_reset_strategy import CoreResetStrategy
+from test.utils.exceptions import FleetEmptyError, InferenceException, LocalExecutionException, TimeoutException
+from test.utils.host_management import Host, HostManager, LocalHost, detect_local_neuron_devices
+from test.utils.host_state import HostRecord, HostState, HostStateStore, OwnerHostStateStore
+from test.utils.metrics_collector import MetricName
+
+
+def _initialized_store(base_dir, target_hosts, cores_by_alias=None):
+    """Build a HostStateStore over base_dir and initialize it from a TargetHost
+    list — the bootstrap the factory (make_host_manager) does — and return it to
+    inject into a HostManager. An empty list leaves the store untouched (local /
+    plugin-provisioned, where the controller initializes instead).
+
+    ``cores_by_alias`` (optional) stamps each host's probed physical-core capacity so
+    capacity-based routing has real counts to rank by; unspecified hosts default to a
+    uniform 64 cores so plain balancing tests need not care about capacity."""
+    store = HostStateStore(base_dir)
+    if target_hosts:
+        store.initialize([ResolvedHost(ssh_host=th.ssh_host, host_type=th.host_type) for th in target_hosts])
+        cores = cores_by_alias or {th.ssh_host: 64 for th in target_hosts}
+        store.set_physical_cores(cores)
+    return store
+
+
+def _poison_platform(base_dir, platform, poisoned=True):
+    """Poison (or un-poison) ``platform`` in the state file at ``base_dir``.
+
+    Poisoning is a controller/refresher action, so it goes through an OwnerHostStateStore —
+    the manager's own store is the worker-side base store, which (correctly) can't poison.
+    A worker's claim then observes the poison via the shared file, exactly as in a real run.
+    """
+    OwnerHostStateStore(base_dir).set_poisoned(platform, poisoned)
 
 
 class TestHostManagerRetryErrorReporting:
     """Test that host errors are captured and reported when all hosts fail."""
+
+    def setup_method(self):
+        self._patchers = []
+
+    def teardown_method(self):
+        # Reverse order: patches stacked on the same target must be undone LIFO, or the
+        # target is left pointing at an intermediate mock instead of the real object.
+        for p in reversed(self._patchers):
+            p.stop()
 
     @pytest.fixture
     def temp_dir(self):
@@ -42,40 +81,7 @@ class TestHostManagerRetryErrorReporting:
     @pytest.fixture
     def mock_host_manager(self, temp_dir):
         """Create a HostManager with mocked hosts for testing."""
-        target_hosts = [
-            TargetHost(ssh_host="host1", host_type=Platforms.TRN2),
-            TargetHost(ssh_host="host2", host_type=Platforms.TRN2),
-        ]
-
-        with patch("test.utils.host_management.SshHost"):
-            manager = HostManager(
-                base_host_info_path=temp_dir,
-                target_hosts=target_hosts,
-                neuron_installation_path="/opt/aws/neuron/bin",
-                ssh_config_path="~/.ssh/config",
-            )
-
-        # Initialize host stats file
-        host_stats_path = os.path.join(temp_dir, "host_stats.json")
-        with open(host_stats_path, "w") as f:
-            json.dump(
-                [
-                    {"host_alias": "host1", "work_queue_depth": 0, "run_id": manager.run_id, "host_type": "trn2"},
-                    {"host_alias": "host2", "work_queue_depth": 0, "run_id": manager.run_id, "host_type": "trn2"},
-                ],
-                f,
-            )
-
-        # Create mock hosts that return their host_id
-        mock_host1 = MagicMock()
-        mock_host1.get_host_id.return_value = "host1"
-        mock_host2 = MagicMock()
-        mock_host2.get_host_id.return_value = "host2"
-
-        manager.target_hosts = {"host1": mock_host1, "host2": mock_host2}
-        manager.host_types = {"host1": Platforms.TRN2, "host2": Platforms.TRN2}
-
-        return manager
+        return self._build_manager_with_hosts(temp_dir, num_hosts=2)
 
     def test_error_details_included_when_all_retries_exhausted(self, mock_host_manager):
         """Test that error details from each host are included in final exception."""
@@ -85,6 +91,8 @@ class TestHostManagerRetryErrorReporting:
             with closing(
                 mock_host_manager.get_host_assignment_with_retry(
                     platform_target=Platforms.TRN2,
+                    collective_ranks=1,
+                    lnc_config=1,
                     collector=mock_collector,
                     connection_failure_cap=2,
                 )
@@ -116,6 +124,8 @@ class TestHostManagerRetryErrorReporting:
             with closing(
                 mock_host_manager.get_host_assignment_with_retry(
                     platform_target=Platforms.TRN2,
+                    collective_ranks=1,
+                    lnc_config=1,
                     collector=mock_collector,
                     connection_failure_cap=3,
                 )
@@ -138,43 +148,21 @@ class TestHostManagerRetryErrorReporting:
 
     def test_single_host_failure_shows_specific_error(self, temp_dir):
         """single host fails, error details should be shown."""
-        target_hosts = [
-            TargetHost(ssh_host="single-host", host_type=Platforms.TRN2),
-        ]
-
-        with patch("test.utils.host_management.SshHost"):
-            manager = HostManager(
-                base_host_info_path=temp_dir,
-                target_hosts=target_hosts,
-                neuron_installation_path="/opt/aws/neuron/bin",
-                ssh_config_path="~/.ssh/config",
-            )
-
-        # Initialize host stats file with single host
-        host_stats_path = os.path.join(temp_dir, "host_stats.json")
-        with open(host_stats_path, "w") as f:
-            json.dump(
-                [{"host_alias": "single-host", "work_queue_depth": 0, "run_id": manager.run_id, "host_type": "trn2"}],
-                f,
-            )
-
-        mock_host = MagicMock()
-        mock_host.get_host_id.return_value = "single-host"
-        manager.target_hosts = {"single-host": mock_host}
-        manager.host_types = {"single-host": Platforms.TRN2}
-
+        manager = self._build_manager_with_hosts(temp_dir, num_hosts=1)
         mock_collector = MagicMock()
 
         with pytest.raises(InferenceException) as exc_info:
             with closing(
                 manager.get_host_assignment_with_retry(
                     platform_target=Platforms.TRN2,
+                    collective_ranks=1,
+                    lnc_config=1,
                     collector=mock_collector,
                     connection_failure_cap=3,
                 )
             ) as host_generator:
                 for host_attempt in host_generator:
-                    with host_attempt as host:
+                    with host_attempt as host:  # noqa: F841
                         raise TimeoutError("SSH connection timed out during inference")
 
         # Verify the specific error is included
@@ -182,26 +170,28 @@ class TestHostManagerRetryErrorReporting:
         print("\n=== Test 3: Single Host Failure ===")
         print(error_message)
         print("=" * 50)
-        assert "single-host" in error_message
+        assert "host1" in error_message
         assert "TimeoutError" in error_message
         assert "SSH connection timed out during inference" in error_message
         assert "Errors from previous host attempts:" in error_message
 
     def test_patience_rotation_is_transient_does_not_mark_failed(self, mock_host_manager):
         """A QueuePatienceRotation (busy FIFO queue) is transient: the host is NOT marked
-        failed and stays eligible, and the loop keeps rotating until it succeeds elsewhere."""
+        unavailable and stays eligible, and the loop keeps rotating until it succeeds elsewhere."""
         from test.utils.exceptions import QueuePatienceRotation
 
         mock_collector = MagicMock()
 
         with patch.object(
-            mock_host_manager, "mark_host_as_failed", wraps=mock_host_manager.mark_host_as_failed
-        ) as mark_failed:
+            mock_host_manager, "mark_host_unavailable", wraps=mock_host_manager.mark_host_unavailable
+        ) as mark_unavailable:
             first_host_id = None
             successful_host_id = None
             with closing(
                 mock_host_manager.get_host_assignment_with_retry(
                     platform_target=Platforms.TRN2,
+                    collective_ranks=1,
+                    lnc_config=1,
                     collector=mock_collector,
                     backoff_seconds=0,
                 )
@@ -218,10 +208,10 @@ class TestHostManagerRetryErrorReporting:
                             raise QueuePatienceRotation("queue ETA exceeds patience")
                         successful_host_id = host_id
 
-        # The busy host was NEVER marked failed and stayed eligible; the loop
+        # The busy host was NEVER marked unavailable and stayed eligible; the loop
         # advanced to a different host and succeeded.
-        assert mark_failed.call_count == 0
-        assert mock_host_manager.failed_hosts == set()
+        assert mark_unavailable.call_count == 0
+        assert mock_host_manager.get_failed_host_count() == 0
         assert first_host_id is not None
         assert successful_host_id is not None
         assert successful_host_id != first_host_id
@@ -254,13 +244,15 @@ class TestHostManagerRetryErrorReporting:
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         deadline_seconds=deadline_seconds,
                         backoff_seconds=backoff,
                     )
                 ) as host_generator:
                     for host_attempt in host_generator:
-                        with host_attempt as host:
+                        with host_attempt as host:  # noqa: F841
                             rotations += 1
                             raise QueuePatienceRotation("queue busy")
 
@@ -268,36 +260,38 @@ class TestHostManagerRetryErrorReporting:
         # Far more rotations than the old fixed cap of 3.
         assert rotations > 3
         assert rotations >= int(deadline_seconds / backoff) - 1
-        # No host was ever marked failed for being merely busy.
-        assert manager.failed_hosts == set()
+        # No host was ever marked unavailable for being merely busy.
+        assert manager.get_failed_host_count() == 0
         # The diagnostic is DISTINCT from the other two terminal messages.
         assert "deadline" in msg.lower()
         assert "No available hosts" not in msg
         assert "Connection error after" not in msg
 
-    def test_connection_failures_still_capped_and_mark_failed(self, temp_dir):
-        """Genuine connection failures still mark hosts failed and stop at the cap."""
+    def test_connection_failures_still_capped_and_mark_unavailable(self, temp_dir):
+        """Genuine connection failures still mark hosts unavailable and stop at the cap."""
         manager = self._build_manager_with_hosts(temp_dir, num_hosts=5)
         mock_collector = MagicMock()
 
-        with patch.object(manager, "mark_host_as_failed", wraps=manager.mark_host_as_failed) as mark_failed:
+        with patch.object(manager, "mark_host_unavailable", wraps=manager.mark_host_unavailable) as mark_unavail:
             with pytest.raises(InferenceException) as exc_info:
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         connection_failure_cap=3,
                         backoff_seconds=0,
                     )
                 ) as host_generator:
                     for host_attempt in host_generator:
-                        with host_attempt as host:
+                        with host_attempt as host:  # noqa: F841
                             raise OSError("network unreachable")
 
         msg = str(exc_info.value)
         assert "Connection error after 3 attempts" in msg
-        assert mark_failed.call_count == 3
-        assert len(manager.failed_hosts) == 3
+        assert mark_unavail.call_count == 3
+        assert manager.get_failed_host_count() == 3
 
     def test_host_rotation_count_recorded_on_failure(self, mock_host_manager):
         """Each host rotation records CoreLockHostRotationCount as a delta of 1.0."""
@@ -309,6 +303,8 @@ class TestHostManagerRetryErrorReporting:
         with closing(
             mock_host_manager.get_host_assignment_with_retry(
                 platform_target=Platforms.TRN2,
+                collective_ranks=1,
+                lnc_config=1,
                 collector=mock_collector,
                 connection_failure_cap=2,
             )
@@ -331,36 +327,28 @@ class TestHostManagerRetryErrorReporting:
         assert rotation_calls[0].args[1] == 1.0
 
     def _build_manager_with_hosts(self, temp_dir, num_hosts):
-        """Build a HostManager backed by ``num_hosts`` mocked TRN2 hosts."""
+        """Build a HostManager backed by ``num_hosts`` mocked TRN2 hosts.
+
+        Hosts are seeded into the state store; SshHost is patched so the manager
+        builds alias-carrying mocks lazily on assignment rather than opening real
+        connections.
+        """
         aliases = [f"host{i}" for i in range(1, num_hosts + 1)]
         target_hosts = [TargetHost(ssh_host=a, host_type=Platforms.TRN2) for a in aliases]
 
-        with patch("test.utils.host_management.SshHost"):
-            manager = HostManager(
-                base_host_info_path=temp_dir,
-                target_hosts=target_hosts,
-                neuron_installation_path="/opt/aws/neuron/bin",
-                ssh_config_path="~/.ssh/config",
-            )
+        def fake_make(alias, **_kwargs):
+            return MagicMock(get_host_id=MagicMock(return_value=alias), connection=MagicMock())
 
-        host_stats_path = os.path.join(temp_dir, "host_stats.json")
-        with open(host_stats_path, "w") as f:
-            json.dump(
-                [
-                    {"host_alias": a, "work_queue_depth": 0, "run_id": manager.run_id, "host_type": "trn2"}
-                    for a in aliases
-                ],
-                f,
-            )
-
-        mocks = {}
-        for a in aliases:
-            m = MagicMock()
-            m.get_host_id.return_value = a
-            mocks[a] = m
-        manager.target_hosts = mocks
-        manager.host_types = {a: Platforms.TRN2 for a in aliases}
-        return manager
+        patcher = patch("test.utils.host_management.SshHost", side_effect=fake_make)
+        patcher.start()
+        self._patchers.append(patcher)
+        return HostManager(
+            state_store=_initialized_store(temp_dir, target_hosts),
+            neuron_installation_path="/opt/aws/neuron/bin",
+            ssh_config_path="~/.ssh/config",
+            testrun_uid="test-run",
+            needs_local_host=False,
+        )
 
     def test_host_rotation_count_datapoints_sum_to_n(self, temp_dir):
         """N rotations must emit N datapoints of 1.0 that sum to N (not N(N+1)/2)."""
@@ -377,6 +365,8 @@ class TestHostManagerRetryErrorReporting:
         with closing(
             manager.get_host_assignment_with_retry(
                 platform_target=Platforms.TRN2,
+                collective_ranks=1,
+                lnc_config=1,
                 collector=mock_collector,
                 connection_failure_cap=n_rotations + 1,
             )
@@ -403,6 +393,46 @@ class TestHostManagerRetryErrorReporting:
         # Guard against a regression to the cumulative-count emission.
         assert sum(rotation_values) != n_rotations * (n_rotations + 1) / 2
 
+    def test_core_lock_exhaustion_marks_host_unavailable(self, mock_host_manager):
+        # Core-lock acquisition that keeps erroring on a host surfaces as a plain OSError
+        # (see SshHost.get_core_allocation). It is routed through the same connection-fault
+        # branch: the host is marked unavailable (recoverable) and the attempt rotates on.
+        mock_collector = MagicMock()
+
+        with pytest.raises(InferenceException, match="Connection error after 2 attempts"):
+            with closing(
+                mock_host_manager.get_host_assignment_with_retry(
+                    platform_target=Platforms.TRN2,
+                    collector=mock_collector,
+                    collective_ranks=1,
+                    lnc_config=1,
+                    connection_failure_cap=2,
+                    backoff_seconds=0,
+                )
+            ) as host_generator:
+                for host_attempt in host_generator:
+                    with host_attempt as host:
+                        raise OSError(
+                            f"[{host.get_host_id()}] Lock acquisition failed after 10 consecutive retryable errors"
+                        )
+
+        # Every host hit was marked unavailable (recoverable), not permanently removed.
+        rows = {h.resolved.ssh_host: h for h in mock_host_manager.state_store.read().hosts}
+        assert rows["host1"].available is False
+        assert rows["host2"].available is False
+
+    def test_unavailable_host_is_revived_by_resolution(self, mock_host_manager):
+        # Recoverable end-to-end: a host taken out for a host-level failure comes back
+        # when a later resolution lists it as good-to-use (no sticky removal).
+        mock_host_manager.mark_host_unavailable("host1")
+        # A resolution is a controller/refresher action, so it reconciles through an owner
+        # store over the same file; the worker's base store (on the manager) then reads it.
+        OwnerHostStateStore(mock_host_manager.state_store.base_dir).apply_resolved(
+            [ResolvedHost(ssh_host="host1", host_type=Platforms.TRN2)]
+        )
+        row = {h.resolved.ssh_host: h for h in mock_host_manager.state_store.read().hosts}["host1"]
+        assert row.available is True
+
 
 class _PatienceRotatingHost(Host):
     """Concrete ``Host`` whose ``get_core_allocation`` always raises
@@ -413,7 +443,7 @@ class _PatienceRotatingHost(Host):
     """
 
     def __init__(self, host_id: str):
-        super().__init__()
+        super().__init__(CoreResetStrategy(exclusive_run=False))
         self._host_id = host_id
 
     def get_host_id(self) -> str:
@@ -450,17 +480,21 @@ class _PatienceRotatingHost(Host):
     def get_neuron_device_info(self):
         return []
 
+    def get_total_physical_cores(self) -> int:
+        return 64
+
 
 class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReporting):
     """Seam/regression test exercising the two combined behaviors TOGETHER through the
-    real ``HostManager`` host-selection (``__get_host_assignment__`` + ``failed_hosts``)
-    machinery -- only the wall clock and the per-attempt outcome are faked.
+    real ``HostManager`` host-selection (``__get_host_assignment__`` + the state store's
+    availability tracking) machinery -- only the wall clock and the per-attempt outcome
+    are faked.
 
     1. ``QueuePatienceRotation`` (busy FIFO queue ETA exceeds patience) is transient: the
-       host is NOT marked failed, NOT counted toward the connection-failure cap, the
+       host is NOT marked unavailable, NOT counted toward the connection-failure cap, the
        rotation metric is recorded, and rotation continues across hosts until a wall-clock
        deadline.
-    2. Genuine connection failures still mark hosts failed and stop at
+    2. Genuine connection failures still mark hosts unavailable and stop at
        ``connection_failure_cap``.
     """
 
@@ -475,6 +509,15 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
             clock["t"] += dt
 
         return fake_time, fake_sleep
+
+    @staticmethod
+    def _seed_hosts(manager, make_host):
+        """Pre-populate the manager's lazy host cache with concrete hosts keyed by the
+        store's aliases, so ``__get_host_assignment__`` returns these instances instead
+        of lazily building a mock. ``make_host(alias)`` builds the host for each alias."""
+        aliases = [h.resolved.ssh_host for h in manager.state_store.read().hosts]
+        manager.target_hosts = {a: make_host(a) for a in aliases}
+        return aliases
 
     def test_a_sustained_busy_reselects_hosts_and_terminates_on_deadline(self, temp_dir):
         """(a) Every attempt is busy: the loop rotates far past ``num_hosts`` (re-selecting
@@ -500,6 +543,8 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         deadline_seconds=deadline_seconds,
                         backoff_seconds=backoff,
@@ -520,7 +565,7 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         # Only real hosts from the pool were ever selected.
         assert set(attempted_hosts).issubset(set(manager.target_hosts.keys()))
         # Merely-busy hosts were NEVER excluded.
-        assert manager.failed_hosts == set()
+        assert manager.get_failed_host_count() == 0
         # Distinct deadline termination, not the other two terminal messages.
         msg = str(exc_info.value)
         assert "deadline" in msg.lower()
@@ -528,33 +573,37 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         assert "Connection error after" not in msg
 
     def test_b_connection_failures_exclude_hosts_and_stop_at_cap(self, temp_dir):
-        """(b) Genuine connection failures still exclude hosts (add to ``failed_hosts``) and
+        """(b) Genuine connection failures still exclude hosts (mark them unavailable) and
         stop at ``connection_failure_cap`` with the connection-error message."""
         connection_failure_cap = 3
         num_hosts = 3
         manager = self._build_manager_with_hosts(temp_dir, num_hosts=num_hosts)
         mock_collector = MagicMock()
 
-        with patch.object(manager, "mark_host_as_failed", wraps=manager.mark_host_as_failed) as mark_failed:
+        with patch.object(manager, "mark_host_unavailable", wraps=manager.mark_host_unavailable) as mark_failed:
             with pytest.raises(InferenceException) as exc_info:
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         connection_failure_cap=connection_failure_cap,
                         backoff_seconds=0,
                     )
                 ) as host_generator:
                     for host_attempt in host_generator:
-                        with host_attempt as host:
+                        with host_attempt as host:  # noqa: F841
                             raise OSError("network unreachable")
 
         msg = str(exc_info.value)
         assert f"Connection error after {connection_failure_cap} attempts" in msg
         assert "deadline" not in msg.lower()
         assert mark_failed.call_count == connection_failure_cap
-        assert len(manager.failed_hosts) == connection_failure_cap
-        assert manager.failed_hosts.issubset(set(manager.target_hosts.keys()))
+        assert manager.get_failed_host_count() == connection_failure_cap
+        all_rows = manager.state_store.read().hosts
+        unavailable = {h.resolved.ssh_host for h in all_rows if not h.available}
+        assert unavailable.issubset({h.resolved.ssh_host for h in all_rows})
 
     def test_c_rotation_metric_recorded_once_per_patience_rotation(self, temp_dir):
         """(c) In the sustained-busy scenario, ``CoreLockHostRotationCount`` is recorded
@@ -578,6 +627,8 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         deadline_seconds=deadline_seconds,
                         backoff_seconds=backoff,
@@ -596,7 +647,7 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         # One datapoint per rotation, each exactly 1.0, and no failure metrics.
         assert len(rotation_values) == rotations
         assert all(v == 1.0 for v in rotation_values)
-        assert manager.failed_hosts == set()
+        assert manager.get_failed_host_count() == 0
 
     def test_d_busy_host_is_reselectable_and_loop_can_succeed(self, temp_dir):
         """(d) A host that patience-rotates stays eligible; a later attempt succeeds and the
@@ -608,10 +659,12 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
 
         attempted_hosts = []
         successful_host_id = None
-        with patch.object(manager, "mark_host_as_failed", wraps=manager.mark_host_as_failed) as mark_failed:
+        with patch.object(manager, "mark_host_unavailable", wraps=manager.mark_host_unavailable) as mark_failed:
             with closing(
                 manager.get_host_assignment_with_retry(
                     platform_target=Platforms.TRN2,
+                    collective_ranks=1,
+                    lnc_config=1,
                     collector=mock_collector,
                     backoff_seconds=0,
                 )
@@ -630,7 +683,7 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         assert len(attempted_hosts) >= 3
         # No host was excluded for being merely busy; the loop ended on success.
         assert mark_failed.call_count == 0
-        assert manager.failed_hosts == set()
+        assert manager.get_failed_host_count() == 0
 
     def test_e_patience_rotation_through_execute_command_is_transient(self, temp_dir):
         """Gap #1: drive ``QueuePatienceRotation`` THROUGH the real
@@ -642,17 +695,19 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
 
         num_hosts = 3
         manager = self._build_manager_with_hosts(temp_dir, num_hosts=num_hosts)
-        # Replace the MagicMock hosts with concrete hosts that exercise the real
-        # execute_command -> get_core_allocation propagation path.
-        manager.target_hosts = {a: _PatienceRotatingHost(a) for a in manager.target_hosts}
+        # Seed concrete hosts that exercise the real execute_command ->
+        # get_core_allocation propagation path (keyed by the store's aliases).
+        self._seed_hosts(manager, _PatienceRotatingHost)
         mock_collector = MagicMock()
 
         attempted_hosts = []
         successful_host_id = None
-        with patch.object(manager, "mark_host_as_failed", wraps=manager.mark_host_as_failed) as mark_failed:
+        with patch.object(manager, "mark_host_unavailable", wraps=manager.mark_host_unavailable) as mark_failed:
             with closing(
                 manager.get_host_assignment_with_retry(
                     platform_target=Platforms.TRN2,
+                    collective_ranks=1,
+                    lnc_config=1,
                     collector=mock_collector,
                     backoff_seconds=0,
                 )
@@ -672,7 +727,7 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         assert len(attempted_hosts) >= 3
         # Transient: no host was marked failed and none excluded.
         assert mark_failed.call_count == 0
-        assert manager.failed_hosts == set()
+        assert manager.get_failed_host_count() == 0
         # The two propagated rotations were recorded as rotation datapoints.
         rotation_values = [
             c.args[1]
@@ -700,11 +755,13 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         outcomes = ["patience", "oserror", "patience", "oserror", "oserror"]
         idx = {"i": 0}
 
-        with patch.object(manager, "mark_host_as_failed", wraps=manager.mark_host_as_failed) as mark_failed:
+        with patch.object(manager, "mark_host_unavailable", wraps=manager.mark_host_unavailable) as mark_failed:
             with pytest.raises(InferenceException) as exc_info:
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         connection_failure_cap=connection_failure_cap,
                         backoff_seconds=0,
@@ -723,7 +780,7 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         assert "deadline" not in msg.lower()
         # Only the 3 genuine failures marked hosts failed / counted toward the cap.
         assert mark_failed.call_count == connection_failure_cap
-        assert len(manager.failed_hosts) == connection_failure_cap
+        assert manager.get_failed_host_count() == connection_failure_cap
         # All 5 non-success attempts (2 patience + 3 genuine) recorded a rotation datapoint.
         rotation_values = [
             c.args[1]
@@ -759,6 +816,8 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         deadline_seconds=deadline_seconds,
                         backoff_seconds=backoff,
@@ -790,9 +849,14 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         # Every host's soft_join_queue raises over-patience; prepare_host is a shared spy
         # that must NEVER be called on the rotation path (proves no upload happened).
         prepare_spy = MagicMock(return_value=contextlib.nullcontext())
-        for host in manager.target_hosts.values():
+
+        def make_host(alias):
+            host = MagicMock(get_host_id=MagicMock(return_value=alias))
             host.soft_join_queue.side_effect = QueuePatienceRotation("queue ETA exceeds patience")
             host.prepare_host = prepare_spy
+            return host
+
+        self._seed_hosts(manager, make_host)
 
         fake_time, fake_sleep = self._patched_clock()
         deadline_seconds = 50.0
@@ -809,6 +873,8 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
                 with closing(
                     manager.get_host_assignment_with_retry(
                         platform_target=Platforms.TRN2,
+                        collective_ranks=1,
+                        lnc_config=1,
                         collector=mock_collector,
                         deadline_seconds=deadline_seconds,
                         backoff_seconds=backoff,
@@ -833,7 +899,7 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         # (1) The upload was NEVER attempted on the rotation path.
         prepare_spy.assert_not_called()
         # (2) An over-patience rotation is transient, not a host failure.
-        assert manager.failed_hosts == set()
+        assert manager.get_failed_host_count() == 0
         # (3) The rotation metric was recorded exactly once per rotation (each value 1.0).
         rotation_values = [
             c.args[1]
@@ -854,45 +920,393 @@ class TestHostRotationUntilDeadlineIntegration(TestHostManagerRetryErrorReportin
         assert "No available hosts" not in msg
         assert "Connection error after" not in msg
 
+    def _build_manager_with_mixed_cores(self, temp_dir, host_cores: dict[str, int]):
+        """Build a HostManager over a state store whose TRN2 host rows carry the given
+        persisted core counts (a heterogeneous pool with an ineligible/too-small host
+        alongside eligible ones). SshHost is patched so claimed hosts are alias mocks."""
+        target_hosts = [TargetHost(ssh_host=a, host_type=Platforms.TRN2) for a in host_cores]
 
-class TestTemporaryRandomSeed:
-    """Tests for the temporary_random_seed context manager."""
+        def fake_make(alias, **_kwargs):
+            return MagicMock(get_host_id=MagicMock(return_value=alias), connection=MagicMock())
 
-    def setup_method(self) -> None:
-        """Set a deterministic seed before each test."""
-        random.seed(42)
+        patcher = patch("test.utils.host_management.SshHost", side_effect=fake_make)
+        patcher.start()
+        self._patchers.append(patcher)
+        return HostManager(
+            state_store=_initialized_store(temp_dir, target_hosts, cores_by_alias=dict(host_cores)),
+            neuron_installation_path="/opt/aws/neuron/bin",
+            ssh_config_path="~/.ssh/config",
+            testrun_uid="test-run",
+            needs_local_host=False,
+        )
 
-    def teardown_method(self) -> None:
-        """Reseed from system entropy so tests don't leak deterministic state."""
-        random.seed()
+    def test_rotation_reset_fires_with_ineligible_host_in_pool(self, temp_dir):
+        """Heterogeneous pool: two eligible same-size hosts + one too-small
+        (ineligible) host. Both eligible hosts must be attempted MORE THAN ONCE
+        across rotations -- proving the busy-set reset fired and re-enabled them --
+        rather than the loop sticking on one host. Under the OLD all-targets
+        comparison the reset can never fire (the too-small host never enters
+        ``busy_hosts``), so the loop would re-pick a single host every iteration."""
+        from test.utils.exceptions import QueuePatienceRotation
 
-    def test_restores_original_state(self) -> None:
-        """RNG state before and after the context manager should be identical."""
-        state_before = random.getstate()
-        with temporary_random_seed(999):
-            random.random()
-        assert random.getstate() == state_before
+        # big1/big2 eligible (>= 32 needed); small ineligible (8 < 32).
+        manager = self._build_manager_with_mixed_cores(temp_dir, {"big1": 64, "big2": 64, "small": 8})
+        mock_collector = MagicMock()
 
-    def test_choice_deterministic_with_same_seed(self) -> None:
-        """Same temporary seed produces the same random.choice result."""
-        items = ["host_a", "host_b", "host_c"]
+        fake_time, fake_sleep = self._patched_clock()
+        deadline_seconds = 100.0
+        backoff = 5.0
 
-        with temporary_random_seed(123):
-            first = random.choice(items)
+        attempted_hosts = []
+        with (
+            patch("test.utils.host_management.time.time", fake_time),
+            patch("test.utils.host_management.time.sleep", fake_sleep),
+        ):
+            with pytest.raises(InferenceException):
+                with closing(
+                    manager.get_host_assignment_with_retry(
+                        platform_target=Platforms.TRN2,
+                        collective_ranks=32,
+                        lnc_config=1,
+                        collector=mock_collector,
+                        deadline_seconds=deadline_seconds,
+                        backoff_seconds=backoff,
+                    )
+                ) as host_generator:
+                    for host_attempt in host_generator:
+                        with host_attempt as host:
+                            attempted_hosts.append(host.get_host_id())
+                            raise QueuePatienceRotation("queue ETA exceeds patience")
 
-        with temporary_random_seed(123):
-            second = random.choice(items)
+        # The too-small host is never eligible and must never be attempted.
+        assert "small" not in attempted_hosts
+        # BOTH eligible hosts were attempted more than once: the reset re-enabled
+        # them so the fleet kept rotating instead of sticking on a single host.
+        assert attempted_hosts.count("big1") > 1
+        assert attempted_hosts.count("big2") > 1
+        # No merely-busy host was ever marked failed.
+        assert manager.get_failed_host_count() == 0
 
-        assert first == second
+    def test_rotation_reset_ignores_ineligible_hosts(self, temp_dir):
+        """Once both eligible hosts are busy, the reset clears ``busy_hosts`` even
+        though an ineligible (too-small) host still exists in ``target_hosts`` --
+        so the loop keeps rotating between the two eligible hosts until the
+        deadline and never attempts the too-small host. Under the OLD all-targets
+        comparison this would stick on one host."""
+        from test.utils.exceptions import QueuePatienceRotation
 
-    def test_outer_sequence_unchanged_with_choice(self) -> None:
-        """random.choice inside the context manager should not alter the outer RNG sequence."""
-        expected_next = random.choice(["a", "b", "c"])
+        manager = self._build_manager_with_mixed_cores(temp_dir, {"big1": 64, "big2": 64, "small": 8})
+        mock_collector = MagicMock()
 
-        random.seed(42)
-        with temporary_random_seed(999):
-            random.choice(["a", "b", "c"])
-        assert random.choice(["a", "b", "c"]) == expected_next
+        fake_time, fake_sleep = self._patched_clock()
+        deadline_seconds = 100.0
+        backoff = 5.0
+
+        attempted_hosts = []
+        with (
+            patch("test.utils.host_management.time.time", fake_time),
+            patch("test.utils.host_management.time.sleep", fake_sleep),
+        ):
+            with pytest.raises(InferenceException):
+                with closing(
+                    manager.get_host_assignment_with_retry(
+                        platform_target=Platforms.TRN2,
+                        collective_ranks=32,
+                        lnc_config=1,
+                        collector=mock_collector,
+                        deadline_seconds=deadline_seconds,
+                        backoff_seconds=backoff,
+                    )
+                ) as host_generator:
+                    for host_attempt in host_generator:
+                        with host_attempt as host:
+                            attempted_hosts.append(host.get_host_id())
+                            raise QueuePatienceRotation("queue ETA exceeds patience")
+
+        # The rotation stays entirely within the eligible set...
+        assert set(attempted_hosts) == {"big1", "big2"}
+        # ...and both eligible hosts get a roughly balanced share, proving the loop
+        # re-rotates between them rather than deterministically re-picking one.
+        assert attempted_hosts.count("big1") > 1
+        assert attempted_hosts.count("big2") > 1
+
+
+class TestSizeBasedHostRouting:
+    """Explicit coverage for size-based host routing: hosts whose physical-core
+    capacity is smaller than the requested ``collective_ranks x lnc_config`` are
+    filtered out of host assignment so a request is only routed to a host big
+    enough to satisfy it."""
+
+    def setup_method(self):
+        self._patchers = []
+
+    def teardown_method(self):
+        # Reverse order: patches stacked on the same target must be undone LIFO, or the
+        # target is left pointing at an intermediate mock instead of the real object.
+        for p in reversed(self._patchers):
+            p.stop()
+
+    @pytest.fixture
+    def temp_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    def _build_manager(self, temp_dir, host_cores: dict[str, int]):
+        """Build a HostManager over a state store whose TRN2 host rows carry the given
+        persisted physical-core counts (the single source of truth capacity routing
+        ranks by). SshHost is patched so claimed hosts are alias-carrying mocks."""
+        target_hosts = [TargetHost(ssh_host=a, host_type=Platforms.TRN2) for a in host_cores]
+
+        def fake_make(alias, **_kwargs):
+            return MagicMock(get_host_id=MagicMock(return_value=alias), connection=MagicMock())
+
+        patcher = patch("test.utils.host_management.SshHost", side_effect=fake_make)
+        patcher.start()
+        self._patchers.append(patcher)
+        return HostManager(
+            state_store=_initialized_store(temp_dir, target_hosts, cores_by_alias=dict(host_cores)),
+            neuron_installation_path="/opt/aws/neuron/bin",
+            ssh_config_path="~/.ssh/config",
+            testrun_uid="test-run",
+            needs_local_host=False,
+        )
+
+    def _set_depths(self, manager, depths: dict[str, int]):
+        """Directly set per-host work_queue_depth in the store (test seam)."""
+        manager.state_store._update(
+            lambda state: HostState(
+                hosts=[
+                    replace(rec, work_queue_depth=depths.get(rec.resolved.ssh_host, rec.work_queue_depth))
+                    for rec in state.hosts
+                ],
+                poisoned=state.poisoned,
+            )
+        )
+
+    def _depths(self, manager) -> dict[str, int]:
+        return {rec.resolved.ssh_host: rec.work_queue_depth for rec in manager.state_store.read().hosts}
+
+    def test_too_small_host_is_filtered_out(self, temp_dir):
+        """A host with fewer physical cores than needed is never selected; the
+        only sufficiently large host is returned."""
+        manager = self._build_manager(temp_dir, {"small": 4, "big": 64})
+        host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=16)
+        assert host.get_host_id() == "big"
+
+    def test_boundary_exactly_enough_is_eligible_one_short_is_not(self, temp_dir):
+        """A host with exactly the needed core count is eligible; one core short is
+        excluded (the filter is ``>=``)."""
+        manager = self._build_manager(temp_dir, {"exact": 16, "short": 15})
+        host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=16)
+        assert host.get_host_id() == "exact"
+
+    def test_all_hosts_too_small_raises_with_size_breakdown(self, temp_dir):
+        """When every matching host is too small, the diagnostic distinguishes a
+        sizing mismatch from a failure: it reports the requested core count and
+        that the hosts are 'too small' (with the largest available), NOT 'unavailable'."""
+        manager = self._build_manager(temp_dir, {"h1": 4, "h2": 8})
+        with pytest.raises(FleetEmptyError, match="No available hosts") as exc:
+            manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=16)
+        msg = str(exc.value)
+        assert "needing 16 physical cores" in msg
+        assert "2 too small" in msg
+        assert "largest available 8 cores" in msg
+        assert "unavailable" not in msg
+
+    def test_all_hosts_unavailable_raises_with_unavailable_breakdown(self, temp_dir):
+        """When every matching, large-enough host has been marked unavailable, the
+        diagnostic reports them as 'unavailable' and NOT as a sizing problem."""
+        manager = self._build_manager(temp_dir, {"h1": 64, "h2": 64})
+        manager.mark_host_unavailable("h1")
+        manager.mark_host_unavailable("h2")
+        with pytest.raises(FleetEmptyError, match="No available hosts") as exc:
+            manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=16)
+        msg = str(exc.value)
+        assert "2 unavailable" in msg
+        assert "too small" not in msg
+
+    def test_mixed_unavailable_and_too_small_breakdown(self, temp_dir):
+        """A pool where one host is unavailable and another is too small reports BOTH
+        reasons distinctly rather than collapsing to a single cause."""
+        manager = self._build_manager(temp_dir, {"down": 64, "tiny": 4})
+        manager.mark_host_unavailable("down")
+        with pytest.raises(FleetEmptyError, match="No available hosts") as exc:
+            manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=16)
+        msg = str(exc.value)
+        assert "1 unavailable" in msg
+        assert "1 too small" in msg
+
+    def test_no_matching_platform_raises_distinct_message(self, temp_dir):
+        """When no host of the requested platform exists, the diagnostic says the
+        type is absent from the pool -- not that hosts were unavailable or too small."""
+        manager = self._build_manager(temp_dir, {"h1": 64})
+        with pytest.raises(FleetEmptyError, match="no host of platform trn1 exists") as exc:
+            manager.__get_host_assignment__(Platforms.TRN1, num_of_physical_cores_needed=16)
+        msg = str(exc.value)
+        assert "unavailable" not in msg
+        assert "too small" not in msg
+
+    def test_retry_routes_using_ranks_times_lnc_requirement(self, temp_dir):
+        """``get_host_assignment_with_retry`` derives the requirement as
+        ``collective_ranks * lnc_config`` (8 * 2 = 16) and routes only to a host
+        large enough; the 8-core host is excluded."""
+        manager = self._build_manager(temp_dir, {"small": 8, "big": 64})
+        mock_collector = MagicMock()
+
+        chosen = []
+        with closing(
+            manager.get_host_assignment_with_retry(
+                platform_target=Platforms.TRN2,
+                collector=mock_collector,
+                collective_ranks=8,
+                lnc_config=2,
+                backoff_seconds=0,
+            )
+        ) as host_generator:
+            for host_attempt in host_generator:
+                with host_attempt as host:
+                    chosen.append(host.get_host_id())
+        assert chosen == ["big"]
+
+    def test_retry_lnc1_only_multiplies_by_one(self, temp_dir):
+        """With lnc1 the requirement equals ``collective_ranks``; a host with that
+        exact count is eligible."""
+        manager = self._build_manager(temp_dir, {"small": 3, "exact": 4})
+        mock_collector = MagicMock()
+
+        chosen = []
+        with closing(
+            manager.get_host_assignment_with_retry(
+                platform_target=Platforms.TRN2,
+                collector=mock_collector,
+                collective_ranks=4,
+                lnc_config=1,
+                backoff_seconds=0,
+            )
+        ) as host_generator:
+            for host_attempt in host_generator:
+                with host_attempt as host:
+                    chosen.append(host.get_host_id())
+        assert chosen == ["exact"]
+
+    def test_assignment_and_release_account_for_full_core_count(self, temp_dir):
+        """Assignment adds the requested physical-core count to the host's queue
+        depth (proportional load, not a flat +1), and ``release_host`` subtracts
+        exactly that amount."""
+        manager = self._build_manager(temp_dir, {"big": 64})
+        needed = 16
+
+        host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=needed)
+        assert self._depths(manager)["big"] == needed
+
+        manager.release_host(host, needed)
+        assert self._depths(manager)["big"] == 0
+
+    def test_pick_prefers_lower_load_ratio_not_absolute_depth(self, temp_dir):
+        """Selection picks the single least-loaded host by load ratio
+        (``work_queue_depth / num_physical_cores``), not by absolute queue depth:
+        a large host carrying a higher absolute depth but a lower ratio wins over a
+        small host with a lower absolute depth but a higher ratio."""
+        manager = self._build_manager(temp_dir, {"big1": 64, "big2": 64, "big3": 64, "small": 8})
+        # big hosts: depth 32 -> ratio 0.5; small: depth 8 -> ratio 1.0. The bigs carry
+        # MORE absolute work yet a LOWER ratio, so the ratio (not absolute depth) must win.
+        self._set_depths(manager, {"big1": 32, "big2": 32, "big3": 32, "small": 8})
+
+        host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=1)
+        assert host.get_host_id() != "small"
+        assert host.get_host_id() in {"big1", "big2", "big3"}
+        # Deterministic: identical state resolves to the same host on repeat (no randomness).
+        manager.release_host(host, 1)
+        again = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=1)
+        assert again.get_host_id() == host.get_host_id()
+
+    def test_assignments_spread_in_proportion_to_capacity(self, temp_dir):
+        """Repeated single-core assignments drain a large host proportionally more than a
+        small one: with a 128-core and an 8-core host (16:1 capacity) the 128-core host
+        receives ~16x the work -- its share of total capacity."""
+        manager = self._build_manager(temp_dir, {"big": 128, "small": 8})
+        counts = {"big": 0, "small": 0}
+        for _ in range(136):  # one full capacity sweep (128 + 8)
+            host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=1)
+            counts[host.get_host_id()] += 1
+        # big holds 128/136 = 94% of capacity -> it must absorb the large majority.
+        assert counts["big"] > counts["small"] * 10
+        # small still gets a fair, capacity-proportional (non-zero) slice.
+        assert counts["small"] > 0
+
+    def test_selection_spreads_across_tied_hosts_over_runs(self, temp_dir):
+        """A pure tie (equal-size hosts all at depth 0, as right after startup) must NOT
+        always resolve to the same host: initialize() shuffles the append order that the
+        ranking falls back on, so first-claim load spreads across independent runs instead
+        of hammering the first-listed host. Ranking itself is still deterministic once
+        loads/capacities differ (see the capacity-proportional and release tests)."""
+        picks = set()
+        for _ in range(30):
+            # Each iteration uses its own store dir so every run starts from identical
+            # (fresh) tied state — the only variable is initialize()'s shuffle.
+            with tempfile.TemporaryDirectory() as iter_dir:
+                manager = self._build_manager(iter_dir, {"a": 64, "b": 64, "c": 64})
+                host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=1)
+                picks.add(host.get_host_id())
+        # Over 30 runs across 3 hosts, a single-host result is astronomically unlikely
+        # (3 * (1/3)^30) unless the shuffle regressed. All picks stay within the pool.
+        assert len(picks) > 1, "tied-host selection should spread across runs, not pin to one host"
+        assert picks <= {"a", "b", "c"}
+
+    def test_idle_small_does_not_steal_from_spare_big(self, temp_dir):
+        """An idle small host must NOT act as a "ratio-0 magnet". Ranking by the
+        POST-placement load ratio, an idle 8-core host (post-ratio (0+2)/8=0.25)
+        loses to a 128-core host already holding 6 cores (post-ratio
+        (6+2)/128=0.0625), because the big host still has proportionally more
+        headroom."""
+        manager = self._build_manager(temp_dir, {"small": 8, "big": 128})
+        self._set_depths(manager, {"big": 6, "small": 0})
+
+        host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=2)
+        assert host.get_host_id() == "big"
+
+    def test_small_is_selected_once_big_is_sufficiently_loaded(self, temp_dir):
+        """Smalls are not starved outright: once the big host is heavily loaded its
+        post-placement ratio climbs past the small's, so the small host wins. Big at
+        depth 120/128 -> post (120+2)/128=0.953 loses to small 0 -> (0+2)/8=0.25."""
+        manager = self._build_manager(temp_dir, {"small": 8, "big": 128})
+        self._set_depths(manager, {"big": 120, "small": 0})
+
+        host = manager.__get_host_assignment__(Platforms.TRN2, num_of_physical_cores_needed=2)
+        assert host.get_host_id() == "small"
+
+
+class TestSshHostTotalPhysicalCores:
+    """Explicit coverage for SshHost.get_total_physical_cores(): physical cores =
+    sum over devices of ``len(neuroncore_ids) * logical_neuroncore_config``,
+    computed once and cached."""
+
+    def test_sums_cores_across_devices(self, tmp_path):
+        host = _make_ssh_host(tmp_path)
+        host._total_physical_cores = None  # force a fresh computation
+        devices = [_make_mock_device([0, 1, 2, 3], lnc_config=2), _make_mock_device([0, 1], lnc_config=2)]
+        with patch.object(host, "get_neuron_device_info", return_value=devices) as mock_info:
+            # (4 cores * lnc2) + (2 cores * lnc2) = 8 + 4 = 12
+            assert host.get_total_physical_cores() == 12
+            mock_info.assert_called_once()
+
+    def test_lnc1_devices(self, tmp_path):
+        host = _make_ssh_host(tmp_path)
+        host._total_physical_cores = None
+        devices = [_make_mock_device([0, 1, 2, 3], lnc_config=1)]
+        with patch.object(host, "get_neuron_device_info", return_value=devices):
+            assert host.get_total_physical_cores() == 4
+
+    def test_result_is_cached(self, tmp_path):
+        """A second call reuses the cached value and does not re-query devices."""
+        host = _make_ssh_host(tmp_path)
+        host._total_physical_cores = None
+        devices = [_make_mock_device([0, 1, 2, 3], lnc_config=2)]
+        with patch.object(host, "get_neuron_device_info", return_value=devices) as mock_info:
+            first = host.get_total_physical_cores()
+            second = host.get_total_physical_cores()
+        assert first == second == 8
+        mock_info.assert_called_once()
 
 
 SAMPLE_NEURON_LS_OUTPUT = json.dumps(
@@ -907,6 +1321,7 @@ SAMPLE_NEURON_LS_OUTPUT = json.dumps(
             "memory_size": 34359738368,
             "neuroncore_ids": [0, 1],
             "neuron_processes": [],
+            "instance_type": "trn2.48xlarge",
         }
     ]
 )
@@ -969,6 +1384,16 @@ def _make_mock_device(core_ids: list[int], lnc_config: int = 2) -> MagicMock:
 class TestLocalHostCoreAllocation:
     """Tests for LocalHost.get_core_allocation() with file-based locking."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_neuron_ls(self):
+        # get_total_physical_cores() reads neuron-ls directly via _run_neuron_ls;
+        # 4 logical cores * lnc2 = 8 physical cores total.
+        with patch(
+            "test.utils.host_management._run_neuron_ls",
+            return_value=[_make_mock_device([0, 1, 2, 3])],
+        ):
+            yield
+
     @pytest.fixture
     def temp_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -976,7 +1401,9 @@ class TestLocalHostCoreAllocation:
 
     @pytest.fixture
     def local_host(self, temp_dir):
-        return LocalHost("/opt/aws/neuron/bin", "localhost", temp_dir)
+        return LocalHost(
+            "/opt/aws/neuron/bin", "localhost", temp_dir, core_reset_strategy=CoreResetStrategy(exclusive_run=False)
+        )
 
     def test_allocates_correct_cores(self, local_host):
         """Core allocation returns the requested number of logical cores."""
@@ -1034,6 +1461,16 @@ class TestLocalHostCoreAllocation:
 class TestLocalHostExecuteCommand:
     """Tests for LocalHost.execute_command()."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_neuron_ls(self):
+        # get_total_physical_cores() reads neuron-ls directly via _run_neuron_ls;
+        # 2 logical cores * lnc2 = 4 physical cores total.
+        with patch(
+            "test.utils.host_management._run_neuron_ls",
+            return_value=[_make_mock_device([0, 1])],
+        ):
+            yield
+
     @pytest.fixture
     def temp_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1041,7 +1478,9 @@ class TestLocalHostExecuteCommand:
 
     @pytest.fixture
     def local_host(self, temp_dir):
-        return LocalHost("/opt/aws/neuron/bin", "localhost", temp_dir)
+        return LocalHost(
+            "/opt/aws/neuron/bin", "localhost", temp_dir, core_reset_strategy=CoreResetStrategy(exclusive_run=False)
+        )
 
     def _mock_collector(self):
         collector = MagicMock()
@@ -1132,10 +1571,10 @@ from test.utils.core_lock_manager import (  # noqa: E402
     CoreLockManager,
     LockAcquisitionError,
 )
-from test.utils.exceptions import QueuePatienceRotation, TimeoutException  # noqa: E402
+from test.utils.exceptions import QueuePatienceRotation  # noqa: E402
 from test.utils.host_management import (  # noqa: E402
+    DEFAULT_PATIENCE_SECONDS,
     FAST_POLL_PERIOD,
-    PATIENCE_SECONDS,
     POLL_JITTER_MAX,
     POLL_PERIOD,
     STALE_THRESHOLD,
@@ -1143,14 +1582,14 @@ from test.utils.host_management import (  # noqa: E402
     select_poll_base,
     should_rotate,
 )
-from test.utils.metrics_collector import MetricName, NoopMetricsCollector  # noqa: E402
+from test.utils.metrics_collector import NoopMetricsCollector  # noqa: E402
 from test.utils.remote_executor import RemoteExecutorError  # noqa: E402
 from test.utils.scripts import remote_lock_scripts  # noqa: E402
 
 # A realistic unix epoch for the integration clock. Starting the fake clock here
 # (rather than ~0) ensures the helper's RELATIVE worst_case_eta is exercised
 # independent of the absolute wall clock: an absolute-timestamp ETA at this
-# epoch (~1.7e9) would dwarf PATIENCE_SECONDS and force instant rotation.
+# epoch (~1.7e9) would dwarf DEFAULT_PATIENCE_SECONDS and force instant rotation.
 _REALISTIC_EPOCH = 1_700_000_000.0
 
 
@@ -1162,7 +1601,7 @@ class _FakeClock:
     same monotonic, sleep-driven time. Integration tests start it at a realistic
     epoch (``_REALISTIC_EPOCH``) rather than ~0: the helper now returns
     ``worst_case_eta`` as a RELATIVE wait (seconds from now), so the absolute
-    clock value must be irrelevant to the PATIENCE_SECONDS threshold. Starting
+    clock value must be irrelevant to the DEFAULT_PATIENCE_SECONDS threshold. Starting
     at a real epoch proves that (with an absolute-timestamp ETA every caller
     would instantly exceed patience and rotate).
     """
@@ -1202,7 +1641,9 @@ def _cm_collector() -> MagicMock:
     return collector
 
 
-def _make_ssh_host(tmp_path, total_physical_cores: int = 8) -> SshHost:
+def _make_ssh_host(
+    tmp_path, total_physical_cores: int = 8, patience_seconds: int = DEFAULT_PATIENCE_SECONDS
+) -> SshHost:
     """Construct an SshHost without any real SSH; locking version/core count pre-seeded."""
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text("")
@@ -1210,9 +1651,9 @@ def _make_ssh_host(tmp_path, total_physical_cores: int = 8) -> SshHost:
         ssh_alias="fakehost",
         test_base_path=str(tmp_path),
         remote_neuron_install_dir="/opt/aws/neuron/bin",
-        run_id="run-1",
         ssh_config_path=str(ssh_config),
         s3_config=MagicMock(),
+        patience_seconds=patience_seconds,
     )
     host._total_physical_cores = total_physical_cores
     host._host_locking_version = 3
@@ -1226,9 +1667,18 @@ class _FakeManager:
     robust to the exact number of poll iterations the loop performs.
     """
 
-    def __init__(self, outcomes):
+    def __init__(self, outcomes, probe_outcomes=None, release_error=None):
         self._outcomes = list(outcomes)
+        # When set, release() raises this exception to exercise the best-effort
+        # release teardown path (locks auto-expire, so a failed release is
+        # swallowed after logging + recording a failure metric).
+        self._release_error = release_error
+        # Separate scripted sequence for the read-only probe pre-screen. When
+        # None, probe returns a benign under-patience outcome so non-gate tests
+        # fall through to acquire(ready=False).
+        self._probe_outcomes = list(probe_outcomes) if probe_outcomes is not None else None
         self.acquire_calls = 0
+        self.probe_calls = 0
         self.dequeue_calls = 0
         self.metrics_calls = 0
         self.released: list[list[int]] = []
@@ -1236,7 +1686,16 @@ class _FakeManager:
         # abandon flush records metrics BEFORE the slot is freed.
         self.events: list[str] = []
 
-    def acquire(self, num_logical_cores, lnc_config, timeout_seconds=None, ready=True):  # noqa: ARG002
+    def probe(self, num_logical_cores, lnc_config, timeout_seconds=None):  # noqa: ARG002
+        self.probe_calls += 1
+        if self._probe_outcomes is None:
+            return AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=0)
+        item = self._probe_outcomes[0] if len(self._probe_outcomes) == 1 else self._probe_outcomes.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def acquire(self, num_logical_cores, lnc_config, ready=True):  # noqa: ARG002
         self.acquire_calls += 1
         item = self._outcomes[0] if len(self._outcomes) == 1 else self._outcomes.pop(0)
         if isinstance(item, Exception):
@@ -1249,6 +1708,8 @@ class _FakeManager:
 
     def release(self, core_ids) -> None:
         self.released.append(list(core_ids))
+        if self._release_error is not None:
+            raise self._release_error
 
     def record_contention_metrics(self) -> None:
         self.metrics_calls += 1
@@ -1259,21 +1720,105 @@ class TestShouldRotate:
     """The pure caller-patience predicate."""
 
     def test_patience_seconds_is_180(self) -> None:
-        assert PATIENCE_SECONDS == 180
+        assert DEFAULT_PATIENCE_SECONDS == 180
 
     def test_rotate_when_eta_exceeds_patience_and_not_draining(self) -> None:
-        assert should_rotate(PATIENCE_SECONDS + 1, draining=False) is True
+        assert (
+            should_rotate(DEFAULT_PATIENCE_SECONDS + 1, draining=False, patience_seconds=DEFAULT_PATIENCE_SECONDS)
+            is True
+        )
 
     def test_no_rotate_when_draining_even_if_eta_large(self) -> None:
         # ETA is meaningless mid-drain; stay-and-probe, never rotate.
-        assert should_rotate(PATIENCE_SECONDS + 1, draining=True) is False
+        assert (
+            should_rotate(DEFAULT_PATIENCE_SECONDS + 1, draining=True, patience_seconds=DEFAULT_PATIENCE_SECONDS)
+            is False
+        )
 
     def test_no_rotate_when_eta_is_none(self) -> None:
-        assert should_rotate(None, draining=False) is False
+        assert should_rotate(None, draining=False, patience_seconds=DEFAULT_PATIENCE_SECONDS) is False
 
     def test_no_rotate_when_eta_within_patience(self) -> None:
-        assert should_rotate(PATIENCE_SECONDS - 1, draining=False) is False
-        assert should_rotate(PATIENCE_SECONDS, draining=False) is False
+        assert (
+            should_rotate(DEFAULT_PATIENCE_SECONDS - 1, draining=False, patience_seconds=DEFAULT_PATIENCE_SECONDS)
+            is False
+        )
+        assert (
+            should_rotate(DEFAULT_PATIENCE_SECONDS, draining=False, patience_seconds=DEFAULT_PATIENCE_SECONDS) is False
+        )
+
+    def test_configured_patience_threshold_is_honored(self) -> None:
+        # A custom (non-default) threshold governs the rotate boundary.
+        assert should_rotate(51, draining=False, patience_seconds=50) is True
+        assert should_rotate(50, draining=False, patience_seconds=50) is False
+        # An ETA above the default but below a larger configured patience must not rotate.
+        assert should_rotate(DEFAULT_PATIENCE_SECONDS + 1, draining=False, patience_seconds=10_000) is False
+
+    def test_negative_patience_disables_rotation(self) -> None:
+        # Negative patience disables the mechanic entirely, regardless of ETA.
+        assert should_rotate(10_000, draining=False, patience_seconds=-1) is False
+
+    def test_zero_patience_disables_rotation(self) -> None:
+        # Zero is not a positive threshold, so rotation stays disabled.
+        assert should_rotate(10_000, draining=False, patience_seconds=0) is False
+
+
+class TestPatienceConfiguration:
+    """Plumbing for the configurable host-rotation patience threshold."""
+
+    def _capture_ssh_host_kwargs(self, tmp_path, **manager_kwargs):
+        """Build a HostManager (SshHost patched out) and lazily materialize one host, so
+        the SshHost the manager constructs in _get_host is captured. Returns its kwargs."""
+        target_hosts = [TargetHost(ssh_host="host1", host_type=Platforms.TRN2)]
+        with patch("test.utils.host_management.SshHost") as mock_host:
+            manager = HostManager(
+                state_store=_initialized_store(str(tmp_path), target_hosts),
+                neuron_installation_path="/opt/aws/neuron/bin",
+                ssh_config_path="~/.ssh/config",
+                testrun_uid="test-run",
+                needs_local_host=False,
+                **manager_kwargs,
+            )
+            manager._get_host("host1")  # lazily builds (and captures) the SshHost
+        return mock_host.call_args.kwargs
+
+    def test_configured_patience_propagates_to_ssh_host(self, tmp_path) -> None:
+        kwargs = self._capture_ssh_host_kwargs(tmp_path, host_rotation_patience_seconds=42)
+        assert kwargs["patience_seconds"] == 42
+
+    def test_none_patience_falls_back_to_default(self, tmp_path) -> None:
+        # Regression: the unset CLI flag resolves to None; HostManager must
+        # coerce it to the default rather than propagating None (which would
+        # crash should_rotate on the int>None comparison).
+        kwargs = self._capture_ssh_host_kwargs(tmp_path, host_rotation_patience_seconds=None)
+        assert kwargs["patience_seconds"] == DEFAULT_PATIENCE_SECONDS
+
+    def test_default_when_arg_omitted(self, tmp_path) -> None:
+        kwargs = self._capture_ssh_host_kwargs(tmp_path)
+        assert kwargs["patience_seconds"] == DEFAULT_PATIENCE_SECONDS
+
+    def test_ssh_host_stores_patience(self, tmp_path) -> None:
+        host = _make_ssh_host(tmp_path, patience_seconds=99)
+        assert host.patience_seconds == 99
+
+    def test_exclusive_run_threads_reset_strategy_into_ssh_host(self, tmp_path) -> None:
+        # _get_host builds the per-host CoreResetStrategy from the manager's exclusive +
+        # testrun_uid (see __build_reset_strategy__). An exclusive strategy is state-backed
+        # and namespaced by testrun_uid + alias; assert it reaches the SshHost so exclusive
+        # per-capture reset isn't silently inert.
+        kwargs = self._capture_ssh_host_kwargs(tmp_path, exclusive=True)
+        strategy = kwargs["core_reset_strategy"]
+        assert strategy._exclusive_run is True
+        # Exclusive path requires (and uses) testrun_uid + ssh_alias; a state path proves both were threaded.
+        assert strategy._state_path is not None
+        assert "test-run" in strategy._state_path and "host1" in strategy._state_path
+
+    def test_shared_run_reset_strategy_is_non_exclusive(self, tmp_path) -> None:
+        # Default (shared) run: the strategy always resets, with no state file.
+        kwargs = self._capture_ssh_host_kwargs(tmp_path)
+        strategy = kwargs["core_reset_strategy"]
+        assert strategy._exclusive_run is False
+        assert strategy._state_path is None
 
 
 class TestSelectPollBase:
@@ -1369,7 +1914,7 @@ class TestSshHostPollLoop:
         host = _make_ssh_host(tmp_path)
         fake_mgr = _FakeManager(
             [
-                AllocationOutcome(status=AllocationStatus.QUEUED, position=1, worst_case_eta=PATIENCE_SECONDS),
+                AllocationOutcome(status=AllocationStatus.QUEUED, position=1, worst_case_eta=DEFAULT_PATIENCE_SECONDS),
                 AllocationOutcome(
                     status=AllocationStatus.ALLOCATED,
                     logical_cores=[0],
@@ -1596,7 +2141,9 @@ class TestSshHostPollLoop:
         host = _make_ssh_host(tmp_path)
         fake_mgr = _FakeManager(
             [
-                AllocationOutcome(status=AllocationStatus.QUEUED, position=5, worst_case_eta=PATIENCE_SECONDS + 1),
+                AllocationOutcome(
+                    status=AllocationStatus.QUEUED, position=5, worst_case_eta=DEFAULT_PATIENCE_SECONDS + 1
+                ),
                 AllocationOutcome(status=AllocationStatus.ALLOCATED, logical_cores=[0], physical_cores=[0, 1]),
             ]
         )
@@ -1644,6 +2191,88 @@ class TestSshHostPollLoop:
         assert fake_mgr.dequeue_calls == 0
 
 
+class TestSshHostReleaseFailureHandling:
+    """Best-effort core release on context exit.
+
+    Core reservations are time-bound (auto-expire), so a failed ``release`` on
+    context teardown must never propagate out of ``get_core_allocation`` and
+    mask the real work result. Instead it is logged at warning and a
+    ``CoreLockReleaseFailedCount`` datapoint is recorded.
+    """
+
+    @contextlib.contextmanager
+    def _run(self, host, fake_mgr, collector, clock=None, **kwargs):
+        """Like TestSshHostPollLoop._run but with a caller-supplied collector so
+        the test can assert on record_metric calls."""
+        clock = clock or _FakeClock()
+        with (
+            patch.object(host_management, "CoreLockManager", return_value=fake_mgr),
+            patch.object(host, "_get_remote_executor", return_value=MagicMock()),
+            patch.object(host, "get_instance_type", return_value="trn1"),
+            patch("time.sleep", clock.sleep),
+            patch("time.time", clock.time),
+        ):
+            with host.get_core_allocation(collector=collector, **kwargs) as alloc:
+                yield alloc
+
+    def _release_failed_count(self, collector) -> int:
+        return sum(
+            1
+            for c in collector.record_metric.call_args_list
+            if c.args and c.args[0] == MetricName.CORE_LOCK_RELEASE_FAILED_COUNT
+        )
+
+    def test_release_failure_is_swallowed_and_records_failure_metric(self, tmp_path) -> None:
+        """A raising release() must not propagate; it records exactly one
+        CoreLockReleaseFailedCount datapoint and still tears the manager down."""
+        host = _make_ssh_host(tmp_path)
+        fake_mgr = _FakeManager(
+            [AllocationOutcome(status=AllocationStatus.ALLOCATED, logical_cores=[0], physical_cores=[0, 1])],
+            release_error=RuntimeError("boom during unlock"),
+        )
+        collector = _cm_collector()
+        # The context manager exits cleanly despite release() raising.
+        with self._run(host, fake_mgr, collector, collective_ranks=1, lnc_config=2) as alloc:
+            assert alloc.logical_core_ids == [0]
+        # release was attempted with the committed physical cores...
+        assert fake_mgr.released == [[0, 1]]
+        # ...the failure was recorded exactly once...
+        assert self._release_failed_count(collector) == 1
+        # ...and the cached manager is dropped even though release failed.
+        assert host._core_lock_manager is None
+
+    def test_successful_release_records_no_failure_metric(self, tmp_path) -> None:
+        """The happy path releases cores and records NO failure metric."""
+        host = _make_ssh_host(tmp_path)
+        fake_mgr = _FakeManager(
+            [AllocationOutcome(status=AllocationStatus.ALLOCATED, logical_cores=[0], physical_cores=[0, 1])],
+        )
+        collector = _cm_collector()
+        with self._run(host, fake_mgr, collector, collective_ranks=1, lnc_config=2) as alloc:
+            assert alloc.logical_core_ids == [0]
+        assert fake_mgr.released == [[0, 1]]
+        assert self._release_failed_count(collector) == 0
+        assert host._core_lock_manager is None
+
+    def test_body_exception_propagates_and_release_failure_does_not_mask_it(self, tmp_path) -> None:
+        """If the with-body raises AND release() also raises, the body's exception
+        must surface (release failure is swallowed) while the failure metric is
+        still recorded."""
+        host = _make_ssh_host(tmp_path)
+        fake_mgr = _FakeManager(
+            [AllocationOutcome(status=AllocationStatus.ALLOCATED, logical_cores=[0], physical_cores=[0, 1])],
+            release_error=RuntimeError("boom during unlock"),
+        )
+        collector = _cm_collector()
+        with pytest.raises(ValueError, match="work failed"):
+            with self._run(host, fake_mgr, collector, collective_ranks=1, lnc_config=2):
+                raise ValueError("work failed")
+        # release was still attempted on teardown and its failure recorded.
+        assert fake_mgr.released == [[0, 1]]
+        assert self._release_failed_count(collector) == 1
+        assert host._core_lock_manager is None
+
+
 class _HelperExecutor:
     """Fake RemoteExecutor running the real lock helper against a temp locks.json.
 
@@ -1680,7 +2309,7 @@ class TestSshHostPollLoopIntegration:
     poll loop and the real helper share one sleep-driven clock. It starts at a
     realistic epoch (``_REALISTIC_EPOCH``): the helper returns ``worst_case_eta``
     as a RELATIVE wait, so lock expiries are written epoch-relative and the
-    PATIENCE_SECONDS threshold is exercised independent of the absolute clock.
+    DEFAULT_PATIENCE_SECONDS threshold is exercised independent of the absolute clock.
     """
 
     def _paths(self, tmp_path):
@@ -1745,11 +2374,11 @@ class TestSshHostPollLoopIntegration:
         assert executor.calls >= 2  # enqueued, polled, then committed
         assert self._read_queue(locks_json) == []  # committed + released -> empty
 
-    def test_eta_over_patience_rotates_and_dequeues(self, tmp_path) -> None:
-        """A deep queue pushes the soft-join caller's ETA past patience -> the
-        pre-upload patience gate in soft_join_queue dequeues + raises
-        QueuePatienceRotation (rotation now originates pre-upload, not in
-        get_core_allocation)."""
+    def test_eta_over_patience_rotates_without_enqueue(self, tmp_path) -> None:
+        """A deep queue pushes the soft-join caller's probed ETA past patience ->
+        the read-only probe pre-screen in soft_join_queue raises
+        QueuePatienceRotation BEFORE any enqueue (no dequeue, no churn): the
+        queue keeps only the seeded waiters."""
         helpers_file, lock_file, locks_json = self._paths(tmp_path)
         clock = _FakeClock(start=_REALISTIC_EPOCH)
         # All cores busy for a full hold window; helper uses the shared clock.
@@ -1781,9 +2410,8 @@ class TestSshHostPollLoopIntegration:
                 with pytest.raises(QueuePatienceRotation, match="rotating host"):
                     host.soft_join_queue(collector=_cm_collector(), collective_ranks=4, lnc_config=2)
 
-        # Our caller soft-joined (4 entries) then dequeued on the pre-upload
-        # rotation -> only the three seeded waiters remain; the abandoned slot is
-        # gone (queue returns to its seeded waiter count).
+        # The probe is read-only: no enqueue, no dequeue -> only the three seeded
+        # waiters remain (our caller never joined the queue).
         assert len(self._read_queue(locks_json)) == 3
 
     def test_stale_entry_pruned_then_reenqueued_records_reenqueue_not_bump(self, tmp_path) -> None:
@@ -2029,11 +2657,18 @@ class _RecordingManager:
         # collector-identity reuse guard can be exercised with this fake.
         self.collector = None
         self.acquire_ready_args: list[bool] = []
+        self.probe_calls = 0
         self._seq: list = []
         self.dequeue_calls = 0
         self.released: list[list[int]] = []
 
-    def acquire(self, num_logical_cores, lnc_config, timeout_seconds=None, ready=True):  # noqa: ARG002
+    def probe(self, num_logical_cores, lnc_config, timeout_seconds=None):  # noqa: ARG002
+        # Benign under-patience peek so the caching/reuse tests proceed to
+        # acquire(ready=False).
+        self.probe_calls += 1
+        return AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=0)
+
+    def acquire(self, num_logical_cores, lnc_config, ready=True):  # noqa: ARG002
         self.acquire_ready_args.append(ready)
         if self._seq:
             item = self._seq.pop(0)
@@ -2067,6 +2702,7 @@ class TestSoftJoinQueue:
             host.soft_join_queue(collector=_cm_collector(), collective_ranks=2, lnc_config=2)
 
         # Exactly one ready=False enqueue; manager cached on the host.
+        assert rec.probe_calls == 1
         assert rec.acquire_ready_args == [False]
         assert ctor.call_count == 1
         assert host._core_lock_manager is rec
@@ -2116,6 +2752,7 @@ class TestSoftJoinQueue:
         ):
             # Must NOT raise even though acquire raises.
             host.soft_join_queue(collector=_cm_collector(), collective_ranks=1, lnc_config=2)
+        assert rec.probe_calls == 1
         assert rec.acquire_ready_args == [False]
 
     def _soft_join(self, host, fake_mgr, **kwargs) -> None:
@@ -2127,96 +2764,169 @@ class TestSoftJoinQueue:
         ):
             host.soft_join_queue(collector=_cm_collector(), **kwargs)
 
-    def test_soft_join_over_patience_queued_rotates_and_dequeues(self, tmp_path) -> None:
-        """An over-patience QUEUED soft-join dequeues the slot and raises
-        QueuePatienceRotation (a TimeoutException) so the host rotates BEFORE the
-        upload; no contention metrics are flushed (none have accrued yet)."""
+    def test_soft_join_over_patience_queued_rotates_without_enqueue(self, tmp_path) -> None:
+        """An over-patience QUEUED probe rotates the host BEFORE any enqueue: it
+        raises QueuePatienceRotation (a TimeoutException) without ever calling
+        acquire or dequeue, and no contention metrics are flushed (none have
+        accrued yet — the host was never joined)."""
         host = _make_ssh_host(tmp_path)
         fake_mgr = _FakeManager(
-            [AllocationOutcome(status=AllocationStatus.QUEUED, position=5, worst_case_eta=PATIENCE_SECONDS + 1)]
+            [],
+            probe_outcomes=[
+                AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=DEFAULT_PATIENCE_SECONDS + 1)
+            ],
         )
         with pytest.raises(QueuePatienceRotation, match="rotating host") as exc_info:
             self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
         assert isinstance(exc_info.value, TimeoutException)
-        # Exactly one ready=False poll, the slot freed once, no contention flush.
-        assert fake_mgr.acquire_calls == 1
-        assert fake_mgr.dequeue_calls == 1
+        # Exactly one probe, zero enqueue, zero dequeue, no contention flush.
+        assert fake_mgr.probe_calls == 1
+        assert fake_mgr.acquire_calls == 0
+        assert fake_mgr.dequeue_calls == 0
         assert fake_mgr.metrics_calls == 0
 
-    def test_soft_join_over_patience_clears_cached_manager(self, tmp_path) -> None:
-        """After an over-patience soft-join raise, the cached manager must be
-        cleared so a re-selection of this same host re-mints a fresh manager
-        (new entry_id + reset fairness counters) instead of inheriting the
-        abandoned soft-join's queue-wait, mirroring get_core_allocation's
-        per-attempt teardown."""
+    def test_soft_join_over_patience_retains_cached_manager(self, tmp_path) -> None:
+        """After an over-patience probe rotation the cached manager is RETAINED:
+        a patience rotation does not mark the host failed, so a re-selection of
+        this same host reuses the unused/enqueued entry (or transparently
+        re-enqueues) on the next attempt — soft-join never drops the cache."""
         host = _make_ssh_host(tmp_path)
         fake_mgr = _FakeManager(
-            [AllocationOutcome(status=AllocationStatus.QUEUED, position=5, worst_case_eta=PATIENCE_SECONDS + 1)]
+            [],
+            probe_outcomes=[
+                AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=DEFAULT_PATIENCE_SECONDS + 1)
+            ],
         )
         with pytest.raises(QueuePatienceRotation, match="rotating host"):
             self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
-        # The slot was freed via the cached manager (dequeue ran) ...
-        assert fake_mgr.dequeue_calls == 1
-        # ... and the cache is cleared so the next attempt starts fresh.
-        assert host._core_lock_manager is None
+        # No enqueue and no dequeue (probe never joined the queue) ...
+        assert fake_mgr.acquire_calls == 0
+        assert fake_mgr.dequeue_calls == 0
+        # ... and the cached manager is retained for the next attempt.
+        assert host._core_lock_manager is fake_mgr
 
     def test_soft_join_within_patience_queued_does_not_raise(self, tmp_path) -> None:
-        """A QUEUED soft-join whose ETA is within patience returns normally and
-        leaves the reserved slot in place (no dequeue, no raise)."""
+        """A QUEUED probe whose ETA is within patience falls through to a single
+        ready=False enqueue (no dequeue, no raise)."""
         host = _make_ssh_host(tmp_path)
         fake_mgr = _FakeManager(
-            [AllocationOutcome(status=AllocationStatus.QUEUED, position=1, worst_case_eta=PATIENCE_SECONDS)]
+            [AllocationOutcome(status=AllocationStatus.QUEUED, position=1, worst_case_eta=DEFAULT_PATIENCE_SECONDS)],
+            probe_outcomes=[AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=DEFAULT_PATIENCE_SECONDS)],
         )
         self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
+        assert fake_mgr.probe_calls == 1
         assert fake_mgr.acquire_calls == 1
         assert fake_mgr.dequeue_calls == 0
         assert fake_mgr.metrics_calls == 0
 
     def test_soft_join_draining_over_patience_does_not_raise(self, tmp_path) -> None:
-        """A DRAINING soft-join never rotates even with an over-patience ETA
-        (should_rotate returns False while draining; stay-and-probe)."""
+        """A DRAINING probe never rotates even with an over-patience ETA
+        (should_rotate returns False while draining), so it falls through to
+        acquire(ready=False)."""
         host = _make_ssh_host(tmp_path)
         fake_mgr = _FakeManager(
-            [AllocationOutcome(status=AllocationStatus.DRAINING, position=0, worst_case_eta=PATIENCE_SECONDS + 1)]
+            [AllocationOutcome(status=AllocationStatus.QUEUED, position=0, worst_case_eta=DEFAULT_PATIENCE_SECONDS)],
+            probe_outcomes=[
+                AllocationOutcome(status=AllocationStatus.DRAINING, worst_case_eta=DEFAULT_PATIENCE_SECONDS + 1)
+            ],
         )
         self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
+        assert fake_mgr.probe_calls == 1
         assert fake_mgr.acquire_calls == 1
         assert fake_mgr.dequeue_calls == 0
         assert fake_mgr.metrics_calls == 0
 
     def test_soft_join_draining_invokes_should_rotate_with_draining_true(self, tmp_path) -> None:
-        """A DRAINING outcome must route the draining state into should_rotate
-        (draining=True), making should_rotate the single suppression point
-        rather than the status guard short-circuiting before it."""
+        """A DRAINING probe outcome must route the draining state into
+        should_rotate (draining=True), making should_rotate the single
+        suppression point rather than the status guard short-circuiting."""
         host = _make_ssh_host(tmp_path)
         fake_mgr = _FakeManager(
-            [AllocationOutcome(status=AllocationStatus.DRAINING, position=0, worst_case_eta=PATIENCE_SECONDS + 1)]
+            [AllocationOutcome(status=AllocationStatus.QUEUED, position=0, worst_case_eta=DEFAULT_PATIENCE_SECONDS)],
+            probe_outcomes=[
+                AllocationOutcome(status=AllocationStatus.DRAINING, worst_case_eta=DEFAULT_PATIENCE_SECONDS + 1)
+            ],
         )
         calls: list[bool] = []
 
-        def _spy(worst_case_eta, draining):
+        def _spy(worst_case_eta, draining, patience_seconds):
             calls.append(draining)
-            return should_rotate(worst_case_eta, draining)
+            return should_rotate(worst_case_eta, draining, patience_seconds=patience_seconds)
 
         with patch.object(host_management, "should_rotate", _spy):
             self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
         assert calls == [True]
 
-    def test_soft_join_failed_poll_is_swallowed_without_dequeue(self, tmp_path) -> None:
-        """A genuine poll failure is swallowed (no raise) and never triggers the
-        patience gate, so the slot is not dequeued."""
+    def test_soft_join_probe_error_is_swallowed_without_acquire(self, tmp_path) -> None:
+        """A probe RPC error is swallowed (no raise) and never reaches acquire or
+        dequeue — the hard acquire in get_core_allocation takes over."""
         host = _make_ssh_host(tmp_path)
-        fake_mgr = _FakeManager([LockAcquisitionError("boom")])
+        fake_mgr = _FakeManager([], probe_outcomes=[LockAcquisitionError("boom")])
         self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
+        assert fake_mgr.probe_calls == 1
+        assert fake_mgr.acquire_calls == 0
+        assert fake_mgr.dequeue_calls == 0
+        assert fake_mgr.metrics_calls == 0
+
+    def test_soft_join_acquire_error_is_swallowed_without_dequeue(self, tmp_path) -> None:
+        """With an under-patience probe, an acquire RPC error is swallowed (no
+        raise) and never triggers a dequeue."""
+        host = _make_ssh_host(tmp_path)
+        fake_mgr = _FakeManager(
+            [LockAcquisitionError("boom")],
+            probe_outcomes=[AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=0)],
+        )
+        self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
+        assert fake_mgr.probe_calls == 1
         assert fake_mgr.acquire_calls == 1
         assert fake_mgr.dequeue_calls == 0
         assert fake_mgr.metrics_calls == 0
+
+    def test_soft_join_unexpected_status_probe_error_is_swallowed_without_acquire(self, tmp_path) -> None:
+        """An ERROR/unexpected-status probe surfaces from CoreLockManager.probe as a
+        LockAcquisitionError; soft-join ignores it best-effort (no raise) and,
+        because probe and acquire share one try, the round never reaches acquire
+        or dequeue."""
+        host = _make_ssh_host(tmp_path)
+        fake_mgr = _FakeManager(
+            [],
+            probe_outcomes=[LockAcquisitionError("[test-host] Unexpected lock status: LockStatus.ALLOCATED")],
+        )
+        # Must NOT raise even though probe raises.
+        self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
+        assert fake_mgr.probe_calls == 1
+        assert fake_mgr.acquire_calls == 0
+        assert fake_mgr.dequeue_calls == 0
+        assert fake_mgr.metrics_calls == 0
+
+    def test_soft_join_patience_disabled_falls_through_to_acquire(self, tmp_path) -> None:
+        """With patience disabled (patience_seconds <= 0) should_rotate returns
+        False, so an over-patience probe ETA does NOT rotate: the round falls
+        through to a single acquire(ready=False) with no QueuePatienceRotation
+        and no dequeue."""
+        host = _make_ssh_host(tmp_path, patience_seconds=-1)
+        fake_mgr = _FakeManager(
+            [AllocationOutcome(status=AllocationStatus.QUEUED, position=1, worst_case_eta=DEFAULT_PATIENCE_SECONDS)],
+            probe_outcomes=[
+                AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=DEFAULT_PATIENCE_SECONDS + 1)
+            ],
+        )
+        # Over-patience ETA but rotation disabled: must NOT raise.
+        self._soft_join(host, fake_mgr, collective_ranks=1, lnc_config=2)
+        assert fake_mgr.probe_calls == 1
+        assert fake_mgr.acquire_calls == 1
+        assert fake_mgr.dequeue_calls == 0
 
     def test_base_and_local_soft_join_is_noop(self, tmp_path) -> None:
         """LocalHost inherits the base no-op; it must not enqueue or error."""
         # LocalHost does not override the base no-op (uses the file-lock path).
         assert LocalHost.soft_join_queue is host_management.Host.soft_join_queue
-        local = LocalHost("/opt/aws/neuron/bin", "localhost", str(tmp_path))
+        local = LocalHost(
+            "/opt/aws/neuron/bin",
+            "localhost",
+            str(tmp_path),
+            core_reset_strategy=CoreResetStrategy(exclusive_run=False),
+        )
         assert local.soft_join_queue(collector=MagicMock(), collective_ranks=2, lnc_config=2) is None
 
 
@@ -2635,12 +3345,12 @@ class TestManagerConcurrentReservationE2E(TestSshHostPollLoopIntegration):
             assert out.position == 1
             # Concurrent-aware ETA is within patience -> the manager would NOT rotate.
             assert out.worst_case_eta is not None
-            assert out.worst_case_eta <= PATIENCE_SECONDS
-            assert not should_rotate(out.worst_case_eta, draining=False)
+            assert out.worst_case_eta <= DEFAULT_PATIENCE_SECONDS
+            assert not should_rotate(out.worst_case_eta, draining=False, patience_seconds=DEFAULT_PATIENCE_SECONDS)
             # The serial-model ETA (predecessor hold stacked on the lock) would have
             # exceeded patience, proving the difference is the concurrent model.
             serial_eta = out.worst_case_eta + 60
-            assert serial_eta > PATIENCE_SECONDS
+            assert serial_eta > DEFAULT_PATIENCE_SECONDS
 
             # Cores free; both reserve disjoint blocks and commit in FIFO order.
             self._free_all_cores(locks_json)
@@ -2719,7 +3429,7 @@ class TestManagerConcurrentReservationE2E(TestSshHostPollLoopIntegration):
             out_b = follower.acquire(num_logical_cores=2, lnc_config=2, ready=True)
             assert out_b.status == AllocationStatus.QUEUED
             v_entry = next(e for e in self._read_queue(locks_json) if e["entry_id"] == vanisher.entry_id)
-            assert v_entry.get("reserved_cores")
+            assert v_entry.get("reserved_region")
 
             # V vanishes. Advance past its commit deadline; B's next poll reclaims
             # the reservation (RESERVE_EXPIRED) -- V keeps its FIFO slot for now.
@@ -2783,3 +3493,258 @@ class TestManagerConcurrentReservationE2E(TestSshHostPollLoopIntegration):
             assert out_b3.status == AllocationStatus.ALLOCATED
 
         self._assert_disjoint([out_a3.physical_cores, out_b3.physical_cores])
+
+
+class _TimerRecordingCollector(NoopMetricsCollector):
+    """Collector spy that captures timed metric names. The recoverable-host wait uses
+    ``collector.timer(...)``, whose context records via ``record_timer`` on exit — a bare
+    MagicMock's ``timer()`` wouldn't run that context, so we inherit the real ``timer`` (it
+    returns a _TimerContext bound to this collector) and just capture the name."""
+
+    def __init__(self):
+        self.timed: list[str] = []
+
+    def record_timer(self, name: str, duration_seconds: float) -> None:
+        self.timed.append(name)
+
+
+class TestHostStateAssignment:
+    """Tests for HostManager assignment against the host-state store."""
+
+    def setup_method(self):
+        self._patchers = []
+
+    def teardown_method(self):
+        # Reverse order: patches stacked on the same target must be undone LIFO, or the
+        # target is left pointing at an intermediate mock instead of the real object.
+        for p in reversed(self._patchers):
+            p.stop()
+
+    @pytest.fixture
+    def temp_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    def _make_manager(self, temp_dir, target_hosts, needs_local_host=None, hosts_recoverable=False):
+        def fake_make(alias, **_kwargs):
+            return MagicMock(get_host_id=MagicMock(return_value=alias), connection=MagicMock())
+
+        # Patch SshHost so lazily-built hosts yield alias-carrying mocks rather
+        # than opening real connections.
+        patcher = patch("test.utils.host_management.SshHost", side_effect=fake_make)
+        patcher.start()
+        self._patchers.append(patcher)
+        # Build + initialize the store and inject it, mirroring the factory (which needs a
+        # local host when there are no static hosts — i.e. a local hardware run).
+        resolved_needs_local = (len(target_hosts) < 1) if needs_local_host is None else needs_local_host
+        return HostManager(
+            state_store=_initialized_store(temp_dir, target_hosts),
+            neuron_installation_path="/opt/aws/neuron/bin",
+            ssh_config_path="~/.ssh/config",
+            testrun_uid="test-run",
+            needs_local_host=resolved_needs_local,
+            hosts_recoverable=hosts_recoverable,
+        )
+
+    def _assign(self, manager, platform=Platforms.TRN2, collector=None, num_of_physical_cores_needed=1):
+        # __get_host_assignment__ takes a real collector (Noop when metrics are off); default
+        # to one rather than forwarding None so this helper matches the production contract.
+        collector = collector or NoopMetricsCollector()
+        return manager.__get_host_assignment__(platform, num_of_physical_cores_needed, collector=collector)
+
+    def test_no_available_host_raises(self, temp_dir):
+        # Non-recoverable pool (default): an empty claim fails immediately, no wait. The
+        # no-hosts terminal is a FleetEmptyError (same kind as the poisoned path), not a
+        # bare Exception.
+        manager = self._make_manager(temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)])
+        manager.mark_host_unavailable("h1")
+        with patch("test.utils.host_management.time.sleep") as sleep:
+            with pytest.raises(FleetEmptyError, match="No available hosts for platform trn2"):
+                self._assign(manager)
+        sleep.assert_not_called()  # recoverable=False → no waiting
+
+    def test_recoverable_pool_waits_then_succeeds_when_host_appears(self, temp_dir):
+        # Recoverable pool: empty claim waits; a background source adds a host during
+        # the wait (simulated in the sleep stub), and the retry then succeeds.
+        manager = self._make_manager(temp_dir, [], needs_local_host=False, hosts_recoverable=True)
+
+        def add_host_during_wait(_seconds):
+            _add_host(manager.state_store, "newhost", Platforms.TRN2)
+
+        with patch("test.utils.host_management.time.sleep", side_effect=add_host_during_wait) as sleep:
+            host = self._assign(manager)
+        assert host.get_host_id() == "newhost"
+        sleep.assert_called_once()  # appeared on the first wait
+
+    def test_recoverable_pool_polls_until_poisoned_then_fails_fast(self, temp_dir):
+        # Recoverable pool, nothing online yet: the worker polls (no per-worker deadline)
+        # until the background re-resolver poisons the pool, then fails fast. Here that
+        # re-resolver is simulated by poisoning on the 3rd poll's sleep.
+        manager = self._make_manager(
+            temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)], hosts_recoverable=True
+        )
+        manager.mark_host_unavailable("h1")
+
+        polls = {"n": 0}
+
+        def poison_on_third_poll(_seconds):
+            polls["n"] += 1
+            if polls["n"] >= 3:
+                _poison_platform(temp_dir, Platforms.TRN2)
+
+        with patch("test.utils.host_management.time.sleep", side_effect=poison_on_third_poll) as sleep:
+            with pytest.raises(FleetEmptyError, match="perpetually empty"):
+                self._assign(manager)
+        # Polled repeatedly (no fixed attempt cap) until poison landed.
+        assert sleep.call_count == 3
+
+    def test_recoverable_wait_times_out_if_re_resolver_never_advances(self, temp_dir):
+        # Backstop for a dead re-resolver: nothing ever comes online AND poison never lands
+        # (the background re-resolver stopped advancing). The wait must not spin forever —
+        # it hits the deadline and raises a DISTINCT TimeoutException (not FleetEmptyError:
+        # the fleet was never declared empty). Drive a fake clock so the deadline trips
+        # without real waiting; each sleep advances time past the budget.
+        manager = self._make_manager(
+            temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)], hosts_recoverable=True
+        )
+        manager.mark_host_unavailable("h1")  # never recovered; poison never set
+
+        clock = {"t": 1000.0}
+
+        def advance(seconds):
+            clock["t"] += seconds
+
+        with (
+            patch("test.utils.host_management.time.time", side_effect=lambda: clock["t"]),
+            patch("test.utils.host_management.time.sleep", side_effect=advance),
+        ):
+            with pytest.raises(TimeoutException, match="re-resolver likely stopped advancing"):
+                self._assign(manager)
+        # The pool was poisoned: a claim that finds no host must NOT wait — it raises
+        # FleetEmptyError immediately (responsibility for availability moved to the
+        # background re-resolver; workers stop rediscovering a known-empty fleet).
+        manager = self._make_manager(
+            temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)], hosts_recoverable=True
+        )
+        manager.mark_host_unavailable("h1")
+        _poison_platform(temp_dir, Platforms.TRN2)
+        with patch("test.utils.host_management.time.sleep") as sleep:
+            with pytest.raises(FleetEmptyError, match="perpetually empty"):
+                self._assign(manager)
+        sleep.assert_not_called()  # poisoned -> no wait at all
+
+    def test_poison_landing_mid_wait_short_circuits(self, temp_dir):
+        # Not poisoned at claim time, so the worker starts waiting; the background
+        # re-resolver poisons the fleet during the first wait (simulated in the sleep
+        # stub). The next cycle's poison check short-circuits with FleetEmptyError instead
+        # of burning the remaining wait budget.
+        manager = self._make_manager(
+            temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)], hosts_recoverable=True
+        )
+        manager.mark_host_unavailable("h1")
+
+        def poison_during_wait(_seconds):
+            _poison_platform(temp_dir, Platforms.TRN2)
+
+        with patch("test.utils.host_management.time.sleep", side_effect=poison_during_wait) as sleep:
+            with pytest.raises(FleetEmptyError, match="perpetually empty"):
+                self._assign(manager)
+        sleep.assert_called_once()  # bailed after the first wait, not the full budget
+
+    def test_unpoisoned_recoverable_wait_still_succeeds(self, temp_dir):
+        # Regression guard: the poison check must not break the normal recoverable
+        # path — an un-poisoned pool that gets a host during the wait still succeeds.
+        manager = self._make_manager(temp_dir, [], needs_local_host=False, hosts_recoverable=True)
+
+        def add_host_during_wait(_seconds):
+            _add_host(manager.state_store, "newhost", Platforms.TRN2)
+
+        with patch("test.utils.host_management.time.sleep", side_effect=add_host_during_wait):
+            host = self._assign(manager)
+        assert host.get_host_id() == "newhost"
+
+    def test_recoverable_wait_records_metrics_on_success(self, temp_dir):
+        # The recoverable-wait path must record RECOVERABLE_HOST_WAIT_TIME and
+        # _ATTEMPTS so a stuck pool is visible in metrics. Previously this branch
+        # (guarded by `if collector is not None`) had zero test coverage. A host
+        # appears on the first wait -> one attempt recorded.
+        manager = self._make_manager(temp_dir, [], needs_local_host=False, hosts_recoverable=True)
+
+        def add_host_during_wait(_seconds):
+            _add_host(manager.state_store, "newhost", Platforms.TRN2)
+
+        collector = _TimerRecordingCollector()
+        with patch("test.utils.host_management.time.sleep", side_effect=add_host_during_wait):
+            self._assign(manager, collector=collector)
+
+        assert MetricName.RECOVERABLE_HOST_WAIT_TIME in collector.timed
+
+    def test_recoverable_wait_records_metrics_when_poisoned(self, temp_dir):
+        # When the wait ends by poisoning (fail fast), the wait-time metric is still recorded
+        # (the timer records on __exit__, so it fires even though the wait raises).
+        manager = self._make_manager(
+            temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)], hosts_recoverable=True
+        )
+        manager.mark_host_unavailable("h1")
+        collector = _TimerRecordingCollector()
+
+        polls = {"n": 0}
+
+        def poison_on_second_poll(_seconds):
+            polls["n"] += 1
+            if polls["n"] >= 2:
+                _poison_platform(temp_dir, Platforms.TRN2)
+
+        with patch("test.utils.host_management.time.sleep", side_effect=poison_on_second_poll):
+            with pytest.raises(FleetEmptyError, match="perpetually empty"):
+                self._assign(manager, collector=collector)
+        assert MetricName.RECOVERABLE_HOST_WAIT_TIME in collector.timed
+
+    def test_lazily_builds_host_added_by_re_resolver(self, temp_dir):
+        # Manager initialized with only h1; a background re-resolution later adds h2 to the file.
+        manager = self._make_manager(temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)])
+        manager.mark_host_unavailable("h1")  # force selection onto h2
+        _add_host(manager.state_store, "h2", Platforms.TRN2)
+        host = self._assign(manager)
+        # h2 wasn't in the original target_hosts; it must be built on demand.
+        assert host.get_host_id() == "h2"
+        assert manager.target_hosts["h2"] is host
+
+    def test_needs_local_host_sets_up_the_local_host(self, temp_dir):
+        # A local hardware run (needs_local_host=True) detects the platform, probes core count,
+        # and adds the local host to the state store.
+        with patch("test.utils.host_management.detect_local_platform", return_value=Platforms.TRN2):
+            with patch("test.utils.host_management.LocalHost.get_total_physical_cores", return_value=8):
+                manager = self._make_manager(temp_dir, [], needs_local_host=True)
+        assert (
+            HostRecord(resolved=ResolvedHost(manager.LOCAL_HOST_ID, Platforms.TRN2, num_physical_cores=8))
+            in manager.state_store.read().hosts
+        )
+
+    def test_local_host_not_set_up_when_not_needed(self, temp_dir):
+        # Compile-only / trace-only / simulation local run: the run never claims a host, so
+        # make_host_manager passes needs_local_host=False. No local-host setup runs — so neuron-ls
+        # is never invoked (it would fail on a non-hardware host) and no store row is added.
+        with patch("test.utils.host_management.detect_local_platform") as detect:
+            with patch("test.utils.host_management.LocalHost.get_total_physical_cores") as cores:
+                manager = self._make_manager(temp_dir, [], needs_local_host=False)
+        detect.assert_not_called()  # no platform detection...
+        cores.assert_not_called()  # ...and no capacity probe (both run neuron-ls)
+        assert manager.LOCAL_HOST_ID not in manager.target_hosts  # no local host registered
+        assert manager.state_store.read() is None  # no store row initialized
+
+
+def _add_host(store, alias, host_type, num_physical_cores=64):
+    """Test seam: inject a host (as a background re-resolution would) via the store's private
+    primitive. Defaults to 64 cores so the host is eligible for typical (small) requests."""
+    store._update(
+        lambda state: HostState(
+            hosts=[
+                *state.hosts,
+                HostRecord(
+                    resolved=ResolvedHost(ssh_host=alias, host_type=host_type, num_physical_cores=num_physical_cores)
+                ),
+            ],
+            poisoned=state.poisoned,
+        )
+    )

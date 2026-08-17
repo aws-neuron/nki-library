@@ -15,9 +15,9 @@
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.attention.ring_attention_unpermute import ring_attention_unpermute
 from nkilib_src.nkilib.experimental.attention.ring_attention_unpermute_torch import ring_attention_unpermute_torch_ref
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     InferenceArgs,

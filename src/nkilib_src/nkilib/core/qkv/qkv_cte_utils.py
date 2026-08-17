@@ -143,6 +143,10 @@ class QKV_CTE_UserInput(nl.NKIObject):
     # --- Strided Input
     strided_input_config: Optional[StridedInputConfig]
     output_hbm: Optional[nl.ndarray]
+    # --- Optional per-segment sum-of-squares outputs (each [B, S, 1])
+    q_squared_sum_out: Optional[nl.ndarray] = None
+    k_squared_sum_out: Optional[nl.ndarray] = None
+    v_squared_sum_out: Optional[nl.ndarray] = None
     # --- FP8 E4M3 dtype mode. See DtypeMode enum.
     dtype_mode: DtypeMode = DtypeMode.NON_OCP
 
@@ -156,6 +160,7 @@ class QKV_Quant_Config(nl.NKIObject):
     quant_dtype: Optional[Any] = None  # Follow _fp8_e4m3_dtype for fp8 and fused_qkv_weights.dtype for other cases
     has_mx_static_dequant_scales: bool = False
     has_row_mx_dequant: bool = False
+    has_mx_native_row_input_dequant: bool = False
 
 
 # Represents kernel config.
@@ -207,6 +212,7 @@ class QKV_CTE_Config(nl.NKIObject):
     load_input_with_DMA_transpose: bool
     compute_mm_dtype: Any
     act_dtype: Any  # Used for activations in normalization.
+    weights_dtype: Any  # Used for the matrix multiplication
     psum_transpose_dtype: Any  # On >=Trn2, PE array supports BF16 transpose.
     use_BxS_input_reshape: bool  # Collapse B and S to BxS for performance.
     total_available_sbuf_space_to_this_kernel: int  # If SbufManger is provided, we need to restrict it.
@@ -503,6 +509,15 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         )
         H = H - ROW_MX_TAIL_SCALE_BYTES
 
+    # Native MX + row-quantized FP8 input: same tail-packed format as ROW_MX.
+    _is_mx_native_row_input = (
+        args.quantization_type == QuantizationType.MX
+        and args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
+        and H == _H * 4 + ROW_MX_TAIL_SCALE_BYTES
+    )
+    if _is_mx_native_row_input:
+        H = H - ROW_MX_TAIL_SCALE_BYTES
+
     # H
     kernel_assert(
         H <= 24576,
@@ -778,7 +793,11 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         )
 
     # FP8 input validation for MX path
-    if args.quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX) and args.input.dtype in [
+    if args.quantization_type in (
+        QuantizationType.MX,
+        QuantizationType.STATIC_MX,
+        QuantizationType.STATIC,
+    ) and args.input.dtype in [
         nl.float8_e4m3,
         nl.float8_e4m3fn,
     ]:
@@ -789,6 +808,30 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         kernel_assert(
             args.fused_residual_add == False,
             f"[QKV CTE Kernel] FP8 input with MX quantization does not support fused residual add.",
+        )
+
+    # Native MX + FP8 input with row-quantized tail-packed scale:
+    # input is [B, S, H+4] where last 4 bytes per row encode a float32 per-row dequant scale.
+    if _is_mx_native_row_input:
+        kernel_assert(
+            not args.is_input_swizzled,
+            "[QKV CTE Kernel] Native MX with row-quantized FP8 input does not support swizzled input.",
+        )
+        kernel_assert(
+            args.qkv_in_scale is None,
+            "[QKV CTE Kernel] Native MX with row-quantized FP8 input packs per-row scales in the input tensor; qkv_in_scale must be None.",
+        )
+        kernel_assert(
+            args.load_input_with_DMA_transpose,
+            "[QKV CTE Kernel] Native MX with row-quantized FP8 input requires load_input_with_DMA_transpose=True.",
+        )
+        kernel_assert(
+            args.weight_layout == QKVWeightLayout.MX_CONTIGUOUS,
+            f"[QKV CTE Kernel] Native MX with row-quantized FP8 input requires MX_CONTIGUOUS weight layout, got {args.weight_layout}.",
+        )
+        kernel_assert(
+            args.d_head is not None and args.num_q_heads is not None and args.num_kv_heads is not None,
+            "[QKV CTE Kernel] Native MX with row-quantized FP8 input requires d_head, num_q_heads, and num_kv_heads.",
         )
 
     # Weight layout validation
@@ -864,6 +907,47 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
 
     _validate_qk_norm_config(args, "qk_norm_pre_rope", args.qk_norm_pre_rope)
     _validate_qk_norm_config(args, "qk_norm_post_rope", args.qk_norm_post_rope)
+
+    # Squared-sum output validation
+    _any_squared_sum = (
+        args.q_squared_sum_out is not None or args.k_squared_sum_out is not None or args.v_squared_sum_out is not None
+    )
+    if _any_squared_sum:
+        kernel_assert(
+            args.output_layout in (QKVOutputLayout.BSD, QKVOutputLayout.NBSd),
+            "[QKV CTE Kernel] q/k/v_squared_sum_out are only supported with the BSD or NBSd output layout, "
+            f"but got {args.output_layout}.",
+        )
+        kernel_assert(
+            args.quantization_type not in (QuantizationType.MX, QuantizationType.ROW_MX),
+            "[QKV CTE Kernel] q/k/v_squared_sum_out are not supported with MX quantization.",
+        )
+        kernel_assert(
+            args.k_cache is None and args.v_cache is None,
+            "[QKV CTE Kernel] q/k/v_squared_sum_out are not supported together with the KV-cache path.",
+        )
+        kernel_assert(
+            args.d_head is not None and args.num_q_heads is not None and args.num_kv_heads is not None,
+            "[QKV CTE Kernel] q/k/v_squared_sum_out require d_head, num_q_heads, and num_kv_heads to be specified.",
+        )
+        if args.q_squared_sum_out is not None:
+            kernel_assert(
+                args.q_squared_sum_out.shape == (B, S, 1),
+                f"[QKV CTE Kernel] q_squared_sum_out must have shape [B, S, 1] = {(B, S, 1)}, "
+                f"but got {args.q_squared_sum_out.shape}.",
+            )
+        if args.k_squared_sum_out is not None:
+            kernel_assert(
+                args.k_squared_sum_out.shape == (B, S, 1),
+                f"[QKV CTE Kernel] k_squared_sum_out must have shape [B, S, 1] = {(B, S, 1)}, "
+                f"but got {args.k_squared_sum_out.shape}.",
+            )
+        if args.v_squared_sum_out is not None:
+            kernel_assert(
+                args.v_squared_sum_out.shape == (B, S, 1),
+                f"[QKV CTE Kernel] v_squared_sum_out must have shape [B, S, 1] = {(B, S, 1)}, "
+                f"but got {args.v_squared_sum_out.shape}.",
+            )
 
     # gamma_fused_in_rope_caches validation
     if args.qk_norm_pre_rope is not None and args.qk_norm_pre_rope.gamma_fused_in_rope_caches:
@@ -1063,27 +1147,24 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         else:
             _logger.info("QKV CTE: BF16 STATIC_MX input but DMA transpose disabled — falling back to PE transpose path")
 
-    _fp8_e4m3_dtype = resolve_fp8_e4m3_dtype(args.dtype_mode)
-
-    if args.quantization_type == QuantizationType.STATIC:
-        # Use the caller's concrete weight dtype when available; resolve from
-        # dtype_mode only for the opaque "float8e4" sentinel. Avoids EOCP001
-        # mismatches when the caller passes nl.float8_e4m3 with dtype_mode=AUTO
-        # on TRN3.
-        weight_dtype_str = str(args.fused_qkv_weights.dtype)
-        if weight_dtype_str == "float8e4":
-            compute_mm_dtype = _fp8_e4m3_dtype
-        else:
-            compute_mm_dtype = args.fused_qkv_weights.dtype
-    else:
-        # Compute dtype used in the kernel. Even if inputs are fp32 or fp8, computations will be done with bf16.
-        compute_mm_dtype = nl.bfloat16 if (args.input.dtype == nl.float32 or _is_fp8_input) else args.input.dtype
+    # Compute dtype used in the kernel. Even if inputs are fp32 or fp8, computations will be done with bf16.
+    compute_mm_dtype = nl.bfloat16 if (args.input.dtype == nl.float32 or _is_fp8_input) else args.input.dtype
 
     act_dtype = nl.float32
 
+    _fp8_e4m3_dtype = resolve_fp8_e4m3_dtype(args.dtype_mode)
+    if args.quantization_type == QuantizationType.STATIC:
+        weight_dtype_str = str(args.fused_qkv_weights.dtype)
+        weights_dtype = _fp8_e4m3_dtype if weight_dtype_str == "float8e4" else args.fused_qkv_weights.dtype
+    else:
+        weights_dtype = compute_mm_dtype
+
     # Instances after >=Trn2 support BF16 transpose mode on PE Array.
     if args.quantization_type == QuantizationType.STATIC:
-        psum_transpose_dtype = nl.bfloat16 if nki.isa.get_nc_version() >= nki.isa.nc_version.gen3 else nl.float32
+        if _is_fp8_input:
+            psum_transpose_dtype = _fp8_e4m3_dtype
+        else:
+            psum_transpose_dtype = nl.bfloat16 if nki.isa.get_nc_version() >= nki.isa.nc_version.gen3 else nl.float32
     else:
         psum_transpose_dtype = compute_mm_dtype if nki.isa.get_nc_version() >= nki.isa.nc_version.gen3 else nl.float32
 
@@ -1149,6 +1230,12 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
             quant_config.quant_dtype = args.fused_qkv_weights.dtype
     quant_config.has_mx_static_dequant_scales = args.quantization_type == QuantizationType.STATIC_MX
     quant_config.has_row_mx_dequant = args.quantization_type == QuantizationType.ROW_MX
+    _H_weights = args.fused_qkv_weights.shape[0]
+    quant_config.has_mx_native_row_input_dequant = (
+        args.quantization_type == QuantizationType.MX
+        and args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
+        and args.input.shape[-1] == _H_weights * 4 + ROW_MX_TAIL_SCALE_BYTES
+    )
 
     return QKV_CTE_Config(
         output_layout=args.output_layout,
@@ -1172,6 +1259,7 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         load_input_with_DMA_transpose=load_input_with_DMA_transpose,
         compute_mm_dtype=compute_mm_dtype,
         act_dtype=act_dtype,
+        weights_dtype=weights_dtype,
         psum_transpose_dtype=psum_transpose_dtype,
         use_BxS_input_reshape=use_BxS_input_reshape,
         total_available_sbuf_space_to_this_kernel=total_available_sbuf_space_to_this_kernel,
@@ -1206,8 +1294,8 @@ def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_
         - Infers d_head from num_q_heads and num_kv_heads if not provided
     """
     B_orig, S_orig, H = args.input.shape
-    # ROW_MX: input is [B, S, H + ROW_MX_TAIL_SCALE_BYTES] with tail-packed float32 scale. Derive true H.
-    if args.quantization_type == QuantizationType.ROW_MX:
+    # ROW_MX / native MX row input: input is [B, S, H + ROW_MX_TAIL_SCALE_BYTES] with tail-packed float32 scale.
+    if args.quantization_type == QuantizationType.ROW_MX or cfg.quantization_config.has_mx_native_row_input_dequant:
         H = H - ROW_MX_TAIL_SCALE_BYTES
     BxS = B_orig * S_orig
     I = args.fused_qkv_weights.shape[1]

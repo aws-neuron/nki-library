@@ -25,7 +25,6 @@ from ...utils.common_types import ActFnType, NormType, QuantizationType
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.logging import Logger, get_logger
-from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
     BS_TILE_SIZE,
@@ -41,8 +40,6 @@ from .mlp_tkg_constants import MLPTKGConstants
 from .mlp_tkg_down_projection import process_down_projection
 from .mlp_tkg_gate_up_projection import process_gate_up_projection
 from .mlp_tkg_utils import (
-    alloc_tensor_view,
-    convert_params_to_views,
     input_fused_add,
     input_norm_load,
     transpose_store_sbuf_copy,
@@ -51,10 +48,10 @@ from .mlp_tkg_utils import (
 
 def _mlp_tkg_impl(
     params: MLPParameters,
-    output_tensor_hbm: nl.ndarray,
-    output_stored_add_tensor_hbm: nl.ndarray,
+    output_tensor_hbm: nl.NkiTensor,
+    output_stored_add_tensor_hbm: nl.NkiTensor,
     sbm: Optional[BufferManager] = None,
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """
     Allocated kernel that computes Norm(hidden) @ wMLP for token generation.
 
@@ -93,12 +90,12 @@ def _mlp_tkg_impl(
             - gate_clamp_upper_limit: Upper clamp limit for gate projection output
             - up_clamp_lower_limit: Lower clamp limit for up projection output
             - up_clamp_upper_limit: Upper clamp limit for up projection output
-        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM
-        output_stored_add_tensor_hbm (nl.ndarray): [B, S, H], Optional fused add result storage
+        output_tensor_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM
+        output_stored_add_tensor_hbm (nl.NkiTensor): [B, S, H], Optional fused add result storage
         sbm (BufferManager): Optional BufferManager for SBUF allocation with consistent naming.
 
     Returns:
-        list[nl.ndarray]: List containing:
+        list[nl.NkiTensor]: List containing:
             - output_tensor_hbm or down_sb: MLP output tensor
             - output_stored_add_tensor_hbm: (optional) Fused add result if store_fused_add_result=True
 
@@ -158,16 +155,14 @@ def _mlp_tkg_impl(
     hidden = params.hidden_tensor
     if mlpp_has_fused_add(params):
         if not params.fused_add_params.store_fused_add_result:
-            fused_add_output = TensorView(
-                sbm.alloc(
-                    (params.batch_size, params.sequence_len, params.hidden_size),
-                    dtype=params.output_dtype,
-                    buffer=nl.shared_hbm,
-                    name="output_stored_add_tensor_hbm",
-                )
+            fused_add_output = sbm.alloc(
+                (params.batch_size, params.sequence_len, params.hidden_size),
+                dtype=params.output_dtype,
+                buffer=nl.shared_hbm,
+                name="output_stored_add_tensor_hbm",
             )
         else:
-            fused_add_output = TensorView(output_stored_add_tensor_hbm)
+            fused_add_output = output_stored_add_tensor_hbm
 
         input_fused_add(
             input=hidden,
@@ -180,7 +175,7 @@ def _mlp_tkg_impl(
         hidden = fused_add_output  # Use fused result as hidden input
 
     # ---------------- Norm / Input Load ----------------
-    if mlpp_has_normalization(params) or (not hidden.is_sbuf()):
+    if mlpp_has_normalization(params) or (not (hidden.buffer == nl.sbuf)):
         input_sb = input_norm_load(hidden, params, dims, sbm)
     else:
         # Hidden already in SBUF — use dims.hidden_layout (defaults to H0_T_H1 if caller didn't set it)
@@ -188,8 +183,7 @@ def _mlp_tkg_impl(
 
     # ---------- Process gate/up projection, silu, gate/up multiplication ----------
     # Allocate SBUF tile for gate/up projection output
-    gate_up_sb = alloc_tensor_view(
-        sbm,
+    gate_up_sb = sbm.alloc_stack(
         (dims.I0, div_ceil(dims.I, dims.I0), dims.T),
         dtype=io_dtype,
         buffer=nl.sbuf,
@@ -211,16 +205,14 @@ def _mlp_tkg_impl(
     # ---------- Process down projection ----------
     # Allocate SBUF tile for down projection output
     if params.use_tkg_down_proj_column_tiling:
-        down_sb = alloc_tensor_view(
-            sbm,
+        down_sb = sbm.alloc_stack(
             (dims.T, dims.H_per_shard),
             dtype=io_dtype,
             buffer=nl.sbuf,
             name="down_sbuf",
         )
     else:
-        down_sb = alloc_tensor_view(
-            sbm,
+        down_sb = sbm.alloc_stack(
             (dims.H0, dims.H1_shard, dims.T),
             dtype=io_dtype,
             buffer=nl.sbuf,
@@ -246,7 +238,7 @@ def _mlp_tkg_impl(
                 dst=output_tensor_hbm.reshape((dims.H0, dims.num_shards * nc_size))[
                     :, dims.shard_id * nc_size : (dims.shard_id + 1) * nc_size
                 ],
-                src=down_sb.base_tensor.reshape((dims.H0, nc_size)),
+                src=down_sb.reshape((dims.H0, nc_size)),
             )
             sbm.close_scope()
             return (
@@ -265,13 +257,13 @@ def _mlp_tkg_impl(
                         dim=1,
                         start=dims.shard_id * dims.H_per_shard,
                         end=(dims.shard_id + 1) * dims.H_per_shard,
-                    ).get_view(),
-                    src=down_sb.slice(dim=1, start=0, end=dims.H_per_shard).get_view(),
+                    ),
+                    src=down_sb.slice(dim=1, start=0, end=dims.H_per_shard),
                 )
             else:
                 # Transpose output[H0, H1, T] to [T, H]
-                output_nd = output_tensor_hbm.base_tensor.reshape((B * S, H))
-                transpose_store_sbuf_copy(down_sb.base_tensor, output_nd, dims, io_dtype, sbm)
+                output_nd = output_tensor_hbm.reshape((B * S, H))
+                transpose_store_sbuf_copy(down_sb, output_nd, dims, io_dtype, sbm)
 
             # reshape back to 3D tensor
             output_tensor_hbm = output_tensor_hbm.reshape((B, S, H))
@@ -286,18 +278,16 @@ def _mlp_tkg_impl(
     else:
         sbm.close_scope()
 
-        return (
-            [down_sb.get_view(), output_stored_add_tensor_hbm] if mlpp_store_fused_add(params) else [down_sb.get_view()]
-        )
+        return [down_sb, output_stored_add_tensor_hbm] if mlpp_store_fused_add(params) else [down_sb]
 
 
 def mlp_tkg(
     params: MLPParameters,
-    output_tensor_hbm: nl.ndarray,
-    output_stored_add_tensor_hbm: nl.ndarray,
+    output_tensor_hbm: nl.NkiTensor,
+    output_stored_add_tensor_hbm: nl.NkiTensor,
     sbm: Optional[BufferManager] = None,
-) -> list[nl.ndarray]:
-    """Wrapper that converts to TensorView, tiles along BxS, and calls _mlp_tkg_impl per tile."""
+) -> list[nl.NkiTensor]:
+    """Wrapper that converts to NkiTensor, tiles along BxS, and calls _mlp_tkg_impl per tile."""
 
     # Dispatch to specialized Llama3-70B high-batch kernel for matching configs
     if _is_llama3_70b_specialized_config(params):
@@ -307,9 +297,6 @@ def mlp_tkg(
     if sbm is None:
         sbm = SbufManager(0, 200 * 1024, Logger("mlp_tkg"))
         sbm.set_name_prefix("mlp_")
-
-    # Convert all tensors to TensorView once, before tiling
-    convert_params_to_views(params)
 
     T = params.batch_size * params.sequence_len
     H = params.hidden_size
@@ -322,12 +309,12 @@ def mlp_tkg(
         T_shard = T // lnc
         if params.input_in_sbuf:
             # SBUF input: [H0, T, H1]
-            params.hidden_tensor = TensorView(params.hidden_tensor).slice(
+            params.hidden_tensor = params.hidden_tensor.slice(
                 dim=1, start=shard_id * T_shard, end=(shard_id + 1) * T_shard
             )
         elif params.transposed_in:
             # Transposed input: [H0, n_prgs, H1_shard, T]
-            params.hidden_tensor = TensorView(params.hidden_tensor).slice(
+            params.hidden_tensor = params.hidden_tensor.slice(
                 dim=3, start=shard_id * T_shard, end=(shard_id + 1) * T_shard
             )
         else:
@@ -364,10 +351,10 @@ def mlp_tkg(
 
     if not params.store_output_in_sbuf:
         if params.transposed_out:
-            output_hbm_view = TensorView(output_tensor_hbm)  # 4D [H0, n_prgs, H1_shard, T]
+            output_hbm_view = output_tensor_hbm  # 4D [H0, n_prgs, H1_shard, T]
         else:
             B, S, H = output_tensor_hbm.shape
-            output_hbm_full = TensorView(output_tensor_hbm.reshape((B * S, H)))
+            output_hbm_full = output_tensor_hbm.reshape((B * S, H))
             if use_t_sharding:
                 output_hbm_view = output_hbm_full.slice(dim=0, start=shard_id * T_shard, end=(shard_id + 1) * T_shard)
             else:
@@ -416,7 +403,7 @@ def mlp_tkg(
     if params.transposed_out:
         output_tensors = [output_tensor_hbm]
     else:
-        output_tensors = [output_hbm_view.base_tensor.reshape((B, S, H))]
+        output_tensors = [output_hbm_full.reshape((B, S, H))]
     if mlpp_store_fused_add(params):
         output_tensors.append(output_stored_add_tensor_hbm)
     return output_tensors

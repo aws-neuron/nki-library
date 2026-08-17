@@ -14,7 +14,7 @@
 
 """PyTorch/numpy reference implementation for quantize_block_mxfp8_kernel.
 
-Computes the expected quantized FP8 data and uint8 scales in the same
+Computes the expected quantized FP8 data and float8_e8m0fnu scales in the same
 interleaved/packed layout the kernel produces, using only src-tree
 utilities (no neuronxcc test internals).
 """
@@ -52,7 +52,7 @@ _FP8_DTYPE_MAP = {
 }
 
 
-def quantize_mxfp8_torch_ref(
+def quantize_block_mxfp8_torch_ref(
     src_tensor: np.ndarray,
     return_fp8_dtype: str,
     run_with_lnc2: bool = False,
@@ -65,7 +65,7 @@ def quantize_mxfp8_torch_ref(
     interleaved/packed layout the kernel produces.
 
     Returns:
-        dict with "quantized_data_hbm" (FP8 ndarray) and "quantized_scales_hbm" (uint8 ndarray).
+        dict with "quantized_data_hbm" (FP8 ndarray) and "quantized_scales_hbm" (float8_e8m0fnu ndarray).
     """
     F, K = src_tensor.shape
     non_x4_dtype = _get_non_x4_dtype(return_fp8_dtype)
@@ -172,11 +172,18 @@ def _interleave_tensor(src: np.ndarray, TILE_P: int = 512) -> np.ndarray:
 
 
 def _pack_scales(golden_scales: np.ndarray, K: int, F: int, enable_scale_packing: bool) -> np.ndarray:
-    """Arrange dense scales [K//4//8, F] into the kernel's output layout."""
+    """Arrange dense scales [K//4//8, F] into the kernel's output layout.
+
+    Returns scales as float8_e8m0fnu matching the kernel output dtype.
+    """
+    # View source uint8 scales as float8_e8m0fnu so assignments into the e8m0
+    # output buffer preserve the binary representation.
+    golden_scales_e8m0 = golden_scales.view(nl.float8_e8m0fnu)
+
     if not enable_scale_packing:
-        out = np.zeros((K // 4, F), dtype=np.uint8)
-        for row_idx in range(golden_scales.shape[0]):
-            out[(row_idx // 4) * 32 + (row_idx % 4), :] = golden_scales[row_idx, :]
+        out = np.zeros((K // 4, F), dtype=nl.float8_e8m0fnu)
+        for row_idx in range(golden_scales_e8m0.shape[0]):
+            out[(row_idx // 4) * 32 + (row_idx % 4), :] = golden_scales_e8m0[row_idx, :]
         return out
 
     L_TILE_K = 512
@@ -194,7 +201,7 @@ def _pack_scales(golden_scales: np.ndarray, K: int, F: int, enable_scale_packing
         remainder_partition_offset = get_remainder_partition_offset(k_idx_within_tile, Q_TILE_K)
         scale_p_start = scaling_group_idx * Q_TILE_K
         num_rows = (tile_k_size // INTERLEAVE_FACTOR) // 8
-        tile_scales = golden_scales[golden_offset : golden_offset + num_rows, :]
+        tile_scales = golden_scales_e8m0[golden_offset : golden_offset + num_rows, :]
         for row_idx in range(num_rows):
             packed_row = (row_idx // 4) * 32 + (row_idx % 4)
             out[scale_p_start + slot_partition_offset + packed_row + remainder_partition_offset, :] = tile_scales[
@@ -203,7 +210,7 @@ def _pack_scales(golden_scales: np.ndarray, K: int, F: int, enable_scale_packing
         return golden_offset + num_rows
 
     packed_scale_P, _ = get_scale_output_shape(K, F, Q_TILE_K, enable_scale_packing=True)
-    out = np.zeros((packed_scale_P, F), dtype=np.uint8)
+    out = np.zeros((packed_scale_P, F), dtype=nl.float8_e8m0fnu)
 
     # Process full 512-tiles
     for i in range(NUM_TILES_IN_K):

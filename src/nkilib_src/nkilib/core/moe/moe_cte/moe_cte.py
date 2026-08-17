@@ -71,12 +71,12 @@ class QuantizationConfig(nl.NKIObject):
     weights back to the target compute precision.
 
     Attributes:
-        gate_up_proj_scale (nl.ndarray, optional): Dequantization scales for gate/up
+        gate_up_proj_scale (nl.NkiTensor, optional): Dequantization scales for gate/up
             projection weights. Shape depends on quantization granularity (per-tensor,
             per-channel, or per-group). Required for quantized gate_up_proj_weight.
             Default: None (no quantization)
 
-        down_proj_scale (nl.ndarray, optional): Dequantization scales for down
+        down_proj_scale (nl.NkiTensor, optional): Dequantization scales for down
             projection weights. Shape depends on quantization granularity.
             Required for quantized down_proj_weight.
             Default: None (no quantization)
@@ -92,8 +92,8 @@ class QuantizationConfig(nl.NKIObject):
         )
     """
 
-    gate_up_proj_scale: Optional[nl.ndarray] = None
-    down_proj_scale: Optional[nl.ndarray] = None
+    gate_up_proj_scale: Optional[nl.NkiTensor] = None
+    down_proj_scale: Optional[nl.NkiTensor] = None
 
 
 @dataclass
@@ -343,22 +343,22 @@ class MoECTEShardingSpecs(nl.NKIObject):
 
 @nki.jit
 def moe_cte(
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
     block_size: int,
     spec: MoECTESpec,
-    conditions: Optional[nl.ndarray] = None,
-    gate_and_up_proj_bias: Optional[nl.ndarray] = None,
-    down_proj_bias: Optional[nl.ndarray] = None,
+    conditions: Optional[nl.NkiTensor] = None,
+    gate_and_up_proj_bias: Optional[nl.NkiTensor] = None,
+    down_proj_bias: Optional[nl.NkiTensor] = None,
     quantization_config: Optional[QuantizationConfig] = None,
-    gate_up_proj_scale: Optional[nl.ndarray] = None,
-    down_proj_scale: Optional[nl.ndarray] = None,
-    gate_up_activations_T: Optional[nl.ndarray] = None,
-    down_activations: Optional[nl.ndarray] = None,
+    gate_up_proj_scale: Optional[nl.NkiTensor] = None,
+    down_proj_scale: Optional[nl.NkiTensor] = None,
+    gate_up_activations_T: Optional[nl.NkiTensor] = None,
+    down_activations: Optional[nl.NkiTensor] = None,
     activation_function: ActFnType = ActFnType.SiLU,
     skip_dma: Optional[SkipMode] = None,
     compute_dtype: Any = nl.bfloat16,
@@ -370,8 +370,10 @@ def moe_cte(
     up_clamp_lower_limit: Optional[float] = None,
     # Per-expert STATIC_MX input scales. The per-expert weight scales reuse the existing
     # gate_up_proj_scale / down_proj_scale tensors (gate/up packed [E, 2, 1], down [E, 1]).
-    gate_up_in_scale: Optional[nl.ndarray] = None,
-    down_in_scale: Optional[nl.ndarray] = None,
+    gate_up_in_scale: Optional[nl.NkiTensor] = None,
+    down_in_scale: Optional[nl.NkiTensor] = None,
+    accumulation_dtype=None,
+    skip_gate_proj: bool = False,
 ):
     """
     Unified entry point for MoE CTE blockwise matrix multiplication kernels.
@@ -388,27 +390,27 @@ def moe_cte(
         I_TP: Intermediate size divided by tensor parallelism degree
 
     Args:
-        hidden_states (nl.ndarray): [T+1, H], Input token embeddings in HBM
-        expert_affinities_masked (nl.ndarray): [(T+1)*E, 1], Expert routing weights in HBM
-        gate_up_proj_weight (nl.ndarray): [E, H, 2, I_TP], Gate and up projection weights in HBM
-        down_proj_weight (nl.ndarray): [E, I_TP, H], Down projection weights in HBM
-        token_position_to_id (nl.ndarray): [N*B], Token to block position mapping in HBM
-        block_to_expert (nl.ndarray): [N, 1], Expert assignment per block in HBM
+        hidden_states (nl.NkiTensor): [T+1, H], Input token embeddings in HBM
+        expert_affinities_masked (nl.NkiTensor): [(T+1)*E, 1], Expert routing weights in HBM
+        gate_up_proj_weight (nl.NkiTensor): [E, H, 2, I_TP], Gate and up projection weights in HBM
+        down_proj_weight (nl.NkiTensor): [E, I_TP, H], Down projection weights in HBM
+        token_position_to_id (nl.NkiTensor): [N*B], Token to block position mapping in HBM
+        block_to_expert (nl.NkiTensor): [N, 1], Expert assignment per block in HBM
         block_size (int): Number of tokens per block
         spec (MoECTESpec): Implementation selection and configuration
-        conditions (nl.ndarray, optional): [N+1], Block padding indicators (HYBRID, BLOCK_MX)
-        gate_and_up_proj_bias (nl.ndarray, optional): Bias for gate/up projections
-        down_proj_bias (nl.ndarray, optional): Bias for down projection
+        conditions (nl.NkiTensor, optional): [N+1], Block padding indicators (HYBRID, BLOCK_MX)
+        gate_and_up_proj_bias (nl.NkiTensor, optional): Bias for gate/up projections
+        down_proj_bias (nl.NkiTensor, optional): Bias for down projection
         quantization_config (QuantizationConfig, optional): Quantization scales configuration
-        gate_up_proj_scale (nl.ndarray, optional): Direct scale tensor for gate/up weights.
+        gate_up_proj_scale (nl.NkiTensor, optional): Direct scale tensor for gate/up weights.
             Takes precedence over quantization_config. Use for MX quantization to avoid
             wrapping tensors in dataclass (NKI tracer limitation). Under STATIC_MX this
             instead carries the per-expert gate/up weight scales as [E, 2, 1].
-        down_proj_scale (nl.ndarray, optional): Direct scale tensor for down weights.
+        down_proj_scale (nl.NkiTensor, optional): Direct scale tensor for down weights.
             Takes precedence over quantization_config. Under STATIC_MX this instead
             carries the per-expert down weight scale as [E, 1].
-        gate_up_activations_T (nl.ndarray, optional): Storage for gate/up activations
-        down_activations (nl.ndarray, optional): Storage for down activations
+        gate_up_activations_T (nl.NkiTensor, optional): Storage for gate/up activations
+        down_activations (nl.NkiTensor, optional): Storage for down activations
         activation_function (ActFnType): Activation function type (default: SiLU)
         skip_dma (SkipMode): DMA skip configuration
         compute_dtype (nki.dtype): Data type for computations (default: bfloat16)
@@ -418,13 +420,13 @@ def moe_cte(
         gate_clamp_lower_limit (float, optional): Lower clamp for gate projection
         up_clamp_upper_limit (float, optional): Upper clamp for up projection
         up_clamp_lower_limit (float, optional): Lower clamp for up projection
-        gate_up_in_scale, down_in_scale (nl.ndarray, optional): Per-expert STATIC_MX
+        gate_up_in_scale, down_in_scale (nl.NkiTensor, optional): Per-expert STATIC_MX
             input quant scales for the gate/up and down projections respectively.
             Only used by shard_on_block_mx under STATIC_MX. (The matching weight
             dequant scales reuse gate_up_proj_scale / down_proj_scale.)
 
     Returns:
-        output (nl.ndarray): Expert-processed token representations in HBM
+        output (nl.NkiTensor): Expert-processed token representations in HBM
 
     Notes:
         - shard_on_block, shard_on_i, shard_on_i_hybrid, shard_on_i_dropping target TRN2
@@ -544,6 +546,7 @@ def moe_cte(
             up_clamp_upper_limit=up_clamp_upper_limit,
             checkpoint_activation=cfg.checkpoint_activation,
             expert_affinity_multiply_on_I=cfg.expert_affinity_multiply_on_I,
+            accumulation_dtype=accumulation_dtype,
         )
 
     elif sharding_spec.implementation == MoECTEImplementation.shard_on_i_hybrid:
@@ -574,6 +577,7 @@ def moe_cte(
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
+            accumulation_dtype=accumulation_dtype,
         )
 
     elif sharding_spec.implementation == MoECTEImplementation.shard_on_i_dropping:
@@ -600,6 +604,7 @@ def moe_cte(
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
+            accumulation_dtype=accumulation_dtype,
         )
 
     elif sharding_spec.implementation == MoECTEImplementation.shard_on_block_mx:

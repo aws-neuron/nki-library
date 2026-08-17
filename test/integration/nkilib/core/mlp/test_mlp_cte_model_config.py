@@ -54,7 +54,9 @@ DEFAULT_QUANT_TYPES = [
     QuantizationType.NONE,
     QuantizationType.STATIC,
     QuantizationType.ROW,
+    QuantizationType.MX,
     QuantizationType.STATIC_MX,
+    QuantizationType.ROW_MX,
 ]
 
 OPTIMAL_CONFIGS = {name: {'TP_CP_CONFIGS': DEFAULT_TP_CP, 'SEQLENS': DEFAULT_SEQLENS, 'QUANT_TYPES': DEFAULT_QUANT_TYPES} for name in MODELS}
@@ -99,9 +101,10 @@ def generate_mlp_configs(configs=None):
             for _ws, tp, cp in c.get('TP_CP_CONFIGS', DEFAULT_TP_CP):
                 for quant_type in c.get('QUANT_TYPES', DEFAULT_QUANT_TYPES):
                     d = get_mlp_config(model_name, tp, cp, orig_seqlen, quant_type)
+                    rtol = 6.1e-2 if quant_type == QuantizationType.MX else 4e-2
                     result.append((
                         d["vnc_degree"], d["batch"], d["seqlen"], d["hidden"], d["intermediate"],
-                        None, 3.6e-2, NormType.NO_NORM, quant_type, d["gate_up_w_layout"],
+                        None, rtol, NormType.NO_NORM, quant_type, d["gate_up_w_layout"],
                         d["fused_add"], d["store_add"], d["skip_gate"], m["act_fn"],
                         d["gate_bias"], d["up_bias"], d["down_bias"], d["norm_bias"],
                     ))

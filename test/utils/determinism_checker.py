@@ -100,7 +100,7 @@ class DeterminismChecker:
         """Load all output tensors for a specific run."""
         artifact_dir = pathlib.Path(self.artifact_path)
 
-        # Determine which files belong to this run based on neuron-profile naming convention:
+        # Determine which files belong to this run based on neuron-explorer naming convention:
         # Run 0: 'out', 'k_out'
         # Run 1: 'out.2', 'k_out.2'
         # Run 2: 'out.3', 'k_out.3'

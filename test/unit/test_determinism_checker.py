@@ -37,7 +37,7 @@ def create_mock_collector():
 
 def create_output_files(artifact_dir: Path, num_runs: int, file_name: str = "out", make_run_differ: int = -1):
     """
-    Helper to create output files following neuron-profile naming convention.
+    Helper to create output files following neuron-explorer naming convention.
 
     Args:
         artifact_dir: Directory to create files in

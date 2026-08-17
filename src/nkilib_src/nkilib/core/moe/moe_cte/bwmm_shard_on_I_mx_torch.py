@@ -46,8 +46,14 @@ def blockwise_mm_shard_intermediate_mx_torch_ref(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
+    use_block128_scales: bool = False,
 ) -> dict:
-    """PyTorch reference for blockwise_mm_shard_intermediate_mx. Signature matches kernel."""
+    """PyTorch reference for blockwise_mm_shard_intermediate_mx. Signature matches kernel.
+
+    ``use_block128_scales`` is a kernel-side scale-layout flag with no effect on the
+    reference math: the test wrapper expands block-128 scales to the native layout
+    before this ref runs, so the parameter is accepted (for signature parity) and ignored.
+    """
     return bwmm_mx_blockwise_loop(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
@@ -98,8 +104,14 @@ def blockwise_mm_shard_intermediate_mx_hybrid_torch_ref(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
+    use_block128_scales: bool = False,
 ) -> dict:
-    """PyTorch reference for blockwise_mm_shard_intermediate_mx_hybrid. Signature matches kernel."""
+    """PyTorch reference for blockwise_mm_shard_intermediate_mx_hybrid. Signature matches kernel.
+
+    ``use_block128_scales`` is a kernel-side scale-layout flag with no effect on the
+    reference math: the test wrapper expands block-128 scales to the native layout
+    before this ref runs, so the parameter is accepted (for signature parity) and ignored.
+    """
     return bwmm_mx_blockwise_loop(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,

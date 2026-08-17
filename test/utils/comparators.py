@@ -11,13 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 from typing import Optional, TextIO
 
 import numpy as np
 from neuron_dtypes import is_float_type
 
 
-def maxAllClose(
+@dataclass(frozen=True)
+class ComparisonResult:
+    """Result of a maxAllClose comparison.
+
+    Attributes:
+        passed: True if the arrays matched within tolerance.
+        accuracy: Relative error of the largest absolute difference,
+            (largest_abs_diff - atol) / max(abs(b)); -1.0 on shape mismatch.
+    """
+
+    passed: bool
+    accuracy: float
+
+
+def max_all_close_with_accuracy(
     a,
     b,
     rtol=1e-05,
@@ -27,9 +42,14 @@ def maxAllClose(
     mode="max",
     logfile: Optional[TextIO] = None,
     min_pass_rate: float = 1.0,
-) -> bool:
+) -> ComparisonResult:
     """
     Compare two arrays for approximate equality with configurable tolerance modes.
+
+    Returns a ComparisonResult(passed, accuracy). The accuracy metric (relative
+    error of the largest absolute difference) is derived from the abs_diff/brange
+    already computed for the comparison, so callers needing both avoid a separate
+    get_largest_abs_diff full-array pass. See maxAllClose for the pass/fail-only variant.
 
     This function provides a custom comparison utility with lower sensitivity by considering
     the overall value range. Unlike numpy.allclose, it offers detailed mismatch reporting and
@@ -70,8 +90,10 @@ def maxAllClose(
             are within tolerance.
 
     Returns:
-        bool: True if all elements are approximately equal within specified tolerances.
-            False if any element exceeds tolerance or if array shapes don't match.
+        ComparisonResult: (passed, accuracy). passed is True if all elements are
+            approximately equal within specified tolerances (False on tolerance
+            failure or shape mismatch). accuracy is the relative error of the
+            largest absolute difference (-1.0 on shape mismatch).
 
     Raises:
         No exceptions are raised. Shape mismatches return False with optional error message.
@@ -120,7 +142,7 @@ def maxAllClose(
     if not a.shape == b.shape:
         if verbose > 0:
             print(f"ERROR: allclose mismatching shapes {a.shape} != {b.shape}")
-        return False
+        return ComparisonResult(passed=False, accuracy=-1.0)
 
     brange = abs(b)
     if mode == "max":
@@ -150,10 +172,10 @@ def maxAllClose(
 
     if not is_finiteness_matching:
         if verbose >= 1:
-            sf += f"ERROR: There are indices with finite-infinite mismatches\n"
+            sf += "ERROR: There are indices with finite-infinite mismatches\n"
 
             if verbose >= 3:
-                indices = zip(*np.where(finiteness_mismatch_tensor))
+                indices = zip(*np.where(finiteness_mismatch_tensor), strict=True)
                 for index in indices:
                     sf += f"{index}: {a[index]} vs {b[index]}\n"
 
@@ -216,9 +238,22 @@ def maxAllClose(
             sf = (s + sMax).format(largest_abs_diff, maxAbsDiffElementRelDiff * 100.0, rtol * 100.0)
         printWithLog(sf)
 
+    # Accuracy metric (relative error of the largest abs diff), computed from the
+    # abs_diff/brange already produced above so callers don't need a second full pass
+    # via get_largest_abs_diff. Matches get_largest_abs_diff's formula:
+    # (largest_abs_diff - atol) / max(abs(b)), with the same NaN/zero-range guards.
+    def _accuracy() -> float:
+        largest_abs_diff = float(np.amax(abs_diff))
+        b_non_nan_max = (
+            brange if mode == "max" else float(np.amax(np.abs(b)[~np.isnan(b)])) if np.any(~np.isnan(b)) else 0.0
+        )
+        if largest_abs_diff < atol or b_non_nan_max == 0:
+            return 0.0
+        return (largest_abs_diff - atol) / b_non_nan_max
+
     all_close = np.all(close) and is_finiteness_matching
     if all_close or min_pass_rate >= 1.0:
-        return all_close
+        return ComparisonResult(passed=bool(all_close), accuracy=_accuracy())
 
     # Check if pass rate meets minimum threshold
     pass_rate = np.mean(close)
@@ -227,7 +262,26 @@ def maxAllClose(
         printWithLog(
             f"INFO: pass rate = {pass_rate:.2%} (required: {min_pass_rate:.2%}) - {'PASSED' if passed else 'FAILED'}\n"
         )
-    return passed
+    return ComparisonResult(passed=bool(passed), accuracy=_accuracy())
+
+
+def maxAllClose(
+    a,
+    b,
+    rtol=1e-05,
+    atol=1e-08,
+    equal_nan_inf=False,
+    verbose=0,
+    mode="max",
+    logfile: Optional[TextIO] = None,
+    min_pass_rate: float = 1.0,
+) -> bool:
+    """Compare two arrays for approximate equality; return pass/fail only.
+
+    Thin wrapper over max_all_close_with_accuracy that returns only the pass/fail
+    flag, for the many callers that don't need the accuracy metric.
+    """
+    return max_all_close_with_accuracy(a, b, rtol, atol, equal_nan_inf, verbose, mode, logfile, min_pass_rate).passed
 
 
 def get_largest_abs_diff(a, b, atol=1e-8):

@@ -43,7 +43,7 @@ def contiguous_access_pattern(src):
     for i in range(src_tiles.shape[0]):
         for j in range(src_tiles.shape[1]):
             tile = src_tiles[i, j].load()
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 

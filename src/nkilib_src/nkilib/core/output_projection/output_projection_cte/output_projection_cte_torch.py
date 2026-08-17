@@ -29,6 +29,8 @@ from ...utils.mx_torch_common import (
     unpack_float8_e4m3fn_x4,
 )
 
+_MXFP4_X4_ITEMSIZE = 2  # bytes; float4_e2m1fn_x4 or its uint16 container label
+
 # FP8 max values for different formats
 _FP8_E4M3_MAX = 240.0
 _FP8_E4M3FN_MAX = 448.0
@@ -319,7 +321,8 @@ def output_projection_cte_mx_torch_ref(
 
     Args:
         attention: Online: numpy bf16 [B, N, D, S]. Pre-quantized: numpy uint8 [B, 1, D_packed, S].
-        weight: numpy float4_e2m1fn_x4 or float8_e4m3fn_x4 [N*D//4, H].
+        weight: numpy float4_e2m1fn_x4 or float8_e4m3fn_x4 [N*D//4, H]. May arrive
+            labeled with the same-width torch container dtype (uint16/uint32).
         bias: Optional[numpy bf16 [1, H]], bias tensor.
         quantization_type: must be QuantizationType.MX.
         input_scales: Pre-quantized only: numpy uint8 [B, D_packed//8, S]. None for online.
@@ -360,7 +363,11 @@ def output_projection_cte_mx_torch_ref(
         )
         w_scale = torch.from_numpy(w_scale_dense).float()
     else:
-        w_unpacked = unpack_float4_x4(weight.reshape(-1, hidden))
+        weight_reshaped = weight.reshape(-1, hidden)
+        if weight_reshaped.dtype.itemsize == _MXFP4_X4_ITEMSIZE:
+            w_unpacked = unpack_float4_x4(weight_reshaped)
+        else:
+            w_unpacked = unpack_float8_e4m3fn_x4(weight_reshaped)
         w_scale = torch.from_numpy(weight_scales.reshape(-1, hidden)).float()
 
     results = []

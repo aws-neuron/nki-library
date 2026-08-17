@@ -22,11 +22,11 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-
 from nkilib_src.nkilib.core.subkernels.norm_tkg_utils import _RMSNORM_QMX_SHARDING_THRESHOLD
 from nkilib_src.nkilib.core.subkernels.rmsnorm_mx_quantize_tkg import rmsnorm_mx_quantize_tkg
-from nkilib_src.nkilib.core.subkernels.rmsnorm_mx_quantize_tkg_torch import rmsnorm_mx_quantize_tkg_torch_ref
+from nkilib_src.nkilib.core.subkernels.rmsnorm_mx_quantize_tkg_torch import rmsnorm_mx_quantize_tkg_wrapper_torch_ref
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info, kernel_assert
+
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
     CompilerArgs,
@@ -66,7 +66,7 @@ def rmsnorm_mx_quantize_tkg_wrapper(
     T = B * S
     kernel_assert(H_free % 4 == 0, f"H_free must be divisible by 4 for quantize_mx, got {H_free=}")
 
-    with_residual = residual != None
+    with_residual = residual is not None
 
     output_shape = (H_par, T, H_free)
     quant_shape = (H_par, H_free // 4, T) if output_quant_in_sbuf or not output_quant_packed else (T, H * 5 // 4)
@@ -245,7 +245,7 @@ def generate_inputs(
         "inp": rng.normal(size=(batch, seqlen, hidden)).astype(in_dtype),
         "gamma": rng.normal(size=(1, hidden)).astype(in_dtype),
     }
-    if hidden_actual != None:
+    if hidden_actual is not None:
         inputs["hidden_actual"] = hidden_actual
     if with_residual:
         inputs["residual"] = rng.normal(size=(batch, seqlen, hidden)).astype(in_dtype)
@@ -398,7 +398,7 @@ class TestRmsNormQuantizeMxTKGKernel:
                 with_residual=with_residual,
             )
 
-        torch_ref = _wrap_torch_ref_skip_out_quant(torch_ref_wrapper(rmsnorm_mx_quantize_tkg_torch_ref))
+        torch_ref = _wrap_torch_ref_skip_out_quant(torch_ref_wrapper(rmsnorm_mx_quantize_tkg_wrapper_torch_ref))
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -412,7 +412,6 @@ class TestRmsNormQuantizeMxTKGKernel:
             compiler_args=CompilerArgs(
                 logical_nc_config=2,
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             rtol=1e-2,
             atol=1e-3,

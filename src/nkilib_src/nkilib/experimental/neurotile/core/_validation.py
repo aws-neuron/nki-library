@@ -11,25 +11,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Input validation for the public factories.
-
-Houses the `_validate_*` helpers used by `tiles()`, `blocks()`,
-`alloc_tiles()`, `alloc_blocks()`, and `tensor_view()`. Keeping them
-in one place keeps `factories.py` focused on dispatch + builder
-pipelines.
-
-Each helper raises `AssertionError` with a named, user-facing message
-on misuse.
-"""
-
 import nki.language as nl
 
-from ._helpers import is_identity_tensor
+from ._helpers import buffer_space
 from .ndslice import NDSlice
 
 # Valid string values for remainder=. Exposed so callers / tests / docstrings
 # can reference one authoritative list.
 _VALID_REMAINDER = (None, "skip")
+
+
+# ============================================================================
+# Source arg
+# ============================================================================
+
+
+def _validate_source(source, caller="nt.tiles/nt.blocks"):
+    """source must be an NDSlice or a tensor-like object with ``.shape``.
+
+    Fails with a named error here rather than a downstream AttributeError
+    deep in the builder.
+    """
+    if isinstance(source, NDSlice):
+        return
+    assert source is not None, (
+        caller + "(source=None): source is required -- an HBM/SBUF tensor, nl.ndarray, or NDSlice."
+    )
+    assert hasattr(source, "shape"), (
+        caller + "(source=...): source must be a tensor-like object with a .shape "
+        "(HBM/SBUF tensor, nl.ndarray, or NDSlice). Got: " + str(source)
+    )
+    # A handle that already carries a runtime (gather / dynamic-select) offset
+    # cannot be tiled directly: the layout path reads only the compile-time
+    # offset, and .ap() drops the runtime offset, so the DMA would silently
+    # read from the base. Apply the runtime index on the view instead.
+    assert not (hasattr(source, "is_indirect") and source.is_indirect()), (
+        caller + "(source=...): source already carries a runtime (gather / "
+        "dynamic-select) offset, which would be silently dropped. Tile the base "
+        "tensor and apply the runtime index on the view: nt.tiles(t, ...)[k]."
+    )
 
 
 # ============================================================================
@@ -108,23 +128,18 @@ def _validate_remainder(remainder):
     )
 
 
-def _validate_buffer_type(buffer_type):
-    """buffer_type must be None, nl.sbuf, nl.private_hbm, or nl.shared_hbm.
+def _validate_buffer_type(buffer_type, caller="nt.alloc_tiles/nt.alloc_blocks"):
+    """Allocation destination must be nl.sbuf, nl.private_hbm, or nl.shared_hbm.
 
-    Raw tensor sources: nl.sbuf for SBUF-backed ndarrays; nl.shared_hbm /
-    nl.private_hbm or None for HBM tensors. nl.psum is rejected -- PSUM
-    buffers are produced via nt.psum_pool(), not via tile factories.
+    nl.psum is rejected -- PSUM buffers are produced via nt.psum_pool().
     """
-    if buffer_type is None:
-        return
     assert isinstance(buffer_type, nl.MemoryRegion), (
-        "nt.tiles/nt.blocks: buffer_type= must be None or an nl.MemoryRegion "
+        caller + ": buffer_type= must be an nl.MemoryRegion "
         "(nl.sbuf, nl.shared_hbm, nl.private_hbm). Got " + str(buffer_type) + "."
     )
     assert buffer_type != nl.psum, (
-        "nt.tiles/nt.blocks: buffer_type=nl.psum is not supported. Use "
-        "nl.sbuf for raw SBUF sources, nl.shared_hbm / nl.private_hbm for "
-        "HBM, or leave unset. PSUM buffers are produced via nt.psum_pool()."
+        caller + ": buffer_type=nl.psum is not supported. Use nl.sbuf, "
+        "nl.shared_hbm, or nl.private_hbm. PSUM buffers are produced via nt.psum_pool()."
     )
 
 
@@ -166,36 +181,6 @@ def _validate_access_pattern(access_pattern):
             "nt.tiles/nt.blocks: access_pattern[" + str(d) + "][1] (count) must be int."
         )
         assert count > 0, "nt.tiles/nt.blocks: access_pattern[" + str(d) + "][1] (count) must be > 0, got " + str(count)
-
-
-def _validate_tile_size_fits_source(size, source_shape):
-    """Per-dim tile size <= source element extent on that dim.
-
-    ``tile_size[d]`` operates on ``source_shape[n_batch + d]``
-    (position-matched after auto-padding leading batch dims). If you want
-    the tile's P-axis to partition an *inner* source dim (transpose-on-
-    load), use ``.load(transpose=True)`` on a contiguous tile instead.
-    """
-    n_batch = len(source_shape) - len(size)
-    if n_batch < 0:
-        return  # handled by the earlier rank check caller
-    for d in range(len(size)):
-        src_d = source_shape[n_batch + d]
-        assert size[d] <= src_d, (
-            "nt.tiles/nt.blocks: tile_size["
-            + str(d)
-            + "]="
-            + str(size[d])
-            + " exceeds source extent "
-            + str(src_d)
-            + " on dim "
-            + str(n_batch + d)
-            + " of source shape "
-            + str(source_shape)
-            + ". tile_size[d] operates on source dim (n_batch + d); use "
-            ".load(transpose=True) if you intended to map the tile's "
-            "P-axis to an inner source dim."
-        )
 
 
 def _ap_element_shape(access_pattern):
@@ -293,7 +278,7 @@ def _validate_alloc_tiles_args(
     assert buffer_type is not None, (
         caller + "(...): buffer_type= is required (nl.sbuf, nl.shared_hbm, or nl.private_hbm)."
     )
-    _validate_buffer_type(buffer_type)
+    _validate_buffer_type(buffer_type, caller=caller)
     assert dtype is not None, caller + "(...): dtype= is required."
     assert grid is None or element_shape is None, (
         caller + "(...): pass either grid= or element_shape=, not both. "
@@ -342,7 +327,6 @@ def _validate_tiles_args(
     source,
     size,
     access_pattern,
-    buffer_type,
     remainder,
 ):
     """Central gate for all nt.tiles()/nt.blocks() public input validation.
@@ -350,8 +334,8 @@ def _validate_tiles_args(
     Fires on wrong types, out-of-range values, rank mismatches, and unknown
     enum strings.
     """
+    _validate_source(source)
     _validate_remainder(remainder)
-    _validate_buffer_type(buffer_type)
 
     if isinstance(source, NDSlice):
         # Re-tile or descend. size is optional; AP is rejected (handled at
@@ -363,6 +347,17 @@ def _validate_tiles_args(
     # Raw tensor: tile_size is required.
     assert size is not None, "nt.tiles(): tile_size= is required for raw tensor sources."
     _validate_tile_size(size)
+
+    # A strided access_pattern only feeds the HBM layout path; the on-chip
+    # (SBUF) builder recomputes strides from the tile grid and would silently
+    # drop the AP's strides (keeping only its counts). Reject the combination
+    # for an SBUF source instead of honoring it partially.
+    assert not (access_pattern is not None and buffer_space(source) == nl.sbuf), (
+        "nt.tiles/nt.blocks(SBUF source, access_pattern=...): access_pattern= "
+        "is not supported for SBUF sources -- the on-chip layout derives strides "
+        "from the tile grid, so the AP's strides would be ignored. "
+        "Reshape/permute the view after construction (.reshape()/.permute())."
+    )
 
     source_shape = tuple(source.shape)
     _validate_access_pattern(access_pattern)
@@ -383,9 +378,6 @@ def _validate_tiles_args(
         + ("access_pattern=" if access_pattern is not None else "source.shape")
         + "); tile_size must not exceed the view's rank."
     )
-
-    # Tile extent per dim must not exceed the view's element extent on that dim.
-    _validate_tile_size_fits_source(tuple(size), view_shape)
 
     # Higher-rank AP (more levels than source.ndim) currently requires
     # tile_size to match the view exactly -- one tile covers the whole
@@ -416,56 +408,6 @@ def _validate_tiles_args(
             + str(tuple(view_shape))
             + ". TODO: support multi-tile iteration over higher-rank-AP views."
         )
-
-
-def _validate_hbm_source(source, root):
-    """Require root= when an HBM source is a sliced view of another tensor.
-
-    Sliced views (e.g. `w_qkv[:, a:b]`) carry a narrowed logical shape
-    but physical strides of the parent. Without root=, the factory
-    would derive strides from the slice's logical shape and silently
-    emit wrong APs -- multi-tile loads would read bytes from wrong
-    offsets. Passing root= fixes the coordinate space to the parent:
-    strides and offsets are correct, and `indirect_dim` consistently
-    indexes into root's dims.
-
-    Non-NKI sources (numpy, MockTensor in tests) skip this check since
-    they lack `_pattern`.
-    """
-    if not hasattr(source, "_pattern"):
-        return
-    if is_identity_tensor(source):
-        return
-    assert root is not None, (
-        "nt.tiles/nt.blocks(source=<sliced view>): the HBM source is a "
-        "slice of another tensor (e.g. `w_qkv[:, a:b]`). Pass "
-        "root=<parent tensor> so strides and offsets are derived against "
-        "the parent's physical memory. Without root=, strides would come "
-        "from the slice's logical shape and multi-tile loads would read "
-        "bytes from wrong offsets."
-    )
-    assert is_identity_tensor(root), (
-        "nt.tiles/nt.blocks(root=...): root must be a top-level tensor, not a view or slice."
-    )
-
-
-def _validate_tensor_view_args(source, access_pattern, buffer_type):
-    """Input validation for nt.tensor_view().
-
-    tensor_view is a constructor over a raw tensor; chain transforms
-    (.reshape, .permute, .flatten_dims, ...) on the result. NDSlice
-    sources are rejected -- the existing view already has a layout to
-    chain against.
-    """
-    assert not isinstance(source, NDSlice), (
-        "nt.tensor_view(source=NDSlice): tensor_view is a constructor over "
-        "a raw tensor. To chain transforms on an existing NDSlice, call "
-        ".reshape() / .permute() / .flatten_dims() on it directly."
-    )
-    _validate_buffer_type(buffer_type)
-    source_shape = tuple(source.shape)
-    _validate_access_pattern(access_pattern)
-    _validate_ap_addresses_fit_source(access_pattern, source_shape)
 
 
 # ============================================================================

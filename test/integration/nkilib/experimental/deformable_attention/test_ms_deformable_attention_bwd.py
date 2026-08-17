@@ -17,13 +17,13 @@
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.deformable_attention.ms_deformable_attention_bwd import (
     ms_deformable_attention_bwd,
 )
 from nkilib_src.nkilib.experimental.deformable_attention.ms_deformable_attention_bwd_torch import (
     ms_deformable_attention_bwd_torch_ref,
 )
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, LazyGoldenGenerator, Platforms, ValidationArgs
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -160,179 +160,181 @@ MS_DEFORM_ATTN_BWD_BEVFORMER_ALL_PARAMS = [
 # fmt: on
 
 
-@pytest_test_metadata(name="MS Deformable Attention Backward Basic")
-@pytest_marks(["deformable_attention", "ms_deform_attn_bwd", "basic"])
-@pytest.mark.parametrize(MS_DEFORM_ATTN_BWD_PARAM_NAMES, MS_DEFORM_ATTN_BWD_BASIC_ALL_PARAMS)
-def test_ms_deformable_attention_bwd_basic(
-    test_manager: Orchestrator,
-    platform_target: Platforms,
-    batch,
-    n_queries,
-    n_heads,
-    c_head,
-    n_levels,
-    n_points,
-    spatial_shapes,
-    dtype,
-    value_layout,
-    sampling_locations_layout,
-    align_corners,
-    padding_mode,
-):
-    """Test multi-scale deformable attention backward pass basic configurations."""
+@pytest_test_metadata(name="MS Deformable Attention Backward")
+@pytest_marks(["deformable_attention", "ms_deform_attn_bwd"])
+class TestMSDeformableAttentionBwd:
+    @pytest_marks(["basic"])
+    @pytest.mark.parametrize(MS_DEFORM_ATTN_BWD_PARAM_NAMES, MS_DEFORM_ATTN_BWD_BASIC_ALL_PARAMS)
+    def test_ms_deformable_attention_bwd_basic(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        n_queries,
+        n_heads,
+        c_head,
+        n_levels,
+        n_points,
+        spatial_shapes,
+        dtype,
+        value_layout,
+        sampling_locations_layout,
+        align_corners,
+        padding_mode,
+    ):
+        """Test multi-scale deformable attention backward pass basic configurations."""
 
-    def input_generator(test_config):
-        return generate_ms_deformable_attention_bwd_inputs(
-            batch=batch,
-            n_queries=n_queries,
-            n_heads=n_heads,
-            c_head=c_head,
-            n_levels=n_levels,
-            n_points=n_points,
-            spatial_shapes=spatial_shapes,
-            dtype=dtype,
-            value_layout=value_layout,
-            sampling_locations_layout=sampling_locations_layout,
-            align_corners=align_corners,
-            padding_mode=padding_mode,
+        def input_generator(test_config):
+            return generate_ms_deformable_attention_bwd_inputs(
+                batch=batch,
+                n_queries=n_queries,
+                n_heads=n_heads,
+                c_head=c_head,
+                n_levels=n_levels,
+                n_points=n_points,
+                spatial_shapes=spatial_shapes,
+                dtype=dtype,
+                value_layout=value_layout,
+                sampling_locations_layout=sampling_locations_layout,
+                align_corners=align_corners,
+                padding_mode=padding_mode,
+            )
+
+        # Compute L for output shapes
+        L = sum(h * w for h, w in spatial_shapes)
+
+        def output_tensors(kernel_input):
+            # Determine output shapes based on layouts
+            if value_layout == "BLNC":
+                grad_value_shape = (batch, L, n_heads, c_head)
+            else:  # BNLC
+                grad_value_shape = (batch, n_heads, L, c_head)
+
+            if sampling_locations_layout == "BQHLP2":
+                grad_sampling_locations_shape = (batch, n_queries, n_heads, n_levels, n_points, 2)
+            else:  # B2QHLP
+                grad_sampling_locations_shape = (batch, 2, n_queries, n_heads, n_levels, n_points)
+
+            return {
+                "out_grad_value": np.zeros(grad_value_shape, dtype=dtype),
+                "out_grad_sampling_locations": np.zeros(grad_sampling_locations_shape, dtype=np.float32),
+                "out_grad_attention_weights": np.zeros((batch, n_queries, n_heads, n_levels, n_points), dtype=dtype),
+            }
+
+        def golden_generator():
+            """Generate golden output using torch reference."""
+            kernel_input = input_generator(None)
+            return torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref)(**kernel_input)
+
+        # Create and run test framework
+        test_framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=ms_deformable_attention_bwd,
+            torch_ref=torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
         )
 
-    # Compute L for output shapes
-    L = sum(h * w for h, w in spatial_shapes)
-
-    def output_tensors(kernel_input):
-        # Determine output shapes based on layouts
-        if value_layout == "BLNC":
-            grad_value_shape = (batch, L, n_heads, c_head)
-        else:  # BNLC
-            grad_value_shape = (batch, n_heads, L, c_head)
-
-        if sampling_locations_layout == "BQHLP2":
-            grad_sampling_locations_shape = (batch, n_queries, n_heads, n_levels, n_points, 2)
-        else:  # B2QHLP
-            grad_sampling_locations_shape = (batch, 2, n_queries, n_heads, n_levels, n_points)
-
-        return {
-            "out_grad_value": np.zeros(grad_value_shape, dtype=dtype),
-            "out_grad_sampling_locations": np.zeros(grad_sampling_locations_shape, dtype=np.float32),
-            "out_grad_attention_weights": np.zeros((batch, n_queries, n_heads, n_levels, n_points), dtype=dtype),
-        }
-
-    def golden_generator():
-        """Generate golden output using torch reference."""
-        kernel_input = input_generator(None)
-        return torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref)(**kernel_input)
-
-    # Create and run test framework
-    test_framework = UnitTestFramework(
-        test_manager=test_manager,
-        kernel_entry=ms_deformable_attention_bwd,
-        torch_ref=torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref),
-        kernel_input_generator=input_generator,
-        output_tensor_descriptor=output_tensors,
-    )
-
-    custom_validation = ValidationArgs(
-        golden_output=LazyGoldenGenerator(
-            output_ndarray=output_tensors(None),
-            lazy_golden_generator=golden_generator,
-        ),
-        relative_accuracy=0.025,
-        absolute_accuracy=1e-06,
-    )
-
-    # Run test with custom validation
-    test_framework.run_test(
-        test_config=None,
-        compiler_args=CompilerArgs(platform_target=platform_target),
-        custom_validation_args=custom_validation,
-    )
-
-
-@pytest_test_metadata(name="MS Deformable Attention Backward BEVFormer")
-@pytest_marks(["deformable_attention", "ms_deform_attn_bwd", "bevformer"])
-@pytest.mark.parametrize(MS_DEFORM_ATTN_BWD_PARAM_NAMES, MS_DEFORM_ATTN_BWD_BEVFORMER_ALL_PARAMS)
-def test_ms_deformable_attention_bwd_bevformer(
-    test_manager: Orchestrator,
-    platform_target: Platforms,
-    batch,
-    n_queries,
-    n_heads,
-    c_head,
-    n_levels,
-    n_points,
-    spatial_shapes,
-    dtype,
-    value_layout,
-    sampling_locations_layout,
-    align_corners,
-    padding_mode,
-):
-    """Test multi-scale deformable attention backward pass with BEVFormer configs."""
-
-    def input_generator(test_config):
-        return generate_ms_deformable_attention_bwd_inputs(
-            batch=batch,
-            n_queries=n_queries,
-            n_heads=n_heads,
-            c_head=c_head,
-            n_levels=n_levels,
-            n_points=n_points,
-            spatial_shapes=spatial_shapes,
-            dtype=dtype,
-            value_layout=value_layout,
-            sampling_locations_layout=sampling_locations_layout,
-            align_corners=align_corners,
-            padding_mode=padding_mode,
+        custom_validation = ValidationArgs(
+            golden_output=LazyGoldenGenerator(
+                output_ndarray=output_tensors(None),
+                lazy_golden_generator=golden_generator,
+            ),
+            relative_accuracy=0.025,
+            absolute_accuracy=1e-06,
         )
 
-    # Compute L for output shapes
-    L = sum(h * w for h, w in spatial_shapes)
+        # Run test with custom validation
+        test_framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            custom_validation_args=custom_validation,
+        )
 
-    def output_tensors(kernel_input):
-        # Determine output shapes based on layouts
-        if value_layout == "BLNC":
-            grad_value_shape = (batch, L, n_heads, c_head)
-        else:  # BNLC
-            grad_value_shape = (batch, n_heads, L, c_head)
+    @pytest_marks(["bevformer"])
+    @pytest.mark.parametrize(MS_DEFORM_ATTN_BWD_PARAM_NAMES, MS_DEFORM_ATTN_BWD_BEVFORMER_ALL_PARAMS)
+    def test_ms_deformable_attention_bwd_bevformer(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        n_queries,
+        n_heads,
+        c_head,
+        n_levels,
+        n_points,
+        spatial_shapes,
+        dtype,
+        value_layout,
+        sampling_locations_layout,
+        align_corners,
+        padding_mode,
+    ):
+        """Test multi-scale deformable attention backward pass with BEVFormer configs."""
 
-        if sampling_locations_layout == "BQHLP2":
-            grad_sampling_locations_shape = (batch, n_queries, n_heads, n_levels, n_points, 2)
-        else:  # B2QHLP
-            grad_sampling_locations_shape = (batch, 2, n_queries, n_heads, n_levels, n_points)
+        def input_generator(test_config):
+            return generate_ms_deformable_attention_bwd_inputs(
+                batch=batch,
+                n_queries=n_queries,
+                n_heads=n_heads,
+                c_head=c_head,
+                n_levels=n_levels,
+                n_points=n_points,
+                spatial_shapes=spatial_shapes,
+                dtype=dtype,
+                value_layout=value_layout,
+                sampling_locations_layout=sampling_locations_layout,
+                align_corners=align_corners,
+                padding_mode=padding_mode,
+            )
 
-        return {
-            "out_grad_value": np.zeros(grad_value_shape, dtype=dtype),
-            "out_grad_sampling_locations": np.zeros(grad_sampling_locations_shape, dtype=np.float32),
-            "out_grad_attention_weights": np.zeros((batch, n_queries, n_heads, n_levels, n_points), dtype=dtype),
-        }
+        # Compute L for output shapes
+        L = sum(h * w for h, w in spatial_shapes)
 
-    def golden_generator():
-        """Generate golden output using torch reference."""
-        kernel_input = input_generator(None)
-        return torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref)(**kernel_input)
+        def output_tensors(kernel_input):
+            # Determine output shapes based on layouts
+            if value_layout == "BLNC":
+                grad_value_shape = (batch, L, n_heads, c_head)
+            else:  # BNLC
+                grad_value_shape = (batch, n_heads, L, c_head)
 
-    # Create test framework
-    test_framework = UnitTestFramework(
-        test_manager=test_manager,
-        kernel_entry=ms_deformable_attention_bwd,
-        torch_ref=torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref),
-        kernel_input_generator=input_generator,
-        output_tensor_descriptor=output_tensors,
-    )
+            if sampling_locations_layout == "BQHLP2":
+                grad_sampling_locations_shape = (batch, n_queries, n_heads, n_levels, n_points, 2)
+            else:  # B2QHLP
+                grad_sampling_locations_shape = (batch, 2, n_queries, n_heads, n_levels, n_points)
 
-    custom_validation = ValidationArgs(
-        golden_output=LazyGoldenGenerator(
-            output_ndarray=output_tensors(None),
-            lazy_golden_generator=golden_generator,
-        ),
-        relative_accuracy=0.025,
-        absolute_accuracy=1e-06,
-    )
+            return {
+                "out_grad_value": np.zeros(grad_value_shape, dtype=dtype),
+                "out_grad_sampling_locations": np.zeros(grad_sampling_locations_shape, dtype=np.float32),
+                "out_grad_attention_weights": np.zeros((batch, n_queries, n_heads, n_levels, n_points), dtype=dtype),
+            }
 
-    # Run test with custom validation
-    test_framework.run_test(
-        test_config=None,
-        compiler_args=CompilerArgs(platform_target=platform_target),
-        custom_validation_args=custom_validation,
-    )
+        def golden_generator():
+            """Generate golden output using torch reference."""
+            kernel_input = input_generator(None)
+            return torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref)(**kernel_input)
+
+        # Create test framework
+        test_framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=ms_deformable_attention_bwd,
+            torch_ref=torch_ref_wrapper(ms_deformable_attention_bwd_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+
+        custom_validation = ValidationArgs(
+            golden_output=LazyGoldenGenerator(
+                output_ndarray=output_tensors(None),
+                lazy_golden_generator=golden_generator,
+            ),
+            relative_accuracy=0.025,
+            absolute_accuracy=1e-06,
+        )
+
+        # Run test with custom validation
+        test_framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            custom_validation_args=custom_validation,
+        )

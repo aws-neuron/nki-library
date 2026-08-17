@@ -20,15 +20,21 @@ import nki.isa as nisa
 import nki.language as nl
 from nki.collectives import ReplicaGroup
 
-from ...core.attention.attention_cte import _Q_GRP_SZ, _SEQLEN_SHARDING_SPLIT_FACTOR_DEFAULT, attention_cte
+from ...core.attention.attention_cte import (
+    _MIN_SEQLEN_FOR_LNC2_SHARDING,
+    _Q_GRP_SZ,
+    _SEQLEN_SHARDING_SPLIT_FACTOR_DEFAULT,
+    attention_cte,
+)
 from ...core.utils.kernel_assert import kernel_assert
+from ...core.utils.kernel_helpers import div_ceil
 from ...core.utils.modular_allocator import ModularAllocator
 from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...core.utils.tensor_view import TensorView
 
 # Maximum number of Q groups to process per output tile in the reduction
 # and normalization loops.
 _MAX_GRPS_PER_TILE = 128
+_FULLY_MASKED_LSE_THRESHOLD = -1.0e30
 
 
 def _load_rank_sb(iota_nw, scalar_rank, qts):
@@ -39,15 +45,15 @@ def _load_rank_sb(iota_nw, scalar_rank, qts):
     directly into SBUF, then stream_shuffle_broadcast to replicate across all
     partitions. This pattern (matching ring_attention_bwd) avoids register_store,
     whose scheduling can be reordered across ring steps on trn3 cp=4 lnc=2
-    striped causal — see steering_private/trn3_ring_id_investigation.md.
+    striped causal.
 
     Args:
-        iota_nw (nl.ndarray): [1, num_workers] HBM iota table containing [0, 1, ..., num_workers-1].
+        iota_nw (nl.NkiTensor): [1, num_workers] HBM iota table containing [0, 1, ..., num_workers-1].
         scalar_rank: Dynamic rank ID (index type from collective_permute).
         qts (int): Q sequence tile size (partition dimension).
 
     Returns:
-        nl.ndarray: [qts, 1], Rank ID broadcast to all partitions in SBUF as float32.
+        nl.NkiTensor: [qts, 1], Rank ID broadcast to all partitions in SBUF as float32.
     """
     sb = nl.ndarray((qts, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(
@@ -93,10 +99,10 @@ def _reduce_attention_stats(
         8. tensor_tensor(add)   — exp_sum_new
 
     Args:
-        neg_max_running (nl.ndarray): [128, num_grps], Running negated row max in SBUF.
-        exp_sum_running (nl.ndarray): [128, num_grps], Running softmax denominator in SBUF.
-        neg_max_curr (nl.ndarray): [128, num_grps], Current step negated row max in SBUF.
-        exp_sum_curr (nl.ndarray): [128, num_grps], Current step softmax denominator in SBUF.
+        neg_max_running (nl.NkiTensor): [128, num_grps], Running negated row max in SBUF.
+        exp_sum_running (nl.NkiTensor): [128, num_grps], Running softmax denominator in SBUF.
+        neg_max_curr (nl.NkiTensor): [128, num_grps], Current step negated row max in SBUF.
+        exp_sum_curr (nl.NkiTensor): [128, num_grps], Current step softmax denominator in SBUF.
         allocator (ModularAllocator): SBUF allocator for temporary buffers.
 
     Returns:
@@ -130,6 +136,124 @@ def _reduce_attention_stats(
     return neg_max_new, exp_sum_new, corr_running, corr_curr
 
 
+def _apply_correction_run(
+    run_start,
+    run_end,
+    rows,
+    max_grps_per_tile,
+    batch_o_offset,
+    sb_p,
+    d,
+    o_prev_hbm,
+    o_curr_hbm,
+    o_prev_sb,
+    o_curr_sb,
+    o_new,
+    o_tmp,
+    corr_running,
+    corr_curr,
+):
+    """Apply online-softmax correction to output groups [run_start, run_end).
+
+    Every group in the run has the same `rows` partition rows (sb_p for full groups,
+    last_grp_rows for the partial final group). Tiled by max_grps_per_tile to bound
+    SBUF usage. Defined at module scope because NKI does not allow nested functions.
+    """
+    for tile_start in range(run_start, run_end, max_grps_per_tile):
+        tile_end = min(tile_start + max_grps_per_tile, run_end)
+        tile_count = tile_end - tile_start
+        tile_o_offset = batch_o_offset + tile_start * sb_p * d
+
+        # Bulk DMA pattern for this tile
+        o_tile_pat = [[d, rows], [128 * d, tile_count], [1, d]]
+
+        # Load this tile's output groups into the front of the pre-allocated buffers
+        nisa.dma_copy(dst=o_prev_sb[:rows, :tile_count, :], src=o_prev_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset))
+        nisa.dma_copy(dst=o_curr_sb[:rows, :tile_count, :], src=o_curr_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset))
+
+        # Broadcast correction factors for this tile's groups (clamp partition dim to rows
+        # so the partial final group matches the (rows, tile_count, d) output view).
+        corr_running_bc = (
+            corr_running.slice(dim=0, start=0, end=rows)
+            .slice(dim=1, start=tile_start, end=tile_end)
+            .expand_dim(dim=2)
+            .broadcast(dim=2, size=d)
+        )
+        corr_curr_bc = (
+            corr_curr.slice(dim=0, start=0, end=rows)
+            .slice(dim=1, start=tile_start, end=tile_end)
+            .expand_dim(dim=2)
+            .broadcast(dim=2, size=d)
+        )
+
+        # Views into the first tile_count groups of the pre-allocated buffers
+        o_prev_view = o_prev_sb[:rows, :tile_count, :]
+        o_curr_view = o_curr_sb[:rows, :tile_count, :]
+        o_new_view = o_new[:rows, :tile_count, :]
+        o_tmp_view = o_tmp[:rows, :tile_count, :]
+
+        # o_new = o_prev * corr_running
+        nisa.tensor_tensor(dst=o_new_view, data1=o_prev_view, data2=corr_running_bc, op=nl.multiply)
+        # o_tmp = o_curr * corr_curr
+        nisa.tensor_tensor(dst=o_tmp_view, data1=o_curr_view, data2=corr_curr_bc, op=nl.multiply)
+        # o_new = o_new + o_tmp
+        nisa.tensor_tensor(dst=o_new_view, data1=o_new_view, data2=o_tmp_view, op=nl.add)
+
+        # Write back this tile
+        nisa.dma_copy(dst=o_prev_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset), src=o_new[:rows, :tile_count, :])
+
+
+def _apply_normalize_run(
+    run_start,
+    run_end,
+    rows,
+    max_grps_per_tile,
+    batch_o_offset,
+    sb_p,
+    d,
+    o_prev_hbm,
+    o_out,
+    o_sb,
+    sum_recip_sb,
+):
+    """Normalize output groups [run_start, run_end) by 1/S and write to o_out.
+
+    Every group in the run has the same `rows` partition rows. o_prev_hbm and o_out
+    share the (bs, seqlen, d) layout, so the same offset/pattern is used for load and
+    store. Defined at module scope because NKI does not allow nested functions.
+    """
+    for tile_start in range(run_start, run_end, max_grps_per_tile):
+        tile_end = min(tile_start + max_grps_per_tile, run_end)
+        tile_count = tile_end - tile_start
+        tile_o_offset = batch_o_offset + tile_start * sb_p * d
+
+        # Bulk DMA pattern for this tile
+        o_tile_pat = [[d, rows], [128 * d, tile_count], [1, d]]
+
+        # Load this tile's output groups
+        nisa.dma_copy(dst=o_sb[:rows, :tile_count, :], src=o_prev_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset))
+
+        # Broadcast 1/S for this tile's groups (clamp partition dim to rows so the
+        # partial final group matches the (rows, tile_count, d) output view).
+        sum_recip_bc = (
+            sum_recip_sb.slice(dim=0, start=0, end=rows)
+            .slice(dim=1, start=tile_start, end=tile_end)
+            .expand_dim(dim=2)
+            .broadcast(dim=2, size=d)
+        )
+
+        # Normalize: o_final = o_unnorm * (1/S)
+        nisa.tensor_tensor(
+            dst=o_sb[:rows, :tile_count, :],
+            data1=o_sb[:rows, :tile_count, :],
+            data2=sum_recip_bc,
+            op=nl.multiply,
+        )
+
+        # Write to final output
+        nisa.dma_copy(dst=o_out.ap(pattern=o_tile_pat, offset=tile_o_offset), src=o_sb[:rows, :tile_count, :])
+
+
 def _reduce_one_batch(
     o_prev_hbm,
     neg_max_prev_hbm,
@@ -140,6 +264,7 @@ def _reduce_one_batch(
     batch_idx,
     grp_start,
     grp_end,
+    seqlen,
     d,
     num_grps,
     sb_p,
@@ -160,32 +285,33 @@ def _reduce_one_batch(
 
     Loads softmax statistics from HBM, computes correction factors via
     _reduce_attention_stats, then applies corrections to output groups using
-    TensorView broadcast. Output groups are processed in tiles of up to
+    nl.NkiTensor broadcast. Output groups are processed in tiles of up to
     max_grps_per_tile to bound SBUF usage.
 
     Args:
-        o_prev_hbm (nl.ndarray): [bs, seqlen, d], Accumulated unnormalized output in HBM.
-        neg_max_prev_hbm (nl.ndarray): [bs, 128, num_grps], Negated row max for accumulated output.
-        sum_prev_hbm (nl.ndarray): [bs, 128, num_grps], Raw softmax denominator S for accumulated output.
-        o_curr_hbm (nl.ndarray): [bs, seqlen, d], Current step unnormalized output in HBM.
-        neg_max_curr_hbm (nl.ndarray): [bs, 128, num_grps], Negated row max for current step.
-        sum_curr_hbm (nl.ndarray): [bs, 128, num_grps], Raw softmax denominator S for current step.
+        o_prev_hbm (nl.NkiTensor): [bs, seqlen, d], Accumulated unnormalized output in HBM.
+        neg_max_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Negated row max for accumulated output.
+        sum_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Raw softmax denominator S for accumulated output.
+        o_curr_hbm (nl.NkiTensor): [bs, seqlen, d], Current step unnormalized output in HBM.
+        neg_max_curr_hbm (nl.NkiTensor): [bs, 128, num_grps], Negated row max for current step.
+        sum_curr_hbm (nl.NkiTensor): [bs, 128, num_grps], Raw softmax denominator S for current step.
         batch_idx (int): Batch index to process.
         grp_start (int): First Q group to reduce (inclusive).
         grp_end (int): Last Q group to reduce (exclusive).
+        seqlen (int): Real query sequence length (may not be a multiple of _Q_GRP_SZ).
         d (int): Head dimension size.
-        num_grps (int): Total number of Q groups (seqlen // _Q_GRP_SZ).
+        num_grps (int): Total number of Q groups (ceil(seqlen / _Q_GRP_SZ)).
         sb_p (int): Partition tile size (128).
         softmax_pat: Array pattern for softmax stat tensors.
         max_grps_per_tile (int): Max groups per output tile (caps SBUF usage).
-        neg_max_prev_sb (nl.ndarray): Pre-allocated SBUF for prev neg_max.
-        sum_prev_sb (nl.ndarray): Pre-allocated SBUF for prev sum.
-        neg_max_curr_sb (nl.ndarray): Pre-allocated SBUF for curr neg_max.
-        sum_curr_sb (nl.ndarray): Pre-allocated SBUF for curr sum.
-        o_prev_sb (nl.ndarray): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for prev output.
-        o_curr_sb (nl.ndarray): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for curr output.
-        o_new (nl.ndarray): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for corrected output.
-        o_tmp (nl.ndarray): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for temporary.
+        neg_max_prev_sb (nl.NkiTensor): Pre-allocated SBUF for prev neg_max.
+        sum_prev_sb (nl.NkiTensor): Pre-allocated SBUF for prev sum.
+        neg_max_curr_sb (nl.NkiTensor): Pre-allocated SBUF for curr neg_max.
+        sum_curr_sb (nl.NkiTensor): Pre-allocated SBUF for curr sum.
+        o_prev_sb (nl.NkiTensor): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for prev output.
+        o_curr_sb (nl.NkiTensor): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for curr output.
+        o_new (nl.NkiTensor): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for corrected output.
+        o_tmp (nl.NkiTensor): [sb_p, max_grps_per_tile, d] Pre-allocated SBUF for temporary.
         batch_loop_addr (int): Allocator checkpoint to reset temporaries.
         allocator (ModularAllocator): SBUF allocator for temporaries.
     """
@@ -193,8 +319,16 @@ def _reduce_one_batch(
 
     grp_count = grp_end - grp_start
 
+    """
+    Final Q group may be partial when seqlen is not a multiple of _Q_GRP_SZ.
+    The output tensors are (bs, seqlen, d), so the batch stride is seqlen * d and
+    the last group occupies only last_grp_rows (<= sb_p) rows. Stats tensors stay
+    (bs, sb_p, num_grps); their padding rows are independent per partition and unused.
+    """
+    last_grp_rows = seqlen - (num_grps - 1) * sb_p
+
     batch_softmax_offset = batch_idx * sb_p * num_grps
-    batch_o_offset = batch_idx * num_grps * sb_p * d
+    batch_o_offset = batch_idx * seqlen * d
 
     nisa.dma_copy(dst=neg_max_prev_sb, src=neg_max_prev_hbm.ap(pattern=softmax_pat, offset=batch_softmax_offset))
     nisa.dma_copy(dst=sum_prev_sb, src=sum_prev_hbm.ap(pattern=softmax_pat, offset=batch_softmax_offset))
@@ -210,48 +344,44 @@ def _reduce_one_batch(
         allocator,
     )
 
-    # Tiled output correction — process up to max_grps_per_tile groups per iteration
-    for tile_start in range(grp_start, grp_end, max_grps_per_tile):
-        tile_end = min(tile_start + max_grps_per_tile, grp_end)
-        tile_count = tile_end - tile_start
-        tile_o_offset = batch_o_offset + tile_start * sb_p * d
-
-        # Bulk DMA pattern for this tile
-        o_tile_pat = [[d, sb_p], [128 * d, tile_count], [1, d]]
-
-        # Load this tile's output groups into the front of the pre-allocated buffers
-        nisa.dma_copy(dst=o_prev_sb[:, :tile_count, :], src=o_prev_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset))
-        nisa.dma_copy(dst=o_curr_sb[:, :tile_count, :], src=o_curr_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset))
-
-        # Broadcast correction factors for this tile's groups
-        corr_running_bc = (
-            TensorView(corr_running)
-            .slice(dim=1, start=tile_start, end=tile_end)
-            .expand_dim(dim=2)
-            .broadcast(dim=2, size=d)
+    # Full (sb_p-row) groups first, then the partial final group if this shard owns it.
+    has_partial = last_grp_rows < sb_p
+    full_grp_end = (num_grps - 1) if has_partial else num_grps
+    _apply_correction_run(
+        grp_start,
+        min(grp_end, full_grp_end),
+        sb_p,
+        max_grps_per_tile,
+        batch_o_offset,
+        sb_p,
+        d,
+        o_prev_hbm,
+        o_curr_hbm,
+        o_prev_sb,
+        o_curr_sb,
+        o_new,
+        o_tmp,
+        corr_running,
+        corr_curr,
+    )
+    if has_partial and grp_end == num_grps:
+        _apply_correction_run(
+            num_grps - 1,
+            num_grps,
+            last_grp_rows,
+            max_grps_per_tile,
+            batch_o_offset,
+            sb_p,
+            d,
+            o_prev_hbm,
+            o_curr_hbm,
+            o_prev_sb,
+            o_curr_sb,
+            o_new,
+            o_tmp,
+            corr_running,
+            corr_curr,
         )
-        corr_curr_bc = (
-            TensorView(corr_curr)
-            .slice(dim=1, start=tile_start, end=tile_end)
-            .expand_dim(dim=2)
-            .broadcast(dim=2, size=d)
-        )
-
-        # Views into the first tile_count groups of the pre-allocated buffers
-        o_prev_view = o_prev_sb[:, :tile_count, :]
-        o_curr_view = o_curr_sb[:, :tile_count, :]
-        o_new_view = o_new[:, :tile_count, :]
-        o_tmp_view = o_tmp[:, :tile_count, :]
-
-        # o_new = o_prev * corr_running
-        nisa.tensor_tensor(dst=o_new_view, data1=o_prev_view, data2=corr_running_bc.get_view(), op=nl.multiply)
-        # o_tmp = o_curr * corr_curr
-        nisa.tensor_tensor(dst=o_tmp_view, data1=o_curr_view, data2=corr_curr_bc.get_view(), op=nl.multiply)
-        # o_new = o_new + o_tmp
-        nisa.tensor_tensor(dst=o_new_view, data1=o_new_view, data2=o_tmp_view, op=nl.add)
-
-        # Write back this tile
-        nisa.dma_copy(dst=o_prev_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset), src=o_new[:, :tile_count, :])
 
     # Write back stats — only the groups we processed
     wb_softmax_pat = [[num_grps, sb_p], [1, grp_count]]
@@ -275,6 +405,7 @@ def _tiled_reduce_attention(
     bs,
     d,
     num_grps,
+    seqlen,
     num_bs_per_shard,
     bs_offset,
     has_remainder,
@@ -299,15 +430,16 @@ def _tiled_reduce_attention(
     independent, each NC reduces only its own groups for the remainder batch.
 
     Args:
-        o_prev_hbm (nl.ndarray): [bs, seqlen, d], Accumulated unnormalized output in HBM.
-        neg_max_prev_hbm (nl.ndarray): [bs, 128, num_grps], Negated row max for accumulated output.
-        sum_prev_hbm (nl.ndarray): [bs, 128, num_grps], Raw softmax denominator S for accumulated output.
-        o_curr_hbm (nl.ndarray): [bs, seqlen, d], Current step unnormalized output in HBM.
-        neg_max_curr_hbm (nl.ndarray): [bs, 128, num_grps], Negated row max for current step.
-        sum_curr_hbm (nl.ndarray): [bs, 128, num_grps], Raw softmax denominator S for current step.
+        o_prev_hbm (nl.NkiTensor): [bs, seqlen, d], Accumulated unnormalized output in HBM.
+        neg_max_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Negated row max for accumulated output.
+        sum_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Raw softmax denominator S for accumulated output.
+        o_curr_hbm (nl.NkiTensor): [bs, seqlen, d], Current step unnormalized output in HBM.
+        neg_max_curr_hbm (nl.NkiTensor): [bs, 128, num_grps], Negated row max for current step.
+        sum_curr_hbm (nl.NkiTensor): [bs, 128, num_grps], Raw softmax denominator S for current step.
         bs (int): Total batch size (b * q_h).
         d (int): Head dimension size.
-        num_grps (int): Number of Q groups (seqlen // _Q_GRP_SZ).
+        num_grps (int): Number of Q groups (ceil(seqlen / _Q_GRP_SZ)).
+        seqlen (int): Real query sequence length (may not be a multiple of _Q_GRP_SZ).
         num_bs_per_shard (int): Number of batches this shard processes (excluding remainder).
         bs_offset (int): Starting batch index for this shard.
         has_remainder (bool): Whether there is a remainder batch (odd bs with LNC2).
@@ -356,6 +488,7 @@ def _tiled_reduce_attention(
             batch_local_idx + bs_offset,
             0,
             num_grps,
+            seqlen,
             d,
             num_grps,
             sb_p,
@@ -373,39 +506,52 @@ def _tiled_reduce_attention(
             allocator,
         )
 
-    # Handle LNC2 remainder batch: each NC reduces only its own seqlen groups,
-    # matching attention_cte's seqlen sharding split. This avoids overwriting
-    # the other NC's groups in the shared HBM output.
+    """
+    Handle LNC2 remainder batch, mirroring attention_cte's remainder sharding:
+      - seqlen >= _MIN_SEQLEN_FOR_LNC2_SHARDING: both NCs seqlen-shard the batch, each
+        reducing only its own groups (no cross-core reads).
+      - seqlen <  _MIN_SEQLEN_FOR_LNC2_SHARDING: attention_cte has core 0 compute the
+        whole batch, so core 0 also reduces the whole batch here. Splitting it would make
+        core 1 read core 0's current-step output with no inter-core barrier (data race).
+    """
     if has_remainder:
-        batch_0_grp = int(num_grps * _SEQLEN_SHARDING_SPLIT_FACTOR_DEFAULT)
-        remainder_grp_start = shard_id * batch_0_grp
-        remainder_grp_end = batch_0_grp if shard_id == 0 else num_grps
-        _reduce_one_batch(
-            o_prev_hbm,
-            neg_max_prev_hbm,
-            sum_prev_hbm,
-            o_curr_hbm,
-            neg_max_curr_hbm,
-            sum_curr_hbm,
-            bs - 1,
-            remainder_grp_start,
-            remainder_grp_end,
-            d,
-            num_grps,
-            sb_p,
-            softmax_pat,
-            max_grps_per_tile,
-            neg_max_prev_sb,
-            sum_prev_sb,
-            neg_max_curr_sb,
-            sum_curr_sb,
-            o_prev_sb,
-            o_curr_sb,
-            o_new,
-            o_tmp,
-            batch_loop_addr,
-            allocator,
-        )
+        if seqlen >= _MIN_SEQLEN_FOR_LNC2_SHARDING:
+            batch_0_grp = int(num_grps * _SEQLEN_SHARDING_SPLIT_FACTOR_DEFAULT)
+            remainder_grp_start = shard_id * batch_0_grp
+            remainder_grp_end = batch_0_grp if shard_id == 0 else num_grps
+            do_remainder = True
+        else:
+            remainder_grp_start = 0
+            remainder_grp_end = num_grps
+            do_remainder = shard_id == 0
+        if do_remainder:
+            _reduce_one_batch(
+                o_prev_hbm,
+                neg_max_prev_hbm,
+                sum_prev_hbm,
+                o_curr_hbm,
+                neg_max_curr_hbm,
+                sum_curr_hbm,
+                bs - 1,
+                remainder_grp_start,
+                remainder_grp_end,
+                seqlen,
+                d,
+                num_grps,
+                sb_p,
+                softmax_pat,
+                max_grps_per_tile,
+                neg_max_prev_sb,
+                sum_prev_sb,
+                neg_max_curr_sb,
+                sum_curr_sb,
+                o_prev_sb,
+                o_curr_sb,
+                o_new,
+                o_tmp,
+                batch_loop_addr,
+                allocator,
+            )
 
     # Free all temporaries
     allocator.set_current_address(init_addr)
@@ -418,9 +564,9 @@ def _compute_cp_offset(rank_id_sb, recv_rank_sb, cp_offset_hbm, seqlen, striped_
     For contiguous mode: cp_offset = (my_rank - recv_rank) * seqlen.
 
     Args:
-        rank_id_sb (nl.ndarray): [_Q_GRP_SZ, 1], Current rank ID broadcast in SBUF.
-        recv_rank_sb (nl.ndarray): [_Q_GRP_SZ, 1], Received rank ID broadcast in SBUF.
-        cp_offset_hbm (nl.ndarray): [1, 1], Output HBM tensor for attention_cte.
+        rank_id_sb (nl.NkiTensor): [_Q_GRP_SZ, 1], Current rank ID broadcast in SBUF.
+        recv_rank_sb (nl.NkiTensor): [_Q_GRP_SZ, 1], Received rank ID broadcast in SBUF.
+        cp_offset_hbm (nl.NkiTensor): [1, 1], Output HBM tensor for attention_cte.
         seqlen (int): Sequence length (used in contiguous mode).
         striped_input (bool): Whether input is striped across ranks.
     """
@@ -444,6 +590,7 @@ def _normalize_one_batch(
     o_out,
     lse_out,
     batch_idx,
+    seqlen,
     d,
     num_grps,
     training,
@@ -455,17 +602,18 @@ def _normalize_one_batch(
     """Normalize and write output for a single batch (or a subset of its groups).
 
     Loads all groups' output tiles in a single bulk DMA, applies normalization
-    using TensorView broadcast, and writes to final output.
+    using nl.NkiTensor broadcast, and writes to final output.
 
     Args:
-        o_prev_hbm (nl.ndarray): [bs, seqlen, d], Accumulated unnormalized output in HBM.
-        neg_max_prev_hbm (nl.ndarray): [bs, 128, num_grps], Negated row max.
-        sum_prev_hbm (nl.ndarray): [bs, 128, num_grps], Raw softmax denominator S.
-        o_out (nl.ndarray): [bs, seqlen, d], Final output tensor in HBM.
-        lse_out (nl.ndarray or None): [bs, 128, num_grps], LSE output (if training).
+        o_prev_hbm (nl.NkiTensor): [bs, seqlen, d], Accumulated unnormalized output in HBM.
+        neg_max_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Negated row max.
+        sum_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Raw softmax denominator S.
+        o_out (nl.NkiTensor): [bs, seqlen, d], Final output tensor in HBM.
+        lse_out (nl.NkiTensor or None): [bs, 128, num_grps], LSE output (if training).
         batch_idx (int): Batch index to normalize.
+        seqlen (int): Real query sequence length (may not be a multiple of _Q_GRP_SZ).
         d (int): Head dimension size.
-        num_grps (int): Number of Q groups (seqlen // _Q_GRP_SZ).
+        num_grps (int): Number of Q groups (ceil(seqlen / _Q_GRP_SZ)).
         training (bool): Whether to compute LSE.
         lse_dtype: Data type for LSE output.
         allocator (ModularAllocator): SBUF allocator for temporaries.
@@ -478,8 +626,15 @@ def _normalize_one_batch(
     sb_p = nl.tile_size.pmax
     softmax_pat = [[num_grps, sb_p], [1, num_grps]]
 
+    """
+    Final Q group may be partial when seqlen is not a multiple of _Q_GRP_SZ.
+    Output tensors are (bs, seqlen, d): batch stride is seqlen * d and the last
+    group has only last_grp_rows (<= sb_p) valid rows.
+    """
+    last_grp_rows = seqlen - (num_grps - 1) * sb_p
+
     batch_softmax_offset = batch_idx * sb_p * num_grps
-    batch_o_offset = batch_idx * num_grps * sb_p * d
+    batch_o_offset = batch_idx * seqlen * d
 
     init_addr = allocator.get_current_address()
 
@@ -495,40 +650,40 @@ def _normalize_one_batch(
     max_grps_per_tile = min(grp_count, _MAX_GRPS_PER_TILE)
     o_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, max_grps_per_tile, d), dtype=nl.bfloat16)
 
-    for tile_start in range(grp_start, grp_end, max_grps_per_tile):
-        tile_end = min(tile_start + max_grps_per_tile, grp_end)
-        tile_count = tile_end - tile_start
-        tile_o_offset = batch_o_offset + tile_start * sb_p * d
-
-        # Bulk DMA pattern for this tile
-        o_tile_pat = [[d, sb_p], [128 * d, tile_count], [1, d]]
-
-        # Load this tile's output groups
-        nisa.dma_copy(dst=o_sb[:, :tile_count, :], src=o_prev_hbm.ap(pattern=o_tile_pat, offset=tile_o_offset))
-
-        # Broadcast 1/S for this tile's groups
-        sum_recip_bc = (
-            TensorView(sum_recip_sb)
-            .slice(dim=1, start=tile_start, end=tile_end)
-            .expand_dim(dim=2)
-            .broadcast(dim=2, size=d)
+    # Full (sb_p-row) groups first, then the partial final group if this shard owns it.
+    has_partial = last_grp_rows < sb_p
+    full_grp_end = (num_grps - 1) if has_partial else num_grps
+    _apply_normalize_run(
+        grp_start,
+        min(grp_end, full_grp_end),
+        sb_p,
+        max_grps_per_tile,
+        batch_o_offset,
+        sb_p,
+        d,
+        o_prev_hbm,
+        o_out,
+        o_sb,
+        sum_recip_sb,
+    )
+    if has_partial and grp_end == num_grps:
+        _apply_normalize_run(
+            num_grps - 1,
+            num_grps,
+            last_grp_rows,
+            max_grps_per_tile,
+            batch_o_offset,
+            sb_p,
+            d,
+            o_prev_hbm,
+            o_out,
+            o_sb,
+            sum_recip_sb,
         )
-
-        # Normalize: o_final = o_unnorm * (1/S)
-        nisa.tensor_tensor(
-            dst=o_sb[:, :tile_count, :],
-            data1=o_sb[:, :tile_count, :],
-            data2=sum_recip_bc.get_view(),
-            op=nl.multiply,
-        )
-
-        # Write to final output
-        o_out_offset = batch_idx * num_grps * sb_p * d + tile_start * sb_p * d
-        nisa.dma_copy(dst=o_out.ap(pattern=o_tile_pat, offset=o_out_offset), src=o_sb[:, :tile_count, :])
 
     # Write LSE if training
     # lse = -neg_max + log(S)
-    if training and lse_out is not None:
+    if training and lse_out != None:
         neg_max_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
         nisa.dma_copy(dst=neg_max_sb, src=neg_max_prev_hbm.ap(pattern=softmax_pat, offset=batch_softmax_offset))
         # sum_sb already loaded above
@@ -538,6 +693,27 @@ def _normalize_one_batch(
         log_s = nl.ndarray((sb_p, num_grps), dtype=lse_dtype, buffer=nl.sbuf)
         nisa.activation(log_s, nl.log, sum_sb)
         nisa.tensor_tensor(lse_tile, lse_tile, log_s, op=nl.add)
+
+        """
+        Zero the partial final group's padding rows. Those rows correspond to no real
+        query position; their raw stats (neg_max=_FLOAT32_MIN, sum=0) would otherwise
+        yield -inf/NaN. Zeroing makes the LSE output deterministic and comparable.
+        """
+        if has_partial and grp_end == num_grps:
+            nisa.memset(lse_tile[last_grp_rows:sb_p, num_grps - 1 : num_grps], 0.0)
+
+        """
+        A fully masked row retains the LSE sentinel, which overflows when backward reconstructs probabilities.
+        Zeroing that LSE lets the existing score mask produce zero probability.
+        """
+        nisa.scalar_tensor_tensor(
+            dst=lse_tile,
+            data=lse_tile,
+            op0=nl.greater,
+            operand0=_FULLY_MASKED_LSE_THRESHOLD,
+            op1=nl.multiply,
+            operand1=lse_tile,
+        )
 
         # Write only our groups' LSE using ap() on the raw tensor
         lse_ap_pat = [[num_grps, sb_p], [1, grp_count]]
@@ -559,6 +735,7 @@ def _normalize_and_write_output(
     bs,
     d,
     num_grps,
+    seqlen,
     num_bs_per_shard,
     bs_offset,
     has_remainder,
@@ -576,14 +753,15 @@ def _normalize_and_write_output(
     seqlen groups, matching attention_cte's seqlen sharding split.
 
     Args:
-        o_prev_hbm (nl.ndarray): [bs, seqlen, d], Accumulated unnormalized output in private HBM.
-        neg_max_prev_hbm (nl.ndarray): [bs, 128, num_grps], Negated row max in private HBM.
-        sum_prev_hbm (nl.ndarray): [bs, 128, num_grps], Raw softmax denominator S in private HBM.
-        o_out (nl.ndarray): [bs, seqlen, d], Final output tensor in shared HBM.
-        lse_out (nl.ndarray or None): [bs, 128, num_grps], LSE output in shared HBM (if training).
+        o_prev_hbm (nl.NkiTensor): [bs, seqlen, d], Accumulated unnormalized output in private HBM.
+        neg_max_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Negated row max in private HBM.
+        sum_prev_hbm (nl.NkiTensor): [bs, 128, num_grps], Raw softmax denominator S in private HBM.
+        o_out (nl.NkiTensor): [bs, seqlen, d], Final output tensor in shared HBM.
+        lse_out (nl.NkiTensor or None): [bs, 128, num_grps], LSE output in shared HBM (if training).
         bs (int): Total batch size.
         d (int): Head dimension size.
-        num_grps (int): Number of Q groups (seqlen // _Q_GRP_SZ).
+        num_grps (int): Number of Q groups (ceil(seqlen / _Q_GRP_SZ)).
+        seqlen (int): Real query sequence length (may not be a multiple of _Q_GRP_SZ).
         num_bs_per_shard (int): Number of batches this shard processes (excluding remainder).
         bs_offset (int): Starting batch index for this shard.
         has_remainder (bool): Whether there is a remainder batch.
@@ -601,6 +779,7 @@ def _normalize_and_write_output(
             o_out,
             lse_out,
             batch_local_idx + bs_offset,
+            seqlen,
             d,
             num_grps,
             training,
@@ -608,27 +787,40 @@ def _normalize_and_write_output(
             allocator,
         )
 
-    # Handle LNC2 remainder batch: each NC normalizes and writes only its own
-    # seqlen groups, matching attention_cte's seqlen sharding split.
+    """
+    Handle LNC2 remainder batch, mirroring attention_cte's remainder sharding:
+      - seqlen >= _MIN_SEQLEN_FOR_LNC2_SHARDING: both NCs seqlen-shard, each normalizing
+        and writing only its own groups.
+      - seqlen <  _MIN_SEQLEN_FOR_LNC2_SHARDING: core 0 computed the whole batch, so core 0
+        normalizes the whole batch (avoids core 1 reading core 0's output unsynchronized).
+    """
     if has_remainder:
-        batch_0_grp = int(num_grps * _SEQLEN_SHARDING_SPLIT_FACTOR_DEFAULT)
-        remainder_grp_start = shard_id * batch_0_grp
-        remainder_grp_end = batch_0_grp if shard_id == 0 else num_grps
-        _normalize_one_batch(
-            o_prev_hbm,
-            neg_max_prev_hbm,
-            sum_prev_hbm,
-            o_out,
-            lse_out,
-            bs - 1,
-            d,
-            num_grps,
-            training,
-            lse_dtype,
-            allocator,
-            grp_start=remainder_grp_start,
-            grp_end=remainder_grp_end,
-        )
+        if seqlen >= _MIN_SEQLEN_FOR_LNC2_SHARDING:
+            batch_0_grp = int(num_grps * _SEQLEN_SHARDING_SPLIT_FACTOR_DEFAULT)
+            remainder_grp_start = shard_id * batch_0_grp
+            remainder_grp_end = batch_0_grp if shard_id == 0 else num_grps
+            do_remainder = True
+        else:
+            remainder_grp_start = 0
+            remainder_grp_end = num_grps
+            do_remainder = shard_id == 0
+        if do_remainder:
+            _normalize_one_batch(
+                o_prev_hbm,
+                neg_max_prev_hbm,
+                sum_prev_hbm,
+                o_out,
+                lse_out,
+                bs - 1,
+                seqlen,
+                d,
+                num_grps,
+                training,
+                lse_dtype,
+                allocator,
+                grp_start=remainder_grp_start,
+                grp_end=remainder_grp_end,
+            )
 
 
 def _init_kv_send_buffers(dst_k, dst_v, src_k, src_v, bs, num_bs_per_shard, bs_offset, has_remainder, shard_id):
@@ -638,10 +830,10 @@ def _init_kv_send_buffers(dst_k, dst_v, src_k, src_v, bs, num_bs_per_shard, bs_o
     For the remainder batch (odd bs), shard 0 handles it.
 
     Args:
-        dst_k (nl.ndarray): Destination K buffer in shared HBM. Layout matches input k.
-        dst_v (nl.ndarray): [bs, seqlen, d], Destination V buffer in shared HBM.
-        src_k (nl.ndarray): Source K buffer. Layout matches input k.
-        src_v (nl.ndarray): [bs, seqlen, d], Source V buffer.
+        dst_k (nl.NkiTensor): Destination K buffer in shared HBM. Layout matches input k.
+        dst_v (nl.NkiTensor): [bs, seqlen, d], Destination V buffer in shared HBM.
+        src_k (nl.NkiTensor): Source K buffer. Layout matches input k.
+        src_v (nl.NkiTensor): [bs, seqlen, d], Source V buffer.
         bs (int): Total batch size.
         num_bs_per_shard (int): Number of batches this shard processes (excluding remainder).
         bs_offset (int): Starting batch index for this shard.
@@ -651,30 +843,30 @@ def _init_kv_send_buffers(dst_k, dst_v, src_k, src_v, bs, num_bs_per_shard, bs_o
     for batch_local_idx in range(num_bs_per_shard):
         batch_idx = batch_local_idx + bs_offset
         nisa.dma_copy(
-            dst=TensorView(dst_k).select(dim=0, index=batch_idx).get_view(),
-            src=TensorView(src_k).select(dim=0, index=batch_idx).get_view(),
+            dst=dst_k.select(dim=0, index=batch_idx),
+            src=src_k.select(dim=0, index=batch_idx),
         )
         nisa.dma_copy(
-            dst=TensorView(dst_v).select(dim=0, index=batch_idx).get_view(),
-            src=TensorView(src_v).select(dim=0, index=batch_idx).get_view(),
+            dst=dst_v.select(dim=0, index=batch_idx),
+            src=src_v.select(dim=0, index=batch_idx),
         )
     if has_remainder and shard_id == 0:
         last_batch = bs - 1
         nisa.dma_copy(
-            dst=TensorView(dst_k).select(dim=0, index=last_batch).get_view(),
-            src=TensorView(src_k).select(dim=0, index=last_batch).get_view(),
+            dst=dst_k.select(dim=0, index=last_batch),
+            src=src_k.select(dim=0, index=last_batch),
         )
         nisa.dma_copy(
-            dst=TensorView(dst_v).select(dim=0, index=last_batch).get_view(),
-            src=TensorView(src_v).select(dim=0, index=last_batch).get_view(),
+            dst=dst_v.select(dim=0, index=last_batch),
+            src=src_v.select(dim=0, index=last_batch),
         )
 
 
 @nki.jit
 def ring_attention_spmd_fwd(
-    q: nl.ndarray,
-    k: nl.ndarray,
-    v: nl.ndarray,
+    q: nl.NkiTensor,
+    k: nl.NkiTensor,
+    v: nl.NkiTensor,
     replica_groups: tuple = None,
     num_workers: int = 1,
     softmax_scale: float = None,
@@ -684,8 +876,8 @@ def ring_attention_spmd_fwd(
     lse_dtype: nki.dtype = nl.float32,
     tp_q: bool = False,
     tp_k: bool = False,
-    bound_min: nl.ndarray = None,
-    bound_max: nl.ndarray = None,
+    bound_min: nl.NkiTensor = None,
+    bound_max: nl.NkiTensor = None,
 ):
     """
     Ring attention forward using attention_cte with HBM I/O.
@@ -706,16 +898,17 @@ def ring_attention_spmd_fwd(
         b: Batch size
         h: Number of attention heads
         d: Head dimension (must be <= 128)
-        seqlen: Sequence length (must be divisible by _K_TILE_SZ and _Q_GRP_SZ)
+        seqlen: Sequence length. For training=False, arbitrary seqlen is supported (the
+            final Q group may be partial). For training=True, must be divisible by _Q_GRP_SZ.
 
     Args:
-        q (nl.ndarray): Query tensor. Shape depends on tp_q:
+        q (nl.NkiTensor): Query tensor. Shape depends on tp_q:
             [b, h, seqlen, d] when tp_q=True (non-transposed, kernel transposes internally via dma_transpose).
             [b, h, d, seqlen] when tp_q=False (pre-transposed layout).
-        k (nl.ndarray): Key tensor. Shape depends on tp_k:
+        k (nl.NkiTensor): Key tensor. Shape depends on tp_k:
             [b, h, seqlen, d] when tp_k=True (non-transposed, kernel transposes internally via dma_transpose).
             [b, h, d, seqlen] when tp_k=False (pre-transposed layout).
-        v (nl.ndarray): [b, h, seqlen, d], Value tensor (non-transposed layout).
+        v (nl.NkiTensor): [b, h, seqlen, d], Value tensor (non-transposed layout).
         replica_groups (list): Replica groups for collective communication.
         num_workers (int): Number of workers in the ring.
         softmax_scale (float): Softmax scale factor. Default: 1/sqrt(d).
@@ -734,7 +927,7 @@ def ring_attention_spmd_fwd(
             When False (default), k must be pre-transposed to (batch, d, seqlen).
             The ring transfer buffers match the input k layout, so collective permute
             transfers k in whichever layout the caller provides.
-        bound_min (nl.ndarray, optional): Sequence packing lower bound. Shape
+        bound_min (nl.NkiTensor, optional): Sequence packing lower bound. Shape
             (b*q_h, seqlen_per_rank, 1), fp32. Per-local-Q-token inclusive lower bound
             on the local K index of the document this Q token belongs to. Must be
             provided together with bound_max. Requires use_causal_mask=True and
@@ -742,12 +935,12 @@ def ring_attention_spmd_fwd(
             is a multiple of num_workers, the local document layout is identical on
             every rank, so the caller produces this tensor once and replicates it to
             every rank. Use cu_seqlens_to_striped_bounds() to build it from cu_seqlens.
-        bound_max (nl.ndarray, optional): Sequence packing upper bound (exclusive).
+        bound_max (nl.NkiTensor, optional): Sequence packing upper bound (exclusive).
             Same shape/dtype/semantics as bound_min.
 
     Returns:
-        o (nl.ndarray): [b, h, seqlen, d], Attention output.
-        lse (nl.ndarray): [b, h, 128, seqlen//128], Log-sum-exp (if training).
+        o (nl.NkiTensor): [b, h, seqlen, d], Attention output.
+        lse (nl.NkiTensor): [b, h, 128, seqlen//128], Log-sum-exp (if training).
 
     Notes:
         - Requires Trainium2 or later (not supported on trn1)
@@ -781,27 +974,32 @@ def ring_attention_spmd_fwd(
 
     kernel_assert(q_h == k_h, "expects q_heads == kv_heads, broadcast before calling")
     kernel_assert(d <= 128, f"head_dim must be <= 128, got {d}")
-    kernel_assert(seqlen % _Q_GRP_SZ == 0, f"seqlen must be divisible by {_Q_GRP_SZ}, got {seqlen}")
+    """
+    Arbitrary seqlen is supported for both inference and training: the final Q group is
+    handled as a ragged (< _Q_GRP_SZ rows) group in the reduction/normalization. For
+    training, the LSE of the partial final group's padding rows is zeroed (see
+    _normalize_one_batch) so the output is deterministic.
 
-    # Sequence packing: bound_min and bound_max must be provided together. Both
-    # must reference LOCAL (per-rank) positions. Under striped input with each
-    # padded doc length a multiple of num_workers, the local document layout is
-    # identical across ranks, so the caller can produce the bounds once and
-    # replicate them to every rank.
-    is_sequence_packed = bound_min is not None
+    Sequence packing: bound_min and bound_max must be provided together. Both
+    must reference LOCAL (per-rank) positions. Under striped input with each
+    padded doc length a multiple of num_workers, the local document layout is
+    identical across ranks, so the caller can produce the bounds once and
+    replicate them to every rank.
+    """
+    is_sequence_packed = bound_min != None
     kernel_assert(
-        is_sequence_packed == (bound_max is not None),
+        is_sequence_packed == (bound_max != None),
         "bound_min and bound_max must both be provided or both be None",
     )
     if is_sequence_packed:
         kernel_assert(use_causal_mask, "bound_min/bound_max require use_causal_mask=True")
         kernel_assert(striped_input, "bound_min/bound_max require striped_input=True")
 
-    if replica_groups is None:
+    if replica_groups == None:
         replica_groups = ()
 
     bs = b * q_h
-    num_grps = seqlen // _Q_GRP_SZ
+    num_grps = div_ceil(seqlen, _Q_GRP_SZ)
 
     # Reshape, attention_cte treats dim 0 as batch
     if tp_q:
@@ -819,7 +1017,7 @@ def ring_attention_spmd_fwd(
     lse = None
     if training:
         lse = nl.ndarray(
-            (bs, nl.tile_size.pmax, seqlen // nl.tile_size.pmax),
+            (bs, nl.tile_size.pmax, num_grps),
             dtype=lse_dtype,
             buffer=nl.shared_hbm,
         )
@@ -829,11 +1027,13 @@ def ring_attention_spmd_fwd(
     # The caller must pre-scale Q by softmax_scale before invoking this kernel.
     attn_scale = 1.0 if use_causal_mask else softmax_scale
 
-    # LNC info — needed for _normalize_and_write_output to write only this
-    # shard's batches to shared output, and for _tiled_reduce_attention.
-    # attention_cte handles LNC sharding internally, so under LNC2 it shards
-    # on batch: NC0 processes batches [0, bs//2), NC1 processes [bs//2, bs).
-    # Outputs are in shared_hbm.
+    """
+    LNC info — needed for _normalize_and_write_output to write only this
+    shard's batches to shared output, and for _tiled_reduce_attention.
+    attention_cte handles LNC sharding internally, so under LNC2 it shards
+    on batch: NC0 processes batches [0, bs//2), NC1 processes [bs//2, bs).
+    Outputs are in shared_hbm.
+    """
     program_ndims = nl.program_ndim()
     shard_id = nl.program_id(0) if program_ndims == 1 else 0
     num_shards = nl.num_programs(0) if program_ndims == 1 else 1
@@ -841,9 +1041,11 @@ def ring_attention_spmd_fwd(
     bs_offset = shard_id * num_bs_per_shard
     has_remainder = (bs % num_shards) != 0
 
-    # Collective permute send/recv buffers for K/V in shared_hbm.
-    # K buffer layout matches input k layout (depends on tp_k).
-    # V buffer: (bs, seqlen, d) — V in non-transposed layout
+    """
+    Collective permute send/recv buffers for K/V in shared_hbm.
+    K buffer layout matches input k layout (depends on tp_k).
+    V buffer: (bs, seqlen, d) — V in non-transposed layout
+    """
     if tp_k:
         # K in non-transposed layout: (bs, seqlen, d)
         send_k_buf = nl.ndarray(
@@ -906,18 +1108,18 @@ def ring_attention_spmd_fwd(
 
     allocator = ModularAllocator(initial_address=0)
 
-    # ================================================================
     # Ring step 0: Local K/V (Q and K from same rank => cp_offset=0)
-    # ================================================================
     if use_causal_mask:
         _cp_zero_sb = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(_cp_zero_sb, 0.0)
         nisa.dma_copy(dst=cp_offset_hbm, src=_cp_zero_sb)
 
-    # attention_cte handles LNC sharding and batch iteration internally.
-    # With skip_output_normalization=True, returns unnormalized output and raw S.
-    # Outputs are in shared_hbm. For LNC2 odd bs, the remainder batch is
-    # seqlen-sharded across NCs — core barrier needed before reduction.
+    """
+    attention_cte handles LNC sharding and batch iteration internally.
+    With skip_output_normalization=True, returns unnormalized output and raw S.
+    Outputs are in shared_hbm. For LNC2 odd bs, the remainder batch is
+    seqlen-sharded across NCs — core barrier needed before reduction.
+    """
     o_prev, neg_max_prev, sum_prev = attention_cte(
         q,
         k,
@@ -940,17 +1142,18 @@ def ring_attention_spmd_fwd(
     # Each NC copies only its assigned batches to parallelize DMA work under LNC2.
     _init_kv_send_buffers(send_k_buf, send_v_buf, k, v, bs, num_bs_per_shard, bs_offset, has_remainder, shard_id)
 
-    # ================================================================
-    # Ring steps 1..num_workers-1
-    # ================================================================
-    # Ping-pong buffer design: instead of copying recv→send after each
-    # step, we swap which buffer is "current" (to send from) and which
-    # is "next" (to receive into). This eliminates per-step K/V DMA copy.
-    #
-    # CC pipeline: to hide collective latency, we pipeline the collective
-    # permute one step ahead: launch the collective for step N+1 in step N.
-    # The first collective is hoisted before the loop (overlaps with
-    # step 0's attention_cte). The last step skips the collective launch.
+    """
+    Ring steps 1..num_workers-1
+
+    Ping-pong buffer design: instead of copying recv→send after each
+    step, we swap which buffer is "current" (to send from) and which
+    is "next" (to receive into). This eliminates per-step K/V DMA copy.
+
+    CC pipeline: to hide collective latency, we pipeline the collective
+    permute one step ahead: launch the collective for step N+1 in step N.
+    The first collective is hoisted before the loop (overlaps with
+    step 0's attention_cte). The last step skips the collective launch.
+    """
     cur_k, nxt_k = send_k_buf, recv_k_buf
     cur_v, nxt_v = send_v_buf, recv_v_buf
 
@@ -1000,11 +1203,13 @@ def ring_attention_spmd_fwd(
             bound_max=bound_max,
         )
 
-        # Swap buffer roles BEFORE launching the next collective.
-        # attention_cte is done reading nxt; after swap, cur points to the
-        # just-received data (for sending) and nxt points to the free buffer
-        # (for receiving). The collective reads cur and writes nxt — no
-        # conflict with attention_cte which already finished reading.
+        """
+        Swap buffer roles BEFORE launching the next collective.
+        attention_cte is done reading nxt; after swap, cur points to the
+        just-received data (for sending) and nxt points to the free buffer
+        (for receiving). The collective reads cur and writes nxt — no
+        conflict with attention_cte which already finished reading.
+        """
         cur_k, nxt_k = nxt_k, cur_k
         cur_v, nxt_v = nxt_v, cur_v
 
@@ -1032,6 +1237,7 @@ def ring_attention_spmd_fwd(
             bs,
             d,
             num_grps,
+            seqlen,
             num_bs_per_shard,
             bs_offset,
             has_remainder,
@@ -1039,9 +1245,7 @@ def ring_attention_spmd_fwd(
             allocator,
         )
 
-    # ================================================================
     # Normalize output and compute LSE
-    # ================================================================
     _normalize_and_write_output(
         o_prev,
         neg_max_prev,
@@ -1051,6 +1255,7 @@ def ring_attention_spmd_fwd(
         bs,
         d,
         num_grps,
+        seqlen,
         num_bs_per_shard,
         bs_offset,
         has_remainder,
@@ -1062,6 +1267,6 @@ def ring_attention_spmd_fwd(
 
     o = o.reshape((b, q_h, seqlen, d))
     if training:
-        lse = lse.reshape((b, q_h, nl.tile_size.pmax, seqlen // nl.tile_size.pmax))
+        lse = lse.reshape((b, q_h, nl.tile_size.pmax, num_grps))
         return o, lse
     return o

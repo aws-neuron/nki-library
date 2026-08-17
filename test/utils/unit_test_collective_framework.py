@@ -31,13 +31,12 @@ from typing import Callable, Optional
 
 import torch
 from nki.collectives import ReplicaGroup
-from torch.distributed import ProcessGroup, Work
-
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import (
     SimDistAdapter,
     replica_group_key,
     set_adapter,
 )
+from torch.distributed import ProcessGroup, Work
 
 from .common_dataclasses import (
     CompilerArgs,
@@ -48,7 +47,7 @@ from .common_dataclasses import (
     ValidationArgs,
 )
 from .metadata_loader import load_model_configs
-from .metrics_collector import IMetricsCollector
+from .metrics_collector import IMetricsCollector, MetricName
 from .test_orchestrator import Orchestrator
 from .unit_test_framework import (
     check_unused_parameters,
@@ -105,7 +104,6 @@ class _MPSimProcessGroup(ProcessGroup):
         return os.path.join(self._coll_dir, f"{self._group_id}_c{call_id}_r{r}.pkl")
 
     def _put_and_sync(self, data):
-        call_id = self._call_idx
         self._call_idx += 1
 
         # Use global counter for file naming (consistent across all PGs)
@@ -349,7 +347,7 @@ class SimDistRunner:
                     p = ctx.Process(target=_worker_record, args=(rank, pass_idx, error_dict))
                     processes.append((rank, p))
                     p.start()
-                for rank, p in processes:
+                for _rank, p in processes:
                     p.join()
                 if p.exitcode and p.exitcode < 0:
                     import signal
@@ -497,7 +495,9 @@ class CollectiveUnitTestFramework:
         self.torch_ref = torch_ref
         self.per_rank_input_generator = per_rank_input_generator
         self.collective_ranks = collective_ranks
-        self.collector = collector
+        # Default to the orchestrator's collector, which is a NoopMetricsCollector
+        # when metrics are disabled.
+        self.collector = collector if collector is not None else test_manager.collector
 
     def run_test(
         self,
@@ -511,7 +511,7 @@ class CollectiveUnitTestFramework:
         metadata: Optional[dict] = None,
         golden_only: bool = False,
     ):
-        if self.collector is not None and metadata is not None:
+        if metadata is not None:
             metadata_list = load_model_configs(metadata["config_name"])
             self.collector.match_and_add_metadata_dimensions(metadata["key"], metadata_list)
 
@@ -541,7 +541,11 @@ class CollectiveUnitTestFramework:
 
         def _generate_all_golden():
             """Lazy: only run multi-process golden gen when first rank is requested."""
-            result = _run_torch_refs_parallel(torch_ref, per_rank_ref_inputs, self.collective_ranks)
+            # Time just the reference compute as GoldenComputationTime (the collective
+            # path has no golden cache, so this always runs). The comparator wrapping
+            # below is validation, not golden compute, so it stays outside the timer.
+            with self.collector.timer(MetricName.GOLDEN_COMPUTATION_TIME):
+                result = _run_torch_refs_parallel(torch_ref, per_rank_ref_inputs, self.collective_ranks)
             if custom_comparator is not None:
                 result = {r: custom_comparator(r, g) for r, g in result.items()}
             return result

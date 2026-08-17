@@ -27,8 +27,6 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
-import fabric2
-
 from . import core_lock_client as lock_client
 from .metrics_collector import IMetricsCollector, MetricName
 from .scripts.remote_lock_scripts import LockStatus
@@ -137,23 +135,25 @@ class InsufficientCoreCountError(LockAcquisitionError):
         self.retryable = False
 
 
-def check_lock_version(conn: fabric2.Connection) -> None:
+def check_lock_version(host_locking_version: int) -> None:
     """
     Check if the host's locking protocol version is compatible with this client.
 
     Args:
-        conn: Active fabric2 Connection to the remote host
+        host_locking_version: The host's required minimum client locking version
 
     Raises:
-        LockVersionError: If the host requires a newer locking protocol
+        LockVersionError: If the host requires a newer locking protocol than this client supports
     """
-    required_version = lock_client.get_host_locking_version(conn)
-
-    if required_version > lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION:
+    if host_locking_version > lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION:
         raise LockVersionError(
-            required_version=required_version,
+            required_version=host_locking_version,
             current_version=lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION,
         )
+
+
+def calculate_total_needed_physical_cores(collectives_ranks: int, lnc_config: int) -> int:
+    return collectives_ranks * lnc_config
 
 
 class CoreLockManager:
@@ -300,7 +300,7 @@ class CoreLockManager:
             LockAcquisitionError: If an unexpected error occurs during the poll
             InsufficientCoreCountError: If the host cannot satisfy the request
         """
-        num_physical_cores = num_logical_cores * lnc_config
+        num_physical_cores = calculate_total_needed_physical_cores(num_logical_cores, lnc_config)
         assert num_physical_cores % lnc_config == 0, (
             f"num_physical_cores ({num_physical_cores}) must be a multiple of lnc_config ({lnc_config})"
         )
@@ -326,7 +326,7 @@ class CoreLockManager:
                     caller_id=self._caller_id,
                 )
         except Exception as e:
-            raise LockAcquisitionError(str(e))
+            raise LockAcquisitionError(str(e)) from e
 
         if lock_result.status == LockStatus.ALLOCATED:
             if lock_result.cores is None:
@@ -364,6 +364,63 @@ class CoreLockManager:
             return AllocationOutcome(
                 status=AllocationStatus.DRAINING if draining else AllocationStatus.QUEUED,
                 position=lock_result.position,
+                worst_case_eta=lock_result.worst_case_eta,
+            )
+
+        if lock_result.status == LockStatus.ERROR:
+            raise LockAcquisitionError(f"[{self.host}] Lock helper error: {lock_result.message}")
+
+        # Unknown status - treat as error
+        raise LockAcquisitionError(f"[{self.host}] Unexpected lock status: {lock_result.status}")
+
+    def probe(
+        self,
+        num_logical_cores: int,
+        lnc_config: int,
+        timeout_seconds: int = lock_client.DEFAULT_LOCK_TIMEOUT_SECONDS,
+    ) -> AllocationOutcome:
+        """Read-only worst-case ETA peek for a not-yet-queued caller.
+
+        Maps the wire ``LockResult`` to an ``AllocationOutcome``. Joins no queue
+        and emits no event, so it touches none of the contention/position
+        counters ``acquire`` maintains (metric-neutral).
+
+        Args:
+            num_logical_cores: Number of logical cores the caller would request
+            lnc_config: LNC configuration (1 or 2) - physical cores per logical core
+            timeout_seconds: Hold-window passed to the probe so the quoted ETA
+                matches what a subsequent ``acquire`` would observe
+
+        Returns:
+            AllocationOutcome with status QUEUED (IN_QUEUE) or DRAINING, carrying
+            ``worst_case_eta``.
+
+        Raises:
+            InsufficientCoreCountError: If the host cannot satisfy the request
+            LockAcquisitionError: If an unexpected error occurs during the probe
+        """
+        num_physical_cores = calculate_total_needed_physical_cores(num_logical_cores, lnc_config)
+        if num_physical_cores > self.total_physical_cores:
+            raise InsufficientCoreCountError(
+                f"[{self.host}] Requested {num_logical_cores} logical cores (lnc{lnc_config} = "
+                f"{num_physical_cores} physical) but host only has {self.total_physical_cores} physical cores"
+            )
+
+        try:
+            lock_result = lock_client.probe(
+                self._executor,
+                self.total_physical_cores,
+                num_physical_cores,
+                timeout_seconds,
+                self.host_locking_version,
+            )
+        except Exception as e:
+            raise LockAcquisitionError(str(e)) from e
+
+        if lock_result.status in (LockStatus.DRAINING, LockStatus.IN_QUEUE):
+            draining = lock_result.status == LockStatus.DRAINING
+            return AllocationOutcome(
+                status=AllocationStatus.DRAINING if draining else AllocationStatus.QUEUED,
                 worst_case_eta=lock_result.worst_case_eta,
             )
 

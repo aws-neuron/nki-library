@@ -21,7 +21,7 @@ import torch
 
 from ...core.router_topk.router_topk import XSBLayout_tp201__2
 from ...core.router_topk.router_topk_torch import router_topk_torch_ref
-from ...core.subkernels.rmsnorm_mx_quantize_tkg_torch import rmsnorm_mx_quantize_tkg_torch_ref
+from ...core.subkernels.rmsnorm_mx_quantize_tkg_torch import rmsnorm_mx_quantize_tkg_wrapper_torch_ref
 from ...core.subkernels.rmsnorm_torch import rms_norm_torch_ref
 from ...core.utils.common_types import QuantizationType, RouterActFnType
 
@@ -60,7 +60,7 @@ def rmsnorm_router_topk_tkg_torch_ref(
 
     if quantization_type == QuantizationType.MX:
         # Use the MX ref to produce the packed FP8 quant‖scales output for validation.
-        mx_result = rmsnorm_mx_quantize_tkg_torch_ref(
+        mx_result = rmsnorm_mx_quantize_tkg_wrapper_torch_ref(
             inp=hidden_states,
             gamma=gamma,
             hidden_actual=hidden_actual,

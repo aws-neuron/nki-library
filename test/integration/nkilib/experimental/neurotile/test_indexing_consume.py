@@ -26,8 +26,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -45,7 +45,7 @@ def _kernel_load_tile_row(src):
         for j in range(row.shape[0]):
             tile = row[j]
             nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-        ov[i, :].store(row.ap())
+        ov[i, :].store(row.data)
     return out
 
 
@@ -59,7 +59,7 @@ def _kernel_load_tile_column(src):
         col = v[:, j].load()
         for i in range(col.shape[0]):
             nisa.tensor_scalar(col[i].data, col[i].data, nl.multiply, 3.0)
-        ov[:, j].store(col.ap())
+        ov[:, j].store(col.data)
     return out
 
 
@@ -76,7 +76,7 @@ def _kernel_load_block_row(src):
             for ti in range(block.shape[0]):
                 for tj in range(block.shape[1]):
                     nisa.tensor_scalar(block[ti, tj].data, block[ti, tj].data, nl.multiply, 2.0)
-        ov[bi, :].store(block_row.ap())
+        ov[bi, :].store(block_row.data)
     return out
 
 
@@ -89,12 +89,12 @@ def _kernel_load_subgrid(src):
     for i in range(v.shape[0]):
         for j in range(v.shape[1]):
             t = v[i, j].load()
-            ov[i, j].store(t.ap())
+            ov[i, j].store(t.data)
     sub = v[1:3, 1:3].load()
     for i in range(sub.shape[0]):
         for j in range(sub.shape[1]):
             nisa.tensor_scalar(sub[i, j].data, sub[i, j].data, nl.multiply, 4.0)
-    ov[1:3, 1:3].store(sub.ap())
+    ov[1:3, 1:3].store(sub.data)
     return out
 
 
@@ -112,7 +112,7 @@ def _kernel_3d_subtile_slice(src):
                 slice1 = tile[:, 1, :]
                 nisa.tensor_scalar(slice0.data, slice0.data, nl.multiply, 2.0)
                 nisa.tensor_scalar(slice1.data, slice1.data, nl.multiply, 3.0)
-                ov[i, j, k].store(tile.ap())
+                ov[i, j, k].store(tile.data)
     return out
 
 

@@ -112,6 +112,7 @@ def _k_inner_loop_helper(
     psum_dtype=nl.float32,
     tile_iter_idx: int = 0,
     enable_psum_copy_in: bool = False,
+    inputs_were_prequantized: bool = False,
 ) -> None:
     """
     Process a single output tile by accumulating across K dimension using BIR AP.
@@ -137,8 +138,11 @@ def _k_inner_loop_helper(
             (tile_iter_idx % 3 == 1) to avoid oversubscribing the scalar engine
             (default: 0).
         enable_psum_copy_in (bool): Whether to use the PSUM copy-in method for
-            cross-block accumulation. Skipped automatically when inputs are
-            pre-quantized (inferred from lhs_td/rhs_td.is_quantized).
+            cross-block accumulation. Skipped when inputs_were_prequantized is True.
+            (default: False).
+        inputs_were_prequantized (bool): Whether the original HBM inputs were
+            pre-quantized (i.e. no online BF16->MXFP8 quantization). When True,
+            the copy method is skipped since there is no online quant to overlap.
             (default: False).
 
     Returns:
@@ -163,11 +167,21 @@ def _k_inner_loop_helper(
     out_offset = lhs_f_idx * RHS_F + rhs_f_start
     out_ap = output_tensor.ap(pattern=out_pattern, offset=out_offset)
 
+    # Copy the running SBUF accumulator into PSUM before matmul to avoid tensor-tensor
+    # adds on the vector engine. Conditions:
+    #   1. accumulate_output: multiple K-blocks require cross-block accumulation
+    #   2. not inputs_were_prequantized: only useful when online quantization loads the
+    #      vector engine (pre-quantized inputs have no quant work to overlap with)
+    #   3. enable_psum_copy_in: caller opted in to the copy-in method
+    #   4. tile_iter_idx % 3 == 1: amortize scalar engine load (tuned hyper-parameter)
+    #   5. psum_dtype == nl.float32: TensorCopy into PSUM requires 4-byte aligned dtype
+    #      on core_v4 (trn3); bfloat16 PSUM writes are only legal from matmult instructions
     use_copy_method = (
         accumulate_output
-        and not (lhs_td.is_quantized or rhs_td.is_quantized)
+        and not inputs_were_prequantized
         and enable_psum_copy_in
         and (tile_iter_idx % 3 == 1)
+        and psum_dtype == nl.float32
     )
 
     if use_copy_method:
@@ -272,6 +286,7 @@ def matmul_mxfp8_blocks(
     global_block_tile_k_idx: int = 0,
     psum_dtype=nl.float32,
     enable_psum_copy_in: bool = False,
+    inputs_were_prequantized: bool = False,
 ) -> None:
     """
     Perform blocked matmul between quantized tensors and store result in SBUF.
@@ -373,6 +388,7 @@ def matmul_mxfp8_blocks(
                     psum_dtype,
                     tile_iter_idx,
                     enable_psum_copy_in,
+                    inputs_were_prequantized,
                 )
                 tile_iter_idx += 1
     elif loop_order == 'mnk' or loop_order == 'MNK':
@@ -398,6 +414,7 @@ def matmul_mxfp8_blocks(
                     psum_dtype,
                     tile_iter_idx,
                     enable_psum_copy_in,
+                    inputs_were_prequantized,
                 )
                 tile_iter_idx += 1
     else:

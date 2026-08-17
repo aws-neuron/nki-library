@@ -30,7 +30,6 @@ from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import _sbm_alloc, get_nl_act_fn_from_type
 from ...utils.logging import get_logger
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
 from .bwmm_shard_on_I import OutputTensors
 from .down_projection_mx import down_projection_mx
 from .gate_up_projection_mx import gate_up_projection_mx_tp
@@ -49,10 +48,12 @@ from .moe_cte_mx_utils import (
     compute_hidden_index_vector,
     convert_to_mxfp_dtype,
     load_and_quantize_hidden_states,
+    load_fp8_hidden_states_mx,
     load_hidden_states_mx,
     quantize_block_hidden_state_T,
     quantize_block_hidden_state_T_static_mx,
     sbuf_layout_adapter,
+    transpose_fp8_hidden_states,
 )
 from .moe_cte_utils import (
     PSUM_SIZE,
@@ -104,12 +105,12 @@ def bwmm_shard_on_block_mx(
     token_position_to_id,
     block_to_expert,
     # dynamic-loop variables
-    conditions: nl.ndarray = None,
-    gate_and_up_proj_bias: nl.ndarray = None,
-    down_proj_bias: nl.ndarray = None,
+    conditions: nl.NkiTensor = None,
+    gate_and_up_proj_bias: nl.NkiTensor = None,
+    down_proj_bias: nl.NkiTensor = None,
     # quantize scales
-    gate_up_proj_scale: nl.ndarray = None,
-    down_proj_scale: nl.ndarray = None,
+    gate_up_proj_scale: nl.NkiTensor = None,
+    down_proj_scale: nl.NkiTensor = None,
     # Non-tensor args
     block_size=None,
     n_static_blocks: int = -1,
@@ -138,8 +139,8 @@ def bwmm_shard_on_block_mx(
     # per-expert weight scales (gate_up_proj_scale: fp32 [E, 2, 1], down_proj_scale: fp32 [E, 1]);
     # the per-tensor input scales come in via gate_up_in_scale / down_in_scale.
     quantization_type: QuantizationType = QuantizationType.NONE,
-    gate_up_in_scale: Optional[nl.ndarray] = None,
-    down_in_scale: Optional[nl.ndarray] = None,
+    gate_up_in_scale: Optional[nl.NkiTensor] = None,
+    down_in_scale: Optional[nl.NkiTensor] = None,
 ):
     """
     Blockwise MXFP MoE kernel, decorated. Use as standalone kernel.
@@ -168,42 +169,42 @@ def bwmm_shard_on_block_mx(
         I: Intermediate size / tp degree
 
     Args:
-        hidden_states (nl.ndarray): Tensor of input hidden states on HBM of size (T+1, H). The reason it is T+1 is because padding token position is set to T.
+        hidden_states (nl.NkiTensor): Tensor of input hidden states on HBM of size (T+1, H). The reason it is T+1 is because padding token position is set to T.
                                        with skip_dma, id will be set to -1, so this shape can be (T, H). Similarly for expert_affinities_masked, output
-        expert_affinities_masked (nl.ndarray): Tensor of expert affinities corresponding to each token of size ((T+1) * E, 1).
+        expert_affinities_masked (nl.NkiTensor): Tensor of expert affinities corresponding to each token of size ((T+1) * E, 1).
                                         TODO: cannot refactor to (T+1, E) as we currently don't support dynamic slice on both axis.
-        gate_up_proj_weight (nl.ndarray): Tensor of concatenated gate and up projection weights on HBM (E, H, 2, I).
+        gate_up_proj_weight (nl.NkiTensor): Tensor of concatenated gate and up projection weights on HBM (E, H, 2, I).
                                           Supports MXFP4 (nl.float4_e2m1fn_x4) and MXFP8 (nl.float8_e4m3fn_x4, nl.float8_e5m2_x4).
-        down_proj_weight (nl.ndarray): Tensor of down projection weights on HBM (E, I, H).
+        down_proj_weight (nl.NkiTensor): Tensor of down projection weights on HBM (E, I, H).
                                        Supports MXFP4 (nl.float4_e2m1fn_x4) and MXFP8 (nl.float8_e4m3fn_x4, nl.float8_e5m2_x4).
         block_size (int): Number of tokens per block
-        token_position_to_id (nl.ndarray): Tensor of block index of the corresponding tokens on HBM (N * B,)
+        token_position_to_id (nl.NkiTensor): Tensor of block index of the corresponding tokens on HBM (N * B,)
                                           Note that we include tokens included for padding purposes and N * B >= T.
                                           For padding token, id is set to T. with skip_dma, id will be set to -1.
-        block_to_expert (nl.ndarray): Tensor of expert indices of corresponding blocks on HBM (N, 1)
+        block_to_expert (nl.NkiTensor): Tensor of expert indices of corresponding blocks on HBM (N, 1)
 
         num_static_block (int): Optional. Number of non-padded blocks if known (default: -1).
         n_dynamic_blocks (int): Number of blocks to process with dynamic loop when n_static_blocks
             is not specified (default: 55, empirically tuned for GPT-OSS).
-        gate_and_up_proj_bias: nl.ndarray = None, Optional. A tensor of shape [E, 2, I].
+        gate_and_up_proj_bias: nl.NkiTensor = None, Optional. A tensor of shape [E, 2, I].
                               Note that if activation function is Swiglu, we expect up_bias = up_bias + 1
-        down_proj_bias: nl.ndarray = None. Optional argument. A tensor of shape [E, H]
+        down_proj_bias: nl.NkiTensor = None. Optional argument. A tensor of shape [E, H]
 
         # Arguments for quantization scales
-        gate_up_proj_scale: nl.ndarray = None. uint8 MX scales of shape
+        gate_up_proj_scale: nl.NkiTensor = None. uint8 MX scales of shape
                             [E, _pmax // _q_height, 2, n_H512_tile, I] (standard layout) or
                             [E, _pmax, n_packed_gup, 2, I] (use_packed_scales=True).
                             Under STATIC_MX it instead carries the per-expert gate/up weight
                             scales as fp32 [E, 2, 1] (idx 0 = gate, idx 1 = up).
-        down_proj_scale: nl.ndarray = None. uint8 MX scales of shape
+        down_proj_scale: nl.NkiTensor = None. uint8 MX scales of shape
                             [E, p_I // _q_height, n_total_I512_tile, H] (standard layout) or
                             [E, _pmax, n_packed_down, H] (use_packed_scales=True).
                             Under STATIC_MX it instead carries the per-expert down weight
                             scale as fp32 [E, 1].
 
         # Unsupported output tensors. Please set to None.
-        gate_up_activations_T: nl.ndarray = None. Currently not supported.
-        down_activations: nl.ndarray = None. Currently not supported
+        gate_up_activations_T: nl.NkiTensor = None. Currently not supported.
+        down_activations: nl.NkiTensor = None. Currently not supported
 
         # meta parameters
         activation_function: one of the Enum in nkilib.core.utils.common_types.ActFnType.
@@ -228,7 +229,7 @@ def bwmm_shard_on_block_mx(
         skip_dma (bool): Whether to skip DMA operations (default: False)
 
     Returns:
-        output (nl.ndarray): Tensor of output hidden states on HBM of size (T+1, H).
+        output (nl.NkiTensor): Tensor of output hidden states on HBM of size (T+1, H).
 
     Notes:
         - All input/output tensors must have the same floating point dtype
@@ -284,9 +285,32 @@ def bwmm_shard_on_block_mx(
     gate_up_proj_weight, target_dtype = convert_to_mxfp_dtype(gate_up_proj_weight, weight_dtype)
     down_proj_weight, _ = convert_to_mxfp_dtype(down_proj_weight, target_dtype)
 
-    T, H = hidden_states.shape
+    # Pre-quantized fp8 hidden states (real MX): hidden_states arrives as a concatenated
+    # [T, H_concat] tensor = [hidden_quant (H fp8) | hidden_scale (H/4 uint8)] from a prior
+    # QMX layer. We skip on-device quantization and gather+transpose both regions. The true
+    # hidden dim H is recovered from the gate/up weight (concat dim hides it on the input).
+    is_fp8_hidden = hidden_states.dtype in (nl.float8_e4m3fn, nl.float8_e5m2)
+
+    T = hidden_states.shape[0]
     B = block_size
-    E, _, _, _, I = gate_up_proj_weight.shape
+    E, _Hp, _, _n_H512, I = gate_up_proj_weight.shape
+    # When the producer fused expert affinities into the row, the concat is
+    # [hidden (H fp8) | scale (scale_region uint8) | affinities (E bf16) | pad]. Detect this by the
+    # concat being wider than hidden+scale, and extract the affinity for this block. affinities_col_offset is the fp8 column
+    # where the affinity region starts (= the end of the hidden+scale region).
+    is_affinities_packed = False
+    affinities_col_offset = 0
+    if is_fp8_hidden:
+        H = _Hp * _n_H512 * _q_width  # real hidden dimension that's not concatted with scales
+        kernel_assert(
+            quantization_type == QuantizationType.MX,
+            f"fp8 pre-quantized hidden states only support QuantizationType.MX, got {quantization_type}",
+        )
+        hidden_scale_width = H + div_ceil(_n_H512, SLOTS_PER_PACKED_BUFFER) * _pmax
+        is_affinities_packed = hidden_states.shape[-1] > hidden_scale_width
+        affinities_col_offset = hidden_scale_width
+    else:
+        _, H = hidden_states.shape
     cond_vec_len = conditions.shape[0] if conditions != None else 0
 
     N = token_position_to_id.shape[0] // B
@@ -306,7 +330,7 @@ def bwmm_shard_on_block_mx(
         # [E, 2, 1] gate/up weight scales, down_proj_scale carries the [E, 1] down weight scale.
         # Split the packed gate/up tensor into separate [E, 1] gate and up views here so the
         # setup below consumes gate_w_scale / up_w_scale symmetrically (idx 0 = gate, idx 1 = up).
-        gate_up_w_view = TensorView(gate_up_proj_scale).reshape((dims.E, 2, 1))
+        gate_up_w_view = gate_up_proj_scale.reshape((dims.E, 2, 1))
         quant_params = MLPQuantizationParameters(
             quantization_type=quantization_type,
             gate_w_scale=gate_up_w_view.slice(dim=1, start=0, end=1).reshape((dims.E, 1)),
@@ -425,12 +449,12 @@ def bwmm_shard_on_block_mx(
         gup_scale_lut_sb = sbm.alloc_stack(
             (_pmax, dims.E, 3), dtype=nl.float32, name="gup_scale_lut_sb", align=SBUF_QUADRANT_SIZE
         )
-        gup_p0 = TensorView(gup_scale_lut_sb).slice(dim=0, start=0, end=1)  # [1, E, 3]
-        gup_slot0 = gup_p0.slice(dim=2, start=0, end=1).get_view()  # [1, E, 1] = in_scale per expert
-        gup_slot1 = gup_p0.slice(dim=2, start=1, end=2).get_view()  # gate w_scale → gate combined (after fuse)
-        gup_slot2 = gup_p0.slice(dim=2, start=2, end=3).get_view()  # up w_scale → up combined (after fuse)
-        gup_slots12 = gup_p0.slice(dim=2, start=1, end=3).get_view()  # gate+up slots, fused together below
-        gup_slot0_bcast2 = gup_p0.slice(dim=2, start=0, end=1).broadcast(dim=2, size=2).get_view()
+        gup_p0 = gup_scale_lut_sb.slice(dim=0, start=0, end=1)  # [1, E, 3]
+        gup_slot0 = gup_p0.slice(dim=2, start=0, end=1)  # [1, E, 1] = in_scale per expert
+        gup_slot1 = gup_p0.slice(dim=2, start=1, end=2)  # gate w_scale → gate combined (after fuse)
+        gup_slot2 = gup_p0.slice(dim=2, start=2, end=3)  # up w_scale → up combined (after fuse)
+        gup_slots12 = gup_p0.slice(dim=2, start=1, end=3)  # gate+up slots, fused together below
+        gup_slot0_bcast2 = gup_p0.slice(dim=2, start=0, end=1).broadcast(dim=2, size=2)
 
         # Load per-expert in_scale into slot 0; gate_w_scale into slot 1, up_w_scale into slot 2.
         nisa.dma_copy(
@@ -440,12 +464,12 @@ def bwmm_shard_on_block_mx(
         )
         nisa.dma_copy(
             dst=gup_slot1,
-            src=TensorView(quant_params.gate_w_scale).reshape((1, dims.E, 1)).get_view(),
+            src=quant_params.gate_w_scale.reshape((1, dims.E, 1)),
             dge_mode=nisa.dge_mode.hwdge,
         )
         nisa.dma_copy(
             dst=gup_slot2,
-            src=TensorView(quant_params.up_w_scale).reshape((1, dims.E, 1)).get_view(),
+            src=quant_params.up_w_scale.reshape((1, dims.E, 1)),
             dge_mode=nisa.dge_mode.hwdge,
         )
         # combined = w_scale * in_scale on slots 1 and 2, (broadcast slot 0 across the 2 inner slots).
@@ -460,9 +484,9 @@ def bwmm_shard_on_block_mx(
         down_scale_lut_sb = sbm.alloc_stack(
             (_pmax, dims.E, 2), dtype=nl.float32, name="down_scale_lut_sb", align=SBUF_QUADRANT_SIZE
         )
-        down_p0 = TensorView(down_scale_lut_sb).slice(dim=0, start=0, end=1)  # [1, E, 2]
-        down_slot0 = down_p0.slice(dim=2, start=0, end=1).get_view()
-        down_slot1 = down_p0.slice(dim=2, start=1, end=2).get_view()
+        down_p0 = down_scale_lut_sb.slice(dim=0, start=0, end=1)  # [1, E, 2]
+        down_slot0 = down_p0.slice(dim=2, start=0, end=1)
+        down_slot1 = down_p0.slice(dim=2, start=1, end=2)
 
         nisa.dma_copy(
             dst=down_slot0,
@@ -486,8 +510,14 @@ def bwmm_shard_on_block_mx(
     arange_4H = sbm.alloc_stack((1, _q_width), dtype=nl.float32, name="arange_4H", align=SBUF_QUADRANT_SIZE)
     nisa.iota(arange_4H, [[1, _q_width]], offset=0)
 
+    # fp8 path keeps the raw concat [T, H_concat] view; the gather helper does its own .ap().
+    # bf16 path reshapes to the H-folded layout consumed by load_hidden_states_mx.
+    _hidden_states_view = (
+        hidden_states if is_fp8_hidden else hidden_states.reshape((T, _q_width, prj_cfg.n_H512_tile, _pmax))
+    )
+
     inps = InputTensors(
-        hidden_states=hidden_states.reshape((T, _q_width, prj_cfg.n_H512_tile, _pmax)),
+        hidden_states=_hidden_states_view,
         gate_up_proj_weight=gate_up_proj_weight,
         gate_and_up_proj_bias=gate_and_up_proj_bias,
         down_proj_bias=down_proj_bias,
@@ -508,16 +538,15 @@ def bwmm_shard_on_block_mx(
         down_scale_lut_sb=down_scale_lut_sb,
     )
 
-    # Full-persistent gup scheme: only when STATIC_MX + skip_weight + tiling active.
+    # Full-persistent gup scheme: only available if SBUF budget alllows.
     # In that case, the persistent gup buffer holds the full (gate+up, full I) weights across blocks, and the cross-block
     # prefetch OOB-skips on same-expert blocks. All other configs keep today's per-tile streaming.
-    _gup_full_persistent = is_static_quant and skip_dma.skip_weight and dims.I > _I_TILE_SZ
+    _gup_full_persistent = skip_dma.skip_weight and dims.I > _I_TILE_SZ
 
     # If the largest SBUF buffers — persistent (full-persistent gup, down weight,
     # hidden_qtz, hidden pre/post-transpose double buffers, block_old) plus the
-    # biggest per-block coexisting buffer (dp_out_sb) — would exceed 85% of
-    # per-partition SBUF, fall back to per-tile streaming so the remaining allocs
-    # don't OOM.
+    # biggest per-block coexisting buffer (dp_out_sb) would exceed 85% of
+    # per-partition SBUF, fall back to per-tile streaming so the remaining allocs don't OOM.
     if _gup_full_persistent:
         _gup_full_bytes = 2 * prj_cfg.n_H512_tile_sharded * dims.I * sizeinbytes(gate_up_proj_weight.dtype)
         _down_w_bytes = prj_cfg.n_total_I512_tile * prj_cfg.H_sharded * sizeinbytes(down_proj_weight.dtype)
@@ -525,13 +554,33 @@ def bwmm_shard_on_block_mx(
         _block_hs_bytes = (dims.B // SBUF_QUADRANT_SIZE) * prj_cfg.n_H512_tile * _pmax * sizeinbytes(compute_dtype)
         _block_old_bytes = div_ceil(dims.B, _pmax) * dims.H * sizeinbytes(compute_dtype)
         _dp_out_bytes = 2 * dims.H * sizeinbytes(compute_dtype)
+        # Persistent uint8 weight-scale buffers (gup_scales_sb + down_scale_sb). Their size varies by
+        # path and, on the standard MX path, is the single largest term this estimate previously
+        # omitted (it was calibrated for STATIC_MX only):
+        #   - STATIC_MX: a tiny shared all-127 dummy is reused -> ~128 B.
+        #   - packed:    4 H512/I512 tiles fold into one 128-wide block -> ~4x smaller.
+        #   - standard:  full per-tile scales (uint8, 1 B/elt) co-resident with gup_full.
+        # Count them so full-resident gup falls back to per-tile streaming when they don't fit.
+        if is_static_quant:
+            _scale_bytes = _pmax
+        elif use_packed_scales:
+            _n_packed_down = div_ceil(prj_cfg.n_total_I512_tile, SLOTS_PER_PACKED_BUFFER)
+            _scale_bytes = n_packed_gup * 2 * dims.I + _n_packed_down * prj_cfg.H_sharded
+        else:
+            _scale_bytes = 2 * prj_cfg.n_H512_tile_sharded * dims.I + prj_cfg.n_total_I512_tile * prj_cfg.H_sharded
         _big_bufs_bytes = (
-            _gup_full_bytes + _down_w_bytes + _hidden_qtz_bytes + 2 * _block_hs_bytes + _block_old_bytes + _dp_out_bytes
+            _gup_full_bytes
+            + _down_w_bytes
+            + _hidden_qtz_bytes
+            + 2 * _block_hs_bytes
+            + _block_old_bytes
+            + _dp_out_bytes
+            + _scale_bytes
         )
         _sbuf_threshold = (nl.tile_size.total_available_sbuf_size * 85) // 100
         if _big_bufs_bytes > _sbuf_threshold:
             logger.info(
-                f"Disabling gup_full_persistent for STATIC_MX: big buffers={_big_bufs_bytes} B > 85% per-partition SBUF "
+                f"Disabling gup_full_persistent: big buffers={_big_bufs_bytes} B > 85% per-partition SBUF "
                 f"({_sbuf_threshold} B). Falling back to per-tile-0 weight skipping."
             )
             _gup_full_persistent = False
@@ -557,14 +606,20 @@ def bwmm_shard_on_block_mx(
         is_static_quant=is_static_quant,
         has_gate_clamp=has_gate_clamp,
         gup_full_persistent=_gup_full_persistent,
+        is_fp8_hidden=is_fp8_hidden,
+        is_affinities_packed=is_affinities_packed,
+        affinities_col_offset=affinities_col_offset,
     )
 
     check_kernel_compatibility(dims, configs)
 
+    # Output is the dequantized result, not fp8. For pre-quantized fp8 hidden, hidden_states.dtype
+    # is fp8, so use compute_dtype (bf16) for the output instead of mirroring the input dtype.
+    output_dtype = compute_dtype if is_fp8_hidden else hidden_states.dtype
     if is_tensor_update_accumulating:
-        output = nl.ndarray((2, dims.T, dims.H), dtype=hidden_states.dtype, buffer=nl.shared_hbm)
+        output = nl.ndarray((2, dims.T, dims.H), dtype=output_dtype, buffer=nl.shared_hbm)
     else:
-        output = nl.ndarray((dims.T, dims.H), dtype=hidden_states.dtype, buffer=nl.shared_hbm)
+        output = nl.ndarray((dims.T, dims.H), dtype=output_dtype, buffer=nl.shared_hbm)
 
     outs = OutputTensors(
         gate_up_activations_T=gate_up_activations_T,
@@ -595,12 +650,35 @@ def bwmm_shard_on_block_mx(
         # STATIC_MX: reuse the shared all-127 dummy [_pmax, _pmax] buffer.
         hidden_scale_sb = static_dummy_scale_sb
     else:
+        # fp8 pre-quantized path: scales arrive packed (4 H512 tiles folded into one 128-wide block),
+        # so the scale buffer holds n_packed blocks instead of n_H512_tile. The online-quant bf16 path
+        # keeps one scale tile per H512 tile.
+        n_scale_dim = div_ceil(prj_cfg.n_H512_tile, 4) if is_fp8_hidden else prj_cfg.n_H512_tile
         hidden_scale_sb = sbm.alloc_stack(
-            (_pmax, prj_cfg.n_H512_tile, dims.B // SBUF_QUADRANT_SIZE, SBUF_QUADRANT_SIZE),
+            (_pmax, n_scale_dim, dims.B // SBUF_QUADRANT_SIZE, SBUF_QUADRANT_SIZE),
             dtype=nl.uint8,
             name="hidden_scale_sb",
             align=SBUF_QUADRANT_SIZE,
         )
+
+    # fp8 pre-quantized path: persistent buffer holding one block's gathered concat rows
+    # ([hidden_quant (H fp8) | hidden_scale (packed: n_packed*128 uint8)] [| affinities (E bf16) | pad]
+    # when affinities are fused) between the prefetch (DMA) and transpose (PE) stages. H and the packed
+    # scale region are both multiples of 4, so the row is fp32-aligned for the transpose's fp8->fp32
+    # reinterpret; the affinity tail (when present) is the full remaining concat width.
+    block_hidden_concat = None
+    if is_fp8_hidden:
+        # Hold the FULL concat row so the gather pulls the (optional) affinity tail too.
+        concat_free_size = hidden_states.shape[-1]
+        block_hidden_concat = sbm.alloc_stack(
+            (_pmax, dims.B // _pmax, concat_free_size),
+            dtype=hidden_states.dtype,
+            name="block_hidden_concat",
+            align=SBUF_QUADRANT_SIZE,
+        )
+
+        if is_affinities_packed and skip_dma.skip_token:
+            nisa.memset(block_hidden_concat[:, :, affinities_col_offset:concat_free_size], value=0)
 
     block_old = sbm.alloc_stack(
         (_pmax, dims.n_B128_tiles, dims.H), dtype=configs.compute_dtype, name="block_old", align=SBUF_QUADRANT_SIZE
@@ -706,6 +784,7 @@ def bwmm_shard_on_block_mx(
         token_4_H_indices_on_p=token_4_H_indices_on_p,
         gup_tile_buf_a=gup_tile_prefetch_buf,
         dummy_inter_scale_sb=dummy_inter_scale_sb,
+        block_hidden_concat=block_hidden_concat,
     )
 
     """
@@ -911,11 +990,7 @@ def bwmm_shard_on_block_mx(
             zeros = sbm.alloc_heap(
                 (_pmax, H), dtype=nl.bfloat16, name="output_init_zeros_dyn", align=SBUF_QUADRANT_SIZE
             )
-            if H % 2 == 0 or H % 4 == 0:
-                zeros_fp32 = TensorView(zeros).reinterpret_cast(nl.float32)
-                nisa.memset(zeros_fp32.get_view(), value=0.0)
-            else:
-                nisa.memset(zeros, value=0.0)
+            nisa.memset(zeros, value=0.0)
             output_initialization(outs.output, dims, sbm=sbm, zeros=zeros)
             sbm.pop_heap()  # free zeros
 
@@ -1290,17 +1365,17 @@ def load_prev_block(output, token_indices, block_old, NUM_TILES, dtype, shard_id
     accumulation across multiple expert evaluations (topK > 1).
 
     Args:
-        output (nl.ndarray): Output tensor of shape [num_shards, T, H] containing
+        output (nl.NkiTensor): Output tensor of shape [num_shards, T, H] containing
             accumulated results from previous blocks.
-        token_indices (nl.ndarray): Token indices for current block of shape [P_MAX, NUM_TILES].
-        block_old (nl.ndarray): Buffer to store loaded values of shape [P_MAX, NUM_TILES, H].
+        token_indices (nl.NkiTensor): Token indices for current block of shape [P_MAX, NUM_TILES].
+        block_old (nl.NkiTensor): Buffer to store loaded values of shape [P_MAX, NUM_TILES, H].
         NUM_TILES (int): Number of tiles in the block (B // 128).
         dtype: Data type for loading.
         shard_id (int): Current shard identifier (0 or 1).
         skip_dma (SkipMode): DMA skip configuration for handling invalid tokens.
 
     Returns:
-        block_old (nl.ndarray): Loaded previous output values for the block.
+        block_old (nl.NkiTensor): Loaded previous output values for the block.
 
     Notes:
         - Uses indirect addressing via token_indices for gather operation
@@ -1347,10 +1422,62 @@ def load_prev_block(output, token_indices, block_old, NUM_TILES, dtype, shard_id
     return block_old
 
 
+def _extract_block_affinity(block_hidden_concat, block_expert, dims, kernel_cfg, sbm, name_prefix="aff"):
+    """Extract this block's expert-affinity column from the gathered fp8 concat rows (packed path).
+
+    When the producer fused the dense [T, E] affinities into the row (is_affinities_packed), each
+    gathered row is [hidden | scale | affinities (E bf16) | pad]. The affinity this block needs is the
+    block_expert column of every token's affinity vector. This is a pure on-chip op (one tensor_copy
+    with scalar_offset=block_expert) -- NOT a DMA -- so it replaces the separate indirect affinity
+    gather (calculate_expert_affinities) and removes a SWDGE pass per B128 tile.
+
+    block_hidden_concat is [_pmax, n_B_tiles, concat_free_size] fp8. The affinity region starts at fp8
+    column kernel_cfg.affinities_col_offset; viewed as bf16 that is column affinities_col_offset // 2,
+    and the per-token row stride in bf16 is concat_free_size // 2.
+
+    Returns a list of n_B_tiles tensors, each [_pmax, 1] fp32 -- the same shape contract as
+    calculate_expert_affinities, so the per-block compute consumes expert_affinity[n] identically.
+    """
+    _bf16_as_fp8 = 2  # bf16 occupies 2 fp8 columns
+    n_B_tiles = dims.B // _pmax
+    aff_col_bf16 = kernel_cfg.affinities_col_offset // _bf16_as_fp8
+
+    # bf16 view of the fp8 concat: [_pmax, n_B_tiles, concat_free_size // 2]. Indexing through the
+    # nl.NkiTensor makes the dynamic expert select operate in bf16 element units
+    # and avoids the fp8-vs-bf16 scalar_offset unit
+
+    concat_bf16 = block_hidden_concat.view(nl.bfloat16)
+
+    # Dynamic select requires a uint32 index (TensorCopyDynamicSrc verifier). block_expert is int32;
+    # experts are 0..E-1 (always positive) so the bit pattern is identical -- reinterpret in place.
+    block_expert_u32 = block_expert.view(nl.uint32)
+
+    expert_affinity = []
+    for n in range(n_B_tiles):
+        affinity_f32 = _sbm_alloc(
+            sbm, (_pmax, 1), dtype=nl.float32, name=f"{name_prefix}_affinity_t{n}", align=SBUF_QUADRANT_SIZE
+        )
+        # [_pmax, n_B_tiles, free_bf16] -> pick B-tile n -> [_pmax, free_bf16]
+        #   -> slice affinity cols [aff_col_bf16, +E] -> [_pmax, E]
+        #   -> dynamic-select this block's expert column -> [_pmax]
+        #   -> expand to [_pmax, 1] for the fp32 affinity contract.
+        aff_tv = (
+            concat_bf16.slice(1, n, n + 1)
+            .squeeze_dim(1)
+            .slice(1, aff_col_bf16, aff_col_bf16 + dims.E)
+            .select(dim=1, index=block_expert_u32)
+            .expand_dim(1)
+        )
+        # tensor_copy bf16 -> fp32 (compute consumes fp32 affinity).
+        nisa.tensor_copy(dst=affinity_f32, src=aff_tv)
+        expert_affinity.append(affinity_f32)
+    return expert_affinity
+
+
 def _gather_gup_in_quant_recip(inps, block_expert, dims, sbm, name_prefix=""):
     """STATIC_MX: pull 1/in_scale[block_expert] from slot 0 of gup_scale_lut_sb."""
     # scalar_offset requires uint32; reinterpret block_expert (int32 [1,1]) in place (same-size bitcast).
-    block_expert_u32 = TensorView(block_expert).reinterpret_cast(nl.uint32).get_view()
+    block_expert_u32 = block_expert.view(nl.uint32)
     in_quant_recip = _sbm_alloc(
         sbm, (_pmax, 1), dtype=nl.float32, name=f"{name_prefix}in_quant_recip", align=SBUF_QUADRANT_SIZE
     )
@@ -1431,7 +1558,7 @@ def _prefetch_gup_tile0(
     )
     nisa.dma_copy(
         dst=buffers.gup_tile_buf_a[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, :load_I],
-        src=gup_weight_view.get_view(),
+        src=gup_weight_view,
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
     )
@@ -1604,7 +1731,7 @@ def check_kernel_compatibility(dims: BWMMMXDimensionSizes, configs: BWMMMXConfig
 
 def load_gup_weights_scales_mx(
     inps: InputTensors,
-    block_expert: nl.ndarray,
+    block_expert: nl.NkiTensor,
     dims: BWMMMXDimensionSizes,
     prj_cfg: ProjConfig,
     skip_dma: SkipMode,
@@ -1625,16 +1752,16 @@ def load_gup_weights_scales_mx(
         inps (InputTensors): Input tensors containing gate_up_proj_weight of shape
             [E, 128, 2, n_H512_tile, I], gate_up_proj_scale, gate_and_up_proj_bias,
             and buffers for scales and index vectors.
-        block_expert (nl.ndarray): Expert index for current block, shape [1, 1].
+        block_expert (nl.NkiTensor): Expert index for current block, shape [1, 1].
         dims (BWMMMXDimensionSizes): Dimension configuration with I, H.
         prj_cfg (ProjConfig): Projection configuration with n_H512_tile_sharded, I.
         skip_dma (SkipMode): DMA skip configuration for weight loading.
 
     Returns:
         tuple: (gup_weights_qtz_sb, gup_scales_sb, gup_bias_sb)
-            - gup_weights_qtz_sb (nl.ndarray): Quantized weights [128, 2, n_H512_tile_sharded, I]
-            - gup_scales_sb (nl.ndarray): Dequantization scales [128, 2, n_H512_tile_sharded, I]
-            - gup_bias_sb (nl.ndarray): Bias values [128, 2, n_total_I512_tile, 128]
+            - gup_weights_qtz_sb (nl.NkiTensor): Quantized weights [128, 2, n_H512_tile_sharded, I]
+            - gup_scales_sb (nl.NkiTensor): Dequantization scales [128, 2, n_H512_tile_sharded, I]
+            - gup_bias_sb (nl.NkiTensor): Bias values [128, 2, n_total_I512_tile, 128]
 
     Notes:
         - Uses indirect DGE with block_expert for expert selection
@@ -1682,7 +1809,7 @@ def load_gup_weights_scales_mx(
     )
     nisa.dma_copy(
         dst=gup_weights_qtz_sb,
-        src=gup_weight_view.get_view(),
+        src=gup_weight_view,
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
     )
@@ -1870,7 +1997,7 @@ def _load_gup_weight_tile(
     )
     nisa.dma_copy(
         dst=dst_weight[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, :cur_I_load_sz],
-        src=gup_weight_view.get_view(),
+        src=gup_weight_view,
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
     )
@@ -1954,14 +2081,14 @@ def _load_gup_weight_tile(
 
 def load_down_proj_weights_mx(
     inps: InputTensors,
-    block_expert: nl.ndarray,
-    dst_weight: nl.ndarray,
+    block_expert: nl.NkiTensor,
+    dst_weight: nl.NkiTensor,
     dims: BWMMMXDimensionSizes,
     prj_cfg: ProjConfig,
     skip_dma: SkipMode,
-    gup_token_indices_on_p: nl.ndarray = None,
+    gup_token_indices_on_p: nl.NkiTensor = None,
     gup_n_quadrants_needed: int = None,
-    dst_scale: nl.ndarray = None,
+    dst_scale: nl.NkiTensor = None,
     sbm=None,
     dst_bias=None,
     use_packed_scales: bool = False,
@@ -1976,8 +2103,8 @@ def load_down_proj_weights_mx(
     Args:
         inps (InputTensors): Input tensors containing down_proj_weight [E, p_I, n_total_I512_tile, H],
             down_proj_scale, down_proj_bias, and index vector buffer.
-        block_expert (nl.ndarray): Expert index for current block, shape [1, 1].
-        dst_weight (nl.ndarray): Destination buffer for weights in SBUF.
+        block_expert (nl.NkiTensor): Expert index for current block, shape [1, 1].
+        dst_weight (nl.NkiTensor): Destination buffer for weights in SBUF.
         dims (BWMMMXDimensionSizes): Dimension configuration with I, H, p_I.
         prj_cfg (ProjConfig): Projection configuration with sharding info.
         skip_dma (SkipMode): DMA skip configuration.
@@ -2030,7 +2157,7 @@ def load_down_proj_weights_mx(
         dim=2, start=prj_cfg.prg_id * prj_cfg.H_sharded, end=(prj_cfg.prg_id + 1) * prj_cfg.H_sharded
     )
     nisa.dma_copy(
-        src=down_weight_view.get_view(),
+        src=down_weight_view,
         dst=dst_weight[: dims.p_I, :, :],
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
@@ -2319,10 +2446,13 @@ def compute_one_block(
             block_new[:, n, :] += block_old[:, n, :]
             dma_copy block_new[:, n, :] to output[shard_id, token_indices_2D[:, n], :]
     """
+    # Per-block disambiguator for op/alloc names. In the dynamic path block_idx is a
+    # runtime SBUF tensor (not a Python int), so f"b{block_idx}" is identical across
+    # iterations; callers pass a distinct name_tag (e.g. "chunk_0", "rem") for uniqueness.
+    tag = name_tag if name_tag else f"b{block_idx}"
     if sbm != None:
         sbm.open_scope(name="compute_block_scope")
         prev_prefix = sbm.get_name_prefix()
-        tag = name_tag if name_tag else f"b{block_idx}"
         sbm.set_name_prefix(f"{prev_prefix}{tag}_")
 
     block_expert = load_block_expert(inps.block_to_expert, block_idx, sbm=sbm)
@@ -2346,7 +2476,7 @@ def compute_one_block(
     down_combined_dequant_per_block = None
     if kernel_cfg.is_static_quant:
         # scalar_offset requires uint32; reinterpret block_expert (int32 [1,1]).
-        block_expert_u32 = TensorView(block_expert).reinterpret_cast(nl.uint32).get_view()
+        block_expert_u32 = block_expert.view(nl.uint32)
 
         # gup gather: 3D pattern walks _pmax × 3-slot expert row.
         # indirect_dim=1 has stride 3, so scalar_offset=block_expert shifts by 3*expert (one expert's slot triple).
@@ -2378,22 +2508,25 @@ def compute_one_block(
         down_in_quant_recip = down_per_block[:, 0:1]
         down_combined_dequant_per_block = down_per_block[:, 1:2]
 
-    if next_block_idx != None:
-        compute_hidden_index_vector(
-            inps, buffers, next_block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic=is_dynamic, sbm=sbm
-        )
+    # fp8 pre-quantized hidden: the load/transpose happens in-block (after token indices are
+    # available) with no online quantize and no bf16 prefetch buffers, so skip the bf16 pipeline.
+    if not kernel_cfg.is_fp8_hidden:
+        if next_block_idx != None:
+            compute_hidden_index_vector(
+                inps, buffers, next_block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic=is_dynamic, sbm=sbm
+            )
 
-    # quantize prefetched data. Note that online quantize can only quantize to fp8
-    # only quantize here if it is a static block. for dynamic block we quantize immediately after fetching
-    if not is_dynamic:
-        if kernel_cfg.is_static_quant:
-            quantize_block_hidden_state_T_static_mx(buffers, prj_cfg, dims, gate_in_quant_recip)
-        else:
-            quantize_block_hidden_state_T(buffers, prj_cfg, dims)
+        # quantize prefetched data. Note that online quantize can only quantize to fp8
+        # only quantize here if it is a static block. for dynamic block we quantize immediately after fetching
+        if not is_dynamic:
+            if kernel_cfg.is_static_quant:
+                quantize_block_hidden_state_T_static_mx(buffers, prj_cfg, dims, gate_in_quant_recip)
+            else:
+                quantize_block_hidden_state_T(buffers, prj_cfg, dims)
 
-    _free_hidden_bufs(sbm, buffers.block_hidden_states, buffers.block_hidden_states_T)
-    buffers.block_hidden_states_T = None
-    buffers.block_hidden_states = None
+        _free_hidden_bufs(sbm, buffers.block_hidden_states, buffers.block_hidden_states_T)
+        buffers.block_hidden_states_T = None
+        buffers.block_hidden_states = None
 
     """
     Alloc block_hidden_states and start DMA load early to overlap with up proj.
@@ -2405,9 +2538,9 @@ def compute_one_block(
     if not kernel_cfg.is_static_quant:
         # STATIC_MX: hidden_scale_sb is the small dummy [_pmax, _pmax] all-127 buffer; matmul
         # site reads it as a 2D view (per-tile shape), so we skip the per-block reshape.
-        buffers.hidden_scale_sb = (
-            TensorView(buffers.hidden_scale_sb).reshape((_pmax, prj_cfg.n_H512_tile, dims.B)).get_view()
-        )
+        # fp8 path: scales are packed (n_packed scale blocks); bf16 path: one tile per H512 tile.
+        n_scale_dim = div_ceil(prj_cfg.n_H512_tile, 4) if kernel_cfg.is_fp8_hidden else prj_cfg.n_H512_tile
+        buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, n_scale_dim, dims.B))
 
     flatten_free_dim = prj_cfg.n_total_I512_tile * dims.B * _q_width
     # Tile by default when I > 512
@@ -2504,6 +2637,11 @@ def compute_one_block(
         f"Expect token_indices_2D to have shape (128, {dims.n_B128_tiles}), got {token_indices_2D.shape}",
     )
 
+    # fp8 pre-quantized hidden: this block's hidden was already gathered + transposed into
+    # hidden_qtz_sb / hidden_scale_sb during the previous block's deferred stage (or driver init for
+    # the first block). The next block's gather (DMA) is issued below during gate/up, and its
+    # transpose (PE) is deferred to the sbuf_layout_adapter site so it overlaps down projection.
+
     # load previous block for accumulation
     if not is_first_block:
         block_old = load_prev_block(
@@ -2516,18 +2654,22 @@ def compute_one_block(
             kernel_cfg.skip_dma,
         )
 
-    expert_affinity = calculate_expert_affinities(
-        inps.expert_affinities_masked,
-        token_indices_2D,
-        block_expert,
-        dims.E,
-        dims.B // _pmax,
-        nl.float32,
-        kernel_cfg.skip_dma,
-        sbm=sbm,
-    )
+    if kernel_cfg.is_affinities_packed:
+        # Extract expert affinities for this block expert
+        expert_affinity = _extract_block_affinity(buffers.block_hidden_concat, block_expert, dims, kernel_cfg, sbm=sbm)
+    else:
+        expert_affinity = calculate_expert_affinities(
+            inps.expert_affinities_masked,
+            token_indices_2D,
+            block_expert,
+            dims.E,
+            dims.B // _pmax,
+            nl.float32,
+            kernel_cfg.skip_dma,
+            sbm=sbm,
+        )
 
-    if next_block_idx != None and not USE_DMA_TRANSPOSE:
+    if next_block_idx != None and not USE_DMA_TRANSPOSE and not kernel_cfg.is_fp8_hidden:
         _alloc_hidden_src_buf(sbm, buffers, dims, prj_cfg, kernel_cfg, tag=f"nb{next_block_idx}_")
         load_hidden_states_mx(
             inps,
@@ -2538,6 +2680,33 @@ def compute_one_block(
             use_dma_transpose=False,
             sbm=sbm,
         )
+
+    # fp8: gather (DMA only) the next block's concat rows here so it overlaps gate/up compute.
+    # The matching transpose (PE) is deferred to the sbuf_layout_adapter site below.
+    if next_block_idx != None and kernel_cfg.is_fp8_hidden:
+        _prev_pfx = sbm.get_name_prefix() if sbm != None else None
+        if sbm != None:
+            sbm.set_name_prefix(f"{_prev_pfx}fp8pf_")
+        if is_dynamic:
+            _nb_tok = load_token_indices_dynamic_block(
+                inps.token_position_to_id,
+                next_block_idx,
+                dims.B,
+                dims.n_B128_tiles,
+                skip_dma=kernel_cfg.skip_dma,
+                sbm=sbm,
+            )
+        else:
+            _nb_tok = load_token_indices(inps.token_position_to_id, next_block_idx, dims.B, dims.n_B128_tiles, sbm=sbm)
+        load_fp8_hidden_states_mx(
+            inps,
+            dims,
+            kernel_cfg.skip_dma,
+            token_indices_on_p=_nb_tok,
+            block_hidden_concat=buffers.block_hidden_concat,
+        )
+        if sbm != None:
+            sbm.set_name_prefix(_prev_pfx)
     """
     GATE/UP PROJECTIONS + ACTIVATION + MULTIPLY
     
@@ -2603,15 +2772,29 @@ def compute_one_block(
                 align=SBUF_QUADRANT_SIZE,
             )
         )
-        gup_wt_b = _sbm_alloc(
-            sbm,
-            tile_buf_shape,
-            dtype=wt_dtype,
-            name="gup_wt_b",
-            align=SBUF_QUADRANT_SIZE,
-        )  # scope-local
 
-        gup_wt_bufs = [gup_wt_a, gup_wt_b]
+        # Single-buffering aliases both ping-pong slots, which is only correct when the
+        # regime-3 inter-tile prefetch (the sole nxt_buf write, gated `not _use_h_chunked`)
+        # is disabled — i.e. the H-chunked regime (H >= 3072). Allocate the second buffer
+        # unless we're both in that regime AND out of SBUF room.
+        _h_chunked_active = dims.H >= 3072 and not kernel_cfg.gup_full_persistent
+        _tile_buf_bytes = 2 * prj_cfg.n_H512_tile_sharded * _I_TILE_SZ * sizeinbytes(wt_dtype)
+        _can_double_buffer = sbm == None or sbm.get_free_space() >= _tile_buf_bytes
+        if _h_chunked_active and not _can_double_buffer:
+            logger.info(
+                f"Single-buffering gate/up tile weights (free={sbm.get_free_space()} B, "
+                f"need={_tile_buf_bytes} B for gup_wt_b)."
+            )
+            gup_wt_bufs = [gup_wt_a, gup_wt_a]
+        else:
+            gup_wt_b = _sbm_alloc(
+                sbm,
+                (tile_buf_shape),
+                dtype=wt_dtype,
+                name="gup_wt_b",
+                align=SBUF_QUADRANT_SIZE,
+            )
+            gup_wt_bufs = [gup_wt_a, gup_wt_b]
 
         # Load full scales once into pre-allocated inps.gup_scales_sb (skip if prefetched).
         # STATIC_MX skips entirely: inps.gup_scales_sb holds persistent dummy 127 from top-level memset.
@@ -2637,7 +2820,7 @@ def compute_one_block(
                         ),
                         oob_mode=oob_mode.skip,
                         dge_mode=dge_mode.hwdge,
-                        name=f"dma_gup_scales_packed_tile0_b{block_idx}",
+                        name=f"dma_gup_scales_packed_tile0_{tag}",
                     )
                 else:
                     nisa.dma_copy(
@@ -2654,7 +2837,7 @@ def compute_one_block(
                         ),
                         oob_mode=oob_mode.error,
                         dge_mode=dge_mode.hwdge,
-                        name=f"dma_gate_scales_packed_tile0_b{block_idx}",
+                        name=f"dma_gate_scales_packed_tile0_{tag}",
                     )
                     nisa.dma_copy(
                         dst=inps.gup_scales_sb[:_pmax, :n_packed_gup, 1:2, : prj_cfg.I],
@@ -2670,7 +2853,7 @@ def compute_one_block(
                         ),
                         oob_mode=oob_mode.error,
                         dge_mode=dge_mode.hwdge,
-                        name=f"dma_up_scales_packed_tile0_b{block_idx}",
+                        name=f"dma_up_scales_packed_tile0_{tag}",
                     )
             else:
                 scale_shape = inps.gate_up_proj_scale.shape
@@ -2816,7 +2999,7 @@ def compute_one_block(
 
         # Pre-build a flat view of the full-resident gup buffer for slicing per I-tile.
         if kernel_cfg.gup_full_persistent:
-            _gup_resident_flat_tv = TensorView(buffers.gup_tile_buf_a).flatten_dims(1, 2)
+            _gup_resident_flat = buffers.gup_tile_buf_a.flatten_dims(1, 2)
 
         # Use H-chunked weight loading for tiles 1+ when H is large (tile-streaming path only)
         _use_h_chunked = dims.H >= 3072 and not kernel_cfg.gup_full_persistent
@@ -2873,19 +3056,19 @@ def compute_one_block(
 
             gate_bias_view = None
             if inps.gate_and_up_proj_bias:
-                gate_bias_view = TensorView(gup_bias_flat).slice(dim=1, start=i_tile, end=i_tile + 1)
+                gate_bias_view = gup_bias_flat.slice(dim=1, start=i_tile, end=i_tile + 1)
             up_bias_view = None
             if inps.gate_and_up_proj_bias:
-                up_bias_view = TensorView(gup_bias_flat).slice(
+                up_bias_view = gup_bias_flat.slice(
                     dim=1, start=prj_cfg.n_total_I512_tile + i_tile, end=prj_cfg.n_total_I512_tile + i_tile + 1
                 )
 
             if kernel_cfg.gup_full_persistent:
                 # Regime 1 (full-resident): slice this I-tile from the persistent buffer; no DMA.
-                gate_wt_view = _gup_resident_flat_tv.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(
+                gate_wt_view = _gup_resident_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(
                     2, cur_I_offset, cur_I_offset + cur_I_tile_sz
                 )
-                up_wt_view = _gup_resident_flat_tv.slice(
+                up_wt_view = _gup_resident_flat.slice(
                     1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded
                 ).slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
 
@@ -2896,46 +3079,44 @@ def compute_one_block(
                     gate_weight_scale_arg = inps.gup_scales_sb[:, :, 0, cur_I_offset : cur_I_offset + cur_I_tile_sz]
                     up_weight_scale_arg = inps.gup_scales_sb[:, :, 1, cur_I_offset : cur_I_offset + cur_I_tile_sz]
                 else:
-                    gate_weight_scale_arg = (
-                        TensorView(gup_scales_flat)
-                        .slice(1, 0, prj_cfg.n_H512_tile_sharded)
-                        .slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
+                    gate_weight_scale_arg = gup_scales_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(
+                        2, cur_I_offset, cur_I_offset + cur_I_tile_sz
                     )
-                    up_weight_scale_arg = (
-                        TensorView(gup_scales_flat)
-                        .slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded)
-                        .slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
-                    )
+                    up_weight_scale_arg = gup_scales_flat.slice(
+                        1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded
+                    ).slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
 
                 gate_up_projection_mx_tp(
-                    hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-                    hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
+                    hidden_qtz_sb=buffers.hidden_qtz_sb,
+                    hidden_scale_sb=buffers.hidden_scale_sb,
                     weight_qtz=gate_wt_view,
                     weight_scale=gate_weight_scale_arg,
                     bias_sb=gate_bias_view,
                     cfg=tile_prj_cfg,
                     sbm=sbm,
-                    psum_bank_offset=0 if i_tile % 2 == 0 else 3,
+                    psum_bank_offset=0 if i_tile % 2 == 0 else 1,
                     name_prefix=f"gate_t{i_tile}",
                     out_sb=intermediate_state_tiled[:_pmax, i_tile : i_tile + 1, : dims.B, :_q_width],
                     is_packed_scale=kernel_cfg.use_packed_scales,
+                    is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
                     w_dequant_scale=gate_combined_dequant,
                     activation_op=_gate_act_op,
                     is_static_quant=kernel_cfg.is_static_quant,
                 )
 
                 gate_up_projection_mx_tp(
-                    hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-                    hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
+                    hidden_qtz_sb=buffers.hidden_qtz_sb,
+                    hidden_scale_sb=buffers.hidden_scale_sb,
                     weight_qtz=up_wt_view,
                     weight_scale=up_weight_scale_arg,
                     bias_sb=up_bias_view,
                     cfg=tile_prj_cfg,
                     sbm=sbm,
-                    psum_bank_offset=4 if i_tile % 2 == 0 else 0,
+                    psum_bank_offset=2 if i_tile % 2 == 0 else 3,
                     name_prefix=f"up_t{i_tile}",
                     out_sb=up_tile_sb[:_pmax, 0:1, : dims.B, :_q_width],
                     is_packed_scale=kernel_cfg.use_packed_scales,
+                    is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
                     w_dequant_scale=up_combined_dequant,
                     activation_op=None,
                     is_static_quant=kernel_cfg.is_static_quant,
@@ -2957,10 +3138,10 @@ def compute_one_block(
                 )
 
                 # Build flattened (gate/up × n_H512) gate/up dst views via
-                # TensorView so partition stride is preserved through to the AP with base tensor AP stride
-                cur_wt_flat_tv = TensorView(gup_wt_bufs[cur_buf]).flatten_dims(1, 2)
-                gate_dst = cur_wt_flat_tv.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(2, 0, _I_TILE_SZ)
-                up_dst = cur_wt_flat_tv.slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded).slice(
+                # nl.NkiTensor so partition stride is preserved through to the AP with base tensor AP stride
+                cur_wt_flat = gup_wt_bufs[cur_buf].flatten_dims(1, 2)
+                gate_dst = cur_wt_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(2, 0, _I_TILE_SZ)
+                up_dst = cur_wt_flat.slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded).slice(
                     2, 0, _I_TILE_SZ
                 )
 
@@ -2971,20 +3152,16 @@ def compute_one_block(
                     gate_weight_scale_arg = inps.gup_scales_sb[:, :, 0, cur_I_offset : cur_I_offset + cur_I_tile_sz]
                     up_weight_scale_arg = inps.gup_scales_sb[:, :, 1, cur_I_offset : cur_I_offset + cur_I_tile_sz]
                 else:
-                    gate_weight_scale_arg = (
-                        TensorView(gup_scales_flat)
-                        .slice(1, 0, prj_cfg.n_H512_tile_sharded)
-                        .slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
+                    gate_weight_scale_arg = gup_scales_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(
+                        2, cur_I_offset, cur_I_offset + cur_I_tile_sz
                     )
-                    up_weight_scale_arg = (
-                        TensorView(gup_scales_flat)
-                        .slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded)
-                        .slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
-                    )
+                    up_weight_scale_arg = gup_scales_flat.slice(
+                        1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded
+                    ).slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
 
                 gate_up_projection_mx_tp(
-                    hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-                    hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
+                    hidden_qtz_sb=buffers.hidden_qtz_sb,
+                    hidden_scale_sb=buffers.hidden_scale_sb,
                     weight_qtz=gate_wt_hbm,
                     weight_scale=gate_weight_scale_arg,
                     dst_weight_sb=gate_dst,
@@ -2992,18 +3169,19 @@ def compute_one_block(
                     cfg=tile_prj_cfg,
                     skip_dma=kernel_cfg.skip_dma,
                     sbm=sbm,
-                    psum_bank_offset=0 if i_tile % 2 == 0 else 3,
+                    psum_bank_offset=0 if i_tile % 2 == 0 else 1,
                     name_prefix=f"gate_t{i_tile}",
                     out_sb=intermediate_state_tiled[:_pmax, i_tile : i_tile + 1, : dims.B, :_q_width],
                     is_packed_scale=kernel_cfg.use_packed_scales,
+                    is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
                     w_dequant_scale=gate_combined_dequant,
                     activation_op=_gate_act_op,
                     is_static_quant=kernel_cfg.is_static_quant,
                 )
 
                 gate_up_projection_mx_tp(
-                    hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-                    hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
+                    hidden_qtz_sb=buffers.hidden_qtz_sb,
+                    hidden_scale_sb=buffers.hidden_scale_sb,
                     weight_qtz=up_wt_hbm,
                     weight_scale=up_weight_scale_arg,
                     dst_weight_sb=up_dst,
@@ -3011,10 +3189,11 @@ def compute_one_block(
                     cfg=tile_prj_cfg,
                     skip_dma=kernel_cfg.skip_dma,
                     sbm=sbm,
-                    psum_bank_offset=4 if i_tile % 2 == 0 else 0,
+                    psum_bank_offset=2 if i_tile % 2 == 0 else 3,
                     name_prefix=f"up_t{i_tile}",
                     out_sb=up_tile_sb[:_pmax, 0:1, : dims.B, :_q_width],
                     is_packed_scale=kernel_cfg.use_packed_scales,
+                    is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
                     w_dequant_scale=up_combined_dequant,
                     activation_op=None,
                     is_static_quant=kernel_cfg.is_static_quant,
@@ -3022,30 +3201,29 @@ def compute_one_block(
             else:
                 # Regime 3 (ping-pong tile): weights already in the SBUF tile buffer —
                 # tile 0 from the cross-block prefetch, or any tile when H < 3072.
-                cur_wt_flat_tv = TensorView(gup_wt_bufs[cur_buf]).flatten_dims(1, 2)
+                cur_wt_flat = gup_wt_bufs[cur_buf].flatten_dims(1, 2)
 
                 if kernel_cfg.is_static_quant:
                     gate_weight_scale_arg = inps.gup_scales_sb
                 elif kernel_cfg.use_packed_scales:
                     gate_weight_scale_arg = inps.gup_scales_sb[:, :, 0, cur_I_offset : cur_I_offset + cur_I_tile_sz]
                 else:
-                    gate_weight_scale_arg = (
-                        TensorView(gup_scales_flat)
-                        .slice(1, 0, prj_cfg.n_H512_tile_sharded)
-                        .slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
+                    gate_weight_scale_arg = gup_scales_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(
+                        2, cur_I_offset, cur_I_offset + cur_I_tile_sz
                     )
                 gate_up_projection_mx_tp(
-                    hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-                    hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
-                    weight_qtz=cur_wt_flat_tv.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(2, 0, cur_I_tile_sz),
+                    hidden_qtz_sb=buffers.hidden_qtz_sb,
+                    hidden_scale_sb=buffers.hidden_scale_sb,
+                    weight_qtz=cur_wt_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded).slice(2, 0, cur_I_tile_sz),
                     weight_scale=gate_weight_scale_arg,
                     bias_sb=gate_bias_view,
                     cfg=tile_prj_cfg,
                     sbm=sbm,
-                    psum_bank_offset=0 if i_tile % 2 == 0 else 3,
+                    psum_bank_offset=0 if i_tile % 2 == 0 else 1,
                     name_prefix=f"gate_t{i_tile}",
                     out_sb=intermediate_state_tiled[:_pmax, i_tile : i_tile + 1, : dims.B, :_q_width],
                     is_packed_scale=kernel_cfg.use_packed_scales,
+                    is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
                     w_dequant_scale=gate_combined_dequant,
                     activation_op=_gate_act_op,
                     is_static_quant=kernel_cfg.is_static_quant,
@@ -3073,25 +3251,24 @@ def compute_one_block(
                 elif kernel_cfg.use_packed_scales:
                     up_weight_scale_arg = inps.gup_scales_sb[:, :, 1, cur_I_offset : cur_I_offset + cur_I_tile_sz]
                 else:
-                    up_weight_scale_arg = (
-                        TensorView(gup_scales_flat)
-                        .slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded)
-                        .slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
-                    )
-                gate_up_projection_mx_tp(
-                    hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-                    hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
-                    weight_qtz=cur_wt_flat_tv.slice(
+                    up_weight_scale_arg = gup_scales_flat.slice(
                         1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded
-                    ).slice(2, 0, cur_I_tile_sz),
+                    ).slice(2, cur_I_offset, cur_I_offset + cur_I_tile_sz)
+                gate_up_projection_mx_tp(
+                    hidden_qtz_sb=buffers.hidden_qtz_sb,
+                    hidden_scale_sb=buffers.hidden_scale_sb,
+                    weight_qtz=cur_wt_flat.slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded).slice(
+                        2, 0, cur_I_tile_sz
+                    ),
                     weight_scale=up_weight_scale_arg,
                     bias_sb=up_bias_view,
                     cfg=tile_prj_cfg,
                     sbm=sbm,
-                    psum_bank_offset=4 if i_tile % 2 == 0 else 0,
+                    psum_bank_offset=2 if i_tile % 2 == 0 else 3,
                     name_prefix=f"up_t{i_tile}",
                     out_sb=up_tile_sb[:_pmax, 0:1, : dims.B, :_q_width],
                     is_packed_scale=kernel_cfg.use_packed_scales,
+                    is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
                     w_dequant_scale=up_combined_dequant,
                     activation_op=None,
                     is_static_quant=kernel_cfg.is_static_quant,
@@ -3116,27 +3293,26 @@ def compute_one_block(
 
     else:
         # ── Non-tiled path ──
-        # Build the flattened (gate/up × n_H512) view via TensorView.flatten_dims
-        # rather than `nl.ndarray.reshape`.
-        gup_weights_flat_tv = TensorView(gate_and_up_weights).flatten_dims(1, 2)
+        # Build the flattened (gate/up × n_H512) view via flatten_dims rather than reshape.
+        gup_weights_flat = gate_and_up_weights.flatten_dims(1, 2)
         if kernel_cfg.use_packed_scales or kernel_cfg.is_static_quant:
             # STATIC_MX: gate_and_up_scales is the shared [_pmax, _pmax] all-127 dummy;
             # the flatten is unused (call sites pass the buffer directly).
-            gup_scales_flat_tv = None
+            gup_scales_flat = None
         else:
-            gup_scales_flat_tv = TensorView(gate_and_up_scales).flatten_dims(1, 2)
+            gup_scales_flat = gate_and_up_scales.flatten_dims(1, 2)
         gate_bias_view = None
         up_bias_view = None
         if gup_bias:
-            gup_bias_flat_tv = TensorView(gup_bias).flatten_dims(1, 2)
-            gate_bias_view = gup_bias_flat_tv.slice(dim=1, start=0, end=prj_cfg.n_total_I512_tile)
+            gup_bias_flat = gup_bias.flatten_dims(1, 2)
+            gate_bias_view = gup_bias_flat.slice(dim=1, start=0, end=prj_cfg.n_total_I512_tile)
 
         if kernel_cfg.is_static_quant:
             gate_weight_scale_arg = inps.gup_scales_sb
         elif kernel_cfg.use_packed_scales:
             gate_weight_scale_arg = inps.gup_scales_sb[:, :, 0, :]
         else:
-            gate_weight_scale_arg = gup_scales_flat_tv.slice(1, 0, prj_cfg.n_H512_tile_sharded)
+            gate_weight_scale_arg = gup_scales_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded)
         # STATIC_MX silu fusion: only when no gate clamp.
         _gate_act_op = (
             get_nl_act_fn_from_type(kernel_cfg.activation_function)
@@ -3144,9 +3320,9 @@ def compute_one_block(
             else None
         )
         gate_proj_out_sb = gate_up_projection_mx_tp(
-            hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-            hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
-            weight_qtz=gup_weights_flat_tv.slice(1, 0, prj_cfg.n_H512_tile_sharded),
+            hidden_qtz_sb=buffers.hidden_qtz_sb,
+            hidden_scale_sb=buffers.hidden_scale_sb,
+            weight_qtz=gup_weights_flat.slice(1, 0, prj_cfg.n_H512_tile_sharded),
             weight_scale=gate_weight_scale_arg,
             bias_sb=gate_bias_view,
             cfg=prj_cfg,
@@ -3154,6 +3330,7 @@ def compute_one_block(
             psum_bank_offset=0,
             name_prefix="gate",
             is_packed_scale=kernel_cfg.use_packed_scales,
+            is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
             w_dequant_scale=gate_combined_dequant,
             activation_op=_gate_act_op,
             is_static_quant=kernel_cfg.is_static_quant,
@@ -3162,7 +3339,7 @@ def compute_one_block(
         gate_proj_out_sb = gate_proj_out_sb.reshape((_pmax, flatten_free_dim))
 
         if gup_bias:
-            up_bias_view = gup_bias_flat_tv.slice(
+            up_bias_view = gup_bias_flat.slice(
                 dim=1, start=prj_cfg.n_total_I512_tile, end=2 * prj_cfg.n_total_I512_tile
             )
 
@@ -3171,13 +3348,11 @@ def compute_one_block(
         elif kernel_cfg.use_packed_scales:
             up_weight_scale_arg = inps.gup_scales_sb[:, :, 1, :]
         else:
-            up_weight_scale_arg = gup_scales_flat_tv.slice(
-                1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded
-            )
+            up_weight_scale_arg = gup_scales_flat.slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded)
         up_proj_out_sb = gate_up_projection_mx_tp(
-            hidden_qtz_sb=TensorView(buffers.hidden_qtz_sb),
-            hidden_scale_sb=TensorView(buffers.hidden_scale_sb),
-            weight_qtz=gup_weights_flat_tv.slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded),
+            hidden_qtz_sb=buffers.hidden_qtz_sb,
+            hidden_scale_sb=buffers.hidden_scale_sb,
+            weight_qtz=gup_weights_flat.slice(1, prj_cfg.n_H512_tile_sharded, 2 * prj_cfg.n_H512_tile_sharded),
             weight_scale=up_weight_scale_arg,
             bias_sb=up_bias_view,
             cfg=prj_cfg,
@@ -3185,6 +3360,7 @@ def compute_one_block(
             psum_bank_offset=4,
             name_prefix="up",
             is_packed_scale=kernel_cfg.use_packed_scales,
+            is_packed_moving_scale=kernel_cfg.is_fp8_hidden,
             w_dequant_scale=up_combined_dequant,
             activation_op=None,
             is_static_quant=kernel_cfg.is_static_quant,
@@ -3208,11 +3384,13 @@ def compute_one_block(
             kernel_cfg.up_clamp_lower_limit,
         )
 
-    buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
-    if not kernel_cfg.is_static_quant:
-        buffers.hidden_scale_sb = (
-            TensorView(buffers.hidden_scale_sb).reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32)).get_view()
-        )
+    # bf16 path reshapes the persistent hidden buffers back to the quantize layout [.., B//32, 32]
+    # for the next-block online quantize below. fp8 path has no online quantize (gather fills the
+    # buffers in-block), so it leaves them in the [.., n_H512_tile, B] matmul layout.
+    if not kernel_cfg.is_fp8_hidden:
+        buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
+        if not kernel_cfg.is_static_quant:
+            buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
 
     # activation and multiply (non-tiled path only; tiled path does this per-tile).
     # STATIC_MX with no gate clamp: silu was already fused into the gate projection.
@@ -3249,7 +3427,19 @@ def compute_one_block(
     if next_block_idx != None:
         _pf_expert = load_block_expert(inps.block_to_expert, next_block_idx, sbm=sbm, name="pf_block_expert")
 
-        if USE_DMA_TRANSPOSE:
+        # fp8 pre-quantized hidden: the next block was gathered (DMA) during gate/up above. Transpose
+        # it (PE) into hidden_qtz_sb / hidden_scale_sb now — deferred here so nc_transpose overlaps
+        # down projection instead of contending with gate/up. No online quantize.
+        if kernel_cfg.is_fp8_hidden:
+            transpose_fp8_hidden_states(
+                dims,
+                prj_cfg,
+                buffers.block_hidden_concat,
+                hidden_qtz_sb=buffers.hidden_qtz_sb,
+                hidden_scale_sb=buffers.hidden_scale_sb,
+                sbm=sbm,
+            )
+        elif USE_DMA_TRANSPOSE:
             # DMA transpose path: only block_hidden_states_T is needed
             # (DMA transpose writes directly into the transposed layout).
             _alloc_hidden_T_buf(sbm, buffers, dims, prj_cfg, kernel_cfg, tag=f"nb{next_block_idx}_")
@@ -3267,7 +3457,7 @@ def compute_one_block(
             _alloc_hidden_T_buf(sbm, buffers, dims, prj_cfg, kernel_cfg, tag=f"nb{next_block_idx}_")
             sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims, sbm=sbm)
 
-        if is_dynamic:
+        if is_dynamic and not kernel_cfg.is_fp8_hidden:
             if kernel_cfg.is_static_quant:
                 # Reuse hoisted _pf_expert to gather next block's 1/in_scale[expert] from gup_scale_lut_sb.
                 _nb_in_quant_recip = _gather_gup_in_quant_recip(inps, _pf_expert, dims, sbm, name_prefix="nb_")
@@ -3367,7 +3557,7 @@ def compute_one_block(
                 (_pmax, n_BxS_tile, dims.H),
                 dtype=nl.bfloat16,
                 buffer=nl.sbuf,
-                name=f"dp_out_sb_reuse_b{block_idx}",
+                name=f"dp_out_sb_reuse_{tag}",
                 address=(0, _gup_wt_addr),
             )
 
@@ -3378,7 +3568,10 @@ def compute_one_block(
         bias_sb=down_bias_sb,
         cfg=prj_cfg,
         sbm=sbm,
-        psum_bank_offset=2,  # 2 because hidden_transpose uses banks 0 and 1
+        # Start past the banks the hidden transpose used: fp8 transpose
+        # (transpose_fp8_hidden_states) occupies banks 0-3, the bf16 transpose
+        # (sbuf_layout_adapter) occupies banks 0-1.
+        psum_bank_offset=4 if kernel_cfg.is_fp8_hidden else 2,
         name_prefix="dp",
         out_sb=_dp_out_sb,
         is_packed_scale=kernel_cfg.use_packed_scales,
@@ -3578,55 +3771,79 @@ def process_static_blocks(
     # prefetch the first block of each core
     first_block_idx = n_blocks_per_shard * dims.shard_id
 
-    # Heap-allocate hidden state buffers for first block load
-    _alloc_hidden_bufs(sbm, buffers, dims, prj_cfg, configs, tag=f"sb{first_block_idx}_")
-
     # Allocate zeros on heap (on top of hidden bufs) for output init, then free
     if is_tensor_update_accumulating:
         H = dims.H
         zeros = sbm.alloc_heap((_pmax, H), dtype=nl.bfloat16, name="output_init_zeros", align=SBUF_QUADRANT_SIZE)
-        if H % 2 == 0 or H % 4 == 0:
-            zeros_fp32 = TensorView(zeros).reinterpret_cast(nl.float32)
-            nisa.memset(zeros_fp32.get_view(), value=0.0)
-        else:
-            nisa.memset(zeros, value=0.0)
+        nisa.memset(zeros, value=0.0)
         output_initialization(outs.output, dims, sbm=sbm, zeros=zeros)
         sbm.pop_heap()  # free zeros, hidden bufs remain
 
-    if USE_DMA_TRANSPOSE:
-        sbm.open_scope(name="init_hiv")
-        compute_hidden_index_vector(inps, buffers, first_block_idx, dims, configs.skip_dma, False, sbm=sbm)
-        sbm.close_scope()
-        load_hidden_states_mx(
+    # fp8 pre-quantized hidden gathers + transposes in-block (no bf16 prefetch buffers, no
+    # init quantize). Only the persistent hidden_qtz_sb/hidden_scale_sb view shape is set up.
+    if not configs.is_fp8_hidden:
+        # Heap-allocate hidden state buffers for first block load
+        _alloc_hidden_bufs(sbm, buffers, dims, prj_cfg, configs, tag=f"sb{first_block_idx}_")
+
+    if configs.is_fp8_hidden:
+        # fp8: persistent hidden buffers stay in the [_pmax, n_H512_tile, B] matmul layout.
+        # Prefetch (gather) the first block here; compute_one_block transposes it and prefetches
+        # the next block, so the gather DMA always overlaps the prior block's compute.
+        buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B))
+        # fp8 scales are packed: n_packed scale blocks (4 H512 tiles each), not n_H512_tile.
+        buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, div_ceil(prj_cfg.n_H512_tile, 4), dims.B))
+        # First block: gather + transpose now so hidden_qtz_sb is ready before the loop. Each
+        # compute_one_block then gathers the next block (during gate/up) and transposes it (deferred
+        # after gate/up), so steady-state gather/transpose always overlap compute.
+        _fb_tok = load_token_indices(inps.token_position_to_id, first_block_idx, dims.B, dims.n_B128_tiles, sbm=sbm)
+        load_fp8_hidden_states_mx(
             inps,
             dims,
             configs.skip_dma,
-            token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
-            block_hidden_states_T=buffers.block_hidden_states_T,
-            use_dma_transpose=True,
+            token_indices_on_p=_fb_tok,
+            block_hidden_concat=buffers.block_hidden_concat,
+        )
+        transpose_fp8_hidden_states(
+            dims,
+            prj_cfg,
+            buffers.block_hidden_concat,
+            hidden_qtz_sb=buffers.hidden_qtz_sb,
+            hidden_scale_sb=buffers.hidden_scale_sb,
             sbm=sbm,
         )
     else:
-        sbm.open_scope(name="init_hiv")
-        compute_hidden_index_vector(inps, buffers, first_block_idx, dims, configs.skip_dma, False, sbm=sbm)
-        sbm.close_scope()
-        load_hidden_states_mx(
-            inps,
-            dims,
-            configs.skip_dma,
-            token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
-            block_hidden_states=buffers.block_hidden_states,
-            use_dma_transpose=False,
-            sbm=sbm,
-        )
-        sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims, sbm=sbm)
+        if USE_DMA_TRANSPOSE:
+            sbm.open_scope(name="init_hiv")
+            compute_hidden_index_vector(inps, buffers, first_block_idx, dims, configs.skip_dma, False, sbm=sbm)
+            sbm.close_scope()
+            load_hidden_states_mx(
+                inps,
+                dims,
+                configs.skip_dma,
+                token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
+                block_hidden_states_T=buffers.block_hidden_states_T,
+                use_dma_transpose=True,
+                sbm=sbm,
+            )
+        else:
+            sbm.open_scope(name="init_hiv")
+            compute_hidden_index_vector(inps, buffers, first_block_idx, dims, configs.skip_dma, False, sbm=sbm)
+            sbm.close_scope()
+            load_hidden_states_mx(
+                inps,
+                dims,
+                configs.skip_dma,
+                token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
+                block_hidden_states=buffers.block_hidden_states,
+                use_dma_transpose=False,
+                sbm=sbm,
+            )
+            sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims, sbm=sbm)
 
-    buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
-    if not configs.is_static_quant:
-        buffers.hidden_scale_sb = (
-            TensorView(buffers.hidden_scale_sb).reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32)).get_view()
-        )
-    # NOTE: we do not quantize here because we will do it in the beginning of each static block
+        buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
+        if not configs.is_static_quant:
+            buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
+        # NOTE: we do not quantize here because we will do it in the beginning of each static block
 
     # 2 different code paths to handle N odd and N even to explicitly handle prefetching
     if num_static_blocks % dims.num_shards == 0:
@@ -3870,32 +4087,67 @@ def process_dynamic_blocks(
             operand1=num_static_blocks + dims.shard_id,
         )
 
-    # Heap-allocate hidden state buffers for first dynamic block load
-    _alloc_hidden_bufs(sbm, buffers, dims, prj_cfg, configs, tag="dyn_init_")
-
-    if sbm != None:
-        sbm.open_scope(name="dyn_block_load_hidden_quant")
-    # STATIC_MX: gather first block's per-expert recip for the software quant.
-    _dyn_init_in_quant_recip = None
-    if configs.is_static_quant:
-        _dyn_init_expert = load_block_expert(inps.block_to_expert, first_block_idx_sb, sbm=sbm, name="dyn_init_expert")
-        _dyn_init_in_quant_recip = _gather_gup_in_quant_recip(
-            inps, _dyn_init_expert, dims, sbm, name_prefix="dyn_init_"
+    if configs.is_fp8_hidden:
+        # fp8: persistent hidden buffers stay in the [_pmax, n_H512_tile, B] matmul layout.
+        # Prefetch (gather) the first dynamic block; compute_one_block transposes it and prefetches
+        # the next block so the gather DMA overlaps the prior block's compute.
+        buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B))
+        # fp8 scales are packed: n_packed scale blocks (4 H512 tiles each), not n_H512_tile.
+        buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, div_ceil(prj_cfg.n_H512_tile, 4), dims.B))
+        # First block: gather + transpose now so hidden_qtz_sb is ready before the loop. Each
+        # compute_one_block then gathers the next block (during gate/up) and transposes it (deferred).
+        _prev_pfx = sbm.get_name_prefix() if sbm != None else None
+        if sbm != None:
+            sbm.set_name_prefix(f"{_prev_pfx}fp8pf_dyninit_")
+        _fb_tok = load_token_indices_dynamic_block(
+            inps.token_position_to_id, first_block_idx_sb, dims.B, dims.n_B128_tiles, skip_dma=configs.skip_dma, sbm=sbm
         )
-    load_and_quantize_hidden_states(
-        inps,
-        first_block_idx_sb,
-        buffers,
-        dims,
-        configs,
-        prj_cfg,
-        is_block_idx_dynamic=True,
-        use_dma_transpose=USE_DMA_TRANSPOSE,
-        sbm=sbm,
-        in_quant_recip=_dyn_init_in_quant_recip,
-    )
-    if sbm != None:
-        sbm.close_scope()
+        load_fp8_hidden_states_mx(
+            inps,
+            dims,
+            configs.skip_dma,
+            token_indices_on_p=_fb_tok,
+            block_hidden_concat=buffers.block_hidden_concat,
+        )
+        if sbm != None:
+            sbm.set_name_prefix(_prev_pfx)
+        transpose_fp8_hidden_states(
+            dims,
+            prj_cfg,
+            buffers.block_hidden_concat,
+            hidden_qtz_sb=buffers.hidden_qtz_sb,
+            hidden_scale_sb=buffers.hidden_scale_sb,
+            sbm=sbm,
+        )
+    else:
+        # Heap-allocate hidden state buffers for first dynamic block load
+        _alloc_hidden_bufs(sbm, buffers, dims, prj_cfg, configs, tag="dyn_init_")
+
+        if sbm != None:
+            sbm.open_scope(name="dyn_block_load_hidden_quant")
+        # STATIC_MX: gather first block's per-expert recip for the software quant.
+        _dyn_init_in_quant_recip = None
+        if configs.is_static_quant:
+            _dyn_init_expert = load_block_expert(
+                inps.block_to_expert, first_block_idx_sb, sbm=sbm, name="dyn_init_expert"
+            )
+            _dyn_init_in_quant_recip = _gather_gup_in_quant_recip(
+                inps, _dyn_init_expert, dims, sbm, name_prefix="dyn_init_"
+            )
+        load_and_quantize_hidden_states(
+            inps,
+            first_block_idx_sb,
+            buffers,
+            dims,
+            configs,
+            prj_cfg,
+            is_block_idx_dynamic=True,
+            use_dma_transpose=USE_DMA_TRANSPOSE,
+            sbm=sbm,
+            in_quant_recip=_dyn_init_in_quant_recip,
+        )
+        if sbm != None:
+            sbm.close_scope()
 
     # Prefetch first-dynamic-block's gup weights into persistent buffer.
     # Under full-resident scheme: load the entire gup. Otherwise: just tile 0.
@@ -4022,7 +4274,7 @@ def process_dynamic_blocks(
                 sbm, (1, 1), dtype=nl.uint8, name="boundary_is_same", align=SBUF_QUADRANT_SIZE
             )
 
-        for _outer in nl.dynamic_range(0, outer_reg):
+        def _process_outer_block(_outer):
             for inner in nl.sequential_range(INNER):
                 _bi_sb = dyn_block_idx_sb
                 _nbi_sb = dyn_next_block_idx_sb
@@ -4195,13 +4447,14 @@ def process_dynamic_blocks(
                 operand0=1,
             )
 
+        nl.fori_loop(0, outer_reg, _process_outer_block)
+
         # Outer -> Remainder transition:
         # At inner=INNER-1 of the last outer iter, we now prefetch the correct
         # block for each shard (index + STEP + shard_id, matching remainder's
         # first block), so no corrective transition prefetch is needed here.
 
-    # --- Remainder ping-pong loop (step=num_shards) -------------------------
-    for _rem in nl.dynamic_range(0, rem_reg):
+    def _process_remainder_block(_rem):
         # block_idx = index + shard_id
         nisa.tensor_scalar(
             dst=dyn_block_idx_sb,
@@ -4278,6 +4531,8 @@ def process_dynamic_blocks(
         nisa.tensor_scalar(dst=buffers.index, data=buffers.index, op0=nl.add, operand0=dims.num_shards)
         if _use_rem_skip:
             nisa.tensor_scalar(dst=rem_shard_iter_sb, data=rem_shard_iter_sb, op0=nl.add, operand0=1)
+
+    nl.fori_loop(0, rem_reg, _process_remainder_block)
 
     # Flush the last dynamic block's pending output
     _write_output_scatter(buffers.block_old, pending_token_indices, outs, dims, dims.shard_id)

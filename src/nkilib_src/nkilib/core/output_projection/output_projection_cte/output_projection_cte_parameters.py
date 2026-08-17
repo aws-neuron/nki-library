@@ -38,6 +38,13 @@ _SBUF_QUADRANT_SIZE = 32
 # Maximum SBUF space (in bytes) allowed for weight tensors
 _MAX_WEIGHT_SBUF_BYTES = 10 * 1024 * 1024  # 10MB
 
+# Torch has no packed MXFP dtypes, so frameworks label x4-packed MX weights with a
+# same-width integer dtype. Map those labels to the packed MX dtype.
+_ALTERNATIVE_DTYPE_TO_MXFP = {
+    nl.uint16: nl.float4_e2m1fn_x4,
+    nl.uint32: nl.float8_e4m3fn_x4,
+}
+
 # Validation limits for testing
 _MAX_VALIDATED_H_SIZE = 16384 + 4321
 _MAX_VALIDATED_B_TIMES_S_SIZE = 128 * 1024
@@ -53,8 +60,8 @@ class QuantizationConfig(nl.NKIObject):
 
     Args:
         is_enabled (bool): Whether quantization is enabled.
-        input_scales (Optional[nl.ndarray]): Input quantization scales.
-        weight_scales (Optional[nl.ndarray]): Weight quantization scales.
+        input_scales (Optional[nl.NkiTensor]): Input quantization scales.
+        weight_scales (Optional[nl.NkiTensor]): Weight quantization scales.
         quant_data_type (Optional[type]): Quantized data type (e.g., nl.float8_e4m3).
         input_quantized (bool): Whether input is already quantized.
         input_data_type (Optional[type]): Original input data type.
@@ -69,8 +76,8 @@ class QuantizationConfig(nl.NKIObject):
     """
 
     is_enabled: bool
-    input_scales: Optional[nl.ndarray] = None
-    weight_scales: Optional[nl.ndarray] = None
+    input_scales: Optional[nl.NkiTensor] = None
+    weight_scales: Optional[nl.NkiTensor] = None
     quant_data_type: Optional[type] = None
     input_quantized: bool = False
     input_data_type: Optional[type] = None
@@ -346,6 +353,9 @@ def build_tiling_config(
     Notes:
         - n_size and d_size in config may differ from inputs due to head packing.
     """
+    # Map the uint container label to its MX dtype so the SBUF byte-budget below sees
+    # the true element width: _get_dtype_size has no uint32 case and would otherwise return 2.
+    weight_dtype = _ALTERNATIVE_DTYPE_TO_MXFP.get(weight_dtype, weight_dtype)
     if (
         quant_config.is_mxfp4_quantized
         or quant_config.is_mxfp8_static_quantized
@@ -428,8 +438,8 @@ def build_tiling_config(
 
 def build_quantization_config(
     quantization_type: QuantizationType,
-    input_scales: Optional[nl.ndarray],
-    weight_scales: Optional[nl.ndarray],
+    input_scales: Optional[nl.NkiTensor],
+    weight_scales: Optional[nl.NkiTensor],
     input_data_type: Optional[type],
     weight_data_type: Optional[type],
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
@@ -440,8 +450,8 @@ def build_quantization_config(
 
     Args:
         quantization_type (QuantizationType): Type of quantization to use.
-        input_scales (Optional[nl.ndarray]): Input quantization scales.
-        weight_scales (Optional[nl.ndarray]): Weight quantization scales.
+        input_scales (Optional[nl.NkiTensor]): Input quantization scales.
+        weight_scales (Optional[nl.NkiTensor]): Weight quantization scales.
         input_data_type (Optional[type]): Data type of input tensor.
         weight_data_type (Optional[type]): Data type of weight tensor.
         dtype_mode (DtypeMode): Quantization dtype policy for STATIC/ROW.
@@ -484,8 +494,11 @@ def build_quantization_config(
         quant_data_type = _resolved_e4m3_for_static_row
         is_fp8_quantized = True
     elif quantization_type == QuantizationType.MX:
+        # Map the uint container label to the packed MX dtype so the fp8-vs-fp4 decision below
+        # picks the right quant_data_type (which then drives the SBUF/PSUM allocations).
+        packed_weight_dtype = _ALTERNATIVE_DTYPE_TO_MXFP.get(weight_data_type, weight_data_type)
         # block-128 compact scales pair with FP8 weights
-        if compact_weight_scales or weight_data_type == nl.float8_e4m3fn_x4:
+        if compact_weight_scales or packed_weight_dtype == nl.float8_e4m3fn_x4:
             quant_data_type = nl.float8_e4m3fn_x4
         else:
             quant_data_type = nl.float4_e2m1fn_x4
@@ -532,8 +545,8 @@ def validate_output_projection_inputs(
     attention_dtype,
     weight_dtype,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    input_scales: Optional[nl.ndarray] = None,
-    weight_scales: Optional[nl.ndarray] = None,
+    input_scales: Optional[nl.NkiTensor] = None,
+    weight_scales: Optional[nl.NkiTensor] = None,
     compact_weight_scales: bool = False,
 ) -> None:
     """
@@ -551,8 +564,8 @@ def validate_output_projection_inputs(
         attention_dtype: Data type of attention tensor.
         weight_dtype: Data type of weight tensor.
         quantization_type (QuantizationType): Type of quantization.
-        input_scales (Optional[nl.ndarray]): Input quantization scales.
-        weight_scales (Optional[nl.ndarray]): Weight quantization scales.
+        input_scales (Optional[nl.NkiTensor]): Input quantization scales.
+        weight_scales (Optional[nl.NkiTensor]): Weight quantization scales.
 
     Raises:
         AssertionError: If any validation check fails.
@@ -587,12 +600,13 @@ def validate_output_projection_inputs(
         n_d = n_size * d_size
         packed_dtypes = (nl.float8_e4m3fn_x4, nl.float4_e2m1fn_x4)
         kernel_assert(
-            weight_dtype in packed_dtypes,
+            weight_dtype in packed_dtypes + tuple(_ALTERNATIVE_DTYPE_TO_MXFP),
             f"Weight type={weight_dtype} is not supported for MX quantization",
         )
+        packed_weight_dtype = _ALTERNATIVE_DTYPE_TO_MXFP.get(weight_dtype, weight_dtype)
         if compact_weight_scales:
             kernel_assert(
-                weight_dtype == nl.float8_e4m3fn_x4,
+                packed_weight_dtype == nl.float8_e4m3fn_x4,
                 f"Weight type={weight_dtype} is not supported for MX quantization with compact_weight_scales. "
                 f"compact scales pair with float8_e4m3fn_x4 weights.",
             )

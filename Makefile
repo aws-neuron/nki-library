@@ -9,10 +9,10 @@ wheel:
 	pip --require-virtualenv --isolated wheel . --wheel-dir dist --no-deps
 
 test:
-	PYTHONPATH=$(CURDIR):$$PYTHONPATH pytest -p test.utils.pytest_plugin $(ARGS)
+	PYTHONPATH=$(CURDIR):$$PYTHONPATH pytest -c test/pytest.ini -p test.utils.pytest_plugin $(ARGS)
 
 unit_test:
-	PYTHONPATH=$(CURDIR):$$PYTHONPATH pytest -p test.utils.pytest_plugin $(ARGS) test/unit
+	PYTHONPATH=$(CURDIR):$$PYTHONPATH pytest -c test/pytest.ini -p test.utils.pytest_plugin $(ARGS) test/unit
 
 lint:
 	ruff check .
@@ -34,6 +34,9 @@ venv:
 
 install:
 	pip install --require-virtualenv --editable .[test]
+
+install_neuron:
+	pip install --require-virtualenv --extra-index-url https://pip.repos.neuron.amazonaws.com .
 
 install_wheelhouse:
 	pip install --require-virtualenv wheelhouse/*.whl

@@ -18,7 +18,6 @@ import ml_dtypes
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental.foreach.foreach_elementwise import (
     add_scalar_kernel,
     add_tensor_kernel,
@@ -47,6 +46,7 @@ from nkilib_src.nkilib.experimental.foreach.foreach_elementwise_torch import (
     sub_scalar_torch_ref,
     sub_tensor_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -151,7 +151,7 @@ def _wrap_tensor_ref(ref_fn):
 
 def _wrap_tensor_alpha_ref(ref_fn):
     def wrapped(data1: torch.Tensor, data2: torch.Tensor, alpha_tensor: torch.Tensor, numel: int) -> torch.Tensor:
-        return ref_fn(data1.float(), data2.float(), alpha=_ALPHA_VALUE).to(data1.dtype)
+        return ref_fn(data1.float(), data2.float(), alpha_tensor=_ALPHA_VALUE).to(data1.dtype)
 
     return wrapped
 
@@ -160,7 +160,7 @@ def _wrap_addcdiv_ref():
     def wrapped(
         data: torch.Tensor, data1: torch.Tensor, data2: torch.Tensor, value_tensor: torch.Tensor, numel: int
     ) -> torch.Tensor:
-        return addcdiv_torch_ref(data.float(), data1.float(), data2.float(), value=_VALUE).to(data.dtype)
+        return addcdiv_torch_ref(data.float(), data1.float(), data2.float(), value_tensor=_VALUE).to(data.dtype)
 
     return wrapped
 
@@ -169,14 +169,14 @@ def _wrap_addcmul_ref():
     def wrapped(
         data: torch.Tensor, data1: torch.Tensor, data2: torch.Tensor, value_tensor: torch.Tensor, numel: int
     ) -> torch.Tensor:
-        return addcmul_torch_ref(data.float(), data1.float(), data2.float(), value=_VALUE).to(data.dtype)
+        return addcmul_torch_ref(data.float(), data1.float(), data2.float(), value_tensor=_VALUE).to(data.dtype)
 
     return wrapped
 
 
 def _wrap_lerp_ref():
     def wrapped(data: torch.Tensor, end: torch.Tensor, weight_tensor: torch.Tensor, numel: int) -> torch.Tensor:
-        return lerp_torch_ref(data.float(), end.float(), weight=_WEIGHT).to(data.dtype)
+        return lerp_torch_ref(data.float(), end.float(), weight_tensor=_WEIGHT).to(data.dtype)
 
     return wrapped
 
@@ -251,10 +251,16 @@ class TestForeachElementwise:
     )
     def test_tensor_ops(self, test_manager: Orchestrator, platform_target: Platforms, shape, kernel, ref, uses_alpha):
         if uses_alpha:
-            gen = lambda _: _tensor_alpha_inputs(shape)
+
+            def gen(_):
+                return _tensor_alpha_inputs(shape)
+
             wrapped_ref = _wrap_tensor_alpha_ref(ref)
         else:
-            gen = lambda _: _tensor_inputs(shape)
+
+            def gen(_):
+                return _tensor_inputs(shape)
+
             wrapped_ref = _wrap_tensor_ref(ref)
         framework = UnitTestFramework(
             test_manager=test_manager,

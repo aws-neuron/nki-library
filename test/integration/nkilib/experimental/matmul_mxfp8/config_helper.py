@@ -30,6 +30,7 @@ from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
     calculate_sbuf_usage,
     fits_in_sbuf,
 )
+
 from test.integration.nkilib.experimental.matmul_mxfp8.constants import (
     DEFAULT_STRIDE,
     SBUF_LIMIT_BYTES,
@@ -95,6 +96,7 @@ class TestConfig:
         # exercise the K-by-F ([K, F]) layout.
         lhs_is_f_by_k: bool = True,
         rhs_is_f_by_k: bool = True,
+        quant_scheme: str = "wrapX",
     ) -> None:
         # Create kernel config with kernel-level params
         self.kernel_config = MatmulMxfp8KernelConfig(
@@ -109,13 +111,13 @@ class TestConfig:
             TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
             TILES_IN_LOAD_M=TILES_IN_LOAD_M,
             TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-            block_loop_order=block_loop_order if block_loop_order != None else 'mnk',
-            tile_loop_order=tile_loop_order if tile_loop_order != None else 'mnk',
-            float8_dtype=float8_dtype if float8_dtype != None else 'float8_e4m3fn',
-            enable_scale_packing=enable_scale_packing if enable_scale_packing != None else False,
-            run_with_lnc2=run_with_lnc2 if run_with_lnc2 != None else True,
+            block_loop_order=block_loop_order if block_loop_order is not None else 'mnk',
+            tile_loop_order=tile_loop_order if tile_loop_order is not None else 'mnk',
+            float8_dtype=float8_dtype if float8_dtype is not None else 'float8_e4m3fn',
+            enable_scale_packing=enable_scale_packing if enable_scale_packing is not None else False,
+            run_with_lnc2=run_with_lnc2 if run_with_lnc2 is not None else True,
             lnc_2_shard_rhs=lnc_2_shard_rhs,
-            spill_reload=spill_reload if spill_reload != None else False,
+            spill_reload=spill_reload if spill_reload is not None else False,
             lhs_is_swizzled=lhs_is_swizzled,
             rhs_is_swizzled=rhs_is_swizzled,
         )
@@ -146,7 +148,7 @@ class TestConfig:
         self.output_dtype = output_dtype
         self.dists = dists
         self.params = params
-        self.stride = stride if stride != None else DEFAULT_STRIDE
+        self.stride = stride if stride is not None else DEFAULT_STRIDE
         self.load_with_PE_swizzle = load_with_PE_swizzle
         # Sub-indices (within this entry's autoGenerateRandomSubset output)
         # to mark pytest.mark.fast. Stable to grid reordering and additions;
@@ -154,6 +156,8 @@ class TestConfig:
         self.fast_subset = frozenset(fast_subset) if fast_subset is not None else frozenset()
         self.lhs_is_f_by_k = lhs_is_f_by_k
         self.rhs_is_f_by_k = rhs_is_f_by_k
+        self.quant_scheme = quant_scheme
+        self.enable_psum_copy_in = None
 
     # ------------------------------------------------------------------
     # Property accessors delegating to kernel_config for backward compat
@@ -278,6 +282,8 @@ class TestConfig:
             "output_dtype": self.output_dtype,
             "lhs_is_swizzled": self.lhs_is_swizzled,
             "rhs_is_swizzled": self.rhs_is_swizzled,
+            "load_with_PE_swizzle": self.load_with_PE_swizzle,
+            "quant_scheme": self.quant_scheme,
             "spill_reload": self.spill_reload,
             "enable_scale_packing": self.enable_scale_packing,
             "lnc_2_shard_rhs": self.lnc_2_shard_rhs,
@@ -363,12 +369,12 @@ class TestConfig:
         Delegates kernel param generation to MatmulMxfp8KernelConfig.auto_generate_default(),
         then wraps the result with test-specific params.
         """
-        assert self.M != None and self.K != None and self.N != None
+        assert self.M is not None and self.K is not None and self.N is not None
 
         # Resolve test-level defaults
-        lhs_dtype = self.lhs_dtype if self.lhs_dtype != None else MatrixPrecision.MXFP8_X4
-        rhs_dtype = self.rhs_dtype if self.rhs_dtype != None else MatrixPrecision.MXFP8_X4
-        output_dtype = self.output_dtype if self.output_dtype != None else MatrixPrecision.BFLOAT16
+        lhs_dtype = self.lhs_dtype if self.lhs_dtype is not None else MatrixPrecision.MXFP8_X4
+        rhs_dtype = self.rhs_dtype if self.rhs_dtype is not None else MatrixPrecision.MXFP8_X4
+        output_dtype = self.output_dtype if self.output_dtype is not None else MatrixPrecision.BFLOAT16
 
         dists = self._generate_random_dists(1)
         lhs_dist = random.choice(dists["lhs"])
@@ -387,11 +393,11 @@ class TestConfig:
             TILES_IN_BLOCK_K=self.kernel_config.TILES_IN_BLOCK_K,
             TILES_IN_LOAD_M=self.kernel_config.TILES_IN_LOAD_M,
             TILES_IN_LOAD_N=self.kernel_config.TILES_IN_LOAD_N,
-            block_loop_order=self.kernel_config.block_loop_order if self._orig_block_loop_order != None else 'mnk',
-            tile_loop_order=self.kernel_config.tile_loop_order if self._orig_tile_loop_order != None else 'mnk',
-            float8_dtype=self.kernel_config.float8_dtype if self._orig_float8_dtype != None else 'float8_e4m3fn',
+            block_loop_order=self.kernel_config.block_loop_order if self._orig_block_loop_order is not None else 'mnk',
+            tile_loop_order=self.kernel_config.tile_loop_order if self._orig_tile_loop_order is not None else 'mnk',
+            float8_dtype=self.kernel_config.float8_dtype if self._orig_float8_dtype is not None else 'float8_e4m3fn',
             enable_scale_packing=self.kernel_config.enable_scale_packing,
-            run_with_lnc2=self.kernel_config.run_with_lnc2 if self._orig_run_with_lnc2 != None else True,
+            run_with_lnc2=self.kernel_config.run_with_lnc2 if self._orig_run_with_lnc2 is not None else True,
             lnc_2_shard_rhs=self.kernel_config.lnc_2_shard_rhs,
             spill_reload=self.kernel_config.spill_reload,
             lhs_is_swizzled=self.kernel_config.lhs_is_swizzled,
@@ -407,7 +413,7 @@ class TestConfig:
         )
 
         # Resolve lnc_2_shard_rhs for the TestConfig wrapper
-        if self._orig_lnc_2_shard_rhs == None:
+        if self._orig_lnc_2_shard_rhs is None:
             lnc_2_shard_rhs_val = kc.lnc_2_shard_rhs
         else:
             lnc_2_shard_rhs_val = self.kernel_config.lnc_2_shard_rhs
@@ -438,15 +444,17 @@ class TestConfig:
             dists=[lhs_dist[0], rhs_dist[0]],
             params=[lhs_dist[1], rhs_dist[1]],
             stride=self.stride,
-            spill_reload=kc.spill_reload if self._orig_spill_reload != None else None,
+            spill_reload=kc.spill_reload if self._orig_spill_reload is not None else None,
             lhs_is_swizzled=kc.lhs_is_swizzled,
             rhs_is_swizzled=kc.rhs_is_swizzled,
             lhs_is_f_by_k=self.lhs_is_f_by_k,
             rhs_is_f_by_k=self.rhs_is_f_by_k,
-            enable_scale_packing=kc.enable_scale_packing if self._orig_enable_scale_packing != None else None,
+            enable_scale_packing=kc.enable_scale_packing if self._orig_enable_scale_packing is not None else None,
             lnc_2_shard_rhs=lnc_2_shard_rhs_val
-            if self._orig_lnc_2_shard_rhs != None or not lnc_2_shard_rhs_val
+            if self._orig_lnc_2_shard_rhs is not None or not lnc_2_shard_rhs_val
             else None,
+            load_with_PE_swizzle=self.load_with_PE_swizzle,
+            quant_scheme=self.quant_scheme,
         )
 
         return [config]
@@ -485,19 +493,19 @@ class TestConfig:
             n_chain = random.choice(n_chains)
             k_chain = random.choice(k_chains)
             independent_values = [random.choice(vals) for vals in independent_param_values]
-            independent_dict = dict(zip(independent_param_names, independent_values))
+            independent_dict = dict(zip(independent_param_names, independent_values, strict=True))
             lhs_dist = random.choice(dists["lhs"])
             rhs_dist = random.choice(dists["rhs"])
 
             # Randomize spill_reload if not explicitly set
-            spill_reload = self.spill_reload if self._orig_spill_reload != None else random.choice([True, False])
+            spill_reload = self.spill_reload if self._orig_spill_reload is not None else random.choice([True, False])
             """
             Randomize enable_scale_packing if not explicitly set.
             Pre-quantized MXFP8 with packed scales requires tile_k=512 because
             the packed scales format uses Q_TILE_K-sized tile indexing that doesn't
             align with smaller physical tile boundaries in the matmul instruction.
             """
-            if self._orig_enable_scale_packing != None:
+            if self._orig_enable_scale_packing is not None:
                 enable_scale_packing = self.enable_scale_packing
             else:
                 enable_scale_packing = random.choice([True, False])
@@ -513,7 +521,7 @@ class TestConfig:
             # Generate run_with_lnc2 independently
             tile_m, tiles_in_block_m, _ = m_chain
             tile_n, tiles_in_block_n, _ = n_chain
-            if self._orig_run_with_lnc2 != None:
+            if self._orig_run_with_lnc2 is not None:
                 run_with_lnc2 = self.run_with_lnc2
             else:
                 num_blocks_in_m = div_ceil(self.M, tile_m * tiles_in_block_m) if (tile_m * tiles_in_block_m) > 0 else 0
@@ -524,7 +532,7 @@ class TestConfig:
                     run_with_lnc2 = False
 
             # Randomize lnc_2_shard_rhs if not explicitly set
-            if self._orig_lnc_2_shard_rhs != None:
+            if self._orig_lnc_2_shard_rhs is not None:
                 lnc_2_shard_rhs = self.lnc_2_shard_rhs
             elif run_with_lnc2:
                 num_blocks_in_m = div_ceil(self.M, tile_m * tiles_in_block_m) if (tile_m * tiles_in_block_m) > 0 else 0
@@ -597,32 +605,32 @@ class TestConfig:
         """Generate independent parameters that don't depend on each other."""
         params: Dict[str, List[Any]] = {}
 
-        if self._orig_tile_loop_order != None:
+        if self._orig_tile_loop_order is not None:
             params['tile_loop_order'] = [self.tile_loop_order]
         else:
             params['tile_loop_order'] = ['mnk']
 
-        if self._orig_block_loop_order != None:
+        if self._orig_block_loop_order is not None:
             params['block_loop_order'] = [self.block_loop_order]
         else:
             params['block_loop_order'] = ['mnk']
 
-        if self._orig_float8_dtype != None:
+        if self._orig_float8_dtype is not None:
             params['float8_dtype'] = [self.float8_dtype]
         else:
             params['float8_dtype'] = ["float8_e4m3fn"]
 
-        if self.lhs_dtype != None:
+        if self.lhs_dtype is not None:
             params['lhs_dtype'] = [self.lhs_dtype]
         else:
             params['lhs_dtype'] = [MatrixPrecision.BFLOAT16, MatrixPrecision.MXFP8, MatrixPrecision.MXFP8_X4]
 
-        if self.rhs_dtype != None:
+        if self.rhs_dtype is not None:
             params['rhs_dtype'] = [self.rhs_dtype]
         else:
             params['rhs_dtype'] = [MatrixPrecision.BFLOAT16, MatrixPrecision.MXFP8, MatrixPrecision.MXFP8_X4]
 
-        if self.output_dtype != None:
+        if self.output_dtype is not None:
             params['output_dtype'] = [self.output_dtype]
         else:
             params['output_dtype'] = [MatrixPrecision.BFLOAT16]
@@ -631,13 +639,13 @@ class TestConfig:
 
     def _generate_random_dists(self, distribution_population_size: int = 200) -> Dict[str, List]:
         res = {}
-        if self.dists != None and self.params != None:
+        if self.dists is not None and self.params is not None:
             assert len(self.dists) == 2, "dists needs to be of length 2"
             assert len(self.params) == 2, "params needs to be of length 2"
             res['lhs'] = [(self.dists[0], self.params[0])]
             res['rhs'] = [(self.dists[1], self.params[1])]
             return res
-        elif self.dists != None:
+        elif self.dists is not None:
             assert len(self.dists) == 2, "dists needs to be of length 2"
             res['lhs'] = get_random_distributions(distribution_population_size, dist_names=[self.dists[0]])
             res['rhs'] = get_random_distributions(distribution_population_size, dist_names=[self.dists[1]])
@@ -656,45 +664,45 @@ class TestConfig:
         lines.append(f"TestConfig: {self.description if self.description else 'Matrix Multiplication Test'}")
         lines.append(f"  Matrix Dimensions: M={self.M}, K={self.K}, N={self.N}")
 
-        if self.tile_m != None or self.tile_k != None or self.tile_n != None:
+        if self.tile_m is not None or self.tile_k is not None or self.tile_n is not None:
             tile_info = []
-            if self.tile_m != None:
+            if self.tile_m is not None:
                 tile_info.append(f"M={self.tile_m}")
-            if self.tile_k != None:
+            if self.tile_k is not None:
                 tile_info.append(f"K={self.tile_k}")
-            if self.tile_n != None:
+            if self.tile_n is not None:
                 tile_info.append(f"N={self.tile_n}")
             lines.append(f"  Tile Sizes: {', '.join(tile_info)}")
 
-        if self.TILES_IN_BLOCK_M != None or self.TILES_IN_BLOCK_K != None or self.TILES_IN_BLOCK_N != None:
+        if self.TILES_IN_BLOCK_M is not None or self.TILES_IN_BLOCK_K is not None or self.TILES_IN_BLOCK_N is not None:
             block_info = []
-            if self.TILES_IN_BLOCK_M != None:
+            if self.TILES_IN_BLOCK_M is not None:
                 block_info.append(f"M={self.TILES_IN_BLOCK_M}")
-            if self.TILES_IN_BLOCK_K != None:
+            if self.TILES_IN_BLOCK_K is not None:
                 block_info.append(f"K={self.TILES_IN_BLOCK_K}")
-            if self.TILES_IN_BLOCK_N != None:
+            if self.TILES_IN_BLOCK_N is not None:
                 block_info.append(f"N={self.TILES_IN_BLOCK_N}")
             lines.append(f"  Tiles in Block: {', '.join(block_info)}")
 
-        if self.TILES_IN_LOAD_M != None or self.TILES_IN_LOAD_N != None:
+        if self.TILES_IN_LOAD_M is not None or self.TILES_IN_LOAD_N is not None:
             load_info = []
-            if self.TILES_IN_LOAD_M != None:
+            if self.TILES_IN_LOAD_M is not None:
                 load_info.append(f"M={self.TILES_IN_LOAD_M}")
-            if self.TILES_IN_LOAD_N != None:
+            if self.TILES_IN_LOAD_N is not None:
                 load_info.append(f"N={self.TILES_IN_LOAD_N}")
             lines.append(f"  Tiles in Load: {', '.join(load_info)}")
 
-        if self.lhs_dtype != None or self.rhs_dtype != None:
+        if self.lhs_dtype is not None or self.rhs_dtype is not None:
             dtype_info = []
-            if self.lhs_dtype != None:
+            if self.lhs_dtype is not None:
                 dtype_info.append(f"LHS={self.lhs_dtype}")
-            if self.rhs_dtype != None:
+            if self.rhs_dtype is not None:
                 dtype_info.append(f"RHS={self.rhs_dtype}")
             lines.append(f"  Data Types: {', '.join(dtype_info)}")
 
-        if self.dists != None and self.params != None:
+        if self.dists is not None and self.params is not None:
             dist_info = []
-            for i, (dist, param) in enumerate(zip(self.dists, self.params)):
+            for i, (dist, param) in enumerate(zip(self.dists, self.params, strict=True)):
                 matrix_name = "LHS" if i == 0 else "RHS"
                 if param:
                     dist_info.append(f"{matrix_name}={dist}({param})")
@@ -702,17 +710,17 @@ class TestConfig:
                     dist_info.append(f"{matrix_name}={dist}")
             lines.append(f"  Distributions: {', '.join(dist_info)}")
 
-        if self._orig_tile_loop_order != None:
+        if self._orig_tile_loop_order is not None:
             lines.append(f"  Tile Loop Order: {self.tile_loop_order}")
-        if self._orig_block_loop_order != None:
+        if self._orig_block_loop_order is not None:
             lines.append(f"  Block Loop Order: {self.block_loop_order}")
-        if self._orig_run_with_lnc2 != None:
+        if self._orig_run_with_lnc2 is not None:
             lines.append(f"  Run with LNC2: {self.run_with_lnc2}")
-        if self._orig_lnc_2_shard_rhs != None:
+        if self._orig_lnc_2_shard_rhs is not None:
             lines.append(f"  LNC2 Shard RHS: {self.lnc_2_shard_rhs}")
-        if self._orig_float8_dtype != None:
+        if self._orig_float8_dtype is not None:
             lines.append(f"  Float8 DType: {self.float8_dtype}")
-        if self.seed != None:
+        if self.seed is not None:
             lines.append(f"  Seed: {self.seed}")
 
         try:
@@ -744,53 +752,53 @@ class TestConfig:
         params.append(f"K={self.K}")
         params.append(f"N={self.N}")
 
-        if self.TILES_IN_BLOCK_M != None:
+        if self.TILES_IN_BLOCK_M is not None:
             params.append(f"TILES_IN_BLOCK_M={self.TILES_IN_BLOCK_M}")
-        if self.TILES_IN_BLOCK_N != None:
+        if self.TILES_IN_BLOCK_N is not None:
             params.append(f"TILES_IN_BLOCK_N={self.TILES_IN_BLOCK_N}")
-        if self.TILES_IN_BLOCK_K != None:
+        if self.TILES_IN_BLOCK_K is not None:
             params.append(f"TILES_IN_BLOCK_K={self.TILES_IN_BLOCK_K}")
-        if self.TILES_IN_LOAD_M != None:
+        if self.TILES_IN_LOAD_M is not None:
             params.append(f"TILES_IN_LOAD_M={self.TILES_IN_LOAD_M}")
-        if self.TILES_IN_LOAD_N != None:
+        if self.TILES_IN_LOAD_N is not None:
             params.append(f"TILES_IN_LOAD_N={self.TILES_IN_LOAD_N}")
-        if self.tile_m != None:
+        if self.tile_m is not None:
             params.append(f"tile_m={self.tile_m}")
-        if self.tile_k != None:
+        if self.tile_k is not None:
             params.append(f"tile_k={self.tile_k}")
-        if self.tile_n != None:
+        if self.tile_n is not None:
             params.append(f"tile_n={self.tile_n}")
-        if self._orig_tile_loop_order != None:
+        if self._orig_tile_loop_order is not None:
             params.append(f"tile_loop_order={self.tile_loop_order!r}")
-        if self._orig_block_loop_order != None:
+        if self._orig_block_loop_order is not None:
             params.append(f"block_loop_order={self.block_loop_order!r}")
-        if self._orig_run_with_lnc2 != None:
+        if self._orig_run_with_lnc2 is not None:
             params.append(f"run_with_lnc2={self.run_with_lnc2}")
-        if self._orig_float8_dtype != None:
+        if self._orig_float8_dtype is not None:
             params.append(f"float8_dtype={self.float8_dtype!r}")
-        if self.lhs_dtype != None:
+        if self.lhs_dtype is not None:
             params.append(f"lhs_dtype={self.lhs_dtype!r}")
-        if self.rhs_dtype != None:
+        if self.rhs_dtype is not None:
             params.append(f"rhs_dtype={self.rhs_dtype!r}")
         if self.xfail != "pass":
             params.append(f"xfail={self.xfail!r}")
         if self.description:
             params.append(f"description={self.description!r}")
-        if self.seed != None:
+        if self.seed is not None:
             params.append(f"seed={self.seed}")
-        if self.output_dtype != None:
+        if self.output_dtype is not None:
             params.append(f"output_dtype={self.output_dtype!r}")
-        if self.dists != None:
+        if self.dists is not None:
             params.append(f"dists={self.dists!r}")
-        if self.params != None:
+        if self.params is not None:
             params.append(f"params={self.params!r}")
         if self.stride != DEFAULT_STRIDE:
             params.append(f"stride={self.stride}")
-        if self._orig_spill_reload != None:
+        if self._orig_spill_reload is not None:
             params.append(f"spill_reload={self.spill_reload}")
         if self.enable_scale_packing:
             params.append(f"enable_scale_packing={self.enable_scale_packing}")
-        if self._orig_lnc_2_shard_rhs != None:
+        if self._orig_lnc_2_shard_rhs is not None:
             params.append(f"lnc_2_shard_rhs={self.lnc_2_shard_rhs}")
 
         return f"TestConfig({', '.join(params)})"

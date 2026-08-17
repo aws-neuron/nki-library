@@ -27,6 +27,9 @@ from ..router_topk.router_topk_torch import router_topk_torch_ref
 from ..subkernels.rmsnorm_torch import rms_norm_torch_ref
 from ..utils.common_types import ExpertAffinityScaleMode, RouterActFnType
 
+# NKI dtype -> torch dtype for the low-precision router-matmul types (str(nl.bfloat16) == "bfloat16").
+_NL_TO_TORCH_DTYPE = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+
 
 def moe_block_tkg_torch_ref(
     inp: torch.Tensor,
@@ -92,9 +95,17 @@ def moe_block_tkg_torch_ref(
     rmsnorm_out = rmsnorm_out.to(dtype).reshape(T, H)
 
     # Step 2: Router TopK
+    # The kernel runs the router matmul on the bf16 (router_mm_dtype) RMSNorm
+    # activation. Round the router's view of rmsnorm_out to that dtype so a sub-ulp
+    # top-k logit tie breaks the same way as the kernel; the full-precision
+    # rmsnorm_out is still used for the MLP below.
     _, E = router_weights.shape
+    router_x = rmsnorm_out
+    router_torch_dtype = _NL_TO_TORCH_DTYPE.get(str(router_mm_dtype))
+    if router_torch_dtype is not None:
+        router_x = rmsnorm_out.to(router_torch_dtype).to(rmsnorm_out.dtype)
     router_outputs = router_topk_torch_ref(
-        x=rmsnorm_out,
+        x=router_x,
         w=router_weights,
         w_bias=router_bias,
         router_logits=torch.zeros(T, E, dtype=dtype),

@@ -14,7 +14,7 @@
 
 """LayerNorm subkernel optimized for token generation (TKG) inference with LNC sharding support."""
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import nki.isa as nisa
 import nki.language as nl
@@ -23,7 +23,6 @@ from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
 from ..utils.logging import get_logger
-from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
 from .norm_tkg_utils import (
     load_gamma_to_sbuf,
@@ -40,10 +39,10 @@ BxS_FULL_TILE_SIZE = 512
 
 
 def layernorm_tkg(
-    input: Union[TensorView, nl.ndarray],
-    gamma: Union[TensorView, nl.ndarray],
-    output: Union[TensorView, nl.ndarray],
-    beta: Optional[Union[TensorView, nl.ndarray]] = None,
+    input: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    output: nl.NkiTensor,
+    beta: Optional[nl.NkiTensor] = None,
     eps: float = 1e-6,
     shard_on_h: bool = False,
     use_heap_memory: bool = False,
@@ -63,17 +62,17 @@ def layernorm_tkg(
         H1: H // H0
 
     Args:
-        input (Union[TensorView, nl.ndarray]): [B, S, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor.
-        gamma (Union[TensorView, nl.ndarray]): [1, H], Gamma tensor used in normalization, in HBM.
-        output (Union[TensorView, nl.ndarray]): [H0, BxS, H1], Output tensor buffer.
-        beta (Optional[Union[TensorView, nl.ndarray]]): [1, H], Beta tensor used in normalization, in HBM.
+        input (nl.NkiTensor): [B, S, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor.
+        gamma (nl.NkiTensor): [1, H], Gamma tensor used in normalization, in HBM.
+        output (nl.NkiTensor): [H0, BxS, H1], Output tensor buffer.
+        beta (Optional[nl.NkiTensor]): [1, H], Beta tensor used in normalization, in HBM.
         eps (float): Epsilon to maintain numerical stability.
         shard_on_h (bool): If True, shard computation along H dimension instead of BxS.
         use_heap_memory (bool): Indicates whether to allocate memory on the heap instead of the stack.
         sbm (Optional[SbufManager]): Instance of SbufManager responsible for handling SBUF allocation.
 
     Returns:
-        output (Union[TensorView, nl.ndarray]): [H0, BxS, H1], Normalized output tensor.
+        output (nl.NkiTensor): [H0, BxS, H1], Normalized output tensor.
 
     Notes:
         - H must be divisible by 128 (partition dimension).
@@ -91,12 +90,12 @@ def layernorm_tkg(
         result = np.concatenate([t0, t1], axis=2)
     """
 
-    input_view = TensorView(input) if not isinstance(input, TensorView) else input
-    gamma_view = TensorView(gamma) if not isinstance(gamma, TensorView) else gamma
-    output_view = TensorView(output) if not isinstance(output, TensorView) else output
+    input_view = input
+    gamma_view = gamma
+    output_view = output
     beta_view = None
     if beta is not None:
-        beta_view = TensorView(beta) if not isinstance(beta, TensorView) else beta
+        beta_view = beta
 
     if not sbm:
         sbm = SbufManager(
@@ -131,17 +130,14 @@ def layernorm_tkg(
 
     sbm.close_scope()
 
-    if isinstance(output, TensorView):
-        return output_view
-    else:
-        return output
+    return output_view
 
 
 def _layernorm_tkg_shard_on_bxs(
-    input_view: TensorView,
-    gamma_view: TensorView,
-    output_view: TensorView,
-    beta_view: Optional[TensorView],
+    input_view: nl.NkiTensor,
+    gamma_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    beta_view: Optional[nl.NkiTensor],
     eps: float = 1e-6,
     use_heap_memory: bool = False,
     sbm: Optional[SbufManager] = None,
@@ -154,10 +150,10 @@ def _layernorm_tkg_shard_on_bxs(
     the output is in SBUF.
 
     Args:
-        input_view (TensorView): [B, S, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view.
-        gamma_view (TensorView): [1, H], Gamma tensor view.
-        output_view (TensorView): [H0, BxS, H1], Output tensor view.
-        beta_view (Optional[TensorView]): [1, H], Beta tensor view.
+        input_view (NkiTensor): [B, S, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view.
+        gamma_view (NkiTensor): [1, H], Gamma tensor view.
+        output_view (NkiTensor): [H0, BxS, H1], Output tensor view.
+        beta_view (Optional[nl.NkiTensor]): [1, H], Beta tensor view.
         eps (float): Epsilon for numerical stability.
         use_heap_memory (bool): If True, allocate on heap; otherwise on stack.
         sbm (Optional[SbufManager]): SBUF memory manager instance.
@@ -169,11 +165,11 @@ def _layernorm_tkg_shard_on_bxs(
 
     alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         output_sb_view = output_view
     else:
         output_sb = alloc_tensor((H0, BxS, H1), dtype=input_view.dtype, buffer=nl.sbuf, name="layernorm_output_sb")
-        output_sb_view = TensorView(output_sb)
+        output_sb_view = output_sb
 
     _, lnc, shard_id = get_verified_program_sharding_info("layernorm_tkg", (0, 1))
 
@@ -184,7 +180,7 @@ def _layernorm_tkg_shard_on_bxs(
 
     shard_size = BxS // num_shards
 
-    if not input_view.is_sbuf():
+    if not (input_view.buffer == nl.sbuf):
         input_view_flat = input_view.flatten_dims(start_dim=0, end_dim=1)
         input_view_sharded = input_view_flat.slice(dim=0, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
     else:
@@ -205,30 +201,30 @@ def _layernorm_tkg_shard_on_bxs(
         sbm=sbm,
     )
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         if do_shard:
             output_view_sharded_other_core = output_sb_view.slice(
                 dim=1, start=(1 - shard_id) * shard_size, end=(2 - shard_id) * shard_size
             )
             nisa.sendrecv(
-                dst=output_view_sharded_other_core.get_view(),
-                src=output_view_sharded.get_view(),
+                dst=output_view_sharded_other_core,
+                src=output_view_sharded,
                 send_to_rank=1 - shard_id,
                 recv_from_rank=1 - shard_id,
                 pipe_id=0,
             )
     else:
         output_hbm_view_sharded = output_view.slice(dim=1, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
-        nisa.dma_copy(dst=output_hbm_view_sharded.get_view(), src=output_view_sharded.get_view())
+        nisa.dma_copy(dst=output_hbm_view_sharded, src=output_view_sharded)
         if use_heap_memory:
             sbm.pop_heap()  # dealloc output_sb
 
 
 def _layernorm_tkg_shard_on_h(
-    input_view: TensorView,
-    gamma_view: TensorView,
-    output_view: TensorView,
-    beta_view: Optional[TensorView],
+    input_view: nl.NkiTensor,
+    gamma_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    beta_view: Optional[nl.NkiTensor],
     eps: float = 1e-6,
     use_heap_memory: bool = False,
     sbm: Optional[SbufManager] = None,
@@ -241,10 +237,10 @@ def _layernorm_tkg_shard_on_h(
     full statistics before normalization.
 
     Args:
-        input_view (TensorView): [B, S, H] when in HBM or [H0, BxS, sharded_H1] when in SBUF, Input tensor view.
-        gamma_view (TensorView): [1, H], Gamma tensor view.
-        output_view (TensorView): [H0, BxS, H1] or [H0, BxS, sharded_H1] if in SBUF, Output tensor view.
-        beta_view (Optional[TensorView]): [1, H], Beta tensor view.
+        input_view (NkiTensor): [B, S, H] when in HBM or [H0, BxS, sharded_H1] when in SBUF, Input tensor view.
+        gamma_view (NkiTensor): [1, H], Gamma tensor view.
+        output_view (NkiTensor): [H0, BxS, H1] or [H0, BxS, sharded_H1] if in SBUF, Output tensor view.
+        beta_view (Optional[nl.NkiTensor]): [1, H], Beta tensor view.
         eps (float): Epsilon for numerical stability.
         use_heap_memory (bool): If True, allocate on heap; otherwise on stack.
         sbm (Optional[SbufManager]): SBUF memory manager instance.
@@ -254,7 +250,7 @@ def _layernorm_tkg_shard_on_h(
     """
     BxS, H, H0, H1, shard_H, shard_H1 = validate_shapes_shard_on_h(input_view, gamma_view, output_view)
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         output_sb_view = output_view
     else:
         alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
@@ -264,13 +260,13 @@ def _layernorm_tkg_shard_on_h(
             buffer=nl.sbuf,
             name="layernorm_output_sb",
         )
-        output_sb_view = TensorView(output_sb)
+        output_sb_view = output_sb
 
     _, lnc, shard_id = get_verified_program_sharding_info("layernorm_tkg", (0, 1))
 
     # Shard input and gamma along H dimension
     input_view_sharded = input_view
-    if not input_view.is_sbuf():
+    if not (input_view.buffer == nl.sbuf):
         input_view_flat = input_view.flatten_dims(start_dim=0, end_dim=1)
         input_view_sharded = input_view_flat.slice(dim=1, start=shard_id * shard_H, end=(shard_id + 1) * shard_H)
 
@@ -293,21 +289,21 @@ def _layernorm_tkg_shard_on_h(
         sbm=sbm,
     )
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         output_view = output_sb_view
     else:
         output_hbm_view_sharded = output_view.slice(dim=2, start=shard_id * shard_H1, end=(shard_id + 1) * shard_H1)
-        nisa.dma_copy(dst=output_hbm_view_sharded.get_view(), src=output_sb_view.get_view())
+        nisa.dma_copy(dst=output_hbm_view_sharded, src=output_sb_view)
 
 
 def _process_layernorm_tile(
-    input_sb_view: TensorView,
-    gamma_sb_view: TensorView,
-    output_sb_view: TensorView,
-    beta_sb_view: Optional[TensorView],
-    zero_bias_view: TensorView,
-    eps_view: TensorView,
-    matmul_reduction_const_view: TensorView,
+    input_sb_view: nl.NkiTensor,
+    gamma_sb_view: nl.NkiTensor,
+    output_sb_view: nl.NkiTensor,
+    beta_sb_view: Optional[nl.NkiTensor],
+    zero_bias_view: nl.NkiTensor,
+    eps_view: nl.NkiTensor,
+    matmul_reduction_const_view: nl.NkiTensor,
     bxs_tile: Tuple,
     hidden_actual: int,
     shard_on_h: bool,
@@ -321,13 +317,13 @@ def _process_layernorm_tile(
     where var = E[X^2] - E[X]^2.
 
     Args:
-        input_sb_view (TensorView): [H0, BxS_tile, H1], Input tensor tile in SBUF.
-        gamma_sb_view (TensorView): [H0, BxS_tile, H1], Gamma tensor view in SBUF (broadcasted).
-        output_sb_view (TensorView): [H0, BxS_tile, H1], Output tensor tile in SBUF.
-        beta_sb_view (Optional[TensorView]): [H0, BxS_tile, H1], Beta tensor view in SBUF (broadcasted).
-        zero_bias_view (TensorView): [H0, 1], Zero bias for activation ops.
-        eps_view (TensorView): [H0, 1], Epsilon value for numerical stability.
-        matmul_reduction_const_view (TensorView): [H0, H0], Constant matrix for reduction (1/H).
+        input_sb_view (NkiTensor): [H0, BxS_tile, H1], Input tensor tile in SBUF.
+        gamma_sb_view (NkiTensor): [H0, BxS_tile, H1], Gamma tensor view in SBUF (broadcasted).
+        output_sb_view (NkiTensor): [H0, BxS_tile, H1], Output tensor tile in SBUF.
+        beta_sb_view (Optional[nl.NkiTensor]): [H0, BxS_tile, H1], Beta tensor view in SBUF (broadcasted).
+        zero_bias_view (NkiTensor): [H0, 1], Zero bias for activation ops.
+        eps_view (NkiTensor): [H0, 1], Epsilon value for numerical stability.
+        matmul_reduction_const_view (NkiTensor): [H0, H0], Constant matrix for reduction (1/H).
         bxs_tile (Tuple): Tile information containing index and size.
         hidden_actual (int): Actual hidden dimension size for mean calculation.
         shard_on_h (bool): If True, exchange partial sums between cores.
@@ -362,8 +358,8 @@ def _process_layernorm_tile(
     nisa.activation(
         dst=input_squared_sb[...],
         op=nl.square,
-        data=input_sb_view.get_view(),
-        bias=zero_bias_view.get_view(),
+        data=input_sb_view,
+        bias=zero_bias_view,
     )
 
     # Pack sum(x) and sum(x^2) into [H0, BxS*2] for a single sendrecv
@@ -376,12 +372,12 @@ def _process_layernorm_tile(
     num_allocated_tensor += 1
 
     # Reduce squares along H1 dimension
-    reduced_input_squared_view = TensorView(packed_reduced_sum_tensor).slice(dim=1, start=0, end=BxS)
-    nisa.tensor_reduce(dst=reduced_input_squared_view.get_view(), op=nl.add, data=input_squared_sb[...], axis=2)
+    reduced_input_squared_view = packed_reduced_sum_tensor.slice(dim=1, start=0, end=BxS)
+    nisa.tensor_reduce(dst=reduced_input_squared_view, op=nl.add, data=input_squared_sb[...], axis=2)
 
     # Step 2: Compute mean(x)
-    reduced_input_view = TensorView(packed_reduced_sum_tensor).slice(dim=1, start=BxS, end=BxS * 2)
-    nisa.tensor_reduce(dst=reduced_input_view.get_view(), op=nl.add, data=input_sb_view.get_view(), axis=2)
+    reduced_input_view = packed_reduced_sum_tensor.slice(dim=1, start=BxS, end=BxS * 2)
+    nisa.tensor_reduce(dst=reduced_input_view, op=nl.add, data=input_sb_view, axis=2)
 
     if shard_on_h:
         _, _, shard_id = get_verified_program_sharding_info("layernorm_tkg", (0, 1))
@@ -425,69 +421,69 @@ def _process_layernorm_tile(
     # Complete mean(x^2) via matmul with 1/H constant
     nisa.nc_matmul(
         dst=input_squared_mean,
-        stationary=matmul_reduction_const_view.get_view(),
-        moving=reduced_input_squared_view.get_view(),
+        stationary=matmul_reduction_const_view,
+        moving=reduced_input_squared_view,
     )
 
     # Complete mean(x) via matmul with 1/H constant
     nisa.nc_matmul(
         dst=input_mean,
-        stationary=matmul_reduction_const_view.get_view(),
-        moving=reduced_input_view.get_view(),
+        stationary=matmul_reduction_const_view,
+        moving=reduced_input_view,
     )
 
     # Step 3: Center input by subtracting mean = X - E[x]
-    input_mean_broadcast = TensorView(input_mean).expand_dim(dim=2).broadcast(dim=2, size=H1)
+    input_mean_broadcast = input_mean.expand_dim(dim=2).broadcast(dim=2, size=H1)
     nisa.tensor_tensor(
-        output_sb_view.get_view(),
-        input_sb_view.get_view(),
-        input_mean_broadcast.get_view(),
+        output_sb_view,
+        input_sb_view,
+        input_mean_broadcast,
         nl.subtract,
     )
 
     # Step 4: Compute variance = E[X^2] - E[X]^2
     # reuse reduced_input_view, reduced_input_squared_view
     nisa.activation(
-        dst=reduced_input_squared_view.get_view(),
+        dst=reduced_input_squared_view,
         op=nl.square,
         data=input_mean[...],
-        bias=zero_bias_view.get_view(),
+        bias=zero_bias_view,
     )
     nisa.tensor_tensor(
-        reduced_input_view.get_view(),
+        reduced_input_view,
         input_squared_mean[...],
-        reduced_input_squared_view.get_view(),
+        reduced_input_squared_view,
         nl.subtract,
     )
     var_view = reduced_input_view
 
     # Step 5: Compute 1/sqrt(var + eps)
     rsqrt_view = reduced_input_squared_view
-    nisa.activation(dst=rsqrt_view.get_view(), op=nl.rsqrt, data=var_view.get_view(), bias=eps_view.get_view())
+    nisa.activation(dst=rsqrt_view, op=nl.rsqrt, data=var_view, bias=eps_view)
 
     # Step 6: Apply gamma scaling
     nisa.tensor_tensor(
-        output_sb_view.get_view(),
-        output_sb_view.get_view(),
-        gamma_sb_view.get_view(),
+        output_sb_view,
+        output_sb_view,
+        gamma_sb_view,
         nl.multiply,
     )
 
     # Step 7: Normalize centered input
     rsqrt_broadcast = rsqrt_view.expand_dim(dim=2).broadcast(dim=2, size=H1)
     nisa.tensor_tensor(
-        output_sb_view.get_view(),
-        output_sb_view.get_view(),
-        rsqrt_broadcast.get_view(),
+        output_sb_view,
+        output_sb_view,
+        rsqrt_broadcast,
         nl.multiply,
     )
 
     # Step 8: Apply beta bias if present
     if beta_sb_view is not None:
         nisa.tensor_tensor(
-            output_sb_view.get_view(),
-            output_sb_view.get_view(),
-            beta_sb_view.get_view(),
+            output_sb_view,
+            output_sb_view,
+            beta_sb_view,
             nl.add,
         )
 
@@ -499,10 +495,10 @@ def _process_layernorm_tile(
 
 
 def _layernorm_tkg_impl(
-    input: TensorView,
-    gamma: TensorView,
-    beta: Optional[TensorView],
-    output: TensorView,
+    input: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    beta: Optional[nl.NkiTensor],
+    output: nl.NkiTensor,
     num_H_shards: int,
     hidden_actual: int,
     eps: float,
@@ -517,10 +513,10 @@ def _layernorm_tkg_impl(
     and LayerNorm is computed tile-by-tile along the BxS dimension.
 
     Args:
-        input (TensorView): [BxS, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view.
-        gamma (TensorView): [1, H], Gamma tensor view.
-        beta (Optional[TensorView]): [1, H], Beta tensor view.
-        output (TensorView): [H0, BxS, H1], Output tensor view in SBUF.
+        input (NkiTensor): [BxS, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view.
+        gamma (NkiTensor): [1, H], Gamma tensor view.
+        beta (Optional[nl.NkiTensor]): [1, H], Beta tensor view.
+        output (NkiTensor): [H0, BxS, H1], Output tensor view in SBUF.
         num_H_shards (int): Number of shards along H dimension.
         hidden_actual (int): Actual hidden dimension size for mean calculation.
         eps (float): Epsilon for numerical stability.
@@ -538,7 +534,7 @@ def _layernorm_tkg_impl(
         - LayerNorm performed on combined [H0, lnc, H1//lnc] dimension.
     """
 
-    if input.is_sbuf():
+    if input.buffer == nl.sbuf:
         H0, BxS, H1 = input.shape
         H = H0 * H1
     else:
@@ -553,7 +549,7 @@ def _layernorm_tkg_impl(
     num_allocated_tensor = 0
 
     # Load input, reuse output buffer
-    if input.is_sbuf():
+    if input.buffer == nl.sbuf:
         input_sb_view = input
     else:
         input_sb_view = load_input_to_sbuf(
@@ -570,7 +566,7 @@ def _layernorm_tkg_impl(
     num_allocated_tensor += 1
     gamma_sb_view = load_gamma_to_sbuf(
         gamma_hbm=gamma,
-        gamma_sb=TensorView(gamma_sb),
+        gamma_sb=gamma_sb,
         num_H_shards=num_H_shards,
         hidden_dim_tp=False,
         shard_on_h=shard_on_h,
@@ -583,7 +579,7 @@ def _layernorm_tkg_impl(
         num_allocated_tensor += 1
         beta_sb_view = load_gamma_to_sbuf(
             gamma_hbm=beta,
-            gamma_sb=TensorView(beta_sb),
+            gamma_sb=beta_sb,
             num_H_shards=num_H_shards,
             hidden_dim_tp=False,
             shard_on_h=shard_on_h,
@@ -621,9 +617,9 @@ def _layernorm_tkg_impl(
             gamma_sb_view=gamma_sb_view_tile,
             output_sb_view=output_sb_view_tile,
             beta_sb_view=beta_sb_view_tile,
-            zero_bias_view=TensorView(zero_bias),
-            eps_view=TensorView(eps_sb),
-            matmul_reduction_const_view=TensorView(matmul_reduction_const),
+            zero_bias_view=zero_bias,
+            eps_view=eps_sb,
+            matmul_reduction_const_view=matmul_reduction_const,
             bxs_tile=bxs_tile,
             hidden_actual=hidden_actual,
             shard_on_h=shard_on_h,

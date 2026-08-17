@@ -32,7 +32,7 @@ from ...quantization.fp8_quantize import pre_combine_dequant_scales
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, _psum_alloc, _sbm_alloc, div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
+from ...utils.tensor_view import as_nki_tensor
 from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
@@ -44,7 +44,7 @@ from .projection_mx_constants import (
 
 
 def _alloc_down_weight_sb(
-    down_weights: nl.ndarray,
+    down_weights: nl.NkiTensor,
     n_I512_tile: int,
     H_shard: int,
 ) -> list:
@@ -56,7 +56,7 @@ def _alloc_down_weight_sb(
     :param H_shard: Sharded hidden dimension size.
     :return: List (size=2) of SBUF tensors, each [_pmax, n_I512_tile, H_shard] @ SB (uninitialized).
     """
-    base_dtype = TensorView(down_weights).base_tensor.dtype
+    base_dtype = down_weights.dtype
     weights_n_buff = []
     for _ in range(2):
         weights_n_buff.append(nl.ndarray((_pmax, n_I512_tile, H_shard), dtype=base_dtype, buffer=nl.sbuf))
@@ -64,14 +64,14 @@ def _alloc_down_weight_sb(
 
 
 def _load_down_weight(
-    weight_sb: nl.ndarray,
-    down_weights: nl.ndarray,
-    expert_scalar: nl.ndarray,
+    weight_sb: nl.NkiTensor,
+    down_weights: nl.NkiTensor,
+    expert_scalar: nl.NkiTensor,
     p_I: int,
     n_I512_tile: int,
     H_offset: int,
     H_shard: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Load down projection weight from HBM into a pre-allocated SBUF buffer.
 
@@ -87,14 +87,12 @@ def _load_down_weight(
     if p_I != _pmax:
         nisa.memset(dst=weight_sb[:, n_I512_tile - 1, :], value=0)
 
-    down_weights_view = (
-        TensorView(TensorView(down_weights).base_tensor)
-        .select(dim=0, index=expert_scalar)
-        .slice(dim=2, start=H_offset, end=H_offset + H_shard)
+    down_weights_view = down_weights.select(dim=0, index=expert_scalar).slice(
+        dim=2, start=H_offset, end=H_offset + H_shard
     )
     nisa.dma_copy(
         dst=weight_sb[:p_I, :, :],
-        src=down_weights_view.get_view(),
+        src=as_nki_tensor(down_weights_view),
         dge_mode=nisa.dge_mode.hwdge,
     )
     return weight_sb.view(down_weights.dtype)
@@ -118,9 +116,9 @@ def _alloc_down_scale_sb(
 
 
 def _load_down_scale(
-    down_scale_sb: nl.ndarray,
-    down_w_scale: nl.ndarray,
-    p_idx_vector: nl.ndarray,
+    down_scale_sb: nl.NkiTensor,
+    down_w_scale: nl.NkiTensor,
+    p_idx_vector: nl.NkiTensor,
     n_I512_tile: int,
     H_shard: int,
     H_offset: int,
@@ -153,13 +151,13 @@ def _load_down_scale(
 
 
 def _down_proj_prep_inter_and_weights(
-    inter_sb: nl.ndarray,
-    weight: nl.ndarray,
-    weight_scale: nl.ndarray,
+    inter_sb: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
     cfg: ProjConfig,
     sbm=None,
     name_prefix: str = None,
-) -> tuple[nl.ndarray, nl.ndarray, nl.ndarray, nl.ndarray]:
+) -> tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     Prep intermediate and weights for down projection:
         - for intermediate, reshape and quantize (and reshape back);
@@ -277,18 +275,18 @@ def _down_proj_prep_inter_and_weights(
 
 
 def down_projection_mx_tp_shard_H(
-    inter_sb: nl.ndarray,
-    weight: nl.ndarray,
-    weight_scale: nl.ndarray,
-    bias_sb: Optional[nl.ndarray],
+    inter_sb: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
+    bias_sb: Optional[nl.NkiTensor],
     cfg: ProjConfig,
     partial_output: bool = False,
     pre_quantized: bool = False,
-    pre_quantized_scale: Optional[nl.ndarray] = None,
+    pre_quantized_scale: Optional[nl.NkiTensor] = None,
     w_dequant_scale=None,
     input_dequant_scale=None,
     name_prefix: str = None,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Performs the Down projection with H-dimension sharding. Math (Neuron matmul):
         inter_sb (moving) [I, BxS] @ weight (stationary) [I, H] → [H, BxS].
@@ -322,10 +320,10 @@ def down_projection_mx_tp_shard_H(
     if pre_quantized:
         # ── STATIC_MX/ROW_MX path: intermediate already quantized, use dummy scales ──
         kernel_assert(pre_quantized_scale is not None, "pre_quantized_scale required when pre_quantized=True")
-        inter_qtz_tv = inter_sb if isinstance(inter_sb, TensorView) else TensorView(inter_sb)
+        inter_qtz_tv = inter_sb if isinstance(inter_sb, nl.NkiTensor) else inter_sb
         inter_qtz_scale = pre_quantized_scale  # Dummy uint8[_pmax, n_I512_tile, BxS] all-127
 
-        weight_base = TensorView(weight).base_tensor if isinstance(weight, TensorView) else weight
+        weight_base = weight if isinstance(weight, nl.NkiTensor) else weight
         if weight_base.buffer == nl.sbuf:
             # Weight already in SBUF
             weight_qtz = weight_base
@@ -353,8 +351,8 @@ def down_projection_mx_tp_shard_H(
         inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale = _down_proj_prep_inter_and_weights(
             inter_sb, weight, weight_scale, cfg, name_prefix=name_prefix
         )
-        # Wrap in TensorView for consistent access in the matmul loop (inter_qtz_tv.slice)
-        inter_qtz_tv = TensorView(inter_qtz)
+        # Wrap in nl.NkiTensor for consistent access in the matmul loop (inter_qtz_tv.slice)
+        inter_qtz_tv = inter_qtz
     if cfg.dbg_weight:
         return weight_qtz, weight_qtz_scale
 
@@ -372,7 +370,7 @@ def down_projection_mx_tp_shard_H(
             nisa.nc_matmul_mx(
                 dst=h128_psum,
                 stationary=weight_qtz[:, i_I512_tile, i_H1 * _pmax : (i_H1 + 1) * _pmax],
-                moving=inter_qtz_tv.slice(1, i_I512_tile, i_I512_tile + 1).get_view(),
+                moving=inter_qtz_tv.slice(1, i_I512_tile, i_I512_tile + 1),
                 stationary_scale=weight_qtz_scale[:, i_I512_tile, i_H1 * _pmax : (i_H1 + 1) * _pmax],
                 moving_scale=inter_qtz_scale[:, i_I512_tile, :],
             )
@@ -429,14 +427,14 @@ def down_projection_mx_tp_shard_H(
             if input_dequant_scale is not None:
                 # Broadcast input_dequant_scale [_pmax, BxS] across H1 dim to avoid per-H1 loop
                 scale_broadcast = (
-                    TensorView(input_dequant_scale[:, : cfg.BxS, 0])
+                    (input_dequant_scale[:, : cfg.BxS, 0])
                     .reshape_dim(dim=1, shape=(1, cfg.BxS))
                     .broadcast(dim=1, size=H1_out)
                 )
                 nisa.tensor_tensor(
                     dst=out_sb[:, :H1_out, :],
                     data1=out_sb[:, :H1_out, :],
-                    data2=scale_broadcast.get_view(),
+                    data2=scale_broadcast,
                     op=nl.multiply,
                 )
 
@@ -457,16 +455,16 @@ def down_projection_mx_tp_shard_H(
 
 
 def down_projection_mx_shard_H(
-    inter_sb: nl.ndarray,
-    weight: nl.ndarray,
-    weight_scale: nl.ndarray,
-    bias_sb: nl.ndarray,
+    inter_sb: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
+    bias_sb: nl.NkiTensor,
     cfg: ProjConfig,
     sbm=None,
     psum_bank_offset: int = 0,
     name_prefix: str = None,
     out_sb=None,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Perform down projection with MXFP quantization.
 
@@ -475,17 +473,17 @@ def down_projection_mx_shard_H(
     by tiling the BxS dimension.
 
     Args:
-        inter_sb (nl.ndarray): Intermediate activations of shape [128, n_I512_tile, BxS, 4]
+        inter_sb (nl.NkiTensor): Intermediate activations of shape [128, n_I512_tile, BxS, 4]
             in SBUF with I dimension shuffled on 128 partitions, bf16 type.
-        weight (nl.ndarray): Quantized weights of shape [128, ceil(I/512), H] in HBM,
+        weight (nl.NkiTensor): Quantized weights of shape [128, ceil(I/512), H] in HBM,
             mxfp_x4 type (supports MXFP4/MXFP8), zero-padded.
-        weight_scale (nl.ndarray): Weight scales of shape [128//8, ceil(I/512), H] in HBM,
+        weight_scale (nl.NkiTensor): Weight scales of shape [128//8, ceil(I/512), H] in HBM,
             uint8 type, zero-padded.
-        bias_sb (nl.ndarray): Optional bias of shape [1, H_sharded] in SBUF, bf16 type.
+        bias_sb (nl.NkiTensor): Optional bias of shape [1, H_sharded] in SBUF, bf16 type.
         cfg (ProjConfig): Projection configuration with H, I, BxS, sharding info.
 
     Returns:
-        output (nl.ndarray): Down projection result of shape [128, ceil(BxS/128), H] in SBUF,
+        output (nl.NkiTensor): Down projection result of shape [128, ceil(BxS/128), H] in SBUF,
             bf16 type. Note: end of last tile contains garbage when BxS % 128 != 0.
 
     Notes:

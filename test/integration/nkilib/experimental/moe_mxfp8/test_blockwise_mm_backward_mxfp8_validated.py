@@ -21,15 +21,12 @@ allclose with scaled atol) matching the MLP MXFP8 pattern.
 import functools
 import math
 from dataclasses import dataclass
-from typing import Any, final
+from typing import final
 
 import nki.language as nl
 import numpy as np
-import numpy.typing as npt
 import pytest
 import torch
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import MatmulMxfp8KernelConfig
 from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import (
     L_TILE_K,
@@ -41,8 +38,25 @@ from nkilib_src.nkilib.experimental.moe_mxfp8.bwd.blockwise_mm_backward_mxfp8 im
 from nkilib_src.nkilib.experimental.moe_mxfp8.bwd.blockwise_mm_backward_mxfp8_torch import (
     blockwise_mm_bwd_mxfp8_torch_ref,
 )
+
 from test.integration.nkilib.experimental.moe_mxfp8.mxfp8_moe_bwd_test_utils import (
     build_mxfp8_moe_bwd_inputs,
+)
+
+# Shared fwd/bwd validated-suite helpers: correctness check, comparator factory,
+# param-marking, abbreviations. See mxfp8_moe_validated_common.
+from test.integration.nkilib.experimental.moe_mxfp8.mxfp8_moe_validated_common import (
+    ABBREVS as _ABBREVS,
+)
+from test.integration.nkilib.experimental.moe_mxfp8.mxfp8_moe_validated_common import (
+    PARAM_NAMES,
+    make_moe_validated_comparator,
+)
+from test.integration.nkilib.experimental.moe_mxfp8.mxfp8_moe_validated_common import (
+    build_params as _build_params_common,
+)
+from test.integration.nkilib.experimental.moe_mxfp8.mxfp8_moe_validated_common import (
+    clamp_tiles as _clamp_tiles,
 )
 from test.utils import common_dataclasses
 from test.utils.pytest_parametrize import pytest_parametrize
@@ -53,7 +67,7 @@ from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 bfloat16 = nl.bfloat16
 
 # ============================================================================
-# Blocking params helper
+# Blocking params helper (backward-specific: 4 phases)
 # ============================================================================
 
 
@@ -65,11 +79,6 @@ class BlockingParams:
     phase2: MatmulMxfp8KernelConfig
     phase3: MatmulMxfp8KernelConfig
     phase4: MatmulMxfp8KernelConfig
-
-
-def _clamp_tiles(desired: int, num_tiles: int) -> int:
-    """Clamp TILES_IN_BLOCK to not exceed available tiles, minimum 1."""
-    return max(1, min(desired, num_tiles))
 
 
 def _compute_blocking_params(
@@ -155,121 +164,15 @@ def _compute_blocking_params(
     return BlockingParams(phase1=phase1, phase2=phase2, phase3=phase3, phase4=phase4)
 
 
-# ============================================================================
-# Correctness thresholds (same as MLP MXFP8 checkpoint tests)
-# ============================================================================
-
-MXFP8_ATOL_GOLDEN_ABSMAX_PERCENTAGE_TOLERANCE = 0.5
-MXFP8_COSINE_SIMILARITY_THRESHOLD = 0.99
-MXFP8_NORMALIZED_EUCLIDEAN_THRESHOLD = 0.70
-NUMERICAL_STABILITY_EPSILON = 1e-12
-DEFAULT_RTOL = 1e-3
+# The three-metric MXFP8 comparator is shared with the forward suite.
+_moe_bwd_comparator = make_moe_validated_comparator
 
 
 # ============================================================================
-# Correctness utilities
-# ============================================================================
-
-
-def cosine_sim(a: npt.NDArray, b: npt.NDArray) -> float:
-    """Cosine similarity between two flattened arrays."""
-    a_flat = a.flatten().astype(np.float32)
-    b_flat = b.flatten().astype(np.float32)
-    dot = np.dot(a_flat, b_flat)
-    return dot / (np.linalg.norm(a_flat) * np.linalg.norm(b_flat) + NUMERICAL_STABILITY_EPSILON)
-
-
-def check_correctness(kernel_result: npt.NDArray, golden_result: npt.NDArray, rtol: float = DEFAULT_RTOL) -> tuple:
-    """Compare kernel output to golden using three-metric MXFP8 criteria.
-
-    Returns (passed, metrics_dict).
-    """
-    k_flat = kernel_result.flatten().astype(np.float32)
-    g_flat = golden_result.flatten().astype(np.float32)
-
-    cos = cosine_sim(k_flat, g_flat)
-    norm_sum = np.linalg.norm(k_flat) + np.linalg.norm(g_flat) + NUMERICAL_STABILITY_EPSILON
-    euclid = np.linalg.norm(k_flat - g_flat) / norm_sum
-    is_close = np.allclose(
-        k_flat,
-        g_flat,
-        atol=np.abs(g_flat).max() * MXFP8_ATOL_GOLDEN_ABSMAX_PERCENTAGE_TOLERANCE,
-        rtol=rtol,
-    )
-    cos_ok = cos >= MXFP8_COSINE_SIMILARITY_THRESHOLD
-    euclid_ok = euclid <= MXFP8_NORMALIZED_EUCLIDEAN_THRESHOLD
-    passed = is_close and cos_ok and euclid_ok
-
-    abs_diff = np.abs(k_flat - g_flat)
-    max_abs_idx = int(np.argmax(abs_diff))
-    max_abs_loc = np.unravel_index(max_abs_idx, kernel_result.shape)
-
-    return passed, {
-        "cosine_similarity": float(cos),
-        "normalized_euclidean_distance": float(euclid),
-        "all_close": is_close,
-        "max_abs_diff": float(abs_diff[max_abs_idx]),
-        "max_abs_loc": max_abs_loc,
-        "max_abs_kernel": float(k_flat[max_abs_idx]),
-        "max_abs_golden": float(g_flat[max_abs_idx]),
-        "atol_used": float(np.abs(g_flat).max() * MXFP8_ATOL_GOLDEN_ABSMAX_PERCENTAGE_TOLERANCE),
-    }
-
-
-# ============================================================================
-# Custom comparator for MXFP8 MoE backward validation
-# ============================================================================
-
-
-def _moe_bwd_comparator(output_shapes):
-    """Create a custom_comparator closure for MoE backward tests.
-
-    Args:
-        output_shapes: dict mapping output names to (shape, kernel_dtype) tuples.
-            kernel_dtype is the actual dtype the kernel writes (bfloat16), which may
-            differ from the golden's dtype (float32 from torch_ref_wrapper).
-    """
-
-    def comparator(golden_dict, output_tensors):
-        result = {}
-        for name, golden in golden_dict.items():
-            shape, kernel_dtype = output_shapes[name]
-
-            class _MoeBwdValidator(common_dataclasses.CustomValidator):
-                _golden = golden
-                _label = name
-
-                @override
-                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
-                    """Validate backward output against golden reference."""
-                    reshaped = inference_output.view(dtype=kernel_dtype).astype(np.float32).reshape(self._golden.shape)
-                    golden_f32 = self._golden.astype(np.float32)
-                    if np.linalg.norm(reshaped) == 0 and np.linalg.norm(golden_f32) == 0:
-                        return True
-                    passed, metrics = check_correctness(reshaped, golden_f32)
-                    if not passed:
-                        self._print_with_log(f"[{self._label}] Validation FAILED")
-                        self._print_with_log(f"  metrics: {metrics}")
-                        self._print_with_log(f"  kernel[0,:5]: {reshaped.flatten()[:5]}")
-                        self._print_with_log(f"  golden[0,:5]: {golden_f32.flatten()[:5]}")
-                    return passed
-
-            result[name] = common_dataclasses.CustomValidatorWithOutputTensorData(
-                validator=_MoeBwdValidator,
-                output_ndarray=np.ndarray(shape, dtype=kernel_dtype),
-            )
-        return result
-
-    return comparator
-
-
-# ============================================================================
-# Test parameter grid
+# Test parameter grid  (PARAM_NAMES + ABBREVS are imported from the shared module)
 # ============================================================================
 
 # fmt: off
-PARAM_NAMES = "hidden, tokens, expert, block_size, top_k, intermediate"
-
 # Per-method fast keys: only the (config, method) pairs that add unique
 # branch coverage in the kernel source. Reuses the same shape as TEST_PARAMS
 # (H, T, E, B, TOPK, I_TP).
@@ -348,35 +251,25 @@ BLOCKING_TEST_PARAMS = [
 # fmt: on
 
 
+# ============================================================================
+# Large-T blocking test params
+# Same [H, T, E, B, TOPK, I_TP, tiles_m, tiles_n, tiles_k] format as
+# BLOCKING_TEST_PARAMS, isolated here because the large token count makes these
+# substantially heavier than the standard blocking sweep.
+# ============================================================================
+
+# fmt: off
+LARGE_T_BLOCKING_TEST_PARAMS = [
+    # H,    T,      E,  B,    TOPK, I_TP,  tm, tn, tk
+    # H=4096, I_TP=384, T=65536: max tiles 8 in M/N/K
+    [4096, 65536, 2,  512,  2,    384,    8,  8,  8],  # P1(1,1,8) P2(1,4,2) P3(1,4,1) P4(4,1,1)
+]
+# fmt: on
+
+
 def _build_params(params_list, fast_keys=None):
-    """Build pytest params with fast, xfail, and skip marks applied.
-
-    fast_keys is a per-method set of TEST_PARAMS tuples that should get
-    pytest.mark.fast for that method.
-    """
-    fast_keys = fast_keys or set()
-    result = []
-    for c in params_list:
-        key = tuple(c)
-        marks = []
-        if key in fast_keys:
-            marks.append(pytest.mark.fast)
-        if key in SKIP_PARAMS:
-            marks.append(pytest.mark.skip(reason=SKIP_PARAMS[key]))
-        elif key in XFAIL_PARAMS:
-            marks.append(pytest.mark.xfail(reason=XFAIL_PARAMS[key], strict=False))
-        result.append(pytest.param(*c, marks=marks) if marks else c)
-    return result
-
-
-_ABBREVS = {
-    "hidden": "hid",
-    "tokens": "tok",
-    "expert": "exp",
-    "block_size": "bs",
-    "top_k": "k",
-    "intermediate": "int",
-}
+    """Build pytest params with this suite's fast/xfail/skip dicts applied."""
+    return _build_params_common(params_list, fast_keys=fast_keys, skip_params=SKIP_PARAMS, xfail_params=XFAIL_PARAMS)
 
 
 def _generate_sweep_params(shapes, num_configs_per_shape, seed=42):
@@ -388,7 +281,7 @@ def _generate_sweep_params(shapes, num_configs_per_shape, seed=42):
         H, T, E, B, top_k, I_TP = shape
         rng = random.Random(seed ^ hash(tuple(shape)))
 
-        for i in range(num_configs_per_shape):
+        for _i in range(num_configs_per_shape):
             spill_reload = rng.choice([True, False])
             use_scale_packing = rng.choice([True, False])
             bias = rng.choice([True, False])
@@ -435,14 +328,14 @@ def _generate_sweep_params(shapes, num_configs_per_shape, seed=42):
                     B,
                     top_k,
                     I_TP,
-                    dict(
-                        spill_reload=spill_reload,
-                        use_scale_packing=use_scale_packing,
-                        bias=bias,
-                        prequantize_weights=prequantize_weights,
-                        clamp_limits=clamp_limits,
-                        blocking_params=blocking,
-                    ),
+                    {
+                        "spill_reload": spill_reload,
+                        "use_scale_packing": use_scale_packing,
+                        "bias": bias,
+                        "prequantize_weights": prequantize_weights,
+                        "clamp_limits": clamp_limits,
+                        "blocking_params": blocking,
+                    },
                     id=test_id,
                 )
             )
@@ -484,21 +377,21 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
         I_TP = intermediate
         E = expert
 
-        build_kwargs = dict(
-            tokens=T,
-            hidden=H,
-            intermediate=I_TP,
-            expert=E,
-            block_size=block_size,
-            top_k=top_k,
-            run_with_lnc2=run_with_lnc2,
-            blocking_params=blocking_params,
-            spill_reload=spill_reload,
-            use_scale_packing=use_scale_packing,
-            prequantize_weights=prequantize_weights,
-            bias=bias,
-            clamp_limits=clamp_limits,
-        )
+        build_kwargs = {
+            "tokens": T,
+            "hidden": H,
+            "intermediate": I_TP,
+            "expert": E,
+            "block_size": block_size,
+            "top_k": top_k,
+            "run_with_lnc2": run_with_lnc2,
+            "blocking_params": blocking_params,
+            "spill_reload": spill_reload,
+            "use_scale_packing": use_scale_packing,
+            "prequantize_weights": prequantize_weights,
+            "bias": bias,
+            "clamp_limits": clamp_limits,
+        }
 
         if prequantize_weights:
             kernel_inputs, orig_gate_up_weight, orig_down_weight = build_mxfp8_moe_bwd_inputs(**build_kwargs)
@@ -509,10 +402,15 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
                 kwargs["down_proj_weight"] = torch.from_numpy(orig_down_weight.astype(np.float32))
                 return blockwise_mm_bwd_mxfp8_torch_ref(**kwargs)
 
-            input_gen = lambda _: kernel_inputs
+            def input_gen(_):
+                return kernel_inputs
+
             torch_ref = torch_ref_wrapper(_pq_torch_ref)
         else:
-            input_gen = lambda _: build_mxfp8_moe_bwd_inputs(**build_kwargs)
+
+            def input_gen(_):
+                return build_mxfp8_moe_bwd_inputs(**build_kwargs)
+
             torch_ref = torch_ref_wrapper(blockwise_mm_bwd_mxfp8_torch_ref)
 
         output_shapes = {
@@ -541,6 +439,9 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
             compiler_args=common_dataclasses.CompilerArgs(
                 logical_nc_config=lnc_count,
                 platform_target=platform_target,
+                additional_cmd_args=[
+                    "--internal-backend-options=--skip-pass=address_rotation_sb --skip-pass=address_rotation_psum"
+                ],
             ),
             custom_comparator=_moe_bwd_comparator(output_shapes),
         )
@@ -577,22 +478,22 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
     # fmt: on
 
     _FEATURE_CONFIGS = [
-        pytest.param(dict(), id="baseline"),
-        pytest.param(dict(use_scale_packing=True), id="scale_packing"),
-        pytest.param(dict(spill_reload=True), id="spill_reload"),
-        pytest.param(dict(bias=True), id="bias"),
+        pytest.param({}, id="baseline"),
+        pytest.param({"use_scale_packing": True}, id="scale_packing"),
+        pytest.param({"spill_reload": True}, id="spill_reload"),
+        pytest.param({"bias": True}, id="bias"),
         pytest.param(
-            dict(
-                clamp_limits=ClampLimits(
+            {
+                "clamp_limits": ClampLimits(
                     non_linear_clamp_upper_limit=1.0,
                     non_linear_clamp_lower_limit=-1.0,
                     linear_clamp_upper_limit=0.5,
                     linear_clamp_lower_limit=-0.5,
                 )
-            ),
+            },
             id="clamp",
         ),
-        pytest.param(dict(prequantize_weights=True, use_scale_packing=True, spill_reload=True), id="prequantized"),
+        pytest.param({"prequantize_weights": True, "use_scale_packing": True, "spill_reload": True}, id="prequantized"),
     ]
 
     @pytest_parametrize(PARAM_NAMES, _build_params(_ALL_FEATURES, _FAST_KEYS_BWD_VALIDATED), abbrevs=_ABBREVS)
@@ -609,7 +510,7 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
         intermediate: int,
         feature_kwargs: dict,
     ):
-        defaults = dict(spill_reload=False, use_scale_packing=False)
+        defaults = {"spill_reload": False, "use_scale_packing": False}
         defaults.update(feature_kwargs)
         self._run_test(
             test_manager=test_manager,
@@ -671,6 +572,53 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
             intermediate=intermediate,
             blocking_params=blocking,
             spill_reload=spill_reload,
+            use_scale_packing=True,
+        )
+
+    # -----------------------------------------------------------------------------------
+    # Test: large-T blocking params (max tiles 8 in M/N/K), spill_reload on/off
+    # -----------------------------------------------------------------------------------
+
+    @pytest.mark.skip(reason="E2E real-model use case (T=65536); too heavy for the standard suite, run manually.")
+    @pytest_parametrize(
+        "hidden, tokens, expert, block_size, top_k, intermediate, tiles_m, tiles_n, tiles_k",
+        LARGE_T_BLOCKING_TEST_PARAMS,
+        abbrevs={**_ABBREVS, "tiles_m": "tm", "tiles_n": "tn", "tiles_k": "tk"},
+    )
+    def test_moe_mxfp8_bwd_validated_blocking_large_t(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+        hidden: int,
+        tokens: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        intermediate: int,
+        tiles_m: int,
+        tiles_n: int,
+        tiles_k: int,
+    ):
+        """Test large-T blocking params (TILES_IN_BLOCK_M/N/K up to 8), spill_reload on/off."""
+        blocking = _compute_blocking_params(
+            H=hidden,
+            B=block_size,
+            I_TP=intermediate,
+            tiles_m=tiles_m,
+            tiles_n=tiles_n,
+            tiles_k=tiles_k,
+        )
+        self._run_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            hidden=hidden,
+            tokens=tokens,
+            expert=expert,
+            block_size=block_size,
+            top_k=top_k,
+            intermediate=intermediate,
+            blocking_params=blocking,
+            spill_reload=True,
             use_scale_packing=True,
         )
 

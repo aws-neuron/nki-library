@@ -23,7 +23,7 @@ from .moe_cte_torch_utils import torch_act_fn
 from .moe_cte_utils import SkipMode
 
 
-def moe_cte_torch_ref(
+def _moe_cte_torch_ref_impl(
     hidden_states: torch.Tensor,
     expert_affinities_masked: torch.Tensor,
     gate_up_proj_weight: torch.Tensor,
@@ -61,6 +61,8 @@ def moe_cte_torch_ref(
     top_k: int = 1,
     down_bias_tp_degree: Optional[int] = None,
     down_bias_tp_rank: Optional[int] = None,
+    accumulation_dtype=None,
+    skip_gate_proj: bool = False,
 ) -> dict:
     """
     PyTorch reference implementation of blockwise MoE matrix multiplication.
@@ -254,7 +256,10 @@ def moe_cte_torch_ref(
             ckpt_gate_up[b_idx] = gate_up_act.permute(1, 2, 0)
 
         # Activation + element-wise multiply
-        intermediate = torch_act_fn(gate_act, activation_function) * up_act
+        if skip_gate_proj:
+            intermediate = torch_act_fn(up_act, activation_function)
+        else:
+            intermediate = torch_act_fn(gate_act, activation_function) * up_act
 
         # Apply affinity on intermediate if multiply_on_I
         if expert_affinity_multiply_on_I:
@@ -356,7 +361,7 @@ def moe_cte_torch_ref(
     return result
 
 
-def moe_cte_unified_torch_ref(
+def moe_cte_torch_ref(
     hidden_states,
     expert_affinities_masked,
     gate_up_proj_weight,
@@ -384,12 +389,14 @@ def moe_cte_unified_torch_ref(
     up_clamp_lower_limit=None,
     gate_up_in_scale=None,
     down_in_scale=None,
+    accumulation_dtype=None,
+    skip_gate_proj: bool = False,
 ) -> dict:
     """
     PyTorch reference for the unified moe_cte() entry point.
 
     Signature matches moe_cte() exactly. Extracts implementation-specific params
-    from spec and quantization_config, then delegates to moe_cte_torch_ref.
+    from spec and quantization_config, then delegates to _moe_cte_torch_ref_impl.
 
     Args:
         spec: MoECTESpec with implementation type and config
@@ -473,7 +480,7 @@ def moe_cte_unified_torch_ref(
         bwmm_func = mx_to_bwmm[impl]
         top_k = 2 if is_tensor_update_accumulating else 1
 
-        return moe_cte_torch_ref(
+        return _moe_cte_torch_ref_impl(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
             gate_up_proj_weight=gup_torch,
@@ -510,7 +517,7 @@ def moe_cte_unified_torch_ref(
     # Infer top_k for torch ref: exact value doesn't matter, only whether > 1
     top_k = 2 if is_tensor_update_accumulating else 1
 
-    return moe_cte_torch_ref(
+    return _moe_cte_torch_ref_impl(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
         gate_up_proj_weight=gate_up_proj_weight,

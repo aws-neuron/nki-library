@@ -124,7 +124,7 @@ def _full_attention_bwd(q, k, v, dy, scale, causal=False, extra_mask=None):
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 
-def ring_attention_spmd_bwd_torch_ref(
+def _ring_attention_spmd_bwd_full(
     q_shards,
     k_shards,
     v_shards,
@@ -245,7 +245,7 @@ def compute_per_rank_o_lse(q_shards, k_shards, v_shards, scale, tp_degree, causa
     return o_per_rank, lse_per_rank
 
 
-def ring_attention_spmd_bwd_per_rank_torch_ref(
+def ring_attention_spmd_bwd_torch_ref(
     q_ref: np.ndarray,
     k_ref: np.ndarray,
     v_ref: np.ndarray,
@@ -325,7 +325,7 @@ def ring_attention_spmd_bwd_per_rank_torch_ref(
         bmin_row = bmin_global[0]
         extra_mask = bmin_row[:, None] == bmin_row[None, :]
 
-    dq_shards, dk_shards, dv_shards = ring_attention_spmd_bwd_torch_ref(
+    dq_shards, dk_shards, dv_shards = _ring_attention_spmd_bwd_full(
         q_shards,
         k_shards,
         v_shards,

@@ -131,6 +131,21 @@ def unpack_float8_e4m3fn_x4(packed_np):
     return torch.where(sign == 1, -val, val)
 
 
+def get_float32_exp(float_data):
+    man_nbits, exp_nbits = 23, 8
+    return (float_data.astype(np.float32).view(np.uint32) >> man_nbits) & ((1 << exp_nbits) - 1)
+
+
+def get_mx_fp_max(dst_dtype):
+    max_values = {nl.float8_e5m2_x4: 57344, nl.float8_e4m3fn_x4: 448, nl.float4_e2m1fn_x4: 6}
+    return max_values.get(dst_dtype)
+
+
+def get_mx_max_exp(dst_dtype):
+    max_exp_values = {nl.float8_e5m2_x4: 14, nl.float8_e4m3fn_x4: 7, nl.float4_e2m1fn_x4: 2}
+    return max_exp_values.get(dst_dtype)
+
+
 def mx_matmul(stationary, moving, stationary_scale, moving_scale):
     """Hardware-accurate MX block-scaled matmul. All inputs are torch tensors.
 
@@ -195,12 +210,12 @@ def quantize_to_mx(data, out_x4_dtype):
         out_x4_dtype = _STR_TO_NL_DTYPE[dtype_str]
 
     # max exponent and max representable value per MX dtype
-    # float8_e5m2:   max_exp=15, max_val=57344
-    # float8_e4m3fn: max_exp=8,  max_val=448
+    # float8_e5m2:   max_exp=14, max_val=57344
+    # float8_e4m3fn: max_exp=7,  max_val=448
     # float4_e2m1fn: max_exp=2,  max_val=6
     _MX_DTYPE_PARAMS = {
-        nl.float8_e5m2_x4: (15, 57344.0),
-        nl.float8_e4m3fn_x4: (8, 448.0),
+        nl.float8_e5m2_x4: (14, 57344.0),
+        nl.float8_e4m3fn_x4: (7, 448.0),
         nl.float4_e2m1fn_x4: (2, 6.0),
     }
 

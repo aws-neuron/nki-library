@@ -24,7 +24,6 @@ from nki.language import NKIObject
 
 from ...utils.allocator import SbufManager
 from ...utils.kernel_helpers import (
-    NUM_HW_PSUM_BANKS,
     resolve_dtype_to_nki,
 )
 from ..mlp_parameters import (
@@ -33,13 +32,30 @@ from ..mlp_parameters import (
     mlpp_has_quantized_weights,
 )
 from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
-from .mlp_cte_tile_info import MLPCTETileInfo
 
 #
 # Public constants
 
 BN_STATS_ELEMENTS_PER_TILE = 6
 BN_AGGR_ELEMENTS_PER_TILE = 2
+
+
+@dataclass(frozen=True)
+class MlpBxsIndices(NKIObject):
+    program_id: int
+    shard_idx: int
+    batch_idx: int
+    bxs_tile_idx: int
+
+    def get_tensor_name(self, object_name: str, suffix: Optional[str] = None) -> str:
+        base_name = (
+            f"{object_name}__shard{self.shard_idx}__prog{self.program_id}__"
+            f"batch{self.batch_idx}__bxs{self.bxs_tile_idx}"
+        )
+        if suffix:
+            return f"{base_name}__{suffix}"
+        return base_name
+
 
 MX_NEUTRAL_SCALE = 127
 
@@ -63,20 +79,15 @@ class MLPCTEConstants(NKIObject):
     # Data type used for normalization weights and biases
     norm_weights_bias_data_type: nki.dtype
     # Bias vector of zeros used for activation functions
-    bxs_dim_subtile_zero_bias_vector_sbuf: nl.ndarray
+    bxs_dim_subtile_zero_bias_vector_sbuf: nl.NkiTensor
     # Bias vector of the epsilon value used for activation functions
-    epsilon_bias_vector_sbuf: nl.ndarray
+    epsilon_bias_vector_sbuf: nl.NkiTensor
     # MX Static scale vectors of 127 used for static quant MX matmuls
-    mx_stationary_neutral_scale_sbuf: nl.ndarray
-    mx_moving_neutral_scale_sbuf: nl.ndarray
+    mx_stationary_neutral_scale_sbuf: nl.NkiTensor
+    mx_moving_neutral_scale_sbuf: nl.NkiTensor
     # PSUM accumulation parameters
     psum_accumulation_data_type: nki.dtype
     psum_fmax: int
-    # Number of PSUM banks required for various matmuls
-    required_src_xpose_psum_bank_count: int
-    required_int_xpose_psum_bank_count: int
-    required_src_proj_psum_bank_count: int
-    required_down_proj_psum_bank_count: int
     # Constants for weights buffering to facilitate overlapped loads
     src_proj_weights_max_buffer_count: int
     down_proj_weights_buffer_count: int
@@ -148,7 +159,6 @@ def _get_xpose_data_type(
 
 def build_mlp_cte_constants(
     mlp_params: MLPParameters,
-    tile_info: MLPCTETileInfo,
     sharded_dim: ShardedDim,
     total_programs: int,
     sbm: SbufManager,
@@ -163,7 +173,6 @@ def build_mlp_cte_constants(
 
     Args:
         mlp_params: MLP configuration parameters
-        tile_info: Tiling information for the computation
         sharded_dim: Dimension being sharded across cores
         total_programs: Total number of programs in SPMD execution
         sbm: SBUF memory manager
@@ -192,11 +201,11 @@ def build_mlp_cte_constants(
     hidden_tile_data_type = src_proj_quant_data_type if mlpp_has_quantized_input(mlp_params) else compute_data_type
     norm_weights_bias_data_type = nl.float32
 
-    alloc_heap = nl.ndarray if sbm == None else sbm.alloc_heap
+    alloc_heap = nl.NkiTensor if sbm == None else sbm.alloc_heap
     # We need a zero bias vector for activations to work around a runtime issue when no bias vector
     # is supplied to the activation method
     bias_vector_sbuf = alloc_heap(
-        (tile_info.bxs_dim_tile.subtile_dim_info.tile_size, 1),
+        (nl.tile_size.pmax, 1),
         activation_data_type,
         buffer=nl.sbuf,
         name=f"bias_vector_sbuf__shard{shard_idx}__prog{program_id}",
@@ -215,33 +224,17 @@ def build_mlp_cte_constants(
         value=mlp_params.eps,
     )
 
-    if mlp_params.quant_params.is_quant_static_mx():
+    if mlp_params.quant_params.is_dtype_mx():
         psum_accumulation_data_type = nl.bfloat16
         psum_fmax = 1024
     else:
         psum_accumulation_data_type = nl.float32
         psum_fmax = 512
-
-    # PSUM bank count requirements
-    required_src_xpose_psum_bank_count = min(
-        NUM_HW_PSUM_BANKS,
-        tile_info.bxs_dim_tile.subtile_dim_info.tile_count * tile_info.xpose_hidden_dim_tile.tile_count,
-    )
-    required_int_xpose_psum_bank_count = min(
-        NUM_HW_PSUM_BANKS,
-        tile_info.bxs_dim_tile.subtile_dim_info.tile_count * tile_info.xpose_intermediate_dim_tile.tile_count,
-    )
-    required_src_proj_psum_bank_count = min(
-        NUM_HW_PSUM_BANKS,
-        tile_info.bxs_dim_tile.subtile_dim_info.tile_count * tile_info.src_proj_intermediate_dim_tile.tile_count,
-    )
-    # We want to use all the banks for down projection
-    required_down_proj_psum_bank_count = NUM_HW_PSUM_BANKS
     # Set up PE transpose info
     use_pe_xpose_flag = True
     xpose_data_type = _get_xpose_data_type(mlp_params, use_pe_xpose_flag, compute_data_type, src_proj_quant_data_type)
 
-    if mlp_params.quant_params.is_quant_static_mx():
+    if mlp_params.quant_params.is_dtype_mx():
         mx_stationary_neutral_scale_sbuf = alloc_heap(
             (nl.tile_size.pmax, nl.tile_size.pmax),
             nl.uint8,
@@ -273,10 +266,6 @@ def build_mlp_cte_constants(
         mx_moving_neutral_scale_sbuf=mx_moving_neutral_scale_sbuf,
         psum_accumulation_data_type=psum_accumulation_data_type,
         psum_fmax=psum_fmax,
-        required_src_xpose_psum_bank_count=required_src_xpose_psum_bank_count,
-        required_int_xpose_psum_bank_count=required_int_xpose_psum_bank_count,
-        required_src_proj_psum_bank_count=required_src_proj_psum_bank_count,
-        required_down_proj_psum_bank_count=required_down_proj_psum_bank_count,
         src_proj_weights_max_buffer_count=src_proj_weights_max_buffer_count,
         down_proj_weights_buffer_count=down_proj_weights_buffer_count,
         down_proj_weights_scales_buffer_count=down_proj_weights_scales_buffer_count,
@@ -305,7 +294,7 @@ def cleanup_mlp_cte_constants(mlp_params: MLPParameters, sbm: SbufManager):
         Called at end of shard execution to clean up allocated memory
     """
     if sbm != None:
-        if mlp_params.quant_params.is_quant_static_mx():
+        if mlp_params.quant_params.is_dtype_mx():
             sbm.pop_heap()  # mx_moving_neutral_scale_sbuf
             sbm.pop_heap()  # mx_stationary_neutral_scale_sbuf
         sbm.pop_heap()  # epsilon_bias_vector_sbuf

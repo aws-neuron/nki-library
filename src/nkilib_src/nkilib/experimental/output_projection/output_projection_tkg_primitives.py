@@ -28,7 +28,6 @@ from ...core.output_projection.output_projection_utils import calculate_head_pac
 from ...core.utils.allocator import BufferManager, create_auto_alloc_manager
 from ...core.utils.common_types import QuantizationType
 from ...core.utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_program_sharding_info
-from ...core.utils.tensor_view import TensorView
 from ...core.utils.tiled_range import TiledRange
 from ..primitives import ColMajor, RowMajor, blas, dma, tile_stream
 from ..primitives.utils import max_tile
@@ -41,16 +40,16 @@ NUM_PSUM_BANKS = 8
 
 
 def output_projection_primitives(
-    attention: nl.ndarray,
-    weight: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    weight_scale: Optional[nl.ndarray] = None,
-    input_scale: Optional[nl.ndarray] = None,
+    weight_scale: Optional[nl.NkiTensor] = None,
+    input_scale: Optional[nl.NkiTensor] = None,
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
     sbm: Optional[BufferManager] = None,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     # Create local sbm if not provided
     if sbm is None:
         sbm = create_auto_alloc_manager()
@@ -70,21 +69,21 @@ def output_projection_primitives(
 
 def _load_static_scales(weight_scale, input_scale, sbm):
     input_scale_buf = tile_stream.alloc_logical((P_MAX, 1), P_MAX, nl.float32, "in_scale", sbm=sbm)
-    dma.load(input_scale_buf, TensorView(input_scale).slice(0, 0, P_MAX))
+    dma.load(input_scale_buf, input_scale.slice(0, 0, P_MAX))
     dequant_scale_buf = tile_stream.alloc_logical((P_MAX, 1), P_MAX, nl.float32, "dequant_scale", sbm=sbm)
-    dma.load(dequant_scale_buf, TensorView(weight_scale).slice(0, 0, P_MAX))
+    dma.load(dequant_scale_buf, weight_scale.slice(0, 0, P_MAX))
     blas.activation(dequant_scale_buf, op=nl.copy, scale=input_scale_buf)
     return input_scale_buf, dequant_scale_buf
 
 
 def _load_and_shuffle_attn(
-    attention: nl.ndarray,
-    input_scale_buf: Optional[TensorView],
+    attention: nl.NkiTensor,
+    input_scale_buf: Optional[nl.NkiTensor],
     quantization_type: QuantizationType,
     d_packed: int,
     use_double_row: bool,
     sbm: BufferManager,
-) -> TensorView:
+) -> nl.NkiTensor:
     d, b, n, s = attention.shape
     bxs = b * s
     is_static = quantization_type == QuantizationType.STATIC
@@ -171,7 +170,7 @@ def _output_projection_regular(attention, weight, bias, quantization_type, weigh
     for w_idx in range(num_w_h_blocks):
         wght_bufs.append(tile_stream.alloc_logical(wght_buf_shape, d_packed, weight.dtype, f"wght_{w_idx}", sbm=sbm))
 
-    wgt_hbm_grid = tile_stream.tile(TensorView(weight).slice(1, h_start, h_start + h_sharded), (n * d, h_block_size))
+    wgt_hbm_grid = tile_stream.tile(weight.slice(1, h_start, h_start + h_sharded), (n * d, h_block_size))
     num_h_blocks = wgt_hbm_grid.get_num_tiles()
 
     # Preload all weights if they fit
@@ -188,7 +187,7 @@ def _output_projection_regular(attention, weight, bias, quantization_type, weigh
 
     scale_hbm_grid = None
     if is_row:
-        scale_hbm_view = TensorView(weight_scale).slice(1, h_start, h_start + h_sharded)
+        scale_hbm_view = weight_scale.slice(1, h_start, h_start + h_sharded)
         scale_hbm_grid = tile_stream.tile(scale_hbm_view, (P_MAX, h_block_size))
 
     # Load bias and broadcast
@@ -196,11 +195,11 @@ def _output_projection_regular(attention, weight, bias, quantization_type, weigh
     if bias is not None:
         # Bias is per-H (1, h_sharded), broadcast to bxs_pmax rows (reused for each output P-tile)
         bias_loaded = tile_stream.alloc_logical((1, h_sharded), 1, bias.dtype, "bias_loaded", sbm=sbm)
-        dma.load(bias_loaded, TensorView(bias).slice(1, h_start, h_start + h_sharded))
+        dma.load(bias_loaded, bias.slice(1, h_start, h_start + h_sharded))
         bias_buf = tile_stream.alloc_logical((bxs_pmax, h_sharded), bxs_pmax, bias.dtype, "bs", sbm=sbm)
         blas.broadcast(bias_buf, bias_loaded)
 
-    out_hbm_grid = tile_stream.tile(TensorView(output).slice(1, h_start, h_start + h_sharded), (bxs_pmax, h_sharded))
+    out_hbm_grid = tile_stream.tile(output.slice(1, h_start, h_start + h_sharded), (bxs_pmax, h_sharded))
 
     # Open scope for output multi-buffering
     sbm.open_scope(interleave_degree=out_sb_interleave_degree, name="output_tile_loop")
@@ -306,7 +305,7 @@ def _output_projection_transposed(attention, weight, bias, quantization_type, we
 
     if use_double_row:
         # Double row: load each head separately into (d, 2, h0, h1) structure
-        wght_view = TensorView(weight).slice(1, h_start, h_start + h_sharded).reshape_dim(1, (h0, h1))
+        wght_view = weight.slice(1, h_start, h_start + h_sharded).reshape_dim(1, (h0, h1))
         wght_buf = tile_stream.alloc_logical((n * d // 2, 2, h0, h1), d_packed, weight.dtype, "wght", sbm=sbm)
         dma.Load(
             tile_stream.tile(wght_buf, (d, h0, h1), tile_dims=(0, 2, 3), iter_order=ColMajor()),
@@ -317,8 +316,7 @@ def _output_projection_transposed(attention, weight, bias, quantization_type, we
         # Reshape HBM to match: (n*d, h0, h1) -> (n_p_tiles, d_packed, h0, h1) -> permute -> (d_packed, n_p_tiles, h0, h1)
         n_p_tiles = div_ceil(n * d, d_packed)
         wght_view = (
-            TensorView(weight)
-            .slice(1, h_start, h_start + h_sharded)
+            weight.slice(1, h_start, h_start + h_sharded)
             .reshape_dim(1, (h0, h1))
             .reshape_dim(0, (n_p_tiles, d_packed))
             .permute((1, 0, 2, 3))
@@ -330,12 +328,12 @@ def _output_projection_transposed(attention, weight, bias, quantization_type, we
         dequant_scale_buf = tile_stream.alloc_logical((h0, h1), h0, nl.float32, "dequant_scale", sbm=sbm)
         dma.load(
             dequant_scale_buf,
-            TensorView(weight_scale).select(0, 0).slice(0, h_start, h_start + h_sharded).reshape_dim(0, (h0, h1)),
+            weight_scale.select(0, 0).slice(0, h_start, h_start + h_sharded).reshape_dim(0, (h0, h1)),
         )
 
     bias_buf = None
     if bias is not None:
-        bias_sliced = TensorView(bias).slice(1, h_start, h_start + h_sharded)
+        bias_sliced = bias.slice(1, h_start, h_start + h_sharded)
         bias_reshaped = bias_sliced.reshape_dim(1, (h0, h1))
         bias_view = bias_reshaped.squeeze_dim(0)
         bias_buf = tile_stream.alloc_logical((h0, h1), h0, bias.dtype, "bs", sbm=sbm)
@@ -374,6 +372,6 @@ def _output_projection_transposed(attention, weight, bias, quantization_type, we
         psum_buffer_degree=None if sbm.is_auto_alloc() else NUM_PSUM_BANKS,
     ).execute()
 
-    dma.store(dst=TensorView(output).select(1, lnc_id), src=out_buf.reshape_dim(1, (h1, bxs)))
+    dma.store(dst=output.select(1, lnc_id), src=out_buf.reshape_dim(1, (h1, bxs)))
 
     return output

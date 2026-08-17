@@ -180,13 +180,13 @@ def test_redundant_combinations_excluded_from_both():
     for tc in valid_tests:
         a, b = tc.values
         assert my_filter(a, b) == FilterResult.VALID, f"Valid test {tc.values} should be VALID"
-        assert a != 3, f"Redundant a=3 should not appear in valid tests"
+        assert a != 3, "Redundant a=3 should not appear in valid tests"
 
     # Invalid tests should only have a=1 with b=True
     for tc in invalid_tests:
         a, b = tc.values
         assert my_filter(a, b) == FilterResult.INVALID, f"Invalid test {tc.values} should be INVALID"
-        assert a != 3, f"Redundant a=3 should not appear in invalid tests"
+        assert a != 3, "Redundant a=3 should not appear in invalid tests"
 
 
 def test_generate_with_bounded_range_explicit():

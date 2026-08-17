@@ -38,5 +38,7 @@ def torch_act_fn(x: torch.Tensor, act_fn: ActFnType) -> torch.Tensor:
         return F.gelu(x, approximate="tanh")
     elif act_fn == ActFnType.Swish:
         return x * torch.sigmoid(1.702 * x)
+    elif act_fn == ActFnType.SquaredReLU:
+        return torch.pow(F.relu(x), 2)
     else:
         raise ValueError(f"Unsupported activation function: {act_fn}")

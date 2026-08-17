@@ -25,14 +25,6 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 from neuronxcc.nki._private.private_api import float8_e4m3fn_x4
-from nkilib_testing.common_dataclasses import (
-    CompilerArgs,
-    CustomValidator,
-    CustomValidatorWithOutputTensorData,
-    Platforms,
-)
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
     _swizzle,
     golden_matmul,
@@ -43,6 +35,8 @@ from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_bwd_mxfp8.config import (
 from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_bwd_mxfp8.mlp_bwd_mxfp8_kernel import (
     mlp_backward_mxfp8_nki,
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils import (
     check_correctness,
     generate_inputs,
@@ -51,13 +45,22 @@ from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils i
 from test.integration.nkilib.experimental.mlp_mxfp8.test_mlp_mxfp8_bwd_checkpoint import (
     build_bwd_kernel_input,
 )
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    CustomValidator,
+    CustomValidatorWithOutputTensorData,
+    Platforms,
+)
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.rng import NKITestsRNG
 from test.utils.unit_test_framework import UnitTestFramework
 
 # Constants
 LNC = 2
 COMPUTE_DTYPE_X4 = float8_e4m3fn_x4
 BWD_GOLDEN_SEED = 123
+
+_bwd_rng = NKITestsRNG(seed=BWD_GOLDEN_SEED)
 
 
 # ============================================================================
@@ -123,8 +126,8 @@ def compute_bwd_golden_mxfp8(
     intermediate_act = gate_act * up
 
     # Phase 1: d_intermediate = output_grad @ W_down (W_down is [H, I])
-    torch.manual_seed(BWD_GOLDEN_SEED)
-    output_grad = torch.nn.init.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
+    _bwd_rng.reset()
+    output_grad = _bwd_rng.kaiming_normal_(torch.empty(S, H)).numpy().astype(bf16)
     # Kernel computes output_grad[S,H] @ W_down.T[I,H] -> [S, I]
     d_intermediate = mxfp8_golden_matmul(output_grad, W_down.T.copy()).astype(np.float32)
 

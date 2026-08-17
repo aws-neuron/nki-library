@@ -33,7 +33,13 @@ from ..utils.common_dataclasses import (
     ValidationArgs,
 )
 from ..utils.output_validator import OutputValidator
+from ..utils.rng import NKITestsRNG
 from ..utils.tensor_histogram import TensorHistogram
+
+# No per-test reset(): these tests only smoke-check the validator and never assert on
+# RNG values, so cross-test draw order is irrelevant. Add a reset() before any draw that
+# a future value assertion would depend on.
+_rng = NKITestsRNG()
 
 
 class TestTensorHistogram:
@@ -54,7 +60,7 @@ class TestTensorHistogram:
     def test_print_histogram_with_valid_data(self):
         """Test histogram printing with valid data."""
         viz = TensorHistogram()
-        data = torch.randn(1000, dtype=torch.float32)
+        data = _rng.randn(1000, dtype=torch.float32)
 
         # Should not raise any exceptions
         viz.print_histogram(data, "Test Histogram")
@@ -78,8 +84,8 @@ class TestTensorHistogram:
     def test_print_comparison_histogram(self):
         """Test overlaid comparison histogram."""
         viz = TensorHistogram()
-        actual = torch.randn(1000, dtype=torch.float32)
-        expected = actual + torch.randn(1000, dtype=torch.float32) * 0.1
+        actual = _rng.randn(1000, dtype=torch.float32)
+        expected = actual + _rng.randn(1000, dtype=torch.float32) * 0.1
 
         # Should not raise any exceptions
         viz.print_comparison_histogram(actual, expected, "Comparison Test")
@@ -87,8 +93,8 @@ class TestTensorHistogram:
     def test_print_comparison_stats(self):
         """Test statistics table printing."""
         viz = TensorHistogram()
-        actual = torch.randn(100, 100, dtype=torch.float32)
-        expected = actual + torch.randn(100, 100, dtype=torch.float32) * 0.01
+        actual = _rng.randn(100, 100, dtype=torch.float32)
+        expected = actual + _rng.randn(100, 100, dtype=torch.float32) * 0.01
 
         # Should not raise any exceptions
         viz.print_comparison_stats(actual, expected, atol=1e-5, rtol=1e-3)
@@ -96,8 +102,8 @@ class TestTensorHistogram:
     def test_print_full_comparison_report(self):
         """Test full comparison report."""
         viz = TensorHistogram()
-        actual = torch.randn(100, 100, dtype=torch.float32)
-        expected = actual + torch.randn(100, 100, dtype=torch.float32) * 0.01
+        actual = _rng.randn(100, 100, dtype=torch.float32)
+        expected = actual + _rng.randn(100, 100, dtype=torch.float32) * 0.01
 
         # Should not raise any exceptions
         viz.print_full_comparison_report(actual, expected, "test_output", atol=1e-5, rtol=1e-3, passed=True)
@@ -105,8 +111,8 @@ class TestTensorHistogram:
     def test_print_to_logfile(self):
         """Test that output is written to logfile."""
         viz = TensorHistogram()
-        actual = torch.randn(100, dtype=torch.float32)
-        expected = actual + torch.randn(100, dtype=torch.float32) * 0.01
+        actual = _rng.randn(100, dtype=torch.float32)
+        expected = actual + _rng.randn(100, dtype=torch.float32) * 0.01
 
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
             logfile_path = f.name
@@ -130,8 +136,8 @@ class TestTensorHistogram:
     def test_print_full_comparison_report_quantile_too_large(self):
         """Test full comparison report."""
         viz = TensorHistogram()
-        actual = torch.randn(5000, 5000, dtype=torch.float32)
-        expected = actual + torch.randn(5000, 5000, dtype=torch.float32) * 0.01
+        actual = _rng.randn(5000, 5000, dtype=torch.float32)
+        expected = actual + _rng.randn(5000, 5000, dtype=torch.float32) * 0.01
 
         # Should not raise any exceptions
         viz.print_full_comparison_report(actual, expected, "test_output", atol=1e-5, rtol=1e-3, passed=True)
@@ -201,11 +207,11 @@ class TestOutputValidatorCustomValidator:
         # NOT NameError for undefined 'expected_output'
         try:
             validator.validate(logfile_path=logfile_path)
-            assert False, "Expected AssertionError to be raised"
+            raise AssertionError("Expected AssertionError to be raised")
         except AssertionError as e:
             assert "Validation failed" in str(e), f"Expected 'Validation failed' error, got: {e}"
         except NameError as e:
-            assert False, f"Got NameError instead of AssertionError - this is the bug: {e}"
+            raise AssertionError(f"Got NameError instead of AssertionError - this is the bug: {e}") from e
 
         # Verify that no golden-*.bin file was created (since custom validators
         # don't have expected_output to save)

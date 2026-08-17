@@ -31,7 +31,6 @@ from ...utils.kernel_helpers import (
     _sbm_alloc,
     div_ceil,
 )
-from ...utils.tensor_view import TensorView
 from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
@@ -53,11 +52,11 @@ _PACKED_TILES_PER_BUFFER = 4
 
 
 def _bulk_load_weight_from_hbm(
-    weight_qtz: TensorView,
+    weight_qtz: nl.NkiTensor,
     cfg: ProjConfig,
     sbm,
     name_prefix: str,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Load full H-sharded weight tile from HBM into a freshly-allocated SBUF buffer."""
     H0, I = cfg.H0, cfg.I
     prg_id = cfg.prg_id
@@ -75,7 +74,7 @@ def _bulk_load_weight_from_hbm(
     )
     nisa.dma_copy(
         dst=weight_qtz_sb,
-        src=weight_qtz.slice(1, prg_id * cfg.n_H512_tile_sharded, (prg_id + 1) * cfg.n_H512_tile_sharded).get_view(),
+        src=weight_qtz.slice(1, prg_id * cfg.n_H512_tile_sharded, (prg_id + 1) * cfg.n_H512_tile_sharded),
         dge_mode=nisa.dge_mode.hwdge,
     )
     return weight_qtz_sb
@@ -83,15 +82,16 @@ def _bulk_load_weight_from_hbm(
 
 def _matmul_one_H512_tile(
     i_H512_tile: int,
-    hidden_qtz_sb: TensorView,
-    hidden_scale_sb: TensorView,
-    weight_qtz_tv: TensorView,
-    weight_scale_tv: TensorView,
+    hidden_qtz_sb: nl.NkiTensor,
+    hidden_scale_sb: nl.NkiTensor,
+    weight_qtz_tv: nl.NkiTensor,
+    weight_scale_tv: nl.NkiTensor,
     out_psum_lst: list,
     cfg: ProjConfig,
     cur_BxS_tile_offset: int,
     cur_BxS_tile_sz: int,
     is_packed_scale: bool = False,
+    is_packed_moving_scale: bool = False,
     is_static_quant: bool = False,
 ):
     """
@@ -99,15 +99,19 @@ def _matmul_one_H512_tile(
 
     Args:
         i_H512_tile (int): Index of the H512 tile being multiplied.
-        hidden_qtz_sb (TensorView): Quantized hidden activations in SBUF.
-        hidden_scale_sb (TensorView): Hidden scale factors in SBUF.
-        weight_qtz_tv (TensorView): Quantized weight tile (SBUF or streamed buffer).
-        weight_scale_tv (TensorView): Weight scale factors (standard or packed layout).
+        hidden_qtz_sb (nl.NkiTensor): Quantized hidden activations in SBUF.
+        hidden_scale_sb (nl.NkiTensor): Hidden scale factors in SBUF.
+        weight_qtz_tv (nl.NkiTensor): Quantized weight tile (SBUF or streamed buffer).
+        weight_scale_tv (nl.NkiTensor): Weight scale factors (standard or packed layout).
         out_psum_lst (list): Per-I512-tile PSUM destinations to accumulate into.
         cfg (ProjConfig): Projection configuration (I, q_width, n_total_I512_tile, etc.).
         cur_BxS_tile_offset (int): Current BxS tile starting offset.
         cur_BxS_tile_sz (int): Current BxS tile size (may be < BxS_tile_sz at the tail).
-        is_packed_scale (bool): If True, weight_scale_tv is in packed layout.
+        is_packed_scale (bool): If True, weight_scale_tv (stationary) is in packed layout.
+        is_packed_moving_scale (bool): If True, hidden_scale_sb (moving) is in packed layout
+            [_pmax, n_packed, B] — selected independently of the weight scale packing. Used by the
+            fp8 pre-quantized hidden path, whose producer (rmsnorm_mx_prefill) folds 4 H512 tiles
+            into one 128-wide scale block.
 
     Returns:
         None: writes into out_psum_lst in place.
@@ -116,7 +120,7 @@ def _matmul_one_H512_tile(
         Packed scale SBUF layout (_pmax, n_packed, I): up to 4 H-tiles are folded into
         a single packed buffer along the partition dim. Tile k occupies 4 contiguous
         partitions starting at offset (k%4)*4 within packed buffer k//4. Addressed via
-        base_tensor[slot_part_off:, packed_buf_idx, I_slice] because TensorView cannot
+        base_tensor[slot_part_off:, packed_buf_idx, I_slice] because nl.NkiTensor cannot
         express partition-strided access.
     """
     I = cfg.I
@@ -128,55 +132,55 @@ def _matmul_one_H512_tile(
             cur_I128_tile_sz = cur_I512_tile_sz // _q_width
             weight_I_offset = i_I512_tile * 512 + i_I_mm_tile * cur_I128_tile_sz
 
-            # Packed scale layout: H tile is folded into the partition dim.
-            # Tile k lives at within-quadrant offset (k%4)*4 in packed buffer
-            # k//4. Engine reads its 4-per-quadrant stripe from that offset.
+            # Packed scale layout: the H tile is folded into the partition dim. Tile k lives at
+            # within-quadrant offset (k%4)*4 in packed buffer k//4; the engine reads its
+            # 4-per-quadrant stripe from that offset. Stationary (weight) and moving (hidden) scales
+            # are packed independently — the fp8 hidden path packs only the moving operand.
             if is_static_quant:
                 # STATIC_MX: weight_scale_tv and hidden_scale_sb are dummy [_pmax, _pmax]
                 # all-127 buffers. Pass as 2D views directly (per-tile shape).
-                stationary_scale_view = weight_scale_tv.slice(1, 0, cur_I128_tile_sz).get_view()
-                moving_scale_view = hidden_scale_sb.slice(1, 0, cur_BxS_tile_sz).get_view()
-            elif is_packed_scale:
+                stationary_scale_view = weight_scale_tv.slice(1, 0, cur_I128_tile_sz)
+                moving_scale_view = hidden_scale_sb.slice(1, 0, cur_BxS_tile_sz)
+            else:
                 _packed_buf_idx = i_H512_tile // _PACKED_TILES_PER_BUFFER
                 _slot_part_off = (i_H512_tile % _PACKED_TILES_PER_BUFFER) * _q_width
-                stationary_scale_view = weight_scale_tv.base_tensor[
-                    _slot_part_off:,
-                    _packed_buf_idx,
-                    weight_I_offset : weight_I_offset + cur_I128_tile_sz,
-                ]
-                moving_scale_view = (
-                    hidden_scale_sb.slice(1, i_H512_tile, i_H512_tile + 1)
-                    .slice(2, cur_BxS_tile_offset, cur_BxS_tile_offset + cur_BxS_tile_sz)
-                    .get_view()
-                )
-            else:
-                stationary_scale_view = (
-                    weight_scale_tv.slice(1, i_H512_tile, i_H512_tile + 1)
-                    .slice(2, weight_I_offset, weight_I_offset + cur_I128_tile_sz)
-                    .get_view()
-                )
-                moving_scale_view = (
-                    hidden_scale_sb.slice(1, i_H512_tile, i_H512_tile + 1)
-                    .slice(2, cur_BxS_tile_offset, cur_BxS_tile_offset + cur_BxS_tile_sz)
-                    .get_view()
-                )
+                if is_packed_scale:
+                    stationary_scale_view = weight_scale_tv[
+                        _slot_part_off:,
+                        _packed_buf_idx,
+                        weight_I_offset : weight_I_offset + cur_I128_tile_sz,
+                    ]
+                else:
+                    stationary_scale_view = weight_scale_tv.slice(1, i_H512_tile, i_H512_tile + 1).slice(
+                        2, weight_I_offset, weight_I_offset + cur_I128_tile_sz
+                    )
+                if is_packed_moving_scale:
+                    moving_scale_view = hidden_scale_sb[
+                        _slot_part_off:,
+                        _packed_buf_idx,
+                        cur_BxS_tile_offset : cur_BxS_tile_offset + cur_BxS_tile_sz,
+                    ]
+                else:
+                    moving_scale_view = hidden_scale_sb.slice(1, i_H512_tile, i_H512_tile + 1).slice(
+                        2, cur_BxS_tile_offset, cur_BxS_tile_offset + cur_BxS_tile_sz
+                    )
             nisa.nc_matmul_mx(
                 dst=out_psum_lst[i_I512_tile][:cur_I128_tile_sz, i_I_mm_tile, :cur_BxS_tile_sz],
-                stationary=weight_qtz_tv.slice(1, i_H512_tile, i_H512_tile + 1)
-                .slice(2, weight_I_offset, weight_I_offset + cur_I128_tile_sz)
-                .get_view(),
-                moving=hidden_qtz_sb.slice(1, i_H512_tile, i_H512_tile + 1)
-                .slice(2, cur_BxS_tile_offset, cur_BxS_tile_offset + cur_BxS_tile_sz)
-                .get_view(),
+                stationary=weight_qtz_tv.slice(1, i_H512_tile, i_H512_tile + 1).slice(
+                    2, weight_I_offset, weight_I_offset + cur_I128_tile_sz
+                ),
+                moving=hidden_qtz_sb.slice(1, i_H512_tile, i_H512_tile + 1).slice(
+                    2, cur_BxS_tile_offset, cur_BxS_tile_offset + cur_BxS_tile_sz
+                ),
                 stationary_scale=stationary_scale_view,
                 moving_scale=moving_scale_view,
             )
 
 
 def _copy_psum_to_out_sb(
-    out_sb: nl.ndarray,
+    out_sb: nl.NkiTensor,
     out_psum_lst: list,
-    bias_sb: TensorView,
+    bias_sb: nl.NkiTensor,
     cfg: ProjConfig,
     cur_BxS_tile_offset: int,
     cur_BxS_tile_sz: int,
@@ -186,9 +190,9 @@ def _copy_psum_to_out_sb(
     Copy PSUM tiles to out_sb, optionally fusing bias-add on NC0.
 
     Args:
-        out_sb (nl.ndarray): Output SBUF buffer to write into.
+        out_sb (nl.NkiTensor): Output SBUF buffer to write into.
         out_psum_lst (list): Per-I512-tile PSUM tiles produced by the matmul.
-        bias_sb (TensorView): Bias view (may be None).
+        bias_sb (nl.NkiTensor): Bias view (may be None).
         cfg (ProjConfig): Projection configuration.
         cur_BxS_tile_offset (int): Current BxS tile starting offset within out_sb.
         cur_BxS_tile_sz (int): Current BxS tile size (may be < BxS_tile_sz at the tail).
@@ -223,7 +227,7 @@ def _copy_psum_to_out_sb(
                         [cur_BxS_tile_sz, _q_width],
                     ]
                 ),
-                data2=bias_tile_view.get_view(),
+                data2=bias_tile_view,
                 op=nl.add,
             )
         else:
@@ -241,7 +245,7 @@ def _copy_psum_to_out_sb(
 
 
 def _psum_dequant_to_out_sb(
-    out_sb: nl.ndarray,
+    out_sb: nl.NkiTensor,
     out_psum_lst: list,
     bias_2d,
     cfg: ProjConfig,
@@ -290,8 +294,8 @@ def _psum_dequant_to_out_sb(
 
 
 def _post_matmul_dequant(
-    out_sb: nl.ndarray,
-    bias_sb: TensorView,
+    out_sb: nl.NkiTensor,
+    bias_sb: nl.NkiTensor,
     cfg: ProjConfig,
     w_dequant_scale,
     input_dequant_scale,
@@ -301,12 +305,12 @@ def _post_matmul_dequant(
     Apply STATIC_MX / ROW_MX post-matmul dequant + bias.
 
     Args:
-        out_sb (nl.ndarray): Output SBUF buffer to dequantize and bias-add in place.
-        bias_sb (TensorView): Optional bias view; broadcast across BxS when present.
+        out_sb (nl.NkiTensor): Output SBUF buffer to dequantize and bias-add in place.
+        bias_sb (nl.NkiTensor): Optional bias view; broadcast across BxS when present.
         cfg (ProjConfig): Projection configuration.
-        w_dequant_scale (nl.ndarray): Weight dequant scale. [_pmax, 1] for STATIC_MX,
+        w_dequant_scale (nl.NkiTensor): Weight dequant scale. [_pmax, 1] for STATIC_MX,
             [_pmax, n_total_I512_tile * _q_width] for ROW_MX.
-        input_dequant_scale (nl.ndarray): Input dequant scale. [_pmax, 1] for STATIC_MX,
+        input_dequant_scale (nl.NkiTensor): Input dequant scale. [_pmax, 1] for STATIC_MX,
             [_pmax, T_padded, 1] for ROW_MX.
 
     Returns:
@@ -321,8 +325,7 @@ def _post_matmul_dequant(
 
     bias_2d = None
     if bias_sb != None:
-        bias_view = bias_sb if isinstance(bias_sb, TensorView) else TensorView(bias_sb)
-        bias_2d = bias_view.flatten_dims(1, 2).get_view()
+        bias_2d = bias_sb.flatten_dims(1, 2)
 
     if w_dequant_scale.shape[1] == 1:
         # STATIC_MX: both scales are [_pmax, 1], pre-combine and broadcast.
@@ -379,24 +382,25 @@ def _post_matmul_dequant(
 
 
 def gate_up_projection_mx_tp(
-    hidden_qtz_sb: TensorView,
-    hidden_scale_sb: TensorView,
-    weight_qtz: TensorView,
-    weight_scale: TensorView,
-    bias_sb: TensorView,
+    hidden_qtz_sb: nl.NkiTensor,
+    hidden_scale_sb: nl.NkiTensor,
+    weight_qtz: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
+    bias_sb: nl.NkiTensor,
     cfg: ProjConfig,
-    w_dequant_scale: Optional[nl.ndarray] = None,
-    input_dequant_scale: Optional[nl.ndarray] = None,
+    w_dequant_scale: Optional[nl.NkiTensor] = None,
+    input_dequant_scale: Optional[nl.NkiTensor] = None,
     sbm=None,
     psum_bank_offset: int = 0,
     name_prefix: Optional[str] = None,
-    out_sb: Optional[nl.ndarray] = None,
-    dst_weight_sb: Optional[nl.ndarray] = None,
+    out_sb: Optional[nl.NkiTensor] = None,
+    dst_weight_sb: Optional[nl.NkiTensor] = None,
     skip_dma=None,
     is_packed_scale: bool = False,
+    is_packed_moving_scale: bool = False,
     activation_op=None,
     is_static_quant: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Gate/Up projection (TP variant: output transposed for the subsequent down projection).
 
@@ -417,40 +421,45 @@ def gate_up_projection_mx_tp(
     H has a tile size of 512 because that is mx_matmul's contraction size (_pmax * _q_width).
 
     Args:
-        hidden_qtz_sb (TensorView): mxfp8_x4[_pmax, n_H512_tile_sharded, BxS] @ SB.
+        hidden_qtz_sb (nl.NkiTensor): mxfp8_x4[_pmax, n_H512_tile_sharded, BxS] @ SB.
             Dim H is shuffled on _pmax.
-        hidden_scale_sb (TensorView): uint8[_pmax, n_H512_tile_sharded, BxS] @ SB.
+        hidden_scale_sb (nl.NkiTensor): uint8[_pmax, n_H512_tile_sharded, BxS] @ SB.
             Dim H is shuffled on _pmax. Pdim has holes.
-        weight_qtz (TensorView): One of:
+        weight_qtz (nl.NkiTensor): One of:
             - mxfp_x4[_pmax, n_H512_tile_sharded, I] @ SB, or
             - mxfp_x4[_pmax, n_H512_tile, I] @ HBM (full unsharded H; this fn slices the prg_id shard), or
             - mxfp_x4[_pmax, n_H512_tile_sharded, I] @ HBM when dst_weight_sb is provided (caller pre-sliced).
-        weight_scale (TensorView): uint8[_pmax, n_H512_tile_sharded, I] @ SB.
-        bias_sb (TensorView, optional): bf16[_pmax, n_I512_tile, _q_width] @ SB.
+        weight_scale (nl.NkiTensor): uint8[_pmax, n_H512_tile_sharded, I] @ SB.
+        bias_sb (nl.NkiTensor, optional): bf16[_pmax, n_I512_tile, _q_width] @ SB.
             For already-sliced (gate-only or up-only) bias, cfg.bias_t_shared_base_offset must be 0.
             For combined gate+up, cfg.bias_t_shared_base_offset specifies the up-projection offset.
         cfg (ProjConfig): Projection configuration (H, I, BxS, sharding info, layout flags).
-        w_dequant_scale (nl.ndarray, optional): Weight dequant scale in SBUF.
+        w_dequant_scale (nl.NkiTensor, optional): Weight dequant scale in SBUF.
             [_pmax, 1] for STATIC_MX, [_pmax, n_I512_tile * _q_width] for ROW_MX, None for MX.
             Not supported on the streaming path.
-        input_dequant_scale (nl.ndarray, optional): Input dequant scale in SBUF.
+        input_dequant_scale (nl.NkiTensor, optional): Input dequant scale in SBUF.
             [_pmax, 1] for STATIC_MX, [_pmax, T_padded, 1] for ROW_MX, None for MX.
         sbm (SbufManager, optional): SBUF allocator. Required when out_sb is None or
             non-SBUF weight_qtz is provided.
         psum_bank_offset (int): Starting PSUM bank index for output tile rotation.
         name_prefix (str, optional): Prefix for SBUF buffer names; useful for debugging.
-        out_sb (nl.ndarray, optional): Pre-allocated output buffer. If None, this fn allocates one.
-        dst_weight_sb (nl.ndarray, optional): SBUF buffer (_pmax, n_H512_tile_sharded, I) to
+        out_sb (nl.NkiTensor, optional): Pre-allocated output buffer. If None, this fn allocates one.
+        dst_weight_sb (nl.NkiTensor, optional): SBUF buffer (_pmax, n_H512_tile_sharded, I) to
             stream weights into. Enables H-chunked streaming. When provided, weight_qtz must
             be in HBM and already prg_id-sliced.
         skip_dma (SkipMode, optional): OOB handling for the streaming path. Required if
             dst_weight_sb is set.
-        is_packed_scale (bool): True when caller pre-packed weight_scale into the compressed
-            layout (_pmax, n_packed, I) where multiple H-tiles are folded along the partition
-            dim. Default False = standard (_pmax, n_H512_tile_sharded, I) layout.
+        is_packed_scale (bool): True when caller pre-packed weight_scale (stationary) into the
+            compressed layout (_pmax, n_packed, I) where multiple H-tiles are folded along the
+            partition dim. Default False = standard (_pmax, n_H512_tile_sharded, I) layout.
+        is_packed_moving_scale (bool): True when hidden_scale_sb (moving) is in the packed layout
+            (_pmax, n_packed, BxS) — 4 H512 tiles folded into one 128-wide block, tile k at
+            within-quadrant partition offset (k%4)*4 in pack k//4. Selected independently of
+            is_packed_scale; the fp8 pre-quantized hidden path packs only the moving operand.
+            Default False = standard (_pmax, n_H512_tile_sharded, BxS) layout.
 
     Returns:
-        nl.ndarray: bf16[_pmax, ceil(I / 512), BxS, _q_width] @ SB.
+        nl.NkiTensor: bf16[_pmax, ceil(I / 512), BxS, _q_width] @ SB.
     """
     H0, I, BxS = cfg.H0, cfg.I, cfg.BxS
 
@@ -460,14 +469,11 @@ def gate_up_projection_mx_tp(
     use_streaming = dst_weight_sb != None
     use_software_quant_path = w_dequant_scale != None
 
-    weight_qtz = TensorView(weight_qtz)
-    weight_scale = TensorView(weight_scale)
-
-    weight_in_sbuf = weight_qtz.is_sbuf()
+    weight_in_sbuf = weight_qtz.buffer == nl.sbuf
 
     kernel_assert(
-        weight_scale.is_sbuf(),
-        f"Expect weight_scale in SBUF, got buffer={weight_scale.base_tensor.buffer}",
+        (weight_scale.buffer == nl.sbuf),
+        f"Expect weight_scale in SBUF, got buffer={weight_scale.buffer}",
     )
     if not is_packed_scale and not is_static_quant:
         kernel_assert(
@@ -490,15 +496,15 @@ def gate_up_projection_mx_tp(
         weight_qtz_tv = weight_qtz
     elif use_streaming:
         # DMA happens per-chunk inside the BxS loop below.
-        weight_qtz_tv = TensorView(dst_weight_sb)
+        weight_qtz_tv = dst_weight_sb
     else:
-        weight_qtz_tv = TensorView(_bulk_load_weight_from_hbm(weight_qtz, cfg, sbm, name_prefix))
+        weight_qtz_tv = _bulk_load_weight_from_hbm(weight_qtz, cfg, sbm, name_prefix)
 
     if cfg.dbg_hidden:
-        return hidden_qtz_sb.base_tensor, hidden_scale_sb.base_tensor
+        return hidden_qtz_sb, hidden_scale_sb
 
     if cfg.dbg_weight:
-        return weight_qtz_tv.base_tensor, weight_scale.base_tensor
+        return weight_qtz_tv, weight_scale
 
     # ── Allocate output buffer ──
     out_sb = (
@@ -535,8 +541,7 @@ def gate_up_projection_mx_tp(
             else w_dequant_scale
         )
         if bias_sb != None:
-            bias_view = bias_sb if isinstance(bias_sb, TensorView) else TensorView(bias_sb)
-            fused_bias_2d = bias_view.flatten_dims(1, 2).get_view()
+            fused_bias_2d = bias_sb.flatten_dims(1, 2)
 
     # ── Matmul loop ──
     for i_BxS_tile in range(n_BxS_tile):
@@ -559,11 +564,8 @@ def gate_up_projection_mx_tp(
                 cur_chunk_n_H512 = min(_H_CHUNK_N_H512, cfg.n_H512_tile_sharded - h_start)
 
                 nisa.dma_copy(
-                    dst=TensorView(dst_weight_sb)
-                    .slice(1, h_start, h_start + cur_chunk_n_H512)
-                    .slice(2, 0, I)
-                    .get_view(),
-                    src=weight_qtz.slice(1, h_start, h_start + cur_chunk_n_H512).slice(2, 0, I).get_view(),
+                    dst=dst_weight_sb.slice(1, h_start, h_start + cur_chunk_n_H512).slice(2, 0, I),
+                    src=weight_qtz.slice(1, h_start, h_start + cur_chunk_n_H512).slice(2, 0, I),
                     oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
                     dge_mode=dge_mode.hwdge,
                 )
@@ -580,6 +582,7 @@ def gate_up_projection_mx_tp(
                         cur_BxS_tile_offset=cur_BxS_tile_offset,
                         cur_BxS_tile_sz=cur_BxS_tile_sz,
                         is_packed_scale=is_packed_scale,
+                        is_packed_moving_scale=is_packed_moving_scale,
                         is_static_quant=is_static_quant,
                     )
         else:
@@ -595,6 +598,7 @@ def gate_up_projection_mx_tp(
                     cur_BxS_tile_offset=cur_BxS_tile_offset,
                     cur_BxS_tile_sz=cur_BxS_tile_sz,
                     is_packed_scale=is_packed_scale,
+                    is_packed_moving_scale=is_packed_moving_scale,
                     is_static_quant=is_static_quant,
                 )
 

@@ -59,6 +59,28 @@ INF_ARTIFACT_DIR_NAME = "infer_result"
 MODEL_TEST_TYPE = "MODEL_WIP"
 
 
+# Env var pytest-xdist sets in each worker process (value is the worker id, e.g. "gw0");
+# absent in the controller/master process.
+PYTEST_XDIST_WORKER_ENV = "PYTEST_XDIST_WORKER"
+
+
+def is_xdist_worker() -> bool:
+    """True if running inside a pytest-xdist worker process (False in the controller, or
+    when not running under xdist at all)."""
+    return PYTEST_XDIST_WORKER_ENV in os.environ
+
+
+def resolve_probe_worker_count(num_hosts: int, max_probe_workers: int | None = None) -> int:
+    """Thread-pool size for probing ``num_hosts`` hosts concurrently over SSH.
+
+    Bounds the pool by the run's parallelism (``max_probe_workers`` — the xdist
+    ``--maxprocesses`` cap threaded in from config), falling back to the CPU count when it is
+    unset or non-positive, and never exceeds ``num_hosts`` nor drops below 1."""
+    if not max_probe_workers or max_probe_workers <= 0:
+        max_probe_workers = os.cpu_count() or 1
+    return max(1, min(num_hosts, max_probe_workers))
+
+
 class ModelTestType(Enum):
     """Classification for model test configs.
 
@@ -158,7 +180,9 @@ def prepare_model_parametrize(configs, id_formatter=None):
     import pytest
 
     if id_formatter is None:
-        id_formatter = lambda params: "-".join(str(p.value) if hasattr(p, "value") else str(p) for p in params)
+
+        def id_formatter(params):
+            return "-".join(str(p.value) if hasattr(p, "value") else str(p) for p in params)
 
     params_list = []
     ids_list = []
@@ -195,6 +219,34 @@ class TraceMode(Enum):
     @staticmethod
     def create(mode: str):
         return TraceMode(mode.lower().replace("-", "_"))
+
+
+class HostProvisioningMode(StrEnum):
+    """How a run obtains the hosts its tests execute on."""
+
+    LOCAL = "local"
+    """tests run on this machine's own Neuron chip (no --target-* given)."""
+    STATIC_HOSTS = "static_hosts"
+    """a fixed host list via --target-host; the test process drives them
+       over SSH locally (no controller-side store bootstrap)."""
+    STATIC_FILE = "static_file"
+    """a fixed, possibly-heterogeneous host list via --target-host-file;
+       a remote run whose membership the workers initialize from the file."""
+    PLUGIN_PROVISIONED = "plugin_provisioned"
+    """hosts supplied by a provisioning plug-in, which reports it via
+       HostProvisioningResult.plugin_provisioned (see maybe_setup_shared_fleet)."""
+
+
+@dataclass(frozen=True)
+class HostProvisioningResult:
+    """What a host-provisioning plug-in did for this run, returned to the controller."""
+
+    plugin_provisioned: bool
+    """A provisioning plug-in claimed this run's host pool (supplied a remote, store-backed
+    set of hosts). Drives HostProvisioningMode.PLUGIN_PROVISIONED."""
+    recoverable: bool = False
+    """The host pool can regain hosts mid-run (a background refresher re-resolves it), so a
+    failed claim should wait for a host rather than fail immediately."""
 
 
 class NKICompilationMode(Enum):
@@ -383,7 +435,7 @@ class ValidationArgs:
             for key, value in self.golden_output.items():
                 assert isinstance(key, str) and isinstance(value, CustomValidatorWithOutputTensorData), error_message
         else:
-            assert False, error_message
+            raise AssertionError(error_message)
 
 
 class Platforms(StrEnum):
@@ -405,6 +457,16 @@ class Platforms(StrEnum):
     @override
     def __str__(self) -> str:
         return self.value
+
+    @classmethod
+    def from_str_safe(cls, value: str) -> "Platforms | None":
+        """Parse a platform string, returning None (with a warning) for an
+        unrecognized value. Use ``Platforms(value)`` for strict."""
+        try:
+            return cls(value)
+        except ValueError:
+            logging.getLogger(__name__).warning("Unknown platform %r; treating as None", value)
+            return None
 
     def is_trn3(self) -> bool:
         return self in (Platforms.TRN3, Platforms.TRN3_A0, Platforms.TRN3_PDS, Platforms.TRN3_PDS_A0)
@@ -453,6 +515,60 @@ class TargetHost:
 
     ssh_host: str
     host_type: Platforms
+
+
+@dataclass(frozen=True)
+class ResolvedHost:
+    """A single provisioned host.
+
+    ``ssh_host`` is the SSH alias the test harness connects to (e.g. the host's
+    public IP). ``host_type`` is the platform that this host supports.
+    ``num_physical_cores`` is the host's total physical-core capacity, probed by the
+    source when it resolves the host (0 if unknown / not probed); it drives capacity-based
+    routing in the host-state store — a host with fewer cores than a request needs is
+    ineligible for it.
+    """
+
+    ssh_host: str
+    host_type: Platforms
+    num_physical_cores: int = 0
+
+
+class InstanceSize(StrEnum):
+    """A fleet host's instance size.
+
+    ``UNKNOWN`` covers a size not enumerated here (or an absent one)."""
+
+    X_48XLARGE = "48xlarge"
+    X_3XLARGE = "3xlarge"
+    UNKNOWN = "unknown"
+
+    @override
+    def __str__(self) -> str:
+        return self.value
+
+    @classmethod
+    def from_str(cls, value: str | None) -> "InstanceSize":
+        """Parse an instance-size string, mapping an unrecognized/absent value to ``UNKNOWN``
+        (with a warning) so a new size is flagged for a real core-count assignment rather than
+        silently mis-weighted."""
+        try:
+            return cls(value)
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                "Unknown instance size %r; treating as UNKNOWN (1 core). Add it to InstanceSize "
+                "with its real core count so the capacity gate weights it correctly",
+                value,
+            )
+            return cls.UNKNOWN
+
+    def get_core_count(self) -> int:
+        """Nominal physical cores for this size. UNKOWN is treated as 1 (assumed to have at least 1 core)."""
+        return {
+            InstanceSize.X_48XLARGE: 128,
+            InstanceSize.X_3XLARGE: 8,
+            InstanceSize.UNKNOWN: 1,
+        }[self]
 
 
 class CompilerArgs:

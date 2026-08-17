@@ -23,18 +23,20 @@ import nki
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import hbm_dma_transpose
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
+    with_active_sbm,
 )
+
 from test.utils import common_dataclasses
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.unit_test_framework import UnitTestFramework
 
 
 @nki.jit
+@with_active_sbm
 def hbm_dma_transpose_kernel(src_hbm, M: int, N: int):
     """Wrapper kernel that calls hbm_dma_transpose and returns the transposed tensor."""
     create_and_set_active_sbm()
@@ -77,6 +79,7 @@ _TEST_SHAPES = [
 
 
 @nki.jit
+@with_active_sbm
 def hbm_dma_transpose_src_slice_kernel(src_hbm, M: int, N: int, row_offset: int, row_size: int):
     """Transpose a row-slice of the source: src_hbm[row_offset:row_offset+row_size, :]."""
     create_and_set_active_sbm()
@@ -113,6 +116,7 @@ _DST_SLICE_SHAPES = [
 
 
 @nki.jit
+@with_active_sbm
 def hbm_dma_transpose_dst_slice_kernel(src_hbm, M: int, N: int, col_offset: int, col_size: int):
     """Transpose src_hbm[:, col_offset:col_offset+col_size] into a row-slice of the destination."""
     create_and_set_active_sbm()

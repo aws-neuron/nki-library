@@ -21,14 +21,14 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental.subkernels.permute_routed_tokens import (
     _SUPPORTED_HIDDEN_DTYPES,
     permute_routed_tokens,
 )
 from nkilib_src.nkilib.experimental.subkernels.permute_routed_tokens_torch import permute_routed_tokens_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
-from test.utils.pytest_test_metadata import pytest_test_metadata
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
@@ -187,10 +187,7 @@ class TestPermuteRoutedTokensKernel:
         _run_test(test_manager, platform_target, lnc_degree, T, H, K, E, hidden_dtype)
 
 
-@pytest_test_metadata(
-    name="PermuteRoutedTokensFP8E4M3",
-    pytest_marks=["permute_routed_tokens", "subkernels"],
-)
+@pytest_marks(["permute_routed_tokens", "subkernels"])
 @final
 @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 class TestPermuteRoutedTokensFP8E4M3Kernel:

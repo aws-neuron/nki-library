@@ -20,7 +20,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributions import Exponential, LogNormal
+
+from test.utils.rng import NKITestsRNG
+
+_rng = NKITestsRNG()
 
 
 def set_seed(seed: int = 42) -> None:
@@ -30,9 +33,10 @@ def set_seed(seed: int = 42) -> None:
     Args:
         seed (int): Random seed value.
     """
-    torch.manual_seed(seed)
+
     np.random.seed(seed)
     random.seed(seed)
+    _rng.reset(seed)
 
 
 class Distribution(ABC):
@@ -59,7 +63,7 @@ class KaimingNormalDistribution(Distribution):
     name = "kaiming_normal"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        return torch.nn.init.kaiming_normal_(tensor, **params)
+        return _rng.kaiming_normal_(tensor, **params)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         return {
@@ -72,7 +76,7 @@ class KaimingUniformDistribution(Distribution):
     name = "kaiming_uniform"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        return torch.nn.init.kaiming_uniform_(tensor, **params)
+        return _rng.kaiming_uniform_(tensor, **params)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         return {
@@ -85,7 +89,7 @@ class XavierNormalDistribution(Distribution):
     name = "xavier_normal"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        return torch.nn.init.xavier_normal_(tensor, **params)
+        return _rng.xavier_normal_(tensor, **params)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         gain = random.choice([1e-4, 1e-2, 100.0, 1000.0]) if edge_case else random.uniform(0.5, 2.0)
@@ -96,7 +100,7 @@ class XavierUniformDistribution(Distribution):
     name = "xavier_uniform"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        return torch.nn.init.xavier_uniform_(tensor, **params)
+        return _rng.xavier_uniform_(tensor, **params)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         gain = random.choice([1e-4, 1e-2, 100.0, 1000.0]) if edge_case else random.uniform(0.5, 2.0)
@@ -107,7 +111,7 @@ class NormalDistribution(Distribution):
     name = "normal"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        return torch.nn.init.normal_(tensor, **params)
+        return _rng.normal_(tensor, **params)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         if edge_case:
@@ -123,7 +127,7 @@ class UniformDistribution(Distribution):
     name = "uniform"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        return torch.nn.init.uniform_(tensor, **params)
+        return _rng.uniform_(tensor, **params)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         if edge_case:
@@ -149,8 +153,7 @@ class ExponentialDistribution(Distribution):
     name = "exponential"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        d = Exponential(**params)
-        return d.sample(tensor.shape)
+        return _rng.exponential_sample(params["rate"], tensor.shape)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         rate = random.choice([1e-4, 1e-2, 100.0, 1000.0]) if edge_case else random.uniform(0.1, 5.0)
@@ -161,8 +164,7 @@ class LogNormalDistribution(Distribution):
     name = "log_normal"
 
     def init_fn(self, tensor: torch.Tensor, **params) -> torch.Tensor:
-        d = LogNormal(**params)
-        return d.sample(tensor.shape)
+        return _rng.lognormal_sample(params["loc"], params["scale"], tensor.shape)
 
     def random_params(self, edge_case: bool = False) -> Dict[str, Any]:
         if edge_case:

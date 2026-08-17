@@ -17,6 +17,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 
+import nki.language as nl
 from nki.language import NKIObject
 
 from ...utils.kernel_assert import kernel_assert
@@ -32,7 +33,7 @@ from ..mlp_parameters import (
 # Calculate the type of sharding we should do given the MLP parameters
 # NOTE: Sharding on just batch * sequence length is supported through the code but is never activated.
 #       But we leave the infrastructure in place in case we need it in the future.
-# Returns a tuple (sharded_dim, shards) instead of ShardInfo to work around KLIR tracing limitations
+# Returns a tuple (sharded_dim, shards) instead of ShardInfo to work around compiler tracing limitations
 # @throws AssertionError: If no valid tile size can be found that divides the bxs evenly, or
 #                         if the bxs is not divisible by a power of 2 >= 256
 def calculate_sharding(mlp_params: MLPParameters):
@@ -231,3 +232,11 @@ def _calculate_bxs_sharding(
     for bxs_tile in bxs_tiles:
         shard_list.append(DimShard(bxs_size_per_worker * program_id + bxs_tile.start_offset, bxs_tile.size, mlp_params))
     return shard_list
+
+
+def is_launch_grid_valid_for_mlp() -> bool:
+    """Check if launch grid configuration is valid for MLP operations."""
+    grid_ndim = nl.program_ndim()
+    if grid_ndim < 0 or grid_ndim > 1:
+        return False
+    return True

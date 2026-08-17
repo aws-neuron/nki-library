@@ -308,6 +308,7 @@ def _get_tile_size(
     is_mx: bool,
     input_dtype=nl.bfloat16,
     weight_dtype=nl.bfloat16,
+    is_all_expert_static_mx: bool = False,
 ) -> int:
     """
     Determine the tile size for T-dimension tiling based on estimated SBUF capacity.
@@ -326,6 +327,7 @@ def _get_tile_size(
         is_mx: Whether using MX quantized weights.
         input_dtype: Input/activation dtype (e.g., nl.bfloat16).
         weight_dtype: Expert weight dtype (e.g., nl.float4_e2m1fn_x4).
+        is_all_expert_static_mx: If True, accounts for bf16 input residing in SBUF during expert MLP (where per-expert quantization happens)
 
     Returns:
         Tile size (multiple of _pmax) that fits within SBUF capacity.
@@ -354,7 +356,7 @@ def _get_tile_size(
         phase1 = tile_T * H_free * input_bytes
 
         # Phase 2: Expert MLP
-        if is_mx:
+        if is_mx and not is_all_expert_static_mx:
             num_H512_tiles = H // (_pmax * _q_width)
             # Quantized input (fp8x4 = 1B) + scale (uint8 = 1B) per element
             input_per_part = num_H512_tiles * tile_T * 2

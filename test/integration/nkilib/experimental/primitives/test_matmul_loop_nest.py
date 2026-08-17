@@ -19,8 +19,14 @@ from dataclasses import dataclass
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
-
 from nkilib_src.nkilib.core.utils.tiled_tensor import TiledTensor
+from nkilib_src.nkilib.experimental.primitives.matmul_loop_nest import matmul_loop_nest
+
+from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def alloc_tiled_sbuf(shape, tile_size, dtype, rotate_dim=None, num_rotation=None):
@@ -36,14 +42,6 @@ def alloc_tiled_psum(shape, tile_size, dtype=nl.float32, num_banks=None):
     n_banks = num_banks if num_banks else grid[0] * grid[1]
     return TiledTensor.alloc(grid=grid, tile_size=tile_size, dtype=dtype, buffer=nl.psum, num_banks=n_banks)
 
-
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
-from nkilib_src.nkilib.experimental.primitives.matmul_loop_nest import matmul_loop_nest
-from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
-from test.utils.common_dataclasses import CompilerArgs, Platforms
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # ── NKIObject callback classes for parser mode ───────────────────────
 
@@ -127,7 +125,7 @@ def kernel_k_accumulation(source, weights, out):
     dst_sb = alloc_tiled_sbuf(shape=(M, N), tile_size=(M, N), dtype=out.dtype)
 
     # HBM weights tiled for load_weights callback
-    weights_hbm = TiledTensor(weights, (K_TILE, N))
+    TiledTensor(weights, (K_TILE, N))
 
     matmul_loop_nest(
         stationary=stat_sb,
@@ -1030,7 +1028,7 @@ def kernel_n_packing_v2(source, weights, scale, out):
     nisa.dma_copy(dst=scale_sb[0, 0], src=scale)
 
     def on_output_scale(psum_tile, out_tile, scale_tile):
-        scale_bc = TensorView(scale_tile).expand_dim(2).broadcast(dim=2, size=N_TILE).get_view()
+        scale_bc = scale_tile.expand_dim(2).broadcast(dim=2, size=N_TILE)
         nisa.tensor_tensor(dst=out_tile, data1=psum_tile, data2=scale_bc, op=nl.multiply)
 
     matmul_loop_nest(
@@ -1238,13 +1236,13 @@ def kernel_degenerate_partition_dim(source, weights, out):
     attn_sb[0:d_size, 0 : n_heads * bxs] = nl.load(source[0:d_size, 0 : n_heads * bxs])
 
     # Tile weight: reshape to (1, 4, 128, 8), tile_size=(1, 1, 128, 1)
-    w_view = TensorView(w_sb).reshape_dim(2, (h1, h2))
+    w_view = w_sb.reshape_dim(2, (h1, h2))
     w_tiled = TiledTensor(w_view, tile_size=(d_size, 1, h1, 1))
     # Grid: (1, 4, 1, 8). squeeze_dim(0).squeeze_dim(1) -> (4, 8)
     stat_tiled = w_tiled.squeeze_dim(0).squeeze_dim(1)
 
     # Tile attn: reshape to (1, 4, 32), tile_size=(1, 1, 32)
-    attn_view = TensorView(attn_sb).reshape_dim(1, (n_heads, bxs))
+    attn_view = attn_sb.reshape_dim(1, (n_heads, bxs))
     attn_tiled = TiledTensor(attn_view, tile_size=(d_size, 1, bxs))
     mov_tiled = attn_tiled.squeeze_dim(0)
 
@@ -1297,7 +1295,7 @@ def kernel_n_packing_partial_group(source, weights, out):
     src_sb[:, :] = nl.load(source[0:K, 0:bxs])
 
     # Tile weight: reshape to (K, h1, h2), tile_size=(K, h1, 1)
-    w_view = TensorView(w_sb).reshape_dim(1, (h1, h2))
+    w_view = w_sb.reshape_dim(1, (h1, h2))
     w_tiled = TiledTensor(w_view, tile_size=(K, h1, 1))
     # Grid: (1, 1, h2). squeeze_dim(0) -> (1, h2)
     stat_tiled = w_tiled.squeeze_dim(0)

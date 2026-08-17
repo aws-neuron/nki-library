@@ -30,9 +30,9 @@ Test Coverage:
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.max.cascaded_max import cascaded_max
 from nkilib_src.nkilib.core.max.cascaded_max_torch import cascaded_max_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
 from test.utils.pytest_parametrize import pytest_parametrize
@@ -71,7 +71,7 @@ class TestCascadedMaxKernel:
         [2, 5, 5, 4058, nl.float32],
 
         # # Llama 3 76B after global gather
-        [1, 4, 5, 8192, nl.float32],
+        pytest.param(1, 4, 5, 8192, nl.float32, marks=pytest.mark.fast),
         [1, 8, 5, 8192, nl.float32],
         [2, 8, 5, 8192, nl.float32],
         [2, 5, 5, 8192, nl.float32],
@@ -83,7 +83,7 @@ class TestCascadedMaxKernel:
 
         # Vocab size generalization
         [2, 1, 1, 256, nl.float32],
-        [2, 1, 1, 16000, nl.float32],
+        pytest.param(2, 1, 1, 16000, nl.float32, marks=pytest.mark.fast),
 
         # Max stage num batch sizes
         [2, 3, 1, 3168, nl.float32],
@@ -109,7 +109,6 @@ class TestCascadedMaxKernel:
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest_parametrize(cascaded_max_unit_params, cascaded_max_unit_perms, abbrevs=_ABBREVS)
     def test_cascaded_max_unit(
         self,

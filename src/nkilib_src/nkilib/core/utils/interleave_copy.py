@@ -34,7 +34,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from .kernel_assert import kernel_assert
-from .tensor_view import TensorView
 
 
 def _is_per_partition_vector(tensor) -> bool:
@@ -62,11 +61,11 @@ def _emit_scalar_engine(dst, src, scale, bias):
     Requires any non-None ``scale`` / ``bias`` to be per-partition shaped.
     """
     if scale is not None and bias is not None:
-        nisa.activation(dst=dst, data=src, scale=scale.get_view(), bias=bias.get_view(), op=nl.copy)
+        nisa.activation(dst=dst, data=src, scale=scale, bias=bias, op=nl.copy)
     elif scale is not None:
-        nisa.activation(dst=dst, data=src, scale=scale.get_view(), op=nl.copy)
+        nisa.activation(dst=dst, data=src, scale=scale, op=nl.copy)
     elif bias is not None:
-        nisa.activation(dst=dst, data=src, bias=bias.get_view(), op=nl.copy)
+        nisa.activation(dst=dst, data=src, bias=bias, op=nl.copy)
     else:
         nisa.activation(dst=dst, data=src, op=nl.copy)
 
@@ -105,9 +104,9 @@ def _emit_vector_engine(dst, src, scale, bias):
             dst=dst,
             data=src,
             op0=nl.multiply,
-            operand0=scale.get_view(),
+            operand0=scale,
             op1=nl.add,
-            operand1=bias.get_view(),
+            operand1=bias,
             engine=nisa.vector_engine,
         )
         return
@@ -118,32 +117,32 @@ def _emit_vector_engine(dst, src, scale, bias):
             dst=dst,
             data=src,
             op0=nl.multiply,
-            operand0=scale.get_view(),
+            operand0=scale,
             op1=nl.add,
-            operand1=bias.get_view(),
+            operand1=bias,
         )
         return
 
     # First op: apply scale (multiply) into dst. If no scale, fall through to bias/copy.
     if scale is not None:
         if scale_pp:
-            nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=scale.get_view(), engine=nisa.vector_engine)
+            nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=scale, engine=nisa.vector_engine)
         else:
-            nisa.tensor_tensor(dst=dst, data1=src, data2=scale.get_view(), op=nl.multiply)
+            nisa.tensor_tensor(dst=dst, data1=src, data2=scale, op=nl.multiply)
         # dst now holds src * scale. If bias present, accumulate below.
         if bias is not None:
             if bias_pp:
-                nisa.tensor_scalar(dst=dst, data=dst, op0=nl.add, operand0=bias.get_view(), engine=nisa.vector_engine)
+                nisa.tensor_scalar(dst=dst, data=dst, op0=nl.add, operand0=bias, engine=nisa.vector_engine)
             else:
-                nisa.tensor_tensor(dst=dst, data1=dst, data2=bias.get_view(), op=nl.add)
+                nisa.tensor_tensor(dst=dst, data1=dst, data2=bias, op=nl.add)
         return
 
     # Bias only
     if bias is not None:
         if bias_pp:
-            nisa.tensor_scalar(dst=dst, data=src, op0=nl.add, operand0=bias.get_view(), engine=nisa.vector_engine)
+            nisa.tensor_scalar(dst=dst, data=src, op0=nl.add, operand0=bias, engine=nisa.vector_engine)
         else:
-            nisa.tensor_tensor(dst=dst, data1=src, data2=bias.get_view(), op=nl.add)
+            nisa.tensor_tensor(dst=dst, data1=src, data2=bias, op=nl.add)
         return
 
     # Pure copy
@@ -151,10 +150,10 @@ def _emit_vector_engine(dst, src, scale, bias):
 
 
 def interleave_copy(
-    dst: nl.ndarray,
-    src: nl.ndarray,
-    scale: TensorView = None,
-    bias: TensorView = None,
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor,
+    scale: nl.NkiTensor = None,
+    bias: nl.NkiTensor = None,
     index: int = 0,
 ):
     """Copy ``src`` into ``dst`` with optional fused scale/bias, alternating engines.
@@ -177,6 +176,7 @@ def interleave_copy(
         index: Engine-selection counter. Callers should pass monotonically
             increasing values so consecutive copies alternate engines.
     """
+
     expected_p = dst.shape[0]
     _validate_partition_dim("src", src, expected_p)
     _validate_partition_dim("scale", scale, expected_p)

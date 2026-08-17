@@ -23,7 +23,7 @@ import nki.language as nl
 from ...subkernels.layernorm_tkg import SHARDING_THRESHOLD as LAYERNORM_THRESHOLD
 from ...subkernels.rmsnorm_tkg import SHARDING_THRESHOLD as RMSNORM_THRESHOLD
 from ...utils.allocator import SbufManager, sizeinbytes
-from ...utils.common_types import HiddenLayout
+from ...utils.common_types import HiddenLayout, MoEAllToAllVStrategy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from .mlp_parameters import (
@@ -166,8 +166,11 @@ class MLPTKGConstants(nl.NKIObject):
 
         # Unbalanced sharding is only supported for MoE all-expert BF16 path.
         # For all other paths, H1 must be evenly divisible by num_shards.
-        is_moe_expert = params.expert_params and params.expert_params.expert_index
-        if H1_remainder != 0 and is_moe_expert:
+        is_moe_all_expert = params.expert_params and (
+            params.expert_params.expert_index
+            or params.expert_params.all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED
+        )
+        if H1_remainder != 0 and is_moe_all_expert:
             # Unbalanced: first (num_shards - 1) shards get floor(H1/num_shards),
             # last shard gets the remainder so all H1 tiles are covered.
             if shard_id < num_shards - 1:

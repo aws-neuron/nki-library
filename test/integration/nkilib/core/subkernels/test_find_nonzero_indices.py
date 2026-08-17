@@ -16,9 +16,9 @@
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.subkernels.find_nonzero_indices import find_nonzero_indices
 from nkilib_src.nkilib.core.subkernels.find_nonzero_indices_torch import find_nonzero_indices_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata

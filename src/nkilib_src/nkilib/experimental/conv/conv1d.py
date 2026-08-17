@@ -26,7 +26,6 @@ from ...core.utils.common_types import ActFnType
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type, get_verified_program_sharding_info
 from ...core.utils.logging import get_logger
-from ...core.utils.tensor_view import TensorView
 
 # Partition alignment constants for K replication strategy
 _PARTITION_STRIDE_32 = 32  # Partition stride when c_in_tile_size <= 32
@@ -192,9 +191,9 @@ class Conv1dMemoryConfig(nl.NKIObject):
 
 
 def _build_conv1d_config(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     stride: int,
     padding: tuple[int, int],
     dilation: int,
@@ -205,9 +204,9 @@ def _build_conv1d_config(
     Build Conv1dConfig from kernel inputs.
 
     Args:
-        x_in (nl.ndarray): [B, C_in, L], Input tensor.
-        filters (nl.ndarray): [K, C_in, C_out], Filter weights.
-        bias (Optional[nl.ndarray]): [C_out], Optional bias tensor.
+        x_in (nl.NkiTensor): [B, C_in, L], Input tensor.
+        filters (nl.NkiTensor): [K, C_in, C_out], Filter weights.
+        bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor.
         stride (int): Stride for convolution.
         padding (tuple[int, int]): Tuple of (left_pad, right_pad).
         dilation (int): Dilation factor.
@@ -457,9 +456,9 @@ def _get_tensor_copy_engine(idx: int):
 
 
 def _validate_conv1d_inputs(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: nl.ndarray,
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: nl.NkiTensor,
     stride: int,
     pad_left: int,
     pad_right: int,
@@ -469,9 +468,9 @@ def _validate_conv1d_inputs(
     Validate all input parameters for conv1d kernel.
 
     Args:
-        x_in (nl.ndarray): [B, C_in, L], Input tensor.
-        filters (nl.ndarray): [K, C_in, C_out], Filter weights.
-        bias (nl.ndarray): Optional bias tensor.
+        x_in (nl.NkiTensor): [B, C_in, L], Input tensor.
+        filters (nl.NkiTensor): [K, C_in, C_out], Filter weights.
+        bias (nl.NkiTensor): Optional bias tensor.
         stride (int): Stride for convolution.
         pad_left (int): Left padding.
         pad_right (int): Right padding.
@@ -519,7 +518,7 @@ def _validate_conv1d_inputs(
 
 
 def _scatter_input_to_stacked(
-    input_view: Optional[TensorView],
+    input_view: Optional[nl.NkiTensor],
     sbm: SbufManager,
     c_in_start: int,
     c_in_end: int,
@@ -534,7 +533,7 @@ def _scatter_input_to_stacked(
     valid_window_end: int,
     name_suffix: str,
     tensor_copy_engine_idx: int,
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """
     Scatter input window to K-replicated stacked format for tensor engine matmul.
 
@@ -543,7 +542,7 @@ def _scatter_input_to_stacked(
     tensor engine utilization by processing multiple filter positions in parallel.
 
     Args:
-        input_view (Optional[TensorView]): [c_in_tile_size, valid_window_size], Input window in SBUF.
+        input_view (Optional[nl.NkiTensor]): [c_in_tile_size, valid_window_size], Input window in SBUF.
         sbm (SbufManager): SBUF memory manager.
         c_in_start (int): Start index of C_in tile.
         c_in_end (int): End index of C_in tile.
@@ -560,7 +559,7 @@ def _scatter_input_to_stacked(
         tensor_copy_engine_idx (int): Starting index for tensor copy engine alternation.
 
     Returns:
-        list[nl.ndarray]: List of stacked input buffers, one per K outer tile.
+        list[nl.NkiTensor]: List of stacked input buffers, one per K outer tile.
             Each buffer has shape [stacked_filter_dim, l_tile_size].
 
     Notes:
@@ -623,11 +622,10 @@ def _scatter_input_to_stacked(
                 src_end = src_start + (num_elements - 1) * stride + 1
 
                 nisa.tensor_copy(
-                    dst=TensorView(input_stacked)
-                    .slice(dim=0, start=partition_offset, end=partition_offset + c_in_tile_size, step=1)
-                    .slice(dim=1, start=first_valid_out, end=last_valid_out, step=1)
-                    .get_view(),
-                    src=input_view.slice(dim=1, start=src_start, end=src_end, step=stride).get_view(),
+                    dst=input_stacked.slice(
+                        dim=0, start=partition_offset, end=partition_offset + c_in_tile_size, step=1
+                    ).slice(dim=1, start=first_valid_out, end=last_valid_out, step=1),
+                    src=input_view.slice(dim=1, start=src_start, end=src_end, step=stride),
                     engine=_get_tensor_copy_engine(tensor_copy_engine_idx + k_outer_idx * K_REP + k_replicate_idx),
                 )
 
@@ -637,18 +635,18 @@ def _scatter_input_to_stacked(
 
 
 def _conv1d_matmul(
-    input_stacked_list: list[nl.ndarray],
-    filters_stacked_list: list[list[nl.ndarray]],
-    psum_tiles: list[nl.ndarray],
+    input_stacked_list: list[nl.NkiTensor],
+    filters_stacked_list: list[list[nl.NkiTensor]],
+    psum_tiles: list[nl.NkiTensor],
 ) -> None:
     """
     Perform matrix multiplication between stacked inputs and filters, accumulating to PSUM.
 
     Args:
-        input_stacked_list (list[nl.ndarray]): List of stacked input buffers from scatter operation.
-        filters_stacked_list (list[list[nl.ndarray]]): Filter buffers organized as
+        input_stacked_list (list[nl.NkiTensor]): List of stacked input buffers from scatter operation.
+        filters_stacked_list (list[list[nl.NkiTensor]]): Filter buffers organized as
             [c_out_tile_idx][k_outer_idx].
-        psum_tiles (list[nl.ndarray]): PSUM accumulation buffers for each C_out tile.
+        psum_tiles (list[nl.NkiTensor]): PSUM accumulation buffers for each C_out tile.
 
     Notes:
         - Accumulates results across all K outer tiles.
@@ -667,9 +665,9 @@ def _conv1d_matmul(
 
 
 def _conv1d_cin_tile(
-    input_view: Optional[TensorView],
-    filters_for_cin: list[list[nl.ndarray]],
-    psum_tiles: list[nl.ndarray],
+    input_view: Optional[nl.NkiTensor],
+    filters_for_cin: list[list[nl.NkiTensor]],
+    psum_tiles: list[nl.NkiTensor],
     sbm: SbufManager,
     c_in_start: int,
     c_in_end: int,
@@ -692,10 +690,10 @@ def _conv1d_cin_tile(
     to accumulate partial results in PSUM.
 
     Args:
-        input_view (Optional[TensorView]): [c_in_tile_size, valid_window_size], Input window in SBUF.
-        filters_for_cin (list[list[nl.ndarray]]): Filter buffers for this C_in tile,
+        input_view (Optional[nl.NkiTensor]): [c_in_tile_size, valid_window_size], Input window in SBUF.
+        filters_for_cin (list[list[nl.NkiTensor]]): Filter buffers for this C_in tile,
             organized as [c_out_tile_idx][k_outer_idx].
-        psum_tiles (list[nl.ndarray]): PSUM accumulation buffers for each C_out tile.
+        psum_tiles (list[nl.NkiTensor]): PSUM accumulation buffers for each C_out tile.
         sbm (SbufManager): SBUF memory manager.
         c_in_start (int): Start index of C_in tile.
         c_in_end (int): End index of C_in tile.
@@ -747,9 +745,9 @@ def _conv1d_cin_tile(
 
 
 def _apply_bias_activation_and_copy(
-    psum_tiles: list[nl.ndarray],
-    result_sbufs: list[nl.ndarray],
-    bias_sbufs: list[Optional[nl.ndarray]],
+    psum_tiles: list[nl.NkiTensor],
+    result_sbufs: list[nl.NkiTensor],
+    bias_sbufs: list[Optional[nl.NkiTensor]],
     has_bias: bool,
     has_activation: bool,
     activation_fn: Optional[ActFnType],
@@ -758,9 +756,9 @@ def _apply_bias_activation_and_copy(
     Apply optional bias and activation, then copy from PSUM to SBUF.
 
     Args:
-        psum_tiles (list[nl.ndarray]): PSUM accumulation buffers for each C_out tile.
-        result_sbufs (list[nl.ndarray]): Destination SBUF buffers for each C_out tile.
-        bias_sbufs (list[Optional[nl.ndarray]]): Bias buffers for each C_out tile (may be None).
+        psum_tiles (list[nl.NkiTensor]): PSUM accumulation buffers for each C_out tile.
+        result_sbufs (list[nl.NkiTensor]): Destination SBUF buffers for each C_out tile.
+        bias_sbufs (list[Optional[nl.NkiTensor]]): Bias buffers for each C_out tile (may be None).
         has_bias (bool): Whether to apply bias addition.
         has_activation (bool): Whether to apply activation function.
         activation_fn (Optional[ActFnType]): Activation function type to apply.
@@ -781,7 +779,7 @@ def _apply_bias_activation_and_copy(
                 dst=result_sbuf,
                 data=psum_tile,
                 op0=nl.add,
-                operand0=TensorView(bias_sbuf).get_view(),
+                operand0=bias_sbuf,
             )
             nisa.activation(
                 dst=result_sbuf,
@@ -793,7 +791,7 @@ def _apply_bias_activation_and_copy(
                 dst=result_sbuf,
                 data=psum_tile,
                 op0=nl.add,
-                operand0=TensorView(bias_sbuf).get_view(),
+                operand0=bias_sbuf,
             )
         elif has_activation:
             nisa.activation(
@@ -806,7 +804,7 @@ def _apply_bias_activation_and_copy(
 
 
 def _load_input_window_to_sbuf(
-    x_in_view: TensorView,
+    x_in_view: nl.NkiTensor,
     sbm: SbufManager,
     l_start: int,
     l_end: int,
@@ -816,12 +814,12 @@ def _load_input_window_to_sbuf(
     dilation: int,
     pad_left: int,
     name: str,
-) -> tuple[Optional[TensorView], int, int]:
+) -> tuple[Optional[nl.NkiTensor], int, int]:
     """
     Load input window from HBM to SBUF for a given L_out tile.
 
     Args:
-        x_in_view (TensorView): [c_in_tile_size, L], Input tensor view on HBM.
+        x_in_view (NkiTensor): [c_in_tile_size, L], Input tensor view on HBM.
         sbm (SbufManager): SBUF memory manager.
         l_start (int): Start index of L_out tile.
         l_end (int): End index of L_out tile.
@@ -834,7 +832,7 @@ def _load_input_window_to_sbuf(
 
     Returns:
         tuple containing:
-            - input_view_sbuf (Optional[TensorView]): Input window in SBUF, or None if fully padded.
+            - input_view_sbuf (Optional[nl.NkiTensor]): Input window in SBUF, or None if fully padded.
             - valid_window_start (int): Start of valid (non-padded) input window.
             - valid_window_end (int): End of valid (non-padded) input window.
 
@@ -853,18 +851,18 @@ def _load_input_window_to_sbuf(
         input_window = sbm.alloc_stack(shape=(c_in_tile_size, valid_window_size), dtype=x_in_view.dtype, name=name)
         nisa.dma_copy(
             dst=input_window,
-            src=x_in_view.slice(dim=1, start=valid_window_start, end=valid_window_end, step=1).get_view(),
+            src=x_in_view.slice(dim=1, start=valid_window_start, end=valid_window_end, step=1),
         )
-        input_view_sbuf = TensorView(input_window)
+        input_view_sbuf = input_window
 
     return input_view_sbuf, valid_window_start, valid_window_end
 
 
 def _conv1d_lout_tile(
-    x_in_view: TensorView,
-    filters_cache: list[list[list[nl.ndarray]]],
-    bias_cache: list[Optional[nl.ndarray]],
-    result_sbufs: list[nl.ndarray],
+    x_in_view: nl.NkiTensor,
+    filters_cache: list[list[list[nl.NkiTensor]]],
+    bias_cache: list[Optional[nl.NkiTensor]],
+    result_sbufs: list[nl.NkiTensor],
     sbm: SbufManager,
     cfg: Conv1dConfig,
     tile_cfg: Conv1dTileConfig,
@@ -882,11 +880,11 @@ def _conv1d_lout_tile(
     iterates over C_in tiles, performs matmul accumulation, and applies bias/activation.
 
     Args:
-        x_in_view (TensorView): [C_in, L], Input tensor view for current batch on HBM.
-        filters_cache (list[list[list[nl.ndarray]]]): Pre-loaded filter buffers organized as
+        x_in_view (NkiTensor): [C_in, L], Input tensor view for current batch on HBM.
+        filters_cache (list[list[list[nl.NkiTensor]]]): Pre-loaded filter buffers organized as
             [c_out_tile_idx][c_in_tile_idx][k_outer_idx].
-        bias_cache (list[Optional[nl.ndarray]]): Pre-loaded bias buffers for each C_out tile.
-        result_sbufs (list[nl.ndarray]): Destination SBUF buffers for each C_out tile.
+        bias_cache (list[Optional[nl.NkiTensor]]): Pre-loaded bias buffers for each C_out tile.
+        result_sbufs (list[nl.NkiTensor]): Destination SBUF buffers for each C_out tile.
         sbm (SbufManager): SBUF memory manager.
         cfg (Conv1dConfig): Convolution configuration.
         tile_cfg (Conv1dTileConfig): Tile configuration.
@@ -988,20 +986,20 @@ def _conv1d_lout_tile(
 
 
 def _load_bias_to_sbuf(
-    bias: TensorView,
+    bias: nl.NkiTensor,
     sbm: SbufManager,
     name: str,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Load bias from HBM to SBUF.
 
     Args:
-        bias (TensorView): [c_out_tile_size], Bias tensor view on HBM.
+        bias (NkiTensor): [c_out_tile_size], Bias tensor view on HBM.
         sbm (SbufManager): SBUF memory manager.
         name (str): Name for the allocated buffer.
 
     Returns:
-        nl.ndarray: [c_out_tile_size, 1], Bias buffer in SBUF.
+        nl.NkiTensor: [c_out_tile_size, 1], Bias buffer in SBUF.
 
     Notes:
         - Bias is always loaded as fp32 because tensor_scalar requires fp32 operands
@@ -1009,27 +1007,27 @@ def _load_bias_to_sbuf(
     """
     c_out_tile_size = bias.shape[0]
     bias_sbuf = sbm.alloc_stack(shape=(c_out_tile_size, 1), dtype=nl.float32, name=name)
-    nisa.dma_copy(dst=bias_sbuf[:, 0], src=bias.get_view())
+    nisa.dma_copy(dst=bias_sbuf[:, 0], src=bias)
     return bias_sbuf
 
 
 def _load_filters_to_sbuf(
-    filters: TensorView,
+    filters: nl.NkiTensor,
     sbm: SbufManager,
     K: int,
     name_suffix: str,
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """
     Load filters from HBM to SBUF with K-replication stacking.
 
     Args:
-        filters (TensorView): [K, c_in_tile_size, c_out_tile_size], Filter tensor view on HBM.
+        filters (NkiTensor): [K, c_in_tile_size, c_out_tile_size], Filter tensor view on HBM.
         sbm (SbufManager): SBUF memory manager.
         K (int): Total kernel size.
         name_suffix (str): Prefix for buffer naming.
 
     Returns:
-        list[nl.ndarray]: List of stacked filter buffers, one per K outer tile.
+        list[nl.NkiTensor]: List of stacked filter buffers, one per K outer tile.
             Each buffer has shape [stacked_filter_dim, c_out_tile_size].
 
     Notes:
@@ -1062,10 +1060,8 @@ def _load_filters_to_sbuf(
             partition_offset = k_replicate_idx * partition_stride
 
             nisa.dma_copy(
-                dst=TensorView(filters_stacked)
-                .slice(dim=0, start=partition_offset, end=partition_offset + c_in_tile_size, step=1)
-                .get_view(),
-                src=filters.select(dim=0, index=k_position).get_view(),
+                dst=filters_stacked.slice(dim=0, start=partition_offset, end=partition_offset + c_in_tile_size, step=1),
+                src=filters.select(dim=0, index=k_position),
             )
 
         filters_stacked_list.append(filters_stacked)
@@ -1074,34 +1070,34 @@ def _load_filters_to_sbuf(
 
 
 def _store_result_to_hbm(
-    y_out_view: TensorView,
-    result_sbuf: nl.ndarray,
+    y_out_view: nl.NkiTensor,
+    result_sbuf: nl.NkiTensor,
 ) -> None:
     """
     Store result from SBUF to HBM.
 
     Args:
-        y_out_view (TensorView): [c_out_tile_size, l_tile_size], Output tensor view on HBM.
-        result_sbuf (nl.ndarray): [c_out_tile_size, l_tile_size], Result buffer in SBUF.
+        y_out_view (NkiTensor): [c_out_tile_size, l_tile_size], Output tensor view on HBM.
+        result_sbuf (nl.NkiTensor): [c_out_tile_size, l_tile_size], Result buffer in SBUF.
     """
-    nisa.dma_copy(dst=y_out_view.get_view(), src=result_sbuf)
+    nisa.dma_copy(dst=y_out_view, src=result_sbuf)
 
 
 def _load_bias_and_filters_for_c_out_group(
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     sbm: SbufManager,
     cfg: Conv1dConfig,
     tile_cfg: Conv1dTileConfig,
     c_out_group_start: int,
     c_out_group_end: int,
-) -> tuple[list[int], list[Optional[nl.ndarray]], list[list[list[nl.ndarray]]]]:
+) -> tuple[list[int], list[Optional[nl.NkiTensor]], list[list[list[nl.NkiTensor]]]]:
     """
     Load bias and filters for all C_out tiles in a C_out group.
 
     Args:
-        filters (nl.ndarray): [K, C_in, C_out], Filter weights on HBM.
-        bias (Optional[nl.ndarray]): [C_out], Optional bias tensor on HBM.
+        filters (nl.NkiTensor): [K, C_in, C_out], Filter weights on HBM.
+        bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM.
         sbm (SbufManager): SBUF memory manager.
         cfg (Conv1dConfig): Convolution configuration.
         tile_cfg (Conv1dTileConfig): Tile configuration.
@@ -1111,8 +1107,8 @@ def _load_bias_and_filters_for_c_out_group(
     Returns:
         tuple containing:
             - c_out_tile_sizes (list[int]): Size of each C_out tile.
-            - bias_cache (list[Optional[nl.ndarray]]): Bias buffers for each C_out tile.
-            - filters_cache (list[list[list[nl.ndarray]]]): Filter buffers organized as
+            - bias_cache (list[Optional[nl.NkiTensor]]): Bias buffers for each C_out tile.
+            - filters_cache (list[list[list[nl.NkiTensor]]]): Filter buffers organized as
               [c_out_tile_idx][c_in_tile_idx][k_outer_idx].
     """
     actual_group_size = div_ceil(c_out_group_end - c_out_group_start, tile_cfg.P_MAX)
@@ -1130,7 +1126,7 @@ def _load_bias_and_filters_for_c_out_group(
         # Load bias
         bias_sbuf = None
         if cfg.has_bias:
-            bias_view = TensorView(bias).slice(dim=0, start=c_out_tile_start, end=c_out_tile_end, step=1)
+            bias_view = bias.slice(dim=0, start=c_out_tile_start, end=c_out_tile_end, step=1)
             bias_sbuf = _load_bias_to_sbuf(bias_view, sbm, f"bias_c{c_out_tile_start}")
         bias_cache.append(bias_sbuf)
 
@@ -1139,10 +1135,8 @@ def _load_bias_and_filters_for_c_out_group(
         for c_in_tile_idx in range(tile_cfg.c_in_tile_count):
             c_in_start = c_in_tile_idx * tile_cfg.P_MAX
             c_in_end = min(c_in_start + tile_cfg.P_MAX, cfg.C_in)
-            filters_view = (
-                TensorView(filters)
-                .slice(dim=1, start=c_in_start, end=c_in_end, step=1)
-                .slice(dim=2, start=c_out_tile_start, end=c_out_tile_end, step=1)
+            filters_view = filters.slice(dim=1, start=c_in_start, end=c_in_end, step=1).slice(
+                dim=2, start=c_out_tile_start, end=c_out_tile_end, step=1
             )
             filters_stacked_list = _load_filters_to_sbuf(
                 filters_view,
@@ -1158,15 +1152,15 @@ def _load_bias_and_filters_for_c_out_group(
 
 @nki.jit
 def conv1d(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     stride: int = 1,
     padding: tuple[int, int] = (0, 0),
     dilation: int = 1,
     activation_fn: Optional[ActFnType] = None,
     lnc_shard: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     1D Convolution operation using tensor engine with replication strategy.
 
@@ -1191,9 +1185,9 @@ def conv1d(
         K: Kernel/filter size
 
     Args:
-        x_in (nl.ndarray): [B, C_in, L], Input tensor on HBM.
-        filters (nl.ndarray): [K, C_in, C_out], Convolution filter weights on HBM.
-        bias (Optional[nl.ndarray]): [C_out], Optional bias tensor on HBM. Default None.
+        x_in (nl.NkiTensor): [B, C_in, L], Input tensor on HBM.
+        filters (nl.NkiTensor): [K, C_in, C_out], Convolution filter weights on HBM.
+        bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM. Default None.
         stride (int): Stride for convolution. Must be >= 1. Default 1.
         padding (tuple[int, int]): Tuple of (left_pad, right_pad). Must be non-negative. Default (0, 0).
         dilation (int): Dilation factor for dilated convolution. Must be >= 1. Default 1.
@@ -1201,7 +1195,7 @@ def conv1d(
         lnc_shard (bool): If True, shard computation across LNC cores on C_out dimension. Default False.
 
     Returns:
-        y_out (nl.ndarray): [B, C_out, L_out], Output tensor on HBM where
+        y_out (nl.NkiTensor): [B, C_out, L_out], Output tensor on HBM where
             L_out = (L + pad_left + pad_right - dilation * (K - 1) - 1) // stride + 1
 
     Notes:
@@ -1303,7 +1297,7 @@ def conv1d(
 
                 # Process L_out tile
                 _conv1d_lout_tile(
-                    x_in_view=TensorView(x_in).select(dim=0, index=batch_idx),
+                    x_in_view=x_in.select(dim=0, index=batch_idx),
                     filters_cache=filters_cache,
                     bias_cache=bias_cache,
                     result_sbufs=result_sbufs,
@@ -1324,8 +1318,7 @@ def conv1d(
                     c_out_end_tile = c_out_start_tile + c_out_tile_sizes[c_out_tile_idx]
 
                     _store_result_to_hbm(
-                        TensorView(y_out)
-                        .select(dim=0, index=batch_idx)
+                        y_out.select(dim=0, index=batch_idx)
                         .slice(dim=0, start=c_out_start_tile, end=c_out_end_tile, step=1)
                         .slice(dim=1, start=l_start, end=l_end, step=1),
                         result_sbufs[c_out_tile_idx],

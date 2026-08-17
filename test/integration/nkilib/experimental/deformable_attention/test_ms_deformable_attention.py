@@ -17,13 +17,13 @@
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.deformable_attention.ms_deformable_attention import (
     ms_deformable_attention,
 )
 from nkilib_src.nkilib.experimental.deformable_attention.ms_deformable_attention_torch import (
     ms_deformable_attention_torch_ref,
 )
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, LazyGoldenGenerator, Platforms, ValidationArgs
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -165,147 +165,149 @@ MS_DEFORM_ATTN_BEVFORMER_ALL_PARAMS = [
 # fmt: on
 
 
-@pytest_test_metadata(name="MS Deformable Attention Basic")
-@pytest_marks(["deformable_attention", "ms_deform_attn", "basic"])
-@pytest.mark.parametrize(MS_DEFORM_ATTN_PARAM_NAMES, MS_DEFORM_ATTN_BASIC_ALL_PARAMS)
-def test_ms_deformable_attention_basic(
-    test_manager: Orchestrator,
-    platform_target: Platforms,
-    batch,
-    n_queries,
-    n_heads,
-    c_head,
-    n_levels,
-    n_points,
-    spatial_shapes,
-    dtype,
-    value_layout,
-    sampling_locations_layout,
-    align_corners,
-    padding_mode,
-):
-    """Test multi-scale deformable attention basic configurations."""
+@pytest_test_metadata(name="MS Deformable Attention")
+@pytest_marks(["deformable_attention", "ms_deform_attn"])
+class TestMSDeformableAttention:
+    @pytest_marks(["basic"])
+    @pytest.mark.parametrize(MS_DEFORM_ATTN_PARAM_NAMES, MS_DEFORM_ATTN_BASIC_ALL_PARAMS)
+    def test_ms_deformable_attention_basic(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        n_queries,
+        n_heads,
+        c_head,
+        n_levels,
+        n_points,
+        spatial_shapes,
+        dtype,
+        value_layout,
+        sampling_locations_layout,
+        align_corners,
+        padding_mode,
+    ):
+        """Test multi-scale deformable attention basic configurations."""
 
-    def input_generator(test_config):
-        return generate_ms_deformable_attention_inputs(
-            batch=batch,
-            n_queries=n_queries,
-            n_heads=n_heads,
-            c_head=c_head,
-            n_levels=n_levels,
-            n_points=n_points,
-            spatial_shapes=spatial_shapes,
-            dtype=dtype,
-            value_layout=value_layout,
-            sampling_locations_layout=sampling_locations_layout,
-            align_corners=align_corners,
-            padding_mode=padding_mode,
+        def input_generator(test_config):
+            return generate_ms_deformable_attention_inputs(
+                batch=batch,
+                n_queries=n_queries,
+                n_heads=n_heads,
+                c_head=c_head,
+                n_levels=n_levels,
+                n_points=n_points,
+                spatial_shapes=spatial_shapes,
+                dtype=dtype,
+                value_layout=value_layout,
+                sampling_locations_layout=sampling_locations_layout,
+                align_corners=align_corners,
+                padding_mode=padding_mode,
+            )
+
+        def output_tensors(kernel_input):
+            return {
+                "out": np.zeros((batch, n_queries, n_heads * c_head), dtype=dtype),
+            }
+
+        def golden_generator():
+            """Generate golden output using torch reference."""
+            kernel_input = input_generator(None)
+            return torch_ref_wrapper(ms_deformable_attention_torch_ref)(**kernel_input)
+
+        # Create and run test framework
+        test_framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=ms_deformable_attention,
+            torch_ref=torch_ref_wrapper(ms_deformable_attention_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
         )
 
-    def output_tensors(kernel_input):
-        return {
-            "out": np.zeros((batch, n_queries, n_heads * c_head), dtype=dtype),
-        }
-
-    def golden_generator():
-        """Generate golden output using torch reference."""
-        kernel_input = input_generator(None)
-        return torch_ref_wrapper(ms_deformable_attention_torch_ref)(**kernel_input)
-
-    # Create and run test framework
-    test_framework = UnitTestFramework(
-        test_manager=test_manager,
-        kernel_entry=ms_deformable_attention,
-        torch_ref=torch_ref_wrapper(ms_deformable_attention_torch_ref),
-        kernel_input_generator=input_generator,
-        output_tensor_descriptor=output_tensors,
-    )
-
-    custom_validation = ValidationArgs(
-        golden_output=LazyGoldenGenerator(
-            output_ndarray=output_tensors(None),
-            lazy_golden_generator=golden_generator,
-        ),
-        relative_accuracy=0.01,
-        absolute_accuracy=1e-06,
-    )
-
-    # Run test with custom validation
-    test_framework.run_test(
-        test_config=None,
-        compiler_args=CompilerArgs(platform_target=platform_target),
-        custom_validation_args=custom_validation,
-    )
-
-
-@pytest_test_metadata(name="MS Deformable Attention BEVFormer")
-@pytest_marks(["deformable_attention", "ms_deform_attn", "bevformer"])
-@pytest.mark.parametrize(MS_DEFORM_ATTN_PARAM_NAMES, MS_DEFORM_ATTN_BEVFORMER_ALL_PARAMS)
-def test_ms_deformable_attention_bevformer(
-    test_manager: Orchestrator,
-    platform_target: Platforms,
-    batch,
-    n_queries,
-    n_heads,
-    c_head,
-    n_levels,
-    n_points,
-    spatial_shapes,
-    dtype,
-    value_layout,
-    sampling_locations_layout,
-    align_corners,
-    padding_mode,
-):
-    """Test multi-scale deformable attention with BEVFormer configs."""
-
-    def input_generator(test_config):
-        return generate_ms_deformable_attention_inputs(
-            batch=batch,
-            n_queries=n_queries,
-            n_heads=n_heads,
-            c_head=c_head,
-            n_levels=n_levels,
-            n_points=n_points,
-            spatial_shapes=spatial_shapes,
-            dtype=dtype,
-            value_layout=value_layout,
-            sampling_locations_layout=sampling_locations_layout,
-            align_corners=align_corners,
-            padding_mode=padding_mode,
+        custom_validation = ValidationArgs(
+            golden_output=LazyGoldenGenerator(
+                output_ndarray=output_tensors(None),
+                lazy_golden_generator=golden_generator,
+            ),
+            relative_accuracy=0.01,
+            absolute_accuracy=1e-06,
         )
 
-    def output_tensors(kernel_input):
-        return {
-            "out": np.zeros((batch, n_queries, n_heads * c_head), dtype=dtype),
-        }
+        # Run test with custom validation
+        test_framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            custom_validation_args=custom_validation,
+        )
 
-    def golden_generator():
-        """Generate golden output using torch reference."""
-        kernel_input = input_generator(None)
-        return torch_ref_wrapper(ms_deformable_attention_torch_ref)(**kernel_input)
+    @pytest_marks(["bevformer"])
+    @pytest.mark.parametrize(MS_DEFORM_ATTN_PARAM_NAMES, MS_DEFORM_ATTN_BEVFORMER_ALL_PARAMS)
+    def test_ms_deformable_attention_bevformer(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        n_queries,
+        n_heads,
+        c_head,
+        n_levels,
+        n_points,
+        spatial_shapes,
+        dtype,
+        value_layout,
+        sampling_locations_layout,
+        align_corners,
+        padding_mode,
+    ):
+        """Test multi-scale deformable attention with BEVFormer configs."""
 
-    # Create test framework
-    test_framework = UnitTestFramework(
-        test_manager=test_manager,
-        kernel_entry=ms_deformable_attention,
-        torch_ref=torch_ref_wrapper(ms_deformable_attention_torch_ref),
-        kernel_input_generator=input_generator,
-        output_tensor_descriptor=output_tensors,
-    )
+        def input_generator(test_config):
+            return generate_ms_deformable_attention_inputs(
+                batch=batch,
+                n_queries=n_queries,
+                n_heads=n_heads,
+                c_head=c_head,
+                n_levels=n_levels,
+                n_points=n_points,
+                spatial_shapes=spatial_shapes,
+                dtype=dtype,
+                value_layout=value_layout,
+                sampling_locations_layout=sampling_locations_layout,
+                align_corners=align_corners,
+                padding_mode=padding_mode,
+            )
 
-    custom_validation = ValidationArgs(
-        golden_output=LazyGoldenGenerator(
-            output_ndarray=output_tensors(None),
-            lazy_golden_generator=golden_generator,
-        ),
-        relative_accuracy=0.01,
-        absolute_accuracy=1e-06,
-    )
+        def output_tensors(kernel_input):
+            return {
+                "out": np.zeros((batch, n_queries, n_heads * c_head), dtype=dtype),
+            }
 
-    # Run test with custom validation
-    test_framework.run_test(
-        test_config=None,
-        compiler_args=CompilerArgs(platform_target=platform_target),
-        custom_validation_args=custom_validation,
-    )
+        def golden_generator():
+            """Generate golden output using torch reference."""
+            kernel_input = input_generator(None)
+            return torch_ref_wrapper(ms_deformable_attention_torch_ref)(**kernel_input)
+
+        # Create test framework
+        test_framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=ms_deformable_attention,
+            torch_ref=torch_ref_wrapper(ms_deformable_attention_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+
+        custom_validation = ValidationArgs(
+            golden_output=LazyGoldenGenerator(
+                output_ndarray=output_tensors(None),
+                lazy_golden_generator=golden_generator,
+            ),
+            relative_accuracy=0.01,
+            absolute_accuracy=1e-06,
+        )
+
+        # Run test with custom validation
+        test_framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            custom_validation_args=custom_validation,
+        )

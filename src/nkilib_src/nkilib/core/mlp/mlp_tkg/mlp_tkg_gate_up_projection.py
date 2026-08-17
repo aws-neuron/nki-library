@@ -21,7 +21,6 @@ from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type, resolve_fp8_e4m3_dtype
-from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
     MLPParameters,
@@ -39,7 +38,6 @@ from .mlp_tkg_gate_up_projection_lhs_rhs_swap import (
 from .mlp_tkg_utils import (
     _clamp_lower_upper_limit,
     adaptive_dge_mode,
-    alloc_tensor_view,
     prepare_gate_up_bias_and_scale,
 )
 
@@ -48,14 +46,14 @@ _DGE_MODE_NONE = 3  # Use STATIC DMA mode
 
 
 def gate_up_projection(
-    hidden: TensorView,
-    weight: TensorView,
-    bias: TensorView,
-    dequant_scale: TensorView,
-    output_tile: TensorView,
-    weight_tiles: list[TensorView],
-    bias_tile: TensorView,
-    dequant_tile: TensorView,
+    hidden: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: nl.NkiTensor,
+    dequant_scale: nl.NkiTensor,
+    output_tile: nl.NkiTensor,
+    weight_tiles: list[nl.NkiTensor],
+    bias_tile: nl.NkiTensor,
+    dequant_tile: nl.NkiTensor,
     dims: MLPTKGConstantsDimensionSizes,
     tiles: MLPTKGConstantsGateUpTileCounts,
     params: MLPParameters,
@@ -65,7 +63,7 @@ def gate_up_projection(
     """
     Performs a single Gate or Up projection shard on the H.
 
-    All inputs are pre-sharded TensorView instances — callers handle LNC/shard slicing.
+    All inputs are pre-sharded NkiTensor instances — callers handle LNC/shard slicing.
 
     Computes: Hidden[H, T] @ Weight[H, I] + Optional(Bias[1, I]) → [T, I]
     - Hidden is the stationary tensor, Weight is the moving tensor.
@@ -99,11 +97,11 @@ def gate_up_projection(
     - Column tiling improves PE utilization for small T
 
     Args:
-        hidden (TensorView): [H0, T, H1_shard] — pre-sharded hidden activations
-        weight (TensorView): [H_per_shard, I_shard] — pre-sharded weight matrix
-        bias (TensorView): [1, I_shard] or None — pre-sharded bias
-        dequant_scale (TensorView): [T, I_shard] or static scale — dequantization scale
-        output_tile (TensorView): [T, I_shard] — pre-sharded output buffer in SBUF
+        hidden (NkiTensor): [H0, T, H1_shard] — pre-sharded hidden activations
+        weight (NkiTensor): [H_per_shard, I_shard] — pre-sharded weight matrix
+        bias (NkiTensor): [1, I_shard] or None — pre-sharded bias
+        dequant_scale (NkiTensor): [T, I_shard] or static scale — dequantization scale
+        output_tile (NkiTensor): [T, I_shard] — pre-sharded output buffer in SBUF
 
     Returns:
         Output tensor with shape [T, I_shard]
@@ -152,8 +150,8 @@ def gate_up_projection(
         bias_hbm_view = bias.broadcast(dim=0, size=T)
         bias_tile_view = bias_tile.slice(dim=1, start=0, end=I)
         nisa.dma_copy(
-            dst=bias_tile_view.get_view(),
-            src=bias_hbm_view.get_view(),
+            dst=bias_tile_view,
+            src=bias_hbm_view,
             dge_mode=_DGE_MODE_NONE,
         )
 
@@ -161,8 +159,8 @@ def gate_up_projection(
     if params.quant_params.is_quant_row():
         dequant_scale_view = dequant_scale.slice(dim=0, start=0, end=T).slice(dim=1, start=0, end=I)
         nisa.dma_copy(
-            dst=dequant_tile.slice(dim=1, start=0, end=I).get_view(),
-            src=dequant_scale_view.get_view(),
+            dst=dequant_tile.slice(dim=1, start=0, end=I),
+            src=dequant_scale_view,
             dge_mode=_DGE_MODE_NONE,
         )
 
@@ -184,8 +182,8 @@ def gate_up_projection(
         weight_sb_tile_slice = weight_tiles[weight_idx].slice(dim=1, start=0, end=h1_tiles).slice(dim=2, start=0, end=I)
 
         nisa.dma_copy(
-            dst=weight_sb_tile_slice.get_view(),
-            src=weight_view.get_view(),
+            dst=weight_sb_tile_slice,
+            src=weight_view,
             dge_mode=_DGE_MODE_NONE,
         )
 
@@ -199,10 +197,10 @@ def gate_up_projection(
                             nl.ds(dims.column_tiling_dim * column_idx, T),
                             0 : i_tile.size,
                         ],
-                        stationary=hidden.select(dim=hidden_h1_dim, index=h_offset + column_tile_offset).get_view(),
-                        moving=weight_sb_tile_slice.select(dim=1, index=column_tile_offset)
-                        .slice(dim=1, start=i_tile.start_offset, end=i_tile.end_offset)
-                        .get_view(),
+                        stationary=hidden.select(dim=hidden_h1_dim, index=h_offset + column_tile_offset),
+                        moving=weight_sb_tile_slice.select(dim=1, index=column_tile_offset).slice(
+                            dim=1, start=i_tile.start_offset, end=i_tile.end_offset
+                        ),
                         tile_position=(0, dims.column_tiling_dim * column_idx),
                         tile_size=(H0, dims.column_tiling_dim),
                     )
@@ -215,7 +213,7 @@ def gate_up_projection(
         sliced_output = output_tile.slice(dim=1, start=i_tile.start_offset, end=i_tile.end_offset)
         # Copy PSUM to SBUF
         nisa.activation(
-            dst=sliced_output.get_view(),
+            dst=sliced_output,
             data=result_psums[i_tile.index][0:T, 0 : i_tile.size],
             op=nl.copy,
         )
@@ -223,9 +221,9 @@ def gate_up_projection(
         # Accumulate PSUMs to SBUF
         for factor_idx in range(1, used_columns):
             nisa.tensor_tensor(
-                dst=sliced_output.get_view(),
+                dst=sliced_output,
                 data1=result_psums[i_tile.index][nl.ds(dims.column_tiling_dim * factor_idx, T), 0 : i_tile.size],
-                data2=sliced_output.get_view(),
+                data2=sliced_output,
                 op=nl.add,
             )
 
@@ -235,8 +233,8 @@ def gate_up_projection(
             dequant_tile_view = dequant_tile_view.slice(dim=1, start=0, end=I)
 
         interleave_copy(
-            dst=output_tile.get_view(),
-            src=output_tile.get_view(),
+            dst=output_tile,
+            src=output_tile,
             scale=dequant_tile_view,
             bias=None,
         )
@@ -245,16 +243,16 @@ def gate_up_projection(
     if is_bias:
         bias_tile_view = bias_tile.slice(dim=1, start=0, end=I)
         nisa.tensor_tensor(
-            dst=output_tile.get_view(),
-            data1=output_tile.get_view(),
-            data2=bias_tile_view.get_view(),
+            dst=output_tile,
+            data1=output_tile,
+            data2=bias_tile_view,
             op=nl.add,
         )
 
 
 def run_gate_up_projection_non_lhs_rhs_swap(
-    hidden: TensorView,
-    output: TensorView,
+    hidden: nl.NkiTensor,
+    output: nl.NkiTensor,
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,
@@ -288,17 +286,13 @@ def run_gate_up_projection_non_lhs_rhs_swap(
                 buffer=nl.sbuf,
                 align=4,
             )
-            gate_up_tv = TensorView(gate_up_sb_fp32)
-            gate_sb_view = gate_up_tv.slice(dim=1, start=0, end=tile_shape[1])
-            up_sb_view = gate_up_tv.slice(dim=1, start=tile_shape[1], end=2 * tile_shape[1])
+            gate_sb_view = gate_up_sb_fp32.slice(dim=1, start=0, end=tile_shape[1])
+            up_sb_view = gate_up_sb_fp32.slice(dim=1, start=tile_shape[1], end=2 * tile_shape[1])
         else:
-            gate_sb_fp32 = sbm.alloc_stack(tile_shape, dtype=nl.float32, name="gate_sbuf_fp32", buffer=nl.sbuf, align=4)
-            up_sb_fp32 = sbm.alloc_stack(tile_shape, dtype=nl.float32, name="up_sbuf_fp32", buffer=nl.sbuf, align=4)
-            gate_sb_view = TensorView(gate_sb_fp32)
-            up_sb_view = TensorView(up_sb_fp32)
+            gate_sb_view = sbm.alloc_stack(tile_shape, dtype=nl.float32, name="gate_sbuf_fp32", buffer=nl.sbuf, align=4)
+            up_sb_view = sbm.alloc_stack(tile_shape, dtype=nl.float32, name="up_sbuf_fp32", buffer=nl.sbuf, align=4)
     else:
-        up_sb_fp32 = sbm.alloc_stack(tile_shape, dtype=nl.float32, name="up_sbuf_fp32", buffer=nl.sbuf, align=4)
-        up_sb_view = TensorView(up_sb_fp32)
+        up_sb_view = sbm.alloc_stack(tile_shape, dtype=nl.float32, name="up_sbuf_fp32", buffer=nl.sbuf, align=4)
         gate_sb_view = None
 
     # ---------------- quantization ----------------
@@ -306,34 +300,27 @@ def run_gate_up_projection_non_lhs_rhs_swap(
     gate_dequant_tile = up_dequant_tile = None
     if params.quant_params.is_quant_static():
         par_dim = dims.T
-        gate_dequant_tile = alloc_tensor_view(
-            sbm, (par_dim, 1), dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4
-        )
-        up_dequant_tile = alloc_tensor_view(sbm, (par_dim, 1), dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4)
+        gate_dequant_tile = sbm.alloc_stack((par_dim, 1), dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4)
+        up_dequant_tile = sbm.alloc_stack((par_dim, 1), dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4)
         gate_w_scale_view = gate_w_scale.slice(dim=0, start=0, end=par_dim)
         up_w_scale_view = up_w_scale.slice(dim=0, start=0, end=par_dim)
         nisa.dma_copy(
-            dst=gate_dequant_tile.get_view(),
-            src=gate_w_scale_view.get_view(),
+            dst=gate_dequant_tile,
+            src=gate_w_scale_view,
             dge_mode=adaptive_dge_mode(gate_w_scale_view),
         )
-        nisa.dma_copy(
-            dst=up_dequant_tile.get_view(), src=up_w_scale_view.get_view(), dge_mode=adaptive_dge_mode(up_w_scale_view)
-        )
+        nisa.dma_copy(dst=up_dequant_tile, src=up_w_scale_view, dge_mode=adaptive_dge_mode(up_w_scale_view))
 
     elif params.quant_params.is_quant_row():
         row_dequant_shape = (dims.T, I_shard_size)
-        gate_dequant_tile = alloc_tensor_view(
-            sbm, row_dequant_shape, dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4
+        gate_dequant_tile = sbm.alloc_stack(
+            row_dequant_shape, dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4
         )
-        up_dequant_tile = alloc_tensor_view(
-            sbm, row_dequant_shape, dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4
-        )
+        up_dequant_tile = sbm.alloc_stack(row_dequant_shape, dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4)
 
     # ---------------- bias ----------------
     if mlpp_has_gate_projection_bias(params) or mlpp_has_up_projection_bias(params):
-        bias_tile = alloc_tensor_view(
-            sbm,
+        bias_tile = sbm.alloc_stack(
             (dims.T, I_shard_size),
             dtype=gate_b.dtype,
             name="gate_up_broadcasted_bias",
@@ -346,7 +333,7 @@ def run_gate_up_projection_non_lhs_rhs_swap(
         if use_fused_gate_up_sendrecv:
             send_recv_buffer_shape = gate_up_sb_fp32.shape
         else:
-            send_recv_buffer_shape = up_sb_view.get_view().shape
+            send_recv_buffer_shape = up_sb_view.shape
         gate_up_recv = sbm.alloc_stack(
             send_recv_buffer_shape,
             dtype=nl.float32,
@@ -361,8 +348,7 @@ def run_gate_up_projection_non_lhs_rhs_swap(
 
     weight_tiles = []
     for w_tile_idx in range(tiles.num_allocated_w_tile):
-        weight_tile = alloc_tensor_view(
-            sbm,
+        weight_tile = sbm.alloc_stack(
             (dims.H0, div_ceil(tiles.HTile, dims.H0), tiles.I_shard_size),
             name=f"gate_up_w_tile_{w_tile_idx}",
             dtype=_fp8_e4m3_tile_dtype if str(up_w.dtype) == "float8e4" else up_w.dtype,
@@ -427,7 +413,7 @@ def run_gate_up_projection_non_lhs_rhs_swap(
 
 
 def _post_process_gate_up(
-    output: TensorView,
+    output: nl.NkiTensor,
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,
@@ -442,20 +428,20 @@ def _post_process_gate_up(
     if params.skip_gate_proj:
         if dims.num_shards > 1:
             nisa.sendrecv(
-                src=up_sb_view.get_view(),
+                src=up_sb_view,
                 dst=gate_up_recv,
                 send_to_rank=(1 - dims.shard_id),
                 recv_from_rank=(1 - dims.shard_id),
                 pipe_id=0,
             )
-            nisa.tensor_tensor(dst=up_sb_view.get_view(), data1=up_sb_view.get_view(), data2=gate_up_recv, op=nl.add)
+            nisa.tensor_tensor(dst=up_sb_view, data1=up_sb_view, data2=gate_up_recv, op=nl.add)
 
-        _clamp_lower_upper_limit(up_sb_view.get_view(), params.up_clamp_lower_limit, params.up_clamp_upper_limit)
+        _clamp_lower_upper_limit(up_sb_view, params.up_clamp_lower_limit, params.up_clamp_upper_limit)
 
         nisa.activation(
-            dst=up_sb_view.get_view() if params.use_tkg_gate_up_proj_column_tiling else output.get_view(),
+            dst=up_sb_view if params.use_tkg_gate_up_proj_column_tiling else output,
             op=get_nl_act_fn_from_type(params.activation_fn),
-            data=up_sb_view.get_view(),
+            data=up_sb_view,
             scale=1.0,
         )
     else:
@@ -471,42 +457,36 @@ def _post_process_gate_up(
                 nisa.tensor_tensor(dst=gate_up_sb_fp32, data1=gate_up_sb_fp32, data2=gate_up_recv, op=nl.add)
             else:
                 nisa.sendrecv(
-                    src=gate_sb_view.get_view(),
+                    src=gate_sb_view,
                     dst=gate_up_recv,
                     send_to_rank=(1 - dims.shard_id),
                     recv_from_rank=(1 - dims.shard_id),
                     pipe_id=0,
                 )
-                nisa.tensor_tensor(
-                    dst=gate_sb_view.get_view(), data1=gate_sb_view.get_view(), data2=gate_up_recv, op=nl.add
-                )
+                nisa.tensor_tensor(dst=gate_sb_view, data1=gate_sb_view, data2=gate_up_recv, op=nl.add)
 
                 nisa.sendrecv(
-                    src=up_sb_view.get_view(),
+                    src=up_sb_view,
                     dst=gate_up_recv,
                     send_to_rank=(1 - dims.shard_id),
                     recv_from_rank=(1 - dims.shard_id),
                     pipe_id=0,
                 )
-                nisa.tensor_tensor(
-                    dst=up_sb_view.get_view(), data1=up_sb_view.get_view(), data2=gate_up_recv, op=nl.add
-                )
+                nisa.tensor_tensor(dst=up_sb_view, data1=up_sb_view, data2=gate_up_recv, op=nl.add)
 
-        _clamp_lower_upper_limit(gate_sb_view.get_view(), params.gate_clamp_lower_limit, params.gate_clamp_upper_limit)
+        _clamp_lower_upper_limit(gate_sb_view, params.gate_clamp_lower_limit, params.gate_clamp_upper_limit)
 
         nisa.activation(
-            dst=gate_sb_view.get_view(),
+            dst=gate_sb_view,
             op=get_nl_act_fn_from_type(params.activation_fn),
-            data=gate_sb_view.get_view(),
+            data=gate_sb_view,
             scale=1.0,
         )
 
-        _clamp_lower_upper_limit(up_sb_view.get_view(), params.up_clamp_lower_limit, params.up_clamp_upper_limit)
+        _clamp_lower_upper_limit(up_sb_view, params.up_clamp_lower_limit, params.up_clamp_upper_limit)
 
         mul_dst = up_sb_view if params.use_tkg_gate_up_proj_column_tiling else output
-        nisa.tensor_tensor(
-            dst=mul_dst.get_view(), data1=gate_sb_view.get_view(), data2=up_sb_view.get_view(), op=nl.multiply
-        )
+        nisa.tensor_tensor(dst=mul_dst, data1=gate_sb_view, data2=up_sb_view, op=nl.multiply)
 
     # ---------- Transpose hidden if column tiling is enabled ----------
     if params.use_tkg_gate_up_proj_column_tiling:
@@ -521,15 +501,14 @@ def _post_process_gate_up(
             )
             nisa.nc_transpose(
                 dst=tp_psum,
-                data=up_sb_view.slice(dim=0, start=0, end=dims.T)
-                .slice(dim=1, start=i_tile.index * dims.I0, end=i_tile.index * dims.I0 + i_tile.size)
-                .get_view(),
+                data=up_sb_view.slice(dim=0, start=0, end=dims.T).slice(
+                    dim=1, start=i_tile.index * dims.I0, end=i_tile.index * dims.I0 + i_tile.size
+                ),
             )
             nisa.tensor_copy(
                 dst=output.slice(dim=0, start=0, end=i_tile.size)
                 .slice(dim=1, start=i_tile.index, end=i_tile.index + 1)
-                .slice(dim=2, start=0, end=dims.T)
-                .get_view(),
+                .slice(dim=2, start=0, end=dims.T),
                 src=tp_psum,
             )
 
@@ -537,8 +516,8 @@ def _post_process_gate_up(
 
 
 def process_gate_up_projection(
-    hidden: TensorView,
-    output: TensorView,
+    hidden: nl.NkiTensor,
+    output: nl.NkiTensor,
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,

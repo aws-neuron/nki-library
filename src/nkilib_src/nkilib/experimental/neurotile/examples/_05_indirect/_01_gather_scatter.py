@@ -47,7 +47,7 @@ def gather_kernel(data, indices):
         idx_tile = idx_iter[i, 0].load()  # tile: [T_K, 1]
         for j in range(out_iter.shape[1]):  # D // T_D
             gathered = data_iter[idx_tile, j].load()  # tile: [T_K, T_D]
-            out_iter[i, j].store(gathered.ap())
+            out_iter[i, j].store(gathered.data)
 
     return out
 
@@ -76,7 +76,7 @@ def scatter_kernel(source, indices, out_rows):
         idx_tile = idx_iter[i, 0].load()  # tile: [T_K, 1]
         for j in range(src_iter.shape[1]):  # D // T_D
             src_tile = src_iter[i, j].load()  # tile: [T_K, T_D]
-            out_iter[idx_tile, j].store(src_tile.ap())  # vector_offset scatter
+            out_iter[idx_tile, j].store(src_tile.data)  # vector_offset scatter
 
     return out
 
@@ -95,7 +95,7 @@ def scalar_gather_dim0(data, row_idx_tensor):
 
     idx_tile = idx_iter[0, 0].load()
     selected = data_iter[idx_tile, 0].load()  # tile: [1, D]
-    out_iter[0, 0].store(selected.ap())
+    out_iter[0, 0].store(selected.data)
     return out
 
 
@@ -113,7 +113,7 @@ def scalar_gather_dim1(data, col_idx_tensor):
 
     idx_tile = idx_iter[0, 0].load()
     selected = data_iter[0, idx_tile].load()  # tile: [N, 1]
-    out_iter[0, 0].store(selected.ap())
+    out_iter[0, 0].store(selected.data)
     return out
 
 

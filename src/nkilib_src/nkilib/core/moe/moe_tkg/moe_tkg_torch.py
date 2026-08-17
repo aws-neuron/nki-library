@@ -779,7 +779,7 @@ def _moe_tkg_static_mx_ref(
         # Step 1: FP8 quantize input (matching kernel's static_quantization → fp8 cast)
         # Kernel: quantized = FP8(input / in_scale), then feeds quantized into nc_matmul_mx
         # Post-matmul: result *= in_scale * w_dequant to recover original scale
-        in_scale = float(gate_up_in_dequant_np[0, 0])
+        in_scale = float(gate_up_in_dequant_np[expert_idx, 0])
         inp_f32 = active_in.astype(np.float32)
         quantized = np.clip(inp_f32 / in_scale, -448.0, 448.0)
 
@@ -885,9 +885,11 @@ def _moe_tkg_static_mx_ref(
         # Activation + multiply
         intermediate = act_fn_func(gate_out) * up_out
 
-        # Step 3: Down projection — kernel uses normal nisa.quantize_mx for intermediate
-        # but dummy 127 weight scales (from memset). No FP8 round-trip on intermediate.
-        mult_t = torch.from_numpy(intermediate)
+        # Step 3: Down projection with MX quantization.
+        down_in_scale = float(down_in_dequant_np[expert_idx, 0])
+        # Pre-quantize intermediate by dividing by down_in_scale
+        intermediate_for_down = np.clip(intermediate / down_in_scale, -448.0, 448.0).astype(np.float32)
+        mult_t = torch.from_numpy(intermediate_for_down)
         dw = down_w[expert_idx]
         dummy_down_w_scale = torch.full((dw.shape[0] // 8,) + dw.shape[1:], 127, dtype=torch.uint8)
         down_out = down_proj_mx_torch_ref(mult_t, dw, dummy_down_w_scale, None, H, I, BxS, weight_unpack_fn=w_unpack)[
@@ -895,7 +897,7 @@ def _moe_tkg_static_mx_ref(
         ].numpy()
 
         # Post-down dequant: result *= down_in_scale * down_w_dequant
-        down_out = down_out * float(down_in_dequant_np[0, 0]) * float(down_w_dequant_np[expert_idx, 0])
+        down_out = down_out * down_in_scale * float(down_w_dequant_np[expert_idx, 0])
 
         # Down bias after dequant — down_b is [E, H] (already in standard layout, no MX packing)
         if down_b != None:

@@ -20,7 +20,6 @@ from typing import final
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.output_projection.output_projection_cte import output_projection_cte
 from nkilib_src.nkilib.core.output_projection.output_projection_cte.output_projection_cte_torch import (
     output_projection_cte_mx_torch_ref,
@@ -30,10 +29,15 @@ from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationTyp
 
 try:
     from test.integration.nkilib.core.output_projection.test_output_proj_cte_model_config import (
+        get_mx_weight_dtype,
         output_proj_cte_model_configs,
     )
 except ImportError:
     output_proj_cte_model_configs = {}
+
+    def get_mx_weight_dtype(configs=None):
+        return "fp4"
+
 
 from test.integration.nkilib.utils.tensor_generators import (
     gaussian_tensor_generator,
@@ -54,6 +58,13 @@ from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+
+# Map the model-config MX weight-dtype token to the nl dtype the input generator expects.
+_MX_WEIGHT_DTYPE_BY_TOKEN = {
+    "fp4": nl.float4_e2m1fn_x4,
+    "fp8": nl.float8_e4m3fn_x4,
+}
+_MODEL_MX_WEIGHT_DTYPE = _MX_WEIGHT_DTYPE_BY_TOKEN[get_mx_weight_dtype()]
 
 
 def generate_output_proj_cte_inputs(
@@ -129,8 +140,9 @@ def generate_output_proj_cte_mx_inputs(
     d_head: int,
     input_prequantized: bool = False,
     test_bias: bool = False,
+    weight_dtype=nl.float4_e2m1fn_x4,
 ) -> dict:
-    """Generate inputs for MX FP4 output projection CTE test."""
+    """Generate inputs for MX output projection CTE test (fp4 default, fp8 via weight_dtype)."""
     dtype = nl.bfloat16
     np.random.seed(42)
 
@@ -143,7 +155,7 @@ def generate_output_proj_cte_mx_inputs(
         weight_scale = np.zeros((n_head * d_head // 32, hidden), dtype=np.uint8)
     else:
         _, weight_quantized, weight_scale = generate_stabilized_mx_data(
-            nl.float4_e2m1fn_x4, weight_logical_shape, val_range=1.0
+            weight_dtype, weight_logical_shape, val_range=1.0
         )
 
     if input_prequantized:
@@ -782,7 +794,6 @@ class TestOutputProjCteKernel:
             test_config=None,
             compiler_args=CompilerArgs(
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             rtol=5e-2,
             atol=1e-5,
@@ -943,6 +954,62 @@ class TestOutputProjCteKernel:
             is_negative_test=is_negative_test_case,
         )
 
+    @pytest.mark.parametrize(
+        "alt_dtype, canonical_dtype",
+        [(np.uint32, nl.float8_e4m3fn_x4), (np.uint16, nl.float4_e2m1fn_x4)],
+        ids=["u32_fp8", "u16_fp4"],
+    )
+    @pytest.mark.parametrize(
+        "hidden, n_head",
+        # h512: single SBUF tile; h5120: forces H-block tiling + exercises the byte-budget guard.
+        [(512, 1), (5120, 8)],
+        ids=["h512", "h5120"],
+    )
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    def test_output_proj_cte_mx_alt_dtype_weight_repro(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        alt_dtype,
+        canonical_dtype,
+        hidden,
+        n_head,
+    ):
+        """Online MX accepts weights labeled with the same-width torch container dtype.
+
+        Frameworks store x4-packed MX weights as uint32 (mxfp8) / uint16 (mxfp4)
+        since torch has no packed MXFP dtypes. Same bytes, different label. The h5120
+        case guards the SBUF byte-budget: the container label must be sized at its true
+        width (uint32 = 4B) for the tiler, not the 2B default fallback.
+        """
+        batch, seqlen, d_head = 1, 128, 128
+        dtype = nl.bfloat16
+
+        def input_generator(test_config):
+            kernel_input = generate_output_proj_cte_mx_inputs(
+                batch, seqlen, hidden, n_head, d_head, test_bias=False, weight_dtype=canonical_dtype
+            )
+            kernel_input["weight"] = kernel_input["weight"].view(alt_dtype)
+            return kernel_input
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=output_projection_cte_mx_torch_ref,
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-5,
+        )
+
     # ============================================================================
     # STATIC_MX Quantization Tests
     # ============================================================================
@@ -1043,7 +1110,6 @@ class TestOutputProjCteKernel:
             test_config=None,
             compiler_args=CompilerArgs(
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             rtol=0.036,
             atol=1e-5,
@@ -1107,14 +1173,14 @@ class TestOutputProjCteKernel:
     # SBUF with the resolved FP8 dtype. OCP is TRN3-gated via pytest.skip;
     # NON_OCP and AUTO run on any platform.
     # ============================================================================
-    _OUTPUT_PROJ_CTE_BY_DTYPE_MODE_CONFIG = dict(
-        batch=1,
-        seqlen=512,
-        hidden=3072,
-        n_head=8,
-        d_head=128,
-        test_bias=True,
-    )
+    _OUTPUT_PROJ_CTE_BY_DTYPE_MODE_CONFIG = {
+        "batch": 1,
+        "seqlen": 512,
+        "hidden": 3072,
+        "n_head": 8,
+        "d_head": 128,
+        "test_bias": True,
+    }
 
     @pytest.mark.fast
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
@@ -1217,7 +1283,15 @@ class TestOutputProjCteModel:
             torch_ref = torch_ref_wrapper(output_projection_cte_mx_torch_ref)
 
             def input_generator(test_config):
-                return generate_output_proj_cte_mx_inputs(batch, seqlen, hidden, n_head, d_head, test_bias=test_bias)
+                return generate_output_proj_cte_mx_inputs(
+                    batch,
+                    seqlen,
+                    hidden,
+                    n_head,
+                    d_head,
+                    test_bias=test_bias,
+                    weight_dtype=_MODEL_MX_WEIGHT_DTYPE,
+                )
         else:
             rtol = 2e-2 if quantization_type == QuantizationType.NONE else 0.036
             torch_ref = torch_ref_wrapper(output_projection_cte_torch_ref)

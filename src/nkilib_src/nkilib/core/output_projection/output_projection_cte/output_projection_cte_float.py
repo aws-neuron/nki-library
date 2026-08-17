@@ -19,7 +19,6 @@ from typing import List, Optional
 import nki.isa as nisa
 import nki.language as nl
 
-from ...utils.tensor_view import TensorView
 from .output_projection_cte_parameters import P_MAX, TilingConfig
 from .output_projection_cte_tensor_io import (
     load_bias,
@@ -29,10 +28,10 @@ from .output_projection_cte_tensor_io import (
 
 
 def perform_float_projection(
-    attention_hbm: nl.ndarray,
-    weight_hbm: nl.ndarray,
-    bias_hbm: Optional[nl.ndarray],
-    out_hbm: nl.ndarray,
+    attention_hbm: nl.NkiTensor,
+    weight_hbm: nl.NkiTensor,
+    bias_hbm: Optional[nl.NkiTensor],
+    out_hbm: nl.NkiTensor,
     cfg: TilingConfig,
     prg_id: int,
 ) -> None:
@@ -52,10 +51,10 @@ def perform_float_projection(
         - Result SBUF: P_MAX * h_block_size * dtype_size per subtile
 
     Args:
-        attention_hbm (nl.ndarray): [B, N, D, S], Input attention tensor in HBM.
-        weight_hbm (nl.ndarray): [N, D, H], Weight tensor in HBM (reshaped in main kernel).
-        bias_hbm (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
-        out_hbm (nl.ndarray): [B, S, H], Output tensor in HBM to write results.
+        attention_hbm (nl.NkiTensor): [B, N, D, S], Input attention tensor in HBM.
+        weight_hbm (nl.NkiTensor): [N, D, H], Weight tensor in HBM (reshaped in main kernel).
+        bias_hbm (Optional[nl.NkiTensor]): [1, H], Optional bias tensor in HBM.
+        out_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM to write results.
         cfg (TilingConfig): Tiling configuration with dimension sizes.
         prg_id (int): Program ID for LNC sharding.
 
@@ -75,12 +74,12 @@ def perform_float_projection(
         h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
 
-        weight_view = TensorView(weight_hbm).slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
+        weight_view = weight_hbm.slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
         w_sbuf = load_float_weights(weight_view=weight_view, cfg=cfg, weight_dtype=weight_hbm.dtype)
 
         bias_sbuf = None
         if bias_hbm != None:
-            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_view = bias_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
         for batch_idx in range(cfg.b_size):
@@ -88,15 +87,11 @@ def perform_float_projection(
                 curr_s_tile_size = cfg.s_tile.get_tile_bound(s_block_idx)
                 s_start = s_block_idx * cfg.s_tile.tile_size
 
-                attention_view = (
-                    TensorView(attention_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=2, start=s_start, end=s_start + curr_s_tile_size)
+                attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=2, start=s_start, end=s_start + curr_s_tile_size
                 )
-                output_view = (
-                    TensorView(out_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                output_view = out_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=1, start=h_start, end=h_start + curr_h_block_size
                 )
 
                 _process_batch_tile(
@@ -112,10 +107,10 @@ def perform_float_projection(
 
 
 def _process_batch_tile(
-    attention_view: TensorView,
-    output_view: TensorView,
-    w_sbuf: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
+    attention_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    w_sbuf: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
@@ -125,10 +120,10 @@ def _process_batch_tile(
     Process a single batch tile for one h_block: computes attention @ weight + bias.
 
     Args:
-        attention_view (TensorView): View of attention tensor for current batch/s_block [N, D, curr_s_tile_size].
-        output_view (TensorView): View of output tensor for current batch/h_block [S, h_block_size].
-        w_sbuf (List[nl.ndarray]): List of weight tensors in SBUF (one per head).
-        bias_sbuf (Optional[nl.ndarray]): Bias tensor in SBUF.
+        attention_view (NkiTensor): View of attention tensor for current batch/s_block [N, D, curr_s_tile_size].
+        output_view (NkiTensor): View of output tensor for current batch/h_block [S, h_block_size].
+        w_sbuf (List[nl.NkiTensor]): List of weight tensors in SBUF (one per head).
+        bias_sbuf (Optional[nl.NkiTensor]): Bias tensor in SBUF.
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         cfg (TilingConfig): Tiling configuration.
@@ -167,22 +162,22 @@ def _process_batch_tile(
 
 
 def _compute_matmul_add_bias(
-    attention_sb: List[nl.ndarray],
-    w_sbuf: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
+    attention_sb: List[nl.NkiTensor],
+    w_sbuf: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
     s_block_idx: int,
     h_block_idx: int,
     curr_h_block_size: int,
     attention_dtype,
     cfg: TilingConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """
     Compute matmul across heads and add bias.
 
     Args:
-        attention_sb (List[nl.ndarray]): Attention tensors in SBUF.
-        w_sbuf (List[nl.ndarray]): Weight tensors in SBUF.
-        bias_sbuf (Optional[nl.ndarray]): Bias tensor in SBUF.
+        attention_sb (List[nl.NkiTensor]): Attention tensors in SBUF.
+        w_sbuf (List[nl.NkiTensor]): Weight tensors in SBUF.
+        bias_sbuf (Optional[nl.NkiTensor]): Bias tensor in SBUF.
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         curr_h_block_size (int): Current H block size.
@@ -190,7 +185,7 @@ def _compute_matmul_add_bias(
         cfg (TilingConfig): Tiling configuration.
 
     Returns:
-        List[nl.ndarray]: Result tensors in SBUF after matmul and bias addition.
+        List[nl.NkiTensor]: Result tensors in SBUF after matmul and bias addition.
     """
     result_sb = []
     for s_subtile_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
@@ -250,8 +245,8 @@ def _compute_matmul_add_bias(
 
 
 def _write_results_to_output(
-    result_sb: List[nl.ndarray],
-    output_view: TensorView,
+    result_sb: List[nl.NkiTensor],
+    output_view: nl.NkiTensor,
     s_start: int,
     s_block_idx: int,
     curr_h_block_size: int,
@@ -261,8 +256,8 @@ def _write_results_to_output(
     Write result tensors to output HBM.
 
     Args:
-        result_sb (List[nl.ndarray]): Result tensors in SBUF.
-        output_view (TensorView): View of output tensor.
+        result_sb (List[nl.NkiTensor]): Result tensors in SBUF.
+        output_view (NkiTensor): View of output tensor.
         s_start (int): Start offset in S dimension.
         s_block_idx (int): Current S block index.
         curr_h_block_size (int): Current H block size.
@@ -275,4 +270,4 @@ def _write_results_to_output(
         s_offset = s_start + s_subtile_idx * P_MAX
 
         out_subtile_view = output_view.slice(dim=0, start=s_offset, end=s_offset + curr_s_subtile_size)
-        nisa.dma_copy(out_subtile_view.get_view(), result_sb[s_subtile_idx][:curr_s_subtile_size, :curr_h_block_size])
+        nisa.dma_copy(out_subtile_view, result_sb[s_subtile_idx][:curr_s_subtile_size, :curr_h_block_size])

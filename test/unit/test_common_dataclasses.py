@@ -11,9 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from unittest.mock import patch
+
 import pytest
 
-from test.utils.common_dataclasses import Platforms
+from test.utils.common_dataclasses import (
+    PYTEST_XDIST_WORKER_ENV,
+    InstanceSize,
+    LazyGoldenGenerator,
+    ModelTestType,
+    Platforms,
+    ValidationArgs,
+    _iter_model_configs,
+    is_model_test_type,
+    is_xdist_worker,
+    prepare_model_parametrize,
+    resolve_probe_worker_count,
+    unpack_model_config,
+)
 
 
 class TestPlatformsIsTrn3:
@@ -46,13 +61,21 @@ class TestPlatformsGetCompileTarget:
         assert platform.get_compile_target() == expected
 
 
-from test.utils.common_dataclasses import (
-    ModelTestType,
-    Platforms,
-    _iter_model_configs,
-    is_model_test_type,
-    prepare_model_parametrize,
-)
+class TestPlatformsFromStrSafe:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("trn2", Platforms.TRN2),
+            ("trn3_pds_a0", Platforms.TRN3_PDS_A0),
+        ],
+    )
+    def test_known_value_parses(self, value, expected):
+        assert Platforms.from_str_safe(value) == expected
+
+    @pytest.mark.parametrize("value", ["bogus", "TRN2", "", "trn2.48xlarge"])
+    def test_unknown_value_returns_none(self, value):
+        # Unrecognized strings degrade to None rather than raising.
+        assert Platforms.from_str_safe(value) is None
 
 
 class TestModelTestType:
@@ -142,9 +165,6 @@ class TestPrepareModelParametrize:
         assert ids == []
 
 
-from test.utils.common_dataclasses import unpack_model_config
-
-
 class TestUnpackModelConfig:
     def test_tuple_entry(self):
         mt, params = unpack_model_config((ModelTestType.GENERALITY, [1, 2, 3]))
@@ -157,9 +177,6 @@ class TestUnpackModelConfig:
         assert params == [1, 2, 3]
 
 
-from test.utils.common_dataclasses import LazyGoldenGenerator, ValidationArgs
-
-
 class TestValidationArgsEqualNanInf:
     def test_default_equal_nan_inf_is_false(self):
         golden = LazyGoldenGenerator(lazy_golden_generator=lambda: {}, output_ndarray={})
@@ -170,3 +187,77 @@ class TestValidationArgsEqualNanInf:
         golden = LazyGoldenGenerator(lazy_golden_generator=lambda: {}, output_ndarray={})
         args = ValidationArgs(golden_output=golden, equal_nan_inf=True)
         assert args.equal_nan_inf is True
+
+
+class TestResolveProbeWorkerCount:
+    """Sizing for the host-probe thread pool, shared by the static capacity probe and the
+    fleet reachability probe: bound by the run's parallelism, floored at 1, never exceeding
+    the host count."""
+
+    def test_bounded_by_parallelism_cap(self):
+        # More hosts than the --maxprocesses cap: the cap wins so probing never outruns the run.
+        assert resolve_probe_worker_count(10, 4) == 4
+
+    def test_bounded_by_host_count(self):
+        # Fewer hosts than the cap: no point spawning idle workers.
+        assert resolve_probe_worker_count(3, 64) == 3
+
+    @pytest.mark.parametrize("cap", [None, 0, -5])
+    def test_non_positive_cap_falls_back_to_cpu_count(self, cap):
+        # An unset/invalid cap falls back to CPU count (then still clamped to host count).
+        with patch("test.utils.common_dataclasses.os.cpu_count", return_value=8):
+            assert resolve_probe_worker_count(20, cap) == 8
+
+    def test_never_below_one(self):
+        # Defensive: callers short-circuit an empty host list, but the pool size stays >= 1.
+        assert resolve_probe_worker_count(0, 8) == 1
+
+
+class TestIsXdistWorker:
+    def test_true_when_worker_env_set(self, monkeypatch):
+        # xdist sets the var (to the worker id) in each worker process.
+        monkeypatch.setenv(PYTEST_XDIST_WORKER_ENV, "gw0")
+        assert is_xdist_worker() is True
+
+    def test_false_when_worker_env_unset(self, monkeypatch):
+        # The controller/master process (and a non-xdist run) has no such var.
+        monkeypatch.delenv(PYTEST_XDIST_WORKER_ENV, raising=False)
+        assert is_xdist_worker() is False
+
+    def test_true_even_for_empty_worker_id(self, monkeypatch):
+        # Presence is what marks a worker, not a truthy value — key by membership so an
+        # (unusual) empty id still reads as a worker rather than silently as the controller.
+        monkeypatch.setenv(PYTEST_XDIST_WORKER_ENV, "")
+        assert is_xdist_worker() is True
+
+
+class TestInstanceSize:
+    """InstanceSize parses catalog size strings and owns each size's nominal physical-core count
+    (used to core-weight the shared-fleet capacity gate)."""
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("48xlarge", InstanceSize.X_48XLARGE),
+            ("3xlarge", InstanceSize.X_3XLARGE),
+        ],
+    )
+    def test_from_str_parses_known_sizes(self, value, expected):
+        assert InstanceSize.from_str(value) == expected
+
+    @pytest.mark.parametrize("value", ["99xlarge", "48XLARGE", "", None])
+    def test_from_str_maps_unrecognized_to_unknown(self, value):
+        # An unrecognized/absent size degrades to UNKNOWN (with a warning) rather than raising,
+        # so a new size is flagged rather than silently mis-weighted.
+        assert InstanceSize.from_str(value) is InstanceSize.UNKNOWN
+
+    @pytest.mark.parametrize(
+        "size,cores",
+        [
+            (InstanceSize.X_48XLARGE, 128),
+            (InstanceSize.X_3XLARGE, 8),
+            (InstanceSize.UNKNOWN, 1),  # a host's existence implies at least one core
+        ],
+    )
+    def test_get_core_count(self, size, cores):
+        assert size.get_core_count() == cores

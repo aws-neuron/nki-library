@@ -85,12 +85,23 @@ def ref_attention_fwd(q, k, v, scale, causal=False, extra_mask=None):
             scores[:, pack_mask] = -float("inf")
 
         row_max = scores.max(axis=-1, keepdims=True)
-        exp_scores = np.exp(scores - row_max)
+        # Fully-masked rows (all scores -inf) have row_max = -inf, which would make
+        # exp/divide produce nan. The kernel writes o=0 and lse=0 for these rows, so
+        # mirror that contract. For any row that attends to >=1 key this is a no-op.
+        fully_masked = np.isneginf(row_max)
+        row_max_safe = np.where(fully_masked, 0.0, row_max)
+        exp_scores = np.exp(scores - row_max_safe)
         row_sum = exp_scores.sum(axis=-1, keepdims=True)
-        softmax_weights = exp_scores / row_sum
+        row_sum_safe = np.where(fully_masked, 1.0, row_sum)
+        softmax_weights = exp_scores / row_sum_safe
 
-        o[:, q_start:q_end, :] = softmax_weights @ v
-        lse[:, q_start:q_end] = (row_max + np.log(row_sum)).squeeze(-1)
+        o_chunk = softmax_weights @ v
+        o[:, q_start:q_end, :] = np.where(fully_masked, 0.0, o_chunk)
+        lse[:, q_start:q_end] = np.where(
+            fully_masked.squeeze(-1),
+            0.0,
+            (row_max_safe + np.log(row_sum_safe)).squeeze(-1),
+        )
 
     return o, lse
 
@@ -218,7 +229,21 @@ def ring_attention_spmd_fwd_torch_ref(
     spr = o_ref.shape[1]
     d = o_ref.shape[2]
     out_o = o_ref.reshape(bs, h, spr, d).astype(q.dtype)
-    lse_2d = lse_ref.reshape(bs, h, spr)
-    out_lse = lse_2d.reshape(bs, h, spr // 128, 128).transpose(0, 1, 3, 2).astype(np.float32)
+    result = {"out_o": out_o}
 
-    return {"out_o": out_o, "out_lse": out_lse}
+    # LSE is only emitted by the kernel when training=True, so only include it then (the
+    # golden's keys must match the kernel's output count). Layout is (bs, h, 128, num_grps)
+    # where query position p = g*128 + r maps to [b, h, r, g]. When seqlen is not a multiple
+    # of 128 the final group is partial; the kernel zeros that group's padding rows, so we
+    # pad the reference LSE with zeros to match before reshaping (no-op when divisible).
+    if training:
+        num_grps = math.ceil(spr / 128)
+        padded = num_grps * 128
+        lse_2d = lse_ref.reshape(bs, h, spr).astype(np.float32)
+        if padded != spr:
+            lse_padded = np.zeros((bs, h, padded), dtype=np.float32)
+            lse_padded[..., :spr] = lse_2d
+            lse_2d = lse_padded
+        result["out_lse"] = lse_2d.reshape(bs, h, num_grps, 128).transpose(0, 1, 3, 2)
+
+    return result

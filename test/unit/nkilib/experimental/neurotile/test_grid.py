@@ -25,9 +25,9 @@ Covers:
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core.axis import AxisLabel
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+
 from test.utils.pytest_test_metadata import pytest_marks
 
 
@@ -109,6 +109,33 @@ class TestGridConstruction:
     def test_block_size_of_unblocked_returns_none(self):
         g = make_tiled_grid((512, 2048), (128, 512))
         assert g.block_size_of(0) is None
+
+
+# ============================================================================
+# index_stride_elements -- public index stride metadata
+# ============================================================================
+
+
+@pytest_marks(["neurotile"])
+class TestIndexStrideElements:
+    @pytest.mark.fast
+    def test_tile_view(self):
+        g = make_tiled_grid((512, 2048), (128, 512))
+        assert g.index_stride_elements() == (128, 512)
+
+    def test_block_view(self):
+        g = make_tiled_grid((512, 2048), (128, 512), block_size=(2, 2))
+        assert g.index_stride_elements() == (256, 1024)
+
+    def test_selected_block_is_tile_relative(self):
+        g = make_tiled_grid((512, 2048), (128, 512), block_size=(2, 2))
+        selected = g.consume(0).consume(1).with_cursor_past_consumed((0, 1))
+        assert selected.index_stride_elements() == (128, 512)
+
+    def test_cursor_relative_after_consumed_dim(self):
+        g = make_tiled_grid((512, 2048), (128, 512))
+        row = g.consume(0).with_cursor_past_consumed((0,))
+        assert row.index_stride_elements() == (512,)
 
 
 # ============================================================================

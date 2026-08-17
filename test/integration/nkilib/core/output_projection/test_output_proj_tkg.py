@@ -16,12 +16,10 @@ import enum
 import functools
 from typing import Optional
 
-import neuron_dtypes as dt
 import nki
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg import (
     output_projection_tkg,
 )
@@ -31,6 +29,7 @@ from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import
 from nkilib_src.nkilib.core.utils.allocator import BufferManager, Logger
 from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+
 from test.integration.nkilib.utils.tensor_generators import (
     FP8_E4M3_MAX,
     gaussian_tensor_generator,
@@ -141,30 +140,12 @@ def build_output_proj_tkg_input(
         attention = convert_to_range(1, random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention"))
         in_scale = (np.abs(attention).max() / FP8_E4M3FN_MAX) * np.random.uniform(0.995, 1.005)
 
-        # Generate scalar fp8 weights, then repack to x4 matching generate_stabilized_mx_data convention.
+        # Generate scalar fp8 weights in unpacked [N_D//4, H, 4] format.
         weight_bf16 = convert_to_range(1, random_gen(shape=(N_D, H), dtype=dtype, name="weight"))
         w_scale = np.abs(weight_bf16).max() / FP8_E4M3FN_MAX
         weight_scalar_fp8 = static_cast(weight_bf16 / w_scale, nl.float8_e4m3fn)
-        # Pack: [N_D, H] → [N_D//4, 4, H] → transpose → [N_D//4, H, 4] → flatten → [N_D//4, H*4] → x4 → [N_D//4, H]
-        flat = (
-            weight_scalar_fp8.reshape(N_D // _q_width, _q_width, H)
-            .transpose(0, 2, 1)
-            .reshape(N_D // _q_width, H * _q_width)
-        )
-        weight = dt.static_cast(flat.astype(np.float32), nl.float8_e4m3fn_x4)
-
-        '''
-        # Alternative: Using generate_stabilized_mx_data directly (commented out) ---
-        # Chose to generate BF16 tensor and pack it manually to compare golden accuracy to the regualar STATIC golden.
-
-         _, weights_qtz, _ = generate_stabilized_mx_data(
-             mx_dtype=nl.float8_e4m3fn_x4,
-             shape=(N_D // _q_width, H * _q_width),
-        )
-        base_scale = 1.0 / FP8_E4M3FN_MAX
-        w_scale = base_scale * np.random.uniform(0.995, 1.005).astype(np.float32)
-        weight = weights_qtz
-        '''
+        # Reshape: [N_D, H] → [N_D//4, 4, H] → transpose → [N_D//4, H, 4]
+        weight = weight_scalar_fp8.reshape(N_D // _q_width, _q_width, H).transpose(0, 2, 1)
 
         weight_scale = np.broadcast_to(np.array([[w_scale]], dtype=np.float32), (128, 1))
         input_scale = np.broadcast_to(np.array([[in_scale]], dtype=np.float32), (128, 1))
@@ -230,7 +211,7 @@ def build_output_proj_tkg_input(
 # Params in order:
 #    B, n_heads, S_tkg, d_head, H, quantization_type, test_bias, transpose_out
 OUTPUT_PROJ_TKG_TEST_CASES = (
-    [512, 8, 4, 32, 3072, QuantizationType.NONE, True, True],
+    pytest.param(512, 8, 4, 32, 3072, QuantizationType.NONE, True, True, marks=pytest.mark.fast),
     [4, 8, 4, 32, 3072, QuantizationType.NONE, True, True],
     [4, 8, 4, 64, 3072, QuantizationType.NONE, False, False],
     [4, 8, 4, 64, 5376, QuantizationType.NONE, False, False],
@@ -246,7 +227,7 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [4, 8, 8, 128, 8192, QuantizationType.NONE, True, False],
     [4, 8, 8, 128, 16384, QuantizationType.NONE, True, False],
     [4, 10, 8, 128, 8192, QuantizationType.NONE, True, False],
-    [4, 16, 8, 128, 16384, QuantizationType.NONE, True, False],
+    pytest.param(4, 16, 8, 128, 16384, QuantizationType.NONE, True, False, marks=pytest.mark.fast),
     [4, 8, 4, 64, 3072, QuantizationType.NONE, True, True],
     [4, 8, 4, 64, 8192, QuantizationType.NONE, True, True],
     [4, 8, 4, 64, 16384, QuantizationType.NONE, True, True],
@@ -259,7 +240,7 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [16, 8, 1, 128, 8192, QuantizationType.STATIC, True, False],
     [8, 8, 1, 128, 8192, QuantizationType.STATIC, False, False],
     [64, 8, 5, 128, 8192, QuantizationType.STATIC, True, True],
-    [32, 8, 3, 128, 3072, QuantizationType.STATIC, False, False],
+    pytest.param(32, 8, 3, 128, 3072, QuantizationType.STATIC, False, False, marks=pytest.mark.fast),
     [128, 8, 3, 128, 3072, QuantizationType.STATIC, True, False],
     [192, 8, 3, 128, 3072, QuantizationType.NONE, True, False],
     [512, 8, 7, 128, 3072, QuantizationType.STATIC, True, False],
@@ -268,12 +249,14 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [32, 6, 3, 128, 3072, QuantizationType.STATIC, False, False],
     # double_row + transpose_out=True coverage
     [64, 8, 5, 128, 8192, QuantizationType.STATIC, False, True],  # no bias
-    [32, 6, 3, 128, 3072, QuantizationType.STATIC, False, True],  # n_heads=6
-    [128, 6, 1, 128, 3072, QuantizationType.STATIC, True, True],  # larger B, n_heads=6
+    pytest.param(32, 6, 3, 128, 3072, QuantizationType.STATIC, False, True, marks=pytest.mark.fast),  # n_heads=6
+    pytest.param(
+        128, 6, 1, 128, 3072, QuantizationType.STATIC, True, True, marks=pytest.mark.fast
+    ),  # larger B, n_heads=6
     [16, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
     [16, 8, 1, 128, 3072, QuantizationType.ROW, False, False],
     [16, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
-    [16, 8, 1, 128, 3072, QuantizationType.ROW, False, True],
+    pytest.param(16, 8, 1, 128, 3072, QuantizationType.ROW, False, True, marks=pytest.mark.fast),
     [128, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
     [128, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
     [256, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
@@ -284,13 +267,13 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [64, 8, 1, 128, 8192, QuantizationType.ROW, True, False],
     [64, 8, 1, 128, 8192, QuantizationType.ROW, True, True],
     # STATIC_MX quantization tests (requires H % 512 == 0, N*D % 4 == 0, TRN3 only)
-    [32, 3, 4, 128, 4096, QuantizationType.STATIC_MX, True, False],
+    pytest.param(32, 3, 4, 128, 4096, QuantizationType.STATIC_MX, True, False, marks=pytest.mark.fast),
     [32, 1, 2, 128, 2048, QuantizationType.STATIC_MX, True, False],
     [64, 4, 2, 128, 3072, QuantizationType.STATIC_MX, True, False],
     [64, 4, 2, 128, 8192, QuantizationType.STATIC_MX, True, False],
     [64, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
     [128, 8, 1, 128, 8192, QuantizationType.STATIC_MX, False, False],
-    [128, 2, 1, 128, 8192, QuantizationType.STATIC_MX, False, False],
+    pytest.param(128, 2, 1, 128, 8192, QuantizationType.STATIC_MX, False, False, marks=pytest.mark.fast),
     # BxS not divisible by 4
     [1, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
     [2, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
@@ -304,7 +287,7 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
 # with test_bias=True (default) and quantization_type=NONE (default)
 MANUAL_PARAM_NAMES = "B, n_heads, S_tkg, d_head, H, quantization_type, test_bias, transpose_out"
 MANUAL_TEST_CASES = [
-    (4, 10, 8, 128, 602, QuantizationType.NONE, True, False),
+    pytest.param(4, 10, 8, 128, 602, QuantizationType.NONE, True, False, marks=pytest.mark.fast),
     (4, 10, 8, 128, 602, QuantizationType.NONE, True, True),
 ]
 
@@ -432,7 +415,6 @@ class TestOutputProjTkgKernel:
             is_negative_test=is_negative_test,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(PARAM_NAMES, OUTPUT_PROJ_TKG_TEST_CASES, abbrevs=_ABBREVS)
     def test_output_proj_tkg_unit(
         self,
@@ -466,109 +448,6 @@ class TestOutputProjTkgKernel:
             transpose_out=transpose_out,
         )
 
-    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    def test_output_proj_tkg_static_mxfp_uint32_input_repro(
-        self,
-        test_manager: Orchestrator,
-        platform_target: Platforms,
-    ):
-        """STATIC_MX O-proj TKG accepts uint32-typed weight HBM operand.
-
-        Companion to ``test_qkv_cte_mxfp8_static_dequant_uint32_input_repro``
-        (CTE) and ``test_qkv_tkg_static_mxfp_uint32_input_repro`` (QKV TKG).
-        Same motivation: ``vllm-neuron`` parameter-stores the x4-packed FP8
-        weights as ``torch.uint32`` (the only torch dtype that matches the
-        byte width of ``nl.float8_e4m3fn_x4`` — torch has no native MXFP
-        dtype). When torch-XLA lowers the parameter, the MLIR memref
-        operand is ``memref<...xui32>``. HWDGE ``nisa.dma_copy`` requires
-        source and destination memref element types to match, so
-        ``_load_weights_folded`` allocates the weight SBUF tile using the
-        source HBM dtype and view-casts each tile to ``nl.float8_e4m3fn_x4``
-        before the matmul (mirrors the QKV CTE/TKG fixes).
-
-        This test guards the o-proj TKG path: the byte layout is identical
-        to the canonical STATIC_MX o-proj TKG inputs (built via
-        ``build_output_proj_tkg_input`` with native ``nl.float8_e4m3fn_x4``
-        dtype), but the weight dtype label is flipped to ``np.uint32``.
-        Numerical accuracy must match within the same tolerances.
-        """
-        if not platform_target.is_trn3():
-            pytest.skip("STATIC_MX quantization is only supported on TRN3.")
-
-        # Smallest STATIC_MX TKG config from ``OUTPUT_PROJ_TKG_TEST_CASES``.
-        # ``B*S_tkg=64`` satisfies the kernel's ``B*S % 4 == 0`` MXFP
-        # requirement and ``H=2048`` satisfies ``H % 4 == 0`` and the
-        # MX-internal H % 512 == 0 alignment.
-        B, n_heads, S_tkg, d_head, H = 32, 1, 2, 128, 2048
-        test_bias, transpose_out = True, False
-
-        compiler_args = CompilerArgs(platform_target=platform_target)
-        lnc_degree = compiler_args.logical_nc_config
-        resolved_dtype_mode = resolve_dtype_mode_for_torch_ref(DtypeMode.NON_OCP, compiler_args.platform_target)
-
-        # Build canonical STATIC_MX o-proj inputs (weight pre-packed as
-        # ``nl.float8_e4m3fn_x4``, scalar input/weight scales).
-        kernel_input = build_output_proj_tkg_input(
-            lnc_degree=lnc_degree,
-            d_head=d_head,
-            B=B,
-            n_heads=n_heads,
-            S_tkg=S_tkg,
-            quantization_type=QuantizationType.STATIC_MX,
-            H=H,
-            test_bias=test_bias,
-            transpose_out=transpose_out,
-            dtype_mode=resolved_dtype_mode,
-        )
-
-        # ── The line that differs from the canonical o-proj TKG STATIC_MX test ──
-        # Same byte layout (already packed by ``build_output_proj_tkg_input``
-        # as ``nl.float8_e4m3fn_x4``), but flip the dtype label to
-        # ``np.uint32``. Both dtypes are 4 bytes per element so a numpy
-        # ``.view(np.uint32)`` only relabels the type tag; no byte
-        # rearrangement. This mimics what torch-XLA produces when lowering
-        # a ``torch.uint32`` nn.Parameter (the path vllm-neuron is forced
-        # to take because torch has no ``float8_e4m3fn_x4`` dtype).
-        kernel_input["weight"] = kernel_input["weight"].view(np.uint32)
-        # ─────────────────────────────────────────────────────────────────
-
-        def input_generator(test_config):
-            return kernel_input
-
-        def output_tensors(_kernel_input):
-            if transpose_out:
-                H0 = 128
-                output_shape = (H0, lnc_degree, H // lnc_degree // H0, B * S_tkg)
-            else:
-                output_shape = (B * S_tkg, H)
-            return {"out": np.zeros(output_shape, dtype=nl.bfloat16)}
-
-        @functools.wraps(output_projection_tkg_torch_ref)
-        def _torch_ref_with_resolved_dtype_mode(**kwargs):
-            kwargs["dtype_mode"] = resolved_dtype_mode
-            return output_projection_tkg_torch_ref(**kwargs)
-
-        framework = UnitTestFramework(
-            test_manager=test_manager,
-            kernel_entry=output_proj_tkg_wrapper,
-            torch_ref=torch_ref_wrapper(_torch_ref_with_resolved_dtype_mode),
-            kernel_input_generator=input_generator,
-            output_tensor_descriptor=output_tensors,
-        )
-
-        # After the kernel patch (alloc SBUF as alt-dtype + view-cast each
-        # tile to ``nl.float8_e4m3fn_x4`` before matmul), the o-proj TKG
-        # kernel should accept ``nl.uint32`` weight HBM input and produce
-        # numerically equivalent output to the canonical STATIC_MX path.
-        framework.run_test(
-            test_config=None,
-            compiler_args=compiler_args,
-            rtol=5e-2,
-            atol=1e-5,
-            inference_args=TKG_INFERENCE_ARGS,
-        )
-
-    @pytest.mark.fast
     @pytest_parametrize(MANUAL_PARAM_NAMES, MANUAL_TEST_CASES, abbrevs=_ABBREVS, prefix="manual")
     def test_output_proj_tkg_sweep_manual(
         self,
@@ -717,7 +596,6 @@ class TestOutputProjTkgKernel:
         )
 
     # MX quantization test cases
-    @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     @pytest.mark.parametrize(
         "batch, n_heads, seqlen, d_head, hidden, add_bias, transpose_out, quantization_type",
@@ -726,10 +604,10 @@ class TestOutputProjTkgKernel:
             [32, 1, 2, 128, 2048, True, False, QuantizationType.MX],
             [64, 4, 2, 128, 3072, True, False, QuantizationType.MX],
             [64, 4, 2, 128, 8192, True, False, QuantizationType.MX],
-            [64, 2, 1, 128, 4096, False, False, QuantizationType.MX],
+            pytest.param(64, 2, 1, 128, 4096, False, False, QuantizationType.MX, marks=pytest.mark.fast),
             [128, 8, 1, 128, 8192, False, False, QuantizationType.MX],
             [128, 2, 1, 128, 8192, False, False, QuantizationType.MX],
-            [128, 32, 1, 64, 6144, True, False, QuantizationType.MX],
+            pytest.param(128, 32, 1, 64, 6144, True, False, QuantizationType.MX, marks=pytest.mark.fast),
             # BxS not divisible by 4
             [1, 2, 1, 128, 4096, False, False, QuantizationType.MX],
             [2, 2, 1, 128, 4096, False, False, QuantizationType.MX],
@@ -763,11 +641,13 @@ class TestOutputProjTkgKernel:
         attention = gaussian_tensor_generator()(shape=(d_head, batch, n_heads, seqlen), dtype=dtype, name="attention")
 
         # Generate pre-quantized weights using stabilized MX data
-        # weights_qtz has [n_heads * d_head // 4, hidden] shape.
-        _, weights_qtz, weight_scales = generate_stabilized_mx_data(
+        # weights_qtz_x4 has [n_heads * d_head // 4, hidden] x4 shape; convert to unpacked [N*D//4, H, 4] fp8.
+        q_width = 4
+        _, weights_qtz_x4, weight_scales = generate_stabilized_mx_data(
             mx_dtype=nl.float8_e4m3fn_x4,
-            shape=((n_heads * d_head) // 4, hidden * 4),
+            shape=((n_heads * d_head) // q_width, hidden * q_width),
         )
+        weights_qtz = weights_qtz_x4.view(nl.float8_e4m3fn).reshape((n_heads * d_head) // q_width, hidden, q_width)
         weight_scales = weight_scales.reshape((n_heads * d_head) // 32, hidden)
 
         bias = gaussian_tensor_generator(std=100)(shape=(1, hidden), dtype=dtype, name="bias") if add_bias else None
@@ -816,16 +696,16 @@ class TestOutputProjTkgKernel:
     # Torch ref: STATIC input clip is derived from dtype_mode (OCP → 448,
     # NON_OCP → 240) so goldens match.
     # ------------------------------------------------------------------
-    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG = dict(
-        B=4,
-        H=3072,
-        S_tkg=4,
-        d_head=128,
-        dtype=nl.bfloat16,
-        n_heads=8,
-        test_bias=True,
-        transpose_out=False,
-    )
+    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG = {
+        "B": 4,
+        "H": 3072,
+        "S_tkg": 4,
+        "d_head": 128,
+        "dtype": nl.bfloat16,
+        "n_heads": 8,
+        "test_bias": True,
+        "transpose_out": False,
+    }
 
     @pytest.mark.fast
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])

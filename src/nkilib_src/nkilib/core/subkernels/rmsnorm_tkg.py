@@ -14,7 +14,7 @@
 
 """RMSNorm kernel optimized for token generation (decoding) phase with efficient sharding and memory management."""
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import nki.isa as nisa
 import nki.language as nl
@@ -24,7 +24,6 @@ from ..utils.common_types import MoEBlockIOLayout
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
-from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
 from .norm_tkg_utils import (
     _DGE_MODE_NONE,
@@ -43,9 +42,9 @@ BxS_FULL_TILE_SIZE = 512
 
 
 def rmsnorm_tkg(
-    input: Union[TensorView, nl.ndarray],
-    gamma: Union[TensorView, nl.ndarray],
-    output: Union[TensorView, nl.ndarray],
+    input: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    output: nl.NkiTensor,
     eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = False,
@@ -64,10 +63,10 @@ def rmsnorm_tkg(
         H: Hidden dimension size
 
     Args:
-        input (Union[TensorView, nl.ndarray]): [B, S, H] when in HBM or [128, B×S, H//128] when in SBUF, Input tensor.
+        input (nl.NkiTensor): [B, S, H] when in HBM or [128, B×S, H//128] when in SBUF, Input tensor.
             When inp_layout=_128_Nprgs_Hfree_T, expects [128, n_prgs, H//128//n_prgs, B×S] in HBM.
-        gamma (Union[TensorView, nl.ndarray]): [1, H], Gamma tensor used in normalization on HBM
-        output (Union[TensorView, nl.ndarray]): [128, B×S, H//128], Output tensor
+        gamma (nl.NkiTensor): [1, H], Gamma tensor used in normalization on HBM
+        output (nl.NkiTensor): [128, B×S, H//128], Output tensor
         eps (float): Epsilon to maintain numerical stability. Default is 1e-6
         hidden_actual (Optional[int]): Actual hidden dimension size for mean calculation
             when input is padded. Default is None
@@ -81,7 +80,7 @@ def rmsnorm_tkg(
             in SBUF before normalization. Default is B_S_H
 
     Returns:
-        output (nl.ndarray): [128, BxS, H//128], Output tensor with RMSNorm applied
+        output (nl.NkiTensor): [128, BxS, H//128], Output tensor with RMSNorm applied
 
     Notes:
         - H must be divisible by 128 (partition dimension).
@@ -99,9 +98,9 @@ def rmsnorm_tkg(
         result = np.concatenate([t0, t1], axis=2)
     """
 
-    input_view = TensorView(input) if not isinstance(input, TensorView) else input
-    gamma_view = TensorView(gamma) if not isinstance(gamma, TensorView) else gamma
-    output_view = TensorView(output) if not isinstance(output, TensorView) else output
+    input_view = input
+    gamma_view = gamma
+    output_view = output
 
     # Handle transposed input: load [H0, n_prgs, H1_shard, T] -> permute to [H0, T, H_free] in SBUF
     if inp_layout == MoEBlockIOLayout._128_Nprgs_Hfree_T:
@@ -116,9 +115,9 @@ def rmsnorm_tkg(
         input_perm_sb = nl.ndarray((_pmax, T, H_free), dtype=input.dtype, buffer=nl.sbuf, name="tin_perm")
         nisa.tensor_copy(
             dst=input_perm_sb,
-            src=TensorView(input_raw_sb).permute(dims=[0, 2, 1]).get_view(),
+            src=input_raw_sb.permute(dims=[0, 2, 1]),
         )
-        input_view = TensorView(input_perm_sb)
+        input_view = input_perm_sb
 
     if not sbm:
         sbm = SbufManager(
@@ -159,16 +158,13 @@ def rmsnorm_tkg(
 
     sbm.close_scope()
 
-    if isinstance(output, TensorView):
-        return output_view
-    else:
-        return output
+    return output_view
 
 
 def _rmsnorm_tkg_shard_on_bxs(
-    input_view: TensorView,
-    gamma_view: TensorView,
-    output_view: TensorView,
+    input_view: nl.NkiTensor,
+    gamma_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
     eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = False,
@@ -184,9 +180,9 @@ def _rmsnorm_tkg_shard_on_bxs(
     the output is in SBUF.
 
     Args:
-        input_view (TensorView): [B, S, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view.
-        gamma_view (TensorView): [1, H], Gamma tensor view.
-        output_view (TensorView): [H0, BxS, H1], Output tensor view.
+        input_view (NkiTensor): [B, S, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view.
+        gamma_view (NkiTensor): [1, H], Gamma tensor view.
+        output_view (NkiTensor): [H0, BxS, H1], Output tensor view.
         eps (float): Epsilon for numerical stability.
         hidden_actual (Optional[int]): Actual hidden dimension size for padded inputs.
         hidden_dim_tp (bool): If True, use TP-sharded hidden dim layout.
@@ -199,12 +195,12 @@ def _rmsnorm_tkg_shard_on_bxs(
     """
     BxS, H, H0, H1 = validate_shapes(input_view, gamma_view, output_view)
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         output_sb_view = output_view
     else:
         alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
         output_sb = alloc_tensor((H0, BxS, H1), dtype=input_view.dtype, buffer=nl.sbuf)
-        output_sb_view = TensorView(output_sb)
+        output_sb_view = output_sb
 
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
 
@@ -219,7 +215,7 @@ def _rmsnorm_tkg_shard_on_bxs(
 
     shard_size = BxS // num_shards
 
-    if not input_view.is_sbuf():
+    if not (input_view.buffer == nl.sbuf):
         input_view_flat = input_view.flatten_dims(start_dim=0, end_dim=1)
         input_view_sharded = input_view_flat.slice(dim=0, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
     else:
@@ -240,29 +236,29 @@ def _rmsnorm_tkg_shard_on_bxs(
         sbm=sbm,
     )
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         if do_shard:
             output_view_sharded_other_core = output_sb_view.slice(
                 dim=1, start=(1 - shard_id) * shard_size, end=(2 - shard_id) * shard_size
             )
             nisa.sendrecv(
-                dst=output_view_sharded_other_core.get_view(),
-                src=output_view_sharded.get_view(),
+                dst=output_view_sharded_other_core,
+                src=output_view_sharded,
                 send_to_rank=1 - shard_id,
                 recv_from_rank=1 - shard_id,
                 pipe_id=0,
             )
     else:
         output_hbm_view_sharded = output_view.slice(dim=1, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
-        nisa.dma_copy(dst=output_hbm_view_sharded.get_view(), src=output_view_sharded.get_view())
+        nisa.dma_copy(dst=output_hbm_view_sharded, src=output_view_sharded)
         if use_heap_memory:
             sbm.pop_heap()  # dealloc output_sb
 
 
 def _rmsnorm_tkg_shard_on_h(
-    input_view: TensorView,
-    gamma_view: TensorView,
-    output_view: TensorView,
+    input_view: nl.NkiTensor,
+    gamma_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
     eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = False,
@@ -278,9 +274,9 @@ def _rmsnorm_tkg_shard_on_h(
     before normalization.
 
     Args:
-        input_view (TensorView): [B, S, H] when in HBM or [H0, BxS, sharded_H1] when in SBUF, Input tensor view.
-        gamma_view (TensorView): [1, H], Gamma tensor view.
-        output_view (TensorView): [H0, BxS, H1] or [H0, BxS, sharded_H1] if in SBUF, Output tensor view.
+        input_view (NkiTensor): [B, S, H] when in HBM or [H0, BxS, sharded_H1] when in SBUF, Input tensor view.
+        gamma_view (NkiTensor): [1, H], Gamma tensor view.
+        output_view (NkiTensor): [H0, BxS, H1] or [H0, BxS, sharded_H1] if in SBUF, Output tensor view.
         eps (float): Epsilon for numerical stability.
         hidden_actual (Optional[int]): Actual hidden dimension size for padded inputs.
         hidden_dim_tp (bool): If True, use TP-sharded hidden dim layout.
@@ -293,23 +289,19 @@ def _rmsnorm_tkg_shard_on_h(
     """
     BxS, H, H0, H1, shard_H, shard_H1 = validate_shapes_shard_on_h(input_view, gamma_view, output_view)
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         output_sb_view = output_view
     else:
         alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
         output_sb = alloc_tensor((H0, BxS, shard_H1), dtype=input_view.dtype, buffer=nl.sbuf)
-        output_sb_view = TensorView(output_sb)
+        output_sb_view = output_sb
 
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
 
     input_view_sharded = input_view
-    if not input_view.is_sbuf():
+    if not (input_view.buffer == nl.sbuf):
         input_view_flat = input_view.flatten_dims(start_dim=0, end_dim=1)
         input_view_sharded = input_view_flat.slice(dim=1, start=shard_id * shard_H, end=(shard_id + 1) * shard_H)
-
-    if not output_view.is_sbuf():
-        output_view_flat = output_view.flatten_dims(start_dim=0, end_dim=1)
-        output_view_sharded = output_view_flat.slice(dim=1, start=shard_id * shard_H, end=(shard_id + 1) * shard_H)
 
     gamma_view = gamma_view.slice(dim=1, start=shard_id * shard_H, end=(shard_id + 1) * shard_H)
 
@@ -326,19 +318,19 @@ def _rmsnorm_tkg_shard_on_h(
         sbm=sbm,
     )
 
-    if output_view.is_sbuf():
+    if output_view.buffer == nl.sbuf:
         output_view = output_sb_view
     else:
         output_hbm_view_sharded = output_view.slice(dim=2, start=shard_id * shard_H1, end=(shard_id + 1) * shard_H1)
-        nisa.dma_copy(dst=output_hbm_view_sharded.get_view(), src=output_sb_view.get_view())
+        nisa.dma_copy(dst=output_hbm_view_sharded, src=output_sb_view)
 
 
 def _process_rmsnorm_tile(
-    input_sb_view: TensorView,
-    gamma_sb_view: TensorView,
-    output_sb_view: TensorView,
-    eps_view: TensorView,
-    matmul_reduction_const_view: TensorView,
+    input_sb_view: nl.NkiTensor,
+    gamma_sb_view: nl.NkiTensor,
+    output_sb_view: nl.NkiTensor,
+    eps_view: nl.NkiTensor,
+    matmul_reduction_const_view: nl.NkiTensor,
     bxs_tile: Tuple,
     hidden_actual: int,
     shard_on_h: bool,
@@ -349,11 +341,11 @@ def _process_rmsnorm_tile(
     Process a single tile of RMSNorm computation.
 
     Args:
-        input_sb_view (TensorView): [H0, BxS, H1], Input tensor view in SBUF
-        gamma_sb_view (TensorView): [H0, BxS, H1], Gamma tensor view in SBUF (broadcasted)
-        output_sb_view (TensorView): [H0, BxS, H1], Output tensor view in SBUF
-        eps_view (TensorView): [H0, 1], Epsilon value for numerical stability
-        matmul_reduction_const_view (TensorView): [H0, H0], Constant matrix for reduction
+        input_sb_view (NkiTensor): [H0, BxS, H1], Input tensor view in SBUF
+        gamma_sb_view (NkiTensor): [H0, BxS, H1], Gamma tensor view in SBUF (broadcasted)
+        output_sb_view (NkiTensor): [H0, BxS, H1], Output tensor view in SBUF
+        eps_view (NkiTensor): [H0, 1], Epsilon value for numerical stability
+        matmul_reduction_const_view (NkiTensor): [H0, H0], Constant matrix for reduction
         bxs_tile (Tuple): Tile information containing index and size
         hidden_actual (int): Actual hidden dimension size
         shard_on_h (bool): If True, exchange partial sums between cores.
@@ -382,7 +374,7 @@ def _process_rmsnorm_tile(
     # Compute x^2 for RMS calculation
     rmsnorm_square = alloc_tensor(shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
-    nisa.activation(rmsnorm_square[...], op=nl.square, data=input_sb_view.get_view())
+    nisa.activation(rmsnorm_square[...], op=nl.square, data=input_sb_view)
 
     # Reduce along H1 dimension to compute sum(x^2)
     rmsnorm_reduced_square = alloc_tensor(
@@ -421,11 +413,11 @@ def _process_rmsnorm_tile(
     # Apply gamma scaling: input * gamma
     gamma_mult = alloc_tensor(shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
-    gamma_mult_view = TensorView(gamma_mult)
+    gamma_mult_view = gamma_mult
     nisa.tensor_tensor(
-        gamma_mult_view.get_view(),
-        input_sb_view.get_view(),
-        gamma_sb_view.get_view(),
+        gamma_mult_view,
+        input_sb_view,
+        gamma_sb_view,
         nl.multiply,
     )
 
@@ -435,7 +427,7 @@ def _process_rmsnorm_tile(
     else:
         final_reduced = nl.ndarray((H0, BxS), dtype=nl.float32, buffer=nl.psum, address=(0, 0))
     nisa.nc_matmul(
-        stationary=matmul_reduction_const_view.get_view(),
+        stationary=matmul_reduction_const_view,
         moving=rmsnorm_reduced_square,
         dst=final_reduced,
     )
@@ -447,15 +439,15 @@ def _process_rmsnorm_tile(
         op=nl.rsqrt,
         data=final_reduced[...],
         scale=hidden_scale,
-        bias=eps_view.get_view(),
+        bias=eps_view,
     )
 
     # Final RMSNorm: (input * gamma) * normalization_factor
-    reduced_view = TensorView(rmsnorm_reduced_square).expand_dim(dim=2).broadcast(dim=2, size=H1)
+    reduced_view = rmsnorm_reduced_square.expand_dim(dim=2).broadcast(dim=2, size=H1)
     nisa.tensor_tensor(
-        output_sb_view.get_view(),
-        gamma_mult_view.get_view(),
-        reduced_view.get_view(),
+        output_sb_view,
+        gamma_mult_view,
+        reduced_view,
         nl.multiply,
     )
 
@@ -467,9 +459,9 @@ def _process_rmsnorm_tile(
 
 
 def rmsnorm_tkg_th(
-    input_hbm: TensorView,
-    gamma: nl.ndarray,
-    output: TensorView,
+    input_hbm: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    output: nl.NkiTensor,
     num_H_shards: int,
     hidden_actual: int,
     eps: float,
@@ -491,9 +483,9 @@ def rmsnorm_tkg_th(
     to get [P0=128, BxS=T, F0=n_H512*4] for row_quantization.
 
     Args:
-        input_hbm: [BxS, H] TensorView in HBM (already T-sliced by caller)
-        gamma: [1, H] nl.ndarray in HBM
-        output: [H0, H1_shard, T] TensorView in SBUF for gate/up projection,
+        input_hbm: [BxS, H] NkiTensor in HBM (already T-sliced by caller)
+        gamma: [1, H] nl.NkiTensor in HBM
+        output: [H0, H1_shard, T] NkiTensor in SBUF for gate/up projection,
                 or [H0, n_H512*4, T] when use_contiguous_x4=True
         num_H_shards: number of H-shards (LNC count)
         hidden_actual: full H for mean calculation
@@ -537,16 +529,14 @@ def rmsnorm_tkg_th(
         gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, buffer=nl.sbuf, name="rmsnorm_th_gamma")
 
         gamma_hbm_view = (
-            TensorView(gamma)
-            .flatten_dims(start_dim=0, end_dim=1)
+            gamma.flatten_dims(start_dim=0, end_dim=1)
             .reshape_dim(dim=0, shape=[num_H_shards, H0, H2])
             .permute(dims=[1, 0, 2])
         )
-        gamma_sb_view = TensorView(gamma_sb).reshape_dim(dim=1, shape=[num_H_shards, H2])
-        nisa.dma_copy(dst=gamma_sb_view.get_view(), src=gamma_hbm_view.get_view(), dge_mode=_DGE_MODE_NONE)
+        gamma_sb_view = gamma_sb.reshape_dim(dim=1, shape=[num_H_shards, H2])
+        nisa.dma_copy(dst=gamma_sb_view, src=gamma_hbm_view, dge_mode=_DGE_MODE_NONE)
         gamma_shard_view = (
-            TensorView(gamma_sb)
-            .reshape_dim(dim=1, shape=[num_H_shards, H2])
+            gamma_sb.reshape_dim(dim=1, shape=[num_H_shards, H2])
             .slice(dim=1, start=shard_id, end=shard_id + 1)
             .squeeze_dim(dim=1)
         )
@@ -557,14 +547,12 @@ def rmsnorm_tkg_th(
             shape=(T0, H_per_shard), dtype=gamma.dtype, buffer=nl.sbuf, name="rmsnorm_th_gamma_flat"
         )
         H_shard_start_gamma = shard_id * H_per_shard
-        gamma_hbm_flat = (
-            TensorView(gamma)
-            .flatten_dims(start_dim=0, end_dim=1)
-            .slice(dim=0, start=H_shard_start_gamma, end=H_shard_start_gamma + H_per_shard)
+        gamma_hbm_flat = gamma.flatten_dims(start_dim=0, end_dim=1).slice(
+            dim=0, start=H_shard_start_gamma, end=H_shard_start_gamma + H_per_shard
         )
         # Broadcast [1, H_per_shard] → [T0, H_per_shard]
         gamma_hbm_broadcast = gamma_hbm_flat.expand_dim(dim=0).broadcast(dim=0, size=T0)
-        nisa.dma_copy(dst=gamma_flat_sb, src=gamma_hbm_broadcast.get_view(), dge_mode=_DGE_MODE_NONE)
+        nisa.dma_copy(dst=gamma_flat_sb, src=gamma_hbm_broadcast, dge_mode=_DGE_MODE_NONE)
 
         # Temp buffer for tensor_copy permute before pe_transpose
         cx4_perm_buf = alloc_tensor(
@@ -590,35 +578,35 @@ def rmsnorm_tkg_th(
         tile_T = t_tile.size
 
         # Slice per-tile views from pre-allocated buffers
-        tile_buf = TensorView(sbuf_buffer).slice(dim=0, start=0, end=tile_T)  # [T_tile, H]
-        tile_sq = TensorView(square_sb).slice(dim=0, start=0, end=tile_T)  # [T_tile , H]
-        tile_red = TensorView(reduced_sq).slice(dim=0, start=0, end=tile_T)  # [T_tile, 1]
+        tile_buf = sbuf_buffer.slice(dim=0, start=0, end=tile_T)  # [T_tile, H]
+        tile_sq = square_sb.slice(dim=0, start=0, end=tile_T)  # [T_tile , H]
+        tile_red = reduced_sq.slice(dim=0, start=0, end=tile_T)  # [T_tile, 1]
 
         # --- Step 1: Contiguous load [tile_T, H] from HBM to SBUF ---
         input_hbm_tile = input_hbm.slice(dim=0, start=t_tile.start_offset, end=t_tile.end_offset)
-        nisa.dma_copy(dst=tile_buf.get_view(), src=input_hbm_tile.get_view(), dge_mode=_DGE_MODE_NONE)
+        nisa.dma_copy(dst=tile_buf, src=input_hbm_tile, dge_mode=_DGE_MODE_NONE)
 
         # --- Step 2: RMSNorm in [tile_T, H] layout ---
         # Compute x^2 and reduce along H: [tile_T, H] -> [tile_T, 1]
         nisa.activation_reduce(
-            tile_sq.get_view(),
+            tile_sq,
             op=nl.square,
-            data=tile_buf.get_view(),
+            data=tile_buf,
             reduce_op=nl.add,
-            reduce_res=tile_red.get_view(),
+            reduce_res=tile_red,
         )
 
         # Normalization factor: 1/sqrt(mean(x^2) + eps)
-        nisa.activation(tile_red.get_view(), op=nl.rsqrt, data=tile_red.get_view(), scale=hidden_scale, bias=eps)
+        nisa.activation(tile_red, op=nl.rsqrt, data=tile_red, scale=hidden_scale, bias=eps)
 
         # input * normalization_factor for this shard's H slice
         input_shard = tile_buf.slice(dim=1, start=H_shard_start, end=H_shard_start + H_per_shard)  # [T_tile, H_shard]
         norm_result_shard = tile_buf.slice(dim=1, start=0, end=H_per_shard)  # [T_tile, H_shard]
         nisa.tensor_scalar(
-            norm_result_shard.get_view(),
-            input_shard.get_view(),
+            norm_result_shard,
+            input_shard,
             op0=nl.multiply,
-            operand0=tile_red.get_view(),
+            operand0=tile_red,
         )
 
         if not use_contiguous_x4:
@@ -639,9 +627,9 @@ def rmsnorm_tkg_th(
             # Step 4: Apply gamma in [H0, H2, tile_T] layout
             gamma_broadcast = gamma_shard_view.expand_dim(dim=2).broadcast(dim=2, size=tile_T)
             nisa.tensor_tensor(
-                dst.get_view(),
-                dst.get_view(),
-                gamma_broadcast.get_view(),
+                dst,
+                dst,
+                gamma_broadcast,
                 nl.multiply,
             )
         else:
@@ -651,29 +639,29 @@ def rmsnorm_tkg_th(
 
             # Step 3a: Apply gamma in [T, H_per_shard] layout (before transpose).
             # gamma_flat_sb is [T0, H_per_shard] with gamma values broadcast on P dim.
-            gamma_tile = TensorView(gamma_flat_sb).slice(dim=0, start=0, end=tile_T)
+            gamma_tile = gamma_flat_sb.slice(dim=0, start=0, end=tile_T)
             nisa.tensor_tensor(
-                norm_result_shard.get_view(),
-                norm_result_shard.get_view(),
-                gamma_tile.get_view(),
+                norm_result_shard,
+                norm_result_shard,
+                gamma_tile,
                 nl.multiply,
             )
 
             # Step 3b: Reshape [T, n_H512, 128, 4] and permute dims 1↔2 → [T, 128, n_H512, 4]
             # so 128 is at dim 1 for pe_transpose (tile_size=128).
             src_4d = norm_result_shard.reshape_dim(dim=1, shape=[n_H512, _pmax, _q_width])
-            perm_tile = TensorView(cx4_perm_buf).slice(dim=0, start=0, end=tile_T)
+            perm_tile = cx4_perm_buf.slice(dim=0, start=0, end=tile_T)
             perm_dst_4d = perm_tile.reshape_dim(dim=1, shape=[_pmax, n_H512, _q_width])
             nisa.tensor_copy(
-                dst=perm_dst_4d.get_view(),
-                src=src_4d.permute(dims=[0, 2, 1, 3]).get_view(),
+                dst=perm_dst_4d,
+                src=src_4d.permute(dims=[0, 2, 1, 3]),
             )
 
             # Step 3c: pe_transpose [T, 128, n_H512*4] → [128(P), tile_T, n_H512*4]
             # into a dedicated contiguous temp buffer, then tensor_copy permute
             # to output [128, n_H512*4, tile_T].
             perm_src_3d = perm_tile.reshape_dim(dim=1, shape=[_pmax, n_H512 * _q_width])
-            xpose_out_tile = TensorView(xpose_out_buf).slice(dim=1, start=0, end=tile_T)
+            xpose_out_tile = xpose_out_buf.slice(dim=1, start=0, end=tile_T)
             pe_transpose(
                 src=perm_src_3d,
                 dst=xpose_out_tile,
@@ -687,8 +675,8 @@ def rmsnorm_tkg_th(
             # via tensor_copy with permute [0, 2, 1].
             out_tile = output.slice(dim=2, start=t_tile.start_offset, end=t_tile.end_offset)
             nisa.tensor_copy(
-                dst=out_tile.get_view(),
-                src=xpose_out_tile.permute(dims=[0, 2, 1]).get_view(),
+                dst=out_tile,
+                src=xpose_out_tile.permute(dims=[0, 2, 1]),
             )
 
     # Cleanup (reverse allocation order)
@@ -704,9 +692,9 @@ def rmsnorm_tkg_th(
 
 
 def _rmsnorm_tkg_llama_impl(
-    input: TensorView,
-    gamma: TensorView,
-    output: TensorView,
+    input: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    output: nl.NkiTensor,
     num_H_shards: int,
     hidden_actual: Optional[int],
     eps: float,
@@ -719,9 +707,9 @@ def _rmsnorm_tkg_llama_impl(
     Perform RMSNorm on input tensor with sharding support.
 
     Args:
-        input (TensorView): [BxS, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view
-        gamma (TensorView): [1, H], Gamma tensor view
-        output (TensorView): [H0, BxS, H1], Output tensor view in SBUF
+        input (NkiTensor): [BxS, H] when in HBM or [H0, BxS, H1] when in SBUF, Input tensor view
+        gamma (NkiTensor): [1, H], Gamma tensor view
+        output (NkiTensor): [H0, BxS, H1], Output tensor view in SBUF
         num_H_shards (int): Number of shards along H dimension
         hidden_actual (Optional[int]): Actual hidden dimension size
         eps (float): Epsilon for numerical stability
@@ -740,7 +728,7 @@ def _rmsnorm_tkg_llama_impl(
         - RMSNorm performed on combined [H0, lnc, H1//lnc] dimension
     """
 
-    if input.is_sbuf():
+    if input.buffer == nl.sbuf:
         H0, BxS, H1 = input.shape
         H = H0 * H1
     else:
@@ -758,7 +746,7 @@ def _rmsnorm_tkg_llama_impl(
     num_allocated_tensor = 0
 
     # Load input and reuse output_buffer
-    if input.is_sbuf():
+    if input.buffer == nl.sbuf:
         input_sb_view = input
     else:
         input_sb_view = load_input_to_sbuf(
@@ -777,7 +765,7 @@ def _rmsnorm_tkg_llama_impl(
     num_allocated_tensor += 1
     gamma_sb_view = load_gamma_to_sbuf(
         gamma_hbm=gamma,
-        gamma_sb=TensorView(gamma_sb),
+        gamma_sb=gamma_sb,
         num_H_shards=num_H_shards,
         hidden_dim_tp=hidden_dim_tp,
         shard_on_h=shard_on_h,
@@ -805,8 +793,8 @@ def _rmsnorm_tkg_llama_impl(
             input_sb_view=input_sb_view_tile,
             gamma_sb_view=gamma_sb_view_tile,
             output_sb_view=output_sb_view_tile,
-            eps_view=TensorView(eps_sb),
-            matmul_reduction_const_view=TensorView(matmul_reduction_const),
+            eps_view=eps_sb,
+            matmul_reduction_const_view=matmul_reduction_const,
             bxs_tile=bxs_tile,
             hidden_actual=hidden_actual,
             shard_on_h=shard_on_h,
@@ -824,10 +812,10 @@ _DLOC_T_TILE_SIZE = 128
 
 
 def _rmsnorm_tkg_dloc(
-    input_hbm: nl.ndarray,
-    gamma: nl.ndarray,
-    output_hbm: nl.ndarray,
-    output_sb: nl.ndarray,
+    input_hbm: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    output_hbm: nl.NkiTensor,
+    output_sb: nl.NkiTensor,
     eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     sync_output: bool = False,
@@ -858,10 +846,10 @@ def _rmsnorm_tkg_dloc(
     if len(input_hbm.shape) == 3:
         B, S, H = input_hbm.shape
         T = B * S
-        input_hbm_view = TensorView(input_hbm).flatten_dims(start_dim=0, end_dim=1)
+        input_hbm_view = input_hbm.flatten_dims(start_dim=0, end_dim=1)
     else:
         T, H = input_hbm.shape
-        input_hbm_view = TensorView(input_hbm)
+        input_hbm_view = input_hbm
     H0 = nl.tile_size.pmax  # 128
     H1 = H // H0
     inter_dtype = nl.float32
@@ -898,11 +886,11 @@ def _rmsnorm_tkg_dloc(
 
     # Load gamma [1, H] -> [tile_size, H] replicated across partition dim
     gamma_sb = sbm.alloc_heap((tile_size, H), dtype=gamma.dtype, buffer=nl.sbuf)
-    gamma_hbm_view = TensorView(gamma).broadcast(dim=0, size=tile_size)
-    nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view.get_view(), dge_mode=_DGE_MODE_NONE)
+    gamma_hbm_view = gamma.broadcast(dim=0, size=tile_size)
+    nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view, dge_mode=_DGE_MODE_NONE)
 
-    output_hbm_view = TensorView(output_hbm)
-    output_sb_view = TensorView(output_sb)
+    output_hbm_view = output_hbm
+    output_sb_view = output_sb
 
     for tile_idx in range(num_tiles):
         t_start = shard_id * T_shard + tile_idx * tile_size  # HBM offset
@@ -910,7 +898,7 @@ def _rmsnorm_tkg_dloc(
 
         # --- Load [tile_size, H] from HBM ---
         input_tile = input_hbm_view.slice(dim=0, start=t_start, end=t_start + tile_size)
-        nisa.dma_copy(dst=tile_buf, src=input_tile.get_view(), dge_mode=_DGE_MODE_NONE)
+        nisa.dma_copy(dst=tile_buf, src=input_tile, dge_mode=_DGE_MODE_NONE)
 
         # --- RMSNorm compute in [tile_size, H] layout ---
         # Square + reduce along H: [tile_size, H] -> [tile_size, 1]
@@ -941,10 +929,10 @@ def _rmsnorm_tkg_dloc(
 
         # --- Output 1: HBM store [tile_size, H] (no layout change needed) ---
         output_tile = output_hbm_view.slice(dim=0, start=t_start, end=t_start + tile_size)
-        nisa.dma_copy(dst=output_tile.get_view(), src=tile_buf, dge_mode=_DGE_MODE_NONE)
+        nisa.dma_copy(dst=output_tile, src=tile_buf, dge_mode=_DGE_MODE_NONE)
 
         # --- Output 2: Transpose [tile_size, H] -> [H0, tile_size, H1] into output_sb ---
-        src_3d = TensorView(tile_buf).reshape_dim(dim=1, shape=[H0, H1])  # [tile_size, H0, H1]
+        src_3d = tile_buf.reshape_dim(dim=1, shape=[H0, H1])  # [tile_size, H0, H1]
         dst_3d = output_sb_view.slice(dim=1, start=sb_t_start, end=sb_t_start + tile_size)
         pe_transpose(src=src_3d, dst=dst_3d, tile_size=H0, dtype=input_hbm.dtype, sbm=sbm)
 
@@ -962,8 +950,8 @@ def _rmsnorm_tkg_dloc(
         local_src = output_sb_view.slice(dim=1, start=sb_shard_offset, end=sb_shard_offset + T_shard)
         remote_dst = output_sb_view.slice(dim=1, start=other_offset, end=other_offset + T_shard)
         nisa.sendrecv(
-            dst=remote_dst.get_view(),
-            src=local_src.get_view(),
+            dst=remote_dst,
+            src=local_src,
             send_to_rank=1 - shard_id,
             recv_from_rank=1 - shard_id,
             pipe_id=0,

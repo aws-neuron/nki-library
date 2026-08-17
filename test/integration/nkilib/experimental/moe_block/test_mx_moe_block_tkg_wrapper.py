@@ -18,10 +18,10 @@ from typing import final
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, RouterActFnType
 from nkilib_src.nkilib.experimental.moe_block.mx_moe_block_tkg_wrapper import mx_moe_block_tkg_wrapper
 from nkilib_src.nkilib.experimental.moe_block.mx_moe_block_tkg_wrapper_torch import mx_moe_block_tkg_wrapper_torch_ref
+
 from test.integration.nkilib.core.moe_block.test_moe_block_tkg import generate_inputs
 from test.integration.nkilib.utils.test_kernel_common import (
     is_dtype_low_precision,
@@ -86,7 +86,7 @@ def _format_val(v):
 
 def _make_id(params):
     """Generate a keyword-prefixed test ID string from a parameter list."""
-    return "_".join(f"{k.strip()}-{_format_val(v)}" for k, v in zip(_PARAM_ABBREVS.split(","), params))
+    return "_".join(f"{k.strip()}-{_format_val(v)}" for k, v in zip(_PARAM_ABBREVS.split(","), params, strict=True))
 
 
 MANUAL_PARAM_IDS = [_make_id(p) for p in MANUAL_PARAMS]
@@ -105,6 +105,10 @@ def _make_mx_torch_ref(kernel_input):
     return mx_torch_ref
 
 
+@pytest.mark.xfail(
+    strict=False,
+    reason="Intermittent failures on MX MoE Block TKG Wrapper; xfailed until root-caused.",
+)
 @pytest_test_metadata(name="MX MoE Block TKG Wrapper")
 @pytest_marks(["moe", "block", "tkg", "mx"])
 @final

@@ -17,9 +17,9 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.cumsum import cumsum
 from nkilib_src.nkilib.core.cumsum.cumsum_torch import cumsum_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import FilterResult
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata

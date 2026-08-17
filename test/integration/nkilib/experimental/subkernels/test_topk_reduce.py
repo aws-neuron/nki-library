@@ -18,9 +18,9 @@ from typing import final
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.subkernels.topk_reduce import topk_reduce
 from nkilib_src.nkilib.experimental.subkernels.topk_reduce_torch import topk_reduce_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator

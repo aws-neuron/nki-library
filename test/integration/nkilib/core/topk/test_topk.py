@@ -20,16 +20,13 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.topk.rotational_topk import (
-    cleanup_rotational_constants,
     create_rotational_topk_config,
     create_topk_config,
-    prepare_rotational_constants,
     rotational_topk,
 )
-from nkilib_src.nkilib.core.topk.torch_ref import topk_torch_ref
+from nkilib_src.nkilib.core.topk.rotational_topk_torch import rotational_topk_torch_ref
+from typing_extensions import override
 
 try:
     from test.integration.nkilib.core.topk.test_topk_model_config import rotational_topk_model_configs
@@ -83,9 +80,6 @@ class TopkEdgeCaseValidator:
             return FilterResult.INVALID
         if vocab_size == k:
             return FilterResult.INVALID
-
-        n_prgs = 1 if BxS == 1 else lnc_degree
-        per_lnc_BxS = (BxS + n_prgs - 1) // n_prgs
 
         max_n_stages = TopkEdgeCaseValidator.PMAX
         if max_n_stages < 1:
@@ -203,18 +197,12 @@ class TestTopKKernel:
             inp_reshaped = inp_3d.reshape((topk_config.BxS, topk_config.vocab_size))
             config = create_rotational_topk_config(inp_shape=inp_reshaped.shape, topk_config=topk_config)
 
-            # Setup constants before kernel execution (pure numpy, no nl calls)
-            config = prepare_rotational_constants(config)
             config.log_strategy()
 
             # When k == vocab_size, the kernel returns inp directly (trivial case),
             # creating a must-alias relationship that Beta 3 runtime requires.
             inp_key = "inp.must_alias_input" if k == vocab else "inp"
             return {inp_key: inp_reshaped, "config": config}
-
-        def cleanup_fn():
-            """Cleanup function called after test execution."""
-            cleanup_rotational_constants()
 
         inputs = input_generator(test_config=None)
 
@@ -283,7 +271,7 @@ class TestTopKKernel:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=rotational_topk,
-            torch_ref=torch_ref_wrapper(topk_torch_ref),
+            torch_ref=torch_ref_wrapper(rotational_topk_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=self.output_tensors,
         )
@@ -298,21 +286,20 @@ class TestTopKKernel:
             atol=1e-5,
             custom_comparator=topk_comparator,
         )
-        cleanup_fn()
 
     # fmt: off
     topk_unit_params = "lnc_degree, batch, seqlen, vocab_size, K, dtype"
     _ABBREVS = {"lnc_degree": "lnc", "batch": "b", "seqlen": "s", "vocab_size": "v", "K": "K", "dtype": "dt"}
 
     large_batch_perms  = [
-            [2, 150, 1, 1000, 50, nl.float32],
+            pytest.param(2, 150, 1, 1000, 50, nl.float32, marks=pytest.mark.fast),
             [2, 200, 1, 2000, 64, nl.float32],
             [2, 1024, 1, 5000, 128, nl.float32],
         ]
 
     topk_unit_perms = [
         # Llama 3 76B before global gather
-        [2, 8, 5, 4058, 256, nl.float32],
+        pytest.param(2, 8, 5, 4058, 256, nl.float32, marks=pytest.mark.fast),
         [2, 5, 5, 4058, 256, nl.float32],
 
         # Llama 3 76B after global gather
@@ -346,7 +333,7 @@ class TestTopKKernel:
 
         # High batch and vocab
         [2, 256, 1, 16384, 256, nl.float32],
-        [2, 256, 1, 2374, 256, nl.float32],
+        pytest.param(2, 256, 1, 2374, 256, nl.float32, marks=pytest.mark.fast),
 
         # K generalization nominal
         [2, 1, 1, 3168, 8, nl.float32],
@@ -354,7 +341,7 @@ class TestTopKKernel:
         [2, 1, 1, 3168, 192, nl.float32],
 
         # K generalization hard
-        [2, 1, 1, 3168, 1, nl.float32],
+        pytest.param(2, 1, 1, 3168, 1, nl.float32, marks=pytest.mark.fast),
         [2, 1, 1, 3168, 7, nl.float32],
         [2, 1, 1, 3168, 60, nl.float32],
         [2, 1, 1, 3168, 99, nl.float32],
@@ -362,7 +349,7 @@ class TestTopKKernel:
         # Mixed tests
         [1, 1, 7, 3999, 256, nl.float32],
         [1, 1, 63, 3999, 20, nl.float32],
-        [2, 1, 127, 3999, 256, nl.float32],
+        pytest.param(2, 1, 127, 3999, 256, nl.float32, marks=pytest.mark.fast),
         [2, 1, 127, 3999, 1, nl.float32],
         [1, 1, 127, 3999, 20, nl.float32],
 
@@ -396,7 +383,6 @@ class TestTopKKernel:
         [2, 1024, 1, 8192, 2048, nl.float32],
     ]
 
-    @pytest.mark.fast
     @pytest_parametrize(topk_unit_params, topk_unit_perms, abbrevs=_ABBREVS)
     def test_topk_unit(
         self,
@@ -442,10 +428,9 @@ class TestTopKKernel:
     topk_unsorted_perms = [
         [2, 1, 1, 25136, 256, nl.float32],
         [2, 8, 5, 4058, 256, nl.float32],
-        [2, 5, 5, 4058, 256, nl.float32],
+        pytest.param(2, 5, 5, 4058, 256, nl.float32, marks=pytest.mark.fast),
     ]
 
-    @pytest.mark.fast
     @pytest_parametrize(topk_unsorted_params, topk_unsorted_perms, abbrevs=_ABBREVS)
     def test_topk_unsorted(
         self,
@@ -459,6 +444,42 @@ class TestTopKKernel:
         K,
         dtype,
     ):
+        self.run_topk_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            lnc_degree=lnc_degree,
+            batch=batch,
+            seqlen=seqlen,
+            vocab=vocab_size,
+            k=K,
+            dtype=dtype,
+            sorted=False,
+        )
+
+    # Trivial k == vocab_size fast-return path: the kernel returns the input unchanged
+    # with sequential indices, tiling index generation over the partition limit (128).
+    # Two configs cover both tiling branches: BxS <= 128 (single full tile, no remainder)
+    # and BxS > 128 (full 128-row tile + partial remainder DMA). sorted=False is required
+    # (the kernel asserts sorted output is unsupported when k == vocab_size).
+    topk_trivial_perms = [
+        pytest.param(2, 8, 1, 8, 8, nl.float32, marks=pytest.mark.fast),
+        pytest.param(2, 129, 1, 8, 8, nl.float32, marks=pytest.mark.fast),
+    ]
+
+    @pytest_parametrize(topk_unit_params, topk_trivial_perms, abbrevs=_ABBREVS)
+    def test_topk_trivial_k_equals_vocab(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        vocab_size,
+        K,
+        dtype,
+    ):
+        """k == vocab_size returns the input with sequential indices."""
         self.run_topk_test(
             test_manager=test_manager,
             platform_target=platform_target,
@@ -512,7 +533,7 @@ def _make_model_id(params):
             return v.value
         return v
 
-    return "_".join(f"{k}-{fmt(v)}" for k, v in zip(abbrevs, params))
+    return "_".join(f"{k}-{fmt(v)}" for k, v in zip(abbrevs, params, strict=True))
 
 
 # MODEL TESTING ENTRY POINT

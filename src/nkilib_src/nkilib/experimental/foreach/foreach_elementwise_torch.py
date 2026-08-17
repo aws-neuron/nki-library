@@ -17,27 +17,40 @@
 import torch
 
 
-def add_scalar_torch_ref(data: torch.Tensor, scalar: float) -> torch.Tensor:
-    return data + scalar
+def _to_scalar(x):
+    """Extract scalar value from tensor or pass through if already scalar."""
+    if isinstance(x, torch.Tensor):
+        return x.flatten()[0].item()
+    return x
 
 
-def sub_scalar_torch_ref(data: torch.Tensor, scalar: float) -> torch.Tensor:
-    return data - scalar
+def add_scalar_torch_ref(data: torch.Tensor, scalar_tensor, numel: int = None) -> torch.Tensor:  # noqa: ARG001
+    return data + _to_scalar(scalar_tensor)
 
 
-def mul_scalar_torch_ref(data: torch.Tensor, scalar: float) -> torch.Tensor:
-    return data * scalar
+def sub_scalar_torch_ref(data: torch.Tensor, scalar_tensor, numel: int = None) -> torch.Tensor:  # noqa: ARG001
+    return data - _to_scalar(scalar_tensor)
 
 
-def div_scalar_torch_ref(data: torch.Tensor, scalar: float) -> torch.Tensor:
-    return data / scalar
+def mul_scalar_torch_ref(data: torch.Tensor, scalar_tensor, numel: int = None) -> torch.Tensor:  # noqa: ARG001
+    return data * _to_scalar(scalar_tensor)
 
 
-def add_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+def div_scalar_torch_ref(data: torch.Tensor, scalar_tensor, numel: int = None) -> torch.Tensor:  # noqa: ARG001
+    return data / _to_scalar(scalar_tensor)
+
+
+def add_tensor_torch_ref(
+    data1: torch.Tensor, data2: torch.Tensor, alpha_tensor=None, numel: int = None
+) -> torch.Tensor:  # noqa: ARG001
+    alpha = _to_scalar(alpha_tensor) if alpha_tensor is not None else 1.0
     return data1 + alpha * data2
 
 
-def sub_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+def sub_tensor_torch_ref(
+    data1: torch.Tensor, data2: torch.Tensor, alpha_tensor=None, numel: int = None
+) -> torch.Tensor:  # noqa: ARG001
+    alpha = _to_scalar(alpha_tensor) if alpha_tensor is not None else 1.0
     return data1 - alpha * data2
 
 
@@ -49,17 +62,24 @@ def div_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor, numel: int = 
     return data1 / data2
 
 
-def addcdiv_torch_ref(data: torch.Tensor, data1: torch.Tensor, data2: torch.Tensor, value: float = 1.0) -> torch.Tensor:
+def addcdiv_torch_ref(
+    data: torch.Tensor, data1: torch.Tensor, data2: torch.Tensor, value_tensor=None, numel: int = None
+) -> torch.Tensor:  # noqa: ARG001
+    value = _to_scalar(value_tensor) if value_tensor is not None else 1.0
     return data + value * (data1 / data2)
 
 
-def addcmul_torch_ref(data: torch.Tensor, data1: torch.Tensor, data2: torch.Tensor, value: float = 1.0) -> torch.Tensor:
+def addcmul_torch_ref(
+    data: torch.Tensor, data1: torch.Tensor, data2: torch.Tensor, value_tensor=None, numel: int = None
+) -> torch.Tensor:  # noqa: ARG001
+    value = _to_scalar(value_tensor) if value_tensor is not None else 1.0
     return data + value * (data1 * data2)
 
 
-def lerp_torch_ref(data: torch.Tensor, end: torch.Tensor, weight: float) -> torch.Tensor:
+def lerp_torch_ref(data: torch.Tensor, end: torch.Tensor, weight_tensor=None, numel: int = None) -> torch.Tensor:  # noqa: ARG001
+    weight = _to_scalar(weight_tensor) if weight_tensor is not None else 0.0
     return data + weight * (end - data)
 
 
-def sqrt_torch_ref(data: torch.Tensor) -> torch.Tensor:
+def sqrt_torch_ref(data: torch.Tensor, numel: int = None) -> torch.Tensor:  # noqa: ARG001
     return torch.sqrt(data)

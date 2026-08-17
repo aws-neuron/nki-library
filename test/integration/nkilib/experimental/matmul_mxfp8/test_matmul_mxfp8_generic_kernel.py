@@ -26,10 +26,10 @@ import numpy.typing as npt
 import pytest
 from neuronxcc.nki._private.private_api import float8_e4m3fn_x4, float8_e5m2_x4
 from neuronxcc.nki._private.test import mx_util
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_kernel
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import (
     config_helper,
     constants,
@@ -1232,14 +1232,18 @@ def build_matmul_inputs(conf):
         conf.seed,
     )
 
-    # Create swizzled versions
-    lhs_swizzled = matmul_utils.swizzle_tensor(lhs_fp32.numpy().astype(nl.bfloat16).T)
-    rhs_swizzled = matmul_utils.swizzle_tensor(rhs_fp32.numpy().astype(nl.bfloat16))
+    # Create swizzled versions. The quant scheme selects the interleave layout:
+    # wrapX scatters a feature's K into four quarters; 1x32 packs four consecutive
+    # K values per feature. Pre-quantized operands are quantized from this layout,
+    # so it must match the scheme the kernel loads with.
+    swizzle = matmul_utils.swizzle_tensor_1x32 if conf.quant_scheme == "1x32" else matmul_utils.swizzle_tensor
+    lhs_swizzled = swizzle(lhs_fp32.numpy().astype(nl.bfloat16).T)
+    rhs_swizzled = swizzle(rhs_fp32.numpy().astype(nl.bfloat16))
 
     # For kernel input, use swizzled or unswizzled based on config
     if conf.lhs_is_swizzled:
         lhs = lhs_swizzled
-    elif getattr(conf, 'lhs_is_f_by_k', True) == False:
+    elif not getattr(conf, 'lhs_is_f_by_k', True):
         # K-by-F: [K, M] layout
         lhs = lhs_fp32.numpy().astype(nl.bfloat16).T
     else:
@@ -1247,7 +1251,7 @@ def build_matmul_inputs(conf):
 
     if conf.rhs_is_swizzled:
         rhs = rhs_swizzled
-    elif getattr(conf, 'rhs_is_f_by_k', True) == False:
+    elif not getattr(conf, 'rhs_is_f_by_k', True):
         # K-by-F: [K, N] layout
         rhs = rhs_fp32.numpy().astype(nl.bfloat16)
     else:
@@ -1321,6 +1325,8 @@ def build_matmul_inputs(conf):
             else {}
         ),
         **({"lnc_2_shard_rhs": conf.lnc_2_shard_rhs} if conf.lnc_2_shard_rhs is not None else {}),
+        "quant_scheme": conf.quant_scheme,
+        "enable_psum_copy_in": conf.enable_psum_copy_in,
     }
 
 
@@ -1421,7 +1427,7 @@ def filter_illegal_combinations(
     K, tile_k, TILES_IN_BLOCK_K = k_chain
 
     # partial combination
-    if lhs_is_swizzled == None or rhs_is_swizzled == None:
+    if lhs_is_swizzled is None or rhs_is_swizzled is None:
         return coverage_parametrized_tests.FilterResult.VALID
 
     # swizzling shape constraints
@@ -1438,7 +1444,7 @@ def filter_illegal_combinations(
         return coverage_parametrized_tests.FilterResult.INVALID
 
     # LNC2 sharding requires at least 2 blocks in the sharded dimension
-    if lnc_2_shard_rhs != None and run_with_lnc2 != None and run_with_lnc2:
+    if lnc_2_shard_rhs is not None and run_with_lnc2 is not None and run_with_lnc2:
         if not lnc_2_shard_rhs:
             num_blocks_in_m = M // (tile_m * TILES_IN_BLOCK_M) if (tile_m * TILES_IN_BLOCK_M) > 0 else 0
             if num_blocks_in_m < 2:
@@ -1449,7 +1455,7 @@ def filter_illegal_combinations(
                 return coverage_parametrized_tests.FilterResult.INVALID
 
     # Prune early once lhs_dtype, rhs_dtype, and enable_scale_packing are known
-    if lhs_dtype != None and rhs_dtype != None and enable_scale_packing != None:
+    if lhs_dtype is not None and rhs_dtype is not None and enable_scale_packing is not None:
         """
         Pre-quantized MXFP8 with packed scales requires tile_k=512 (tile_k=Q_TILE_K=128)
         because the packed scales format uses Q_TILE_K-sized tile indexing that doesn't
@@ -1465,12 +1471,12 @@ def filter_illegal_combinations(
                 return coverage_parametrized_tests.FilterResult.INVALID
 
     if (
-        lhs_dtype == None
-        or rhs_dtype == None
-        or output_dtype == None
-        or tile_loop_order == None
-        or block_loop_order == None
-        or run_with_lnc2 == None
+        lhs_dtype is None
+        or rhs_dtype is None
+        or output_dtype is None
+        or tile_loop_order is None
+        or block_loop_order is None
+        or run_with_lnc2 is None
     ):
         return coverage_parametrized_tests.FilterResult.VALID
 
@@ -1575,24 +1581,201 @@ def _mxfp8_comparator(conf, output_dtype, gpu_golden_enabled=False):
 
 
 _ABBREVS = {
-    "lhs_is_swizzled": "lsw",
-    "rhs_is_swizzled": "rsw",
-    "lhs_dtype": "ldt",
-    "rhs_dtype": "rdt",
-    "output_dtype": "odt",
-    "tile_loop_order": "tlo",
-    "block_loop_order": "blo",
-    "float8_dtype": "f8",
-    "lhs_dist": "ld",
-    "rhs_dist": "rd",
+    "lhs_is_swizzled": "lw",
+    "rhs_is_swizzled": "rw",
+    "lhs_dtype": "ld",
+    "rhs_dtype": "rd",
+    "output_dtype": "od",
+    "tile_loop_order": "tl",
+    "block_loop_order": "bl",
+    "float8_dtype": "f",
+    "lhs_dist": "x",
+    "rhs_dist": "y",
     "m_chain": "m",
     "n_chain": "n",
     "k_chain": "k",
-    "spill_reload": "sr",
-    "enable_scale_packing": "sp",
-    "lnc_2_shard_rhs": "ls",
-    "run_with_lnc2": "lnc",
+    "spill_reload": "s",
+    "enable_scale_packing": "p",
+    "enable_psum_copy_in": "c",
+    "lnc_2_shard_rhs": "h",
+    "run_with_lnc2": "l",
 }
+
+# TODO: Add quant_scheme=["wrapX", "1x32"] to test_matmul_mxfp8_sweep once pre-quantized/pre-swizzled
+# inputs properly bypass the 1x32 quantize path in the load pipeline. Currently, mixed configs
+# (e.g., one operand pre-quantized wrapX + other operand BF16 with 1x32) cause OOB compilation errors.
+
+GRID_1X32 = [
+    config_helper.TestConfig(
+        M=512,
+        K=512,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: minimal",
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={0, 1, 2},
+    ),
+    config_helper.TestConfig(
+        M=2048,
+        K=2048,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=4,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=4,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: square matrix",
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={2},
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=1536,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=3,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=4,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: non-square",
+        seed=52,
+        quant_scheme="1x32",
+    ),
+    config_helper.TestConfig(
+        M=1216,
+        K=1024,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: non-divisible M",
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={0, 1, 2},
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=1024,
+        N=2080,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: non-divisible N",
+        run_with_lnc2=False,
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={0, 1, 2},
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=768,
+        N=1024,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: non-divisible K",
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={0, 1, 2},
+    ),
+    config_helper.TestConfig(
+        M=640,
+        K=1536,
+        N=3008,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=3,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: all dims non-divisible",
+        run_with_lnc2=False,
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={0, 1, 2},
+    ),
+    config_helper.TestConfig(
+        M=4096,
+        K=4096,
+        N=1536,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_BLOCK_M=16,
+        TILES_IN_BLOCK_N=3,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32: large shape 4096x4096x1536",
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={0, 1, 2},
+    ),
+]
 
 
 @pytest_test_metadata(name="Matmul MXFP8")
@@ -1830,6 +2013,30 @@ class TestMatmulMxfp8GenericKernel:
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
 
+    @pytest.mark.parametrize(
+        "M,K,N",
+        [
+            (512, 512, 512),
+            (2048, 2048, 2048),
+            (640, 1600, 3008),
+            (1312, 2560, 2880),
+            (4096, 4096, 1536),
+        ],
+        ids=["small_square", "medium_square", "non_divisible_all", "non_divisible_M", "qwen3_qkv_proj"],
+    )
+    def test_matmul_mxfp8_shape_only_defaults(self, test_manager, platform_target, M, K, N):
+        """Test matmul with only shapes specified, letting auto_generate_default configure everything."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+
+        np.random.seed(42)
+        conf = config_helper.TestConfig(M=M, K=K, N=N)
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
+
     @pytest.mark.coverage_parametrize(
         m_chain=generate_chain("M"),
         n_chain=generate_chain("N"),
@@ -1856,6 +2063,7 @@ class TestMatmulMxfp8GenericKernel:
         rhs_dist=get_dists(num=SWEEP_NUM_VALUES, edge_rate=0.3),
         spill_reload=[True, False],
         enable_scale_packing=[True, False],
+        enable_psum_copy_in=[True, False],
         filter=filter_illegal_combinations,
         coverage="singles",
         enable_automatic_boundary_tests=False,  # TODO: Fix assertions
@@ -1884,6 +2092,7 @@ class TestMatmulMxfp8GenericKernel:
         rhs_is_swizzled,
         spill_reload,
         lnc_2_shard_rhs,
+        enable_psum_copy_in,
     ):
         if not platform_target.is_trn3():
             pytest.skip("MX is only supported on TRN3.")
@@ -1919,6 +2128,7 @@ class TestMatmulMxfp8GenericKernel:
             enable_scale_packing=enable_scale_packing,
             lnc_2_shard_rhs=lnc_2_shard_rhs,
         )
+        conf.enable_psum_copy_in = enable_psum_copy_in
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if run_with_lnc2 else 1,
             platform_target=platform_target,
@@ -1926,3 +2136,44 @@ class TestMatmulMxfp8GenericKernel:
         self.run_matmul_mxfp8_generic_test(
             test_manager, compiler_args, conf, is_negative_test=is_negative_test_case, gpu_golden_enabled=False
         )
+
+    @pytest.mark.parametrize("conf", populate_tests(GRID_1X32))
+    def test_matmul_mxfp8_1x32(self, test_manager, conf, platform_target):
+        """Test matmul with 1x32 quantization scheme using FP32 reinterpret PE swizzle."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
+
+    def test_matmul_mxfp8_4096x4096x1536_pe_swizzle_1x32_spill_reload(self, test_manager, platform_target):
+        """Test 4096x4096x1536 PE swizzle with 1x32 quantization + spill_reload."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        np.random.seed(42)
+        conf = config_helper.TestConfig(
+            M=4096,
+            K=4096,
+            N=1536,
+            lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            lhs_is_swizzled=False,
+            rhs_is_swizzled=False,
+            tile_m=128,
+            tile_n=512,
+            tile_k=512,
+            TILES_IN_BLOCK_K=2,
+            TILES_IN_BLOCK_M=16,
+            TILES_IN_BLOCK_N=3,
+            TILES_IN_LOAD_M=4,
+            TILES_IN_LOAD_N=1,
+            quant_scheme="1x32",
+            spill_reload=True,
+        )
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)

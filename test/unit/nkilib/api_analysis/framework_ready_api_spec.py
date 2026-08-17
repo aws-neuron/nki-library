@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 import numpy as np
-
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant import RmsNormQuantKernelArgs
 from nkilib_src.nkilib.core.utils.common_types import RouterActFnType
 from nkilib_src.nkilib.core.utils.logging import Logger, LogLevel

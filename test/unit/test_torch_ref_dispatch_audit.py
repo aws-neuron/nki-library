@@ -35,7 +35,6 @@ from pathlib import Path
 from typing import List, Tuple
 
 import pytest
-
 from nkilib_src.nkilib.core.utils import kernel_torch_dispatch
 from nkilib_src.nkilib.core.utils.kernel_torch_dispatch import dispatch
 
@@ -87,53 +86,7 @@ def _find_kernel_entries() -> List[Tuple[str, str, str]]:
 # When a kernel is fixed, remove it. Adding new entries requires justification.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DISPATCH_KNOWN_FAILURES = frozenset(
-    [
-        # Gap 1: no matching torch_ref file/function
-        "adam",
-        "adamw",
-        "all_expert_moe_tkg_mx",
-        "attention_block_tkg",
-        "blockwise_mm_baseline_shard_hidden",
-        "blockwise_mm_baseline_shard_intermediate",
-        "blockwise_mm_baseline_shard_intermediate_hybrid",
-        "blockwise_mm_bwd",
-        "blockwise_mm_shard_intermediate_dropping",
-        "bwmm_shard_on_block",
-        "bwmm_shard_on_block_hybrid",
-        "dma_broadcast",
-        "dma_load_full_array",
-        "dma_reload_same_block",
-        "down_projection_mx",
-        "dve_broadcast",
-        "gate_up_projection_mx",
-        "load_broadcast_down_weight_scale_bias",
-        "mxfp_load_performance_wrapper",
-        "pad",
-        "pe_broadcast_no_tiling",
-        "quantize_block_mxfp8",
-        "rotational_topk",
-        "row_tiling_pe_broadcast",
-        "row_tiling_pe_broadcast_shuffled",
-        "row_tiling_pe_broadcast_shuffled_vectorized_psum",
-        "transformer_tkg",
-        # Gap 2: signature mismatch
-        "add_scalar",
-        "add_tensor",
-        "addcdiv",
-        "addcmul",
-        "attention_tkg",
-        "div_scalar",
-        "lerp",
-        "moe_cte",
-        "mul_scalar",
-        "ring_attention_spmd_bwd",
-        "rmsnorm_mx_quantize_tkg",
-        "sqrt",
-        "sub_scalar",
-        "sub_tensor",
-    ]
-)
+DISPATCH_KNOWN_FAILURES = frozenset()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tests

@@ -64,7 +64,7 @@ def reshape_permute_load(src_hbm):
     tile = src_view.load()  # tile: [128, 4, 8]
 
     dst_tiles = nt.tiles(dst, tile_size=(128, 4, 8))
-    dst_tiles[0, 0, 0].store(tile.ap())
+    dst_tiles[0, 0, 0].store(tile.data)
     return dst
 
 
@@ -109,7 +109,7 @@ def attention_qk_layout(q_hbm):
     tile = q_head0.load()  # tile: [16, 128, 1]
 
     dst_tiles = nt.tiles(dst, tile_size=(head_dim, B * S))
-    dst_tiles[0, 0].store(tile.ap())
+    dst_tiles[0, 0].store(tile.data)
     return dst
 
 
@@ -129,7 +129,7 @@ def tile_reshape_elementwise(src):
             for ci in range(4):
                 chunk = reshaped[:, ci, :]  # [128, 1, 128]
                 nisa.tensor_scalar(chunk.data, chunk.data, nl.multiply, 2.0)
-            dst_tiles[i, j].store(tile.ap())
+            dst_tiles[i, j].store(tile.data)
 
     return dst
 
@@ -153,7 +153,7 @@ def block_reshape_elementwise(src):
                     for ci in range(4):
                         chunk = reshaped[:, ci, :]
                         nisa.tensor_scalar(chunk.data, chunk.data, nl.multiply, 2.0)
-            dst_blocks[bi, bj].store(block.ap())
+            dst_blocks[bi, bj].store(block.data)
 
     return dst
 
@@ -177,7 +177,7 @@ def block_reshape_chunked(src):
                     for ci in range(2):
                         chunk = chunked[:, ci, :]
                         nisa.tensor_scalar(chunk.data, chunk.data, nl.add, 1.0)
-            dst_blocks[bi, bj].store(block.ap())
+            dst_blocks[bi, bj].store(block.data)
 
     return dst
 

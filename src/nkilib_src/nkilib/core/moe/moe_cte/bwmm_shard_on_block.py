@@ -70,18 +70,18 @@ class DimensionSizes(NKIObject):
 
 @nki.jit
 def bwmm_shard_on_block(
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
     block_size: int,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    gate_and_up_proj_bias: Optional[nl.ndarray] = None,
-    down_proj_bias: Optional[nl.ndarray] = None,
-    gate_up_proj_scale: Optional[nl.ndarray] = None,
-    down_proj_scale: Optional[nl.ndarray] = None,
-    down_activations: Optional[nl.ndarray] = None,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    gate_and_up_proj_bias: Optional[nl.NkiTensor] = None,
+    down_proj_bias: Optional[nl.NkiTensor] = None,
+    gate_up_proj_scale: Optional[nl.NkiTensor] = None,
+    down_proj_scale: Optional[nl.NkiTensor] = None,
+    down_activations: Optional[nl.NkiTensor] = None,
     activation_function: common_types.ActFnType = common_types.ActFnType.SiLU,
     skip_dma: SkipMode = SkipMode(False, False),
     compute_dtype: Any = nl.bfloat16,
@@ -113,18 +113,18 @@ def bwmm_shard_on_block(
         I_TP: Intermediate size divided by tensor parallelism degree
 
     Args:
-        hidden_states (nl.ndarray): [T, H], Input token embeddings in HBM
-        expert_affinities_masked (nl.ndarray): [(T+1)*E, 1], Expert routing weights for token assignments in HBM
-        gate_up_proj_weight (nl.ndarray): [E, H, 2, I_TP], Combined gate and up projection weights in HBM
-        down_proj_weight (nl.ndarray): [E, I_TP, H], Down projection weights in HBM
+        hidden_states (nl.NkiTensor): [T, H], Input token embeddings in HBM
+        expert_affinities_masked (nl.NkiTensor): [(T+1)*E, 1], Expert routing weights for token assignments in HBM
+        gate_up_proj_weight (nl.NkiTensor): [E, H, 2, I_TP], Combined gate and up projection weights in HBM
+        down_proj_weight (nl.NkiTensor): [E, I_TP, H], Down projection weights in HBM
         block_size (int): Number of tokens processed per block
-        token_position_to_id (nl.ndarray): [N*B], Mapping from block positions to token IDs in HBM
-        block_to_expert (nl.ndarray): [N, 1], Expert assignment for each block in HBM
-        gate_and_up_proj_bias (nl.ndarray, optional): [E, 2, I_TP], Bias terms for gate/up projections in HBM
-        down_proj_bias (nl.ndarray, optional): [E, 1, H], Bias terms for down projection in HBM
-        gate_up_proj_scale (nl.ndarray, optional): [E, 1, 2*I_TP], Dequantization scales for gate/up weights in HBM
-        down_proj_scale (nl.ndarray, optional): [E, 1, H], Dequantization scales for down weights in HBM
-        down_activations (nl.ndarray, optional): [N, B, H], Storage for intermediate activations in HBM
+        token_position_to_id (nl.NkiTensor): [N*B], Mapping from block positions to token IDs in HBM
+        block_to_expert (nl.NkiTensor): [N, 1], Expert assignment for each block in HBM
+        gate_and_up_proj_bias (nl.NkiTensor, optional): [E, 2, I_TP], Bias terms for gate/up projections in HBM
+        down_proj_bias (nl.NkiTensor, optional): [E, 1, H], Bias terms for down projection in HBM
+        gate_up_proj_scale (nl.NkiTensor, optional): [E, 1, 2*I_TP], Dequantization scales for gate/up weights in HBM
+        down_proj_scale (nl.NkiTensor, optional): [E, 1, H], Dequantization scales for down weights in HBM
+        down_activations (nl.NkiTensor, optional): [N, B, H], Storage for intermediate activations in HBM
         activation_function (ActFnType): Activation function type (SiLU, GELU, etc.)
         skip_dma (SkipMode): DMA skip configuration for memory optimization
         compute_dtype (nki.dtype): Data type for internal computations (default: bfloat16)
@@ -138,7 +138,7 @@ def bwmm_shard_on_block(
         block_sharding_strategy (BlockShardStrategy): Block distribution strategy across cores
 
     Returns:
-        output (nl.ndarray): Expert-processed token representations in HBM. Shape depends on accumulation mode:
+        output (nl.NkiTensor): Expert-processed token representations in HBM. Shape depends on accumulation mode:
             - Single expert (is_tensor_update_accumulating=False): [T, H]
             - Multiple experts (is_tensor_update_accumulating=True): [T, 2, H] for cross-core accumulation
 
@@ -1067,11 +1067,11 @@ def bwmm_shard_on_block(
 
 def compute_same_weights_block_parallel_hbm(
     N: int,
-    block_to_expert: nl.ndarray,
+    block_to_expert: nl.NkiTensor,
     num_shards: int,
     shard_id: int,
     shard_strat: BlockShardStrategy,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Compute weight reuse mask for block-parallel execution.
 
@@ -1080,13 +1080,13 @@ def compute_same_weights_block_parallel_hbm(
 
     Args:
         N (int): Total number of blocks
-        block_to_expert (nl.ndarray): Expert assignment for each block
+        block_to_expert (nl.NkiTensor): Expert assignment for each block
         num_shards (int): Number of shards for parallel execution
         shard_id (int): Current shard identifier
         shard_strat (BlockShardStrategy): Block distribution strategy
 
     Returns:
-        nl.ndarray: Boolean mask indicating weight reuse opportunities
+        nl.NkiTensor: Boolean mask indicating weight reuse opportunities
     """
     kernel_assert(shard_strat == BlockShardStrategy.PING_PONG, "only support PING_PONG for right now")
     n_blocks_per_shard = div_ceil(N, num_shards)
@@ -1281,8 +1281,8 @@ def compute_same_weights_block_parallel_hbm(
 
 
 def load_down_proj_weight(
-    down_proj_weight: nl.ndarray,
-    block_expert: nl.ndarray,
+    down_proj_weight: nl.NkiTensor,
+    block_expert: nl.NkiTensor,
     compute_dtype,
     skip_dma: SkipMode = SkipMode(),
     load_dst: Optional[list] = None,
@@ -1360,8 +1360,8 @@ def load_down_proj_weight(
 
 
 def load_gate_up_proj_weights(
-    gate_up_proj_weight: nl.ndarray,
-    block_expert: nl.ndarray,
+    gate_up_proj_weight: nl.NkiTensor,
+    block_expert: nl.NkiTensor,
     compute_dtype,
     skip_dma: SkipMode = SkipMode(),
     load_dst: Optional[list] = None,
@@ -1499,7 +1499,7 @@ def compute_block_output(
         dp_weights (list): Down projection weights [gup_tile_count][TILE_SIZE, H]
         expert_affinity (list, optional): Expert affinities [NUM_TILES][TILE_SIZE, 1]
         block_old (list, optional): Previous block outputs for accumulation [NUM_TILES][TILE_SIZE, H]
-        down_activations (nl.ndarray, optional): Storage for intermediate activations
+        down_activations (nl.NkiTensor, optional): Storage for intermediate activations
         block_idx (int): Current block index
         H (int): Hidden dimension size
         I_TP (int): Intermediate dimension size
@@ -1507,9 +1507,9 @@ def compute_block_output(
         output_dtype (nki.dtype): Output data type
         compute_dtype (nki.dtype): Computation data type
         is_tensor_update_accumulating (bool): Enable accumulation mode
-        down_bias_broadcasted (nl.ndarray, optional): Broadcasted bias [TILE_SIZE, H]
+        down_bias_broadcasted (nl.NkiTensor, optional): Broadcasted bias [TILE_SIZE, H]
         allocate (bool): Unused parameter
-        down_scale (nl.ndarray, optional): Dequantization scales
+        down_scale (nl.NkiTensor, optional): Dequantization scales
 
     Returns:
         list: Block output tensors [NUM_TILES][TILE_SIZE, H]
@@ -1682,13 +1682,13 @@ def compute_block_output(
 
 
 def reduce_outputs(
-    output: nl.ndarray, zeros: nl.ndarray, num_tiles: int, reduce_tile_size: int, offset: int, dim_hidden: int
+    output: nl.NkiTensor, zeros: nl.NkiTensor, num_tiles: int, reduce_tile_size: int, offset: int, dim_hidden: int
 ):
     """Synchronize across axis=0 in output by performing FMA reduce and store.
 
     Args:
-        output (nl.ndarray): Output tensor, size [T, 2, H]
-        zeros (nl.ndarray): Zero tensor, size [reduce_tile_size, 1, H]
+        output (nl.NkiTensor): Output tensor, size [T, 2, H]
+        zeros (nl.NkiTensor): Zero tensor, size [reduce_tile_size, 1, H]
         num_tiles (int): Number of tiles (iterations)
         reduce_tile_size (int): Size of tile size on partition dimension
         offset (int): Output read/write offset on row
@@ -1728,10 +1728,10 @@ def load_and_transpose_gup_bias(inps: InputTensors, dims: DimensionSizes, cfg: C
         inps (InputTensors): Input tensor container
         dims (DimensionSizes): Dimension configuration
         cfg (Configs): Kernel configuration
-        block_expert (nl.ndarray): Expert index for current block [1, 1]
+        block_expert (nl.NkiTensor): Expert index for current block [1, 1]
 
     Returns:
-        nl.ndarray: Transposed bias tensor [TILE_SIZE, 2*gup_tile_count] in SBUF
+        nl.NkiTensor: Transposed bias tensor [TILE_SIZE, 2*gup_tile_count] in SBUF
     """
     gate_up_bias = nl.ndarray((2, dims.I_TP), dtype=cfg.compute_dtype)
     gate_up_bias_T = nl.ndarray((TILE_SIZE, 2 * dims.gup_tile_count), dtype=cfg.compute_dtype)
@@ -1816,10 +1816,10 @@ def load_and_broadcast_down_bias(inps: InputTensors, dims: DimensionSizes, cfg: 
         inps (InputTensors): Input tensor container
         dims (DimensionSizes): Dimension configuration
         cfg (Configs): Kernel configuration
-        block_expert (nl.ndarray): Expert index for current block
+        block_expert (nl.NkiTensor): Expert index for current block
 
     Returns:
-        nl.ndarray: Broadcasted bias tensor with shape [128, H]
+        nl.NkiTensor: Broadcasted bias tensor with shape [128, H]
     """
     down_bias = nl.ndarray((1, dims.H), dtype=cfg.compute_dtype, buffer=nl.sbuf)
     nisa.memset(down_bias, value=0.0)

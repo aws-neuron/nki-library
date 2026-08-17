@@ -49,7 +49,7 @@ def kv_cache_load(kv_cache, batch_id, seq_offset_tensor):
     kv_data = kv_iter[batch_id, seq_tile].load()  # tile: [1, D]
 
     out_iter = nt.tiles(out, tile_size=(1, D))
-    out_iter[0, 0].store(kv_data.ap())
+    out_iter[0, 0].store(kv_data.data)
     return out
 
 
@@ -73,7 +73,7 @@ def kv_cache_load_raw_sbuf_index(kv_cache, batch_id, seq_offset_tensor):
     kv_data = kv_iter[batch_id, seq_sbuf].load()  # raw SBUF ndarray as index
 
     out_iter = nt.tiles(out, tile_size=(1, D))
-    out_iter[0, 0].store(kv_data.ap())
+    out_iter[0, 0].store(kv_data.data)
     return out
 
 
@@ -114,7 +114,7 @@ def kv_cache_multi_pos(kv_cache, batch_indices, seq_positions):
     kv_data = flat_iter[flat_idx, 0].load()  # tile: [K, D]
 
     out_iter = nt.tiles(out, tile_size=(K, D))
-    out_iter[0, 0].store(kv_data.ap())
+    out_iter[0, 0].store(kv_data.data)
     return out
 
 

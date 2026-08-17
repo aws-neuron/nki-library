@@ -16,7 +16,7 @@
 
 Tests real DMA through the pipeline: factory -> index -> load -> store.
 All kernels use only declarative public APIs (__getitem__, .load(),
-.store(), .ap(), .tolist(), .stream()).
+.store(), .data, .tolist(), .stream()).
 
 This is the migrated subset covering the core nki-integration test
 classes (basic load/store, sequential range, indirect index, vector
@@ -35,8 +35,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -55,7 +55,7 @@ def _kernel_single_tile(src):
     v = nt.tiles(src, tile_size=(P, F))
     out_v = nt.tiles(out, tile_size=(P, F))
     tile = v[0, 0].load()
-    out_v[0, 0].store(tile.ap())
+    out_v[0, 0].store(tile.data)
     return out
 
 
@@ -71,7 +71,7 @@ def _kernel_multi_tile(src):
     for i in range(2):
         for j in range(2):
             tile = v[i, j].load()
-            out_v[i, j].store(tile.ap())
+            out_v[i, j].store(tile.data)
     return out
 
 
@@ -85,7 +85,43 @@ def _kernel_remainder(src):
     for i in range(v.shape[0]):
         for j in range(v.shape[1]):
             tile = v[i, j].load()
-            out_v[i, j].store(tile.ap())
+            out_v[i, j].store(tile.data)
+    return out
+
+
+# =============================================================================
+# .data is the access-pattern view (.data == .data)
+# =============================================================================
+
+
+@nki.jit
+def _kernel_data_as_source(src):
+    """Use ``.data`` (not ``.data``) as the DMA source: ``.data`` is the
+    access-pattern view, so it is a valid DMA/compute operand."""
+    M, N = src.shape
+    out = nl.ndarray((M, N), dtype=src.dtype, buffer=nl.shared_hbm)
+    v = nt.tiles(src, tile_size=(128, 512))
+    out_v = nt.tiles(out, tile_size=(128, 512))
+    for i in range(v.shape[0]):
+        for j in range(v.shape[1]):
+            tile = v[i, j].load()
+            # .data feeds store directly -- exercises the .data == .data contract.
+            out_v[i, j].store(tile.data)
+    return out
+
+
+@nki.jit
+def _kernel_data_remainder(src):
+    """``.data`` on a partial trailing tile addresses only the real extent
+    (300/128 -> last row-tile is 44 rows; 512 cols full)."""
+    M, N = src.shape
+    out = nl.ndarray((M, N), dtype=src.dtype, buffer=nl.shared_hbm)
+    v = nt.tiles(src, tile_size=(128, 512))
+    out_v = nt.tiles(out, tile_size=(128, 512))
+    for i in range(v.shape[0]):
+        for j in range(v.shape[1]):
+            tile = v[i, j].load()
+            out_v[i, j].store(tile.data)
     return out
 
 
@@ -104,7 +140,7 @@ def _kernel_seq_range_rows(src):
     for i in nl.sequential_range(v.shape[0]):
         for j in range(v.shape[1]):
             t = v[i, j].load()
-            out_v[i, j].store(t.ap())
+            out_v[i, j].store(t.data)
     return out
 
 
@@ -118,7 +154,7 @@ def _kernel_seq_range_cols(src):
     for j in nl.sequential_range(v.shape[1]):
         for i in range(v.shape[0]):
             t = v[i, j].load()
-            out_v[i, j].store(t.ap())
+            out_v[i, j].store(t.data)
     return out
 
 
@@ -172,6 +208,38 @@ class TestBasicLoadStore:
             kernel_entry=_kernel_multi_tile,
             torch_ref=torch_ref_wrapper(_identity_ref),
             kernel_input_generator=_src_inputs((256, 1024), seed=42),
+            output_tensor_descriptor=_src_output,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_data_as_source(self, test_manager: Orchestrator, platform_target: Platforms):
+        """``.data`` used directly as the DMA source (the .data == .data view)."""
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_kernel_data_as_source,
+            torch_ref=torch_ref_wrapper(_identity_ref),
+            kernel_input_generator=_src_inputs((256, 1024), seed=42),
+            output_tensor_descriptor=_src_output,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_data_as_source_remainder(self, test_manager: Orchestrator, platform_target: Platforms):
+        """``.data`` on partial trailing tiles (non-divisible shape) round-trips."""
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_kernel_data_remainder,
+            torch_ref=torch_ref_wrapper(_identity_ref),
+            kernel_input_generator=_src_inputs((300, 512), seed=42),
             output_tensor_descriptor=_src_output,
         )
         framework.run_test(

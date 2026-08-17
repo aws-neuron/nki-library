@@ -60,17 +60,23 @@ def dynamic_elementwise_add(
     Pseudocode:
         result = allocate([M, H], bf16, HBM)
         trip_count = load_register(num_m_tiles)
-        m_offset = 0
+        m_offset = 0  # tracked in SBUF; advanced inside the loop body, not loop-carried
 
-        for _ in dynamic_range(trip_count):
+        # nl.fori_loop follows Pallas fori_loop semantics: the body is a function
+        # invoked per iteration with the loop index. Loop-carried dependencies
+        # (a value threaded from one iteration's return into the next) are NOT
+        # supported yet, so state like m_offset is kept in SBUF and mutated
+        # in place rather than passed through the loop.
+        def body(i):
             for h_tile_idx in affine_range(H // H_TILE_SIZE):
                 h_start = h_tile_idx * H_TILE_SIZE
                 a_tile = dma_load(input_a[m_offset:m_offset+P_MAX, h_start:h_start+H_TILE_SIZE])
                 b_tile = dma_load(input_b[m_offset:m_offset+P_MAX, h_start:h_start+H_TILE_SIZE])
                 out_tile = a_tile + b_tile
                 dma_store(result[m_offset:m_offset+P_MAX, h_start:h_start+H_TILE_SIZE], out_tile)
-            m_offset += P_MAX
+            m_offset += P_MAX  # mutate SBUF state in place (no loop-carried value)
 
+        fori_loop(0, trip_count, body, step=1)
         return result
     """
     m_static, hidden = input_a.shape
@@ -94,7 +100,7 @@ def dynamic_elementwise_add(
     # Allocate output on HBM
     result = nl.ndarray(shape=(m_static, hidden), dtype=input_a.dtype, buffer=nl.shared_hbm)
 
-    # Load num_m_tiles scalar into a hardware register for dynamic_range
+    # Load num_m_tiles scalar into a hardware register for the fori_loop trip count
     num_m_tiles_sbuf = nl.ndarray(shape=(1, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.dma_copy(dst=num_m_tiles_sbuf, src=num_m_tiles[0])
     num_m_tiles_reg = nisa.register_alloc()
@@ -104,7 +110,7 @@ def dynamic_elementwise_add(
     m_tile_start = nl.ndarray(shape=(1, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.memset(dst=m_tile_start, value=0)
 
-    for _ in nl.dynamic_range(0, num_m_tiles_reg, 1):
+    def _process_m_tile(_):
         for h_tile_idx in nl.affine_range(H_TILE_COUNT):
             h_start = h_tile_idx * H_TILE_SIZE
 
@@ -152,8 +158,14 @@ def dynamic_elementwise_add(
                 src=out_tile[0:P_MAX, 0:H_TILE_SIZE],
             )
 
-        # Advance M-tile offset by P_MAX rows
+        # Advance M-tile offset by P_MAX rows. State is mutated in SBUF rather than
+        # passed between iterations: fori_loop has no loop-carried dependency support.
         nisa.tensor_scalar(dst=m_tile_start, data=m_tile_start, op0=nl.add, operand0=P_MAX)
+
+    # nl.fori_loop follows Pallas fori_loop semantics: it calls _process_m_tile(i)
+    # for each index in [0, num_m_tiles_reg). Loop-carried values are not supported
+    # yet, so m_tile_start lives in SBUF and is updated in place by the body above.
+    nl.fori_loop(0, num_m_tiles_reg, _process_m_tile, step=1)
 
     # HBM fence: ensure all DMA writes complete before kernel returns
     nisa.dma_copy(dst=result, src=result)

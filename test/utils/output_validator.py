@@ -34,7 +34,7 @@ from .common_dataclasses import (
     LazyGoldenGenerator,
     PerRankLazyGoldenGenerator,
 )
-from .comparators import get_largest_abs_diff, maxAllClose
+from .comparators import max_all_close_with_accuracy
 from .metrics_collector import IMetricsCollector, MetricName
 from .tensor_histogram import TensorHistogram
 
@@ -150,7 +150,7 @@ class OutputValidator:
             golden = params.golden_output.for_rank(rank_id)
             if rank_id in params.golden_output.computation_times:
                 metrics_collector.record_timer(
-                    MetricName.GOLDEN_COMPUTATION_TIME, params.golden_output.computation_times[rank_id]
+                    MetricName.GOLDEN_ACQUISITION_TIME, params.golden_output.computation_times[rank_id]
                 )
             return golden, None
         elif isinstance(params.golden_output, LazyGoldenGenerator):
@@ -158,13 +158,13 @@ class OutputValidator:
             assert golden
             if params.golden_output.computation_time is not None:
                 metrics_collector.record_timer(
-                    MetricName.GOLDEN_COMPUTATION_TIME, params.golden_output.computation_time
+                    MetricName.GOLDEN_ACQUISITION_TIME, params.golden_output.computation_time
                 )
             return golden, params.golden_output.output_ndarray
         elif isinstance(params.golden_output, dict):
             return params.golden_output, None
         else:
-            assert False, f"Unknown golden generator/validator found"
+            raise AssertionError("Unknown golden generator/validator found")
 
     def _compare_raw_byte(
         self,
@@ -235,7 +235,7 @@ class OutputValidator:
         rank_prefix = f"rank{rank_id}:" if rank_id is not None else ""
         for output_key, expected_value in golden_output.items():
             assert output_key in actual_outputs, (
-                f"{rank_prefix}{output_key} was not emitted by neuron-profile capture. Double check the names of golden outputs and variable names of what {self.kernels_args.kernel_func.__name__} returns "
+                f"{rank_prefix}{output_key} was not emitted by neuron-explorer capture. Double check the names of golden outputs and variable names of what {self.kernels_args.kernel_func.__name__} returns "
             )
 
             if isinstance(expected_value, CustomValidatorWithOutputTensorData):
@@ -278,19 +278,14 @@ class OutputValidator:
                     actual_output = unpacker(actual_outputs[output_key]).numpy().astype(np.float32)
                     expected_output = unpacker(expected_value).numpy().astype(np.float32)
 
-                largest_abs_diff = get_largest_abs_diff(actual_output, expected_output, atol=params.absolute_accuracy)
-
-                # Record -1 if accuracy metric is invalid
-                if math.isfinite(largest_abs_diff):
-                    metrics_collector.record_metric(MetricName.ACCURACY_HW, largest_abs_diff, "None")
-                else:
-                    metrics_collector.record_metric(MetricName.ACCURACY_HW, -1.0, "None")
-
-                # Perform comparison
+                # max_all_close_with_accuracy hands back the largest-abs-diff accuracy
+                # metric it already computes internally, so we avoid a second
+                # full-array pass that a separate get_largest_abs_diff call would
+                # cost (significant for large unpacked MX outputs).
                 self.LOGGER.info(f"Results for {rank_prefix}{output_key}:")
                 if logfile:
                     print(f"Results for {rank_prefix}{output_key}:", file=logfile)
-                comparison_passed = maxAllClose(
+                result = max_all_close_with_accuracy(
                     actual_output,
                     expected_output,
                     params.relative_accuracy,
@@ -299,6 +294,14 @@ class OutputValidator:
                     verbose=1,
                     logfile=logfile,
                 )
+                comparison_passed = result.passed
+                largest_abs_diff = result.accuracy
+
+                # Record -1 if accuracy metric is invalid
+                if math.isfinite(largest_abs_diff):
+                    metrics_collector.record_metric(MetricName.ACCURACY_HW, largest_abs_diff, "None")
+                else:
+                    metrics_collector.record_metric(MetricName.ACCURACY_HW, -1.0, "None")
 
                 # Print visualization report (always if enabled, regardless of pass/fail)
                 visualizer.print_full_comparison_report(
@@ -332,7 +335,7 @@ class OutputValidator:
         result: dict[str, npt.NDArray[Any]] = {}
 
         for output_file_path in output_file_list:
-            # neuron-profiler names files the same as output variable name
+            # neuron-explorer names files the same as output variable name
             file_name_without_extension = os.path.splitext(os.path.basename(output_file_path))[0]
 
             if file_name_without_extension not in golden_output:

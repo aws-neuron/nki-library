@@ -55,6 +55,42 @@ LHS_QUANTIZE_TILE = (MATMUL_TILE_K_PHYSICAL, TILE_M * INTERLEAVE_FACTOR)
 RHS_QUANTIZE_TILE = (MATMUL_TILE_K_PHYSICAL, TILE_N * INTERLEAVE_FACTOR)
 
 
+def build_tile_sizes(tile_m: int = TILE_M, l_tile_k: int = L_TILE_K, tile_n: int = TILE_N) -> dict:
+    """Build a tiles dict from explicit tile sizes (no dimension-adaptive capping).
+
+    Companion to :func:`get_tile_sizes`, which derives the tile sizes from the
+    tensor dims and caps ``tile_n`` at ``TILE_N``. This variant takes the tile
+    sizes directly (e.g. from an autotune-cache config) so a caller can use a
+    tuned ``tile_n`` that exceeds ``TILE_N`` (a moving-dim tile spanning multiple
+    PSUM banks) while producing the same derived shapes ``get_tile_sizes`` does.
+
+    Args:
+        tile_m: Stationary (M) tile size.
+        l_tile_k: Logical contraction (K) tile size; physical K is
+            ``l_tile_k // INTERLEAVE_FACTOR``.
+        tile_n: Moving (N) tile size.
+
+    Returns:
+        Dict with keys: tile_m, tile_n, l_tile_k, matmul_tile_k_physical,
+        lhs_matmul_tile_physical, rhs_matmul_tile_physical,
+        lhs_load_tile, rhs_load_tile, lhs_quantize_tile, rhs_quantize_tile.
+    """
+    matmul_tile_k_physical = l_tile_k // INTERLEAVE_FACTOR
+
+    return {
+        'tile_m': tile_m,
+        'tile_n': tile_n,
+        'l_tile_k': l_tile_k,
+        'matmul_tile_k_physical': matmul_tile_k_physical,
+        'lhs_matmul_tile_physical': (matmul_tile_k_physical, tile_m),
+        'rhs_matmul_tile_physical': (matmul_tile_k_physical, tile_n),
+        'lhs_load_tile': (l_tile_k, tile_m),
+        'rhs_load_tile': (l_tile_k, tile_n),
+        'lhs_quantize_tile': (matmul_tile_k_physical, tile_m * INTERLEAVE_FACTOR),
+        'rhs_quantize_tile': (matmul_tile_k_physical, tile_n * INTERLEAVE_FACTOR),
+    }
+
+
 def get_tile_sizes(K, M, N):
     """Return tile sizes adapted to tensor dimensions, matching matmul kernel auto-generation.
 
@@ -71,20 +107,7 @@ def get_tile_sizes(K, M, N):
     tile_m = TILE_M if M >= TILE_M else M
     tile_n = TILE_N if N >= TILE_N else N
     l_tile_k = L_TILE_K if K >= L_TILE_K else K
-    matmul_tile_k_physical = l_tile_k // INTERLEAVE_FACTOR
-
-    return {
-        'tile_m': tile_m,
-        'tile_n': tile_n,
-        'l_tile_k': l_tile_k,
-        'matmul_tile_k_physical': matmul_tile_k_physical,
-        'lhs_matmul_tile_physical': (matmul_tile_k_physical, tile_m),
-        'rhs_matmul_tile_physical': (matmul_tile_k_physical, tile_n),
-        'lhs_load_tile': (l_tile_k, tile_m),
-        'rhs_load_tile': (l_tile_k, tile_n),
-        'lhs_quantize_tile': (matmul_tile_k_physical, tile_m * INTERLEAVE_FACTOR),
-        'rhs_quantize_tile': (matmul_tile_k_physical, tile_n * INTERLEAVE_FACTOR),
-    }
+    return build_tile_sizes(tile_m=tile_m, l_tile_k=l_tile_k, tile_n=tile_n)
 
 
 def _build_matmul_params(
@@ -161,7 +184,7 @@ def _allocate_spill_buffer(
 
     return TensorDescriptor(
         data=nl.ndarray((k_dim, f_dim), dtype=fp8_x4_dtype, buffer=data_buffer),
-        scales=nl.ndarray(scale_shape, dtype=nl.uint8, buffer=data_buffer),
+        scales=nl.ndarray(scale_shape, dtype=nl.float8_e8m0fnu, buffer=data_buffer),
         is_swizzled=True,
         is_x4=True,
         scales_are_packed=use_scale_packing,

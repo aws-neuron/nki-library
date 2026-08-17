@@ -21,10 +21,7 @@ The math is identical — only quantization-aware arguments differ.
 
 import torch
 
-from test.integration.nkilib.experimental.moe.test_bwmm_bwd_common import (
-    blockwise_mm_bwd_torch_ref,
-)
-
+from ...moe.bwd.blockwise_mm_backward_torch import blockwise_mm_bwd_torch_ref
 from ...moe.bwd.moe_bwd_parameters import (
     ActFnType,
     AffinityOption,

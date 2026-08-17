@@ -13,12 +13,14 @@ source .venv/bin/activate
 # 3. Install nki-library + all dependencies
 make install
 
+# 4. run below to install latest supported versions
+make install_neuron
+# OR
 # 4. Download the Neuron compiler, Neuron Kernel Interface (NKI) wheels into `wheelhouse` directory
-
-# 5. Install the compiler and NKI wheels
+# 4.a Install the compiler and NKI wheels
 make install_wheelhouse
 
-# 6. Now you can run regular make targets
+# 5. Now you can run regular make targets
 make test
 ```
 
@@ -333,4 +335,6 @@ The CSV contains: `TestName`, `TpbSgCyclesSum` (cycles), `MbuEstimatedPercent` (
 ### Tips
 
 - **Always rebuild before testing** - Tests run against built artifacts
+- **Redirect output for analysis:** `brazil-build integration-test ... > /tmp/test.txt 2>&1`
 - **Use parallelism** (`-n auto --maxprocesses 64 --dist worksteal`) - Always use unless <20 test configs
+- **Use timeouts** for long runs: `timeout 300 brazil-build integration-test ...`

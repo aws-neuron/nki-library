@@ -327,6 +327,13 @@ class Grid(nl.NKIObject):
         outer = self.outer_axis(dim)
         return 1 if outer is None else outer.step
 
+    def index_stride_elements(self):
+        """Source-element stride for each current public index dim."""
+        result = []
+        for d in range(self.cursor, self.ndim):
+            result.append(self.current_step(d))
+        return tuple(result)
+
     def current_count(self, dim):
         """Outermost-axis count on dim, or 1."""
         return self._outer_count(dim)
@@ -481,6 +488,15 @@ class Grid(nl.NKIObject):
         result = []
         for d in range(self.ndim):
             result.append(self._owned_extent(d))
+        return tuple(result)
+
+    def gathered_dims(self):
+        """The non-trivial (extent > 1) remaining dims a gather/transpose operates
+        on, outermost-first -- size-1 dims (consumed batch / partition leaf) drop."""
+        result = []
+        for extent in self.remaining:
+            if extent > 1:
+                result.append(extent)
         return tuple(result)
 
     def has_strided_axis(self, dim):
@@ -640,67 +656,62 @@ class Grid(nl.NKIObject):
         return self._replace(axes=tuple(new_axes))
 
     def truncate_to_source(self, dim, elements_consumed):
-        """Cap the elem-leaf count on ``dim`` to fit the addressable remainder.
+        """Clamp ``dim``'s tile walk to the addressable remainder
+        (``element_shape[dim] - elements_consumed``) and flag it partial.
 
-        After ``elements_consumed`` source elements have been consumed on
-        ``dim`` (via index or slice), the elem-leaf (``step==1``) on
-        ``dim`` may walk past the remaining source extent. Clamp the
-        elem-leaf's count to the addressable remainder
-        (``element_shape[d] - elements_consumed``) and flag the Grid as
-        a partial-tile view.
+        Clamps the TILE axis to the tiles the remainder fills
+        (``ceil(addressable / tile_extent)``), and the element leaf to a lone
+        partial tile's width. The leaf is clamped only for a single partial
+        tile -- across several tiles the trailing partial resolves per tile at
+        descent time, so the shared leaf stays full width.
 
-        Finds the innermost ``step==1`` axis on ``dim`` so this works
-        in both shapes the caller invokes:
-          - ``consume`` followed by ``advance`` (int branch): outer IS
-            the elem-leaf,
-          - ``narrow`` + ``advance`` over a tile-grid slice (slice
-            branch): elem-leaf sits inside a TILE / BLOCK wrapper.
-
-        No-op when:
-          - no elem-leaf (``step==1``) exists on ``dim``,
-          - the leaf already addresses the full ``element_shape[dim]``
-            (single-tile partial baked in at construction),
-          - the addressable remainder still fits within the leaf,
-          - the addressable remainder is non-positive,
-          - ``elements_consumed`` is not a compile-time int.
+        No-op when ``elements_consumed`` is not a compile-time int, ``dim`` has
+        no element leaf, the leaf already spans the source extent, the
+        remainder is non-positive, or the walk already fits.
         """
         if not isinstance(elements_consumed, int) or elements_consumed < 0:
             return self
         elem_leaf = self._elem_leaf_on_dim(dim)
         if elem_leaf is None:
             return self
-        # Leaf already capped at the per-dim element extent: no
-        # multi-tile parent to truncate from.
+        # Leaf already capped at the per-dim element extent: no multi-tile
+        # parent to truncate from.
         if elem_leaf.count >= self.element_shape[dim]:
             return self
         addressable = self.element_shape[dim] - elements_consumed
-        if addressable >= elem_leaf.count:
-            return self
         if addressable <= 0:
             return self
-        # If the elem-leaf IS the outermost axis on this dim, ``narrow``
-        # is the right primitive (preserves _replace ordering). When the
-        # elem-leaf sits inside TILE / BLOCK wrappers, build new axes
-        # manually -- ``narrow`` only resizes the outermost axis.
-        outer = self.outer_axis(dim)
-        if outer == elem_leaf:
-            return self.narrow(dim, addressable)._replace(
+
+        tile_extent = elem_leaf.count
+        reachable_tiles = ceiling_div(addressable, tile_extent)
+        last_tile_width = addressable - (reachable_tiles - 1) * tile_extent
+        # A lone partial tile narrows the leaf; multiple tiles keep the leaf
+        # full (the trailing partial resolves per tile at descent time).
+        clamp_leaf = reachable_tiles == 1 and last_tile_width < elem_leaf.count
+
+        # The elem-leaf being the dim's outermost axis (no TILE wrapper, e.g. a
+        # consumed slice) means ``narrow`` is the right primitive.
+        if self.outer_axis(dim) == elem_leaf:
+            if not clamp_leaf:
+                return self
+            return self.narrow(dim, last_tile_width)._replace(
                 is_remainder=True,
                 remainder_dims=(dim,),
             )
+
+        changed = False
         new_axes = []
         for ax in self.axes:
-            if ax.dim == dim and ax.step == 1 and ax.count == elem_leaf.count:
-                new_axes.append(
-                    Axis(
-                        count=addressable,
-                        step=ax.step,
-                        dim=ax.dim,
-                        label=ax.label,
-                    )
-                )
+            if ax.dim == dim and ax.label == AxisLabel.TILE and ax.count > reachable_tiles:
+                new_axes.append(ax.with_count(reachable_tiles))
+                changed = True
+            elif ax.dim == dim and ax.step == 1 and ax.count == tile_extent and clamp_leaf:
+                new_axes.append(ax.with_count(last_tile_width))
+                changed = True
             else:
                 new_axes.append(ax)
+        if not changed:
+            return self
         return self._replace(
             axes=tuple(new_axes),
             is_remainder=True,

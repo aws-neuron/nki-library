@@ -43,3 +43,6 @@ pyrightconfig.json
 oncall_data/
 test/utils/bin/neuron_explorer_profile_upload
 qor_separated_analysis.csv
+/.agents/skills
+/.codex/agents
+.ruff_cache

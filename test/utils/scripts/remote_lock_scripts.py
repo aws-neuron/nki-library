@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Remote lock helper functions for atomic core locking.
+"""Remote lock helper functions for atomic core locking.
 
 This file is deployed to remote hosts and executed under flock for atomic
 read-modify-write operations on locks.json. The functions are documented
@@ -53,20 +52,27 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # Bump this whenever the helper's public verbs/API change (e.g. adding
 # poll/probe/dequeue). The remote deploy is version-gated: a client only
 # overwrites the deployed helper when its SCRIPT_VERSION is strictly newer than
 # the version already on the host, so a stale client can never downgrade a
 # newer deployed helper out from under concurrent newer clients.
-SCRIPT_VERSION = 3
+SCRIPT_VERSION = 4
 EVENTS_LOG_PREFIX = "events-"
+
+# When this env var is truthy on the host, reconcile-driven grants emit a
+# verbose RESERVE event (region cores + assembly time) so an offline pipeline
+# can reconstruct idle-held and fragmentation metrics. Default off so the
+# event log stays small in production; benchmarking turns it on.
+DEBUG_EVENTS_ENV = "CORE_LOCK_DEBUG_EVENTS"
 
 # Shared timing constants for the FIFO core-allocation queue. This helper is the
 # single source of truth for these timings: because it is redeployed from this
@@ -86,6 +92,51 @@ COMMIT_WINDOW = 2 * POLL_PERIOD + 2
 # POLL_JITTER_MAX, i.e. 10 * (5 + 0.5) = 55s; 12 * POLL_PERIOD = 60s clears it
 # with headroom for RPC latency.
 STALE_THRESHOLD = 12 * POLL_PERIOD
+# Upper bound on branch-and-bound nodes the cooperative placement solver
+# explores before falling back to a greedy (min-assembly) completion of the
+# remaining entries. The contended large-request set is tiny in practice, so
+# the solver terminates well under this cap; it only guards pathological queue
+# depth from making a reconcile pass expensive.
+SOLVER_NODE_CAP = 5000
+# Max ready, region-less entries placed via recursive branch-and-bound in one
+# reconcile pass. Beyond this, fall back to the iterative greedy completion so a
+# very deep ready-queue degrades gracefully instead of exceeding the interpreter
+# recursion limit. Kept well under sys.getrecursionlimit() (default 1000).
+SOLVER_DEPTH_CAP = 256
+
+
+class EventType(str, Enum):
+    """Event-log event names.
+
+    Subclasses ``str`` so members are wire-compatible: ``json.dumps`` serializes
+    a member to its plain string value and ``EventType.COMMIT == "COMMIT"`` is
+    True. Never use ``str(EventType.X)`` (yields ``"EventType.X"``); pass the
+    member itself so the on-disk JSON ``event`` field stays the plain string.
+    """
+
+    ENQUEUE = "ENQUEUE"
+    COMMIT = "COMMIT"
+    DEQUEUE = "DEQUEUE"
+    RELEASE = "RELEASE"
+    PRUNE = "PRUNE"
+    RESERVE = "RESERVE"
+    RESERVE_EXPIRED = "RESERVE_EXPIRED"
+    BUMP = "BUMP"
+    DRAIN = "DRAIN"
+    UNDRAIN = "UNDRAIN"
+    SOLVER_OVERFLOW = "SOLVER_OVERFLOW"
+
+
+class ReconcileEvent(NamedTuple):
+    """A single reconcile-driven event for the caller to log.
+
+    ``extra`` carries optional fields (e.g. the verbose RESERVE payload). It is
+    read-only and never mutated by consumers.
+    """
+
+    event: EventType
+    entry_id: str
+    extra: dict[str, Any] = {}
 
 
 class LockStatus(Enum):
@@ -102,7 +153,7 @@ class LockStatus(Enum):
     IN_QUEUE = ("IN_QUEUE", 15)
     ERROR = ("ERROR", 99)
 
-    def __new__(cls, value: str, exit_code: int) -> "LockStatus":
+    def __new__(cls, value: str, exit_code: int) -> LockStatus:
         obj = object.__new__(cls)
         obj._value_ = value
         return obj
@@ -111,7 +162,7 @@ class LockStatus(Enum):
         self.exit_code = exit_code
 
     @classmethod
-    def from_exit_code(cls, exit_code: int) -> "LockStatus | None":
+    def from_exit_code(cls, exit_code: int) -> LockStatus | None:
         """Look up a LockStatus by exit code, or None if not found."""
         for member in cls:
             if member.exit_code == exit_code:
@@ -171,7 +222,7 @@ class LockResult:
         return json.dumps(result)
 
     @classmethod
-    def from_json(cls, json_str: str) -> "LockResult":
+    def from_json(cls, json_str: str) -> LockResult:
         """Parse from JSON string."""
         data = json.loads(json_str)
         return cls(
@@ -201,7 +252,7 @@ class QueueEntry:
     enqueued_ts: int
     last_seen_ts: int
     commit_deadline_ts: int | None = None
-    reserved_cores: list[int] = field(default_factory=list)
+    reserved_region: list[int] = field(default_factory=list)
     ready: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -214,14 +265,14 @@ class QueueEntry:
         }
         if self.commit_deadline_ts is not None:
             result["commit_deadline_ts"] = self.commit_deadline_ts
-        if self.reserved_cores:
-            result["reserved_cores"] = self.reserved_cores
+        if self.reserved_region:
+            result["reserved_region"] = self.reserved_region
         if self.ready:
             result["ready"] = self.ready
         return result
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "QueueEntry":
+    def from_dict(cls, data: dict[str, Any]) -> QueueEntry:
         """Parse a queue entry from a JSON dict."""
         return cls(
             entry_id=data["entry_id"],
@@ -229,7 +280,7 @@ class QueueEntry:
             enqueued_ts=data["enqueued_ts"],
             last_seen_ts=data["last_seen_ts"],
             commit_deadline_ts=data.get("commit_deadline_ts"),
-            reserved_cores=data.get("reserved_cores", []),
+            reserved_region=data.get("reserved_region") or data.get("reserved_cores", []),
             ready=data.get("ready", False),
         )
 
@@ -244,7 +295,7 @@ class LockState:
     queue: list[QueueEntry] = field(default_factory=list)  # FIFO waiters
 
     @classmethod
-    def empty(cls, version: int) -> "LockState":
+    def empty(cls, version: int) -> LockState:
         """Create an empty lock state with given protocol version."""
         return cls(
             version=version,
@@ -254,7 +305,7 @@ class LockState:
         )
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], default_version: int) -> "LockState":
+    def from_dict(cls, data: dict[str, Any], default_version: int) -> LockState:
         """Parse lock state from JSON dict."""
         return cls(
             version=data.get("version", default_version),
@@ -292,7 +343,7 @@ class LockState:
 
     def get_free_tiles(self, now: int, total_cores: int) -> list[int]:
         """Cores free of both live locks and any queue entry's reservation."""
-        reserved = {c for e in self.queue for c in e.reserved_cores}
+        reserved = {c for e in self.queue for c in e.reserved_region}
         return sorted(set(self.get_available_cores(now, total_cores)) - reserved)
 
     def get_locked_cores(self, now: int) -> list[int]:
@@ -318,7 +369,7 @@ class LockState:
         self.draining_enabled_with_timeout = expiry
 
 
-def append_event(locks_file: str, event: str, caller_id: str | None = None, **fields: Any) -> None:
+def append_event(locks_file: str, event: str | EventType, caller_id: str | None = None, **fields: Any) -> None:
     """Append an event to the event log file.
 
     Events are written to daily log files (``events-YYYY-MM-DD.log``) stored
@@ -337,6 +388,7 @@ def append_event(locks_file: str, event: str, caller_id: str | None = None, **fi
         event: Event type (e.g., ACQUIRE, RELEASE, DRAIN, UNDRAIN)
         caller_id: Optional caller identifier (e.g., "gw7:test_qkv_tkg_sweep")
         **fields: Additional fields to include in the event
+
     """
     log_dir = str(Path(locks_file).parent)
     today = datetime.date.today().isoformat()
@@ -347,6 +399,24 @@ def append_event(locks_file: str, event: str, caller_id: str | None = None, **fi
     entry.update(fields)
     with open(events_file, "a") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+def _debug_events_enabled() -> bool:
+    """True when the host env opts into verbose RESERVE events."""
+    return os.environ.get(DEBUG_EVENTS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _flush_events(locks_file: str, caller_id: str | None, events: list[ReconcileEvent]) -> None:
+    """Transition-only logging of reconcile-driven events.
+
+    Emits PRUNE/RESERVE_EXPIRED/BUMP (plus the verbose RESERVE event with its
+    extra payload when debug is on). Must be called under flock.
+    """
+    for evt in events:
+        # For reconcile-driven events the caller (caller_id) is the poller that
+        # triggered this pass, not necessarily the owner of the affected entry;
+        # the affected entry is identified by entry_id.
+        append_event(locks_file, evt.event, caller_id, entry_id=evt.entry_id, **evt.extra)
 
 
 def load_state(locks_file: str, default_version: int) -> LockState:
@@ -367,9 +437,10 @@ def load_state(locks_file: str, default_version: int) -> LockState:
 
     Returns:
         LockState object
+
     """
     try:
-        with open(locks_file, "r") as f:
+        with open(locks_file) as f:
             data = json.load(f)
             return LockState.from_dict(data, default_version)
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
@@ -389,6 +460,7 @@ def save_state(locks_file: str, state: LockState) -> None:
     Args:
         locks_file: Path to locks.json
         state: LockState object to save
+
     """
     with open(locks_file, "w") as f:
         json.dump(state.to_dict(), f)
@@ -400,6 +472,7 @@ def write_result(result_file: str, result: LockResult) -> None:
     Args:
         result_file: Path to write result JSON
         result: LockResult to write
+
     """
     Path(result_file).write_text(result.to_json())
 
@@ -425,6 +498,7 @@ def find_contiguous_cores(
 
     Returns:
         List of contiguous physical core IDs, or None if not found
+
     """
     if len(available) < num_physical:
         return None
@@ -444,23 +518,221 @@ def find_contiguous_cores(
 
 
 def _assert_reservation_invariant(state: LockState, now: int) -> None:
-    """Reservations are pairwise disjoint and disjoint from live locks.
+    """Reservations are pairwise disjoint among entries; a region MAY overlap the live locks it is waiting on.
 
     Guards the concurrent per-entry reservation model against a future change
-    silently double-allocating the same physical core to two waiters, or
-    reserving a core that is still held by a live lock.
+    silently double-allocating the same physical core to two waiters.
     """
-    all_reserved = [c for e in state.queue for c in e.reserved_cores]
-    locked = set(state.get_locked_cores(now))
-    assert len(all_reserved) == len(set(all_reserved)), (
-        f"reconcile invariant violated: overlapping reservations {all_reserved}"
-    )
-    assert not (set(all_reserved) & locked), (
-        f"reconcile invariant violated: reservation overlaps live lock {sorted(set(all_reserved) & locked)}"
-    )
+    all_reserved = [c for e in state.queue for c in e.reserved_region]
+    if len(all_reserved) != len(set(all_reserved)):
+        raise RuntimeError(f"reconcile invariant violated: overlapping reservations {all_reserved}")
 
 
-def reconcile(state: LockState, now: int, total_cores: int, *, draining: bool) -> list[tuple[str, str]]:
+def _build_free_at(state: LockState, now: int, total_cores: int) -> dict[int, int]:
+    """Earliest-free time per core for cores eligible for NEW region placement.
+
+    Cores already held by an entry's reserved_region are fixed and excluded.
+    For each remaining core: now if free or its lock expired, else the live
+    lock expiry. Pure: now is injected; no time.time() and no I/O.
+
+    Args:
+        state: Lock state to read (not mutated).
+        now: Current unix timestamp (injected for determinism).
+        total_cores: Total physical cores on the host.
+
+    Returns:
+        Mapping from placement-eligible core id to the timestamp at which it
+        becomes free. Cores held by an entry's reserved_region are omitted.
+
+    """
+    held = {c for e in state.queue for c in e.reserved_region}
+    free_at: dict[int, int] = {}
+    for core_id in range(total_cores):
+        if core_id in held:
+            continue
+        expiry = state.physical_neuron_cores_lock_timeout.get(str(core_id))
+        free_at[core_id] = expiry if expiry is not None and expiry > now else now
+    return free_at
+
+
+def _candidate_blocks(
+    k: int,
+    free_at: dict[int, int],
+    used: set[int],
+    total_cores: int,
+) -> list[tuple[list[int], int]]:
+    """Enumerate aligned candidate blocks of size ``k`` for one request.
+
+    Aligned offsets are multiples of ``k`` (the alignment NRT requires for a
+    collective). Every core in a block must be placement-eligible (present in
+    ``free_at``) and not already taken by an earlier pick (``used``). A block
+    may include cores that are still locked: such a block is a *future* region
+    that assembles once those locks expire. Pure: no clock or I/O.
+
+    Args:
+        k: Number of contiguous aligned cores the request needs.
+        free_at: Earliest-free time per placement-eligible core.
+        used: Cores already claimed by earlier picks this pass.
+        total_cores: Total physical cores on the host.
+
+    Returns:
+        List of ``(block, assembly_time)`` where ``assembly_time`` is the time
+        the whole block is free (``max free_at`` over the block); a fully-free
+        block assembles at ``now``.
+
+    """
+    out: list[tuple[list[int], int]] = []
+    if k <= 0:
+        # Defensive: a non-positive request size has no valid aligned block and
+        # would make range() step zero. Treat as unplaceable rather than crash
+        # the whole reconcile pass for every poller on the host.
+        return out
+    for start in range(0, total_cores - k + 1, k):
+        block = list(range(start, start + k))
+        if all(c in free_at and c not in used for c in block):
+            out.append((block, max(free_at[c] for c in block)))
+    return out
+
+
+def _solve_placement(
+    reqs: list[int],
+    free_at: dict[int, int],
+    total_cores: int,
+    now: int,
+    node_cap: int = SOLVER_NODE_CAP,
+    stats: dict[str, Any] | None = None,
+) -> list[list[int] | None]:
+    """Lexicographic-FIFO joint placement of ready, region-less entries.
+
+    ``reqs`` is the per-entry ``request_cores`` of the ready, region-less
+    waiters in FIFO order. Returns a list aligned with ``reqs`` of a chosen
+    block (``list[int]``) or ``None``. Once an entry is unplaceable, it and all
+    entries after it are ``None`` (FIFO no-overtake: an earlier waiter is never
+    sacrificed to place a later one).
+
+    Objective, minimized lexicographically: the per-entry assembly time (the
+    ``max free_at`` over the chosen block). All fully-free blocks tie at
+    ``now``, so the common case packs several FIFO-leading entries into disjoint
+    free-now blocks at once (co-scheduling). Ties are broken by least idle-held
+    (count of cores that are free now but sit idle inside a placed future block
+    until it assembles), then by a wear-leveling shuffle among equal candidates.
+
+    Bounded branch-and-bound DFS: candidates are explored earliest-assembly
+    first and branches whose assembly prefix already loses to the incumbent are
+    pruned. On exceeding ``node_cap`` the remaining entries are completed
+    greedily (each takes its min-assembly disjoint block), guaranteeing a valid
+    disjoint, aligned assignment. Pure: ``now`` injected, no ``time.time()`` and
+    no I/O (the only nondeterminism is the wear-leveling shuffle).
+    """
+    n = len(reqs)
+    # Sentinel assembly for an unplaced entry: dominates any real assembly so the
+    # lexicographic comparison prefers placing earlier entries sooner, then
+    # placing more entries.
+    sentinel = now + 10**9
+
+    def idle_of(block: list[int], assembly: int) -> int:
+        # Cores free now held inside a future block sit idle until it assembles.
+        if assembly <= now:
+            return 0
+        return sum(1 for c in block if free_at.get(c, now) <= now)
+
+    def ordered_candidates(used: set[int], k: int) -> list[tuple[list[int], int]]:
+        groups: dict[tuple[int, int], list[tuple[list[int], int]]] = {}
+        for block, asm in _candidate_blocks(k, free_at, used, total_cores):
+            groups.setdefault((asm, idle_of(block, asm)), []).append((block, asm))
+        out: list[tuple[list[int], int]] = []
+        for key in sorted(groups):
+            grp = groups[key]
+            random.shuffle(grp)  # wear-leveling among equal candidates
+            out.extend(grp)
+        return out
+
+    best: dict[str, Any] = {"key": None, "assign": [None] * n}
+    progress: dict[str, Any] = {"nodes": 0, "overflow": False}
+
+    def consider(assign: list[list[int] | None], assembly: list[int], idle_total: int) -> None:
+        key = (tuple(assembly), idle_total)
+        if best["key"] is None or key < best["key"]:
+            best["key"] = key
+            best["assign"] = list(assign)
+
+    def greedy_complete(
+        i: int,
+        used: set[int],
+        assign: list[list[int] | None],
+        assembly: list[int],
+        idle_total: int,
+    ) -> None:
+        assign = list(assign)
+        assembly = list(assembly)
+        for j in range(i, n):
+            cands = _candidate_blocks(reqs[j], free_at, used, total_cores)
+            if not cands:
+                assign.extend([None] * (n - j))
+                assembly.extend([sentinel] * (n - j))
+                consider(assign, assembly, idle_total)
+                return
+            block, asm = min(cands, key=lambda bc: (bc[1], idle_of(bc[0], bc[1]), bc[0][0]))
+            assign.append(block)
+            assembly.append(asm)
+            idle_total += idle_of(block, asm)
+            used = used | set(block)
+        consider(assign, assembly, idle_total)
+
+    def dfs(i: int, used: set[int], assign: list[list[int] | None], assembly: list[int], idle_total: int) -> None:
+        if progress["overflow"]:
+            return
+        if i == n:
+            consider(assign, assembly, idle_total)
+            return
+        # Prune: an assembly prefix already worse than the incumbent's cannot win.
+        if best["key"] is not None and tuple(assembly) > best["key"][0][:i]:
+            return
+        candidates = ordered_candidates(used, reqs[i])
+        if not candidates:
+            # No eligible block: this entry and all behind it are unplaced.
+            consider(assign + [None] * (n - i), assembly + [sentinel] * (n - i), idle_total)
+            return
+        for block, asm in candidates:
+            progress["nodes"] += 1
+            if progress["nodes"] > node_cap:
+                progress["overflow"] = True
+                greedy_complete(i, used, assign, assembly, idle_total)
+                return
+            dfs(
+                i + 1,
+                used | set(block),
+                assign + [block],
+                assembly + [asm],
+                idle_total + idle_of(block, asm),
+            )
+
+    if n > SOLVER_DEPTH_CAP:
+        # Too many entries for recursive B&B; complete greedily (iterative, FIFO,
+        # min-assembly per entry) to stay within the interpreter recursion limit.
+        greedy_complete(0, set(), [], [], 0)
+        if stats is not None:
+            stats["greedy_fallback"] = True
+            stats["reason"] = "depth_cap"
+            stats["queue_len"] = n
+    else:
+        dfs(0, set(), [], [], 0)
+        if stats is not None:
+            stats["greedy_fallback"] = progress["overflow"]
+            stats["queue_len"] = n
+            stats["nodes"] = progress["nodes"]
+            stats["reason"] = "node_cap" if progress["overflow"] else None
+    return best["assign"]
+
+
+def reconcile(
+    state: LockState,
+    now: int,
+    total_cores: int,
+    *,
+    draining: bool,
+    debug: bool = False,
+) -> list[ReconcileEvent]:
     """Side-effect-free FIFO-queue reconcile pass with concurrent reservations.
 
     Mutates ``state`` in place (consistent with ``release``) but is pure with
@@ -469,11 +741,13 @@ def reconcile(state: LockState, now: int, total_cores: int, *, draining: bool) -
     ``(state, now, total_cores, draining)`` it always produces the same mutation
     and the same ordered event list.
 
-    Rather than a single head commit window, every ready waiter that fits is
-    granted its OWN disjoint block of ``reserved_cores`` via proactive Tetris
-    packing in FIFO order. A reserved entry commits its own block on a later
-    poll; an entry that holds a reservation but never commits before its
-    deadline has the tiles reclaimed.
+    Rather than a single head commit window, every ready waiter is placed
+    cooperatively into its OWN disjoint aligned ``reserved_region`` in FIFO
+    order. A region may include cores that are still locked (a *future* region
+    that assembles once those locks expire, bounded by the lock cap); a fully
+    free region opens its commit window immediately. A reserved entry commits
+    its own block on a later poll; an entry that holds a reservation but never
+    commits before its deadline has the tiles reclaimed.
 
     Steps, in order:
       1. Expire stale core locks (reusing the existing expiry predicate) and
@@ -485,30 +759,41 @@ def reconcile(state: LockState, now: int, total_cores: int, *, draining: bool) -
          reservation; only clear an already-expired ``commit_deadline_ts`` so a
          stale timer does not fire on undrain. No reclaim, bump, or packing.
 
-      2. Reclaim expired reservations: an entry that holds ``reserved_cores``
+      2. Reclaim expired reservations: an entry that holds ``reserved_region``
          whose ``commit_deadline_ts`` has passed releases its tiles (emit
          ``RESERVE_EXPIRED``) but keeps its FIFO position; packing may re-reserve
          it the same pass.
       3. Bump every not-ready entry whose one-shot readiness grace expired
          (emit ``BUMP``) so the queue cannot wedge behind stuck uploaders.
-      4. Proactive packing: scan FIFO keeping existing reservations stable and
-         assigning new disjoint aligned blocks into the remaining free tiles. A
-         not-ready entry reserves nothing (transparent to backfill); each
-         not-ready entry that a hypothetical FIFO allocation would place gets a
-         one-shot readiness grace window. The first ready entry that does not
-         fit is a barrier -- nobody behind it is placed.
+      4. Cooperative aligned-block placement: a joint solver assigns each ready,
+         region-less entry its own disjoint aligned region (free-now or future),
+         minimizing assembly time lexicographically in FIFO order. Held regions
+         stay fixed; a held region opens its commit window the first pass it is
+         fully assembled. A not-ready entry reserves nothing (transparent to
+         backfill); each not-ready entry a hypothetical free-now allocation would
+         place gets a one-shot readiness grace window. A large front entry takes
+         a future region instead of blocking, so smaller entries behind backfill
+         disjoint free cores; the only true barrier is capacity exhaustion (no
+         eligible aligned block remains for an entry).
 
     Args:
         state: Lock state to reconcile (mutated in place).
         now: Current unix timestamp (injected for determinism).
         total_cores: Total physical cores on the host.
         draining: Whether the host is currently draining (freezes the queue).
+        debug: When True, each first-time region assignment also appends a
+            verbose ``RESERVE`` 3-tuple ``(event, entry_id, {cores, assembly_ts})``
+            for offline analysis. Default off keeps the event list byte-for-byte
+            unchanged. This flag is the only switch: ``reconcile`` never reads
+            the environment, preserving its purity.
 
     Returns:
-        Ordered list of ``(event, entry_id)`` tuples for the caller to log.
-        Events: ``PRUNE``, ``RESERVE_EXPIRED``, ``BUMP``.
+        Ordered list of ``ReconcileEvent`` for the caller to log (PRUNE,
+        RESERVE_EXPIRED, BUMP, plus a verbose RESERVE carrying region cores and
+        assembly time in ``extra`` when ``debug`` is True).
+
     """
-    events: list[tuple[str, str]] = []
+    events: list[ReconcileEvent] = []
 
     # Step 1: expire stale core locks. Reuse the expiry predicate in
     # get_locked_cores (non-expired cores) instead of duplicating the
@@ -518,12 +803,12 @@ def reconcile(state: LockState, now: int, total_cores: int, *, draining: bool) -
     state.unlock_cores(expired_core_ids)
 
     # Step 1 (cont.): prune dead queue entries. Pruning drops an entry's
-    # reserved_cores automatically (get_free_tiles unions over the survivors).
+    # reserved_region automatically (get_free_tiles unions over the survivors).
     pruned_ids = {e.entry_id for e in state.queue if now - e.last_seen_ts > STALE_THRESHOLD}
     if pruned_ids:
         for entry in state.queue:
             if entry.entry_id in pruned_ids:
-                events.append(("PRUNE", entry.entry_id))
+                events.append(ReconcileEvent(EventType.PRUNE, entry.entry_id))
         state.queue = [e for e in state.queue if e.entry_id not in pruned_ids]
 
     if draining:
@@ -543,10 +828,10 @@ def reconcile(state: LockState, now: int, total_cores: int, *, draining: bool) -
     # did not commit before its deadline (e.g. its client died) releases the
     # tiles but keeps its FIFO position; packing below may re-reserve it.
     for e in state.queue:
-        if e.reserved_cores and e.commit_deadline_ts is not None and now > e.commit_deadline_ts:
-            e.reserved_cores = []
+        if e.reserved_region and e.commit_deadline_ts is not None and now > e.commit_deadline_ts:
+            e.reserved_region = []
             e.commit_deadline_ts = None
-            events.append(("RESERVE_EXPIRED", e.entry_id))
+            events.append(ReconcileEvent(EventType.RESERVE_EXPIRED, e.entry_id))
 
     # Step 3: bump every not-ready entry whose readiness grace expired. Grace
     # timers are opened in Step 4 for each not-ready entry a hypothetical FIFO
@@ -562,24 +847,64 @@ def reconcile(state: LockState, now: int, total_cores: int, *, draining: bool) -
         survivors = [e for e in state.queue if e.entry_id not in expired_ids]
         for e in expired:
             e.commit_deadline_ts = None
-            events.append(("BUMP", e.entry_id))
+            events.append(ReconcileEvent(EventType.BUMP, e.entry_id))
         state.queue[:] = survivors + expired
 
-    # Step 4: proactive Tetris packing (FIFO scan, stable reservations). Free
-    # tiles exclude live locks AND all currently-held reservations; only NEW
-    # blocks are assigned into the remaining gaps.
-    free = set(state.get_available_cores(now, total_cores)) - {c for e in state.queue for c in e.reserved_cores}
-    # Hypothetical FIFO allocation used only to decide which not-ready entries
-    # get a grace window. Must be an independent copy of free so simulated
-    # soft-lock placements never shrink the real free pool used for reservations.
-    simulated_free = set(free)
+    # Step 4: cooperative aligned-block placement. Held regions are fixed; the
+    # solver only places ready, region-less entries. A placed region may include
+    # still-locked cores (a future region) and assembles when they expire.
+    free_at = _build_free_at(state, now, total_cores)
+    locked_now = set(state.get_locked_cores(now))
+    ready_regionless = [e for e in state.queue if e.ready and not e.reserved_region]
+    solver_stats: dict[str, Any] = {}
+    blocks = _solve_placement(
+        [e.request_cores for e in ready_regionless],
+        free_at,
+        total_cores,
+        now,
+        stats=solver_stats,
+    )
+    assignment = {id(e): block for e, block in zip(ready_regionless, blocks, strict=True)}
+
+    if debug and solver_stats.get("greedy_fallback"):
+        # Pass-level diagnostic: the solver fell back to greedy completion (lost
+        # B&B optimality). entry_id is empty because this is not tied to one
+        # waiter; the detail is carried in extra.
+        events.append(
+            ReconcileEvent(
+                EventType.SOLVER_OVERFLOW,
+                "",
+                {k: solver_stats[k] for k in ("reason", "queue_len", "nodes") if k in solver_stats},
+            ),
+        )
+
+    # Free-now pool used only to decide which not-ready entries earn a readiness
+    # grace window. It is independent of the solver's reservations; a placed
+    # ready block (free-now or future) is subtracted as the FIFO scan reaches it
+    # so a not-ready entry never counts cores a ready entry ahead already took.
+    simulated_free = set(state.get_free_tiles(now, total_cores))
     for e in state.queue:
-        if e.reserved_cores:
-            continue  # already holds a disjoint block; leave it stable
+        if e.reserved_region:
+            # Drop a stale held region so the entry re-solves cleanly: a
+            # readiness downgrade (not-ready entries hold nothing) or a changed
+            # request size (the held block no longer matches the requested core
+            # count) invalidates the region. Falling through leaves the entry
+            # region-less this pass; it is re-placed next pass (if still ready)
+            # or handled by the W-lazy path below (if not ready).
+            if not e.ready or len(e.reserved_region) != e.request_cores:
+                e.reserved_region = []
+                e.commit_deadline_ts = None
+            else:
+                # Held region is fixed. Open its commit window the first pass it is
+                # fully assembled (no locked cores remain); a partial region keeps
+                # commit_deadline_ts None so Step 2 never reclaims it.
+                if e.commit_deadline_ts is None and set(e.reserved_region).isdisjoint(locked_now):
+                    e.commit_deadline_ts = now + COMMIT_WINDOW
+                continue
         if not e.ready:
             # W-lazy: a not-ready entry reserves nothing and is transparent to
-            # backfill. If a contiguous block would fit for it in the simulated
-            # allocation, it is imminent: give it a one-shot readiness grace so
+            # backfill. If a free-now contiguous block would fit it in the
+            # simulation, it is imminent: give it a one-shot readiness grace so
             # Step 3 can bump it if it never becomes ready.
             simulated_block = find_contiguous_cores(sorted(simulated_free), e.request_cores, total_cores)
             if simulated_block:
@@ -588,14 +913,32 @@ def reconcile(state: LockState, now: int, total_cores: int, *, draining: bool) -
                 # this not-ready entry consumes simulated cores for entries behind it
                 simulated_free -= set(simulated_block)
             continue
-        # ready + unreserved -> place a disjoint aligned block in the gaps.
-        block = find_contiguous_cores(sorted(free), e.request_cores, total_cores)
+        # ready + region-less -> take the solver's block, if any. None means no
+        # eligible aligned block this pass (capacity exhausted by earlier picks);
+        # leave it unreserved but do NOT break -- not-ready entries behind it may
+        # still earn a readiness grace.
+        block = assignment.get(id(e))
         if block is None:
-            break  # barrier: first ready-unfit entry; nobody behind it lands
-        e.reserved_cores = block
-        e.commit_deadline_ts = now + COMMIT_WINDOW
-        free -= set(block)
-        # record that we just assigned real cores to a ready slot
+            continue
+        e.reserved_region = block
+        if debug:
+            # Transition-only: emit the verbose grant event the single pass a
+            # region is first assigned. Held regions skip this branch, so a
+            # region never re-emits on a later pass.
+            events.append(
+                ReconcileEvent(
+                    EventType.RESERVE,
+                    e.entry_id,
+                    {"cores": list(block), "assembly_ts": max(free_at[c] for c in block)},
+                ),
+            )
+        if max(free_at[c] for c in block) <= now:
+            # fully free now -> open the commit window immediately.
+            e.commit_deadline_ts = now + COMMIT_WINDOW
+        else:
+            # partial (future) region -> no window until it fully assembles.
+            e.commit_deadline_ts = None
+        # a placed block leaves the readiness-grace pool for entries behind it
         simulated_free -= set(block)
 
     _assert_reservation_invariant(state, now)
@@ -613,7 +956,7 @@ def estimate_eta(
 
     Seeds a per-core "becomes free" timeline from
     ``state.physical_neuron_cores_lock_timeout`` (live locks) AND from every
-    queue entry's ``reserved_cores`` (committed-imminent blocks held for
+    queue entry's ``reserved_region`` (committed-imminent blocks held for
     ``hold_window``), then walks the existing FIFO queue placing only the
     entries the caller actually waits behind, and finally returns the earliest
     time at which the caller's ``request_cores`` cores are free. Worst case =
@@ -621,9 +964,12 @@ def estimate_eta(
 
     Seeding/skip rules (matching how ``reconcile`` actually grants):
       - Live locks seed ``free_at`` from their expiry.
-      - A queued entry's ``reserved_cores`` are committed-imminent: each such
-        core is marked busy until ``max(free_at[c], now + hold_window)``.
-      - The FIFO walk SKIPS entries that already hold ``reserved_cores`` (their
+      - A queued entry's ``reserved_region`` is held until it fully assembles:
+        every core is marked busy until ``max(free_at[c] for c in region) +
+        hold_window`` (the region commits when its latest core frees, then holds
+        for the window). For a free-now region this reduces to ``now +
+        hold_window``; a future region defers the hold to its assembly time.
+      - The FIFO walk SKIPS entries that already hold ``reserved_region`` (their
         block is in the seed -- placing them again would double-count) and
         entries with ``ready is False`` (W-lazy: a ready caller backfills past a
         not-ready entry, so it does not delay the caller). Only ready,
@@ -661,6 +1007,7 @@ def estimate_eta(
         Earliest unix timestamp at which ``request_cores`` cores are estimated
         to be free for the caller. Empty queue with enough free cores now
         returns ``now``.
+
     """
     if request_cores <= 0:
         return now
@@ -672,13 +1019,25 @@ def estimate_eta(
         expiry = state.physical_neuron_cores_lock_timeout.get(str(core_id))
         free_at.append(expiry if expiry is not None and expiry > now else now)
 
-    # Seed committed-imminent reservations as occupied. A queued entry holding
-    # reserved_cores will hold them for hold_window, so mark each reserved core
-    # busy until now + hold_window (in addition to any live lock on that core).
+    # Seed reservations as occupied. A queued entry commits only once its whole
+    # region assembles (its latest core frees), then holds for hold_window, so
+    # mark every reserved core busy until max(free_at over the region) +
+    # hold_window. For a free-now region this is just now + hold_window; for a
+    # future region (some cores still locked) it correctly defers the hold to
+    # the assembly time. (A region MAY include still-locked cores it is waiting
+    # on.)
     for entry in state.queue:
-        for c in entry.reserved_cores:
-            if 0 <= c < total_cores:
-                free_at[c] = max(free_at[c], now + hold_window)
+        # ETA-only clamp: tolerate a reserved_region read from older or foreign
+        # host state whose core ids may exceed THIS host's total_cores. ETA is
+        # advisory, so out-of-range ids are simply dropped here. _build_free_at
+        # and reconcile deliberately do NOT clamp: they operate on the
+        # authoritative current-host total_cores and a well-formed region.
+        region = [c for c in entry.reserved_region if 0 <= c < total_cores]
+        if not region:
+            continue
+        busy_until = max(free_at[c] for c in region) + hold_window
+        for c in region:
+            free_at[c] = max(free_at[c], busy_until)
 
     def earliest_free(k: int) -> int:
         # Earliest time at which k cores are simultaneously free, by COUNT: the
@@ -692,11 +1051,11 @@ def estimate_eta(
             free_at[i] = start + hold_window
 
     # Walk queued entries in FIFO order, placing only the ones the ready caller
-    # actually waits behind. Skip entries already holding reserved_cores (in the
+    # actually waits behind. Skip entries already holding reserved_region (in the
     # seed -- placing again would double-count) and not-ready entries (W-lazy:
     # the caller backfills past them). Only ready+unreserved entries are placed.
     for entry in state.queue:
-        if entry.reserved_cores:
+        if entry.reserved_region:
             continue
         if not entry.ready:
             continue
@@ -743,7 +1102,7 @@ def poll(
 
     Flow:
       1. Load state, refresh THIS caller's queue entry (readiness, last_seen,
-         request size) BEFORE running ``reconcile`` so proactive packing uses
+         request size) BEFORE running ``reconcile`` so cooperative placement uses
          fresh readiness, then run ``reconcile(..., draining=draining)``,
          collecting its transition events.
       2. Not yet queued: append a tail ``QueueEntry`` carrying its readiness
@@ -751,7 +1110,7 @@ def poll(
          position + worst-case ETA. A new entry never commits same-exec
          (two-phase: ENQUEUE now, COMMIT on a later poll once reconcile has
          reserved it a block).
-      3. Already queued: commit its OWN ``reserved_cores`` block when NOT
+      3. Already queued: commit its OWN ``reserved_region`` block when NOT
          draining and ``ready`` -- at ANY position, since the reservation is
          disjoint and free by the reconcile invariant. A ``ready=false`` entry
          holds no reservation and never commits; no entry commits while
@@ -778,6 +1137,7 @@ def poll(
     Returns:
         LockResult: ALLOCATED (with cores/expiry) on commit, else
         IN_QUEUE with position + worst_case_eta (relative seconds from now).
+
     """
     # Read wall-clock once at the verb boundary; pure helpers receive it as a param.
     now = int(time.time())
@@ -786,7 +1146,7 @@ def poll(
     draining = state.is_draining(now)
 
     # Refresh THIS caller's readiness and request size BEFORE reconcile so
-    # proactive packing uses fresh values. last_seen_ts is intentionally NOT
+    # cooperative placement uses fresh values. last_seen_ts is intentionally NOT
     # refreshed yet: reconcile must still see a stale timestamp so a long-absent
     # entry is pruned (and re-enqueued below with re_enqueued=True).
     existing = next((e for e in state.queue if e.entry_id == entry_id), None)
@@ -797,21 +1157,23 @@ def poll(
         existing.request_cores = num_physical
 
     # Step 1: FIFO maintenance (prune/reclaim/bump/pack). While draining,
-    # reconcile freezes the queue so no grants are handed out.
-    reconcile_events = reconcile(state, now, total_cores, draining=draining)
+    # reconcile freezes the queue so no grants are handed out. The env var is
+    # read here at the verb boundary and passed in; reconcile stays pure.
+    debug = _debug_events_enabled()
+    reconcile_events = reconcile(state, now, total_cores, draining=draining, debug=debug)
 
     # Did reconcile bump THIS caller's entry to the tail this cycle? Derived from
     # the events reconcile already returns (no state re-scan). Surfaced on the
     # queued LockResult so the client can detect sole-entry bumps (0->0) that a
     # position delta is blind to.
-    bumped_this_cycle = ("BUMP", entry_id) in reconcile_events
+    bumped_this_cycle = any(evt.event == EventType.BUMP and evt.entry_id == entry_id for evt in reconcile_events)
 
     # Did reconcile prune THIS caller's entry this cycle? If so and the entry is
     # absent below, the Step-3 enqueue re-appends it at the tail -- a silent FIFO
     # position loss (e.g. a long soft-join upload outlasting STALE_THRESHOLD).
     # Surfaced on the re-enqueue LockResult so the client can distinguish this
     # from a bump or a first-ever enqueue.
-    re_enqueued_this_cycle = ("PRUNE", entry_id) in reconcile_events
+    re_enqueued_this_cycle = any(evt.event == EventType.PRUNE and evt.entry_id == entry_id for evt in reconcile_events)
 
     # Reconcile may have bumped this entry to the tail; re-find it. If it
     # survived (was not pruned as stale), refresh its last_seen_ts now (never
@@ -821,9 +1183,8 @@ def poll(
         existing.last_seen_ts = now
 
     def _flush_reconcile_events() -> None:
-        # Transition-only logging: emit PRUNE/RESERVE_EXPIRED/BUMP for the affected entries.
-        for event, affected_id in reconcile_events:
-            append_event(locks_file, event, caller_id, entry_id=affected_id)
+        # Transition-only logging of reconcile-driven events. Must run under flock.
+        _flush_events(locks_file, caller_id, reconcile_events)
 
     def _eta_for_position(position: int) -> int:
         # Worst-case ETA considers only the entries AHEAD of the caller.
@@ -835,7 +1196,7 @@ def poll(
         )
         return estimate_eta(ahead, num_physical, now, total_cores, hold_window=timeout_seconds)
 
-    def _lock_and_save(block: list[int], event: str) -> LockResult:
+    def _lock_and_save(block: list[int], event: str | EventType) -> LockResult:
         # Reuse acquire's expiry/lock/append_event mechanics for commit.
         expiry = now + timeout_seconds
         state.lock_cores(block, expiry)
@@ -860,7 +1221,7 @@ def poll(
         eta = _eta_for_position(position)
         save_state(locks_file, state)
         _flush_reconcile_events()
-        append_event(locks_file, "ENQUEUE", caller_id, entry_id=entry_id, position=position)
+        append_event(locks_file, EventType.ENQUEUE, caller_id, entry_id=entry_id, position=position)
         queued_status = LockStatus.DRAINING if draining else LockStatus.IN_QUEUE
         return LockResult(
             status=queued_status,
@@ -871,14 +1232,20 @@ def poll(
         )
 
     # Step 3: already queued -> commit its OWN reserved block when ready and not
-    # draining (any position; the reservation is disjoint & free by the reconcile
-    # invariant, so committing it directly is safe). A ready=false entry holds no
-    # reservation and never commits; no entry commits while draining (reconcile
-    # granted none).
-    if not draining and existing.reserved_cores and ready:
-        block = list(existing.reserved_cores)
+    # draining, but ONLY once the block is fully free (no core still locked). A
+    # partial (future) region is held until its locked cores expire and it
+    # assembles; committing it early would double-allocate a core another caller
+    # still holds. A ready=false entry holds no reservation and never commits; no
+    # entry commits while draining (reconcile granted none).
+    if (
+        not draining
+        and existing.reserved_region
+        and ready
+        and set(existing.reserved_region).isdisjoint(state.get_locked_cores(now))
+    ):
+        block = list(existing.reserved_region)
         state.queue.remove(existing)
-        return _lock_and_save(block, "COMMIT")
+        return _lock_and_save(block, EventType.COMMIT)
 
     position = state.queue.index(existing)
     eta = _eta_for_position(position)
@@ -928,6 +1295,7 @@ def probe(
     Returns:
         LockResult with DRAINING status while draining else IN_QUEUE, carrying
         ``worst_case_eta`` (relative seconds from now until estimated acquire).
+
     """
     # Read wall-clock once at the verb boundary; estimate_eta stays clock-free.
     now = int(time.time())
@@ -970,6 +1338,7 @@ def dequeue(
 
     Returns:
         LockResult with RELEASED status.
+
     """
     # Read wall-clock once at the verb boundary; reconcile stays clock-free.
     now = int(time.time())
@@ -978,8 +1347,10 @@ def dequeue(
 
     # FIFO maintenance (prune/bump/open-window) before removal. Derive drain
     # state the same single way poll does, so we never open a commit window
-    # during a drain that poll will never grant.
-    reconcile_events = reconcile(state, now, total_cores, draining=state.is_draining(now))
+    # during a drain that poll will never grant. The env var is read here at the
+    # verb boundary and passed in; reconcile stays pure.
+    debug = _debug_events_enabled()
+    reconcile_events = reconcile(state, now, total_cores, draining=state.is_draining(now), debug=debug)
 
     # Remove the abandoning entry, if present. Removing the head (and its
     # window) is safe: the next reconcile promotes + windows the new head.
@@ -989,12 +1360,11 @@ def dequeue(
 
     save_state(locks_file, state)
 
-    # Transition-only logging: emit reconcile's PRUNE/BUMP, then DEQUEUE only
-    # when an entry was actually removed.
-    for event, affected_id in reconcile_events:
-        append_event(locks_file, event, caller_id, entry_id=affected_id)
+    # Transition-only logging: emit reconcile's PRUNE/BUMP (and verbose RESERVE
+    # when debug is on), then DEQUEUE only when an entry was actually removed.
+    _flush_events(locks_file, caller_id, reconcile_events)
     if existing is not None:
-        append_event(locks_file, "DEQUEUE", caller_id, entry_id=entry_id)
+        append_event(locks_file, EventType.DEQUEUE, caller_id, entry_id=entry_id)
 
     return LockResult(status=LockStatus.RELEASED)
 
@@ -1022,6 +1392,7 @@ def release(
 
     Returns:
         LockResult with RELEASED status
+
     """
     state = load_state(locks_file, version)
 
@@ -1042,9 +1413,9 @@ def release(
     save_state(locks_file, state)
 
     if skipped_cores:
-        append_event(locks_file, "RELEASE", caller_id, cores=cores_to_unlock, skipped=skipped_cores)
+        append_event(locks_file, EventType.RELEASE, caller_id, cores=cores_to_unlock, skipped=skipped_cores)
     else:
-        append_event(locks_file, "RELEASE", caller_id, cores=cores_to_unlock)
+        append_event(locks_file, EventType.RELEASE, caller_id, cores=cores_to_unlock)
 
     return LockResult(status=LockStatus.RELEASED)
 
@@ -1059,6 +1430,7 @@ def drain(locks_file: str, timeout_seconds: int, version: int) -> LockResult:
 
     Returns:
         LockResult with DRAINED status
+
     """
     # Use local time on the inference host to avoid clock drift issues
     now = int(time.time())
@@ -1072,7 +1444,7 @@ def drain(locks_file: str, timeout_seconds: int, version: int) -> LockResult:
     expiry = max_lock_expiry + timeout_seconds
     state.set_draining(expiry)
     save_state(locks_file, state)
-    append_event(locks_file, "DRAIN", expiry=expiry, max_lock_expiry=max_lock_expiry)
+    append_event(locks_file, EventType.DRAIN, expiry=expiry, max_lock_expiry=max_lock_expiry)
 
     return LockResult(status=LockStatus.DRAINED, max_lock_expiry=max_lock_expiry)
 
@@ -1086,11 +1458,12 @@ def undrain(locks_file: str, version: int) -> LockResult:
 
     Returns:
         LockResult with UNDRAINED status
+
     """
     state = load_state(locks_file, version)
     state.draining_enabled_with_timeout = None
     save_state(locks_file, state)
-    append_event(locks_file, "UNDRAIN")
+    append_event(locks_file, EventType.UNDRAIN)
     return LockResult(status=LockStatus.UNDRAINED)
 
 
@@ -1105,6 +1478,7 @@ def is_host_draining(locks_file: str, version: int) -> LockResult:
 
     Returns:
         LockResult with DRAINING if draining, UNDRAINED otherwise
+
     """
     now = int(time.time())
     state = load_state(locks_file, version)
@@ -1121,6 +1495,7 @@ def main(args: list[str]) -> LockResult:
 
     Returns:
         LockResult from the command (also written to result file if specified)
+
     """
     parser = argparse.ArgumentParser(prog="lock_helpers.py", description="Core lock management")
     subparsers = parser.add_subparsers(dest="command", required=True)

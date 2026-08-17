@@ -949,3 +949,14 @@ class TensorView(nl.NKIObject):
             True if the tensor has dynamic access, False otherwise
         """
         return self.scalar_offset != None and self.indirect_dim != None
+
+
+def as_nki_tensor(view: Union[TensorView, nl.ndarray]) -> nl.ndarray:
+    """Materialize a TensorView to a NkiTensor for nki.isa ops; pass NkiTensors through.
+
+    nki.isa ops (e.g. dma_copy) require a NkiTensor and read NkiTensor-internal
+    attributes such as ``buffer``/``_vector_offset``. A TensorView is not a
+    NkiTensor, so resolve it via get_view() first. NkiTensor has no get_view, so
+    this is a no-op for real tensors. Call in eager scope, not inside affine_range.
+    """
+    return view.get_view() if isinstance(view, TensorView) else view

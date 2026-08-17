@@ -29,7 +29,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
     MatmulMxfp8KernelConfig,
     auto_generate_default,
@@ -55,10 +54,12 @@ from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses im
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
+    with_active_sbm,
 )
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
     get_fp8_dtype_x4,
 )
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import config_helper, constants
 from test.integration.nkilib.experimental.matmul_mxfp8.test_matmul_mxfp8_generic_kernel import (
     _mxfp8_comparator,
@@ -210,6 +211,7 @@ def _store_sbuf_to_hbm(output_sbuf, output_hbm, bd, LHS_MATMUL_TILE_M):
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_hbm_k_loop(
     lhs,
     rhs,
@@ -236,6 +238,8 @@ def _kernel_hbm_k_loop(
     rhs_load_with_PE_swizzle=False,
     lhs_is_f_by_k=None,
     rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     create_and_set_active_sbm()
     sbm = get_active_sbm()
@@ -287,7 +291,7 @@ def _kernel_hbm_k_loop(
                 ),
                 scales=nl.ndarray(
                     (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, shapes['BLOCKS_IN_M'] * bd.BLOCK_M_LOGICAL),
-                    dtype=nl.uint8,
+                    dtype=nl.float8_e8m0fnu,
                     buffer=data_buffer,
                 ),
                 is_swizzled=True,
@@ -302,7 +306,7 @@ def _kernel_hbm_k_loop(
                 ),
                 scales=nl.ndarray(
                     (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
-                    dtype=nl.uint8,
+                    dtype=nl.float8_e8m0fnu,
                     buffer=data_buffer,
                 ),
                 is_swizzled=True,
@@ -360,6 +364,7 @@ def _kernel_hbm_k_loop(
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_sbuf_preloaded(
     lhs,
     rhs,
@@ -386,6 +391,8 @@ def _kernel_sbuf_preloaded(
     rhs_load_with_PE_swizzle=False,
     lhs_is_f_by_k=None,
     rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     create_and_set_active_sbm()
     sbm = get_active_sbm()
@@ -439,14 +446,14 @@ def _kernel_sbuf_preloaded(
     )
 
     # Quantize if BF16 input
-    if lhs_loaded != None:
+    if lhs_loaded is not None:
         lhs_data_loaded, lhs_scales_loaded = quantize_mxfp8_block.quantize_mxfp8_block(
             lhs_loaded,
             shapes['lhs_quantize_tile_shape'],
             True,
             float8_dtype,
         )
-    if rhs_loaded != None:
+    if rhs_loaded is not None:
         rhs_data_loaded, rhs_scales_loaded = quantize_mxfp8_block.quantize_mxfp8_block(
             rhs_loaded,
             shapes['rhs_quantize_tile_shape'],
@@ -516,6 +523,7 @@ def _kernel_sbuf_preloaded(
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_sbuf_empty_td_fill(
     lhs,
     rhs,
@@ -542,6 +550,8 @@ def _kernel_sbuf_empty_td_fill(
     rhs_load_with_PE_swizzle=False,
     lhs_is_f_by_k=None,
     rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     """Pass empty TDs, API loads and fills them. Then use the filled TDs
     in a second API call (which skips loading). If the second call produces
@@ -657,6 +667,7 @@ def _kernel_sbuf_empty_td_fill(
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_lhs_m_sharded(
     lhs,
     rhs,
@@ -683,6 +694,8 @@ def _kernel_lhs_m_sharded(
     rhs_load_with_PE_swizzle=False,
     lhs_is_f_by_k=None,
     rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     """M-sharded LNC2: LHS is col_parallel_sharded (halves M), RHS is full."""
     create_and_set_active_sbm()
@@ -975,6 +988,8 @@ def _api_torch_ref(
     rhs_load_with_PE_swizzle=False,
     lhs_is_f_by_k=None,
     rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     """Torch ref for API test kernels — delegates to matmul_mxfp8_torch_ref."""
     return matmul_mxfp8_torch_ref(

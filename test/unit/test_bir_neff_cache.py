@@ -203,7 +203,7 @@ class TestLookupCache:
         # JSON round-trips int keys to strings; lookup_cache must coerce them
         # back so the framework's `i in aliases` rename lookup (where i is int)
         # finds the entry. Otherwise the rename is silently skipped and the
-        # validator fails with "<name> was not emitted by neuron-profile
+        # validator fails with "<name> was not emitted by neuron-explorer
         # capture".
         assert result.input_output_aliases == {0: "x"}
         assert result.mlir_time == 0.0

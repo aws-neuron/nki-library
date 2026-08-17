@@ -102,6 +102,24 @@ def _load_single_tensor(
                 f_offset=f_sbuf_start,
             )
             load_tile(load_loc, data_store_loc=data_store_loc)
+        elif load_td.fast_dma_transpose:
+            # Fast DMA gathers the whole (32-aligned) remainder in one op — no 256/128
+            # decomposition. SBUF is pre-zeroed so any masked K contributes zero.
+            load_loc = TileLocation(
+                tensor=load_td,
+                tile_k=remaining_k,
+                tile_f=LOAD_TILE_F,
+                k_offset=k_global,
+                f_offset=f_global + f_offset,
+            )
+            data_store_loc = TileLocation(
+                tensor=store_td,
+                tile_k=remaining_k,
+                tile_f=LOAD_TILE_F,
+                k_offset=tile_idx_k,
+                f_offset=f_sbuf_start,
+            )
+            load_tile(load_loc, data_store_loc=data_store_loc)
         else:
             # Remainder tile: decompose into 256 and/or 128 sub-tiles
             k_offset = k_global
@@ -496,7 +514,7 @@ def load_lhs_and_rhs(
         )
         _zero_sbuf(lhs_sbuf, lhs_data_sbuf, lhs_scales_sbuf, lhs_td.is_quantized, needs_masking)
 
-        if lhs_td.is_unswizzled_bf16 and not lhs_td.load_with_PE_swizzle:
+        if lhs_td.is_unswizzled_bf16 and not lhs_td.load_with_PE_swizzle and not lhs_td.fast_dma_transpose:
             lhs_td.set_vector_offset_patterns(LHS_LOAD_TILE_K, LHS_LOAD_TILE_M)
 
         # Build SBUF TD for load destination
@@ -522,7 +540,7 @@ def load_lhs_and_rhs(
         )
         _zero_sbuf(rhs_sbuf, rhs_data_sbuf, rhs_scales_sbuf, rhs_td.is_quantized, needs_masking)
 
-        if rhs_td.is_unswizzled_bf16 and not rhs_td.load_with_PE_swizzle:
+        if rhs_td.is_unswizzled_bf16 and not rhs_td.load_with_PE_swizzle and not rhs_td.fast_dma_transpose:
             rhs_td.set_vector_offset_patterns(RHS_LOAD_TILE_K, RHS_LOAD_TILE_N)
 
         # Build SBUF TD for load destination

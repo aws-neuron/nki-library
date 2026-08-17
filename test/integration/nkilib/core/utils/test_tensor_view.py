@@ -23,9 +23,9 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     Platforms,

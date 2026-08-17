@@ -55,7 +55,7 @@ def _adam_ref(
     )
 
 
-def adam_kernel_torch_ref_matched(
+def adam_torch_ref(
     param_ptr,
     grad_ptr,
     exp_avg_ptr,
@@ -101,7 +101,7 @@ def adam_kernel_torch_ref_matched(
     return result
 
 
-def adamw_kernel_torch_ref_matched(
+def adamw_torch_ref(
     param_ptr,
     grad_ptr,
     exp_avg_ptr,

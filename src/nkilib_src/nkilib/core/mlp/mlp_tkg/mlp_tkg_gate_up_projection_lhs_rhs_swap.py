@@ -21,7 +21,6 @@ from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
-from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters
 from .mlp_tkg_constants import (
@@ -32,14 +31,14 @@ from .mlp_tkg_utils import _load_transposed_tile
 
 
 def gate_up_projection_lhs_rhs_swap(
-    hidden: TensorView,
-    weight: TensorView,
-    bias: TensorView,
-    dequant_scale: TensorView,
-    output_tile: TensorView,
-    weight_tiles: list[TensorView],
-    bias_tile: TensorView,
-    dequant_tile: TensorView,
+    hidden: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: nl.NkiTensor,
+    dequant_scale: nl.NkiTensor,
+    output_tile: nl.NkiTensor,
+    weight_tiles: list[nl.NkiTensor],
+    bias_tile: nl.NkiTensor,
+    dequant_tile: nl.NkiTensor,
     dims: MLPTKGConstantsDimensionSizes,
     tiles: MLPTKGConstantsGateUpTileCounts,
     params: MLPParameters,
@@ -49,7 +48,7 @@ def gate_up_projection_lhs_rhs_swap(
     """
     Performs a single Gate or Up projection shard on the H using regular matmult with operands swapped.
 
-    All inputs are pre-sharded TensorView instances — callers handle LNC/shard slicing.
+    All inputs are pre-sharded NkiTensor instances — callers handle LNC/shard slicing.
     Hidden is pre-sliced on T dimension by the caller (no T_offset parameter).
 
     Computes: Weight[H, I] @ Hidden[H, T] + Optional(Bias[1, I]) → [T, I]
@@ -59,11 +58,11 @@ def gate_up_projection_lhs_rhs_swap(
         H/128 * [ I/128 * (Weight[128, 128] @ Hidden[128, T]) ]
 
     Args:
-        hidden (TensorView): [H0, T, H1_shard] — pre-sharded, pre-sliced on T
-        weight (TensorView): [H_per_shard, I_shard] — pre-sharded weight matrix
-        bias (TensorView): [I_shard] or [1, I_shard] or None — pre-sharded bias
-        dequant_scale (TensorView): dequantization scale or None
-        output_tile (TensorView): [I0, num_I_tiles_shard, T] — pre-sharded output buffer
+        hidden (NkiTensor): [H0, T, H1_shard] — pre-sharded, pre-sliced on T
+        weight (NkiTensor): [H_per_shard, I_shard] — pre-sharded weight matrix
+        bias (NkiTensor): [I_shard] or [1, I_shard] or None — pre-sharded bias
+        dequant_scale (NkiTensor): dequantization scale or None
+        output_tile (NkiTensor): [I0, num_I_tiles_shard, T] — pre-sharded output buffer
 
     Returns:
         Output tensor with shape [128, I/128, T]
@@ -131,8 +130,8 @@ def gate_up_projection_lhs_rhs_swap(
         weight_sb_tile_slice = weight_tiles[weight_idx].slice(dim=1, start=0, end=h1_size).slice(dim=2, start=0, end=I)
 
         nisa.dma_copy(
-            dst=weight_sb_tile_slice.get_view(),
-            src=weight_view.get_view(),
+            dst=weight_sb_tile_slice,
+            src=weight_view,
             dge_mode=nisa.dge_mode.hwdge,
         )
 
@@ -141,10 +140,10 @@ def gate_up_projection_lhs_rhs_swap(
             for i_tile in TiledRange(I, I0):
                 nisa.nc_matmul(
                     result_psums[i_tile.index][0 : i_tile.size, 0:T],
-                    weight_sb_tile_slice.select(dim=1, index=h1_tile.index)
-                    .slice(dim=1, start=i_tile.start_offset, end=i_tile.end_offset)
-                    .get_view(),
-                    hidden.select(dim=hidden_h1_dim, index=h_start_offset + h1_tile.index).get_view(),
+                    weight_sb_tile_slice.select(dim=1, index=h1_tile.index).slice(
+                        dim=1, start=i_tile.start_offset, end=i_tile.end_offset
+                    ),
+                    hidden.select(dim=hidden_h1_dim, index=h_start_offset + h1_tile.index),
                 )
 
     # ---------- Accumulate partial PSUMs to output ----------
@@ -164,7 +163,7 @@ def gate_up_projection_lhs_rhs_swap(
         # PSUM to SBUF copy while applying dequant tensor optionally
         interleave_copy(
             index=i_tile.index,
-            dst=output_tile_view.get_view(),
+            dst=output_tile_view,
             src=result_psums[i_tile.index][0 : i_tile.size, 0:T],
             scale=dequant_tile_view,
             bias=None,
@@ -175,9 +174,9 @@ def gate_up_projection_lhs_rhs_swap(
         num_I_tiles = div_ceil(I, I0)
         bias_tile_view = bias_tile.slice(dim=1, start=0, end=num_I_tiles).expand_dim(dim=2).broadcast(dim=2, size=T)
         nisa.tensor_tensor(
-            dst=output_tile.get_view(),
-            data1=output_tile.get_view(),
-            data2=bias_tile_view.get_view(),
+            dst=output_tile,
+            data1=output_tile,
+            data2=bias_tile_view,
             op=nl.add,
         )
 
@@ -189,14 +188,13 @@ from ..mlp_parameters import (
 from .mlp_tkg_constants import MLPTKGConstants
 from .mlp_tkg_utils import (
     adaptive_dge_mode,
-    alloc_tensor_view,
     prepare_gate_up_bias_and_scale,
 )
 
 
 def run_gate_up_projection_lhs_rhs_swap(
-    hidden: TensorView,
-    output: TensorView,
+    hidden: nl.NkiTensor,
+    output: nl.NkiTensor,
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,
@@ -210,7 +208,7 @@ def run_gate_up_projection_lhs_rhs_swap(
     `params.use_tkg_gate_up_proj_column_tiling` is False.
 
     Returns:
-        tiles, gate_sb_view, up_sb_view, up_sb_fp32, gate_up_recv
+        tiles, gate_sb_view, up_sb_view, gate_up_recv
     """
     gate_w, up_w = params.gate_proj_weights_tensor, params.up_proj_weights_tensor
     gate_b, up_b, gate_w_scale, up_w_scale = prepare_gate_up_bias_and_scale(params, dims)
@@ -221,31 +219,28 @@ def run_gate_up_projection_lhs_rhs_swap(
     tile_shape = (dims.I0, num_I_tiles, dims.T)
 
     if not params.skip_gate_proj:
-        gate_sb_fp32 = sbm.alloc_stack(
+        gate_sb_view = sbm.alloc_stack(
             tile_shape,
             dtype=nl.float32,
             name="gate_sbuf_fp32",
             buffer=nl.sbuf,
             align=4,
         )
-        up_sb_fp32 = sbm.alloc_stack(
+        up_sb_view = sbm.alloc_stack(
             tile_shape,
             dtype=nl.float32,
             name="up_sbuf_fp32",
             buffer=nl.sbuf,
             align=4,
         )
-        gate_sb_view = TensorView(gate_sb_fp32)
-        up_sb_view = TensorView(up_sb_fp32)
     else:
-        up_sb_fp32 = sbm.alloc_stack(
+        up_sb_view = sbm.alloc_stack(
             tile_shape,
             dtype=nl.float32,
             name="up_sbuf_fp32",
             buffer=nl.sbuf,
             align=4,
         )
-        up_sb_view = TensorView(up_sb_fp32)
         gate_sb_view = None
 
     # ---------------- quantization ----------------
@@ -253,15 +248,13 @@ def run_gate_up_projection_lhs_rhs_swap(
     gate_dequant_tile = up_dequant_tile = None
     if params.quant_params.is_quant_static():
         par_dim = dims.I0
-        gate_dequant_tile = alloc_tensor_view(
-            sbm,
+        gate_dequant_tile = sbm.alloc_stack(
             (par_dim, 1),
             dtype=gate_w_scale.dtype,
             name="gate_w_scale_sb",
             align=4,
         )
-        up_dequant_tile = alloc_tensor_view(
-            sbm,
+        up_dequant_tile = sbm.alloc_stack(
             (par_dim, 1),
             dtype=up_w_scale.dtype,
             name="up_w_scale_sb",
@@ -270,25 +263,21 @@ def run_gate_up_projection_lhs_rhs_swap(
         gate_w_scale_view = gate_w_scale.slice(dim=0, start=0, end=par_dim)
         up_w_scale_view = up_w_scale.slice(dim=0, start=0, end=par_dim)
         nisa.dma_copy(
-            dst=gate_dequant_tile.get_view(),
-            src=gate_w_scale_view.get_view(),
+            dst=gate_dequant_tile,
+            src=gate_w_scale_view,
             dge_mode=adaptive_dge_mode(gate_w_scale_view),
         )
-        nisa.dma_copy(
-            dst=up_dequant_tile.get_view(), src=up_w_scale_view.get_view(), dge_mode=adaptive_dge_mode(up_w_scale_view)
-        )
+        nisa.dma_copy(dst=up_dequant_tile, src=up_w_scale_view, dge_mode=adaptive_dge_mode(up_w_scale_view))
 
     elif params.quant_params.is_quant_row():
         row_dequant_shape = (dims.I0, div_ceil(I_shard_size, dims.I0))
-        gate_dequant_tile = alloc_tensor_view(
-            sbm,
+        gate_dequant_tile = sbm.alloc_stack(
             row_dequant_shape,
             dtype=gate_w_scale.dtype,
             name="gate_w_scale_sb",
             align=32,
         )
-        up_dequant_tile = alloc_tensor_view(
-            sbm,
+        up_dequant_tile = sbm.alloc_stack(
             row_dequant_shape,
             dtype=up_w_scale.dtype,
             name="up_w_scale_sb",
@@ -297,10 +286,9 @@ def run_gate_up_projection_lhs_rhs_swap(
 
     # ---------------- bias ----------------
     if mlpp_has_gate_projection_bias(params) or mlpp_has_up_projection_bias(params):
-        bias_tile = alloc_tensor_view(
-            sbm,
+        bias_tile = sbm.alloc_stack(
             (dims.I0, div_ceil(I_shard_size, dims.I0)),
-            dtype=nl.float32 if gate_b.has_dynamic_access() else gate_b.dtype,
+            dtype=nl.float32 if gate_b.is_indirect() else gate_b.dtype,
             name="gate_up_bias",
             align=32,
         )
@@ -309,7 +297,7 @@ def run_gate_up_projection_lhs_rhs_swap(
     gate_up_recv = None
     if dims.num_shards > 1:
         gate_up_recv = sbm.alloc_stack(
-            up_sb_view.get_view().shape,
+            up_sb_view.shape,
             dtype=nl.float32,
             buffer=nl.sbuf,
             name="gate_up_recv_buffer_fp32",
@@ -323,8 +311,7 @@ def run_gate_up_projection_lhs_rhs_swap(
     weight_shape = (dims.H0, HTile_h1, dims.I) if use_old_sharding_shape else (dims.H0, HTile_h1, tiles.I_shard_size)
     _fp8_e4m3_tile_dtype = resolve_fp8_e4m3_dtype(params.dtype_mode)
     for w_tile_idx in range(tiles.num_allocated_w_tile):
-        weight_tile = alloc_tensor_view(
-            sbm,
+        weight_tile = sbm.alloc_stack(
             weight_shape,
             name=f"gate_up_w_tile_{w_tile_idx}",
             dtype=_fp8_e4m3_tile_dtype if str(up_w.dtype) == "float8e4" else up_w.dtype,

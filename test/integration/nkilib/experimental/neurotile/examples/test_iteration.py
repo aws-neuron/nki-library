@@ -16,7 +16,6 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._01_iteration import (
     _01_tiles as tiles_mod,
 )
@@ -53,6 +52,7 @@ from nkilib_src.nkilib.experimental.neurotile.examples._01_iteration import (
 from nkilib_src.nkilib.experimental.neurotile.examples._01_iteration import (
     _06_sliced_sources_torch as sliced_refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -304,7 +304,7 @@ class TestNeurotileSlicedSources:
     """Tutorials in 06_sliced_sources.py — fp32 inputs."""
 
     @pytest.mark.fast
-    def test_root_window_scale(self, test_manager, platform_target):
+    def test_window_scale(self, test_manager, platform_target):
         def _inputs(_):
             np.random.seed(42)
             return {"src": np.random.randn(256, 512).astype(np.float32)}
@@ -315,8 +315,8 @@ class TestNeurotileSlicedSources:
         _run(
             test_manager,
             platform_target,
-            sliced_mod.root_window_scale,
-            sliced_refs.root_window_scale_torch_ref,
+            sliced_mod.window_scale,
+            sliced_refs.window_scale_torch_ref,
             _inputs,
             _outputs,
             rtol=1e-5,
@@ -324,7 +324,7 @@ class TestNeurotileSlicedSources:
         )
 
     @pytest.mark.fast
-    def test_root_two_windows(self, test_manager, platform_target):
+    def test_two_windows(self, test_manager, platform_target):
         def _inputs(_):
             np.random.seed(42)
             return {"src": np.random.randn(256, 512).astype(np.float32)}
@@ -332,8 +332,8 @@ class TestNeurotileSlicedSources:
         _run(
             test_manager,
             platform_target,
-            sliced_mod.root_two_windows,
-            sliced_refs.root_two_windows_torch_ref,
+            sliced_mod.two_windows,
+            sliced_refs.two_windows_torch_ref,
             _inputs,
             _zeros_like("src"),
             rtol=1e-5,

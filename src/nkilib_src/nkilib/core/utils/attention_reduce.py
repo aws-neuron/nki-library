@@ -30,7 +30,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from .modular_allocator import ModularAllocator
-from .tensor_view import TensorView
 
 # Maximum number of physical SBUF tiles to allocate for group-tiled buffers.
 # Caps num_free_tiles to limit SBUF usage when num_grps is large.
@@ -328,7 +327,7 @@ def normalize_one_batch(
         num_free_tiles=[min(num_grps, _MAX_FREE_TILES)],
     )
 
-    o_batch_view = TensorView(o_out).select(dim=0, index=batch_idx)
+    o_batch_view = o_out.select(dim=0, index=batch_idx)
 
     for grp_i in range(grp_start, grp_end):
         grp_o_offset = batch_o_offset + grp_i * sb_p * d
@@ -338,14 +337,14 @@ def normalize_one_batch(
             src=o_prev_hbm.ap(pattern=o_tile_pat, offset=grp_o_offset),
         )
 
-        sum_recip_grp = TensorView(sum_recip_sb).slice(dim=1, start=grp_i, end=grp_i + 1)
+        sum_recip_grp = sum_recip_sb.slice(dim=1, start=grp_i, end=grp_i + 1)
         # Normalize: o_final = o_unnorm * (1/S)
-        nisa.tensor_scalar(dst=o_sb[grp_i], data=o_sb[grp_i], op0=nl.multiply, operand0=sum_recip_grp.get_view())
+        nisa.tensor_scalar(dst=o_sb[grp_i], data=o_sb[grp_i], op0=nl.multiply, operand0=sum_recip_grp)
 
         # Write to final output
         o_grp_view = o_batch_view.reshape_dim(dim=0, shape=(num_grps, sb_p)).select(dim=0, index=grp_i)
         nisa.dma_copy(
-            dst=o_grp_view.get_view(),
+            dst=o_grp_view,
             src=o_sb[grp_i],
         )
 
@@ -361,8 +360,6 @@ def normalize_one_batch(
         log_s = nl.ndarray((sb_p, num_grps), dtype=lse_dtype, buffer=nl.sbuf)
         nisa.activation(log_s, nl.log, sum_sb)
         nisa.tensor_tensor(lse_tile, lse_tile, log_s, op=nl.add)
-
-        lse_batch_view = TensorView(lse_out).select(dim=0, index=batch_idx)
         # Write only our groups' LSE using ap() on the raw tensor
         grp_count = grp_end - grp_start
         lse_ap_pat = [[num_grps, sb_p], [1, grp_count]]

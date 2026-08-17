@@ -147,7 +147,7 @@ def _compute_nki_wrapped_kernels():
     reaches a return statement.
     """
     public, _, _ = get_nki_kernels_split()
-    public_names: set[str] = set(loc.name for loc in public)
+    public_names: set[str] = {loc.name for loc in public}
     public_info: dict[str, KernelLocation] = {loc.name: loc for loc in public}
 
     # Build func bodies for public kernels

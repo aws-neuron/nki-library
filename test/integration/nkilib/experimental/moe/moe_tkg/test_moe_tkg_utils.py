@@ -19,11 +19,11 @@ from typing import Callable
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
-
 from nkilib_src.nkilib.core.utils.common_types import (
     ExpertAffinityScaleMode,
     QuantizationType,
 )
+
 from test.integration.nkilib.core.mlp.test_mlp_common import gen_moe_mx_weights
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
 from test.integration.nkilib.utils.test_kernel_common import is_dtype_mx

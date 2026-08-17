@@ -49,8 +49,9 @@ from .common_dataclasses import (
     ValidationArgs,
 )
 from .coverage_parametrized_tests import assert_negative_test_case
+from .golden_provider import CustomComparatorProducer, GoldenProducer, TorchRefProducer
 from .metadata_loader import load_model_configs
-from .metrics_collector import IMetricsCollector
+from .metrics_collector import IMetricsCollector, MetricName
 from .test_orchestrator import Orchestrator
 
 
@@ -191,7 +192,11 @@ class UnitTestFramework:
             # returns early and .golden is never accessed), and in normal mode it runs
             # after the kernel compile+infer, right before output data comparison.
             def compute_ref():
-                ref_result = self.torch_ref(**ref_input)
+                # Timed as GoldenComputationTime — the actual reference compute. The
+                # producer may serve the golden without invoking this, so the metric is
+                # present only when a compute actually happens.
+                with self.test_manager.collector.timer(MetricName.GOLDEN_COMPUTATION_TIME):
+                    ref_result = self.torch_ref(**ref_input)
                 _validate_key_sets(
                     expected=set(ref_result.keys()),
                     actual=set(output_tensors.keys()),
@@ -199,13 +204,26 @@ class UnitTestFramework:
                     expected_label="torch_ref returns but output_tensor_descriptor doesn't provide",
                     actual_label="output_tensor_descriptor provides but torch_ref doesn't return",
                 )
-                if custom_comparator is not None:
-                    return custom_comparator(ref_result, output_tensors)
                 return ref_result
 
+            # Golden production is a pluggable stage (GoldenProducer): the producer yields
+            # the golden the validator consumes, for both the plain and custom_comparator
+            # paths. run_test composes the producer with the validator; how the producer
+            # obtains the golden is its own concern.
+            producer: GoldenProducer = TorchRefProducer(
+                compute_ref,
+                self.torch_ref,
+                ref_input,
+                output_tensors,
+                self.test_manager.collector,
+                self.test_manager.torch_ref_cache_path,
+            )
+            if custom_comparator is not None:
+                producer = CustomComparatorProducer(producer, custom_comparator, output_tensors)
+
             lazy_golden = LazyGoldenGenerator(
-                lazy_golden_generator=compute_ref,
-                output_ndarray=output_tensors,
+                lazy_golden_generator=producer.produce,
+                output_ndarray=producer.output_spec(),
             )
 
             # Execute test

@@ -15,7 +15,16 @@
 """Tensor descriptor for managing quantized tensor metadata and layout information."""
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Optional, Tuple
+
+
+class QuantScheme(Enum):
+    """Quantization scheme for MXFP8 PE swizzle layout."""
+
+    WRAPX = "wrapX"
+    _1x32 = "1x32"
+
 
 import nki.isa as nisa
 import nki.language as nl
@@ -52,7 +61,7 @@ class TensorDescriptor(nl.NKIObject):
         scales_are_packed (bool): True if scales are packed.
         is_col_parallel_sharded (bool): True if tensor is sharded across 2 cores (LNC2).
         load_with_PE_swizzle (bool): When True, use PE transpose
-            (load_tile_bf16_PE_transpose) instead of DGT for loading unswizzled bf16.
+            (load_tile_PE_swizzle_wrapX) instead of DGT for loading unswizzled bf16.
             Supports both direct (contiguous) and indirect (scattered) DMA modes;
             indirect mode is activated when indirect_dma_vector_offset is set.
         indirect_dma_vector_offset (Optional[nl.ndarray]): SBUF
@@ -90,7 +99,12 @@ class TensorDescriptor(nl.NKIObject):
     vector_offset_pattern_256: Optional[nl.ndarray] = None
     vector_offset_pattern_128: Optional[nl.ndarray] = None
 
-    # When True, use PE swizzle (load_tile_bf16_PE_transpose) instead of DGT
+    # Quantization scheme for PE swizzle layout.
+    # WRAPX (default): 4-partition interleave (DGT / load_tile_PE_swizzle_wrapX)
+    # _1x32: 1x32 contiguous block layout (load_tile_PE_Swizzle_1x32 / load_tile_bf16_xbar_transpose)
+    quant_scheme: QuantScheme = QuantScheme.WRAPX
+
+    # When True, use PE swizzle (load_tile_PE_swizzle_wrapX) instead of DGT
     # for loading unswizzled bf16 tensors. Supports both:
     #   - Direct DMA (contiguous rows): when indirect_dma_vector_offset is None
     #   - Indirect DMA (scattered token gather): when indirect_dma_vector_offset
@@ -99,6 +113,14 @@ class TensorDescriptor(nl.NKIObject):
     # Whether indirect or direct is determined by the presence of vector_offset
     # on the TileLocation at load time.
     load_with_PE_swizzle: bool = False
+
+    # When True, use a direct access pattern on the source tensor for DMA
+    # gather-transpose instead of flattening + vector offsets. This avoids
+    # generating vector_offset_pattern buffers in SBUF and simplifies the DGT
+    # path by specifying a 4D access pattern directly on the [F, K] source:
+    #   pattern=[[VECTOR_SIZE, INTERLEAVE], [1, 1], [K, TILE_F], [1, VECTOR_SIZE]]
+    #   offset=f_offset * K + k_offset
+    fast_dma_transpose: bool = False
     indirect_dma_vector_offset: Optional[nl.ndarray] = None
 
     # Runtime scalar offset added uniformly to every DGT vector_offset entry
@@ -185,6 +207,12 @@ class TensorDescriptor(nl.NKIObject):
             else:
                 self.sharded_physical_shape = self.physical_shape
                 self.sharded_logical_shape = self.logical_shape
+
+    def shard_col_parallel(self):
+        """Enable column-parallel sharding, halving the second (F/M/N) dimension."""
+        self.is_col_parallel_sharded = True
+        self.sharded_physical_shape = (self.physical_shape[0], self.physical_shape[1] // 2)
+        self.sharded_logical_shape = (self.logical_shape[0], self.logical_shape[1] // 2)
 
     def _generate_vector_offset_pattern(self, tile_k: int, tile_f: int) -> nl.ndarray:
         """
@@ -424,8 +452,14 @@ class TileLocation(nl.NKIObject):
         Skipped when load_with_PE_swizzle=True, since PE transpose uses either
         user-provided row indices (indirect) or contiguous DMA (direct), and
         does not need DGT vector offsets.
+
+        Skipped when fast_dma_transpose=True, since the fast path uses a direct
+        access pattern on the source tensor without vector offsets.
         """
         if self.tensor.load_with_PE_swizzle:
+            return
+
+        if self.tensor.fast_dma_transpose:
             return
 
         if not self.tensor.is_swizzled and self.tensor.is_f_by_k:

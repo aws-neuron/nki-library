@@ -28,7 +28,6 @@ from ..utils import (
     cross_partition_copy,
     kernel_helpers,
     stream_shuffle_broadcast,
-    tensor_view,
     tiled_range,
 )
 from ..utils.common_types import RouterActFnType
@@ -55,9 +54,9 @@ XSBLayout__128_Hdiv128_T__3 = 3
 
 @nki.jit
 def router_topk(
-    x: nl.ndarray,
-    w: nl.ndarray,
-    w_bias: nl.ndarray,
+    x: nl.NkiTensor,
+    w: nl.NkiTensor,
+    w_bias: nl.NkiTensor,
     router_logits: nt.mutable_tensor,
     expert_affinities: nt.mutable_tensor,
     expert_index: nt.mutable_tensor,
@@ -93,11 +92,11 @@ def router_topk(
         K: Number of top experts to select per token
 
     Args:
-        x (nl.ndarray): Input tensor. Buffer type is auto-detected.
+        x (nl.NkiTensor): Input tensor. Buffer type is auto-detected.
                         If in HBM: [H, T] or [T, H] depending on x_hbm_layout.
                         If in SBUF: a permutation of [128, T, H/128] depending on x_sb_layout.
-        w (nl.ndarray): Weight tensor [H, E] in HBM
-        w_bias (nl.ndarray): Optional bias tensor [1, E] or [E] in HBM
+        w (nl.NkiTensor): Weight tensor [H, E] in HBM
+        w_bias (nl.NkiTensor): Optional bias tensor [1, E] or [E] in HBM
         router_logits (nt.mutable_tensor): Output router logits [T, E] in HBM
         expert_affinities (nt.mutable_tensor): Output expert affinities [T, E] in HBM or SBUF.
                         Buffer type is auto-detected.
@@ -357,8 +356,8 @@ def router_topk(
         )
         # router_logits_bias_vector_sb = nl.load(w_bias)
         nisa.dma_copy(
-            dst=tensor_view.TensorView(router_logits_bias_vector_sb).get_view(),
-            src=tensor_view.TensorView(w_bias).get_view(),
+            dst=router_logits_bias_vector_sb,
+            src=w_bias,
         )
         if use_PE_broadcast_w_bias:  # Use TensorE/matmul to do the broadcast
             ones_mask = nl.ndarray((1, t_tile_size), dtype=router_logits_bias_vector_sb.dtype, buffer=nl.sbuf)
@@ -407,11 +406,8 @@ def router_topk(
                 XSBLayout_tp2013__1,
                 XSBLayout_tp201__2,
             ]:  # x_sb = [128, T, num_h_tiles]
-                x_tile_sb = (
-                    tensor_view.TensorView(x_sb)
-                    .slice(dim=1, start=start_t, end=start_t + t_tile_size_actual)
-                    .select(dim=2, index=h_tile_idx)
-                    .get_view()
+                x_tile_sb = x_sb.slice(dim=1, start=start_t, end=start_t + t_tile_size_actual).select(
+                    dim=2, index=h_tile_idx
                 )
             else:  # internal_x_sb_layout==3, x_sb = [128, num_h_tiles, T]
                 x_tile_sb = x_sb[:, h_tile_idx, start_t:end_t]
@@ -990,7 +986,7 @@ def router_topk(
                 offset = (T_offset + t_tile_idx * t_p_dim) * E
 
                 nisa.iota(
-                    dst=index_offset_sb.ap([[1, t_p_dim], [1, 1], [1, 1]]),
+                    dst=index_offset_sb.reshape((t_p_dim, 1, 1)),
                     pattern=[[1, 1]],
                     offset=offset,
                     channel_multiplier=E,
@@ -1021,7 +1017,7 @@ def router_topk(
                 )
 
                 nisa.tensor_scalar(
-                    dst=router_indexes_topk_flattened_sb.ap([[k, t_p_dim], [1, 1], [1, k]]),
+                    dst=router_indexes_topk_flattened_sb.reshape((t_p_dim, 1, k)),
                     data=router_indexes_topk_sb[:, t_tile_idx, :],
                     op0=nl.add,
                     operand0=index_offset_sb,
@@ -1033,19 +1029,14 @@ def router_topk(
 
                 for k_idx in range(k):
                     # router_indexes_topk_flattened_sb has shape [T,k]
-                    index_column = router_indexes_topk_flattened_sb.ap(
-                        pattern=[[k, t_p_dim], [1, 1], [1, 1]], offset=k_idx
-                    )
+                    index_column = router_indexes_topk_flattened_sb[:, k_idx : k_idx + 1]
 
                     # Do the indirect DMA using the column vector as the dynamic indexes.
                     # Copy the k'th column of expert_affinities_topk_sb into the scattered positions given by index_column.
+                    flat_col = k_idx + t_tile_idx * k
                     nisa.dma_copy(
-                        dst=expert_affinities_hbm_1d.ap(
-                            [[k * num_t_tiles, t_p_dim], [1, 1]], offset=0, vector_offset=index_column, indirect_dim=0
-                        ),
-                        src=expert_affinities_topk_sb.ap(
-                            [[k * num_t_tiles, t_p_dim], [1, 1]], offset=k_idx + t_tile_idx * k
-                        ),
+                        dst=expert_affinities_hbm_1d.reshape((T * E, 1)).vector_select(0, index_column),
+                        src=expert_affinities_topk_sb.reshape((t_p_dim, num_t_tiles * k))[:, flat_col : flat_col + 1],
                     )
 
     # when using one-hot scatter method, spill expert affinities to HBM outside of t_tile loop
@@ -1180,7 +1171,7 @@ def router_topk(
 
 
 def _hbm_tiled_store_view(tensor, T_offset, num_t_whole_tiles, t_p_dim):
-    """Create TensorView for tiled HBM store: slice -> reshape -> permute.
+    """Create a native NkiTensor view for tiled HBM store: slice -> reshape -> permute.
 
     Transforms tensor[T, X] to view compatible with SBUF layout [t_p_dim, num_tiles, X].
     Shape transformations:
@@ -1189,16 +1180,14 @@ def _hbm_tiled_store_view(tensor, T_offset, num_t_whole_tiles, t_p_dim):
                 -> permute -> [t_p_dim, num_t_whole_tiles, X]
     """
     return (
-        tensor_view.TensorView(tensor)
-        .slice(dim=0, start=T_offset, end=T_offset + num_t_whole_tiles * t_p_dim)
+        tensor.slice(dim=0, start=T_offset, end=T_offset + num_t_whole_tiles * t_p_dim)
         .reshape_dim(dim=0, shape=(num_t_whole_tiles, t_p_dim))
         .permute((1, 0, 2))
-        .get_view()
     )
 
 
 def _hbm_remainder_store_view(tensor, T_offset, num_t_whole_tiles, t_p_dim, t_remainder):
-    """Create TensorView for remainder HBM store: slice -> expand_dim.
+    """Create a native NkiTensor view for remainder HBM store: slice -> expand_dim.
 
     Shape transformations:
         [T, X] -> slice -> [t_remainder, X]
@@ -1207,19 +1196,14 @@ def _hbm_remainder_store_view(tensor, T_offset, num_t_whole_tiles, t_p_dim, t_re
     expand_dim is needed to match the 3D SBUF layout [t_p_dim, num_tiles, X].
     The remainder has only 1 tile, so we insert a dimension of size 1 at dim=1.
     """
-    return (
-        tensor_view.TensorView(tensor)
-        .slice(
-            dim=0,
-            start=T_offset + num_t_whole_tiles * t_p_dim,
-            end=T_offset + num_t_whole_tiles * t_p_dim + t_remainder,
-        )
-        .expand_dim(dim=1)
-        .get_view()
-    )
+    return tensor.slice(
+        dim=0,
+        start=T_offset + num_t_whole_tiles * t_p_dim,
+        end=T_offset + num_t_whole_tiles * t_p_dim + t_remainder,
+    ).expand_dim(dim=1)
 
 
-def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_layout=XSBLayout_tp2013__1):
+def router_topk_input_x_load(x: nl.NkiTensor, hbm_layout=XHBMLayout_H_T__0, sb_layout=XSBLayout_tp2013__1):
     """
     Load input tensor x from HBM to SBUF with specified layout transformations.
 
@@ -1257,12 +1241,12 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
         └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
     Args:
-        x (nl.ndarray): Input tensor in HBM. Shape [H, T] if hbm_layout=0, [T, H] if hbm_layout=1
+        x (nl.NkiTensor): Input tensor in HBM. Shape [H, T] if hbm_layout=0, [T, H] if hbm_layout=1
         hbm_layout (int): Layout of x in HBM (0=[H,T], 1=[T,H])
         sb_layout (int): Target layout in SBUF (0-3). See layout descriptions above
 
     Returns:
-        x_sb (nl.ndarray): Input tensor in SBUF with transformed layout.
+        x_sb (nl.NkiTensor): Input tensor in SBUF with transformed layout.
                           Shape depends on sb_layout: [128, T, H/128] for layouts 0-2,
                           [128, H/128, T] for layout 3
 
@@ -1350,10 +1334,8 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
 
         x_sb = nl.ndarray((P_MAX, T, num_h_tiles), dtype=x.dtype, buffer=nl.sbuf)
         nisa.dma_copy(
-            src=(
-                tensor_view.TensorView(x).reshape_dim(dim=1, shape=(P_MAX, num_h_tiles)).permute((1, 0, 2)).get_view()
-            ),
-            dst=tensor_view.TensorView(x_sb).get_view(),
+            src=(x.reshape_dim(dim=1, shape=(P_MAX, num_h_tiles)).permute((1, 0, 2))),
+            dst=x_sb,
         )
 
     # sb_layout == 1
@@ -1403,8 +1385,8 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
             (P_MAX, T, 2, num_h_tiles_by_2), dtype=x.dtype, buffer=nl.sbuf
         )  # Declare SB tensor as 4D for now.
         nisa.dma_copy(
-            src=tensor_view.TensorView(x_reshape).permute([2, 0, 1, 3]).get_view(),
-            dst=tensor_view.TensorView(x_sb).get_view(),
+            src=x_reshape.permute([2, 0, 1, 3]),
+            dst=x_sb,
         )
         # We reshape to 3D to maintain compatibility with existing upstream kernels who produce this this layout in this 3D shape:
         x_sb = x_sb.reshape((P_MAX, T, num_h_tiles))
@@ -1445,8 +1427,8 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
         x_sb = nl.ndarray((P_MAX, T, num_h_tiles), dtype=x.dtype, buffer=nl.sbuf)  # [128,T,H/128]
         # nisa.dma_copy(src=x_reshape[i_x_t, i_x_h, i_x_p], dst=x_sb[i_x_p, i_x_t, i_x_h])
         nisa.dma_copy(
-            src=tensor_view.TensorView(x_reshape).permute([2, 0, 1]).get_view(),
-            dst=tensor_view.TensorView(x_sb).get_view(),
+            src=x_reshape.permute([2, 0, 1]),
+            dst=x_sb,
         )
     # sb_layout == 3
 
@@ -1498,10 +1480,8 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
         x_sb = nl.ndarray((P_MAX, num_h_tiles, T), dtype=x.dtype)
 
         nisa.dma_copy(
-            src=(
-                tensor_view.TensorView(x).reshape_dim(dim=0, shape=(num_h_tiles, P_MAX)).permute((1, 0, 2)).get_view()
-            ),
-            dst=tensor_view.TensorView(x_sb).get_view(),
+            src=(x.reshape_dim(dim=0, shape=(num_h_tiles, P_MAX)).permute((1, 0, 2))),
+            dst=x_sb,
         )
 
     else:
@@ -1511,7 +1491,7 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
     return x_sb
 
 
-def router_topk_input_w_load(w: nl.ndarray, x_sb_layout):
+def router_topk_input_w_load(w: nl.NkiTensor, x_sb_layout):
     """
     Load weight tensor w from HBM to SBUF with layout matching x tensor.
 
@@ -1520,12 +1500,12 @@ def router_topk_input_w_load(w: nl.ndarray, x_sb_layout):
     matmul operations.
 
     Args:
-        w (nl.ndarray): Weight tensor [H, E] in HBM
+        w (nl.NkiTensor): Weight tensor [H, E] in HBM
         x_sb_layout (int): Layout of x in SBUF (0-3), determines w layout
         name (str): Optional tensor annotation name for debugging
 
     Returns:
-        w_sb (nl.ndarray): Weight tensor in SBUF [128, H/128, E] with layout
+        w_sb (nl.NkiTensor): Weight tensor in SBUF [128, H/128, E] with layout
                           matching x_sb_layout H-dimension stride pattern
 
     Notes:
@@ -1682,29 +1662,21 @@ def router_topk_input_w_load(w: nl.ndarray, x_sb_layout):
             w_reshape = w.reshape((2, P_MAX, num_h_tiles_by_2, E))
             w_sb_4d = w_sb.reshape((P_MAX, 2, num_h_tiles_by_2, E))
             nisa.dma_copy(
-                src=tensor_view.TensorView(w_reshape).permute([1, 0, 2, 3]).get_view(),
-                dst=tensor_view.TensorView(w_sb_4d).get_view(),
+                src=w_reshape.permute([1, 0, 2, 3]),
+                dst=w_sb_4d,
             )
         else:
             # Unbalanced: load each half with correct stride to match x layout
             h2_first = num_h_tiles_by_2  # floor(num_h_tiles / 2)
             h2_second = num_h_tiles - h2_first
             # Half 0: [h2_first * P_MAX, E] -> [P_MAX, h2_first, E]
-            w_half0_view = (
-                tensor_view.TensorView(w)
-                .slice(dim=0, start=0, end=h2_first * P_MAX)
-                .reshape_dim(dim=0, shape=[P_MAX, h2_first])
-            )
-            w_sb_half0 = tensor_view.TensorView(w_sb).slice(dim=1, start=0, end=h2_first)
-            nisa.dma_copy(src=w_half0_view.get_view(), dst=w_sb_half0.get_view())
+            w_half0_view = w.slice(dim=0, start=0, end=h2_first * P_MAX).reshape_dim(dim=0, shape=[P_MAX, h2_first])
+            w_sb_half0 = w_sb.slice(dim=1, start=0, end=h2_first)
+            nisa.dma_copy(src=w_half0_view, dst=w_sb_half0)
             # Half 1: [h2_second * P_MAX, E] -> [P_MAX, h2_second, E]
-            w_half1_view = (
-                tensor_view.TensorView(w)
-                .slice(dim=0, start=h2_first * P_MAX, end=H)
-                .reshape_dim(dim=0, shape=[P_MAX, h2_second])
-            )
-            w_sb_half1 = tensor_view.TensorView(w_sb).slice(dim=1, start=h2_first, end=num_h_tiles)
-            nisa.dma_copy(src=w_half1_view.get_view(), dst=w_sb_half1.get_view())
+            w_half1_view = w.slice(dim=0, start=h2_first * P_MAX, end=H).reshape_dim(dim=0, shape=[P_MAX, h2_second])
+            w_sb_half1 = w_sb.slice(dim=1, start=h2_first, end=num_h_tiles)
+            nisa.dma_copy(src=w_half1_view, dst=w_sb_half1)
 
     else:  # x_sb_layout = 2,3
         # HBM tensor shape [H,E] reshaped (new view) as [num_h_tiles, 128, E].
@@ -1752,10 +1724,8 @@ def router_topk_input_w_load(w: nl.ndarray, x_sb_layout):
         w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf)
 
         nisa.dma_copy(
-            src=(
-                tensor_view.TensorView(w).reshape_dim(dim=0, shape=(num_h_tiles, P_MAX)).permute((1, 0, 2)).get_view()
-            ),
-            dst=tensor_view.TensorView(w_sb).get_view(),
+            src=(w.reshape_dim(dim=0, shape=(num_h_tiles, P_MAX)).permute((1, 0, 2))),
+            dst=w_sb,
         )
 
     return w_sb
@@ -1822,12 +1792,7 @@ def compute_activation(
             data=input_tensor[:t_tile_size, t_tile_idx : t_tile_idx + 1, :],
             bias=local_negmax_sb[:t_tile_size, t_tile_idx : t_tile_idx + 1],
             reduce_op=nl.add,
-            reduce_res=(
-                tensor_view.TensorView(local_exp_sum_sb)
-                .slice(dim=0, start=0, end=t_tile_size)
-                .select(dim=1, index=t_tile_idx)
-                .get_view()
-            ),
+            reduce_res=(local_exp_sum_sb.slice(dim=0, start=0, end=t_tile_size).select(dim=1, index=t_tile_idx)),
             reduce_cmd=reduce_cmd.reset_reduce,
         )
 

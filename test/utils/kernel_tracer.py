@@ -34,7 +34,7 @@ from .common_dataclasses import (
     ValidationArgs,
     normalize_golden_output,
 )
-from .metrics_collector import IMetricsCollector
+from .metrics_collector import IMetricsCollector, MetricName
 
 DEFAULT_COMPILER_DEBUG_FLAGS = [
     "--internal-backend-options=--print-format=condensed",
@@ -45,17 +45,9 @@ DUMP_AFTER_LOWERING_FLAGS = [
     "--internal-backend-options=--print-format=condensed --print-after=translate_nki_ast_to_bir,lower_klir_kernel",
 ]
 
-DEFAULT_COMPILER_FLAGS = [
-    "--verbose=info",
-    "--pipeline",
-    "compile",
-    "SaveTemps",
-]
 
-
-def __construct_additional_arguments__(
-    compiler_args: CompilerArgs, validation_args: ValidationArgs | None = None
-) -> str:
+def _collect_neuronx_cc_flags(compiler_args: CompilerArgs, validation_args: ValidationArgs | None = None) -> list[str]:
+    """Collect neuronx-cc flags configured by compiler and validation inputs."""
     additional_args = compiler_args.additional_cmd_args.copy()
 
     if compiler_args.enable_debugging:
@@ -78,9 +70,7 @@ def __construct_additional_arguments__(
     if compiler_args.dump_after_lowering:
         additional_args.extend(DUMP_AFTER_LOWERING_FLAGS)
 
-    additional_args.extend(DEFAULT_COMPILER_FLAGS)
-
-    return " ".join(additional_args)
+    return additional_args
 
 
 def is_tensor(maybe_tensor: Any) -> bool:
@@ -138,7 +128,7 @@ def trace_kernel(
     frontendMode,
     output_names: list[str] | None = None,
     neuronx_cc_cache_path: str | None = None,
-    collector: IMetricsCollector | None = None,
+    collector: IMetricsCollector,
 ) -> Optional[object]:
     """Compile NKI kernel to MLIR, and optionally to NEFF.
 
@@ -172,33 +162,26 @@ def trace_kernel(
     platform_target = str(kernel_under_test.compiler_input.platform_target.get_compile_target())
     grid = kernel_under_test.compiler_input.logical_nc_config
 
-    test_additional_cmd_args = list(kernel_under_test.compiler_input.additional_cmd_args)
-    if kernel_under_test.compiler_input.enable_debugging:
-        test_additional_cmd_args.extend(DEFAULT_COMPILER_DEBUG_FLAGS)
-    if kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE:
-        test_additional_cmd_args.append(
-            f"--internal-enable-separate-load-and-compute={kernel_under_test.compiler_input.separation_pass_mode.value}"
-        )
-    if kernel_under_test.compiler_input.dump_after_lowering:
-        test_additional_cmd_args.extend(DUMP_AFTER_LOWERING_FLAGS)
+    neuronx_cc_args = _collect_neuronx_cc_flags(kernel_under_test.compiler_input, kernel_under_test.validation_args)
 
     compile_opts = CompileOptions(
         target=platform_target,
         lnc=grid,
         output_path=os.path.join(output_directory, "file.neff"),
         artifacts_dir=os.path.join(output_directory, "artifacts"),
-        neuronx_cc_args=tuple(test_additional_cmd_args),
+        neuronx_cc_args=tuple(neuronx_cc_args),
         enable_device_dump=enable_device_dump,
     )
     compile_opts = compile_opts.disable_backend_optimizations()
 
-    result = compile_to_bir(
-        kernel_func=kernel_under_test.kernel_func,
-        frontend=frontend,
-        inputs=cleaned_input,
-        compile_opts=compile_opts,
-        output_names=output_names,
-    )
+    with collector.timer(MetricName.FRONTEND_TRACE_TIME):
+        result = compile_to_bir(
+            kernel_func=kernel_under_test.kernel_func,
+            frontend=frontend,
+            inputs=cleaned_input,
+            compile_opts=compile_opts,
+            output_names=output_names,
+        )
 
     if mode not in (TraceMode.CompileOnly, TraceMode.CompileAndInfer, TraceMode.Debugger):
         return None

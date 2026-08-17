@@ -38,7 +38,6 @@ from ...core.utils.allocator import SbufManager, sizeinbytes
 # NKI Library
 from ...core.utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
 from ...core.utils.logging import get_logger
-from ...core.utils.tensor_view import TensorView
 
 # Primitives
 from ...experimental.primitives import ColMajor, RowMajor, blas, dma, tile_stream
@@ -62,40 +61,40 @@ def _get_psum_bank_size() -> int:
 
 
 def qkv_cte(
-    input: nl.ndarray,
-    fused_qkv_weights: nl.ndarray,
+    input: nl.NkiTensor,
+    fused_qkv_weights: nl.NkiTensor,
     output_layout: QKVOutputLayout = QKVOutputLayout.BSD,
     # -- Bias
-    bias: Optional[nl.ndarray] = None,
+    bias: Optional[nl.NkiTensor] = None,
     # -- Fused Residual Add
     fused_residual_add: Optional[bool] = False,
-    mlp_prev: Optional[nl.ndarray] = None,
-    attention_prev: Optional[nl.ndarray] = None,
+    mlp_prev: Optional[nl.NkiTensor] = None,
+    attention_prev: Optional[nl.NkiTensor] = None,
     # --- Fused Norm Related
     fused_norm_type: NormType = NormType.NO_NORM,
-    gamma_norm_weights: Optional[nl.ndarray] = None,
-    layer_norm_bias: Optional[nl.ndarray] = None,
+    gamma_norm_weights: Optional[nl.NkiTensor] = None,
+    layer_norm_bias: Optional[nl.NkiTensor] = None,
     norm_eps: Optional[float] = 1e-6,
     hidden_actual: Optional[int] = None,
     # --- Fused RoPE Related
     fused_rope: Optional[bool] = False,
-    cos_cache: Optional[nl.ndarray] = None,
-    sin_cache: Optional[nl.ndarray] = None,
+    cos_cache: Optional[nl.NkiTensor] = None,
+    sin_cache: Optional[nl.NkiTensor] = None,
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
     # --- FP8 KV Cache Quantization Related
-    k_cache: Optional[nl.ndarray] = None,
-    v_cache: Optional[nl.ndarray] = None,
-    k_scale: Optional[nl.ndarray] = None,
-    v_scale: Optional[nl.ndarray] = None,
+    k_cache: Optional[nl.NkiTensor] = None,
+    v_cache: Optional[nl.NkiTensor] = None,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
     fp8_max: Optional[float] = None,
     fp8_min: Optional[float] = None,
     kv_dtype: Optional[type] = None,
     # --- Block KV Cache Related
     use_block_kv: bool = False,
     block_size: Optional[int] = None,
-    slot_mapping: Optional[nl.ndarray] = None,
+    slot_mapping: Optional[nl.NkiTensor] = None,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -105,14 +104,14 @@ def qkv_cte(
     use_auto_allocation: bool = False,
     # --- Quantization Related
     quantization_type: QuantizationType = QuantizationType.NONE,
-    qkv_w_scale: Optional[nl.ndarray] = None,
-    qkv_in_scale: Optional[nl.ndarray] = None,
+    qkv_w_scale: Optional[nl.NkiTensor] = None,
+    qkv_in_scale: Optional[nl.NkiTensor] = None,
     # ----------------------------------------
     load_input_with_DMA_transpose: bool = True,
     # ----------------------------------------
     is_input_swizzled: bool = False,
     weight_layout: QKVWeightLayout = QKVWeightLayout.CONTIGUOUS,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
 
@@ -158,23 +157,23 @@ def qkv_cte(
         num_heads: Total number of heads = num_q_heads + 2*num_kv_heads
 
     Args:
-        input (nl.ndarray): [B, S, H], Input hidden states tensor where B=batch, S=sequence_length, H=hidden_dim.
+        input (nl.NkiTensor): [B, S, H], Input hidden states tensor where B=batch, S=sequence_length, H=hidden_dim.
             We name it 'input' and not 'hidden' to avoid ambiguity with the size of "hidden dimension".
-        fused_qkv_weights (nl.ndarray): [H, I],  or [H//4, I] for MX, Fused QKV weight matrix where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
+        fused_qkv_weights (nl.NkiTensor): [H, I],  or [H//4, I] for MX, Fused QKV weight matrix where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
         output_layout (QKVOutputLayout): Output tensor layout: QKVOutputLayout.BSD=[B, S, I] or QKVOutputLayout.NBSd=[num_heads, B, S, d_head]. Default: QKVOutputLayout.BSD
-        bias (Optional[nl.ndarray]): [1, I], Bias tensor to add to QKV projection output. Default: None
+        bias (Optional[nl.NkiTensor]): [1, I], Bias tensor to add to QKV projection output. Default: None
         fused_residual_add (Optional[bool]): Whether to perform residual addition: input = input + mlp_prev + attention_prev. Default: False
-        mlp_prev (Optional[nl.ndarray]): [B, S, H], Previous MLP output tensor for residual addition. Default: None
-        attention_prev (Optional[nl.ndarray]): [B, S, H], Previous attention output tensor for residual addition. Default: None
+        mlp_prev (Optional[nl.NkiTensor]): [B, S, H], Previous MLP output tensor for residual addition. Default: None
+        attention_prev (Optional[nl.NkiTensor]): [B, S, H], Previous attention output tensor for residual addition. Default: None
         fused_norm_type (NormType): Type of normalization: NormType.NO_NORM, NormType.RMS_NORM, NormType.RMS_NORM_SKIP_GAMMA, or NormType.LAYER_NORM.
             NormType.RMS_NORM_SKIP_GAMMA assumes fused_qkv_weights have been pre-multiplied with gamma vector, so its skipped here. Default: NormType.NO_NORM
-        gamma_norm_weights (Optional[nl.ndarray]): [1, H], Normalization gamma/scale weights (required for NormType.RMS_NORM and NormType.LAYER_NORM). Default: None
-        layer_norm_bias (Optional[nl.ndarray]): [1, H], Layer normalization beta/bias weights (only for NormType.LAYER_NORM). Using layer norm bias is optional. Default: None
+        gamma_norm_weights (Optional[nl.NkiTensor]): [1, H], Normalization gamma/scale weights (required for NormType.RMS_NORM and NormType.LAYER_NORM). Default: None
+        layer_norm_bias (Optional[nl.NkiTensor]): [1, H], Layer normalization beta/bias weights (only for NormType.LAYER_NORM). Using layer norm bias is optional. Default: None
         norm_eps (Optional[float]): Epsilon value for numerical stability in normalization. Default: 1e-6
         hidden_actual (Optional[int]): Actual hidden dimension for padded tensors (if H contains padding). Default: None
         fused_rope (Optional[bool]): Whether to apply RoPE rotation to Query and Key heads after QKV projection. Default: False
-        cos_cache (Optional[nl.ndarray]): [B, S, d_head], Cosine cache for RoPE (required if fused_rope=True). Default: None
-        sin_cache (Optional[nl.ndarray]): [B, S, d_head], Sine cache for RoPE (required if fused_rope=True). Default: None
+        cos_cache (Optional[nl.NkiTensor]): [B, S, d_head], Cosine cache for RoPE (required if fused_rope=True). Default: None
+        sin_cache (Optional[nl.NkiTensor]): [B, S, d_head], Sine cache for RoPE (required if fused_rope=True). Default: None
         d_head (Optional[int]): Dimension per attention head (required for QKVOutputLayout.NBSd and RoPE). Default: None
         num_q_heads (Optional[int]): Number of query heads (required for RoPE). Default: None
         num_kv_heads (Optional[int]): Number of key/value heads (required for RoPE). Default: None
@@ -185,9 +184,9 @@ def qkv_cte(
             If 'sbm' is provided by user, user has the responsibility to set use_auto_allocation=True in the provided SbufManager. Default: False
         load_input_with_DMA_transpose (bool): Whether to use DMA transpose optimization. Default: True
         quantization_type: QuantizationType, default=QuantizationType.NONE
-        qkv_w_scale: Optional[nl.ndarray], default=None The weight quantization scale for qkv projection,
+        qkv_w_scale: Optional[nl.NkiTensor], default=None The weight quantization scale for qkv projection,
             Shape: [H//32, I] for MX
-        qkv_in_scale: Optional[nl.ndarray], default=None The input quantization scale for qkv projection, currently assume the input quantization scales are the scale for q, k, v projections
+        qkv_in_scale: Optional[nl.NkiTensor], default=None The input quantization scale for qkv projection, currently assume the input quantization scales are the scale for q, k, v projections
         is_input_swizzled: bool, default=False
             Whether the input tensor is swizzled (only applicable with MX Quantization).
             If not swizzled, input has shape [B, S, H].
@@ -197,7 +196,7 @@ def qkv_cte(
             docstring for packing instructions. Default: QKVWeightLayout.CONTIGUOUS
 
     Returns:
-        output (nl.ndarray): QKV projection output tensor:
+        output (nl.NkiTensor): QKV projection output tensor:
             - If output_layout=QKVOutputLayout.BSD: shape [B, S, I]
             - If output_layout=QKVOutputLayout.NBSd: shape [num_heads, B, S, d_head]
 
@@ -359,28 +358,28 @@ def _qkv_cte_impl(
     cfg: QKV_CTE_Config,
     dims: QKV_CTE_Dims,
     sbm: SbufManager,
-    bias_hbm: Optional[nl.ndarray] = None,
+    bias_hbm: Optional[nl.NkiTensor] = None,
     # Fused Residual Add Related
-    mlp_prev_hbm: Optional[nl.ndarray] = None,
-    attention_prev_hbm: Optional[nl.ndarray] = None,
+    mlp_prev_hbm: Optional[nl.NkiTensor] = None,
+    attention_prev_hbm: Optional[nl.NkiTensor] = None,
     # Fused Normalization Related
-    gamma_norm_weights_hbm: Optional[nl.ndarray] = None,
-    layer_norm_bias_hbm: Optional[nl.ndarray] = None,
+    gamma_norm_weights_hbm: Optional[nl.NkiTensor] = None,
+    layer_norm_bias_hbm: Optional[nl.NkiTensor] = None,
     norm_eps: Optional[float] = 1e-6,
     # Fused RoPE Related
-    cos_cache_hbm: Optional[nl.ndarray] = None,
-    sin_cache_hbm: Optional[nl.ndarray] = None,
+    cos_cache_hbm: Optional[nl.NkiTensor] = None,
+    sin_cache_hbm: Optional[nl.NkiTensor] = None,
     # FP8 KV Cache Quantization Related
-    q_tensor_hbm: Optional[nl.ndarray] = None,
-    k_cache_hbm: Optional[nl.ndarray] = None,
-    v_cache_hbm: Optional[nl.ndarray] = None,
-    k_scale_hbm: Optional[nl.ndarray] = None,
-    v_scale_hbm: Optional[nl.ndarray] = None,
+    q_tensor_hbm: Optional[nl.NkiTensor] = None,
+    k_cache_hbm: Optional[nl.NkiTensor] = None,
+    v_cache_hbm: Optional[nl.NkiTensor] = None,
+    k_scale_hbm: Optional[nl.NkiTensor] = None,
+    v_scale_hbm: Optional[nl.NkiTensor] = None,
     # Block KV Cache Related
-    slot_mapping_hbm: Optional[nl.ndarray] = None,
+    slot_mapping_hbm: Optional[nl.NkiTensor] = None,
     # Quantization Related
-    qkv_in_scale: Optional[nl.ndarray] = None,
-    qkv_w_scale: Optional[nl.ndarray] = None,
+    qkv_in_scale: Optional[nl.NkiTensor] = None,
+    qkv_w_scale: Optional[nl.NkiTensor] = None,
 ):
     """
     Core QKV CTE kernel implementation.
@@ -390,23 +389,23 @@ def _qkv_cte_impl(
     between HBM, SBUF, and PSUM.
 
     Args:
-        input_hbm (nl.ndarray): [dims.B, dims.S, dims.H], Input tensor on HBM
-        fused_qkv_weights_hbm (nl.ndarray): [dims.H, dims.I], Weight matrix on HBM
-        output_hbm (nl.ndarray): Output tensor on HBM with shape determined by cfg.output_layout
+        input_hbm (nl.NkiTensor): [dims.B, dims.S, dims.H], Input tensor on HBM
+        fused_qkv_weights_hbm (nl.NkiTensor): [dims.H, dims.I], Weight matrix on HBM
+        output_hbm (nl.NkiTensor): Output tensor on HBM with shape determined by cfg.output_layout
         cfg (QKV_CTE_Config): Kernel configuration object
         dims (QKV_CTE_Dims): Tensor dimensions object
         sbm (SbufManager): SBUF memory manager
-        bias_hbm (Optional[nl.ndarray]): [1, I], Optional bias tensor on HBM
-        mlp_prev_hbm (Optional[nl.ndarray]): [dims.B, dims.S, dims.H], Optional MLP residual on HBM
-        attention_prev_hbm (Optional[nl.ndarray]): [dims.B, dims.S, dims.H], Optional attention residual on HBM
-        gamma_norm_weights_hbm (Optional[nl.ndarray]): [1, H], Optional normalization weights on HBM
-        layer_norm_bias_hbm (Optional[nl.ndarray]): [1, H], Optional layer norm bias on HBM
+        bias_hbm (Optional[nl.NkiTensor]): [1, I], Optional bias tensor on HBM
+        mlp_prev_hbm (Optional[nl.NkiTensor]): [dims.B, dims.S, dims.H], Optional MLP residual on HBM
+        attention_prev_hbm (Optional[nl.NkiTensor]): [dims.B, dims.S, dims.H], Optional attention residual on HBM
+        gamma_norm_weights_hbm (Optional[nl.NkiTensor]): [1, H], Optional normalization weights on HBM
+        layer_norm_bias_hbm (Optional[nl.NkiTensor]): [1, H], Optional layer norm bias on HBM
         norm_eps (Optional[float]): Epsilon for normalization stability
-        cos_cache_hbm (Optional[nl.ndarray]): [B, S, d_head], Optional RoPE cosine cache on HBM
-        sin_cache_hbm (Optional[nl.ndarray]): [B, S, d_head], Optional RoPE sine cache on HBM
+        cos_cache_hbm (Optional[nl.NkiTensor]): [B, S, d_head], Optional RoPE cosine cache on HBM
+        sin_cache_hbm (Optional[nl.NkiTensor]): [B, S, d_head], Optional RoPE sine cache on HBM
 
     Returns:
-        nl.ndarray: Output tensor (same as output_hbm parameter)
+        nl.NkiTensor: Output tensor (same as output_hbm parameter)
 
     Notes:
         - Processes only dims.S_shard portion of sequence dimension when sharded
@@ -449,12 +448,12 @@ def _qkv_cte_impl(
     zero_bias_sb = tile_stream.alloc_logical(
         (nl.tile_size.pmax, 1), nl.tile_size.pmax, cfg.compute_mm_dtype, "zero_bias_sb", sbm
     )
-    nisa.memset(dst=zero_bias_sb.get_view(), value=0)
+    nisa.memset(dst=zero_bias_sb, value=0)
 
     norm_eps_sb = tile_stream.alloc_logical(
         (nl.tile_size.pmax, 1), nl.tile_size.pmax, cfg.compute_mm_dtype, "norm_eps_sb", sbm
     )
-    nisa.memset(dst=norm_eps_sb.get_view(), value=norm_eps)
+    nisa.memset(dst=norm_eps_sb, value=norm_eps)
 
     if cfg.add_bias:
         bias_sb = _load_and_broadcast_bias(bias_hbm=bias_hbm, cfg=cfg, dims=dims, sbm=sbm)
@@ -493,7 +492,7 @@ def _qkv_cte_impl(
 
         dma.Load(
             tile_stream.tile(weights_prefetched_sb, (nl.tile_size.pmax, I), iter_order=RowMajor()),
-            tile_stream.tile_hbm(TensorView(fused_qkv_weights_hbm), (nl.tile_size.pmax, I), iter_order=RowMajor()),
+            tile_stream.tile_hbm(fused_qkv_weights_hbm, (nl.tile_size.pmax, I), iter_order=RowMajor()),
         ).execute()
         weights_sb.append(weights_prefetched_sb)
 
@@ -647,9 +646,9 @@ def _qkv_cte_impl(
                             logical_p=H,
                         ),
                         src=tile_stream.tile_hbm(
-                            TensorView(input_hbm)
-                            .select(0, i_batch)
-                            .slice(0, s_tile_global_offset, s_tile_global_offset + s_tile_sz),
+                            input_hbm.select(0, i_batch).slice(
+                                0, s_tile_global_offset, s_tile_global_offset + s_tile_sz
+                            ),
                             (s_tile_sz, nl.tile_size.pmax),
                             iter_order=RowMajor(),
                         ),
@@ -749,9 +748,9 @@ def _qkv_cte_impl(
 
                     dma.Store(
                         dst=tile_stream.tile_hbm(
-                            TensorView(output_hbm)
-                            .select(0, i_batch)
-                            .slice(0, s_tile_global_offset, s_tile_global_offset + s_tile_sz),
+                            output_hbm.select(0, i_batch).slice(
+                                0, s_tile_global_offset, s_tile_global_offset + s_tile_sz
+                            ),
                             (s_tile_sz, I),
                             iter_order=RowMajor(),
                         ),
@@ -774,8 +773,7 @@ def _qkv_cte_impl(
 
                         dma.Store(
                             dst=tile_stream.tile_hbm(
-                                TensorView(output_hbm)
-                                .select(0, i_head)
+                                output_hbm.select(0, i_head)
                                 .select(0, i_batch)
                                 .slice(0, s_tile_global_offset, s_tile_global_offset + s_tile_sz)
                                 .slice(1, 0, num_d),
@@ -797,8 +795,8 @@ def _qkv_cte_impl(
 
 
 def _load_and_broadcast_bias(
-    bias_hbm: nl.ndarray, cfg: QKV_CTE_Config, dims: QKV_CTE_Dims, sbm: SbufManager
-) -> nl.ndarray:
+    bias_hbm: nl.NkiTensor, cfg: QKV_CTE_Config, dims: QKV_CTE_Dims, sbm: SbufManager
+) -> nl.NkiTensor:
     """
     Loads bias with shape [1,I] to SBUF and broadcasts it to [nl.tile_size.pmax, I], using stream_shuffle.
 
@@ -811,7 +809,7 @@ def _load_and_broadcast_bias(
     )
     dma.Load(
         tile_stream.tile(bias_sb.slice(0, 0, 1), (1, dims.I), iter_order=RowMajor()),
-        tile_stream.tile_hbm(TensorView(bias_hbm), (1, dims.I), iter_order=RowMajor()),
+        tile_stream.tile_hbm(bias_hbm, (1, dims.I), iter_order=RowMajor()),
     ).execute()
     blas.Broadcast(
         tile_stream.tile(bias_sb, (nl.tile_size.pmax, dims.I), iter_order=RowMajor()),
@@ -821,11 +819,11 @@ def _load_and_broadcast_bias(
 
 
 def _load_norm_weights(
-    norm_weights_hbm: nl.ndarray,
+    norm_weights_hbm: nl.NkiTensor,
     cfg: QKV_CTE_Config,
     dims: QKV_CTE_Dims,
     sbm: SbufManager,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Loads norm_weights with shape [H] to SBUF as [nl.tile_size.pmax, H // nl.tile_size.pmax].
 
@@ -856,7 +854,7 @@ def _load_norm_weights(
 
 
 def _multi_buffering_degree_for_seqlen(
-    cfg: QKV_CTE_Config, dims: QKV_CTE_Dims, sbm: SbufManager, qkv_in_scale: Optional[nl.ndarray] = None
+    cfg: QKV_CTE_Config, dims: QKV_CTE_Dims, sbm: SbufManager, qkv_in_scale: Optional[nl.NkiTensor] = None
 ) -> Tuple[int, int]:
     """
     Compute maximum multi-buffering degree that we can use for SEQLEN without over-flowing SBUF or PSUM space.
@@ -945,7 +943,7 @@ def _get_sbuf_space_taken_by_tensors_about_to_be_multi_buffered(
     dims: QKV_CTE_Dims,
     sbm: SbufManager,
     is_fp8_dma_xpose: bool = False,
-    qkv_in_scale: Optional[nl.ndarray] = None,
+    qkv_in_scale: Optional[nl.NkiTensor] = None,
 ) -> int:
     """
     Compute the total SBUF space taken (per partition) by simultaneously live tensors that will be multi-buffered in the kernel.
@@ -1009,26 +1007,26 @@ def _use_weight_prefetch(
 
 
 def _sv(tv, s_tile_sz, f_offset, f_size):
-    """Slice a TensorView to (s_tile_sz, f_size) at free-dim offset, returning nl.ndarray for nisa calls.
+    """Slice a nl.NkiTensor to (s_tile_sz, f_size) at free-dim offset, returning nl.NkiTensor for nisa calls.
     Assumes container shape (pdim, 1, F) from alloc_logical with n_p_tiles=1."""
-    return tv.slice(0, 0, s_tile_sz).select(1, 0).slice(1, f_offset, f_offset + f_size).get_view()
+    return tv.slice(0, 0, s_tile_sz).select(1, 0).slice(1, f_offset, f_offset + f_size)
 
 
 def _copy_psum_to_sbuf_apply_rope_and_bias(
-    qkv_MM_output_psum: List[nl.ndarray],
-    output_sb: List[nl.ndarray],
-    cos_buffer_sb: List[nl.ndarray],
-    sin_buffer_sb: List[nl.ndarray],
-    rope_intermediate_buffer_sb: List[nl.ndarray],
-    cos_cache_hbm: nl.ndarray,
-    sin_cache_hbm: nl.ndarray,
+    qkv_MM_output_psum: List[nl.NkiTensor],
+    output_sb: List[nl.NkiTensor],
+    cos_buffer_sb: List[nl.NkiTensor],
+    sin_buffer_sb: List[nl.NkiTensor],
+    rope_intermediate_buffer_sb: List[nl.NkiTensor],
+    cos_cache_hbm: nl.NkiTensor,
+    sin_cache_hbm: nl.NkiTensor,
     i_tile_S: int,
     s_tile_sz: int,
     i_batch: int,
     s_tile_local_offset: int,
     cfg: QKV_CTE_Config,
     dims: QKV_CTE_Dims,
-    bias_sb: Optional[nl.ndarray],
+    bias_sb: Optional[nl.NkiTensor],
 ) -> None:
     """
     Apply RoPE rotation to Q/K heads and copy V heads from PSUM matmul results to output buffer.
@@ -1048,7 +1046,7 @@ def _copy_psum_to_sbuf_apply_rope_and_bias(
     d_head = dims.d_head
     d_head_half = d_head // 2
 
-    # Get TensorView for this S tile's PSUM buffer (pmax, I)
+    # Get nl.NkiTensor for this S tile's PSUM buffer (pmax, I)
     psum_tv = qkv_MM_output_psum[i_tile_S]
     rope_tv = rope_intermediate_buffer_sb[i_tile_S]
     cos_tv = cos_buffer_sb[i_tile_S]
@@ -1060,9 +1058,7 @@ def _copy_psum_to_sbuf_apply_rope_and_bias(
     dma.Load(
         tile_stream.tile(cos_tv, (s_tile_sz, d_head), iter_order=RowMajor(), logical_p=s_tile_sz),
         tile_stream.tile_hbm(
-            TensorView(cos_cache_hbm)
-            .select(0, i_batch)
-            .slice(0, s_tile_global_offset, s_tile_global_offset + s_tile_sz),
+            cos_cache_hbm.select(0, i_batch).slice(0, s_tile_global_offset, s_tile_global_offset + s_tile_sz),
             (s_tile_sz, d_head),
             iter_order=RowMajor(),
         ),
@@ -1071,8 +1067,7 @@ def _copy_psum_to_sbuf_apply_rope_and_bias(
     dma.Load(
         tile_stream.tile(sin_tv, (s_tile_sz, d_head_half), iter_order=RowMajor(), logical_p=s_tile_sz),
         tile_stream.tile_hbm(
-            TensorView(sin_cache_hbm)
-            .select(0, i_batch)
+            sin_cache_hbm.select(0, i_batch)
             .slice(0, s_tile_global_offset, s_tile_global_offset + s_tile_sz)
             .slice(1, 0, d_head_half),
             (s_tile_sz, d_head_half),

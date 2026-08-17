@@ -19,7 +19,6 @@ from typing import Tuple, Union
 import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
-from ....core.utils.tensor_view import TensorView
 from ..iter_order import ColMajor, RowMajor
 
 
@@ -29,17 +28,17 @@ def div_ceil(a: int, b: int) -> int:
 
 
 def prepare_hbm_view(
-    hbm_source: Union[nl.ndarray, TensorView],
+    hbm_source: Union[nl.NkiTensor, nl.NkiTensor],
     tile_shape: Tuple[int, ...],
-) -> Tuple[TensorView, Tuple[int, ...]]:
+) -> Tuple[nl.NkiTensor, Tuple[int, ...]]:
     """Prepare HBM view for tiled access and compute tile_dims.
 
     Returns (view, tile_dims) where tile_dims maps tile dimensions to physical dims.
     P is always placed at dim 0; F is always the last dim."""
-    if isinstance(hbm_source, TensorView):
+    if isinstance(hbm_source, nl.NkiTensor):
         view = hbm_source
     else:
-        view = TensorView(hbm_source)
+        view = hbm_source
 
     ndim = len(view.shape)
 
@@ -60,22 +59,22 @@ class HBMStream(nl.NKIObject):
 
     def __init__(
         self,
-        hbm_source: Union[nl.ndarray, TensorView],
+        hbm_source: Union[nl.NkiTensor, nl.NkiTensor],
         tile_shape: Tuple[int, ...],
         iter_order: Union[RowMajor, ColMajor] = None,
         tile_dims: Tuple[int, ...] = None,
     ) -> None:
         """
         Args:
-            hbm_source: HBM tensor or TensorView
+            hbm_source: HBM tensor or nl.NkiTensor
             tile_shape: Shape of each tile
             iter_order: Iteration order (RowMajor or ColMajor). Defaults to RowMajor.
             tile_dims: Which logical dims to tile. If None, defaults to trailing dims.
         """
-        if isinstance(hbm_source, TensorView):
+        if isinstance(hbm_source, nl.NkiTensor):
             self._hbm_view = hbm_source
         else:
-            self._hbm_view = TensorView(hbm_source)
+            self._hbm_view = hbm_source
 
         self._tile_shape = tile_shape
         self._iter_order = iter_order if iter_order is not None else RowMajor()
@@ -133,7 +132,7 @@ class HBMStream(nl.NKIObject):
                 grid.append(div_ceil(physical[dim], self._tile_sizes[dim]))
         return tuple(grid)
 
-    def get_tile(self) -> TensorView:
+    def get_tile(self) -> nl.NkiTensor:
         """Get current tile and advance iterator."""
         kernel_assert(self._cur_tile[0] < self._tile_grid[0], "HBMStream tile grid exhausted")
 
@@ -141,7 +140,7 @@ class HBMStream(nl.NKIObject):
         self._iter_order.advance(self._cur_tile, self._tile_grid)
         return tile
 
-    def get_tile_at_index(self, grid_pos: Tuple[int, ...]) -> TensorView:
+    def get_tile_at_index(self, grid_pos: Tuple[int, ...]) -> nl.NkiTensor:
         """Get tile at specified grid position (in logical dimension order)."""
         physical = self._physical_shape
         physical_ndim = len(physical)

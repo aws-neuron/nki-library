@@ -26,7 +26,7 @@ def get_nki_framework_kernels(proven_names: set[str]) -> list[KernelLocation]:
     invocable as top-level framework kernels.
     """
     public, _, _ = get_nki_kernels_split()
-    wrapped_names: set[str] = set(loc.name for loc in get_nki_wrapped_kernels().keys())
+    wrapped_names: set[str] = {loc.name for loc in get_nki_wrapped_kernels().keys()}
 
     return [
         loc

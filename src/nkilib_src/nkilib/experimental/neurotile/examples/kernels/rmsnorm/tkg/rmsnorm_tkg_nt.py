@@ -82,8 +82,10 @@ def rmsnorm_tkg(
 
     # -- Hoisted loads ------------------------------------------
 
-    # Gamma: [1, H] -> [H0, H1] via contiguous reshape
-    gamma_sb = nt.tensor_view(gamma).reshape((H0, H1)).load()
+    # Gamma: [1, H] -> [H0, H1] via contiguous reshape, loaded in one DMA.
+    # No tiling here -- a transformed NkiTensor is a valid dma_copy source.
+    gamma_sb = nl.ndarray((H0, H1), dtype=gamma.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gamma_sb, src=gamma.reshape((H0, H1)))
 
     # All-ones [H0, H0] for partition-dim reduction via nc_matmul
     ones = nl.ndarray((H0, H0), dtype=nl.float32, buffer=nl.sbuf)
@@ -95,8 +97,7 @@ def rmsnorm_tkg(
 
     # -- Permuted view + sharded tiles --------------------------
     hidden = (
-        nt.tensor_view(hidden)
-        .flatten_dims(0, 1)  # [BxS, H]
+        hidden.flatten_dims(0, 1)  # [BxS, H]
         .reshape_dim(1, (H0, H1))  # [BxS, H0, H1]
         .permute((1, 0, 2))  # [H0, BxS, H1]
     )
@@ -109,8 +110,8 @@ def rmsnorm_tkg(
     x_tiles = nt.tiles(hidden, tile_size=tile_size)[:, shard_range, :]
 
     # Pre-allocate SBUF output: full BxS (both shards) for sendrecv exchange.
-    full_buf = nl.ndarray(hidden.element_shape, dtype=hidden.dtype, buffer=nl.sbuf)
-    out_tiles = nt.tiles(full_buf, tile_size=tile_size, buffer_type=nl.sbuf)[:, shard_range, :]
+    full_buf = nl.ndarray(hidden.shape, dtype=hidden.dtype, buffer=nl.sbuf)
+    out_tiles = nt.tiles(full_buf, tile_size=tile_size)[:, shard_range, :]
 
     for tile_idx in range(x_tiles.shape[1]):
         out_data = out_tiles[0, tile_idx, 0].data
@@ -133,21 +134,19 @@ def rmsnorm_tkg(
         # Step 5: rsqrt
         nisa.activation(reduced, op=nl.rsqrt, data=full_reduced, scale=1.0 / H_denom, bias=eps_sb)
 
-        # Step 6: gamma * x (broadcast gamma via stride-0 AP)
-        gamma_bc = nt.tensor_view(gamma_sb.data, buffer_type=nl.sbuf)
-        gamma_bc = gamma_bc.expand_dim(1).broadcast(1, bxs_tile)
+        # Step 6: gamma * x (broadcast gamma via stride-0 view on the NkiTensor)
+        gamma_bc = gamma_sb.expand_dim(1).broadcast(1, bxs_tile)
         gamma_x = nl.ndarray(tile_size, dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(gamma_x, out_data, gamma_bc.ap(), nl.multiply)
+        nisa.tensor_tensor(gamma_x, out_data, gamma_bc, nl.multiply)
 
-        # Step 7: (gamma * x) * inv_rms -> output slot (broadcast via stride-0 AP)
-        inv_rms_bc = nt.tensor_view(reduced, buffer_type=nl.sbuf)
-        inv_rms_bc = inv_rms_bc.expand_dim(2).broadcast(2, H1)
-        nisa.tensor_tensor(out_data, gamma_x, inv_rms_bc.ap(), nl.multiply)
+        # Step 7: (gamma * x) * inv_rms -> output slot (broadcast via stride-0 view)
+        inv_rms_bc = reduced.expand_dim(2).broadcast(2, H1)
+        nisa.tensor_tensor(out_data, gamma_x, inv_rms_bc, nl.multiply)
 
     # -- Exchange shards ----------------------------------------
     if do_shard:
         other_id = 1 - shard_id
-        shard_tiles = nt.tiles(full_buf, tile_size=(H0, shard_size, H1), buffer_type=nl.sbuf)
+        shard_tiles = nt.tiles(full_buf, tile_size=(H0, shard_size, H1))
         nisa.sendrecv(
             dst=shard_tiles[0, other_id, 0].data,
             src=shard_tiles[0, shard_id, 0].data,

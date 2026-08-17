@@ -18,7 +18,6 @@ import itertools
 import random
 
 import pytest
-
 from nkilib_src.nkilib.core.router_topk.router_topk import (
     XHBMLayout_H_T__0,
     XHBMLayout_T_H__1,
@@ -27,6 +26,7 @@ from nkilib_src.nkilib.core.router_topk.router_topk import (
     XSBLayout_tp2013__1,
 )
 from nkilib_src.nkilib.core.utils.common_types import RouterActFnType
+
 from test.integration.nkilib.core.router_topk.test_router_topk_common import (
     generate_router_topk_inputs,
     router_topk_kernel_wrapper,

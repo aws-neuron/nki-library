@@ -18,7 +18,9 @@ from ._helpers import (
     contiguous_ap_pattern,
     contiguous_strides,
     p_tile_count,
+    physical_row_width,
     product,
+    reachable_dim_extent,
     remove_at,
     validate_index_key,
 )
@@ -380,6 +382,14 @@ class SBUFLayout(nl.NKIObject):
             return 0
         return (self.offset // inner_span) % element_shape[dim]
 
+    def dim_addressable(self, dim, grid):
+        """Source elements reachable on `dim` before walking off the source.
+
+        See :func:`reachable_dim_extent` for the shared offset-clamp rule;
+        this is the SBUF-layout entry point into it.
+        """
+        return reachable_dim_extent(grid, self, dim)
+
     def is_remainder(self, grid):
         """True when this view sits on a partial trailing tile.
 
@@ -559,8 +569,12 @@ class SBUFLayout(nl.NKIObject):
             data = src[:, nl.ds(self.offset, actual_f)]
         else:
             data = self.tile_data()
-        pattern = []
-        for d in range(len(remaining)):
+        # Level 0 pins to the buffer's physical row width (what the compiler
+        # validates), not the logical tile width -- a sub-tile of a multi-tile
+        # allocation is backed by a wider buffer. Inner levels keep the
+        # transform's strides (stride-0 broadcast, contiguous, etc).
+        pattern = [[SBUFLayout._partition_row_stride(data), remaining[0]]]
+        for d in range(1, len(remaining)):
             pattern.append([self.ap_strides[d], remaining[d]])
         return data.ap(pattern=pattern)
 
@@ -569,12 +583,19 @@ class SBUFLayout(nl.NKIObject):
         remaining = grid.remaining
         tile_p = self.alloc_tile_size[0]
         p_tiles = p_tile_count(remaining[0], tile_p)
+        # Single P-tile: the AP level-0 count is the ADDRESSABLE P (grid.remaining[0]),
+        # not the uniform alloc tile_p -- so .data on a partial P-tile (element_shape[0]
+        # < tile_p) reports its real height (e.g. 44), matching how a partial trailing
+        # F-tile already reports its real width. Multi-P-tile (p_tiles > 1) keeps tile_p:
+        # the fold packs full-height P-tiles into F, and any trailing P-partial is
+        # resolved per-tile by the Grid, not here.
+        ap_tile_p = min(tile_p, remaining[0]) if p_tiles == 1 else tile_p
         slice_f = self._walked_f_extent(grid)
         if self.offset + slice_f <= self.source.shape[-1]:
             data = self.source[:, self.offset : self.offset + slice_f]
         else:
             data = self.tile_data()
-        return SBUFLayout._build_ap(data, remaining, tile_p, p_tiles, grid=grid)
+        return SBUFLayout._build_ap(data, remaining, ap_tile_p, p_tiles, grid=grid)
 
     def _walked_f_extent(self, grid):
         """F-column span actually walked from the current offset.
@@ -640,23 +661,12 @@ class SBUFLayout(nl.NKIObject):
     def _partition_row_stride(sbuf):
         """Element distance between adjacent SBUF partition rows.
 
-        SBUF is partition-major: row p of the underlying ndarray starts at
-        flat element offset ``p * product(underlying_F_dims)`` from row 0.
-        The new ``nki`` compiler validates that level-0 of every emitted AP
-        pattern equals this value -- crucially, against the underlying
-        ndarray's free width (``_storage_shape``), not the sliced view's
-        narrow free width (``shape``). NKI views preserve ``_storage_shape``
-        through ``[:, slice]`` indexing, so reading from it gives the
-        compiler-valid stride for both full buffers and sliced views.
-
-        ``hasattr`` is used (not ``getattr(default=...)``) because the NKI
-        kernel tracer rejects ``builtins.getattr`` during static analysis.
+        SBUF is partition-major: the new ``nki`` compiler validates that level-0
+        of every emitted AP pattern equals the underlying ndarray's physical free
+        width -- not a sliced view's narrow free width -- so this reads the
+        physical row width (preserved through ``[:, slice]`` indexing).
         """
-        if hasattr(sbuf, "_storage_shape"):
-            underlying_shape = sbuf._storage_shape
-        else:
-            underlying_shape = sbuf.shape
-        return product(tuple(underlying_shape), start=1)
+        return physical_row_width(sbuf)
 
     @staticmethod
     def _build_default_ap(sbuf, remaining, tile_p, p_tiles):

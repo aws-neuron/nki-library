@@ -17,7 +17,6 @@ Unit tests for param_extractor module.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 from unittest.mock import Mock
 
 import pytest
@@ -30,7 +29,6 @@ from ..utils.param_extractor import (
     extract_pytest_params,
     normalize_param_names,
     normalize_param_value,
-    normalize_params_with_type_hints,
 )
 
 
@@ -40,13 +38,6 @@ class SampleEnum(Enum):
     VALUE_A = 0
     VALUE_B = 1
     VALUE_C = 2
-
-
-class AnotherEnum(Enum):
-    """Another enum for testing suffix matching."""
-
-    TYPE_X = 0
-    TYPE_Y = 1
 
 
 class TestNormalizeParamValue:
@@ -122,7 +113,10 @@ class TestUnwrapKernelFunc:
 
     def test_unwraps_func_attribute(self):
         """Objects with 'func' attribute are unwrapped."""
-        original = lambda: None
+
+        def original():
+            return None
+
         mock_kernel = Mock()
         mock_kernel.func = original
 
@@ -131,144 +125,33 @@ class TestUnwrapKernelFunc:
 
     def test_unwraps_wrapped_attribute(self):
         """Decorated functions with __wrapped__ are unwrapped."""
-        original = lambda: None
-        decorated = lambda: None
+
+        def original():
+            return None
+
+        def decorated():
+            return None
+
         decorated.__wrapped__ = original
 
         assert _unwrap_kernel_func(decorated) is original
 
     def test_recursive_unwrap(self):
         """Nested wrappers are unwrapped recursively."""
-        original = lambda: None
+
+        def original():
+            return None
 
         # Create nested wrapper: GenericKernel(decorated(original))
-        decorated = lambda: None
+        def decorated():
+            return None
+
         decorated.__wrapped__ = original
         mock_kernel = Mock()
         mock_kernel.func = decorated
 
         result = _unwrap_kernel_func(mock_kernel)
         assert result is original
-
-
-class TestNormalizeParamsWithTypeHints:
-    """Tests for normalize_params_with_type_hints function."""
-
-    def test_empty_params_returns_empty(self):
-        """Empty params dict returns empty dict."""
-
-        def kernel_func(x: int):
-            pass
-
-        assert normalize_params_with_type_hints({}, kernel_func) == {}
-
-    def test_none_kernel_func_uses_basic_normalization(self):
-        """When kernel_func is None, basic normalization is applied."""
-        params = {"value": SampleEnum.VALUE_A, "count": 5}
-        result = normalize_params_with_type_hints(params, None)
-        assert result == {"value": "VALUE_A", "count": 5}
-
-    def test_int_converted_to_enum_name(self):
-        """Integer values are converted to enum names when type hint matches."""
-
-        def kernel_func(mode: SampleEnum):
-            pass
-
-        params = {"mode": 1}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"mode": "VALUE_B"}
-
-    def test_int_converted_to_bool(self):
-        """Integer values are converted to bool when type hint is bool."""
-
-        def kernel_func(enabled: bool):
-            pass
-
-        params = {"enabled": 1}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"enabled": True}
-
-        params = {"enabled": 0}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"enabled": False}
-
-    def test_optional_bool_converted(self):
-        """Integer values are converted to bool for Optional[bool] type hints."""
-
-        def kernel_func(flag: Optional[bool]):
-            pass
-
-        params = {"flag": 1}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"flag": True}
-
-    def test_suffix_matching_for_enums(self):
-        """Enum type hints match by suffix (e.g., 'type' matches 'norm_type')."""
-
-        def kernel_func(norm_type: SampleEnum):
-            pass
-
-        params = {"type": 0}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"type": "VALUE_A"}
-
-    def test_suffix_matching_for_bools(self):
-        """Bool type hints match by suffix."""
-
-        def kernel_func(use_bias: bool):
-            pass
-
-        params = {"bias": 1}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"bias": True}
-
-    def test_enum_value_passes_through_as_name(self):
-        """Enum values are converted to their name string."""
-
-        def kernel_func(mode: SampleEnum):
-            pass
-
-        params = {"mode": SampleEnum.VALUE_C}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"mode": "VALUE_C"}
-
-    def test_non_integer_values_pass_through(self):
-        """Non-integer values pass through unchanged."""
-
-        def kernel_func(name: str, ratio: float):
-            pass
-
-        params = {"name": "test", "ratio": 0.5}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"name": "test", "ratio": 0.5}
-
-    def test_none_values_filtered_out(self):
-        """None values are filtered from the result."""
-
-        def kernel_func(x: int):
-            pass
-
-        params = {"x": None, "y": 5}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"y": 5}
-
-    def test_invalid_enum_value_keeps_original(self):
-        """Invalid enum integer values keep the original value."""
-
-        def kernel_func(mode: SampleEnum):
-            pass
-
-        params = {"mode": 999}  # Invalid enum value
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"mode": 999}
-
-    def test_type_hints_unavailable_falls_back(self):
-        """Falls back to basic normalization when type hints unavailable."""
-        # Lambda functions don't have type hints accessible
-        kernel_func = lambda x: x
-        params = {"value": SampleEnum.VALUE_A, "count": 5}
-        result = normalize_params_with_type_hints(params, kernel_func)
-        assert result == {"value": "VALUE_A", "count": 5}
 
 
 class TestExtractPytestParams:

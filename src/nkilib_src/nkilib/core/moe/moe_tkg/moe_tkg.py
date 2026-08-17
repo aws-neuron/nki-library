@@ -55,22 +55,22 @@ _MOE_TKG_ERROR_PREFIX = "[MoE TKG Kernel]"
 
 @nki.jit
 def moe_tkg(
-    hidden_input: nl.ndarray,
-    expert_gate_up_weights: nl.ndarray,
-    expert_down_weights: nl.ndarray,
-    expert_affinities: nl.ndarray,
-    expert_index: nl.ndarray,
+    hidden_input: nl.NkiTensor,
+    expert_gate_up_weights: nl.NkiTensor,
+    expert_down_weights: nl.NkiTensor,
+    expert_affinities: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
     is_all_expert: bool,
-    rank_id: Optional[nl.ndarray] = None,
-    expert_gate_up_bias: Optional[nl.ndarray] = None,
-    expert_down_bias: Optional[nl.ndarray] = None,
-    expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
-    expert_down_weights_scale: Optional[nl.ndarray] = None,
-    hidden_input_scale: Optional[nl.ndarray] = None,
-    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
-    expert_down_input_scale: Optional[nl.ndarray] = None,
+    rank_id: Optional[nl.NkiTensor] = None,
+    expert_gate_up_bias: Optional[nl.NkiTensor] = None,
+    expert_down_bias: Optional[nl.NkiTensor] = None,
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
+    expert_down_weights_scale: Optional[nl.NkiTensor] = None,
+    hidden_input_scale: Optional[nl.NkiTensor] = None,
+    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
+    expert_down_input_scale: Optional[nl.NkiTensor] = None,
     mask_unselected_experts: bool = False,
-    expert_affinities_eager: Optional[nl.ndarray] = None,
+    expert_affinities_eager: Optional[nl.NkiTensor] = None,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
     activation_fn: ActFnType = ActFnType.SiLU,
     output_dtype: nki.dtype = None,
@@ -81,12 +81,12 @@ def moe_tkg(
     output_in_sbuf: bool = False,
     is_all_expert_dynamic: bool = False,
     block_size: int = None,
-    input_dequant_scale: Optional[nl.ndarray] = None,
+    input_dequant_scale: Optional[nl.NkiTensor] = None,
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
     output_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
-    output: Optional[nl.ndarray] = None,
+    output: Optional[nl.NkiTensor] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Mixture of Experts (MoE) MLP token generation kernel.
 
@@ -108,47 +108,48 @@ def moe_tkg(
             and global token index are concatenated and bitcast to a common fp8 dtype.
 
     Args:
-        hidden_input (nl.ndarray): [T, H] or [T, H_concat] in HBM or [H0, T, H1] in SBUF, Input hidden states tensor.
+        hidden_input (nl.NkiTensor): [T, H] or [T, H_concat] in HBM or [H0, T, H1] in SBUF, Input hidden states tensor.
             When all_to_all_v_strategy != DISABLED, input is expected to have layout [T, H_concat] and fp8 dtype,
             where H_concat = H + H/4 + E_L * 2 + 4 (hidden_quant | hidden_scale | expert_affinities | token_indices).
-        expert_gate_up_weights (nl.ndarray): [E_L, H, 2, I] for bf16/fp16 or [E_L, 128, 2, ceil(H/512), I] for MxFP4,
+        expert_gate_up_weights (nl.NkiTensor): [E_L, H, 2, I] for bf16/fp16 or [E_L, 128, 2, ceil(H/512), I] for MxFP4,
             Fused gate and up projection weights.
-        expert_down_weights (nl.ndarray): [E_L, I, H] for bf16/fp16 or [E_L, I_p, ceil(I/512), H] for MxFP4,
+        expert_down_weights (nl.NkiTensor): [E_L, I, H] for bf16/fp16 or [E_L, I_p, ceil(I/512), H] for MxFP4,
             Down projection weights.
-        expert_affinities (nl.ndarray): [T, E], Expert routing weights/affinities. None when
+        expert_affinities (nl.NkiTensor): [T, E], Expert routing weights/affinities. None when
             all_to_all_v_strategy != DISABLED (affinities are packed in hidden_input). For all-expert mode with
             affinity scaling, this will be sliced to [T, E_L] internally.
-        expert_index (nl.ndarray): [T, K], Top-K expert indices per token. None when
+        expert_index (nl.NkiTensor): [T, K], Top-K expert indices per token. None when
             all_to_all_v_strategy != DISABLED.
         is_all_expert (bool): If True, process all experts for all tokens; otherwise, process only selected
             top-k experts.
-        rank_id (nl.ndarray, optional): [1, 1], Rank ID tensor specifying which worker processes experts
+        rank_id (nl.NkiTensor, optional): [1, 1], Rank ID tensor specifying which worker processes experts
             [E_L * rank_id, E_L * (rank_id + 1)). Required for all-expert mode with affinity scaling enabled.
-        expert_gate_up_bias (nl.ndarray, optional): [E_L, 2, I] for non-MX or [E_L, I_p, 2, ceil(I/512), 4]
+        expert_gate_up_bias (nl.NkiTensor, optional): [E_L, 2, I] for non-MX or [E_L, I_p, 2, ceil(I/512), 4]
             for MX, Bias for gate/up projections.
-        expert_down_bias (nl.ndarray, optional): [E_L, H], Bias for down projection.
-        expert_gate_up_weights_scale (nl.ndarray, optional): [E_L, 2, I] for FP8 row quantization, [E_L, 2, 1] for
+        expert_down_bias (nl.NkiTensor, optional): [E_L, H], Bias for down projection.
+        expert_gate_up_weights_scale (nl.NkiTensor, optional): [E_L, 2, I] for FP8 row quantization, [E_L, 2, 1] for
             FP8 static quantization, or [E_L, 128/8, 2, ceil(H/512), I] for MxFP4, Quantization scales for
             gate/up weights.
-        expert_down_weights_scale (nl.ndarray, optional): [E_L, H] for FP8 row quantization, [E_L, 1] for FP8 static
+        expert_down_weights_scale (nl.NkiTensor, optional): [E_L, H] for FP8 row quantization, [E_L, 1] for FP8 static
             quantization, or [E_L, I_p/8, ceil(I/512), H] for MxFP4, Quantization scales for down weights.
-        hidden_input_scale (nl.ndarray, optional): [H0, H/512, T], MX quantization scale for pre-quantized
+        hidden_input_scale (nl.NkiTensor, optional): [H0, H/512, T], MX quantization scale for pre-quantized
             hidden_input in SBUF. When provided with MX weights in all-expert mode, indicates that hidden_input
             is already quantized and skips internal swizzle + quantization. The hidden_input buffer must be in
             SBUF when hidden_input_scale is provided. dtype: nl.uint8.
-        expert_gate_up_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for gate/up input.
+        expert_gate_up_input_scale (nl.NkiTensor, optional): [E_L, 1], FP8 dequantization scales for gate/up input.
             Used for static quantization.
-        expert_down_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for down input. Used for
+        expert_down_input_scale (nl.NkiTensor, optional): [E_L, 1], FP8 dequantization scales for down input. Used for
             static quantization.
         mask_unselected_experts (bool): Whether to apply expert affinity masking based on expert_index. When
             True, affinities are masked to zero for experts not selected by each token. Only used in all-expert
             mode with affinity scaling. (default: False)
-        expert_affinities_eager (nl.ndarray, optional): [T, K], Eager expert affinities. Not used in
+        expert_affinities_eager (nl.NkiTensor, optional): [T, K], Eager expert affinities. Not used in
             all_expert mode.
         expert_affinities_scaling_mode (ExpertAffinityScaleMode): When to apply affinity scaling. Supported
             values: NO_SCALE, POST_SCALE. (default: NO_SCALE)
         activation_fn (ActFnType): Activation function type. (default: SiLU)
-        output_dtype: Output tensor data type. Defaults to None; if None, uses hidden_input dtype.
+        output_dtype: Output tensor data type. Defaults to None.
+            If None, uses hidden_input dtype when hidden_input is a ≥ 2 byte dtype or bf16 when hidden_input is quantized.
         gate_clamp_upper_limit (float, optional): Upper bound value to clamp gate projection results.
         gate_clamp_lower_limit (float, optional): Lower bound value to clamp gate projection results.
         up_clamp_upper_limit (float, optional): Upper bound value to clamp up projection results.
@@ -160,8 +161,8 @@ def moe_tkg(
         block_size (int): Block size for all-expert dynamic algorithm, used to group tokens for dynamic control flow. Required argument
             when is_all_expert_dynamic=True. block_size must:
             - Evenly divide T, resulting in at least 2 blocks.
-            - Be divisible by 8 and less than 32, divisible by 32 and less than 128, or divisible by 128.
-        input_dequant_scale (nl.ndarray, optional): [128, 1] in SBUF, Pre-computed input FP8 dequantization
+            - Be divisible by 4 and ≤ 32, divisible by 32 and ≤ 128, or divisible by 128.
+        input_dequant_scale (nl.NkiTensor, optional): [128, 1] in SBUF, Pre-computed input FP8 dequantization
             scale for STATIC_MX mode. Passed from moe_block_tkg which computes it during the fused
             RMSNorm+quantize step. Used by the all-expert MX path to combine with per-expert weight
             dequant scales for post-matmul dequantization. Derived from expert_gate_up_input_scale.
@@ -182,7 +183,7 @@ def moe_tkg(
               elsewhere.
 
     Returns:
-        output (nl.ndarray): [T, H] or [128, n_prgs, H//128//n_prgs, T] depending on output_layout,
+        output (nl.NkiTensor): [T, H] or [128, n_prgs, H//128//n_prgs, T] depending on output_layout,
             or same shape as hidden_input if output_in_sbuf=True. Output tensor with
             MoE computation results.
 
@@ -259,11 +260,9 @@ def moe_tkg(
         block_size=block_size,
     )
 
-    output_dtype = hidden_input.dtype if output_dtype == None else output_dtype
-    kernel_assert(
-        sizeinbytes(output_dtype) >= 2,
-        f"output_dtype must be at least a 2-byte dtype, got {output_dtype}",
-    )
+    # Default output_dtype to hidden_input.dtype when hidden_input is not quantized, and bf16 when hidden_input is quantized.
+    if output_dtype is None:
+        output_dtype = hidden_input.dtype if sizeinbytes(hidden_input.dtype) >= 2 else nl.bfloat16
 
     # Column tiling improves PE utilization for small T (32, 64, 128) but requires:
     #   - Quantized weights (FP8): unquantized bf16/fp16 weights are not supported
@@ -328,6 +327,7 @@ def moe_tkg(
         expert_gate_up_input_scale=expert_gate_up_input_scale,
         expert_down_input_scale=expert_down_input_scale,
         expert_affinities_eager=expert_affinities_eager,
+        output_dtype=output_dtype,
     )
 
     # Allocate output tensor if not provided by caller
@@ -366,21 +366,21 @@ def moe_tkg(
 
 
 def _extract_quantization_type(
-    expert_gate_up_weights: nl.ndarray,
-    expert_gate_up_weights_scale: Optional[nl.ndarray],
-    expert_down_weights_scale: Optional[nl.ndarray],
-    expert_gate_up_input_scale: Optional[nl.ndarray],
-    expert_down_input_scale: Optional[nl.ndarray],
+    expert_gate_up_weights: nl.NkiTensor,
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor],
+    expert_down_weights_scale: Optional[nl.NkiTensor],
+    expert_gate_up_input_scale: Optional[nl.NkiTensor],
+    expert_down_input_scale: Optional[nl.NkiTensor],
 ) -> tuple[QuantizationType, bool]:
     """
     Extract quantization type from kernel parameters.
 
     Args:
-        expert_gate_up_weights (nl.ndarray): Gate/up projection weights tensor.
-        expert_gate_up_weights_scale (nl.ndarray, optional): Quantization scale for gate/up weights.
-        expert_down_weights_scale (nl.ndarray, optional): Quantization scale for down weights.
-        expert_gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
-        expert_down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
+        expert_gate_up_weights (nl.NkiTensor): Gate/up projection weights tensor.
+        expert_gate_up_weights_scale (nl.NkiTensor, optional): Quantization scale for gate/up weights.
+        expert_down_weights_scale (nl.NkiTensor, optional): Quantization scale for down weights.
+        expert_gate_up_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for gate/up input.
+        expert_down_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for down input.
 
     Returns:
         tuple[QuantizationType, bool]: (quant_type, is_mx_kernel) tuple indicating the detected
@@ -418,13 +418,14 @@ def _validate_moe_tkg_inputs(
     block_size: int,
     is_mx_kernel: bool,
     expert_weight_dtype: nki.dtype,
-    expert_gate_up_weights_scale: Optional[nl.ndarray],
-    expert_down_weights_scale: Optional[nl.ndarray],
-    hidden_input_scale: Optional[nl.ndarray],
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor],
+    expert_down_weights_scale: Optional[nl.NkiTensor],
+    hidden_input_scale: Optional[nl.NkiTensor],
     expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-    expert_gate_up_input_scale: Optional[nl.ndarray],
-    expert_down_input_scale: Optional[nl.ndarray],
-    expert_affinities_eager: Optional[nl.ndarray],
+    expert_gate_up_input_scale: Optional[nl.NkiTensor],
+    expert_down_input_scale: Optional[nl.NkiTensor],
+    expert_affinities_eager: Optional[nl.NkiTensor],
+    output_dtype: nki.dtype,
 ) -> None:
     """
     Validate MoE TKG kernel input parameters.
@@ -435,13 +436,14 @@ def _validate_moe_tkg_inputs(
         is_all_expert_dynamic (bool): Whether all-expert mode uses dynamic control flow.
         is_all_to_all_v (bool): Whether MoE layer uses all_to_all_v collective, which provides sparse input and requires shuffled output.
         is_mx_kernel (bool): Whether using MX quantization.
-        expert_gate_up_weights_scale (nl.ndarray, optional): Quantization scale for gate/up weights.
-        expert_down_weights_scale (nl.ndarray, optional): Quantization scale for down weights.
-        hidden_input_scale (nl.ndarray, optional): MX quantization scale for hidden input.
+        expert_gate_up_weights_scale (nl.NkiTensor, optional): Quantization scale for gate/up weights.
+        expert_down_weights_scale (nl.NkiTensor, optional): Quantization scale for down weights.
+        hidden_input_scale (nl.NkiTensor, optional): MX quantization scale for hidden input.
         expert_affinities_scaling_mode (ExpertAffinityScaleMode): When to apply affinity scaling.
-        expert_gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
-        expert_down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
-        expert_affinities_eager (nl.ndarray, optional): Eager expert affinities.
+        expert_gate_up_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for gate/up input.
+        expert_down_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for down input.
+        expert_affinities_eager (nl.NkiTensor, optional): Eager expert affinities.
+        output_dtype (nki.dtype): Resolved output dtype (must be at least 2 bytes).
 
     Returns:
         None
@@ -500,6 +502,11 @@ def _validate_moe_tkg_inputs(
     kernel_assert(
         expert_affinities_scaling_mode != ExpertAffinityScaleMode.PRE_SCALE,
         f"{_MOE_TKG_ERROR_PREFIX} Kernel does not support pre-scale mode",
+    )
+
+    kernel_assert(
+        sizeinbytes(output_dtype) >= 2,
+        f"{_MOE_TKG_ERROR_PREFIX} output_dtype must be at least a 2-byte dtype, got {output_dtype}",
     )
 
     # Static quantization without MX weights: input stays BF16, TRN2 does BF16 × FP8 matmul.

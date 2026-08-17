@@ -17,7 +17,6 @@ import enum
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import (
     output_projection_tkg_torch_ref,
 )
@@ -26,6 +25,7 @@ from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib_src.nkilib.experimental.output_projection.output_projection_tkg_primitives import (
     output_projection_primitives,
 )
+
 from test.integration.nkilib.utils.tensor_generators import (
     FP8_E4M3_MAX,
     gaussian_tensor_generator,

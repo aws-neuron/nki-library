@@ -26,7 +26,6 @@ from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type, get_verified_program_sharding_info
 from ...utils.logging import get_logger
-from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
     BS_TILE_SIZE,
@@ -73,16 +72,16 @@ class RowMxPreallocBuffers(nl.NKIObject):
 
 def _mlp_tkg_row_mx_impl(
     params: MLPParameters,
-    output_tensor_hbm: nl.ndarray,
-    output_stored_add_tensor_hbm: nl.ndarray,
+    output_tensor_hbm: nl.NkiTensor,
+    output_stored_add_tensor_hbm: nl.NkiTensor,
     name_prefix: str = "",
     sbm: SbufManager = None,
     mx_buf: RowMxPreallocBuffers = None,
-    inp_qtz_in: TensorView = None,
+    inp_qtz_in: nl.NkiTensor = None,
     skip_norm: bool = False,
     skip_output_store: bool = False,
     activation_op=None,
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """
     MLP TKG kernel with ROW_MX (row-wise / dynamic) FP8 quantization.
 
@@ -101,11 +100,11 @@ def _mlp_tkg_row_mx_impl(
 
     Args:
         params (MLPParameters): MLP configuration with FP8 quantized weights.
-        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM
-        output_stored_add_tensor_hbm (nl.ndarray): Optional fused add output in HBM
+        output_tensor_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM
+        output_stored_add_tensor_hbm (nl.NkiTensor): Optional fused add output in HBM
 
     Returns:
-        list[nl.ndarray]:
+        list[nl.NkiTensor]:
             - [output_tensor_hbm] when store_output_in_sbuf=False
             - [down_out_sb] when store_output_in_sbuf=True
     """
@@ -138,7 +137,7 @@ def _mlp_tkg_row_mx_impl(
             if not use_contiguous_x4:
                 # Software quant path: rmsnorm_tkg produces sharded output [H0, T, H1_shard]
                 H1_shard = dims.H_per_shard // _pmax
-                rmsnorm_out = TensorView(nl.ndarray((dims.H0, dims.T * H1_shard), dtype=io_dtype, buffer=nl.sbuf))
+                rmsnorm_out = nl.ndarray((dims.H0, dims.T * H1_shard), dtype=io_dtype, buffer=nl.sbuf)
                 old_prefix = sbm.get_name_prefix()
                 sbm.set_name_prefix(name_prefix)
                 rmsnorm_out, rmsnorm_layout = rmsnorm_tkg(
@@ -153,10 +152,10 @@ def _mlp_tkg_row_mx_impl(
                 sbm.set_name_prefix(old_prefix)
                 if rmsnorm_layout == HiddenLayout.H0_H1_T:
                     # _th path outputs [H0, H1_shard, T] — permute to [H0, T, H1_shard]
-                    rmsnorm_permuted = TensorView(nl.ndarray((_pmax, dims.T, H1_shard), dtype=io_dtype, buffer=nl.sbuf))
+                    rmsnorm_permuted = nl.ndarray((_pmax, dims.T, H1_shard), dtype=io_dtype, buffer=nl.sbuf)
                     nisa.tensor_copy(
-                        dst=rmsnorm_permuted.get_view(),
-                        src=rmsnorm_out.permute(dims=[0, 2, 1]).get_view(),
+                        dst=rmsnorm_permuted,
+                        src=rmsnorm_out.permute(dims=[0, 2, 1]),
                     )
                     hidden_tensor = rmsnorm_permuted
                 else:
@@ -168,7 +167,7 @@ def _mlp_tkg_row_mx_impl(
                 eps = params.eps
                 hidden_flat = params.hidden_tensor
                 if len(hidden_flat.shape) == 3 and hidden_flat.buffer != nl.sbuf:
-                    hidden_flat = TensorView(hidden_flat).flatten_dims(start_dim=0, end_dim=1)
+                    hidden_flat = hidden_flat.flatten_dims(start_dim=0, end_dim=1)
                 elif hidden_flat.buffer == nl.sbuf:
                     kernel_assert(False, "contiguous_x4 rmsnorm from SBUF input not yet supported")
                 rmsnorm_sbm = SbufManager(0, _RMSNORM_SBUF_BUDGET_BYTES, get_logger("rmsnorm_cx4"), use_auto_alloc=True)
@@ -176,7 +175,7 @@ def _mlp_tkg_row_mx_impl(
                 rmsnorm_tkg_th(
                     input_hbm=hidden_flat,
                     gamma=norm_weights,
-                    output=TensorView(rmsnorm_out),
+                    output=rmsnorm_out,
                     num_H_shards=dims.num_shards,
                     hidden_actual=dims.H,
                     eps=eps,
@@ -214,12 +213,12 @@ def _mlp_tkg_row_mx_impl(
             hidden_permuted = nl.ndarray((_pmax, dims.T, H1_shard_cx4), dtype=io_dtype, buffer=nl.sbuf)
             nisa.tensor_copy(
                 dst=hidden_permuted,
-                src=TensorView(hidden_tensor).permute(dims=[0, 2, 1]).get_view(),
+                src=hidden_tensor.permute(dims=[0, 2, 1]),
             )
             hidden_tensor = hidden_permuted
 
         quantized_input, input_dequant_scale_raw = row_quantization(
-            hidden_tensor.get_view() if isinstance(hidden_tensor, TensorView) else hidden_tensor,
+            hidden_tensor,
             output_dtype=nl.float8_e4m3fn,
         )
         # Pad dequant_scale from [_pmax, T, 1] to [_pmax, T_padded, 1]
@@ -238,51 +237,48 @@ def _mlp_tkg_row_mx_impl(
                 # hidden_tensor is already [H0, T, H1_shard] from rmsnorm —
                 # reshape directly with n_H512_tile_sharded, no slice needed.
                 qtz_4d = quantized_input.reshape((_pmax, dims.T, n_H512_tile_sharded, _q_width))
-                qtz_x4_4d = TensorView(qtz_4d).reinterpret_cast(nl.float8_e4m3fn_x4)
+                qtz_x4_4d = qtz_4d.view(nl.float8_e4m3fn_x4)
                 qtz_x4 = qtz_x4_4d.reshape((_pmax, dims.T, n_H512_tile_sharded))
 
                 # Permute [H0, T, n_H512_sharded] → [H0, n_H512_sharded, T]
-                src_perm_x4 = TensorView(qtz_x4).permute(dims=[0, 2, 1])
+                src_perm_x4 = qtz_x4.permute(dims=[0, 2, 1])
             else:
                 # input_in_sbuf without rmsnorm: hidden_tensor is [H0, T, H1] (full H).
                 # Reinterpret fp8 → fp8_x4, slice for shard, permute on x4 data.
                 n_H512_total = n_H512_tile_sharded * dims.num_shards
                 qtz_4d = quantized_input.reshape((_pmax, dims.T, n_H512_total, _q_width))
-                qtz_x4_4d = TensorView(qtz_4d).reinterpret_cast(nl.float8_e4m3fn_x4)
+                qtz_x4_4d = qtz_4d.view(nl.float8_e4m3fn_x4)
                 qtz_x4 = qtz_x4_4d.reshape((_pmax, dims.T, n_H512_total))
 
                 # Slice for shard, then permute — all on x4 (4× fewer free-dim elements)
                 src_perm_x4 = (
-                    TensorView(qtz_x4)
-                    .slice(
+                    qtz_x4.slice(
                         dim=2,
                         start=dims.shard_id * n_H512_tile_sharded,
                         end=(dims.shard_id + 1) * n_H512_tile_sharded,
-                    )
-                    .permute(dims=[0, 2, 1])  # [H0, n_H512_sharded, T]
+                    ).permute(dims=[0, 2, 1])  # [H0, n_H512_sharded, T]
                 )
 
-            inp_qtz_sb = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-            nisa.memset(dst=inp_qtz_sb, value=0)
+            inp_qtz = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+            nisa.memset(dst=inp_qtz, value=0)
             nisa.tensor_copy(
-                dst=inp_qtz_sb[:, :, : dims.T],
-                src=src_perm_x4.get_view(),
+                dst=inp_qtz[:, :, : dims.T],
+                src=src_perm_x4,
             )
         else:
             qtz_4d = quantized_input.reshape((_pmax, dims.T, n_H512_tile_sharded, _q_width))
-            qtz_x4_4d = TensorView(qtz_4d).reinterpret_cast(nl.float8_e4m3fn_x4)
+            qtz_x4_4d = qtz_4d.view(nl.float8_e4m3fn_x4)
             qtz_x4 = qtz_x4_4d.reshape((_pmax, dims.T, n_H512_tile_sharded))
 
-            src_perm_x4 = TensorView(qtz_x4).permute(dims=[0, 2, 1])
+            src_perm_x4 = qtz_x4.permute(dims=[0, 2, 1])
 
-            inp_qtz_sb = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-            nisa.memset(dst=inp_qtz_sb, value=0)
+            inp_qtz = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+            nisa.memset(dst=inp_qtz, value=0)
             nisa.tensor_copy(
-                dst=inp_qtz_sb[:, :, : dims.T],
-                src=src_perm_x4.get_view(),
+                dst=inp_qtz[:, :, : dims.T],
+                src=src_perm_x4,
             )
 
-        inp_qtz = TensorView(inp_qtz_sb)
     else:
         # HBM path: load → quantize → x4 packing
         H1_shard = dims.H_per_shard // _pmax
@@ -290,13 +286,12 @@ def _mlp_tkg_row_mx_impl(
 
         if not use_contiguous_x4:
             input_view = (
-                TensorView(hidden_tensor)
-                .reshape_dim(dim=1, shape=[dims.num_shards, H1_shard, _pmax])
+                hidden_tensor.reshape_dim(dim=1, shape=[dims.num_shards, H1_shard, _pmax])
                 .permute(dims=[3, 0, 1, 2])
                 .select(dim=2, index=dims.shard_id)
             )
             input_sb = nl.ndarray((_pmax, dims.T, H1_shard), dtype=io_dtype, buffer=nl.sbuf)
-            nisa.dma_copy(src=input_view.get_view(), dst=input_sb)
+            nisa.dma_copy(src=input_view, dst=input_sb)
 
             quantized_input, input_dequant_scale_raw = row_quantization(
                 input_sb,
@@ -313,42 +308,40 @@ def _mlp_tkg_row_mx_impl(
                 input_dequant_scale = input_dequant_scale_raw
 
             qtz_4d = quantized_input.reshape((_pmax, dims.T, n_H512_tile_sharded, _q_width))
-            qtz_x4_4d = TensorView(qtz_4d).reinterpret_cast(nl.float8_e4m3fn_x4)
+            qtz_x4_4d = qtz_4d.view(nl.float8_e4m3fn_x4)
             qtz_x4 = qtz_x4_4d.reshape((_pmax, dims.T, n_H512_tile_sharded))
 
-            src_perm_x4 = TensorView(qtz_x4).permute(dims=[0, 2, 1])
+            src_perm_x4 = qtz_x4.permute(dims=[0, 2, 1])
 
-            inp_qtz_sb = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-            nisa.memset(dst=inp_qtz_sb, value=0)
+            inp_qtz = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+            nisa.memset(dst=inp_qtz, value=0)
             nisa.tensor_copy(
-                dst=inp_qtz_sb[:, :, : dims.T],
-                src=src_perm_x4.get_view(),
+                dst=inp_qtz[:, :, : dims.T],
+                src=src_perm_x4,
             )
         else:
             # contiguous_x4 (HBM no-norm): contiguous load + on-chip transpose + quantize
             H_shard_local = _pmax * H1_shard
 
-            input_hbm_shard = TensorView(hidden_tensor).slice(
+            input_hbm_shard = hidden_tensor.slice(
                 dim=1, start=dims.shard_id * H_shard_local, end=(dims.shard_id + 1) * H_shard_local
             )
             input_th_sb = nl.ndarray((dims.T, H_shard_local), dtype=io_dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=input_th_sb, src=input_hbm_shard.get_view(), dge_mode=_DGE_MODE_NONE)
+            nisa.dma_copy(dst=input_th_sb, src=input_hbm_shard, dge_mode=_DGE_MODE_NONE)
 
-            src_4d_hbm = TensorView(input_th_sb).reshape_dim(dim=1, shape=[n_H512_tile_sharded, _pmax, _q_width])
+            src_4d_hbm = input_th_sb.reshape_dim(dim=1, shape=[n_H512_tile_sharded, _pmax, _q_width])
             input_th_perm = nl.ndarray((dims.T, H_shard_local), dtype=io_dtype, buffer=nl.sbuf)
-            dst_4d_hbm = TensorView(input_th_perm).reshape_dim(dim=1, shape=[_pmax, n_H512_tile_sharded, _q_width])
+            dst_4d_hbm = input_th_perm.reshape_dim(dim=1, shape=[_pmax, n_H512_tile_sharded, _q_width])
             nisa.tensor_copy(
-                dst=dst_4d_hbm.get_view(),
-                src=src_4d_hbm.permute(dims=[0, 2, 1, 3]).get_view(),
+                dst=dst_4d_hbm,
+                src=src_4d_hbm.permute(dims=[0, 2, 1, 3]),
             )
 
-            perm_src_3d_hbm = TensorView(input_th_perm).reshape_dim(
-                dim=1, shape=[_pmax, n_H512_tile_sharded * _q_width]
-            )
+            perm_src_3d_hbm = input_th_perm.reshape_dim(dim=1, shape=[_pmax, n_H512_tile_sharded * _q_width])
             cx4_xpose_tile = nl.ndarray((_pmax, dims.T, n_H512_tile_sharded * _q_width), dtype=io_dtype, buffer=nl.sbuf)
             pe_transpose(
                 src=perm_src_3d_hbm,
-                dst=TensorView(cx4_xpose_tile),
+                dst=cx4_xpose_tile,
                 tile_size=_pmax,
                 dtype=io_dtype,
                 sbm=sbm,
@@ -369,25 +362,23 @@ def _mlp_tkg_row_mx_impl(
                 input_dequant_scale = input_dequant_scale_raw
 
             qtz_4d = quantized_input.reshape((_pmax, dims.T, n_H512_tile_sharded, _q_width))
-            qtz_x4_4d = TensorView(qtz_4d).reinterpret_cast(nl.float8_e4m3fn_x4)
+            qtz_x4_4d = qtz_4d.view(nl.float8_e4m3fn_x4)
             qtz_x4 = qtz_x4_4d.reshape((_pmax, dims.T, n_H512_tile_sharded))
-            src_perm_x4 = TensorView(qtz_x4).permute(dims=[0, 2, 1])
+            src_perm_x4 = qtz_x4.permute(dims=[0, 2, 1])
 
-            inp_qtz_sb = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-            nisa.memset(dst=inp_qtz_sb, value=0)
+            inp_qtz = nl.ndarray((_pmax, n_H512_tile_sharded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+            nisa.memset(dst=inp_qtz, value=0)
             nisa.tensor_copy(
-                dst=inp_qtz_sb[:, :, : dims.T],
-                src=src_perm_x4.get_view(),
+                dst=inp_qtz[:, :, : dims.T],
+                src=src_perm_x4,
             )
-        inp_qtz = TensorView(inp_qtz_sb)
 
     # Cache quantized input for reuse across I-tiles (first I-tile only)
     if mx_buf.inp_qtz_cache_buf != None and inp_qtz_in == None:
         cache_buf = mx_buf.inp_qtz_cache_buf
         if T_padded > dims.T:
             nisa.memset(dst=cache_buf, value=0)
-        inp_qtz_nd = inp_qtz.base_tensor if isinstance(inp_qtz, TensorView) else inp_qtz
-        nisa.tensor_copy(dst=cache_buf[:, :, : dims.T], src=inp_qtz_nd[:, :, : dims.T])
+        nisa.tensor_copy(dst=cache_buf[:, :, : dims.T], src=inp_qtz[:, :, : dims.T])
 
     # Cache ROW_MX dequant scale for reuse across I-tiles (first I-tile only)
     if mx_buf.inp_dequant_scale_cache_buf != None and inp_qtz_in == None:
@@ -414,11 +405,11 @@ def _mlp_tkg_row_mx_impl(
     gate_w_dequant_sb = mx_buf.gate_w_dequant_sb
 
     gate_out_sb = gate_up_projection_mx_tp_shard_H(
-        hidden_qtz_sb=inp_qtz if isinstance(inp_qtz, TensorView) else TensorView(inp_qtz),
-        hidden_scale_sb=TensorView(dummy_scale_tile),
-        weight_qtz=TensorView(params.gate_proj_weights_tensor),
-        weight_scale=TensorView(dummy_scale_tile),
-        bias_sb=TensorView(gate_bias_sb) if gate_bias_sb != None else None,
+        hidden_qtz_sb=inp_qtz,
+        hidden_scale_sb=dummy_scale_tile,
+        weight_qtz=params.gate_proj_weights_tensor,
+        weight_scale=dummy_scale_tile,
+        bias_sb=gate_bias_sb if gate_bias_sb != None else None,
         cfg=proj_cfg,
         w_dequant_scale=gate_w_dequant_sb,
         input_dequant_scale=input_dequant_scale,
@@ -440,11 +431,11 @@ def _mlp_tkg_row_mx_impl(
     up_w_dequant_sb = mx_buf.up_w_dequant_sb
 
     up_out_sb = gate_up_projection_mx_tp_shard_H(
-        hidden_qtz_sb=inp_qtz if isinstance(inp_qtz, TensorView) else TensorView(inp_qtz),
-        hidden_scale_sb=TensorView(dummy_scale_tile),
-        weight_qtz=TensorView(params.up_proj_weights_tensor),
-        weight_scale=TensorView(dummy_scale_tile),
-        bias_sb=TensorView(up_bias_sb) if up_bias_sb != None else None,
+        hidden_qtz_sb=inp_qtz,
+        hidden_scale_sb=dummy_scale_tile,
+        weight_qtz=params.up_proj_weights_tensor,
+        weight_scale=dummy_scale_tile,
+        bias_sb=up_bias_sb if up_bias_sb != None else None,
         cfg=proj_cfg,
         w_dequant_scale=up_w_dequant_sb,
         input_dequant_scale=input_dequant_scale,
@@ -475,8 +466,8 @@ def _mlp_tkg_row_mx_impl(
         dtype=inter_4d.dtype,
         buffer=nl.sbuf,
     )
-    src_perm = TensorView(inter_4d).permute(dims=[0, 2, 1, 3])
-    nisa.tensor_copy(dst=inter_permuted, src=src_perm.get_view())
+    src_perm = inter_4d.permute(dims=[0, 2, 1, 3])
+    nisa.tensor_copy(dst=inter_permuted, src=src_perm)
 
     # Reshape to rank-3 [_pmax, T_padded, n_I512*_q_width] for row_quantization
     inter_3d = inter_permuted.reshape((_pmax, T_padded, n_I512_tile * _q_width))
@@ -487,7 +478,7 @@ def _mlp_tkg_row_mx_impl(
 
     # Reshape to [_pmax, T_padded, n_I512, _q_width] fp8, reinterpret_cast to fp8_x4
     quantized_4d = quantized_3d.reshape((_pmax, T_padded, n_I512_tile, _q_width))
-    quantized_x4 = TensorView(quantized_4d).reinterpret_cast(nl.float8_e4m3fn_x4)
+    quantized_x4 = quantized_4d.view(nl.float8_e4m3fn_x4)
 
     # Permute [_pmax, T_padded, n_I512] → [_pmax, n_I512, T_padded] fp8_x4
     inter_qtz = nl.ndarray(
@@ -495,8 +486,8 @@ def _mlp_tkg_row_mx_impl(
         dtype=nl.float8_e4m3fn_x4,
         buffer=nl.sbuf,
     )
-    src_perm_back = TensorView(quantized_x4.reshape((_pmax, T_padded, n_I512_tile))).permute(dims=[0, 2, 1])
-    nisa.tensor_copy(dst=inter_qtz, src=src_perm_back.get_view())
+    src_perm_back = (quantized_x4.reshape((_pmax, T_padded, n_I512_tile))).permute(dims=[0, 2, 1])
+    nisa.tensor_copy(dst=inter_qtz, src=src_perm_back)
 
     down_w_dequant_sb = mx_buf.down_w_dequant_sb
 
@@ -521,20 +512,19 @@ def _mlp_tkg_row_mx_impl(
 
     if not params.store_output_in_sbuf:
         B, S, H = output_tensor_hbm.shape
-        output_tensor_hbm = TensorView(output_tensor_hbm).flatten_dims(start_dim=0, end_dim=1)
+        output_tensor_hbm = output_tensor_hbm.flatten_dims(start_dim=0, end_dim=1)
 
         output_hbm_view = output_tensor_hbm.slice(
             dim=1, start=dims.shard_id * dims.H_per_shard, end=(dims.shard_id + 1) * dims.H_per_shard
         )
 
-        down_out_view = TensorView(down_out_sb).slice(dim=2, start=0, end=dims.T)
+        down_out_view = down_out_sb.slice(dim=2, start=0, end=dims.T)
         output_sb = nl.ndarray(
             (dims.T, dims.H_per_shard),
             dtype=output_tensor_hbm.dtype,
             buffer=nl.sbuf,
             name=f"{name_prefix}tkg_mlp_output_sb",
         )
-        output_sb_view = TensorView(output_sb)
 
         for h1_tile_idx in range(dims.H1_shard):
             psum_idx = h1_tile_idx % dims._psum_bmax
@@ -544,21 +534,19 @@ def _mlp_tkg_row_mx_impl(
                 buffer=nl.psum,
                 name=f"{name_prefix}transpose_output_{h1_tile_idx}",
             )
-            nisa.nc_transpose(dst=tp_psum, data=down_out_view.select(dim=1, index=h1_tile_idx).get_view())
+            nisa.nc_transpose(dst=tp_psum, data=down_out_view.select(dim=1, index=h1_tile_idx))
             interleave_copy(
-                dst=output_sb_view.slice(
-                    dim=1, start=h1_tile_idx * dims.H0, end=(h1_tile_idx + 1) * dims.H0
-                ).get_view(),
+                dst=output_sb.slice(dim=1, start=h1_tile_idx * dims.H0, end=(h1_tile_idx + 1) * dims.H0),
                 src=tp_psum,
                 index=h1_tile_idx,
             )
 
         nisa.dma_copy(
-            dst=output_hbm_view.get_view(),
-            src=output_sb_view.get_view(),
+            dst=output_hbm_view,
+            src=output_sb,
         )
 
-        output_tensor_hbm = output_tensor_hbm.base_tensor.reshape((B, S, H))
+        output_tensor_hbm = output_tensor_hbm.reshape((B, S, H))
 
         return (
             [output_tensor_hbm, output_stored_add_tensor_hbm] if mlpp_store_fused_add(params) else [output_tensor_hbm]
@@ -570,9 +558,9 @@ def _mlp_tkg_row_mx_impl(
 
 def mlp_tkg_quad_fp8_row(
     params: MLPParameters,
-    output_tensor_hbm: nl.ndarray,
-    output_stored_add_tensor_hbm: nl.ndarray,
-) -> list[nl.ndarray]:
+    output_tensor_hbm: nl.NkiTensor,
+    output_stored_add_tensor_hbm: nl.NkiTensor,
+) -> list[nl.NkiTensor]:
     """
     ROW_MX (row-wise / dynamic FP8) MLP TKG wrapper that tiles along both BxS and I.
 
@@ -585,11 +573,11 @@ def mlp_tkg_quad_fp8_row(
 
     Args:
         params (MLPParameters): MLP configuration. Must report ROW_MX quantization.
-        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM.
-        output_stored_add_tensor_hbm (nl.ndarray): Optional fused-add output in HBM.
+        output_tensor_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM.
+        output_stored_add_tensor_hbm (nl.NkiTensor): Optional fused-add output in HBM.
 
     Returns:
-        list[nl.ndarray]:
+        list[nl.NkiTensor]:
             - [output_tensor_hbm] when ``store_fused_add_result`` is False.
             - [output_tensor_hbm, output_stored_add_tensor_hbm] when fused-add storage
               is enabled.
@@ -615,8 +603,7 @@ def mlp_tkg_quad_fp8_row(
 
     B, S, H_out = output_tensor_hbm.shape
     if not params.store_output_in_sbuf:
-        output_hbm_2d = output_tensor_hbm.reshape((B * S, H_out))
-        output_hbm_view = TensorView(output_hbm_2d)
+        output_hbm_view = output_tensor_hbm.reshape((B * S, H_out))
 
     I = params.intermediate_size
 
@@ -641,6 +628,22 @@ def mlp_tkg_quad_fp8_row(
     gate_w_hbm = params.gate_proj_weights_tensor
     up_w_hbm = params.up_proj_weights_tensor
     down_w_hbm = params.down_proj_weights_tensor
+
+    # Convert 6D scalar fp8 gate/up weights to flat 3D scalar fp8.
+    # [128, n_H512, n_I512, 4, 128, 4] → [128, n_H512, I_padded*4] scalar fp8
+    if len(gate_w_hbm.shape) == 6:
+        n_H512_w = gate_w_hbm.shape[1]
+        I_padded = gate_w_hbm.shape[2] * gate_w_hbm.shape[3] * gate_w_hbm.shape[4]
+        gate_w_hbm = gate_w_hbm.reshape((_pmax, n_H512_w, I_padded * _q_width))
+        up_w_hbm = up_w_hbm.reshape((_pmax, n_H512_w, I_padded * _q_width))
+
+    # Convert 4D scalar fp8 down weights to flat 3D scalar fp8.
+    # [128_I, n_I512, H, 4] → [128_I, n_I512, H*4] scalar fp8
+    if len(down_w_hbm.shape) == 4:
+        p_I_d = down_w_hbm.shape[0]
+        n_I512_d = down_w_hbm.shape[1]
+        down_w_hbm = down_w_hbm.reshape((p_I_d, n_I512_d, H * _q_width))
+
     gate_bias_hbm = params.bias_params.gate_proj_bias_tensor
     up_bias_hbm = params.bias_params.up_proj_bias_tensor
     original_I = I
@@ -724,7 +727,7 @@ def mlp_tkg_quad_fp8_row(
                     inp_dequant_scale_cache[bxs_tile.index] if inp_dequant_scale_cache else None
                 )
             else:
-                inp_qtz_in = TensorView(inp_qtz_cache[bxs_tile.index]) if inp_qtz_cache else None
+                inp_qtz_in = inp_qtz_cache[bxs_tile.index] if inp_qtz_cache else None
                 skip_norm = True if inp_qtz_cache else False
                 mx_buf.inp_qtz_cache_buf = None
                 mx_buf.inp_dequant_scale_cache_buf = (
@@ -746,17 +749,14 @@ def mlp_tkg_quad_fp8_row(
 
             # Transpose down_out_sb [H0, H1_shard, T] → [T, H_shard]
             down_out_sb = mx_buf.down_out_sb
-            down_out_view = TensorView(down_out_sb).slice(dim=2, start=0, end=bxs_tile.size)
+            down_out_view = down_out_sb.slice(dim=2, start=0, end=bxs_tile.size)
             output_sb = sbm.alloc_stack((bxs_tile.size, H_sharded), dtype=nl.bfloat16, buffer=nl.sbuf, align=32)
-            output_sb_view = TensorView(output_sb)
 
             for h1_tile_idx in range(H1_shard):
                 tp_psum = nl.ndarray((bxs_tile.size, _pmax), dtype=nl.bfloat16, buffer=nl.psum)
-                nisa.nc_transpose(dst=tp_psum, data=down_out_view.select(dim=1, index=h1_tile_idx).get_view())
+                nisa.nc_transpose(dst=tp_psum, data=down_out_view.select(dim=1, index=h1_tile_idx))
                 interleave_copy(
-                    dst=output_sb_view.slice(
-                        dim=1, start=h1_tile_idx * _pmax, end=(h1_tile_idx + 1) * _pmax
-                    ).get_view(),
+                    dst=output_sb.slice(dim=1, start=h1_tile_idx * _pmax, end=(h1_tile_idx + 1) * _pmax),
                     src=tp_psum,
                     index=h1_tile_idx,
                 )
@@ -771,12 +771,12 @@ def mlp_tkg_quad_fp8_row(
                 out_hbm_tile = output_hbm_view.slice(dim=0, start=bxs_tile.start_offset, end=bxs_tile.end_offset)
                 out_hbm_shard = out_hbm_tile.slice(dim=1, start=shard_id * H_sharded, end=(shard_id + 1) * H_sharded)
                 if i_tile.index == 0:
-                    nisa.dma_copy(dst=out_hbm_shard.get_view(), src=output_sb)
+                    nisa.dma_copy(dst=out_hbm_shard, src=output_sb)
                 else:
                     existing_sb = sbm.alloc_stack((bxs_tile.size, H_sharded), dtype=nl.bfloat16, buffer=nl.sbuf)
-                    nisa.dma_copy(dst=existing_sb, src=out_hbm_shard.get_view())
+                    nisa.dma_copy(dst=existing_sb, src=out_hbm_shard)
                     nisa.tensor_tensor(dst=output_sb, data1=output_sb, data2=existing_sb, op=nl.add)
-                    nisa.dma_copy(dst=out_hbm_shard.get_view(), src=output_sb)
+                    nisa.dma_copy(dst=out_hbm_shard, src=output_sb)
 
             sbm.close_scope()
         sbm.close_scope()  # I-tile scope

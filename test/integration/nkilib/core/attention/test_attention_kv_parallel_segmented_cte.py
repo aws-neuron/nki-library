@@ -13,124 +13,208 @@
 # limitations under the License.
 """Tests for KV-parallel segmented prefill attention kernel."""
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-from neuronxcc.starfish.support import dtype as dt
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.core.attention.attention_kv_parallel_segmented_cte import (
     attention_kv_parallel_segmented_cte,
 )
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import get_rank
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
+    ModelTestType,
     Platforms,
+    prepare_model_parametrize,
 )
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
 
-_CONTIGUOUS_PARAM_NAMES = (
-    "group_size,seqlen,head_dim,block_size,seg_size,prior_tokens,local_kv_multiplier,num_groups,lnc_degree,tp_out"
-)
+try:
+    from test.integration.nkilib.core.attention.test_attention_kv_parallel_segmented_cte_model_config import (
+        kvp_segmented_attention_cte_model_configs,
+    )
+except ImportError:
+    kvp_segmented_attention_cte_model_configs = {}
+
+_CONTIGUOUS_PARAM_NAMES = "group_size,q_heads_per_rank,seqlen,head_dim,block_size,seg_size,prior_tokens,local_kv_multiplier,num_groups,lnc_degree,tp_out"
 
 _CONTIGUOUS_FAST_PARAMS = [
     # Contiguous KV distribution (backward compatibility, not the production path)
-    # LNC2 (default)
-    pytest.param(8, 512, 128, 128, 512, 0, 1, 1, 2, False, id="g8_s512_h128_b128_seg512_lnc2"),
-    pytest.param(8, 512, 128, 128, 512, 512, 2, 1, 2, False, id="g8_s512_h128_b128_seg512_prior512_full_lnc2"),
-    pytest.param(8, 512, 128, 128, 512, 256, 1, 1, 2, False, id="g8_s512_h128_b128_seg512_prior256_partial_lnc2"),
-    pytest.param(8, 1024, 128, 128, 512, 0, 1, 1, 2, False, id="g8_s1024_h128_b128_seg512_2chunks_lnc2"),
-    pytest.param(8, 512, 128, 64, 512, 0, 1, 1, 2, False, id="g8_s512_h128_b64_seg512_lnc2"),
-    pytest.param(8, 512, 128, 32, 512, 0, 1, 1, 2, False, id="g8_s512_h128_b32_seg512_lnc2"),
-    pytest.param(8, 512, 64, 128, 512, 0, 1, 1, 2, False, id="g8_s512_h64_b128_seg512_lnc2"),
-    pytest.param(8, 512, 128, 128, 512, 0, 2, 1, 2, True, id="g8_s512_h128_b128_seg512_2xkv_tp_out_lnc2"),
-    # LNC1 (baseline only)
-    pytest.param(8, 512, 128, 128, 512, 0, 1, 1, 1, False, id="g8_s512_h128_b128_seg512"),
+    # LNC2 (default): group_size=4 physical ranks, q_heads_per_rank=2
+    pytest.param(4, 2, 512, 128, 128, 512, 0, 1, 1, 2, False, id="g4_qh2_s512_h128_b128_seg512_lnc2"),
+    pytest.param(4, 2, 512, 128, 128, 512, 512, 2, 1, 2, False, id="g4_qh2_s512_h128_b128_seg512_prior512_full_lnc2"),
+    pytest.param(
+        4, 2, 512, 128, 128, 512, 256, 1, 1, 2, False, id="g4_qh2_s512_h128_b128_seg512_prior256_partial_lnc2"
+    ),
+    pytest.param(4, 2, 1024, 128, 128, 512, 0, 1, 1, 2, False, id="g4_qh2_s1024_h128_b128_seg512_2chunks_lnc2"),
+    pytest.param(4, 2, 512, 128, 64, 512, 0, 1, 1, 2, False, id="g4_qh2_s512_h128_b64_seg512_lnc2"),
+    pytest.param(4, 2, 512, 128, 32, 512, 0, 1, 1, 2, False, id="g4_qh2_s512_h128_b32_seg512_lnc2"),
+    pytest.param(4, 2, 512, 64, 128, 512, 0, 1, 1, 2, False, id="g4_qh2_s512_h64_b128_seg512_lnc2"),
+    pytest.param(4, 2, 512, 128, 128, 512, 0, 2, 1, 2, True, id="g4_qh2_s512_h128_b128_seg512_2xkv_tp_out_lnc2"),
+    # LNC1 (baseline only): group_size=8 physical ranks, q_heads_per_rank=1
+    pytest.param(8, 1, 512, 128, 128, 512, 0, 1, 1, 1, False, id="g8_qh1_s512_h128_b128_seg512"),
+    # q_heads_per_rank < lnc_degree: group_size=4, q_heads_per_rank=1, lnc_degree=2 (total_heads=4)
+    pytest.param(4, 1, 512, 128, 128, 512, 0, 1, 1, 2, False, id="g4_qh1_s512_h128_b128_seg512_lnc2"),
 ]
 _CONTIGUOUS_FAST_PARAMS = [pytest.param(*p.values, marks=pytest.mark.fast, id=p.id) for p in _CONTIGUOUS_FAST_PARAMS]
 
 _CONTIGUOUS_FULL_ONLY_PARAMS = [
     # Heavy compile — full suite only
-    pytest.param(8, 2048, 128, 128, 2048, 2048, 2, 1, 2, False, id="g8_s2048_h128_b128_seg2048_prior2048_lnc2"),
+    pytest.param(4, 2, 2048, 128, 128, 2048, 2048, 2, 1, 2, False, id="g4_qh2_s2048_h128_b128_seg2048_prior2048_lnc2"),
 ]
 
-_INTERLEAVED_PARAM_NAMES = "group_size,seqlen,head_dim,block_size,seg_size,prior_tokens,num_global_blocks,num_groups,lnc_degree,tp_out,sliding_window"
+_INTERLEAVED_PARAM_NAMES = "group_size,q_heads_per_rank,seqlen,head_dim,block_size,seg_size,prior_tokens,num_global_blocks,num_groups,lnc_degree,tp_out,sliding_window"
 
 _INTERLEAVED_FAST_PARAMS = [
-    # === LNC2 (production target) ===
+    # === g4_qh2_lnc2: 4 logical ranks, 2 Q heads/rank, LNC2 (baseline) ===
     # --- block_size=128 ---
-    pytest.param(8, 512, 128, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b128_seg512"),
-    pytest.param(8, 512, 128, 128, 512, 512, 32, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b128_seg512_prior512"),
-    pytest.param(8, 512, 128, 128, 512, 1024, 48, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b128_seg512_prior1024"),
-    pytest.param(8, 1024, 128, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_lnc2_s1024_h128_b128_seg512_2chunks"),
-    # --- block_size=64 ---
-    pytest.param(8, 512, 128, 64, 512, 0, 64, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b64_seg512"),
-    pytest.param(8, 512, 128, 64, 512, 512, 64, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b64_seg512_prior512"),
-    # --- block_size=32 ---
-    pytest.param(8, 512, 128, 32, 512, 0, 128, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b32_seg512"),
-    pytest.param(8, 512, 128, 32, 512, 512, 128, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b32_seg512_prior512"),
-    # --- head_dim=64 ---
-    pytest.param(8, 512, 64, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_lnc2_s512_h64_b128_seg512"),
-    pytest.param(8, 512, 64, 128, 512, 512, 32, 1, 2, False, 0, id="ilv_lnc2_s512_h64_b128_seg512_prior512"),
-    pytest.param(8, 512, 64, 64, 512, 0, 64, 1, 2, False, 0, id="ilv_lnc2_s512_h64_b64_seg512"),
-    pytest.param(8, 512, 64, 64, 512, 512, 64, 1, 2, False, 0, id="ilv_lnc2_s512_h64_b64_seg512_prior512"),
-    # --- long prior (multiple full prior segments) ---
-    pytest.param(8, 512, 128, 128, 512, 2048, 80, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b128_seg512_prior2048"),
-    pytest.param(8, 512, 128, 64, 512, 2048, 160, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b64_seg512_prior2048"),
-    # === LNC1 (basic coverage) ===
-    pytest.param(8, 512, 128, 128, 512, 0, 32, 1, 1, False, 0, id="ilv_lnc1_s512_h128_b128_seg512"),
-    pytest.param(8, 512, 128, 128, 512, 512, 32, 1, 1, False, 0, id="ilv_lnc1_s512_h128_b128_seg512_prior512"),
-    pytest.param(8, 512, 128, 64, 512, 0, 64, 1, 1, False, 0, id="ilv_lnc1_s512_h128_b64_seg512"),
-    # --- partial prior ---
-    pytest.param(8, 512, 128, 64, 512, 256, 64, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b64_seg512_prior256_partial"),
-    pytest.param(8, 512, 128, 128, 512, 256, 32, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b128_seg512_prior256_partial"),
-    # --- multi-chunk + prior ---
-    pytest.param(8, 1024, 128, 128, 512, 512, 48, 1, 2, False, 0, id="ilv_lnc2_s1024_h128_b128_seg512_2chunks_prior"),
-    # --- block_size=16 ---
-    pytest.param(8, 512, 128, 16, 512, 0, 256, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b16_seg512"),
-    pytest.param(8, 512, 128, 16, 512, 512, 256, 1, 2, False, 0, id="ilv_lnc2_s512_h128_b16_seg512_prior512"),
-    # --- tp_out=True ---
-    pytest.param(8, 512, 128, 128, 512, 0, 32, 1, 2, True, 0, id="ilv_lnc2_s512_h128_b128_seg512_tp_out"),
-    pytest.param(8, 512, 128, 128, 512, 512, 32, 1, 2, True, 0, id="ilv_lnc2_s512_h128_b128_seg512_prior512_tp_out"),
-    # --- multi-chunk + b64 ---
-    pytest.param(8, 1024, 128, 64, 512, 0, 64, 1, 2, False, 0, id="ilv_lnc2_s1024_h128_b64_seg512_2chunks"),
-    # --- h64 + b32 ---
-    pytest.param(8, 512, 64, 32, 512, 0, 128, 1, 2, False, 0, id="ilv_lnc2_s512_h64_b32_seg512"),
-    pytest.param(8, 512, 64, 32, 512, 512, 128, 1, 2, False, 0, id="ilv_lnc2_s512_h64_b32_seg512_prior512"),
-    # --- h64 + multi-chunk ---
-    pytest.param(8, 1024, 64, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_lnc2_s1024_h64_b128_seg512_2chunks"),
-    # === SWA (sliding window attention) + interleaved ===
-    pytest.param(8, 512, 128, 128, 512, 512, 32, 1, 2, False, 256, id="ilv_lnc2_s512_h128_b128_seg512_prior512_sw256"),
+    pytest.param(4, 2, 512, 128, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512"),
     pytest.param(
-        8, 512, 128, 128, 512, 1024, 48, 1, 2, False, 512, id="ilv_lnc2_s512_h128_b128_seg512_prior1024_sw512"
+        4, 2, 512, 128, 128, 512, 512, 32, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_prior512"
     ),
-    pytest.param(8, 512, 128, 64, 512, 512, 64, 1, 2, False, 256, id="ilv_lnc2_s512_h128_b64_seg512_prior512_sw256"),
-    pytest.param(8, 512, 64, 128, 512, 512, 32, 1, 2, False, 256, id="ilv_lnc2_s512_h64_b128_seg512_prior512_sw256"),
+    pytest.param(
+        4, 2, 512, 128, 128, 512, 1024, 48, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_prior1024"
+    ),
+    pytest.param(4, 2, 1024, 128, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s1024_h128_b128_seg512_2chunks"),
+    # --- block_size=64 ---
+    pytest.param(4, 2, 512, 128, 64, 512, 0, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b64_seg512"),
+    pytest.param(4, 2, 512, 128, 64, 512, 512, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b64_seg512_prior512"),
+    # --- block_size=32 ---
+    pytest.param(4, 2, 512, 128, 32, 512, 0, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b32_seg512"),
+    pytest.param(4, 2, 512, 128, 32, 512, 512, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b32_seg512_prior512"),
+    # --- head_dim=64 ---
+    pytest.param(4, 2, 512, 64, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h64_b128_seg512"),
+    pytest.param(4, 2, 512, 64, 128, 512, 512, 32, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h64_b128_seg512_prior512"),
+    pytest.param(4, 2, 512, 64, 64, 512, 0, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h64_b64_seg512"),
+    pytest.param(4, 2, 512, 64, 64, 512, 512, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h64_b64_seg512_prior512"),
+    # --- long prior (multiple full prior segments) ---
+    pytest.param(
+        4, 2, 512, 128, 128, 512, 2048, 80, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_prior2048"
+    ),
+    pytest.param(
+        4, 2, 512, 128, 64, 512, 2048, 160, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b64_seg512_prior2048"
+    ),
+    # === g8_qh1_lnc1: 8 logical ranks, 1 Q head/rank, LNC1 ===
+    pytest.param(8, 1, 512, 128, 128, 512, 0, 32, 1, 1, False, 0, id="ilv_g8_qh1_lnc1_s512_h128_b128_seg512"),
+    pytest.param(
+        8, 1, 512, 128, 128, 512, 512, 32, 1, 1, False, 0, id="ilv_g8_qh1_lnc1_s512_h128_b128_seg512_prior512"
+    ),
+    pytest.param(8, 1, 512, 128, 64, 512, 0, 64, 1, 1, False, 0, id="ilv_g8_qh1_lnc1_s512_h128_b64_seg512"),
+    # --- partial prior ---
+    pytest.param(
+        4, 2, 512, 128, 64, 512, 256, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b64_seg512_prior256_partial"
+    ),
+    pytest.param(
+        4, 2, 512, 128, 128, 512, 256, 32, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_prior256_partial"
+    ),
+    # --- multi-chunk + prior ---
+    pytest.param(
+        4, 2, 1024, 128, 128, 512, 512, 48, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s1024_h128_b128_seg512_2chunks_prior"
+    ),
+    # --- block_size=16 ---
+    pytest.param(4, 2, 512, 128, 16, 512, 0, 256, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b16_seg512"),
+    pytest.param(4, 2, 512, 128, 16, 512, 512, 256, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h128_b16_seg512_prior512"),
+    # --- tp_out=True ---
+    pytest.param(4, 2, 512, 128, 128, 512, 0, 32, 1, 2, True, 0, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_tp_out"),
+    pytest.param(
+        4, 2, 512, 128, 128, 512, 512, 32, 1, 2, True, 0, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_prior512_tp_out"
+    ),
+    # --- multi-chunk + b64 ---
+    pytest.param(4, 2, 1024, 128, 64, 512, 0, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s1024_h128_b64_seg512_2chunks"),
+    # --- h64 + b32 ---
+    pytest.param(4, 2, 512, 64, 32, 512, 0, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h64_b32_seg512"),
+    pytest.param(4, 2, 512, 64, 32, 512, 512, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s512_h64_b32_seg512_prior512"),
+    # --- h64 + multi-chunk ---
+    pytest.param(4, 2, 1024, 64, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s1024_h64_b128_seg512_2chunks"),
+    # === SWA (sliding window attention) + interleaved ===
+    pytest.param(
+        4, 2, 512, 128, 128, 512, 512, 32, 1, 2, False, 256, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_prior512_sw256"
+    ),
+    pytest.param(
+        4, 2, 512, 128, 128, 512, 1024, 48, 1, 2, False, 512, id="ilv_g4_qh2_lnc2_s512_h128_b128_seg512_prior1024_sw512"
+    ),
+    pytest.param(
+        4, 2, 512, 128, 64, 512, 512, 64, 1, 2, False, 256, id="ilv_g4_qh2_lnc2_s512_h128_b64_seg512_prior512_sw256"
+    ),
+    pytest.param(
+        4, 2, 512, 64, 128, 512, 512, 32, 1, 2, False, 256, id="ilv_g4_qh2_lnc2_s512_h64_b128_seg512_prior512_sw256"
+    ),
+    # === q_heads_per_rank > lnc_degree: multiple heads per NC ===
+    # g4_qh4_lnc2: 4 logical ranks, 4 Q heads/rank, LNC2
+    pytest.param(4, 4, 512, 128, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh4_lnc2_s512_h128_b128_seg512"),
+    pytest.param(
+        4, 4, 512, 128, 128, 512, 512, 32, 1, 2, False, 0, id="ilv_g4_qh4_lnc2_s512_h128_b128_seg512_prior512"
+    ),
+    pytest.param(4, 4, 1024, 128, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh4_lnc2_s1024_h128_b128_seg512_2chunks"),
+    pytest.param(4, 4, 512, 128, 64, 512, 0, 64, 1, 2, False, 0, id="ilv_g4_qh4_lnc2_s512_h128_b64_seg512"),
+    pytest.param(4, 4, 512, 64, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh4_lnc2_s512_h64_b128_seg512"),
+    pytest.param(4, 4, 512, 128, 128, 512, 0, 32, 1, 2, True, 0, id="ilv_g4_qh4_lnc2_s512_h128_b128_seg512_tp_out"),
+    # g2_qh4_lnc2: 2 logical ranks, 4 Q heads/rank, LNC2
+    pytest.param(2, 4, 512, 128, 128, 512, 0, 16, 1, 2, False, 0, id="ilv_g2_qh4_lnc2_s512_h128_b128_seg512"),
+    pytest.param(
+        2, 4, 512, 128, 128, 512, 512, 16, 1, 2, False, 0, id="ilv_g2_qh4_lnc2_s512_h128_b128_seg512_prior512"
+    ),
+    # === q_heads_per_rank < lnc_degree: fewer heads than NCs ===
+    # g4_qh1_lnc2: 4 logical ranks, 1 Q head/rank, LNC2 (total_heads=4, divisible by lnc=2)
+    pytest.param(4, 1, 512, 128, 128, 512, 0, 32, 1, 2, False, 0, id="ilv_g4_qh1_lnc2_s512_h128_b128_seg512"),
+    pytest.param(
+        4, 1, 512, 128, 128, 512, 512, 32, 1, 2, False, 0, id="ilv_g4_qh1_lnc2_s512_h128_b128_seg512_prior512"
+    ),
 ]
 _INTERLEAVED_FAST_PARAMS = [pytest.param(*p.values, marks=pytest.mark.fast, id=p.id) for p in _INTERLEAVED_FAST_PARAMS]
 
 _INTERLEAVED_FULL_ONLY_PARAMS = [
     # Heavy compile — full suite only
-    pytest.param(8, 2048, 128, 128, 2048, 0, 64, 1, 2, False, 0, id="ilv_lnc2_s2048_h128_b128_seg2048"),
-    pytest.param(8, 2048, 128, 128, 2048, 2048, 128, 1, 2, False, 0, id="ilv_lnc2_s2048_h128_b128_seg2048_prior2048"),
-    pytest.param(8, 2048, 128, 64, 2048, 0, 128, 1, 2, False, 0, id="ilv_lnc2_s2048_h128_b64_seg2048"),
-    pytest.param(8, 2048, 128, 64, 2048, 2048, 192, 1, 2, False, 0, id="ilv_lnc2_s2048_h128_b64_seg2048_prior2048"),
-    pytest.param(8, 2048, 128, 32, 2048, 0, 256, 1, 2, False, 0, id="ilv_lnc2_s2048_h128_b32_seg2048"),
-    pytest.param(8, 2048, 64, 128, 2048, 0, 64, 1, 2, False, 0, id="ilv_lnc2_s2048_h64_b128_seg2048"),
-    pytest.param(8, 2048, 64, 128, 2048, 2048, 128, 1, 2, False, 0, id="ilv_lnc2_s2048_h64_b128_seg2048_prior2048"),
-    pytest.param(8, 2048, 128, 128, 2048, 0, 128, 1, 1, False, 0, id="ilv_lnc1_s2048_h128_b128_seg2048"),
-    pytest.param(8, 2048, 128, 32, 2048, 2048, 512, 1, 2, False, 0, id="ilv_lnc2_s2048_h128_b32_seg2048_prior2048"),
+    pytest.param(4, 2, 2048, 128, 128, 2048, 0, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h128_b128_seg2048"),
     pytest.param(
-        8, 2048, 128, 128, 2048, 2048, 128, 1, 2, False, 512, id="ilv_lnc2_s2048_h128_b128_seg2048_prior2048_sw512"
+        4, 2, 2048, 128, 128, 2048, 2048, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h128_b128_seg2048_prior2048"
     ),
-    pytest.param(8, 4096, 128, 128, 4096, 0, 128, 1, 2, False, 0, id="ilv_lnc2_s4096_h128_b128_seg4096"),
-    pytest.param(8, 4096, 128, 128, 4096, 4096, 256, 1, 2, False, 0, id="ilv_lnc2_s4096_h128_b128_seg4096_prior4096"),
+    pytest.param(4, 2, 2048, 128, 64, 2048, 0, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h128_b64_seg2048"),
+    pytest.param(
+        4, 2, 2048, 128, 64, 2048, 2048, 192, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h128_b64_seg2048_prior2048"
+    ),
+    pytest.param(4, 2, 2048, 128, 32, 2048, 0, 256, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h128_b32_seg2048"),
+    pytest.param(4, 2, 2048, 64, 128, 2048, 0, 64, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h64_b128_seg2048"),
+    pytest.param(
+        4, 2, 2048, 64, 128, 2048, 2048, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h64_b128_seg2048_prior2048"
+    ),
+    pytest.param(8, 1, 2048, 128, 128, 2048, 0, 128, 1, 1, False, 0, id="ilv_g8_qh1_lnc1_s2048_h128_b128_seg2048"),
+    pytest.param(
+        4, 2, 2048, 128, 32, 2048, 2048, 512, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s2048_h128_b32_seg2048_prior2048"
+    ),
+    pytest.param(
+        4,
+        2,
+        2048,
+        128,
+        128,
+        2048,
+        2048,
+        128,
+        1,
+        2,
+        False,
+        512,
+        id="ilv_g4_qh2_lnc2_s2048_h128_b128_seg2048_prior2048_sw512",
+    ),
+    pytest.param(4, 2, 4096, 128, 128, 4096, 0, 128, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s4096_h128_b128_seg4096"),
+    pytest.param(
+        4, 2, 4096, 128, 128, 4096, 4096, 256, 1, 2, False, 0, id="ilv_g4_qh2_lnc2_s4096_h128_b128_seg4096_prior4096"
+    ),
+    # q_heads_per_rank > lnc_degree (heavy compile)
+    pytest.param(4, 4, 2048, 128, 128, 2048, 0, 64, 1, 2, False, 0, id="ilv_g4_qh4_lnc2_s2048_h128_b128_seg2048"),
+    pytest.param(
+        4, 4, 2048, 128, 128, 2048, 2048, 128, 1, 2, False, 0, id="ilv_g4_qh4_lnc2_s2048_h128_b128_seg2048_prior2048"
+    ),
 ]
 
 
 @pytest_test_metadata(name="KV Parallel Segmented Prefill", pytest_marks=["attention", "kv_parallel"], tag=["model"])
+@pytest.mark.platforms(exclude=list(set(Platforms) - {Platforms.TRN2}))
 @pytest.mark.skip_simulation
 class TestKVParallelSegmentedPrefill:
     """Test class for KV-parallel segmented prefill attention."""
@@ -140,6 +224,7 @@ class TestKVParallelSegmentedPrefill:
         self,
         test_manager: Orchestrator,
         group_size: int,
+        q_heads_per_rank: int,
         seqlen: int,
         head_dim: int,
         block_size: int,
@@ -161,7 +246,8 @@ class TestKVParallelSegmentedPrefill:
         5. Return final result
 
         Args:
-            group_size: Number of ranks per replica group
+            group_size: Number of physical ranks per replica group
+            q_heads_per_rank: Number of Q heads per physical rank
             seqlen: Sequence length (Q length)
             head_dim: Head dimension
             block_size: KV cache block size
@@ -175,15 +261,12 @@ class TestKVParallelSegmentedPrefill:
         num_kv_heads = 1
         local_kv_len = seg_size * local_kv_multiplier
         num_blocks = local_kv_len // block_size
-
-        # With LNC>1, collectives operate at physical rank level, not NC level
         # collective_ranks = number of physical ranks participating in collectives
-        # Each physical rank has lnc_degree NCs that share the work internally
-        num_physical_ranks = group_size // lnc_degree
-        collective_ranks = num_physical_ranks * num_groups
+        collective_ranks = group_size * num_groups
+        # Each physical rank has q_heads_per_rank Q heads
+        total_q_heads = q_heads_per_rank * group_size * num_groups
 
-        # Generate Q for all groups (each group has group_size Q heads)
-        total_q_heads = group_size * num_groups
+        # Generate Q for all groups (each group has group_size * q_heads_per_rank Q heads)
         q_global = np.random.randn(total_q_heads, 1, seqlen, head_dim).astype(nl.bfloat16)
 
         # Generate KV shards for all physical ranks across all groups
@@ -200,30 +283,27 @@ class TestKVParallelSegmentedPrefill:
         block_tables = dt.static_cast(block_tables, nl.int32)
 
         # Create replica groups at physical rank level
-        # With LNC=2 and group_size=8: replica_group = [[0,1,2,3]] (4 physical ranks)
         replica_group_lists = [
-            list(range(group_idx * num_physical_ranks, (group_idx + 1) * num_physical_ranks))
-            for group_idx in range(num_groups)
+            list(range(group_idx * group_size, (group_idx + 1) * group_size)) for group_idx in range(num_groups)
         ]
         replica_groups = ReplicaGroup(replica_group_lists)
 
         def create_inputs(rank_id: int):
             # rank_id is physical rank index (0 to collective_ranks-1)
-            # Each physical rank has lnc_degree NCs sharing the same KV shard
 
             # Determine which group this rank belongs to and its position within the group
-            group_id = rank_id // num_physical_ranks
-            rank_in_group = rank_id % num_physical_ranks
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
 
             # cp_offset based on physical rank's KV position within its group
             k_offset = rank_in_group * local_kv_len
             cp_offset_value = -k_offset + prior_tokens
             cp_offset = dt.static_cast(np.array([[cp_offset_value]], dtype=np.int32), nl.int32)
 
-            # q_local contains lnc_degree Q heads for this physical rank
-            # Shape: [lnc_degree, seqlen, head_dim]
-            q_start = group_id * group_size + rank_in_group * lnc_degree
-            q_local = q_global[q_start : q_start + lnc_degree, 0, :, :]  # [lnc_degree, seqlen, head_dim]
+            # q_local contains q_heads_per_rank Q heads for this physical rank
+            # Shape: [q_heads_per_rank, seqlen, head_dim]
+            q_start = (group_id * group_size + rank_in_group) * q_heads_per_rank
+            q_local = q_global[q_start : q_start + q_heads_per_rank, 0, :, :]
 
             return {
                 "q": q_local,
@@ -242,15 +322,15 @@ class TestKVParallelSegmentedPrefill:
 
         def create_golden(rank_id: int):
             # rank_id is physical rank index (0 to collective_ranks-1)
-            # Each physical rank outputs lnc_degree Q heads
-            group_id = rank_id // num_physical_ranks
-            rank_in_group = rank_id % num_physical_ranks
+            # Each physical rank outputs q_heads_per_rank Q heads
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
 
             # Concatenate KV shards from all physical ranks in the same group
             k_full = []
             v_full = []
-            for pr in range(num_physical_ranks):
-                global_pr = group_id * num_physical_ranks + pr
+            for pr in range(group_size):
+                global_pr = group_id * group_size + pr
                 # Layout: (num_blocks, num_kv_heads, block_size, head_dim) → flatten to (total_kv_len, head_dim)
                 k_seq = k_cache_global[global_pr, :, 0, :, :].reshape(-1, head_dim).astype(np.float32)
                 v_seq = v_cache_global[global_pr, :, 0, :, :].reshape(-1, head_dim).astype(np.float32)
@@ -263,10 +343,10 @@ class TestKVParallelSegmentedPrefill:
 
             # Compute attention for each of this rank's Q heads
             outputs = []
-            q_start_global = group_id * group_size + rank_in_group * lnc_degree
+            q_start_global = (group_id * group_size + rank_in_group) * q_heads_per_rank
 
-            for nc in range(lnc_degree):
-                q_head_idx = q_start_global + nc
+            for head_idx in range(q_heads_per_rank):
+                q_head_idx = q_start_global + head_idx
                 q = q_global[q_head_idx, 0].astype(np.float32)  # [seqlen, head_dim]
 
                 # Compute attention scores
@@ -290,10 +370,10 @@ class TestKVParallelSegmentedPrefill:
                 out = np.matmul(attn_weights, v_full)  # [seqlen, head_dim]
                 outputs.append(out)
 
-            # Stack outputs: [lnc_degree, seqlen, head_dim] or [lnc_degree, head_dim, seqlen] if tp_out
+            # Stack outputs: [q_heads_per_rank, seqlen, head_dim] or [q_heads_per_rank, head_dim, seqlen] if tp_out
             out_stacked = np.stack(outputs, axis=0).astype(nl.bfloat16)
             if tp_out:
-                out_stacked = np.transpose(out_stacked, (0, 2, 1))  # [lnc_degree, head_dim, seqlen]
+                out_stacked = np.transpose(out_stacked, (0, 2, 1))  # [q_heads_per_rank, head_dim, seqlen]
 
             return {
                 "out": out_stacked,
@@ -315,6 +395,8 @@ class TestKVParallelSegmentedPrefill:
             sliding_window=0,
             kvp_rank_id=None,
             kvp_group_size=0,
+            apc_mode=False,
+            valid_num_prior_tokens=None,
         ):
             return create_golden(get_rank())
 
@@ -338,6 +420,7 @@ class TestKVParallelSegmentedPrefill:
         self,
         test_manager: Orchestrator,
         group_size: int,
+        q_heads_per_rank: int,
         seqlen: int,
         head_dim: int,
         block_size: int,
@@ -358,35 +441,32 @@ class TestKVParallelSegmentedPrefill:
         np.random.seed(42)
 
         num_kv_heads = 1
-        num_physical_ranks = group_size // lnc_degree
-        collective_ranks = num_physical_ranks * num_groups
+        collective_ranks = group_size * num_groups
 
         # Global KV: num_global_blocks blocks, each block_size tokens
         global_kv_len = num_global_blocks * block_size
         k_global_flat = np.random.randn(num_global_blocks, num_kv_heads, block_size, head_dim).astype(nl.bfloat16)
         v_global_flat = np.random.randn(num_global_blocks, num_kv_heads, block_size, head_dim).astype(nl.bfloat16)
 
-        # Round-robin assignment: global block b goes to rank (b % num_physical_ranks)
+        # Round-robin assignment: global block b goes to rank (b % group_size)
         # Each rank's local blocks, sorted by global position
-        blocks_per_rank = num_global_blocks // num_physical_ranks
 
         # Generate Q for all groups
-        total_q_heads = group_size * num_groups
+        total_q_heads = q_heads_per_rank * group_size * num_groups
         q_global = np.random.randn(total_q_heads, 1, seqlen, head_dim).astype(nl.bfloat16)
 
         # Replica groups
         replica_group_lists = [
-            list(range(group_idx * num_physical_ranks, (group_idx + 1) * num_physical_ranks))
-            for group_idx in range(num_groups)
+            list(range(group_idx * group_size, (group_idx + 1) * group_size)) for group_idx in range(num_groups)
         ]
         replica_groups = ReplicaGroup(replica_group_lists)
 
         def create_inputs(rank_id: int):
-            group_id = rank_id // num_physical_ranks
-            rank_in_group = rank_id % num_physical_ranks
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
 
             # Collect this rank's blocks (round-robin)
-            local_global_block_ids = list(range(rank_in_group, num_global_blocks, num_physical_ranks))
+            local_global_block_ids = list(range(rank_in_group, num_global_blocks, group_size))
             num_local_blocks = len(local_global_block_ids)
 
             # Build local KV cache from global blocks
@@ -404,8 +484,8 @@ class TestKVParallelSegmentedPrefill:
             cp_offset_value = prior_tokens
             cp_offset = dt.static_cast(np.array([[cp_offset_value]], dtype=np.int32), nl.int32)
 
-            q_start = group_id * group_size + rank_in_group * lnc_degree
-            q_local = q_global[q_start : q_start + lnc_degree, 0, :, :]
+            q_start = (group_id * group_size + rank_in_group) * q_heads_per_rank
+            q_local = q_global[q_start : q_start + q_heads_per_rank, 0, :, :]
 
             return {
                 "q": q_local,
@@ -422,22 +502,22 @@ class TestKVParallelSegmentedPrefill:
                 "tp_out": tp_out,
                 "sliding_window": sliding_window,
                 "kvp_rank_id": dt.static_cast(np.array([[rank_in_group]], dtype=np.int32), nl.int32),
-                "kvp_group_size": num_physical_ranks,
+                "kvp_group_size": group_size,
             }
 
         def create_golden(rank_id: int):
-            group_id = rank_id // num_physical_ranks
-            rank_in_group = rank_id % num_physical_ranks
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
 
             # Concatenate ALL ranks' KV in global order for the golden reference
             k_full = k_global_flat[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
             v_full = v_global_flat[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
 
             outputs = []
-            q_start_global = group_id * group_size + rank_in_group * lnc_degree
+            q_start_global = (group_id * group_size + rank_in_group) * q_heads_per_rank
 
-            for nc in range(lnc_degree):
-                q_head_idx = q_start_global + nc
+            for head_idx in range(q_heads_per_rank):
+                q_head_idx = q_start_global + head_idx
                 q = q_global[q_head_idx, 0].astype(np.float32)
 
                 scores = np.matmul(q, k_full.T)
@@ -484,6 +564,8 @@ class TestKVParallelSegmentedPrefill:
             sliding_window=0,
             kvp_rank_id=None,
             kvp_group_size=0,
+            apc_mode=False,
+            valid_num_prior_tokens=None,
         ):
             return create_golden(get_rank())
 
@@ -501,3 +583,470 @@ class TestKVParallelSegmentedPrefill:
             rtol=5e-2,
             atol=1e-2,
         )
+
+    _APC_PARAM_NAMES = "group_size,q_heads_per_rank,seqlen,head_dim,block_size,seg_size,prior_tokens,num_global_blocks,lnc_degree,tp_out"
+
+    _APC_FAST_PARAMS = [
+        pytest.param(
+            4,
+            2,
+            1024,
+            128,
+            128,
+            512,
+            1024,
+            128,
+            2,
+            False,
+            marks=pytest.mark.fast,
+            id="apc_lnc2_s1024_h128_b128_prior1024",
+        ),
+        pytest.param(
+            4,
+            2,
+            1024,
+            128,
+            64,
+            512,
+            512,
+            128,
+            2,
+            False,
+            marks=pytest.mark.fast,
+            id="apc_lnc2_s1024_h128_b64_prior512",
+        ),
+        pytest.param(
+            4,
+            2,
+            1024,
+            128,
+            128,
+            512,
+            2048,
+            192,
+            2,
+            False,
+            marks=pytest.mark.fast,
+            id="apc_lnc2_s1024_h128_b128_prior2048",
+        ),
+        # No prefix hit — active-only path, 0 prior segments
+        pytest.param(
+            4,
+            2,
+            1024,
+            128,
+            128,
+            512,
+            0,
+            128,
+            2,
+            False,
+            marks=pytest.mark.fast,
+            id="apc_lnc2_s1024_h128_b128_prior0",
+        ),
+        # cp_offset < stride — prior_tokens rounds to 0, no prior segments
+        # cp_offset < stride: stride-clamp zeros prior_tokens so active starts at block 0
+        pytest.param(
+            4,
+            2,
+            512,
+            128,
+            128,
+            512,
+            128,
+            128,
+            2,
+            False,
+            marks=pytest.mark.fast,
+            id="apc_lnc2_s512_h128_b128_prior128",
+        ),
+        # Partial prior segment: prior_tokens=768 → 1 full + 256 partial
+        pytest.param(
+            4,
+            2,
+            1024,
+            128,
+            128,
+            512,
+            768,
+            128,
+            2,
+            False,
+            marks=pytest.mark.fast,
+            id="apc_lnc2_s1024_h128_b128_prior768",
+        ),
+    ]
+
+    _APC_FULL_ONLY_PARAMS = [
+        # Larger stride (group_size=4, block_size=64 → stride=256), exercises different geometry
+        pytest.param(4, 2, 1024, 128, 64, 512, 1024, 128, 2, False, id="apc_lnc2_s1024_h128_b64_prior1024_full"),
+        # tp_out=True
+        pytest.param(4, 2, 1024, 128, 128, 512, 1024, 128, 2, True, id="apc_lnc2_s1024_h128_b128_prior1024_tp_out"),
+        # Large prior with many degenerate iterations to skip
+        pytest.param(4, 2, 1024, 128, 128, 512, 4096, 288, 2, False, id="apc_lnc2_s1024_h128_b128_prior4096"),
+        # Multiple Q heads per rank (q_heads_per_rank > lnc_degree)
+        pytest.param(4, 4, 1024, 128, 128, 512, 1024, 128, 2, False, id="apc_lnc2_qh4_s1024_h128_b128_prior1024"),
+        pytest.param(4, 4, 1024, 128, 128, 512, 2048, 192, 2, False, id="apc_lnc2_qh4_s1024_h128_b128_prior2048"),
+        # Large S (8 chunks): exercises per-chunk prior_tokens increment across many iterations
+        pytest.param(
+            4, 2, 4096, 128, 128, 512, 2048, 256, 2, False, id="apc_lnc2_s4096_h128_b128_prior2048_multichunk"
+        ),
+    ]
+
+    @pytest.mark.parametrize(_APC_PARAM_NAMES, _APC_FAST_PARAMS + _APC_FULL_ONLY_PARAMS)
+    def test_kv_parallel_segmented_prefill_interleaved_apc(
+        self,
+        test_manager: Orchestrator,
+        group_size: int,
+        q_heads_per_rank: int,
+        seqlen: int,
+        head_dim: int,
+        block_size: int,
+        seg_size: int,
+        prior_tokens: int,
+        num_global_blocks: int,
+        lnc_degree: int,
+        tp_out: bool,
+    ):
+        """
+        Test APC mode: global_q_offset=0, prior count derived from runtime kvp_q_offset.
+
+        Simulates automated prefix caching where the actual prefix hit length is only
+        known at runtime, not compile time.
+        """
+        np.random.seed(42)
+
+        num_kv_heads = 1
+        num_groups = 1
+        collective_ranks = group_size * num_groups
+
+        global_kv_len = num_global_blocks * block_size
+        k_global_flat = np.random.randn(num_global_blocks, num_kv_heads, block_size, head_dim).astype(nl.bfloat16)
+        v_global_flat = np.random.randn(num_global_blocks, num_kv_heads, block_size, head_dim).astype(nl.bfloat16)
+
+        total_q_heads = q_heads_per_rank * group_size * num_groups
+        q_global = np.random.randn(total_q_heads, 1, seqlen, head_dim).astype(nl.bfloat16)
+
+        replica_group_lists = [
+            list(range(group_idx * group_size, (group_idx + 1) * group_size)) for group_idx in range(num_groups)
+        ]
+        replica_groups = ReplicaGroup(replica_group_lists)
+
+        def create_inputs(rank_id: int):
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
+
+            local_global_block_ids = list(range(rank_in_group, num_global_blocks, group_size))
+            num_local_blocks = len(local_global_block_ids)
+
+            k_local = np.zeros((num_local_blocks, num_kv_heads, block_size, head_dim), dtype=nl.bfloat16)
+            v_local = np.zeros((num_local_blocks, num_kv_heads, block_size, head_dim), dtype=nl.bfloat16)
+
+            for local_idx, global_blk_id in enumerate(local_global_block_ids):
+                k_local[local_idx] = k_global_flat[global_blk_id]
+                v_local[local_idx] = v_global_flat[global_blk_id]
+
+            block_tables = np.arange(num_local_blocks, dtype=np.int32).reshape(1, num_local_blocks)
+            block_tables = dt.static_cast(block_tables, nl.int32)
+
+            # APC: kvp_q_offset = actual global Q position (runtime), global_q_offset = 0
+            cp_offset = dt.static_cast(np.array([[prior_tokens]], dtype=np.int32), nl.int32)
+            # valid_num_prior_tokens = number of fully-visible local prior tokens for chunk 0.
+            # Rank r's local block i is at global pos i*stride + r*block_size.
+            # Fully visible if last token: i*stride + r*block_size + block_size - 1 <= kvp_q_offset.
+            stride = group_size * block_size
+            rank_offset = rank_in_group * block_size
+            threshold = prior_tokens - rank_offset - block_size + 1
+            num_fully_visible_blocks = max(0, threshold // stride + 1) if threshold >= 0 else 0
+            valid_prior = num_fully_visible_blocks * block_size
+            num_prior = dt.static_cast(np.array([[valid_prior]], dtype=np.int32), nl.int32)
+
+            q_start = (group_id * group_size + rank_in_group) * q_heads_per_rank
+            q_local = q_global[q_start : q_start + q_heads_per_rank, 0, :, :]
+
+            return {
+                "q": q_local,
+                "k_cache": k_local,
+                "v_cache": v_local,
+                "block_tables": block_tables,
+                "kvp_q_offset": cp_offset,
+                "replica_groups": replica_groups,
+                "group_size": group_size,
+                "block_size": block_size,
+                "seg_size": seg_size,
+                "scale": 1.0,
+                "global_q_offset": 0,
+                "tp_out": tp_out,
+                "sliding_window": 0,
+                "kvp_rank_id": dt.static_cast(np.array([[rank_in_group]], dtype=np.int32), nl.int32),
+                "kvp_group_size": group_size,
+                "apc_mode": True,
+                "valid_num_prior_tokens": num_prior,
+            }
+
+        def create_golden(rank_id: int):
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
+
+            k_full = k_global_flat[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
+            v_full = v_global_flat[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
+
+            outputs = []
+            q_start_global = (group_id * group_size + rank_in_group) * q_heads_per_rank
+
+            for head_idx in range(q_heads_per_rank):
+                q_head_idx = q_start_global + head_idx
+                q = q_global[q_head_idx, 0].astype(np.float32)
+
+                scores = np.matmul(q, k_full.T)
+
+                q_pos = np.arange(prior_tokens, prior_tokens + seqlen).reshape(-1, 1)
+                k_pos = np.arange(global_kv_len).reshape(1, -1)
+                causal_mask = q_pos < k_pos
+                scores = np.where(causal_mask, -np.inf, scores)
+
+                max_scores = np.max(scores, axis=-1, keepdims=True)
+                max_scores = np.where(np.isinf(max_scores), 0, max_scores)
+                exp_scores = np.exp(scores - max_scores)
+                sum_exp = np.sum(exp_scores, axis=-1, keepdims=True)
+                sum_exp = np.where(sum_exp == 0, 1, sum_exp)
+                attn_weights = exp_scores / sum_exp
+
+                out = np.matmul(attn_weights, v_full)
+                outputs.append(out)
+
+            out_stacked = np.stack(outputs, axis=0).astype(nl.bfloat16)
+            if tp_out:
+                out_stacked = np.transpose(out_stacked, (0, 2, 1))
+            return {"out": out_stacked}
+
+        def _torch_ref(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            kvp_q_offset,
+            replica_groups,
+            group_size,
+            block_size,
+            seg_size,
+            scale=1.0,
+            global_q_offset=0,
+            tp_out=False,
+            sliding_window=0,
+            kvp_rank_id=None,
+            kvp_group_size=0,
+            apc_mode=False,
+            valid_num_prior_tokens=None,
+        ):
+            return create_golden(get_rank())
+
+        framework = CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_kv_parallel_segmented_cte,
+            torch_ref=_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=Platforms.TRN2, logical_nc_config=lnc_degree),
+            output_keys=["out"],
+            rtol=5e-2,
+            atol=1e-2,
+        )
+
+
+@pytest.mark.attention
+@pytest.mark.kv_parallel
+class TestKVParallelSegmentedPrefillModelConfigs:
+    """Model-driven tests for KVP segmented prefill attention.
+
+    Exercises production model shapes (Llama-3.2-1B) with DCP prefill configs,
+    including APC (chunked context with prior cached tokens).
+    """
+
+    _MODEL_PARAMS = "model_name,group_size,q_heads_per_rank,seqlen,head_dim,block_size,seg_size,prior_tokens,num_global_blocks,lnc_degree,tp_out,apc_mode"
+
+    _OPTIMAL_PARAMS, _OPTIMAL_IDS = (
+        prepare_model_parametrize(
+            {ModelTestType.OPTIMAL: kvp_segmented_attention_cte_model_configs.get(ModelTestType.OPTIMAL, [])}
+        )
+        if kvp_segmented_attention_cte_model_configs
+        else ([], [])
+    )
+
+    def _run_model_test(
+        self,
+        test_manager: Orchestrator,
+        model_name: str,
+        group_size: int,
+        q_heads_per_rank: int,
+        seqlen: int,
+        head_dim: int,
+        block_size: int,
+        seg_size: int,
+        prior_tokens: int,
+        num_global_blocks: int,
+        lnc_degree: int,
+        tp_out: bool,
+        apc_mode: bool,
+    ):
+        np.random.seed(42)
+
+        num_kv_heads = 1
+        num_groups = 1
+        collective_ranks = group_size * num_groups
+
+        global_kv_len = num_global_blocks * block_size
+        k_global_flat = np.random.randn(num_global_blocks, num_kv_heads, block_size, head_dim).astype(nl.bfloat16)
+        v_global_flat = np.random.randn(num_global_blocks, num_kv_heads, block_size, head_dim).astype(nl.bfloat16)
+
+        total_q_heads = q_heads_per_rank * group_size * num_groups
+        q_global = np.random.randn(total_q_heads, 1, seqlen, head_dim).astype(nl.bfloat16)
+
+        replica_group_lists = [
+            list(range(group_idx * group_size, (group_idx + 1) * group_size)) for group_idx in range(num_groups)
+        ]
+        replica_groups = ReplicaGroup(replica_group_lists)
+
+        def create_inputs(rank_id: int):
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
+
+            local_global_block_ids = list(range(rank_in_group, num_global_blocks, group_size))
+            num_local_blocks = len(local_global_block_ids)
+
+            k_local = np.zeros((num_local_blocks, num_kv_heads, block_size, head_dim), dtype=nl.bfloat16)
+            v_local = np.zeros((num_local_blocks, num_kv_heads, block_size, head_dim), dtype=nl.bfloat16)
+
+            for local_idx, global_blk_id in enumerate(local_global_block_ids):
+                k_local[local_idx] = k_global_flat[global_blk_id]
+                v_local[local_idx] = v_global_flat[global_blk_id]
+
+            block_tables = np.arange(num_local_blocks, dtype=np.int32).reshape(1, num_local_blocks)
+            block_tables = dt.static_cast(block_tables, nl.int32)
+
+            cp_offset = dt.static_cast(np.array([[prior_tokens]], dtype=np.int32), nl.int32)
+
+            q_start = (group_id * group_size + rank_in_group) * q_heads_per_rank
+            q_local = q_global[q_start : q_start + q_heads_per_rank, 0, :, :]
+
+            inputs = {
+                "q": q_local,
+                "k_cache": k_local,
+                "v_cache": v_local,
+                "block_tables": block_tables,
+                "kvp_q_offset": cp_offset,
+                "replica_groups": replica_groups,
+                "group_size": group_size,
+                "block_size": block_size,
+                "seg_size": seg_size,
+                "scale": 1.0,
+                "global_q_offset": 0,
+                "tp_out": tp_out,
+                "sliding_window": 0,
+                "kvp_rank_id": dt.static_cast(np.array([[rank_in_group]], dtype=np.int32), nl.int32),
+                "kvp_group_size": group_size,
+                "apc_mode": apc_mode,
+            }
+            if apc_mode:
+                stride = group_size * block_size
+                rank_offset = rank_in_group * block_size
+                threshold = prior_tokens - rank_offset - block_size + 1
+                num_fully_visible_blocks = max(0, threshold // stride + 1) if threshold >= 0 else 0
+                valid_prior = num_fully_visible_blocks * block_size
+                inputs["valid_num_prior_tokens"] = dt.static_cast(np.array([[valid_prior]], dtype=np.int32), nl.int32)
+            return inputs
+
+        def create_golden(rank_id: int):
+            group_id = rank_id // group_size
+            rank_in_group = rank_id % group_size
+
+            k_full = k_global_flat[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
+            v_full = v_global_flat[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
+
+            outputs = []
+            q_start_global = (group_id * group_size + rank_in_group) * q_heads_per_rank
+
+            for head_idx in range(q_heads_per_rank):
+                q_head_idx = q_start_global + head_idx
+                q = q_global[q_head_idx, 0].astype(np.float32)
+
+                scores = np.matmul(q, k_full.T)
+
+                q_pos = np.arange(prior_tokens, prior_tokens + seqlen).reshape(-1, 1)
+                k_pos = np.arange(global_kv_len).reshape(1, -1)
+                causal_mask = q_pos < k_pos
+                scores = np.where(causal_mask, -np.inf, scores)
+
+                max_scores = np.max(scores, axis=-1, keepdims=True)
+                max_scores = np.where(np.isinf(max_scores), 0, max_scores)
+                exp_scores = np.exp(scores - max_scores)
+                sum_exp = np.sum(exp_scores, axis=-1, keepdims=True)
+                sum_exp = np.where(sum_exp == 0, 1, sum_exp)
+                attn_weights = exp_scores / sum_exp
+
+                out = np.matmul(attn_weights, v_full)
+                outputs.append(out)
+
+            out_stacked = np.stack(outputs, axis=0).astype(nl.bfloat16)
+            if tp_out:
+                out_stacked = np.transpose(out_stacked, (0, 2, 1))
+            return {"out": out_stacked}
+
+        def _torch_ref(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            kvp_q_offset,
+            replica_groups,
+            group_size,
+            block_size,
+            seg_size,
+            scale=1.0,
+            global_q_offset=0,
+            tp_out=False,
+            sliding_window=0,
+            kvp_rank_id=None,
+            kvp_group_size=0,
+            apc_mode=False,
+            valid_num_prior_tokens=None,
+        ):
+            return create_golden(get_rank())
+
+        framework = CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_kv_parallel_segmented_cte,
+            torch_ref=_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=Platforms.TRN2, logical_nc_config=lnc_degree),
+            output_keys=["out"],
+            rtol=5e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.parametrize(_MODEL_PARAMS, _OPTIMAL_PARAMS, ids=_OPTIMAL_IDS)
+    def test_optimal(
+        self,
+        test_manager: Orchestrator,
+        model_name: str,
+        group_size: int,
+        q_heads_per_rank: int,
+        seqlen: int,
+        head_dim: int,
+        block_size: int,
+        seg_size: int,
+        prior_tokens: int,
+        num_global_blocks: int,
+        lnc_degree: int,
+        tp_out: bool,
+        apc_mode: bool,
+    ):
+        """OPTIMAL: Production model configs for KVP segmented prefill with DCP."""
+        self._run_model_test(**{k: v for k, v in locals().items() if k != "self"})

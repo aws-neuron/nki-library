@@ -24,11 +24,11 @@ from typing import Any, final
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_bwd_mxfp8.mlp_bwd_mxfp8_kernel import (
     mlp_backward_mxfp8_nki,
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils import (
     ALL_CHECKPOINTS_ENABLED,
     LNC,
@@ -139,7 +139,7 @@ def _make_weights_pq_torch_ref(original_hidden, original_gate_up, original_down)
     return torch_ref
 
 
-@pytest_test_metadata(name="MLP MXFP8 Bwd Weights Prequantized")
+@pytest_test_metadata(name="MLP MXFP8 Bwd Prequantized")
 @pytest_marks(["mlp_mxfp8_prequantized", "mx"])
 @pytest.mark.platforms(exclude=[common_dataclasses.Platforms.TRN1, common_dataclasses.Platforms.TRN2])
 @final
@@ -333,7 +333,6 @@ def _make_all_pq_torch_ref(original_hidden, original_gate_up, original_down):
     return torch_ref
 
 
-@pytest_test_metadata(name="MLP MXFP8 Bwd All Prequantized")
 @pytest_marks(["mlp_mxfp8_prequantized", "mx"])
 @pytest.mark.platforms(exclude=[common_dataclasses.Platforms.TRN1, common_dataclasses.Platforms.TRN2])
 @final

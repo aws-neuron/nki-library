@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import math
 import os
 from dataclasses import asdict
 from functools import lru_cache
@@ -48,8 +49,6 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.attention.attention_tkg import (
     AttnTKGConfig,
     TileConstants,
@@ -62,11 +61,14 @@ from nkilib_src.nkilib.core.attention.attention_tkg import (
 )
 from nkilib_src.nkilib.core.attention.attention_tkg_torch import attention_tkg_torch_ref
 from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
+    is_qk_swapped,
     uses_batch_tiling,
 )
 from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
 from nkilib_src.nkilib.core.utils.allocator import SbufManager, create_auto_alloc_manager, sizeinbytes
 from nkilib_src.nkilib.core.utils.logging import Logger
+from typing_extensions import override
+
 from test.integration.nkilib.utils.tensor_generators import np_random_sample, np_random_sample_fp8
 from test.utils.common_dataclasses import (
     MODEL_TEST_TYPE,
@@ -107,6 +109,7 @@ def attn_tkg_wrapper(
     sink,
     active_blocks_table,
     attn_out_shape,
+    attn_out_sb_shape,
     k_out_shape,
     cfg: AttnTKGConfig,
     dtype,
@@ -135,10 +138,12 @@ def attn_tkg_wrapper(
     sbm.open_scope()
 
     # Create output tensors
+    d_tile_size = min(cfg.d_head, P_MAX)
+    n_d_tiles = math.ceil(cfg.d_head / P_MAX)
     out_buffer = nl.sbuf if cfg.out_in_sb else nl.shared_hbm
     k_out_buffer = nl.sbuf if cfg.k_out_in_sb else nl.shared_hbm
     if cfg.out_in_sb:
-        out = sbm.alloc_stack(attn_out_shape, dtype=dtype, buffer=nl.sbuf)
+        out = sbm.alloc_stack(attn_out_sb_shape, dtype=dtype, buffer=nl.sbuf)
     else:
         out = nl.ndarray(attn_out_shape, dtype=dtype, buffer=out_buffer)
     k_out = None
@@ -151,10 +156,22 @@ def attn_tkg_wrapper(
 
     # Load QK if kernel wants SB inputs
     if cfg.qk_in_sb:
-        q_input = sbm.alloc_stack(q.shape, dtype=q.dtype, buffer=nl.sbuf)
-        k_active_input = sbm.alloc_stack(k_active.shape, dtype=k_active.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(q_input, q)
-        nisa.dma_copy(k_active_input, k_active)
+        q_free = cfg.bs * cfg.q_head * cfg.s_active
+        q_input = sbm.alloc_stack((d_tile_size, n_d_tiles * q_free), dtype=q.dtype, buffer=nl.sbuf)
+        for i_d in range(n_d_tiles):
+            d_start = i_d * d_tile_size
+            nisa.dma_copy(
+                q_input[:, i_d * q_free : (i_d + 1) * q_free],
+                q[d_start : d_start + d_tile_size, :],
+            )
+        k_free = cfg.bs * cfg.s_active
+        k_active_input = sbm.alloc_stack((d_tile_size, n_d_tiles * k_free), dtype=k_active.dtype, buffer=nl.sbuf)
+        for i_d in range(n_d_tiles):
+            d_start = i_d * d_tile_size
+            nisa.dma_copy(
+                k_active_input[:, i_d * k_free : (i_d + 1) * k_free],
+                k_active[d_start : d_start + d_tile_size, :],
+            )
     else:
         q_input = q
         k_active_input = k_active
@@ -212,9 +229,15 @@ def attn_tkg_wrapper(
 
     # Handle output if needed
     if cfg.out_in_sb:
-        # This is a bug, the name generation logic is faulty.
-        attn_out_hbm = nl.ndarray(attn_out.shape, dtype=attn_out.dtype, buffer=nl.shared_hbm, name="attn_out_hbm")
-        nisa.dma_copy(dst=attn_out_hbm, src=attn_out)
+        out_bqh = cfg.bs * cfg.q_head * cfg.s_active
+        attn_out_hbm = nl.ndarray(attn_out_shape, dtype=attn_out.dtype, buffer=nl.shared_hbm, name="attn_out_hbm")
+        for i_d in range(n_d_tiles):
+            d_start = i_d * d_tile_size
+            src_offset = i_d * out_bqh
+            nisa.dma_copy(
+                dst=attn_out_hbm[d_start : d_start + d_tile_size, :],
+                src=attn_out[:, src_offset : src_offset + out_bqh],
+            )
         attn_out = attn_out_hbm
 
     if cfg.k_out_in_sb and cfg.fuse_rope:
@@ -257,6 +280,9 @@ def run_attention_tkg_test(
     else:
         relative_tolerance, absolute_tolerance = 1e-2, 1e-5
 
+    # KV cache dtype for this config (used to derive the is_2byte_kv arg of is_qk_swapped).
+    kv_dtype = FP8_TEST_DTYPE if fp8_kv else dtype
+
     # Shapes that differ base on config
     q_shape = (
         (cfg.d_head, cfg.bs * cfg.q_head * cfg.s_active)
@@ -264,7 +290,6 @@ def run_attention_tkg_test(
         else (cfg.bs, cfg.q_head, cfg.s_active, cfg.d_head)
     )
     k_active_shape = (cfg.d_head, cfg.bs * cfg.s_active) if cfg.qk_in_sb else (cfg.bs, 1, cfg.s_active, cfg.d_head)
-    resize_factor = None
     if is_block_kv:
         assumed_num_cache_blocks = cfg.bs * cfg.curr_sprior // cfg.block_len
         if cfg.fp8_packed:
@@ -278,11 +303,14 @@ def run_attention_tkg_test(
         )
         v_prior_shape = (cfg.bs, 1, cfg.full_sprior, cfg.d_head)
 
-    attn_out_shape = (
-        (cfg.d_head, cfg.bs * cfg.q_head * cfg.s_active)
-        if cfg.out_in_sb
-        else (cfg.bs, cfg.q_head, cfg.d_head, cfg.s_active)
-    )
+    n_d_tiles = math.ceil(cfg.d_head / P_MAX)
+    d_tile_size = min(cfg.d_head, P_MAX)
+    if cfg.out_in_sb:
+        attn_out_shape = (cfg.d_head, cfg.bs * cfg.q_head * cfg.s_active)
+        attn_out_sb_shape = (d_tile_size, n_d_tiles * cfg.bs * cfg.q_head * cfg.s_active)
+    else:
+        attn_out_shape = (cfg.bs, cfg.q_head, cfg.d_head, cfg.s_active)
+        attn_out_sb_shape = None
     k_out_shape = (cfg.d_head, cfg.bs * cfg.s_active) if cfg.k_out_in_sb else (cfg.bs, 1, cfg.d_head, cfg.s_active)
 
     # Generate pos_id outside of tensor_gen so it stays the same for all inputs
@@ -305,7 +333,7 @@ def run_attention_tkg_test(
             kv_random_gen = random_gen
             kv_dtype = dtype
 
-        q = random_gen(shape=q_shape, dtype=dtype, name='q').astype(kv_dtype)
+        q = random_gen(shape=q_shape, dtype=dtype, name='q')
         k_active = kv_random_gen(shape=k_active_shape, dtype=kv_dtype, name='k_active').astype(kv_dtype)
         v_active = kv_random_gen(shape=(cfg.bs, 1, cfg.s_active, cfg.d_head), dtype=kv_dtype, name='v_active').astype(
             kv_dtype
@@ -320,6 +348,9 @@ def run_attention_tkg_test(
                 .astype(np.bool_)
             )
         else:
+            # TODO: migrate to gen_mask_tkg_hbm_torch_ref so this test shares the
+            # same swap-aware mask reference as attention_block_tkg.
+            # This requires flat-KV support for non-strided MM1 in the HBM reference.
             cache_lens_torch = torch.from_numpy(np.asarray(pos_id).flatten()).to(torch.float32)
             active_mask = (
                 build_full_attention_mask(
@@ -338,6 +369,20 @@ def run_attention_tkg_test(
                 .numpy()
                 .astype(np.bool_)
             )
+            if is_qk_swapped(
+                bs=cfg.bs,
+                q_head=cfg.q_head,
+                d_head=cfg.d_head,
+                s_active=cfg.s_active,
+                curr_sprior=cfg.curr_sprior,
+                lnc=lnc,
+                p_max=P_MAX,
+                is_block_kv=is_block_kv,
+                is_2byte_kv=sizeinbytes(kv_dtype) == 2,
+                fp8_packed=cfg.fp8_packed,
+                fuse_rope=cfg.fuse_rope,
+            ):
+                active_mask = np.ascontiguousarray(active_mask.transpose(1, 2, 3, 0))  # [s_ctx,B,N,S]->[B,N,S,s_ctx]
         active_mask = active_mask.astype(np.uint8)
 
         inv_freqs = np.random.random(size=(cfg.d_head // 2, 1)).astype(np.float32) if cfg.fuse_rope else None
@@ -379,6 +424,7 @@ def run_attention_tkg_test(
             "sink": sink,
             "active_blocks_table": active_blocks_table,
             "attn_out_shape": attn_out_shape,
+            "attn_out_sb_shape": attn_out_sb_shape,
             "k_out_shape": k_out_shape,
             "cfg": cfg,
             "dtype": dtype,
@@ -403,6 +449,7 @@ def run_attention_tkg_test(
         sink,
         active_blocks_table,
         attn_out_shape,
+        attn_out_sb_shape,
         k_out_shape,
         cfg: AttnTKGConfig,
         dtype,
@@ -443,13 +490,32 @@ def run_attention_tkg_test(
                 )
                 DBG_TENSORS = DBG_TENSORS + (DBG_ACTIVE_TABLE,)
 
+        # input_generator hands the kernel the swap (bqh-major) mask [B, N, s_active, s_ctx] for swap
+        # configs. attention_tkg_torch_ref only implements the canonical s_prior-major [s_ctx, B, N, s_active]
+        # layout, so un-swap here.
+        golden_mask = mask
+        if not cfg.use_pos_id and is_qk_swapped(
+            bs=cfg.bs,
+            q_head=cfg.q_head,
+            d_head=cfg.d_head,
+            s_active=cfg.s_active,
+            curr_sprior=cfg.curr_sprior,
+            lnc=lnc,
+            p_max=P_MAX,
+            is_block_kv=is_block_kv,
+            is_2byte_kv=sizeinbytes(kv_dtype) == 2,
+            fp8_packed=cfg.fp8_packed,
+            fuse_rope=cfg.fuse_rope,
+        ):
+            golden_mask = mask.permute(3, 0, 1, 2)  # [B, N, s_active, s_ctx] -> [s_ctx, B, N, s_active]
+
         out, k_out = attention_tkg_torch_ref[lnc](
             q=q,
             k_active=k_active,
             v_active=v_active,
             k_prior=k_prior,
             v_prior=v_prior,
-            mask=mask,
+            mask=golden_mask,
             out=out,
             cfg=cfg,
             sbm=None,
@@ -681,6 +747,8 @@ def filter_invalid_tests(
             return FilterResult.INVALID
         if qk_in_sb is not None and not qk_in_sb:
             return FilterResult.INVALID
+        if dtype is not None and dtype == nl.float32:
+            return FilterResult.INVALID
 
     # fp8_packed constraints
     if fp8_packed is not None and fp8_packed:
@@ -874,6 +942,9 @@ attention_tkg_fast_configs = [
     # FP8 KV with Block KV fp8_packed
     [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
     [AttnTKGConfig(8, 8, 5, 4096, 4096, 64, 32, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
+    # FP8 KV with Block KV fp8_packed d_head=64 - validates k_active stitching with position packing
+    [AttnTKGConfig(4, 8, 4, 4096, 4096, 64, 64, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
+    [AttnTKGConfig(16, 8, 4, 16384, 16384, 64, 64, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
     pytest.param(AttnTKGConfig(2, 8, 5, 256, 256, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True, sliding_window=128), marks=pytest.mark.fast),
     # Block KV Tests with gen_mask_tkg mask generation (use_pos_id=True)
     [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
@@ -891,6 +962,36 @@ attention_tkg_fast_configs = [
 
     #################### Test sprior_sharding when s_active_bqh > 128####################
     [AttnTKGConfig(5, 7, 7, 24576, 24576, 64, 0, use_pos_id=True, qk_in_sb=True), AttnTKGTestParams(test_sink=True)],
+
+    #################### QK-swap + SWA ####################
+    pytest.param(AttnTKGConfig(4, 16, 8, 2048, 2048, 64, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True, sliding_window=128), marks=pytest.mark.fast),
+    [AttnTKGConfig(4, 16, 8, 2048, 2048, 64, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True, sliding_window=256)],
+
+    #################### d_head = 256 (num_d_tiles=2, Qwen3.5 decode path) ####################
+    # Flat KV, single active token
+    [AttnTKGConfig(4, 1, 1, 2048, 2048, 256, 0, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+    # Block KV, single active token (Qwen3.5 decode)
+    pytest.param(AttnTKGConfig(4, 1, 1, 2048, 2048, 256, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(), marks=pytest.mark.fast),
+    # Block KV, speculative decode (s_active > 1)
+    [AttnTKGConfig(4, 1, 5, 2048, 2048, 256, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+
+    #################### d_head = 512 ####################
+    # Flat KV with PE transpose (d_head > 128 requires PE transpose path, fuse_rope not supported)
+    [AttnTKGConfig(4, 1, 1, 1024, 1024, 512, 0, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+    [AttnTKGConfig(4, 1, 1, 2048, 2048, 512, 0, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+    # Block KV with d_head=512
+    [AttnTKGConfig(4, 1, 1, 2048, 2048, 512, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+    [AttnTKGConfig(1, 4, 1, 256, 256, 512, 128, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+    # Block KV with d_head=512, small s_prior (triggers block resize), matches Gemma4 global layer config
+    [AttnTKGConfig(1, 4, 1, 256, 256, 512, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams()],
+    # FP8 KV with d_head=512 (flat KV)
+    [AttnTKGConfig(4, 1, 1, 1024, 1024, 512, 0, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
+    # FP8 KV with d_head=512 (block KV)
+    [AttnTKGConfig(4, 1, 1, 2048, 2048, 512, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
+    # FP8 KV with d_head=512, TP=16-like (q_head=2, block KV, Gemma4 global + TP16)
+    [AttnTKGConfig(1, 2, 1, 256, 256, 512, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(fp8_kv=True)],
+    # FP8 KV with d_head=512, production-like (TP=16, BS=64, s_prior=1024, block_len=16)
+    [AttnTKGConfig(64, 2, 1, 1024, 1024, 512, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(fp8_kv=True)],
 
     #################### SWA (Sliding Window Attention) Tests ####################
     # SWA requires use_pos_id=True, sliding_window > 0

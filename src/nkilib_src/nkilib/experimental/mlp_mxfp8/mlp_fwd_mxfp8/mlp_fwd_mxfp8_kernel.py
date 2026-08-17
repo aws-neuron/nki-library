@@ -22,7 +22,7 @@ from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
 from ...matmul_mxfp8.matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
 from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
-from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm
+from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
 from ...mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import INTERLEAVE_FACTOR
 from ..common_utils import (
     DGT_MIN_K,
@@ -382,6 +382,7 @@ def compute_fused_gate_up_down_mxfp8(
     )
 
 
+@with_active_sbm
 def mlp_forward_mxfp8_nki(
     hidden: nl.ndarray,
     gate_up_weights: nl.ndarray,

@@ -21,10 +21,9 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from nkilib_src.nkilib.core.utils.tiled_tensor import TiledTensor
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
 )
@@ -268,7 +267,7 @@ def kernel_test_construction_negative(
 ):
     """Test kernel for construction failures."""
     src = nl.ndarray(source_shape, nl.bfloat16, buffer)
-    tt = TiledTensor(src, tile_size)
+    TiledTensor(src, tile_size)
     return dummy_out
 
 
@@ -281,22 +280,21 @@ def kernel_test_from_tensor_view(
     view_ops: tuple,
     expected_grid_shape: tuple,
 ):
-    """Test kernel that creates TiledTensor from a pre-processed TensorView."""
+    """Test kernel that creates TiledTensor from a pre-processed NkiTensor."""
     src = nl.ndarray(source_shape, nl.bfloat16, buffer)
-    tv = TensorView(src)
     for i in range(len(view_ops)):
         op_name = view_ops[i][0]
         args = view_ops[i][1]
         if op_name == "reshape_dim":
             dim, shape = args
-            tv = tv.reshape_dim(dim, shape)
+            src = src.reshape_dim(dim, shape)
         elif op_name == "permute":
             (dims,) = args
-            tv = tv.permute(dims)
+            src = src.permute(dims)
         elif op_name == "slice":
             dim, start, end, step = args
-            tv = tv.slice(dim, start, end, step)
-    tt = TiledTensor(tv, tile_size)
+            src = src.slice(dim, start, end, step)
+    tt = TiledTensor(src, tile_size)
     grid_shape = tt.get_shape()
     for i in range(len(expected_grid_shape)):
         kernel_assert(
@@ -511,16 +509,16 @@ class TestTiledTensor:
             expected_view_offset,
         )
 
-    # ----- Construction from TensorView -----
+    # ----- Construction from NkiTensor -----
 
     @pytest.mark.trace_only
     @pytest.mark.fast
     @pytest.mark.parametrize(
         "source_shape,view_ops,tile_size,expected_grid_shape",
         [
-            # TensorView with reshape_dim: (512, 1024) -> reshape_dim(1, (512, 2)) -> (512, 512, 2)
+            # NkiTensor with reshape_dim: (512, 1024) -> reshape_dim(1, (512, 2)) -> (512, 512, 2)
             ((512, 1024), (("reshape_dim", (1, (512, 2))),), (128, 256, 1), (4, 2, 2)),
-            # TensorView with slice: (512, 1024) -> slice(0, 0, 256) -> (256, 1024)
+            # NkiTensor with slice: (512, 1024) -> slice(0, 0, 256) -> (256, 1024)
             ((512, 1024), (("slice", (0, 0, 256, 1)),), (128, 256), (2, 4)),
         ],
     )
@@ -1501,7 +1499,7 @@ def kernel_tiled_dma_copy(src_hbm):
       1. Tile the source
       2. Loop over tile grid
       3. Access individual tiles via get_tile
-      4. Use tile TensorView with nisa.dma_copy
+      4. Use tile NkiTensor with nisa.dma_copy
     """
     src_tiles = TiledTensor(src_hbm, tile_size=(128, 512))
     grid = src_tiles.get_shape()
@@ -1514,8 +1512,8 @@ def kernel_tiled_dma_copy(src_hbm):
             src_tile = src_tiles.get_tile((i, j))
             dst_tile = dst_tiles.get_tile((i, j))
             sbuf = nl.ndarray((128, 512), dtype=src_hbm.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=sbuf, src=src_tile.get_view())
-            nisa.dma_copy(dst=dst_tile.get_view(), src=sbuf)
+            nisa.dma_copy(dst=sbuf, src=src_tile)
+            nisa.dma_copy(dst=dst_tile, src=sbuf)
 
     return out
 
@@ -1525,7 +1523,7 @@ def kernel_tiled_row_select_copy(src_hbm, row_idx: int):
     """Kernel: select a tile row via get_view and DMA the whole row at once.
 
     Demonstrates coalesced access: select a row of tiles and use get_view()
-    to get a single contiguous TensorView covering all tiles in that row.
+    to get a single contiguous NkiTensor covering all tiles in that row.
     Returns a (128, 1024) tensor containing that row.
     """
     src_tiles = TiledTensor(src_hbm, tile_size=(128, 256))
@@ -1535,7 +1533,7 @@ def kernel_tiled_row_select_copy(src_hbm, row_idx: int):
     out = nl.ndarray((128, 1024), dtype=src_hbm.dtype, buffer=nl.shared_hbm)
 
     sbuf = nl.ndarray((128, 1024), dtype=src_hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=sbuf, src=row_view.get_view())
+    nisa.dma_copy(dst=sbuf, src=row_view)
     nisa.dma_copy(dst=out, src=sbuf)
 
     return out
@@ -1567,7 +1565,7 @@ def kernel_tiled_reshape_select(src_hbm):
     first_row_tiles = first_half.select(0, 0)
     first_row_view = first_row_tiles.get_view()
     sbuf = nl.ndarray((128, 1024), dtype=src_hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=sbuf, src=first_row_view.get_view())
+    nisa.dma_copy(dst=sbuf, src=first_row_view)
     nisa.dma_copy(dst=out, src=sbuf)
 
     return out

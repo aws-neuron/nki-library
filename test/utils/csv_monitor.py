@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .common_dataclasses import PYTEST_XDIST_WORKER_ENV
+
 
 def _parse_fields(row: str, num_fields: int) -> tuple[str, list[str]]:
     """Split a CSV row into (test_id, [field1, field2, ...]).
@@ -67,7 +69,7 @@ class CSVMonitor:
     def append(self, output_dir: Path, row: str) -> None:
         """Append a raw CSV row (no header, no newline) to the current worker's file."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
+        worker_id = os.environ.get(PYTEST_XDIST_WORKER_ENV, "master")
         with open(output_dir / f"{self.prefix}_{worker_id}.csv", "a") as f:
             f.write(row + "\n")
 
@@ -106,17 +108,15 @@ DURATION_MONITOR = CSVMonitor(
     header="test_id,cpu_time_s,wall_time_s",
     sort_field=1,
     sort_descending=True,
-    format_row=lambda test_id, fields: (f"{float(fields[0]):8.1f}s cpu  {float(fields[1]):8.1f}s wall  {test_id}"),
+    format_row=lambda test_id, fields: f"{float(fields[0]):8.1f}s cpu  {float(fields[1]):8.1f}s wall  {test_id}",
     title_template="Duration Monitor: Top {top_n} by CPU Time ({total} total)",
 )
 
 MEMORY_MONITOR = CSVMonitor(
     prefix="memory_monitor",
-    header="test_id,peak_rss_mb,delta_rss_mb",
+    header="test_id,peak_mb,delta_mb",
     sort_field=2,
     sort_descending=True,
-    format_row=lambda test_id, fields: (
-        f"{float(fields[1]):8.1f} MB delta ({float(fields[0]):8.1f} MB peak)  {test_id}"
-    ),
-    title_template="Memory Monitor: Top {top_n} by Delta RSS ({total} tests)",
+    format_row=lambda test_id, fields: f"{float(fields[1]):8.1f} MB delta ({float(fields[0]):8.1f} MB peak)  {test_id}",
+    title_template="Memory Monitor: Top {top_n} by Delta ({total} tests)",
 )

@@ -23,7 +23,6 @@ from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type
 from ...utils.logging import get_logger
-from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
     BS_TILE_SIZE,
@@ -48,10 +47,10 @@ _RMSNORM_SBUF_BUDGET_BYTES = 200 * 1024
 
 def _mlp_tkg_hw_mx_impl(
     params: MLPParameters,
-    output_tensor_hbm: nl.ndarray,
-    output_stored_add_tensor_hbm: nl.ndarray,
+    output_tensor_hbm: nl.NkiTensor,
+    output_stored_add_tensor_hbm: nl.NkiTensor,
     name_prefix: str = "",
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """
     MLP TKG kernel with hardware MX (MXFP) quantization.
 
@@ -60,11 +59,11 @@ def _mlp_tkg_hw_mx_impl(
 
     Args:
         params (MLPParameters): MLP configuration with FP8 quantized weights.
-        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM
-        output_stored_add_tensor_hbm (nl.ndarray): Optional fused add output in HBM
+        output_tensor_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM
+        output_stored_add_tensor_hbm (nl.NkiTensor): Optional fused add output in HBM
 
     Returns:
-        list[nl.ndarray]:
+        list[nl.NkiTensor]:
             - [output_tensor_hbm] when store_output_in_sbuf=False
             - [down_out_sb] when store_output_in_sbuf=True
     """
@@ -164,11 +163,11 @@ def _mlp_tkg_hw_mx_impl(
     gate_bias_sb = load_gate_up_bias_mx(params.bias_params.gate_proj_bias_tensor, dims.I, _pmax, n_I512_tile, _q_width)
 
     gate_out_sb = gate_up_projection_mx_tp_shard_H(
-        hidden_qtz_sb=TensorView(inp_qtz),
-        hidden_scale_sb=TensorView(inp_scale),
-        weight_qtz=TensorView(params.gate_proj_weights_tensor),
-        weight_scale=TensorView(params.quant_params.gate_w_scale),
-        bias_sb=TensorView(gate_bias_sb) if gate_bias_sb != None else None,
+        hidden_qtz_sb=inp_qtz,
+        hidden_scale_sb=inp_scale,
+        weight_qtz=params.gate_proj_weights_tensor,
+        weight_scale=params.quant_params.gate_w_scale,
+        bias_sb=gate_bias_sb if gate_bias_sb != None else None,
         cfg=proj_cfg,
     )
 
@@ -183,11 +182,11 @@ def _mlp_tkg_hw_mx_impl(
     up_bias_sb = load_gate_up_bias_mx(params.bias_params.up_proj_bias_tensor, dims.I, _pmax, n_I512_tile, _q_width)
 
     up_out_sb = gate_up_projection_mx_tp_shard_H(
-        hidden_qtz_sb=TensorView(inp_qtz),
-        hidden_scale_sb=TensorView(inp_scale),
-        weight_qtz=TensorView(params.up_proj_weights_tensor),
-        weight_scale=TensorView(params.quant_params.up_w_scale),
-        bias_sb=TensorView(up_bias_sb) if up_bias_sb != None else None,
+        hidden_qtz_sb=inp_qtz,
+        hidden_scale_sb=inp_scale,
+        weight_qtz=params.up_proj_weights_tensor,
+        weight_scale=params.quant_params.up_w_scale,
+        bias_sb=up_bias_sb if up_bias_sb != None else None,
         cfg=proj_cfg,
     )
 
@@ -220,20 +219,19 @@ def _mlp_tkg_hw_mx_impl(
     # Section 7: Output Transpose and Storage
     if not params.store_output_in_sbuf:
         B, S, H = output_tensor_hbm.shape
-        output_tensor_hbm = TensorView(output_tensor_hbm).flatten_dims(start_dim=0, end_dim=1)
+        output_tensor_hbm = output_tensor_hbm.flatten_dims(start_dim=0, end_dim=1)
 
         output_hbm_view = output_tensor_hbm.slice(
             dim=1, start=dims.shard_id * dims.H_per_shard, end=(dims.shard_id + 1) * dims.H_per_shard
         )
 
-        down_out_view = TensorView(down_out_sb).slice(dim=2, start=0, end=dims.T)
+        down_out_view = down_out_sb.slice(dim=2, start=0, end=dims.T)
         output_sb = nl.ndarray(
             (dims.T, dims.H_per_shard),
             dtype=output_tensor_hbm.dtype,
             buffer=nl.sbuf,
             name=f"{name_prefix}tkg_mlp_output_sb",
         )
-        output_sb_view = TensorView(output_sb)
 
         for h1_tile_idx in range(dims.H1_shard):
             psum_idx = h1_tile_idx % dims._psum_bmax
@@ -243,21 +241,19 @@ def _mlp_tkg_hw_mx_impl(
                 buffer=nl.psum,
                 name=f"{name_prefix}transpose_output_{h1_tile_idx}",
             )
-            nisa.nc_transpose(dst=tp_psum, data=down_out_view.select(dim=1, index=h1_tile_idx).get_view())
+            nisa.nc_transpose(dst=tp_psum, data=down_out_view.select(dim=1, index=h1_tile_idx))
             interleave_copy(
-                dst=output_sb_view.slice(
-                    dim=1, start=h1_tile_idx * dims.H0, end=(h1_tile_idx + 1) * dims.H0
-                ).get_view(),
+                dst=output_sb.slice(dim=1, start=h1_tile_idx * dims.H0, end=(h1_tile_idx + 1) * dims.H0),
                 src=tp_psum,
                 index=h1_tile_idx,
             )
 
         nisa.dma_copy(
-            dst=output_hbm_view.get_view(),
-            src=output_sb_view.get_view(),
+            dst=output_hbm_view,
+            src=output_sb,
         )
 
-        output_tensor_hbm = output_tensor_hbm.base_tensor.reshape((B, S, H))
+        output_tensor_hbm = output_tensor_hbm.reshape((B, S, H))
 
         return (
             [output_tensor_hbm, output_stored_add_tensor_hbm] if mlpp_store_fused_add(params) else [output_tensor_hbm]
@@ -269,9 +265,9 @@ def _mlp_tkg_hw_mx_impl(
 
 def mlp_tkg_quad_fp8_mx(
     params: MLPParameters,
-    output_tensor_hbm: nl.ndarray,
-    output_stored_add_tensor_hbm: nl.ndarray,
-) -> list[nl.ndarray]:
+    output_tensor_hbm: nl.NkiTensor,
+    output_stored_add_tensor_hbm: nl.NkiTensor,
+) -> list[nl.NkiTensor]:
     """
     Hardware-MX MLP TKG wrapper that tiles along the BxS dimension.
 
@@ -281,11 +277,11 @@ def mlp_tkg_quad_fp8_mx(
 
     Args:
         params (MLPParameters): MLP configuration. Must report MX quantization.
-        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM.
-        output_stored_add_tensor_hbm (nl.ndarray): Optional fused-add output in HBM.
+        output_tensor_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM.
+        output_stored_add_tensor_hbm (nl.NkiTensor): Optional fused-add output in HBM.
 
     Returns:
-        list[nl.ndarray]:
+        list[nl.NkiTensor]:
             - [output_tensor_hbm] when ``store_fused_add_result`` is False.
             - [output_tensor_hbm, output_stored_add_tensor_hbm] when fused-add storage
               is enabled.
@@ -307,8 +303,7 @@ def mlp_tkg_quad_fp8_mx(
 
     B, S, H_out = output_tensor_hbm.shape
     if not params.store_output_in_sbuf:
-        output_hbm_2d = output_tensor_hbm.reshape((B * S, H_out))
-        output_hbm_view = TensorView(output_hbm_2d)
+        output_hbm_view = output_tensor_hbm.reshape((B * S, H_out))
 
     # Hardware MX: no I-tiling needed, T-tile only
     for bxs_tile in TiledRange(T, tile_size):
@@ -316,10 +311,8 @@ def mlp_tkg_quad_fp8_mx(
         params.sequence_len = bxs_tile.size
         if not params.input_in_sbuf:
             params.hidden_tensor = hidden[bxs_tile.start_offset : bxs_tile.end_offset, :].reshape((1, bxs_tile.size, H))
-        output_tile = (
-            output_hbm_view.slice(dim=0, start=bxs_tile.start_offset, end=bxs_tile.end_offset)
-            .expand_dim(dim=0)
-            .get_view()
+        output_tile = output_hbm_view.slice(dim=0, start=bxs_tile.start_offset, end=bxs_tile.end_offset).expand_dim(
+            dim=0
         )
         _mlp_tkg_hw_mx_impl(
             params,

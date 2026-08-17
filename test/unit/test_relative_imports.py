@@ -120,7 +120,7 @@ def compute_relative_import_suggestion(
     module_parts = _strip_prefix_parts(module, prefixes)
 
     common_depth = 0
-    for i, (file_part, mod_part) in enumerate(zip(file_parts, module_parts)):
+    for i, (file_part, mod_part) in enumerate(zip(file_parts, module_parts, strict=False)):
         if file_part == mod_part:
             common_depth = i + 1
         else:
@@ -268,7 +268,7 @@ def _run_check(label: str, package_root: Path, prefixes: tuple[str, ...]):
             ]
         )
 
-        assert False, "\n".join(error_lines)
+        raise AssertionError("\n".join(error_lines))
 
     # Success message
     assert len(all_files) > 0, "No Python files found to check"

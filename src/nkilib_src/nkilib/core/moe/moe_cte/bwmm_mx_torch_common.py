@@ -248,7 +248,7 @@ def bwmm_mx_blockwise_loop(
             # Pack FP8 values back to x4 layout for mx_matmul. Kernel uses dummy-127 MX scale
             # (no per-block normalization), so feed raw FP8 bytes directly.
             h_fp8_np = h_fp8.numpy()
-            h_fp8_packed = h_fp8_np.astype(__import__('ml_dtypes').float8_e4m3fn)
+            h_fp8_packed = h_fp8_np.astype(dt.float8_e4m3fn)
             hidden_mx = np.frombuffer(h_fp8_packed.tobytes(), dtype=np.uint32).reshape(_pmax, -1)
             hidden_mx = hidden_mx.reshape(_pmax, n_H512, B)
             hidden_scale_t = torch.full((_pmax // _q_height, n_H512, B), 127, dtype=torch.uint8)
@@ -388,7 +388,7 @@ def bwmm_mx_blockwise_loop(
             else:
                 weight_np = weight_np[:P_aligned]
             # Pack the FP8-rounded inter to x4 uint32 directly (no MX scale extraction).
-            inter_fp8_bytes = inter_flat.astype(__import__('ml_dtypes').float8_e4m3fn)
+            inter_fp8_bytes = inter_flat.astype(dt.float8_e4m3fn)
             inter_x4 = np.frombuffer(inter_fp8_bytes.tobytes(), dtype=np.uint32).reshape(P_aligned, -1)
             dummy_inter_sc = torch.full((P_aligned // _q_height, inter_x4.shape[1]), 127, dtype=torch.uint8)
             down_no_bias = _mx_matmul(

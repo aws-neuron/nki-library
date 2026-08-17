@@ -17,11 +17,11 @@
 Architecture overview::
 
     pad (top-level @nki.jit kernel)
-     ├── _normalize_to_4d       → reshape to (NC, D, H, W) TensorViews + PadParams
+     ├── _normalize_to_4d       → reshape to (NC, D, H, W) NkiTensors + PadParams
      ├── compute_tiling_strategy → tile sizes, sharding, SBUF padding policy
      └── 4 nested loops (NC, D, H, W):
           ├── tile_params        → per-tile PadParams (progressive narrowing)
-          ├── _tile_input / _tile_output → TensorView slicing
+          ├── _tile_input / _tile_output → NkiTensor slicing
           └── inner body:
                ├── DMA load     → contiguous input tile into SBUF
                ├── pad_compute  → interior copy + padding fill (W → H → D)
@@ -36,7 +36,6 @@ import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
-from ...core.utils.tensor_view import TensorView
 from .pad_compute import pad_compute
 from .pad_modes import PadMode, make_pad_mode
 from .pad_params import PadParams
@@ -49,14 +48,14 @@ from .pad_tiling import PadTilingStrategy, compute_tiling_strategy
 
 
 def _normalize_to_4d(x_ref, out_ref, padding: tuple, mode: str) -> tuple:
-    """Reshape input/output to 4D ``(NC, D, H, W)`` TensorViews and build PadParams.
+    """Reshape input/output to 4D ``(NC, D, H, W)`` NkiTensors and build PadParams.
 
     Supports arbitrary batch dimensions. The last ``len(padding) // 2``
     dimensions are treated as spatial; all preceding dimensions are collapsed
     into a single NC batch axis.
 
     Returns:
-        ``(x_4d, out_4d, params)`` — TensorView pair and PadParams.
+        ``(x_4d, out_4d, params)`` — NkiTensor pair and PadParams.
     """
     ndim = len(x_ref.shape)
     n_spatial = len(padding) // 2
@@ -99,8 +98,8 @@ def _normalize_to_4d(x_ref, out_ref, padding: tuple, mode: str) -> tuple:
     else:
         D, H, W = spatial_dims[0], spatial_dims[1], spatial_dims[2]
 
-    x_4d = TensorView(x_ref.reshape((NC, D, H, W)))
-    out_4d = TensorView(out_ref.reshape((NC, D + params.total(0), H + params.total(1), W + params.total(2))))
+    x_4d = x_ref.reshape((NC, D, H, W))
+    out_4d = out_ref.reshape((NC, D + params.total(0), H + params.total(1), W + params.total(2)))
 
     return x_4d, out_4d, params
 
@@ -120,8 +119,8 @@ def _compute_output_shape(in_shape: tuple, padding: tuple) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def _tile_input(x: TensorView, dim: int, tile_strategy: PadTilingStrategy, tile_idx: int) -> TensorView:
-    """Slice input TensorView for tile *tile_idx* along spatial *dim*."""
+def _tile_input(x: nl.NkiTensor, dim: int, tile_strategy: PadTilingStrategy, tile_idx: int) -> nl.NkiTensor:
+    """Slice input NkiTensor for tile *tile_idx* along spatial *dim*."""
     axis = dim + 1
     start = tile_idx * tile_strategy.tile_sizes[dim]
     end = min(start + tile_strategy.tile_sizes[dim], tile_strategy.src_sizes[dim])
@@ -129,9 +128,9 @@ def _tile_input(x: TensorView, dim: int, tile_strategy: PadTilingStrategy, tile_
 
 
 def _tile_output(
-    out: TensorView, dim: int, tile_strategy: PadTilingStrategy, tile_params: PadParams, tile_idx: int
-) -> TensorView:
-    """Slice output TensorView for tile *tile_idx* along spatial *dim*.
+    out: nl.NkiTensor, dim: int, tile_strategy: PadTilingStrategy, tile_params: PadParams, tile_idx: int
+) -> nl.NkiTensor:
+    """Slice output NkiTensor for tile *tile_idx* along spatial *dim*.
 
     The output slice includes the tile's interior plus any SBUF padding
     assigned to this tile by ``tile_params``.
@@ -149,7 +148,9 @@ def _tile_output(
 # ---------------------------------------------------------------------------
 
 
-def _fill_deferred_padding(out_view: TensorView, pad_mode: PadMode, dim: int, tile_strategy: PadTilingStrategy) -> None:
+def _fill_deferred_padding(
+    out_view: nl.NkiTensor, pad_mode: PadMode, dim: int, tile_strategy: PadTilingStrategy
+) -> None:
     """Fill padding on *dim* by copying from already-written output slices.
 
     Called after all tiles along *dim* have been processed, so the interior
@@ -232,13 +233,13 @@ def pad(x_ref, padding, mode="replicate", value=0):
                     out_w = _tile_output(out_h, 2, tile_strategy, params_w, wi)
 
                     # Load contiguous input tile into SBUF
-                    src_sb = TensorView(nl.ndarray(x_w.shape, dtype=dtype, buffer=nl.sbuf))
-                    nisa.dma_copy(dst=src_sb.get_view(), src=x_w.get_view())
+                    src_sb = nl.ndarray(x_w.shape, dtype=dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=src_sb, src=x_w)
 
                     # Pad in SBUF and store to HBM
-                    padded_sb = TensorView(nl.ndarray(out_w.shape, dtype=dtype, buffer=nl.sbuf))
+                    padded_sb = nl.ndarray(out_w.shape, dtype=dtype, buffer=nl.sbuf)
                     pad_compute(src_sb, padded_sb, params_w, pad_mode)
-                    nisa.dma_copy(dst=out_w.get_view(), src=padded_sb.get_view())
+                    nisa.dma_copy(dst=out_w, src=padded_sb)
 
                 # Deferred W padding (reflect/circular on multi-tiled W)
                 if tile_strategy.needs_deferred_padding(2):

@@ -129,7 +129,7 @@ def guess_tensor_dtype(dtype):
     elif dtype in (nl.tfloat32, nl.bfloat16, nl.float8_e4m3):
         return np.float32
     else:
-        assert False, f"unsupported dtype {dtype}"
+        raise AssertionError(f"unsupported dtype {dtype}")
 
 
 def gaussian_tensor_generator(mean: float = 0.0, std: float = 1.0, modifier_fn=None, lnc=None, seed: int = 0):
@@ -217,7 +217,7 @@ def np_random_sample(seed=0):
 
     @update_func_str(seed=seed)
     def generator(shape, dtype, name=None):
-        if dtype == np.bool_ or dtype == bool:
+        if dtype in (np.bool_, bool):
             return np.random.randint(low=0, high=2, size=shape, dtype=dtype)
         elif np.issubdtype(dtype, np.integer):
             return np.random.randint(
@@ -233,7 +233,7 @@ def np_random_sample(seed=0):
             rand_arr_casted = dt.static_cast(dt.static_cast(rand_arr, dtype), np.float32)
             return dt.static_cast(rand_arr_casted, dtype)
         else:
-            assert False, f"unsupported dtype {dtype} for random number generation"
+            raise AssertionError(f"unsupported dtype {dtype} for random number generation")
 
     return generator
 

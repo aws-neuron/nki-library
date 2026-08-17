@@ -39,15 +39,14 @@ from ....core.utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type
 
 # Common utils
 from ....core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ....core.utils.tensor_view import TensorView
 from ...primitives import ColMajor, RowMajor, ViewOrder, blas, dma, tile_stream
 from ...primitives.view_spec import ViewSpec, view
 
 
 def _selective_expert_moe_tkg_mxfp4_primitives(
     params: MLPParameters,
-    output: nl.ndarray,
-) -> nl.ndarray:
+    output: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     Perform selective-expert MoE MLP token generation with MXFP4 quantization.
 
@@ -55,10 +54,10 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
 
     Args:
         params (MLPParameters): MLPParameters containing all input tensors and configuration.
-        output (nl.ndarray): [T, H], Output tensor in HBM.
+        output (nl.NkiTensor): [T, H], Output tensor in HBM.
 
     Returns:
-        output (nl.ndarray): [T, H], Output tensor with MoE computation results in HBM.
+        output (nl.NkiTensor): [T, H], Output tensor with MoE computation results in HBM.
 
     Notes:
         - This kernel only supports gate/up and down proj both swapped
@@ -127,9 +126,9 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
 
     inp_qtz = tile_stream.alloc_logical((n_H512_tile_sharded * _pmax, T_padded), _pmax, dtype=nl.float8_e4m3fn_x4)
     inp_scale = tile_stream.alloc_logical((n_H512_tile_sharded * _pmax, T_padded), _pmax, dtype=nl.uint8)
-    nisa.quantize_mx(dst=inp_qtz.get_view(), src=input_sb_shfl.get_view(), dst_scale=inp_scale.get_view())
-    inp_qtz = inp_qtz.base_tensor
-    inp_scale = inp_scale.base_tensor
+    nisa.quantize_mx(dst=inp_qtz, src=input_sb_shfl, dst_scale=inp_scale)
+    inp_qtz = inp_qtz
+    inp_scale = inp_scale
 
     # Allocate SBUF location to accumulate output which has shape [128, H_per_shard] to store the outputs for
     # four tokens on each of the four SBUF quadrants. This is to save sendrecvs (reduced by 4x).
@@ -166,7 +165,7 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
             expert_idx_scalar_broadcasted, tile_shape=(4, dims.T), tile_dims=(0, 1), has_p_tile_dim=False
         ),
         src=tile_stream.tile(
-            TensorView(expert_idx_f32).slice(dim=1, start=K_start, end=K_start + K_sharded),
+            expert_idx_f32.slice(dim=1, start=K_start, end=K_start + K_sharded),
             tile_shape=(dims.T, 1),
             has_p_tile_dim=False,
             tile_view=ViewSpec().broadcast(dim=1, size=4),
@@ -223,10 +222,8 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
             (dims._pmax, K_sharded, dims.T), dtype=params.expert_params.expert_affinities.dtype, buffer=nl.sbuf
         )
         K_start = shard_id * K_sharded if shard_on_K else 0
-        affi_eager_src = (
-            TensorView(params.expert_params.expert_affinities_eager)
-            .slice(dim=0, start=0, end=dims.T)
-            .slice(dim=1, start=K_start, end=K_start + K_sharded)
+        affi_eager_src = params.expert_params.expert_affinities_eager.slice(dim=0, start=0, end=dims.T).slice(
+            dim=1, start=K_start, end=K_start + K_sharded
         )
         blas.Transpose(
             dst=tile_stream.tile(expert_affi_eager_sb, tile_shape=(1, dims.T), tile_dims=(0, 1), has_p_tile_dim=False),
@@ -345,7 +342,7 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
                     # Load down proj weights into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mx_x4 (packed I)
                     down_weight_qtz_sb = nl.ndarray(
                         (_pmax, n_I512_tile, dims.H_shard),
-                        dtype=TensorView(params.down_proj_weights_tensor).base_tensor.dtype,
+                        dtype=params.down_proj_weights_tensor.dtype,
                         buffer=nl.sbuf,
                     )
                     # Memset weight if input weight HBM does not pad on par dim
@@ -354,20 +351,17 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
 
                     # down_proj_weights_tensor shape: (E, p_I, n_I512_tile, H)
                     H_offset = 0 if shard_on_K else (dims.shard_id * dims.H_shard)
-                    expert_scalar = (
-                        TensorView(expert_idx)
-                        .slice(dim=0, start=i_t, end=i_t + 1)
-                        .slice(dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1)
-                        .get_view()
+                    expert_scalar = expert_idx.slice(dim=0, start=i_t, end=i_t + 1).slice(
+                        dim=1, start=i_k_lnc_adjusted, end=i_k_lnc_adjusted + 1
                     )
                     down_weights_view = (
-                        TensorView(TensorView(params.down_proj_weights_tensor).base_tensor)
+                        (params.down_proj_weights_tensor)
                         .select(dim=0, index=expert_scalar)
                         .slice(dim=2, start=H_offset, end=H_offset + dims.H_shard)
                     )
                     nisa.dma_copy(
                         dst=down_weight_qtz_sb[:p_I, :, :],
-                        src=down_weights_view.get_view(),
+                        src=down_weights_view,
                         dge_mode=nisa.dge_mode.hwdge,
                     )
                     down_weight_qtz_sb = down_weight_qtz_sb.view(params.down_proj_weights_tensor.dtype)
@@ -480,11 +474,11 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
             # Transpose output since down proj is lhs/rhs swapped and producing HT layout
             blas.Transpose(
                 dst=tile_stream.tile(
-                    TensorView(output_temp_tp).slice(dim=2, start=t_start, end=t_end),
+                    output_temp_tp.slice(dim=2, start=t_start, end=t_end),
                     tile_shape=(dims.H1_shard, dims.H0),
                 ),
                 src=tile_stream.tile(
-                    TensorView(output_temp).slice(dim=1, start=t_start, end=t_end),
+                    output_temp.slice(dim=1, start=t_start, end=t_end),
                     tile_shape=(dims.H0, dims.H1_shard),
                     has_p_tile_dim=False,
                 ),
@@ -493,14 +487,12 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
             # Store transposed output to HBM — output[T, H] reshaped as [T, H1, H0] to match SBUF tile shape
             dma.Store(
                 dst=tile_stream.tile(
-                    TensorView(output)
-                    .reshape_dim(dim=1, shape=(dims.H1, dims.H0))
-                    .slice(dim=0, start=t_start, end=t_end),
+                    output.reshape_dim(dim=1, shape=(dims.H1, dims.H0)).slice(dim=0, start=t_start, end=t_end),
                     tile_shape=(dims.H1_shard, dims.H0),
                     tile_dims=(1, 2),
                 ),
                 src=tile_stream.tile(
-                    TensorView(output_temp_tp).slice(dim=2, start=t_start, end=t_end),
+                    output_temp_tp.slice(dim=2, start=t_start, end=t_end),
                     tile_shape=(dims.H1_shard, dims.H0),
                 ),
             ).execute()
@@ -509,7 +501,7 @@ def _selective_expert_moe_tkg_mxfp4_primitives(
     return output
 
 
-def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
+def _layout_adapter_hbm(src: nl.NkiTensor, n_prgs: int, prg_id: int):
     """
     Load and transpose input tensor from HBM to SBUF with swizzled layout.
 
@@ -520,12 +512,12 @@ def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
     4. Obtain swizzle layout: [16_H * 8_H(P), H/512, T/4, 4_T * 4_H]
 
     Args:
-        src (nl.ndarray): [T, H], 5D tensor in HBM with internally shuffled layout [T, 4_H, H/512, 16_H, 8_H].
+        src (nl.NkiTensor): [T, H], 5D tensor in HBM with internally shuffled layout [T, 4_H, H/512, 16_H, 8_H].
         n_prgs (int): Number of programs.
         prg_id (int): Program ID.
 
     Returns:
-        result (nl.ndarray): [16_H * 8_H(P), H/512, ceil(T/4) * 4, 4_H], 4D tensor in SBUF with swizzled layout.
+        result (nl.NkiTensor): [16_H * 8_H(P), H/512, ceil(T/4) * 4, 4_H], 4D tensor in SBUF with swizzled layout.
     """
     _q_width = 4
     _pmax = nl.tile_size.pmax
@@ -541,10 +533,10 @@ def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
     # [16_H * 8_H(P), H/512, T/4, 4_T * 4_H]
     result = tile_stream.alloc_logical((H_div_512 * _pmax, T_padded * _q_width), _pmax, dtype=src.dtype)
     # [T, 4_H, H_div_512 * 16_H * 8_H]
-    src = TensorView(src).reshape_dim(dim=1, shape=(_q_width, n_prgs, H_div_512 * _pmax)).select(2, prg_id)
+    src = src.reshape_dim(dim=1, shape=(_q_width, n_prgs, H_div_512 * _pmax)).select(2, prg_id)
     # [4_T * 4_H (P), T/4, H/512, 16_H * 8_H]
     src_sbuf = tile_stream.alloc_logical((T_padded * _q_width, H_div_512 * _pmax), 4 * _q_width, dtype=src.dtype)
-    nisa.memset(dst=src_sbuf.get_view(), value=0.0)
+    nisa.memset(dst=src_sbuf, value=0.0)
 
     """
     Load [4_T * 4_H (P), T/4, H/512, 16_H * 8_H]@SBUF
@@ -575,18 +567,18 @@ def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
 
 
 def _process_fused_gate_up_projection_mxfp4(
-    hidden: nl.ndarray,
-    hidden_scale: nl.ndarray,
-    gate_up_weights: nl.ndarray,
-    gate_up_scale: nl.ndarray,
-    gate_up_bias: nl.ndarray,
-    p_idx_vector: nl.ndarray,
-    gate_up_scale_sb: nl.ndarray,
-    output: nl.ndarray,
+    hidden: nl.NkiTensor,
+    hidden_scale: nl.NkiTensor,
+    gate_up_weights: nl.NkiTensor,
+    gate_up_scale: nl.NkiTensor,
+    gate_up_bias: nl.NkiTensor,
+    p_idx_vector: nl.NkiTensor,
+    gate_up_scale_sb: nl.NkiTensor,
+    output: nl.NkiTensor,
     attrs: MLPParameters,
     dims,
-    gate_up_weights_E_offset: Optional[nl.ndarray],
-    gate_up_bias_E_offset: Optional[nl.ndarray],
+    gate_up_weights_E_offset: Optional[nl.NkiTensor],
+    gate_up_bias_E_offset: Optional[nl.NkiTensor],
 ):
     """
     Process gate and up projection, including the activation of gate projection and the final elem-wise multiply:
@@ -604,7 +596,7 @@ def _process_fused_gate_up_projection_mxfp4(
     n_I512_tile = div_ceil(dims.I, (_pmax * _q_width))
 
     # Allocate and load weight sbuf shared between gate and up projection
-    base_weight = TensorView(gate_up_weights).base_tensor
+    base_weight = gate_up_weights
     weight_sb = nl.ndarray((_pmax, 2, n_H512_tile_sharded, dims.I), dtype=base_weight.dtype, buffer=nl.sbuf)
     if gate_up_weights_E_offset is None:
         nisa.dma_copy(
@@ -614,12 +606,10 @@ def _process_fused_gate_up_projection_mxfp4(
         )
     else:
         # gate_up_weights shape: (E, _pmax, 2, n_H512_tiles, I)
-        gate_up_weights_view = (
-            TensorView(base_weight)
-            .select(dim=0, index=gate_up_weights_E_offset)
-            .slice(dim=2, start=shard_id * n_H512_tile_sharded, end=(shard_id + 1) * n_H512_tile_sharded)
+        gate_up_weights_view = base_weight.select(dim=0, index=gate_up_weights_E_offset).slice(
+            dim=2, start=shard_id * n_H512_tile_sharded, end=(shard_id + 1) * n_H512_tile_sharded
         )
-        nisa.dma_copy(dst=weight_sb, src=gate_up_weights_view.get_view())
+        nisa.dma_copy(dst=weight_sb, src=gate_up_weights_view)
     weight_sb = weight_sb.view(gate_up_weights.dtype)
 
     # Alloc and load weight scale, which needs zero padding in sbuf
@@ -721,12 +711,12 @@ def _process_fused_gate_up_projection_mxfp4(
         bias_t_shared_between_gate_up=True,
         bias_t_shared_base_offset=n_I512_tile * _q_width,
     )
-    # Wrap tensors in TensorView and use slice() for dimension 1
-    hidden_tv = TensorView(hidden)
-    hidden_scale_tv = TensorView(hidden_scale)
-    weight_tv = TensorView(weight_sb)
-    scale_tv = TensorView(gate_up_scale_sb)
-    bias_tv = TensorView(bias_sb)
+    # Wrap tensors in nl.NkiTensor and use slice() for dimension 1
+    hidden_tv = hidden
+    hidden_scale_tv = hidden_scale
+    weight_tv = weight_sb
+    scale_tv = gate_up_scale_sb
+    bias_tv = bias_sb
 
     gate_proj_out_sb = _gate_up_projection_mx_tp_shard_H_primitives(
         hidden_qtz_sb=hidden_tv,
@@ -784,13 +774,13 @@ def _process_fused_gate_up_projection_mxfp4(
 
 
 def _gate_up_projection_mx_tp_shard_H_primitives(
-    hidden_qtz_sb: TensorView,
-    hidden_scale_sb: TensorView,
-    weight_qtz_tv: TensorView,
-    weight_scale_tv: TensorView,
-    bias_sb: TensorView,
+    hidden_qtz_sb: nl.NkiTensor,
+    hidden_scale_sb: nl.NkiTensor,
+    weight_qtz_tv: nl.NkiTensor,
+    weight_scale_tv: nl.NkiTensor,
+    bias_sb: nl.NkiTensor,
     cfg: ProjConfig,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Primitives version of gate_up_projection_mx_tp_shard_H using blas.Matmul.
 
@@ -799,9 +789,9 @@ def _gate_up_projection_mx_tp_shard_H_primitives(
 
     :param hidden_qtz_sb: mxfp8_x4[_pmax, n_H512_tile_sharded, BxS] @ SB.
     :param hidden_scale_sb: uint8[_pmax, n_H512_tile_sharded, BxS] @ SB.
-    :param weight_qtz_tv: TensorView of mxfp_x4[_pmax, n_H512_tile_sharded, I] @ SB.
-    :param weight_scale_tv: TensorView of uint8[_pmax, n_H512_tile_sharded, I] @ SB.
-    :param bias_sb [OPTIONAL]: TensorView of bf16[_pmax, n_I512_tile, _q_width] @ SB.
+    :param weight_qtz_tv: nl.NkiTensor of mxfp_x4[_pmax, n_H512_tile_sharded, I] @ SB.
+    :param weight_scale_tv: nl.NkiTensor of uint8[_pmax, n_H512_tile_sharded, I] @ SB.
+    :param bias_sb [OPTIONAL]: nl.NkiTensor of bf16[_pmax, n_I512_tile, _q_width] @ SB.
     :return: bf16[_pmax, ceil(I / 512), BxS, _q_width] @ SB.
     """
     n_prgs, prg_id = cfg.n_prgs, cfg.prg_id
@@ -884,7 +874,7 @@ def _gate_up_projection_mx_tp_shard_H_primitives(
     ).execute()
 
     # Unwrap to base ndarray, reshape to downstream expected layout
-    out_sb = out_sb.base_tensor.reshape((_pmax, cfg.n_total_I512_tile, BxS, _q_width))
+    out_sb = out_sb.reshape((_pmax, cfg.n_total_I512_tile, BxS, _q_width))
 
     # Zero unused partitions to prevent NaN from uninitialized SBUF
     if cfg.zero_unused_partitions and I128_tile_sz < _pmax:
@@ -902,7 +892,7 @@ def _gate_up_projection_mx_tp_shard_H_primitives(
     return out_sb
 
 
-def _lnc_reduce_proj_out(cur_nc_proj_out: nl.ndarray, shard_id: int):
+def _lnc_reduce_proj_out(cur_nc_proj_out: nl.NkiTensor, shard_id: int):
     """In-place LNC2 reduction of projection output."""
     # SendRecv
     proj_out_recv = nl.ndarray(cur_nc_proj_out.shape, dtype=cur_nc_proj_out.dtype, buffer=nl.sbuf)
@@ -915,8 +905,8 @@ def _lnc_reduce_proj_out(cur_nc_proj_out: nl.ndarray, shard_id: int):
 
 
 def _down_proj_prep_inter_and_weights(
-    inter_sb: nl.ndarray, weight: nl.ndarray, weight_scale: nl.ndarray, cfg: ProjConfig
-) -> tuple[nl.ndarray, nl.ndarray, nl.ndarray, nl.ndarray]:
+    inter_sb: nl.NkiTensor, weight: nl.NkiTensor, weight_scale: nl.NkiTensor, cfg: ProjConfig
+) -> tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     Prep intermediate and weights for down projection:
         - for intermediate, reshape and quantize (and reshape back);
@@ -986,13 +976,13 @@ def _down_proj_prep_inter_and_weights(
 
 
 def _down_projection_mx_tp_shard_H(
-    inter_sb: nl.ndarray,
-    weight: nl.ndarray,
-    weight_scale: nl.ndarray,
-    bias_sb: Optional[nl.ndarray],
+    inter_sb: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
+    bias_sb: Optional[nl.NkiTensor],
     cfg: ProjConfig,
     partial_output: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Performs the Down projection with H-dimension sharding. Math (Neuron matmul):
         inter_sb (moving) [I, BxS] @ weight (stationary) [I, H] → [H, BxS].

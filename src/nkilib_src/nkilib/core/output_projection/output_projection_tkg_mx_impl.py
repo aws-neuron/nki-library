@@ -24,7 +24,6 @@ from ..utils.common_types import QuantizationType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_program_sharding_info
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
 
 P_MAX = 128
@@ -39,22 +38,22 @@ _SBUF_QUADRANT_SIZE = 32
 
 
 def _output_projection_tkg_mx(
-    attention: nl.ndarray,
-    weights_qtz: nl.ndarray,
-    weight_scales_hbm: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    attention: nl.NkiTensor,
+    weights_qtz: nl.NkiTensor,
+    weight_scales_hbm: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     TRANSPOSE_OUT: bool = False,
     quantization_type=None,
-    input_scale: Optional[nl.ndarray] = None,
-) -> nl.ndarray:
+    input_scale: Optional[nl.NkiTensor] = None,
+) -> nl.NkiTensor:
     """
     MX / STATIC_MX quantized output projection for TKG.
 
-    For MX: weights are pre-quantized to float8_e4m3fn_x4, attention is quantized
-    online via quantize_mx. Optimized for BxS <= 128.
+    For MX: weights are pre-quantized to unpacked fp8_e4m3fn [NxD//4, H, 4], attention is
+    quantized online via quantize_mx. Optimized for BxS <= 128.
 
-    For STATIC_MX: weights are pre-quantized to float8_e4m3fn_x4, attention is
-    quantized via software static_quantization with dummy MX scales (127).
+    For STATIC_MX: weights are pre-quantized to unpacked fp8_e4m3fn [NxD//4, H, 4], attention
+    is quantized via software static_quantization with dummy MX scales (127).
     Post-matmul dequantization applies combined_scale = input_scale * weight_scale.
 
     Dimensions:
@@ -66,20 +65,20 @@ def _output_projection_tkg_mx(
         NxD_packed: N x D // 4
 
     Args:
-        attention (nl.ndarray): [D, B, N, S], Input attention tensor in HBM.
-        weights_qtz (nl.ndarray): [NxD_packed, H], Pre-quantized weights
-            in float8_e4m3fn_x4 dtype.
-        weight_scales_hbm (nl.ndarray): MX weight scales in HBM.
+        attention (nl.NkiTensor): [D, B, N, S], Input attention tensor in HBM.
+        weights_qtz (nl.NkiTensor): [NxD_packed, H, 4], Pre-quantized weights
+            in unpacked fp8_e4m3fn dtype.
+        weight_scales_hbm (nl.NkiTensor): MX weight scales in HBM.
             MX: [NxD // 32, H], nl.uint8.
             STATIC_MX: [P_MAX, 1], nl.float32 (per-tensor weight dequant scale).
-        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor.
+        bias (Optional[nl.NkiTensor]): [1, H], Optional bias tensor.
         TRANSPOSE_OUT (bool): Whether returned output should be transposed.
         quantization_type: QuantizationType.MX or QuantizationType.STATIC_MX.
-        input_scale (Optional[nl.ndarray]): [P_MAX, 1], nl.float32.
+        input_scale (Optional[nl.NkiTensor]): [P_MAX, 1], nl.float32.
             Per-tensor input dequant scale. Required for STATIC_MX, unused for MX.
 
     Returns:
-        nl.ndarray:
+        nl.NkiTensor:
             If not TRANSPOSE_OUT: [B*S, H] in HBM.
             If TRANSPOSE_OUT: [H1, H0, H2, BxS] in HBM, where
                 H0 = n_prgs, H1 = P_MAX, H2 = H // n_prgs // P_MAX.
@@ -116,7 +115,7 @@ def _change_layout_and_fold_attention(attn_sb):
     Step 2: Fold heads + swap B/N -> [D_packed_folded, N_folded, BxS, 4]
 
     Args:
-        attn_sb (nl.ndarray): [D_packed, 4, B, N, S] in SBUF (any dtype).
+        attn_sb (nl.NkiTensor): [D_packed, 4, B, N, S] in SBUF (any dtype).
         B (int): Batch size.
         N (int): Number of heads.
         S (int): Sequence length.
@@ -246,11 +245,12 @@ def _change_layout_and_fold_attention(attn_sb):
 def _load_weights_folded(weights_qtz, D_packed_folded, N_folded, H_sharded, H_BLOCK_SIZE, n_prgs, prg_id):
     """Load pre-quantized weights with head folding.
 
-    Loads H_shard of weights_qtz with shape [NxD_packed, H] to SBUF.
-    as a list of num_h_blocks x N_folded tensors with shapes [D_packed_folded][H_BLOCK_SIZE].
+    Loads H_shard of weights_qtz with shape [NxD_packed, H, 4] (unpacked fp8_e4m3fn) to SBUF.
+    as a list of num_h_blocks x N_folded tensors with shapes [D_packed_folded][H_BLOCK_SIZE]
+    in nl.float8_e4m3fn_x4 dtype (view-cast from fp8_e4m3fn after DMA).
 
     Args:
-        weights_qtz (nl.ndarray): [NxD_packed, H], Pre-quantized weights in fp8_x4 on HBM.
+        weights_qtz (nl.NkiTensor): [NxD_packed, H, 4], Pre-quantized weights in fp8_e4m3fn on HBM.
         D_packed_folded (int): Folded partition dimension.
         N_folded (int): Number of head groups after folding.
         H_sharded (int): Per-core hidden dimension.
@@ -258,15 +258,8 @@ def _load_weights_folded(weights_qtz, D_packed_folded, N_folded, H_sharded, H_BL
         prg_id (int): Current core index.
 
     Returns:
-        list: weights_qtz_sb — [num_h_blocks][N_folded] of [D_packed_folded][H_BLOCK_SIZE] tensors in SBUF.
+        list: weights_qtz_sb — [num_h_blocks][N_folded] of [D_packed_folded][H_BLOCK_SIZE] x4 tensors in SBUF.
     """
-    # HBM-side dtype may be the canonical ``nl.float8_e4m3fn_x4`` or a
-    # torch-compatible alt-dtype ``nl.uint32`` (vllm-neuron path; torch
-    # has no ``float8_e4m3fn_x4``). HWDGE requires src/dst memref element
-    # types to match, so SBUF allocation tracks the source dtype and we
-    # return a view-cast alias re-tagged to ``nl.float8_e4m3fn_x4`` for
-    # the downstream ``nc_matmul_mx`` consumer. Mirrors the QKV CTE fix
-    # in commit ``560a5f16`` (CR-277644685).
     _hbm_weight_dtype = weights_qtz.dtype
     weights_qtz_sb = []
     for h_block in TiledRange(H_sharded, H_BLOCK_SIZE):
@@ -274,7 +267,7 @@ def _load_weights_folded(weights_qtz, D_packed_folded, N_folded, H_sharded, H_BL
         h_offset_global = prg_id * H_sharded + h_block.start_offset
         for head_group_idx in nl.affine_range(N_folded):
             w_tensor = nl.ndarray(
-                (D_packed_folded, h_block.size),
+                (D_packed_folded, h_block.size * _MX_PACK_FACTOR),
                 dtype=_hbm_weight_dtype,
                 buffer=nl.sbuf,
                 name=f"weight_qtz_{h_block.index}_{head_group_idx}",
@@ -284,12 +277,10 @@ def _load_weights_folded(weights_qtz, D_packed_folded, N_folded, H_sharded, H_BL
                 src=weights_qtz[
                     nl.ds(head_group_idx * D_packed_folded, D_packed_folded),
                     nl.ds(h_offset_global, h_block.size),
+                    nl.ds(0, _MX_PACK_FACTOR),
                 ],
             )
-            # Matmul-side alias: same SBUF storage, relabeled to the MX
-            # matmul element type. No data movement.
-            if _hbm_weight_dtype != nl.float8_e4m3fn_x4:
-                w_tensor = w_tensor.view(nl.float8_e4m3fn_x4)
+            w_tensor = w_tensor.view(nl.float8_e4m3fn_x4)
             weights_h_block_sb.append(w_tensor)
         weights_qtz_sb.append(weights_h_block_sb)
     return weights_qtz_sb
@@ -304,7 +295,7 @@ def _load_weight_scales_folded(
     as a list of num_h_blocks x N_folded tensors with shapes [D_packed_folded][H_BLOCK_SIZE].
 
     Args:
-        weight_scales_hbm (nl.ndarray): [NxD // 32, H], MX weight scales in uint8.
+        weight_scales_hbm (nl.NkiTensor): [NxD // 32, H], MX weight scales in uint8.
         D_packed_folded (int): Folded partition dimension.
         N_folded (int): Number of head groups after folding.
         H (int): Full hidden dimension.
@@ -352,13 +343,13 @@ def _load_weight_scales_folded(
 
 
 def _output_projection_tkg_mx_without_transpose_out(
-    attention: nl.ndarray,
-    weights_qtz: nl.ndarray,
-    weight_scales_hbm: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    attention: nl.NkiTensor,
+    weights_qtz: nl.NkiTensor,
+    weight_scales_hbm: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     quantization_type: QuantizationType = QuantizationType.MX,
-    input_scale_hbm: Optional[nl.ndarray] = None,
-) -> nl.ndarray:
+    input_scale_hbm: Optional[nl.NkiTensor] = None,
+) -> nl.NkiTensor:
     """
     MX / STATIC_MX quantized output projection with head folding optimization.
 
@@ -367,18 +358,18 @@ def _output_projection_tkg_mx_without_transpose_out(
     and post-matmul dequantization via combined_scale = input_scale * weight_scale.
 
     Args:
-        attention (nl.ndarray): [D, B, N, S], Input attention tensor in HBM.
-        weights_qtz (nl.ndarray): [NxD_packed, H], Pre-quantized weights in fp8_x4.
-        weight_scales_hbm (nl.ndarray): MX: [NxD // 32, H] uint8. STATIC_MX: [P_MAX, 1] fp32.
-        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor.
+        attention (nl.NkiTensor): [D, B, N, S], Input attention tensor in HBM.
+        weights_qtz (nl.NkiTensor): [NxD_packed, H], Pre-quantized weights in fp8_x4.
+        weight_scales_hbm (nl.NkiTensor): MX: [NxD // 32, H] uint8. STATIC_MX: [P_MAX, 1] fp32.
+        bias (Optional[nl.NkiTensor]): [1, H], Optional bias tensor.
         quantization_type (QuantizationType): MX or STATIC_MX.
-        input_scale_hbm (Optional[nl.ndarray]): [P_MAX, 1] fp32. Required for STATIC_MX.
+        input_scale_hbm (Optional[nl.NkiTensor]): [P_MAX, 1] fp32. Required for STATIC_MX.
 
     Returns:
-        nl.ndarray: [B*S, H] in HBM.
+        nl.NkiTensor: [B*S, H] in HBM.
     """
     D, B, N, S = attention.shape
-    NxD_packed, H = weights_qtz.shape
+    NxD_packed, H, _ = weights_qtz.shape
     BxS = B * S
     D_packed = D // _MX_PACK_FACTOR
 
@@ -460,10 +451,10 @@ def _output_projection_tkg_mx_without_transpose_out(
     # [D_packed_folded, N_folded, T_padded, 4]  -> [D_packed_folded, N_folded, T_padded]
     if is_static_mx:
         # Reinterpret cast fp8 -> fp8_x4 + dummy MX scales
-        attn_qtz_tv = TensorView(
-            attn_for_quant_sb.reshape((D_packed_folded, N_folded, T_padded, _MX_PACK_FACTOR))
-        ).reinterpret_cast(nl.float8_e4m3fn_x4)
-        attn_qtz_sb = attn_qtz_tv.reshape((D_packed_folded, N_folded, T_padded)).get_view()
+        attn_qtz_tv = (attn_for_quant_sb.reshape((D_packed_folded, N_folded, T_padded, _MX_PACK_FACTOR))).view(
+            nl.float8_e4m3fn_x4
+        )
+        attn_qtz_sb = attn_qtz_tv.reshape((D_packed_folded, N_folded, T_padded))
         attn_scale_sb = nl.ndarray(
             (D_packed_folded, N_folded, T_padded), dtype=nl.uint8, buffer=nl.sbuf, name='attn_scale_dummy'
         )
@@ -569,26 +560,26 @@ def _output_projection_tkg_mx_without_transpose_out(
 
 
 def _output_projection_tkg_mx_with_transpose_out(
-    attention: nl.ndarray,
-    weights_qtz: nl.ndarray,
-    weight_scales_hbm: nl.ndarray,
-    bias: Optional[nl.ndarray],
-) -> nl.ndarray:
+    attention: nl.NkiTensor,
+    weights_qtz: nl.NkiTensor,
+    weight_scales_hbm: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
+) -> nl.NkiTensor:
     """
     MX quantized output projection with transposed output (not yet implemented).
 
     Computes: (attention @ weight + bias)^T.
 
     Args:
-        attention (nl.ndarray): [D, B, N, S], Input attention tensor in HBM.
-        weights_qtz (nl.ndarray): [NxD_packed, H], Pre-quantized weights
-            in float8_e4m3fn_x4 dtype.
-        weight_scales_hbm (nl.ndarray): [NxD // 32, H], MX weight scales
+        attention (nl.NkiTensor): [D, B, N, S], Input attention tensor in HBM.
+        weights_qtz (nl.NkiTensor): [NxD_packed, H, 4], Pre-quantized weights
+            in unpacked fp8_e4m3fn dtype.
+        weight_scales_hbm (nl.NkiTensor): [NxD // 32, H], MX weight scales
             in nl.uint8 dtype.
-        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor.
+        bias (Optional[nl.NkiTensor]): [1, H], Optional bias tensor.
 
     Returns:
-        nl.ndarray: [H1, H0, H2, BxS] in HBM, where
+        nl.NkiTensor: [H1, H0, H2, BxS] in HBM, where
             H0 = n_prgs, H1 = P_MAX, H2 = H // n_prgs // P_MAX.
 
     Notes:

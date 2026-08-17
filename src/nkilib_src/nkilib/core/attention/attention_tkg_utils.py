@@ -13,12 +13,17 @@
 # limitations under the License.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Tuple
 
 import nki.language as nl
 
 from ..utils.kernel_assert import kernel_assert
+
+# QK-swap (transposed-score, column-tiled) MM1 is enabled by default on compatible shapes.
+# Set NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1 to force the default (non-swap) path, e.g. for A/B testing.
+_ATTN_TKG_NO_SWAP = os.environ.get("NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP", "").lower() in ("1", "true", "yes", "on")
 
 # Flash attention: use FA when s_prior > threshold, tile size = threshold
 _FA_TILE_SIZE = 8 * 1024  # 8K - serves as both threshold and tile size
@@ -100,6 +105,11 @@ class AttnTKGConfig(nl.NKIObject):
     (which requires 2-byte elements) for FP8 block KV, avoiding the slower PE transpose fallback.
     Requires: block_len > 0, FP8 KV cache, block_len % 2 == 0."""
 
+    return_cp_softmax_stats: bool = False
+    """When True, return unnormalized attention output (sum of exp(QK-max)*V without dividing
+    by the softmax denominator) and export local softmax stats (max, sum) via cp_softmax_stats_out.
+    Used by CP for distributed softmax correction across ranks."""
+
 
 ### Constants
 @dataclass
@@ -147,12 +157,24 @@ def uses_flash_attention(cfg_flag: bool, s_prior: int) -> Tuple[bool, int]:
 
 
 def uses_batch_tiling(
-    bs_per_nc: int, q_head: int, s_active: int, fa_tile_s_prior: int, is_auto_alloc: bool, dtype_size: int
+    bs_per_nc: int,
+    q_head: int,
+    s_active: int,
+    fa_tile_s_prior: int,
+    is_auto_alloc: bool,
+    dtype_size: int,
+    qk_swapped: bool = False,
 ) -> Tuple[bool, int]:
     """
     Determine if batch tiling is needed and compute the batch tile size.
 
     Batch tiling is used when the full per-NC batch exceeds the SBUF memory budget.
+
+    Per-batch SBUF cost is qk (float32=4) + qk_io_type (dtype_size) + mask (1). The QK-swap path also
+    holds a bf16 pre-transpose exp buffer (qk_io_transposed) live across the nc_transpose, but it is
+    intentionally not added to this estimate and encorporates it into _BATCH_TILE_SBUF_BUDGET.
+    `qk_swapped` is used to round the batch tile down to a multiple of col_tiling_factor since the swap
+    path needs whole column-tile groups per tile).
 
     Returns (use_batch_tiling, batch_tile_size) where batch_tile_size <= bs_per_nc.
     """
@@ -175,6 +197,12 @@ def uses_batch_tiling(
         f"requires {per_batch_cost} bytes per batch, exceeding budget of {_BATCH_TILE_SBUF_BUDGET}.",
     )
     max_tile_bs = min(bs_per_nc, max_tile_bs)
+    # QK-swap column-tiles col_tiling_factor (= p_max // (q_head*s_active)) batches into one PSUM, so
+    # a batch tile must be a whole number of those groups (bs % col_tiling_factor == 0). Round the tile
+    # down to a multiple of col_tiling_factor (at least one group); bs_per_nc is already a multiple.
+    if qk_swapped:
+        col_tiling_factor = max(1, nl.tile_size.pmax // (q_head * s_active))
+        max_tile_bs = max((max_tile_bs // col_tiling_factor) * col_tiling_factor, col_tiling_factor)
     return (max_tile_bs < bs_per_nc, max_tile_bs)
 
 
@@ -207,11 +235,13 @@ def is_batch_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_ma
         return False
     LNC = 2
     # Batch sharding is needed if:
-    # - BQS is large, to reduce the number of BQS tiles, or
+    # - BQS fills (or overflows) the partition dim, so batch-sharding keeps each core's BQS within
+    #   one p_max tile AND keeps the two cores symmetric (both run the same per-batch code instead
+    #   of the s_prior-sharded path where only the last core loads k_active/v_active), or
     # - s_prior is too small to shard
     #   (at curr_sprior=256 we can shard on sprior but use batch sharding so we
     #    can support packed fp8 layout which requires block size >= 2 after resize)
-    return (bs % LNC == 0) and (bs * q_head * s_active > p_max or curr_sprior <= 2 * p_max)
+    return (bs % LNC == 0) and (bs * q_head * s_active >= p_max or curr_sprior <= 2 * p_max)
 
 
 def is_s_prior_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_max: int, fuse_rope: bool = False):
@@ -261,6 +291,126 @@ def get_total_n_prgs(
     if is_batch_sharded(*_args) or is_s_prior_sharded(*_args):
         return lnc
     return 1
+
+
+def is_qk_swapped(
+    bs: int,
+    q_head: int,
+    d_head: int,
+    s_active: int,
+    curr_sprior: int,
+    lnc: int,
+    p_max: int,
+    is_block_kv: bool,
+    is_2byte_kv: bool,
+    fp8_packed: bool,
+    fuse_rope: bool,
+    kv_heads: int = 1,
+) -> bool:
+    """Whether the QK-swap (transposed-score, column-tiled) MM1 path is active for a config.
+
+    The QK-swap path makes Q stationary and K moving, producing a transposed score tile and
+    column-tiling multiple batches into one PSUM bank. It is enabled by default whenever the shape,
+    layout, and KV-load requirements below are all met. Attention, gen_mask, and the tests all call
+    this one function so the swap decision stays consistent across all three.
+
+    Set ``NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1`` to force the default (K-stationary) path.
+
+    Args:
+        bs: Full batch size before LNC sharding (per KV head, i.e. B_attn — NOT yet folded with kv_heads).
+        q_head: Total number of query heads across kv_heads (q_heads_attn for GQA).
+        d_head: Head dimension (embedding size per head).
+        s_active: Active (query) sequence length being generated this step.
+        curr_sprior: The current KV-cache length, how much context (prior) is currently live.
+            This is NOT the allocated cache capacity (``full_sprior``).
+        lnc: LNC value the attention kernel will run on.
+        p_max: Hardware partition dimension (``nl.tile_size.pmax``, 128 on current targets).
+        is_block_kv: True iff the KV cache is block-paged (block_len > 0).
+        is_2byte_kv: True iff the raw KV cache element is a 2-byte type (bfloat16 / float16). False for
+            1-byte (fp8) and 4-byte (float32) KV. Ignored when fp8_packed is True.
+        fp8_packed: True iff fp8 KV uses the fp8 packed in bf16 layout.
+        fuse_rope: Whether fused RoPE is enabled in the attention kernel.
+        kv_heads: Number of KV heads (GQA) matching q_head.
+
+    Returns:
+        True iff the QK-swap MM1 path is active for this config; False for the default K-stationary path.
+
+    Example (4-batch, 8-q_head/kv_head, d_head=128, block-KV bf16, 8192 context on LNC2):
+        >>> is_qk_swapped(
+        ...     bs=4,
+        ...     q_head=16,
+        ...     d_head=128,
+        ...     s_active=1,
+        ...     curr_sprior=8192,
+        ...     lnc=2,
+        ...     p_max=128,
+        ...     is_block_kv=True,
+        ...     is_2byte_kv=True,
+        ...     fp8_packed=False,
+        ...     fuse_rope=False,
+        ...     kv_heads=2,
+        ... )
+    """
+    if _ATTN_TKG_NO_SWAP:
+        return False
+    # Disable due to sometimes causing OOB errors.
+    # TODO: remove this gate.
+    return False
+    if not is_block_kv:
+        return False
+    if curr_sprior < 1024:  # TODO: small context sizes not evaluated
+        return False
+    # The swap K-load is a 2-byte indirect dma_transpose, so KV must resolve to a 2-byte SBUF tile:
+    # a raw 2-byte type (bf16/fp16), or fp8 in the packed 2-per-bf16-slot layout. Unpacked fp8 (1-byte)
+    # and float32 (4-byte) fall back to the non-swap path (which handles them via nc_transpose).
+    if not (is_2byte_kv or fp8_packed):
+        return False
+    # d_head tiling not yet supported
+    if d_head > p_max:
+        return False
+
+    # GQA: the attention_tkg kernel folds kv_heads into the batch (B_folded = bs * kv_heads) and runs
+    # with q_head = q_per_group (= q_head // kv_heads). Match that logic here.
+    bs = bs * kv_heads
+    q_head_per_kv = q_head // kv_heads
+    s_active_qh = s_active * q_head_per_kv
+
+    # LNC sharding: batch shard takes priority; else s_prior shard (mirrors _get_lnc_sharding).
+    batch_sharded = lnc > 1 and is_batch_sharded(bs, q_head_per_kv, s_active, curr_sprior, p_max, fuse_rope)
+    sprior_sharded = (
+        lnc > 1 and not batch_sharded and is_s_prior_sharded(bs, q_head_per_kv, s_active, curr_sprior, p_max, fuse_rope)
+    )
+    bs_per_nc = bs // (lnc if batch_sharded else 1)
+    s_prior_per_shard = curr_sprior // (lnc if sprior_sharded else 1)
+
+    # Q tiling not yet supported.
+    if s_active_qh > p_max:
+        return False
+    # Small s_active_qh (<= 4) not supported: the swap MM1 K-load would gather too many batches per
+    # dma_transpose to fit the DGE cap, and cannot be sub-divided below one mm1 group.
+    if s_active_qh <= 4:
+        return False
+    # s_active_qh must column-tile into (a whole number of, or a whole fraction of) a 32-wide tile.
+    if not (s_active_qh % 32 == 0 or 32 % s_active_qh == 0):
+        return False
+    # s_active_qh must divide the partition dim, and there must be enough per-NC batches to fill it.
+    if p_max % s_active_qh != 0 or bs_per_nc % (p_max // s_active_qh) != 0:
+        return False
+
+    # The de-interleaved swap evict reshapes each mm1 group as [.., qk_row_tile_factor, pack_factor * p_max].
+    # Every FA tile's s_prior must be a whole multiple of # p_max * qk_row_tile_factor * pack_factor.
+    # NOTE: the kernel gates qk_row_tile_factor==2 on sbm.is_auto_alloc() which is not accounted for in this
+    # function; this function always assumes auto-alloc. This is fine as with row_tile=2 is a stricter
+    # condition than row_tile=1 so this condition only ever REJECTS manually allocated configs that could
+    # have swapped, making it fall back to the functional unswapped path.
+    qk_row_tile_factor = 2 if d_head == 64 else 1
+    pack_factor = 2 if fp8_packed else 1
+    evict_unit = p_max * qk_row_tile_factor * pack_factor
+    last_fa_tile = s_prior_per_shard % _FA_TILE_SIZE if s_prior_per_shard > _FA_TILE_SIZE else s_prior_per_shard
+    if last_fa_tile % evict_unit != 0:
+        return False
+
+    return True
 
 
 ### Block KV

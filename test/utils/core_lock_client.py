@@ -57,12 +57,12 @@ REMOTE_FLOCK_FILE = f"{REMOTE_LOCK_DIR}/atomic_lock"
 REMOTE_LOCK_HELPERS = f"{REMOTE_LOCK_DIR}/lock_helpers.py"
 
 # Default locking protocol version for hosts without version file
-DEFAULT_LOCKING_PROTOCOL_VERSION = 3
+DEFAULT_LOCKING_PROTOCOL_VERSION = 4
 
-# Build-time guard: this constant and the deployed v3 queue verbs must move
+# Build-time guard: this constant and the deployed v4 queue verbs must move
 # together. Fail fast at import if the constant drifts from the protocol the
 # verbs implement, rather than silently regressing hosts.
-assert DEFAULT_LOCKING_PROTOCOL_VERSION == 3, "locking protocol constant must stay pinned to v3"
+assert DEFAULT_LOCKING_PROTOCOL_VERSION == 4, "locking protocol constant must stay pinned to v4"
 
 # JSON key in version file
 MIN_CLIENT_VERSION_KEY = "minClientLockingVersion"
@@ -74,8 +74,6 @@ MIN_CLIENT_VERSION_KEY = "minClientLockingVersion"
 # capture.
 DEFAULT_LOCK_TIMEOUT_SECONDS = 60
 
-INFERENCE_LOCK_TIMEOUT_SECONDS = 1800
-
 # Path to the local helper script that gets deployed to remote hosts
 _LOCAL_LOCK_HELPERS_PATH = Path(__file__).parent / "scripts" / "remote_lock_scripts.py"
 
@@ -85,11 +83,11 @@ def get_lock_helpers_content() -> str:
     """Load the lock helpers script content from the local filesystem."""
     try:
         return _LOCAL_LOCK_HELPERS_PATH.read_text()
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         raise FileNotFoundError(
             f"Lock helpers script not found at {_LOCAL_LOCK_HELPERS_PATH}. "
             f"Ensure {_LOCAL_LOCK_HELPERS_PATH.name} is present in the same directory."
-        )
+        ) from e
 
 
 # =============================================================================
@@ -133,9 +131,9 @@ def _remote_initialize(
             try:
                 fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except BlockingIOError:
+            except BlockingIOError as e:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"flock timed out after {flock_timeout}s")
+                    raise TimeoutError(f"flock timed out after {flock_timeout}s") from e
                 time.sleep(0.1 + random.uniform(0, 0.025))
         try:
             # Version-gate the deploy under the held flock (read + decide + write
@@ -182,9 +180,9 @@ def _remote_lock_operation(lock_file, helpers_file, command, args, kwargs=None, 
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except BlockingIOError:
+            except BlockingIOError as e:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"flock timed out after {flock_timeout}s")
+                    raise TimeoutError(f"flock timed out after {flock_timeout}s") from e
                 time.sleep(0.1 + random.uniform(0, 0.025))
         try:
             lr = fn(*args, **kwargs)
@@ -360,6 +358,25 @@ def dequeue(
         version,
         entry_id,
         caller_id=caller_id,
+    )
+
+
+def probe(
+    executor,
+    total_physical_cores: int,
+    num_physical_cores: int,
+    timeout_seconds: int,
+    version: int,
+) -> LockResult:
+    """Read-only worst-case ETA peek (no enqueue / no mutation)."""
+    return _run_lock_helper(
+        executor,
+        "probe",
+        REMOTE_LOCKS_JSON,
+        total_physical_cores,
+        num_physical_cores,
+        timeout_seconds,
+        version,
     )
 
 

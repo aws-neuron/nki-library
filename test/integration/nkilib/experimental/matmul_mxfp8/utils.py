@@ -93,6 +93,39 @@ def swizzle_tensor(src_tensor, TILE_P=512):
     return dst_tensor.astype(src_tensor.dtype)
 
 
+def swizzle_tensor_1x32(src_tensor):
+    """
+    Golden reference for the 1x32 (contiguous-K) interleave layout.
+
+    Unlike wrapX (``swizzle_tensor``), which splits a feature's K into four
+    far-apart quarters, the 1x32 layout packs four *consecutive* K values of a
+    feature into its four adjacent output columns:
+
+        dst[p, f * INTERLEAVE_FACTOR + c] = src[INTERLEAVE_FACTOR * p + c, f]
+
+    This matches the layout produced by the hardware ``load_tile_PE_Swizzle_1x32``
+    loader (fp32-reinterpret PE transpose). The mapping is local to each group of
+    INTERLEAVE_FACTOR rows and independent of tile boundaries, so no TILE_P
+    remainder decomposition is needed.
+
+    Args:
+        src_tensor (np.ndarray): Source tensor of shape (P, F).
+
+    Returns:
+        np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
+    """
+    P, F = src_tensor.shape
+
+    if P % INTERLEAVE_FACTOR != 0:
+        raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({INTERLEAVE_FACTOR})")
+
+    return (
+        src_tensor.reshape(P // INTERLEAVE_FACTOR, INTERLEAVE_FACTOR, F)
+        .transpose(0, 2, 1)
+        .reshape(P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR)
+    )
+
+
 def unswizzle_tensor(src_tensor, TILE_P=512):
     """
     Golden reference for reversing interleave loading.
@@ -209,7 +242,7 @@ def check_correctness(kernel_result, golden_result, rtol=1e-3):
     Returns:
         tuple: (passed boolean, metrics dict).
     """
-    if type(kernel_result) != type(golden_result):
+    if type(kernel_result) is not type(golden_result):
         raise TypeError(f"Inputs must be of the same type. {type(kernel_result)=} && {type(golden_result)=}")
 
     kernel_result_flat = kernel_result.flatten().astype(np.float32)

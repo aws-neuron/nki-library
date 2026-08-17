@@ -21,8 +21,8 @@ import pytest
 import torch
 import torch.distributed as dist
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import get_pg, get_rank
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,
@@ -326,17 +326,17 @@ class TestCollectiveUnitTestFramework:
         def torch_ref(a):
             return {"out": a}
 
-        mock_manager = MagicMock()
         mock_collector = MagicMock()
+        mock_manager = MagicMock()
         metadata_list = [{"test_settings": {"k": 1}}]
 
         framework = CollectiveUnitTestFramework(
             test_manager=mock_manager,
+            collector=mock_collector,
             kernel_entry=kernel,
             torch_ref=torch_ref,
             per_rank_input_generator=lambda rank_id: {"a": np.array([1.0])},
             collective_ranks=2,
-            collector=mock_collector,
         )
 
         with patch("test.utils.unit_test_framework.load_model_configs", return_value=metadata_list):

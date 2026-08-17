@@ -38,24 +38,23 @@ from ...core.qkv.qkv_cte import _get_psum_bank_size
 from ...core.utils.allocator import SbufManager, sizeinbytes
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
-from ...core.utils.tensor_view import TensorView
 
 NUM_HW_PSUM_BANKS = 8
 H_PACK = 4
 
 
 def _validate_mla_inputs(
-    x_hbm: nl.ndarray,
-    wqkv_a_hbm: nl.ndarray,
-    wqkv_a_scale_hbm: nl.ndarray,
-    wq_b_hbm: nl.ndarray,
-    wq_b_scale_hbm: nl.ndarray,
-    q_norm_gamma_hbm: nl.ndarray,
-    wkv_b_hbm: nl.ndarray,
-    wkv_b_scale_hbm: nl.ndarray,
-    kv_norm_gamma_hbm: nl.ndarray,
-    cos_cache_hbm: nl.ndarray,
-    sin_cache_hbm: nl.ndarray,
+    x_hbm: nl.NkiTensor,
+    wqkv_a_hbm: nl.NkiTensor,
+    wqkv_a_scale_hbm: nl.NkiTensor,
+    wq_b_hbm: nl.NkiTensor,
+    wq_b_scale_hbm: nl.NkiTensor,
+    q_norm_gamma_hbm: nl.NkiTensor,
+    wkv_b_hbm: nl.NkiTensor,
+    wkv_b_scale_hbm: nl.NkiTensor,
+    kv_norm_gamma_hbm: nl.NkiTensor,
+    cos_cache_hbm: nl.NkiTensor,
+    sin_cache_hbm: nl.NkiTensor,
     n_heads: int,
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
@@ -223,15 +222,15 @@ def _validate_mla_inputs(
 
 
 def _validate_mla_v4_inputs(
-    x_hbm: nl.ndarray,
-    wqkv_hbm: nl.ndarray,
-    wqkv_scale_hbm: nl.ndarray,
-    wq_b_hbm: nl.ndarray,
-    wq_b_scale_hbm: nl.ndarray,
-    q_norm_gamma_hbm: nl.ndarray,
-    kv_norm_gamma_hbm: nl.ndarray,
-    cos_cache_hbm: nl.ndarray,
-    sin_cache_hbm: nl.ndarray,
+    x_hbm: nl.NkiTensor,
+    wqkv_hbm: nl.NkiTensor,
+    wqkv_scale_hbm: nl.NkiTensor,
+    wq_b_hbm: nl.NkiTensor,
+    wq_b_scale_hbm: nl.NkiTensor,
+    q_norm_gamma_hbm: nl.NkiTensor,
+    kv_norm_gamma_hbm: nl.NkiTensor,
+    cos_cache_hbm: nl.NkiTensor,
+    sin_cache_hbm: nl.NkiTensor,
     n_heads: int,
     head_dim: int,
     qk_rope_head_dim: int,
@@ -488,10 +487,10 @@ def _v32_compute_k_slab_size_512_tiles(
 
 
 def _load_mx_weights_k_slab(
-    weights_hbm: nl.ndarray,
-    scales_hbm: nl.ndarray,
-    weights_sb: nl.ndarray,
-    scales_sb: nl.ndarray,
+    weights_hbm: nl.NkiTensor,
+    scales_hbm: nl.NkiTensor,
+    weights_sb: nl.NkiTensor,
+    scales_sb: nl.NkiTensor,
     in_dim_full: int,
     out_dim: int,
     k_tile_start: int,
@@ -568,18 +567,18 @@ def _load_mx_weights_k_slab(
         )
 
     # ---- Stage 2: Vector-engine broadcast into the materialized scales_sb. ----
-    src_view = TensorView(compact_scales_sb).expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK).get_view()
-    dst_view = TensorView(scales_sb).reshape_dim(dim=2, shape=(n_blocks, SCALE_BLOCK)).get_view()
+    src_view = compact_scales_sb.expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK)
+    dst_view = scales_sb.reshape_dim(dim=2, shape=(n_blocks, SCALE_BLOCK))
     nisa.tensor_copy(dst=dst_view, src=src_view)
 
     sbm.close_scope()  # Frees compact_scales_sb.
 
 
 def _mx_matmul_split_k_range(
-    input_qtz_sb: nl.ndarray,
-    input_scale_sb: nl.ndarray,
-    weights_slab_sb: nl.ndarray,
-    weights_slab_scale_sb: nl.ndarray,
+    input_qtz_sb: nl.NkiTensor,
+    input_scale_sb: nl.NkiTensor,
+    weights_slab_sb: nl.NkiTensor,
+    weights_slab_scale_sb: nl.NkiTensor,
     k_tile_start: int,
     k_tile_count: int,
     m_dim: int,
@@ -988,15 +987,15 @@ def _v4_compute_dispatch(
 
 
 def _load_mx_weights(
-    weights_hbm: nl.ndarray,
-    scales_hbm: nl.ndarray,
+    weights_hbm: nl.NkiTensor,
+    scales_hbm: nl.NkiTensor,
     in_dim: int,
     out_dim: int,
     sbm: SbufManager,
     name: str = "mx",
     full_out_dim: int = None,
     out_col_offset: int = 0,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """Load MX weights and DeepSeek-style block-128 scales from HBM to SBUF.
 
     Loads fp8x4 packed weights and per-(128 K x 128 N) block uint8 scales
@@ -1113,8 +1112,8 @@ def _load_mx_weights(
     # ---- Stage 2: Vector-engine broadcast into the final scales_sb. ----
     # Source view: [P_MAX, num_512_tiles, n_blocks, 1] -> broadcast(dim=3, size=128).
     # Destination view: [P_MAX, num_512_tiles, n_blocks, 128] (reshape of the 3D scales_sb).
-    src_view = TensorView(compact_scales_sb).expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK).get_view()
-    dst_view = TensorView(scales_sb).reshape_dim(dim=2, shape=(out_n_blocks, SCALE_BLOCK)).get_view()
+    src_view = compact_scales_sb.expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK)
+    dst_view = scales_sb.reshape_dim(dim=2, shape=(out_n_blocks, SCALE_BLOCK))
     nisa.tensor_copy(dst=dst_view, src=src_view)
 
     sbm.close_scope()  # Frees compact_scales_sb.
@@ -1123,11 +1122,11 @@ def _load_mx_weights(
 
 
 def _load_norm_weights_for_mx(
-    norm_weights_hbm: nl.ndarray,
+    norm_weights_hbm: nl.NkiTensor,
     dim: int,
     sbm: SbufManager,
     name: str = "norm_gamma",
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Load norm weights [1, dim] to SBUF in swizzled format for MX path.
 
@@ -1135,13 +1134,13 @@ def _load_norm_weights_for_mx(
     one element per 128-element sub-tile, matching the MX quantization layout.
 
     Args:
-        norm_weights_hbm (nl.ndarray): [1, dim] bf16, Norm gamma weights on HBM
+        norm_weights_hbm (nl.NkiTensor): [1, dim] bf16, Norm gamma weights on HBM
         dim (int): Hidden dimension size
         sbm (SbufManager): SBUF memory manager
         name (str): Name for the allocated buffer
 
     Returns:
-        nl.ndarray: [P_MAX, num_512_tiles * H_PACK] float32, Swizzled gamma weights in SBUF
+        nl.NkiTensor: [P_MAX, num_512_tiles * H_PACK] float32, Swizzled gamma weights in SBUF
     """
     P_MAX = nl.tile_size.pmax
     num_512_tiles = dim // (P_MAX * H_PACK)
@@ -1165,26 +1164,26 @@ def _load_norm_weights_for_mx(
 
 
 def _quantize_mx(
-    transposed_sb: nl.ndarray,
+    transposed_sb: nl.NkiTensor,
     num_512_tiles: int,
     s_tile_sz: int,
     sbm: SbufManager,
     name: str = "qtz",
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Quantize bf16 tensor to MX format (fp8x4 + uint8 scales).
 
     Args:
-        transposed_sb (nl.ndarray): [P_MAX, num_512_tiles, s_tile_sz * H_PACK], Input tensor in SBUF
+        transposed_sb (nl.NkiTensor): [P_MAX, num_512_tiles, s_tile_sz * H_PACK], Input tensor in SBUF
         num_512_tiles (int): Number of 512-element tiles
         s_tile_sz (int): Number of active sequence positions in the tile
         sbm (SbufManager): SBUF memory manager
         name (str): Name prefix for allocated buffers
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]:
-            - qtz_sb (nl.ndarray): [P_MAX, num_512_tiles, s_tile_sz] fp8x4, Quantized values
-            - scale_sb (nl.ndarray): [P_MAX, num_512_tiles, s_tile_sz] uint8, Per-block scales
+        Tuple[nl.NkiTensor, nl.NkiTensor]:
+            - qtz_sb (nl.NkiTensor): [P_MAX, num_512_tiles, s_tile_sz] fp8x4, Quantized values
+            - scale_sb (nl.NkiTensor): [P_MAX, num_512_tiles, s_tile_sz] uint8, Per-block scales
     """
     P_MAX = nl.tile_size.pmax
 
@@ -1210,24 +1209,24 @@ def _quantize_mx(
 
 
 def _mx_matmul(
-    input_qtz_sb: nl.ndarray,
-    input_scale_sb: nl.ndarray,
-    weights_sb: nl.ndarray,
-    weights_scale_sb: nl.ndarray,
+    input_qtz_sb: nl.NkiTensor,
+    input_scale_sb: nl.NkiTensor,
+    weights_sb: nl.NkiTensor,
+    weights_scale_sb: nl.NkiTensor,
     num_k_tiles: int,
     m_dim: int,
     n_dim: int,
     sbm: SbufManager,
     name: str = "matmul",
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     MX matrix multiplication: input @ weights.
 
     Args:
-        input_qtz_sb (nl.ndarray): [P_MAX, num_k_tiles, m_dim] fp8x4, Quantized input (stationary)
-        input_scale_sb (nl.ndarray): [P_MAX, num_k_tiles, m_dim] uint8, Input scales
-        weights_sb (nl.ndarray): [P_MAX, num_k_tiles, n_dim] fp8x4, Quantized weights (moving)
-        weights_scale_sb (nl.ndarray): [P_MAX, num_k_tiles, n_dim] uint8, Weight scales
+        input_qtz_sb (nl.NkiTensor): [P_MAX, num_k_tiles, m_dim] fp8x4, Quantized input (stationary)
+        input_scale_sb (nl.NkiTensor): [P_MAX, num_k_tiles, m_dim] uint8, Input scales
+        weights_sb (nl.NkiTensor): [P_MAX, num_k_tiles, n_dim] fp8x4, Quantized weights (moving)
+        weights_scale_sb (nl.NkiTensor): [P_MAX, num_k_tiles, n_dim] uint8, Weight scales
         num_k_tiles (int): Number of K-dimension tiles to accumulate over
         m_dim (int): M dimension (sequence tile size)
         n_dim (int): N dimension (total output width)
@@ -1235,7 +1234,7 @@ def _mx_matmul(
         name (str): Name prefix for allocated buffers
 
     Returns:
-        nl.ndarray: [m_dim, n_dim] bf16, Matrix multiplication result in SBUF
+        nl.NkiTensor: [m_dim, n_dim] bf16, Matrix multiplication result in SBUF
     """
     P_MAX = nl.tile_size.pmax
     F_MAX = 512
@@ -1277,26 +1276,26 @@ def _mx_matmul(
 
 
 def _mx_matmul_split(
-    input_qtz_sb: nl.ndarray,
-    input_scale_sb: nl.ndarray,
-    weights_sb: nl.ndarray,
-    weights_scale_sb: nl.ndarray,
+    input_qtz_sb: nl.NkiTensor,
+    input_scale_sb: nl.NkiTensor,
+    weights_sb: nl.NkiTensor,
+    weights_scale_sb: nl.NkiTensor,
     num_k_tiles: int,
     m_dim: int,
     n_dim: int,
     split_points: List[int],
     sbm: SbufManager,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """
     MX matmul with split output: input @ weights -> multiple output buffers.
 
     Split happens during PSUM->SBUF copy to avoid extra memory movement.
 
     Args:
-        input_qtz_sb (nl.ndarray): [P_MAX, num_k_tiles, m_dim] fp8x4, Quantized input (stationary)
-        input_scale_sb (nl.ndarray): [P_MAX, num_k_tiles, m_dim] uint8, Input scales
-        weights_sb (nl.ndarray): [P_MAX, num_k_tiles, n_dim] fp8x4, Quantized weights (moving)
-        weights_scale_sb (nl.ndarray): [P_MAX, num_k_tiles, n_dim] uint8, Weight scales
+        input_qtz_sb (nl.NkiTensor): [P_MAX, num_k_tiles, m_dim] fp8x4, Quantized input (stationary)
+        input_scale_sb (nl.NkiTensor): [P_MAX, num_k_tiles, m_dim] uint8, Input scales
+        weights_sb (nl.NkiTensor): [P_MAX, num_k_tiles, n_dim] fp8x4, Quantized weights (moving)
+        weights_scale_sb (nl.NkiTensor): [P_MAX, num_k_tiles, n_dim] uint8, Weight scales
         num_k_tiles (int): Number of K-dimension tiles to accumulate over
         m_dim (int): M dimension (sequence tile size)
         n_dim (int): N dimension (total output width)
@@ -1304,7 +1303,7 @@ def _mx_matmul_split(
         sbm (SbufManager): SBUF memory manager
 
     Returns:
-        List[nl.ndarray]: List of SBUF tensors, one per split segment
+        List[nl.NkiTensor]: List of SBUF tensors, one per split segment
     """
     P_MAX = nl.tile_size.pmax
     F_MAX = 512
@@ -1368,15 +1367,15 @@ def _mx_matmul_split(
 
 
 def _transpose_preswizzled_for_mx(
-    input_sb: nl.ndarray,
+    input_sb: nl.NkiTensor,
     s_tile_sz: int,
     hidden_dim: int,
     num_512_tiles: int,
     sbm: SbufManager,
-    gamma_sb: nl.ndarray = None,
-    rsqrt_scale_sb: nl.ndarray = None,
+    gamma_sb: nl.NkiTensor = None,
+    rsqrt_scale_sb: nl.NkiTensor = None,
     name: str = "transpose_preswizzled",
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Transpose pre-swizzled [S, H] -> [H, S] for MX quantization using all 8 PSUM banks.
 
     Processes two h_tiles simultaneously using 8 PSUM banks (4 per h_tile).
@@ -1385,19 +1384,19 @@ def _transpose_preswizzled_for_mx(
     PSUM->SBUF eviction performs a single multiply instead of two ops.
 
     Args:
-        input_sb (nl.ndarray): [s_tile_sz, hidden_dim], Pre-swizzled input in SBUF.
+        input_sb (nl.NkiTensor): [s_tile_sz, hidden_dim], Pre-swizzled input in SBUF.
         s_tile_sz (int): Number of active sequence positions in the tile.
         hidden_dim (int): Hidden dimension size.
         num_512_tiles (int): Number of 512-element tiles along H.
         sbm (SbufManager): SBUF memory manager.
-        gamma_sb (nl.ndarray, optional): [P_MAX, num_512_tiles * H_PACK] gamma weights,
+        gamma_sb (nl.NkiTensor, optional): [P_MAX, num_512_tiles * H_PACK] gamma weights,
             applied during the eviction multiply if provided.
-        rsqrt_scale_sb (nl.ndarray, optional): [s_tile_sz, 1] rsqrt scale; if also
+        rsqrt_scale_sb (nl.NkiTensor, optional): [s_tile_sz, 1] rsqrt scale; if also
             ``gamma_sb`` is provided, the two are pre-multiplied into a fused gamma.
         name (str): Name prefix for allocated buffers.
 
     Returns:
-        nl.ndarray: [P_MAX, num_512_tiles, s_tile_sz * H_PACK], Transposed tensor in SBUF.
+        nl.NkiTensor: [P_MAX, num_512_tiles, s_tile_sz * H_PACK], Transposed tensor in SBUF.
     """
     if rsqrt_scale_sb is not None and gamma_sb is not None:
         fused_gamma_sb = sbm.alloc_stack(gamma_sb.shape, dtype=nl.float32, buffer=nl.sbuf, name=f"{name}_fused_gamma")
@@ -1497,29 +1496,29 @@ def _transpose_preswizzled_for_mx(
 
 
 def _compute_rms_norm_scale(
-    input_sb: nl.ndarray,
-    zero_bias_sb: nl.ndarray,
-    norm_eps_sb: nl.ndarray,
+    input_sb: nl.NkiTensor,
+    zero_bias_sb: nl.NkiTensor,
+    norm_eps_sb: nl.NkiTensor,
     s_tile_sz: int,
     hidden_dim: int,
     sbm: SbufManager,
     name: str = "rms",
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Compute rsqrt(mean(x²) + eps) scale factor without applying it.
 
     Returns the [s_tile_sz, 1] scale factor to be fused into a later step.
 
     Args:
-        input_sb (nl.ndarray): [s_tile_sz, hidden_dim], Input tensor in SBUF.
-        zero_bias_sb (nl.ndarray): [P_MAX, 1], Pre-zeroed bias tensor for activation_reduce.
-        norm_eps_sb (nl.ndarray): [P_MAX, 1], Pre-filled epsilon tensor.
+        input_sb (nl.NkiTensor): [s_tile_sz, hidden_dim], Input tensor in SBUF.
+        zero_bias_sb (nl.NkiTensor): [P_MAX, 1], Pre-zeroed bias tensor for activation_reduce.
+        norm_eps_sb (nl.NkiTensor): [P_MAX, 1], Pre-filled epsilon tensor.
         s_tile_sz (int): Number of active sequence positions.
         hidden_dim (int): Hidden dimension size.
         sbm (SbufManager): SBUF memory manager.
         name (str): Name prefix for allocated buffers.
 
     Returns:
-        nl.ndarray: [P_MAX, 1] float32, rsqrt scale factor in SBUF.
+        nl.NkiTensor: [P_MAX, 1] float32, rsqrt scale factor in SBUF.
     """
     P_MAX = nl.tile_size.pmax
 
@@ -1547,9 +1546,9 @@ def _compute_rms_norm_scale(
 
 
 def _apply_rms_norm_inplace(
-    input_sb: nl.ndarray,
-    zero_bias_sb: nl.ndarray,
-    norm_eps_sb: nl.ndarray,
+    input_sb: nl.NkiTensor,
+    zero_bias_sb: nl.NkiTensor,
+    norm_eps_sb: nl.NkiTensor,
     s_tile_sz: int,
     hidden_dim: int,
     sbm: SbufManager,
@@ -1583,14 +1582,14 @@ def _apply_rms_norm_inplace(
 
 
 def _apply_rope_to_tensor(
-    x_sb: nl.ndarray,
-    cos_sb: nl.ndarray,
-    sin_sb: nl.ndarray,
+    x_sb: nl.NkiTensor,
+    cos_sb: nl.NkiTensor,
+    sin_sb: nl.NkiTensor,
     s_tile_sz: int,
     rope_dim: int,
     sbm: SbufManager,
     name: str = "rope",
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Apply Rotary Position Embedding (RoPE) to a tensor, returning a new buffer.
 
@@ -1598,16 +1597,16 @@ def _apply_rope_to_tensor(
     where x1 and x2 are the first and second halves of the input along rope_dim.
 
     Args:
-        x_sb (nl.ndarray): [s_tile_sz, rope_dim], Input tensor in SBUF.
-        cos_sb (nl.ndarray): [s_tile_sz, rope_dim], Cosine frequencies in SBUF.
-        sin_sb (nl.ndarray): [s_tile_sz, rope_dim // 2], Sine frequencies in SBUF.
+        x_sb (nl.NkiTensor): [s_tile_sz, rope_dim], Input tensor in SBUF.
+        cos_sb (nl.NkiTensor): [s_tile_sz, rope_dim], Cosine frequencies in SBUF.
+        sin_sb (nl.NkiTensor): [s_tile_sz, rope_dim // 2], Sine frequencies in SBUF.
         s_tile_sz (int): Number of active sequence positions.
         rope_dim (int): RoPE dimension (must be even).
         sbm (SbufManager): SBUF memory manager.
         name (str): Name prefix for allocated buffers.
 
     Returns:
-        nl.ndarray: [s_tile_sz, rope_dim], New tensor with RoPE applied in SBUF.
+        nl.NkiTensor: [s_tile_sz, rope_dim], New tensor with RoPE applied in SBUF.
     """
     half_dim = rope_dim // 2
 
@@ -1653,9 +1652,9 @@ def _apply_rope_to_tensor(
 
 
 def _apply_rope_inplace(
-    x_sb: nl.ndarray,
-    cos_sb: nl.ndarray,
-    sin_sb: nl.ndarray,
+    x_sb: nl.NkiTensor,
+    cos_sb: nl.NkiTensor,
+    sin_sb: nl.NkiTensor,
     s_tile_sz: int,
     rope_dim: int,
 ) -> None:
@@ -1667,10 +1666,10 @@ def _apply_rope_inplace(
     ``x_sb[rope_dim:rope_dim*2]`` as scratch space.
 
     Args:
-        x_sb (nl.ndarray): [s_tile_sz, rope_dim * 2], Input modified in-place.
+        x_sb (nl.NkiTensor): [s_tile_sz, rope_dim * 2], Input modified in-place.
             First rope_dim elements are the input; second rope_dim are scratch.
-        cos_sb (nl.ndarray): [s_tile_sz, rope_dim], Cosine frequencies.
-        sin_sb (nl.ndarray): [s_tile_sz, rope_dim // 2], Sine frequencies.
+        cos_sb (nl.NkiTensor): [s_tile_sz, rope_dim], Cosine frequencies.
+        sin_sb (nl.NkiTensor): [s_tile_sz, rope_dim // 2], Sine frequencies.
         s_tile_sz (int): Number of active sequence positions.
         rope_dim (int): RoPE dimension (must be even).
     """
@@ -1721,13 +1720,13 @@ def _apply_rope_inplace(
 
 
 def _v4_load_rope_caches(
-    cos_cache_hbm: nl.ndarray,
-    sin_cache_hbm: nl.ndarray,
+    cos_cache_hbm: nl.NkiTensor,
+    sin_cache_hbm: nl.NkiTensor,
     sbm: SbufManager,
     s_tile_sz: int,
     qk_rope_head_dim: int,
     rope_offset: int,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """Allocate cos/sin SBUF buffers and DMA them in from HBM.
 
     The full ``cos`` cache is stored ``[batch * S, qk_rope_head_dim]`` and
@@ -1762,10 +1761,10 @@ def _v4_load_rope_caches(
 
 
 def _v4_apply_kv_norm_inplace(
-    kv_sb: nl.ndarray,
-    kv_gamma_sb: nl.ndarray,
-    zero_bias_sb: nl.ndarray,
-    norm_eps_sb: nl.ndarray,
+    kv_sb: nl.NkiTensor,
+    kv_gamma_sb: nl.NkiTensor,
+    zero_bias_sb: nl.NkiTensor,
+    norm_eps_sb: nl.NkiTensor,
     sbm: SbufManager,
     s_tile_sz: int,
     kv_dim: int,
@@ -1802,9 +1801,9 @@ def _v4_apply_kv_norm_inplace(
 
 
 def _v4_apply_q_post_rsqrt_norm(
-    q_sb: nl.ndarray,
-    zero_bias_sb: nl.ndarray,
-    norm_eps_sb: nl.ndarray,
+    q_sb: nl.NkiTensor,
+    zero_bias_sb: nl.NkiTensor,
+    norm_eps_sb: nl.NkiTensor,
     sbm: SbufManager,
     s_tile_pad: int,
     n_heads: int,
@@ -1816,7 +1815,7 @@ def _v4_apply_q_post_rsqrt_norm(
     Two-step: per-head sum-of-squares via ``activation_reduce`` accumulating
     into ``sum_sq_sb[..., i_head]``, then a single ``activation`` op with
     ``op=rsqrt`` and ``scale=1/head_dim`` produces the per-head scale, which
-    is broadcast-multiplied across ``head_dim`` via ``TensorView``.
+    is broadcast-multiplied across ``head_dim`` via ``nl.NkiTensor``.
 
     Used by both fast and chunked paths; the chunked path passes
     ``n_heads=heads_per_chunk``.
@@ -1851,20 +1850,20 @@ def _v4_apply_q_post_rsqrt_norm(
         bias=norm_eps_sb[0:s_tile_pad, 0:1],
         scale=float(1.0 / head_dim),
     )
-    q_3d = TensorView(q_sb).reshape_dim(dim=1, shape=(n_heads, head_dim))
-    scale_broadcast = TensorView(sum_sq_sb).reshape_dim(dim=1, shape=(n_heads, 1)).broadcast(dim=2, size=head_dim)
+    q_3d = q_sb.reshape_dim(dim=1, shape=(n_heads, head_dim))
+    scale_broadcast = sum_sq_sb.reshape_dim(dim=1, shape=(n_heads, 1)).broadcast(dim=2, size=head_dim)
     nisa.tensor_tensor(
-        dst=q_3d.get_view(),
-        data1=q_3d.get_view(),
-        data2=scale_broadcast.get_view(),
+        dst=q_3d,
+        data1=q_3d,
+        data2=scale_broadcast,
         op=nl.multiply,
     )
 
 
 def _v4_apply_q_rope_inplace(
-    q_sb: nl.ndarray,
-    cos_sb: nl.ndarray,
-    sin_sb: nl.ndarray,
+    q_sb: nl.NkiTensor,
+    cos_sb: nl.NkiTensor,
+    sin_sb: nl.NkiTensor,
     sbm: SbufManager,
     n_heads: int,
     head_dim: int,
@@ -1881,11 +1880,11 @@ def _v4_apply_q_rope_inplace(
     qk_nope_head_dim = head_dim - qk_rope_head_dim
     half_rope = qk_rope_head_dim // 2
 
-    q_3d = TensorView(q_sb).reshape_dim(dim=1, shape=(n_heads, head_dim))
+    q_3d = q_sb.reshape_dim(dim=1, shape=(n_heads, head_dim))
     q_pe_view = q_3d.slice(dim=2, start=qk_nope_head_dim, end=head_dim)
 
-    cos_3d = TensorView(cos_sb).expand_dim(dim=1).broadcast(dim=1, size=n_heads)
-    sin_half = TensorView(sin_sb).expand_dim(dim=1).broadcast(dim=1, size=n_heads)
+    cos_3d = cos_sb.expand_dim(dim=1).broadcast(dim=1, size=n_heads)
+    sin_half = sin_sb.expand_dim(dim=1).broadcast(dim=1, size=n_heads)
 
     rope_tmp_sb = sbm.alloc_stack(
         (P_MAX, n_heads * qk_rope_head_dim),
@@ -1893,7 +1892,7 @@ def _v4_apply_q_rope_inplace(
         buffer=nl.sbuf,
         name="q_rope_tmp",
     )
-    rope_tmp_3d = TensorView(rope_tmp_sb).reshape_dim(dim=1, shape=(n_heads, qk_rope_head_dim))
+    rope_tmp_3d = rope_tmp_sb.reshape_dim(dim=1, shape=(n_heads, qk_rope_head_dim))
 
     q_pe_first = q_pe_view.slice(dim=2, start=0, end=half_rope)
     q_pe_second = q_pe_view.slice(dim=2, start=half_rope, end=qk_rope_head_dim)
@@ -1903,47 +1902,47 @@ def _v4_apply_q_rope_inplace(
     rope_tmp_second = rope_tmp_3d.slice(dim=2, start=half_rope, end=qk_rope_head_dim)
 
     nisa.tensor_tensor(
-        dst=rope_tmp_first.get_view(),
-        data1=q_pe_second.get_view(),
-        data2=sin_half.get_view(),
+        dst=rope_tmp_first,
+        data1=q_pe_second,
+        data2=sin_half,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=rope_tmp_second.get_view(),
-        data1=q_pe_first.get_view(),
-        data2=sin_half.get_view(),
+        dst=rope_tmp_second,
+        data1=q_pe_first,
+        data2=sin_half,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=q_pe_first.get_view(),
-        data1=q_pe_first.get_view(),
-        data2=cos_first.get_view(),
+        dst=q_pe_first,
+        data1=q_pe_first,
+        data2=cos_first,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=q_pe_first.get_view(),
-        data1=q_pe_first.get_view(),
-        data2=rope_tmp_first.get_view(),
+        dst=q_pe_first,
+        data1=q_pe_first,
+        data2=rope_tmp_first,
         op=nl.subtract,
     )
     nisa.tensor_tensor(
-        dst=q_pe_second.get_view(),
-        data1=q_pe_second.get_view(),
-        data2=cos_second.get_view(),
+        dst=q_pe_second,
+        data1=q_pe_second,
+        data2=cos_second,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=q_pe_second.get_view(),
-        data1=q_pe_second.get_view(),
-        data2=rope_tmp_second.get_view(),
+        dst=q_pe_second,
+        data1=q_pe_second,
+        data2=rope_tmp_second,
         op=nl.add,
     )
 
 
 def _v4_apply_kv_rope_inplace(
-    kv_sb: nl.ndarray,
-    cos_sb: nl.ndarray,
-    sin_sb: nl.ndarray,
+    kv_sb: nl.NkiTensor,
+    cos_sb: nl.NkiTensor,
+    sin_sb: nl.NkiTensor,
     sbm: SbufManager,
     kv_dim: int,
     qk_rope_head_dim: int,
@@ -1957,8 +1956,8 @@ def _v4_apply_kv_rope_inplace(
     half_rope = qk_rope_head_dim // 2
     kv_rope_offset = kv_dim - qk_rope_head_dim
 
-    kv_pe_first = TensorView(kv_sb).slice(dim=1, start=kv_rope_offset, end=kv_rope_offset + half_rope)
-    kv_pe_second = TensorView(kv_sb).slice(dim=1, start=kv_rope_offset + half_rope, end=kv_dim)
+    kv_pe_first = kv_sb.slice(dim=1, start=kv_rope_offset, end=kv_rope_offset + half_rope)
+    kv_pe_second = kv_sb.slice(dim=1, start=kv_rope_offset + half_rope, end=kv_dim)
 
     kv_rope_tmp_sb = sbm.alloc_stack(
         (P_MAX, qk_rope_head_dim),
@@ -1966,46 +1965,46 @@ def _v4_apply_kv_rope_inplace(
         buffer=nl.sbuf,
         name="kv_rope_tmp",
     )
-    kv_tmp_first = TensorView(kv_rope_tmp_sb).slice(dim=1, start=0, end=half_rope)
-    kv_tmp_second = TensorView(kv_rope_tmp_sb).slice(dim=1, start=half_rope, end=qk_rope_head_dim)
+    kv_tmp_first = kv_rope_tmp_sb.slice(dim=1, start=0, end=half_rope)
+    kv_tmp_second = kv_rope_tmp_sb.slice(dim=1, start=half_rope, end=qk_rope_head_dim)
 
-    cos_first_1d = TensorView(cos_sb).slice(dim=1, start=0, end=half_rope)
-    cos_second_1d = TensorView(cos_sb).slice(dim=1, start=half_rope, end=qk_rope_head_dim)
-    sin_half_1d = TensorView(sin_sb)
+    cos_first_1d = cos_sb.slice(dim=1, start=0, end=half_rope)
+    cos_second_1d = cos_sb.slice(dim=1, start=half_rope, end=qk_rope_head_dim)
+    sin_half_1d = sin_sb
 
     nisa.tensor_tensor(
-        dst=kv_tmp_first.get_view(),
-        data1=kv_pe_second.get_view(),
-        data2=sin_half_1d.get_view(),
+        dst=kv_tmp_first,
+        data1=kv_pe_second,
+        data2=sin_half_1d,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=kv_tmp_second.get_view(),
-        data1=kv_pe_first.get_view(),
-        data2=sin_half_1d.get_view(),
+        dst=kv_tmp_second,
+        data1=kv_pe_first,
+        data2=sin_half_1d,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=kv_pe_first.get_view(),
-        data1=kv_pe_first.get_view(),
-        data2=cos_first_1d.get_view(),
+        dst=kv_pe_first,
+        data1=kv_pe_first,
+        data2=cos_first_1d,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=kv_pe_first.get_view(),
-        data1=kv_pe_first.get_view(),
-        data2=kv_tmp_first.get_view(),
+        dst=kv_pe_first,
+        data1=kv_pe_first,
+        data2=kv_tmp_first,
         op=nl.subtract,
     )
     nisa.tensor_tensor(
-        dst=kv_pe_second.get_view(),
-        data1=kv_pe_second.get_view(),
-        data2=cos_second_1d.get_view(),
+        dst=kv_pe_second,
+        data1=kv_pe_second,
+        data2=cos_second_1d,
         op=nl.multiply,
     )
     nisa.tensor_tensor(
-        dst=kv_pe_second.get_view(),
-        data1=kv_pe_second.get_view(),
-        data2=kv_tmp_second.get_view(),
+        dst=kv_pe_second,
+        data1=kv_pe_second,
+        data2=kv_tmp_second,
         op=nl.add,
     )

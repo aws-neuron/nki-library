@@ -24,12 +24,12 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental.loss import cross_entropy_backward
 from nkilib_src.nkilib.experimental.loss.cross_entropy_torch import (
     cross_entropy_backward_torch_ref,
     cross_entropy_forward_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize, tag_params
 from test.utils.pytest_test_metadata import pytest_marks
@@ -246,9 +246,7 @@ class TestCrossEntropyBackwardSweep:
         reduction: str,
     ):
         """Cross entropy backward sweep test."""
-        numpy_dtype = _NUMPY_DTYPE.get(dtype_str, np.float32)
         nki_dtype = _NKI_DTYPE.get(dtype_str, nl.bfloat16)
-        num_positions = B * T
 
         def input_generator(test_config):
             inputs = self.generate_inputs(B, T, V, dtype_str)

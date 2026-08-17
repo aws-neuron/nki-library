@@ -14,6 +14,6 @@
 
 """RNG kernels for getting/setting GPSIMD RNG state and generating random numbers."""
 
-from .rng import generate_random, get_rng_state_gpsimd, set_rng_state_gpsimd
+from .rng import generate_random, generate_random_fast, get_rng_state_gpsimd, set_rng_state_gpsimd
 
-__all__ = ["get_rng_state_gpsimd", "set_rng_state_gpsimd", "generate_random"]
+__all__ = ["get_rng_state_gpsimd", "set_rng_state_gpsimd", "generate_random", "generate_random_fast"]

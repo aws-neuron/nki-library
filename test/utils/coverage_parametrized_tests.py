@@ -211,7 +211,7 @@ def _generate_invalid_combination_tests(
         seen.add(case)
 
         # Check if it's INVALID
-        case_dict = dict(zip(param_names, case))
+        case_dict = dict(zip(param_names, case, strict=True))
         result = filter_func(**case_dict)
         if result == FilterResult.INVALID:
             invalid_cases.append(CoverageTestCase(values=case, is_negative=True, prefix="invalid"))
@@ -269,8 +269,8 @@ def generate_singles(params: Dict[str, Any], filter_func=None):
     if len(params) < 2:
         return filtered_singles
     # 3. Track what we have covered vs what we need
-    covered = set((k, v) for row in filtered_singles for k, v in zip(param_names, row))
-    all_requirements = set((k, v) for k, values in params.items() for v in values)
+    covered = {(k, v) for row in filtered_singles for k, v in zip(param_names, row, strict=True)}
+    all_requirements = {(k, v) for k, values in params.items() for v in values}
     missing = all_requirements - covered
 
     # 4. If gaps exist, fill from AllPairs
@@ -279,7 +279,7 @@ def generate_singles(params: Dict[str, Any], filter_func=None):
         pairwise_pool = _create_all_pairs(param_values, filter_func)
 
         for row in pairwise_pool:
-            row_coverage = set(zip(param_names, row))
+            row_coverage = set(zip(param_names, row, strict=True))
             # Does this row cover any of our missing 1-way requirements?
             if row_coverage.intersection(missing):
                 filtered_singles.append(list(row))
@@ -332,15 +332,18 @@ def _make_partial_filter(filter_func, params: Dict[str, Any], accept_result: Fil
         def partial_filter(case):
             if len(case) < n_params:
                 return True  # Allow partial combinations during generation
-            case_params = dict(zip(param_names, case))
+            case_params = dict(zip(param_names, case, strict=True))
             return filter_func(**case_params) == accept_result
     else:
         # For regular functions, check required params by name
-        filter_params = set(name for name in sig.parameters)
-        required_params = set(name for name, param in sig.parameters.items() if param.default is param.empty)
+        filter_params = set(sig.parameters)
+        required_params = {name for name, param in sig.parameters.items() if param.default is param.empty}
 
         def partial_filter(case):
-            case_params = dict(zip(param_names, case))
+            # `case` may be a partial combination (fewer elements than param_names)
+            # while AllPairs is still building up a full combination; truncate instead
+            # of raising so exploration can proceed.
+            case_params = dict(zip(param_names, case, strict=False))
             if not required_params.issubset(case_params.keys()):
                 return True  # Allow partial combinations during generation
             case_params = {k: case_params[k] if k in case_params else None for k in filter_params}
@@ -486,7 +489,9 @@ def extract_parametrize_args(
 
     for tc in test_cases:
         values_list.append(tc.values + (tc.is_negative,))
-        params_str = "-".join(f"{dn}_{format_param_value(val)}" for dn, val in zip(display_names, tc.values))
+        params_str = "-".join(
+            f"{dn}_{format_param_value(val)}" for dn, val in zip(display_names, tc.values, strict=True)
+        )
         test_id = f"{tc.prefix}_{params_str}" if tc.prefix else params_str
         full_len = overhead + len(test_id)
         assert full_len <= MAX_PATH_COMPONENT_LENGTH, (

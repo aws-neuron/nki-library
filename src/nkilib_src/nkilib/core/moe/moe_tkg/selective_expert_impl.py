@@ -23,7 +23,6 @@ from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim, Quantizati
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.logging import get_logger
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
 from .mlp_parameters import (
     MLPBiasParameters,
     MLPParameters,
@@ -38,15 +37,14 @@ from .moe_tkg_utils import (
     broadcast_token_affinity,
     gather_expert_affinities,
     reshape_scale_for_mlp,
-    safe_tensor_view,
 )
 from .projection_utils import input_norm_load, transpose_store
 
 
 def _selective_expert_moe_tkg(
     params: MLPParameters,
-    output: nl.ndarray,
-) -> nl.ndarray:
+    output: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     Selective-expert Mixture of Experts (MoE) kernel for token generation (TKG).
 
@@ -55,14 +53,13 @@ def _selective_expert_moe_tkg(
 
     Args:
         params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
-        output (nl.ndarray): Output tensor to store the final result.
+        output (nl.NkiTensor): Output tensor to store the final result.
 
     Returns:
-        output (nl.ndarray): Output tensor with accumulated expert results.
+        output (nl.NkiTensor): Output tensor with accumulated expert results.
 
     Notes:
         - Processes tokens sequentially, experts selectively based on top-K indices
-        - Uses safe_tensor_view for dynamic expert weight selection
         - Column tiling is disabled for this implementation
         - SBUF I/O mode is supported
 
@@ -152,9 +149,7 @@ def _selective_expert_moe_tkg(
             buffer=nl.sbuf,
             name="input_sb",
         )
-        hidden_tensor_view = safe_tensor_view(params.hidden_tensor)
-        input_sb_view = safe_tensor_view(input_sb)
-        input_norm_load(hidden_tensor_view, input_sb_view, params, dims, sbm=sbm)
+        input_norm_load(params.hidden_tensor, input_sb, params, dims, sbm=sbm)
 
     # Allocate SBUF location to accumulate output
     output_temp = sbm.alloc_stack(
@@ -206,6 +201,7 @@ def _selective_expert_moe_tkg(
         nisa.tensor_copy(dst=expert_affinities_sb[0 : dims.T, 0 : dims.E], src=expert_affinities)
     else:
         # Prefetch expertIndices (Up to 128 tokens input)
+        nisa.memset(expert_affinities_sb, value=0.0)
         nisa.dma_copy(
             dst=expert_affinities_sb[0 : dims.T, 0 : dims.E],
             src=expert_affinities[0 : dims.T, 0 : dims.E],
@@ -216,18 +212,16 @@ def _selective_expert_moe_tkg(
     params.use_tkg_gate_up_proj_column_tiling = False
     params.use_tkg_down_proj_column_tiling = False
 
-    initial_gate_proj_weights_tv = safe_tensor_view(params.gate_proj_weights_tensor)
-    initial_up_proj_weights_tv = safe_tensor_view(params.up_proj_weights_tensor)
-    initial_down_proj_weights_tv = safe_tensor_view(params.down_proj_weights_tensor)
+    initial_gate_proj_weights = params.gate_proj_weights_tensor
+    initial_up_proj_weights = params.up_proj_weights_tensor
+    initial_down_proj_weights = params.down_proj_weights_tensor
 
     initial_mlp_bias_params = params.bias_params
-    initial_gate_proj_bias_tv = safe_tensor_view(initial_mlp_bias_params.gate_proj_bias_tensor)
-    initial_up_proj_bias_tv = safe_tensor_view(initial_mlp_bias_params.up_proj_bias_tensor)
-    initial_down_proj_bias_tv = safe_tensor_view(initial_mlp_bias_params.down_proj_bias_tensor)
+    initial_gate_proj_bias = initial_mlp_bias_params.gate_proj_bias_tensor
+    initial_up_proj_bias = initial_mlp_bias_params.up_proj_bias_tensor
+    initial_down_proj_bias = initial_mlp_bias_params.down_proj_bias_tensor
 
     initial_mlp_quant_params = params.quant_params
-    input_sb_tv = safe_tensor_view(input_sb)
-    gate_up_output_tv = safe_tensor_view(gate_up_output)
 
     memory_safe_degree = 2
     if shard_on_T:
@@ -257,36 +251,36 @@ def _selective_expert_moe_tkg(
             expert_id_scalar_offset = expert_idx.ap(
                 pattern=[[dims.K, 1], [1, 1]], offset=global_token_idx * dims.K + expert_k_idx
             )
-            params.gate_proj_weights_tensor = initial_gate_proj_weights_tv.select(
+            params.gate_proj_weights_tensor = initial_gate_proj_weights.select(
                 dim=0, index=expert_id_scalar_offset
             ).select(dim=1, index=GateUpDim.GATE.value)
 
-            params.up_proj_weights_tensor = initial_up_proj_weights_tv.select(
-                dim=0, index=expert_id_scalar_offset
-            ).select(dim=1, index=GateUpDim.UP.value)
+            params.up_proj_weights_tensor = initial_up_proj_weights.select(dim=0, index=expert_id_scalar_offset).select(
+                dim=1, index=GateUpDim.UP.value
+            )
 
-            params.down_proj_weights_tensor = initial_down_proj_weights_tv.select(dim=0, index=expert_id_scalar_offset)
+            params.down_proj_weights_tensor = initial_down_proj_weights.select(dim=0, index=expert_id_scalar_offset)
 
-            gate_proj_bias_tensor_view = None
-            up_proj_bias_tensor_view = None
-            down_proj_bias_tensor_view = None
-            if initial_gate_proj_bias_tv is not None:
-                gate_proj_bias_tensor_view = initial_gate_proj_bias_tv.select(
-                    dim=0, index=expert_id_scalar_offset
-                ).select(dim=0, index=GateUpDim.GATE.value)
+            gate_proj_bias_tensor = None
+            up_proj_bias_tensor = None
+            down_proj_bias_tensor = None
+            if initial_gate_proj_bias is not None:
+                gate_proj_bias_tensor = initial_gate_proj_bias.select(dim=0, index=expert_id_scalar_offset).select(
+                    dim=0, index=GateUpDim.GATE.value
+                )
 
-            if initial_up_proj_bias_tv is not None:
-                up_proj_bias_tensor_view = initial_up_proj_bias_tv.select(dim=0, index=expert_id_scalar_offset).select(
+            if initial_up_proj_bias is not None:
+                up_proj_bias_tensor = initial_up_proj_bias.select(dim=0, index=expert_id_scalar_offset).select(
                     dim=0, index=GateUpDim.UP.value
                 )
 
-            if initial_down_proj_bias_tv is not None:
-                down_proj_bias_tensor_view = initial_down_proj_bias_tv.select(dim=0, index=expert_id_scalar_offset)
+            if initial_down_proj_bias is not None:
+                down_proj_bias_tensor = initial_down_proj_bias.select(dim=0, index=expert_id_scalar_offset)
 
             params.bias_params = MLPBiasParameters(
-                gate_proj_bias_tensor=gate_proj_bias_tensor_view,
-                up_proj_bias_tensor=up_proj_bias_tensor_view,
-                down_proj_bias_tensor=down_proj_bias_tensor_view,
+                gate_proj_bias_tensor=gate_proj_bias_tensor,
+                up_proj_bias_tensor=up_proj_bias_tensor,
+                down_proj_bias_tensor=down_proj_bias_tensor,
             )
 
             params.quant_params = _select_quant_scales(
@@ -298,7 +292,7 @@ def _selective_expert_moe_tkg(
             if initial_mlp_quant_params.quantization_type == QuantizationType.STATIC:
                 """
                 The MLP projection expects (128, 1) scales, but MOE per-expert
-                selection produces a broadcast TensorView over a scalar that DMA
+                selection produces a broadcast NkiTensor over a scalar that DMA
                 can't handle. Load to partition 0 and broadcast on-chip instead.
                 """
                 gate_w_dequant_sb = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -306,32 +300,32 @@ def _selective_expert_moe_tkg(
                 down_w_dequant_sb = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(
                     dst=gate_w_dequant_sb[0:1, 0:1],
-                    src=params.quant_params.gate_w_scale.slice(dim=0, start=0, end=1).get_view(),
+                    src=params.quant_params.gate_w_scale.slice(dim=0, start=0, end=1),
                 )
                 stream_shuffle_broadcast(gate_w_dequant_sb, gate_w_dequant_sb)
                 nisa.dma_copy(
                     dst=up_w_dequant_sb[0:1, 0:1],
-                    src=params.quant_params.up_w_scale.slice(dim=0, start=0, end=1).get_view(),
+                    src=params.quant_params.up_w_scale.slice(dim=0, start=0, end=1),
                 )
                 stream_shuffle_broadcast(up_w_dequant_sb, up_w_dequant_sb)
                 nisa.dma_copy(
                     dst=down_w_dequant_sb[0:1, 0:1],
-                    src=params.quant_params.down_w_scale.slice(dim=0, start=0, end=1).get_view(),
+                    src=params.quant_params.down_w_scale.slice(dim=0, start=0, end=1),
                 )
                 stream_shuffle_broadcast(down_w_dequant_sb, down_w_dequant_sb)
                 params.quant_params = MLPQuantizationParameters(
                     quantization_type=QuantizationType.STATIC,
-                    gate_w_scale=TensorView(gate_w_dequant_sb),
-                    up_w_scale=TensorView(up_w_dequant_sb),
-                    down_w_scale=TensorView(down_w_dequant_sb),
+                    gate_w_scale=gate_w_dequant_sb,
+                    up_w_scale=up_w_dequant_sb,
+                    down_w_scale=down_w_dequant_sb,
                     gate_up_in_scale=None,
                     down_in_scale=None,
                     clipping_bound=params.quant_params.clipping_bound,
                 )
 
             gate_tile_info = process_gate_up_projection(
-                hidden=input_sb_tv.slice(dim=1, start=global_token_idx, end=global_token_idx + 1),
-                output=gate_up_output_tv.slice(dim=2, start=expert_k_idx, end=expert_k_idx + 1),
+                hidden=input_sb.slice(dim=1, start=global_token_idx, end=global_token_idx + 1),
+                output=gate_up_output.slice(dim=2, start=expert_k_idx, end=expert_k_idx + 1),
                 params=params,
                 dims=dims,
                 sbm=sbm,
@@ -340,10 +334,9 @@ def _selective_expert_moe_tkg(
 
             # Down projection
             down_sb = down_output_list[expert_k_idx]
-            down_sb_view = safe_tensor_view(down_sb)
             process_down_projection(
-                hidden=gate_up_output_tv.slice(dim=2, start=expert_k_idx, end=expert_k_idx + 1),
-                output=down_sb_view,
+                hidden=gate_up_output.slice(dim=2, start=expert_k_idx, end=expert_k_idx + 1),
+                output=down_sb,
                 params=params,
                 dims=dims,
                 gate_tile_info=gate_tile_info,
@@ -377,7 +370,7 @@ def _selective_expert_moe_tkg(
     dims.T = T_per_shard
 
     # Store output
-    output_is_sbuf = output.is_sbuf() if isinstance(output, TensorView) else output.buffer == nl.sbuf
+    output_is_sbuf = output.buffer == nl.sbuf
     if output_is_sbuf:
         # Transpose output_temp [H0, H1_shard, T_per_shard] -> [H0, T, H1_shard] for SBUF output
         for h1_idx in range(dims.H1_shard):
@@ -407,57 +400,53 @@ def _selective_expert_moe_tkg(
     return output
 
 
-def _select_quant_scales(quant_params: MLPQuantizationParameters, expert_id_offset: nl.ndarray):
+def _select_quant_scales(quant_params: MLPQuantizationParameters, expert_id_offset: nl.NkiTensor):
     """
     Select and reshape quantization scales for a specific expert.
 
     Args:
         quant_params (MLPQuantizationParameters): Quantization parameters.
-        expert_id_offset (nl.ndarray): Expert ID offset for selecting scales.
+        expert_id_offset (nl.NkiTensor): Expert ID offset for selecting scales.
 
     Returns:
         MLPQuantizationParameters: Quantization parameters with scales for the specified expert.
     """
-    gate_w_scale_view = None
-    up_w_scale_view = None
-    down_w_scale_view = None
-    gate_up_in_scale_view = None
-    down_in_scale_view = None
+    gate_w_scale = None
+    up_w_scale = None
+    down_w_scale = None
+    gate_up_in_scale = None
+    down_in_scale = None
 
-    gate_w_scale_tv = safe_tensor_view(quant_params.gate_w_scale)
-    up_w_scale_tv = safe_tensor_view(quant_params.up_w_scale)
-    down_w_scale_tv = safe_tensor_view(quant_params.down_w_scale)
-    gate_up_in_scale_tv = safe_tensor_view(quant_params.gate_up_in_scale)
-    down_in_scale_tv = safe_tensor_view(quant_params.down_in_scale)
-
-    if gate_w_scale_tv is not None:
-        gate_w_scale_view = gate_w_scale_tv.select(dim=0, index=expert_id_offset).select(
+    if quant_params.gate_w_scale is not None:
+        gate_w_scale = quant_params.gate_w_scale.select(dim=0, index=expert_id_offset).select(
             dim=0, index=GateUpDim.GATE.value
         )
-        gate_w_scale_view = reshape_scale_for_mlp(gate_w_scale_view)
+        gate_w_scale = reshape_scale_for_mlp(gate_w_scale)
 
-    if up_w_scale_tv is not None:
-        up_w_scale_view = up_w_scale_tv.select(dim=0, index=expert_id_offset).select(dim=0, index=GateUpDim.UP.value)
-        up_w_scale_view = reshape_scale_for_mlp(up_w_scale_view)
+    if quant_params.up_w_scale is not None:
+        up_w_scale = quant_params.up_w_scale.select(dim=0, index=expert_id_offset).select(
+            dim=0, index=GateUpDim.UP.value
+        )
+        up_w_scale = reshape_scale_for_mlp(up_w_scale)
 
-    if down_w_scale_tv is not None:
-        down_w_scale_view = down_w_scale_tv.select(dim=0, index=expert_id_offset)
-        down_w_scale_view = reshape_scale_for_mlp(down_w_scale_view)
+    if quant_params.down_w_scale is not None:
+        down_w_scale = quant_params.down_w_scale.select(dim=0, index=expert_id_offset)
+        down_w_scale = reshape_scale_for_mlp(down_w_scale)
 
-    if gate_up_in_scale_tv is not None:
-        gate_up_in_scale_view = gate_up_in_scale_tv.select(dim=0, index=expert_id_offset)
-        gate_up_in_scale_view = reshape_scale_for_mlp(gate_up_in_scale_view)
+    if quant_params.gate_up_in_scale is not None:
+        gate_up_in_scale = quant_params.gate_up_in_scale.select(dim=0, index=expert_id_offset)
+        gate_up_in_scale = reshape_scale_for_mlp(gate_up_in_scale)
 
-    if down_in_scale_tv is not None:
-        down_in_scale_view = down_in_scale_tv.select(dim=0, index=expert_id_offset)
-        down_in_scale_view = reshape_scale_for_mlp(down_in_scale_view)
+    if quant_params.down_in_scale is not None:
+        down_in_scale = quant_params.down_in_scale.select(dim=0, index=expert_id_offset)
+        down_in_scale = reshape_scale_for_mlp(down_in_scale)
 
     return MLPQuantizationParameters(
         quantization_type=quant_params.quantization_type,
-        gate_w_scale=gate_w_scale_view,
-        up_w_scale=up_w_scale_view,
-        down_w_scale=down_w_scale_view,
-        gate_up_in_scale=gate_up_in_scale_view,
-        down_in_scale=down_in_scale_view,
+        gate_w_scale=gate_w_scale,
+        up_w_scale=up_w_scale,
+        down_w_scale=down_w_scale,
+        gate_up_in_scale=gate_up_in_scale,
+        down_in_scale=down_in_scale,
         clipping_bound=quant_params.clipping_bound,
     )

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Sliced HBM sources: pass root= so strides are derived from the parent
-tensor's physical layout, not from the slice's logical shape.
+Sliced HBM sources: tile a slice directly. A slice (``src[a:b, c:d]``) shares
+its parent's storage and carries the parent's physical strides + its own
+offset, so ``nt.tiles(slice, ...)`` addresses it correctly with no extra
+argument -- including a nonzero-offset window.
 """
 
 import nki
@@ -30,43 +32,43 @@ from nkilib_src.nkilib.experimental import neurotile as nt
 
 
 @nki.jit
-def root_window_scale(src):
-    """Tile a sliced HBM window. root= ties the access pattern back to the
-    parent so DMAs read at the parent's stride."""
+def window_scale(src):
+    """Tile a sliced HBM window directly -- the slice carries the parent's
+    stride and its own offset, so no root= is needed."""
     P, F = 128, 512
     out = nl.ndarray((P, F), dtype=src.dtype, buffer=nl.shared_hbm)
 
     window = src[0:P, 0:F]
-    src_tiles = nt.tiles(window, tile_size=(P, F), root=src)
+    src_tiles = nt.tiles(window, tile_size=(P, F))
     out_tiles = nt.tiles(out, tile_size=(P, F))
 
     tile = src_tiles[0, 0].load()
     nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-    out_tiles[0, 0].store(tile.ap())
+    out_tiles[0, 0].store(tile.data)
 
     return out
 
 
 @nki.jit
-def root_two_windows(src):
-    """Two non-overlapping windows of the same parent. Each window passes
-    root=src so strides match the parent's layout."""
+def two_windows(src):
+    """Two non-overlapping windows of the same parent. The second is a
+    nonzero-offset slice (rows P:2P) -- it self-addresses, no root= needed."""
     P, F = 128, 512
     out = nl.ndarray(src.shape, dtype=src.dtype, buffer=nl.shared_hbm)
 
     top = src[0:P, 0:F]
-    bottom = src[P : 2 * P, 0:F]
+    bottom = src[P : 2 * P, 0:F]  # offset P*F into the parent
 
-    top_tiles = nt.tiles(top, tile_size=(P, F), root=src)
-    bottom_tiles = nt.tiles(bottom, tile_size=(P, F), root=src)
+    top_tiles = nt.tiles(top, tile_size=(P, F))
+    bottom_tiles = nt.tiles(bottom, tile_size=(P, F))
     out_tiles = nt.tiles(out, tile_size=(P, F))
 
     top_tile = top_tiles[0, 0].load()
-    out_tiles[0, 0].store(top_tile.ap())
+    out_tiles[0, 0].store(top_tile.data)
 
     bottom_tile = bottom_tiles[0, 0].load()
     nisa.tensor_scalar(bottom_tile.data, bottom_tile.data, nl.multiply, -1.0)
-    out_tiles[1, 0].store(bottom_tile.ap())
+    out_tiles[1, 0].store(bottom_tile.data)
 
     return out
 
@@ -91,28 +93,28 @@ def to_numpy(t):
 # ============================================================================
 
 
-def test_root_window_scale():
+def test_window_scale():
     np.random.seed(42)
     data = np.random.randn(256, 512).astype(np.float32)
-    result = root_window_scale(to_device(data))
+    result = window_scale(to_device(data))
     expected = data[0:128, 0:512] * 2.0
     np.testing.assert_allclose(to_numpy(result), expected, rtol=1e-5)
-    print("root_window_scale: PASSED")
+    print("window_scale: PASSED")
 
 
-def test_root_two_windows():
+def test_two_windows():
     np.random.seed(42)
     data = np.random.randn(256, 512).astype(np.float32)
-    result = root_two_windows(to_device(data))
+    result = two_windows(to_device(data))
     expected = data.copy()
     expected[128:256, :] *= -1.0
     np.testing.assert_allclose(to_numpy(result), expected, rtol=1e-5)
-    print("root_two_windows: PASSED")
+    print("two_windows: PASSED")
 
 
 def main():
-    test_root_window_scale()
-    test_root_two_windows()
+    test_window_scale()
+    test_two_windows()
 
 
 if __name__ == "__main__":

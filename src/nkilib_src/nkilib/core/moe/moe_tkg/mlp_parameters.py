@@ -33,7 +33,6 @@ from ...utils.common_types import (
 )
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import is_rms_normalization, normalization_uses_weights, resolve_dtype_to_nki
-from ...utils.tensor_view import TensorView
 
 SUPPORTED_DTYPES = [
     nl.bfloat16,
@@ -56,7 +55,7 @@ SUPPORTED_QUANT_TYPES = [
 ]
 
 
-def get_T_from_hidden_input(hidden_input: nl.ndarray, hidden_input_scale: Optional[nl.ndarray] = None) -> int:
+def get_T_from_hidden_input(hidden_input: nl.NkiTensor, hidden_input_scale: Optional[nl.NkiTensor] = None) -> int:
     """
     Extract T (number of tokens) from hidden_input tensor based on its layout.
 
@@ -102,24 +101,24 @@ _Q_HEIGHT = 8  # Quantization height (elements per quantization group on partiti
 @dataclass
 class MLPQuantizationParameters(NKIObject):
     quantization_type: QuantizationType
-    gate_w_scale: Optional[nl.ndarray]
-    up_w_scale: Optional[nl.ndarray]
-    down_w_scale: Optional[nl.ndarray]
-    gate_up_in_scale: Optional[nl.ndarray]
-    down_in_scale: Optional[nl.ndarray]
+    gate_w_scale: Optional[nl.NkiTensor]
+    up_w_scale: Optional[nl.NkiTensor]
+    down_w_scale: Optional[nl.NkiTensor]
+    gate_up_in_scale: Optional[nl.NkiTensor]
+    down_in_scale: Optional[nl.NkiTensor]
     clipping_bound: float
-    mx_dummy_scale_hbm: Optional[nl.ndarray]
+    mx_dummy_scale_hbm: Optional[nl.NkiTensor]
 
     def __init__(
         self,
         quantization_type: QuantizationType,
-        gate_w_scale: Optional[nl.ndarray],
-        up_w_scale: Optional[nl.ndarray],
-        down_w_scale: Optional[nl.ndarray],
-        gate_up_in_scale: Optional[nl.ndarray],
-        down_in_scale: Optional[nl.ndarray],
+        gate_w_scale: Optional[nl.NkiTensor],
+        up_w_scale: Optional[nl.NkiTensor],
+        down_w_scale: Optional[nl.NkiTensor],
+        gate_up_in_scale: Optional[nl.NkiTensor],
+        down_in_scale: Optional[nl.NkiTensor],
         clipping_bound: float,
-        mx_dummy_scale_hbm: Optional[nl.ndarray] = None,
+        mx_dummy_scale_hbm: Optional[nl.NkiTensor] = None,
     ):
         self.quantization_type = quantization_type
         self.gate_w_scale = gate_w_scale
@@ -279,15 +278,15 @@ class MLPQuantizationParameters(NKIObject):
 
     def convert_to_view(self):
         if self.gate_w_scale is not None:
-            self.gate_w_scale = TensorView(self.gate_w_scale)
+            self.gate_w_scale = self.gate_w_scale
         if self.up_w_scale is not None:
-            self.up_w_scale = TensorView(self.up_w_scale)
+            self.up_w_scale = self.up_w_scale
         if self.down_w_scale is not None:
-            self.down_w_scale = TensorView(self.down_w_scale)
+            self.down_w_scale = self.down_w_scale
         if self.gate_up_in_scale is not None:
-            self.gate_up_in_scale = TensorView(self.gate_up_in_scale)
+            self.gate_up_in_scale = self.gate_up_in_scale
         if self.down_in_scale is not None:
-            self.down_in_scale = TensorView(self.down_in_scale)
+            self.down_in_scale = self.down_in_scale
 
 
 #
@@ -300,10 +299,10 @@ class MLPQuantizationParameters(NKIObject):
 
 @dataclass
 class MLPFusedAddParameters(NKIObject):
-    fused_add_tensor: Optional[nl.ndarray]
+    fused_add_tensor: Optional[nl.NkiTensor]
     store_fused_add_result: bool
 
-    def __init__(self, fused_add_tensor: Optional[nl.ndarray], store_fused_add_result: bool):
+    def __init__(self, fused_add_tensor: Optional[nl.NkiTensor], store_fused_add_result: bool):
         self.fused_add_tensor = fused_add_tensor if fused_add_tensor != None else None
         self.store_fused_add_result = store_fused_add_result
 
@@ -316,9 +315,9 @@ class MLPFusedAddParameters(NKIObject):
             )
 
     def convert_to_view(self):
-        """Convert fused add tensor to TensorView in-place."""
+        """Convert fused add tensor to NkiTensor in-place."""
         if self.fused_add_tensor is not None:
-            self.fused_add_tensor = TensorView(self.fused_add_tensor)
+            self.fused_add_tensor = self.fused_add_tensor
 
 
 #
@@ -331,14 +330,14 @@ class MLPFusedAddParameters(NKIObject):
 @dataclass
 class MLPNormalizationParameters(NKIObject):
     normalization_type: NormType
-    normalization_weights_tensor: Optional[nl.ndarray]
-    normalization_bias_tensor: Optional[nl.ndarray]
+    normalization_weights_tensor: Optional[nl.NkiTensor]
+    normalization_bias_tensor: Optional[nl.NkiTensor]
 
     def __init__(
         self,
         normalization_type: NormType,
-        normalization_weights_tensor: Optional[nl.ndarray],
-        normalization_bias_tensor: Optional[nl.ndarray],
+        normalization_weights_tensor: Optional[nl.NkiTensor],
+        normalization_bias_tensor: Optional[nl.NkiTensor],
     ):
         # If NO_NORM, set all fields to None
         if normalization_type == NormType.NO_NORM:
@@ -367,9 +366,9 @@ class MLPNormalizationParameters(NKIObject):
 
 @dataclass
 class MLPExpertParameters(NKIObject):
-    expert_affinities: nl.ndarray
-    expert_index: nl.ndarray
-    expert_affinities_eager: Optional[nl.ndarray]
+    expert_affinities: nl.NkiTensor
+    expert_index: nl.NkiTensor
+    expert_affinities_eager: Optional[nl.NkiTensor]
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE
     is_all_expert_dynamic: bool = False
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED
@@ -385,15 +384,15 @@ class MLPExpertParameters(NKIObject):
 
 @dataclass
 class MLPBiasParameters(NKIObject):
-    gate_proj_bias_tensor: Optional[nl.ndarray]
-    up_proj_bias_tensor: Optional[nl.ndarray]
-    down_proj_bias_tensor: Optional[nl.ndarray]
+    gate_proj_bias_tensor: Optional[nl.NkiTensor]
+    up_proj_bias_tensor: Optional[nl.NkiTensor]
+    down_proj_bias_tensor: Optional[nl.NkiTensor]
 
     def __init__(
         self,
-        gate_proj_bias_tensor: Optional[nl.ndarray],
-        up_proj_bias_tensor: Optional[nl.ndarray],
-        down_proj_bias_tensor: Optional[nl.ndarray],
+        gate_proj_bias_tensor: Optional[nl.NkiTensor],
+        up_proj_bias_tensor: Optional[nl.NkiTensor],
+        down_proj_bias_tensor: Optional[nl.NkiTensor],
     ):
         self.gate_proj_bias_tensor = gate_proj_bias_tensor
         self.up_proj_bias_tensor = up_proj_bias_tensor
@@ -420,13 +419,13 @@ class MLPBiasParameters(NKIObject):
             )
 
     def convert_to_view(self):
-        """Convert bias tensors to TensorView in-place."""
+        """Convert bias tensors to NkiTensor in-place."""
         if self.gate_proj_bias_tensor is not None:
-            self.gate_proj_bias_tensor = TensorView(self.gate_proj_bias_tensor)
+            self.gate_proj_bias_tensor = self.gate_proj_bias_tensor
         if self.up_proj_bias_tensor is not None:
-            self.up_proj_bias_tensor = TensorView(self.up_proj_bias_tensor)
+            self.up_proj_bias_tensor = self.up_proj_bias_tensor
         if self.down_proj_bias_tensor is not None:
-            self.down_proj_bias_tensor = TensorView(self.down_proj_bias_tensor)
+            self.down_proj_bias_tensor = self.down_proj_bias_tensor
 
 
 #
@@ -438,10 +437,10 @@ class MLPBiasParameters(NKIObject):
 
 @dataclass
 class MLPParameters(NKIObject):
-    hidden_tensor: nl.ndarray
-    gate_proj_weights_tensor: nl.ndarray
-    up_proj_weights_tensor: nl.ndarray
-    down_proj_weights_tensor: nl.ndarray
+    hidden_tensor: nl.NkiTensor
+    gate_proj_weights_tensor: nl.NkiTensor
+    up_proj_weights_tensor: nl.NkiTensor
+    down_proj_weights_tensor: nl.NkiTensor
     activation_fn: ActFnType
     output_dtype: Optional[np.dtype]
     fused_add_params: Optional[MLPFusedAddParameters]
@@ -455,8 +454,8 @@ class MLPParameters(NKIObject):
     hidden_size: int
     intermediate_size: int
     input_in_sbuf: bool
-    hidden_input_scale: Optional[nl.ndarray]
-    input_dequant_scale: Optional[nl.ndarray]
+    hidden_input_scale: Optional[nl.NkiTensor]
+    input_dequant_scale: Optional[nl.NkiTensor]
     store_output_in_sbuf: bool
     skip_gate_proj: bool
     use_tkg_gate_up_proj_column_tiling: bool
@@ -477,25 +476,25 @@ class MLPParameters(NKIObject):
 
     def __init__(
         self,
-        hidden_tensor: nl.ndarray,
-        gate_proj_weights_tensor: nl.ndarray,
-        up_proj_weights_tensor: nl.ndarray,
-        down_proj_weights_tensor: nl.ndarray,
-        normalization_weights_tensor: Optional[nl.ndarray] = None,
-        gate_proj_bias_tensor: Optional[nl.ndarray] = None,
-        up_proj_bias_tensor: Optional[nl.ndarray] = None,
-        down_proj_bias_tensor: Optional[nl.ndarray] = None,
-        normalization_bias_tensor: Optional[nl.ndarray] = None,
-        fused_add_tensor: Optional[nl.ndarray] = None,
+        hidden_tensor: nl.NkiTensor,
+        gate_proj_weights_tensor: nl.NkiTensor,
+        up_proj_weights_tensor: nl.NkiTensor,
+        down_proj_weights_tensor: nl.NkiTensor,
+        normalization_weights_tensor: Optional[nl.NkiTensor] = None,
+        gate_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+        up_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+        down_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+        normalization_bias_tensor: Optional[nl.NkiTensor] = None,
+        fused_add_tensor: Optional[nl.NkiTensor] = None,
         store_fused_add_result: bool = False,
         activation_fn: ActFnType = ActFnType.SiLU,
         normalization_type: NormType = NormType.NO_NORM,
         quantization_type: QuantizationType = QuantizationType.NONE,
-        gate_w_scale: Optional[nl.ndarray] = None,
-        up_w_scale: Optional[nl.ndarray] = None,
-        down_w_scale: Optional[nl.ndarray] = None,
-        gate_up_in_scale: Optional[nl.ndarray] = None,
-        down_in_scale: Optional[nl.ndarray] = None,
+        gate_w_scale: Optional[nl.NkiTensor] = None,
+        up_w_scale: Optional[nl.NkiTensor] = None,
+        down_w_scale: Optional[nl.NkiTensor] = None,
+        gate_up_in_scale: Optional[nl.NkiTensor] = None,
+        down_in_scale: Optional[nl.NkiTensor] = None,
         quant_clipping_bound: float = 0.0,
         output_dtype: Optional[np.dtype] = None,
         store_output_in_sbuf: bool = False,
@@ -510,10 +509,10 @@ class MLPParameters(NKIObject):
         up_clamp_lower_limit: Optional[float] = None,
         up_clamp_upper_limit: Optional[float] = None,
         expert_params: Optional[MLPExpertParameters] = None,
-        hidden_input_scale: Optional[nl.ndarray] = None,
-        input_dequant_scale: Optional[nl.ndarray] = None,
+        hidden_input_scale: Optional[nl.NkiTensor] = None,
+        input_dequant_scale: Optional[nl.NkiTensor] = None,
         force_cte_mode: bool = False,
-        mx_dummy_scale_hbm: Optional[nl.ndarray] = None,
+        mx_dummy_scale_hbm: Optional[nl.NkiTensor] = None,
         mode: ComputationMode = ComputationMode.AUTO,
         transposed_in: bool = False,
         transposed_out: bool = False,

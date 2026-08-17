@@ -44,7 +44,7 @@ def fold_into_partition(src_hbm):
     tile = folded.load()  # tile: [128, 512]
 
     dst_tiles = nt.tiles(dst, tile_size=(P * K, F))
-    dst_tiles[0, 0].store(tile.ap())
+    dst_tiles[0, 0].store(tile.data)
     return dst
 
 
@@ -60,7 +60,7 @@ def fold_free_dim(src_hbm):
     tile = folded.load()  # tile: [32, 512]
 
     dst_tiles = nt.tiles(dst, tile_size=(P, F * K))
-    dst_tiles[0, 0].store(tile.ap())
+    dst_tiles[0, 0].store(tile.data)
     return dst
 
 
@@ -116,7 +116,7 @@ def fold_chain_4d(src_hbm):
     tile = step2.load()  # tile: [32, 512]
 
     dst_tiles = nt.tiles(dst, tile_size=(32, 512))
-    dst_tiles[0, 0].store(tile.ap())
+    dst_tiles[0, 0].store(tile.data)
     return dst
 
 
@@ -136,7 +136,7 @@ def pattern_override_load(src_hbm):
     )  # tile: [32, 512]
 
     dst_tiles = nt.tiles(dst, tile_size=(P, F_dst))
-    dst_tiles[0, 0].store(tile.ap())
+    dst_tiles[0, 0].store(tile.data)
     return dst
 
 

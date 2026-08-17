@@ -21,7 +21,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import torch
-
 from nkilib_src.nkilib.core.mlp.mlp import mlp
 from nkilib_src.nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
 from nkilib_src.nkilib.core.mlp.mlp_tkg.projection_mx_constants import (
@@ -40,9 +39,12 @@ from nkilib_src.nkilib.core.utils.common_types import (
     QuantizationType,
 )
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
-from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
+from nkilib_src.nkilib.core.utils.kernel_helpers import (
+    get_max_positive_value_for_dtype,
+    get_verified_program_sharding_info,
+)
 from nkilib_src.nkilib.core.utils.logging import Logger
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+
 from test.integration.nkilib.utils.tensor_generators import (
     TensorTemplate,
     gaussian_tensor_generator,
@@ -147,7 +149,6 @@ def _run_mlp_test(
     lnc = compiler_args.logical_nc_config
     kernel_fn = kernel_entry if kernel_entry is not None else mlp
     transposed_out = kernel_input.get("transposed_out", False)
-    transposed_in = kernel_input.get("transposed_in", False)
 
     # Pre-resolve DtypeMode.AUTO for the torch ref using the platform target.
     # The kernel still receives the original dtype_mode and resolves at trace
@@ -236,12 +237,20 @@ def build_fused_norm_mlp(
     up_clamp_upper_limit=None,
     transposed_in=False,
     transposed_out=False,
-    gate_up_w_layout=None,
+    gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
     tensor_generator: Callable = gaussian_tensor_generator(),
     mode: ComputationMode = ComputationMode.AUTO,
+    use_mx_block_scale_input: bool = False,
 ):
     np.random.seed(42)
     rng = np.random.default_rng(42)
+
+    # For MX flows, default gate_up_w_layout to H_X4_MIDDLE if not explicitly set
+    if gate_up_w_layout == MLPGateUpWeightLayout.CONTIGUOUS and quantization_type in (
+        QuantizationType.STATIC_MX,
+        QuantizationType.ROW_MX,
+    ):
+        gate_up_w_layout = MLPGateUpWeightLayout.H_X4_MIDDLE
 
     is_tkg_mode = mode == ComputationMode.DECODE or (
         mode == ComputationMode.AUTO and (batch * seqlen) <= TKG_BS_SEQLEN_THRESHOLD
@@ -254,7 +263,7 @@ def build_fused_norm_mlp(
         tensor_generator(shape=(batch, seqlen, hidden), dtype=dtype, name="fused_add_tensor") if fused_add else None
     )
 
-    if quantization_type == QuantizationType.MX:
+    if quantization_type == QuantizationType.MX and is_tkg_mode:
         tokens = batch * seqlen
         n_H512_tile = hidden // _psum_fmax
         n_I512_tile = math.ceil(intermediate / (_pmax * _q_width))
@@ -267,12 +276,19 @@ def build_fused_norm_mlp(
             hidden_states.reshape(tokens, n_H512_tile, _pmax, _q_width).transpose(0, 3, 1, 2).reshape(tokens, hidden)
         )
         hidden_input = dt.static_cast(hidden_states, dtype).reshape(batch, seqlen, hidden)
+    elif is_input_quantized and use_mx_block_scale_input:
+        from test.integration.nkilib.core.moe.moe_cte.test_utils import build_prequantized_hidden_concat
+
+        tokens = batch * seqlen
+        n_H512_tile = hidden // (_pmax * _q_width)
+        hidden_concat, _mx_block_hidden_fp32 = build_prequantized_hidden_concat(tokens, n_H512_tile, hidden)
+        hidden_input = dt.static_cast(hidden_concat.reshape(batch, seqlen, -1), quant_dtype)
     elif is_input_quantized:
-        if quantization_type == QuantizationType.ROW:
+        if quantization_type.is_logical_row() or quantization_type == QuantizationType.MX:
             hidden_input = tensor_generator(
                 shape=(batch, seqlen, hidden + 4), dtype=quant_dtype, name='hidden'
             )  # +4 to allow space for an fp32 dequant value
-        elif quantization_type in [QuantizationType.STATIC, QuantizationType.STATIC_MX]:
+        elif quantization_type.is_logical_static():
             hidden_input = tensor_generator(shape=(batch, seqlen, hidden), dtype=quant_dtype, name='hidden')
     else:
         hidden_input = tensor_generator(shape=(batch, seqlen, hidden), dtype=dtype, name="hidden")
@@ -290,24 +306,23 @@ def build_fused_norm_mlp(
 
     # Pre-generate MX weights if using MX quantization
     if quantization_type == QuantizationType.MX:
-        mx_weights = gen_mlp_mxfp_weights(hidden, intermediate, quant_dtype)
+        mx_quant_dtype = nl.float8_e4m3fn_x4 if quant_dtype in [nl.float8_e4m3, nl.float8_e4m3fn] else quant_dtype
+        mx_weights = gen_mlp_mxfp_weights(hidden, intermediate, mx_quant_dtype)
 
     weight_dtype = quant_dtype if quant_dtype is not None else dtype
 
-    if gate_up_w_layout is None:
-        if quantization_type in [QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX]:
-            if use_contiguous_x4_gate_up:
-                gate_up_w_layout = MLPGateUpWeightLayout.H_X4_INNERMOST
-            else:
-                gate_up_w_layout = MLPGateUpWeightLayout.H_X4_MIDDLE
-        else:
-            gate_up_w_layout = MLPGateUpWeightLayout.CONTIGUOUS
-
     # Use pre-generated MX weights or generate regular weights
     if quantization_type == QuantizationType.MX:
-        gate_w = mx_weights.gate_w_qtz
-        up_w = mx_weights.up_w_qtz
-        down_w = mx_weights.down_w_qtz
+        if is_tkg_mode:
+            gate_w = mx_weights.gate_w_qtz
+            up_w = mx_weights.up_w_qtz
+            down_w = mx_weights.down_w_qtz
+        else:
+            H0, H1 = mx_weights.gate_w_qtz.shape[0], mx_weights.gate_w_qtz.shape[1]
+            I0, I1 = mx_weights.down_w_qtz.shape[0], mx_weights.down_w_qtz.shape[1]
+            gate_w = mx_weights.gate_w_qtz.view(quant_dtype).reshape(H0, H1, I1, 4, I0, 4)
+            up_w = mx_weights.up_w_qtz.view(quant_dtype).reshape(H0, H1, I1, 4, I0, 4)
+            down_w = mx_weights.down_w_qtz.view(quant_dtype).reshape(I0, I1, hidden, 4)
     elif quantization_type == QuantizationType.STATIC_MX:
         # STATIC_MX weight format depends on kernel mode:
         # - TKG (BxS <= 96 or DECODE mode): x4-packed 3D weights [128, H//512, I] for nc_matmul_mx
@@ -341,11 +356,10 @@ def build_fused_norm_mlp(
                 scale_shape=(_pmax, 1),
                 quantize_dim=0,
             )
-            gate_w = _fp8_to_gate_up_x4(gate_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
-            up_w = _fp8_to_gate_up_x4(up_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
-            down_w = _fp8_to_down_x4(down_w_scalar, intermediate, hidden)
+            gate_w = _fp8_to_gate_up_6d(gate_w_scalar, hidden, intermediate, gate_up_w_layout)
+            up_w = _fp8_to_gate_up_6d(up_w_scalar, hidden, intermediate, gate_up_w_layout)
+            down_w = _fp8_to_down_4d(down_w_scalar, intermediate, hidden)
         else:
-            # CTE: 2D scalar fp8 weights (CTE kernel handles internal layout)
             gate_w = tensor_generator(
                 shape=(128, hidden // 512, intermediate // 512, 4, 128, 4), dtype=weight_dtype, name="gate_w"
             )
@@ -357,36 +371,45 @@ def build_fused_norm_mlp(
         # ROW_MX: weights use per-row scaling.
         # gate_up_weight [H, I] → scale [1, I] broadcast to [128, I]
         # down_weight [I, H] → scale [1, H] broadcast to [128, H]
-        gate_w_scalar, gate_w_scale_extracted = generate_and_quantize_to_fp8(
-            shape=(hidden, intermediate),
-            dtype=dtype,
-            quant_dtype=quant_dtype,
-            rng=rng,
-            quantization_type=QuantizationType.ROW,
-            scale_shape=(_pmax, intermediate),
-            quantize_dim=0,
-        )
-        up_w_scalar, up_w_scale_extracted = generate_and_quantize_to_fp8(
-            shape=(hidden, intermediate),
-            dtype=dtype,
-            quant_dtype=quant_dtype,
-            rng=rng,
-            quantization_type=QuantizationType.ROW,
-            scale_shape=(_pmax, intermediate),
-            quantize_dim=0,
-        )
-        down_w_scalar, down_w_scale_extracted = generate_and_quantize_to_fp8(
-            shape=(intermediate, hidden),
-            dtype=dtype,
-            quant_dtype=quant_dtype,
-            rng=rng,
-            quantization_type=QuantizationType.ROW,
-            scale_shape=(_pmax, hidden),
-            quantize_dim=0,
-        )
-        gate_w = _fp8_to_gate_up_x4(gate_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
-        up_w = _fp8_to_gate_up_x4(up_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
-        down_w = _fp8_to_down_x4(down_w_scalar, intermediate, hidden)
+        if is_tkg_mode:
+            gate_w_scalar, gate_w_scale_extracted = generate_and_quantize_to_fp8(
+                shape=(hidden, intermediate),
+                dtype=dtype,
+                quant_dtype=quant_dtype,
+                rng=rng,
+                quantization_type=QuantizationType.ROW,
+                scale_shape=(_pmax, intermediate),
+                quantize_dim=0,
+            )
+            up_w_scalar, up_w_scale_extracted = generate_and_quantize_to_fp8(
+                shape=(hidden, intermediate),
+                dtype=dtype,
+                quant_dtype=quant_dtype,
+                rng=rng,
+                quantization_type=QuantizationType.ROW,
+                scale_shape=(_pmax, intermediate),
+                quantize_dim=0,
+            )
+            down_w_scalar, down_w_scale_extracted = generate_and_quantize_to_fp8(
+                shape=(intermediate, hidden),
+                dtype=dtype,
+                quant_dtype=quant_dtype,
+                rng=rng,
+                quantization_type=QuantizationType.ROW,
+                scale_shape=(_pmax, hidden),
+                quantize_dim=0,
+            )
+            gate_w = _fp8_to_gate_up_6d(gate_w_scalar, hidden, intermediate, gate_up_w_layout)
+            up_w = _fp8_to_gate_up_6d(up_w_scalar, hidden, intermediate, gate_up_w_layout)
+            down_w = _fp8_to_down_4d(down_w_scalar, intermediate, hidden)
+        else:
+            gate_w = tensor_generator(
+                shape=(128, hidden // 512, intermediate // 512, 4, 128, 4), dtype=weight_dtype, name="gate_w"
+            )
+            up_w = tensor_generator(
+                shape=(128, hidden // 512, intermediate // 512, 4, 128, 4), dtype=weight_dtype, name="up_w"
+            )
+            down_w = tensor_generator(shape=(128, intermediate // 512, hidden, 4), dtype=weight_dtype, name="down_w")
     else:
         gate_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="gate_w")
         up_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="up_w")
@@ -414,8 +437,20 @@ def build_fused_norm_mlp(
 
     if quantization_type == QuantizationType.MX:
         # MX quantization uses uint8 scales
-        gate_w_scale = mx_weights.gate_w_scale
-        up_w_scale = mx_weights.up_w_scale
+        if is_tkg_mode:
+            gate_w_scale = mx_weights.gate_w_scale
+            up_w_scale = mx_weights.up_w_scale
+        else:
+            # CTE expects gate/up scales pre-transposed to match the 6D weight layout's
+            # physical I order: [16, H/512, I/512, 4, 128] (within each 512-tile, logical
+            # order (128, 4) is transposed to physical order (4, 128)).
+            n_I512_tile = math.ceil(intermediate / (_pmax * _q_width))
+            gate_w_scale = mx_weights.gate_w_scale.reshape(16, hidden // 512, n_I512_tile, _pmax, _q_width).transpose(
+                0, 1, 2, 4, 3
+            )
+            up_w_scale = mx_weights.up_w_scale.reshape(16, hidden // 512, n_I512_tile, _pmax, _q_width).transpose(
+                0, 1, 2, 4, 3
+            )
         down_w_scale = mx_weights.down_w_scale
         gate_up_in_scale = None
         down_in_scale = None
@@ -441,23 +476,50 @@ def build_fused_norm_mlp(
             gate_up_in_scale = tensor_generator(shape=(_pmax, 1), dtype=np.float32, name="gate_up_in_scale")
             down_in_scale = tensor_generator(shape=(_pmax, 1), dtype=np.float32, name="down_in_scale")
     elif quantization_type == QuantizationType.ROW_MX:
-        # ROW_MX: per-row weight scales, no input scales (computed dynamically).
-        # Pre-shuffle to match MX output layout for efficient per-partition dequant in kernel.
-        gate_w_scale = _shuffle_gate_up_w_scale_for_row_mx(gate_w_scale_extracted, intermediate)
-        up_w_scale = _shuffle_gate_up_w_scale_for_row_mx(up_w_scale_extracted, intermediate)
-        down_w_scale = _shuffle_down_w_scale_for_row_mx(down_w_scale_extracted, hidden)
-        gate_up_in_scale = None
-        down_in_scale = None
+        if is_tkg_mode:
+            # ROW_MX: per-row weight scales, no input scales (computed dynamically).
+            # Pre-shuffle to match MX output layout for efficient per-partition dequant in kernel.
+            gate_w_scale = _shuffle_gate_up_w_scale_for_row_mx_h_x4_middle(gate_w_scale_extracted, intermediate)
+            up_w_scale = _shuffle_gate_up_w_scale_for_row_mx_h_x4_middle(up_w_scale_extracted, intermediate)
+            down_w_scale = _shuffle_down_w_scale_for_row_mx(down_w_scale_extracted, hidden)
+            gate_up_in_scale = None
+            down_in_scale = None
+        else:
+            gate_w_scale = tensor_generator(
+                shape=(_pmax, math.ceil(intermediate / 512), 4), dtype=np.float32, name="gate_w_scale"
+            )
+            up_w_scale = tensor_generator(
+                shape=(_pmax, math.ceil(intermediate / 512), 4), dtype=np.float32, name="up_w_scale"
+            )
+            down_w_scale = np.broadcast_to(
+                tensor_generator(shape=(1, hidden), dtype=np.float32, name="down_w_scale"), (_pmax, hidden)
+            )
+            gate_up_in_scale = None
+            down_in_scale = None
     elif quantization_type in [QuantizationType.STATIC]:
-        gate_w_scale = tensor_generator(shape=(_pmax, 1), dtype=np.float32, name="gate_w_scale")
-        up_w_scale = tensor_generator(shape=(_pmax, 1), dtype=np.float32, name="up_w_scale")
-        down_w_scale = tensor_generator(shape=(_pmax, 1), dtype=np.float32, name="down_w_scale")
-        gate_up_in_scale = tensor_generator(shape=(_pmax, 1), dtype=np.float32, name="gate_up_in_scale")
-        down_in_scale = tensor_generator(shape=(_pmax, 1), dtype=np.float32, name="down_in_scale")
+        gate_w_scale = np.broadcast_to(
+            tensor_generator(shape=(1, 1), dtype=np.float32, name="gate_w_scale"), (_pmax, 1)
+        )
+        up_w_scale = np.broadcast_to(tensor_generator(shape=(1, 1), dtype=np.float32, name="up_w_scale"), (_pmax, 1))
+        down_w_scale = np.broadcast_to(
+            tensor_generator(shape=(1, 1), dtype=np.float32, name="down_w_scale"), (_pmax, 1)
+        )
+        gate_up_in_scale = np.broadcast_to(
+            tensor_generator(shape=(1, 1), dtype=np.float32, name="gate_up_in_scale"), (_pmax, 1)
+        )
+        down_in_scale = np.broadcast_to(
+            tensor_generator(shape=(1, 1), dtype=np.float32, name="down_in_scale"), (_pmax, 1)
+        )
     elif quantization_type == QuantizationType.ROW or quant_dtype is not None:
-        gate_w_scale = tensor_generator(shape=(_pmax, intermediate), dtype=np.float32, name="gate_w_scale")
-        up_w_scale = tensor_generator(shape=(_pmax, intermediate), dtype=np.float32, name="up_w_scale")
-        down_w_scale = tensor_generator(shape=(_pmax, hidden), dtype=np.float32, name="down_w_scale")
+        gate_w_scale = np.broadcast_to(
+            tensor_generator(shape=(intermediate,), dtype=np.float32, name="gate_w_scale"), (_pmax, intermediate)
+        )
+        up_w_scale = np.broadcast_to(
+            tensor_generator(shape=(intermediate,), dtype=np.float32, name="up_w_scale"), (_pmax, intermediate)
+        )
+        down_w_scale = np.broadcast_to(
+            tensor_generator(shape=(hidden,), dtype=np.float32, name="down_w_scale"), (_pmax, hidden)
+        )
         gate_up_in_scale = None
         down_in_scale = None
     else:
@@ -689,22 +751,49 @@ def modify_down_proj_lhs_rhs_swap_unit_stride_layout(tensor_template, tensor, ln
     return tensor
 
 
-def modify_for_row_quant(tensor_template, tensor, lnc):
-    rng = np.random.default_rng(0)
-    if tensor_template.name == "hidden":
-        B, S, H_PLUS_4 = tensor.shape
-        single_row = rng.normal(size=(1, 1, 1)) * 0.001
-        single_row_split = single_row.astype(np.float32).view(nl.float8_e4m3).astype(tensor_template.dtype)
-        while not np.isfinite(single_row_split).all():
-            single_row = rng.normal(size=(1, 1, 1)) * 0.001
-            single_row_split = single_row.astype(np.float32).view(nl.float8_e4m3).astype(tensor_template.dtype)
-        full_scale = single_row_split.repeat(B, axis=0).repeat(S, axis=1)
-        tensor[:, :, -4:] = full_scale
-    elif "scale" in tensor_template.name:
-        P, F = tensor.shape
-        single_row = rng.normal(size=(1, F)) * 0.001
-        tensor = single_row.repeat(P, axis=0).astype(tensor_template.dtype)
-    return tensor
+def mlp_row_quant_tensor_generator(hidden_std: float = 1.0, weight_std: float = 1.0, scale_std: float = 0.001):
+    """Create a tensor generator function that produces Gaussian-distributed tensors
+    and allows for different distributions for different input tensor types.
+
+    The hidden tensor will be generated with a packed fp32 scale. That scale will be
+    generated with mean zero and scale_std.
+
+    This factory function returns a tensor generator that creates tensors. The generator
+    uses a configurable random seed for reproducibility.
+
+    Args:
+        hidden_std (float, optional): The standard deviation of the hidden tensor.
+                                      Defaults to 1.0.
+        weight_std (float, optional): The standard deviation of the weight tensors.
+                                      Defaults to 1.0.
+        scale_std (float, optional):  The standard deviation of the scale tensors.
+                                      Defaults to 0.001.
+
+    Returns:
+        callable: A tensor generator function that accepts a tensor_template and
+                  returns a NumPy array with the same shape and dtype as the template.
+    """
+    rng = np.random.default_rng(42)
+
+    @update_func_str()
+    def tensor_generator(shape, dtype, name):
+        if name == "hidden":
+            max_pos_val = get_max_positive_value_for_dtype(dtype)
+            tensor = rng.normal(size=shape, scale=hidden_std).clip(-max_pos_val, max_pos_val).astype(dtype)
+            B, S, H_PLUS_4 = shape
+            scale_fp32 = rng.normal(size=(B, S, 1), scale=scale_std).astype(nl.float32)
+            scale_fp8 = scale_fp32.view(dtype)
+            tensor[:, :, -4:] = scale_fp8
+        elif "_scale" in name:
+            tensor = rng.normal(size=shape, scale=scale_std).astype(dtype)
+        elif "_w" in name:
+            max_pos_val = get_max_positive_value_for_dtype(dtype)
+            tensor = rng.normal(size=shape, scale=weight_std).clip(-max_pos_val, max_pos_val).astype(dtype)
+        else:
+            tensor = rng.normal(size=shape)
+        return tensor
+
+    return tensor_generator
 
 
 def modify_fp8_static_scale(tensor_template, tensor, lnc):
@@ -885,6 +974,68 @@ def _fp8_to_down_x4(fp8_2d, I, H):
     return result
 
 
+def _fp8_to_gate_up_6d(fp8_2d, H, I, layout):
+    """Convert scalar fp8 [H, I] to 6D [128, H/512, ceil(I/512), 4, 128, 4] for gate/up projection.
+
+    Pads I to the nearest multiple of 512 with zeros if needed.
+
+    Args:
+        fp8_2d: scalar fp8 weight [H, I]
+        H: hidden dimension
+        I: intermediate dimension (may not be multiple of 512)
+        layout: MLPGateUpWeightLayout.H_X4_MIDDLE or H_X4_INNERMOST
+
+    Returns:
+        [128, H/512, ceil(I/512), 4, 128, 4] in scalar fp8
+    """
+    n_H512 = H // _psum_fmax
+    I_padded = math.ceil(I / _psum_fmax) * _psum_fmax
+    n_I512 = I_padded // _psum_fmax
+
+    # Pad I to multiple of 512
+    if I < I_padded:
+        padded = np.zeros((H, I_padded), dtype=fp8_2d.dtype)
+        padded[:, :I] = fp8_2d
+        fp8_2d = padded
+
+    if layout == MLPGateUpWeightLayout.H_X4_MIDDLE:
+        # [H, I] → [H/512, 4_H, 128_H, I/512, 128_I, 4_I] → transpose(2,0,3,5,4,1)
+        # → [128_H, H/512, I/512, 4_I, 128_I, 4_H]
+        return fp8_2d.reshape(n_H512, 4, _pmax, n_I512, _pmax, 4).transpose(2, 0, 3, 5, 4, 1).astype(nl.float8_e4m3fn)
+    else:
+        # H_X4_INNERMOST:
+        # [H, I] → [H/512, 128_H, 4_H, I/512, 128_I, 4_I] → transpose(1,0,3,5,4,2)
+        # → [128_H, H/512, I/512, 4_I, 128_I, 4_H]
+        return fp8_2d.reshape(n_H512, _pmax, 4, n_I512, _pmax, 4).transpose(1, 0, 3, 5, 4, 2).astype(nl.float8_e4m3fn)
+
+
+def _fp8_to_down_4d(fp8_2d, I, H):
+    """Convert scalar fp8 [I, H] to 4D [128_I, I/512, H, 4_I] for down projection.
+
+    Uses I-contiguous x4 packing: element [p, tile, h, q] = W[512*tile + 4*p + q, h].
+
+    Args:
+        fp8_2d: scalar fp8 weight [I, H]
+        I: intermediate dimension
+        H: hidden dimension
+
+    Returns:
+        [128_I, I/512, H, 4] in scalar fp8
+    """
+    n_I512 = math.ceil(I / _psum_fmax)
+    p_I = I // _q_width if I < _psum_fmax else _pmax
+    result = np.zeros((p_I, n_I512, H, _q_width), dtype=fp8_2d.dtype)
+    for i_tile in range(n_I512):
+        start = i_tile * _psum_fmax
+        end = min(start + _psum_fmax, I)
+        tile_rows = end - start
+        tile = fp8_2d[start:end, :]  # [tile_rows, H]
+        # Group 4 consecutive I rows: [tile_rows, H] → [tile_rows//4, 4, H] → [tile_rows//4, H, 4]
+        tile_grouped = tile.reshape(tile_rows // _q_width, _q_width, H).transpose(0, 2, 1)
+        result[: tile_rows // _q_width, i_tile, :, :] = tile_grouped
+    return result.astype(nl.float8_e4m3fn)
+
+
 def setup_sbuf_input(hidden_tensor):
     """Load HBM input into SBUF for mlp kernel. Returns (hidden_sb, sbm)."""
     B, S, H = hidden_tensor.shape
@@ -896,13 +1047,12 @@ def setup_sbuf_input(hidden_tensor):
     H1_shard = H1 // num_shards
     hidden_sb = nl.ndarray(shape=(H0, T, H1), dtype=hidden_tensor.dtype, buffer=nl.sbuf, name="hidden_sb")
     input_view = (
-        TensorView(hidden_tensor)
-        .flatten_dims(start_dim=0, end_dim=1)
+        hidden_tensor.flatten_dims(start_dim=0, end_dim=1)
         .reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])
         .permute(dims=[2, 0, 1, 3])
     )
-    dst_view = TensorView(hidden_sb).reshape_dim(dim=2, shape=[num_shards, H1_shard])
-    nisa.dma_copy(dst=dst_view.get_view(), src=input_view.get_view())
+    dst_view = hidden_sb.reshape_dim(dim=2, shape=[num_shards, H1_shard])
+    nisa.dma_copy(dst=dst_view, src=input_view)
 
     sbm = SbufManager(0, 200 * 1024, logger=Logger("mlp-tkg-sbuf-input"), use_auto_alloc=False)
     sbm.set_name_prefix("mlp_")
@@ -924,21 +1074,22 @@ def copy_sbuf_output_to_hbm(output_sb, hidden_tensor, down_proj_weights_tensor):
     return [output_hbm.reshape((B, S, H_out))]
 
 
-def _shuffle_gate_up_w_scale_for_row_mx(original_scale, I):
-    """Pre-shuffle gate/up weight scale from [128, I] to [128, n_I512*4] for ROW_MX.
+def _shuffle_gate_up_w_scale_for_row_mx_h_x4_middle(original_scale, I):
+    """Pre-shuffle gate/up weight scale for ROW_MX with I-dim in [n_I512, 4_I, 128_I] order.
 
-    shuffled[p, i_tile*4 + q] = original[0, i_tile*512 + q*I128 + p]
-    where I128 = min(512, I - i_tile*512) // 4.
+    In the 6D layout, the I dimension within each 512-tile is ordered as (4, 128).
+    The kernel iterates I as i_tile*512 + q*128 + p, so the element at kernel position
+    (p, i_tile, q) corresponds to original I position i_tile*512 + p*4 + q.
+
+    shuffled[p, i_tile*4 + q] = original[0, i_tile*512 + p*4 + q]
     """
     n_I512 = math.ceil(I / (_pmax * _q_width))
     shuffled = np.zeros((_pmax, n_I512 * _q_width), dtype=original_scale.dtype)
     for i_tile in range(n_I512):
-        cur_I512_sz = min(_psum_fmax, I - i_tile * _psum_fmax)
-        cur_I128_sz = cur_I512_sz // _q_width
         for q in range(_q_width):
             out_col = i_tile * _q_width + q
-            for p in range(min(_pmax, cur_I128_sz)):
-                i_pos = i_tile * _psum_fmax + q * cur_I128_sz + p
+            for p in range(_pmax):
+                i_pos = i_tile * _psum_fmax + p * _q_width + q
                 if i_pos < I:
                     shuffled[p, out_col] = original_scale[0, i_pos]
     return shuffled

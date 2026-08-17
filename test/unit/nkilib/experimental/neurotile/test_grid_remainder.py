@@ -30,9 +30,9 @@ The PSUM new-API tests live in ``test_psum_pool_api.py``.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core.axis import Axis, AxisLabel
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+
 from test.utils.pytest_test_metadata import pytest_marks
 
 # ============================================================================
@@ -198,6 +198,49 @@ class TestTruncateToSource:
         clamped = g.truncate_to_source(dim=1, elements_consumed=100)
         assert clamped is g
 
+    @pytest.mark.fast
+    def test_clamps_tile_count_for_partial_block(self):
+        """Partial trailing block walks fewer whole tiles than its nominal count.
+
+        A 2-tile M-block over a source of 384 rows (tile 128): block 1 starts
+        at row 256, so only 384 - 256 = 128 rows remain -- one whole tile, not
+        two. The remainder is a whole number of tiles (no partial last tile),
+        so the leaf stays 128 and only the TILE-grid count clamps 2 -> 1, which
+        keeps ``shape`` / ``tile_shape`` and tile iteration from indexing a tile
+        the block does not hold.
+        """
+        es = (384, 1024)
+        ax_t = Axis(count=2, step=128, dim=0, label=AxisLabel.TILE)
+        ax_p = Axis(count=128, step=1, dim=0, label=AxisLabel.PARTITION)
+        ax_e = Axis(count=1024, step=1, dim=1, label=AxisLabel.ELEM)
+        g = Grid(element_shape=es, axes=(ax_t, ax_p, ax_e), cursor=0, n_batch_dims=0)
+        clamped = g.truncate_to_source(dim=0, elements_consumed=256)
+        tile = [ax for ax in clamped.axes if ax.dim == 0 and ax.label == AxisLabel.TILE][0]
+        assert tile.count == 1  # 1 whole tile reachable, not the nominal 2
+        partition = [ax for ax in clamped.axes if ax.label == AxisLabel.PARTITION][0]
+        assert partition.count == 128  # leaf unchanged: the lone tile is full
+        assert 0 in clamped.remainder_dims
+
+    @pytest.mark.fast
+    def test_multi_tile_remainder_keeps_full_leaf(self):
+        """A remainder spanning several tiles keeps the shared leaf full width.
+
+        A 2-tile N-block over 1792 cols (tile 512): block 1 starts at col 1024,
+        leaving 768 = one full 512 tile + a 256 partial. The trailing partial
+        is resolved per tile at descent, so the TILE count stays 2 and the leaf
+        stays 512 -- only a lone partial tile narrows the leaf.
+        """
+        es = (128, 1792)
+        ax_p = Axis(count=128, step=1, dim=0, label=AxisLabel.PARTITION)
+        ax_t = Axis(count=2, step=512, dim=1, label=AxisLabel.TILE)
+        ax_e = Axis(count=512, step=1, dim=1, label=AxisLabel.ELEM)
+        g = Grid(element_shape=es, axes=(ax_p, ax_t, ax_e), cursor=0, n_batch_dims=0)
+        clamped = g.truncate_to_source(dim=1, elements_consumed=1024)
+        tile = [ax for ax in clamped.axes if ax.dim == 1 and ax.label == AxisLabel.TILE][0]
+        elem = [ax for ax in clamped.axes if ax.dim == 1 and ax.step == 1][0]
+        assert tile.count == 2  # ceil(768 / 512) = 2 tiles reachable
+        assert elem.count == 512  # leaf full: trailing partial handled per tile
+
 
 # ============================================================================
 # _compute_remaining: partial-trailing-tile formula on flagged dims only
@@ -267,3 +310,98 @@ class TestComputeRemainingPartialTile:
         # remainder_dims must be empty for sharded views.
         assert g.remainder_dims == ()
         assert g.remaining[1] == 1024
+
+
+# ============================================================================
+# Multi-P-tile trailing partial: a partition extent that spans several P-tiles
+# with a short last one (e.g. 300 = 128 + 128 + 44). The partition axis folds
+# its tiles into the free axis, so the P-tile index -- not layout offset -- is
+# what identifies the trailing partial. These pin the folded-P descent and its
+# symmetry with the free-axis trailing partial.
+# ============================================================================
+
+
+def _descend_tile(element_shape, tile_size, p_index, f_index):
+    """Reproduce ``NDSlice.__getitem__`` int-descent for ``view[p_index, f_index]``
+    at the Grid level (offsets live on Layout; this asserts Grid state only).
+
+    On both axes the elements consumed to reach tile ``k`` are ``k * tile_size``:
+    on the partition axis the tiles fold into free so a layout-offset query
+    returns 0, and ``index * tile_p`` is what finds the addressable remainder.
+    """
+    g = Grid.from_shape(element_shape=element_shape, tile_size=tile_size)
+    for dim, k in ((0, p_index), (1, f_index)):
+        g = g.consume(dim)
+        g = g.truncate_to_source(dim, k * tile_size[dim])
+    g, _ = g.cleanup()
+    return g
+
+
+@pytest_marks(["neurotile"])
+class TestFoldedPartitionTrailing:
+    """A trailing partial P-tile narrows to its addressable partition extent
+    (300 = 128 + 128 + 44). The extent is the load-bearing fact -- a compute /
+    DMA op sizes off it -- and is consistent across trace and compile paths.
+    """
+
+    @pytest.mark.fast
+    def test_full_p_tiles_report_full_extent(self):
+        for pi in (0, 1):
+            g = _descend_tile((300, 256), (128, 128), pi, 0)
+            assert g.remaining == (128, 128), f"P-tile [{pi},0] expected full (128,128)"
+
+    @pytest.mark.fast
+    def test_trailing_p_tile_narrows_to_addressable_extent(self):
+        g = _descend_tile((300, 256), (128, 128), 2, 0)
+        # 300 - 2*128 = 44 addressable partition rows on the trailing tile.
+        assert g.remaining[0] == 44
+
+    @pytest.mark.fast
+    def test_folded_partition_uses_tile_index_not_layout_offset(self):
+        """The P-fold makes a layout-offset query 0, so the descent must use
+        ``index * tile_p`` to find the addressable remainder. A second index
+        (2 vs 1) must move the addressable extent."""
+        g1 = _descend_tile((300, 256), (128, 128), 1, 0)
+        g2 = _descend_tile((300, 256), (128, 128), 2, 0)
+        assert g1.remaining[0] == 128  # full middle tile
+        assert g2.remaining[0] == 44  # short trailing tile
+
+
+@pytest_marks(["neurotile"])
+class TestPartitionFreeAxisSymmetry:
+    """A trailing partial narrows its addressable extent the same way on the
+    partition axis and the free axis. Only the physical representation differs
+    (the partition axis is capped at 128 rows and folds into free)."""
+
+    @pytest.mark.fast
+    def test_partition_trailing_extent_matches_free_trailing(self):
+        # P-partial: (300,256) trailing tile [2,0] -> 44 partition rows.
+        p_tile = _descend_tile((300, 256), (128, 128), 2, 0)
+        # F-partial: (128,300) trailing tile [0,2] -> 44 free columns.
+        f_tile = _descend_tile((128, 300), (128, 128), 0, 2)
+
+        # Both narrow their trailing extent to the same addressable 44.
+        assert p_tile.remaining[0] == 44
+        assert f_tile.remaining[1] == 44
+
+    @pytest.mark.fast
+    def test_free_trailing_flags_is_remainder(self):
+        # The free axis reliably flags is_remainder on its trailing partial.
+        f_tile = _descend_tile((128, 300), (128, 128), 0, 2)
+        assert f_tile.is_remainder is True
+        assert 1 in f_tile.remainder_dims
+
+    @pytest.mark.xfail(
+        reason="Known asymmetry: is_remainder on a folded-P trailing tile is not "
+        "set on the trace path (it is on the compile path). The addressable extent "
+        "is correct on both; only the flag diverges. Remove xfail once the folded-P "
+        "is_remainder is consistent with the free axis.",
+        strict=False,
+    )
+    @pytest.mark.fast
+    def test_partition_trailing_flags_is_remainder(self):
+        # Desired (matches the free axis and the compile path): the folded-P
+        # trailing tile flags is_remainder. Currently False on the trace path.
+        p_tile = _descend_tile((300, 256), (128, 128), 2, 0)
+        assert p_tile.is_remainder is True
+        assert 0 in p_tile.remainder_dims

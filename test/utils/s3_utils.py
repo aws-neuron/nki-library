@@ -26,11 +26,13 @@ from functools import lru_cache
 from urllib.parse import urlparse
 
 import boto3
+from botocore.client import BaseClient
+from botocore.config import Config
 from botocore.credentials import EnvProvider
 from botocore.exceptions import ClientError
 
 # Retry configuration for credential fetching
-# Isengard has a rate limit of ~3 TPS for GetIAMRole, so we need backoff when hitting limits
+# The credential vendor rate-limits GetIAMRole (~3 TPS), so we back off when hitting limits
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0  # seconds
 DEFAULT_MAX_DELAY = 30.0  # seconds
@@ -179,7 +181,7 @@ def _is_throttling_error(exception: Exception) -> bool:
             return True
 
     # Fallback: string matching for non-ClientError exceptions (e.g., from credential providers)
-    # This handles Isengard errors which may not be wrapped in ClientError
+    # This handles credential-vendor errors which may not be wrapped in ClientError
     error_str = str(exception).lower()
     string_indicators = ["throttl", "rate exceeded", "rate limit", "too many requests"]
     return any(indicator in error_str for indicator in string_indicators)
@@ -196,11 +198,11 @@ def _create_boto3_session_with_retry(
 
     Note: boto3's built-in retry (Config retries) only applies to API calls made by clients,
     not to the credential fetching process itself. The throttling we're handling here occurs
-    when Isengard fetches credentials, which happens before we have a boto3 client.
+    when the credential vendor fetches credentials, which happens before we have a boto3 client.
 
-    Uses exponential backoff with jitter to handle Isengard rate limiting.
-    Isengard has a rate limit of ~3 TPS for GetIAMRole, which can be exceeded
-    when multiple processes/containers fetch credentials simultaneously.
+    Uses exponential backoff with jitter to handle credential-vendor rate limiting: the
+    vendor rate-limits GetIAMRole (~3 TPS), which can be exceeded when multiple
+    processes/containers fetch credentials simultaneously.
 
     Args:
         profile: Optional AWS profile name for authentication.
@@ -222,7 +224,7 @@ def _create_boto3_session_with_retry(
             # Force credential resolution to detect throttling errors early
             creds = session.get_credentials()
             if creds is not None:
-                # Trigger actual credential fetch (may involve Isengard call)
+                # Trigger actual credential fetch (may involve a credential-vendor call)
                 creds.get_frozen_credentials()
             return session
         except Exception as e:
@@ -252,8 +254,8 @@ def prefetch_and_cache_credentials(profile: str | None = None) -> None:
     Pre-fetch AWS credentials and cache them in environment variables.
 
     This should be called once from the main pytest process before xdist workers spawn.
-    Workers will then use these pre-fetched credentials instead of calling Isengard,
-    avoiding rate limiting when multiple workers start simultaneously.
+    Workers will then use these pre-fetched credentials instead of calling the credential
+    vendor, avoiding rate limiting when multiple workers start simultaneously.
 
     Args:
         profile: Optional AWS profile name for authentication.
@@ -278,15 +280,60 @@ def prefetch_and_cache_credentials(profile: str | None = None) -> None:
         logging.warning(f"Failed to pre-fetch AWS credentials: {e}. Workers will fetch their own credentials.")
 
 
-@lru_cache(maxsize=1)
+# Standard client-side retry for AWS API calls. Built fresh per client: botocore
+# normalizes a Config's ``retries`` dict IN PLACE when constructing a client (e.g.
+# ``max_attempts`` -> ``total_max_attempts``), so a shared module-global Config would be
+# mutated out from under later callers (and tests asserting on it).
+def _boto_client_retry_config() -> Config:
+    return Config(retries={"max_attempts": 5, "mode": "standard"})
+
+
+@lru_cache(maxsize=None)
+def _get_boto_session_cached(profile: str | None) -> boto3.Session:
+    """Helper to ensure canonical form for caching"""
+    return _create_boto3_session_with_retry(profile)
+
+
+def get_boto_session(profile: str | None = None) -> boto3.Session:
+    """Get or create a boto3 Session (cached per profile).
+
+    Uses retry logic for credential fetching to handle credential-vendor rate limiting.
+    Cached so every caller in a process shares one session — and thus one
+    credential fetch — per profile.
+
+    boto3 picks up AWS_* env vars automatically if they were pre-fetched (see
+    prefetch_and_cache_credentials).
+    """
+    return _get_boto_session_cached(profile)
+
+
+@lru_cache(maxsize=None)
+def _get_boto_client_cached(service: str, region: str | None, profile: str | None) -> BaseClient:
+    """Helper to ensure canonical form for caching"""
+    session = get_boto_session(profile)
+    return session.client(service, region_name=region, config=_boto_client_retry_config())
+
+
+def get_boto_client(service: str, *, region: str | None = None, profile: str | None = None) -> BaseClient:
+    """Get or create a boto3 client for ``service`` (cached per service/region/profile).
+
+    Backed by the shared per-profile session, so clients across services and regions
+    reuse one session (one credential fetch). Configured with standard API retry.
+
+    Args:
+        service: AWS service name (e.g. "s3", "ec2", "autoscaling").
+        region: Region for the client; None uses the session/default region.
+        profile: Optional AWS profile name for authentication.
+    """
+    return _get_boto_client_cached(service, region, profile)
+
+
 def get_s3_client_and_session(profile: str | None = None):
     """
     Get or create boto3 S3 client and session (cached).
 
-    Uses retry logic for credential fetching to handle Isengard rate limiting.
-    The S3 client is configured with boto3's standard retry mode for S3 operations.
-
-    Returns both client and session to support different use cases:
+    Thin wrapper over the shared ``get_boto_client`` / ``get_boto_session`` helpers,
+    returning both because callers need each for different things:
     - Client for S3 operations (upload, download, head_bucket, etc.)
     - Session for extracting credentials (needed for remote AWS CLI commands)
 
@@ -307,9 +354,4 @@ def get_s3_client_and_session(profile: str | None = None):
         # Extract credentials for remote commands
         creds = session.get_credentials().get_frozen_credentials()
     """
-    # Use retry logic for credential fetching (handles Isengard rate limiting)
-    # boto3 will automatically pick up AWS_* env vars if they were pre-fetched
-    session = _create_boto3_session_with_retry(profile)
-
-    s3_client = session.client('s3')
-    return s3_client, session
+    return get_boto_client("s3", profile=profile), get_boto_session(profile)

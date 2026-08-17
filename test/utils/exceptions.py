@@ -81,10 +81,23 @@ class InferenceException(Exception):
     status = TestStatus.INFERENCE_FAILURE
 
 
+class FleetEmptyError(InferenceException):
+    """Raised when a host claim is attempted while the fleet is poisoned — no hosts
+    are available and the fleet stayed empty long enough, so an individual claim must fail
+    fast. Unretriable.
+
+    Subclasses ``InferenceException`` so the orchestrator surfaces it as a clean
+    inference failure."""
+
+
 class ValidationException(Exception):
     """Raised when output validation fails."""
 
     status = TestStatus.VALIDATION_FAILURE
+
+
+class HostsBusyError(Exception):
+    """Raised when no host could be reserved for an exclusive session."""
 
 
 class UnimplementedException(Exception):

@@ -48,7 +48,6 @@ from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_nl_act_fn_from_type, get_program_sharding_info
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
 from .bwmm_shard_on_I import OutputTensors
 from .moe_cte_mx_utils import (
     SBUF_QUADRANT_SIZE,
@@ -95,16 +94,16 @@ MAX_BLOCK_SIZE = 1024
 
 @nki.jit
 def blockwise_mm_shard_intermediate_mx(
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    gate_and_up_proj_bias: Optional[nl.ndarray] = None,
-    down_proj_bias: Optional[nl.ndarray] = None,
-    gate_up_proj_scale: nl.ndarray = None,
-    down_proj_scale: nl.ndarray = None,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    gate_and_up_proj_bias: Optional[nl.NkiTensor] = None,
+    down_proj_bias: Optional[nl.NkiTensor] = None,
+    gate_up_proj_scale: nl.NkiTensor = None,
+    down_proj_scale: nl.NkiTensor = None,
     block_size: int = None,
     activation_function: ActFnType = ActFnType.SiLU,
     skip_dma: SkipMode = SkipMode(),
@@ -116,6 +115,7 @@ def blockwise_mm_shard_intermediate_mx(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
+    use_block128_scales: bool = False,
 ):
     """
     MXFP Blockwise matrix multiplication kernel for MoE with intermediate dimension sharding.
@@ -141,16 +141,20 @@ def blockwise_mm_shard_intermediate_mx(
         I: Intermediate size (before TP sharding)
 
     Args:
-        hidden_states (nl.ndarray): [T+1, H], Input hidden states on HBM.
-        expert_affinities_masked (nl.ndarray): [(T+1)*E, 1], Expert affinities per token.
-        gate_up_proj_weight (nl.ndarray): [E, 128, 2, n_H512_tile, I], MXFP4/MXFP8 gate/up weights.
-        down_proj_weight (nl.ndarray): [E, p_I, n_I512_tile, H], MXFP4/MXFP8 down projection weights.
-        token_position_to_id (nl.ndarray): [N*B], Token to block position mapping.
-        block_to_expert (nl.ndarray): [N, 1], Expert assignment per block.
-        gate_and_up_proj_bias (nl.ndarray, optional): [E, 128, 2, n_I512_tile, 4], Projection bias.
-        down_proj_bias (nl.ndarray, optional): [E, H], Down projection bias.
-        gate_up_proj_scale (nl.ndarray): [E, 16, 2, n_H512_tile, I], uint8 dequant scales.
-        down_proj_scale (nl.ndarray): [E, 16, n_I512_tile, H], uint8 dequant scales.
+        hidden_states (nl.NkiTensor): [T+1, H], Input hidden states on HBM.
+        expert_affinities_masked (nl.NkiTensor): [(T+1)*E, 1], Expert affinities per token.
+        gate_up_proj_weight (nl.NkiTensor): [E, 128, 2, n_H512_tile, I], MXFP4/MXFP8 gate/up weights.
+        down_proj_weight (nl.NkiTensor): [E, p_I, n_I512_tile, H], MXFP4/MXFP8 down projection weights.
+        token_position_to_id (nl.NkiTensor): [N*B], Token to block position mapping.
+        block_to_expert (nl.NkiTensor): [N, 1], Expert assignment per block.
+        gate_and_up_proj_bias (nl.NkiTensor, optional): [E, 128, 2, n_I512_tile, 4], Projection bias.
+        down_proj_bias (nl.NkiTensor, optional): [E, H], Down projection bias.
+        gate_up_proj_scale (nl.NkiTensor): uint8 dequant scales. Native MX layout
+            [E, 16, 2, n_H512_tile, I]; block-128 layout [E, 4, 2, n_H512_tile, ceil(I/128)]
+            when use_block128_scales=True.
+        down_proj_scale (nl.NkiTensor): uint8 dequant scales. Native MX layout
+            [E, 16, n_I512_tile, H]; block-128 layout [E, 4, n_I512_tile, ceil(H/128)]
+            when use_block128_scales=True.
         block_size (int): Number of tokens per block.
         activation_function (ActFnType): Activation function (default: SiLU).
         skip_dma (SkipMode): DMA skip configuration for debugging.
@@ -161,9 +165,12 @@ def blockwise_mm_shard_intermediate_mx(
         gate_clamp_lower_limit (float, optional): Lower clamp for gate projection.
         up_clamp_upper_limit (float, optional): Upper clamp for up projection.
         up_clamp_lower_limit (float, optional): Lower clamp for up projection.
+        use_block128_scales (bool): When True, weight scales are supplied in
+            DeepSeek-style block-128 layout (one uint8 per 128(K)x128(N) block)
+            instead of the native per-(8p x 4f) MX micro-scale layout. Default False.
 
     Returns:
-        output (nl.ndarray): [T+1, H], Output hidden states on HBM.
+        output (nl.NkiTensor): [T+1, H], Output hidden states on HBM.
 
     Notes:
         - All input/output tensors must have the same floating point dtype
@@ -299,6 +306,7 @@ def blockwise_mm_shard_intermediate_mx(
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         qtz_dtype=nl.float8_e4m3fn_x4,
+        use_block128_scales=use_block128_scales,
     )
 
     # Allocate output tensors
@@ -407,17 +415,17 @@ def blockwise_mm_shard_intermediate_mx(
 
 @nki.jit
 def blockwise_mm_shard_intermediate_mx_hybrid(
-    conditions: nl.ndarray,
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    gate_and_up_proj_bias: Optional[nl.ndarray] = None,
-    down_proj_bias: Optional[nl.ndarray] = None,
-    gate_up_proj_scale: nl.ndarray = None,
-    down_proj_scale: nl.ndarray = None,
+    conditions: nl.NkiTensor,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    gate_and_up_proj_bias: Optional[nl.NkiTensor] = None,
+    down_proj_bias: Optional[nl.NkiTensor] = None,
+    gate_up_proj_scale: nl.NkiTensor = None,
+    down_proj_scale: nl.NkiTensor = None,
     block_size: int = None,
     num_static_block: Optional[int] = None,
     # Meta parameters
@@ -431,6 +439,7 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
+    use_block128_scales: bool = False,
 ):
     """
     MXFP4/MXFP8 Blockwise matrix multiplication kernel for MoE with hybrid static/dynamic loop control.
@@ -459,18 +468,18 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
         I: Intermediate size (before TP sharding)
 
     Args:
-        conditions (nl.ndarray): [N+1], Indicates whether block is padded (0) or non-padded (1).
+        conditions (nl.NkiTensor): [N+1], Indicates whether block is padded (0) or non-padded (1).
             Last entry must be 0 to guarantee loop termination.
-        hidden_states (nl.ndarray): [T+1, H], Input hidden states on HBM.
-        expert_affinities_masked (nl.ndarray): [(T+1)*E, 1], Expert affinities per token.
-        gate_up_proj_weight (nl.ndarray): [E, 128, 2, n_H512_tile, I], MXFP4/MXFP8 gate/up weights.
-        down_proj_weight (nl.ndarray): [E, p_I, n_I512_tile, H], MXFP4/MXFP8 down projection weights.
-        token_position_to_id (nl.ndarray): [N*B], Token to block position mapping.
-        block_to_expert (nl.ndarray): [N, 1], Expert assignment per block.
-        gate_and_up_proj_bias (nl.ndarray, optional): [E, 128, 2, n_I512_tile, 4], Projection bias.
-        down_proj_bias (nl.ndarray, optional): [E, H], Down projection bias.
-        gate_up_proj_scale (nl.ndarray): [E, 16, 2, n_H512_tile, I], uint8 dequant scales.
-        down_proj_scale (nl.ndarray): [E, 16, n_I512_tile, H], uint8 dequant scales.
+        hidden_states (nl.NkiTensor): [T+1, H], Input hidden states on HBM.
+        expert_affinities_masked (nl.NkiTensor): [(T+1)*E, 1], Expert affinities per token.
+        gate_up_proj_weight (nl.NkiTensor): [E, 128, 2, n_H512_tile, I], MXFP4/MXFP8 gate/up weights.
+        down_proj_weight (nl.NkiTensor): [E, p_I, n_I512_tile, H], MXFP4/MXFP8 down projection weights.
+        token_position_to_id (nl.NkiTensor): [N*B], Token to block position mapping.
+        block_to_expert (nl.NkiTensor): [N, 1], Expert assignment per block.
+        gate_and_up_proj_bias (nl.NkiTensor, optional): [E, 128, 2, n_I512_tile, 4], Projection bias.
+        down_proj_bias (nl.NkiTensor, optional): [E, H], Down projection bias.
+        gate_up_proj_scale (nl.NkiTensor): [E, 16, 2, n_H512_tile, I], uint8 dequant scales.
+        down_proj_scale (nl.NkiTensor): [E, 16, n_I512_tile, H], uint8 dequant scales.
         block_size (int): Number of tokens per block.
         num_static_block (int, optional): Number of non-padded blocks if known.
         activation_function (ActFnType): Activation function (default: SiLU).
@@ -482,9 +491,12 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
         gate_clamp_lower_limit (float, optional): Lower clamp for gate projection.
         up_clamp_upper_limit (float, optional): Upper clamp for up projection.
         up_clamp_lower_limit (float, optional): Lower clamp for up projection.
+        use_block128_scales (bool): When True, weight scales are supplied in
+            DeepSeek-style block-128 layout (one uint8 per 128(K)x128(N) block)
+            instead of the native per-(8p x 4f) MX micro-scale layout. Default False.
 
     Returns:
-        output (nl.ndarray): [T+1, H], Output hidden states on HBM.
+        output (nl.NkiTensor): [T+1, H], Output hidden states on HBM.
 
     Notes:
         - All input/output tensors must have the same floating point dtype
@@ -616,6 +628,7 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         qtz_dtype=nl.float8_e4m3fn_x4,
+        use_block128_scales=use_block128_scales,
     )
 
     # Allocate output tensors
@@ -741,8 +754,9 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
     # Block index for dynamic loop (stored in SBUF for dynamic indexing)
     block_idx_sbuf = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32)
     nisa.memset(block_idx_sbuf, value=NUM_STATIC_BLOCKS)
+
     # Dynamic loop over remaining blocks
-    for _ in nl.dynamic_range(NUM_STATIC_BLOCKS, cond_reg):
+    def _dynamic_block_body(_):
         next_block_idx_sbuf = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
         tmp_fp32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
@@ -769,6 +783,8 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
         # Increment block index
         nisa.tensor_scalar(dst=block_idx_sbuf, data=block_idx_sbuf, op0=nl.add, operand0=1)
         nisa.core_barrier(block_idx_sbuf, (0, 1))
+
+    nl.fori_loop(NUM_STATIC_BLOCKS, cond_reg, _dynamic_block_body)
 
     # Final DMA to ensure output is flushed
     nisa.dma_copy(output, output)
@@ -905,6 +921,7 @@ def compute_one_block_mx(
             prj_cfg=prj_cfg,
             skip_dma=kernel_cfg.skip_dma,
             name_prefix=name_prefix,
+            use_block128_scales=kernel_cfg.use_block128_scales,
         )
     )
 
@@ -918,6 +935,7 @@ def compute_one_block_mx(
         gup_token_indices_on_p=gup_token_indices_on_p,
         gup_n_quadrants_needed=gup_n_quadrants_needed,
         name_prefix=name_prefix,
+        use_block128_scales=kernel_cfg.use_block128_scales,
     )
     down_bias_broadcasted = None
     if down_bias_sb is not None:
@@ -947,9 +965,8 @@ def compute_one_block_mx(
     if gup_bias:
         gup_bias_reshaped = gup_bias.reshape((_pmax, dims.num_shards * prj_cfg.n_total_I512_tile_lnc_sharded, _q_width))
 
-        # Use TensorView to slice bias without tensor_copy
-        gup_bias_view = TensorView(gup_bias_reshaped)
-        gate_bias_view = gup_bias_view.slice(dim=1, start=0, end=prj_cfg.n_total_I512_tile_lnc_sharded)
+        # Slice bias without tensor_copy
+        gate_bias_view = gup_bias_reshaped.slice(dim=1, start=0, end=prj_cfg.n_total_I512_tile_lnc_sharded)
 
     gate_proj_out_sb = gate_up_projection_mx_tp_shard_I(
         hidden_qtz_sb=buffers.hidden_qtz_sb[:, :, :],
@@ -972,10 +989,10 @@ def compute_one_block_mx(
     # ═══════════════════════════════════════════════════════════════════════════
     # Step 6: UP PROJECTION - hidden @ up_weight + bias
     # ═══════════════════════════════════════════════════════════════════════════
-    # Use TensorView to slice bias without tensor_copy
+    # Slice bias without tensor_copy
     up_bias_view = None
     if gup_bias:
-        up_bias_view = gup_bias_view.slice(
+        up_bias_view = gup_bias_reshaped.slice(
             dim=1, start=prj_cfg.n_total_I512_tile_lnc_sharded, end=2 * prj_cfg.n_total_I512_tile_lnc_sharded
         )
 
@@ -1105,11 +1122,12 @@ def compute_one_block_mx(
 
 def load_gup_weights_scales_shard_on_intermediate_mx(
     inps: InputTensors,
-    block_expert: nl.ndarray,
+    block_expert: nl.NkiTensor,
     dims: BWMMMXDimensionSizes,
     prj_cfg: ProjConfig,
     skip_dma: SkipMode,
     name_prefix: str = "",
+    use_block128_scales: bool = False,
 ):
     """
     Load gate and up projection weights, scales, and biases for current expert.
@@ -1121,16 +1139,16 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
         inps (InputTensors): Input tensors containing gate_up_proj_weight of shape
             [E, 128, 2, n_H512_tile, I], gate_up_proj_scale, gate_and_up_proj_bias,
             and buffers for scales and index vectors.
-        block_expert (nl.ndarray): Expert index for current block, shape [1, 1].
+        block_expert (nl.NkiTensor): Expert index for current block, shape [1, 1].
         dims (BWMMMXDimensionSizes): Dimension configuration with I, H.
         prj_cfg (ProjConfig): Projection configuration with n_H512_tile, I.
         skip_dma (SkipMode): DMA skip configuration for weight loading.
 
     Returns:
         tuple: (gup_weights_qtz_sb, gup_scales_sb, gup_bias_sb)
-            - gup_weights_qtz_sb (nl.ndarray): Quantized weights [128, 2, n_H512_tile, I]
-            - gup_scales_sb (nl.ndarray): Dequantization scales [128, 2, n_H512_tile, I]
-            - gup_bias_sb (nl.ndarray): Bias values [128, 2, n_total_I512_tile, 128]
+            - gup_weights_qtz_sb (nl.NkiTensor): Quantized weights [128, 2, n_H512_tile, I]
+            - gup_scales_sb (nl.NkiTensor): Dequantization scales [128, 2, n_H512_tile, I]
+            - gup_bias_sb (nl.NkiTensor): Bias values [128, 2, n_total_I512_tile, 128]
 
     Notes:
         - Uses indirect DGE with block_expert for expert selection
@@ -1168,7 +1186,7 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
     )
     nisa.dma_copy(
         dst=gup_weights_qtz_sb,
-        src=gup_weight_view.get_view(),
+        src=gup_weight_view,
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
     )
@@ -1180,52 +1198,109 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
 
     scale_shape = inps.gate_up_proj_scale.shape
 
-    # fold E * 16 together
-    gup_scale_view = inps.gate_up_proj_scale.reshape(
-        (scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3], scale_shape[4])
-    )
-
-    """
-    Construct a vector DGE index to index into E*16
-        if block_expert == 0, we want something like this (tranposed to the P dimension)
-        [0 1 2 3 -1 -1 -1 ..... 4 5 6 7 -1 -1 -1 .... 8 9 10 11 -1 -1 -1 .... 12 13 14 15 -1 -1 -1... -1]  
-    
-        if block_expert == 3, we want something like this
-        [48 49 50 51 -1 -1 -1 ..... 52 53 54 55 -1 -1 -1 .... 56 57 58 59 -1 -1 -1 .... 60 61 62 63 -1 -1 -1... -1]  
-        i.e, basically the same as above, with offset 16*3 = 48
-    """
-
+    # gup_n_quadrants_needed is also consumed by the down loader (to decide whether the
+    # gup expert index vector can be reused), so compute it for both scale formats.
     gup_n_quadrants_needed = prj_cfg.H0 // SBUF_QUADRANT_SIZE
-    token_indices_on_p = _generate_expert_index_vector(
-        expert_index=block_expert,
-        dst_idx_vector=inps.p_gup_idx_vector,
-        scale_factor=scale_shape[1],
-        n_quadrants_needed=gup_n_quadrants_needed,
-        n_remaining_partition=0,
-        name_prefix=f"{name_prefix}gup_eiv",
-    )
-    # gup_scale_view shape: (E*16, 2, n_H512_tile, I) - use FULL source tensor dimensions for strides
-    # The source tensor has full n_H512_tile, we only load n_H512_tile elements
-    full_n_H512_tile_scale = scale_shape[3]  # Get actual n_H512_tile from source tensor (before reshape)
-    stride_dim0 = 2 * full_n_H512_tile_scale * prj_cfg.I
-    nisa.dma_copy(
-        src=gup_scale_view.ap(
-            pattern=[
-                [stride_dim0, _pmax],  # stride for dim 0 (uses full n_H512_tile)
-                [full_n_H512_tile_scale * prj_cfg.I, 2],  # stride for gate/up dim (uses full n_H512_tile)
-                [prj_cfg.I, prj_cfg.n_H512_tile],  # stride for H512 tile (only load sharded count)
-                [1, prj_cfg.I // 2],  # stride for I dim
-            ],
-            offset=(prj_cfg.I // 2) * dims.shard_id,
-            vector_offset=token_indices_on_p.ap(
-                [[1, _pmax], [1, 1]],
-                offset=0,
+
+    if use_block128_scales:
+        # ── Block-128 scales (DeepSeek ue8m0): one uint8 per 128(K) x 128(N) weight block.
+        # HBM gate_up_proj_scale: uint8[E, 4, 2, n_H512_tile, ceil(I/128)] (4 = 128/32
+        # block-rows per 512-K tile, one per SBUF quadrant). Materialize into the same
+        # gup_scales_sb [128, 2, n_H512_tile, I//2] layout the native path produces, via a
+        # two-stage broadcast (DMA can't free-dim stride-0; see qkv _load_mx_weights).
+        token_indices_on_p = None
+        SCALE_BLOCK = 128
+        SCALE_P_PER_QUAD = 4  # scale rows materialized per SBUF quadrant
+        I_shard = prj_cfg.I // 2  # I_lnc_sharded
+        n_blocks = I_shard // SCALE_BLOCK  # I % 1024 == 0 -> I//2 multiple of 128
+        n_block_offset = (I_shard * dims.shard_id) // SCALE_BLOCK
+        full_n_blocks = scale_shape[4]  # ceil(full I / 128)
+        n_quadrants = gup_n_quadrants_needed  # 128 // 32 = 4, one block-row per quadrant
+
+        # Stage 1: DMA compact scales with partition broadcast only (4 rows per quadrant).
+        compact_scales_sb = nl.ndarray(
+            (_pmax, 2, prj_cfg.n_H512_tile, n_blocks),
+            dtype=nl.uint8,
+            buffer=nl.sbuf,
+            name=f"{name_prefix}gup_scales_compact",
+        )
+        # gate_up_proj_scale[e] is contiguous over (4 block-rows, 2 gate/up,
+        # n_H512_tile, full_n_blocks); compute element strides for each axis.
+        blkrow_stride = scale_shape[2] * scale_shape[3] * full_n_blocks  # 2 * n_H512 * full_n_blocks
+        gu_stride = scale_shape[3] * full_n_blocks  # n_H512 * full_n_blocks
+        h512_stride = full_n_blocks
+        for quad_idx in nl.affine_range(n_quadrants):
+            nisa.dma_copy(
+                dst=compact_scales_sb[
+                    nl.ds(quad_idx * SBUF_QUADRANT_SIZE, SCALE_P_PER_QUAD), :2, : prj_cfg.n_H512_tile, :n_blocks
+                ],
+                src=inps.gate_up_proj_scale.ap(
+                    pattern=[
+                        [0, SCALE_P_PER_QUAD],  # partition broadcast: 1 source byte -> 4 rows
+                        [gu_stride, 2],  # gate/up
+                        [h512_stride, prj_cfg.n_H512_tile],  # H512 tile (load sharded count)
+                        [1, n_blocks],  # N block walk
+                    ],
+                    offset=quad_idx * blkrow_stride + n_block_offset,
+                    scalar_offset=block_expert,
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.skip,
+                dge_mode=dge_mode.hwdge,
+            )
+
+        # Stage 2: vector-engine broadcast each block scale 128x along N into gup_scales_sb.
+        src_view = compact_scales_sb.expand_dim(dim=4).broadcast(dim=4, size=SCALE_BLOCK)
+        dst_view = inps.gup_scales_sb[:_pmax, :2, : prj_cfg.n_H512_tile, :I_shard].reshape_dim(
+            dim=3, shape=(n_blocks, SCALE_BLOCK)
+        )
+        nisa.tensor_copy(dst=dst_view, src=src_view)
+    else:
+        # fold E * 16 together
+        gup_scale_view = inps.gate_up_proj_scale.reshape(
+            (scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3], scale_shape[4])
+        )
+
+        """
+        Construct a vector DGE index to index into E*16
+            if block_expert == 0, we want something like this (tranposed to the P dimension)
+            [0 1 2 3 -1 -1 -1 ..... 4 5 6 7 -1 -1 -1 .... 8 9 10 11 -1 -1 -1 .... 12 13 14 15 -1 -1 -1... -1]
+
+            if block_expert == 3, we want something like this
+            [48 49 50 51 -1 -1 -1 ..... 52 53 54 55 -1 -1 -1 .... 56 57 58 59 -1 -1 -1 .... 60 61 62 63 -1 -1 -1... -1]
+            i.e, basically the same as above, with offset 16*3 = 48
+        """
+
+        token_indices_on_p = _generate_expert_index_vector(
+            expert_index=block_expert,
+            dst_idx_vector=inps.p_gup_idx_vector,
+            scale_factor=scale_shape[1],
+            n_quadrants_needed=gup_n_quadrants_needed,
+            n_remaining_partition=0,
+            name_prefix=f"{name_prefix}gup_eiv",
+        )
+        # gup_scale_view shape: (E*16, 2, n_H512_tile, I) - use FULL source tensor dimensions for strides
+        # The source tensor has full n_H512_tile, we only load n_H512_tile elements
+        full_n_H512_tile_scale = scale_shape[3]  # Get actual n_H512_tile from source tensor (before reshape)
+        stride_dim0 = 2 * full_n_H512_tile_scale * prj_cfg.I
+        nisa.dma_copy(
+            src=gup_scale_view.ap(
+                pattern=[
+                    [stride_dim0, _pmax],  # stride for dim 0 (uses full n_H512_tile)
+                    [full_n_H512_tile_scale * prj_cfg.I, 2],  # stride for gate/up dim (uses full n_H512_tile)
+                    [prj_cfg.I, prj_cfg.n_H512_tile],  # stride for H512 tile (only load sharded count)
+                    [1, prj_cfg.I // 2],  # stride for I dim
+                ],
+                offset=(prj_cfg.I // 2) * dims.shard_id,
+                vector_offset=token_indices_on_p.ap(
+                    [[1, _pmax], [1, 1]],
+                    offset=0,
+                ),
+                indirect_dim=0,
             ),
-            indirect_dim=0,
-        ),
-        dst=inps.gup_scales_sb[:_pmax, :2, : prj_cfg.n_H512_tile, : prj_cfg.I // 2],
-        oob_mode=oob_mode.skip,
-    )
+            dst=inps.gup_scales_sb[:_pmax, :2, : prj_cfg.n_H512_tile, : prj_cfg.I // 2],
+            oob_mode=oob_mode.skip,
+        )
 
     """
     GATE UP BIAS
@@ -1291,14 +1366,15 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
 
 def load_down_proj_weights_shard_on_intermediate_mx(
     inps: InputTensors,
-    block_expert: nl.ndarray,
-    dst_weight: nl.ndarray,
+    block_expert: nl.NkiTensor,
+    dst_weight: nl.NkiTensor,
     dims: BWMMMXDimensionSizes,
     prj_cfg: ProjConfig,
     skip_dma: SkipMode,
-    gup_token_indices_on_p: nl.ndarray = None,
+    gup_token_indices_on_p: nl.NkiTensor = None,
     gup_n_quadrants_needed: int = None,
     name_prefix: str = "",
+    use_block128_scales: bool = False,
 ):
     """
     Load down projection weights, scales, and biases for current expert.
@@ -1309,8 +1385,8 @@ def load_down_proj_weights_shard_on_intermediate_mx(
     Args:
         inps (InputTensors): Input tensors containing down_proj_weight [E, p_I, n_total_I512_tile, H],
             down_proj_scale, down_proj_bias, and index vector buffer.
-        block_expert (nl.ndarray): Expert index for current block, shape [1, 1].
-        dst_weight (nl.ndarray): Destination buffer for weights in SBUF.
+        block_expert (nl.NkiTensor): Expert index for current block, shape [1, 1].
+        dst_weight (nl.NkiTensor): Destination buffer for weights in SBUF.
         dims (BWMMMXDimensionSizes): Dimension configuration with I, H, p_I.
         prj_cfg (ProjConfig): Projection configuration with sharding info.
         skip_dma (SkipMode): DMA skip configuration.
@@ -1360,7 +1436,7 @@ def load_down_proj_weights_shard_on_intermediate_mx(
         end=prj_cfg.n_I512_tile_lnc_sharded * (dims.shard_id + 1),
     )
     nisa.dma_copy(
-        src=down_weight_view.get_view(),
+        src=down_weight_view,
         dst=dst_weight[: dims.p_I, :, :],
         oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
         dge_mode=dge_mode.hwdge,
@@ -1382,50 +1458,107 @@ def load_down_proj_weights_shard_on_intermediate_mx(
         down_scale_sb.shape == (128, prj_cfg.n_I512_tile_lnc_sharded, prj_cfg.H), f"Got {down_scale_sb.shape}"
     )
 
-    down_scale_view = inps.down_proj_scale.reshape((scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3]))
-    """
-    Construct a vector DGE index to index into E*16
-    if block_expert == 0, we want something like this (tranposed to the P dimension)
-    [0 1 2 3 -1 -1 -1 ..... 4 5 6 7 -1 -1 -1 .... 8 9 10 11 -1 -1 -1 .... 12 13 14 15 -1 -1 -1... -1]  
-
-    if block_expert == 3, we want something like this
-    [48 49 50 51 -1 -1 -1 ..... 52 53 54 55 -1 -1 -1 .... 56 57 58 59 -1 -1 -1 .... 60 61 62 63 -1 -1 -1... -1]  
-    i.e, basically the same as above, with offset 16*3 = 48
-    """
-
-    down_n_quadrants_needed, n_remaining_partition = divmod(dims.p_I, SBUF_QUADRANT_SIZE)
-    n_remaining_partition = n_remaining_partition // _q_height
-
-    # Reuse gup token indices if quadrants match, otherwise regenerate
-    if gup_n_quadrants_needed is not None and gup_n_quadrants_needed == down_n_quadrants_needed:
-        token_indices_on_p = gup_token_indices_on_p
-    else:
-        token_indices_on_p = _generate_expert_index_vector(
-            expert_index=block_expert,
-            dst_idx_vector=inps.p_down_idx_vector,
-            scale_factor=scale_shape[1],
-            n_quadrants_needed=down_n_quadrants_needed,
-            n_remaining_partition=n_remaining_partition,
-            name_prefix=f"{name_prefix}down_eiv",
+    if use_block128_scales:
+        # ── Block-128 scales: one uint8 per 128(K) x 128(N) block. For down, the
+        # contraction dim (I) runs along partitions and N is H. HBM down_proj_scale:
+        # uint8[E, 4, n_total_I512_tile, ceil(H/128)] (4 block-rows, one per quadrant).
+        # Materialize into the same down_scale_sb [128, n_I512_tile_lnc_sharded, H]
+        # layout via a two-stage broadcast (DMA can't free-dim stride-0).
+        SCALE_BLOCK = 128
+        SCALE_P_PER_QUAD = 4  # scale rows materialized per SBUF quadrant
+        n_blocks_H = prj_cfg.H // SCALE_BLOCK  # H % 512 == 0 -> multiple of 128
+        full_n_blocks_H = scale_shape[3]  # ceil(full H / 128)
+        n_quadrants = _pmax // SBUF_QUADRANT_SIZE  # 4; p_I == 128 on shard-on-I path
+        kernel_assert(
+            dims.p_I == _pmax,
+            f"block-128 down scales require p_I == {_pmax} (I_TP multiple of 1024), got {dims.p_I}",
         )
-    # down_scale_view shape: (E*16, n_total_I512_tile, H)
-    # accumulated shape to right of dim 0: n_total_I512_tile * H
-    down_scale_stride_dim0 = prj_cfg.n_total_I512_tile * dims.H
-    static_offset = prj_cfg.n_I512_tile_lnc_sharded * dims.H * dims.shard_id
-    # Use AP for dst to match src pattern and avoid issues with dynamic blocks
-    nisa.dma_copy(
-        src=down_scale_view.ap(
-            pattern=[[down_scale_stride_dim0, _pmax], [dims.H, prj_cfg.n_I512_tile_lnc_sharded], [1, prj_cfg.H]],
-            offset=static_offset,
-            vector_offset=token_indices_on_p.ap(
-                [[1, _pmax], [1, 1]],
-                offset=0,
+
+        # Stage 1: DMA compact scales with partition broadcast only (4 rows per quadrant).
+        compact_scales_sb = nl.ndarray(
+            (_pmax, prj_cfg.n_I512_tile_lnc_sharded, n_blocks_H),
+            dtype=nl.uint8,
+            buffer=nl.sbuf,
+            name=f"{name_prefix}down_scales_compact",
+        )
+        # down_proj_scale[e] strides over (4, n_total_I512_tile, full_n_blocks_H).
+        blkrow_stride = scale_shape[2] * full_n_blocks_H
+        tile_stride = full_n_blocks_H
+        tile_offset = prj_cfg.n_I512_tile_lnc_sharded * full_n_blocks_H * dims.shard_id
+        for quad_idx in nl.affine_range(n_quadrants):
+            nisa.dma_copy(
+                dst=compact_scales_sb[
+                    nl.ds(quad_idx * SBUF_QUADRANT_SIZE, SCALE_P_PER_QUAD),
+                    : prj_cfg.n_I512_tile_lnc_sharded,
+                    :n_blocks_H,
+                ],
+                src=inps.down_proj_scale.ap(
+                    pattern=[
+                        [0, SCALE_P_PER_QUAD],  # partition broadcast: 1 source byte -> 4 rows
+                        [tile_stride, prj_cfg.n_I512_tile_lnc_sharded],  # I512 tile (sharded count)
+                        [1, n_blocks_H],  # N block walk over H
+                    ],
+                    offset=quad_idx * blkrow_stride + tile_offset,
+                    scalar_offset=block_expert,
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.skip,
+                dge_mode=dge_mode.hwdge,
+            )
+
+        # Stage 2: vector-engine broadcast each block scale 128x along H into down_scale_sb.
+        src_view = compact_scales_sb.expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK)
+        dst_view = down_scale_sb[:_pmax, : prj_cfg.n_I512_tile_lnc_sharded, : prj_cfg.H].reshape_dim(
+            dim=2, shape=(n_blocks_H, SCALE_BLOCK)
+        )
+        nisa.tensor_copy(dst=dst_view, src=src_view)
+    else:
+        down_scale_view = inps.down_proj_scale.reshape(
+            (scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3])
+        )
+        """
+        Construct a vector DGE index to index into E*16
+        if block_expert == 0, we want something like this (tranposed to the P dimension)
+        [0 1 2 3 -1 -1 -1 ..... 4 5 6 7 -1 -1 -1 .... 8 9 10 11 -1 -1 -1 .... 12 13 14 15 -1 -1 -1... -1]
+
+        if block_expert == 3, we want something like this
+        [48 49 50 51 -1 -1 -1 ..... 52 53 54 55 -1 -1 -1 .... 56 57 58 59 -1 -1 -1 .... 60 61 62 63 -1 -1 -1... -1]
+        i.e, basically the same as above, with offset 16*3 = 48
+        """
+
+        down_n_quadrants_needed, n_remaining_partition = divmod(dims.p_I, SBUF_QUADRANT_SIZE)
+        n_remaining_partition = n_remaining_partition // _q_height
+
+        # Reuse gup token indices if quadrants match, otherwise regenerate
+        if gup_n_quadrants_needed is not None and gup_n_quadrants_needed == down_n_quadrants_needed:
+            token_indices_on_p = gup_token_indices_on_p
+        else:
+            token_indices_on_p = _generate_expert_index_vector(
+                expert_index=block_expert,
+                dst_idx_vector=inps.p_down_idx_vector,
+                scale_factor=scale_shape[1],
+                n_quadrants_needed=down_n_quadrants_needed,
+                n_remaining_partition=n_remaining_partition,
+                name_prefix=f"{name_prefix}down_eiv",
+            )
+        # down_scale_view shape: (E*16, n_total_I512_tile, H)
+        # accumulated shape to right of dim 0: n_total_I512_tile * H
+        down_scale_stride_dim0 = prj_cfg.n_total_I512_tile * dims.H
+        static_offset = prj_cfg.n_I512_tile_lnc_sharded * dims.H * dims.shard_id
+        # Use AP for dst to match src pattern and avoid issues with dynamic blocks
+        nisa.dma_copy(
+            src=down_scale_view.ap(
+                pattern=[[down_scale_stride_dim0, _pmax], [dims.H, prj_cfg.n_I512_tile_lnc_sharded], [1, prj_cfg.H]],
+                offset=static_offset,
+                vector_offset=token_indices_on_p.ap(
+                    [[1, _pmax], [1, 1]],
+                    offset=0,
+                ),
+                indirect_dim=0,
             ),
-            indirect_dim=0,
-        ),
-        dst=down_scale_sb[:128, : prj_cfg.n_I512_tile_lnc_sharded, : prj_cfg.H],
-        oob_mode=oob_mode.skip,
-    )
+            dst=down_scale_sb[:128, : prj_cfg.n_I512_tile_lnc_sharded, : prj_cfg.H],
+            oob_mode=oob_mode.skip,
+        )
 
     # load bias
     # down_proj_bias shape: (E, H)
@@ -1636,13 +1769,13 @@ def store_block_output_shard_over_block_size(
 
 
 def gate_up_projection_mx_tp_shard_I(
-    hidden_qtz_sb: nl.ndarray,
-    hidden_scale_sb: nl.ndarray,
-    weight_qtz: nl.ndarray,
-    weight_scale: nl.ndarray,
-    bias_sb: Optional[TensorView],
+    hidden_qtz_sb: nl.NkiTensor,
+    hidden_scale_sb: nl.NkiTensor,
+    weight_qtz: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
+    bias_sb: Optional[nl.NkiTensor],
     cfg: ProjConfig,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Performs the Gate/Up projection with I-dimension sharding. This is the TP version of the projection, i.e. the output will be in transposed
     for down projection. Math (Neuron matmul):
@@ -1661,7 +1794,7 @@ def gate_up_projection_mx_tp_shard_I(
     :param weight_scale:
         - uint8[_pmax, n_H512_tile, I] @ SB, or
         - uint8[_pmax // _q_height, n_H512_tile, I] @ HBM.
-    :param bias_sb [OPTIONAL]: TensorView of bf16[_pmax, n_I512_tile, _q_width] @ SB.
+    :param bias_sb [OPTIONAL]: nl.NkiTensor of bf16[_pmax, n_I512_tile, _q_width] @ SB.
     :return: bf16[_pmax, ceil(I / 512), BxS, _q_width] @ SB.
     """
     n_prgs, prg_id = cfg.n_prgs, cfg.prg_id
@@ -1771,7 +1904,7 @@ def gate_up_projection_mx_tp_shard_I(
             """
             if bias_sb is not None:
                 """
-                Use TensorView to slice and broadcast bias.
+                Use NkiTensor to slice and broadcast bias.
                 
                 For combined gate+up: bias_t_shared_base_offset // _q_width gives starting tile index
                 For already-sliced: bias_t_shared_base_offset is 0
@@ -1789,7 +1922,7 @@ def gate_up_projection_mx_tp_shard_I(
                     data1=out_psum_lst[i_tile_idx].ap(
                         [[_q_width * cur_BxS_tile_sz, cur_I_pdim_sz], [1, cur_BxS_tile_sz], [cur_BxS_tile_sz, _q_width]]
                     ),  # strided read
-                    data2=bias_tile_view.get_view(),
+                    data2=bias_tile_view,
                     op=nl.add,
                 )
             else:
@@ -1806,8 +1939,8 @@ def gate_up_projection_mx_tp_shard_I(
 
 
 def down_projection_mx_shard_I(
-    inter_sb: nl.ndarray, weight: nl.ndarray, weight_scale: nl.ndarray, bias_sb: nl.ndarray, cfg: ProjConfig
-) -> nl.ndarray:
+    inter_sb: nl.NkiTensor, weight: nl.NkiTensor, weight_scale: nl.NkiTensor, bias_sb: nl.NkiTensor, cfg: ProjConfig
+) -> nl.NkiTensor:
     """
     Perform down projection with MXFP4/MXFP8 quantization.
 
@@ -1816,17 +1949,17 @@ def down_projection_mx_shard_I(
     by tiling the BxS dimension.
 
     Args:
-        inter_sb (nl.ndarray): Intermediate activations of shape [128, n_I512_tile, BxS, 4]
+        inter_sb (nl.NkiTensor): Intermediate activations of shape [128, n_I512_tile, BxS, 4]
             in SBUF with I dimension shuffled on 128 partitions, bf16 type.
-        weight (nl.ndarray): Quantized weights of shape [128, ceil(I/512), H] in HBM,
+        weight (nl.NkiTensor): Quantized weights of shape [128, ceil(I/512), H] in HBM,
             mxfp4_x4/mxfp8_x4 type, zero-padded.
-        weight_scale (nl.ndarray): Weight scales of shape [128//8, ceil(I/512), H] in HBM,
+        weight_scale (nl.NkiTensor): Weight scales of shape [128//8, ceil(I/512), H] in HBM,
             uint8 type, zero-padded.
-        bias_sb (nl.ndarray): Optional bias of shape [1, H] in SBUF, bf16 type.
+        bias_sb (nl.NkiTensor): Optional bias of shape [1, H] in SBUF, bf16 type.
         cfg (ProjConfig): Projection configuration with H, I, BxS, sharding info.
 
     Returns:
-        output (nl.ndarray): Down projection result of shape [128, ceil(BxS/128), H] in SBUF,
+        output (nl.NkiTensor): Down projection result of shape [128, ceil(BxS/128), H] in SBUF,
             bf16 type. Note: end of last tile contains garbage when BxS % 128 != 0.
 
     Notes:
@@ -1931,8 +2064,8 @@ def down_projection_mx_shard_I(
 
 
 def _down_proj_prep_inter_and_weights(
-    inter_sb: nl.ndarray, weight: nl.ndarray, weight_scale: nl.ndarray, cfg: ProjConfig
-) -> tuple[nl.ndarray, nl.ndarray, nl.ndarray, nl.ndarray]:
+    inter_sb: nl.NkiTensor, weight: nl.NkiTensor, weight_scale: nl.NkiTensor, cfg: ProjConfig
+) -> tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     Prep intermediate and weights for down projection:
         - for intermediate, reshape and quantize (and reshape back);

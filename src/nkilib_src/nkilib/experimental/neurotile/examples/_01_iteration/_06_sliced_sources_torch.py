@@ -17,11 +17,11 @@ _TILE_P = 128
 _TILE_F = 128
 
 
-def root_window_scale_torch_ref(src):
+def window_scale_torch_ref(src):
     return src[0:128, 0:512] * 2.0
 
 
-def root_two_windows_torch_ref(src):
+def two_windows_torch_ref(src):
     out = src.clone()
     out[128:256, :] *= -1.0
     return out

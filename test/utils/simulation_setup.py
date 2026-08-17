@@ -23,7 +23,7 @@ import sys
 
 import numpy as np
 
-from .common_dataclasses import GoldenTensorDict, normalize_golden_output
+from .common_dataclasses import GoldenTensorDict, is_xdist_worker, normalize_golden_output
 from .simulation_constants import SIMULATION_RUN_ALL_ENV_VAR
 
 # Patterns to identify tests with large shapes that are slow on CPU simulation
@@ -34,7 +34,7 @@ def setup_simulation_mode():
     """Setup simulation mode"""
 
     # Limit BLAS threading in xdist workers to avoid contention
-    if "PYTEST_XDIST_WORKER" in os.environ:
+    if is_xdist_worker():
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -118,8 +118,10 @@ def run_simulator_inference(kernel_under_test) -> dict[str, np.ndarray]:
             f"Got: {[type(o).__name__ for o in kernel_outputs]}, Expected names: {output_names}"
         )
 
-    # Convert kernel outputs to numpy arrays with dtypes matching golden tensors
-    return {
-        name: np.asarray(output, dtype=golden.dtype)
-        for name, output, golden in zip(output_names, kernel_outputs, golden_tensors.values())
-    }
+    # Return the kernel outputs in their native dtype, mirroring the hardware path:
+    # neuron-explorer dumps the device output's raw bytes and lets the validator apply
+    # the readback dtype. We do NOT pre-cast to the golden dtype here -- value-casting
+    # would crash on packed x4 dtypes (e.g. float8_e4m3fn_x4), which can only be
+    # bit-reinterpreted, and is unnecessary since the same OutputValidator runs
+    # downstream on the dumped sim outputs and already handles dtype reconciliation.
+    return {name: np.asarray(output) for name, output in zip(output_names, kernel_outputs, strict=True)}

@@ -67,15 +67,20 @@ class ClampLimits(nl.NKIObject):
 
 class ShardOption(Enum):
     """
-    Sharding strategies for blockwise backward kernel.
+    Sharding strategies for blockwise kernels.
 
     Attributes:
         SHARD_ON_FREE: Shard across the free (output) dimension of each matmul.
         SHARD_ON_HIDDEN: Shard across hidden dimension for all functions.
+        SHARD_ON_BLOCK: Partition whole token-blocks across cores — each core
+            computes a disjoint subset of the N blocks end-to-end and writes its
+            own output slab; the per-shard slabs are reduced at the end. Used by
+            the MXFP8 MoE forward kernel (blockwise_mm_fwd_mxfp8).
     """
 
     SHARD_ON_FREE = 0
     SHARD_ON_HIDDEN = 1
+    SHARD_ON_BLOCK = 2
 
 
 class AffinityOption(Enum):
@@ -118,7 +123,15 @@ class DownProjOutputGradBlocking(nl.NKIObject):
     buffer_degree: int = 4
 
     def estimate_sbuf_usage(
-        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+        self,
+        B,
+        H,
+        I_TP,
+        num_shards,
+        dtype,
+        shard_option=None,
+        affinity_option=None,
+        is_tensor_update_accumulating=True,
     ):
         """
         Estimate peak SBUF bytes for _compute_down_projection_output_grad.
@@ -181,10 +194,19 @@ class GateUpOutputGradBlocking(nl.NKIObject):
     block_h: int = 8
     block_b: int = 2
     block_i: int = 2
-    buffer_degree: int = 3
+    buffer_degree: int = 3  # not reduced for fp32: this pipelined tile's peak SBUF is non-monotonic in degree
 
     def estimate_sbuf_usage(
-        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+        self,
+        B,
+        H,
+        I_TP,
+        num_shards,
+        dtype,
+        shard_option=None,
+        affinity_option=None,
+        is_tensor_update_accumulating=True,
+        grad_accum_dtype=None,
     ):
         """
         Estimate peak SBUF bytes for _compute_gate_up_projection_output_grad.
@@ -205,6 +227,9 @@ class GateUpOutputGradBlocking(nl.NKIObject):
         TILE_SIZE = 128
         PSUM_SIZE = 512
         elem = sizeinbytes(dtype)
+        # fp32-capable tiles (silu_dx_gate, silu_gate_grad, gate_silu_activation,
+        # partial_block_gate_up_mult_grad, sendrecv_recv_buf) follow grad_accum_dtype.
+        grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
 
         is_shard_on_h = shard_option == ShardOption.SHARD_ON_HIDDEN if shard_option is not None else False
 
@@ -231,10 +256,13 @@ class GateUpOutputGradBlocking(nl.NKIObject):
         # For (P, NUM_B_TILES, I_TP_BLOCK_SIZE): bytes = NUM_B_TILES * I_TP_BLOCK_SIZE * elem
 
         # 6 persistent tensors: (B_TILE, NUM_B_TILES, I_TP_BLOCK_SIZE)
-        base_persistent = 6 * NUM_B_TILES * I_TP_BLOCK_SIZE * elem
+        # 3 follow grad_accum_dtype (silu_dx_gate, silu_gate_grad, gate_silu_activation),
+        # 3 stay compute_dtype (up_activation_grad, gate_activation_grad, block_gate_up_mult).
+        base_persistent = (3 * grad_elem + 3 * elem) * NUM_B_TILES * I_TP_BLOCK_SIZE
 
-        # buffer_degree × (3 large + 1 weight_temp)
-        buffered = self.buffer_degree * (3 * NUM_B_TILES * I_TP_BLOCK_SIZE * elem + H_BLOCK_SIZE * elem)
+        # buffer_degree × (3 large + 1 weight_temp); of the 3 large,
+        # partial_block_gate_up_mult_grad follows grad_accum_dtype, the other 2 stay compute_dtype.
+        buffered = self.buffer_degree * ((grad_elem + 2 * elem) * NUM_B_TILES * I_TP_BLOCK_SIZE + H_BLOCK_SIZE * elem)
 
         # Affinity I adds significant persistent buffers
         is_affinity_i = affinity_option == AffinityOption.AFFINITY_ON_I if affinity_option is not None else False
@@ -258,7 +286,7 @@ class GateUpOutputGradBlocking(nl.NKIObject):
         shard_h_bytes = 0
         if is_shard_on_h:
             b_tiles_per_core = max(1, NUM_B_TILES // num_shards)
-            shard_h_bytes = b_tiles_per_core * I_TP_BLOCK_SIZE * elem
+            shard_h_bytes = b_tiles_per_core * I_TP_BLOCK_SIZE * grad_elem
 
         persistent_bytes = base_persistent + buffered + affinity_i_bytes + shard_h_bytes
 
@@ -280,13 +308,44 @@ class DownWeightGradBlocking(nl.NKIObject):
         buffer_degree (int): Number of multi-buffer sections for interleaved execution.
     """
 
-    block_h: int = 2
+    block_h: int = 2  # bf16 / TOT
     block_b: int = 4
     block_i: int = 8
-    buffer_degree: int = 3
+    buffer_degree: int = 3  # bf16 / TOT
+    buffer_degree_fp32: int = 1  # fp32: weight-grad accumulators are 2x bytes -> less buffering
+    block_h_fp32: int = 1  # fp32: halve block_h to fit the SBUF budget
+
+    def get_buffer_degree(self, grad_accum_dtype):
+        """Return the dtype-appropriate buffer degree (fp32 accumulators are 2x bytes)."""
+        return self.buffer_degree_fp32 if grad_accum_dtype == nl.float32 else self.buffer_degree
+
+    def set_buffer_degree(self, buffer_degree, buffer_degree_fp32=None):
+        """Configure the bf16 (default) and optional fp32 buffer degrees."""
+        self.buffer_degree = buffer_degree
+        if buffer_degree_fp32 is not None:
+            self.buffer_degree_fp32 = buffer_degree_fp32
+
+    def get_block_h(self, grad_accum_dtype):
+        """Return the dtype-appropriate block_h (fp32 accumulator is 2x bytes)."""
+        return self.block_h_fp32 if grad_accum_dtype == nl.float32 else self.block_h
+
+    def set_block_h(self, block_h, block_h_fp32=None):
+        """Configure the bf16 (default) and optional fp32 block_h."""
+        self.block_h = block_h
+        if block_h_fp32 is not None:
+            self.block_h_fp32 = block_h_fp32
 
     def estimate_sbuf_usage(
-        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+        self,
+        B,
+        H,
+        I_TP,
+        num_shards,
+        dtype,
+        shard_option=None,
+        affinity_option=None,
+        is_tensor_update_accumulating=True,
+        grad_accum_dtype=None,
     ):
         """
         Estimate peak SBUF bytes for _compute_down_projection_weight_grad.
@@ -313,7 +372,7 @@ class DownWeightGradBlocking(nl.NKIObject):
         H_TILE_SIZE = min(PSUM_SIZE, H_SHARDED)
         I_TP_TILE_SIZE = TILE_SIZE
 
-        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H_SHARDED)
+        H_BLOCK_SIZE = min(self.get_block_h(grad_accum_dtype) * H_TILE_SIZE, H_SHARDED)
         I_TP_BLOCK_SIZE = min(self.block_i * I_TP_TILE_SIZE, I_TP)
         B_BLOCK_SIZE = min(self.block_b * B_TILE_SIZE, B)
 
@@ -322,12 +381,14 @@ class DownWeightGradBlocking(nl.NKIObject):
 
         # Persistent: buffer_degree × (result_tiles + existing_weight_grad)
         # Shape: (I_TP_TILE_SIZE, NUM_I_TP_TILES, H_BLOCK_SIZE) → free = NUM_I_TP_TILES * H_BLOCK_SIZE
-        persistent_bytes = 2 * self.buffer_degree * NUM_I_TP_TILES * H_BLOCK_SIZE * elem
+        # Both accumulators follow the grad-output dtype (fp32 when caller preallocates fp32 grad HBM).
+        grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
+        persistent_bytes = 2 * self.get_buffer_degree(grad_accum_dtype) * NUM_I_TP_TILES * H_BLOCK_SIZE * grad_elem
 
         # Inner section: lhs_tiles (B_TILE, NUM_B_TILES, I_TP_BLOCK) + rhs_tiles (B_TILE, NUM_B_TILES, H_BLOCK)
         inner_section_bytes = NUM_B_TILES * (I_TP_BLOCK_SIZE + H_BLOCK_SIZE) * elem
 
-        return persistent_bytes + self.buffer_degree * inner_section_bytes
+        return persistent_bytes + self.get_buffer_degree(grad_accum_dtype) * inner_section_bytes
 
 
 @dataclass
@@ -346,9 +407,40 @@ class HiddenGradBlocking(nl.NKIObject):
     block_b: int = 4
     block_i: int = 8
     buffer_degree: int = 3
+    block_h_fp32: int = 4  # fp32: widen block_h so H fits in fewer H-blocks -> fewer grad-out scatter intervals
+    buffer_degree_fp32: int = 2  # fp32: less buffering to offset the wider block_h and stay in SBUF
+
+    def get_buffer_degree(self, grad_accum_dtype):
+        """Return the dtype-appropriate buffer degree (fp32 accumulators are 2x bytes)."""
+        return self.buffer_degree_fp32 if grad_accum_dtype == nl.float32 else self.buffer_degree
+
+    def set_buffer_degree(self, buffer_degree, buffer_degree_fp32=None):
+        """Configure the bf16 (default) and optional fp32 buffer degrees."""
+        self.buffer_degree = buffer_degree
+        if buffer_degree_fp32 is not None:
+            self.buffer_degree_fp32 = buffer_degree_fp32
+
+    def get_block_h(self, grad_accum_dtype):
+        """Return the dtype-appropriate block_h (fp32 grad-out is 2x bytes)."""
+        return self.block_h_fp32 if grad_accum_dtype == nl.float32 else self.block_h
+
+    def set_block_h(self, block_h, block_h_fp32=None):
+        """Configure the bf16 (default) and optional fp32 block_h."""
+        self.block_h = block_h
+        if block_h_fp32 is not None:
+            self.block_h_fp32 = block_h_fp32
 
     def estimate_sbuf_usage(
-        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+        self,
+        B,
+        H,
+        I_TP,
+        num_shards,
+        dtype,
+        shard_option=None,
+        affinity_option=None,
+        is_tensor_update_accumulating=True,
+        grad_accum_dtype=None,
     ):
         """
         Estimate peak SBUF bytes for _compute_hidden_states_grad.
@@ -375,7 +467,10 @@ class HiddenGradBlocking(nl.NKIObject):
         H_TILE_SIZE = min(PSUM_SIZE, H_SHARDED)
         I_TP_TILE_SIZE = min(TILE_SIZE, I_TP)
 
-        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H_SHARDED)
+        _bh = self.get_block_h(grad_accum_dtype)
+        _bd = self.get_buffer_degree(grad_accum_dtype)
+
+        H_BLOCK_SIZE = min(_bh * H_TILE_SIZE, H_SHARDED)
         I_TP_BLOCK_SIZE = min(self.block_i * I_TP_TILE_SIZE, I_TP)
         B_BLOCK_SIZE = min(self.block_b * B_TILE_SIZE, B)
 
@@ -386,15 +481,17 @@ class HiddenGradBlocking(nl.NKIObject):
         # Persistent: buffer_degree × (rhs_temp + result_tiles + optional existing_hidden_grad)
         # rhs_temp: (TILE_SIZE, NUM_H_INNER_TILES, I_TP_BLOCK_SIZE) → free = NUM_H_INNER_TILES * I_TP_BLOCK_SIZE
         # result_tiles: (B_TILE, NUM_B_TILES, H_BLOCK_SIZE) → free = NUM_B_TILES * H_BLOCK_SIZE
+        # rhs_temp stays compute_dtype; the result/existing accumulators follow the grad-output dtype.
+        grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
         result_count = 2 if is_tensor_update_accumulating else 1
-        persistent_bytes = self.buffer_degree * (
-            NUM_H_INNER_TILES * I_TP_BLOCK_SIZE * elem + result_count * NUM_B_TILES * H_BLOCK_SIZE * elem
+        persistent_bytes = _bd * (
+            NUM_H_INNER_TILES * I_TP_BLOCK_SIZE * elem + result_count * NUM_B_TILES * H_BLOCK_SIZE * grad_elem
         )
 
         # Inner section: lhs_tiles (I_TP_TILE, NUM_I_TP_TILES, B_BLOCK) + rhs_tiles (I_TP_TILE, NUM_I_TP_TILES, H_BLOCK)
         inner_section_bytes = NUM_I_TP_TILES * (B_BLOCK_SIZE + H_BLOCK_SIZE) * elem
 
-        return persistent_bytes + self.buffer_degree * inner_section_bytes
+        return persistent_bytes + _bd * inner_section_bytes
 
 
 @dataclass
@@ -412,10 +509,30 @@ class GateUpWeightGradBlocking(nl.NKIObject):
     block_h: int = 4
     block_b: int = 4
     block_i: int = 4
-    buffer_degree: int = 3
+    buffer_degree: int = 3  # bf16 / TOT
+    buffer_degree_fp32: int = 1  # fp32: weight-grad accumulators are 2x bytes -> less buffering
+
+    def get_buffer_degree(self, grad_accum_dtype):
+        """Return the dtype-appropriate buffer degree (fp32 accumulators are 2x bytes)."""
+        return self.buffer_degree_fp32 if grad_accum_dtype == nl.float32 else self.buffer_degree
+
+    def set_buffer_degree(self, buffer_degree, buffer_degree_fp32=None):
+        """Configure the bf16 (default) and optional fp32 buffer degrees."""
+        self.buffer_degree = buffer_degree
+        if buffer_degree_fp32 is not None:
+            self.buffer_degree_fp32 = buffer_degree_fp32
 
     def estimate_sbuf_usage(
-        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+        self,
+        B,
+        H,
+        I_TP,
+        num_shards,
+        dtype,
+        shard_option=None,
+        affinity_option=None,
+        is_tensor_update_accumulating=True,
+        grad_accum_dtype=None,
     ):
         """
         Estimate peak SBUF bytes for _compute_gate_up_projection_weight_grad.
@@ -451,12 +568,14 @@ class GateUpWeightGradBlocking(nl.NKIObject):
 
         # Persistent: buffer_degree × (weight_grad_accum + existing_weight_grad)
         # Shape: (H_TILE, NUM_H_TILES, I_TP_BLOCK_SIZE) → free = NUM_H_TILES * I_TP_BLOCK_SIZE
-        persistent_bytes = 2 * self.buffer_degree * NUM_H_TILES * I_TP_BLOCK_SIZE * elem
+        # Both accumulators follow the grad-output dtype (fp32 when caller preallocates fp32 grad HBM).
+        grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
+        persistent_bytes = 2 * self.get_buffer_degree(grad_accum_dtype) * NUM_H_TILES * I_TP_BLOCK_SIZE * grad_elem
 
         # Inner section: gate_up_proj_output_grad (B_TILE, NUM_B_TILES, I_TP_BLOCK) + block_hidden_states (B_TILE, NUM_B_TILES, H_BLOCK)
         inner_section_bytes = NUM_B_TILES * (I_TP_BLOCK_SIZE + H_BLOCK_SIZE) * elem
 
-        return persistent_bytes + self.buffer_degree * inner_section_bytes
+        return persistent_bytes + self.get_buffer_degree(grad_accum_dtype) * inner_section_bytes
 
 
 @dataclass
@@ -568,6 +687,7 @@ class MOEBwdParameters(nl.NKIObject):
     skip_grad_initialization: bool = False
     clamp_limits: ClampLimits = None
     activation_type: ActFnType = ActFnType.SiLU
+    skip_gate_proj: bool = False
     blocking_params: MOEBwdDroplessBlockingParams = None
     affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_H
     shard_option: ShardOption = ShardOption.SHARD_ON_FREE
@@ -655,18 +775,14 @@ class MOEBwdParameters(nl.NKIObject):
 
     def get_activation_ops(self):
         """
-        Get forward and backward activation functions based on activation_type.
+        Get the activation type for forward and backward pass dispatch.
 
         Returns:
-            tuple: (forward_fn, backward_fn) activation function pair.
+            ActFnType: The activation function type. Callers use apply_activation()
+            and apply_activation_dx() from kernel_helpers with this type.
         """
-        if self.activation_type == ActFnType.Swish:
-            return nl.gelu_apprx_sigmoid, nl.gelu_apprx_sigmoid_dx
-        elif self.activation_type == ActFnType.SiLU:
-            return nl.silu, nl.silu_dx
-        # The dropless backward only implements SiLU and Swish. GELU / GELU_Tanh_Approx exist
-        # in the shared ActFnType but are not supported by this kernel
         kernel_assert(
-            False,
-            "moe dropless backward supports only SiLU and Swish activations",
+            self.activation_type in (ActFnType.SiLU, ActFnType.Swish, ActFnType.SquaredReLU),
+            f"moe dropless backward supports only SiLU, Swish, and SquaredReLU activations, got {self.activation_type}",
         )
+        return self.activation_type

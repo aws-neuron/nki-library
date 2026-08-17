@@ -13,7 +13,6 @@
 # limitations under the License.
 import nki.language as nl
 
-from ._helpers import MAX_AP_LEVELS
 from .axis import AxisLabel
 
 
@@ -35,8 +34,9 @@ class APEmitter(nl.NKIObject):
       - drop_unit_levels: drop [stride, 1] entries; keep at most one
         matching the partition stride.
 
-    Output: list of [stride, count] pairs, capped at MAX_AP_LEVELS.
-    Stride per AP level is `axis.step * source_strides[axis.dim]`.
+    Output: list of [stride, count] pairs. Stride per AP level is
+    `axis.step * source_strides[axis.dim]`. No level-count cap -- the compiler
+    validates descriptor depth when the AP is consumed.
     """
 
     @staticmethod
@@ -62,19 +62,14 @@ class APEmitter(nl.NKIObject):
             Drops ``count == 1`` levels (except the partition axis, which
             is structurally required for SBUF AP rank consistency).
             Applies merge-contiguous (with source clamp) and
-            partition-hoist peephole passes.
-
-        Raises:
-            AssertionError: Result exceeds ``MAX_AP_LEVELS`` after the
-                peephole passes -- the AP cannot be represented within
-                the hardware's AP-level cap.
+            partition-hoist peephole passes. No level-count cap (the
+            compiler validates descriptor depth).
         """
         levels = APEmitter._emit_raw(axes, source_strides)
         levels = APEmitter._merge_contiguous(axes, levels, element_shape)
         levels = APEmitter._hoist_partition(axes, source_strides, levels)
         partition_stride = APEmitter._partition_stride(axes, source_strides)
         levels = APEmitter._drop_unit_levels(levels, partition_stride)
-        assert len(levels) <= MAX_AP_LEVELS, "AP exceeds " + str(MAX_AP_LEVELS) + " levels: " + str(levels)
         return levels
 
     # ================================================================

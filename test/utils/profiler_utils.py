@@ -12,34 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Utility functions for neuron-profile command generation.
+Utility functions for neuron-explorer command generation.
 """
 
 import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .core_lock_client import INFERENCE_LOCK_TIMEOUT_SECONDS
+from .core_lock_client import DEFAULT_LOCK_TIMEOUT_SECONDS
 
 NEURON_RT_ENABLE_DGE_NOTIFICATIONS: str = "NEURON_RT_ENABLE_DGE_NOTIFICATIONS"
 
 
 def extract_and_filter_output_files(stdout: str, download_all: bool) -> list[str]:
     """
-    Extract output files from neuron-profile stdout and filter based on profiling configuration.
+    Extract output files from neuron-explorer stdout and filter based on profiling configuration.
 
     Args:
-        stdout: stdout from neuron-profile execution
+        stdout: stdout from neuron-explorer execution
         download_all: If True, return all outputs. If False, return only last execution.
 
     Returns:
         List of output filenames to copy from remote host
     """
-    # Extract output files from neuron-profile stdout
+    # Extract output files from neuron-explorer stdout
     output_files = re.findall(r'saved output "[^"]+" as "([^"]+)"', stdout)
 
     # Filter output files based on download_all flag.
-    # When download_all=False, neuron-profile still generates all outputs,
+    # When download_all=False, neuron-explorer still generates all outputs,
     # but we only want to copy outputs from the last execution for validation.
     # For kernels with multiple outputs (e.g., out + k_out), we need to keep
     # ALL outputs from the last execution, not just the very last file.
@@ -65,7 +65,7 @@ def extract_and_filter_output_files(stdout: str, download_all: bool) -> list[str
 
 @dataclass
 class ProfilerCommands:
-    """Container for all neuron-profile commands and expected files."""
+    """Container for all neuron-explorer commands and expected files."""
 
     capture_cmd: str
     show_cmd: str
@@ -93,12 +93,12 @@ class ProfilerCommands:
         explorer_binary_path: str = "neuron-explorer",
     ):
         """
-        Build all neuron-profile commands for capture, show-session, and JSON generation.
+        Build all neuron-explorer commands for capture, show-session, and JSON generation.
 
         Args:
             num_runs: Total number of kernel executions
             profile_all_runs: Whether to profile all executions or just the last (controls --profile-nth-exec)
-            profiler_binary_path: Path to neuron-profile binary
+            profiler_binary_path: Path to neuron-explorer binary
             kernel_input_args: Formatted kernel input arguments for profiler
                 For single input: "input inp-input-000.bin weights inp-weights-000.bin"
                 For per-rank inputs: "--multi-input 4rank_inputs.txt"
@@ -111,7 +111,7 @@ class ProfilerCommands:
                 is empty (post-lock show-session/view-JSON/parquet commands become no-ops), and
                 profile-derived metrics (MBU, MFU, cycles, ActiveInferenceTime) are recorded as -1.
             save_all_outputs: Whether to save outputs from all executions or just the last (controls --save-nth-output)
-            force_clean_input_writes: Force neuron-profile to re-read all input tensors between N
+            force_clean_input_writes: Force neuron-explorer to re-read all input tensors between N
                 executions, so that tensors from previous runs don't clobber subsequent executions.
                 Useful for kernels with aliased input tensors AND using tensor cache.
             separation_pass_enabled: Whether separation pass is enabled (adds --ignore-exec-errors)
@@ -126,7 +126,7 @@ class ProfilerCommands:
         collective_args = self._generate_collective_args(collective_ranks, profile_all_ranks)
 
         # Timeout should be less than lock timeout to avoid hanging past lock expiration
-        timeout_seconds = INFERENCE_LOCK_TIMEOUT_SECONDS - 5
+        timeout_seconds = DEFAULT_LOCK_TIMEOUT_SECONDS - 5
 
         capture_cmd_parts = [
             "TIMEFORMAT='NEURON_PROFILE_CAPTURE_TIME: %R'; time"
@@ -167,7 +167,7 @@ class ProfilerCommands:
             show_cmd_parts.append(f"({header} && {' '.join(show_parts)})")
         self.show_cmd = " && ".join(show_cmd_parts)
 
-        # Build JSON generation commands if metrics enabled (neuron-profile view).
+        # Build JSON generation commands if metrics enabled (neuron-explorer view).
         # Uses summary-json format which only outputs summary metrics
         self.expected_profiler_view_json_files = []
         json_cmd_parts = []
@@ -240,7 +240,7 @@ class ProfilerCommands:
         """
         Generate list of expected ntff file names based on configuration.
 
-        neuron-profile naming behavior:
+        neuron-explorer naming behavior:
         - --num-exec=1: creates profile.ntff
         - --num-exec=N (N>1): creates profile.ntff for exec 1, profile_exec_2.ntff, ..., profile_exec_N.ntff
         - --num-exec=N --profile-nth-exec=M: creates profile_exec_M.ntff (or profile.ntff if N=1)
@@ -280,7 +280,7 @@ class ProfilerCommands:
 
     def _generate_profiler_exec_args(self, num_runs: int, profile_all_runs: bool, save_all_outputs: bool) -> str:
         """
-        Generate neuron-profile execution arguments.
+        Generate neuron-explorer execution arguments.
 
         Args:
             num_runs: Total number of kernel executions
@@ -288,7 +288,7 @@ class ProfilerCommands:
             save_all_outputs: Whether to save all executions' outputs or just the last
 
         Returns:
-            String of neuron-profile arguments (e.g., "--num-exec=3 --profile-nth-exec=3")
+            String of neuron-explorer arguments (e.g., "--num-exec=3 --profile-nth-exec=3")
         """
 
         args = f"--num-exec={num_runs}"
@@ -304,14 +304,14 @@ class ProfilerCommands:
 
     def _generate_collective_args(self, collective_ranks: int, profile_all_ranks: bool) -> str:
         """
-        Generate neuron-profile collective arguments.
+        Generate neuron-explorer collective arguments.
 
         Args:
             collective_ranks: Number of collective ranks
             profile_all_ranks: Whether to profile all ranks or just rank 0 (controls --collectives-profile-id)
 
         Returns:
-            String of neuron-profile arguments for collectives
+            String of neuron-explorer arguments for collectives
         """
         if collective_ranks <= 1:
             return ""

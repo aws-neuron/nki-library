@@ -24,7 +24,9 @@ import logging
 import os
 import shutil
 import sys
+import time
 from collections.abc import Generator
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,14 +35,10 @@ import pytest_timeout
 from _pytest.config import Config
 
 from .utils import cpu_timeout
+from .utils.common_dataclasses import is_xdist_worker
 
 if TYPE_CHECKING:
     from .utils.test_orchestrator import Orchestrator
-
-# Set consistent hash seed for xdist workers to ensure identical test collection
-_RNG_SEED_ENV_KEY = "NEURON_PYTHONHASHSEED"
-if "PYTEST_XDIST_WORKER" in os.environ and _RNG_SEED_ENV_KEY not in os.environ:
-    os.environ[_RNG_SEED_ENV_KEY] = "0"
 
 
 import pytest
@@ -53,6 +51,9 @@ from .utils.artifact_manager import (
     validate_s3_credentials,
 )
 from .utils.common_dataclasses import (
+    PYTEST_XDIST_WORKER_ENV,
+    HostProvisioningMode,
+    HostProvisioningResult,
     NKICompilationMode,
     Platforms,
     TargetHost,
@@ -67,24 +68,45 @@ from .utils.feature_flag_helper import (
     resolve_base_output_directory,
 )
 from .utils.host_management import HostManager
-from .utils.metrics_collector import IMetricsCollector
+from .utils.host_state import OwnerHostStateStore
+from .utils.memory_monitor import ProcessTreeMemoryMonitor
+from .utils.metrics_collector import (
+    IMetricsCollector,
+    MetricsCollector,
+    NoopMetricsCollector,
+    add_rerun_dimensions,
+)
 from .utils.metrics_emitter import IMetricsEmitter, OutputMode, SessionContext
 from .utils.pytest_plugin import (
+    CONTROLLER_SETUP_COLLECTOR_KEY,
+    QOR_SESSION_ID_KEY,
+    SESSION_CONTEXT_KEY,
+    apply_host_provisioning_result,
     get_platform_targets,
+    is_recoverable_run,
     make_collector,
     make_emitter,
     make_host_manager,
     make_test_manager,
     resolve_current_user,
+    resolve_host_provisioning_mode,
     resolve_session_trace_mode,
+    resolve_testrun_uid,
 )
 from .utils.pytest_test_metadata import derive_labeled_kernel_name
 from .utils.qor_collector import collect_qor_from_test_dir
+from .utils.relevant_test_selection.filtering import (
+    partition_items_by_relevance,
+    resolve_relevant_test_dirs,
+    ship_relevant_test_dirs_to_worker,
+)
 from .utils.s3_utils import S3ArtifactUploadConfig, prefetch_and_cache_credentials
 from .utils.sqs_emitter import SQSEmitter
 
-# Key for storing relevant test directories on pytest config (used by --run-relevant-tests)
-RELEVANT_TEST_DIRS_KEY = "_relevant_test_dirs"
+# Set consistent hash seed for xdist workers to ensure identical test collection
+_RNG_SEED_ENV_KEY = "NEURON_PYTHONHASHSEED"
+if is_xdist_worker() and _RNG_SEED_ENV_KEY not in os.environ:
+    os.environ[_RNG_SEED_ENV_KEY] = "0"
 
 
 def pytest_addoption(parser):
@@ -157,13 +179,13 @@ def pytest_addoption(parser):
         nargs="?",
         const=20,
         default=None,
-        help="Track per-test peak RSS and print the N slowest (default 20)",
+        help="Track per-test peak memory and print the N slowest (default 20)",
     )
     group.addoption(
         "--memory-limit",
         type=float,
         default=None,
-        help="Kill a test if its process tree RSS exceeds this many MB",
+        help="Kill a test if its process tree memory exceeds this many MB",
     )
     group.addoption(
         "--monitor-durations",
@@ -190,7 +212,7 @@ def artifacts_output_directory(request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture(scope="session")
 def test_worker_id() -> str:
-    return os.environ.get("PYTEST_XDIST_WORKER", default="gw_master")
+    return os.environ.get(PYTEST_XDIST_WORKER_ENV, default="gw_master")
 
 
 # Logging from xdist is very tricky, as workers can only write to stderr and ignore most of the logging configuration.
@@ -235,62 +257,81 @@ def setup_logging(request: pytest.FixtureRequest, test_worker_id: str, artifacts
     logging.info(f'Logging format in worker: {log_format=} {log_file=} {log_level=}')
 
 
+def _resolve_target_host_file(config: Config) -> list[TargetHost] | None:
+    """Parse the ``--target-host-file`` into a TargetHost list (with the internal
+    ``dice`` pseudo-host filtered out), or None when no file is given.
+
+    Returning None lets make_host_manager fall back to its own ``--target-host`` CLI
+    handling, keeping this private file/dice parsing out of the shared plugin.
+    """
+    target_host_file: str | None = get_feature_flag(config, "target_host_file")
+    if not target_host_file:
+        return None
+
+    platforms = get_platform_targets(config)
+    with open(target_host_file, "r") as f:
+        data = json.load(f)
+
+    target_hosts: list[TargetHost] = []
+    for i, host in enumerate(data["sharedFleet"]):
+        # sshHost takes precedence over publicIp.
+        # TODO: Support for publicIp can be removed once we stop supporting static host lists in the pipeline.
+        if "sshHost" in host:
+            ssh_host = host["sshHost"]
+        elif "publicIp" in host:
+            ssh_host = host["publicIp"]
+        else:
+            raise ValueError(f"Host entry {i} in {target_host_file} is missing required 'sshHost' or 'publicIp' field")
+        if "hostType" not in host:
+            logging.warning(
+                "Host entry %d in %s is missing 'hostType', falling back to %s",
+                i,
+                target_host_file,
+                platforms[0].value,
+            )
+        host_type = Platforms(host["hostType"]) if "hostType" in host else platforms[0]
+        target_hosts.append(TargetHost(ssh_host=ssh_host, host_type=host_type))
+
+    # Filter out "dice" pseudo-host — DICE inference is handled via DICE_ENDPOINT env var.
+    return [th for th in target_hosts if th.ssh_host != "dice"]
+
+
+def _initialize_exclusive_mode(config: Config) -> None:
+    """Reserve one host for the exclusive session, then narrow the env so workers use it.
+
+    Probes fleet candidates, picks the first reachable host, and exports
+    NKILIB_TARGET_HOST so xdist workers (which inherit env before spawning —
+    DSession.pytest_sessionstart is @pytest.hookimpl(trylast=True)) take the
+    --target-host path in make_host_manager. If the user already specified
+    --target-host explicitly, their choice is respected and no probing occurs.
+    """
+    # Respect an explicit --target-host; do not override the user's choice.
+    explicit_targets: list[str] = get_feature_flag(config, "target_host", [])
+    if explicit_targets:
+        return
+
+    target_hosts = _resolve_target_host_file(config)
+    if not target_hosts:
+        raise pytest.UsageError(
+            "--exclusive-host requires a remote fleet host file (--shared-fleet or NKILIB_TARGET_HOST_FILE)."
+        )
+    alias = HostManager.test_session(
+        target_hosts=target_hosts,
+        ssh_config_path=os.path.expanduser(get_feature_flag(config, "ssh_config_path", "~/.ssh/config")),
+        testrun_uid=resolve_testrun_uid(config),
+    )
+    os.environ["NKILIB_TARGET_HOST"] = alias
+    os.environ.pop("NKILIB_TARGET_HOST_FILE", None)
+
+
 @pytest.fixture(scope="session")
 def host_manager(request: pytest.FixtureRequest) -> HostManager:
-    platforms = get_platform_targets(request.config)
-    target_host_file: str | None = get_feature_flag(request.config, "target_host_file")
-
-    # Build target hosts list
-    target_hosts: list[TargetHost] = []
-    if target_host_file:
-        # Load hosts from JSON file (includes host types, defaults to platform_target if missing)
-        with open(target_host_file, "r") as f:
-            data = json.load(f)
-        for i, host in enumerate(data["sharedFleet"]):
-            # sshHost takes precedence over publicIp.
-            # TODO: Support for publicIp can be removed once we stop supporting static host lists in the pipeline.
-            if "sshHost" in host:
-                ssh_host = host["sshHost"]
-            elif "publicIp" in host:
-                ssh_host = host["publicIp"]
-            else:
-                raise ValueError(
-                    f"Host entry {i} in {target_host_file} is missing required 'sshHost' or 'publicIp' field"
-                )
-            if "hostType" not in host:
-                logging.warning(
-                    "Host entry %d in %s is missing 'hostType', falling back to %s",
-                    i,
-                    target_host_file,
-                    platforms[0].value,
-                )
-            host_type = Platforms(host["hostType"]) if "hostType" in host else platforms[0]
-            target_hosts.append(
-                TargetHost(
-                    ssh_host=ssh_host,
-                    host_type=host_type,
-                )
-            )
-
-    # Filter out "dice" pseudo-host — DICE inference is handled via DICE_ENDPOINT env var
-    target_hosts = [th for th in target_hosts if th.ssh_host != "dice"]
-
-    # When no host file, let make_host_manager handle --target-host CLI (including single-platform assertion)
-    if not target_host_file:
-        return make_host_manager(request.config)
-
-    return make_host_manager(request.config, target_hosts=target_hosts)
+    return make_host_manager(request.config, target_hosts=_resolve_target_host_file(request.config))
 
 
 @pytest.fixture(scope="session")
 def session_trace_mode(request: pytest.FixtureRequest) -> TraceMode:
     """Session-wide trace mode from CLI flags. Individual tests may override via markers."""
-    # --target-host-file implies CompileAndInfer (internal option not known to plugin)
-    test_mode = get_feature_flag(request.config, "test_mode")
-    if test_mode:
-        return TraceMode.create(test_mode)
-    if get_feature_flag(request.config, "target_host_file"):
-        return TraceMode.CompileAndInfer
     return resolve_session_trace_mode(request.config)
 
 
@@ -313,7 +354,7 @@ def emitter(
     if metric_output_mode is None:
         emitter = make_emitter(metric_output_mode)
     else:
-        session_ctx = getattr(request.config, "_session_context", None)
+        session_ctx = request.config.stash.get(SESSION_CONTEXT_KEY, None)
         emitters: list[IMetricsEmitter] = [make_emitter(metric_output_mode)]
         if session_ctx and session_ctx.sqs_queue_url:
             emitters.append(SQSEmitter(session=session_ctx))
@@ -426,6 +467,19 @@ def pytest_runtest_makereport(item, call):
                 # (e.g. assertion in test setup, fixture error, or pre-orchestrator validation).
                 collector.add_dimension({"Status": "TEST_EXECUTION_FAILURE"})
 
+            # execution_count is set by pytest-rerunfailures (1-based attempt
+            # index). rep.failed is read here before rerunfailures flips
+            # rep.outcome to "rerun", so it accurately reflects this attempt.
+            failure_reason = None
+            if rep.failed and rep.longrepr is not None:
+                failure_reason = str(getattr(rep.longrepr, "reprcrash", None) or rep.longrepr)
+            add_rerun_dimensions(
+                collector,
+                getattr(item, "execution_count", 1),
+                rep.failed,
+                failure_reason,
+            )
+
             emitter = getattr(item, "_emitter", None)
             if emitter:
                 emitter.emit(collector)
@@ -458,9 +512,9 @@ def run_after_every_test(
 
             # Collect QoR data BEFORE cleanup (only if test dir exists)
             if os.path.isdir(test_dir_full_path):
-                # Get session ID from master or worker
-                if hasattr(request.config, "_qor_session_id"):
-                    session_id = request.config._qor_session_id
+                # Get session ID from master (stash) or worker (bridged via workerinput)
+                if QOR_SESSION_ID_KEY in request.config.stash:
+                    session_id = request.config.stash[QOR_SESSION_ID_KEY]
                 elif hasattr(request.config, "workerinput"):
                     session_id = request.config.workerinput.get("qor_session_id")
                 else:
@@ -489,13 +543,11 @@ def run_after_every_test(
 
 @pytest.fixture(autouse=True)
 def _memory_monitor(request: pytest.FixtureRequest) -> Generator[None, None, None]:
-    """Track per-test peak RSS and enforce memory limits.
+    """Track per-test peak memory and enforce memory limits.
 
-    --monitor-memory: record peak and delta RSS per test to memory_monitor.csv
-    --memory-limit N: kill the test if its delta RSS exceeds N MB
+    --monitor-memory: record peak and delta memory per test to memory_monitor.csv
+    --memory-limit N: kill the test if its delta memory exceeds N MB
     """
-    from test.utils.memory_monitor import ProcessTreeMemoryMonitor
-
     monitor_memory = get_feature_flag(request.config, "monitor_memory")
     memory_limit_mb = request.config.getoption("memory_limit", default=None)
 
@@ -513,9 +565,7 @@ def _memory_monitor(request: pytest.FixtureRequest) -> Generator[None, None, Non
 
         if monitor_memory:
             output_dir = Path(resolve_base_output_directory(request.config))
-            MEMORY_MONITOR.append(
-                output_dir, f"{request.node.nodeid},{snapshot.peak_rss_mb:.1f},{snapshot.delta_rss_mb:.1f}"
-            )
+            MEMORY_MONITOR.append(output_dir, f"{request.node.nodeid},{snapshot.peak_mb:.1f},{snapshot.delta_mb:.1f}")
 
 
 @pytest.fixture(autouse=True)
@@ -525,8 +575,6 @@ def _duration_monitor(request: pytest.FixtureRequest) -> Generator[None, None, N
     --monitor-durations N: record CPU time + wall time per test, print the N slowest
     (sorted by CPU time) in the summary.
     """
-    import time
-
     top_n = get_feature_flag(request.config, "monitor_durations")
     if top_n is None:
         yield
@@ -549,34 +597,83 @@ def pytest_ignore_collect(collection_path, config):
             return True
 
 
+# Synthetic kernel/test identity for controller-side (non-per-kernel) infra metrics, so they
+# ride the existing per-test SQS/OpenSearch path
+# HACK: params are set so the emitter's "skip params-less collector" guard doesn't drop it.
+_INFRA_METRIC_KERNEL_NAME = "_infra"
+_CONTROLLER_SETUP_TEST_NAME = "controller_setup"
+
+
+def _make_controller_setup_collector(config: Config) -> IMetricsCollector:
+    """Build a controller-side metrics collector for infra metrics emitted before/around the
+    test session. Returns a NoopMetricsCollector when metrics are disabled.
+    Stamped with a synthetic kernel/test identity so it flows through
+    the same per-test SQS emission path (see pytest_sessionfinish)."""
+    metric_output = get_feature_flag(config, "metric_output")
+    if not metric_output:
+        return NoopMetricsCollector()
+    namespace = get_feature_flag(config, "metrics_namespace", default_value="NeuronCompiler")
+    collector = MetricsCollector()
+    collector.set_namespace(namespace)
+    collector.add_dimension({"KernelName": _INFRA_METRIC_KERNEL_NAME})
+    collector.set_test_name(_CONTROLLER_SETUP_TEST_NAME)
+    # Non-empty params: the SQS emitter skips params-less collectors as non-dashboard.
+    collector.set_kernel_params({"component": "controller_setup"})
+    return collector
+
+
+def _setup_host_state(config: Config, profile: str | None) -> None:
+    """Controller-only host_state.json setup at session start.
+
+    This function should be called once, and only by the master.
+    """
+    state_store = OwnerHostStateStore(resolve_base_output_directory(config))
+
+    try:
+        from .utils.shared_fleet_plugin_private import maybe_setup_shared_fleet
+
+        collector = _make_controller_setup_collector(config)
+        config.stash[CONTROLLER_SETUP_COLLECTOR_KEY] = collector
+        result = maybe_setup_shared_fleet(config, profile, state_store, collector)
+        if result.plugin_provisioned:
+            apply_host_provisioning_result(config, result)
+            return  # the plug-in claimed the run
+    except ImportError:
+        pass
+
+    has_static_hosts = get_feature_flag(config, "target_host_file") or get_feature_flag(config, "target_host", [])
+    if not has_static_hosts:
+        return  # no remote hosts
+
+    # Static --target-host-file / --target-host: clean slate so workers don't inherit a
+    # previous run's state, then each worker initializes membership from its host list.
+    state_store.reset()
+
+
 def pytest_configure(config: Config):
     # Set env var early so model_config modules see it at import time during collection
     if get_feature_flag(config, "skip_model_tests", False):
         os.environ["SKIP_MODEL_TESTS"] = "1"
         logging.info("SKIP_MODEL_TESTS enabled: model config modules will not be loaded")
 
+    if hasattr(config, "workerinput"):
+        blob = config.workerinput.get("host_provisioning_result")
+        if blob is not None:
+            apply_host_provisioning_result(config, HostProvisioningResult(**blob))
+
     sqs_queue_url = get_feature_flag(config, "sqs_queue_url")
 
-    # Pre-fetch AWS credentials before xdist workers spawn to avoid Isengard rate limiting
-    # This only runs in the main process; workers will inherit the env vars
-    # Workers have 'workerinput' attribute set on config, master does not
+    # Resolve the relevant-test selection onto config in every process (master
+    # computes it; each worker adopts it)
+    resolve_relevant_test_dirs(config, Path(__file__).parent.parent, get_feature_flag)
+
+    # Once-per-session master-only setup (workers inherit env vars / get shipped state).
+    # Workers have 'workerinput' on config; the master does not.
     if not hasattr(config, "workerinput"):
         # Generate QoR session ID for this test run
-        config._qor_session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        config.stash[QOR_SESSION_ID_KEY] = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-        # Build relevant test directory set when --run-relevant-tests is active
-        commit_ids = get_feature_flag(config, "run_relevant_tests")
-        if commit_ids:
-            from .utils.relevant_test_finder import RelevantTestFinder
-
-            finder = RelevantTestFinder(repo_root=Path(__file__).parent.parent)
-            setattr(config, RELEVANT_TEST_DIRS_KEY, finder.get_relevant_test_dirs(commit_ids))
-            relevant_dirs = getattr(config, RELEVANT_TEST_DIRS_KEY)
-            if relevant_dirs is not None:
-                logging.info("Relevant test directories: %s", relevant_dirs)
-            else:
-                logging.info("Running all tests (infrastructure change or fallback)")
-
+        # Pre-fetch AWS credentials before xdist workers spawn to avoid Isengard rate limiting.
         artifact_bucket = get_feature_flag(config, "artifact_upload_s3_bucket")
         test_output_bucket = get_feature_flag(config, "test_output_s3_bucket")
         profile = get_feature_flag(config, "aws_profile")
@@ -584,9 +681,12 @@ def pytest_configure(config: Config):
         if artifact_bucket or test_output_bucket or sqs_queue_url:
             prefetch_and_cache_credentials(profile)
 
+        # Set up host_state.json for remote runs
+        _setup_host_state(config, profile)
+
     # Create session context (single source of truth for session-level fields).
     # Must be outside the master-only block so xdist workers also build it.
-    config._session_context = SessionContext(
+    config.stash[SESSION_CONTEXT_KEY] = SessionContext(
         target=",".join(p.value for p in get_platform_targets(config)),
         trace_mode=resolve_session_trace_mode(config).value,
         nki_compilation_mode=get_feature_flag(config, "nki_compilation_mode"),
@@ -613,35 +713,32 @@ def pytest_configure(config: Config):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
-    # Filter to relevant tests when --run-relevant-tests is active
-    relevant_dirs = getattr(config, RELEVANT_TEST_DIRS_KEY, "NOT_SET")
-    if relevant_dirs != "NOT_SET" and relevant_dirs is not None:
-        original_count = len(items)
-        kept = []
-        deselected = []
-        for item in items:
-            if any(str(item.fspath).startswith(d) for d in relevant_dirs):
-                kept.append(item)
-            else:
-                deselected.append(item)
-        if deselected:
-            config.hook.pytest_deselected(items=deselected)
-        items[:] = kept
-        logging.info(
-            "Relevant test filter: %d -> %d tests (%d deselected)", original_count, len(items), len(deselected)
-        )
+    # Filter to relevant tests when --run-relevant-tests is active. The selection
+    # was resolved onto config in pytest_configure (same attribute in every process),
+    # so this reads uniformly regardless of master/worker.
+    partitioned = partition_items_by_relevance(config, items)
+    if partitioned is None:
+        return  # flag off, or finder chose to run everything
+    kept, deselected = partitioned
+    original_count = len(items)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = kept
+    logging.info("Relevant test filter: %d -> %d tests (%d deselected)", original_count, len(kept), len(deselected))
 
 
 def pytest_configure_node(node):
     """Pass session state from master to workers (xdist hook)."""
-    if hasattr(node.config, "_qor_session_id"):
-        node.workerinput["qor_session_id"] = node.config._qor_session_id
-    if hasattr(node.config, RELEVANT_TEST_DIRS_KEY):
-        node.workerinput["relevant_test_dirs"] = (
-            list(getattr(node.config, RELEVANT_TEST_DIRS_KEY))
-            if getattr(node.config, RELEVANT_TEST_DIRS_KEY) is not None
-            else None
-        )
+    stash = node.config.stash
+    if QOR_SESSION_ID_KEY in stash:
+        node.workerinput["qor_session_id"] = stash[QOR_SESSION_ID_KEY]
+    ship_relevant_test_dirs_to_worker(node)
+
+    result = HostProvisioningResult(
+        plugin_provisioned=resolve_host_provisioning_mode(node.config) is HostProvisioningMode.PLUGIN_PROVISIONED,
+        recoverable=is_recoverable_run(node.config),
+    )
+    node.workerinput["host_provisioning_result"] = asdict(result)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -655,8 +752,14 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if hasattr(session.config, "workerinput"):
         return
 
+    # Clean up exclusive-host reset-state files (controller only, after all workers done).
+    from .utils.core_reset_strategy import CoreResetStrategy
+
+    uid = resolve_testrun_uid(session.config)
+    CoreResetStrategy.cleanup_session_locks(uid)
+
     # Emit run_complete via SQS
-    session_ctx = getattr(session.config, "_session_context", None)
+    session_ctx = session.config.stash.get(SESSION_CONTEXT_KEY, None)
     if session_ctx and session_ctx.sqs_queue_url:
         terminalreporter = session.config.pluginmanager.get_plugin("terminalreporter")
         # A skipped test has a "passed" setup phase, so exclude skipped nodeids from passed.
@@ -671,12 +774,22 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             tests_skipped=len(skipped_ids),
             tests_xfailed=len(xfailed_ids),
             coverage_data=get_coverage_data(session.config),
+            # Total run duration exactly as pytest reports it in the terminal
+            # summary's "... in <N>s" line (reusing pytest's own session timer).
+            run_duration_sec=terminalreporter._session_start.elapsed().seconds,
         )
 
+        # Emit the controller-side setup-phase metrics (e.g. a provisioning plug-in's startup
+        # timing). These are recorded on the master with no per-test emit cycle, so they ride
+        # the session-end SQS path here rather than a test's collector.
+        setup_collector = session.config.stash.get(CONTROLLER_SETUP_COLLECTOR_KEY, None)
+        if setup_collector is not None:
+            SQSEmitter(session=session_ctx).emit(setup_collector)
+
     # Log QoR CSV file path
-    if hasattr(session.config, "_qor_session_id"):
+    if QOR_SESSION_ID_KEY in session.config.stash:
         output_dir = resolve_base_output_directory(session.config)
-        filepath = os.path.join(output_dir, f"qor_data_{session.config._qor_session_id}.csv")
+        filepath = os.path.join(output_dir, f"qor_data_{session.config.stash[QOR_SESSION_ID_KEY]}.csv")
         if os.path.exists(filepath):
             print(f"\nQoR data collected to {filepath}")
 
@@ -719,10 +832,16 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
-    """nkilib-internal: clean stale monitor CSVs."""
-    if not hasattr(session.config, "workerinput"):
-        output_dir = Path(resolve_base_output_directory(session.config))
-        if get_feature_flag(session.config, "monitor_memory") is not None:
-            MEMORY_MONITOR.cleanup_stale(output_dir)
-        if get_feature_flag(session.config, "monitor_durations") is not None:
-            DURATION_MONITOR.cleanup_stale(output_dir)
+    """Controller-only session setup: clean stale monitor CSVs and, in
+    exclusive-host mode, reserve one host for the whole session."""
+    if hasattr(session.config, "workerinput"):
+        return  # workers do nothing here
+
+    output_dir = Path(resolve_base_output_directory(session.config))
+    if get_feature_flag(session.config, "monitor_memory") is not None:
+        MEMORY_MONITOR.cleanup_stale(output_dir)
+    if get_feature_flag(session.config, "monitor_durations") is not None:
+        DURATION_MONITOR.cleanup_stale(output_dir)
+
+    if get_feature_flag(session.config, "exclusive_host", False):
+        _initialize_exclusive_mode(session.config)

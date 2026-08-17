@@ -20,7 +20,7 @@ Provides three interleaving strategies for preparing data for MXFP8 quantization
    Loads unswizzled [F, K] bf16 from HBM directly into interleaved SBUF layout
    via hardware gather-transpose.
 
-2. FP32 reinterpret transpose — ``load_tile_fp32_transpose``
+2. FP32 reinterpret transpose — ``load_tile_PE_Swizzle_1x32``
    Loads [F, K] bf16 from HBM, reinterprets as fp32 to halve the partition count,
    then uses 2× nc_transpose + scalar-engine tensor_copy to interleave.
    Best for data coming from HBM (weights, activations).
@@ -38,13 +38,14 @@ import nki.language as nl
 from nki.isa.constants import dge_mode, oob_mode
 
 from ....core.utils.kernel_assert import kernel_assert
-from .common_dataclasses import TensorDescriptor, TileLocation
+from .common_dataclasses import QuantScheme, TensorDescriptor, TileLocation
 from .common_utils import get_active_sbm
 from .quantize_mxfp8_utils import (
     INTERLEAVE_FACTOR,
     L_TILE_K,
     MIN_F_FOR_QUANTIZATION,
     MIN_K_FOR_QUANTIZATION,
+    MX_PARTITION_SIZE,
     Q_TILE_K,
     get_fp8_dtype_x4,
 )
@@ -126,10 +127,14 @@ def load_tile(
         kernel_assert(not load_loc.tensor.is_f_by_k, "The tensor needs to be K by F.")
         kernel_assert(load_loc.tensor.data.dtype == nl.bfloat16, "Input tensor must be bfloat16.")
         _load_tile_dma_copy(load_loc, data_store_loc, load_scales=False)
+    # bf16/fp16, unswizzled 1x32 quantization scheme: use FP32 reinterpret transpose path
+    elif load_loc.tensor.quant_scheme == QuantScheme._1x32:
+        kernel_assert(load_loc.tensor.is_f_by_k, "1x32 quantization currently requires F-by-K tensor layout.")
+        load_tile_PE_Swizzle_1x32(load_loc, data_store_loc)
     # bf16/fp16, unswizzled with PE swizzle: use PE transpose (indirect or direct
-    # determined by vector_offset presence inside load_tile_bf16_PE_transpose).
+    # determined by vector_offset presence inside load_tile_PE_swizzle_wrapX).
     elif load_loc.tensor.load_with_PE_swizzle:
-        load_tile_bf16_PE_transpose(load_loc, data_store_loc)
+        load_tile_PE_swizzle_wrapX(load_loc, data_store_loc)
     # bf16/fp16, unswizzled with direct dma loads use DGT.
     else:
         load_tile_dgt(load_loc, data_store_loc)
@@ -357,12 +362,21 @@ def load_tile_dgt(
     # Ensure input is F-by-K and 16-bit dtype
     kernel_assert(load_loc.tensor.is_f_by_k, "Transpose not implemented. DGT input tensor needs to be F by K.")
     kernel_assert(
+        load_loc.tensor.quant_scheme == QuantScheme.WRAPX,
+        "load_tile_dgt only supports wrapX quantization scheme.",
+    )
+    kernel_assert(
         src_data.dtype in (nl.bfloat16, nl.float16),
         f"DGT input tensor must be bfloat16 or float16, got {src_data.dtype}.",
     )
+    # The fast DMA transpose path gathers any tile_k that is a multiple of
+    # MX_PARTITION_SIZE (the quantization scale granularity) in a single op, so it only
+    # needs K aligned to MX_PARTITION_SIZE. The legacy vector-offset path still requires
+    # the coarser MIN_K_FOR_QUANTIZATION alignment.
+    min_k_alignment = MX_PARTITION_SIZE if load_loc.tensor.fast_dma_transpose else MIN_K_FOR_QUANTIZATION
     kernel_assert(
-        K % MIN_K_FOR_QUANTIZATION == 0,
-        f"K dimension must be divisible by {MIN_K_FOR_QUANTIZATION} for mxfp8 quantization, got {K=}",
+        K % min_k_alignment == 0,
+        f"K dimension must be divisible by {min_k_alignment} for mxfp8 quantization, got {K=}",
     )
     kernel_assert(
         F % MIN_F_FOR_QUANTIZATION == 0,
@@ -382,10 +396,6 @@ def load_tile_dgt(
             tile_f=load_loc.tile_f,
         )
 
-    # Flatten source: [F, K] -> [F*K/vector_size, 1, 1, vector_size]
-    vector_size = load_loc.tile_k // INTERLEAVE_FACTOR
-    src_flattened = src_data.reshape((F * K // vector_size, 1, 1, vector_size))
-
     # Compute actual tile_f for partial tiles (boundary handling).
     # Use effective_f_dim (per-expert F) when set, otherwise full tensor F.
     F_effective = load_loc.tensor.effective_f_dim if load_loc.tensor.effective_f_dim is not None else F
@@ -399,20 +409,40 @@ def load_tile_dgt(
     actual_physical_k = load_loc.tile_k // INTERLEAVE_FACTOR
     dst_slice = store_loc.tensor.data[nl.ds(0, actual_physical_k), nl.ds(tile_idx, 1), :, f_start:f_end]
 
-    kernel_assert(
-        load_loc.access_pattern != None and load_loc.vector_offset != None,
-        "Must set load location access pattern and vector offset before ",
-    )
+    # Fast DMA transpose path: use direct access pattern on the source tensor
+    # instead of flattening + vector offsets
+    if load_loc.tensor.fast_dma_transpose:
+        vector_size = load_loc.tile_k // INTERLEAVE_FACTOR
+        src_ap = src_data.ap(
+            pattern=[[vector_size, INTERLEAVE_FACTOR], [1, 1], [K, actual_tile_f], [1, vector_size]],
+            offset=load_loc.f_offset * K + load_loc.k_offset,
+        )
+        nisa.dma_transpose(
+            dst=dst_slice.reshape((vector_size, 1, actual_tile_f, INTERLEAVE_FACTOR)),
+            src=src_ap,
+            axes=(3, 1, 2, 0),
+            dge_mode=dge_mode.hwdge,
+        )
+    else:
+        # Legacy path: flatten source and use vector offsets
+        # Flatten source: [F, K] -> [F*K/vector_size, 1, 1, vector_size]
+        vector_size = load_loc.tile_k // INTERLEAVE_FACTOR
+        src_flattened = src_data.reshape((F * K // vector_size, 1, 1, vector_size))
 
-    # Perform DMA gather transpose
-    nisa.dma_transpose(
-        dst=dst_slice,
-        src=src_flattened.ap(
-            pattern=load_loc.access_pattern,
-            vector_offset=load_loc.vector_offset,
-        ),
-        axes=(3, 1, 2, 0),
-    )
+        kernel_assert(
+            load_loc.access_pattern != None and load_loc.vector_offset != None,
+            "Must set load location access pattern and vector offset before ",
+        )
+
+        # Perform DMA gather transpose
+        nisa.dma_transpose(
+            dst=dst_slice,
+            src=src_flattened.ap(
+                pattern=load_loc.access_pattern,
+                vector_offset=load_loc.vector_offset,
+            ),
+            axes=(3, 1, 2, 0),
+        )
 
     return store_loc
 
@@ -441,10 +471,10 @@ def load_and_quantize_tile(
         data_store_loc (Optional[TileLocation]): Destination for quantized data.
             If None, allocated as [Q_TILE_K, tile_f] fp8_x4 in SBUF.
         scale_store_loc (Optional[TileLocation]): Destination for quantization scales.
-            If None, allocated as [Q_TILE_K, tile_f] uint8 in SBUF.
+            If None, allocated as [Q_TILE_K, tile_f] float8_e8m0fnu in SBUF.
 
     Returns:
-        TensorDescriptor: Quantized tensor with data (fp8_x4) and scales (uint8),
+        TensorDescriptor: Quantized tensor with data (fp8_x4) and scales (float8_e8m0fnu),
                           shape [Q_TILE_K, tile_f]. Access via .data and .scales.
     """
     sbm = get_active_sbm()
@@ -457,7 +487,9 @@ def load_and_quantize_tile(
         if data_store_loc == None and scale_store_loc == None:
             store_td = TensorDescriptor(
                 data=sbm.alloc_stack(shape=(load_loc.tile_k, load_loc.tile_f), dtype=fp8_x4_dtype, buffer=nl.sbuf),
-                scales=sbm.alloc_stack(shape=(load_loc.tile_k, load_loc.tile_f), dtype=nl.uint8, buffer=nl.sbuf),
+                scales=sbm.alloc_stack(
+                    shape=(load_loc.tile_k, load_loc.tile_f), dtype=nl.float8_e8m0fnu, buffer=nl.sbuf
+                ),
                 is_f_by_k=False,
             )
             data_store_loc = TileLocation(tensor=store_td, tile_k=load_loc.tile_k, tile_f=load_loc.tile_f)
@@ -491,7 +523,7 @@ def load_and_quantize_tile(
         data = data_store_loc.tensor.data
 
     if scale_store_loc == None:
-        scale = sbm.alloc_stack(shape=(Q_TILE_K, load_loc.tile_f), dtype=nl.uint8, buffer=nl.sbuf)
+        scale = sbm.alloc_stack(shape=(Q_TILE_K, load_loc.tile_f), dtype=nl.float8_e8m0fnu, buffer=nl.sbuf)
     else:
         scale = scale_store_loc.tensor.scales
 
@@ -506,44 +538,42 @@ def load_and_quantize_tile(
     )
 
 
-def load_tile_fp32_transpose(
+def load_tile_PE_Swizzle_1x32(
     load_loc: TileLocation,
     data_store_loc: Optional[TileLocation] = None,
-    scale_store_loc: Optional[TileLocation] = None,
 ) -> None:
     """
-    Load an unswizzled [F, K] bf16 tile from HBM, interleave via FP32 reinterpret
-    transpose, and quantize to MXFP8 in SBUF.
+    Load an unswizzled [F, K] bf16 tile from HBM and interleave into the
+    swizzled [K//4, F*4] layout in SBUF using FP32 PE transpose.
 
     Uses the FP32 PE swizzle approach: reinterprets bf16 as fp32 to
     halve the partition count, then 2x nc_transpose with stride-2 APs interleaves
     the partitions. Suitable for data coming from HBM (weights, activations).
 
+    The output is a swizzled bf16 buffer — NOT quantized. Quantization (if needed)
+    should be done separately downstream via nisa.quantize_mx on the output.
+
     For each SUB_TILE (128) rows of the tile:
       1. dma_copy [SUB_TILE, L_TILE_K] bf16 as [SUB_TILE, L_TILE_K//2] fp32
       2. 2x nc_transpose with stride-2 src/dst APs in fp32 space
-      3. tensor_copy PSUM -> SBUF via scalar engine
-      4. quantize_mx with bf16 reinterpret on the swizzled fp32 buffer
+      3. tensor_copy PSUM -> destination with AP reinterpret as bf16
 
     Args:
         load_loc (TileLocation): Source tile location in HBM. Tensor must be
             [F, K] bf16 with is_f_by_k=True.
-        data_store_loc (Optional[TileLocation]): Destination for quantized data.
+        data_store_loc (Optional[TileLocation]): Destination for swizzled bf16 data.
             If None, allocated as [Q_TILE_K, tile_f] fp8_x4 in SBUF.
-        scale_store_loc (Optional[TileLocation]): Destination for quantization scales.
-            If None, allocated as [Q_TILE_K, tile_f] uint8 in SBUF.
 
     Returns:
-        None (writes into data_store_loc and scale_store_loc)
+        None (writes swizzled bf16 data into data_store_loc)
 
     Pseudocode:
         validate input is F-by-K bf16, tile_k == L_TILE_K
-        allocate data/scale SBUF if not provided
+        allocate data SBUF if not provided
         for each sub-tile of SUB_TILE rows:
             dma_copy HBM bf16 as fp32 (reinterpret)
             2x nc_transpose stride-2 in fp32 -> PSUM
-            tensor_copy PSUM -> SBUF (scalar engine)
-            quantize_mx with bf16 reinterpret -> data, scale
+            tensor_copy PSUM -> destination with bf16 reinterpret AP
     """
 
     sbm = get_active_sbm()
@@ -584,16 +614,6 @@ def load_tile_fp32_transpose(
             tile_k=Q_TILE_K,
             tile_f=tile_f,
         )
-    if scale_store_loc == None:
-        scale_sbuf = sbm.alloc_stack(shape=(Q_TILE_K, tile_f), dtype=nl.uint8, buffer=nl.sbuf)
-        scale_store_loc = TileLocation(
-            tensor=TensorDescriptor(scales=scale_sbuf, is_f_by_k=False),
-            tile_k=Q_TILE_K,
-            tile_f=tile_f,
-        )
-
-    data_dst = data_store_loc.tensor.data
-    scale_dst = scale_store_loc.tensor.scales
 
     K_fp32 = K // BF16_TO_FP32_RATIO
     k_fp32_offset = k_offset // BF16_TO_FP32_RATIO
@@ -627,52 +647,47 @@ def load_tile_fp32_transpose(
                 ),
             )
 
-        # Step 3: Copy PSUM -> SBUF via scalar engine
-        swizzled_fp32 = sbm.alloc_stack(shape=(SUB_TILE, L_TILE_K_FP32), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=swizzled_fp32, src=psum_fp32, engine=nisa.scalar_engine)
+        # Step 3: Copy PSUM -> destination with bf16 reinterpret AP
+        # psum_fp32 is (P_MAX=128, L_TILE_K_FP32=256) fp32 = (128, 512) bf16 when reinterpreted
+        # This is the same [K//4, F*4] = [physical_tile_k, SUB_TILE*INTERLEAVE_FACTOR] layout
+        physical_tile_k = L_TILE_K // INTERLEAVE_FACTOR  # 512 // 4 = 128
+        tile_idx = data_store_loc.k_offset
+        f_start = (data_store_loc.f_offset + subtile_idx * SUB_TILE) * INTERLEAVE_FACTOR
+        f_end = f_start + SUB_TILE * INTERLEAVE_FACTOR
+        dst_slice = data_store_loc.tensor.data[nl.ds(0, physical_tile_k), nl.ds(tile_idx, 1), :, f_start:f_end]
 
-        # Step 4: quantize_mx with bf16 reinterpret
-        f_out_start = data_store_loc.f_offset + subtile_idx * SUB_TILE
-        nisa.quantize_mx(
-            dst=data_dst[:, nl.ds(f_out_start, SUB_TILE)],
-            src=swizzled_fp32.ap(
+        nisa.tensor_copy(
+            dst=dst_slice,
+            src=psum_fp32.ap(
                 pattern=[[L_TILE_K, P_MAX], [1, L_TILE_K]],
                 dtype=nl.bfloat16,
             ),
-            dst_scale=scale_dst[:, nl.ds(f_out_start, SUB_TILE)],
         )
 
 
-def load_tile_bf16_PE_transpose(
+def load_tile_PE_swizzle_wrapX(
     load_loc: TileLocation,
     data_store_loc: TileLocation,
 ) -> None:
     """
-    Load an unswizzled [F, K] bf16 tile from HBM and interleave into the
+    Load an unswizzled bf16 tile from HBM and interleave into the
     swizzled [K//4, F*4] layout in SBUF using BF16 PE transpose.
 
+    Supports both [F, K] (F-by-K) and [K, F] (K-by-F) input layouts.
     This produces the same swizzled layout as DGT (load_tile_dgt) but uses
-    a different mechanism: contiguous DMA loads followed by strided nc_transpose
-    and tensor_copy, rather than hardware gather-transpose.
+    a different mechanism: DMA loads followed by strided nc_transpose
+    and tensor_copy, rather than hardware gather-transpose with interleaving.
 
-    Supports two loading modes based on load_loc.vector_offset:
-      - Direct DMA (load_loc.vector_offset is None):
-        Loads contiguous F rows starting at load_loc.f_offset.
-      - Indirect DMA (load_loc.vector_offset is an SBUF tensor):
-        Gathers non-contiguous F rows using indices from load_loc.vector_offset.
-        Used for MoE-style token gathering where tokens are scattered in HBM.
+    Loading strategy depends on input layout:
+      - F-by-K direct: single dma_copy with 3-pair AP for the full tile.
+      - F-by-K indirect: per-sub-tile dma_copy with vector_offset (128
+        partition HW limit on dma_copy gather).
+      - K-by-F direct: 4x dma_transpose per 128-F sub-tile, each transposes
+        [tile_k, 128] from HBM directly into [128P, tile_k F] SBUF.
+      - K-by-F indirect: not supported (kernel_assert).
 
-    Algorithm (per SUB_TILE of 128 rows):
-      1. dma_copy: Load [SUB_TILE, L_TILE_K] bf16 from HBM to SBUF.
-         - Direct mode: uses f_offset-based addressing (contiguous F rows).
-         - Indirect mode: uses load_loc.vector_offset + indirect_dim=0 to
-           gather non-contiguous F rows by index.
-      2. nc_transpose (4 passes): Read SUB_TILE contiguous partitions from SBUF,
-         write into PSUM with stride-8 + 2-element pair grouping. Each pass
-         offsets by 2 in the destination to fill alternating pairs.
-      3. tensor_copy: Copy from PSUM to the final SBUF destination with a
-         reordering access pattern that produces the [4F, 128P] layout
-         required by DVE quantization and PE matmul.
+    After loading, the PE swizzle loop (4x nc_transpose + tensor_copy)
+    interleaves partitions into the final [K//4, F*4] layout.
 
     The output is a swizzled bf16 buffer — NOT quantized. Quantization (if needed)
     should be done separately via nisa.quantize_mx on the output.
@@ -704,7 +719,7 @@ def load_tile_bf16_PE_transpose(
             k_offset=0, f_offset=128,
             vector_offset=None,  # direct DMA
         )
-        load_tile_bf16_PE_transpose(load_loc)
+        load_tile_PE_swizzle_wrapX(load_loc)
 
         # Indirect mode (gather scattered tokens, tile_f=256 → 2 sub-tiles):
         # Shape (P_MAX=128, NUM_SUB_TILES=2): column 0 has first 128 row indices,
@@ -716,7 +731,7 @@ def load_tile_bf16_PE_transpose(
             k_offset=0, f_offset=0,
             vector_offset=token_indices,  # indirect DMA
         )
-        load_tile_bf16_PE_transpose(load_loc)
+        load_tile_PE_swizzle_wrapX(load_loc)
     """
 
     sbm = get_active_sbm()
@@ -731,6 +746,10 @@ def load_tile_bf16_PE_transpose(
 
     kernel_assert(not load_loc.tensor.is_swizzled, "BF16 transpose load requires unswizzled input.")
     kernel_assert(not load_loc.tensor.is_quantized, "BF16 transpose load requires non-quantized input.")
+    kernel_assert(
+        load_loc.tensor.quant_scheme == QuantScheme.WRAPX,
+        "load_tile_PE_swizzle_wrapX only supports wrapX quantization scheme.",
+    )
     kernel_assert(
         src_data.dtype in (nl.bfloat16, nl.float16),
         f"BF16 transpose load requires bfloat16 or float16 input, got {src_data.dtype}.",
@@ -771,38 +790,37 @@ def load_tile_bf16_PE_transpose(
     if load_loc.tensor.skip_dma is not None:
         skip_token = load_loc.tensor.skip_dma.skip_token
 
-    data_dst = data_store_loc.tensor.data
+    # ========================================================================
+    # Step 1: DMA load — issue bulk DMA(s) BEFORE the sub-tile PE swizzle loop.
+    # Each path produces sbuf_tile [P_MAX, NUM_SUB_TILES * tile_k] where sub-tile
+    # `i` occupies free-axis columns [i*tile_k : (i+1)*tile_k].
+    # ========================================================================
 
-    for subtile_idx in nl.affine_range(NUM_SUB_TILES):
-        f_sub = f_offset + subtile_idx * SUB_TILE
-
-        # Step 1: DMA load [SUB_TILE, L_TILE_K] bf16 from HBM to SBUF
-        sbuf_data = sbm.alloc_stack(shape=(SUB_TILE, tile_k), dtype=original_dtype, buffer=nl.sbuf)
-
+    if is_f_by_k and not use_indirect_dma:
+        # --- F-by-K direct: single DMA for the full tile ---
+        # Load [tile_f, tile_k] from HBM into [P_MAX, NUM_SUB_TILES * tile_k] SBUF.
+        # Groups of P_MAX=128 consecutive F-rows map to partitions; successive groups
+        # are placed at increasing free-axis offsets (tile_k apart).
+        sbuf_tile = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES * tile_k), dtype=original_dtype, buffer=nl.sbuf)
         if skip_token:
-            nisa.memset(sbuf_data, value=0.0)
+            nisa.memset(sbuf_tile, value=0.0)
+        nisa.dma_copy(
+            dst=sbuf_tile,
+            src=src_data.ap(
+                pattern=[[K, P_MAX], [K * P_MAX, NUM_SUB_TILES], [1, tile_k]],
+                offset=f_offset * K + k_offset,
+                dtype=original_dtype,
+            ),
+        )
 
-        if use_indirect_dma:
-            # Indirect DMA token-gather is only implemented for F-by-K: the gather AP indexes
-            # F-rows with K-row stride. K-by-F (K-major) gather is not supported.
-            kernel_assert(is_f_by_k, "Indirect DMA (token gather) requires F-by-K layout; K-by-F is not supported.")
-            # Indirect DMA: gather non-contiguous F rows using load_loc.vector_offset.
-            #
-            # vector_offset is shaped (P_MAX, NUM_SUB_TILES) where:
-            #   - dim 0 (partitions, P_MAX=128): holds the row index values
-            #   - dim 1 (free, NUM_SUB_TILES): one column per sub-tile
-            # We slice column subtile_idx to get this sub-tile's 128 row indices.
-            #
-            # Source AP: [[K, SUB_TILE], [1, L_TILE_K]]
-            #   Pair 0 [K, SUB_TILE]: stride=K (row stride), count=SUB_TILE
-            #     -> indirect_dim=0: the sequential index 0,1,2,...,SUB_TILE-1
-            #        is replaced by values from vector_offset. Each value is
-            #        multiplied by K to compute the row's address.
-            #   Pair 1 [1, L_TILE_K]: reads L_TILE_K contiguous elements per row.
-            #
-            # offset=k_offset: shifts within each row (selects K tile start).
+    elif is_f_by_k and use_indirect_dma:
+        # --- F-by-K indirect: one DMA per sub-tile (128 partition limit) ---
+        sbuf_tile = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES * tile_k), dtype=original_dtype, buffer=nl.sbuf)
+        if skip_token:
+            nisa.memset(sbuf_tile, value=0.0)
+        for subtile_idx in nl.affine_range(NUM_SUB_TILES):
             nisa.dma_copy(
-                dst=sbuf_data,
+                dst=sbuf_tile[:, nl.ds(subtile_idx * tile_k, tile_k)],
                 src=src_data.ap(
                     pattern=[[K, SUB_TILE], [1, tile_k]],
                     offset=k_offset,
@@ -811,52 +829,53 @@ def load_tile_bf16_PE_transpose(
                 ),
                 oob_mode=oob_mode.skip if skip_token else oob_mode.error,
             )
-        else:
-            # Direct DMA: load SUB_TILE contiguous F rows starting at f_sub
-            if is_f_by_k:
-                # F-by-K [F, K]: stride=K between F-rows, tile_k contiguous K-elements
-                nisa.dma_copy(
-                    dst=sbuf_data,
-                    src=src_data.ap(
-                        pattern=[[K, SUB_TILE], [1, tile_k]],
-                        offset=f_sub * K + k_offset,
-                        dtype=original_dtype,
-                    ),
-                )
-            else:
-                # K-by-F [K, F]: load [P_MAX, SUB_TILE] blocks from K-rows,
-                # then nc_transpose to get [SUB_TILE, tile_k] (partitions=F, free=K).
-                # NOTE: DGT (load_tile_dgt) is not used for K-by-F because DGT requires an
-                # F-by-K source layout. Until the DMA gather-transpose API supports K-major
-                # sources, K-by-F is handled here via an explicit nc_transpose, which also
-                # imposes the F % 512 (full F load-tile) requirement asserted in the kernel.
-                # TODO: switch to the DMA gather-transpose API to drop the explicit transpose
-                # and relax the F-divisibility constraint.
-                num_k_chunks = tile_k // P_MAX
-                for k_chunk_idx in nl.affine_range(num_k_chunks):
-                    sbuf_tmp = sbm.alloc_stack(shape=(P_MAX, SUB_TILE), dtype=original_dtype, buffer=nl.sbuf)
-                    k_start = k_offset + k_chunk_idx * P_MAX
-                    nisa.dma_copy(
-                        dst=sbuf_tmp,
-                        src=src_data[k_start : k_start + P_MAX, f_sub : f_sub + SUB_TILE],
-                    )
-                    # Transpose [P_MAX=128, SUB_TILE=128] -> [SUB_TILE=128, P_MAX=128]
-                    # Tensor Engine nc_transpose: SBUF -> PSUM, then copy PSUM -> SBUF
-                    psum_tmp = nl.ndarray((SUB_TILE, P_MAX), dtype=original_dtype, buffer=nl.psum)
-                    nisa.nc_transpose(dst=psum_tmp, data=sbuf_tmp)
-                    nisa.tensor_copy(
-                        dst=sbuf_data[
-                            nl.ds(0, SUB_TILE),
-                            nl.ds(k_chunk_idx * P_MAX, P_MAX),
-                        ],
-                        src=psum_tmp,
-                    )
 
+    elif not is_f_by_k and not use_indirect_dma:
+        # --- K-by-F direct: 4x fast DMA direct transpose (one per 128-F sub-tile) ---
+        # Each reads [tile_k, SUB_TILE] from HBM and transposes to [SUB_TILE=128P, tile_k F].
+        sbuf_tile_4d = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES, 1, tile_k), dtype=original_dtype, buffer=nl.sbuf)
+        if skip_token:
+            nisa.memset(sbuf_tile_4d, value=0.0)
+
+        for subtile_idx in nl.affine_range(NUM_SUB_TILES):
+            f_sub = f_offset + subtile_idx * SUB_TILE
+            nisa.dma_transpose(
+                dst=sbuf_tile_4d[:, nl.ds(subtile_idx, 1), :, :],
+                src=src_data.ap(
+                    pattern=[[F, tile_k], [1, 1], [1, 1], [1, SUB_TILE]],
+                    offset=k_offset * F + f_sub,
+                ),
+                axes=(3, 1, 2, 0),
+            )
+
+        sbuf_tile = sbuf_tile_4d.reshape((P_MAX, NUM_SUB_TILES * tile_k))
+
+    elif not is_f_by_k and use_indirect_dma:
+        # --- K-by-F indirect: one DMA per sub-tile (gather token rows from [K, F]) ---
+        sbuf_tile = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES * tile_k), dtype=original_dtype, buffer=nl.sbuf)
+        if skip_token:
+            nisa.memset(sbuf_tile, value=0.0)
+        for subtile_idx in nl.affine_range(NUM_SUB_TILES):
+            nisa.dma_copy(
+                dst=sbuf_tile[:, nl.ds(subtile_idx * tile_k, tile_k)],
+                src=src_data.ap(
+                    pattern=[[F, SUB_TILE], [1, tile_k]],
+                    offset=k_offset,
+                    vector_offset=load_loc.vector_offset[:, nl.ds(subtile_idx, 1)],
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.skip if skip_token else oob_mode.error,
+            )
+
+    else:
+        kernel_assert(False, "Unsupported DMA load configuration for load_tile_PE_swizzle_wrapX.")
+
+    # ========================================================================
+    # Step 2-3: PE swizzle loop — operates on sbuf_tile sub-tile slices.
+    # ========================================================================
+    for subtile_idx in nl.affine_range(NUM_SUB_TILES):
         # Step 2: nc_transpose in bf16 space (4 passes)
-        # PSUM has (SUB_TILE=128 partitions, tile_k free). Both src and dst use
-        # SUB_TILE partitions — this is a crossbar partition shuffle, not a P↔F swap.
-        # Each pass shuffles SUB_TILE partitions with tile_k/4 contiguous free elements,
-        # offset by SUB_TILE each pass to cover all tile_k free elements.
+        # Source reads from sbuf_tile at free-axis offset subtile_idx * tile_k.
         psum_interleaved = nl.ndarray(
             (physical_tile_k, SUB_TILE * INTERLEAVE_FACTOR), dtype=original_dtype, buffer=nl.psum
         )
@@ -866,9 +885,9 @@ def load_tile_bf16_PE_transpose(
                     pattern=[[SUB_TILE * INTERLEAVE_FACTOR, physical_tile_k], [8, SUB_TILE // 2], [1, 2]],
                     offset=interleave_pass_idx * 2,
                 ),
-                data=sbuf_data.ap(
-                    pattern=[[tile_k, SUB_TILE], [1, physical_tile_k]],
-                    offset=interleave_pass_idx * physical_tile_k,
+                data=sbuf_tile.ap(
+                    pattern=[[NUM_SUB_TILES * tile_k, SUB_TILE], [1, physical_tile_k]],
+                    offset=subtile_idx * tile_k + interleave_pass_idx * physical_tile_k,
                 ),
             )
 
@@ -932,7 +951,7 @@ def load_tile_bf16_xbar_transpose(
 
     q_tile_f = tile_f // INTERLEAVE_FACTOR
     data = sbm.alloc_stack(shape=(Q_TILE_K, q_tile_f), dtype=fp8_x4_dtype, buffer=nl.sbuf)
-    scale = sbm.alloc_stack(shape=(Q_TILE_K, q_tile_f), dtype=nl.uint8, buffer=nl.sbuf)
+    scale = sbm.alloc_stack(shape=(Q_TILE_K, q_tile_f), dtype=nl.float8_e8m0fnu, buffer=nl.sbuf)
 
     # Step 1: 4-pass nc_transpose in bf16 space
     """

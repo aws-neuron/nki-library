@@ -22,7 +22,7 @@ import tempfile
 from unittest.mock import MagicMock
 
 from test.utils import core_lock_client
-from test.utils.core_lock_client import dequeue, poll
+from test.utils.core_lock_client import dequeue, poll, probe
 from test.utils.scripts import remote_lock_scripts
 from test.utils.scripts.remote_lock_scripts import LockStatus
 
@@ -158,6 +158,45 @@ class TestDequeueWrapperUnit:
         assert kwargs["kwargs"] == {"caller_id": "gw2:test"}
 
 
+class TestProbeWrapperUnit:
+    """Unit tests for probe() response -> LockResult mapping."""
+
+    def test_probe_in_queue_carries_eta(self) -> None:
+        executor = MagicMock()
+        executor.call_function.return_value = {
+            "status": "IN_QUEUE",
+            "worst_case_eta": 1234567890,
+        }
+        result = probe(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION)
+        assert result.status == LockStatus.IN_QUEUE
+        assert result.worst_case_eta == 1234567890
+
+    def test_probe_draining_status(self) -> None:
+        executor = MagicMock()
+        executor.call_function.return_value = {
+            "status": "DRAINING",
+            "worst_case_eta": 42,
+        }
+        result = probe(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION)
+        assert result.status == LockStatus.DRAINING
+        assert result.worst_case_eta == 42
+
+    def test_probe_forwards_expected_args(self) -> None:
+        executor = MagicMock()
+        executor.call_function.return_value = {"status": "IN_QUEUE", "worst_case_eta": 1}
+        probe(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION)
+        _, kwargs = executor.call_function.call_args
+        assert kwargs["command"] == "probe"
+        assert kwargs["args"] == [
+            core_lock_client.REMOTE_LOCKS_JSON,
+            TOTAL_CORES,
+            NUM_PHYSICAL,
+            TIMEOUT,
+            VERSION,
+        ]
+        assert not kwargs["kwargs"]
+
+
 # =============================================================================
 # Integration test (no hardware): a fake executor whose call_function actually
 # invokes the real remote helper verb against a temp locks.json, exercising the
@@ -224,10 +263,7 @@ def test_poll_round_trip_enqueue_then_allocate(tmp_path) -> None:
 
 
 class TestProtocolVersionDriftGuard:
-    """Build-time guard: both version sites are coupled at v3."""
-
-    def test_default_locking_protocol_version_is_3(self) -> None:
-        assert core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION == 3
+    """Build-time guard: both version sites are coupled."""
 
     def test_remote_initialize_default_derives_from_constant(self) -> None:
         """The version initialize_and_deploy would write must equal the constant.
@@ -265,6 +301,50 @@ class TestGetHostLockingVersionRecreateWarns:
         write_result = MagicMock()
         write_result.failed = False
         mock_conn.run.side_effect = [test_result, write_result]
+
+        with caplog.at_level(logging.WARNING, logger=core_lock_client.logger.name):
+            version = core_lock_client.get_host_locking_version(mock_conn)
+
+        assert version == core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION
+        assert any(
+            "Recreating infra_version.json" in rec.message and rec.levelno == logging.WARNING for rec in caplog.records
+        )
+
+    def test_recreate_when_key_missing_warns_and_returns_constant(self, caplog) -> None:
+        mock_conn = MagicMock()
+        mock_conn.host = "test-host"
+
+        # File exists but lacks the version key -> recreate with the default.
+        test_result = MagicMock()
+        test_result.ok = True
+        cat_result = MagicMock()
+        cat_result.failed = False
+        cat_result.stdout = json.dumps({"someOtherKey": 123})
+        write_result = MagicMock()
+        write_result.failed = False
+        mock_conn.run.side_effect = [test_result, cat_result, write_result]
+
+        with caplog.at_level(logging.WARNING, logger=core_lock_client.logger.name):
+            version = core_lock_client.get_host_locking_version(mock_conn)
+
+        assert version == core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION
+        assert any(
+            "Recreating infra_version.json" in rec.message and rec.levelno == logging.WARNING for rec in caplog.records
+        )
+
+    def test_recreate_when_json_corrupted_warns_and_returns_constant(self, caplog) -> None:
+        mock_conn = MagicMock()
+        mock_conn.host = "test-host"
+
+        # File exists but contains corrupted JSON -> recreate with the default.
+        test_result = MagicMock()
+        test_result.ok = True
+        cat_result = MagicMock()
+        cat_result.failed = False
+        cat_result.stdout = "not valid json {{{"
+        write_result = MagicMock()
+        write_result.failed = False
+        mock_conn.run.side_effect = [test_result, cat_result, write_result]
 
         with caplog.at_level(logging.WARNING, logger=core_lock_client.logger.name):
             version = core_lock_client.get_host_locking_version(mock_conn)
@@ -341,6 +421,12 @@ class TestScriptVersionBumpGuard:
 
     def test_script_version_was_bumped_past_one(self) -> None:
         assert remote_lock_scripts.SCRIPT_VERSION > 1
+
+    def test_script_version_bumped_for_cooperative_placement(self) -> None:
+        # The cooperative-placement change redeploys the helper; the bump is the
+        # deploy gate. The client-facing locking protocol version stays pinned.
+        assert remote_lock_scripts.SCRIPT_VERSION == 4
+        assert core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION == 4
 
 
 class TestRemoteInitializeStaleRedeployIntegration:

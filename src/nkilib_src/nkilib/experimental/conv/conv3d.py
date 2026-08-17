@@ -15,7 +15,7 @@
 """3D Convolution kernel for NeuronCore with K-replication strategy."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import nki
 import nki.isa as nisa
@@ -30,7 +30,6 @@ from ...core.utils.kernel_helpers import (
     get_verified_program_sharding_info,
 )
 from ...core.utils.logging import get_logger
-from ...core.utils.tensor_view import TensorView
 
 _PARTITION_STRIDE_32 = 32
 _PARTITION_STRIDE_64 = 64
@@ -44,15 +43,15 @@ _HEAP_ALIGN = nl.tile_size.sbuf_min_align
 
 @nki.jit
 def conv3d(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     stride: tuple[int, int, int] = (1, 1, 1),
     padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
     dilation: tuple[int, int, int] = (1, 1, 1),
     activation_fn: Optional[ActFnType] = None,
     lnc_shard: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     3D Convolution using tensor engine with K-replication strategy and W-contiguous tiling.
 
@@ -84,9 +83,9 @@ def conv3d(
         W_out: Output width = (W + pad_w_left + pad_w_right - dilation_w * (K_w - 1) - 1) // stride_w + 1
 
     Args:
-        x_in (nl.ndarray): [B, C_in, D, H, W], Input tensor on HBM.
-        filters (nl.ndarray): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
-        bias (Optional[nl.ndarray]): [C_out], Optional bias tensor on HBM.
+        x_in (nl.NkiTensor): [B, C_in, D, H, W], Input tensor on HBM.
+        filters (nl.NkiTensor): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
+        bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM.
         stride (tuple[int, int, int]): (stride_d, stride_h, stride_w), Convolution strides.
         padding (tuple[int, int, int, int, int, int]): (pad_d_left, pad_d_right, pad_h_top,
             pad_h_bottom, pad_w_left, pad_w_right), Padding for each spatial dimension.
@@ -95,7 +94,7 @@ def conv3d(
         lnc_shard (bool): Enable LNC sharding across neuron cores.
 
     Returns:
-        y_out (nl.ndarray): [B, C_out, D_out, H_out, W_out], Output tensor on HBM.
+        y_out (nl.NkiTensor): [B, C_out, D_out, H_out, W_out], Output tensor on HBM.
 
     Pseudocode:
         cfg = build_config(x_in, filters, bias, stride, padding, dilation)
@@ -227,7 +226,7 @@ def conv3d(
         c_in_slot_counter = 0
 
         for batch_idx in range(cfg.B):
-            x_in_batch = TensorView(x_in).select(dim=0, index=batch_idx)
+            x_in_batch = x_in.select(dim=0, index=batch_idx)
 
             chunk_preloaded_windows = None
             dh_group_idx = tile_cfg.dh_start
@@ -324,15 +323,14 @@ def conv3d(
                         c_out_tile_end = c_out_tile_start + c_out_tile_sizes[c_out_tile_idx]
 
                         result_view = (
-                            TensorView(result_sbufs[c_out_tile_idx])
+                            (result_sbufs[c_out_tile_idx])
                             .slice(dim=0, start=0, end=c_out_tile_sizes[c_out_tile_idx], step=1)
                             .slice(dim=1, start=0, end=effective_free_dim, step=1)
                             .reshape_dim(1, (num_dh_positions, w_tile_size))
                         )
                         total_dh = cfg.D_out * cfg.H_out
                         y_out_view = (
-                            TensorView(y_out)
-                            .select(dim=0, index=batch_idx)
+                            y_out.select(dim=0, index=batch_idx)
                             .slice(dim=0, start=c_out_tile_start, end=c_out_tile_end, step=1)
                             .flatten_dims(1, 3)
                             .reshape_dim(1, (total_dh, cfg.W_out))
@@ -340,8 +338,8 @@ def conv3d(
                             .slice(dim=2, start=w_start, end=w_end, step=1)
                         )
                         nisa.dma_copy(
-                            dst=y_out_view.get_view(),
-                            src=result_view.get_view(),
+                            dst=y_out_view,
+                            src=result_view,
                         )
 
                     w_out_tile_counter += 1
@@ -521,9 +519,9 @@ class Conv3dMemoryConfig(nl.NKIObject):
 
 
 def _build_conv3d_config(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     stride: tuple[int, int, int],
     padding: tuple[int, int, int, int, int, int],
     dilation: tuple[int, int, int],
@@ -887,7 +885,7 @@ def _build_memory_config(cfg: Conv3dConfig, tile_cfg: Conv3dTileConfig, dtype_si
     return mem_cfg
 
 
-def _get_tensor_copy_engine(idx: int, modulo: int = 4):
+def _get_tensor_copy_engine(idx: int, modulo: int = 4) -> Any:
     """Alternate between vector and scalar engines for tensor copy pipelining.
 
     TODO: Determine optimal modulo using workload characteristics and cost model.
@@ -895,7 +893,7 @@ def _get_tensor_copy_engine(idx: int, modulo: int = 4):
     return nisa.scalar_engine if idx % modulo == 0 else nisa.vector_engine
 
 
-def _get_memset_engine(idx: int, modulo: int = 2):
+def _get_memset_engine(idx: int, modulo: int = 2) -> Any:
     """Alternate between gpsimd and vector engines for memset pipelining.
 
     TODO: Determine optimal modulo using workload characteristics and cost model.
@@ -904,9 +902,9 @@ def _get_memset_engine(idx: int, modulo: int = 2):
 
 
 def _validate_conv3d_inputs(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     cfg: Conv3dConfig,
 ) -> None:
     """Validate all input parameters for the 3D convolution kernel."""
@@ -1018,9 +1016,57 @@ def _compute_valid_free_range(
     return global_valid_start, global_valid_end
 
 
+def _compute_unwritten_free_ranges(
+    cfg: Conv3dConfig,
+    tile_cfg: Conv3dTileConfig,
+    dh_positions: list[tuple[int, int]],
+    w_start: int,
+    w_end: int,
+) -> list[tuple[int, int]]:
+    """
+    Compute free-dim ranges that no nc_matmul will ever write for this output tile.
+    """
+    K_total_used = tile_cfg.K_total_used
+    K_REP = tile_cfg.K_REP_max
+    K_outer_tile_count = tile_cfg.K_outer_tile_count
+    w_tile_size = w_end - w_start
+    effective_free_dim = len(dh_positions) * w_tile_size
+
+    # Build a written mask over the free dimension by unioning each K-outer tile's
+    # valid range. Positions left False are never written by any matmul.
+    written = [False] * effective_free_dim
+    for k_outer_idx in range(K_outer_tile_count):
+        k_start = k_outer_idx * K_REP
+        k_end = min(k_start + K_REP, K_total_used)
+        valid_start, valid_end = _compute_valid_free_range(
+            cfg,
+            dh_positions,
+            w_start,
+            w_end,
+            tile_cfg.used_k_positions,
+            k_start,
+            k_end,
+        )
+        for pos in range(valid_start, valid_end):
+            written[pos] = True
+
+    # Coalesce contiguous unwritten positions into ranges
+    unwritten_ranges: list[tuple[int, int]] = []
+    pos = 0
+    while pos < effective_free_dim:
+        if written[pos]:
+            pos += 1
+            continue
+        gap_start = pos
+        while pos < effective_free_dim and not written[pos]:
+            pos += 1
+        unwritten_ranges.append((gap_start, pos))
+    return unwritten_ranges
+
+
 def _scatter_input_to_stacked(
-    input_window: Optional[nl.ndarray],
-    stacked_input_bufs: list[nl.ndarray],
+    input_window: Optional[nl.NkiTensor],
+    stacked_input_bufs: list[nl.NkiTensor],
     cfg: Conv3dConfig,
     c_in_tile_size: int,
     dh_positions: list[tuple[int, int]],
@@ -1037,7 +1083,7 @@ def _scatter_input_to_stacked(
     memset_engine_idx: int = 0,
     tensor_copy_engine_modulo: int = 4,
     memset_engine_modulo: int = 2,
-) -> tuple[list[Optional[nl.ndarray]], list[int], list[int]]:
+) -> tuple[list[Optional[nl.NkiTensor]], list[int], list[int]]:
     """
     Scatter input window data into K-replicated stacked buffers for matmul.
 
@@ -1054,7 +1100,7 @@ def _scatter_input_to_stacked(
     effective_free_dim = num_dh_stacked * w_tile_size
     K_REP, partition_stride = _get_k_replication_params(c_in_tile_size, K_total_used) if c_in_tile_size > 0 else (1, 1)
     K_outer_tile_count = div_ceil(K_total_used, K_REP)
-    input_stacked_list: list[Optional[nl.ndarray]] = []
+    input_stacked_list: list[Optional[nl.NkiTensor]] = []
     valid_offsets: list[int] = []
     valid_sizes: list[int] = []
     valid_dh_starts: list[int] = []
@@ -1270,12 +1316,10 @@ def _scatter_input_to_stacked(
                         dst_end = dst_start + num_w_elements
                         nisa.tensor_copy(
                             dst=raw_buf[partition_offset : partition_offset + c_in_tile_size, dst_start:dst_end],
-                            src=TensorView(input_window)
-                            .slice(dim=0, start=0, end=c_in_tile_size, step=1)
+                            src=input_window.slice(dim=0, start=0, end=c_in_tile_size, step=1)
                             .select(dim=1, index=d_local_start)
                             .select(dim=1, index=h_local_start)
-                            .slice(dim=1, start=src_w_start, end=src_w_end, step=cfg.stride_w)
-                            .get_view(),
+                            .slice(dim=1, start=src_w_start, end=src_w_end, step=cfg.stride_w),
                             engine=_get_tensor_copy_engine(
                                 tensor_copy_engine_idx
                                 + group_start_dh * K_total_used
@@ -1288,15 +1332,13 @@ def _scatter_input_to_stacked(
                         # Multiple H positions, 2D strided copy
                         h_local_end = h_local_start + (num_h - 1) * cfg.stride_h + 1
                         src_view = (
-                            TensorView(input_window)
-                            .slice(dim=0, start=0, end=c_in_tile_size, step=1)
+                            input_window.slice(dim=0, start=0, end=c_in_tile_size, step=1)
                             .select(dim=1, index=d_local_start)
                             .slice(dim=1, start=h_local_start, end=h_local_end, step=cfg.stride_h)
                             .slice(dim=2, start=src_w_start, end=src_w_end, step=cfg.stride_w)
                         )
                         dst_view = (
-                            TensorView(raw_buf)
-                            .slice(
+                            raw_buf.slice(
                                 dim=0,
                                 start=partition_offset,
                                 end=partition_offset + c_in_tile_size,
@@ -1313,8 +1355,8 @@ def _scatter_input_to_stacked(
                             .slice(dim=2, start=first_valid_out, end=last_valid_out, step=1)
                         )
                         nisa.tensor_copy(
-                            dst=dst_view.get_view(),
-                            src=src_view.get_view(),
+                            dst=dst_view,
+                            src=src_view,
                             engine=_get_tensor_copy_engine(
                                 tensor_copy_engine_idx
                                 + group_start_dh * K_total_used
@@ -1328,15 +1370,13 @@ def _scatter_input_to_stacked(
                         d_local_end = d_local_start + (num_d - 1) * cfg.stride_d + 1
                         h_local_end = h_local_start + (num_h - 1) * cfg.stride_h + 1
                         src_view = (
-                            TensorView(input_window)
-                            .slice(dim=0, start=0, end=c_in_tile_size, step=1)
+                            input_window.slice(dim=0, start=0, end=c_in_tile_size, step=1)
                             .slice(dim=1, start=d_local_start, end=d_local_end, step=cfg.stride_d)
                             .slice(dim=2, start=h_local_start, end=h_local_end, step=cfg.stride_h)
                             .slice(dim=3, start=src_w_start, end=src_w_end, step=cfg.stride_w)
                         )
                         dst_view = (
-                            TensorView(raw_buf)
-                            .slice(
+                            raw_buf.slice(
                                 dim=0,
                                 start=partition_offset,
                                 end=partition_offset + c_in_tile_size,
@@ -1354,8 +1394,8 @@ def _scatter_input_to_stacked(
                             .slice(dim=3, start=first_valid_out, end=last_valid_out, step=1)
                         )
                         nisa.tensor_copy(
-                            dst=dst_view.get_view(),
-                            src=src_view.get_view(),
+                            dst=dst_view,
+                            src=src_view,
                             engine=_get_tensor_copy_engine(
                                 tensor_copy_engine_idx
                                 + group_start_dh * K_total_used
@@ -1407,13 +1447,11 @@ def _scatter_input_to_stacked(
         if use_strided:
             # Strided case
             input_strided = (
-                TensorView(raw_buf)
-                .slice(dim=0, start=0, end=stacked_filter_dim, step=1)
+                raw_buf.slice(dim=0, start=0, end=stacked_filter_dim, step=1)
                 .slice(dim=1, start=0, end=effective_free_dim, step=1)
                 .reshape_dim(1, (num_dh_stacked, w_tile_size))
                 .slice(dim=1, start=first_valid_dh_idx, end=first_valid_dh_idx + valid_dh_count, step=1)
                 .slice(dim=2, start=k_w_valid_start_val, end=k_w_valid_end_val, step=1)
-                .get_view()
             )
             input_stacked_list.append(input_strided)
         else:
@@ -1440,9 +1478,9 @@ def _scatter_input_to_stacked(
 
 
 def _conv3d_matmul(
-    input_stacked_list: list[Optional[nl.ndarray]],
-    filters_stacked_list: list[list[nl.ndarray]],
-    psum_tiles: list[nl.ndarray],
+    input_stacked_list: list[Optional[nl.NkiTensor]],
+    filters_stacked_list: list[list[nl.NkiTensor]],
+    psum_tiles: list[nl.NkiTensor],
     valid_offsets: list[int],
     valid_sizes: list[int],
     effective_free_dim: int,
@@ -1483,11 +1521,7 @@ def _conv3d_matmul(
                 )
             elif not use_strided_flags[k_outer_idx]:
                 # Contiguous path (single dh, full W, or K_REP>1 with different W ranges)
-                psum_sub = (
-                    TensorView(psum_tiles[c_out_idx])
-                    .slice(dim=1, start=k_offset, end=k_offset + k_size, step=1)
-                    .get_view()
-                )
+                psum_sub = (psum_tiles[c_out_idx]).slice(dim=1, start=k_offset, end=k_offset + k_size, step=1)
                 nisa.nc_matmul(
                     dst=psum_sub,
                     stationary=filters_stacked_list[c_out_idx][k_outer_idx],
@@ -1496,12 +1530,11 @@ def _conv3d_matmul(
             else:
                 # Multiple dh positions with W-padding and K_REP=1
                 psum_sub = (
-                    TensorView(psum_tiles[c_out_idx])
+                    (psum_tiles[c_out_idx])
                     .slice(dim=1, start=0, end=effective_free_dim, step=1)
                     .reshape_dim(1, (num_dh_stacked, w_tile_size))
                     .slice(dim=1, start=dh_start, end=dh_start + dh_count, step=1)
                     .slice(dim=2, start=w_start_k, end=w_start_k + w_count, step=1)
-                    .get_view()
                 )
                 nisa.nc_matmul(
                     dst=psum_sub,
@@ -1511,10 +1544,10 @@ def _conv3d_matmul(
 
 
 def _conv3d_cin_tile(
-    input_window: Optional[nl.ndarray],
-    filters_for_cin: list[list[nl.ndarray]],
-    psum_tiles: list[nl.ndarray],
-    stacked_input_bufs: list[nl.ndarray],
+    input_window: Optional[nl.NkiTensor],
+    filters_for_cin: list[list[nl.NkiTensor]],
+    psum_tiles: list[nl.NkiTensor],
+    stacked_input_bufs: list[nl.NkiTensor],
     cfg: Conv3dConfig,
     c_in_tile_size: int,
     dh_positions: list[tuple[int, int]],
@@ -1590,14 +1623,16 @@ def _conv3d_cin_tile(
 
 
 def _apply_bias_activation_and_copy(
-    psum_tiles: list[nl.ndarray],
-    result_sbufs: list[nl.ndarray],
-    bias_sbufs: list[Optional[nl.ndarray]],
+    psum_tiles: list[nl.NkiTensor],
+    result_sbufs: list[nl.NkiTensor],
+    bias_sbufs: list[Optional[nl.NkiTensor]],
     c_out_tile_sizes: list[int],
     has_bias: bool,
     has_activation: bool,
     activation_fn: Optional[ActFnType],
     effective_free_dim: int,
+    unwritten_free_ranges: Optional[list[tuple[int, int]]] = None,
+    memset_engine_modulo: int = 2,
 ) -> None:
     """
     Apply optional bias addition and activation, then copy PSUM results to SBUF.
@@ -1606,6 +1641,8 @@ def _apply_bias_activation_and_copy(
     addition and/or activation function as configured. If neither is needed,
     performs a direct tensor copy from PSUM to SBUF.
     """
+    has_unwritten = unwritten_free_ranges != None and len(unwritten_free_ranges) > 0
+
     for c_out_tile_idx in range(len(result_sbufs)):
         psum_tile = psum_tiles[c_out_tile_idx]
         result_full = result_sbufs[c_out_tile_idx]
@@ -1623,15 +1660,35 @@ def _apply_bias_activation_and_copy(
         else:
             nisa.tensor_copy(dst=result, src=psum_tile)
 
+        if not has_unwritten:
+            continue
+
+        # Handle never-written to PSUM locations f(0 + bias)
+        for gap_idx in range(len(unwritten_free_ranges)):
+            gap_start, gap_end = unwritten_free_ranges[gap_idx]
+            gap_result = result_full[:c_out_tile_size, gap_start:gap_end]
+            nisa.memset(
+                dst=gap_result,
+                value=0.0,
+                engine=_get_memset_engine(c_out_tile_idx + gap_idx, memset_engine_modulo),
+            )
+            if has_bias and has_activation:
+                nisa.tensor_scalar(dst=gap_result, data=gap_result, op0=nl.add, operand0=bias_sbuf)
+                nisa.activation(dst=gap_result, data=gap_result, op=get_nl_act_fn_from_type(activation_fn))
+            elif has_bias:
+                nisa.tensor_scalar(dst=gap_result, data=gap_result, op0=nl.add, operand0=bias_sbuf)
+            elif has_activation:
+                nisa.activation(dst=gap_result, data=gap_result, op=get_nl_act_fn_from_type(activation_fn))
+
 
 def _load_input_window_to_sbuf_3d(
-    x_in_cin: TensorView,
-    input_window_buf: nl.ndarray,
+    x_in_cin: nl.NkiTensor,
+    input_window_buf: nl.NkiTensor,
     cfg: Conv3dConfig,
     dh_positions: list[tuple[int, int]],
     w_start: int,
     w_end: int,
-) -> tuple[Optional[nl.ndarray], int, int, int, int, int, int]:
+) -> tuple[Optional[nl.NkiTensor], int, int, int, int, int, int]:
     """
     Load the union input window from HBM into an SBUF buffer via DMA.
 
@@ -1672,19 +1729,18 @@ def _load_input_window_to_sbuf_3d(
         dst=input_window_buf[:c_in_tile_size, :d_window_size, :h_window_size, :w_window_size],
         src=x_in_cin.slice(dim=1, start=valid_d_start, end=valid_d_end, step=1)
         .slice(dim=2, start=valid_h_start, end=valid_h_end, step=1)
-        .slice(dim=3, start=valid_w_start, end=valid_w_end, step=1)
-        .get_view(),
+        .slice(dim=3, start=valid_w_start, end=valid_w_end, step=1),
     )
     return input_window_buf, valid_d_start, valid_d_end, valid_h_start, valid_h_end, valid_w_start, valid_w_end
 
 
 def _conv3d_output_tile(
-    x_in_batch: TensorView,
-    filters_cache: list[list[list[nl.ndarray]]],
-    bias_cache: list[Optional[nl.ndarray]],
-    result_sbufs: list[nl.ndarray],
-    input_window_slots: list[nl.ndarray],
-    stacked_input_slots: list[list[nl.ndarray]],
+    x_in_batch: nl.NkiTensor,
+    filters_cache: list[list[list[nl.NkiTensor]]],
+    bias_cache: list[Optional[nl.NkiTensor]],
+    result_sbufs: list[nl.NkiTensor],
+    input_window_slots: list[nl.NkiTensor],
+    stacked_input_slots: list[list[nl.NkiTensor]],
     cfg: Conv3dConfig,
     tile_cfg: Conv3dTileConfig,
     c_out_tile_sizes: list[int],
@@ -1707,6 +1763,9 @@ def _conv3d_output_tile(
     w_tile_size = w_end - w_start
     num_dh_stacked = len(dh_positions)
     effective_free_dim = num_dh_stacked * w_tile_size
+
+    # Free-dim positions whose entire receptive field is padding receive no matmul.
+    unwritten_free_ranges = _compute_unwritten_free_ranges(cfg, tile_cfg, dh_positions, w_start, w_end)
 
     # Process c_out tiles in sub-groups that fit within PSUM banks
     for sub_group_start in range(0, num_c_out_tiles, _NUM_PSUM_BANKS):
@@ -1797,6 +1856,8 @@ def _conv3d_output_tile(
             has_activation=cfg.has_activation,
             activation_fn=cfg.activation_fn,
             effective_free_dim=effective_free_dim,
+            unwritten_free_ranges=unwritten_free_ranges,
+            memset_engine_modulo=tile_cfg.memset_gpsimd_engine_offload,
         )
 
 
@@ -1809,7 +1870,7 @@ def _allocate_filter_bias_buffers(
     tile_cfg: Conv3dTileConfig,
     mem_cfg: Conv3dMemoryConfig,
     dtype,
-) -> tuple[list[Optional[nl.ndarray]], list[list[nl.ndarray]]]:
+) -> tuple[list[Optional[nl.NkiTensor]], list[list[nl.NkiTensor]]]:
     """
     Allocate SBUF heap buffers for bias and filter storage.
 
@@ -1818,7 +1879,7 @@ def _allocate_filter_bias_buffers(
     """
     c_out_wide = mem_cfg.c_out_interleave * tile_cfg.c_out_tile_size_max
 
-    bias_bufs: list[Optional[nl.ndarray]] = []
+    bias_bufs: list[Optional[nl.NkiTensor]] = []
     for tile_idx in range(mem_cfg.c_out_interleave):
         if cfg.has_bias:
             bias_bufs.append(
@@ -1831,9 +1892,9 @@ def _allocate_filter_bias_buffers(
         else:
             bias_bufs.append(None)
 
-    filter_bufs: list[list[nl.ndarray]] = []
+    filter_bufs: list[list[nl.NkiTensor]] = []
     for cin_idx in range(tile_cfg.c_in_tile_count):
-        cin_filters: list[nl.ndarray] = []
+        cin_filters: list[nl.NkiTensor] = []
         for k_idx in range(tile_cfg.K_outer_tile_count):
             cin_filters.append(
                 sbm.alloc_heap(
@@ -1849,23 +1910,23 @@ def _allocate_filter_bias_buffers(
 
 
 def _load_bias_into_buf(
-    bias: nl.ndarray,
-    bias_buf: nl.ndarray,
+    bias: nl.NkiTensor,
+    bias_buf: nl.NkiTensor,
     c_out_start: int,
     c_out_end: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Load a slice of the bias tensor from HBM into an SBUF buffer via DMA."""
     c_out_size = c_out_end - c_out_start
     nisa.dma_copy(
         dst=bias_buf[:c_out_size, 0],
-        src=TensorView(bias).slice(dim=0, start=c_out_start, end=c_out_end, step=1).get_view(),
+        src=bias.slice(dim=0, start=c_out_start, end=c_out_end, step=1),
     )
-    return TensorView(bias_buf).slice(dim=0, start=0, end=c_out_size, step=1).get_view()
+    return bias_buf.slice(dim=0, start=0, end=c_out_size, step=1)
 
 
 def _load_filters_into_bufs(
-    filters: nl.ndarray,
-    filter_bufs: list[nl.ndarray],
+    filters: nl.NkiTensor,
+    filter_bufs: list[nl.NkiTensor],
     cfg: Conv3dConfig,
     c_in_start: int,
     c_in_end: int,
@@ -1909,27 +1970,25 @@ def _load_filters_into_bufs(
             k_d_idx, k_h_idx, k_w_idx = _decompose_k_position(flat_k_pos, K_h, K_w)
             nisa.dma_copy(
                 dst=raw_buf[partition_offset : partition_offset + c_in_size, :c_out_wide],
-                src=TensorView(filters)
-                .select(dim=0, index=k_d_idx)
+                src=filters.select(dim=0, index=k_d_idx)
                 .select(dim=0, index=k_h_idx)
                 .select(dim=0, index=k_w_idx)
                 .slice(dim=0, start=c_in_start, end=c_in_end, step=1)
-                .slice(dim=1, start=c_out_group_start, end=c_out_group_start + c_out_wide, step=1)
-                .get_view(),
+                .slice(dim=1, start=c_out_group_start, end=c_out_group_start + c_out_wide, step=1),
                 dge_mode=nisa.dge_mode.hwdge,
             )
 
 
 def _load_bias_and_filters_for_c_out_group(
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     cfg: Conv3dConfig,
     tile_cfg: Conv3dTileConfig,
     c_out_group_start: int,
     c_out_group_end: int,
-    pre_bias_bufs: list[Optional[nl.ndarray]],
-    pre_filter_bufs: list[list[nl.ndarray]],
-) -> tuple[list[int], list[Optional[nl.ndarray]], list[list[list[nl.ndarray]]]]:
+    pre_bias_bufs: list[Optional[nl.NkiTensor]],
+    pre_filter_bufs: list[list[nl.NkiTensor]],
+) -> tuple[list[int], list[Optional[nl.NkiTensor]], list[list[list[nl.NkiTensor]]]]:
     """
     Load bias and filter weights for an entire C_out interleave group.
 
@@ -1938,7 +1997,7 @@ def _load_bias_and_filters_for_c_out_group(
     """
     actual_group_size = div_ceil(c_out_group_end - c_out_group_start, tile_cfg.P_MAX)
     c_out_tile_sizes = []
-    bias_cache: list[Optional[nl.ndarray]] = []
+    bias_cache: list[Optional[nl.NkiTensor]] = []
 
     for c_out_tile_idx in range(actual_group_size):
         c_out_tile_start = c_out_group_start + c_out_tile_idx * tile_cfg.P_MAX
@@ -1977,16 +2036,16 @@ def _load_bias_and_filters_for_c_out_group(
             memset_engine_modulo=tile_cfg.memset_gpsimd_engine_offload,
         )
 
-    filters_cache: list[list[list[nl.ndarray]]] = []
+    filters_cache: list[list[list[nl.NkiTensor]]] = []
     for c_out_tile_idx in range(actual_group_size):
         c_out_offset = c_out_tile_idx * tile_cfg.P_MAX
         c_out_tile_size = c_out_tile_sizes[c_out_tile_idx]
-        tile_filters: list[list[nl.ndarray]] = []
+        tile_filters: list[list[nl.NkiTensor]] = []
         for c_in_tile_idx in range(tile_cfg.c_in_tile_count):
             c_in_size = min(tile_cfg.P_MAX, cfg.C_in - c_in_tile_idx * tile_cfg.P_MAX)
             K_REP_cin, partition_stride_cin = _get_k_replication_params(c_in_size, K_total_used)
             K_outer_tile_count_cin = div_ceil(K_total_used, K_REP_cin)
-            cin_k_views: list[nl.ndarray] = []
+            cin_k_views: list[nl.NkiTensor] = []
             for k_outer_idx in range(K_outer_tile_count_cin):
                 k_start = k_outer_idx * K_REP_cin
                 k_end = min(k_start + K_REP_cin, K_total_used)

@@ -123,7 +123,7 @@ def lookup_cache(
         # cache-write time come back as strings. The framework's rename loop
         # in test_orchestrator.py looks them up by int (`i in aliases`), so
         # without this coercion every cache hit produces a missing-rename and
-        # the validator fails with "<name> was not emitted by neuron-profile
+        # the validator fails with "<name> was not emitted by neuron-explorer
         # capture". Coerce on read so existing entries stay usable.
         raw_aliases = meta.get("input_output_aliases") or {}
         aliases = {int(k): v for k, v in raw_aliases.items()}

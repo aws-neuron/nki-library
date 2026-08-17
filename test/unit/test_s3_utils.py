@@ -16,7 +16,7 @@ Unit tests for s3_utils module.
 """
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from botocore.credentials import EnvProvider
@@ -26,9 +26,13 @@ from ..utils.s3_utils import (
     S3ArtifactUploadConfig,
     S3TransferDirection,
     _create_boto3_session_with_retry,
+    _get_boto_client_cached,
+    _get_boto_session_cached,
     _is_throttling_error,
     build_remote_s3_cli_command,
     generate_s3_key,
+    get_boto_client,
+    get_boto_session,
     get_s3_client_and_session,
     prefetch_and_cache_credentials,
 )
@@ -314,38 +318,112 @@ class TestPrefetchAndCacheCredentials:
         assert EnvProvider.TOKENS[1] not in os.environ
 
 
-class TestGetS3ClientAndSession:
-    """Test get_s3_client_and_session function."""
+class _BotoCacheTestBase:
+    """Shared setup/teardown: clear the per-process session/client caches and isolate
+    AWS_* env vars so cache state never leaks across tests."""
 
     def setup_method(self):
-        """Clear LRU cache and save original env vars before each test."""
-        get_s3_client_and_session.cache_clear()
+        _get_boto_session_cached.cache_clear()
+        _get_boto_client_cached.cache_clear()
         self._original_env = {}
         for var in [EnvProvider.ACCESS_KEY, EnvProvider.SECRET_KEY, EnvProvider.TOKENS[1]]:
             self._original_env[var] = os.environ.get(var)
             os.environ.pop(var, None)
 
     def teardown_method(self):
-        """Cleanup after each test."""
-        get_s3_client_and_session.cache_clear()
+        _get_boto_session_cached.cache_clear()
+        _get_boto_client_cached.cache_clear()
         for var, value in self._original_env.items():
             if value is not None:
                 os.environ[var] = value
             else:
                 os.environ.pop(var, None)
 
+
+class TestGetBotoSessionAndClient(_BotoCacheTestBase):
+    """Test the shared session/client helpers used across services and regions."""
+
     @patch("test.utils.s3_utils._create_boto3_session_with_retry")
-    def test_uses_retry_logic_for_credentials(self, mock_create_session):
-        """Test that get_s3_client_and_session uses retry logic for credential fetching."""
+    def test_session_uses_retry_logic_and_caches_per_profile(self, mock_create_session):
+        mock_create_session.side_effect = lambda profile=None: MagicMock()
+
+        a1 = get_boto_session("p1")
+        a2 = get_boto_session("p1")
+        b = get_boto_session("p2")
+
+        assert a1 is a2  # same profile -> one session (one credential fetch)
+        assert a1 is not b  # distinct profile -> distinct session
+        assert mock_create_session.call_count == 2
+        mock_create_session.assert_any_call("p1")
+
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_client_is_built_with_region_and_retry_config(self, mock_create_session):
         mock_session = MagicMock()
-        mock_client = MagicMock()
-        mock_session.client.return_value = mock_client
         mock_create_session.return_value = mock_session
 
-        client, session = get_s3_client_and_session(profile="my-profile")
+        get_boto_client("ec2", region="eu-west-1", profile="p1")
+
+        _, kwargs = mock_session.client.call_args
+        assert mock_session.client.call_args.args[0] == "ec2"
+        assert kwargs["region_name"] == "eu-west-1"
+        assert kwargs["config"].retries["max_attempts"] == 5
+
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_client_caches_per_service_region_profile_sharing_one_session(self, mock_create_session):
+        mock_session = MagicMock()
+        mock_session.client.side_effect = lambda *a, **k: MagicMock()  # fresh client per underlying call
+        mock_create_session.return_value = mock_session
+
+        a1 = get_boto_client("ec2", region="us-west-2", profile="p1")
+        a2 = get_boto_client("ec2", region="us-west-2", profile="p1")
+        b = get_boto_client("ec2", region="eu-west-1", profile="p1")
+        c = get_boto_client("autoscaling", region="us-west-2", profile="p1")
+
+        assert a1 is a2  # same (service, region, profile) -> cached
+        assert len({id(a1), id(b), id(c)}) == 3  # distinct keys -> distinct clients
+        assert mock_session.client.call_count == 3  # a2 served from cache
+        mock_create_session.assert_called_once()  # all clients share one session
+
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_session_call_forms_canonicalize_to_one_entry(self, mock_create_session):
+        # The private-cached-core split closes the lru_cache literal-call-shape gap: omitting
+        # profile, passing it positionally, and passing it by keyword are the same logical
+        # session and must share ONE cache entry (one credential fetch), not three.
+        mock_create_session.side_effect = lambda profile=None: MagicMock()
+
+        omitted = get_boto_session()
+        positional = get_boto_session(None)
+        keyword = get_boto_session(profile=None)
+
+        assert omitted is positional is keyword
+        assert mock_create_session.call_count == 1
+
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_client_omitted_region_and_explicit_none_canonicalize(self, mock_create_session):
+        # Same gap for the client: omitting region vs passing region=None are one logical
+        # client -> one cache entry, not two.
+        mock_session = MagicMock()
+        mock_session.client.side_effect = lambda *a, **k: MagicMock()
+        mock_create_session.return_value = mock_session
+
+        omitted = get_boto_client("ec2", profile="p1")
+        explicit_none = get_boto_client("ec2", region=None, profile="p1")
+
+        assert omitted is explicit_none
+        assert mock_session.client.call_count == 1
+
+
+class TestGetS3ClientAndSession(_BotoCacheTestBase):
+    """Test get_s3_client_and_session — now a thin wrapper over the shared helpers."""
+
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_uses_retry_logic_for_credentials(self, mock_create_session):
+        mock_create_session.return_value = MagicMock()
+
+        _, session = get_s3_client_and_session(profile="my-profile")
 
         mock_create_session.assert_called_once_with("my-profile")
-        assert session == mock_session
+        assert session is mock_create_session.return_value
 
     @patch("test.utils.s3_utils._create_boto3_session_with_retry")
     def test_returns_s3_client_and_session(self, mock_create_session):
@@ -356,10 +434,11 @@ class TestGetS3ClientAndSession:
 
         client, session = get_s3_client_and_session()
 
-        assert client == mock_client
-        assert session == mock_session
-        # Verify S3 client is created
-        mock_session.client.assert_called_once_with("s3")
+        assert client is mock_client
+        assert session is mock_session
+        # The wrapper builds exactly one client, for the s3 service (region/config
+        # wiring is get_boto_client's contract — covered in TestGetBotoSessionAndClient).
+        mock_session.client.assert_called_once_with("s3", region_name=None, config=ANY)
 
     @patch("test.utils.s3_utils._create_boto3_session_with_retry")
     def test_caches_result(self, mock_create_session):

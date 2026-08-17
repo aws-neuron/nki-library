@@ -69,7 +69,7 @@ def upload_profile(
                 print(f"    ✓ {url}")
                 return url
 
-        print(f"    ⚠ No URL found in output")
+        print("    ⚠ No URL found in output")
         return None
     except Exception as e:
         print(f"    ✗ Upload failed: {e}")
@@ -88,7 +88,7 @@ def find_metrics_json(test_dir):
 
 def format_metric(col, value):
     """Format metric values."""
-    if value == "" or value == "N/A" or value == None:
+    if value == "" or value == "N/A" or value is None:
         return value
     try:
         v = float(value)
@@ -137,7 +137,7 @@ def main(
 
     # Collect all parameter keys from all tests
     all_param_keys = set()
-    for test_name, test_dir in test_dirs:
+    for _test_name, test_dir in test_dirs:
         metrics_json = find_metrics_json(test_dir)
         if metrics_json:
             with open(metrics_json, "r") as f:
@@ -174,6 +174,7 @@ def main(
                     "InputDumpTime",
                     "KernelAPI",
                     "MlirToBirTime",
+                    "FrontendTraceTime",
                     "SftpDownloadTime",
                     "SftpUploadTime",
                     "SimulationTime",
@@ -248,14 +249,14 @@ def main(
         active_speedup = "N/A"
         try:
             if (
-                bf16_inference_time != None
+                bf16_inference_time is not None
                 and bf16_inference_time > 0
                 and inference_time != "N/A"
                 and float(inference_time) > 0
             ):
                 speedup = f"{float(bf16_inference_time) / float(inference_time):.2f}x"
             if (
-                bf16_active_inference_time != None
+                bf16_active_inference_time is not None
                 and bf16_active_inference_time > 0
                 and active_inference_time != "N/A"
                 and float(active_inference_time) > 0

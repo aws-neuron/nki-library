@@ -19,9 +19,9 @@ from typing import final
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.conv.depthwise_conv1d import depthwise_conv1d_implicit_gemm
 from nkilib_src.nkilib.experimental.conv.depthwise_conv1d_torch import depthwise_conv1d_implicit_gemm_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -106,7 +106,7 @@ ALL_TEST_CASES = [
     (1, 16, 512, 200, (1, 1), ((0, 0), (10, 10)), nl.bfloat16),
     pytest.param(
         1, 1024, 1024, 128, (1, 1), ((0, 0), (5, 5)), nl.bfloat16,
-        marks=pytest.mark.skip(reason="Skipped: neuron-profile view OOM on 128GB TRN instance during JSON generation"),
+        marks=pytest.mark.skip(reason="Skipped: neuron-explorer view OOM on 128GB TRN instance during JSON generation"),
         id="1-1024-1024-128-1_1-0_0_5_5-bfloat16-SKIP_OOM",
     ),
     (1, 256, 2048, 128, (1, 1), ((0, 0), (10, 10)), nl.bfloat16),

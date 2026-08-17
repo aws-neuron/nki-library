@@ -26,7 +26,6 @@ from ...core.subkernels.rmsnorm_tkg import _process_rmsnorm_tile
 from ...core.utils.allocator import SbufManager
 from ...core.utils.common_types import RouterActFnType
 from ...core.utils.kernel_helpers import get_verified_program_sharding_info
-from ...core.utils.tensor_view import TensorView
 from ...core.utils.tiled_range import TiledRange
 
 _pmax = 128
@@ -41,18 +40,17 @@ def _rmsnorm_small_t(hidden_states, gamma, eps, output_sb, output_hbm, T, H, H0,
     """
     # Load input: HBM [T, H] → SBUF [H0, T, H_free]
     input_hbm_view = (
-        TensorView(hidden_states)
-        .flatten_dims(start_dim=0, end_dim=1)  # [T, H]
+        hidden_states.flatten_dims(start_dim=0, end_dim=1)  # [T, H]
         .reshape_dim(dim=1, shape=[H0, H_free])  # [T, H0, H_free]
         .permute(dims=[1, 0, 2])  # [H0, T, H_free]
     )
     # Reuse output_sb as input buffer (loaded in-place, then overwritten by normalization)
-    nisa.dma_copy(dst=output_sb, src=input_hbm_view.get_view())
+    nisa.dma_copy(dst=output_sb, src=input_hbm_view)
 
     # Load gamma: [1, H] → [H0, H_free]
     gamma_sb = nl.ndarray((H0, H_free), dtype=gamma.dtype, buffer=nl.sbuf)
-    gamma_hbm_view = TensorView(gamma).reshape_dim(dim=1, shape=[H0, H_free]).permute(dims=[1, 0, 2])
-    nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view.get_view())
+    gamma_hbm_view = gamma.reshape_dim(dim=1, shape=[H0, H_free]).permute(dims=[1, 0, 2])
+    nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view)
 
     # Prepare eps and reduction constant
     eps_sb = nl.ndarray((H0, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -61,15 +59,15 @@ def _rmsnorm_small_t(hidden_states, gamma, eps, output_sb, output_hbm, T, H, H0,
     nisa.memset(matmul_reduction_const, value=1.0)
 
     # Process all T tokens
-    input_sb_view = TensorView(output_sb)
-    output_sb_view = TensorView(output_sb)
+    input_sb_view = output_sb
+    output_sb_view = output_sb
 
     sbm = SbufManager(0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True)
     sbm.open_scope()
 
     for bxs_tile in TiledRange(T, _BxS_FULL_TILE_SIZE):
         input_tile = input_sb_view.slice(dim=1, start=bxs_tile.start_offset, end=bxs_tile.start_offset + bxs_tile.size)
-        gamma_tile = TensorView(gamma_sb).expand_dim(dim=1).broadcast(dim=1, size=bxs_tile.size)
+        gamma_tile = gamma_sb.expand_dim(dim=1).broadcast(dim=1, size=bxs_tile.size)
         output_tile = output_sb_view.slice(
             dim=1, start=bxs_tile.start_offset, end=bxs_tile.start_offset + bxs_tile.size
         )
@@ -77,8 +75,8 @@ def _rmsnorm_small_t(hidden_states, gamma, eps, output_sb, output_hbm, T, H, H0,
             input_sb_view=input_tile,
             gamma_sb_view=gamma_tile,
             output_sb_view=output_tile,
-            eps_view=TensorView(eps_sb),
-            matmul_reduction_const_view=TensorView(matmul_reduction_const),
+            eps_view=eps_sb,
+            matmul_reduction_const_view=matmul_reduction_const,
             bxs_tile=bxs_tile,
             hidden_actual=H,
             shard_on_h=False,
@@ -96,23 +94,22 @@ def _rmsnorm_small_t(hidden_states, gamma, eps, output_sb, output_hbm, T, H, H0,
         T_offset = 0
 
     output_hbm_shard_view = (
-        TensorView(output_hbm)
-        .slice(dim=0, start=T_offset, end=T_offset + T_shard)  # [T_shard, H]
+        output_hbm.slice(dim=0, start=T_offset, end=T_offset + T_shard)  # [T_shard, H]
         .reshape_dim(dim=1, shape=[H0, H_free])  # [T_shard, H0, H_free]
         .permute(dims=[1, 0, 2])  # [H0, T_shard, H_free]
     )
     nisa.dma_copy(
-        dst=output_hbm_shard_view.get_view(),
+        dst=output_hbm_shard_view,
         src=output_sb[:, nl.ds(T_offset, T_shard), :],
     )
 
 
 @nki.jit
 def rmsnorm_router_topk_a2av(
-    hidden_states: nl.ndarray,
-    gamma: nl.ndarray,
-    router_weights: nl.ndarray,
-    router_bias: Optional[nl.ndarray] = None,
+    hidden_states: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    router_weights: nl.NkiTensor,
+    router_bias: Optional[nl.NkiTensor] = None,
     eps: float = 1e-6,
     top_k: int = 1,
     router_act_fn: RouterActFnType = RouterActFnType.SIGMOID,
@@ -130,18 +127,18 @@ def rmsnorm_router_topk_a2av(
         K: top_k experts per token
 
     Args:
-        hidden_states (nl.ndarray): [B, S, H]@HBM, bf16/fp16 input.
-        gamma (nl.ndarray): [1, H]@HBM, bf16/fp16 RMSNorm scale weights.
-        router_weights (nl.ndarray): [H, E]@HBM, bf16/fp16 router projection.
-        router_bias (Optional[nl.ndarray]): [1, E]@HBM, optional router bias.
+        hidden_states (nl.NkiTensor): [B, S, H]@HBM, bf16/fp16 input.
+        gamma (nl.NkiTensor): [1, H]@HBM, bf16/fp16 RMSNorm scale weights.
+        router_weights (nl.NkiTensor): [H, E]@HBM, bf16/fp16 router projection.
+        router_bias (Optional[nl.NkiTensor]): [1, E]@HBM, optional router bias.
         eps (float): RMSNorm epsilon for numerical stability.
         top_k (int): Number of top experts to select per token.
         router_act_fn (RouterActFnType): Activation for router (SOFTMAX or SIGMOID).
 
     Returns:
-        norm_output (nl.ndarray): [T, H]@HBM, normalized hidden states.
-        expert_index (nl.ndarray): [T, K]@HBM, int32 top-K expert indices.
-        expert_affinities (nl.ndarray): [T, E]@HBM, bf16 masked affinities.
+        norm_output (nl.NkiTensor): [T, H]@HBM, normalized hidden states.
+        expert_index (nl.NkiTensor): [T, K]@HBM, int32 top-K expert indices.
+        expert_affinities (nl.NkiTensor): [T, E]@HBM, bf16 masked affinities.
 
     Notes:
         - T = B * S must be <= 128 (single tile processing)
@@ -190,7 +187,7 @@ def rmsnorm_router_topk_a2av(
         router_pre_norm=False,
         norm_topk_prob=False,
         use_column_tiling=True,
-        use_indirect_dma_scatter=True,
+        use_indirect_dma_scatter=False,
         use_PE_broadcast_w_bias=False,
         shard_on_tokens=False,
         skip_store_expert_index=False,

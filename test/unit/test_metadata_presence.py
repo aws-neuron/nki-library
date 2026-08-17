@@ -19,6 +19,9 @@ suite have the required @pytest_test_metadata decorator for proper test discover
 tracking.
 """
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from test.utils.pytest_test_metadata import extract_pytest_test_metadata_from_file
@@ -26,6 +29,7 @@ from test.utils.test_validation_utils import (
     IntegrationFileCollector,
     ValidationErrorReporter,
     ValidationViolation,
+    get_decorator_name,
 )
 
 # Fix instructions for @pytest_test_metadata decorator
@@ -127,17 +131,43 @@ def test_all_integration_test_classes_have_metadata():
     print(f"\n✓ All {total_classes} test classes in {len(test_files)} files have @pytest_test_metadata decorators")
 
 
+def _count_pytest_test_metadata(file_path: Path) -> int:
+    """Count @pytest_test_metadata decorators in a file (on any class or function).
+
+    Each @pytest_test_metadata occurrence is discovered as a separate test entry, regardless
+    of whether it decorates a class or a test function, so this counts both.
+    AST-based to avoid matching the name in docstrings/imports/strings.
+    """
+    tree = ast.parse(Path(file_path).read_text(encoding="utf-8"), filename=str(file_path))
+    return sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        for decorator in node.decorator_list
+        if get_decorator_name(decorator) == "pytest_test_metadata"
+    )
+
+
 def test_one_metadata_per_file():
     """
-    Enforce that each test file has at most one @pytest_test_metadata annotation.
+    Enforce that each test file under integration/nkilib has at most one
+    @pytest_test_metadata annotation.
 
-    The CDK creates one pipeline approval step per @pytest_test_metadata annotation.
-    Multiple annotations in the same file cause duplicate approval steps running the
-    same tests. Use @pytest_marks for additional test classes instead.
+    Each @pytest_test_metadata annotation is discovered as a separate test entry across the
+    whole integration/nkilib tree (not just core). Multiple annotations in the same file
+    cause duplicate entries that re-run the same file. Use @pytest_marks for additional
+    test classes/functions instead.
+
+    Files with no @pytest_test_metadata (e.g. experimental/not-ready tests) are unaffected.
     """
-    integration_core_dir = IntegrationFileCollector.get_integration_core_dir()
-    collector = IntegrationFileCollector(integration_core_dir)
+    # Scan all of integration/nkilib (core + experimental + private), matching test discovery.
+    nkilib_dir = IntegrationFileCollector.get_integration_core_dir().parent
+    collector = IntegrationFileCollector(nkilib_dir)
     test_files = collector.collect()
+
+    assert len(test_files) > 0, (
+        f"No test files found in {nkilib_dir}. This might indicate the test is looking in the wrong directory."
+    )
 
     reporter = ValidationErrorReporter(
         error_title="Found test files with multiple @pytest_test_metadata annotations",
@@ -146,8 +176,8 @@ def test_one_metadata_per_file():
         [
             "Each test file must have exactly ONE @pytest_test_metadata decorator.",
             "",
-            "Only the first test class should have @pytest_test_metadata.",
-            "Other test classes should only use @pytest_marks for marking:",
+            "Only the first test class/function should have @pytest_test_metadata.",
+            "Other test classes/functions should only use @pytest_marks for marking:",
             "",
             "   @pytest_test_metadata(",
             '       name="My Kernel",',
@@ -163,14 +193,12 @@ def test_one_metadata_per_file():
     )
 
     for file_info in test_files:
-        test_classes = extract_pytest_test_metadata_from_file(file_info.file_path)
-        annotated = [tc for tc in test_classes if tc.metadata is not None]
-
-        if len(annotated) > 1:
+        count = _count_pytest_test_metadata(file_info.file_path)
+        if count > 1:
             reporter.add_violation(
                 ValidationViolation(
                     file_path=file_info.file_path,
-                    message=f"Found {len(annotated)} @pytest_test_metadata annotations",
+                    message=f"Found {count} @pytest_test_metadata annotations (expected at most 1)",
                 )
             )
 

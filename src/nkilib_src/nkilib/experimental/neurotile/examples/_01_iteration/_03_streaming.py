@@ -105,7 +105,7 @@ def stream_dim_walks_columns(src):
         for k in range(src_tiles.shape[0]):
             tile = col[k]  # tile: [128, 128]
             nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-        dst_tiles[:, j].store(col.ap())
+        dst_tiles[:, j].store(col.data)
 
     return dst
 
@@ -134,7 +134,7 @@ def stream_2d_blocks(src):
                 for tj in range(block.shape[1]):
                     tile = block[ti, tj]  # tile: [128, 256]
                     nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 2.0)
-            dst_blocks[bi, bj].store(block.ap())
+            dst_blocks[bi, bj].store(block.data)
 
     return dst
 

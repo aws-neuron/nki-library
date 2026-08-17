@@ -15,8 +15,10 @@
 """Backward pass kernel for blockwise matrix multiplication in Mixture of Experts."""
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 
+from ....core.utils.kernel_assert import kernel_assert
 from .bwmm_bwd_dropless import blockwise_mm_bwd_dropless
 from .moe_bwd_parameters import (
     ActFnType,
@@ -59,6 +61,7 @@ def blockwise_mm_bwd(
     gate_up_proj_weight_grad_out: nl.ndarray = None,
     down_proj_weight_grad_out: nl.ndarray = None,
     accumulation_dtype: nki.dtype = None,
+    skip_gate_proj: bool = False,
 ) -> tuple:
     """
     Compute backward pass for blockwise MoE layer.
@@ -112,9 +115,13 @@ def blockwise_mm_bwd(
             gate/up projection weight gradient. If None, allocated internally.
         down_proj_weight_grad_out (nl.ndarray, optional): Pre-allocated [E, I_TP, H] output tensor for down
             projection weight gradient. If None, allocated internally.
-        accumulation_dtype (nki.dtype, optional): Opt-in high-precision dtype for the bias-gradient
-            accumulators. Default None = compute_dtype (baseline, unchanged). Set to nl.float32 to
-            accumulate bias gradients in fp32 (reduces bf16 accumulation error; e.g. for fp32 grad buffers).
+        accumulation_dtype (nki.dtype, optional): Opt-in high-precision dtype for the gradient
+            accumulators (hidden/affinity/weight/bias grads). Default None = compute_dtype (baseline,
+            unchanged). Set to nl.float32 to accumulate all gradients in fp32 (reduces bf16 accumulation
+            error). fp32 accumulation is also auto-enabled if any *_grad_out buffer is fp32. When fp32
+            accumulation is requested but the output buffer is bf16, the kernel accumulates into an
+            internal fp32 scratch and downcasts to the bf16 buffer on return. Passing a lower-precision
+            accumulation_dtype together with fp32 grad-out buffers is contradictory and raises ValueError.
 
     Returns:
         tuple: Gradient tensors:
@@ -138,50 +145,110 @@ def blockwise_mm_bwd(
     if clamp_limits == None:
         clamp_limits = ClampLimits()
 
-    # If a *_grad_out tensor is provided, use it instead of allocating internally.
+    # ------------------------------------------------------------------
+    # Resolve grad-output buffers + the effective accumulation dtype.
+    #
+    # fp32 accumulation is enabled if EITHER the caller allocates fp32 grad-out buffers OR passes
+    # accumulation_dtype=float32. When enabled but the output buffer is bf16, the kernel accumulates
+    # into an internal fp32 scratch and downcasts to the caller's bf16 buffer at the end -- so callers
+    # can keep bf16 grads and still get full-precision (fp32) accumulation. Passing a lower-precision
+    # accumulation_dtype together with fp32 grad buffers is contradictory and rejected.
+    # ------------------------------------------------------------------
+    fp32 = nl.float32
+    any_fp32_grad_buffer = (
+        (hidden_states_grad_out != None and hidden_states_grad_out.dtype == fp32)
+        or (expert_affinities_masked_grad_out != None and expert_affinities_masked_grad_out.dtype == fp32)
+        or (gate_up_proj_weight_grad_out != None and gate_up_proj_weight_grad_out.dtype == fp32)
+        or (down_proj_weight_grad_out != None and down_proj_weight_grad_out.dtype == fp32)
+    )
+
+    # Row-6: a lower-precision accumulation_dtype together with fp32 grad-out buffers is contradictory.
+    kernel_assert(
+        not (any_fp32_grad_buffer and accumulation_dtype != None and accumulation_dtype != fp32),
+        "accumulation_dtype conflicts with fp32 grad-out buffers: pass fp32 grad buffers OR "
+        "accumulation_dtype=float32 (not a lower-precision accumulation_dtype together with fp32 buffers).",
+    )
+
+    if accumulation_dtype == fp32 or any_fp32_grad_buffer:
+        effective_accum_dtype = fp32
+    else:
+        effective_accum_dtype = compute_dtype
+
+    # Single switch for the whole kernel: when True, accumulate every gradient into an internal fp32
+    # scratch buffer and downcast back to the caller's bf16 grad buffers at the end. True only when fp32
+    # accumulation is requested via accumulation_dtype while the grad-out buffers are bf16. (If the
+    # buffers are already fp32 we accumulate into them directly; bf16 with no opt-in = bf16 baseline.)
+    need_fp32_scratch = effective_accum_dtype == fp32 and not any_fp32_grad_buffer
+
+    # Return (output) buffers: caller's if provided, else internally allocated at the io dtype.
     if hidden_states_grad_out != None:
         hidden_states_grad = hidden_states_grad_out
     else:
         hidden_states_grad = nl.ndarray(hidden_states.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
-
     if expert_affinities_masked_grad_out != None:
         expert_affinities_masked_grad = expert_affinities_masked_grad_out
     else:
         expert_affinities_masked_grad = nl.ndarray(
             expert_affinities_masked.shape, dtype=expert_affinities_masked.dtype, buffer=nl.shared_hbm
         )
-
     if gate_up_proj_weight_grad_out != None:
         gate_up_proj_weight_grad = gate_up_proj_weight_grad_out
     else:
         gate_up_proj_weight_grad = nl.ndarray(
             gate_up_proj_weight.shape, dtype=gate_up_proj_weight.dtype, buffer=nl.shared_hbm
         )
-
     if down_proj_weight_grad_out != None:
         down_proj_weight_grad = down_proj_weight_grad_out
     else:
         down_proj_weight_grad = nl.ndarray(down_proj_weight.shape, dtype=down_proj_weight.dtype, buffer=nl.shared_hbm)
 
+    # Kernel (accumulation) buffers: fp32 scratch when need_fp32_scratch, else the output buffers.
+    if need_fp32_scratch:
+        hidden_states_grad_kbuf = nl.ndarray(hidden_states.shape, dtype=fp32, buffer=nl.shared_hbm)
+        expert_affinities_masked_grad_kbuf = nl.ndarray(
+            expert_affinities_masked.shape, dtype=fp32, buffer=nl.shared_hbm
+        )
+        gate_up_proj_weight_grad_kbuf = nl.ndarray(gate_up_proj_weight.shape, dtype=fp32, buffer=nl.shared_hbm)
+        down_proj_weight_grad_kbuf = nl.ndarray(down_proj_weight.shape, dtype=fp32, buffer=nl.shared_hbm)
+    else:
+        hidden_states_grad_kbuf = hidden_states_grad
+        expert_affinities_masked_grad_kbuf = expert_affinities_masked_grad
+        gate_up_proj_weight_grad_kbuf = gate_up_proj_weight_grad
+        down_proj_weight_grad_kbuf = down_proj_weight_grad
+
     gate_and_up_proj_bias_grad = None
     down_proj_bias_grad = None
+    gate_and_up_proj_bias_grad_kbuf = None
+    down_proj_bias_grad_kbuf = None
     if bias:
-        expert_count, hidden_dim, _, intermediate_dim = gate_up_proj_weight_grad.shape
+        expert_count, hidden_dim, _, intermediate_dim = gate_up_proj_weight.shape
+        # Bias grads are returned at their paired weight-grad output dtype; accumulate via fp32 scratch
+        # when need_fp32_scratch, else directly into the output buffer.
         gate_and_up_proj_bias_grad = nl.ndarray(
-            shape=(expert_count, 2, intermediate_dim), dtype=compute_dtype, buffer=nl.shared_hbm
+            (expert_count, 2, intermediate_dim), dtype=gate_up_proj_weight_grad.dtype, buffer=nl.shared_hbm
         )
-        down_proj_bias_grad = nl.ndarray(shape=(expert_count, hidden_dim), dtype=compute_dtype, buffer=nl.shared_hbm)
+        down_proj_bias_grad = nl.ndarray(
+            (expert_count, hidden_dim), dtype=down_proj_weight_grad.dtype, buffer=nl.shared_hbm
+        )
+        if need_fp32_scratch:
+            gate_and_up_proj_bias_grad_kbuf = nl.ndarray(
+                (expert_count, 2, intermediate_dim), dtype=fp32, buffer=nl.shared_hbm
+            )
+            down_proj_bias_grad_kbuf = nl.ndarray((expert_count, hidden_dim), dtype=fp32, buffer=nl.shared_hbm)
+        else:
+            gate_and_up_proj_bias_grad_kbuf = gate_and_up_proj_bias_grad
+            down_proj_bias_grad_kbuf = down_proj_bias_grad
 
     params = MOEBwdParameters(
         hidden_states=hidden_states,
-        hidden_states_grad=hidden_states_grad,
+        hidden_states_grad=hidden_states_grad_kbuf,
         expert_affinities_masked=expert_affinities_masked,
-        expert_affinities_masked_grad=expert_affinities_masked_grad,
+        expert_affinities_masked_grad=expert_affinities_masked_grad_kbuf,
         gate_up_proj_weight=gate_up_proj_weight,
-        gate_up_proj_weight_grad=gate_up_proj_weight_grad,
+        gate_up_proj_weight_grad=gate_up_proj_weight_grad_kbuf,
         gate_up_proj_act_checkpoint_T=gate_up_proj_act_checkpoint_T,
         down_proj_weight=down_proj_weight,
-        down_proj_weight_grad=down_proj_weight_grad,
+        down_proj_weight_grad=down_proj_weight_grad_kbuf,
         down_proj_act_checkpoint=None if affinity_option == AffinityOption.AFFINITY_ON_I else down_proj_act_checkpoint,
         token_position_to_id=token_position_to_id,
         block_to_expert=block_to_expert,
@@ -192,19 +259,30 @@ def blockwise_mm_bwd(
         is_tensor_update_accumulating=is_tensor_update_accumulating,
         skip_grad_initialization=skip_grad_initialization,
         clamp_limits=clamp_limits,
-        gate_and_up_proj_bias_grad=gate_and_up_proj_bias_grad,
-        down_proj_bias_grad=down_proj_bias_grad,
+        gate_and_up_proj_bias_grad=gate_and_up_proj_bias_grad_kbuf,
+        down_proj_bias_grad=down_proj_bias_grad_kbuf,
         activation_type=activation_type,
         affinity_option=affinity_option,
         blocking_params=blocking_params,
         shard_option=shard_option,
-        accumulation_dtype=accumulation_dtype,
+        accumulation_dtype=effective_accum_dtype,
+        skip_gate_proj=skip_gate_proj,
     )
 
     params.validate()
     params.validate_sharding(nl.num_programs(axes=0))
 
     blockwise_mm_bwd_dropless(params)
+
+    # Downcast the fp32 scratch accumulators back to the caller's bf16 grad buffers (HBM->HBM DMA cast).
+    if need_fp32_scratch:
+        nisa.dma_copy(dst=hidden_states_grad, src=hidden_states_grad_kbuf)
+        nisa.dma_copy(dst=expert_affinities_masked_grad, src=expert_affinities_masked_grad_kbuf)
+        nisa.dma_copy(dst=gate_up_proj_weight_grad, src=gate_up_proj_weight_grad_kbuf)
+        nisa.dma_copy(dst=down_proj_weight_grad, src=down_proj_weight_grad_kbuf)
+        if bias:
+            nisa.dma_copy(dst=gate_and_up_proj_bias_grad, src=gate_and_up_proj_bias_grad_kbuf)
+            nisa.dma_copy(dst=down_proj_bias_grad, src=down_proj_bias_grad_kbuf)
 
     if bias:
         return (

@@ -40,84 +40,172 @@ from .matmul_mxfp8_constants import (
     TILE_M_DEFAULTS,
     TILE_N_DEFAULTS,
     TILE_SIZE_P_MAX_LOGICAL,
+    autotune_cache_key,
 )
 
 # Autotune cache: optimal configs discovered by sweep for known shapes.
-# Key format: "{M}x{K}x{N}_{dtype}" where dtype is 'mxfp8_x4' or 'bfloat16'.
+# Key format: "{M}x{K}x{N}_{lhs}_{rhs}_{loadmethod}" where lhs/rhs are 'mxfp8' or
+# 'bf16' and loadmethod is 'swizzled', 'dgt', or 'pe_<scheme>' (e.g. 'pe_1x32').
 # fmt: off
 _AUTOTUNE_CACHE = {
-    "1024x1024x3584_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 7, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 7},
-    "1024x1024x3584_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 7, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 7},
-    "1024x512x2560_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5},
-    "1024x512x2560_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1280, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
-    "1152x768x2176_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 9},
-    "1152x768x2176_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 9},
-    "1536x1920x2048_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
-    "1536x1920x2048_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 12, 'TILES_IN_LOAD_N': 2},
-    "1536x4096x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
-    "1536x4096x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 12, 'TILES_IN_LOAD_N': 2},
-    "1664x3456x1792_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 896, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
-    "1664x3456x1792_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 896, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
-    "2048x2048x1536_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3},
-    "2048x2048x1536_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3},
-    "2048x2048x512_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
-    "2048x2048x512_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 1},
-    "2048x3584x2048_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "2048x3584x2048_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "2304x4096x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "2304x4096x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "2560x2560x2560_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 10, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 10, 'TILES_IN_LOAD_N': 5},
-    "2560x2560x2560_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 20, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5},
-    "2560x4096x2880_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1440, 'TILES_IN_BLOCK_M': 10, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 10, 'TILES_IN_LOAD_N': 1, "spill_reload": False},
-    "2560x4096x2880_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1440, 'TILES_IN_BLOCK_M': 20, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, "spill_reload": False},
-    "2880x4096x2048_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, "spill_reload": True},
-    "2880x4096x2048_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, "spill_reload": False},
-    "3072x3200x1792_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1792, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
-    "3072x3200x1792_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1792, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
-    "3200x768x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 2},
-    "3200x768x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
-    "3328x3200x1664_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1664, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
-    "3328x3200x1664_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1664, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
-    "4096x1024x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
-    "4096x1024x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
-    "4096x128x4096_bfloat16": {'tile_m': 128, 'tile_k': 128, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
-    "4096x128x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 128, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4},
-    "4096x1536x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
-    "4096x1536x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 4},
-    "4096x2048x2880_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "4096x2048x2880_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "4096x2048x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, "spill_reload": True},
-    "4096x2048x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "4096x2304x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, "spill_reload": True},
-    "4096x2304x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "4096x2560x2880_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 5, "spill_reload": True},
-    "4096x2560x2880_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "4096x2880x2048_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, "spill_reload": False},
-    "4096x2880x2048_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "4096x2880x2560_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 5, "spill_reload": True},
-    "4096x2880x2560_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, "spill_reload": False},
-    "4096x3072x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "4096x3072x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
-    "4096x4096x1024_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "4096x4096x1024_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "4096x4096x128_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 1},
-    "4096x4096x128_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 1},
-    "4096x4096x1536_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3},
-    "4096x4096x1536_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3},
-    "4096x4096x2048_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, "spill_reload": False},
-    "4096x4096x2048_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, "spill_reload": False},
-    "4096x4096x2304_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 9, "spill_reload": True},
-    "4096x4096x2304_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 9, "spill_reload": False},
-    "4096x4096x3072_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "4096x4096x3072_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3},
-    "4096x4096x6144_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 6, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "4096x4096x6144_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "4096x6144x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 4},
-    "4096x6144x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
-    "512x512x1024_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
-    "512x512x1024_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
-    "6144x4096x4096_bfloat16": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 24, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 24, 'TILES_IN_LOAD_N': 2},
-    "6144x4096x4096_mxfp8_x4": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
+    "1024x1024x1792_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 7, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 7},
+    "1024x1024x1792_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 7, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 7},
+    "1024x1536x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "1024x2048x1536_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3},
+    "1024x2048x1536_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3},
+    "1024x2048x512_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
+    "1024x2048x512_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 1},
+    "1024x3072x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "1024x4096x1536_bf16_bf16_dgt": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "1024x4096x1536_bf16_bf16_pe_1x32": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': True},
+    "1024x4096x1536_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "1024x4096x1536_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "1024x4096x768_bf16_bf16_dgt": {'tile_m': 128, 'tile_k': 512, 'tile_n': 768, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 1, 'spill_reload': True},
+    "1024x4096x768_bf16_bf16_pe_1x32": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': True},
+    "1024x4096x768_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 768, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': True},
+    "1024x4096x768_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "1024x512x1280_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5},
+    "1024x512x1280_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1280, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
+    "1024x768x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "1152x768x1088_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 9},
+    "1152x768x1088_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 9},
+    "1440x4096x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "1440x4096x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "1536x1024x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "1536x1920x1024_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
+    "1536x1920x1024_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 12, 'TILES_IN_LOAD_N': 2},
+    "1536x2048x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "1536x3200x1792_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1792, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
+    "1536x3200x1792_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1792, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
+    "1536x4096x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
+    "1536x4096x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 12, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "1536x512x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 6, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 6, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "1664x3200x1664_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1664, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
+    "1664x3200x1664_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1664, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
+    "1664x3456x896_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 896, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
+    "1664x3456x896_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 896, 'TILES_IN_BLOCK_M': 13, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 13, 'TILES_IN_LOAD_N': 1},
+    "2048x1024x1536_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x1024x3072_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 6, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x1024x768_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x1536x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x2048x1536_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x2048x2880_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x2048x2880_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x2048x3072_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x2048x768_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x2560x2880_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 5, 'spill_reload': True},
+    "2048x2560x2880_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x2880x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "2048x2880x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x2880x2560_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 5, 'spill_reload': True},
+    "2048x2880x2560_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "2048x3072x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "2048x3584x1024_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "2048x3584x1024_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 7, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "2048x4096x1024_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "2048x4096x1024_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "2048x4096x128_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "2048x4096x128_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 128, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "2048x4096x1536_bf16_bf16_dgt": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "2048x4096x1536_bf16_bf16_pe_1x32": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 3, 'spill_reload': True},
+    "2048x4096x1536_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': True},
+    "2048x4096x1536_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x4096x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x4096x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "2048x4096x2304_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 9, 'spill_reload': True},
+    "2048x4096x2304_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 9, 'spill_reload': False},
+    "2048x4096x3072_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "2048x4096x3072_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x4096x768_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x5120x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "2048x5120x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "2048x5120x2560_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "2048x5120x2560_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "2048x512x1536_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "2048x512x3072_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 6, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2048x512x768_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 768, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "2048x768x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2304x4096x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2304x4096x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2304x4096x4096_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 9, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 9, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2560x2560x1280_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 10, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 10, 'TILES_IN_LOAD_N': 5},
+    "2560x2560x1280_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 20, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5},
+    "2560x4096x1440_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1440, 'TILES_IN_BLOCK_M': 10, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 10, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "2560x4096x1440_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 1440, 'TILES_IN_BLOCK_M': 20, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "2560x4096x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 10, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 10, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2560x4096x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 10, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 10, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "2560x4096x2560_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 10, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 10, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "2560x4096x2560_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 20, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 20, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "3072x4096x4096_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 24, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 24, 'TILES_IN_LOAD_N': 2},
+    "3072x4096x4096_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 12, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2},
+    "3200x768x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 2},
+    "3200x768x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
+    "4096x1024x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
+    "4096x1024x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
+    "4096x12800x2560_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': True},
+    "4096x12800x2560_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "4096x128x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 128, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 4, 'spill_reload': True},
+    "4096x128x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 128, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "4096x1536x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 4},
+    "4096x1536x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x2048x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "4096x2048x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x2048x2560_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "4096x2048x2560_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "4096x2304x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': True},
+    "4096x2304x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x2560x2560_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': True},
+    "4096x2560x2560_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "4096x3072x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "4096x3072x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 32, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 6, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x4096x2048_bf16_bf16_dgt": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "4096x4096x2048_bf16_bf16_pe_1x32": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': True},
+    "4096x4096x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "4096x4096x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x4096x2304_bf16_bf16_dgt": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "4096x4096x2304_bf16_bf16_pe_1x32": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 9, 'spill_reload': True},
+    "4096x4096x2304_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 9, 'spill_reload': True},
+    "4096x4096x2304_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 9, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 9, 'spill_reload': False},
+    "4096x4096x3072_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 6, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "4096x4096x3072_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "4096x4096x4096_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x4096x4608_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x4608x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 9, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x5120x3200_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "4096x5120x3200_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x5120x6400_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 4, 'spill_reload': True},
+    "4096x5120x6400_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 5, 'TILES_IN_LOAD_M': 16, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x6144x2048_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 4},
+    "4096x6144x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2},
+    "4096x6400x2560_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 5, 'spill_reload': True},
+    "4096x6400x2560_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "4096x768x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x8192x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4096x9216x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "4608x4096x4096_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "5120x4096x3200_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "5120x4096x3200_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 16, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 8, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "512x1536x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 3, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "512x3072x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
+    "512x4096x1536_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "512x4096x384_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 384, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "512x4096x768_bf16_bf16_dgt": {'tile_m': 128, 'tile_k': 512, 'tile_n': 768, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "512x4096x768_bf16_bf16_pe_1x32": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 3, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 3, 'spill_reload': False},
+    "512x4096x768_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 768, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "512x4096x768_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 768, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 8, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "512x512x256_bf16_bf16_dgt": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': True},
+    "512x512x256_bf16_bf16_pe_1x32": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "512x512x256_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 2, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 2, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "512x512x256_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 256, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1, 'spill_reload': False},
+    "512x512x512_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
+    "512x512x512_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 1, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 1},
+    "512x768x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 4, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "6400x4096x5120_bf16_bf16_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 25, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 25, 'TILES_IN_LOAD_N': 2, 'spill_reload': True},
+    "6400x4096x5120_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 8, 'TILES_IN_BLOCK_N': 5, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 4, 'TILES_IN_LOAD_N': 5, 'spill_reload': False},
+    "768x1024x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 6, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 2, 'TILES_IN_LOAD_M': 6, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "768x2048x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 6, 'TILES_IN_BLOCK_N': 2, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 6, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "768x4096x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 6, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 4, 'TILES_IN_LOAD_M': 6, 'TILES_IN_LOAD_N': 2, 'spill_reload': False},
+    "768x512x2048_mxfp8_mxfp8_swizzled": {'tile_m': 128, 'tile_k': 512, 'tile_n': 512, 'TILES_IN_BLOCK_M': 6, 'TILES_IN_BLOCK_N': 4, 'TILES_IN_BLOCK_K': 1, 'TILES_IN_LOAD_M': 6, 'TILES_IN_LOAD_N': 4, 'spill_reload': False},
 }
 # fmt: on
 
@@ -151,6 +239,8 @@ class MatmulMxfp8KernelConfig(nl.NKIObject):
     enable_psum_copy_in: bool = True
     lhs_is_swizzled: bool = True
     rhs_is_swizzled: bool = True
+    load_with_PE_swizzle: bool = False
+    quant_scheme: str = "wrapX"
     output_dtype: Optional[object] = None
     # Computed by validate_shapes():
     bd: Optional[BlockDescriptor] = None
@@ -292,7 +382,7 @@ def resolve_lnc2_sharding(M, N, run_with_lnc2, lnc_2_shard_rhs, tile_m=128, tile
     return run_with_lnc2, lnc_2_shard_rhs
 
 
-def auto_generate_default(config, lhs_dtype, rhs_dtype, output_dtype_str, use_cache=True):
+def auto_generate_default(config, lhs_dtype, rhs_dtype, output_dtype_str, use_cache=True, enable_psum_copy_in=None):
     """Fill None fields on config using the block_count_reducer strategy. Returns config.
 
     Precision parameters use plain string values ('mxfp8', 'mxfp8_x4', 'bfloat16', 'fp32')
@@ -320,14 +410,39 @@ def auto_generate_default(config, lhs_dtype, rhs_dtype, output_dtype_str, use_ca
     else:
         effective_m, effective_n = config.M, config.N
 
-    # Check autotune cache for known-good config
-    _lhs_pq = lhs_dtype in (PRECISION_MXFP8, PRECISION_MXFP8_X4)
-    _rhs_pq = rhs_dtype in (PRECISION_MXFP8, PRECISION_MXFP8_X4)
-    _dtype_key = 'mxfp8_x4' if (_lhs_pq and _rhs_pq) else 'bfloat16'
-    _cache_key = f"{config.M}x{config.K}x{config.N}_{_dtype_key}"
-    _shard_rhs_matches = config.lnc_2_shard_rhs == (config.N >= config.M)
-    _inputs_swizzled = config.lhs_is_swizzled and config.rhs_is_swizzled
-    _cached = _shard_rhs_matches and _inputs_swizzled and _AUTOTUNE_CACHE.get(_cache_key)
+    # Check autotune cache for known-good config. The key encodes shape, per-operand
+    # dtype, and load method (swizzled / dgt / pe_<scheme>), since the optimal tiling
+    # depends on the input-preparation path, not just the shape.
+    #
+    # Only consult the cache when the caller left the blocking/load tiling unspecified,
+    # i.e. is actually asking to be autotuned. A caller that fully specifies the tiling
+    # (all TILES_IN_BLOCK_*/TILES_IN_LOAD_* set) has opted out of autotuning, so the
+    # cache must not run — otherwise its cached spill_reload / enable_psum_copy_in would
+    # silently override the caller's explicit values.
+    _tiling_unspecified = (
+        config.TILES_IN_BLOCK_M is None
+        or config.TILES_IN_BLOCK_N is None
+        or config.TILES_IN_BLOCK_K is None
+        or config.TILES_IN_LOAD_M is None
+        or config.TILES_IN_LOAD_N is None
+    )
+    # Key by the per-core (post-sharding) shape: run_with_lnc2 + lnc_2_shard_rhs
+    # select which dim is halved, so a sharded run looks up the tiling tuned for
+    # the shape each core actually computes.
+    _cache_key = autotune_cache_key(
+        config.M,
+        config.K,
+        config.N,
+        lhs_dtype,
+        rhs_dtype,
+        config.lhs_is_swizzled,
+        config.rhs_is_swizzled,
+        config.load_with_PE_swizzle,
+        config.quant_scheme,
+        config.run_with_lnc2,
+        config.lnc_2_shard_rhs,
+    )
+    _cached = _tiling_unspecified and _AUTOTUNE_CACHE.get(_cache_key)
     if use_cache and _cached:
         if config.tile_m == None:
             config.tile_m = _cached.get('tile_m', 128)
@@ -350,6 +465,8 @@ def auto_generate_default(config, lhs_dtype, rhs_dtype, output_dtype_str, use_ca
         config.enable_psum_copy_in = _cached.get('enable_psum_copy_in', True)
         if 'spill_reload' in _cached:
             config.spill_reload = _cached['spill_reload']
+        if enable_psum_copy_in is not None:
+            config.enable_psum_copy_in = enable_psum_copy_in
         return config
 
     if config.tile_m == None:
@@ -443,6 +560,8 @@ def auto_generate_default(config, lhs_dtype, rhs_dtype, output_dtype_str, use_ca
         else:
             config.TILES_IN_LOAD_N = config.TILES_IN_BLOCK_N
 
+    if enable_psum_copy_in is not None:
+        config.enable_psum_copy_in = enable_psum_copy_in
     return config
 
 
@@ -581,7 +700,13 @@ def validate_shapes(config, lhs_td, rhs_td):
     config.BLOCKS_IN_K = div_ceil(K_LOGICAL, config.bd.BLOCK_K_LOGICAL)
 
     if not lhs_td.is_swizzled or not rhs_td.is_swizzled:
-        kernel_assert(K_LOGICAL % 128 == 0, f"K must be divisible by 128 for DGT")
+        # DGT requires K divisible by 128; the fast DMA transpose path relaxes this to
+        # MX_PARTITION_SIZE (32) since it gathers any 32-aligned K in a single op.
+        unswizzled_fast_dma = (not lhs_td.is_swizzled and lhs_td.fast_dma_transpose) or (
+            not rhs_td.is_swizzled and rhs_td.fast_dma_transpose
+        )
+        k_alignment = quantize_mxfp8_utils.MX_PARTITION_SIZE if unswizzled_fast_dma else 128
+        kernel_assert(K_LOGICAL % k_alignment == 0, f"K must be divisible by {k_alignment} for DGT")
 
     return config
 

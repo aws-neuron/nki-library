@@ -30,6 +30,7 @@ def test_metrics_collector_with_timers():
     with tempfile.TemporaryDirectory() as tmpdir:
         collector = MetricsCollector()
         collector.set_namespace("NeuronCompiler")
+        collector.set_pytest_marks(["fast", "mlp"])
 
         emitter = MetricsEmitter(
             output_mode=OutputMode.FILE,
@@ -94,6 +95,7 @@ def test_metrics_collector_with_timers():
         assert data["IsSuccessful"] == "true"
         assert data["KernelName"] == "test_kernel"
         assert data["LNCCores"] == "2"
+        assert data["PytestMarks"] == ["fast", "mlp"]
 
         # Check elapsed time was added
         assert MetricName.ELAPSED_ALL_SEC in data

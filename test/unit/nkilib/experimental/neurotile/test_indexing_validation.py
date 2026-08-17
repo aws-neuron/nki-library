@@ -35,17 +35,9 @@ from nkilib_src.nkilib.experimental.neurotile.core.axis import Axis, AxisLabel
 from nkilib_src.nkilib.experimental.neurotile.core.factories import blocks, tiles
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
 from nkilib_src.nkilib.experimental.neurotile.core.shard_helpers import interleaved_range
+
+from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
-
-
-class _Src:
-    """Lightweight source-tensor stand-in for factory call paths."""
-
-    def __init__(self, shape=(128, 2048), dtype="float32", offset=0):
-        self.shape = shape
-        self.dtype = dtype
-        self.offset = offset
-
 
 # ---------------------------------------------------------------------------
 # _level_hint
@@ -70,7 +62,7 @@ class TestLevelHint:
 
     def test_interleaved_shard_outer_hint(self):
         """Interleaved-sharded views surface a 'shard axis' hint."""
-        v = tiles(_Src(shape=(128, 1024)), tile_size=(128, 128))  # 8 tiles on dim 1
+        v = tiles(MockTensor((128, 1024)), tile_size=(128, 128))  # 8 tiles on dim 1
         # Stepped slice -> split_peers -> consumes peer axis with SHARD label.
         # The owned axis remains as outer; structurally still 'shard'-spaced.
         v[:, interleaved_range(rank=0, num_shards=4, total=8)]
@@ -78,7 +70,7 @@ class TestLevelHint:
         # present. After interleaved indexing, peer is consumed; the owned axis
         # carries the gap. The hint covers the case where the user looks at a
         # block-level view; we just exercise that it is empty for plain tile.
-        assert level_hint(v.grid, 1) == ""
+        assert level_hint(v._grid, 1) == ""
 
     def test_shard_axis_hint_string(self):
         """When a Grid still carries a SHARD-labelled axis on a dim, the
@@ -214,18 +206,18 @@ class TestLevelHintInErrors:
 class TestNDSliceIntegration:
     @pytest.mark.fast
     def test_tiles_view_oob_slice_rejects(self):
-        v = tiles(_Src(shape=(128, 2048)), tile_size=(128, 512))  # shape (1, 4)
+        v = tiles(MockTensor((128, 2048)), tile_size=(128, 512))  # shape (1, 4)
         with pytest.raises(AssertionError, match=r"slice \[0:10:1\] out of range"):
             v[:, 0:10]
 
     def test_blocks_view_oob_slice_rejects_with_block_hint(self):
-        v = blocks(_Src(shape=(128, 2048)), tile_size=(128, 512), block_size=(1, 4))
+        v = blocks(MockTensor((128, 2048)), tile_size=(128, 512), block_size=(1, 4))
         # shape (1, 1) at block level; user expecting tile semantics gets helpful hint.
         with pytest.raises(AssertionError, match="block-level view"):
             v[:, 1:3]
 
     def test_too_many_keys_rejects(self):
-        v = tiles(_Src(shape=(128, 2048)), tile_size=(128, 512))
+        v = tiles(MockTensor((128, 2048)), tile_size=(128, 512))
         with pytest.raises(AssertionError, match="too many keys"):
             v[0, 0, 0]
 
@@ -240,7 +232,7 @@ class TestNDSliceIntegration:
 class TestTolistDimIndexing:
     @pytest.mark.fast
     def test_oob_int_on_tolist_dim_list(self):
-        v = tiles(_Src(shape=(128, 2048)), tile_size=(128, 512))
+        v = tiles(MockTensor((128, 2048)), tile_size=(128, 512))
         # Dim 1 has 4 tiles; index 10 is out of range on the materialized list.
         items = v.tolist(dim=1)
         with pytest.raises(IndexError):
@@ -248,7 +240,7 @@ class TestTolistDimIndexing:
 
     def test_stepped_slice_on_tolist_dim_list(self):
         """Stepped slicing is a plain-Python list operation; returns a sub-list."""
-        v = tiles(_Src(shape=(128, 2048)), tile_size=(128, 512))
+        v = tiles(MockTensor((128, 2048)), tile_size=(128, 512))
         items = v.tolist(dim=1)
         # Python list slicing supports step; returns 2 items (0, 2).
         assert len(items[::2]) == 2

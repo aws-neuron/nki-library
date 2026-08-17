@@ -50,7 +50,7 @@ class BoxTable:
     def add_row(self, values: list[str]):
         """Add a data row to the table."""
         cells = []
-        for val, width in zip(values, self.col_widths):
+        for val, width in zip(values, self.col_widths, strict=True):
             # Truncate or pad to fit column width
             cell = val[:width].ljust(width)
             cells.append(f" {cell} ")

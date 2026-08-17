@@ -54,7 +54,6 @@ from ...utils.allocator import SbufManager
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import _sbm_alloc, reduce
-from ...utils.tensor_view import TensorView
 
 TILE_SIZE = 128
 PSUM_SIZE = 512
@@ -269,6 +268,7 @@ class Configs(NKIObject):
     up_clamp_lower_limit: Optional[float]
     checkpoint_activation: bool = False
     expert_affinity_multiply_on_I: bool = False
+    skip_gate_proj: bool = False
     # Accumulator/checkpoint precision; None = io_dtype (default). Set fp32 to reduce bf16 error.
     accumulation_dtype: Any = None
     # Flat quant fields. Kept flat (not on a nested QuantConfig) because the NKI
@@ -330,15 +330,15 @@ def load_block_expert(block_to_expert, block_idx, sbm: Optional[SbufManager] = N
     mapping tensor, handling both static and dynamic block indices.
 
     Args:
-        block_to_expert (nl.ndarray): Mapping tensor of shape [N, 1] where N is
+        block_to_expert (nl.NkiTensor): Mapping tensor of shape [N, 1] where N is
             number of blocks, containing expert indices.
-        block_idx (int or nl.ndarray): Block index to load, either static integer
+        block_idx (int or nl.NkiTensor): Block index to load, either static integer
             or dynamic tensor value.
         sbm (SbufManager): Optional SbufManager for SBUF allocation.
         name (str): Name for the allocated tensor (must be unique within scope).
 
     Returns:
-        block_expert (nl.ndarray): Expert ID tensor of shape [1, 1] in SBUF.
+        block_expert (nl.NkiTensor): Expert ID tensor of shape [1, 1] in SBUF.
 
     Notes:
         - Handles both static (int) and dynamic (tensor) block indices
@@ -374,14 +374,14 @@ def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES, sbm=None):
     efficient partition-dimension access.
 
     Args:
-        token_position_to_id (nl.ndarray): Token position mapping of shape [N*B].
+        token_position_to_id (nl.NkiTensor): Token position mapping of shape [N*B].
         block_idx (int): Current block index.
         B (int): Block size (number of tokens per block).
         NUM_TILES (int): Number of tiles (B // TILE_SIZE).
         sbm (SbufManager): Optional SbufManager for SBUF allocation.
 
     Returns:
-        result (nl.ndarray): Transposed token indices of shape [TILE_SIZE, NUM_TILES] in SBUF.
+        result (nl.NkiTensor): Transposed token indices of shape [TILE_SIZE, NUM_TILES] in SBUF.
 
     Notes:
         - Uses dma_transpose for efficient layout transformation
@@ -420,14 +420,14 @@ def load_token_indices_dynamic_block(
     than a static integer, using scalar_offset for indirect addressing.
 
     Args:
-        token_position_to_id (nl.ndarray): Token position mapping tensor.
-        block_idx (nl.ndarray): Dynamic block index tensor.
+        token_position_to_id (nl.NkiTensor): Token position mapping tensor.
+        block_idx (nl.NkiTensor): Dynamic block index tensor.
         B (int): Block size (number of tokens per block).
         NUM_TILES (int): Number of tiles (B // TILE_SIZE).
         skip_dma (SkipMode): DMA skip configuration.
 
     Returns:
-        local_token_indices (nl.ndarray): Token indices of shape [TILE_SIZE, NUM_TILES] in SBUF.
+        local_token_indices (nl.NkiTensor): Token indices of shape [TILE_SIZE, NUM_TILES] in SBUF.
 
     Notes:
         - Handles dynamic block_idx by copying to temp tensor for scalar_offset
@@ -494,6 +494,7 @@ def compute_intermediate_states(
     expert_affinity_multiply_on_I=False,
     sbm: Optional[SbufManager] = None,
     intermediate_states_lst: Optional[list] = None,
+    skip_gate_proj: bool = False,
 ):
     """
     Compute intermediate states with activation and gating.
@@ -515,7 +516,7 @@ def compute_intermediate_states(
         I_TP (int): Intermediate size per shard
         dtype: Data type for intermediate computations
         activation_function (ActFnType): Activation function (SiLU, Swish, etc.)
-        expert_affinity_T_broadcasted (nl.ndarray, optional): Broadcasted expert affinities (TILE_SIZE, B)
+        expert_affinity_T_broadcasted (nl.NkiTensor, optional): Broadcasted expert affinities (TILE_SIZE, B)
         gup_scale (list, optional): FP8 dequantization scales [GUP_N_TILES][2] for gate/up projections
         expert_affinity_multiply_on_I (bool): Controls where expert affinity scaling is applied.
             - True: Apply affinity scaling on intermediate states (I) after activation
@@ -585,6 +586,8 @@ def compute_intermediate_states(
 
             if expert_affinity_T_broadcasted != None and not expert_affinity_multiply_on_I:
                 for gate_or_up in range(2):
+                    if skip_gate_proj and gate_or_up == 0:
+                        continue
                     if gup_scale != None:
                         nisa.scalar_tensor_tensor(
                             data=gate_and_up_proj_states[gate_or_up][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
@@ -605,6 +608,8 @@ def compute_intermediate_states(
 
             elif gup_scale != None:
                 for gate_or_up in range(2):
+                    if skip_gate_proj and gate_or_up == 0:
+                        continue
                     nisa.tensor_scalar(
                         data=gate_and_up_proj_states[gate_or_up][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
                         op0=nl.multiply,
@@ -612,7 +617,53 @@ def compute_intermediate_states(
                         dst=gate_and_up_proj_states[gate_or_up][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
                     )
 
-            if activation_function == ActFnType.SiLU:
+            if skip_gate_proj:
+                if activation_function == ActFnType.SquaredReLU:
+                    nisa.activation(
+                        op=nl.relu,
+                        data=gate_and_up_proj_states[1][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
+                        scale=1.0,
+                        dst=intermediate_states_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                    )
+                    nisa.activation(
+                        op=nl.square,
+                        data=intermediate_states_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                        dst=intermediate_states_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                    )
+                elif activation_function == ActFnType.SiLU:
+                    nisa.activation(
+                        op=nl.silu,
+                        data=gate_and_up_proj_states[1][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
+                        scale=1.0,
+                        dst=intermediate_states_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                    )
+                elif activation_function == ActFnType.Swish:
+                    nisa.activation(
+                        op=nl.gelu_apprx_sigmoid,
+                        data=gate_and_up_proj_states[1][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
+                        scale=1.0,
+                        dst=intermediate_states_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                    )
+            elif activation_function == ActFnType.SquaredReLU:
+                nisa.activation(
+                    op=nl.relu,
+                    data=gate_and_up_proj_states[0][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
+                    scale=1.0,
+                    dst=tmp_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                )
+                nisa.activation(
+                    op=nl.square,
+                    data=tmp_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                    dst=tmp_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                )
+                nisa.tensor_tensor(
+                    dst=intermediate_states_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                    data1=tmp_lst[i_tile_idx][0:num_tile, start_idx:end_idx],
+                    op=nl.multiply,
+                    data2=gate_and_up_proj_states[1][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
+                )
+
+            elif activation_function == ActFnType.SiLU:
                 nisa.activation(
                     op=nl.silu,
                     data=gate_and_up_proj_states[0][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],
@@ -682,7 +733,7 @@ def calculate_expert_affinities(
             resulting in block sizes > 1024.
 
     Returns:
-        expert_affinity_f32 (List[nl.ndarray]): List of expert affinity tensors in SBUF,
+        expert_affinity_f32 (List[nl.NkiTensor]): List of expert affinity tensors in SBUF,
             one per tile, each of shape [TILE_SIZE, 1] in float32.
 
     Notes:
@@ -766,7 +817,7 @@ def calculate_expert_affinities(
 
 
 def reduce_outputs(
-    output: nl.ndarray,
+    output: nl.NkiTensor,
     num_tiles: int,
     reduce_tile_size: int,
     offset: int,
@@ -780,9 +831,9 @@ def reduce_outputs(
     output[0], and zeroing output[1].
 
     Args:
-        output (nl.ndarray): Output tensor of shape [2, T, H] where T is sequence
+        output (nl.NkiTensor): Output tensor of shape [2, T, H] where T is sequence
             length and H is hidden dimension.
-        zeros (nl.ndarray): Zero tensor of shape [reduce_tile_size, H] used for
+        zeros (nl.NkiTensor): Zero tensor of shape [reduce_tile_size, H] used for
             zeroing operations.
         num_tiles (int): Number of tiles to process in the reduction loop.
         reduce_tile_size (int): Size of each tile along the partition dimension.
@@ -829,7 +880,7 @@ def output_initialization(output, dims, sbm=None, zeros=None):
     Zero initialize output buffer for accumulation mode.
 
     Args:
-        output (nl.ndarray): Output tensor in HBM, either [T, H] or [num_shards, T, H].
+        output (nl.NkiTensor): Output tensor in HBM, either [T, H] or [num_shards, T, H].
         dims: Dimension configuration object containing T, H, shard_id, num_shards, and TILESIZE.
         sbm: Optional SBUF manager.
         zeros: Optional pre-allocated zero buffer of shape [TILE_SIZE, H]. If None, allocates on stack.
@@ -840,8 +891,8 @@ def output_initialization(output, dims, sbm=None, zeros=None):
     if zeros == None:
         if H % 2 == 0 or H % 4 == 0:
             zeros = _sbm_alloc(sbm, (TILE_SIZE, H), dtype=nl.bfloat16, name=f"init_zeros", align=SBUF_QUADRANT_SIZE)
-            zeros_fp32 = TensorView(zeros).reinterpret_cast(nl.float32)
-            nisa.memset(zeros_fp32.get_view(), value=0.0)
+            zeros_fp32 = zeros.view(nl.float32)
+            nisa.memset(zeros_fp32, value=0.0)
         else:
             zeros = _sbm_alloc(sbm, (TILE_SIZE, H), dtype=nl.bfloat16, name=f"init_zeros", align=SBUF_QUADRANT_SIZE)
             nisa.memset(zeros, value=0.0)

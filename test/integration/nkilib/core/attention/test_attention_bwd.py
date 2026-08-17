@@ -23,10 +23,10 @@ import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.attention.attention_bwd import attention_bwd
 from nkilib_src.nkilib.core.attention.attention_bwd_torch import attention_bwd_torch_ref, compute_o_lse
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.integration.nkilib.utils.test_kernel_common import convert_to_torch
 from test.utils.common_dataclasses import CompilerArgs, Platforms
@@ -218,6 +218,7 @@ class TestAttentionBwdKernel:
         (1, 8, 1, 8192, 96, nl.bfloat16, True, None, 0),      # (head_dim=96, MQA)
         (1, 16, 8, 8192, 256, nl.float32, True, None, 0),     # gemma2-9b (dtype=float32)
         pytest.param(1, 8, 2, 16384, 128, nl.bfloat16, True, None, 0, marks=_heavy_mark),    # phi-4 (16K seqlen, reduced heads)
+        pytest.param(1, 2, 2, 8704, 128, nl.bfloat16, True, None, 0, marks=_heavy_mark),     # seqlen_k not a multiple of k_seq_section_len (8192 + 512 tail): regression for double-buffered KV prefetch dma_copy size mismatch
     ]
 
     # ===== Sliding window configs (4) =====
@@ -584,6 +585,9 @@ class TestAttentionBwdKernel:
         pytest.param(2, 2, 2, 512, 1024, 128, nl.bfloat16, 512, 512),
         # Equal Q/K lengths with offset — use smaller cp_offset so sliding window still covers valid K range
         pytest.param(1, 1, 1, 512, 512, 128, nl.bfloat16, 512, 256),
+        # seqlen_k (8704 = 8192 + 512 tail) not a multiple of k_seq_section_len: regression for
+        # double-buffered KV prefetch dma_copy size mismatch in ring sliding-window backward.
+        pytest.param(1, 1, 1, 512, 8704, 128, nl.bfloat16, 512, 512, id="prefetch_tail_8704"),
     ]
     # fmt: on
 

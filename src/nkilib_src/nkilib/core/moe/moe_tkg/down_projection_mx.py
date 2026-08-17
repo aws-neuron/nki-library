@@ -40,7 +40,7 @@ from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
+from ...utils.tensor_view import as_nki_tensor
 from .all_expert_mx_utils import SUPPORTED_MOE_SHARDING_STRATEGIES
 
 # Shared MX constants
@@ -51,11 +51,10 @@ from .projection_mx_constants import (
 )
 
 
-@nki.jit
 def load_broadcast_down_weight_scale_bias(
-    weight: nl.ndarray,
-    scale: nl.ndarray,
-    bias: Optional[nl.ndarray],
+    weight: nl.NkiTensor,
+    scale: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
     expert_idx: int,
     H: int,
     tile_I: int,
@@ -66,7 +65,7 @@ def load_broadcast_down_weight_scale_bias(
     use_PE_bias_broadcast: bool = True,
     sharding_strategy: MoELNCShardingStrategy = MoELNCShardingStrategy.SHARD_I,
     skip_scale_load: bool = False,
-) -> tuple[nl.ndarray, nl.ndarray, Optional[nl.ndarray]]:
+) -> tuple[nl.NkiTensor, nl.NkiTensor, Optional[nl.NkiTensor]]:
     """
     Load down projection weight, scale, and bias (optional) for one expert using static DMA.
 
@@ -74,9 +73,9 @@ def load_broadcast_down_weight_scale_bias(
     with NC0 loading the first half of H and NC1 loading the second half.
 
     Args:
-        weight (nl.ndarray): [E_L, 128_I, I/512, H], Down projection weight tensor from HBM (4_I packed in x4 dtype).
-        scale (nl.ndarray): [E_L, 16_I, I/512, H], Down projection MX scale tensor from HBM (uint8 MX scales).
-        bias (Optional[nl.ndarray]): [E_L, H], Optional down projection bias tensor from HBM.
+        weight (nl.NkiTensor): [E_L, 128_I, I/512, H], Down projection weight tensor from HBM (4_I packed in x4 dtype).
+        scale (nl.NkiTensor): [E_L, 16_I, I/512, H], Down projection MX scale tensor from HBM (uint8 MX scales).
+        bias (Optional[nl.NkiTensor]): [E_L, H], Optional down projection bias tensor from HBM.
         expert_idx (int): Index of the current expert to load.
         H (int): Hidden dimension size.
         tile_I (int): Tile size for I dimension (typically 128).
@@ -89,9 +88,9 @@ def load_broadcast_down_weight_scale_bias(
         sharding_strategy (MoELNCShardingStrategy): LNC sharding strategy. Determines bias H-sharding behavior.
 
     Returns:
-        weight_sb (nl.ndarray): [128_I, n_I512_tiles, H], Weight in SBUF (4_I packed in x4 dtype).
-        scale_sb (nl.ndarray): [128_I, n_I512_tiles, H], Scales in SBUF (in leading 4P of each SBUF quadrant).
-        bias_sb (Optional[nl.ndarray]): [tile_T, H], Broadcasted bias in SBUF (zeros when bias=None, sharded on H
+        weight_sb (nl.NkiTensor): [128_I, n_I512_tiles, H], Weight in SBUF (4_I packed in x4 dtype).
+        scale_sb (nl.NkiTensor): [128_I, n_I512_tiles, H], Scales in SBUF (in leading 4P of each SBUF quadrant).
+        bias_sb (Optional[nl.NkiTensor]): [tile_T, H], Broadcasted bias in SBUF (zeros when bias=None, sharded on H
             when LNC=2).
 
     Notes:
@@ -106,11 +105,11 @@ def load_broadcast_down_weight_scale_bias(
     bias_sb_shape = (tile_T, H)
 
     # Allocate buffers
-    base_weight = TensorView(weight).base_tensor
+    base_weight = weight
     weight_sb = nl.ndarray(weight_sb_shape, dtype=base_weight.dtype, buffer=nl.sbuf)
     scale_dtype = nl.uint8 if skip_scale_load else scale.dtype
     scale_sb = nl.ndarray(weight_sb_shape, dtype=scale_dtype, buffer=nl.sbuf)
-    bias_sb: Optional[nl.ndarray] = None
+    bias_sb: Optional[nl.NkiTensor] = None
 
     actual_prg_offset = tile_offset
     I_p_in_hbm = base_weight.shape[1]
@@ -119,19 +118,15 @@ def load_broadcast_down_weight_scale_bias(
     # Shape: [E_L, I_p, I/512, H] -> [I_p, n_I512_tiles, H] -> padded to [128_I, n_I512_tiles, H]
     if I_p_in_hbm < tile_I:
         nisa.memset(dst=weight_sb[...], value=0)
-        weight_view = (
-            TensorView(base_weight)
-            .select(dim=0, index=expert_idx)
-            .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
+        weight_view = base_weight.select(dim=0, index=expert_idx).slice(
+            dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
     else:
-        weight_view = (
-            TensorView(base_weight)
-            .select(dim=0, index=expert_idx)
-            .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
+        weight_view = base_weight.select(dim=0, index=expert_idx).slice(
+            dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -155,8 +150,7 @@ def load_broadcast_down_weight_scale_bias(
             actual_scale_p = min(SCALE_P_ELEM_PER_QUADRANT, I_p_scale_in_hbm - SCALE_P_ELEM_PER_QUADRANT * quadrant_idx)
             if actual_scale_p > 1:
                 scale_view = (
-                    TensorView(scale)
-                    .select(dim=0, index=expert_idx)
+                    scale.select(dim=0, index=expert_idx)
                     .slice(
                         dim=0,
                         start=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx,
@@ -165,7 +159,7 @@ def load_broadcast_down_weight_scale_bias(
                     .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
                 )
                 nisa.dma_copy(
-                    src=scale_view.get_view(),
+                    src=scale_view,
                     dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, actual_scale_p), :, :],
                     dge_mode=nisa.dge_mode.none,
                 )
@@ -203,12 +197,10 @@ def load_broadcast_down_weight_scale_bias(
         else:
             nisa.memset(dst=bias_sb[...], value=0.0, engine=nisa.gpsimd_engine)
         H_slice_local = nl.ds(H_offset, H_size_local)
-        bias_view = (
-            TensorView(bias)
-            .slice(dim=0, start=expert_idx, end=expert_idx + 1)
-            .slice(dim=1, start=H_offset, end=H_offset + H_size_local)
+        bias_view = bias.slice(dim=0, start=expert_idx, end=expert_idx + 1).slice(
+            dim=1, start=H_offset, end=H_offset + H_size_local
         )
-        nisa.dma_copy(src=bias_view.get_view(), dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(bias_view), dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
 
         # Broadcast bias using PE
         if use_PE_bias_broadcast:
@@ -242,31 +234,29 @@ def load_broadcast_down_weight_scale_bias(
     return weight_sb, scale_sb, bias_sb
 
 
-@nki.jit
 def down_projection_mx(
-    act_sb: nl.ndarray,
-    act_scale_sb: nl.ndarray,
-    weight_sb: nl.ndarray,
-    weight_scale_sb: nl.ndarray,
-    bias_sb: Optional[nl.ndarray],
-    expert_affinities_masked_sb: nl.ndarray,
+    act_sb: nl.NkiTensor,
+    act_scale_sb: nl.NkiTensor,
+    weight_sb: nl.NkiTensor,
+    weight_scale_sb: nl.NkiTensor,
+    bias_sb: Optional[nl.NkiTensor],
+    expert_affinities_masked_sb: nl.NkiTensor,
     expert_idx: int,
-    out_sb: nl.ndarray,
-    out_hbm: Optional[nl.ndarray] = None,
-    token_position_to_id_T: Optional[nl.ndarray] = None,
+    out_sb: nl.NkiTensor,
+    out_hbm: Optional[nl.NkiTensor] = None,
+    token_position_to_id_T: Optional[nl.NkiTensor] = None,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
     activation_compute_dtype=nl.bfloat16,
     is_first_expert: bool = False,
     is_last_expert: bool = False,
     sharding_strategy: MoELNCShardingStrategy = MoELNCShardingStrategy.SHARD_I,
     T_offset: int = 0,
-    down_dequant_scale: Optional[nl.ndarray] = None,
-    down_input_dequant_scale: Optional[nl.ndarray] = None,
+    down_dequant_scale: Optional[nl.NkiTensor] = None,
+    down_input_dequant_scale: Optional[nl.NkiTensor] = None,
     output_t_offset: int = 0,
     is_software_quant: bool = False,
-    is_row_quant: bool = False,
     T_physical: int = None,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Computes down projection, expert affinity scaling, expert add, LNC reduction, and SB->HBM spill.
     Supports multiple LNC sharding strategies (see SUPPORTED_MOE_SHARDING_STRATEGIES in all_expert_mx_utils.py).
@@ -276,19 +266,19 @@ def down_projection_mx(
         Applicable to: any algorithm requiring mx LNC-sharded down projection
 
     Args:
-        act_sb (nl.ndarray): [16_I * 8_I, I/512, T], Activation tensor in SBUF (4_I packed in x4 dtype).
-        act_scale_sb (nl.ndarray): [16_I * 8_I, I/512, T], Activation scales in SBUF
+        act_sb (nl.NkiTensor): [16_I * 8_I, I/512, T], Activation tensor in SBUF (4_I packed in x4 dtype).
+        act_scale_sb (nl.NkiTensor): [16_I * 8_I, I/512, T], Activation scales in SBUF
             (in leading 4P of each SBUF quadrant).
-        weight_sb (nl.ndarray): [16_I * 8_I, I/512, H], Weight tensor in SBUF (4_I packed in x4 dtype).
-        weight_scale_sb (nl.ndarray): [16_I * 8_I, I/512, H], Weight scales in SBUF
+        weight_sb (nl.NkiTensor): [16_I * 8_I, I/512, H], Weight tensor in SBUF (4_I packed in x4 dtype).
+        weight_scale_sb (nl.NkiTensor): [16_I * 8_I, I/512, H], Weight scales in SBUF
             (in leading 4P of each SBUF quadrant).
-        bias_sb (Optional[nl.ndarray]): [1, H], Optional bias tensor in SBUF.
-        expert_affinities_masked_sb (nl.ndarray): [T, E_L] or [128_T, T/128, E_L],
+        bias_sb (Optional[nl.NkiTensor]): [1, H], Optional bias tensor in SBUF.
+        expert_affinities_masked_sb (nl.NkiTensor): [T, E_L] or [128_T, T/128, E_L],
             Expert affinity scores in SBUF.
         expert_idx (int): Index of the current expert.
-        out_sb (nl.ndarray): [min(T, 128), ⌈T/128⌉, H], Output tensor in SBUF.
-        out_hbm (Optional[nl.ndarray]): [T, H], Optional output tensor in HBM for spill.
-        token_position_to_id_T (Optional[nl.ndarray]): [128_T, T/128], Token position indices for indirect
+        out_sb (nl.NkiTensor): [min(T, 128), ⌈T/128⌉, H], Output tensor in SBUF.
+        out_hbm (Optional[nl.NkiTensor]): [T, H], Optional output tensor in HBM for spill.
+        token_position_to_id_T (Optional[nl.NkiTensor]): [128_T, T/128], Token position indices for indirect
             DMA scatter. When provided, enables blockwise output spill.
         expert_affinities_scaling_mode (ExpertAffinityScaleMode): Scaling mode for expert affinities.
         activation_compute_dtype: Compute dtype for activations (default: bfloat16).
@@ -297,16 +287,15 @@ def down_projection_mx(
         sharding_strategy (MoELNCShardingStrategy): LNC sharding strategy.
             Supported: see SUPPORTED_MOE_SHARDING_STRATEGIES in all_expert_mx_utils.py.
         T_offset (int): Offset for T dimension in HBM output (used with direct DMA).
-        down_dequant_scale (Optional[nl.ndarray]): Dequant scale for down projection.
+        down_dequant_scale (Optional[nl.NkiTensor]): Dequant scale for down projection.
             STATIC_MX: [tile_T, 1] combined (input * weight) scale. ROW_MX: [tile_T, H//_pmax] per-row weight scale.
-        down_input_dequant_scale (Optional[nl.ndarray]): [_pmax, T, 1], ROW_MX per-token intermediate dequant scale.
+        down_input_dequant_scale (Optional[nl.NkiTensor]): [_pmax, T, 1], ROW_MX per-token intermediate dequant scale.
         is_software_quant (bool): When True, weight_scale_sb is a 2D [128, H] dummy tile indexed
-            as [:, :TILE_H] instead of the normal 3D [:, tile_i, H_slice].
-        is_row_quant (bool): When True, act_scale_sb is a 2D [128, T] dummy tile indexed
+            as [:, :TILE_H] instead of the normal 3D [:, tile_i, H_slice]; and act_scale_sb is a 2D [128, T] dummy tile indexed
             as [:, :T] instead of the normal 3D [:, tile_i, T_slice].
 
     Returns:
-        out_sb (nl.ndarray): [min(T, 128), ⌈T/128⌉, H], Output tensor in SBUF with accumulated results.
+        out_sb (nl.NkiTensor): [min(T, 128), ⌈T/128⌉, H], Output tensor in SBUF with accumulated results.
     """
 
     # Validate sharding strategy is supported (use explicit equality checks for NKI tracing compatibility)
@@ -314,6 +303,7 @@ def down_projection_mx(
         (sharding_strategy == MoELNCShardingStrategy.NO_SHARD)
         or (sharding_strategy == MoELNCShardingStrategy.SHARD_I)
         or (sharding_strategy == MoELNCShardingStrategy.SHARD_T)
+        or (sharding_strategy == MoELNCShardingStrategy.SHARD_E)
     )
     kernel_assert(
         _is_supported_strategy,
@@ -422,7 +412,6 @@ def down_projection_mx(
                 need_down_dequant=need_down_dequant,
                 activation_compute_dtype=activation_compute_dtype,
                 is_software_quant=is_software_quant,
-                is_row_quant=is_row_quant,
             )
 
             tile_T_out_actual = min(tile_T_actual, T_out - tile_T_offset)
@@ -497,8 +486,9 @@ def down_projection_mx(
                 )
                 kernel_assert(
                     sharding_strategy == MoELNCShardingStrategy.SHARD_I
-                    or sharding_strategy == MoELNCShardingStrategy.SHARD_T,
-                    "Blockwise down_projection_mx must use shard_on_I or shard_on_T",
+                    or sharding_strategy == MoELNCShardingStrategy.SHARD_T
+                    or sharding_strategy == MoELNCShardingStrategy.SHARD_E,
+                    "Blockwise down_projection_mx must use shard_on_I, shard_on_T, or shard_on_E",
                 )
                 out_src_other = nl.ndarray((tile_T_actual, 1, H), dtype=out_sb.dtype, buffer=nl.sbuf)
                 nisa.sendrecv(
@@ -509,7 +499,46 @@ def down_projection_mx(
                     pipe_id=0,
                 )
 
-                if sharding_strategy == MoELNCShardingStrategy.SHARD_I:
+                if sharding_strategy == MoELNCShardingStrategy.SHARD_E:
+                    out_idx_other = nl.ndarray((tile_T_actual, 1), dtype=token_position_to_id_T.dtype, buffer=nl.sbuf)
+                    nisa.sendrecv(
+                        src=token_position_to_id_T.ap(pattern=[[n_T128_tiles, tile_T_actual], [1, 1]], offset=tile_t),
+                        dst=out_idx_other,
+                        send_to_rank=1 - nl.program_id(0),
+                        recv_from_rank=1 - nl.program_id(0),
+                        pipe_id=0,
+                    )
+                    dst_ap_other_core = out_hbm.ap(
+                        pattern=[[H, tile_T_actual], [1, H]],
+                        offset=0,
+                        vector_offset=out_idx_other,
+                        indirect_dim=0,
+                    )
+                    if nl.program_id(0) == 0:
+                        if is_first_expert:
+                            nisa.dma_copy(src=out_src, dst=dst_ap, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge)
+                            nisa.dma_compute(
+                                srcs=[dst_ap_other_core, out_src_other],
+                                dst=dst_ap_other_core,
+                                oob_mode=oob_mode.skip,
+                                reduce_op=nl.add,
+                            )
+                        else:
+                            nisa.dma_compute(
+                                dst=dst_ap,
+                                srcs=[dst_ap, out_src],
+                                scales=[1.0, 1.0],
+                                reduce_op=nl.add,
+                                oob_mode=oob_mode.skip,
+                            )
+                            nisa.dma_compute(
+                                dst=dst_ap_other_core,
+                                srcs=[dst_ap_other_core, out_src_other],
+                                scales=[1.0, 1.0],
+                                reduce_op=nl.add,
+                                oob_mode=oob_mode.skip,
+                            )
+                elif sharding_strategy == MoELNCShardingStrategy.SHARD_I:
                     # This only works in shard on I, as both cores has the same index
                     out_src_agg = nl.ndarray((tile_T_actual, 1, H), dtype=out_sb.dtype, buffer=nl.sbuf)
                     nisa.tensor_tensor(out_src_agg, out_src_other, out_src, op=nl.add)
@@ -586,10 +615,13 @@ def down_projection_mx(
                         accumulate=False,
                     )
                 else:
-                    H_local = H if (n_prgs == 1 or sharding_strategy == MoELNCShardingStrategy.SHARD_T) else H // n_prgs
-                    H_offset_local = (
-                        0 if (n_prgs == 1 or sharding_strategy == MoELNCShardingStrategy.SHARD_T) else H_local * prg_id
+                    _no_h_shard = (
+                        n_prgs == 1
+                        or sharding_strategy == MoELNCShardingStrategy.SHARD_T
+                        or sharding_strategy == MoELNCShardingStrategy.SHARD_E
                     )
+                    H_local = H if _no_h_shard else H // n_prgs
+                    H_offset_local = 0 if _no_h_shard else H_local * prg_id
                     nisa.dma_copy(
                         src=out_sb[:tile_T_out_actual, tile_t : tile_t + 1, nl.ds(H_offset_local, H_local)],
                         dst=out_hbm[
@@ -603,9 +635,9 @@ def down_projection_mx(
 
 
 def _lnc_reduce_and_write(
-    src_send: nl.ndarray,
-    src_local: nl.ndarray,
-    hbm_dst: nl.ndarray,
+    src_send: nl.NkiTensor,
+    src_local: nl.NkiTensor,
+    hbm_dst: nl.NkiTensor,
     tile_T_actual: int,
     TILE_T: int,
     H_local: int,
@@ -658,10 +690,10 @@ def _lnc_reduce_and_write(
 
 
 def _apply_down_dequant(
-    expert_out_tile_sb: nl.ndarray,
-    down_dequant_scale: nl.ndarray,
-    down_input_dequant_scale: Optional[nl.ndarray],
-    bias_sb: Optional[nl.ndarray],
+    expert_out_tile_sb: nl.NkiTensor,
+    down_dequant_scale: nl.NkiTensor,
+    down_input_dequant_scale: Optional[nl.NkiTensor],
+    bias_sb: Optional[nl.NkiTensor],
     tile_T_actual: int,
     tile_T_offset: int,
     tile_H_offset: int,
@@ -689,7 +721,7 @@ def _apply_down_dequant(
     else:
         # ROW_MX: per-column weight dequant, then per-token input dequant
         n_H128_in_tile = TILE_H // pmax
-        dequant_scale_view = TensorView(down_dequant_scale).slice(dim=0, start=0, end=tile_T_actual)
+        dequant_scale_view = down_dequant_scale.slice(dim=0, start=0, end=tile_T_actual)
         for i_h128 in nl.affine_range(n_H128_in_tile):
             h_col = tile_H_offset // pmax + i_h128
             h_slice = nl.ds(i_h128 * pmax, pmax)
@@ -721,14 +753,14 @@ def _apply_down_dequant(
 
 
 def _down_proj_tile_compute(
-    act_sb: nl.ndarray,
-    act_scale_sb: nl.ndarray,
-    weight_sb: nl.ndarray,
-    weight_scale_sb: nl.ndarray,
-    bias_sb: Optional[nl.ndarray],
-    expert_affinities_masked_fp32_sb: nl.ndarray,
-    down_dequant_scale: Optional[nl.ndarray],
-    down_input_dequant_scale: Optional[nl.ndarray],
+    act_sb: nl.NkiTensor,
+    act_scale_sb: nl.NkiTensor,
+    weight_sb: nl.NkiTensor,
+    weight_scale_sb: nl.NkiTensor,
+    bias_sb: Optional[nl.NkiTensor],
+    expert_affinities_masked_fp32_sb: nl.NkiTensor,
+    down_dequant_scale: Optional[nl.NkiTensor],
+    down_input_dequant_scale: Optional[nl.NkiTensor],
     t_tile_idx: int,
     tile_T_offset: int,
     tile_T_actual: int,
@@ -742,7 +774,6 @@ def _down_proj_tile_compute(
     need_down_dequant: bool,
     activation_compute_dtype: nki.dtype,
     is_software_quant: bool = False,
-    is_row_quant: bool = False,
 ) -> nl.ndarray:
     """Compute one (T-tile, H-tile) of the down projection for a single expert.
 
@@ -779,8 +810,7 @@ def _down_proj_tile_compute(
         need_down_dequant: Whether software dequantization is needed.
         activation_compute_dtype: Compute dtype for the output SBUF buffer.
         is_software_quant (bool): When True, weight_scale_sb is a 2D [128, H] dummy tile indexed
-            as [:, :TILE_H] instead of the normal 3D [:, tile_i, H_slice].
-        is_row_quant (bool): When True, act_scale_sb is a 2D [128, T] dummy tile indexed
+            as [:, :TILE_H] instead of the normal 3D [:, tile_i, H_slice]; and act_scale_sb is a 2D [128, T] dummy tile indexed
             as [:, :T] instead of the normal 3D [:, tile_i, T_slice].
 
     Returns:
@@ -793,7 +823,9 @@ def _down_proj_tile_compute(
             dst=out_psum[:tile_T_actual, :],
             stationary=act_sb[:, tile_i, tile_T_slice],
             moving=weight_sb[:, tile_i, weight_H_slice],
-            stationary_scale=act_scale_sb[:, :tile_T_actual] if is_row_quant else act_scale_sb[:, tile_i, tile_T_slice],
+            stationary_scale=act_scale_sb[:, :tile_T_actual]
+            if is_software_quant
+            else act_scale_sb[:, tile_i, tile_T_slice],
             moving_scale=weight_scale_sb[:, :TILE_H]
             if is_software_quant
             else weight_scale_sb[:, tile_i, weight_H_slice],

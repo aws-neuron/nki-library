@@ -19,19 +19,14 @@ from typing import final
 import nki.language as nl
 import numpy as np
 import pytest
-import torch
-
 from nkilib_src.nkilib.experimental.pad.pad import pad
+from nkilib_src.nkilib.experimental.pad.pad_torch import pad_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import FilterResult
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
-
-def _torch_ref(x_ref, padding, mode, value):
-    """Torch reference for pad."""
-    return torch.nn.functional.pad(x_ref, padding, mode=mode, value=value)
 
 
 def _output_shape(shape, padding):
@@ -153,7 +148,7 @@ class TestPad:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=pad,
-            torch_ref=torch_ref_wrapper(_torch_ref),
+            torch_ref=torch_ref_wrapper(pad_torch_ref),
             kernel_input_generator=lambda _: self.generate_inputs(shape_and_pad, mode, dtype),
             output_tensor_descriptor=lambda _: self.output_tensors(shape_and_pad, dtype),
         )
@@ -175,7 +170,7 @@ class TestPad:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=pad,
-            torch_ref=torch_ref_wrapper(_torch_ref),
+            torch_ref=torch_ref_wrapper(pad_torch_ref),
             kernel_input_generator=lambda _: self.generate_inputs(shape_and_pad, mode, dtype),
             output_tensor_descriptor=lambda _: self.output_tensors(shape_and_pad, dtype),
         )

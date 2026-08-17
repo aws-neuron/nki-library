@@ -11,13 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from unittest.mock import MagicMock
 
 from test.utils.feature_flag_helper import (
     NEURON_NEV_PREFIX,
     derive_pytest_test_id,
+    env_flag_enabled,
     get_feature_flag,
+    resolve_ssh_config_path,
 )
+
+
+class TestEnvFlagEnabled:
+    """Boolean env parsing: only recognized truthy strings enable; "0"/"false"/unset do not
+    (so setting a flag to "0" to disable it doesn't silently enable via bare truthiness)."""
+
+    _KEY = "NEURON_TEST_FLAG_XYZ"
+
+    def test_unset_is_false(self, monkeypatch):
+        monkeypatch.delenv(self._KEY, raising=False)
+        assert env_flag_enabled(self._KEY) is False
+
+    def test_truthy_values_enable(self, monkeypatch):
+        for val in ("1", "true", "TRUE", "yes", "on", " 1 "):
+            monkeypatch.setenv(self._KEY, val)
+            assert env_flag_enabled(self._KEY) is True, val
+
+    def test_falsy_values_do_not_enable(self, monkeypatch):
+        for val in ("0", "false", "no", "off", "", "  "):
+            monkeypatch.setenv(self._KEY, val)
+            assert env_flag_enabled(self._KEY) is False, val
 
 
 class TestGetFeatureFlag:
@@ -90,3 +114,19 @@ class TestDerivePytestTestId:
         result = derive_pytest_test_id()
 
         assert result == "test_sweep_3648_128_1024_512"
+
+
+class TestResolveSshConfigPath:
+    """resolve_ssh_config_path is the single source of truth shared by make_host_manager
+    (worker connections) and the fleet reachability probe — so they can't drift apart."""
+
+    def test_defaults_to_user_ssh_config(self, monkeypatch):
+        monkeypatch.delenv(f"{NEURON_NEV_PREFIX}SSH_CONFIG_PATH", raising=False)
+        config = MagicMock()
+        config.getoption.return_value = None  # no CLI flag
+        assert resolve_ssh_config_path(config) == os.path.expanduser("~/.ssh/config")
+
+    def test_uses_and_expands_configured_path(self):
+        config = MagicMock()
+        config.getoption.return_value = "~/custom/ssh_config"
+        assert resolve_ssh_config_path(config) == os.path.expanduser("~/custom/ssh_config")

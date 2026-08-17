@@ -25,7 +25,6 @@ import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.attention.attention_cte import (
     _MAX_BS,
     _MAX_BS_TIMES_SEQLEN_QK,
@@ -38,6 +37,7 @@ from nkilib_src.nkilib.core.attention.attention_cte import (
 from nkilib_src.nkilib.core.attention.attention_cte_torch import (
     attention_cte_torch_ref,
 )
+
 from test.integration.nkilib.utils.tensor_generators import np_random_sample
 from test.utils.common_dataclasses import (
     CompilerArgs,
@@ -1444,15 +1444,13 @@ class TestRangedAttentionCTEKernels:
         # Context parallel or regular seqlen_q
         if context_parallel:
             config[CP_DEGREE_DIM_NAME] = BoundedRange(
-                list(
-                    map(
-                        lambda n: 2**n,
-                        filter(
-                            lambda n: _MIN_GLOBAL_CP_DEGREE <= 2**n <= _MAX_GLOBAL_CP_DEGREE,
-                            range(_MIN_GLOBAL_CP_DEGREE - 1, _MAX_GLOBAL_CP_DEGREE),
-                        ),
+                [
+                    2**n
+                    for n in filter(
+                        lambda n: _MIN_GLOBAL_CP_DEGREE <= 2**n <= _MAX_GLOBAL_CP_DEGREE,
+                        range(_MIN_GLOBAL_CP_DEGREE - 1, _MAX_GLOBAL_CP_DEGREE),
                     )
-                ),
+                ],
                 boundary_values=[],
             )
             config[CP_STRIDED_Q_DIM_NAME] = BoundedRange([0, 1], boundary_values=[])
@@ -2072,7 +2070,7 @@ class TestRangedAttentionCTEKernels:
       [1,     1,          16384,      16384,            0,              16384,    128,  0,            False,        True, False,True,   True],
       [1,     1,          16384,      16384,            15873,          16384,    128,  1,            True,         True, True, False,  True],
       [2,     2,          123,        30909,            30000,          123,      128,  0,            True,         False,True, False,  True],
-      [2,     1,          123,        30909,            1,              123,      128,  10000,        True,         True, True, True,   False],
+      pytest.param(2,     1,          123,        30909,            1,              123,      128,  10000,        True,         True, True, True,   False, marks=pytest.mark.fast),
     ]
 
     # Slow-compile cases
@@ -2082,10 +2080,7 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    attn_cte_sweep_manual_nocp_perms_all = [
-        pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:8]) not in _FULL_ONLY_KEYS else c
-        for c in attn_cte_sweep_manual_nocp_perms
-    ] + attn_cte_sweep_manual_nocp_perms_slow
+    attn_cte_sweep_manual_nocp_perms_all = attn_cte_sweep_manual_nocp_perms + attn_cte_sweep_manual_nocp_perms_slow
 
     @pytest_parametrize(
         attn_cte_sweep_manual_nocp_params, attn_cte_sweep_manual_nocp_perms_all, abbrevs=_ATTN_CTE_ABBREVS
@@ -2148,14 +2143,14 @@ class TestRangedAttentionCTEKernels:
     # fmt: off
     attn_cte_sweep_manual_cp_params = \
         "bs, gqa_factor, seqlen_kv, seqlen_kv_prior, prior_used_len, cp_degree, cp_rank_id, d, sliding_window, causal_mask, tp_q, tp_k, tp_out, sink"
-    attn_cte_sweep_manual_cp_perms_fast = [
+    attn_cte_sweep_manual_cp_perms = [
     # BATCH, GQA_FACTOR, SEQLEN_KV,  SEQLEN_KV_PRIOR,  PRIOR_USED_LEN,  CP_DEGREE, CP_RANK_ID,  D,  SLIDING_WINDOW, CAUSAL_MASK,  TP_Q, TP_K, TP_OUT, SINK
       [2,     1,          32768,      None,             None,           8,          0,          128,  1024,         True,         True, False,True,   True],
       [2,     2,          32768,      None,             None,           32,         16,         128,  0,            True,         True, True, False,  True],
-      [1,     1,          32768,      None,             None,           32,         10,         128,  0,            True,         False,False,False,  False],
-      [1,     1,          32768,      None,             None,           32,         31,         128,  2,            True,         False,False,False,  False],
-      [1,     1,          32768,      None,             None,           32,         31,         128,  127,          True,         True, True, True,   False],
-      [2,     2,          32768,      None,             None,           32,         13,         128,  30000,        True,         True, True, True,   False],
+      pytest.param(1,     1,          32768,      None,             None,           32,         10,         128,  0,            True,         False,False,False,  False, marks=pytest.mark.fast),
+      pytest.param(1,     1,          32768,      None,             None,           32,         31,         128,  2,            True,         False,False,False,  False, marks=pytest.mark.fast),
+      pytest.param(1,     1,          32768,      None,             None,           32,         31,         128,  127,          True,         True, True, True,   False, marks=pytest.mark.fast),
+      pytest.param(2,     2,          32768,      None,             None,           32,         13,         128,  30000,        True,         True, True, True,   False, marks=pytest.mark.fast),
     ]
     attn_cte_sweep_manual_cp_perms_slow = [
       [2,     2,          32768,      None,             None,           2,          1,          128,  0,            True,         False,True, True,   True],
@@ -2164,9 +2159,7 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    attn_cte_sweep_manual_cp_perms_all = [
-        pytest.param(*c, marks=pytest.mark.fast) for c in attn_cte_sweep_manual_cp_perms_fast
-    ] + attn_cte_sweep_manual_cp_perms_slow
+    attn_cte_sweep_manual_cp_perms_all = attn_cte_sweep_manual_cp_perms + attn_cte_sweep_manual_cp_perms_slow
 
     @pytest_parametrize(attn_cte_sweep_manual_cp_params, attn_cte_sweep_manual_cp_perms_all, abbrevs=_ATTN_CTE_ABBREVS)
     @pytest.mark.parametrize("lnc_degree", [1, 2])
@@ -2349,9 +2342,9 @@ class TestRangedAttentionCTEKernels:
     @pytest.mark.parametrize(
         "bs, seqlen, d, causal_mask",
         [
-            pytest.param(1, 256, 64, True, marks=pytest.mark.fast),
+            (1, 256, 64, True),
             pytest.param(1, 256, 64, False, marks=pytest.mark.fast),
-            pytest.param(2, 256, 64, True, marks=pytest.mark.fast),
+            (2, 256, 64, True),
             pytest.param(1, 512, 128, True, marks=pytest.mark.fast),
             (1, 1024, 128, True),
             (1, 2048, 128, True),
@@ -2438,8 +2431,8 @@ class TestRangedAttentionCTEKernels:
     @pytest.mark.parametrize(
         "bs, seqlen, d, sliding_window",
         [
-            pytest.param(1, 256, 64, 128, marks=pytest.mark.fast),
-            pytest.param(1, 512, 128, 128, marks=pytest.mark.fast),
+            (1, 256, 64, 128),
+            (1, 512, 128, 128),
             (1, 1024, 128, 128),
             (1, 2048, 128, 128),
             (1, 4096, 128, 128),
@@ -2520,8 +2513,8 @@ class TestRangedAttentionCTEKernels:
         "bs, seqlen, seqlen_prior, prior_used_len, d",
         [
             pytest.param(1, 256, 512, 256, 64, marks=pytest.mark.fast),
-            pytest.param(1, 384, 512, 256, 64, marks=pytest.mark.fast),
-            pytest.param(1, 512, 512, 512, 128, marks=pytest.mark.fast),
+            (1, 384, 512, 256, 64),
+            (1, 512, 512, 512, 128),
             (1, 1024, 512, 512, 128),
             (1, 1536, 1024, 768, 128),
             (1, 2048, 1024, 512, 128),
@@ -2670,16 +2663,16 @@ class TestRangedAttentionCTEKernels:
         "bs, bs_kv, seqlen, d, sliding_window, prior_band_width, seqlen_prior, prior_used_len, use_sink",
         [
             # SWA only (no prior band, no prefix caching).
-            pytest.param(1, None, 256, 64, 128, 0, None, None, False, marks=pytest.mark.fast),
-            pytest.param(1, None, 512, 128, 128, 0, None, None, False, marks=pytest.mark.fast),
-            pytest.param(2, None, 256, 64, 128, 0, None, None, False, marks=pytest.mark.fast),
+            (1, None, 256, 64, 128, 0, None, None, False),
+            (1, None, 512, 128, 128, 0, None, None, False),
+            (2, None, 256, 64, 128, 0, None, None, False),
             # SWA + prefix caching (prior band active).
-            pytest.param(1, None, 256, 64, 128, 128, 128, 128, False, marks=pytest.mark.fast),
-            pytest.param(1, None, 256, 64, 128, 128, 128, 64, False, marks=pytest.mark.fast),
+            (1, None, 256, 64, 128, 128, 128, 128, False),
+            (1, None, 256, 64, 128, 128, 128, 64, False),
             pytest.param(1, None, 256, 64, 128, 128, 128, 0, False, marks=pytest.mark.fast),
             # GQA + sinks.
             pytest.param(4, 2, 256, 64, 128, 128, 128, 128, True, marks=pytest.mark.fast),
-            pytest.param(4, 2, 256, 64, 128, 128, 128, 64, True, marks=pytest.mark.fast),
+            (4, 2, 256, 64, 128, 128, 128, 64, True),
             # Production scale.
             (1, None, 1024, 128, 128, 0, None, None, False),
             (1, None, 2048, 128, 128, 0, None, None, False),

@@ -24,7 +24,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
-from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import TileStream, get_logical_shape
@@ -39,8 +38,8 @@ class Activation(nl.NKIObject):
     Scale can be:
     - None: no scaling (defaults to 1.0)
     - float: scalar scale applied to all elements
-    - nl.ndarray: raw tensor, used directly with nisa.activation
-    - TensorView: tensor view, get_view() called for nisa.activation
+    - nl.NkiTensor: raw tensor, used directly with nisa.activation
+    - nl.NkiTensor: tensor view, get_view() called for nisa.activation
     - TileStream: must be single tile, broadcasts (P, 1) -> (P, F)
     """
 
@@ -49,7 +48,7 @@ class Activation(nl.NKIObject):
         dst: TileStream,
         src: TileStream,
         op=nl.copy,
-        scale: Optional[Union[float, nl.ndarray, TensorView, TileStream]] = None,
+        scale: Optional[Union[float, nl.NkiTensor, nl.NkiTensor, TileStream]] = None,
         bias: Optional[TileStream] = None,
     ) -> None:
         self._name = f"Activation(dst={dst.get_name()}, src={src.get_name()}, op={op})"
@@ -74,11 +73,11 @@ class Activation(nl.NKIObject):
             return self._scale
         elif isinstance(self._scale, TileStream):
             self._scale.reset_cur_tile()
-            return self._scale.get_tile().get_view()
-        elif isinstance(self._scale, TensorView):
-            return self._scale.get_view()
+            return self._scale.get_tile()
+        elif isinstance(self._scale, nl.NkiTensor):
+            return self._scale
         else:
-            # Assume raw nl.ndarray
+            # Assume raw nl.NkiTensor
             return self._scale
 
     def execute(self) -> None:
@@ -95,11 +94,11 @@ class Activation(nl.NKIObject):
             bias_tile = self._bias.get_tile() if self._bias is not None else None
 
             nisa.activation(
-                dst=dst_tile.get_view(),
+                dst=dst_tile,
                 op=self._op,
-                data=src_tile.get_view(),
+                data=src_tile,
                 scale=scale_val,
-                bias=bias_tile.get_view() if bias_tile is not None else None,
+                bias=bias_tile if bias_tile is not None else None,
             )
 
         self._dst.reset_cur_tile()
@@ -111,11 +110,11 @@ class Activation(nl.NKIObject):
 
 
 def activation(
-    dst: Union[TensorView, nl.ndarray],
-    src: Union[TensorView, nl.ndarray] = None,
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor = None,
     op=nl.copy,
-    scale: Optional[Union[float, TensorView, nl.ndarray]] = None,
-    bias: Optional[Union[TensorView, nl.ndarray]] = None,
+    scale: Optional[Union[float, nl.NkiTensor, nl.NkiTensor]] = None,
+    bias: Optional[nl.NkiTensor] = None,
 ) -> None:
     """Compact activation: dst = op(src * scale + bias). Whole tensor, no tiling.
 

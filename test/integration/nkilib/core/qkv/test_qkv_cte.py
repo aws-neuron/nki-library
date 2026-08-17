@@ -26,20 +26,26 @@ try:
         FUSED_GAMMA_ROPE_MODELS,
         QK_NORM_MODELS,
         STATIC_DEQUANT_MODELS,
+        _get_sharded_head_counts,
         qkv_cte_model_configs,
+    )
+    from test.integration.nkilib.core.qkv.test_qkv_cte_model_config import (
+        MODELS as _QKV_MODELS,
     )
 except ImportError:
     QK_NORM_MODELS = set()
     STATIC_DEQUANT_MODELS = set()
     FUSED_GAMMA_ROPE_MODELS = set()
     qkv_cte_model_configs = {}
+    _QKV_MODELS = {}
+    _get_sharded_head_counts = None
 
+import math
 from typing import final
 
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.qkv.qkv import qkv
 from nkilib_src.nkilib.core.qkv.qkv_torch import qkv_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import (
@@ -53,6 +59,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
 )
 from nkilib_src.nkilib.experimental.qkv.qkv_cte_mla import qkv_mla_mx, qkv_mla_mx_deepseek_v4
 from nkilib_src.nkilib.experimental.qkv.qkv_cte_mla_torch import qkv_mla_mx_deepseek_v4_torch_ref, qkv_mla_mx_torch_ref
+
 from test.integration.nkilib.core.qkv.test_qkv_common import (
     build_noncontiguous_slot_mapping,
     build_qkv_input,
@@ -80,6 +87,10 @@ from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+
+# Constructed once at module load and shared across all callers that rely on the default,
+# matching the previous behavior where the default argument expression was evaluated once.
+_DEFAULT_TENSOR_GEN = gaussian_tensor_generator()
 
 
 @pytest_test_metadata(name="QKV CTE", tags=["model"])
@@ -109,7 +120,7 @@ class TestQkvCteKernel:
         n_kv_heads: int | None = None,
         d_head: int | None = None,
         quantization_type: QuantizationType = QuantizationType.NONE,
-        tensor_gen=gaussian_tensor_generator(),
+        tensor_gen=_DEFAULT_TENSOR_GEN,
         fp8_kv_cache: bool = False,
         bf16_kv_cache: bool = False,
         max_seq_len: int | None = None,
@@ -682,29 +693,87 @@ class TestQkvCteKernel:
             atol=2e-2,
         )
 
+        # nl.float8_e4m3
+
+    qkv_cte_kernel_static_quantization_fp8_inputs_test_params = (
+        "vnc_degree, batch, seqlen, hidden_dim, n_q_heads, n_kv_heads, d_head, output_layout, eps"
+    )
+    qkv_cte_kernel_static_quantization_fp8_inputs_test_perms = [
+        # 70B
+        [2, 1, 128, 8192, 8, 1, 128, QKVOutputLayout.BSD, 1e-6],
+        [2, 1, 1024, 8192, 8, 1, 128, QKVOutputLayout.BSD, 1e-6],
+        [2, 1, 16384, 8192, 8, 1, 128, QKVOutputLayout.BSD, 1e-6],
+    ]
+    # fmt: on
+
+    @pytest_parametrize(
+        qkv_cte_kernel_static_quantization_fp8_inputs_test_params,
+        qkv_cte_kernel_static_quantization_fp8_inputs_test_perms,
+    )
+    def test_qkv_cte_static_quantization_fp8_inputs(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree,
+        batch,
+        seqlen,
+        hidden_dim,
+        n_q_heads,
+        n_kv_heads,
+        d_head,
+        output_layout,
+        eps,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
+
+        fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
+        self.run_qkv_cte_test_utf(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            B=batch,
+            H=hidden_dim,
+            S=seqlen,
+            fused_qkv_dim=fused_qkv_dim,
+            lnc_degree=vnc_degree,
+            dtype=nl.float8_e4m3,
+            eps=eps,
+            norm_type=NormType.NO_NORM,
+            fused_add=False,
+            qkv_bias=False,
+            norm_bias=False,
+            output_layout=output_layout,
+            hidden_actual=None,
+            d_head=d_head,
+            quantization_type=QuantizationType.STATIC,
+            n_q_heads=n_q_heads,
+            n_kv_heads=n_kv_heads,
+            rtol=5e-2,
+            atol=2e-2,
+        )
+
     ####################################################################################################################
     # FP8 quant mode canary for QKV CTE.
     # Tests NON_OCP, OCP, AUTO across STATIC and ROW.
     ####################################################################################################################
-    _QKV_CTE_BY_DTYPE_MODE_CONFIG = dict(
-        B=1,
-        H=8192,
-        S=128,
-        lnc_degree=2,
-        dtype=nl.bfloat16,
-        eps=1e-6,
-        norm_type=NormType.NO_NORM,
-        use_dma_transpose=True,
-        fused_add=False,
-        qkv_bias=False,
-        norm_bias=False,
-        output_layout=QKVOutputLayout.BSD,
-        d_head=128,
-        n_q_heads=8,
-        n_kv_heads=1,
-        rtol=5e-2,
-        atol=2e-2,
-    )
+    _QKV_CTE_BY_DTYPE_MODE_CONFIG = {
+        "B": 1,
+        "H": 8192,
+        "S": 128,
+        "lnc_degree": 2,
+        "dtype": nl.bfloat16,
+        "eps": 1e-6,
+        "norm_type": NormType.NO_NORM,
+        "use_dma_transpose": True,
+        "fused_add": False,
+        "qkv_bias": False,
+        "norm_bias": False,
+        "output_layout": QKVOutputLayout.BSD,
+        "d_head": 128,
+        "n_q_heads": 8,
+        "n_kv_heads": 1,
+        "rtol": 5e-2,
+        "atol": 2e-2,
+    }
 
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
     @pytest.mark.parametrize(
@@ -911,7 +980,6 @@ class TestQkvCteKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         )
         fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
         self.run_qkv_cte_test_utf(
@@ -2729,7 +2797,6 @@ class TestQkvCteKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         )
         fused_qkv_dim = (n_q_heads + n_kv_heads * 2) * d_head
 
@@ -2835,7 +2902,6 @@ class TestQkvCteKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         )
         fused_qkv_dim = (n_q_heads + n_kv_heads * 2) * d_head
 
@@ -2921,7 +2987,6 @@ class TestQkvCteKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         )
         fused_qkv_dim = (n_q_heads + n_kv_heads * 2) * d_head
 
@@ -3377,6 +3442,284 @@ class TestQkvCteKernel:
             kernel_input_generator=generate_inputs,
             output_tensor_descriptor=output_tensor_descriptor,
             check_unused_params=True,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=6e-2,
+            atol=1e-2,
+        )
+
+    ####################################################################################################################
+    # QKV CTE: rmsnorm_quant ROW output → native MX weights (row-quantized FP8 input + per-block MX weight scales)
+    ####################################################################################################################
+    # fmt: off
+    qkv_cte_mx_native_row_input_test_params = \
+        "batch, seqlen, hidden_dim, n_q_heads, n_kv_heads, d_head, output_layout, qkv_bias, fused_rope"
+    qkv_cte_mx_native_row_input_test_perms = [
+        # Basic: small H
+        [1, 128, 512, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # + bias
+        [1, 128, 512, 2, 1, 128, QKVOutputLayout.BSD, True, False],
+        # + RoPE
+        [1, 128, 512, 2, 1, 128, QKVOutputLayout.BSD, False, True],
+        # + bias + RoPE
+        [1, 128, 512, 2, 1, 128, QKVOutputLayout.BSD, True, True],
+        # GQA (4Q/1KV)
+        [1, 128, 512, 4, 1, 128, QKVOutputLayout.BSD, False, True],
+        # multi-S-tile (S=256)
+        [1, 256, 512, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # NBSd layout
+        [1, 128, 1024, 2, 1, 128, QKVOutputLayout.NBSd, False, True],
+        # large H
+        [1, 128, 2048, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # partial H (non-512-aligned)
+        [1, 128, 896, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # large S
+        [1, 2048, 512, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # S=4096
+        [1, 4096, 512, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # S=8192
+        [1, 8192, 512, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # S=16384
+        [1, 16384, 512, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+        # S=32768
+        [1, 32768, 512, 2, 1, 128, QKVOutputLayout.BSD, False, False],
+    ]
+    # fmt: on
+    @pytest_parametrize(
+        qkv_cte_mx_native_row_input_test_params,
+        qkv_cte_mx_native_row_input_test_perms,
+    )
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    def test_qkv_cte_mx_native_row_input(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        seqlen,
+        hidden_dim,
+        n_q_heads,
+        n_kv_heads,
+        d_head,
+        output_layout,
+        qkv_bias,
+        fused_rope,
+    ):
+        """Test rmsnorm_quant ROW output fed directly into QKV CTE with native MX weights.
+
+        Input is [B, S, H+4] FP8 with per-row float32 dequant scale packed in the tail
+        (produced by rmsnorm_quant with QuantizationType.ROW). Weights are native MXFP8
+        with per-block scales [H//32, I]. Post-matmul dequant applies only the per-row
+        input scale (weight dequant is handled by nc_matmul_mx per-block scales).
+        """
+        if not platform_target.is_trn3():
+            pytest.skip("Native MX with row-quantized FP8 input is only supported on TRN3.")
+
+        B, S, H = batch, seqlen, hidden_dim
+        I = (n_q_heads + 2 * n_kv_heads) * d_head
+        vnc_degree = 2
+        eps = 1e-6
+
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
+
+        # === Generate FP8 input data and per-row scales (simulating rmsnorm_quant ROW output) ===
+        np.random.seed(42)
+        input_f32 = np.random.randn(B, S, H).astype(np.float32).clip(-240, 240)
+        fp8_data = input_f32.astype(nl.float8_e4m3fn)
+        row_scales = np.abs(input_f32).max(axis=-1, keepdims=True).astype(np.float32) / 240.0
+        row_scales = np.maximum(row_scales, 1e-12)
+
+        # Pack as [B, S, H+4]: [H bytes FP8 data | 4 bytes float32 scale]
+        scale_bytes = row_scales.view(np.uint8).reshape(B, S, 4)
+        packed_input = np.concatenate(
+            [
+                fp8_data.view(np.uint8),
+                scale_bytes,
+            ],
+            axis=2,
+        ).view(nl.float8_e4m3fn)
+
+        # === Generate FP8 weights in [H//4, I, 4] (MX_CONTIGUOUS layout) with per-block scales ===
+        weights_f32 = (np.random.randn(H, I) / np.sqrt(H)).astype(np.float32)
+        weights_fp8 = weights_f32.astype(nl.float8_e4m3fn)
+        mx_weights = weights_fp8.reshape(H // 4, 4, I).transpose(0, 2, 1)
+
+        # Per-block MX weight scales [H//32, I] as uint8 exponents (2^(val-127))
+        # Use real non-neutral scales to validate per-block dequant in the kernel
+        w_scale = np.random.randint(120, 135, size=(H // 32, I)).astype(np.uint8)
+
+        # === Optional bias and RoPE caches ===
+        bias = np.random.randn(1, I).astype(np.float32) * 0.1 if qkv_bias else None
+        cos_cache = None
+        sin_cache = None
+        if fused_rope:
+            gen = rope_gaussian_tensor_generator()
+            cos_cache = gen(shape=(B, S, d_head), dtype=np.float32, name="cos_cache")
+            sin_cache = gen(shape=(B, S, d_head), dtype=np.float32, name="sin_cache")
+
+        def generate_inputs(test_config):
+            inputs = {
+                "input": packed_input,
+                "fused_qkv_weights": mx_weights,
+                "output_layout": output_layout,
+                "bias": bias,
+                "quantization_type": QuantizationType.MX,
+                "qkv_w_scale": w_scale,
+                "qkv_in_scale": None,
+                "fused_residual_add": False,
+                "mlp_prev": None,
+                "attention_prev": None,
+                "fused_norm_type": NormType.NO_NORM,
+                "gamma_norm_weights": None,
+                "layer_norm_bias": None,
+                "norm_eps": eps,
+                "hidden_actual": None,
+                "fused_rope": fused_rope,
+                "cos_cache": cos_cache,
+                "sin_cache": sin_cache,
+                "d_head": d_head,
+                "num_q_heads": n_q_heads,
+                "num_kv_heads": n_kv_heads,
+                "store_output_in_sbuf": False,
+                "sbm": None,
+                "use_auto_allocation": False,
+                "load_input_with_DMA_transpose": True,
+                "weight_layout": QKVWeightLayout.MX_CONTIGUOUS,
+            }
+            return inputs
+
+        def output_tensor_descriptor(kernel_input):
+            if output_layout == QKVOutputLayout.NBSd:
+                num_heads = n_q_heads + 2 * n_kv_heads
+                return {"out": np.zeros((num_heads, B, S, d_head), dtype=nl.bfloat16)}
+            return {"out": np.zeros((B, S, I), dtype=nl.bfloat16)}
+
+        def mx_native_row_input_ref(
+            input,
+            fused_qkv_weights,
+            output_layout,
+            bias,
+            quantization_type,
+            qkv_w_scale,
+            qkv_in_scale,
+            fused_residual_add,
+            mlp_prev,
+            attention_prev,
+            fused_norm_type,
+            gamma_norm_weights,
+            layer_norm_bias,
+            norm_eps,
+            hidden_actual,
+            fused_rope,
+            cos_cache,
+            sin_cache,
+            d_head,
+            num_q_heads,
+            num_kv_heads,
+            store_output_in_sbuf,
+            sbm,
+            use_auto_allocation,
+            load_input_with_DMA_transpose,
+            weight_layout,
+            block_size=None,
+            dtype_mode=None,
+            fp8_max=None,
+            fp8_min=None,
+            fp8_packed=None,
+            is_h_dim_4h_transposed=None,
+            k_cache=None,
+            k_cos_cache=None,
+            k_scale=None,
+            k_sin_cache=None,
+            kv_dtype=None,
+            output_hbm=None,
+            qk_norm_post_rope=None,
+            qk_norm_post_rope_k_beta=None,
+            qk_norm_post_rope_k_gamma=None,
+            qk_norm_post_rope_q_beta=None,
+            qk_norm_post_rope_q_gamma=None,
+            qk_norm_pre_rope=None,
+            qk_norm_pre_rope_k_beta=None,
+            qk_norm_pre_rope_k_gamma=None,
+            qk_norm_pre_rope_q_beta=None,
+            qk_norm_pre_rope_q_gamma=None,
+            slot_mapping=None,
+            strided_input_config=None,
+            transpose_k_cache=None,
+            transposed_in=None,
+            use_block_kv=None,
+            v_cache=None,
+            v_scale=None,
+            k_squared_sum_out=None,
+            q_squared_sum_out=None,
+            v_squared_sum_out=None,
+        ):
+            """Reference for native MX weights + row-quantized FP8 input.
+
+            Applies per-block MX weight dequant (2^(scale-127)) then:
+            Reference = dequant_input @ dequant_weights [+ bias] [+ RoPE].
+            """
+            import torch
+
+            # Unpack MX weights [H//4, I, 4] fp8 -> [H, I] float32
+            w_np = fused_qkv_weights
+            if isinstance(w_np, torch.Tensor):
+                w_np = w_np.float().numpy()
+            else:
+                w_np = w_np.astype(np.float32)
+            _, I_dim, _ = w_np.shape
+            w_f32 = w_np.transpose(0, 2, 1).reshape(-1, I_dim)
+
+            # Apply per-block MX weight scales: each block of 32 rows shares a scale
+            ws_np = qkv_w_scale if isinstance(qkv_w_scale, np.ndarray) else qkv_w_scale.numpy()
+            block_scales = 2.0 ** (ws_np.astype(np.float32) - 127.0)  # [H//32, I]
+            for blk in range(H // 32):
+                w_f32[blk * 32 : (blk + 1) * 32, :] *= block_scales[blk : blk + 1, :]
+
+            # Dequantize input: fp8_data * row_scales
+            inp_dequant = fp8_data.astype(np.float32) * row_scales
+
+            # Plain matmul
+            qkv_out = (inp_dequant.reshape(B * S, H) @ w_f32).reshape(B, S, I)
+
+            # Apply bias if present
+            if bias is not None:
+                bias_np = bias.float().numpy() if isinstance(bias, torch.Tensor) else bias.astype(np.float32)
+                qkv_out = qkv_out + bias_np
+
+            # Apply RoPE if enabled
+            if fused_rope:
+                cos_np = (
+                    cos_cache.float().numpy() if isinstance(cos_cache, torch.Tensor) else cos_cache.astype(np.float32)
+                )
+                sin_np = (
+                    sin_cache.float().numpy() if isinstance(sin_cache, torch.Tensor) else sin_cache.astype(np.float32)
+                )
+                d_half = d_head // 2
+                for head_idx in range(n_q_heads + n_kv_heads):
+                    offset = head_idx * d_head
+                    x1 = qkv_out[:, :, offset : offset + d_half].copy()
+                    x2 = qkv_out[:, :, offset + d_half : offset + d_head].copy()
+                    cos_v = cos_np[:, :, :d_half]
+                    sin_v = sin_np[:, :, :d_half]
+                    qkv_out[:, :, offset : offset + d_half] = x1 * cos_v - x2 * sin_v
+                    qkv_out[:, :, offset + d_half : offset + d_head] = x2 * cos_v + x1 * sin_v
+
+            if output_layout == QKVOutputLayout.NBSd:
+                num_heads = n_q_heads + 2 * n_kv_heads
+                qkv_out = qkv_out.reshape(B, S, num_heads, d_head).transpose(0, 2, 1, 3)
+                qkv_out = qkv_out.reshape(num_heads, B, S, d_head)
+
+            return {"out": qkv_out.astype(np.float32)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=qkv,
+            torch_ref=mx_native_row_input_ref,
+            kernel_input_generator=generate_inputs,
+            output_tensor_descriptor=output_tensor_descriptor,
+            check_unused_params=False,
         )
         framework.run_test(
             test_config=None,
@@ -4016,7 +4359,6 @@ class TestQkvCteKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         )
         qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -4103,7 +4445,6 @@ class TestQkvCteKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         )
         kv_dim = kv_lora_rank + qk_rope_head_dim
 
@@ -4277,3 +4618,91 @@ class TestQkvCteModel:
         """OPTIMAL: Performance-optimized model configs."""
         kwargs = {k: v for k, v in locals().items() if k != "self"}
         self._run_model_test(**kwargs)
+
+    ####################################################################################################################
+    # QKV CTE FP8 Packed K-cache model perf sweep (llama3_70b / gptoss_120b)
+    #
+    # Reproduces the CR-275918024 comparison: BF16 QKV projection + FP8 block KV cache,
+    # comparing the packed K/V cache layout against the unpacked baseline across model x
+    # seqlen x TP. The 'packed' variant exercises the new head-major layouts
+    #   K: [num_blocks, num_kv_heads, block_size//2, d_head, 2]
+    #   V: [num_blocks, num_kv_heads, block_size, d_head]
+    # The 'unpacked' variant is the fp8 block-KV baseline (no packing).
+    # Run on hardware (shared-fleet trn3_a0) and read latency/MFU from the QOR CSV.
+    ####################################################################################################################
+    # fmt: off
+    qkv_cte_fp8_packed_perf_sweep_params = "model_name, seqlen, tp, variant"
+    qkv_cte_fp8_packed_perf_sweep_perms = [
+        [m, s, tp, v]
+        for m in ["llama3_70b", "gptoss_120b"]
+        for s in [1024, 8192]
+        for tp in [4, 8]
+        for v in ["packed", "unpacked"]
+    ]
+    # fmt: on
+
+    @pytest.mark.optimal
+    @pytest_parametrize(
+        qkv_cte_fp8_packed_perf_sweep_params,
+        qkv_cte_fp8_packed_perf_sweep_perms,
+    )
+    def test_qkv_cte_fp8_packed_perf_sweep(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        model_name,
+        seqlen,
+        tp,
+        variant,
+    ):
+        """Perf sweep: BF16 projection + FP8 block KV cache, packed vs unpacked layout."""
+        m = _QKV_MODELS[model_name]
+        n_q_heads, n_kv_heads = _get_sharded_head_counts(tp, m["n_q_heads"], m["n_kv_heads"])
+        d_head = m["d_head"]
+        hidden_dim = math.ceil(m["hidden"] / 512) * 512
+        batch = 1
+        block_size = 128
+        # Enough physical blocks to hold all sequence positions (round up + headroom).
+        num_blocks = math.ceil(seqlen / block_size) + 1
+
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        fused_qkv_dim = (n_q_heads + n_kv_heads * 2) * d_head
+
+        np.random.seed(42)
+        slot_mapping = build_noncontiguous_slot_mapping(seqlen, batch, block_size, num_blocks)
+
+        kernel = TestQkvCteKernel()
+        kernel.run_qkv_cte_test_utf(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            B=batch,
+            H=hidden_dim,
+            S=seqlen,
+            fused_qkv_dim=fused_qkv_dim,
+            lnc_degree=2,
+            dtype=nl.bfloat16,
+            eps=1e-6,
+            norm_type=NormType.NO_NORM,
+            fused_add=False,
+            qkv_bias=m["bias"],
+            output_layout=QKVOutputLayout.BSD,
+            n_q_heads=n_q_heads,
+            n_kv_heads=n_kv_heads,
+            d_head=d_head,
+            fp8_kv_cache=True,
+            bf16_kv_cache=False,
+            k_scale_val=1.67,
+            v_scale_val=1.67,
+            fp8_max=240.0,
+            fp8_min=-240.0,
+            use_block_kv=True,
+            fp8_packed=(variant == "packed"),
+            transpose_k_cache=False,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            slot_mapping=slot_mapping,
+            tensor_gen=gaussian_tensor_generator(seed=42),
+            quantization_type=QuantizationType.NONE,
+            rtol=1e-1,
+            atol=1e-5,
+        )

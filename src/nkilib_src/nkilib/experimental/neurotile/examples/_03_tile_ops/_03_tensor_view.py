@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-nt.tensor_view: build reshape / permute chains BEFORE tiling, plus
-direct higher-rank tile loads. tensor_view is an untiled view; chain
-.flatten_dims / .reshape_dim / .permute / .slice on it, then pass the
-result to nt.tiles to tile the transformed layout.
+Transform-then-tile: build reshape / permute chains BEFORE tiling by calling
+the raw tensor's own native view ops (.flatten_dims / .reshape_dim / .permute /
+.slice), then pass the transformed tensor to nt.tiles. Also shows direct
+higher-rank tile loads.
 """
 
 import nki
@@ -43,8 +43,8 @@ def tensor_view_chain(src):
 
     dst = nl.ndarray((H0, B * S * H1), dtype=src.dtype, buffer=nl.shared_hbm)
 
-    view = nt.tensor_view(src)
-    view = view.flatten_dims(0, 1)  # [B*S, H]
+    # Transform the raw tensor with its own native view ops, then tile it.
+    view = src.flatten_dims(0, 1)  # [B*S, H]
     view = view.reshape_dim(1, [H0, H1])  # [B*S, H0, H1]
     view = view.permute((1, 0, 2))  # [H0, B*S, H1]
 
@@ -72,7 +72,7 @@ def tensor_view_select(src):
     nisa.tensor_scalar(tile.data, tile.data, nl.multiply, 3.0)
 
     dst_tiles = nt.tiles(dst, tile_size=(128, 16))
-    dst_tiles[0, 0].store(tile.ap())
+    dst_tiles[0, 0].store(tile.data)
     return dst
 
 

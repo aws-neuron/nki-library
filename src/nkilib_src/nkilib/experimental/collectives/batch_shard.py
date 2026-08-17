@@ -23,7 +23,6 @@ import nki.language as nl
 from nki.collectives import ReplicaGroup
 
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.tensor_view import TensorView
 
 
 class AttnQBatchShardLayout(Enum):
@@ -88,20 +87,16 @@ def attn_q_batch_shard(
     else:
         rank_id = ncc.rank_id()
 
-    # Layout-specific shapes and rearrange patterns
+    # Layout-specific shapes and per-G split sizes
     G = gqa_group_size
     if layout == AttnQBatchShardLayout.NBSd:
         n, B, S, d = input.shape
         gathered_shape = (G * n, B, S, d)
-        rearrange_src = (('G', 'n'), 'B', 'S', 'd')
-        rearrange_dst = ('G', 'n', 'B', 'S', 'd')
         final_shape = (G * n, B // G, S, d)
     else:  # dBnS (requires n=1)
         d, B, n, S = input.shape
         kernel_assert(n == 1, f"dBnS layout requires n=1, got n={n}")
         gathered_shape = (G * d, B, n, S)
-        rearrange_src = (('G', 'd'), 'B', 'n', 'S')
-        rearrange_dst = ('G', 'd', 'B', 'n', 'S')
         final_shape = (G, d, B // G, S)  # G becomes the new n dimension
 
     B_per_rank = B // G
@@ -118,13 +113,14 @@ def attn_q_batch_shard(
     ncc.all_gather(dsts=[gathered], srcs=[src], replica_group=replica_group, collective_dim=0)
 
     # reshape to separate G: (G*dim0, ...) -> (G, dim0, ...)
-    gathered_view = TensorView(gathered).rearrange(rearrange_src, rearrange_dst, {'G': G})
+    # split the gathered G*x leading dim into (G, x)
+    gathered_view = gathered.reshape_dim(0, (G, -1))
 
     # WORKAROUND: Copy to input buffer because scalar_offset fails on internal tensors.
     # Using gathered directly causes compiler error:
     #   "Assertion `tensorId >= 0 && "Request tensorId must >= 0"' failed"
     # gathered_buf must be passed as kernel input for scalar_offset to work.
-    nisa.dma_copy(dst=gathered_buf, src=gathered_view.get_view())
+    nisa.dma_copy(dst=gathered_buf, src=gathered_view)
 
     # WORKAROUND: Convert rank_id to batch_offset using iota lookup table.
     # NKI compiler doesn't support arithmetic on rank_id (e.g., rank_id % gqa_group_size * B_per_rank),
@@ -136,8 +132,8 @@ def attn_q_batch_shard(
     )
 
     # Extract this rank's batch slice using dynamic offset
-    slice_view = TensorView(gathered_buf).slice(dim=2, start=0, end=B_per_rank)
-    slice_pattern, slice_offset = slice_view._get_pattern_and_offset()
+    slice_view = gathered_buf.slice(dim=2, start=0, end=B_per_rank)
+    slice_pattern, slice_offset = slice_view.get_pattern(), slice_view.offset
     q_out = nl.ndarray(slice_view.shape, dtype=input.dtype, buffer=nl.shared_hbm)
     nisa.dma_copy(
         dst=q_out,

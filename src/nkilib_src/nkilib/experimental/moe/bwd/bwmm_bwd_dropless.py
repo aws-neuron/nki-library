@@ -23,6 +23,8 @@ from ....core.utils.allocator import SbufManager, align_to, sizeinbytes
 from ....core.utils.kernel_helpers import (
     NUM_HW_PSUM_BANKS,
     PSUM_BANK_SIZE,
+    apply_activation,
+    apply_activation_dx,
     div_ceil,
     get_program_sharding_info,
 )
@@ -878,7 +880,10 @@ def _compute_down_projection_output_grad(
     NUM_H_BLOCKS = div_ceil(H_DIM, H_BLOCK_SIZE)
 
     down_proj_output_grad_hbm = nl.ndarray(
-        (B_DIM, H_DIM), dtype=dtype, buffer=nl.shared_hbm, name=f"down_proj_output_grad_hbm_shared_block_{block_idx}"
+        (B_DIM, H_DIM),
+        dtype=dtype,
+        buffer=nl.shared_hbm,
+        name=f"down_proj_output_grad_hbm_shared_block_{block_idx}",
     )
     # Broadcast expert_idx to tile size
     if manage_scope:
@@ -1118,10 +1123,11 @@ def _compute_gate_up_projection_output_grad(
     block_idx,
     expert_idx,
     compute_dtype,
-    nki_activation_fwd_op,
-    nki_activation_bwd_op,
+    activation_type,
     sbm,
     clamp_limits: ClampLimits = ClampLimits(),
+    skip_gate_proj: bool = False,
+    grad_accum_dtype=None,
     BLOCK_H=2,
     BLOCK_B=2,
     BLOCK_I_TP=2,
@@ -1242,23 +1248,29 @@ def _compute_gate_up_projection_output_grad(
     if manage_scope:
         sbm.open_scope(name=f"Gate Up Output Grad")
 
+    # Adaptive accumulator precision: SwiGLU-bwd internal tiles follow the grad-output
+    # HBM dtype. bf16 caller (nkilib default) -> bf16 (== baseline, fits SBUF); fp32
+    # caller (e.g. nki_moe.py fp32 grad buffers) -> fp32 (full-precision SwiGLU bwd).
+    if grad_accum_dtype is None:
+        grad_accum_dtype = compute_dtype
+
     up_activation_grad = sbm.alloc_stack(
         (B_TILE_SIZE, NUM_B_TILES, I_TP_BLOCK_SIZE),
-        dtype=compute_dtype,
+        dtype=compute_dtype,  # grad output of up — stays bf16 (cast on final multiply)
         name=f"up_act_grad_{block_idx}",
         align=32,
     )
 
-    # Compute silu_dx(gate_activation)
+    # Compute silu_dx(gate_activation) — fp32 (SwiGLU bwd internal compute)
     silu_dx_gate = sbm.alloc_stack(
         (B_TILE_SIZE, NUM_B_TILES, I_TP_BLOCK_SIZE),
-        dtype=compute_dtype,
+        dtype=grad_accum_dtype,
         name=f"silu_dx_gate_{block_idx}",
         align=32,
     )
     silu_gate_grad = sbm.alloc_stack(
         (B_TILE_SIZE, NUM_B_TILES, I_TP_BLOCK_SIZE),
-        dtype=compute_dtype,
+        dtype=grad_accum_dtype,
         name=f"silu_gate_grad_{block_idx}",
         align=32,
     )
@@ -1266,7 +1278,7 @@ def _compute_gate_up_projection_output_grad(
     # Gradient of gate_activation: d_gate = d_silu_gate * silu_dx(gate)
     gate_activation_grad = sbm.alloc_stack(
         (B_TILE_SIZE, NUM_B_TILES, I_TP_BLOCK_SIZE),
-        dtype=compute_dtype,
+        dtype=compute_dtype,  # grad output of gate — stays bf16 (cast on final multiply)
         name=f"gate_act_grad_{block_idx}",
         align=32,
     )
@@ -1285,14 +1297,14 @@ def _compute_gate_up_projection_output_grad(
 
     gate_silu_activation = sbm.alloc_stack(
         (B_TILE_SIZE, NUM_B_TILES, I_TP_BLOCK_SIZE),
-        dtype=compute_dtype,
+        dtype=grad_accum_dtype,  # silu(gate) fwd recompute — follows grad-out dtype
         name=f"gate_silu_act_{block_idx}",
         align=32,
     )
 
     block_gate_up_mult = sbm.alloc_stack(
         (B_TILE_SIZE, NUM_B_TILES, I_TP_BLOCK_SIZE),
-        dtype=compute_dtype,
+        dtype=compute_dtype,  # swiglu fwd value, stored to bf16 HBM — keep bf16
         name=f"gate_up_mult_{block_idx}",
         align=32,
     )
@@ -1315,7 +1327,7 @@ def _compute_gate_up_projection_output_grad(
         partial_block_gate_up_mult_grad.append(
             sbm.alloc_stack(
                 (B_TILE_SIZE, NUM_B_TILES, I_TP_BLOCK_SIZE),
-                dtype=compute_dtype,
+                dtype=grad_accum_dtype,  # grad input of swiglu block — follows grad-out dtype
                 align=32,
             )
         )
@@ -1349,7 +1361,7 @@ def _compute_gate_up_projection_output_grad(
         peer_b_start = b_tiles_per_core * (1 - shard_id) if NUM_B_TILES >= num_shards else 0
         core_b_end = core_b_start + b_tiles_per_core
         sendrecv_recv_buf = sbm.alloc_stack(
-            (B_TILE_SIZE, b_tiles_per_core, I_TP_BLOCK_SIZE), dtype=compute_dtype, align=32
+            (B_TILE_SIZE, b_tiles_per_core, I_TP_BLOCK_SIZE), dtype=grad_accum_dtype, align=32
         )
 
     # Affinity I: allocate EA grad accumulators and broadcast expert_idx
@@ -1423,54 +1435,75 @@ def _compute_gate_up_projection_output_grad(
         for b_block_idx in range(NUM_B_BLOCKS):
             gup_buffer_idx = (i_tp_block_idx * NUM_B_BLOCKS + b_block_idx) % BUFFER_DEGREE
             # Perform Gup Forward and Save Intermediate States
-            for gate_or_up in range(GATE_UP_WEIGHT_COUNT):
-                if gate_or_up == 0:
-                    _load_gate_up_projection_checkpoint(
-                        gate_up_proj_act_checkpoint_T,
-                        gate_activation[gup_buffer_idx],
-                        NUM_B_TILES,
-                        I_TP_BLOCK_SIZE,
-                        B_TILE_SIZE,
-                        B_DIM,
-                        block_idx,
-                        GATE_UP_WEIGHT_COUNT,
-                        I_TP_DIM,
-                        gate_or_up,
-                        i_tp_global_offset,
-                        b_block_idx,
-                        B_BLOCK_SIZE,
-                        valid_i_block,
-                    )
-                    nisa.activation(
-                        dst=gate_silu_activation[:, :, 0:valid_i_block],
-                        op=nki_activation_fwd_op,
-                        data=gate_activation[gup_buffer_idx][:, :, 0:valid_i_block],
-                        bias=None,
-                        scale=1.0,
-                    )
-                else:
-                    _load_gate_up_projection_checkpoint(
-                        gate_up_proj_act_checkpoint_T,
-                        up_activation[gup_buffer_idx],
-                        NUM_B_TILES,
-                        I_TP_BLOCK_SIZE,
-                        B_TILE_SIZE,
-                        B_DIM,
-                        block_idx,
-                        GATE_UP_WEIGHT_COUNT,
-                        I_TP_DIM,
-                        gate_or_up,
-                        i_tp_global_offset,
-                        b_block_idx,
-                        B_BLOCK_SIZE,
-                        valid_i_block,
-                    )
-                    nisa.tensor_tensor(
-                        dst=block_gate_up_mult[:, :, 0:valid_i_block],
-                        op=nl.multiply,
-                        data1=gate_silu_activation[:, :, 0:valid_i_block],
-                        data2=up_activation[gup_buffer_idx][:, :, 0:valid_i_block],
-                    )
+            if skip_gate_proj:
+                _load_gate_up_projection_checkpoint(
+                    gate_up_proj_act_checkpoint_T,
+                    up_activation[gup_buffer_idx],
+                    NUM_B_TILES,
+                    I_TP_BLOCK_SIZE,
+                    B_TILE_SIZE,
+                    B_DIM,
+                    block_idx,
+                    GATE_UP_WEIGHT_COUNT,
+                    I_TP_DIM,
+                    1,
+                    i_tp_global_offset,
+                    b_block_idx,
+                    B_BLOCK_SIZE,
+                    valid_i_block,
+                )
+                apply_activation(
+                    dst=block_gate_up_mult[:, :, 0:valid_i_block],
+                    data=up_activation[gup_buffer_idx][:, :, 0:valid_i_block],
+                    act_fn=activation_type,
+                )
+            else:
+                for gate_or_up in range(GATE_UP_WEIGHT_COUNT):
+                    if gate_or_up == 0:
+                        _load_gate_up_projection_checkpoint(
+                            gate_up_proj_act_checkpoint_T,
+                            gate_activation[gup_buffer_idx],
+                            NUM_B_TILES,
+                            I_TP_BLOCK_SIZE,
+                            B_TILE_SIZE,
+                            B_DIM,
+                            block_idx,
+                            GATE_UP_WEIGHT_COUNT,
+                            I_TP_DIM,
+                            gate_or_up,
+                            i_tp_global_offset,
+                            b_block_idx,
+                            B_BLOCK_SIZE,
+                            valid_i_block,
+                        )
+                        apply_activation(
+                            dst=gate_silu_activation[:, :, 0:valid_i_block],
+                            data=gate_activation[gup_buffer_idx][:, :, 0:valid_i_block],
+                            act_fn=activation_type,
+                        )
+                    else:
+                        _load_gate_up_projection_checkpoint(
+                            gate_up_proj_act_checkpoint_T,
+                            up_activation[gup_buffer_idx],
+                            NUM_B_TILES,
+                            I_TP_BLOCK_SIZE,
+                            B_TILE_SIZE,
+                            B_DIM,
+                            block_idx,
+                            GATE_UP_WEIGHT_COUNT,
+                            I_TP_DIM,
+                            gate_or_up,
+                            i_tp_global_offset,
+                            b_block_idx,
+                            B_BLOCK_SIZE,
+                            valid_i_block,
+                        )
+                        nisa.tensor_tensor(
+                            dst=block_gate_up_mult[:, :, 0:valid_i_block],
+                            op=nl.multiply,
+                            data1=gate_silu_activation[:, :, 0:valid_i_block],
+                            data2=up_activation[gup_buffer_idx][:, :, 0:valid_i_block],
+                        )
 
             # Store block_gate_up_mult to gate_up_multipy_output_hbm
             for b_tile_idx in range(NUM_B_TILES):
@@ -1755,12 +1788,25 @@ def _compute_gate_up_projection_output_grad(
             # Activation backward — shard-on-H operates on this core's B tile slice only
             act_bwd_b = slice(core_b_start, core_b_end) if is_shard_on_h else slice(0, NUM_B_TILES)
 
-            nisa.tensor_tensor(
-                dst=up_activation_grad[:, act_bwd_b, 0:valid_i_block],
-                op=nl.multiply,
-                data1=partial_block_gate_up_mult_grad[result_buffer_idx][:, act_bwd_b, 0:valid_i_block],
-                data2=gate_silu_activation[:, act_bwd_b, 0:valid_i_block],
-            )
+            if skip_gate_proj:
+                apply_activation_dx(
+                    dst=up_activation_grad[:, act_bwd_b, 0:valid_i_block],
+                    data=up_activation[gup_buffer_idx][:, act_bwd_b, 0:valid_i_block],
+                    act_fn=activation_type,
+                )
+                nisa.tensor_tensor(
+                    dst=up_activation_grad[:, act_bwd_b, 0:valid_i_block],
+                    op=nl.multiply,
+                    data1=up_activation_grad[:, act_bwd_b, 0:valid_i_block],
+                    data2=partial_block_gate_up_mult_grad[result_buffer_idx][:, act_bwd_b, 0:valid_i_block],
+                )
+            else:
+                nisa.tensor_tensor(
+                    dst=up_activation_grad[:, act_bwd_b, 0:valid_i_block],
+                    op=nl.multiply,
+                    data1=partial_block_gate_up_mult_grad[result_buffer_idx][:, act_bwd_b, 0:valid_i_block],
+                    data2=gate_silu_activation[:, act_bwd_b, 0:valid_i_block],
+                )
 
             # Apply gradient clamping for linear activation (up) backward pass
             if clamp_limits.linear_clamp_upper_limit != None or clamp_limits.linear_clamp_lower_limit != None:
@@ -1804,10 +1850,10 @@ def _compute_gate_up_projection_output_grad(
                 data2=up_activation[gup_buffer_idx][:, act_bwd_b, 0:valid_i_block],
             )
 
-            nisa.activation(
+            apply_activation_dx(
                 dst=silu_dx_gate[:, act_bwd_b, 0:valid_i_block],
-                op=nki_activation_bwd_op,
                 data=gate_activation[gup_buffer_idx][:, act_bwd_b, 0:valid_i_block],
+                act_fn=activation_type,
             )
 
             nisa.tensor_tensor(
@@ -1857,14 +1903,15 @@ def _compute_gate_up_projection_output_grad(
             store_b_end = core_b_end if is_shard_on_h else NUM_B_TILES
             for b_tile_idx in range(store_b_start, store_b_end):
                 b_offset = b_block_idx * B_BLOCK_SIZE + b_tile_idx * B_TILE_SIZE
-                nisa.dma_copy(
-                    dst=gate_up_proj_output_grad_hbm.ap(
-                        pattern=[[GATE_UP_WEIGHT_COUNT * I_TP_DIM, B_TILE_SIZE], [1, valid_i_block]],
-                        offset=b_offset * GATE_UP_WEIGHT_COUNT * I_TP_DIM + 0 * I_TP_DIM + i_tp_global_offset,
-                    ),
-                    src=gate_activation_grad[:, b_tile_idx, 0:valid_i_block],
-                    dge_mode=dge_mode.hwdge,
-                )
+                if not skip_gate_proj:
+                    nisa.dma_copy(
+                        dst=gate_up_proj_output_grad_hbm.ap(
+                            pattern=[[GATE_UP_WEIGHT_COUNT * I_TP_DIM, B_TILE_SIZE], [1, valid_i_block]],
+                            offset=b_offset * GATE_UP_WEIGHT_COUNT * I_TP_DIM + 0 * I_TP_DIM + i_tp_global_offset,
+                        ),
+                        src=gate_activation_grad[:, b_tile_idx, 0:valid_i_block],
+                        dge_mode=dge_mode.hwdge,
+                    )
                 nisa.dma_copy(
                     dst=gate_up_proj_output_grad_hbm.ap(
                         pattern=[[GATE_UP_WEIGHT_COUNT * I_TP_DIM, B_TILE_SIZE], [1, valid_i_block]],
@@ -2033,17 +2080,19 @@ def _compute_down_projection_weight_grad(
     existing_weight_grad = []
 
     for n_buffer in range(BUFFER_DEGREE):
+        # Weight-grad accumulators follow grad-output HBM dtype (adaptive): bf16 -> baseline
+        # (fits SBUF); fp32 caller (nki_moe.py) -> fp32 full-precision cross-expert accum.
         result_tiles.append(
             sbm.alloc_stack(
                 (I_TP_TILE_SIZE, NUM_I_TP_TILES, H_BLOCK_SIZE),
-                dtype=compute_dtype,
+                dtype=down_projection_weight_grad.dtype,
                 align=32,
             )
         )
         existing_weight_grad.append(
             sbm.alloc_stack(
                 (I_TP_TILE_SIZE, NUM_I_TP_TILES, H_BLOCK_SIZE),
-                dtype=compute_dtype,
+                dtype=down_projection_weight_grad.dtype,
                 align=32,
             )
         )
@@ -2257,6 +2306,7 @@ def _compute_hidden_states_grad(
     BLOCK_I_TP=2,
     manage_scope=True,
     BUFFER_DEGREE=3,
+    skip_gate_proj=False,
 ):
     """
     Compute hidden states gradient with H-dimension sharding.
@@ -2280,6 +2330,7 @@ def _compute_hidden_states_grad(
         BLOCK_H (int): H dimension blocking factor.
         BLOCK_B (int): B dimension blocking factor.
         BLOCK_I_TP (int): I dimension blocking factor.
+        skip_gate_proj (bool): Whether to omit the gate-projection contribution.
 
     Returns:
         None: Hidden states gradient is written/accumulated in-place.
@@ -2329,10 +2380,13 @@ def _compute_hidden_states_grad(
                 align=32,
             )
         )
+        # Cross-expert RMW accumulator follows the grad-output HBM dtype (adaptive):
+        # bf16 caller -> bf16 (== baseline, fits SBUF); fp32 caller (nki_moe.py) -> fp32
+        # so the RMW load+add stays dtype-matched with HBM.
         result_tiles.append(
             sbm.alloc_stack(
                 (B_TILE_SIZE, NUM_B_TILES, H_BLOCK_SIZE),
-                dtype=compute_dtype,
+                dtype=hidden_states_grad.dtype,
                 align=32,
             )
         )
@@ -2341,7 +2395,7 @@ def _compute_hidden_states_grad(
             existing_hidden_grad.append(
                 sbm.alloc_stack(
                     (B_TILE_SIZE, NUM_B_TILES, H_BLOCK_SIZE),
-                    dtype=compute_dtype,
+                    dtype=hidden_states_grad.dtype,
                     align=32,
                 )
             )
@@ -2378,7 +2432,11 @@ def _compute_hidden_states_grad(
                     )
 
                     # Load lhs_tiles from gate_up_proj_output_grad_hbm [B, 2, I_TP] with dma_transpose
+                    if skip_gate_proj and gate_or_up == 0:
+                        nisa.memset(lhs_tiles[:, :, :], value=0.0)
                     for i_tile_idx in range(NUM_I_TP_TILES):
+                        if skip_gate_proj and gate_or_up == 0:
+                            break
                         i_tile_start = i_tile_idx * I_TP_TILE_SIZE
                         if i_tile_start >= valid_i_block:
                             break
@@ -2511,7 +2569,7 @@ def _compute_hidden_states_grad(
                                     stationary=lhs_tiles[0:valid_i_tile, i_tile_idx, nl.ds(b_tile_start, B_TILE_SIZE)],
                                     moving=rhs_tiles[0:valid_i_tile, i_tile_idx, nl.ds(h_tile_start, valid_h_tile)],
                                 )
-                            if i_block_idx == 0 and gate_or_up == 0:
+                            if i_block_idx == 0 and (gate_or_up == 0 or (skip_gate_proj and gate_or_up == 1)):
                                 nisa.tensor_copy(
                                     dst=result_tiles[result_buffer_idx][
                                         :, b_tile_idx, nl.ds(h_tile_start, valid_h_tile)
@@ -2598,6 +2656,7 @@ def _compute_gate_up_projection_weight_grad(
     BLOCK_I_TP=1,
     manage_scope=True,
     BUFFER_DEGREE=3,
+    skip_gate_proj=False,
 ):
     """
     Compute gate and up projection weight gradient with H-dimension sharding.
@@ -2620,6 +2679,7 @@ def _compute_gate_up_projection_weight_grad(
         BLOCK_H (int): H dimension blocking factor.
         BLOCK_B (int): B dimension blocking factor.
         BLOCK_I_TP (int): I dimension blocking factor.
+        skip_gate_proj (bool): Whether to omit the gate-projection contribution.
 
     Returns:
         None: Weight gradient is accumulated in-place.
@@ -2659,11 +2719,13 @@ def _compute_gate_up_projection_weight_grad(
     matmul_psum_idx = 0
 
     for n_buffer in range(BUFFER_DEGREE):
+        # Weight-grad accumulators follow grad-output HBM dtype (adaptive): bf16 -> baseline
+        # (fits SBUF); fp32 caller (nki_moe.py) -> fp32 full-precision cross-expert accum.
         weight_grad_accum.append(
-            sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES, I_TP_BLOCK_SIZE), dtype=compute_dtype, align=32)
+            sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES, I_TP_BLOCK_SIZE), dtype=gate_up_proj_weight_grad.dtype, align=32)
         )
         existing_weight_grad.append(
-            sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES, I_TP_BLOCK_SIZE), dtype=compute_dtype, align=32)
+            sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES, I_TP_BLOCK_SIZE), dtype=gate_up_proj_weight_grad.dtype, align=32)
         )
     sbm.open_scope(name=f"Gate Up Weight Grad Double Buffer", interleave_degree=BUFFER_DEGREE)
     # Process one (h_tile, i_tile) at a time to minimize memory
@@ -2698,19 +2760,27 @@ def _compute_gate_up_projection_weight_grad(
                     if skip_dma.skip_token:
                         nisa.memset(block_hidden_states[:, :, 0:valid_h_block], value=0.0)
 
+                    if skip_gate_proj and gate_or_up == 0:
+                        nisa.memset(gate_up_proj_output_grad[:, :, 0:valid_i_block], value=0.0)
+
                     for b_tile_idx in range(NUM_B_TILES):
                         # Load gate_up_proj_output_grad for this tile
                         global_tile_idx = b_block_idx * NUM_B_TILES + b_tile_idx
                         b_offset = b_block_idx * B_BLOCK_SIZE + b_tile_idx * B_TILE_SIZE
-                        nisa.dma_copy(
-                            dst=gate_up_proj_output_grad[:, b_tile_idx, 0:valid_i_block],
-                            src=gate_up_proj_output_grad_hbm.ap(
-                                pattern=[[GATE_UP_WEIGHT_COUNT * I_TP_DIM, B_TILE_SIZE], [1, 1], [1, valid_i_block]],
-                                offset=b_offset * GATE_UP_WEIGHT_COUNT * I_TP_DIM
-                                + gate_or_up * I_TP_DIM
-                                + i_block_start,
-                            ),
-                        )
+                        if not (skip_gate_proj and gate_or_up == 0):
+                            nisa.dma_copy(
+                                dst=gate_up_proj_output_grad[:, b_tile_idx, 0:valid_i_block],
+                                src=gate_up_proj_output_grad_hbm.ap(
+                                    pattern=[
+                                        [GATE_UP_WEIGHT_COUNT * I_TP_DIM, B_TILE_SIZE],
+                                        [1, 1],
+                                        [1, valid_i_block],
+                                    ],
+                                    offset=b_offset * GATE_UP_WEIGHT_COUNT * I_TP_DIM
+                                    + gate_or_up * I_TP_DIM
+                                    + i_block_start,
+                                ),
+                            )
 
                         nisa.dma_copy(
                             dst=block_hidden_states[:, b_tile_idx, 0:valid_h_block],
@@ -2953,27 +3023,42 @@ def _compute_function_sbuf_budgets(params, num_shards):
     H = params.H
     I_TP = params.I_TP
     dtype = params.compute_dtype
+    # Accumulator tiles in the bwd kernel follow the grad-output HBM dtype (fp32 when the caller
+    # preallocates fp32 grad buffers); thread it so scope-merge budgeting sizes them correctly.
+    hidden_grad_dtype = params.hidden_states_grad.dtype
+    gate_up_wgrad_dtype = params.gate_up_proj_weight_grad.dtype
+    down_wgrad_dtype = params.down_proj_weight_grad.dtype
     ao = params.affinity_option
     so = params.shard_option
 
     budgets = [0, 0, 0, 0, 0]
     if ao == AffinityOption.AFFINITY_ON_I:
         budgets[0] = bp.gate_up_output_grad.estimate_sbuf_usage(
-            B, H, I_TP, num_shards, dtype, shard_option=so, affinity_option=ao
+            B, H, I_TP, num_shards, dtype, shard_option=so, affinity_option=ao, grad_accum_dtype=hidden_grad_dtype
         )
     else:
         budgets[0] = bp.down_proj_output_grad.estimate_sbuf_usage(
             B, H, I_TP, num_shards, dtype, shard_option=so, affinity_option=ao
         )
         budgets[1] = bp.gate_up_output_grad.estimate_sbuf_usage(
-            B, H, I_TP, num_shards, dtype, shard_option=so, affinity_option=ao
+            B, H, I_TP, num_shards, dtype, shard_option=so, affinity_option=ao, grad_accum_dtype=hidden_grad_dtype
         )
 
     budgets[2] = bp.hidden_grad.estimate_sbuf_usage(
-        B, H, I_TP, num_shards, dtype, is_tensor_update_accumulating=params.is_tensor_update_accumulating
+        B,
+        H,
+        I_TP,
+        num_shards,
+        dtype,
+        is_tensor_update_accumulating=params.is_tensor_update_accumulating,
+        grad_accum_dtype=hidden_grad_dtype,
     )
-    budgets[3] = bp.gate_up_weight_grad.estimate_sbuf_usage(B, H, I_TP, num_shards, dtype)
-    budgets[4] = bp.down_weight_grad.estimate_sbuf_usage(B, H, I_TP, num_shards, dtype)
+    budgets[3] = bp.gate_up_weight_grad.estimate_sbuf_usage(
+        B, H, I_TP, num_shards, dtype, grad_accum_dtype=gate_up_wgrad_dtype
+    )
+    budgets[4] = bp.down_weight_grad.estimate_sbuf_usage(
+        B, H, I_TP, num_shards, dtype, grad_accum_dtype=down_wgrad_dtype
+    )
 
     return budgets
 
@@ -3140,8 +3225,8 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
     N = params.N
     NUM_B_TILES = div_ceil(B, TILE_SIZE)
 
-    # Get activation functions
-    nki_activation_fwd_op, nki_activation_bwd_op = params.get_activation_ops()
+    # Get activation function type for forward/backward dispatch
+    activation_type = params.get_activation_ops()
 
     _, num_shards, shard_id = get_program_sharding_info()
     params.validate_sharding(num_shards)
@@ -3162,6 +3247,13 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
 
     # Get blocking params
     bp = params.blocking_params
+
+    # Grad accumulators follow their grad-output HBM dtype (bf16 default == baseline; fp32 when the
+    # caller preallocates fp32 grad buffers). Hoisted into named locals (mirrors __estimate_sbuf__)
+    # so the per-tile dtype reads below stay readable.
+    hidden_grad_dtype = params.hidden_states_grad.dtype
+    gate_up_wgrad_dtype = params.gate_up_proj_weight_grad.dtype
+    down_wgrad_dtype = params.down_proj_weight_grad.dtype
 
     # Open scope for buffers that persist across all block iterations
     sbm.open_scope(name="Block loop prefetch")
@@ -3248,8 +3340,9 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
                 block_idx=block_idx,
                 expert_idx=expert_idx,
                 compute_dtype=params.compute_dtype,
-                nki_activation_fwd_op=nki_activation_fwd_op,
-                nki_activation_bwd_op=nki_activation_bwd_op,
+                grad_accum_dtype=hidden_grad_dtype,
+                activation_type=activation_type,
+                skip_gate_proj=params.skip_gate_proj,
                 sbm=sbm,
                 clamp_limits=params.clamp_limits,
                 BLOCK_H=bp.gate_up_output_grad.block_h,
@@ -3306,8 +3399,9 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
                 block_idx=block_idx,
                 expert_idx=expert_idx,
                 compute_dtype=params.compute_dtype,
-                nki_activation_fwd_op=nki_activation_fwd_op,
-                nki_activation_bwd_op=nki_activation_bwd_op,
+                grad_accum_dtype=hidden_grad_dtype,
+                activation_type=activation_type,
+                skip_gate_proj=params.skip_gate_proj,
                 sbm=sbm,
                 clamp_limits=params.clamp_limits,
                 BLOCK_H=bp.gate_up_output_grad.block_h,
@@ -3354,11 +3448,12 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             params.is_tensor_update_accumulating,
             block_idx,
             sbm=sbm,
-            BLOCK_H=bp.hidden_grad.block_h,
+            BLOCK_H=bp.hidden_grad.get_block_h(hidden_grad_dtype),
             BLOCK_B=bp.hidden_grad.block_b,
             BLOCK_I_TP=bp.hidden_grad.block_i,
             manage_scope=ms_flags[2],
-            BUFFER_DEGREE=bp.hidden_grad.buffer_degree,
+            BUFFER_DEGREE=bp.hidden_grad.get_buffer_degree(hidden_grad_dtype),
+            skip_gate_proj=params.skip_gate_proj,
         )
 
         if inc_after[2]:
@@ -3386,7 +3481,8 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             BLOCK_B=bp.gate_up_weight_grad.block_b,
             BLOCK_I_TP=bp.gate_up_weight_grad.block_i,
             manage_scope=ms_flags[3],
-            BUFFER_DEGREE=bp.gate_up_weight_grad.buffer_degree,
+            BUFFER_DEGREE=bp.gate_up_weight_grad.get_buffer_degree(gate_up_wgrad_dtype),
+            skip_gate_proj=params.skip_gate_proj,
         )
 
         if inc_after[3]:
@@ -3408,7 +3504,7 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             params.compute_dtype,
             block_idx,
             sbm=sbm,
-            BLOCK_H=bp.down_weight_grad.block_h,
+            BLOCK_H=bp.down_weight_grad.get_block_h(down_wgrad_dtype),
             BLOCK_B=bp.down_weight_grad.block_b,
             BLOCK_I_TP=bp.down_weight_grad.block_i,
             block_token_pos_to_id_full=block_token_pos_to_id_full
@@ -3417,7 +3513,7 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             skip_dma=params.skip_dma if params.affinity_option == AffinityOption.AFFINITY_ON_I else None,
             iota_vec=iota_vec,
             manage_scope=ms_flags[4],
-            BUFFER_DEGREE=bp.down_weight_grad.buffer_degree,
+            BUFFER_DEGREE=bp.down_weight_grad.get_buffer_degree(down_wgrad_dtype),
         )
 
         if inc_after[4]:

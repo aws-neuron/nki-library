@@ -19,10 +19,14 @@ from typing import Any, final
 
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import map_skip_mode
 from test.integration.nkilib.core.moe.moe_cte.test_utils import (
+    block128_to_native_down,
+    block128_to_native_gate_up,
     build_moe_bwmm_mx_cte,
     build_moe_bwmm_mx_cte_from_model_test_config,
+    dequant_prequantized_hidden_concat,
     gather_from_packed_down,
     gather_from_packed_gate_up,
+    n_packed_buffers_for,
     order_kernel_input,
 )
 from test.utils.common_dataclasses import (
@@ -31,7 +35,6 @@ from test.utils.common_dataclasses import (
     CustomValidatorWithOutputTensorData,
     ModelTestType,
     Platforms,
-    ValidationArgs,
     prepare_model_parametrize,
 )
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
@@ -51,8 +54,6 @@ import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx import bwmm_shard_on_block_mx
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx_torch import bwmm_shard_on_block_mx_torch_ref
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I_mx import (
@@ -64,6 +65,7 @@ from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I_mx_torch import (
     blockwise_mm_shard_intermediate_mx_torch_ref,
 )
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType
+from typing_extensions import override
 
 # fmt: off
 SHARD_ON_BLOCK_PARAMS = "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, ep_degree, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_uint_weights, unpacked_weights, n_static_blocks, use_packed_scales, quant_type"
@@ -85,6 +87,7 @@ _SHARD_BLOCK_FULL_ONLY = [
     [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     [2, 3072, 10240, 1536, 32, 256, 4, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     [2, 3072, 1024, 1536, 32, 256, 4, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 2048, 3072, 16, 256, 4, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # Scale Packing
     [2, 3072, 256, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
     # MXFP4 test cases (blk=512)
@@ -110,21 +113,21 @@ _SHARD_BLOCK_FULL_ONLY = [
     [2, 3072, 1024, 384, 16, 256, 2, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # STATIC_MX large-config
     [2, 4096, 10240, 1536, 16, 256, 2, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
+    # No Bias with partial Clipping (demoted from fast by min-set workflow)
+    [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, False, None, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    # STATIC_MX with smaller block (demoted from fast by min-set workflow)
+    [2, 4096, 4096, 1536, 2, 128, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
 ]
 
 
-# Fast entries (run in both fast and full suite)
 _SHARD_BLOCK_FAST_RAW = [
-    # No Bias with partial Clipping
-    [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, False, None, False, QuantizationType.MX],
-    [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, False, None, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # n_static_blocks test cases
     [2, 4096, 4096, 1536, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, False, 2, False, QuantizationType.MX],
     [2, 4096, 4096, 1024, 4, 256, 4, 32, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
     [2, 3072, 4096, 384, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
     # STATIC_MX coverage (MXFP8 e4m3fn weights, unpacked fp8 carriers, no clamp)
     [2, 4096, 4096, 1536, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
-    [2, 4096, 4096, 1536, 2, 128, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
     [2, 4096, 10240, 768, 4, 256, 2, 32, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
     [2, 4096, 4096, 384, 16, 256, 2, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, True, None, False, QuantizationType.STATIC_MX],
 ]
@@ -156,6 +159,20 @@ SHARD_ON_I_UNIT_PERMS = [
     [2, 4096, 4096, 2048, 2, 512, 2, 64, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
     [2, 4096, 4096, 2048, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
 ]
+
+# Shard-on-I block-128 (DeepSeek ue8m0) scale configs. I_TP must be a multiple of 1024.
+# Params: vnc, hidden, tokens, intermediate, expert, block_size, top_k, ep_degree, act_fn,
+#         eas_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gcu, gcl, ucu, ucl
+# NOTE: intentionally NOT marked @pytest.mark.fast — like SHARD_ON_I_UNIT_PERMS, shard-on-I MX
+# compiles are memory-heavy and the fast dry-run suite already runs near the 3000 MB per-worker
+# limit. Adding these to the fast suite tips borderline co-scheduled tests over. These run in the
+# full shared-fleet suite instead (validated on trn3_a0 with compile-and-infer).
+SHARD_ON_I_BLOCK128_PERMS = [
+    [2, 3072, 1024, 2048, 8, 256, 4, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0],
+    [2, 3072, 1024, 2048, 8, 256, 4, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0],
+    [2, 7168, 1024, 1024, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0],
+]
+SHARD_ON_I_BLOCK128_PARAMS = "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, ep_degree, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower"
 # fmt: on
 
 _ABBREVS = {
@@ -309,6 +326,8 @@ def _gen_block_inputs(
     ep_degree: int = 1,
     use_packed_scales: bool = False,
     quantization_type: QuantizationType = QuantizationType.MX,
+    use_prequant_hidden: bool = False,
+    pack_affinities_into_hidden: bool = False,
 ) -> dict:
     assert skewness_pct is not None or top_k is not None, "Either skewness_pct or top_k must be provided"
     assert not (use_uint_weights and unpacked_weights), "use_uint_weights and unpacked_weights are mutually exclusive"
@@ -361,6 +380,8 @@ def _gen_block_inputs(
             n_static_blocks=n_static_blocks,
             use_packed_scales=use_packed_scales,
             quantization_type=quantization_type,
+            use_prequant_hidden=use_prequant_hidden,
+            pack_affinities_into_hidden=pack_affinities_into_hidden,
         )
     ordered = order_kernel_input(ki, variant='shard_on_block_mx')
     # Forward routing shape to the kernel for its best-case static-block estimate.
@@ -386,6 +407,21 @@ def _mx_torch_ref_wrapper(torch_ref_func) -> callable:
 
     @functools.wraps(torch_ref_func)
     def wrapped(**kwargs):
+        # Pre-quantized fp8 hidden: the kernel receives a concat [T, H + scale_region] fp8 tensor
+        # (packed scales), but the reference math wants fp32 [T, H]. Dequantize the concat back to
+        # fp32 so kernel and golden compare the same numbers. Detect from the hidden dtype + width.
+        hidden = kwargs.get('hidden_states')
+        gup_w_for_h = kwargs.get('gate_up_proj_weight')
+        if isinstance(hidden, np.ndarray) and 'float8' in str(hidden.dtype) and gup_w_for_h is not None:
+            # gate_up_proj_weight: (E, 128, 2, n_H512_tile, I) → H = 128 * n_H512_tile * 4
+            _n_H512 = gup_w_for_h.shape[3]
+            _H = gup_w_for_h.shape[1] * _n_H512 * 4
+            _scale_region = n_packed_buffers_for(_n_H512) * 128  # packed scale region width
+            # Accept the bare concat (== H + scale_region) or the affinity-packed concat (wider: the
+            # affinity tail follows the scale region). dequant reads only the hidden+scale prefix.
+            if hidden.shape[-1] >= _H + _scale_region:
+                kwargs['hidden_states'] = dequant_prequantized_hidden_concat(hidden, _H).astype(np.float32)
+
         # View framework-carrier weights (uint16/uint32 NxD or unpacked fp8 STATIC_MX)
         # back to the packed _x4 dtype before the base wrapper processes them.
         wdt = kwargs.get('weight_dtype')
@@ -413,6 +449,26 @@ def _mx_torch_ref_wrapper(torch_ref_func) -> callable:
             p_I = dwn_w.shape[1]
             p_scale = p_I // 8  # _q_height
             kwargs['down_proj_scale'] = gather_from_packed_down(kwargs['down_proj_scale'], n_I512_tile, p_scale=p_scale)
+        # Strip the kernel-only block-128 flag and expand the compact block-128
+        # scales back to the native (coarse) layout the reference consumes — the
+        # SAME values the kernel materializes, so kernel and ref agree exactly.
+        if kwargs.pop('use_block128_scales', False):
+            gup_w = kwargs.get('gate_up_proj_weight')
+            assert gup_w is not None, "need gate_up_proj_weight to determine n_H512_tile / I"
+            # gate_up_proj_weight shape: (E, _pmax, 2, n_H512_tile, I)
+            n_H512_tile = gup_w.shape[3]
+            I = gup_w.shape[4]
+            kwargs['gate_up_proj_scale'] = block128_to_native_gate_up(kwargs['gate_up_proj_scale'], n_H512_tile, I)
+            dwn_w = kwargs.get('down_proj_weight')
+            assert dwn_w is not None, "need down_proj_weight to determine n_I512_tile / p_scale / H"
+            # down_proj_weight shape: (E, p_I, n_total_I512_tile, H)
+            n_I512_tile = dwn_w.shape[2]
+            p_I = dwn_w.shape[1]
+            H = dwn_w.shape[3]
+            p_scale = p_I // 8  # _q_height
+            kwargs['down_proj_scale'] = block128_to_native_down(
+                kwargs['down_proj_scale'], n_I512_tile, H, p_scale=p_scale
+            )
         return base_wrapper(**kwargs)
 
     return wrapped
@@ -441,6 +497,7 @@ def _gen_I_inputs(
     skewness_pct: float = None,
     global_top_k: int = None,
     ep_degree: int = None,
+    use_block128_scales: bool = False,
 ) -> dict:
     assert skewness_pct is not None or top_k is not None, "Either skewness_pct or top_k must be provided"
     if skewness_pct is not None:
@@ -489,6 +546,7 @@ def _gen_I_inputs(
             up_clamp_lower_limit=up_clamp_lower,
             is_shard_on_I=True,
             n_static_blocks=n_static_blocks,
+            use_block128_scales=use_block128_scales,
         )
     variant = 'shard_on_I_mx_hybrid' if is_dynamic else 'shard_on_I_mx'
     # Shard-on-I kernel doesn't accept STATIC_MX kwargs (no STATIC_MX path yet);
@@ -509,45 +567,50 @@ def _block_output(
     return {"output": np.zeros((out_T, hidden), dtype=numpy_dtype)}
 
 
-def _make_shard0_validator(torch_ref_fn, input_gen, tokens, hidden, vnc_degree, dtype, rtol, atol):
-    """Create a CustomValidator that only compares output[0, :tokens, :hidden].
+def _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol, atol):
+    """Return a custom_comparator that compares only output[0, :tokens, :hidden].
 
     After reduce_outputs, output[0] has the correct reduced result but output[1]
-    contains garbage (not zeroed). This validator ignores shard 1.
+    contains garbage (not zeroed); this ignores shard 1. The golden comes from the
+    framework (custom_comparator receives it), so the torch-ref cache can serve it
+    instead of the validator recomputing it.
     """
     from test.utils.comparators import maxAllClose
 
     numpy_dtype = dt.finfo(dtype).dtype
 
-    class Shard0Validator(CustomValidator):
-        @override
-        def validate(self, actual_raw_output):
-            ki = input_gen(None)
-            golden_dict = torch_ref_fn(**ki)
-            golden = golden_dict["output"]
-            if hasattr(golden, "numpy"):
-                golden = golden.numpy()
-            golden = golden.astype(np.float32)
+    def comparator(golden_dict, output_tensors):
+        golden = golden_dict["output"]
+        if hasattr(golden, "numpy"):
+            golden = golden.numpy()
+        golden = golden.astype(np.float32)
 
-            actual = (
-                np.frombuffer(actual_raw_output, dtype=numpy_dtype).reshape(vnc_degree, -1, hidden).astype(np.float32)
+        class Shard0Validator(CustomValidator):
+            @override
+            def validate(self, actual_raw_output):
+                actual = (
+                    np.frombuffer(actual_raw_output, dtype=numpy_dtype)
+                    .reshape(vnc_degree, -1, hidden)
+                    .astype(np.float32)
+                )
+                # Only compare shard 0, real tokens
+                return maxAllClose(
+                    actual[0, :tokens, :hidden],
+                    golden[0, :tokens, :hidden],
+                    rtol=rtol,
+                    atol=atol,
+                    verbose=1,
+                    logfile=self.logfile,
+                )
+
+        return {
+            "output": CustomValidatorWithOutputTensorData(
+                validator=Shard0Validator,
+                output_ndarray=output_tensors["output"],
             )
+        }
 
-            # Only compare shard 0, real tokens
-            actual_slice = actual[0, :tokens, :hidden]
-            golden_slice = golden[0, :tokens, :hidden]
-            comparison_passed = maxAllClose(
-                actual_slice,
-                golden_slice,
-                rtol=rtol,
-                atol=atol,
-                verbose=1,
-                logfile=self.logfile,
-            )
-
-            return comparison_passed
-
-    return Shard0Validator
+    return comparator
 
 
 def _I_output(ki: dict, tokens: int, hidden: int, dtype, skip_mode: int) -> dict:
@@ -626,35 +689,15 @@ class TestMoeBwmmMxShardBlockKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         )
 
         def out_desc(ki):
             return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
 
         is_accumulating = top_k != 1
-        custom_validation = None
+        custom_comparator = None
         if is_accumulating:
-            torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
-            output_placeholder = out_desc(input_gen(None))
-            validator_cls = _make_shard0_validator(
-                torch_ref,
-                input_gen,
-                tokens,
-                hidden,
-                vnc_degree,
-                dtype,
-                rtol=5e-2,
-                atol=1e-5,
-            )
-            custom_validation = ValidationArgs(
-                golden_output={
-                    "output": CustomValidatorWithOutputTensorData(
-                        validator=validator_cls,
-                        output_ndarray=output_placeholder["output"],
-                    ),
-                },
-            )
+            custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
 
         UnitTestFramework(
             test_manager=test_manager,
@@ -667,7 +710,139 @@ class TestMoeBwmmMxShardBlockKernel:
             compiler_args=compiler_args,
             rtol=5e-2,
             atol=1e-5,
-            custom_validation_args=custom_validation,
+            custom_comparator=custom_comparator,
+        )
+
+    # fmt: off
+    # Pre-quantized fp8 hidden states (real MX): hidden_states arrives as a concatenated
+    # [T, H+H/4] fp8 tensor (fp8 data | uint8 MX scales). Real MX weights only.
+    # use_packed_scales packs the WEIGHT scales (orthogonal to the hidden-state path).
+    # pack_affin (last field): when True the dense expert affinities are folded into the hidden concat
+    # Fast configs are kept SMALL: the prequant path generates the fp8 concat plus a full fp32
+    # reference hidden on top of the MX weight tensors, so host input-gen memory (gated at 3000 MB in
+    # the suite) scales with E * H * I. Keep E/H/I modest here; the larger shapes live in the
+    # full-only list below.
+    _PREQUANT_HIDDEN_PERMS = [
+        # vnc, hidden, tokens, inter, exp, blk, k, act, eas, dtype, wdt, sk, bias, dyn, gcu, gcl, ucu, ucl, pack, pack_affin
+        # skip both (dynamic): exercises the affinity-tail memset + dynamic select.
+        [2, 512, 1024, 384, 16, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True],
+        # Odd E=17 -> E*2 not a multiple of 4: exercises the row pad-to-4.
+        [2, 512, 1024, 384, 17, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True],
+        # skip_weight only (skip_mode=1): no affinity holes -> memset is a no-op path.
+        [2, 512, 1024, 384, 16, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, True],
+        # no skip (skip_mode=0).
+        [2, 512, 1024, 384, 16, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, True, True],
+    ]
+
+    # Full-suite prequant coverage: the MX shapes from _SHARD_BLOCK_FULL_ONLY run through the
+    # pre-quantized fp8 hidden path with affinities packed into the row (pack_affin=True). STATIC_MX
+    # rows are excluded (prequant fp8-hidden only supports QuantizationType.MX); the uint/unpacked
+    # weight-carrier flags don't apply here so those rows become plain MX shapes. Each row keeps its
+    # source use_packed_scales (the WEIGHT-scale packing, orthogonal to the hidden path).
+    _PREQUANT_HIDDEN_FULL_PERMS = [
+        # vnc, hidden, tokens, inter, exp, blk, k, act, eas, dtype, wdt, sk, bias, dyn, gcu, gcl, ucu, ucl, pack, pack_affin
+        # MXFP4 (blk=256)
+        [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, True],
+        [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, True],
+        [2, 3072, 8192, 1536, 64, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True],
+        [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, True],
+        [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, True],
+        [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, True],
+        [2, 3072, 10240, 1536, 32, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, True],
+        [2, 3072, 1024, 1536, 32, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, True],
+        # DeepSeek 3.2: EP32 TP2, H=7168, I_TP=1024, E_local=8, blk=256, top_k=8, MXFP8.
+        [2, 7168, 1024, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, True],
+        [2, 7168, 4096, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, True],
+        [2, 7168, 8192, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, True],
+        [2, 7168, 16384, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, True],
+    ]
+    # fmt: on
+
+    @pytest_parametrize(
+        "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, act_fn, "
+        "expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, "
+        "gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_packed_scales, pack_affinities",
+        [pytest.param(*c, marks=pytest.mark.fast) for c in _PREQUANT_HIDDEN_PERMS] + _PREQUANT_HIDDEN_FULL_PERMS,
+        abbrevs=_ABBREVS,
+    )
+    def test_moe_bwmm_mx_shard_block_prequant_hidden(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree: int,
+        hidden: int,
+        tokens: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        act_fn: ActFnType,
+        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+        dtype: Any,
+        weight_dtype: Any,
+        skip_mode: int,
+        bias: bool,
+        is_dynamic: bool,
+        gate_clamp_upper: float,
+        gate_clamp_lower: float,
+        up_clamp_upper: float,
+        up_clamp_lower: float,
+        use_packed_scales: bool,
+        pack_affinities: bool,
+    ):
+        """Unit test for the pre-quantized fp8 hidden-state (real MX) gate-up path."""
+
+        def input_gen(tc):
+            return _gen_block_inputs(
+                vnc_degree=vnc_degree,
+                hidden=hidden,
+                tokens=tokens,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                act_fn=act_fn,
+                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                skip_mode=skip_mode,
+                bias=bias,
+                is_dynamic=is_dynamic,
+                gate_clamp_upper=gate_clamp_upper,
+                gate_clamp_lower=gate_clamp_lower,
+                up_clamp_upper=up_clamp_upper,
+                up_clamp_lower=up_clamp_lower,
+                use_packed_scales=use_packed_scales,
+                quantization_type=QuantizationType.MX,
+                use_prequant_hidden=True,
+                pack_affinities_into_hidden=pack_affinities,
+            )
+
+        compiler_args = CompilerArgs(
+            logical_nc_config=vnc_degree,
+            platform_target=platform_target,
+        )
+
+        def out_desc(ki):
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
+
+        is_accumulating = top_k != 1
+        custom_comparator = None
+        if is_accumulating:
+            custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=bwmm_shard_on_block_mx,
+            torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=5e-2,
+            atol=1e-5,
+            custom_comparator=custom_comparator,
         )
 
     @pytest.mark.coverage_parametrize(
@@ -745,28 +920,9 @@ class TestMoeBwmmMxShardBlockKernel:
             return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
 
         is_accumulating = top_k != 1
-        custom_validation = None
+        custom_comparator = None
         if is_accumulating and not is_negative_test_case:
-            torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
-            output_placeholder = out_desc(input_gen(None))
-            validator_cls = _make_shard0_validator(
-                torch_ref,
-                input_gen,
-                tokens,
-                hidden,
-                vnc_degree,
-                dtype,
-                rtol=5e-2,
-                atol=1e-5,
-            )
-            custom_validation = ValidationArgs(
-                golden_output={
-                    "output": CustomValidatorWithOutputTensorData(
-                        validator=validator_cls,
-                        output_ndarray=output_placeholder["output"],
-                    ),
-                },
-            )
+            custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
 
         UnitTestFramework(
             test_manager=test_manager,
@@ -779,12 +935,11 @@ class TestMoeBwmmMxShardBlockKernel:
             compiler_args=CompilerArgs(
                 logical_nc_config=vnc_degree,
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             rtol=5e-2,
             atol=1e-5,
             is_negative_test=is_negative_test_case,
-            custom_validation_args=custom_validation,
+            custom_comparator=custom_comparator,
         )
 
 
@@ -859,6 +1014,80 @@ class TestMoeBwmmMxShardIKernel:
                 up_clamp_upper=up_clamp_upper,
                 up_clamp_lower=up_clamp_lower,
                 n_static_blocks=n_static_blocks,
+            )
+
+        def out_desc(ki):
+            return _I_output(ki, tokens, hidden, dtype, skip_mode)
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kf,
+            torch_ref=_mx_torch_ref_wrapper(tr),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-5,
+        )
+
+    @pytest.mark.parametrize(SHARD_ON_I_BLOCK128_PARAMS, SHARD_ON_I_BLOCK128_PERMS)
+    def test_moe_bwmm_mx_shard_I_block128_unit(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree: int,
+        hidden: int,
+        tokens: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        ep_degree: int,
+        act_fn: ActFnType,
+        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+        dtype: Any,
+        weight_dtype: Any,
+        skip_mode: int,
+        bias: bool,
+        is_dynamic: bool,
+        gate_clamp_upper: float,
+        gate_clamp_lower: float,
+        up_clamp_upper: float,
+        up_clamp_lower: float,
+    ):
+        """Unit test for shard-on-I kernel consuming DeepSeek block-128 weight scales."""
+        if vnc_degree != 2:
+            pytest.skip("Shard-on-I kernel requires exactly 2 shards.")
+        kf = blockwise_mm_shard_intermediate_mx_hybrid if is_dynamic else blockwise_mm_shard_intermediate_mx
+        tr = (
+            blockwise_mm_shard_intermediate_mx_hybrid_torch_ref
+            if is_dynamic
+            else blockwise_mm_shard_intermediate_mx_torch_ref
+        )
+
+        def input_gen(tc):
+            return _gen_I_inputs(
+                vnc_degree=vnc_degree,
+                hidden=hidden,
+                tokens=tokens,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                act_fn=act_fn,
+                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                skip_mode=skip_mode,
+                bias=bias,
+                is_dynamic=is_dynamic,
+                gate_clamp_upper=gate_clamp_upper,
+                gate_clamp_lower=gate_clamp_lower,
+                up_clamp_upper=up_clamp_upper,
+                up_clamp_lower=up_clamp_lower,
+                use_block128_scales=True,
             )
 
         def out_desc(ki):
@@ -1097,52 +1326,9 @@ class TestMoeBwmmMxCteModel:
                 return _block_output(ki, tokens, hidden, dtype, skip_mode, min(expert, global_top_k) > 1, vnc_degree)
 
             is_accumulating = min(expert, global_top_k) > 1
-            custom_validation = None
+            custom_comparator = None
             if is_accumulating:
-                torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
-                output_placeholder = out_desc(input_gen(None))
-                validator_cls = _make_shard0_validator(
-                    torch_ref,
-                    input_gen,
-                    tokens,
-                    hidden,
-                    vnc_degree,
-                    dtype,
-                    rtol=5e-2,
-                    atol=1e-5,
-                )
-                custom_validation = ValidationArgs(
-                    golden_output={
-                        "output": CustomValidatorWithOutputTensorData(
-                            validator=validator_cls,
-                            output_ndarray=output_placeholder["output"],
-                        ),
-                    },
-                )
-
-            is_accumulating = min(expert, global_top_k) > 1
-            custom_validation = None
-            if is_accumulating:
-                torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
-                output_placeholder = out_desc(input_gen(None))
-                validator_cls = _make_shard0_validator(
-                    torch_ref,
-                    input_gen,
-                    tokens,
-                    hidden,
-                    vnc_degree,
-                    dtype,
-                    rtol=5e-2,
-                    atol=1e-5,
-                )
-                custom_validation = ValidationArgs(
-                    golden_output={
-                        "output": CustomValidatorWithOutputTensorData(
-                            validator=validator_cls,
-                            output_ndarray=output_placeholder["output"],
-                        ),
-                    },
-                )
+                custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
 
             UnitTestFramework(
                 test_manager=test_manager,
@@ -1155,7 +1341,7 @@ class TestMoeBwmmMxCteModel:
                 compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
                 rtol=5e-2,
                 atol=1e-5,
-                custom_validation_args=custom_validation,
+                custom_comparator=custom_comparator,
             )
 
     @pytest.mark.optimal

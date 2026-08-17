@@ -27,7 +27,6 @@ from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim, MoEAllToAl
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.logging import get_logger
-from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from .mlp_parameters import (
     MLPBiasParameters,
@@ -44,7 +43,6 @@ from .moe_tkg_utils import (
     get_all_expert_tile_affinities,
     load_all_expert_affinities,
     reshape_scale_for_mlp,
-    safe_tensor_view,
 )
 from .projection_utils import input_norm_load, transpose_store
 
@@ -140,7 +138,7 @@ def _extract_a2av_affinities(hidden_input, H, E_L, T, pmax):
     Affinities are at columns [H : H+E_L], shape [T, E_L].
 
     Returns:
-        expert_affinities_hbm (nl.ndarray): [T, E_L] affinities in private HBM.
+        expert_affinities_hbm (nl.NkiTensor): [T, E_L] affinities in private HBM.
     """
     expert_affinities_hbm = nl.ndarray((T, E_L), dtype=hidden_input.dtype, buffer=nl.private_hbm)
     # Copy affinity columns from concatenated input to separate HBM buffer
@@ -183,17 +181,17 @@ def _build_pack_output_indices(expert_affinities, T, E, pmax, dynamism_cfg, hidd
     to packed output positions.
 
     Args:
-        expert_affinities (nl.ndarray): [T, E] affinities in HBM.
+        expert_affinities (nl.NkiTensor): [T, E] affinities in HBM.
         T: Total tokens.
         E: Number of local experts.
         pmax: Partition max.
         dynamism_cfg: Dynamism config.
-        hidden_input (nl.ndarray): [T, H+E+2] concatenated input in HBM.
-        output (nl.ndarray): [T, H+2] output in HBM.
+        hidden_input (nl.NkiTensor): [T, H+E+2] concatenated input in HBM.
+        output (nl.NkiTensor): [T, H+2] output in HBM.
         H: Hidden dimension.
 
     Returns:
-        output_indices_hbm (nl.ndarray): [T, 1] in private HBM. Maps routed input position → packed output row.
+        output_indices_hbm (nl.NkiTensor): [T, 1] in private HBM. Maps routed input position → packed output row.
     """
     tile_T = dynamism_cfg.blk_tile_T
     n_T_tiles = dynamism_cfg.blk_n_T_tiles
@@ -207,11 +205,9 @@ def _build_pack_output_indices(expert_affinities, T, E, pmax, dynamism_cfg, hidd
     nisa.memset(aff_sum_sb, 0)
     for e in range(E):
         expert_aff_sb = nl.ndarray((1, T), dtype=expert_affinities.dtype, buffer=nl.sbuf)
-        src_view = (
-            TensorView(expert_affinities).select(dim=1, index=e).expand_dim(dim=1).expand_dim(dim=1).expand_dim(dim=1)
-        )
-        dst_view = TensorView(expert_aff_sb).expand_dim(dim=1).expand_dim(dim=1)
-        nisa.dma_transpose(src=src_view.get_view(), dst=dst_view.get_view())
+        src_view = expert_affinities.select(dim=1, index=e).expand_dim(dim=1).expand_dim(dim=1).expand_dim(dim=1)
+        dst_view = expert_aff_sb.expand_dim(dim=1).expand_dim(dim=1)
+        nisa.dma_transpose(src=src_view, dst=dst_view)
         # Accumulate absolute value (affinity can be negative)
         aff_abs_sb = nl.ndarray((1, T), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(data=expert_aff_sb, op0=nl.abs, operand0=0, dst=aff_abs_sb)
@@ -296,17 +292,17 @@ def _build_pack_output_indices(expert_affinities, T, E, pmax, dynamism_cfg, hidd
 
 def _all_expert_moe_tkg(
     params: MLPParameters,
-    output: nl.ndarray,
-) -> nl.ndarray:
+    output: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     All-expert MoE kernel for token generation (TKG). Dispatches to static or dynamic implementation.
 
     Args:
         params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
-        output (nl.ndarray): Output tensor to store the final result.
+        output (nl.NkiTensor): Output tensor to store the final result.
 
     Returns:
-        output (nl.ndarray): Output tensor with accumulated expert results.
+        output (nl.NkiTensor): Output tensor with accumulated expert results.
     """
     dynamism_cfg = _init_dynamism_config(params)
 
@@ -319,8 +315,8 @@ def _all_expert_moe_tkg(
 def _all_expert_moe_tkg_dynamic(
     params: MLPParameters,
     dynamism_cfg: AllExpertDynamismConfig,
-    output: nl.ndarray,
-) -> nl.ndarray:
+    output: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     All-expert MoE with dynamic control flow (DLoC).
 
@@ -335,10 +331,10 @@ def _all_expert_moe_tkg_dynamic(
     Args:
         params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
         dynamism_cfg (AllExpertDynamismConfig): Dynamic control flow configuration.
-        output (nl.ndarray): Output tensor [T, H] in HBM.
+        output (nl.NkiTensor): Output tensor [T, H] in HBM.
 
     Returns:
-        output (nl.ndarray): Output tensor with accumulated expert results.
+        output (nl.NkiTensor): Output tensor with accumulated expert results.
     """
     io_dtype = params.hidden_tensor.dtype
     expert_affinities = params.expert_params.expert_affinities
@@ -398,23 +394,36 @@ def _all_expert_moe_tkg_dynamic(
     sbm.open_scope()
     allocator = sbm.alloc_stack
 
-    # Wrap tensors in TensorView
-    gate_proj_weights_view = safe_tensor_view(params.gate_proj_weights_tensor)
-    up_proj_weights_view = safe_tensor_view(params.up_proj_weights_tensor)
-    down_proj_weights_view = safe_tensor_view(params.down_proj_weights_tensor)
-    gate_proj_bias_view = safe_tensor_view(params.bias_params.gate_proj_bias_tensor)
-    up_proj_bias_view = safe_tensor_view(params.bias_params.up_proj_bias_tensor)
-    down_proj_bias_view = safe_tensor_view(params.bias_params.down_proj_bias_tensor)
-    gate_w_scale_view = safe_tensor_view(params.quant_params.gate_w_scale)
-    up_w_scale_view = safe_tensor_view(params.quant_params.up_w_scale)
-    down_w_scale_view = safe_tensor_view(params.quant_params.down_w_scale)
-    gate_up_in_scale_view = safe_tensor_view(params.quant_params.gate_up_in_scale)
-    down_in_scale_view = safe_tensor_view(params.quant_params.down_in_scale)
+    # Pre-allocate projection buffers outside dynamic loops to avoid NCC_IGCA108
+    # (compiler requires tensors with loop-carried dependency to be defined outside of loop)
+    block_T = dynamism_cfg.block_size
+    num_I_tiles = div_ceil(dims.I, dims.I0)
+    prealloc_gate_up_sb = nl.ndarray((dims.I0, num_I_tiles, block_T), dtype=nl.float32, buffer=nl.sbuf)
+    prealloc_gate_up_sb_casted = nl.ndarray((dims.I0, num_I_tiles, block_T), dtype=io_dtype, buffer=nl.sbuf)
+    # Internal gate/up projection accumulation buffers
+    gate_up_proj_tile_shape = (dims.I0, num_I_tiles, block_T)
+    prealloc_gate_sb_fp32 = nl.ndarray(gate_up_proj_tile_shape, dtype=nl.float32, buffer=nl.sbuf)
+    prealloc_up_sb_fp32 = nl.ndarray(gate_up_proj_tile_shape, dtype=nl.float32, buffer=nl.sbuf)
+    prealloc_gate_up_buffers = (prealloc_gate_sb_fp32, prealloc_up_sb_fp32)
+
+    # Save original tensors before expert loop (params is mutated by _select_expert_params)
+    gate_proj_weights = params.gate_proj_weights_tensor
+    up_proj_weights = params.up_proj_weights_tensor
+    down_proj_weights = params.down_proj_weights_tensor
+    gate_proj_bias = params.bias_params.gate_proj_bias_tensor
+    up_proj_bias = params.bias_params.up_proj_bias_tensor
+    down_proj_bias = params.bias_params.down_proj_bias_tensor
+    gate_w_scale = params.quant_params.gate_w_scale
+    up_w_scale = params.quant_params.up_w_scale
+    down_w_scale = params.quant_params.down_w_scale
+    gate_up_in_scale = params.quant_params.gate_up_in_scale
+    down_in_scale = params.quant_params.down_in_scale
 
     # Zero-initialize output buffer: each NC memsets its own [T, H_per_shard] slice
     # For PACK_OUTPUT_ROWS: ensures padding positions beyond routed tokens are deterministic
     # For PRESERVE_ROW_ORDER: ensures unrouted token positions are zero for correct combine-sum
     H_per_shard = dims.H_per_shard
+    h_offset = dims.H1_offset * dims.H0
     zero_tile_T = min(pmax, T)
     zero_sb = nl.ndarray((zero_tile_T, H_per_shard), dtype=io_dtype, buffer=nl.sbuf)
     nisa.memset(zero_sb, 0)
@@ -422,7 +431,7 @@ def _all_expert_moe_tkg_dynamic(
         tile_T_actual = min(zero_tile_T, T - t_start)
         nisa.dma_copy(
             src=zero_sb[:tile_T_actual, :H_per_shard],
-            dst=output[nl.ds(t_start, tile_T_actual), nl.ds(dims.shard_id * H_per_shard, H_per_shard)],
+            dst=output[nl.ds(t_start, tile_T_actual), nl.ds(h_offset, H_per_shard)],
         )
 
     # For PACK_OUTPUT_ROWS with E=1, track write position for sequential output.
@@ -440,17 +449,17 @@ def _all_expert_moe_tkg_dynamic(
         _select_expert_params(
             params,
             expertIdx,
-            gate_proj_weights_view,
-            up_proj_weights_view,
-            down_proj_weights_view,
-            gate_proj_bias_view,
-            up_proj_bias_view,
-            down_proj_bias_view,
-            gate_w_scale_view,
-            up_w_scale_view,
-            down_w_scale_view,
-            gate_up_in_scale_view,
-            down_in_scale_view,
+            gate_proj_weights,
+            up_proj_weights,
+            down_proj_weights,
+            gate_proj_bias,
+            up_proj_bias,
+            down_proj_bias,
+            gate_w_scale,
+            up_w_scale,
+            down_w_scale,
+            gate_up_in_scale,
+            down_in_scale,
         )
 
         # Find routed tokens and build dynamic decision vector
@@ -497,7 +506,7 @@ def _all_expert_moe_tkg_dynamic(
         dynamic_block_idx = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.memset(dynamic_block_idx, 0)
 
-        for _ in nl.dynamic_range(n_dynamic_blocks_reg):
+        def _dynamic_block_body(_):
             _compute_dynamic_block(
                 params=params,
                 dims=dims,
@@ -513,10 +522,15 @@ def _all_expert_moe_tkg_dynamic(
                 write_offset=write_offset,
                 is_first_expert=(expertIdx == 0),
                 output_indices_hbm=output_indices_hbm,
+                prealloc_gate_up_sb=prealloc_gate_up_sb,
+                prealloc_gate_up_sb_casted=prealloc_gate_up_sb_casted,
+                prealloc_gate_up_buffers=prealloc_gate_up_buffers,
             )
 
             # Advance to next dynamic block
             nisa.tensor_scalar(data=dynamic_block_idx, op0=nl.add, operand0=1, dst=dynamic_block_idx)
+
+        nl.fori_loop(0, n_dynamic_blocks_reg, _dynamic_block_body)
 
     sbm.close_scope()
     return output
@@ -524,8 +538,8 @@ def _all_expert_moe_tkg_dynamic(
 
 def _all_expert_moe_tkg_static(
     params: MLPParameters,
-    output: nl.ndarray,
-) -> nl.ndarray:
+    output: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     Static all-expert MoE computation without dynamic loop on chip (DLoC).
 
@@ -538,10 +552,10 @@ def _all_expert_moe_tkg_static(
 
     Args:
         params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
-        output (nl.ndarray): Output tensor to store the final result.
+        output (nl.NkiTensor): Output tensor to store the final result.
 
     Returns:
-        output (nl.ndarray): Output tensor with accumulated expert results.
+        output (nl.NkiTensor): Output tensor with accumulated expert results.
 
     Notes:
         - Column tiling for down projection is not supported.
@@ -588,25 +602,25 @@ def _all_expert_moe_tkg_static(
     sbm.open_scope()
     allocator = sbm.alloc_stack
 
-    # Wrap hidden/weight/bias tensors in TensorView for slicing (shared across all T-tiles)
-    hidden_tensor_view = safe_tensor_view(params.hidden_tensor)
-    gate_proj_weights_view = safe_tensor_view(params.gate_proj_weights_tensor)
-    up_proj_weights_view = safe_tensor_view(params.up_proj_weights_tensor)
-    down_proj_weights_view = safe_tensor_view(params.down_proj_weights_tensor)
+    # Save original tensors before expert loop (params is mutated by _select_expert_params)
+    hidden_tensor = params.hidden_tensor
+    gate_proj_weights = params.gate_proj_weights_tensor
+    up_proj_weights = params.up_proj_weights_tensor
+    down_proj_weights = params.down_proj_weights_tensor
 
-    gate_proj_bias_view = safe_tensor_view(params.bias_params.gate_proj_bias_tensor)
-    up_proj_bias_view = safe_tensor_view(params.bias_params.up_proj_bias_tensor)
-    down_proj_bias_view = safe_tensor_view(params.bias_params.down_proj_bias_tensor)
+    gate_proj_bias = params.bias_params.gate_proj_bias_tensor
+    up_proj_bias = params.bias_params.up_proj_bias_tensor
+    down_proj_bias = params.bias_params.down_proj_bias_tensor
 
-    gate_w_scale_view = safe_tensor_view(params.quant_params.gate_w_scale)
-    up_w_scale_view = safe_tensor_view(params.quant_params.up_w_scale)
-    down_w_scale_view = safe_tensor_view(params.quant_params.down_w_scale)
-    gate_up_in_scale_view = safe_tensor_view(params.quant_params.gate_up_in_scale)
-    down_in_scale_view = safe_tensor_view(params.quant_params.down_in_scale)
+    gate_w_scale = params.quant_params.gate_w_scale
+    up_w_scale = params.quant_params.up_w_scale
+    down_w_scale = params.quant_params.down_w_scale
+    gate_up_in_scale = params.quant_params.gate_up_in_scale
+    down_in_scale = params.quant_params.down_in_scale
 
     # Allocate accumulation buffer [H0, H1_shard, tile_T * num_tiles]
     output_temp = allocator((dims.H0, dims.H1_shard, t_cfg.tile_T * t_cfg.num_tiles), dtype=io_dtype, buffer=nl.sbuf)
-    output_in_sbuf = output.is_sbuf() if isinstance(output, TensorView) else output.buffer == nl.sbuf
+    output_in_sbuf = (output.buffer == nl.sbuf) if isinstance(output, nl.NkiTensor) else output.buffer == nl.sbuf
 
     # Load expert affinities for all T-tiles upfront
     pmax = dims._pmax
@@ -633,9 +647,8 @@ def _all_expert_moe_tkg_static(
                 buffer=nl.sbuf,
                 name=f"input_sb_t{t_tile.index}",
             )
-            isb_view = safe_tensor_view(isb)
-            input_norm_load(hidden_tensor_view, isb_view, params, dims, sbm=sbm, T_offset=t_tile.start_offset)
-            input_sb_tiles.append(isb_view)
+            input_norm_load(hidden_tensor, isb, params, dims, sbm=sbm, T_offset=t_tile.start_offset)
+            input_sb_tiles.append(isb)
 
     # E-then-T: outer loop over experts (load weights once), inner loop over T-tiles
     for expertIdx in range(dims.E):
@@ -645,17 +658,17 @@ def _all_expert_moe_tkg_static(
         _select_expert_params(
             params,
             expertIdx,
-            gate_proj_weights_view,
-            up_proj_weights_view,
-            down_proj_weights_view,
-            gate_proj_bias_view,
-            up_proj_bias_view,
-            down_proj_bias_view,
-            gate_w_scale_view,
-            up_w_scale_view,
-            down_w_scale_view,
-            gate_up_in_scale_view,
-            down_in_scale_view,
+            gate_proj_weights,
+            up_proj_weights,
+            down_proj_weights,
+            gate_proj_bias,
+            up_proj_bias,
+            down_proj_bias,
+            gate_w_scale,
+            up_w_scale,
+            down_w_scale,
+            gate_up_in_scale,
+            down_in_scale,
         )
 
         # Inner loop over T-tiles for this expert
@@ -670,7 +683,7 @@ def _all_expert_moe_tkg_static(
 
             # Use pre-loaded input for this T-tile
             if hidden_in_sbuf:
-                input_sb = hidden_tensor_view
+                input_sb = hidden_tensor
             else:
                 input_sb = input_sb_tiles[t_idx]
 
@@ -743,38 +756,38 @@ def _all_expert_moe_tkg_static(
 def _select_expert_params(
     params,
     expertIdx,
-    gate_proj_weights_view,
-    up_proj_weights_view,
-    down_proj_weights_view,
-    gate_proj_bias_view,
-    up_proj_bias_view,
-    down_proj_bias_view,
-    gate_w_scale_view,
-    up_w_scale_view,
-    down_w_scale_view,
-    gate_up_in_scale_view,
-    down_in_scale_view,
+    gate_proj_weights,
+    up_proj_weights,
+    down_proj_weights,
+    gate_proj_bias,
+    up_proj_bias,
+    down_proj_bias,
+    gate_w_scale,
+    up_w_scale,
+    down_w_scale,
+    gate_up_in_scale,
+    down_in_scale,
 ):
     """Select weights, biases, and quant scales for a single expert, mutating params in-place."""
-    expert_gate_w = gate_proj_weights_view.select(dim=0, index=expertIdx)
-    expert_up_w = up_proj_weights_view.select(dim=0, index=expertIdx)
-    expert_down_w = down_proj_weights_view.select(dim=0, index=expertIdx)
+    expert_gate_w = gate_proj_weights.select(dim=0, index=expertIdx)
+    expert_up_w = up_proj_weights.select(dim=0, index=expertIdx)
+    expert_down_w = down_proj_weights.select(dim=0, index=expertIdx)
 
     if len(expert_gate_w.shape) > 2:
         expert_gate_w = expert_gate_w.select(dim=1, index=GateUpDim.GATE.value)
         expert_up_w = expert_up_w.select(dim=1, index=GateUpDim.UP.value)
 
     expert_gate_b, expert_up_b, expert_down_b = None, None, None
-    if gate_proj_bias_view != None:
-        expert_gate_b = gate_proj_bias_view.select(dim=0, index=expertIdx)
+    if gate_proj_bias != None:
+        expert_gate_b = gate_proj_bias.select(dim=0, index=expertIdx)
         if len(expert_gate_b.shape) > 1:
             expert_gate_b = expert_gate_b.select(dim=0, index=GateUpDim.GATE.value)
-    if up_proj_bias_view != None:
-        expert_up_b = up_proj_bias_view.select(dim=0, index=expertIdx)
+    if up_proj_bias != None:
+        expert_up_b = up_proj_bias.select(dim=0, index=expertIdx)
         if len(expert_up_b.shape) > 1:
             expert_up_b = expert_up_b.select(dim=0, index=GateUpDim.UP.value)
-    if down_proj_bias_view != None:
-        expert_down_b = down_proj_bias_view.select(dim=0, index=expertIdx)
+    if down_proj_bias != None:
+        expert_down_b = down_proj_bias.select(dim=0, index=expertIdx)
 
     params.gate_proj_weights_tensor = expert_gate_w
     params.up_proj_weights_tensor = expert_up_w
@@ -788,11 +801,11 @@ def _select_expert_params(
     if params.quant_params.quantization_type != QuantizationType.NONE:
         params.quant_params = _select_quant_scales(
             params.quant_params,
-            gate_w_scale_view,
-            up_w_scale_view,
-            down_w_scale_view,
-            gate_up_in_scale_view,
-            down_in_scale_view,
+            gate_w_scale,
+            up_w_scale,
+            down_w_scale,
+            gate_up_in_scale,
+            down_in_scale,
             expertIdx,
         )
 
@@ -802,15 +815,15 @@ def _find_routed_tokens(expert_affinities, expert_idx, T, pmax, dynamism_cfg):
     Find indices of tokens routed to a specific expert and build dynamic block decision vector.
 
     Args:
-        expert_affinities (nl.ndarray): [T, E] expert affinities in HBM.
+        expert_affinities (nl.NkiTensor): [T, E] expert affinities in HBM.
         expert_idx: Index of the expert.
         T: Total number of tokens.
         pmax: Partition max size.
         dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
 
     Returns:
-        routed_token_indices_sb (nl.ndarray): [pmax, T+1] in SBUF. Partition 0 has routed indices + count.
-        dynamic_decision_sb (nl.ndarray): [1, n_dynamic_blocks+1] in SBUF. Decision vector.
+        routed_token_indices_sb (nl.NkiTensor): [pmax, T+1] in SBUF. Partition 0 has routed indices + count.
+        dynamic_decision_sb (nl.NkiTensor): [1, n_dynamic_blocks+1] in SBUF. Decision vector.
     """
     # Load expert affinities for this expert: transpose [T, E] -> [1, T]
     expert_aff_f32_sb = nl.ndarray((pmax, T), dtype=nl.float32, buffer=nl.sbuf)
@@ -821,15 +834,9 @@ def _find_routed_tokens(expert_affinities, expert_idx, T, pmax, dynamism_cfg):
     else:
         load_dst = expert_aff_f32_sb
 
-    src_view = (
-        TensorView(expert_affinities)
-        .select(dim=1, index=expert_idx)
-        .expand_dim(dim=1)
-        .expand_dim(dim=1)
-        .expand_dim(dim=1)
-    )
-    dst_view = TensorView(load_dst).expand_dim(dim=1).expand_dim(dim=1)
-    nisa.dma_transpose(src=src_view.get_view(), dst=dst_view.get_view())
+    src_view = expert_affinities.select(dim=1, index=expert_idx).expand_dim(dim=1).expand_dim(dim=1).expand_dim(dim=1)
+    dst_view = load_dst.expand_dim(dim=1).expand_dim(dim=1)
+    nisa.dma_transpose(src=src_view, dst=dst_view)
     if needs_cast:
         nisa.tensor_copy(src=expert_aff_sb[...], dst=expert_aff_f32_sb[0, :])
 
@@ -865,7 +872,7 @@ def _init_dynamic_indices_hbm(dynamism_cfg, routed_token_indices_sb, dynamic_dec
     Move routed token indices for dynamic blocks to HBM.
 
     Returns:
-        dynamic_block_token_indices_hbm (nl.ndarray): [n_dynamic_blocks, block_size] in private HBM.
+        dynamic_block_token_indices_hbm (nl.NkiTensor): [n_dynamic_blocks, block_size] in private HBM.
     """
     n_static_tokens = dynamism_cfg.n_static_blocks * dynamism_cfg.block_size
     n_dynamic_tokens = dynamism_cfg.n_dynamic_blocks * dynamism_cfg.block_size
@@ -898,7 +905,7 @@ def _get_block_token_indices(dynamism_cfg, routed_token_indices, block_idx, is_d
         is_dynamic_block (bool): Whether this is a dynamic block.
 
     Returns:
-        token_indices_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles] transposed indices in SBUF (int32).
+        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed indices in SBUF (int32).
     """
     # Load indices to SBUF
     if is_dynamic_block:
@@ -947,8 +954,8 @@ def _gather_input_block(hidden_input, token_indices_T_sb, dims, dynamism_cfg, io
     indirect DMA gather + on-chip transpose.
 
     Args:
-        hidden_input (nl.ndarray): [T, H] or [T, H_concat] input in HBM.
-        token_indices_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles] transposed token indices.
+        hidden_input (nl.NkiTensor): [T, H] or [T, H_concat] input in HBM.
+        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed token indices.
         dims: MLPTKGConstantsDimensionSizes.
         dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
         io_dtype: Data type.
@@ -956,13 +963,14 @@ def _gather_input_block(hidden_input, token_indices_T_sb, dims, dynamism_cfg, io
         input_row_stride (int): Row stride of hidden_input. Defaults to dims.H.
 
     Returns:
-        input_sb (TensorView): [H0, block_T, H1_shard] in SBUF.
+        input_sb (nl.NkiTensor): [H0, block_T, H1_shard] in SBUF.
     """
     block_T = dynamism_cfg.block_size
     H0 = dims.H0  # pmax = 128
     H1_shard = dims.H1_shard
     H_per_shard = dims.H_per_shard
     shard_id = dims.shard_id
+    h_offset = dims.H1_offset * H0
     row_stride = input_row_stride if input_row_stride is not None else dims.H
 
     input_sb = nl.ndarray((H0, block_T, H1_shard), dtype=io_dtype, buffer=nl.sbuf)
@@ -979,7 +987,7 @@ def _gather_input_block(hidden_input, token_indices_T_sb, dims, dynamism_cfg, io
         nisa.dma_copy(
             src=hidden_input.ap(
                 pattern=[[row_stride, dynamism_cfg.blk_tile_T], [1, H_per_shard]],
-                offset=shard_id * H_per_shard,
+                offset=h_offset,
                 vector_offset=token_indices_T_sb.ap(
                     pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
                     offset=tile_t,
@@ -1006,7 +1014,7 @@ def _gather_input_block(hidden_input, token_indices_T_sb, dims, dynamism_cfg, io
                 src=tp_psum[:H0, :tile_T_actual],
             )
 
-    return safe_tensor_view(input_sb)
+    return input_sb
 
 
 def _scatter_output_block(
@@ -1023,9 +1031,9 @@ def _scatter_output_block(
     Transpose block output from [H0, H1_shard, block_T] to [block_T, H] and scatter to HBM.
 
     Args:
-        output_sb (nl.ndarray): [H0, H1_shard, block_T] expert MLP output in SBUF.
-        output_hbm (nl.ndarray): [T, H] or [T, H+2] output in HBM.
-        token_indices_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles] transposed token indices.
+        output_sb (nl.NkiTensor): [H0, H1_shard, block_T] expert MLP output in SBUF.
+        output_hbm (nl.NkiTensor): [T, H] or [T, H+2] output in HBM.
+        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed token indices.
         dims: MLPTKGConstantsDimensionSizes.
         dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
         io_dtype: Data type.
@@ -1037,6 +1045,7 @@ def _scatter_output_block(
     H1_shard = dims.H1_shard
     H_per_shard = dims.H_per_shard
     shard_id = dims.shard_id
+    h_offset = dims.H1_offset * H0
     row_stride = output_row_stride if output_row_stride is not None else dims.H
 
     # Transpose [H0, H1_shard, block_T] -> [block_T, H_per_shard] in SBUF
@@ -1055,7 +1064,7 @@ def _scatter_output_block(
         tile_T_actual = min(dynamism_cfg.blk_tile_T, block_T - tile_t * dynamism_cfg.blk_tile_T)
         dst_ap = output_hbm.ap(
             pattern=[[row_stride, dynamism_cfg.blk_tile_T], [1, H_per_shard]],
-            offset=shard_id * H_per_shard,
+            offset=h_offset,
             vector_offset=token_indices_T_sb.ap(
                 pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
                 offset=tile_t,
@@ -1097,11 +1106,11 @@ def _sequential_store_block(
     Also copies token indices from input to output at the packed position.
 
     Args:
-        output_sb (nl.ndarray): [H0, H1_shard, block_T] expert MLP output in SBUF.
-        output_hbm (nl.ndarray): [T, H+2] output in HBM.
-        token_indices_T_sb (nl.ndarray): [blk_tile_T, blk_n_T_tiles] transposed token indices (original positions).
-        hidden_input (nl.ndarray): [T, H_concat] input in HBM (for token index extraction).
-        write_offset (nl.ndarray): [1, 1] SBUF tensor tracking current write position.
+        output_sb (nl.NkiTensor): [H0, H1_shard, block_T] expert MLP output in SBUF.
+        output_hbm (nl.NkiTensor): [T, H+2] output in HBM.
+        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed token indices (original positions).
+        hidden_input (nl.NkiTensor): [T, H_concat] input in HBM (for token index extraction).
+        write_offset (nl.NkiTensor): [1, 1] SBUF tensor tracking current write position.
         dims: MLPTKGConstantsDimensionSizes.
         dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
         io_dtype: Data type.
@@ -1112,6 +1121,7 @@ def _sequential_store_block(
     H1_shard = dims.H1_shard
     H_per_shard = dims.H_per_shard
     shard_id = dims.shard_id
+    h_offset = dims.H1_offset * H0
     H = dims.H
     E_L = dims.E
     input_row_stride = hidden_input.shape[-1]
@@ -1135,7 +1145,7 @@ def _sequential_store_block(
             src=out_transposed[nl.ds(tile_t * dynamism_cfg.blk_tile_T, tile_T_actual), :H_per_shard],
             dst=output_hbm.ap(
                 pattern=[[output_row_stride, dynamism_cfg.blk_tile_T], [1, H_per_shard]],
-                offset=shard_id * H_per_shard,
+                offset=h_offset,
                 scalar_offset=write_offset,
                 indirect_dim=0,
             ),
@@ -1189,6 +1199,9 @@ def _compute_dynamic_block(
     write_offset=None,
     is_first_expert=True,
     output_indices_hbm=None,
+    prealloc_gate_up_sb=None,
+    prealloc_gate_up_sb_casted=None,
+    prealloc_gate_up_buffers=None,
 ):
     """
     Compute expert MLP for a single block of routed tokens.
@@ -1203,10 +1216,10 @@ def _compute_dynamic_block(
         allocator: SBUF allocator callable.
         io_dtype: I/O data type.
         routed_token_indices: Static: [pmax, T+1] SBUF. Dynamic: [n_dynamic_blocks, block_size] HBM.
-        expert_affinities (nl.ndarray): [T, E] expert affinities.
+        expert_affinities (nl.NkiTensor): [T, E] expert affinities.
         expert_idx: Current expert index.
         block_idx: Block index (int literal for static, [1,1] SBUF tensor for dynamic).
-        output_hbm (nl.ndarray): [T, H] output in HBM.
+        output_hbm (nl.NkiTensor): [T, H] output in HBM.
         is_dynamic_block (bool): Whether this is a dynamic block.
         is_first_expert (bool): Whether this is the first expert (overwrite vs accumulate output).
     """
@@ -1240,20 +1253,25 @@ def _compute_dynamic_block(
     dims.T = block_T
 
     # Gate Up projection
-    gate_up_sb = nl.ndarray(
-        (dims.I0, div_ceil(dims.I, dims.I0), block_T),
-        dtype=nl.float32,
-        buffer=nl.sbuf,
-    )
+    if prealloc_gate_up_sb is not None:
+        gate_up_sb = prealloc_gate_up_sb
+        nisa.memset(gate_up_sb, 0)
+    else:
+        gate_up_sb = nl.ndarray(
+            (dims.I0, div_ceil(dims.I, dims.I0), block_T),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+        )
     gate_tile_info = process_gate_up_projection(
         hidden=input_sb,
-        output=safe_tensor_view(gate_up_sb),
+        output=gate_up_sb,
         params=params,
         dims=dims,
         sbm=block_sbm,
         T_offset=0,
         share_memory_scope=True,
         use_dge=is_dynamic_block,
+        prealloc_gate_up_buffers=prealloc_gate_up_buffers if is_dynamic_block else None,
     )
 
     # Load and broadcast expert affinity for this block
@@ -1299,15 +1317,18 @@ def _compute_dynamic_block(
         dtype=io_dtype,
         buffer=nl.sbuf,
     )
-    gate_up_sb_casted = nl.ndarray(
-        (dims.I0, div_ceil(dims.I, dims.I0), block_T),
-        dtype=io_dtype,
-        buffer=nl.sbuf,
-    )
+    if prealloc_gate_up_sb_casted is not None:
+        gate_up_sb_casted = prealloc_gate_up_sb_casted
+    else:
+        gate_up_sb_casted = nl.ndarray(
+            (dims.I0, div_ceil(dims.I, dims.I0), block_T),
+            dtype=io_dtype,
+            buffer=nl.sbuf,
+        )
     nisa.tensor_copy(dst=gate_up_sb_casted, src=gate_up_sb)
     process_down_projection(
-        hidden=safe_tensor_view(gate_up_sb_casted),
-        output=safe_tensor_view(down_sb),
+        hidden=gate_up_sb_casted,
+        output=down_sb,
         params=params,
         dims=dims,
         gate_tile_info=gate_tile_info,
@@ -1414,7 +1435,7 @@ def _compute_expert_mlp_tkg(
     static and (future) dynamic paths.
 
     Args:
-        input_sb: Input hidden states for this T-tile (TensorView in SBUF).
+        input_sb: Input hidden states for this T-tile (nl.NkiTensor in SBUF).
         params (MLPParameters): MLP parameters with expert weights already selected.
         dims: MLPTKGConstantsDimensionSizes with T set to current_tile_T.
         sbm (SbufManager): SBUF memory manager.
@@ -1444,14 +1465,12 @@ def _compute_expert_mlp_tkg(
         name="gate_up_sbuf",
         buffer=nl.sbuf,
     )
-    gate_up_sb_view = safe_tensor_view(gate_up_sb)
     down_sb = allocator((dims.H0, dims.H1_shard, current_tile_T), dtype=io_dtype, name="down_sbuf", buffer=nl.sbuf)
-    down_sb_view = safe_tensor_view(down_sb)
 
     # Gate Up projection
     gate_tile_info = process_gate_up_projection(
         hidden=input_sb,
-        output=gate_up_sb_view,
+        output=gate_up_sb,
         params=params,
         dims=dims,
         sbm=sbm,
@@ -1481,11 +1500,10 @@ def _compute_expert_mlp_tkg(
         name="gate_up_sbuf_with_io_dtype",
         buffer=nl.sbuf,
     )
-    gate_up_sb_casted_view = safe_tensor_view(gate_up_sb_casted)
     nisa.tensor_copy(dst=gate_up_sb_casted, src=gate_up_sb)
     process_down_projection(
-        hidden=gate_up_sb_casted_view,
-        output=down_sb_view,
+        hidden=gate_up_sb_casted,
+        output=down_sb,
         params=params,
         dims=dims,
         gate_tile_info=gate_tile_info,
@@ -1520,11 +1538,11 @@ def _compute_expert_mlp_tkg(
 
 def _select_quant_scales(
     quant_params: MLPQuantizationParameters,
-    gate_w_scale_view: TensorView,
-    up_w_scale_view: TensorView,
-    down_w_scale_view: TensorView,
-    gate_up_in_scale_view: TensorView,
-    down_in_scale_view: TensorView,
+    gate_w_scale: nl.NkiTensor,
+    up_w_scale: nl.NkiTensor,
+    down_w_scale: nl.NkiTensor,
+    gate_up_in_scale: nl.NkiTensor,
+    down_in_scale: nl.NkiTensor,
     expertIdx: int,
 ):
     """
@@ -1532,11 +1550,11 @@ def _select_quant_scales(
 
     Args:
         quant_params (MLPQuantizationParameters): Quantization parameters.
-        gate_w_scale_view (TensorView): Gate weight scale tensor view.
-        up_w_scale_view (TensorView): Up weight scale tensor view.
-        down_w_scale_view (TensorView): Down weight scale tensor view.
-        gate_up_in_scale_view (TensorView): Gate/up input scale tensor view.
-        down_in_scale_view (TensorView): Down input scale tensor view.
+        gate_w_scale (nl.NkiTensor): Gate weight scale tensor.
+        up_w_scale (nl.NkiTensor): Up weight scale tensor.
+        down_w_scale (nl.NkiTensor): Down weight scale tensor.
+        gate_up_in_scale (nl.NkiTensor): Gate/up input scale tensor.
+        down_in_scale (nl.NkiTensor): Down input scale tensor.
         expertIdx (int): Expert index to select scales for.
 
     Returns:
@@ -1544,27 +1562,27 @@ def _select_quant_scales(
     """
     quantization_type = quant_params.quantization_type
     expert_gate_w_scale = None
-    if gate_w_scale_view != None:
-        expert_gate_w_scale = gate_w_scale_view.select(dim=0, index=expertIdx).select(dim=0, index=GateUpDim.GATE.value)
+    if gate_w_scale != None:
+        expert_gate_w_scale = gate_w_scale.select(dim=0, index=expertIdx).select(dim=0, index=GateUpDim.GATE.value)
         expert_gate_w_scale = reshape_scale_for_mlp(expert_gate_w_scale)
 
     expert_up_w_scale = None
-    if up_w_scale_view != None:
-        expert_up_w_scale = up_w_scale_view.select(dim=0, index=expertIdx).select(dim=0, index=GateUpDim.UP.value)
+    if up_w_scale != None:
+        expert_up_w_scale = up_w_scale.select(dim=0, index=expertIdx).select(dim=0, index=GateUpDim.UP.value)
         expert_up_w_scale = reshape_scale_for_mlp(expert_up_w_scale)
 
     expert_down_w_scale = None
-    if down_w_scale_view != None:
-        expert_down_w_scale = down_w_scale_view.select(dim=0, index=expertIdx)
+    if down_w_scale != None:
+        expert_down_w_scale = down_w_scale.select(dim=0, index=expertIdx)
         expert_down_w_scale = reshape_scale_for_mlp(expert_down_w_scale)
 
     expert_gate_up_in_scale = None
-    if gate_up_in_scale_view != None:
-        expert_gate_up_in_scale = reshape_scale_for_mlp(gate_up_in_scale_view.select(dim=0, index=expertIdx))
+    if gate_up_in_scale != None:
+        expert_gate_up_in_scale = reshape_scale_for_mlp(gate_up_in_scale.select(dim=0, index=expertIdx))
 
     expert_down_in_scale = None
-    if down_in_scale_view != None:
-        expert_down_in_scale = reshape_scale_for_mlp(down_in_scale_view.select(dim=0, index=expertIdx))
+    if down_in_scale != None:
+        expert_down_in_scale = reshape_scale_for_mlp(down_in_scale.select(dim=0, index=expertIdx))
 
     return MLPQuantizationParameters(
         quantization_type=quantization_type,

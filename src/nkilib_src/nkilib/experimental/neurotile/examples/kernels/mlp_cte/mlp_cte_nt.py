@@ -484,6 +484,6 @@ def mlp_cte(
         gated_tiles = compute_swiglu(x_T, gate, up, bias_vector, config)
         gated_T = transpose_in_place(gated_tiles)
         out_block = compute_down_matmul(gated_T, down, config)
-        output_blocks[m_batch_idx].store(out_block.ap())
+        output_blocks[m_batch_idx].store(out_block.data)
 
     return output.reshape((B, S, H))

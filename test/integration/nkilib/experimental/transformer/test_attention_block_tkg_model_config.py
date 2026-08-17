@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os as _os
+
 if _os.environ.get("SKIP_MODEL_TESTS"):
     raise ImportError("Model tests skipped via SKIP_MODEL_TESTS")
 
@@ -20,7 +21,6 @@ if _os.environ.get("SKIP_MODEL_TESTS"):
 Attention Block TKG model configuration data
 """
 
-import nki.language as nl
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_utils import AttnBlkTestConfig
 from test.utils.common_dataclasses import ModelTestType, Platforms
@@ -32,8 +32,8 @@ attention_block_tkg_model_configs = {
     ModelTestType.TIER0: [
     # llama3_70b (with block KV on and FP8 static quantization, trn2 only)
     AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=9216, S_max_ctx=9216, S_tkg=1, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True),
-    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, DCP=8, supported_platforms=_TRN2_ONLY),
-    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1, block_len=32, transposed_out=True, DCP=8, supported_platforms=_TRN2_ONLY),
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, CP=8, supported_platforms=_TRN2_ONLY),
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1, block_len=32, transposed_out=True, CP=8, supported_platforms=_TRN2_ONLY),
     AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, KVDP=8, supported_platforms=_TRN2_ONLY),
     AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1, block_len=32, transposed_out=True, KVDP=8, supported_platforms=_TRN2_ONLY),
     AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, KVDP=8, supported_platforms=_TRN2_ONLY),
@@ -53,12 +53,13 @@ attention_block_tkg_model_configs = {
     ## TP8 sliding-window attention
     AttnBlkTestConfig(batch=32, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=128, S_max_ctx=11264, S_tkg=2, transposed_out=False),
     # gptoss_120b fp8_packed block KV (d_head=64, q_heads=8, block_len=64, FP8 KV quant)
-    ## Full attention (S_ctx=16384)
-    *[AttnBlkTestConfig(batch=b, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=16384, S_max_ctx=16384, S_tkg=s,
+    ## Full attention
+    *[AttnBlkTestConfig(batch=b, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=s_ctx, S_max_ctx=s_ctx, S_tkg=s,
                         block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, test_bias=True, test_sink=True,
-                        cache_lens_mean=1.0, cache_lens_stddev=0.0)
+                        cache_lens_mean=8192 / s_ctx, cache_lens_stddev=0.05)
       for b in [2, 4, 8, 16, 32, 64, 128]
-      for s in [1, 4]],
+      for s in [1, 4]
+      for s_ctx in [10240, 12288, 16384]],
     ## SWA (S_ctx=256, sliding_window=128)
     *[AttnBlkTestConfig(batch=b, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=256, S_max_ctx=256, S_tkg=s,
                         block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, test_bias=True, test_sink=True,
@@ -67,7 +68,7 @@ attention_block_tkg_model_configs = {
       for s in [1, 4]],
     # Other
     AttnBlkTestConfig(batch=1, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=5, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, supported_platforms=_TRN2_ONLY),
-    AttnBlkTestConfig(batch=1, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=5, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, DCP=4, supported_platforms=_TRN2_ONLY),
+    AttnBlkTestConfig(batch=1, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=5, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, CP=4, supported_platforms=_TRN2_ONLY),
     ],
     ModelTestType.OPTIMAL: [
     # gemma3_27b

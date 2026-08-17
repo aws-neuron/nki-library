@@ -14,12 +14,9 @@
 
 """Reciprocal primitive for nkiprimitives."""
 
-from typing import Union
-
 import nki.isa as nisa
 import nki.language as nl
 
-from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import TileStream, get_logical_shape
@@ -49,15 +46,15 @@ class Reciprocal(nl.NKIObject):
             src_tile = self._src.get_tile()
 
             nisa.reciprocal(
-                dst=dst_tile.get_view(),
-                data=src_tile.get_view(),
+                dst=dst_tile,
+                data=src_tile,
             )
 
         self._dst.reset_cur_tile()
         self._src.reset_cur_tile()
 
 
-def reciprocal(dst: Union[TensorView, nl.ndarray], src: Union[TensorView, nl.ndarray] = None) -> None:
+def reciprocal(dst: nl.NkiTensor, src: nl.NkiTensor = None) -> None:
     """Compact reciprocal: dst = 1 / src. Whole tensor, no tiling.
 
     If src is None, operates in-place (src = dst).

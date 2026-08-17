@@ -253,6 +253,7 @@ def _kvp_partial_prior_attention(
             skip_output_normalization=True,
             k_cache_sbuf=k_cache_sbuf[:num_partial_k_tiles],
             v_cache_sbuf=v_cache_sbuf[:num_partial_v_tiles],
+            kv_used_len=partial_prior_tokens,
             out_o_hbm=o_curr_hbm,
             out_neg_max_hbm=neg_max_curr_hbm,
             out_sum_hbm=sum_curr_hbm,
@@ -742,20 +743,20 @@ def fused_segmented_attention_impl(
     is_partial_reg = nisa.register_alloc()
     nisa.register_load(dst=is_partial_reg, src=is_partial_prior_segment)
 
-    for _ in nl.dynamic_range(0, is_partial_reg):
+    def _attend_partial_prior(_):
         if is_kvp:
             # KVP path pre-allocates separate k_prior_sbuf / v_prior_sbuf buffers
             # because its helper expects prior K/V already loaded before the call.
             k_prior_sbuf = allocator.alloc_sbuf_tensor(
                 shape=(d_tile_size_par_dim, _K_TILE_SZ),
-                dtype=nl.bfloat16,
+                dtype=k_cache.dtype,
                 block_dim=[num_k_tiles_per_seg, num_d_tiles],
                 num_free_tiles=[num_k_tiles_per_seg, num_d_tiles],
                 align_to=32,
             )
             v_prior_sbuf = allocator.alloc_sbuf_tensor(
                 shape=(_V_TILE_SZ, d_tile_size_free_dim),
-                dtype=nl.bfloat16,
+                dtype=v_cache.dtype,
                 block_dim=[num_v_tiles_for_prior, num_d_tiles_free_dim],
                 num_free_tiles=[num_v_tiles_for_prior, num_d_tiles_free_dim],
             )
@@ -870,10 +871,12 @@ def fused_segmented_attention_impl(
             allocator.set_current_address(init_sbuf_addr)
         allocator.set_current_address(init_sbuf_addr)
 
+    nl.fori_loop(0, is_partial_reg, _attend_partial_prior)
+
     is_not_partial_reg = nisa.register_alloc()
     nisa.register_load(dst=is_not_partial_reg, src=is_not_partial_prior_segment)
 
-    for _ in nl.dynamic_range(0, is_not_partial_reg):
+    def _attend_full_prior(_):
         if is_kvp:
             # KVP: use attention_cte_fn with cp_offset for correct shifted causal masking.
             # _run_groups with use_cp=True is not used here to avoid potential issues
@@ -934,6 +937,8 @@ def fused_segmented_attention_impl(
             sbuf_inner = allocator.get_current_address()
             _run_groups(0, n_grps, ac_a, atp_a, sp_active, bufs, q_hbm, 0, o_prev_hbm, sbuf_inner, sink=sink)
 
+    nl.fori_loop(0, is_not_partial_reg, _attend_full_prior)
+
     # Load initial stats into SBUF running buffers
     # For partial prior: stats were written to HBM by _attention_cte, load them
     # For KVP no-partial-prior: stats were also written to HBM by attention_cte_fn, load them
@@ -947,9 +952,12 @@ def fused_segmented_attention_impl(
     else:
         is_partial_reg2 = nisa.register_alloc()
         nisa.register_load(dst=is_partial_reg2, src=is_partial_prior_segment)
-        for _ in nl.dynamic_range(0, is_partial_reg2):
+
+        def _load_partial_stats(_):
             nisa.dma_copy(dst=bufs.mm1_running_max, src=neg_max_prev_hbm.ap(pattern=sm_pat, offset=0))
             nisa.dma_copy(dst=bufs.exp_running_sum, src=sum_prev_hbm.ap(pattern=sm_pat, offset=0))
+
+        nl.fori_loop(0, is_partial_reg2, _load_partial_stats)
 
     # --- PRIOR SEGMENTS (section_idx=1, kv_section_idx=0, dynamic loop) ---
     # section_idx=1 triggers accumulation: _write_back_impl loads prev output from o_prev_hbm,
@@ -968,12 +976,18 @@ def fused_segmented_attention_impl(
     prior_offset_save = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
     nisa.tensor_copy(dst=prior_offset_save, src=prior_block_offset)
 
+    # For interleaved KVP: scratch tensor to detect fully-masked prior segments.
+    # A segment is degenerate when min_global_K > max_Q (all K beyond Q's reach).
+    kvp_prior_should_compute = None
+    if is_kvp and kvp_group_size > 0:
+        kvp_prior_should_compute = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.int32)
+
     num_prior_reg = nisa.register_alloc()
     nisa.register_load(dst=num_prior_reg, src=num_full_prior_segments_i32)
 
     loop_addr = allocator.get_current_address()
 
-    for _ in nl.dynamic_range(0, num_prior_reg):
+    def _process_prior_segment(_):
         nisa.tensor_scalar(
             dst=prior_block_offset, data=prior_block_offset, op0=nl.subtract, operand0=num_blocks_per_seg
         )
@@ -1019,114 +1033,142 @@ def fused_segmented_attention_impl(
                 nisa.tensor_copy(dst=kvp_seg_offset_sbuf, src=prior_block_offset)
                 nisa.dma_copy(dst=kvp_seg_offset_hbm, src=kvp_seg_offset_sbuf)
             init_sbuf_addr = allocator.get_current_address()
-            # For interleaved KV without SWA: prior segments are guaranteed fully visible
-            # (active_block_offset is set so boundary falls in active, not prior).
-            # Use causal_mask=False and no CP params to skip all masking overhead.
-            # With SWA: prior segments may have tokens outside the sliding window, keep masking.
             if kvp_group_size > 0 and kvp_prior_fully_visible:
-                attention_cte_fn(
-                    q_hbm,
-                    None,
-                    None,
-                    scale=scale,
-                    causal_mask=False,
-                    tp_q=tp_q,
-                    tp_k=False,
-                    tp_out=False,
-                    cache_softmax=True,
-                    skip_output_normalization=True,
-                    k_cache_sbuf=k_cache_sbuf[:num_k_tiles_per_seg],
-                    v_cache_sbuf=v_cache_sbuf[:num_v_tiles_per_seg],
-                    out_o_hbm=o_curr_hbm,
-                    out_neg_max_hbm=neg_max_curr_hbm,
-                    out_sum_hbm=sum_curr_hbm,
-                    init_sbuf_addr=init_sbuf_addr,
-                    k_scale_sb=k_scale_sb,
-                    block_size=block_size,
-                    sliding_window=0,
+                # Prior segments are fully visible: use _run_groups with section_idx=1
+                # for in-place SBUF accumulation (avoids HBM roundtrip via reduce_one_batch).
+                ac_pv, atp_pv = _make_ac_atp(
+                    seqlen_q,
+                    seqlen_k_prior,
+                    head_dim,
+                    q_hbm.dtype,
+                    False,
+                    scale,
+                    tp_q,
+                    False,
+                    total_sections,
                 )
+                _allocate_attention_buffers(allocator, ac_pv, atp_pv, bufs, sink, k_cache_sbuf, v_cache_sbuf)
+                _setup_range_select_bounds(ac_pv, atp_pv, bufs, allocator, None, None, None, None, batch_id=0)
+                sbuf_inner_p = allocator.get_current_address()
+                _run_groups(0, n_grps, ac_pv, atp_pv, sp_prior, bufs, q_hbm, 0, o_prev_hbm, sbuf_inner_p)
             else:
-                attention_cte_fn(
-                    q_hbm,
-                    None,
-                    None,
-                    scale=scale,
-                    causal_mask=True,
-                    tp_q=tp_q,
-                    tp_k=False,
-                    tp_out=False,
-                    cache_softmax=True,
-                    skip_output_normalization=True,
-                    k_cache_sbuf=k_cache_sbuf[:num_k_tiles_per_seg],
-                    v_cache_sbuf=v_cache_sbuf[:num_v_tiles_per_seg],
-                    out_o_hbm=o_curr_hbm,
-                    out_neg_max_hbm=neg_max_curr_hbm,
-                    out_sum_hbm=sum_curr_hbm,
-                    init_sbuf_addr=init_sbuf_addr,
-                    cp_offset=prior_cp_offset,
-                    global_cp_deg=1,
-                    k_scale_sb=k_scale_sb,
-                    kvp_rank_id=kvp_rank_id,
-                    kvp_group_size=kvp_group_size,
-                    block_size=block_size,
-                    kvp_seg_block_offset=kvp_seg_offset_hbm,
-                    sliding_window=sliding_window,
-                    kvp_k_threshold_sb=bufs.k_threshold_sb,
-                )
-            allocator.set_current_address(init_sbuf_addr)
+                # Skip fully-masked prior segments in interleaved KVP mode.
+                # A segment is degenerate when its minimum global K position exceeds
+                # Q's maximum position: prior_block_offset * stride > cp_offset + seg_size - 1.
+                # Merging degenerate segments via reduce_one_batch corrupts the accumulator.
+                if kvp_prior_should_compute is not None:
+                    stride = kvp_group_size * block_size
+                    # should_compute = (prior_block_offset * stride <= kvp_q_offset + seg_size - 1)
+                    nisa.tensor_scalar(
+                        dst=kvp_prior_should_compute, data=prior_block_offset, op0=nl.multiply, operand0=stride
+                    )
+                    nisa.tensor_tensor(
+                        dst=kvp_prior_should_compute, data1=kvp_q_offset, data2=kvp_prior_should_compute, op=nl.subtract
+                    )
+                    # result = kvp_q_offset - prior_block_offset * stride
+                    # should_compute = (result >= -(seg_size - 1)), i.e. result + seg_size - 1 >= 0
+                    nisa.tensor_scalar(
+                        dst=kvp_prior_should_compute,
+                        data=kvp_prior_should_compute,
+                        op0=nl.add,
+                        operand0=seqlen_q - 1,
+                        op1=nl.greater_equal,
+                        operand1=0,
+                    )
+                    kvp_prior_compute_reg = nisa.register_alloc()
+                    nisa.register_load(dst=kvp_prior_compute_reg, src=kvp_prior_should_compute)
+                else:
+                    kvp_prior_compute_reg = None
 
-            # Reduce current segment into accumulated output
-            softmax_pat = [[num_grps, sb_p], [1, num_grps]]
-            o_pat = [[head_dim, sb_p], [1, head_dim]]
-            num_free = min(num_grps, _MAX_FREE_TILES)
-            neg_max_prev_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
-            sum_prev_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
-            neg_max_curr_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
-            sum_curr_sb_buf = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
-            o_prev_sb = allocator.alloc_sbuf_tensor(
-                shape=(sb_p, head_dim), dtype=nl.float32, block_dim=[num_grps], num_free_tiles=[num_free]
-            )
-            o_curr_sb = allocator.alloc_sbuf_tensor(
-                shape=(sb_p, head_dim), dtype=nl.float32, block_dim=[num_grps], num_free_tiles=[num_free]
-            )
-            o_new_sb = allocator.alloc_sbuf_tensor(
-                shape=(sb_p, head_dim), dtype=nl.float32, block_dim=[num_grps], num_free_tiles=[num_free]
-            )
-            batch_loop_addr = allocator.get_current_address()
-            reduce_one_batch(
-                o_prev_hbm,
-                neg_max_prev_hbm,
-                sum_prev_hbm,
-                o_curr_hbm,
-                neg_max_curr_hbm,
-                sum_curr_hbm,
-                0,
-                0,
-                num_grps,
-                head_dim,
-                num_grps,
-                sb_p,
-                softmax_pat,
-                o_pat,
-                neg_max_prev_sb,
-                sum_prev_sb,
-                neg_max_curr_sb,
-                sum_curr_sb_buf,
-                o_prev_sb,
-                o_curr_sb,
-                o_new_sb,
-                batch_loop_addr,
-                allocator,
-            )
-            # Reload updated stats into SBUF running buffers
-            nisa.dma_copy(dst=bufs.mm1_running_max, src=neg_max_prev_hbm.ap(pattern=softmax_pat, offset=0))
-            nisa.dma_copy(dst=bufs.exp_running_sum, src=sum_prev_hbm.ap(pattern=softmax_pat, offset=0))
+                def _kvp_prior_body(_):
+                    attention_cte_fn(
+                        q_hbm,
+                        None,
+                        None,
+                        scale=scale,
+                        causal_mask=True,
+                        tp_q=tp_q,
+                        tp_k=False,
+                        tp_out=False,
+                        cache_softmax=True,
+                        skip_output_normalization=True,
+                        k_cache_sbuf=k_cache_sbuf[:num_k_tiles_per_seg],
+                        v_cache_sbuf=v_cache_sbuf[:num_v_tiles_per_seg],
+                        out_o_hbm=o_curr_hbm,
+                        out_neg_max_hbm=neg_max_curr_hbm,
+                        out_sum_hbm=sum_curr_hbm,
+                        init_sbuf_addr=init_sbuf_addr,
+                        cp_offset=prior_cp_offset,
+                        global_cp_deg=1,
+                        k_scale_sb=k_scale_sb,
+                        kvp_rank_id=kvp_rank_id,
+                        kvp_group_size=kvp_group_size,
+                        block_size=block_size,
+                        kvp_seg_block_offset=kvp_seg_offset_hbm,
+                        sliding_window=sliding_window,
+                        kvp_k_threshold_sb=bufs.k_threshold_sb,
+                    )
+                    allocator.set_current_address(init_sbuf_addr)
+
+                    # Reduce current segment into accumulated output
+                    softmax_pat = [[num_grps, sb_p], [1, num_grps]]
+                    o_pat = [[head_dim, sb_p], [1, head_dim]]
+                    num_free = min(num_grps, _MAX_FREE_TILES)
+                    neg_max_prev_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
+                    sum_prev_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
+                    neg_max_curr_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
+                    sum_curr_sb_buf = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
+                    o_prev_sb = allocator.alloc_sbuf_tensor(
+                        shape=(sb_p, head_dim), dtype=nl.float32, block_dim=[num_grps], num_free_tiles=[num_free]
+                    )
+                    o_curr_sb = allocator.alloc_sbuf_tensor(
+                        shape=(sb_p, head_dim), dtype=nl.float32, block_dim=[num_grps], num_free_tiles=[num_free]
+                    )
+                    o_new_sb = allocator.alloc_sbuf_tensor(
+                        shape=(sb_p, head_dim), dtype=nl.float32, block_dim=[num_grps], num_free_tiles=[num_free]
+                    )
+                    batch_loop_addr = allocator.get_current_address()
+                    reduce_one_batch(
+                        o_prev_hbm,
+                        neg_max_prev_hbm,
+                        sum_prev_hbm,
+                        o_curr_hbm,
+                        neg_max_curr_hbm,
+                        sum_curr_hbm,
+                        0,
+                        0,
+                        num_grps,
+                        head_dim,
+                        num_grps,
+                        sb_p,
+                        softmax_pat,
+                        o_pat,
+                        neg_max_prev_sb,
+                        sum_prev_sb,
+                        neg_max_curr_sb,
+                        sum_curr_sb_buf,
+                        o_prev_sb,
+                        o_curr_sb,
+                        o_new_sb,
+                        batch_loop_addr,
+                        allocator,
+                    )
+                    # Reload updated stats into SBUF running buffers
+                    softmax_pat_reload = [[num_grps, sb_p], [1, num_grps]]
+                    nisa.dma_copy(
+                        dst=bufs.mm1_running_max, src=neg_max_prev_hbm.ap(pattern=softmax_pat_reload, offset=0)
+                    )
+                    nisa.dma_copy(dst=bufs.exp_running_sum, src=sum_prev_hbm.ap(pattern=softmax_pat_reload, offset=0))
+
+                nl.fori_loop(0, kvp_prior_compute_reg if kvp_prior_compute_reg is not None else 1, _kvp_prior_body)
         else:
             _setup_range_select_bounds(ac_p, atp_p, bufs, allocator, None, None, None, None, batch_id=0)
             sbuf_inner_p = allocator.get_current_address()
             _run_groups(0, n_grps, ac_p, atp_p, sp_prior, bufs, q_hbm, 0, o_prev_hbm, sbuf_inner_p)
 
         allocator.set_current_address(loop_addr)
+
+    nl.fori_loop(0, num_prior_reg, _process_prior_segment)
 
     # Restore
     nisa.tensor_copy(dst=prior_block_offset, src=prior_offset_save)

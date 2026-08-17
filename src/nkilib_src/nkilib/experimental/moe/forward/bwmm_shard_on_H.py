@@ -38,6 +38,12 @@ from ....core.moe.moe_cte.moe_cte_utils import (
 from ....core.utils.common_types import ExpertAffinityScaleMode
 from ....core.utils.kernel_assert import kernel_assert
 
+# Numerical precision controls:
+# - activation_dtype: dtype used inside compute_intermediate_states for SiLU(gate)*up.
+#   Default nl.float32 (full-precision SwiGLU). For bf16 compute_dtype the result is cast
+#   to compute_dtype before the down_proj matmul; it is also auto-promoted to fp32 when
+#   compute_dtype is fp32 so the down_proj matmul operands stay dtype-matched.
+
 
 @dataclass
 class DimensionSizes(nl.NKIObject):
@@ -377,12 +383,12 @@ def compute_gate_and_up_projections_shard(
     return gate_and_up_proj_states
 
 
-def load_old_block_shard(output, token_indices, dims, cfg, shard_id):
+def load_old_block_shard(output, token_indices, dims, cfg, shard_id, accum_dtype=nl.bfloat16):
     """Load the old block from the output tensor."""
     h_offset = dims.H_per_shard * shard_id
     block_old = []
     for _ in range(dims.NUM_TILES):
-        tile = nl.ndarray((TILE_SIZE, dims.H_per_shard), dtype=cfg.compute_dtype, buffer=nl.sbuf)
+        tile = nl.ndarray((TILE_SIZE, dims.H_per_shard), dtype=accum_dtype, buffer=nl.sbuf)
         block_old.append(tile)
 
     for tile_idx in range(dims.NUM_TILES):
@@ -404,7 +410,16 @@ def load_old_block_shard(output, token_indices, dims, cfg, shard_id):
 
 
 def compute_block_output_shard(
-    intermediate_states, dp_weights, expert_affinity, block_old, down_activations, block_idx, dims, cfg, shard_id
+    intermediate_states,
+    dp_weights,
+    expert_affinity,
+    block_old,
+    down_activations,
+    block_idx,
+    dims,
+    cfg,
+    shard_id,
+    accum_dtype=nl.bfloat16,
 ):
     """
     Compute the new block output with down projection and expert affinity adjustment.
@@ -432,7 +447,7 @@ def compute_block_output_shard(
 
     block_new = []
     for _ in range(dims.NUM_TILES):
-        tile = nl.ndarray((TILE_SIZE, dims.H_per_shard), dtype=cfg.io_dtype, buffer=nl.sbuf)
+        tile = nl.ndarray((TILE_SIZE, dims.H_per_shard), dtype=accum_dtype, buffer=nl.sbuf)
         block_new.append(tile)
 
     for tile_idx in range(dims.NUM_TILES):
@@ -467,7 +482,7 @@ def compute_block_output_shard(
 
                     if cfg.is_tensor_update_accumulating:
                         if cfg.scaling_mode == ExpertAffinityScaleMode.POST_SCALE and expert_affinity != None:
-                            scaled = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=cfg.compute_dtype, buffer=nl.sbuf)
+                            scaled = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=accum_dtype, buffer=nl.sbuf)
                             nisa.tensor_scalar(
                                 dst=scaled[0:TILE_SIZE, 0:num_h],
                                 data=down_proj[h_bank_idx][0:TILE_SIZE, 0:num_h],
@@ -548,6 +563,8 @@ def blockwise_mm_baseline_shard_hidden(
     compute_dtype: nki.dtype = nl.bfloat16,
     is_tensor_update_accumulating: bool = True,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
+    activation_dtype: nki.dtype = nl.float32,
+    accum_dtype: nki.dtype = nl.bfloat16,
 ) -> tuple:
     """
     Blockwise matrix multiplication kernel with hidden dimension sharding for MoE.
@@ -649,7 +666,19 @@ def blockwise_mm_baseline_shard_hidden(
         fuse_gate_and_up_load=False,
     )
 
-    output = nl.ndarray(hidden_states.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
+    # SwiGLU precision: keep it matched to the down_proj matmul operand dtype.
+    # For fp32 io the down_proj weight is fp32, so promote bf16 -> fp32 to avoid a
+    # mixed-dtype nc_matmul (stationary=intermediate_states must match moving=weights).
+    #
+    # Cross-expert/cross-block accumulation precision (output HBM + block_old/new/scaled):
+    # default nl.bfloat16 (cheap, == baseline). Auto-promote to fp32 when compute is fp32;
+    # a caller with bf16 compute can explicitly pass accum_dtype=nl.float32 for full-precision
+    # cross-expert accumulation (the accumulator is cast back to the io dtype before return).
+    if compute_dtype == nl.float32:
+        activation_dtype = nl.float32
+        accum_dtype = nl.float32
+
+    output = nl.ndarray(hidden_states.shape, dtype=accum_dtype, buffer=nl.shared_hbm)
     output_initialization_shard(output, dims, shard_id)
 
     for block_idx in nl.sequential_range(N):  # sequential_range for sequential HBM block access
@@ -679,10 +708,20 @@ def blockwise_mm_baseline_shard_hidden(
             block_hidden_states_T, gup_weights, gate_up_activations_T, block_idx, dims, cfg, shard_id
         )
 
-        intermediate_states = compute_intermediate_states(gate_and_up_proj_states, B, I_TP, compute_dtype)
+        intermediate_states_act = compute_intermediate_states(gate_and_up_proj_states, B, I_TP, activation_dtype)
+        # down_proj matmul needs the stationary operand (intermediate_states) to match the
+        # down_proj weight dtype (compute_dtype). Cast only if SwiGLU ran at a different dtype.
+        if activation_dtype != compute_dtype:
+            intermediate_states = []
+            for _i in range(len(intermediate_states_act)):
+                _cast_tile = nl.ndarray(intermediate_states_act[_i].shape, dtype=compute_dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=_cast_tile, src=intermediate_states_act[_i])
+                intermediate_states.append(_cast_tile)
+        else:
+            intermediate_states = intermediate_states_act
 
         if is_tensor_update_accumulating:
-            block_old = load_old_block_shard(output, token_indices, dims, cfg, shard_id)
+            block_old = load_old_block_shard(output, token_indices, dims, cfg, shard_id, accum_dtype)
         else:
             block_old = None
 
@@ -703,8 +742,17 @@ def blockwise_mm_baseline_shard_hidden(
             dims,
             cfg,
             shard_id,
+            accum_dtype,
         )
 
         store_block_output_shard(output, block_new, token_indices, dims, shard_id, skip_dma)
 
-    return output, gate_up_activations_T
+    # Cast the accumulator back to the io dtype only if it ran at a wider precision.
+    if accum_dtype == hidden_states.dtype:
+        return output, gate_up_activations_T
+
+    output_bf16 = nl.ndarray(output.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
+    # Direct HBM->HBM DMA cast (wider accum_dtype -> io dtype); no SBUF round-trip or tiling loop.
+    nisa.dma_copy(dst=output_bf16, src=output)
+
+    return output_bf16, gate_up_activations_T

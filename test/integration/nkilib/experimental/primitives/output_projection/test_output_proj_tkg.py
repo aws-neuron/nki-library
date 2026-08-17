@@ -21,7 +21,6 @@ import nki
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import (
     output_projection_tkg_torch_ref,
 )
@@ -31,6 +30,7 @@ from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib_src.nkilib.experimental.primitives.output_projection.output_projection_tkg import (
     output_projection_tkg,
 )
+
 from test.integration.nkilib.utils.tensor_generators import (
     FP8_E4M3_MAX,
     gaussian_tensor_generator,
@@ -702,16 +702,16 @@ class TestOutputProjTkgKernel:
     # Torch ref: STATIC input clip is derived from dtype_mode (OCP → 448,
     # NON_OCP → 240) so goldens match.
     # ------------------------------------------------------------------
-    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG = dict(
-        B=4,
-        H=3072,
-        S_tkg=4,
-        d_head=128,
-        dtype=nl.bfloat16,
-        n_heads=8,
-        test_bias=True,
-        transpose_out=False,
-    )
+    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG = {
+        "B": 4,
+        "H": 3072,
+        "S_tkg": 4,
+        "d_head": 128,
+        "dtype": nl.bfloat16,
+        "n_heads": 8,
+        "test_bias": True,
+        "transpose_out": False,
+    }
 
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
     @pytest.mark.parametrize("quantization_type", [QuantizationType.STATIC, QuantizationType.ROW])

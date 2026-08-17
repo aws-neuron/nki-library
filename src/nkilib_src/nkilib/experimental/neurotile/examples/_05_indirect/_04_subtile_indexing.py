@@ -40,7 +40,7 @@ def static_view_select(data, select_idx):
 
     sub_view = data_iter[select_idx]  # one slab
     tile = sub_view.load()  # tile: [P, F]
-    out_iter[0, 0].store(tile.ap())
+    out_iter[0, 0].store(tile.data)
     return out
 
 
@@ -57,7 +57,7 @@ def chained_view_select(data, slab_idx, row_idx):
     slab_view = data_iter[slab_idx]
     row_view = slab_view[row_idx, :]  # narrow PART to one row
     tile = row_view.load()  # tile: [1, F]
-    out_iter[0, 0].store(tile.ap())
+    out_iter[0, 0].store(tile.data)
     return out
 
 
@@ -73,7 +73,7 @@ def loop_view_select(data):
 
     for e in range(E):
         slab = data_iter[e].load()  # tile: [P, F]
-        out_iter[E - 1 - e].store(slab.ap())
+        out_iter[E - 1 - e].store(slab.data)
 
     return out
 
@@ -95,7 +95,7 @@ def tile_row_extract(data, row_idx):
 
     tile = data_iter[0, 0].load()  # tile: [P, F]
     sub = tile[row_idx]  # [1, F]
-    out_iter[0, 0].store(sub.ap())
+    out_iter[0, 0].store(sub.data)
     return out
 
 
@@ -111,7 +111,7 @@ def tile_element_extract(data, row_idx, col_idx):
 
     tile = data_iter[0, 0].load()
     sub = tile[row_idx, col_idx]  # [1, 1]
-    out_iter[0, 0].store(sub.ap())
+    out_iter[0, 0].store(sub.data)
     return out
 
 
@@ -145,7 +145,7 @@ def dynamic_select_row_extract(weights, expert_id_tensor, row_idx):
     eid_tile = eid_iter[0, 0].load()
     expert = w_iter[eid_tile].load()  # tile: [P, F]
     sub = expert[row_idx]  # [1, F]
-    out_iter[0, 0].store(sub.ap())
+    out_iter[0, 0].store(sub.data)
     return out
 
 

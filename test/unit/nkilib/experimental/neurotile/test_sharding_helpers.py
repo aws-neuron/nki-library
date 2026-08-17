@@ -27,13 +27,13 @@ NKI Beta 3 caveats relevant here:
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core.shard_helpers import (
     block_range,
     get_shard_info,
     interleaved_range,
     uneven_block_range,
 )
+
 from test.utils.pytest_test_metadata import pytest_marks
 
 # ============================================================================
@@ -90,7 +90,7 @@ class TestBlockRange:
                 return _MulResult()
 
         rt = _RuntimeScalar()
-        s = block_range(rank=rt, num_shards=2, total=4)
+        block_range(rank=rt, num_shards=2, total=4)
         # owned = 2 -> rt * 2 was computed
         assert rt.mul_called_with == 2
 
@@ -174,7 +174,7 @@ class TestUnevenBlockRange:
                 return _MulResult()
 
         rt = _RuntimeScalar()
-        s = uneven_block_range(rank=rt, num_shards=2, total=8)
+        uneven_block_range(rank=rt, num_shards=2, total=8)
         # owned = 4 -> start = rt * 4
         assert rt.mul_called_with == 4
 

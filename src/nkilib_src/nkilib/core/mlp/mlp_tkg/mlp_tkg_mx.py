@@ -48,9 +48,9 @@ MxPreallocBuffers = StaticMxPreallocBuffers
 
 def mlp_tkg_mx(
     params: MLPParameters,
-    output_tensor_hbm: nl.ndarray,
-    output_stored_add_tensor_hbm: nl.ndarray,
-) -> list[nl.ndarray]:
+    output_tensor_hbm: nl.NkiTensor,
+    output_stored_add_tensor_hbm: nl.NkiTensor,
+) -> list[nl.NkiTensor]:
     """
     Dispatcher that routes to the appropriate MX quantization implementation.
 
@@ -62,11 +62,11 @@ def mlp_tkg_mx(
     Args:
         params (MLPParameters): MLP configuration. ``params.quant_params`` must
             report one of MX, STATIC_MX, or ROW_MX quantization.
-        output_tensor_hbm (nl.ndarray): [B, S, H], Output tensor in HBM.
-        output_stored_add_tensor_hbm (nl.ndarray): Optional fused-add output in HBM.
+        output_tensor_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM.
+        output_stored_add_tensor_hbm (nl.NkiTensor): Optional fused-add output in HBM.
 
     Returns:
-        list[nl.ndarray]: The output list returned by the selected implementation.
+        list[nl.NkiTensor]: The output list returned by the selected implementation.
             Typically ``[output_tensor_hbm]`` or ``[output_tensor_hbm, output_stored_add_tensor_hbm]``
             when fused add is stored; may be SBUF-resident if ``store_output_in_sbuf=True``.
 

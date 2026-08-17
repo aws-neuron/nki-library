@@ -15,15 +15,12 @@
 """Utility functions and configuration classes for top-k operations including rotational algorithm support and scanning implementations."""
 
 import math
-import os
 from dataclasses import dataclass
-from tempfile import NamedTemporaryFile
 from typing import List, Optional, Tuple
 
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
-from scipy.linalg import circulant
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil
@@ -113,6 +110,10 @@ def reduce(op: str = 'mul', input_list: Optional[List] = None, initial_value=Non
             initial_value = min(initial_value, element)
         elif op == 'max':
             initial_value = max(initial_value, element)
+        # This else only absorbs the phantom false-arc coverage flags off the last
+        # elif; it is unreachable given the supported_ops assert above.
+        else:  # pragma: no cover - unreachable: op validated against supported_ops above
+            kernel_assert(False, f"reduce: no handler for op '{op}' despite passing supported_ops check")
     return initial_value
 
 
@@ -230,81 +231,6 @@ def create_topk_config(
     kernel_assert(config.inp_shape_valid(), "topk expects input to be at least 2D")
     kernel_assert(config.vocab_size_valid(), f"topk expects vocab_size ({vocab_size}) >= k ({k})")
     return config
-
-
-class RotationalConstants:
-    """Helper class for managing rotational algorithm constants and shared cache."""
-
-    _shared_const_cache = {}
-
-    def _get_permutation_matrix(block_size, num_blocks, inp_dtype):
-        """
-        Generate permutation matrix for rotational algorithm.
-
-        Args:
-            block_size (int): Size of each block
-            num_blocks (int): Number of blocks
-            inp_dtype: Data type for matrix
-
-        Returns:
-            None: Matrix is saved to temporary file and cached
-
-        Notes:
-            - Creates circulant block-diagonal matrix using Kronecker product
-            - Saves result to temporary file for shared constant access
-        """
-        shift = 1
-
-        base_perm = np.zeros(block_size)
-        base_perm[shift % block_size] = 1
-        P_block = circulant(base_perm)
-
-        I_blocks = np.eye(num_blocks)
-        B = np.kron(I_blocks, P_block)
-        out = B.astype(inp_dtype)
-        cache_key = map(str, (block_size, num_blocks))
-        with NamedTemporaryFile(suffix='.npy', delete=False) as f:
-            np.save(f, out)
-        RotationalConstants._shared_const_cache['_'.join(cache_key)] = f.name
-
-    def _get_global_indices(n_stages, stage_free_size, per_lnc_BxS, padded_vocab_size, inp_dtype):
-        """
-        Generate global index array for rotational algorithm.
-
-        Args:
-            n_stages (int): Number of stages
-            stage_free_size (int): Free dimension size per stage
-            per_lnc_BxS (int): Batch size per logical core
-            padded_vocab_size (int): Padded vocabulary size
-            inp_dtype: Data type for indices
-
-        Returns:
-            None: Index array is saved to temporary file and cached
-
-        Notes:
-            - Creates tiled index array for tracking global positions
-            - Saves result to temporary file for shared constant access
-        """
-        BxS_size = per_lnc_BxS
-        out = np.tile(
-            np.arange(padded_vocab_size).astype(inp_dtype).reshape((n_stages, stage_free_size)),
-            (BxS_size, 1),
-        )
-        cache_key = '_'.join(map(str, (padded_vocab_size, n_stages, stage_free_size, BxS_size)))
-        with NamedTemporaryFile(suffix='.npy', delete=False) as f:
-            np.save(f, out)
-            RotationalConstants._shared_const_cache[cache_key] = f.name
-
-    def cleanup():
-        """
-        Clean up temporary files created for shared constants.
-
-        Returns:
-            None: Removes temporary files from filesystem
-        """
-        for file_path in RotationalConstants._shared_const_cache.values():
-            if os.path.exists(file_path):
-                os.remove(file_path)
 
 
 @dataclass(frozen=True, eq=True)
@@ -645,7 +571,9 @@ def _find_optimal_tile_size_baseline(
             continue
 
         stage_free_size = div_ceil(vocab_size, n_stages)
-        if stage_free_size > HW_PARAMS.max_free_dim:
+        if (
+            stage_free_size > HW_PARAMS.max_free_dim
+        ):  # pragma: no cover - unreachable: n_stages>=ceil(vocab/max_free) forces stage_free=ceil(vocab/n_stages)<=max_free
             continue
         k_per_stage = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
         if stage_free_size + n_stages * k_per_stage > HW_PARAMS.max_free_dim:
@@ -692,22 +620,6 @@ def _exceeds_concatenated_free_dim(orig_k: int, vocab_size: int, tile_size: int,
     chunk = div_ceil(vocab_size, n_stages)
     local_k = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
     return chunk + n_stages * local_k > HW_PARAMS.max_free_dim
-
-
-def _generate_stage_offsets_interleaved(n_stages, stage_free_size, BxS_size):
-    """Generate per-partition interleaved stage offset constant for on-chip index init."""
-    total_part = n_stages * BxS_size
-    offsets = np.zeros((total_part, 1), dtype=np.float32)
-    for partition_idx in range(total_part):
-        stage_idx = partition_idx % n_stages
-        offsets[partition_idx, 0] = stage_idx * stage_free_size
-
-    cache_key = f"offsets_interleaved_{n_stages}_{stage_free_size}_{BxS_size}"
-    if cache_key not in RotationalConstants._shared_const_cache:
-        with NamedTemporaryFile(suffix=".npy", delete=False) as temp_file:
-            np.save(temp_file, offsets)
-            RotationalConstants._shared_const_cache[cache_key] = temp_file.name
-    return cache_key
 
 
 def create_rotational_topk_config(
@@ -788,6 +700,45 @@ def create_rotational_topk_config(
         _pmax=pmax,
         _shared_const_cache=shared_const_cache,
     )
+
+
+def build_stage_offsets(n_stages: int, bxs_size: int, stage_free_size: int):
+    """Generate per-partition interleaved stage offsets on-device.
+
+    Builds offsets[p] = (p % n_stages) * stage_free_size. Used to convert
+    stage-local indices into global vocabulary indices by adding the
+    per-stage base offset to each partition's local index range.
+
+    Args:
+        n_stages: Number of rotational stages.
+        bxs_size: Batch-sequence tile size (partitions per stage).
+        stage_free_size: Free dimension size per stage.
+
+    Returns:
+        [total_partition_dim, 1] SBUF tensor (float32) of stage offsets.
+
+    Example (n_stages=3, bxs_size=2, stage_free_size=4096)::
+
+        offsets = [[    0],   # partition 0: stage 0
+                   [ 4096],   # partition 1: stage 1
+                   [ 8192],   # partition 2: stage 2
+                   [    0],   # partition 3: stage 0
+                   [ 4096],   # partition 4: stage 1
+                   [ 8192]]   # partition 5: stage 2
+    """
+    total_partition_dim = n_stages * bxs_size
+    padded = ((total_partition_dim + 31) // 32) * 32
+    lhs = nl.ndarray((1, padded), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(lhs[:, 0:total_partition_dim], pattern=[[0, bxs_size], [stage_free_size, n_stages]])
+    offsets = nl.ndarray((padded, 1), dtype=nl.float32, buffer=nl.sbuf)
+    # Transpose in <=32-wide chunks, clamping the last chunk to total_partition_dim
+    # so it never reads the alignment padding that iota does not fill.
+    n_chunks = (total_partition_dim + 31) // 32
+    for i in nl.affine_range(n_chunks):
+        chunk = min(32, total_partition_dim - i * 32)
+        chunk_slice = nl.ds(i * 32, chunk)
+        nisa.nc_transpose(dst=offsets[chunk_slice, 0:1], data=lhs[0:1, chunk_slice], engine=nisa.vector_engine)
+    return offsets[0:total_partition_dim, 0:1]
 
 
 def rotate(dst: nl.ndarray, tensor: nl.ndarray, rotation_matrix: nl.ndarray) -> nl.ndarray:
@@ -989,7 +940,9 @@ def sort(data_sbuf, indices, true_k):
     for pass_num in nl.sequential_range(num_pass):
         cur_slice = nl.ds(pass_num * HW_PARAMS.dve_max_alus, HW_PARAMS.dve_max_alus)
         nisa.max8(dst=topk_val_buf[:, cur_slice], src=data_sbuf)
-        if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        if (
+            nisa.get_nc_version() <= nisa.nc_version.gen2
+        ):  # pragma: no cover - gen2/TRN1 legacy path; coverage targets trn2(gen3) and trn3_a0(gen4)
             nisa.nc_find_index8(dst=topk_idx_buf[:, cur_slice], data=data_sbuf[...], vals=topk_val_buf[:, cur_slice])
             nisa.nc_match_replace8(
                 dst=data_sbuf[...], data=data_sbuf[...], vals=topk_val_buf[:, cur_slice], imm=float("-inf")

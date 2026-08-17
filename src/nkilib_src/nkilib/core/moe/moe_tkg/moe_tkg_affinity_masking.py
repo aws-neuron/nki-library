@@ -29,16 +29,16 @@ _DGE_ALIGNMENT = 16  # DMA gather engine alignment requirement
 
 
 def mask_expert_affinities(
-    expert_affinities: nl.ndarray,
-    expert_index: nl.ndarray,
-    rank_id: nl.ndarray,
+    expert_affinities: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
+    rank_id: nl.NkiTensor,
     E_L: int,
     T: int,
     K: int,
     io_dtype,
     mask_unselected_experts: bool,
     output_in_sbuf: bool,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Mask expert affinities for all-expert MoE computation.
 
@@ -46,9 +46,9 @@ def mask_expert_affinities(
     masks affinities by checking expert_index against each local expert (when mask_unselected_experts=True).
 
     Args:
-        expert_affinities (nl.ndarray): [T, E], Global expert affinities in HBM.
-        expert_index (nl.ndarray): [T, K], Top-K expert indices per token in SBUF.
-        rank_id (nl.ndarray): [1, 1], Rank ID tensor in HBM, specifies which experts this rank processes.
+        expert_affinities (nl.NkiTensor): [T, E], Global expert affinities in HBM.
+        expert_index (nl.NkiTensor): [T, K], Top-K expert indices per token in SBUF.
+        rank_id (nl.NkiTensor): [1, 1], Rank ID tensor in HBM, specifies which experts this rank processes.
         E_L (int): Number of local experts.
         T (int): Number of tokens.
         K (int): Top-K value.
@@ -57,7 +57,7 @@ def mask_expert_affinities(
         output_in_sbuf (bool): If True, output affinities in SBUF; otherwise in shared HBM.
 
     Returns:
-        expert_affinities_masked (nl.ndarray): [T, E_L]@SBUF or [128_T, T/128, E_L]@SBUF or [T, E_L]@HBM
+        expert_affinities_masked (nl.NkiTensor): [T, E_L]@SBUF or [128_T, T/128, E_L]@SBUF or [T, E_L]@HBM
 
     Notes:
         - For T <= 128, returns 2D tensor [T, E_L]
@@ -196,9 +196,9 @@ def _slice_affinities_hbm(expert_affinities, expert_offset_sbuf, E_L, T, io_dtyp
 
 
 def _apply_expert_index_mask(
-    expert_affinities_masked: nl.ndarray,
-    expert_index: nl.ndarray,
-    expert_offset_sbuf: nl.ndarray,
+    expert_affinities_masked: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
+    expert_offset_sbuf: nl.NkiTensor,
     E_L: int,
     T: int,
     K: int,
@@ -211,9 +211,9 @@ def _apply_expert_index_mask(
     Zeros out affinities for experts not selected by each token.
 
     Args:
-        expert_affinities_masked (nl.ndarray): [T, E_L], Affinities to mask in-place in SBUF.
-        expert_index (nl.ndarray): [T, K], Top-K expert indices in SBUF.
-        expert_offset_sbuf (nl.ndarray): [1, 1], Starting expert index for this rank in SBUF.
+        expert_affinities_masked (nl.NkiTensor): [T, E_L], Affinities to mask in-place in SBUF.
+        expert_index (nl.NkiTensor): [T, K], Top-K expert indices in SBUF.
+        expert_offset_sbuf (nl.NkiTensor): [1, 1], Starting expert index for this rank in SBUF.
         E_L (int): Number of local experts.
         T (int): Number of tokens.
         K (int): Top-K value.

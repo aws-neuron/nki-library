@@ -18,8 +18,8 @@ from typing import final
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     BWMMFunc,
     _shard_on_block_output_validator,

@@ -160,7 +160,7 @@ def spill_block(
                 )
 
         else:
-            # Scales are always the same format (uint8, one per x4 group)
+            # Scales are always the same format (float8_e8m0fnu, one per x4 group)
             nisa.dma_copy(
                 dst=quantized_scales_hbm[nl.ds(k_hbm, TILE_K), nl.ds(f_start_scales, F_x4)],
                 src=quantized_scales_sbuf.ap(pattern=[[step_p, TILE_K], [1, F_x4]], offset=sbuf_offset),
@@ -258,7 +258,7 @@ def _quantize_and_spill_operand(
                 // quantize_mxfp8_utils.MAX_TILES_PER_SCALE_PACKING_GROUP,
                 loaded.shape[2] // quantize_mxfp8_utils.INTERLEAVE_FACTOR,
             ),
-            dtype=nl.uint8,
+            dtype=nl.float8_e8m0fnu,
             buffer=nl.sbuf,
         )
         data_loaded, _ = quantize_mxfp8_block.quantize_mxfp8_block(
@@ -609,6 +609,7 @@ def generic_matmul_mxfp8_api(
                     global_block_tile_k_idx=global_k_tile_start,
                     psum_dtype=output_dtype if bd.TILES_IN_BLOCK_K == 1 and output_dtype != nl.float32 else nl.float32,
                     enable_psum_copy_in=config.enable_psum_copy_in if config else True,
+                    inputs_were_prequantized=eff_lhs_td.is_quantized or eff_rhs_td.is_quantized,
                 )
 
             # --- Store to HBM if output is HBM ---

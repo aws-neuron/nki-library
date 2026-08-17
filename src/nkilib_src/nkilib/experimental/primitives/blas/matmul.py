@@ -24,7 +24,6 @@ from ....core.utils.allocator import sizeinbytes
 from ....core.utils.common_types import QuantizationType
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil, reduce
-from ....core.utils.tensor_view import TensorView
 from ..tile_stream import TileStream
 from ..view_spec import Broadcast, Permute, ReshapeDim, Select, Slice, ViewSpec
 
@@ -90,7 +89,7 @@ class Matmul(nl.NKIObject):
 
         if skip_evict:
             kernel_assert(
-                dst.get_container().base_tensor.buffer == nl.psum,
+                dst.get_container().buffer == nl.psum,
                 "skip_evict=True requires dst buffer to be nl.psum",
             )
 
@@ -226,7 +225,7 @@ class Matmul(nl.NKIObject):
                 # Choose accumulation target
                 if self._skip_evict:
                     dst_tile = self._dst.get_tile()
-                    accum = dst_tile.get_view()
+                    accum = dst_tile
                 else:
                     accum = self._alloc_psum(self._p_tile, self._dst_f_tile)
 
@@ -248,23 +247,23 @@ class Matmul(nl.NKIObject):
                             if self._use_mx:
                                 nisa.nc_matmul_mx(
                                     dst=psum_slice,
-                                    stationary=stationary_cache[stat_idx][k].get_view(),
-                                    moving=moving_cache[mov_idx][k].get_view(),
-                                    stationary_scale=stationary_scale_cache[stat_idx][k].get_view(),
-                                    moving_scale=moving_scale_cache[mov_idx][k].get_view(),
+                                    stationary=stationary_cache[stat_idx][k],
+                                    moving=moving_cache[mov_idx][k],
+                                    stationary_scale=stationary_scale_cache[stat_idx][k],
+                                    moving_scale=moving_scale_cache[mov_idx][k],
                                 )
                             elif self._perf_mode == "double_row":
                                 nisa.nc_matmul(
                                     dst=psum_slice,
-                                    stationary=stationary_cache[stat_idx][k].get_view(),
-                                    moving=moving_cache[mov_idx][k].get_view(),
+                                    stationary=stationary_cache[stat_idx][k],
+                                    moving=moving_cache[mov_idx][k],
                                     perf_mode=matmul_perf_mode.double_row,
                                 )
                             else:
                                 nisa.nc_matmul(
                                     dst=psum_slice,
-                                    stationary=stationary_cache[stat_idx][k].get_view(),
-                                    moving=moving_cache[mov_idx][k].get_view(),
+                                    stationary=stationary_cache[stat_idx][k],
+                                    moving=moving_cache[mov_idx][k],
                                 )
 
                 # Evict PSUM to dst (skip when accumulating directly into dst PSUM)
@@ -288,7 +287,7 @@ class Matmul(nl.NKIObject):
         # Slice dst_tile to match actual_p_size written to PSUM
         dst_tile = dst_tile.slice(0, 0, actual_p_size)
 
-        psum_view = TensorView(accum).slice(0, 0, actual_p_size).slice(1, 0, actual_f_size)
+        psum_view = accum.slice(0, 0, actual_p_size).slice(1, 0, actual_f_size)
 
         if self._psum_evict_view is not None:
             for op in self._psum_evict_view.get_ops():
@@ -308,18 +307,18 @@ class Matmul(nl.NKIObject):
                 elif isinstance(op, Permute):
                     psum_view = psum_view.permute(op.dims)
 
-        dst_view = dst_tile.get_view()
-        psum = psum_view.get_view()
+        dst_view = dst_tile
+        psum = psum_view
 
         if self._use_dequant:
             dequant_tile = dequant_cache[dequant_idx % len(dequant_cache)]
             dequant_idx = dequant_idx + 1
 
             if self._dequant_type == QuantizationType.ROW:
-                nisa.tensor_tensor(dst=dst_view, data1=psum, data2=dequant_tile.get_view(), op=nl.multiply)
+                nisa.tensor_tensor(dst=dst_view, data1=psum, data2=dequant_tile, op=nl.multiply)
             elif self._dequant_type == QuantizationType.STATIC:
                 scale_container = self._dequant_scale.get_container()
-                scale_base = scale_container.base_tensor
+                scale_base = scale_container
                 if len(scale_base.shape) == 3 and scale_base.shape[1] == 1:
                     scale_base = scale_base[:, 0, :]
                 p_size = psum.shape[0]
@@ -333,15 +332,15 @@ class Matmul(nl.NKIObject):
             bias_idx = bias_idx + 1
             # Slice bias_tile to match actual_p_size
             bias_tile = bias_tile.slice(0, 0, actual_p_size)
-            bias_view = bias_tile.get_view()
+            bias_view = bias_tile
 
             if len(bias_view.shape) == 3 and len(evicted.shape) == 2:
                 dst_3d = dst_tile.reshape_dim(1, (bias_view.shape[1], bias_view.shape[2]))
                 if self._use_dequant:
-                    nisa.tensor_tensor(dst=dst_3d.get_view(), data1=dst_3d.get_view(), data2=bias_view, op=nl.add)
+                    nisa.tensor_tensor(dst=dst_3d, data1=dst_3d, data2=bias_view, op=nl.add)
                 else:
                     psum_3d = psum_view.reshape_dim(1, (bias_view.shape[1], bias_view.shape[2]))
-                    nisa.tensor_tensor(dst=dst_3d.get_view(), data1=psum_3d.get_view(), data2=bias_view, op=nl.add)
+                    nisa.tensor_tensor(dst=dst_3d, data1=psum_3d, data2=bias_view, op=nl.add)
             else:
                 nisa.tensor_tensor(dst=dst_view, data1=evicted, data2=bias_view, op=nl.add)
         elif not self._use_dequant:

@@ -14,13 +14,10 @@
 
 """Store primitive: SBUF TileStream to HBM."""
 
-from typing import Union
-
 import nki.isa as nisa
 import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
-from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import HBMStream, TileStream, get_logical_shape, tile_hbm
@@ -54,15 +51,15 @@ class Store(nl.NKIObject):
         for _ in range(self._dst.get_num_tiles()):
             src_tile = self._src.get_tile()
             dst_tile = self._dst.get_tile()
-            nisa.dma_copy(dst=dst_tile.get_view(), src=src_tile.get_view())
+            nisa.dma_copy(dst=dst_tile, src=src_tile)
 
         self._src.reset_cur_tile()
         self._dst.reset_cur_tile()
 
 
 def store(
-    dst: Union[TensorView, nl.ndarray],
-    src: Union[TensorView, nl.ndarray],
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor,
 ) -> None:
     """Compact store: SBUF to HBM. Whole tensor, no tiling.
 
@@ -70,12 +67,12 @@ def store(
 
     Args:
         dst: Destination tensor in HBM
-        src: Source tensor in SBUF (from alloc_logical or nl.ndarray)
+        src: Source tensor in SBUF (from alloc_logical or nl.NkiTensor)
     """
     logical_shape = get_logical_shape(src)
     src_ts = tile_stream.tile(src, logical_shape, iter_order=RowMajor())
 
-    dst_view = dst if isinstance(dst, TensorView) else TensorView(dst)
+    dst_view = dst
     dst_hbm = tile_hbm(dst_view, tuple(dst_view.shape), iter_order=RowMajor())
 
     Store(dst=dst_hbm, src=src_ts).execute()

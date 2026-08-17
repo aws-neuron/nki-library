@@ -16,15 +16,15 @@
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8 import (
     quantize_block_mxfp8_kernel,
 )
+
 from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_utils import (
     build_custom_validation_args,
     build_output_tensors,
     generate_quantize_mxfp8_inputs,
-    quantize_mxfp8_torch_ref,
+    quantize_block_mxfp8_torch_ref,
 )
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
@@ -172,7 +172,7 @@ def _run_test(
     framework = UnitTestFramework(
         test_manager=test_manager,
         kernel_entry=quantize_block_mxfp8_kernel,
-        torch_ref=quantize_mxfp8_torch_ref,
+        torch_ref=quantize_block_mxfp8_torch_ref,
         kernel_input_generator=input_generator,
         output_tensor_descriptor=build_output_tensors,
     )

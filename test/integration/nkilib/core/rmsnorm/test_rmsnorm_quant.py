@@ -19,8 +19,6 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant import (
     RmsNormQuantKernelArgs,
     rmsnorm_quant_kernel,
@@ -28,6 +26,7 @@ from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant import (
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant_torch import rmsnorm_quant_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import DtypeMode, NormType, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+from typing_extensions import override
 
 try:
     from test.integration.nkilib.core.rmsnorm.test_rmsnorm_quant_cte_model_config import (
@@ -276,7 +275,6 @@ class TestRmsNormQuantKernel:
         # concrete dtype. The kernel receives the original mode and resolves
         # at trace time.
         resolved_dtype_mode = resolve_dtype_mode_for_torch_ref(dtype_mode, platform_target)
-        quant_nki_dtype = nl.float8_e4m3fn if resolved_dtype_mode == DtypeMode.OCP else nl.float8_e4m3
         quant_np_dtype = dt.float8_e4m3fn if resolved_dtype_mode == DtypeMode.OCP else dt.float8_e4m3
 
         def input_generator(_):

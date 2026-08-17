@@ -51,25 +51,25 @@ from .mlp_tkg.mlp_tkg_mx import mlp_tkg_mx
 
 @nki.jit
 def mlp(
-    hidden_tensor: nl.ndarray,
-    gate_proj_weights_tensor: nl.ndarray,
-    up_proj_weights_tensor: nl.ndarray,
-    down_proj_weights_tensor: nl.ndarray,
-    normalization_weights_tensor: Optional[nl.ndarray] = None,
-    gate_proj_bias_tensor: Optional[nl.ndarray] = None,
-    up_proj_bias_tensor: Optional[nl.ndarray] = None,
-    down_proj_bias_tensor: Optional[nl.ndarray] = None,
-    normalization_bias_tensor: Optional[nl.ndarray] = None,
-    fused_add_tensor: Optional[nl.ndarray] = None,
+    hidden_tensor: nl.NkiTensor,
+    gate_proj_weights_tensor: nl.NkiTensor,
+    up_proj_weights_tensor: nl.NkiTensor,
+    down_proj_weights_tensor: nl.NkiTensor,
+    normalization_weights_tensor: Optional[nl.NkiTensor] = None,
+    gate_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+    up_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+    down_proj_bias_tensor: Optional[nl.NkiTensor] = None,
+    normalization_bias_tensor: Optional[nl.NkiTensor] = None,
+    fused_add_tensor: Optional[nl.NkiTensor] = None,
     store_fused_add_result: bool = False,
     activation_fn: ActFnType = ActFnType.SiLU,
     normalization_type: NormType = NormType.NO_NORM,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    gate_w_scale: Optional[nl.ndarray] = None,
-    up_w_scale: Optional[nl.ndarray] = None,
-    down_w_scale: Optional[nl.ndarray] = None,
-    gate_up_in_scale: Optional[nl.ndarray] = None,
-    down_in_scale: Optional[nl.ndarray] = None,
+    gate_w_scale: Optional[nl.NkiTensor] = None,
+    up_w_scale: Optional[nl.NkiTensor] = None,
+    down_w_scale: Optional[nl.NkiTensor] = None,
+    gate_up_in_scale: Optional[nl.NkiTensor] = None,
+    down_in_scale: Optional[nl.NkiTensor] = None,
     quant_clipping_bound: float = 0.0,
     output_dtype=None,
     store_output_in_sbuf: bool = False,
@@ -78,7 +78,7 @@ def mlp(
     use_tkg_gate_up_proj_column_tiling: bool = True,
     use_tkg_down_proj_column_tiling: bool = True,
     use_tkg_down_proj_optimized_layout: bool = False,
-    use_contiguous_x4_gate_up: bool = False,
+    use_contiguous_x4_gate_up: bool = False,  # TODO: Remove once all callers migrate to gate_up_w_layout
     gate_clamp_upper_limit: Optional[float] = None,
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
@@ -86,12 +86,12 @@ def mlp(
     force_cte_mode: bool = False,
     mode: ComputationMode = ComputationMode.AUTO,
     sbm: Optional[BufferManager] = None,
-    mx_dummy_scale_hbm: Optional[nl.ndarray] = None,
+    mx_dummy_scale_hbm: Optional[nl.NkiTensor] = None,
     transposed_in: bool = False,
     transposed_out: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """
     MLP (Multi-Layer Perceptron) Kernel implementation.
 
@@ -119,18 +119,18 @@ def mlp(
         output = down_proj_out
 
     Args:
-        hidden_tensor (nl.ndarray): Input hidden states tensor with shape [B, S, H], SBUF layout,
+        hidden_tensor (nl.NkiTensor): Input hidden states tensor with shape [B, S, H], SBUF layout,
             or transposed HBM layout [H0, n_prgs, H1_shard, BxS] when transposed_in=True.
-        gate_proj_weights_tensor (nl.ndarray): Gate projection weight matrix with shape [H, I].
-        up_proj_weights_tensor (nl.ndarray): Up projection weight matrix with shape [H, I].
-        down_proj_weights_tensor (nl.ndarray, optional): Down projection weight matrix with shape [I, H].
-        normalization_weights_tensor (nl.ndarray, optional): Normalization weights with shape [1, H].
-        gate_proj_bias_tensor (nl.ndarray, optional): Bias tensor for gate projection with shape [1, I].
-        up_proj_bias_tensor (nl.ndarray, optional): Bias tensor for up projection with shape [1, I].
-        down_proj_bias_tensor (nl.ndarray, optional): Bias tensor for down projection with shape [1, H].
-        normalization_bias_tensor (nl.ndarray, optional): Bias tensor for normalization with shape [1, H].
+        gate_proj_weights_tensor (nl.NkiTensor): Gate projection weight matrix with shape [H, I].
+        up_proj_weights_tensor (nl.NkiTensor): Up projection weight matrix with shape [H, I].
+        down_proj_weights_tensor (nl.NkiTensor, optional): Down projection weight matrix with shape [I, H].
+        normalization_weights_tensor (nl.NkiTensor, optional): Normalization weights with shape [1, H].
+        gate_proj_bias_tensor (nl.NkiTensor, optional): Bias tensor for gate projection with shape [1, I].
+        up_proj_bias_tensor (nl.NkiTensor, optional): Bias tensor for up projection with shape [1, I].
+        down_proj_bias_tensor (nl.NkiTensor, optional): Bias tensor for down projection with shape [1, H].
+        normalization_bias_tensor (nl.NkiTensor, optional): Bias tensor for normalization with shape [1, H].
             Only applicable for layer normalization.
-        fused_add_tensor (nl.ndarray, optional): tensor to fuse for the residual connection..
+        fused_add_tensor (nl.NkiTensor, optional): tensor to fuse for the residual connection..
         store_fused_add_result (bool): If True, stores the fused_add output to HBM, and
             the kernel returns both the fused_add output and the MLP output.
             (default: False)
@@ -147,18 +147,18 @@ def mlp(
                 - It expects up and gate weights to be swizzled as well. See gate_up_w_layout for details.
             - QuantizationType.ROW: FP8 row-wise quantization (CTE and TKG)
             - QuantizationType.MX: MXFP quantization (MXFP4/MXFP8, TKG only)
-        gate_w_scale (nl.ndarray, optional): Dequantization scales for gate weights.
+        gate_w_scale (nl.NkiTensor, optional): Dequantization scales for gate weights.
             - FP8: Shape [128, I] for row-wise, [128, 1] for tensor-wise quantization
             - MXFP (TKG only): Scale factors for MXFP quantized weights
-        up_w_scale (nl.ndarray, optional): Dequantization scales for up weights.
+        up_w_scale (nl.NkiTensor, optional): Dequantization scales for up weights.
             - FP8: Shape [128, I] for row-wise, [128, 1] for tensor-wise quantization
             - MXFP (TKG only): Scale factors for MXFP quantized weights
-        down_w_scale (nl.ndarray, optional): Dequantization scales for down weights.
+        down_w_scale (nl.NkiTensor, optional): Dequantization scales for down weights.
             - FP8: Shape [128, I] for row-wise, [128, 1] for tensor-wise quantization
             - MXFP (TKG only): Scale factors for MXFP quantized weights
-        gate_up_in_scale (nl.ndarray, optional): FP8 dequantization scales for gate and up input.
+        gate_up_in_scale (nl.NkiTensor, optional): FP8 dequantization scales for gate and up input.
             Used for tensor-wise quantization with shape [128, 1]. Defaults to None.
-        down_in_scale (nl.ndarray, optional): FP8 dequantization scales for down input.
+        down_in_scale (nl.NkiTensor, optional): FP8 dequantization scales for down input.
             Used for tensor-wise quantization with shape [128, 1]. Defaults to None.
         quant_clipping_bound (float): Clipping boundary for context encoding FP8 row quantization (default: 0.0)
         output_dtype: Output tensor data type. Defaults to None; if None, the hidden tensor’s dtype is used.

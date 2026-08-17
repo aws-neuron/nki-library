@@ -16,7 +16,6 @@
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.moe.moe_tkg.moe_tkg import moe_tkg as moe_tkg_core
 from nkilib_src.nkilib.core.moe.moe_tkg.moe_tkg_torch import moe_tkg_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import (
@@ -25,6 +24,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     QuantizationType,
 )
 from nkilib_src.nkilib.experimental.moe.moe_tkg.moe_tkg import moe_tkg as moe_tkg_primitives
+
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_utils import build_moe_tkg, get_expert_affinity_dtype
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_wrapper import moe_tkg_sbuf_io_wrapper
 from test.utils.common_dataclasses import MODEL_TEST_TYPE, TKG_INFERENCE_ARGS, CompilerArgs, Platforms
@@ -81,21 +81,21 @@ def _run_moe_tkg_test(
     """Common test runner for moe_tkg kernel tests."""
     resolved_in = _resolve_dtype(in_dtype if in_dtype is not None else dtype)
     resolved_out = _resolve_dtype(out_dtype if out_dtype is not None else dtype)
-    build_kw = dict(
-        tokens=tokens,
-        hidden=hidden,
-        intermediate=intermediate,
-        expert=expert,
-        top_k=top_k,
-        act_fn=act_fn,
-        expert_affinities_scaling_mode=scale_mode,
-        is_all_expert=all_expert,
-        expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-        in_dtype=resolved_in,
-        out_dtype=resolved_out,
-        bias=bias,
-        clamp=clamp,
-    )
+    build_kw = {
+        "tokens": tokens,
+        "hidden": hidden,
+        "intermediate": intermediate,
+        "expert": expert,
+        "top_k": top_k,
+        "act_fn": act_fn,
+        "expert_affinities_scaling_mode": scale_mode,
+        "is_all_expert": all_expert,
+        "expert_affinities_dtype": get_expert_affinity_dtype(all_expert),
+        "in_dtype": resolved_in,
+        "out_dtype": resolved_out,
+        "bias": bias,
+        "clamp": clamp,
+    }
     if q_dtype is not None:
         build_kw["quant_dtype"] = _resolve_dtype(q_dtype)
     if q_type is not None:
@@ -387,7 +387,7 @@ def _make_sweep_params(*, T, H, I, E, configs=_STD_CONFIGS, vnc=2):
             e.append(lst[-1])
         return e
 
-    dim_tuples = list(zip(_expand(T), _expand(H), _expand(I), _expand(E)))
+    dim_tuples = list(zip(_expand(T), _expand(H), _expand(I), _expand(E), strict=True))
     params = []
     for t, h, i, e in dim_tuples:
         for act_fn, scale_mode, all_expert, dtype, clamp, bias, top_k in configs:

@@ -22,7 +22,6 @@ import nki
 import nki.language as nl
 
 from ...core.moe_block.moe_block_tkg import moe_block_tkg as moe_block_tkg_kernel
-from ...core.utils.tensor_view import TensorView
 
 # Reverse mapping: NKI unsigned integer dtype → MX x4 dtype for reinterpret_cast
 # mxfp4_x4: 4 bits × 4 = 16 bits → uint16
@@ -79,8 +78,8 @@ def mx_moe_block_tkg_wrapper(
     reinterpreted as float4_e2m1fn_x4 or float8_e4m3fn_x4 dtype.
     """
     mx_dtype = _UINT_TO_MX_DTYPE[expert_gate_up_weights.dtype]
-    gate_up_view = TensorView(expert_gate_up_weights).reinterpret_cast(mx_dtype)
-    down_view = TensorView(expert_down_weights).reinterpret_cast(mx_dtype)
+    gate_up_view = expert_gate_up_weights.view(mx_dtype)
+    down_view = expert_down_weights.view(mx_dtype)
 
     return moe_block_tkg_kernel(
         inp=inp,

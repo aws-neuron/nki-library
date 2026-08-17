@@ -14,13 +14,10 @@
 
 """TensorCopy primitive: SBUF to SBUF copy between TileStreams."""
 
-from typing import Union
-
 import nki.isa as nisa
 import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
-from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import TileStream, get_logical_shape
@@ -50,15 +47,15 @@ class TensorCopy(nl.NKIObject):
         for _ in range(self._dst.get_num_tiles()):
             dst_tile = self._dst.get_tile()
             src_tile = self._src.get_tile()
-            nisa.tensor_copy(dst=dst_tile.get_view(), src=src_tile.get_view())
+            nisa.tensor_copy(dst=dst_tile, src=src_tile)
 
         self._dst.reset_cur_tile()
         self._src.reset_cur_tile()
 
 
 def tensor_copy(
-    dst: Union[TensorView, nl.ndarray],
-    src: Union[TensorView, nl.ndarray],
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor,
 ) -> None:
     """Compact tensor_copy: SBUF to SBUF. Whole tensor, no tiling.
 

@@ -174,7 +174,7 @@ def test_license_headers():
             f"at the top of the file.\n"
             f"{'=' * 70}\n"
         )
-        assert False, error_message
+        raise AssertionError(error_message)
 
     # Success message
     assert len(all_files) > 0, "No Python files found to check"

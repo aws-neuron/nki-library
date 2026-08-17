@@ -16,6 +16,7 @@
 
 from typing import Optional
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 
@@ -23,29 +24,34 @@ from ..mlp.mlp_tkg.projection_mx_constants import _q_width
 from ..quantization.fp8_quantize import row_quantization, static_quantization
 from ..utils.kernel_helpers import div_ceil
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ..utils.tensor_view import TensorView
 from .norm_tkg_utils import _1B_XPOSE_PSUM_STEP, _MX_SCALE_DTYPE, _UINT8_TP_VIEW_DTYPE, validate_rmsnorm_mx_quantize_tkg
 
 
+@nki.jit
 def rmsnorm_mx_quantize_tkg(
-    input: nl.ndarray,
-    gamma: nl.ndarray,
-    output: nl.ndarray,
-    output_quant: nl.ndarray,
-    output_scale: Optional[nl.ndarray] = None,
-    residual: Optional[nl.ndarray] = None,
-    output_residual: Optional[nl.ndarray] = None,
+    input: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    output: nl.NkiTensor,
+    output_quant: Optional[nl.NkiTensor] = None,
+    output_scale: Optional[nl.NkiTensor] = None,
+    residual: Optional[nl.NkiTensor] = None,
+    output_residual: Optional[nl.NkiTensor] = None,
     eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     hidden_dim_tp: bool = True,
-    gate_up_in_scale: Optional[nl.ndarray] = None,
-    output_input_dequant_scale: Optional[nl.ndarray] = None,
+    gate_up_in_scale: Optional[nl.NkiTensor] = None,
+    output_input_dequant_scale: Optional[nl.NkiTensor] = None,
     is_row_quant: bool = False,
-    output_row_dequant_scale: Optional[nl.ndarray] = None,
+    is_static_mx: bool = False,
+    output_row_dequant_scale: Optional[nl.NkiTensor] = None,
     skip_output_gather: bool = False,
 ):
     """
-    Fused residual add (optional) + RMSNorm + MX/static/row quantization for token generation.
+    Fused residual add (optional) + RMSNorm + optional MX/static/row quantization for token generation.
+
+    When output_quant=None, performs RMSNorm (+ optional residual add) only, producing bf16 output
+    without any quantization. This mode is used by STATIC_MX all-expert to defer quantization
+    to the per-expert loop downstream.
 
     Dimensions:
         B: Batch size
@@ -55,39 +61,42 @@ def rmsnorm_mx_quantize_tkg(
         H1: H // H0
 
     Args:
-        input (nl.ndarray): [B, S, H], Input tensor on HBM.
-        gamma (nl.ndarray): [1, H], RMSNorm scaling weights on HBM.
-        output (nl.ndarray): [H0, B*S, H1], FP16/BF16 output tensor in SBUF.
-        output_quant (nl.ndarray): [H0, H/512, B*S], FP8x4 quantized output tensor in HBM or SBUF,
+        input (nl.NkiTensor): [B, S, H], Input tensor on HBM.
+        gamma (nl.NkiTensor): [1, H], RMSNorm scaling weights on HBM.
+        output (nl.NkiTensor): [H0, B*S, H1], FP16/BF16 output tensor in SBUF.
+        output_quant (Optional[nl.NkiTensor]): [H0, H/512, B*S], FP8x4 quantized output tensor in HBM or SBUF,
             or [B*S, H + H/4] FP8 quantized output tensor in HBM (packed layout).
-            The packed layout represents concatenated quantized hidden states [B*S, H] and MX scales [B*S, H/4].
-        output_scale (Optional[nl.ndarray]): [H0, H/512, B*S], MX scale output tensor in SBUF.
-            Expected to be None when packed [B*S, H + H/4] output_quant is provided in HBM.
-        residual (Optional[nl.ndarray]): [B, S, H], Optional residual tensor for fused add on HBM.
-        output_residual (Optional[nl.ndarray]): [B*S, H], Optional output for residual add result on HBM.
+            When None, quantization is skipped entirely (bf16-only output mode).
+        output_scale (Optional[nl.NkiTensor]): [H0, H/512, B*S], MX scale output tensor in SBUF.
+            Expected to be None when output_quant is None or when packed layout is used.
+        residual (Optional[nl.NkiTensor]): [B, S, H], Optional residual tensor for fused add on HBM.
+        output_residual (Optional[nl.NkiTensor]): [B*S, H], Optional output for residual add result on HBM.
         eps (float): Epsilon for numerical stability. Default is 1e-6.
         hidden_actual (Optional[int]): Actual hidden dimension for padded inputs. Default is None (uses H).
         hidden_dim_tp (bool): If True, H dimension view is (H/128, 128). Default is True.
-        gate_up_in_scale (Optional[nl.ndarray]): [E_L, 1], Per-tensor FP8 dequant scale for STATIC_MX.
-            When provided, uses software static_quantization instead of hardware nisa.quantize_mx.
-            Produces dummy MX scales (127 = 1.0) and FP8 quantized output.
-        output_input_dequant_scale (Optional[nl.ndarray]): [pmax, 1], Pre-allocated SBUF buffer for
+        gate_up_in_scale (Optional[nl.NkiTensor]): [E_L, 1], Per-tensor FP8 dequant scale for STATIC_MX.
+            When provided (with output_quant != None), uses software static_quantization instead of
+            hardware nisa.quantize_mx. Produces dummy MX scales (127 = 1.0) and FP8 quantized output.
+        output_input_dequant_scale (Optional[nl.NkiTensor]): [pmax, 1], Pre-allocated SBUF buffer for
             the broadcast input dequant scale. Required when gate_up_in_scale is provided.
         is_row_quant (bool): If True, uses per-token row_quantization instead of static_quantization.
             Produces per-token dequant scales and dummy MX scales (127 = 1.0). Default is False.
-        output_row_dequant_scale (Optional[nl.ndarray]): [pmax, B*S, 1], Pre-allocated SBUF buffer for
+        is_static_mx (bool): If True, indicates STATIC_MX quantization mode. When True with
+            gate_up_in_scale provided, uses software static_quantization. Default is False.
+        output_row_dequant_scale (Optional[nl.NkiTensor]): [pmax, B*S, 1], Pre-allocated SBUF buffer for
             per-token dequant scales. Required when is_row_quant is True. Populated with per-token
             scales from row_quantization, with LNC sendrecv exchange across cores.
 
     Returns:
-        Tuple of:
-            (output, output_quant) when output_scale and residual are not provided.
-            (output, output_quant, output_scale) when output_scale is provided but residual is not.
-            (output, output_quant, output_scale, output_residual) when output_scale and residual are provided.
+        None. Results are written to pre-allocated output tensors:
+            - output: always populated with bf16 RMSNorm result
+            - output_quant/output_scale: populated when output_quant is not None
+            - output_residual: populated when residual is provided
 
     Notes:
         - Requires LNC=2 sharding configuration
         - Output tensors must be pre-allocated
+        - When output_quant=None, only bf16 output and optional residual are produced
         - When output_scale is not provided (packed layout), QMX output and scales are transposed
           from [H0, num_H512_tiles, shard_size] to [pmax, n_tiles, H] and [pmax, n_tiles, H/4] and concatenated
           into output_quant [B*S, H + H/4] in HBM.
@@ -100,11 +109,13 @@ def rmsnorm_mx_quantize_tkg(
         normalized = (hidden * gamma) / rms
         output = normalized
 
-        # Quantization (one of three modes):
-        if is_row_quant:
+        # Quantization (skipped when output_quant=None):
+        if output_quant is None:
+            pass  # bf16-only mode
+        elif is_row_quant:
             output_quant = row_quantize(output)       # per-token FP8 + dequant scales
         elif is_static_mx:
-            output_quant = static_quantize(output)     # per-tensor FP8 + dummy MX scales
+            output_quant = static_quantize(output)    # per-tensor FP8 + dummy MX scales
         else:
             output_quant, output_scale = quantize_mx(output)  # hardware MX quantization
 
@@ -117,9 +128,9 @@ def rmsnorm_mx_quantize_tkg(
         input_shape=input.shape,
         gamma_shape=gamma.shape,
         output_shape=output.shape,
-        output_quant_dtype=output_quant.dtype,
-        output_quant_shape=output_quant.shape,
-        output_quant_buffer=output_quant.buffer,
+        output_quant_dtype=output_quant.dtype if output_quant != None else None,
+        output_quant_shape=output_quant.shape if output_quant != None else None,
+        output_quant_buffer=output_quant.buffer if output_quant != None else None,
         output_scale_shape=output_scale.shape if output_scale != None else None,
         output_scale_buffer=output_scale.buffer if output_scale != None else None,
         output_dtype=output.dtype,
@@ -130,7 +141,7 @@ def rmsnorm_mx_quantize_tkg(
         residual_shape=residual.shape if residual != None else None,
         has_output_residual=output_residual != None,
         output_residual_shape=output_residual.shape if output_residual != None else None,
-        has_gate_up_in_scale=gate_up_in_scale != None,
+        is_static_mx=is_static_mx,
         has_output_input_dequant_scale=output_input_dequant_scale != None,
     )
 
@@ -145,7 +156,10 @@ def rmsnorm_mx_quantize_tkg(
     reduction_const_matrix = nl.ndarray((dims.H0, dims.H0), dtype=dims.inter_dtype, buffer=nl.sbuf)
     eps_loaded = nl.ndarray((dims.H0, 1), dtype=dims.inter_dtype, buffer=nl.sbuf)
 
-    if cfg.is_output_quant_in_sbuf:
+    if output_quant == None:
+        output_quant_sb = None
+        output_scale_sb = None
+    elif cfg.is_output_quant_in_sbuf:
         output_quant_sb = output_quant
         output_scale_sb = output_scale
     else:
@@ -155,27 +169,29 @@ def rmsnorm_mx_quantize_tkg(
         output_scale_sb = nl.ndarray(
             (dims.H0, dims.num_H512_tiles, cfg.shard_size), dtype=_MX_SCALE_DTYPE, buffer=nl.sbuf
         )
+        # nisa.quantize_mx writes only 4 of 32 scale partitions per quadrant; zero-init so the
+        # unwritten padding reads as 0 (matching the golden reference) rather than an uninitialized value.
+        nisa.memset(output_scale_sb, value=0)
 
     nisa.memset(zero_bias, value=0.0)
     nisa.memset(reduction_const_matrix, value=1.0)
     nisa.memset(eps_loaded, value=cfg.eps)
 
     # Load gamma with transpose: (1, H) -> (H) -> (H1, H0) -> (H0, H1)
-    gamma_hbm = TensorView(gamma).flatten_dims(start_dim=0, end_dim=1)
+    gamma_hbm = gamma.flatten_dims(start_dim=0, end_dim=1)
     gamma_hbm_view = gamma_hbm.reshape_dim(dim=0, shape=[dims.H1, dims.H0]).expand_dim(dim=1).expand_dim(dim=1)
-    gamma_sb_view = TensorView(gamma_sb).expand_dim(dim=1).expand_dim(dim=1)
-    nisa.dma_transpose(dst=gamma_sb_view.get_view(), src=gamma_hbm_view.get_view())
+    gamma_sb_view = gamma_sb.expand_dim(dim=1).expand_dim(dim=1)
+    nisa.dma_transpose(dst=gamma_sb_view, src=gamma_hbm_view)
 
-    # STATIC_MX: load and broadcast input dequant scale once before tile loop
-    if cfg.is_static_mx:
+    # STATIC_MX pre-quantization for E_L=1 case (currently not used): Load and broadcast input dequant scale once before tile loop.
+    # When gate_up_in_scale=None for STATIC_MX, quantization is skipped (handled per-expert downstream in expert MLP loop).
+    if cfg.is_static_mx and gate_up_in_scale != None:
         nisa.dma_copy(dst=output_input_dequant_scale[:1, :], src=gate_up_in_scale[0:1, :])
         stream_shuffle_broadcast(src=output_input_dequant_scale, dst=output_input_dequant_scale)
 
-    # Reshape HBM views for loading with TensorView
-    residual_hbm_view = (
-        TensorView(residual.reshape((dims.B * dims.S * dims.H1, dims.H0))) if cfg.is_residual_add else None
-    )
-    input_hbm_view = TensorView(input.reshape((dims.B * dims.S * dims.H1, dims.H0)))
+    # Reshape HBM views for loading with NkiTensor
+    residual_hbm_view = residual.reshape((dims.B * dims.S * dims.H1, dims.H0)) if cfg.is_residual_add else None
+    input_hbm_view = input.reshape((dims.B * dims.S * dims.H1, dims.H0))
 
     # Step 3: Process tiles - Residual Add + RMSNorm + MX Quantization
     for bxs_tile_idx in range(cfg.num_BxS_tiles):
@@ -218,23 +234,26 @@ def rmsnorm_mx_quantize_tkg(
             output_tile_BxS_slice=tile_BxS_slice_with_offset,
         )
 
-        # Step 3.4: Swizzle and MX quantize
-        _swizzle_quantize_mx(
-            dims=dims,
-            cfg=cfg,
-            output=output,
-            output_tile_swizzled=output_tile_swizzled,
-            output_quant=output_quant,
-            output_quant_sb=output_quant_sb,
-            output_scale=output_scale,
-            output_scale_sb=output_scale_sb,
-            output_input_dequant_scale=output_input_dequant_scale,
-            output_tile_BxS_slice=tile_BxS_slice_with_offset,
-            quant_tile_BxS_slice=tile_BxS_slice_with_offset if cfg.is_output_quant_in_sbuf else tile_BxS_slice_local,
-            is_row_quant=is_row_quant,
-            output_row_dequant_scale=output_row_dequant_scale,
-            tile_BxS_offset=tile_BxS_offset,
-        )
+        # Step 3.4: Swizzle and MX quantize (skipped when output_quant=None for STATIC_MX bf16-only output)
+        if output_quant != None:
+            _swizzle_quantize_mx(
+                dims=dims,
+                cfg=cfg,
+                output=output,
+                output_tile_swizzled=output_tile_swizzled,
+                output_quant=output_quant,
+                output_quant_sb=output_quant_sb,
+                output_scale=output_scale,
+                output_scale_sb=output_scale_sb,
+                output_input_dequant_scale=output_input_dequant_scale,
+                output_tile_BxS_slice=tile_BxS_slice_with_offset,
+                quant_tile_BxS_slice=tile_BxS_slice_with_offset
+                if cfg.is_output_quant_in_sbuf
+                else tile_BxS_slice_local,
+                is_row_quant=is_row_quant,
+                output_row_dequant_scale=output_row_dequant_scale,
+                tile_BxS_offset=tile_BxS_offset,
+            )
 
     # Step 4: Gather unquantized output across LNC cores
     # Skip when downstream router_topk also shards on BxS — each NC only needs its own shard.
@@ -250,8 +269,8 @@ def rmsnorm_mx_quantize_tkg(
         )
 
     # Step 5: Gather output_quant and output_scale across NCs
-    # When output is in SBUF, gather with sendrecv
-    if cfg.is_output_quant_in_sbuf and cfg.do_shard:
+    # When output is in SBUF, gather with sendrecv (skip when output_quant=None)
+    if output_quant != None and cfg.is_output_quant_in_sbuf and cfg.do_shard:
         send_to_rank = recv_from_rank = 1 - cfg.shard_id
         nisa.sendrecv(
             send_to_rank=send_to_rank,
@@ -283,7 +302,7 @@ def rmsnorm_mx_quantize_tkg(
             )
 
     # When output is packed in HBM, transpose and concatenate [quant | scales] -> [B*S, H + H/4] for A2A-v
-    elif cfg.is_output_quant_packed:
+    elif output_quant != None and cfg.is_output_quant_packed:
         n_BxS_tiles = div_ceil(cfg.shard_size, dims.pmax)
         H_packed = dims.num_H512_tiles * dims.H0
 
@@ -293,7 +312,7 @@ def rmsnorm_mx_quantize_tkg(
         _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_quant_sb, dst_sb=output_quant_transposed_sb)
 
         # Reinterpret f32 -> f8 (unpacks x4 to individual f8 elements), then spill quant data to [B*S, 0:H]
-        output_quant_transposed_view = TensorView(output_quant_transposed_sb).reinterpret_cast(cfg.output_quant_dtype)
+        output_quant_transposed_view = output_quant_transposed_sb.view(cfg.output_quant_dtype)
         _spill_tiled_sb_to_hbm(
             src_sb=output_quant_transposed_view,
             dst_hbm=output_quant,
@@ -311,7 +330,7 @@ def rmsnorm_mx_quantize_tkg(
         _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_scale_sb, dst_sb=output_scale_transposed_sb)
 
         # Reinterpret f8 -> f8 used by packed output_quant, then spill scales to [B*S, H:H+H/4]
-        output_scale_transposed_sb = TensorView(output_scale_transposed_sb).reinterpret_cast(cfg.output_quant_dtype)
+        output_scale_transposed_sb = output_scale_transposed_sb.view(cfg.output_quant_dtype)
         _spill_tiled_sb_to_hbm(
             src_sb=output_scale_transposed_sb,
             dst_hbm=output_quant,
@@ -322,7 +341,7 @@ def rmsnorm_mx_quantize_tkg(
         )
 
     # When output is untransposed in HBM, gather output_quant and output_scale separately in HBM
-    else:
+    elif output_quant != None:
         nisa.dma_copy(
             src=output_quant_sb[0 : dims.H0, 0 : dims.num_H512_tiles, 0 : cfg.shard_size],
             dst=output_quant[0 : dims.H0, 0 : dims.num_H512_tiles, nl.ds(cfg.BxS_offset, cfg.shard_size)],
@@ -370,7 +389,7 @@ def _load_hidden_compute_residual(
         .expand_dim(dim=1)
         .expand_dim(dim=1)
     )
-    input_dst_view = TensorView(input_tile_sb).flatten_dims(start_dim=1, end_dim=2).expand_dim(dim=1).expand_dim(dim=1)
+    input_dst_view = input_tile_sb.flatten_dims(start_dim=1, end_dim=2).expand_dim(dim=1).expand_dim(dim=1)
 
     if cfg.is_residual_add:
         residual_src_view = (
@@ -379,16 +398,15 @@ def _load_hidden_compute_residual(
             .expand_dim(dim=1)
         )
         residual_dst_view = (
-            TensorView(residual_sb)
-            .slice(dim=1, start=tile_BxS_start_idx, end=tile_BxS_start_idx + cfg.BxS_tile_size)
+            residual_sb.slice(dim=1, start=tile_BxS_start_idx, end=tile_BxS_start_idx + cfg.BxS_tile_size)
             .flatten_dims(start_dim=1, end_dim=2)
             .expand_dim(dim=1)
             .expand_dim(dim=1)
         )
 
         # Transpose load residual and input
-        nisa.dma_transpose(dst=residual_dst_view.get_view(), src=residual_src_view.get_view())
-        nisa.dma_transpose(dst=input_dst_view.get_view(), src=input_src_view.get_view())
+        nisa.dma_transpose(dst=residual_dst_view, src=residual_src_view)
+        nisa.dma_transpose(dst=input_dst_view, src=input_src_view)
 
         # Residual add: hidden = input + residual
         nisa.tensor_tensor(
@@ -400,7 +418,7 @@ def _load_hidden_compute_residual(
         hidden_sb = residual_sb[:, residual_tile_BxS_slice, :]
     else:
         # Transpose load input
-        nisa.dma_transpose(dst=input_dst_view.get_view(), src=input_src_view.get_view())
+        nisa.dma_transpose(dst=input_dst_view, src=input_src_view)
         hidden_sb = input_tile_sb
 
     return hidden_sb
@@ -430,8 +448,8 @@ def _compute_rmsnorm(
     nisa.activation(dst=square, op=nl.square, data=hidden_sb, bias=zero_bias)
 
     # Input * gamma (broadcast gamma across BxS_tile_size)
-    gamma_sb_view = TensorView(gamma_sb).expand_dim(dim=1).broadcast(dim=1, size=cfg.BxS_tile_size)
-    nisa.tensor_tensor(input_tile_sb, hidden_sb, gamma_sb_view.get_view(), nl.multiply)
+    gamma_sb_view = gamma_sb.expand_dim(dim=1).broadcast(dim=1, size=cfg.BxS_tile_size)
+    nisa.tensor_tensor(input_tile_sb, hidden_sb, gamma_sb_view, nl.multiply)
 
     # Reduce squared input along H1 dimension (last free dimension)
     nisa.tensor_reduce(dst=reduced, op=nl.add, data=square, axis=2)
@@ -443,8 +461,8 @@ def _compute_rmsnorm(
     nisa.activation(dst=sqrt, op=nl.rsqrt, data=final_reduced, scale=(1.0 / dims.hidden_actual), bias=eps_loaded)
 
     # Compute input * 1/RMS(input)
-    sqrt_view = TensorView(sqrt).expand_dim(dim=2).broadcast(dim=2, size=dims.H1)
-    nisa.tensor_tensor(output[:, output_tile_BxS_slice, :], input_tile_sb, sqrt_view.get_view(), nl.multiply)
+    sqrt_view = sqrt.expand_dim(dim=2).broadcast(dim=2, size=dims.H1)
+    nisa.tensor_tensor(output[:, output_tile_BxS_slice, :], input_tile_sb, sqrt_view, nl.multiply)
 
 
 def _swizzle_quantize_mx(
@@ -621,7 +639,6 @@ def _transpose_residual(dims, cfg, residual_sb):
     residual_transposed_sb = nl.ndarray((dims.pmax, num_pmax_token_tiles, dims.H), dtype=residual_dtype, buffer=nl.sbuf)
     for pmax_token_tile_idx in nl.affine_range(num_pmax_token_tiles):
         tile_tokens_actual = min(dims.pmax, cfg.shard_size - pmax_token_tile_idx * dims.pmax)
-        residual_sb_ap = [[cfg.shard_size * dims.H1, dims.H0], [dims.H1, tile_tokens_actual]]
         for transpose_tile_idx in nl.affine_range(num_transpose_tiles):
             residual_transposed_tile_psum = nl.ndarray(
                 (dims.pmax, transpose_tile_H), dtype=residual_dtype, buffer=nl.psum
@@ -630,7 +647,11 @@ def _transpose_residual(dims, cfg, residual_sb):
                 H1_idx = transpose_tile_idx * num_H1_per_transpose_tile + h1_in_tile_idx
                 nisa.nc_transpose(
                     dst=residual_transposed_tile_psum[0:tile_tokens_actual, nl.ds(h1_in_tile_idx * dims.H0, dims.H0)],
-                    data=residual_sb.ap(residual_sb_ap, offset=pmax_token_tile_idx * dims.pmax * dims.H1 + H1_idx),
+                    data=residual_sb[
+                        :,
+                        pmax_token_tile_idx * dims.pmax : pmax_token_tile_idx * dims.pmax + tile_tokens_actual,
+                        H1_idx,
+                    ],
                 )
             nisa.tensor_copy(
                 dst=residual_transposed_sb[
@@ -649,8 +670,8 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
     """DMA spill from tiled SBUF [pmax, n_tiles, total_free] to a region of HBM [..., dst_total_free].
 
     Args:
-        src_sb: Source SBUF tensor or TensorView of shape [pmax, n_tiles, total_free].
-        dst_hbm: Destination HBM tensor or TensorView.
+        src_sb: Source SBUF tensor or NkiTensor of shape [pmax, n_tiles, total_free].
+        dst_hbm: Destination HBM tensor or NkiTensor.
         shard_size: Total number of token rows to spill.
         BxS_offset: Row offset in dst_hbm.
         total_free: Number of elements in the free dimension per tile.
@@ -659,8 +680,8 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
     pmax = nl.tile_size.pmax
     num_full_tiles = shard_size // pmax
     remainder = shard_size % pmax
-    src_view = src_sb if isinstance(src_sb, TensorView) else TensorView(src_sb)
-    dst_view = dst_hbm if isinstance(dst_hbm, TensorView) else TensorView(dst_hbm)
+    src_view = src_sb
+    dst_view = dst_hbm
     dst_total_free = dst_view.shape[-1]
 
     if remainder == 0 and num_full_tiles > 1:
@@ -674,8 +695,8 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
             .permute((1, 0, 2))
         )
         nisa.dma_copy(
-            src=src_3d.get_view(),
-            dst=dst_tile.get_view(),
+            src=src_3d,
+            dst=dst_tile,
         )
     elif remainder == 0:
         # Single full tile
@@ -684,8 +705,8 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
             dim=1, start=dst_free_offset, end=dst_free_offset + total_free
         )
         nisa.dma_copy(
-            src=src_tile.get_view(),
-            dst=dst_tile.get_view(),
+            src=src_tile,
+            dst=dst_tile,
         )
     else:
         # Has partial last tile
@@ -700,8 +721,8 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
                 .permute((1, 0, 2))
             )
             nisa.dma_copy(
-                src=src_3d.get_view(),
-                dst=dst_tile.get_view(),
+                src=src_3d,
+                dst=dst_tile,
             )
         elif num_full_tiles == 1:
             # Single full tile
@@ -710,8 +731,8 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
                 dim=1, start=dst_free_offset, end=dst_free_offset + total_free
             )
             nisa.dma_copy(
-                src=src_tile.get_view(),
-                dst=dst_tile.get_view(),
+                src=src_tile,
+                dst=dst_tile,
             )
         # Single DMA for partial last tile
         partial_offset = num_full_tiles * pmax
@@ -720,6 +741,6 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
             dim=0, start=BxS_offset + partial_offset, end=BxS_offset + partial_offset + remainder
         ).slice(dim=1, start=dst_free_offset, end=dst_free_offset + total_free)
         nisa.dma_copy(
-            src=src_partial.get_view(),
-            dst=dst_partial.get_view(),
+            src=src_partial,
+            dst=dst_partial,
         )

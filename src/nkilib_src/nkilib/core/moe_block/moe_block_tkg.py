@@ -247,7 +247,14 @@ def moe_block_tkg(
     E_L = expert_gate_up_weights.shape[0]
     I = expert_gate_up_weights.shape[-1]
     tile_T = _get_tile_size(
-        dims.T, dims.H, E_L, I, quant_config.is_moe_weight_mx, inp.dtype, expert_gate_up_weights.dtype
+        dims.T,
+        dims.H,
+        E_L,
+        I,
+        quant_config.is_moe_weight_mx,
+        inp.dtype,
+        expert_gate_up_weights.dtype,
+        is_all_expert_static_mx=quant_config.is_static_quant and expert_config.is_all_expert,
     )
     needs_tiling = tile_T < dims.T
 
@@ -300,16 +307,18 @@ def moe_block_tkg(
     num_H512_tiles = dims.H // (_pmax * _q_width)
 
     # Pre-allocate full-T HBM tensors
+    is_tiled_static_mx = quant_config.is_static_quant
     rmsnorm_quant_hbm = nl.ndarray((_pmax, num_H512_tiles, total_T), dtype=nl.float8_e4m3fn_x4, buffer=nl.shared_hbm)
     rmsnorm_scale_hbm = nl.ndarray((_pmax, num_H512_tiles, total_T), dtype=nl.uint8, buffer=nl.shared_hbm)
+    rmsnorm_bf16_hbm = (
+        nl.ndarray((total_T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm) if is_tiled_static_mx else None
+    )
     affinities_dtype = nl.float16 if is_dynamic else nl.float32
     expert_affinities_hbm = nl.ndarray((total_T, dims.E), dtype=affinities_dtype, buffer=nl.shared_hbm)
     expert_index_hbm = nl.ndarray((total_T, dims.K), dtype=nl.uint32, buffer=nl.shared_hbm)
 
     kernel_assert(not quant_config.is_row_quant, "row_quant is not supported with T-tiling")
     input_dequant_scale_sb = None
-    if quant_config.is_static_quant:
-        input_dequant_scale_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
 
     # Pre-allocate tile input buffer and reshape input
     inp_2d = inp.reshape((total_T, 1, dims.H))
@@ -338,33 +347,65 @@ def moe_block_tkg(
             expert_gate_up_input_scale=expert_gate_up_input_scale,
         )[0]
 
-        # RMSNorm + MX quantize per tile (SBUF)
+        # RMSNorm per tile (SBUF)
         rmsnorm_out = nl.ndarray((_pmax, cur_tile_T, tile_dims.H_free), dtype=inp.dtype, buffer=nl.sbuf)
-        quant_shape = (_pmax, num_H512_tiles, cur_tile_T)
-        rmsnorm_out_quant = nl.ndarray(quant_shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-        rmsnorm_out_scale = nl.ndarray(quant_shape, dtype=nl.uint8, buffer=nl.sbuf)
 
-        _rmsnorm_mx_quantize_tkg(
-            input=inp_tile_buf,
-            gamma=gamma,
-            output=rmsnorm_out,
-            output_quant=rmsnorm_out_quant,
-            output_scale=rmsnorm_out_scale,
-            residual=None,
-            output_residual=None,
-            eps=eps,
-            hidden_actual=tile_dims.hidden_actual,
-            hidden_dim_tp=True,
-            gate_up_in_scale=expert_gate_up_input_scale if quant_config.is_static_quant else None,
-            output_input_dequant_scale=input_dequant_scale_sb,
-            is_row_quant=quant_config.is_row_quant,
-            output_row_dequant_scale=input_dequant_scale_sb if quant_config.is_row_quant else None,
-            skip_output_gather=True,
-        )
+        if is_tiled_static_mx:
+            _rmsnorm_mx_quantize_tkg(
+                input=inp_tile_buf,
+                gamma=gamma,
+                output=rmsnorm_out,
+                output_quant=None,
+                output_scale=None,
+                residual=None,
+                output_residual=None,
+                eps=eps,
+                hidden_actual=tile_dims.hidden_actual,
+                hidden_dim_tp=True,
+                gate_up_in_scale=None,
+                output_input_dequant_scale=None,
+                is_row_quant=False,
+                is_static_mx=True,
+                output_row_dequant_scale=None,
+                skip_output_gather=False,
+            )
+            # Spill bf16 RMSNorm output [H0=pmax, cur_tile_T, H_free] to HBM [T, H]
+            # This matches the access pattern the all-expert static-MX kernel uses
+            # to read the input back (partition p at H-stride 1).
+            nisa.dma_copy(
+                dst=rmsnorm_bf16_hbm.ap(
+                    pattern=[[1, _pmax], [dims.H, cur_tile_T], [_pmax, tile_dims.H_free]],
+                    offset=t_start * dims.H,
+                ),
+                src=rmsnorm_out,
+            )
+        else:
+            # fused RMSNorm + quantize, spill fp8_x4 to HBM
+            quant_shape = (_pmax, num_H512_tiles, cur_tile_T)
+            rmsnorm_out_quant = nl.ndarray(quant_shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+            rmsnorm_out_scale = nl.ndarray(quant_shape, dtype=nl.uint8, buffer=nl.sbuf)
 
-        # Spill quantized output + scales to HBM at correct T offset
-        nisa.dma_copy(dst=rmsnorm_quant_hbm[:, :, nl.ds(t_start, cur_tile_T)], src=rmsnorm_out_quant)
-        nisa.dma_copy(dst=rmsnorm_scale_hbm[:, :, nl.ds(t_start, cur_tile_T)], src=rmsnorm_out_scale)
+            _rmsnorm_mx_quantize_tkg(
+                input=inp_tile_buf,
+                gamma=gamma,
+                output=rmsnorm_out,
+                output_quant=rmsnorm_out_quant,
+                output_scale=rmsnorm_out_scale,
+                residual=None,
+                output_residual=None,
+                eps=eps,
+                hidden_actual=tile_dims.hidden_actual,
+                hidden_dim_tp=True,
+                gate_up_in_scale=None,
+                output_input_dequant_scale=input_dequant_scale_sb,
+                is_row_quant=quant_config.is_row_quant,
+                output_row_dequant_scale=input_dequant_scale_sb if quant_config.is_row_quant else None,
+                skip_output_gather=True,
+            )
+
+            # Spill quantized output + scales to HBM at correct T offset
+            nisa.dma_copy(dst=rmsnorm_quant_hbm[:, :, nl.ds(t_start, cur_tile_T)], src=rmsnorm_out_quant)
+            nisa.dma_copy(dst=rmsnorm_scale_hbm[:, :, nl.ds(t_start, cur_tile_T)], src=rmsnorm_out_scale)
 
         # Router per tile
         router_in = rmsnorm_out
@@ -397,9 +438,11 @@ def moe_block_tkg(
             skip_store_router_logits=True,
         )
 
-    # Expert MLPs with full T — pre-quantized HBM data accessed per-tile by all_expert_mx_impl
+    # Expert MLPs with full T
+    expert_mlp_input = rmsnorm_bf16_hbm if is_tiled_static_mx else rmsnorm_quant_hbm
+    expert_mlp_input_scale = None if is_tiled_static_mx else rmsnorm_scale_hbm
     result = _moe_tkg(
-        hidden_input=rmsnorm_quant_hbm,
+        hidden_input=expert_mlp_input,
         expert_gate_up_weights=expert_gate_up_weights,
         expert_down_weights=expert_down_weights,
         expert_affinities=expert_affinities_hbm,
@@ -410,10 +453,10 @@ def moe_block_tkg(
         expert_down_bias=expert_down_bias,
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
-        hidden_input_scale=rmsnorm_scale_hbm,
+        hidden_input_scale=expert_mlp_input_scale,
         expert_gate_up_input_scale=expert_gate_up_input_scale,
         expert_down_input_scale=expert_down_input_scale,
-        input_dequant_scale=input_dequant_scale_sb,
+        input_dequant_scale=None if is_tiled_static_mx else input_dequant_scale_sb,
         mask_unselected_experts=router_pre_norm and not norm_topk_prob,
         expert_affinities_scaling_mode=expert_affinities_scaling_mode,
         activation_fn=hidden_act_fn,
@@ -477,8 +520,8 @@ def _moe_block_tkg_no_t_tiling(
     residual_out = None
 
     input_dequant_scale_sb = None  # STATIC_MX: [_pmax, 1], ROW_MX: [_pmax, T, 1]
-    if is_mxfp_all_expert and not is_dynamic:
-        # MXFP all-expert mode (non-dynamic): use fused RMSNorm + MX/static quantization
+    if is_mxfp_all_expert and not is_dynamic and not quant_config.is_static_quant:
+        # MXFP all-expert mode (non-dynamic and non-STATIC_MX): use fused RMSNorm + MX/static quantization
         num_H512_tiles = dims.H // (_pmax * _q_width)
         quant_shape = (_pmax, num_H512_tiles, dims.T)
         rmsnorm_out_quant = nl.ndarray(quant_shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
@@ -486,9 +529,7 @@ def _moe_block_tkg_no_t_tiling(
         residual_out = nl.ndarray((dims.T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm) if residual != None else None
 
         # Allocate SBUF buffer for input dequant scale
-        if quant_config.is_static_quant:
-            input_dequant_scale_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        elif quant_config.is_row_quant:
+        if quant_config.is_row_quant:
             input_dequant_scale_sb = nl.ndarray((_pmax, dims.T, 1), dtype=nl.float32, buffer=nl.sbuf)
 
         # Skip unquantized output gather when router_topk shards on tokens — each NC only
@@ -505,11 +546,34 @@ def _moe_block_tkg_no_t_tiling(
             eps=eps,
             hidden_actual=dims.hidden_actual,
             hidden_dim_tp=True,
-            gate_up_in_scale=expert_gate_up_input_scale if quant_config.is_static_quant else None,
+            gate_up_in_scale=None,
             output_input_dequant_scale=input_dequant_scale_sb,
             is_row_quant=quant_config.is_row_quant,
             output_row_dequant_scale=input_dequant_scale_sb if quant_config.is_row_quant else None,
             skip_output_gather=True,
+        )
+    elif is_mxfp_all_expert and not is_dynamic and quant_config.is_static_quant:
+        # STATIC_MX all-expert: RMSNorm + optional residual only, skip pre-quantization.
+        # Per-expert quantization happens inside the expert loop (_all_expert_mx_static_quant).
+        # TODO: For E_L=1, can optimize by pre-quantizing here (fused RMSNorm+quantize)
+        residual_out = nl.ndarray((dims.T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm) if residual != None else None
+        _rmsnorm_mx_quantize_tkg(
+            input=inp,
+            gamma=gamma,
+            output=rmsnorm_out,
+            output_quant=None,
+            output_scale=None,
+            residual=residual,
+            output_residual=residual_out,
+            eps=eps,
+            hidden_actual=dims.hidden_actual,
+            hidden_dim_tp=True,
+            gate_up_in_scale=None,
+            output_input_dequant_scale=None,
+            is_row_quant=False,
+            is_static_mx=True,
+            output_row_dequant_scale=None,
+            skip_output_gather=False,
         )
     elif is_mxfp_all_expert and is_dynamic:
         # MXFP all-expert dynamic mode: use DLoC RMSNorm that produces both
@@ -622,14 +686,19 @@ def _moe_block_tkg_no_t_tiling(
         pass
 
     # Step 4: compute expert MLPs
-    expert_mlp_in_scale = rmsnorm_out_scale if (is_mxfp_all_expert and not is_dynamic) else None
+    expert_mlp_in_scale = (
+        rmsnorm_out_scale if (is_mxfp_all_expert and not is_dynamic and not quant_config.is_static_quant) else None
+    )
     # Determine if we're using shard_on_T for selective expert
     selective_expert_shard_on_T = not expert_config.is_all_expert and dims.T > 1
     if is_mxfp_all_expert and is_dynamic:
         # Dynamic all-expert: use unquantized HBM tensor; _moe_tkg handles quantization internally
         expert_mlp_in = rmsnorm_out_hbm
+    elif is_mxfp_all_expert and quant_config.is_static_quant:
+        # STATIC_MX all-expert: pass bf16 for per-expert quantization in the expert loop
+        expert_mlp_in = rmsnorm_out
     elif is_mxfp_all_expert:
-        # Both regular MX and STATIC_MX: use pre-quantized SBUF output from fused rmsnorm
+        # Regular MX all-expert: use pre-quantized SBUF output from fused rmsnorm
         expert_mlp_in = rmsnorm_out_quant
     elif quant_config.is_moe_weight_mx or selective_expert_shard_on_T:
         # MXFP selective-expert or shard_on_T mode: use full rmsnorm output

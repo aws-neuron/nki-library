@@ -45,7 +45,7 @@ def mxfp_load_performance_wrapper(tensor: nl.ndarray):
     Returns:
         out_data_hbm (nl.ndarray): [P_MAX, M * K // 512] float8_e4m3fn_x4 in HBM.
             Quantized MXFP8 data with K blocks concatenated along free dimension.
-        out_scale_hbm (nl.ndarray): [P_MAX, M * K // 512] uint8 in HBM.
+        out_scale_hbm (nl.ndarray): [P_MAX, M * K // 512] float8_e8m0fnu in HBM.
             MX scales with 16 active rows at partition offsets [0, 32, 64, 96].
 
     Notes:
@@ -66,12 +66,15 @@ def mxfp_load_performance_wrapper(tensor: nl.ndarray):
     out_free_dim = M * k_block_count
 
     mx_data_sbuf = nl.ndarray((P_MAX, out_free_dim), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-    mx_scale_sbuf = nl.ndarray((P_MAX, out_free_dim), dtype=nl.uint8, buffer=nl.sbuf)
+    mx_scale_sbuf = nl.ndarray((P_MAX, out_free_dim), dtype=nl.float8_e8m0fnu, buffer=nl.sbuf)
+
+    # Memset to avoid uninitialized reads
+    nki.isa.memset(mx_scale_sbuf, 0)
 
     load_and_quantize_mxfp_mk(tensor, mx_data_sbuf, mx_scale_sbuf)
 
     out_data_hbm = nl.ndarray(shape=mx_data_sbuf.shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.shared_hbm)
-    out_scale_hbm = nl.ndarray(shape=mx_scale_sbuf.shape, dtype=nl.uint8, buffer=nl.shared_hbm)
+    out_scale_hbm = nl.ndarray(shape=mx_scale_sbuf.shape, dtype=nl.float8_e8m0fnu, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=out_data_hbm, src=mx_data_sbuf)
     nisa.dma_copy(dst=out_scale_hbm, src=mx_scale_sbuf)
 
@@ -93,7 +96,7 @@ def load_and_quantize_mxfp_mk(
         tensor (nl.ndarray): [M, K] bfloat16 in HBM. Input tensor.
         mx_data_sbuf (nl.ndarray): [P_MAX, M * K // 512] float8_e4m3fn_x4 in SBUF.
             Pre-allocated output for quantized data.
-        mx_scales_sbuf (nl.ndarray): [P_MAX, M * K // 512] uint8 in SBUF.
+        mx_scales_sbuf (nl.ndarray): [P_MAX, M * K // 512] float8_e8m0fnu in SBUF.
             Pre-allocated output for MX scales.
 
     Notes:

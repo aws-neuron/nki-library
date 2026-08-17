@@ -234,6 +234,17 @@ def generate_moe_expert_mlp_shapes(config_path: str, TP=1, moe_block_sizes=None)
     a SwiGLU MLP on a subset of tokens (block size). TP shards expert
     weights regardless of expert parallelism.
 
+    Parallelism assumption:
+        This function hardcodes Megatron-style column-row TP parallelism:
+        - Gate+Up projection: column-parallel (TP shards output/N dim)
+        - Down projection: row-parallel (TP shards input/K dim)
+        LNC2 sharding is assumed blockwise (each core gets a different block),
+        so block size B is not affected by LNC2.
+
+    TODO: Add a parallelism_config parameter to support alternative sharding
+    strategies (e.g., double column-parallel, all-blockwise) instead of
+    hardcoding column-row.
+
     Args:
         config_path (str): Path to model configuration JSON file.
         TP (int): Tensor parallelism degree.
@@ -248,27 +259,35 @@ def generate_moe_expert_mlp_shapes(config_path: str, TP=1, moe_block_sizes=None)
     cfg = TorchTitanModelConfig.from_json(config_path)
 
     H = cfg["dim"]
-    expert_ffn = cfg["moe_inter_dim"]
+    moe_inter_dim = cfg["moe_inter_dim"]
 
     all_shapes = []
     for moe_block_size in moe_block_sizes:
-        gate_up_out = 2 * expert_ffn // TP
-        down_in = expert_ffn // TP
+        # Column-row parallelism: gate+up shards N, down shards K
+        gate_up_out = 2 * moe_inter_dim // TP  # column-parallel: full fused output per rank
+        down_in = moe_inter_dim // TP  # row-parallel: per-rank slice of FFN input
 
-        # FWD GateUp: [cap, H] @ [H, gate_up_out]
-        all_shapes.append([f"FWD-MoE-GateUp(cap={moe_block_size})", moe_block_size, H, gate_up_out])
-        # FWD Down: [cap, down_in] @ [down_in, H]
-        all_shapes.append([f"FWD-MoE-Down(cap={moe_block_size})", moe_block_size, down_in, H])
-        # BWD GateUp IPGrad: [cap, gate_up_out] @ [gate_up_out, H]
-        all_shapes.append([f"BWD-MoE-GateUp-IPGrad(cap={moe_block_size})", moe_block_size, gate_up_out, H])
-        # BWD GateUp WTGrad: gate and up compute gradients separately
-        # dW_gate = X^T @ dY_gate = [H, cap] @ [cap, FFN/TP]
-        # dW_up   = X^T @ dY_up   = [H, cap] @ [cap, FFN/TP]
-        all_shapes.append([f"BWD-MoE-GateUp-WTGrad(cap={moe_block_size})", H, moe_block_size, down_in])
-        # BWD Down IPGrad: [cap, H] @ [H, down_in]
-        all_shapes.append([f"BWD-MoE-Down-IPGrad(cap={moe_block_size})", moe_block_size, H, down_in])
-        # BWD Down WTGrad: dW = X^T @ dY = [down_in, cap] @ [cap, H]
-        all_shapes.append([f"BWD-MoE-Down-WTGrad(cap={moe_block_size})", down_in, moe_block_size, H])
+        # FWD GateUp (column-parallel): Y = X @ W_gate_up
+        # [B, H] @ [H, 2*moe_inter_dim/TP] — TP shards output (N) dim
+        all_shapes.append([f"FWD-MoE-GateUp(B={moe_block_size})", moe_block_size, H, gate_up_out])
+        # FWD Down (row-parallel): Y = X @ W_down
+        # [B, moe_inter_dim/TP] @ [moe_inter_dim/TP, H] — TP shards input (K) dim
+        all_shapes.append([f"FWD-MoE-Down(B={moe_block_size})", moe_block_size, down_in, H])
+        # BWD GateUp IPGrad (row-parallel): dX = dY_gate_up @ W_gate_up^T
+        # [B, 2*moe_inter_dim/TP] @ [2*moe_inter_dim/TP, H] — TP shards input (K) dim
+        all_shapes.append([f"BWD-MoE-GateUp-IPGrad(B={moe_block_size})", moe_block_size, gate_up_out, H])
+        # BWD GateUp WTGrad — unfused (column-parallel): dW_gate = X^T @ dY_gate
+        # [H, B] @ [B, moe_inter_dim/TP] — gate and up computed as separate matmuls
+        all_shapes.append([f"BWD-MoE-GateUp-WTGrad-Unfused(B={moe_block_size})", H, moe_block_size, down_in])
+        # BWD GateUp WTGrad — fused (column-parallel): dW_gate_up = X^T @ [dY_gate | dY_up]
+        # [H, B] @ [B, 2*moe_inter_dim/TP] — gate and up concatenated into one wider matmul
+        all_shapes.append([f"BWD-MoE-GateUp-WTGrad-Fused(B={moe_block_size})", H, moe_block_size, gate_up_out])
+        # BWD Down IPGrad (column-parallel): dX = dY_down @ W_down^T
+        # [B, H] @ [H, moe_inter_dim/TP] — TP shards output (N) dim
+        all_shapes.append([f"BWD-MoE-Down-IPGrad(B={moe_block_size})", moe_block_size, H, down_in])
+        # BWD Down WTGrad (row-parallel): dW_down = X^T @ dY_down
+        # [moe_inter_dim/TP, B] @ [B, H] — TP shards input (M) dim
+        all_shapes.append([f"BWD-MoE-Down-WTGrad(B={moe_block_size})", down_in, moe_block_size, H])
 
     return all_shapes
 
@@ -312,7 +331,7 @@ def load_model_configs(config_dir: str = None) -> dict:
     Returns:
         dict: Dictionary mapping config names to TestConfig lists.
     """
-    if config_dir == None:
+    if config_dir is None:
         # Default to the directory containing this file
         config_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -357,6 +376,14 @@ def load_model_configs(config_dir: str = None) -> dict:
         moe_shapes = generate_moe_expert_mlp_shapes(qwen3_235b_path, TP=4)
         configs['qwen3_235b_tp4'] = shapes_to_test_configs(attn_shapes + moe_shapes, "Qwen3-235B-TP4")
 
+        attn_shapes = generate_attention_shapes(qwen3_235b_path, TP=2, CP=1)
+        moe_shapes = generate_moe_expert_mlp_shapes(qwen3_235b_path, TP=2, moe_block_sizes=[512, 1024, 2048, 4096])
+        configs['qwen3_235b_tp2'] = shapes_to_test_configs(attn_shapes + moe_shapes, "Qwen3-235B-TP2")
+
+        attn_shapes = generate_attention_shapes(qwen3_235b_path, TP=1, CP=1)
+        moe_shapes = generate_moe_expert_mlp_shapes(qwen3_235b_path, TP=1, moe_block_sizes=[512, 1024, 2048, 4096])
+        configs['qwen3_235b_tp1'] = shapes_to_test_configs(attn_shapes + moe_shapes, "Qwen3-235B-TP1")
+
         shapes = generate_transformer_block_shapes(qwen3_235b_path, TP=4, CP=16)
         configs['qwen3_235b_cp16_tp4'] = shapes_to_test_configs(shapes, "Qwen3-235B-CP16-TP4")
 
@@ -378,5 +405,7 @@ qwen3_32b_tp4 = _all_configs.get('qwen3_32b_tp4', [])
 gpt_oss_20b_tp4 = _all_configs.get('gpt_oss_20b_tp4', [])
 gpt_oss_20b_tp2 = _all_configs.get('gpt_oss_20b_tp2', [])
 qwen3_235b_tp4 = _all_configs.get('qwen3_235b_tp4', [])
+qwen3_235b_tp2 = _all_configs.get('qwen3_235b_tp2', [])
+qwen3_235b_tp1 = _all_configs.get('qwen3_235b_tp1', [])
 qwen3_235b_cp16_tp4 = _all_configs.get('qwen3_235b_cp16_tp4', [])
 qwen3_235b_cp4_tp4 = _all_configs.get('qwen3_235b_cp4_tp4', [])

@@ -82,7 +82,7 @@ def _extract_abbrevs_from_file(filepath: Path) -> dict[str, str]:
             if "ABBREV" not in target.id.upper():
                 continue
             if isinstance(node.value, ast.Dict):
-                for key, val in zip(node.value.keys, node.value.values):
+                for key, val in zip(node.value.keys, node.value.values, strict=True):
                     if isinstance(key, ast.Constant) and isinstance(val, ast.Constant):
                         abbrevs[str(key.value)] = str(val.value)
     return abbrevs
@@ -114,7 +114,7 @@ def test_no_abbreviation_collisions():
         msg += "\n\nFix: ensure each abbreviation maps to only one parameter name."
         import warnings
 
-        warnings.warn(msg)
+        warnings.warn(msg, stacklevel=2)
 
 
 def test_no_new_alias_usage():

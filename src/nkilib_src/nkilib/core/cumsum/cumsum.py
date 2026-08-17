@@ -27,7 +27,7 @@ F_TILE_SIZE = 2048
 
 
 @nki.jit
-def cumsum(x: nl.ndarray, axis: int = -1) -> nl.ndarray:
+def cumsum(x: nl.NkiTensor, axis: int = -1) -> nl.NkiTensor:
     """
     Compute cumulative sum along the last dimension.
 
@@ -42,13 +42,13 @@ def cumsum(x: nl.ndarray, axis: int = -1) -> nl.ndarray:
         outer_dim: Product of all dimensions except the last (B for 2D, B * S for 3D)
 
     Args:
-        x (nl.ndarray): Input HBM tensor of shape [B, H] for 2D or [B, S, H] for 3D.
+        x (nl.NkiTensor): Input HBM tensor of shape [B, H] for 2D or [B, S, H] for 3D.
             dtype can be any NKI-supported type.
         axis (int): Axis along which to compute cumsum. Must be -1 or the last
             dimension index. Default: -1.
 
     Returns:
-        nl.ndarray: Output HBM tensor with same shape and dtype as input, containing
+        nl.NkiTensor: Output HBM tensor with same shape and dtype as input, containing
             cumulative sums along the last dimension.
 
     Notes:

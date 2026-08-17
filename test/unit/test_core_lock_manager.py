@@ -13,19 +13,22 @@
 # limitations under the License.
 """Unit tests for core_lock_manager module."""
 
-import json
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from test.utils.core_lock_client import (
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
     DEFAULT_LOCKING_PROTOCOL_VERSION,
 )
 from test.utils.core_lock_manager import (
     AllocationStatus,
     CoreLockManager,
+    InsufficientCoreCountError,
+    LockAcquisitionError,
     LockVersionError,
+    calculate_total_needed_physical_cores,
     check_lock_version,
 )
 from test.utils.metrics_collector import MetricName, NoopMetricsCollector
@@ -47,108 +50,39 @@ class TestLockVersionError:
 
 
 class TestCheckLockVersion:
-    """Tests for check_lock_version function."""
+    """Tests for the check_lock_version guard (pure version comparison)."""
 
-    def _mock_conn_with_file(self, file_content: str) -> MagicMock:
-        """Create mock connection where version file exists with given content."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
+    def test_passes_when_equal(self):
+        """Returns None (does not raise) when host version == client's supported version."""
+        assert check_lock_version(DEFAULT_LOCKING_PROTOCOL_VERSION) is None
 
-        # First call: test -f (file exists)
-        test_result = MagicMock()
-        test_result.ok = True
+    def test_passes_when_host_requires_lower(self):
+        """Returns None (does not raise) when the host requires an older version."""
+        assert check_lock_version(DEFAULT_LOCKING_PROTOCOL_VERSION - 1) is None
 
-        # Second call: cat (returns content)
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = file_content
-
-        mock_conn.run.side_effect = [test_result, cat_result]
-        return mock_conn
-
-    def _mock_conn_without_file(self) -> MagicMock:
-        """Create mock connection where version file doesn't exist."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
-
-        # First call: test -f (file doesn't exist)
-        test_result = MagicMock()
-        test_result.ok = False
-
-        # Second call: mkdir && echo (create file)
-        write_result = MagicMock()
-        write_result.failed = False
-
-        mock_conn.run.side_effect = [test_result, write_result]
-        return mock_conn
-
-    def test_version_check_passes_when_compatible(self):
-        """Test that version check passes when client version is sufficient."""
-        mock_conn = self._mock_conn_with_file(json.dumps({"minClientLockingVersion": 1}))
-        # Should not raise
-        check_lock_version(mock_conn)
-
-    def test_version_check_fails_when_client_too_old(self):
-        """Test that version check fails when client version is too old."""
-        mock_conn = self._mock_conn_with_file(json.dumps({"minClientLockingVersion": 99}))
-
+    def test_fails_when_client_too_old(self):
+        """Raise LockVersionError when the host requires a newer version than the client."""
         with pytest.raises(LockVersionError) as exc_info:
-            check_lock_version(mock_conn)
+            check_lock_version(99)
 
         assert exc_info.value.required_version == 99
         assert exc_info.value.current_version == DEFAULT_LOCKING_PROTOCOL_VERSION
 
-    def test_version_check_handles_missing_file(self):
-        """Test that version check creates file when missing."""
-        mock_conn = self._mock_conn_without_file()
-        # Should not raise - creates file with default version
-        check_lock_version(mock_conn)
 
-    def test_version_check_handles_missing_key(self):
-        """Test that version check recreates file when key is missing."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
+class TestCalculateTotalNeededPhysicalCores:
+    """Tests for calculate_total_needed_physical_cores (collectives_ranks * lnc_config)."""
 
-        # First call: test -f (file exists)
-        test_result = MagicMock()
-        test_result.ok = True
+    def test_lnc2_multiplies_ranks_by_two(self):
+        assert calculate_total_needed_physical_cores(collectives_ranks=4, lnc_config=2) == 8
 
-        # Second call: cat (returns content without key)
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = json.dumps({"someOtherKey": 123})
+    def test_lnc1_equals_ranks(self):
+        assert calculate_total_needed_physical_cores(collectives_ranks=4, lnc_config=1) == 4
 
-        # Third call: mkdir && echo (recreate file)
-        write_result = MagicMock()
-        write_result.failed = False
+    def test_single_rank(self):
+        assert calculate_total_needed_physical_cores(collectives_ranks=1, lnc_config=2) == 2
 
-        mock_conn.run.side_effect = [test_result, cat_result, write_result]
-
-        # Should not raise - recreates file
-        check_lock_version(mock_conn)
-
-    def test_version_check_handles_corrupted_json(self):
-        """Test that version check recreates file when JSON is corrupted."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
-
-        # First call: test -f (file exists)
-        test_result = MagicMock()
-        test_result.ok = True
-
-        # Second call: cat (returns corrupted content)
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = "not valid json {{{"
-
-        # Third call: mkdir && echo (recreate file)
-        write_result = MagicMock()
-        write_result.failed = False
-
-        mock_conn.run.side_effect = [test_result, cat_result, write_result]
-
-        # Should not raise - recreates file
-        check_lock_version(mock_conn)
+    def test_zero_ranks(self):
+        assert calculate_total_needed_physical_cores(collectives_ranks=0, lnc_config=2) == 0
 
 
 class TestPhysicalToLogicalCores:
@@ -370,6 +304,106 @@ class TestDequeueProbe:
         kwargs = mock_dequeue.call_args[1]
         assert mgr.entry_id in args
         assert kwargs.get("caller_id") == mgr._caller_id
+
+
+class TestProbe:
+    """Tests for CoreLockManager.probe -> AllocationOutcome mapping (metric-neutral)."""
+
+    def _make_manager(self, collector=None) -> CoreLockManager:
+        return CoreLockManager(
+            "test-host",
+            total_physical_cores=8,
+            collector=collector or NoopMetricsCollector(),
+            executor=MagicMock(),
+            host_locking_version=DEFAULT_LOCKING_PROTOCOL_VERSION,
+        )
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_in_queue_maps_to_queued_with_eta(self, mock_probe):
+        """IN_QUEUE probe result maps to a QUEUED outcome carrying worst_case_eta."""
+        mock_probe.return_value = LockResult(status=LockStatus.IN_QUEUE, worst_case_eta=42)
+        mgr = self._make_manager()
+        outcome = mgr.probe(num_logical_cores=1, lnc_config=2)
+        assert outcome.status == AllocationStatus.QUEUED
+        assert outcome.worst_case_eta == 42
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_draining_maps_to_draining_with_eta(self, mock_probe):
+        """DRAINING probe result maps to a DRAINING outcome carrying worst_case_eta."""
+        mock_probe.return_value = LockResult(status=LockStatus.DRAINING, worst_case_eta=7)
+        mgr = self._make_manager()
+        outcome = mgr.probe(num_logical_cores=1, lnc_config=2)
+        assert outcome.status == AllocationStatus.DRAINING
+        assert outcome.worst_case_eta == 7
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_probe_is_metric_neutral(self, mock_probe):
+        """probe() touches no contention/position counters, never calls _note_enqueued,
+        and records no metric (read-only peek joins no queue)."""
+        mock_probe.return_value = LockResult(status=LockStatus.IN_QUEUE, worst_case_eta=99)
+        collector = MagicMock()
+        collector.test_name = "test_probe"
+        mgr = self._make_manager(collector)
+        before_no_cores = mgr._no_cores_count
+        before_contention_ts = mgr._first_contention_ts
+        with patch.object(mgr, "_note_enqueued") as spy_enqueue:
+            mgr.probe(num_logical_cores=1, lnc_config=2)
+        assert mgr._no_cores_count == before_no_cores
+        assert mgr._first_contention_ts == before_contention_ts
+        spy_enqueue.assert_not_called()
+        # No metric of any kind recorded by the probe path.
+        collector.record_metric.assert_not_called()
+        collector.record_timer.assert_not_called()
+        collector.timer.assert_not_called()
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_over_capacity_raises_without_client_call(self, mock_probe):
+        """A request exceeding host capacity raises InsufficientCoreCountError and never
+        reaches the client probe wrapper."""
+        mgr = self._make_manager()
+        with pytest.raises(InsufficientCoreCountError):
+            mgr.probe(num_logical_cores=5, lnc_config=2)  # 10 physical > 8
+        mock_probe.assert_not_called()
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_default_timeout_matches_acquire_default(self, mock_probe):
+        """probe()'s default timeout_seconds equals acquire's default."""
+        mock_probe.return_value = LockResult(status=LockStatus.IN_QUEUE, worst_case_eta=1)
+        mgr = self._make_manager()
+        mgr.probe(num_logical_cores=1, lnc_config=2)
+        assert DEFAULT_LOCK_TIMEOUT_SECONDS in mock_probe.call_args[0]
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_rpc_error_wrapped_as_lock_acquisition_error(self, mock_probe):
+        """A client probe RPC exception is blanket-wrapped as LockAcquisitionError."""
+        mock_probe.side_effect = RuntimeError("ssh boom")
+        mgr = self._make_manager()
+        with pytest.raises(LockAcquisitionError):
+            mgr.probe(num_logical_cores=1, lnc_config=2)
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_error_status_raises_retryable_lock_acquisition_error(self, mock_probe):
+        """An ERROR LockResult raises a retryable LockAcquisitionError carrying the
+        host and the 'Lock helper error' prefix (the helper-error branch)."""
+        mock_probe.return_value = LockResult(status=LockStatus.ERROR, message="helper boom")
+        mgr = self._make_manager()
+        with pytest.raises(LockAcquisitionError) as exc_info:
+            mgr.probe(num_logical_cores=1, lnc_config=2)
+        assert "test-host" in str(exc_info.value)
+        assert "Lock helper error" in str(exc_info.value)
+        assert exc_info.value.retryable is True
+
+    @patch("test.utils.core_lock_client.probe")
+    def test_unexpected_status_raises_lock_acquisition_error(self, mock_probe):
+        """A status the read-only probe should never emit (ALLOCATED) falls through
+        to the unknown-status branch and raises LockAcquisitionError. This is the
+        contract that lets soft-join treat such a result as a swallowed probe
+        failure."""
+        mock_probe.return_value = LockResult(status=LockStatus.ALLOCATED, cores=[0, 1], expiry=123)
+        mgr = self._make_manager()
+        with pytest.raises(LockAcquisitionError) as exc_info:
+            mgr.probe(num_logical_cores=1, lnc_config=2)
+        assert "Unexpected lock status" in str(exc_info.value)
 
 
 # =============================================================================

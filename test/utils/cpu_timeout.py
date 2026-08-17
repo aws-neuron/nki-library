@@ -135,9 +135,13 @@ def prepare_timeout_watchdog(item: pytest.Item, settings: pytest_timeout.Setting
 
         # Overwrite pytest-timeout's handler; ITIMER_REAL keeps ticking
         _ = signal.signal(signal.SIGALRM, handler)
-        trigger: Callable[[], None] = lambda: os.kill(os.getpid(), signal.SIGALRM)
+
+        def trigger() -> None:
+            os.kill(os.getpid(), signal.SIGALRM)
     else:
-        trigger = lambda: pytest_timeout.timeout_timer(item, settings)
+
+        def trigger() -> None:
+            pytest_timeout.timeout_timer(item, settings)
 
     watchdog: CPUTimeWatchdog = CPUTimeWatchdog(cpu_limit, start_cpu, trigger)
 

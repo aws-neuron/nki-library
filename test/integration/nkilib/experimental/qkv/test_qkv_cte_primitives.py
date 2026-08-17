@@ -30,12 +30,12 @@ except ImportError:
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import (
     NormType,
     QKVOutputLayout,
     QuantizationType,
 )
+
 from test.integration.nkilib.core.qkv.test_qkv_common import (
     rope_gaussian_tensor_generator,
     run_qkv_test,
@@ -50,6 +50,10 @@ from test.utils.common_dataclasses import (
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework  # noqa: F401
+
+# Constructed once at module load and shared across all callers that rely on the default,
+# matching the previous behavior where the default argument expression was evaluated once.
+_DEFAULT_TENSOR_GEN = gaussian_tensor_generator()
 
 # Utility maps to serialize type so that generated test name don't contain Python objects
 dtype_int_to_type = {0: nl.bfloat16, 1: np.float16, 2: np.float32}
@@ -81,7 +85,7 @@ class TestQkvCteKernel:
         n_kv_heads: int | None = None,
         d_head: int | None = None,
         quantization_type: QuantizationType = QuantizationType.NONE,
-        tensor_gen=gaussian_tensor_generator(),
+        tensor_gen=_DEFAULT_TENSOR_GEN,
         fp8_kv_cache: bool = False,
         max_seq_len: int | None = None,
         k_scale_val: float | None = None,

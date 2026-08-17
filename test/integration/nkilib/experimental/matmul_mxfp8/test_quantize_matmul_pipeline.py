@@ -34,8 +34,6 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_kernel
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
     quantize_lhs_matmul_pipeline_torch_ref,
@@ -44,10 +42,13 @@ from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
+    with_active_sbm,
 )
 from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8 import (
     quantize_block_mxfp8_kernel,
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import config_helper
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.utils import common_dataclasses, test_orchestrator
@@ -56,6 +57,7 @@ from test.utils.unit_test_framework import UnitTestFramework
 
 
 @nki.jit
+@with_active_sbm
 def quantize_lhs_matmul_pipeline_kernel(
     lhs_bf16,
     rhs_sw,
@@ -78,7 +80,8 @@ def quantize_lhs_matmul_pipeline_kernel(
 ):
     """Combined kernel: quantize LHS only, RHS is BF16 swizzled (matmul quantizes internally)."""
 
-    create_and_set_active_sbm()
+    if get_active_sbm() is None:
+        create_and_set_active_sbm()
     sbm = get_active_sbm()
     sbm.open_scope("TEST QUANT + MM")
 
@@ -111,6 +114,7 @@ def quantize_lhs_matmul_pipeline_kernel(
 
 
 @nki.jit
+@with_active_sbm
 def quantize_rhs_matmul_pipeline_kernel(
     lhs_sw,
     rhs_bf16,
@@ -132,7 +136,8 @@ def quantize_rhs_matmul_pipeline_kernel(
     spill_reload: bool,
 ):
     """Combined kernel: quantize RHS only, LHS is BF16 swizzled (matmul quantizes internally)."""
-    create_and_set_active_sbm()
+    if get_active_sbm() is None:
+        create_and_set_active_sbm()
     sbm = get_active_sbm()
     sbm.open_scope("TEST QUANT + MM")
 

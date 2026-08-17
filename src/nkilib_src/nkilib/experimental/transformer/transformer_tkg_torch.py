@@ -637,3 +637,56 @@ def llama3_transformer_fwd_tkg_torch(
             return_values.append(torch.zeros((B, S_tkg, H), dtype=dtype, device=device))
 
     return tuple(return_values) if len(return_values) > 1 else return_values[0]
+
+
+# Dispatch convention wrapper matching transformer_tkg kernel signature
+def transformer_tkg_torch_ref(
+    X,
+    W_qkvs,
+    W_outs,
+    W_gates,
+    W_ups,
+    W_downs,
+    W_gamma_qkvs,
+    W_gamma_mlps,
+    K_caches,
+    V_caches,
+    RoPE_cos,
+    RoPE_sin,
+    attention_mask,
+    position_ids,
+    num_layers,
+    eps,
+    replica_groups,
+    sbuf_residual_and_cc,
+    clamp_bound,
+    W_gate_scales,
+    W_up_scales,
+    W_down_scales,
+    dtype_mode=DtypeMode.NON_OCP,
+):
+    return llama3_transformer_fwd_tkg_torch(
+        X=X,
+        W_qkvs=W_qkvs,
+        W_outs=W_outs,
+        W_gates=W_gates,
+        W_gate_scales=W_gate_scales,
+        W_ups=W_ups,
+        W_up_scales=W_up_scales,
+        W_downs=W_downs,
+        W_down_scales=W_down_scales,
+        W_gamma_qkvs=W_gamma_qkvs,
+        W_gamma_mlps=W_gamma_mlps,
+        RoPE_cos=RoPE_cos,
+        RoPE_sin=RoPE_sin,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        K_caches=K_caches,
+        V_caches=V_caches,
+        num_layers=num_layers,
+        replica_groups=replica_groups,
+        eps=eps,
+        clamp_bound=clamp_bound,
+        sbuf_residual_and_cc=sbuf_residual_and_cc,
+        dtype_mode=dtype_mode,
+    )

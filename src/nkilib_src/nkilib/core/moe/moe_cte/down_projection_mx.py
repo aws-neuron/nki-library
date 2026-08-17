@@ -30,7 +30,6 @@ import nki.language as nl
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, _psum_alloc, _sbm_alloc, div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
 from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     SCALE_P_ELEM_PER_QUADRANT,
@@ -48,15 +47,15 @@ _PACKED_TILES_PER_BUFFER = 4
 
 
 def _down_proj_prep_inter_and_weights(
-    inter_sb: nl.ndarray,
-    weight: nl.ndarray,
-    weight_scale: nl.ndarray,
+    inter_sb: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
     cfg: ProjConfig,
     sbm=None,
     name_prefix: str = None,
-    inter_quant_recip: Optional[nl.ndarray] = None,
-    dummy_inter_scale: Optional[nl.ndarray] = None,
-) -> tuple[nl.ndarray, nl.ndarray, nl.ndarray, nl.ndarray]:
+    inter_quant_recip: Optional[nl.NkiTensor] = None,
+    dummy_inter_scale: Optional[nl.NkiTensor] = None,
+) -> tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     Prep intermediate and weights for down projection.
 
@@ -64,29 +63,29 @@ def _down_proj_prep_inter_and_weights(
     For weight: load from HBM into SBUF.
 
     Args:
-        inter_sb (nl.ndarray): bf16[_pmax, n_I512_tile, BxS, 4] @ SB. Dim I is shuffled on 128.
-        weight (nl.ndarray): mxfp_x4[128_I, ceil(I/512), H] @ HBM. Expects zero-padding.
+        inter_sb (nl.NkiTensor): bf16[_pmax, n_I512_tile, BxS, 4] @ SB. Dim I is shuffled on 128.
+        weight (nl.NkiTensor): mxfp_x4[128_I, ceil(I/512), H] @ HBM. Expects zero-padding.
             I-contiguous x4 packing: element [p, tile, h] packs W[512*tile + 4p + q, h]
             for q=0..3 (4 consecutive I values at the same H column). Layout shared with
             the CTE MX down projection path.
-        weight_scale (nl.ndarray): uint8[128_I // _q_height, ceil(I/512), H] @ HBM. Expects zero-padding.
+        weight_scale (nl.NkiTensor): uint8[128_I // _q_height, ceil(I/512), H] @ HBM. Expects zero-padding.
         cfg (ProjConfig): Projection configuration.
         sbm (SbufManager, optional): SBUF allocator.
         name_prefix (str, optional): Prefix for SBUF buffer names.
-        inter_quant_recip (nl.ndarray, optional): fp32[_pmax, 1] = 1 / down_in_scale. When
+        inter_quant_recip (nl.NkiTensor, optional): fp32[_pmax, 1] = 1 / down_in_scale. When
             provided, take the STATIC_MX path: quantize the intermediate via tensor_scalar
             (saturation cast to fp8) instead of nisa.quantize_mx. Caller must also pass
             dummy_inter_scale.
-        dummy_inter_scale (nl.ndarray, optional): uint8[_pmax, BxS_tile_sz] all-127
+        dummy_inter_scale (nl.NkiTensor, optional): uint8[_pmax, BxS_tile_sz] all-127
             (per-tile shape, not the full 3D scale shape). Matmul site slices 2D
             per BxS tile under STATIC_MX.
 
     Returns:
         tuple: (inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale)
-            - inter_qtz (nl.ndarray): mxfp8_x4[_pmax, cfg.n_total_I512_tile, BxS]
-            - inter_qtz_scale (nl.ndarray): uint8[_pmax, cfg.n_total_I512_tile, BxS]
-            - weight_qtz (nl.ndarray): mxfp_x4[_pmax, cfg.n_total_I512_tile, H_sharded]
-            - weight_qtz_scale (nl.ndarray): uint8[_pmax, cfg.n_total_I512_tile, H_sharded]
+            - inter_qtz (nl.NkiTensor): mxfp8_x4[_pmax, cfg.n_total_I512_tile, BxS]
+            - inter_qtz_scale (nl.NkiTensor): uint8[_pmax, cfg.n_total_I512_tile, BxS]
+            - weight_qtz (nl.NkiTensor): mxfp_x4[_pmax, cfg.n_total_I512_tile, H_sharded]
+            - weight_qtz_scale (nl.NkiTensor): uint8[_pmax, cfg.n_total_I512_tile, H_sharded]
     """
     n_prgs, prg_id = cfg.n_prgs, cfg.prg_id
     H, I, BxS = cfg.H, cfg.I, cfg.BxS
@@ -115,7 +114,7 @@ def _down_proj_prep_inter_and_weights(
     )
     if is_static_quant:
         # STATIC_MX: tensor_scalar(intermediate × 1/down_in_scale) with fp8 saturation cast.
-        inter_qtz_fp8 = TensorView(inter_qtz).reinterpret_cast(nl.float8_e4m3fn).get_view()
+        inter_qtz_fp8 = inter_qtz.view(nl.float8_e4m3fn)
         nisa.tensor_scalar(
             dst=inter_qtz_fp8,
             data=inter_sb,
@@ -209,20 +208,20 @@ def _down_proj_prep_inter_and_weights(
 
 
 def down_projection_mx(
-    inter_sb: nl.ndarray,
-    weight: nl.ndarray,
-    weight_scale: nl.ndarray,
-    bias_sb: nl.ndarray,
+    inter_sb: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    weight_scale: nl.NkiTensor,
+    bias_sb: nl.NkiTensor,
     cfg: ProjConfig,
     sbm=None,
     psum_bank_offset: int = 0,
     name_prefix: Optional[str] = None,
-    out_sb: Optional[nl.ndarray] = None,
+    out_sb: Optional[nl.NkiTensor] = None,
     is_packed_scale: bool = False,
-    w_dequant_scale: Optional[nl.ndarray] = None,
-    inter_quant_recip: Optional[nl.ndarray] = None,
-    dummy_inter_scale: Optional[nl.ndarray] = None,
-) -> nl.ndarray:
+    w_dequant_scale: Optional[nl.NkiTensor] = None,
+    inter_quant_recip: Optional[nl.NkiTensor] = None,
+    dummy_inter_scale: Optional[nl.NkiTensor] = None,
+) -> nl.NkiTensor:
     """
     Perform down projection with MXFP quantization.
 
@@ -231,13 +230,13 @@ def down_projection_mx(
     by tiling the BxS dimension.
 
     Args:
-        inter_sb (nl.ndarray): Intermediate activations of shape [128, n_I512_tile, BxS, 4]
+        inter_sb (nl.NkiTensor): Intermediate activations of shape [128, n_I512_tile, BxS, 4]
             in SBUF with I dimension shuffled on 128 partitions, bf16 type.
-        weight (nl.ndarray): Quantized weights of shape [128, ceil(I/512), H] in HBM,
+        weight (nl.NkiTensor): Quantized weights of shape [128, ceil(I/512), H] in HBM,
             mxfp_x4 type (supports MXFP4/MXFP8), zero-padded.
-        weight_scale (nl.ndarray): Weight scales of shape [128//8, ceil(I/512), H] in HBM,
+        weight_scale (nl.NkiTensor): Weight scales of shape [128//8, ceil(I/512), H] in HBM,
             uint8 type, zero-padded.
-        bias_sb (nl.ndarray): Optional bias of shape [1, H_sharded] in SBUF, bf16 type.
+        bias_sb (nl.NkiTensor): Optional bias of shape [1, H_sharded] in SBUF, bf16 type.
         cfg (ProjConfig): Projection configuration with H, I, BxS, sharding info.
         is_packed_scale (bool): Set True when caller pre-packed weight_scale into the
             compressed layout (_pmax, n_packed, H_sharded) where multiple I/512 tiles
@@ -245,7 +244,7 @@ def down_projection_mx(
             (_pmax, n_total_I512_tile, H_sharded) layout.
 
     Returns:
-        output (nl.ndarray): Down projection result of shape [128, ceil(BxS/128), H] in SBUF,
+        output (nl.NkiTensor): Down projection result of shape [128, ceil(BxS/128), H] in SBUF,
             bf16 type. Note: end of last tile contains garbage when BxS % 128 != 0.
 
     Notes:

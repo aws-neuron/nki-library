@@ -50,7 +50,7 @@ def row_hoist_f_remainder(src):
             data = row.load(oob_mode=nisa.oob_mode.skip, oob_value=0.0)
         else:
             data = row.load()
-        out_tiles[i, :].store(data.ap(), oob_mode=nisa.oob_mode.skip)
+        out_tiles[i, :].store(data.data, oob_mode=nisa.oob_mode.skip)
 
     return out
 
@@ -74,7 +74,7 @@ def col_hoist_p_remainder(src):
                 data = tile_view.load(oob_mode=nisa.oob_mode.skip, oob_value=0.0)
             else:
                 data = tile_view.load()
-            out_tiles[i, j].store(data.ap(), oob_mode=nisa.oob_mode.skip)
+            out_tiles[i, j].store(data.data, oob_mode=nisa.oob_mode.skip)
 
     return out
 
@@ -96,7 +96,7 @@ def range_slice_remainder(src):
                 data = tile_view.load(oob_mode=nisa.oob_mode.skip, oob_value=0.0)
             else:
                 data = tile_view.load()
-            out_tiles[i, j].store(data.ap(), oob_mode=nisa.oob_mode.skip)
+            out_tiles[i, j].store(data.data, oob_mode=nisa.oob_mode.skip)
 
     return out
 
@@ -116,7 +116,7 @@ def store_oob_mode(src):
         data = row.load(oob_mode=nisa.oob_mode.skip, oob_value=0.0)
     else:
         data = row.load()
-    out_tiles[0, :].store(data.ap(), oob_mode=nisa.oob_mode.skip)
+    out_tiles[0, :].store(data.data, oob_mode=nisa.oob_mode.skip)
     return out
 
 
@@ -136,7 +136,7 @@ def multi_range_interior(src):
         data = sub.load(oob_mode=nisa.oob_mode.skip, oob_value=0.0)
     else:
         data = sub.load()  # interior fast path
-    out_tiles[0:2, 0:3].store(data.ap())
+    out_tiles[0:2, 0:3].store(data.data)
     return out
 
 

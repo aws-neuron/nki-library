@@ -18,10 +18,10 @@ Validates that slice-based sharding on a SBUF view addresses owned tiles
 correctly under both LNC=1 and LNC=2:
 
   Single-tile access (after indexing the view, e.g. `view[0, i]`) works
-  for both `.data` (ISA ops consume a contiguous tile) and `.ap()`
+  for both `.data` (ISA ops consume a contiguous tile) and `.data`
   (DMA store/load of one owned tile).
 
-  Multi-tile `.ap()` on the sharded view emits a stacked AP pattern that
+  Multi-tile `.data` on the sharded view emits a stacked AP pattern that
   walks only owned tiles; the DMA engine skips gap bytes.
 """
 
@@ -31,8 +31,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -63,14 +63,14 @@ def _lnc1_single_tile_kernel():
 
     total_tiles = nt.ceiling_div(S_LNC1, TS)
     own = nt.interleaved_range(rank=nl.program_id(0), num_shards=nl.num_programs(0), total=total_tiles)
-    k_own = nt.tiles(k_full, tile_size=(H0, TS), buffer_type=nl.sbuf)[:, own]
+    k_own = nt.tiles(k_full, tile_size=(H0, TS))[:, own]
 
     for i in range(N_SLOTS_LNC1):
         nisa.memset(k_own[0, i].data, float(i + 1))
 
     out_tiles = nt.tiles(out, tile_size=(H0, TS))
     for i in range(N_SLOTS_LNC1):
-        out_tiles[0, i].store(k_own[0, i].ap())
+        out_tiles[0, i].store(k_own[0, i].data)
     return out
 
 
@@ -106,14 +106,14 @@ def _lnc2_own_view_kernel():
     total_tiles = nt.ceiling_div(S_LNC2, TS)
 
     own = nt.interleaved_range(rank=rank, num_shards=num_shards, total=total_tiles)
-    k_own = nt.tiles(k_full, tile_size=(H0, TS), buffer_type=nl.sbuf)[:, own]
+    k_own = nt.tiles(k_full, tile_size=(H0, TS))[:, own]
 
     for i in range(N_LOCAL_LNC2):
         nisa.memset(k_own[0, i].data, float(100 + i))
 
     out_own = nt.tiles(out, tile_size=(H0, TS))[:, own]
     for i in range(N_LOCAL_LNC2):
-        out_own[0, i].store(k_own[0, i].ap())
+        out_own[0, i].store(k_own[0, i].data)
     return out
 
 
@@ -145,14 +145,14 @@ def _lnc2_peer_view_kernel():
     total_tiles = nt.ceiling_div(S_LNC2, TS)
 
     peer = nt.interleaved_range(rank=1 - rank, num_shards=num_shards, total=total_tiles)
-    k_peer = nt.tiles(k_full, tile_size=(H0, TS), buffer_type=nl.sbuf)[:, peer]
+    k_peer = nt.tiles(k_full, tile_size=(H0, TS))[:, peer]
 
     for i in range(N_LOCAL_LNC2):
         nisa.memset(k_peer[0, i].data, float(200 + i))
 
     out_peer = nt.tiles(out, tile_size=(H0, TS))[:, peer]
     for i in range(N_LOCAL_LNC2):
-        out_peer[0, i].store(k_peer[0, i].ap())
+        out_peer[0, i].store(k_peer[0, i].data)
     return out
 
 
@@ -165,13 +165,13 @@ def _lnc2_peer_ref() -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# .ap() on multi-tile sharded view: stacked pattern walks only owned tiles
+# .data on multi-tile sharded view: stacked pattern walks only owned tiles
 # ---------------------------------------------------------------------------
 
 
 @nki.jit
 def _lnc2_multi_tile_ap_kernel():
-    """Multi-tile .ap() on sharded SBUF view drives a correct strided DMA."""
+    """Multi-tile .data on sharded SBUF view drives a correct strided DMA."""
     out = nl.ndarray((H0, S_LNC2), dtype=nl.float32, buffer=nl.shared_hbm)
     k_full = nl.ndarray((H0, S_LNC2), dtype=nl.float32, buffer=nl.sbuf)
 
@@ -180,13 +180,13 @@ def _lnc2_multi_tile_ap_kernel():
     total_tiles = nt.ceiling_div(S_LNC2, TS)
 
     own = nt.interleaved_range(rank=rank, num_shards=num_shards, total=total_tiles)
-    k_own = nt.tiles(k_full, tile_size=(H0, TS), buffer_type=nl.sbuf)[:, own]
+    k_own = nt.tiles(k_full, tile_size=(H0, TS))[:, own]
 
     for i in range(N_LOCAL_LNC2):
         nisa.memset(k_own[0, i].data, float(300 + i))
 
     out_own = nt.tiles(out, tile_size=(H0, TS))[:, own]
-    out_own.store(k_own.ap())
+    out_own.store(k_own.data)
     return out
 
 
@@ -218,7 +218,6 @@ def _lnc2_block_view_shard_kernel():
         k_full,
         tile_size=(H0, TS),
         block_size=(1, BLOCK_SIZE_F),
-        buffer_type=nl.sbuf,
     )[:, own_blocks]
 
     k_tiles = nt.tiles(k_blocks)
@@ -232,7 +231,7 @@ def _lnc2_block_view_shard_kernel():
     )[:, own_blocks]
     out_tiles = nt.tiles(out_blocks)
     for i in range(N_LOCAL_LNC2):
-        out_tiles[0, i].store(k_tiles[0, i].ap())
+        out_tiles[0, i].store(k_tiles[0, i].data)
     return out
 
 
@@ -245,25 +244,26 @@ def _lnc2_block_view_ref() -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Slice + root= support: nt.tiles accepts a sliced SBUF view with root=
+# Sliced SBUF source: nt.tiles accepts a sliced SBUF view directly
+# (the slice self-addresses; no root= needed)
 # ---------------------------------------------------------------------------
 
 
 @nki.jit
 def _slice_root_kernel():
-    """Write distinct values to a sub-region of k_full via nt.tiles(slice, root=)."""
+    """Write distinct values to a sub-region of k_full via nt.tiles on a slice."""
     out = nl.ndarray((H0, 2 * S_LNC1), dtype=nl.float32, buffer=nl.shared_hbm)
     k_full = nl.ndarray((H0, 2 * S_LNC1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(k_full, 0.0)
 
     sub = k_full[:, 0:S_LNC1]
-    sub_tiles = nt.tiles(sub, tile_size=(H0, TS), buffer_type=nl.sbuf, root=k_full)
+    sub_tiles = nt.tiles(sub, tile_size=(H0, TS))
     for i in range(N_SLOTS_LNC1):
         nisa.memset(sub_tiles[0, i].data, float(10 + i))
 
     out_tiles = nt.tiles(out, tile_size=(H0, TS))
     for i in range(2 * N_SLOTS_LNC1):
-        out_tiles[0, i].store(nt.tiles(k_full, tile_size=(H0, TS), buffer_type=nl.sbuf)[0, i].ap())
+        out_tiles[0, i].store(nt.tiles(k_full, tile_size=(H0, TS))[0, i].data)
     return out
 
 

@@ -49,12 +49,12 @@ from .host_management import Host, HostManager
 from .metrics_collector import IMetricsCollector, MetricName
 from .negative_test_helpers import is_in_negative_test_context
 from .output_validator import OutputValidator
-from .param_extractor import normalize_params_with_type_hints
 from .profiler_utils import (
     NEURON_RT_ENABLE_DGE_NOTIFICATIONS,
     ProfilerCommands,
     extract_and_filter_output_files,
 )
+from .s3_utils import parse_s3_uri
 
 
 def _resolve_neuronx_cc_jobs(config) -> int | None:
@@ -196,7 +196,7 @@ class Orchestrator:
         if perf_analysis_enabled and not hw_profile_enabled:
             raise ValueError(
                 "--enable-perf-analysis requires --enable-hw-profile=True; perf analysis "
-                "reads NTFF artifacts produced by neuron-profile capture."
+                "reads NTFF artifacts produced by neuron-explorer capture."
             )
 
         self.fs_config: FilesystemArgs = FilesystemArgs(
@@ -212,7 +212,7 @@ class Orchestrator:
         self.hw_profile_enabled: bool = hw_profile_enabled
         self.kernel_name: str = kernel_name
 
-        self.profiler_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-profile")
+        self.profiler_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-explorer")
         self.explorer_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-explorer")
         self.neuron_ls_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-ls")
         self.enable_kernel_debugging: bool = feature_flag_helper.get_feature_flag(config, "debug_kernels", False)
@@ -228,6 +228,11 @@ class Orchestrator:
         self.neuronx_cc_cache_path: str | None = feature_flag_helper.get_feature_flag(
             config, "s3_neuronx_cc_cache_path"
         )
+        self.torch_ref_cache_path: str | None = feature_flag_helper.get_feature_flag(config, "s3_torch_ref_cache_path")
+        # Validate the URI up front so a malformed path fails loudly instead of
+        # silently becoming a cache miss. Empty/unset disables caching.
+        if self.torch_ref_cache_path:
+            parse_s3_uri(self.torch_ref_cache_path)
         self.upload_profile_to_explorer: Optional[UploadProfileMode] = (
             UploadProfileMode.from_str(val)
             if (val := feature_flag_helper.get_feature_flag(config, "upload_profile_to_explorer", None))
@@ -236,7 +241,7 @@ class Orchestrator:
         if self.upload_profile_to_explorer and not hw_profile_enabled:
             raise ValueError(
                 "--upload-profile-to-explorer requires --enable-hw-profile=True; "
-                "explorer upload bundles the NTFF trace from neuron-profile capture."
+                "explorer upload bundles the NTFF trace from neuron-explorer capture."
             )
 
     def execute(self, kernel_under_test: KernelArgs):
@@ -270,13 +275,6 @@ class Orchestrator:
 
         # Start timing right before compilation stage
         self.collector.start_test()
-
-        # Normalize pytest-captured params using kernel function's type hints
-        # This converts integers to enum names for cleaner dashboard display
-        params = self.collector.get_kernel_params()
-        if params:
-            normalized_params = normalize_params_with_type_hints(params, kernel_under_test.kernel_func)
-            self.collector.set_kernel_params(normalized_params)
 
         status = TestStatus.SUCCESS
 
@@ -315,6 +313,16 @@ class Orchestrator:
             # Run Inference
             local_artifact_download_path = self._run_inference(kernel_under_test, input_file_paths)
             self._rename_neff_outputs_to_python_names(local_artifact_download_path, output_names)
+
+            # Inference (incl. any host-rotation retries) has succeeded, so no
+            # further re-upload of the input tensors can occur. Only now is it
+            # safe to free their local disk under --force-local-cleanup; deleting
+            # earlier would make a rotation retry ship an archive missing the
+            # inputs (neuron-explorer "open inp-*.bin: no such file or directory").
+            if self.fs_config.force_local_cleanup:
+                from .host_io import cleanup_input_bins
+
+                cleanup_input_bins(self.fs_config.artifacts_output_directory_path)
 
             # Run performance analysis if perf analysis is enabled
             if self.perf_analysis_enabled:
@@ -396,6 +404,7 @@ class Orchestrator:
             MetricName.VALIDATION_TIME,
             MetricName.SIMULATION_TIME,
             MetricName.HOST_ARCH_VALIDATION_TIME,
+            MetricName.FRONTEND_TRACE_TIME,
             MetricName.MLIR_TO_BIR_TIME,
             MetricName.BIR_TO_NEFF_TIME,
             MetricName.INPUT_DUMP_TIME,
@@ -403,6 +412,7 @@ class Orchestrator:
             MetricName.DETERMINISM_CHECK_TIME,
             MetricName.VALIDATION_OUTPUT_LOAD_TIME,
             MetricName.VALIDATION_COMPARE_TIME,
+            MetricName.GOLDEN_ACQUISITION_TIME,
             MetricName.GOLDEN_COMPUTATION_TIME,
         ]
 
@@ -501,7 +511,7 @@ class Orchestrator:
             raise CompilationException(error_msg) from e
 
     def _run_inference(self, kernel_under_test: KernelArgs, input_file_paths: dict[str, str]) -> str | None:
-        """Run compiled kernel on hardware using neuron-profile."""
+        """Run compiled kernel on hardware using neuron-explorer."""
         assert self.fs_config.artifacts_output_directory_path
 
         logging.info(f"Running inference for {self.fs_config.artifacts_output_directory_path=}")
@@ -514,6 +524,8 @@ class Orchestrator:
                 self.fs_config.host_manager.get_host_assignment_with_retry(
                     platform_target=kernel_under_test.compiler_input.platform_target,
                     collector=self.collector,
+                    collective_ranks=kernel_under_test.inference_args.collective_ranks,
+                    lnc_config=kernel_under_test.compiler_input.logical_nc_config,
                 )
             ) as host_assignment_generator:
                 for host_assignment_attempt in host_assignment_generator:
@@ -567,7 +579,7 @@ class Orchestrator:
         input_file_paths: dict[str, str],
         collector,
     ) -> str | None:
-        """Run neuron-profile on the prepared host."""
+        """Run neuron-explorer on the prepared host."""
         kernel_input_args = self.__format_profiler_kernel_input_args__(kernel_under_test, input_file_paths)
 
         env_vars: Optional[dict[str, str]] = kernel_under_test.inference_args.env_vars
@@ -715,7 +727,7 @@ class Orchestrator:
     def _rename_neff_outputs_to_python_names(self, artifact_path: str, output_names: list[str] | None) -> None:
         """Rename NEFF output files (output_N) to Python-level names.
 
-        When using neuron-profile with a CompiledKernel that has output_specs,
+        When using neuron-explorer with a CompiledKernel that has output_specs,
         the NEFF uses generic names like output_0 but the validator expects
         the Python-level names (e.g. 'y'). This renames the files to match.
         """
@@ -857,7 +869,7 @@ class Orchestrator:
             raise Exception(f"{platform_target} is currently unsupported by this test framework!")
 
     def __format_profiler_kernel_input_args__(self, kernel_input: KernelArgs, input_file_paths: dict[str, str]) -> str:
-        """Format kernel input arguments for neuron-profile command.
+        """Format kernel input arguments for neuron-explorer command.
 
         Args:
             kernel_input: Kernel arguments
@@ -866,7 +878,7 @@ class Orchestrator:
                 For per-rank inputs: {"--multi-input": "4rank_inputs.txt"}
 
         Returns:
-            Formatted string for neuron-profile command:
+            Formatted string for neuron-explorer command:
                 For single input: "input inp-input-000.bin weights inp-weights-000.bin"
                 For per-rank inputs: "--multi-input 4rank_inputs.txt"
         """
@@ -884,7 +896,7 @@ class Orchestrator:
         """
         Dump tensors to target directory using provided naming function.
 
-        For numpy arrays, saves as raw .bin files for neuron-profile compatibility.
+        For numpy arrays, saves as raw .bin files for neuron-explorer compatibility.
         """
         os.makedirs(target_directory, exist_ok=True)
         dumped_files = {}
@@ -895,7 +907,7 @@ class Orchestrator:
                     file_path = os.path.join(target_directory, file_name)
                     np.save(file_path, value)
                 else:
-                    # Save as raw binary for neuron-profile
+                    # Save as raw binary for neuron-explorer
                     file_name = name_fn(name) + ".bin"
                     file_path = os.path.join(target_directory, file_name)
                     with open(file_path, "wb") as f:
@@ -933,11 +945,17 @@ class Orchestrator:
                     # compare against, but input dumps still feed sanitizer/race/barrier checks.
                     output_golden = {k: v for k, v in output_golden.items() if isinstance(v, np.ndarray)}
                     if output_golden:
+                        # Cast goldens to the kernel's output dtype (torch_ref often returns fp32
+                        # but birsim expects the dtype to match the kernel output).
+                        output_ndarray = kernel_under_test.validation_args.golden_output.output_ndarray
+                        for k in output_golden:
+                            if k in output_ndarray and output_golden[k].dtype != output_ndarray[k].dtype:
+                                output_golden[k] = output_golden[k].astype(output_ndarray[k].dtype)
                         # birsim is looking for files with specific naming pattern. moreover, they
                         # have to be numpy files, not binary files
                         _ = self.__dump_tensors__(birsim_dir, output_golden, lambda name: f"value_{name}", True)
                 else:
-                    assert False, (
+                    raise AssertionError(
                         "Birsim does not support custom validator as golden output! Please disable bir sim or switch to a different golden generator"
                     )
 
@@ -963,9 +981,9 @@ class Orchestrator:
 
     def __dump_per_rank_inputs__(self, target_directory: str, kernel_under_test: KernelArgs) -> dict[str, str]:
         """
-        Dump per-rank inputs and generate multi-input file for neuron-profile.
+        Dump per-rank inputs and generate multi-input file for neuron-explorer.
 
-        The --multi-input neuron-profile flag is used for collectives with per-rank inputs.
+        The --multi-input neuron-explorer flag is used for collectives with per-rank inputs.
         It specifies a file where each line provides inputs for one rank (line 1 = rank 0,
         line 2 = rank 1, etc.). Each line has space-separated pairs: "arg_name filename ..."
 

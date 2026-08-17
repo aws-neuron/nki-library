@@ -32,6 +32,22 @@ def _get_mx_max_exp(dst_dtype):
     return {float8_e5m2_x4: 14, float8_e4m3fn_x4: 7}[dst_dtype]
 
 
+def _raw_exponent_scale(scale):
+    """Return the MX scale tensor's raw biased exponent bytes as uint8.
+
+    MX scales encode a biased exponent as one byte. ``mx_util.nc_matmul_mx_golden``
+    expects the integer byte value (0-255) via ``.astype``. When the pre-quantized
+    scale input is float8_e8m0fnu, ``.astype`` would convert the represented value
+    (2^(byte-127)) rather than the byte, corrupting the golden scale factors.
+    Reinterpret the bytes via ``.view(uint8)``; no-op for scales already uint8.
+    """
+    import nki.language as nl
+
+    if scale.dtype == nl.float8_e8m0fnu:
+        return scale.view(np.uint8)
+    return scale
+
+
 # NOTE: This duplicates test/integration/.../matmul_mxfp8/utils.py:swizzle_tensor
 # intentionally — src/ modules must not import from test/.
 def _swizzle(src_tensor, TILE_P=512):
@@ -95,6 +111,38 @@ def _swizzle(src_tensor, TILE_P=512):
     return dst_tensor.astype(src_tensor.dtype)
 
 
+# NOTE: This duplicates test/integration/.../matmul_mxfp8/utils.py:swizzle_tensor_1x32
+# intentionally — src/ modules must not import from test/.
+def _swizzle_1x32(src_tensor):
+    """
+    Golden reference for the 1x32 (contiguous-K) interleave layout.
+
+    Packs INTERLEAVE_FACTOR consecutive K values of a feature into its four
+    adjacent output columns (contrast with wrapX ``_swizzle``, which scatters
+    K into four quarters):
+
+        dst[p, f * INTERLEAVE_FACTOR + c] = src[INTERLEAVE_FACTOR * p + c, f]
+
+    Matches the hardware ``load_tile_PE_Swizzle_1x32`` loader. The mapping is
+    local to each group of INTERLEAVE_FACTOR rows, so no tile-remainder handling
+    is needed.
+
+    Args:
+        src_tensor (np.ndarray): Source tensor of shape (P, F).
+
+    Returns:
+        np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
+    """
+    P, F = src_tensor.shape
+    if P % _INTERLEAVE_FACTOR != 0:
+        raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({_INTERLEAVE_FACTOR})")
+    return (
+        src_tensor.reshape(P // _INTERLEAVE_FACTOR, _INTERLEAVE_FACTOR, F)
+        .transpose(0, 2, 1)
+        .reshape(P // _INTERLEAVE_FACTOR, F * _INTERLEAVE_FACTOR)
+    )
+
+
 def _resolve_x4_dtype(float8_dtype_str):
     """Convert float8 dtype string to neuron x4 dtype."""
     name = float8_dtype_str if float8_dtype_str.endswith("_x4") else float8_dtype_str + "_x4"
@@ -133,6 +181,9 @@ def matmul_mxfp8_torch_ref(
     load_with_PE_swizzle=False,
     lhs_is_f_by_k=True,
     rhs_is_f_by_k=True,
+    fast_dma_transpose=False,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     """Compute golden matmul output for MXFP8 matrix multiplication.
 
@@ -147,6 +198,10 @@ def matmul_mxfp8_torch_ref(
 
     compute_dtype_x4 = _resolve_x4_dtype(float8_dtype)
     out_dt = output_dtype if output_dtype is not None else nl.float32
+
+    # Both operands' K axis must use the same permutation for the matmul to be
+    # valid, so a single quant_scheme selects the swizzle for every BF16 operand.
+    swizzle = _swizzle_1x32 if quant_scheme == "1x32" else _swizzle
 
     lhs_prequantized = lhs_scales is not None
     rhs_prequantized = rhs_scales is not None
@@ -163,26 +218,26 @@ def matmul_mxfp8_torch_ref(
             lhs_sw = lhs
         elif not lhs_is_f_by_k:
             # lhs is [K, M] already (K-by-F); swizzle directly
-            lhs_sw = _swizzle(lhs.copy())
+            lhs_sw = swizzle(lhs.copy())
         else:
             # lhs is [M, K] unswizzled (F-by-K, the default); transpose to [K, M] then swizzle
-            lhs_sw = _swizzle(lhs.T.copy())
+            lhs_sw = swizzle(lhs.T.copy())
 
         if rhs_is_swizzled:
             rhs_sw = rhs
         elif not rhs_is_f_by_k:
             # rhs is [K, N] already (K-by-F); swizzle directly
-            rhs_sw = _swizzle(rhs.copy())
+            rhs_sw = swizzle(rhs.copy())
         else:
             # rhs is [N, K] unswizzled (F-by-K, the default); transpose to [K, N] then swizzle
-            rhs_sw = _swizzle(rhs.T.copy())
+            rhs_sw = swizzle(rhs.T.copy())
 
         result = golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
     else:
         # At least one operand is pre-quantized.
         # For BF16 operands, swizzle and quantize. For pre-quantized, use directly.
         if not lhs_prequantized:
-            lhs_sw = lhs if lhs_is_swizzled else (_swizzle(lhs.copy()) if not lhs_is_f_by_k else _swizzle(lhs.T.copy()))
+            lhs_sw = lhs if lhs_is_swizzled else (swizzle(lhs.copy()) if not lhs_is_f_by_k else swizzle(lhs.T.copy()))
             a_data, a_scale = mx_util.quantize_mx_golden(lhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             # Pre-quantized: data may be non-x4 dtype, view as x4
@@ -195,9 +250,10 @@ def matmul_mxfp8_torch_ref(
                 a_scale = _unpack_packed_scales(lhs_scales, K, F)
             else:
                 a_scale = _compact_scales(lhs_scales)
+            a_scale = _raw_exponent_scale(a_scale)
 
         if not rhs_prequantized:
-            rhs_sw = rhs if rhs_is_swizzled else (_swizzle(rhs.copy()) if not rhs_is_f_by_k else _swizzle(rhs.T.copy()))
+            rhs_sw = rhs if rhs_is_swizzled else (swizzle(rhs.copy()) if not rhs_is_f_by_k else swizzle(rhs.T.copy()))
             b_data, b_scale = mx_util.quantize_mx_golden(rhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             b_data = rhs
@@ -209,6 +265,7 @@ def matmul_mxfp8_torch_ref(
                 b_scale = _unpack_packed_scales(rhs_scales, K, F)
             else:
                 b_scale = _compact_scales(rhs_scales)
+            b_scale = _raw_exponent_scale(b_scale)
 
         result = mx_util.nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
 

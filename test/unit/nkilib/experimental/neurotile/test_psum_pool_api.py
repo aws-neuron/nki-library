@@ -23,9 +23,10 @@ helpers directly.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core._validation import _validate_psum_pool_grid_args
 from nkilib_src.nkilib.experimental.neurotile.core.layout_psum import PSUMLayout
+
+from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 
 # ============================================================================
@@ -406,30 +407,13 @@ class TestPSUMLayoutAdvance:
 # ============================================================================
 
 
-class _FakeNdarray:
-    """Stub ndarray supporting ``[:, a:b]`` slicing with shape tracking.
-
-    PSUMLayout.get_data slices the active tile's ndarray on dim 1 to the
-    addressable F-width. Only that 2-D slice form is exercised here.
-    """
-
-    def __init__(self, shape):
-        self.shape = tuple(shape)
-
-    def __getitem__(self, key):
-        # ``data[:, 0:k]`` -- shape becomes (P, k).
-        slice_p, slice_f = key
-        new_f = slice_f.stop - slice_f.start
-        return _FakeNdarray((self.shape[0], new_f))
-
-
 def _make_full_tile_layout(grid_shape, alloc_tile_size, bank_axis=None, slots_per_bank=None):
     """Build a PSUMLayout with tile ndarrays sized to ``alloc_tile_size``."""
     tile_count = 1
     for d in range(len(grid_shape)):
         tile_count = tile_count * grid_shape[d]
     spb = slots_per_bank if slots_per_bank is not None else 1
-    tiles = tuple(_FakeNdarray(alloc_tile_size) for _ in range(tile_count))
+    tiles = tuple(MockTensor(alloc_tile_size) for _ in range(tile_count))
     return PSUMLayout(
         tile_arrays=tiles,
         offset=0,
@@ -511,6 +495,106 @@ class TestPSUMLayoutGetData:
         )
         data = layout.get_data(grid=None)
         assert data is layout.tile_arrays[0]
+
+
+@pytest_marks(["neurotile"])
+class TestPSUMLayoutApClamp:
+    """``PSUMLayout.ap`` clamps the active tile's AP to ``grid.remaining`` -- the
+    same partial-trailing-tile width ``get_data`` reports (consistent with the
+    SBUF/HBM layouts). A partial PSUM tile that reported the full alloc width
+    here broke ``nc_matmul`` operand matching (dst free product != moving free
+    product)."""
+
+    @pytest.mark.fast
+    def test_full_tile_ap_is_alloc_width(self):
+        layout = _make_full_tile_layout(grid_shape=(1, 1), alloc_tile_size=(128, 512))
+        from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+
+        grid = Grid.from_shape(element_shape=(128, 512), tile_size=(128, 512))
+        assert layout.ap(grid).shape == (128, 512)
+
+    @pytest.mark.fast
+    def test_partial_trailing_tile_ap_clamps_to_remaining(self):
+        """Trailing tile: alloc 512 F, addressable 256 F -> ap is (P, 256),
+        matching get_data (regression guard: ap used to report the full 512)."""
+        layout = _make_full_tile_layout(grid_shape=(1, 1), alloc_tile_size=(128, 512))
+        from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+
+        grid = Grid.from_shape(element_shape=(128, 256), tile_size=(128, 512))
+        assert grid.remaining == (128, 256)
+        assert layout.ap(grid).shape == (128, 256)
+        # ap and get_data agree on the partial tile width.
+        assert layout.ap(grid).shape == layout.get_data(grid).shape
+
+    @pytest.mark.fast
+    def test_subwidth_slice_pins_physical_partition_stride(self):
+        """A tile backed by a WIDER bank (slice of a 512-wide bank viewed as 144)
+        must emit AP level-0 stride = the physical row width 512, not the
+        contiguous-of-logical 144. Regression guard for the on-chip
+        partition-stride check ("Partition step 144 must equal 512")."""
+        from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+
+        # Tile mock whose logical shape is 144 but physical storage is 512 wide
+        # (what `bank.data[:, :144]` reports: .shape=(128,144), _storage_shape=(128,512)).
+        tile = MockTensor((128, 144), storage_shape=(128, 512))
+        layout = PSUMLayout(
+            tile_arrays=(tile,),
+            offset=0,
+            alloc_tile_size=(128, 144),
+            bank_axis=None,
+            slots_per_bank=1,
+            dtype=None,
+            grid_shape=(1, 1),
+        )
+        grid = Grid.from_shape(element_shape=(128, 144), tile_size=(128, 144))
+        ap = layout.ap(grid)
+        assert ap.shape == (128, 144)
+        assert ap.strides[0] == 512  # physical row width, not the logical 144
+
+        # Reshape path: a transform sets ap_strides to the contiguous-of-logical
+        # values (here level-0 would be 144). ap() must still pin level-0 to the
+        # physical 512 and keep the transform's inner strides.
+        reshaped_layout = layout.apply_transform((144, 12, 1))
+        reshaped = reshaped_layout.ap(Grid.from_shape(element_shape=(128, 12, 12), tile_size=(128, 12, 12)))
+        assert reshaped.strides[0] == 512  # physical row width, NOT the transform's 144
+        assert reshaped.strides[1:] == (12, 1)  # inner levels keep the transform strides
+
+    @pytest.mark.fast
+    def test_narrow_free_advances_offset_not_tile_index(self):
+        """A free-dim slice narrows WITHIN the active tile: ``narrow_free``
+        advances ``free_offset`` (via the element strides) and ``ap()`` emits it
+        as the AP offset, while the tile index (``offset``) is untouched. The
+        W-padded conv3d chain: reshape (4, 12) then slice dh and W."""
+        from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+
+        tile = MockTensor((128, 48), storage_shape=(128, 512))
+        layout = PSUMLayout(
+            tile_arrays=(tile,),
+            offset=0,
+            alloc_tile_size=(128, 48),
+            bank_axis=None,
+            slots_per_bank=1,
+            dtype=None,
+            grid_shape=(1, 1),
+        )
+        # reshape flat 48 -> (4 dh, 12 w): element strides become (48, 12, 1).
+        reshaped = layout.apply_transform((48, 12, 1))
+        # slice dh[1:3] (dim 1, start 1) then w[3:10] (dim 2, start 3) on a
+        # (128, 4, 12) element shape.
+        dh_sliced = reshaped.narrow_free(1, 1, (128, 4, 12))
+        wh_sliced = dh_sliced.narrow_free(2, 3, (128, 4, 12))
+
+        # free_offset = 1*12 (dh) + 3*1 (w) = 15; tile index stays 0.
+        assert wh_sliced.free_offset == 15
+        assert wh_sliced.offset == 0  # tile selection untouched
+        assert wh_sliced.tile_arrays is layout.tile_arrays
+
+        # ap() emits the strided sub-region at that offset, level-0 still 512.
+        ap = wh_sliced.ap(Grid.from_shape(element_shape=(128, 2, 7), tile_size=(128, 2, 7)))
+        assert ap.offset == 15
+        assert ap.strides[0] == 512  # physical row width
+        assert ap.strides[1:] == (12, 1)  # dh stride 12, w stride 1
+        assert ap.shape == (128, 2, 7)
 
 
 # ============================================================================

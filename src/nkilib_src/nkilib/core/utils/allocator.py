@@ -42,7 +42,7 @@ def sizeinbytes(dtype):
     elif (
         str(dtype) == str(nl.int8)
         or str(dtype) == str(nl.uint8)
-        or str(dtype) in ["float8e4", "float8_e4m3", "float8_e4m3fn", "float8e5", "float8_e5m2"]
+        or str(dtype) in ["float8e4", "float8_e4m3", "float8_e4m3fn", "float8e5", "float8_e5m2", "float8_e8m0fnu"]
     ):
         return 1
     elif str(dtype) == str(nl.int32) or str(dtype) == str(nl.uint32):

@@ -20,24 +20,26 @@ deep imports (Grid, NDSlice, HBMLayout) per the §3.5 exception.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import contiguous_strides
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
 from nkilib_src.nkilib.experimental.neurotile.core.layout_hbm import HBMLayout
 from nkilib_src.nkilib.experimental.neurotile.core.ndslice import NDSlice
+
+from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 
 
 def _make_view(element_shape, tile_size_2d, block_size=None, n_batch=0):
     """Build an NDSlice over a mock HBM layout for attribute checks."""
-    ndim = len(element_shape)
     full_tile = tuple([1] * n_batch) + tuple(tile_size_2d)
     full_block = None
     if block_size is not None:
         full_block = tuple([1] * n_batch) + tuple(block_size)
     grid = Grid.from_shape(element_shape, full_tile, block_size=full_block, n_batch_dims=n_batch)
     strides = contiguous_strides(element_shape)
-    layout = HBMLayout(source="mock", offset=0, strides=strides, dtype="float32", buffer_type="shared_hbm")
+    layout = HBMLayout(
+        source=MockTensor(element_shape), offset=0, strides=strides, dtype="float32", buffer_type="shared_hbm"
+    )
     return NDSlice(grid, layout)
 
 
@@ -182,22 +184,22 @@ class TestSingleIntDeflectPastConsumedDims:
     def test_row_j_targets_dim_1(self):
         v = _tile_view()
         row = v[0, :]
-        assert row.grid.cursor == 1
+        assert row._grid.cursor == 1
         tile = row[2]
         assert tile.element_shape == (128, 128)
 
     def test_block_row_bj_targets_dim_1(self):
         v = _block_view()
         block_row = v[0, :]
-        assert block_row.grid.cursor == 1
+        assert block_row._grid.cursor == 1
         block = block_row[0]
         assert block.shape == (2, 2)
         assert block.element_shape == (256, 256)
 
     def test_no_deflect_on_batch_dim(self):
         v = _make_view((8, 256, 256), (128, 128), n_batch=1)
-        assert v.grid.cursor == 1
-        assert v.grid.n_batch_dims == 1
+        assert v._grid.cursor == 1
+        assert v._grid.n_batch_dims == 1
         slab = v[3]
         assert slab.ndim == 2
-        assert slab.grid.n_batch_dims == 0
+        assert slab._grid.n_batch_dims == 0

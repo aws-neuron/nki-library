@@ -17,7 +17,7 @@ PyTorch reference for attention_tkg kernel
 """
 
 import math
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, Tuple, Union
 
 import torch
 
@@ -63,7 +63,8 @@ Args:
     dtype_mode: Quantization dtype policy (accepted for kernel signature parity; unused on CPU).
 
 Returns:
-    Tuple of (out, k_out) tensors
+    Tuple of (out, k_out) tensors. When cfg.return_cp_softmax_stats=True, out is unnormalized and
+    the local softmax stats are written into the cp_softmax_stats_out dict.
 """
 
 
@@ -83,14 +84,20 @@ def _attention_tkg_torch_ref_impl(
     sink: Optional[torch.Tensor] = None,
     active_blocks_table: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
+    cp_softmax_stats_out: Optional[dict] = None,
     DBG_TENSORS: Optional[tuple] = None,
     max_context_len=None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for kernel signature parity (no FP8 tile allocations on CPU)
-) -> Tuple[torch.Tensor, torch.Tensor | None]:
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor | None], Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]
+]:
+    """Reference implementation for attention_tkg. See attention_tkg_torch_ref for the full contract."""
     LNC = attention_tkg_torch_ref.lnc
-    # Currently hardcoding P_MAX to 128, the kernel determines P_MAX through nl.tile_size.pmax
-    # which isn't available in torch golden.
-    # TODO: Need to find a better way to dynamically configure this. Confirm whether
+    """
+    Hardcode P_MAX to 128. The kernel derives P_MAX from nl.tile_size.pmax,
+    which is unavailable in the torch golden reference.
+    TODO: Configure this dynamically instead of hardcoding.
+    """
     P_MAX = 128
 
     batch = cfg.bs
@@ -153,11 +160,12 @@ def _attention_tkg_torch_ref_impl(
         # Only reshape mask if NOT using use_pos_id (i.e., pre-computed full cache mask)
         # When use_pos_id=True, the mask is a small active mask that will be expanded in _attention_tkg_fwd_ref
         if not cfg.use_pos_id:
-            # The pre-generated mask is in n_sprior_tile-major HBM layout:
-            # flat index i -> (f = i // P_MAX, p = i % P_MAX)
-            # where fold = f // block_len, blk_offset = f % block_len
-            # token = fold * P_MAX * block_len + p * block_len + blk_offset
-            # Unshuffle back to linear token order.
+            """
+            Unshuffle the pre-generated mask from n_sprior_tile-major HBM layout to linear token order.
+            flat index i -> (f = i // P_MAX, p = i % P_MAX)
+            where fold = f // block_len, blk_offset = f % block_len
+            token = fold * P_MAX * block_len + p * block_len + blk_offset
+            """
             active_mask = (
                 active_mask.permute(1, 2, 3, 0)
                 .reshape((-1, reduced_blk_len, P_MAX))
@@ -177,18 +185,20 @@ def _attention_tkg_torch_ref_impl(
     start_pos_ids = start_pos_ids.to(torch.float32) if start_pos_ids is not None else None
     sink = sink.to(torch.float32) if sink is not None else None
 
-    attn_out, attn_k_out, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM = _attention_tkg_fwd_ref(
-        q=q,
-        k_active=k_active,
-        v_active=v_active,
-        k_prior=k_prior,
-        v_prior=v_prior,
-        active_mask=active_mask,
-        inv_freqs=inv_freqs,
-        rope_pos_ids=rope_pos_ids,
-        start_pos_ids=start_pos_ids,
-        sink=sink,
-        cfg=cfg,
+    attn_out, attn_k_out, softmax_max, softmax_sum, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM = (
+        _attention_tkg_fwd_ref(
+            q=q,
+            k_active=k_active,
+            v_active=v_active,
+            k_prior=k_prior,
+            v_prior=v_prior,
+            active_mask=active_mask,
+            inv_freqs=inv_freqs,
+            rope_pos_ids=rope_pos_ids,
+            start_pos_ids=start_pos_ids,
+            sink=sink,
+            cfg=cfg,
+        )
     )
 
     # Need to transpose and reshape if output is in sbuf
@@ -226,10 +236,22 @@ def _attention_tkg_torch_ref_impl(
         for dst_tensor, dbg_result in zip(DBG_TENSORS, DBG_RESULTS):
             dst_tensor.view(dbg_result.shape).copy_(dbg_result)
 
+    if cfg.return_cp_softmax_stats:
+        # out is unnormalized (not divided by softmax_sum) — caller handles global normalization.
+        kernel_assert(
+            cp_softmax_stats_out is not None,
+            "cp_softmax_stats_out dict is required when cfg.return_cp_softmax_stats=True",
+        )
+        cp_softmax_stats_out["fa_running_max"] = softmax_max
+        cp_softmax_stats_out["fa_running_sum"] = softmax_sum
+        cp_softmax_stats_out["max_negated"] = False
     return out, k_out
 
 
-def _reshape_q_and_k_active(q, k_active, cfg: AttnTKGConfig):
+def _reshape_q_and_k_active(
+    q: torch.Tensor, k_active: torch.Tensor, cfg: AttnTKGConfig
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reshape/transpose q and k_active into the layout the torch reference expects."""
     # attention_tkg supports qk tensors starting out in sbuf instead of hbm
     # in this case, we need to transpose them into dimension config that torch expects
     d_head, batch, q_head, s_active = cfg.d_head, cfg.bs, cfg.q_head, cfg.s_active
@@ -245,7 +267,10 @@ def _reshape_q_and_k_active(q, k_active, cfg: AttnTKGConfig):
     return q, k_active
 
 
-def _slice_and_reshape_kv_prior(k_prior, v_prior, cfg: AttnTKGConfig):
+def _slice_and_reshape_kv_prior(
+    k_prior: torch.Tensor, v_prior: torch.Tensor, cfg: AttnTKGConfig
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Slice prior KV to the active batch and reshape into the layout the torch reference expects."""
     batch, s_prior = cfg.bs, cfg.curr_sprior
 
     k_prior = k_prior[:batch, ...]  # when has_cache_buffer, there is an extra buffer batch in the end
@@ -260,20 +285,28 @@ def _slice_and_reshape_kv_prior(k_prior, v_prior, cfg: AttnTKGConfig):
     return k_prior, v_prior
 
 
-def _gather_block_kv_to_flat(block_cache, active_blocks_table, batch, S_max_ctx, d_head, block_len):
+def _gather_block_kv_to_flat(
+    block_cache: torch.Tensor,
+    active_blocks_table: torch.Tensor,
+    batch: int,
+    S_max_ctx: int,
+    d_head: int,
+    block_len: int,
+) -> torch.Tensor:
     '''Gather block cache to flat layout, skipping inactive blocks (INACTIVE_BLOCK_IDX).'''
     flat_cache = torch.zeros((batch, S_max_ctx, d_head), dtype=block_cache.dtype)
-    for b in range(batch):
-        valid_mask = active_blocks_table[b] != INACTIVE_BLOCK_IDX
-        valid_indices = active_blocks_table[b][valid_mask]
+    for batch_idx in range(batch):
+        valid_mask = active_blocks_table[batch_idx] != INACTIVE_BLOCK_IDX
+        valid_indices = active_blocks_table[batch_idx][valid_mask]
         num_valid_tokens = len(valid_indices) * block_len
-        flat_cache[b][:num_valid_tokens, :] = block_cache[valid_indices].reshape((-1, d_head))
+        flat_cache[batch_idx][:num_valid_tokens, :] = block_cache[valid_indices].reshape((-1, d_head))
     return flat_cache
 
 
-# Intermediate verification to verify active blocks reshape and load to SBUF.
-def _get_dbg_active_table(active_blocks_table, resize_factor, batch, p_max):
-    '''Get debug active table'''
+def _get_dbg_active_table(
+    active_blocks_table: torch.Tensor, resize_factor: int, batch: int, p_max: int
+) -> torch.Tensor:
+    '''Build debug active table to verify the active-blocks reshape and load to SBUF.'''
     table_repeated = torch.repeat_interleave(active_blocks_table, resize_factor, axis=1) * resize_factor
     increment_pattern = torch.arange(resize_factor).repeat(active_blocks_table.shape[1])
     table_incremented = table_repeated + increment_pattern[None, :]
@@ -282,7 +315,8 @@ def _get_dbg_active_table(active_blocks_table, resize_factor, batch, p_max):
     return dbg_active_table
 
 
-def _gen_rope_coeff(inv_freq, pos_ids):
+def _gen_rope_coeff(inv_freq: torch.Tensor, pos_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate the cos/sin RoPE coefficients from inverse frequencies and position ids."""
     d_head_half, _ = inv_freq.shape
     batch, seqlen = pos_ids.shape
 
@@ -298,7 +332,9 @@ def _gen_rope_coeff(inv_freq, pos_ids):
     return freqs_cos, freqs_sin
 
 
-def _apply_rope(x, cos, sin, d_head):
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, d_head: int) -> torch.Tensor:
+    """Apply RoPE to x using precomputed cos/sin, returning the rotated tensor in BNdS layout."""
+
     def _rotate_half(x):
         x1 = x[: d_head // 2, ...]
         x2 = x[d_head // 2 :, ...]
@@ -316,18 +352,22 @@ def _apply_rope(x, cos, sin, d_head):
 
 
 def _attention_tkg_fwd_ref(
-    q,
-    k_active,
-    v_active,
-    k_prior,
-    v_prior,
-    active_mask,
-    inv_freqs,
-    rope_pos_ids,
-    start_pos_ids,
-    sink,
+    q: torch.Tensor,
+    k_active: torch.Tensor,
+    v_active: torch.Tensor,
+    k_prior: torch.Tensor,
+    v_prior: torch.Tensor,
+    active_mask: torch.Tensor,
+    inv_freqs: Optional[torch.Tensor],
+    rope_pos_ids: Optional[torch.Tensor],
+    start_pos_ids: Optional[torch.Tensor],
+    sink: Optional[torch.Tensor],
     cfg: AttnTKGConfig,
-):
+) -> Tuple[torch.Tensor, ...]:
+    """Core forward reference: optional RoPE, masked QK^T, online-softmax stats, and softmax @ V.
+
+    Returns (out, k_active, score_max, score_sum, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM).
+    """
     batch, q_head, s_active, s_prior, d_head = cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, cfg.d_head
 
     # clone to avoid inplace modification
@@ -397,11 +437,16 @@ def _attention_tkg_fwd_ref(
 
     # Pad sink to the end of s_prior dimension.
     if sink is not None:
-        sink = sink.reshape((q_head, 1))[None, :, :, None].expand(batch, q_head, 1, s_active)
-        score = torch.cat([score, sink], axis=2)
+        kv_heads = sink.numel() // q_head
+        B_attn = batch // kv_heads  # batch is the folded B_attn*kv_heads axis
+        sink = sink.reshape(kv_heads, q_head, 1, 1)  # [kv_heads * n] -> [kv_heads, n, 1, 1]
+        sink = sink.repeat(B_attn, 1, 1, s_active)  # [kv_heads, n, 1, 1] -> [b, n, 1, s_active]
+        score = torch.cat([score, sink], axis=2)  # [b, n, s_prior, s_active] -> [b, n, s_prior + 1, s_active]
 
     # Take column wise max
     score_max = torch.max(score, dim=2, keepdim=True).values  # [b, n, 1, s_active]
+    # Clamp -inf to finite min to prevent NaN from exp(-inf - (-inf)) on fully-masked positions
+    score_max = torch.clamp(score_max, min=torch.finfo(torch.float32).min)
 
     DBG_QK_MAX = -score_max  # The debug tensor is always negated
 
@@ -416,8 +461,9 @@ def _attention_tkg_fwd_ref(
 
     DBG_EXP_SUM = score_sum
 
-    # Divide score by exp sum
-    score = score / score_sum  # [b, n, s_prior, s_active]
+    # Normalize (skip for CP — caller handles global normalization)
+    if not cfg.return_cp_softmax_stats:
+        score = score / score_sum  # [b, n, s_prior, s_active]
 
     # Remove sink from the end of s_prior dimension.
     if sink is not None:
@@ -427,11 +473,11 @@ def _attention_tkg_fwd_ref(
     out = score.permute(0, 1, 3, 2) @ v_prior  # [b, n, s_active, d_head]
     out = out.permute(0, 1, 3, 2)  # [b, n, d_head, s_active]
 
-    return out, k_active, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM
+    score_max = score_max.squeeze(2)  # [b, n, 1, s_active] -> [b, n, s_active]
+    score_sum = score_sum.squeeze(2)  # [b, n, 1, s_active] -> [b, n, s_active]
+    return out, k_active, score_max, score_sum, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM
 
 
-# is_block_kv or bs_n_prgs == 1 : [b, n, s_prior, s_active] -> [P_MAX, n_prgs, sprior_tiles, [reduced_blk_len,] b, n, s_active]
-# bs_n_prgs > 1: [b, n, s_prior, s_active] -> [s_prior, b, n, s_active]
 def _reshape_debug_tensor(
     tensor: torch.Tensor,
     cfg: AttnTKGConfig,
@@ -439,7 +485,13 @@ def _reshape_debug_tensor(
     n_prgs: int,
     is_block_kv: bool,
     reduced_blk_len: int = None,
-):
+) -> torch.Tensor:
+    """Reshape a debug tensor from linear [b, n, s_prior, s_active] to the kernel's tiled SBUF layout.
+
+    is_block_kv or bs_n_prgs == 1: [b, n, s_prior, s_active] ->
+        [P_MAX, n_prgs, sprior_tiles, [reduced_blk_len,] b, n, s_active]
+    bs_n_prgs > 1: [b, n, s_prior, s_active] -> [s_prior, b, n, s_active]
+    """
     batch, q_head, s_prior, s_active = cfg.bs, cfg.q_head, cfg.curr_sprior, cfg.s_active
     batch_sharded = is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max, cfg.fuse_rope)
     sprior_n_prgs = (
@@ -493,10 +545,13 @@ class _AttentionTkgTorchRefFn(Protocol):
         sink: Optional[torch.Tensor] = None,
         active_blocks_table: Optional[torch.Tensor] = None,
         k_out: Optional[torch.Tensor] = None,
+        cp_softmax_stats_out: Optional[dict] = None,
         DBG_TENSORS: Optional[tuple] = None,
         max_context_len=None,
         dtype_mode: DtypeMode = DtypeMode.NON_OCP,
-    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor | None], Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]
+    ]:
         """
         PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
 
@@ -524,7 +579,8 @@ class _AttentionTkgTorchRefFn(Protocol):
             dtype_mode: Quantization dtype policy (accepted for kernel signature parity; unused on CPU).
 
         Returns:
-            Tuple of (out, k_out) tensors
+            Tuple of (out, k_out) tensors. When cfg.return_cp_softmax_stats=True, out is unnormalized and
+            the local softmax stats are written into the cp_softmax_stats_out dict.
         """
         ...
 

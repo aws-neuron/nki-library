@@ -26,8 +26,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -51,7 +51,7 @@ def _tensor_add_block_sharded(a, b):
             at = A[i, j].load()
             bt = B[i, j].load()
             nisa.tensor_tensor(at.data, at.data, bt.data, op=nl.add)
-            C[i, j].store(at.ap())
+            C[i, j].store(at.data)
     return c
 
 
@@ -72,7 +72,7 @@ def _tensor_add_interleaved(a, b):
             at = A[i, j].load()
             bt = B[i, j].load()
             nisa.tensor_tensor(at.data, at.data, bt.data, op=nl.add)
-            C[i, j].store(at.ap())
+            C[i, j].store(at.data)
     return c
 
 

@@ -11,39 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""nkilib.experimental.neurotile - Tile Iterator Library for NKI.
+"""nkilib.experimental.neurotile - Tile Iterator Library for NKI."""
 
-User-facing API: see neurotile_api_reference.md.
+from .api import *  # noqa: F401,F403  -- re-export the public surface (nt.*)
 
-Canonical consumer style:
-    from nkilib_src.nkilib.experimental import neurotile as nt
-    nt.tiles(...)
-    nt.blocks(...)
-    nt.alloc_tiles(...)
-    # etc.
-"""
-
-from .core._helpers import ceiling_div, largest_divisor
-from .core.factories import alloc_blocks, alloc_tiles, blocks, tensor_view, tiles
-from .core.psum_pool import psum_pool
-from .core.shard_helpers import (
-    block_range,
-    get_shard_info,
-    interleaved_range,
-    uneven_block_range,
+# The view types are NOT part of the nt.* public surface (not in __all__), so
+# ``import *`` does not bind them. Import them explicitly so they are resolvable
+# as package attributes -- the API docs (autoclass under currentmodule) and type
+# cross-references need that. Users still never construct them directly.
+from .api import (  # noqa: F401
+    BlockStream,
+    NDSlice,
+    __all__,  # re-export the contract list verbatim
 )
-
-__all__ = [
-    "alloc_blocks",
-    "alloc_tiles",
-    "block_range",
-    "blocks",
-    "ceiling_div",
-    "get_shard_info",
-    "interleaved_range",
-    "largest_divisor",
-    "psum_pool",
-    "tensor_view",
-    "tiles",
-    "uneven_block_range",
-]

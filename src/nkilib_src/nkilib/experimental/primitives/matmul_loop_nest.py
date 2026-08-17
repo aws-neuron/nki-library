@@ -21,7 +21,6 @@ post-matmul operations, and drain.
 import nki.isa as nisa
 import nki.language as nl
 
-from ...core.utils.tensor_view import TensorView
 from ...core.utils.tiled_tensor import TiledTensor as _CoreTiledTensor
 
 
@@ -48,7 +47,7 @@ class _DimsAccessor(nl.NKIObject):
         if nd == 2:
             if hasattr(self._tt, '_tiles') and self._tt._tiles is not None:
                 return self._tt[k, x]
-            return self._tt.get_tile((k, x), keep_dim=False).get_view()
+            return self._tt.get_tile((k, x), keep_dim=False)
         indices = [0] * nd
         if self._k_dim is not None:
             indices[self._k_dim] = k
@@ -173,8 +172,7 @@ def matmul_loop_nest(
         # Simple case: no packing, wrap on_output as on_drain
         def _v2_drain(psum_tile, sbuf_tile, m, n):
             aux_views = [
-                aux.get_tile((m, n), keep_dim=True).get_view() if hasattr(aux, 'get_tile') else aux[m, n]
-                for aux in _auxiliaries
+                aux.get_tile((m, n), keep_dim=True) if hasattr(aux, 'get_tile') else aux[m, n] for aux in _auxiliaries
             ]
             _on_output(psum_tile, sbuf_tile, *aux_views)
 
@@ -278,7 +276,7 @@ def matmul_loop_nest(
                 if _on_output is not None:
                     out_tile = _output[m, n] if _output is not None else None
                     aux_views = [
-                        aux.get_tile((m, n), keep_dim=True).get_view() if hasattr(aux, 'get_tile') else aux[m, n]
+                        aux.get_tile((m, n), keep_dim=True) if hasattr(aux, 'get_tile') else aux[m, n]
                         for aux in _auxiliaries
                     ]
                     _on_output(psum, out_tile, *aux_views)
@@ -427,10 +425,10 @@ def matmul_loop_nest(
                     out_full = _output[m, n0]
                     bxs_col = n1 * mov_for_drain.shape[-1]
                     actual_cols = min(mov_for_drain.shape[-1], out_full.shape[-1] - bxs_col)
-                    out_slice = TensorView(out_full).slice(dim=1, start=bxs_col, end=bxs_col + actual_cols).get_view()
+                    out_slice = out_full.slice(dim=1, start=bxs_col, end=bxs_col + actual_cols)
                     psum_clamped = psum[: stat_for_drain.shape[-1], :actual_cols]
                     aux_views = [
-                        aux.get_tile((m, n0), keep_dim=True).get_view() if hasattr(aux, 'get_tile') else aux[m, n0]
+                        aux.get_tile((m, n0), keep_dim=True) if hasattr(aux, 'get_tile') else aux[m, n0]
                         for aux in _auxiliaries
                     ]
                     _on_output(psum_clamped, out_slice, *aux_views)

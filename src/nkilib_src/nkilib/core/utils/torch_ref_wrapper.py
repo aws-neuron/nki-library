@@ -50,6 +50,12 @@ def torch_ref_wrapper(
         Wrapped function that takes numpy arrays and returns numpy arrays.
     """
 
+    # Options that change the golden but aren't in the ref's kwargs; the torch-ref
+    # cache folds these into its key so wrappers differing only in an option don't
+    # collide. locals() before any other binding is exactly the parameters.
+    _params = dict(locals())
+    cache_options = {name: value for name, value in _params.items() if name != "torch_ref_func"}
+
     @functools.wraps(torch_ref_func)
     def wrapped(**kwargs):
         torch_kwargs = {}
@@ -109,4 +115,5 @@ def torch_ref_wrapper(
         else:
             return result
 
+    wrapped._torch_ref_cache_options = cache_options
     return wrapped

@@ -19,9 +19,9 @@ from typing import final
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.scan import selective_scan
 from nkilib_src.nkilib.experimental.scan.selective_scan_torch import selective_scan_torch_ref
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import FilterResult
@@ -136,8 +136,8 @@ class TestSelectiveScanKernel:
         )
 
     @pytest.mark.coverage_parametrize(
-        batch=[1, 2, 4],
-        channels=[128, 256, 512, 768],
+        batch=[1, 2, 4, 8, 16],
+        channels=[128, 256, 512, 768, 2560],
         seq_len=[128, 512, 1024, 2048, 4096],
         state_size=[8, 16, 32, 64],
         use_D=[True, False],

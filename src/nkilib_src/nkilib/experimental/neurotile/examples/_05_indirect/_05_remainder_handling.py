@@ -45,7 +45,7 @@ def indirect_gather_oob(data, indices):
 
     idx_tile = idx_iter[0, 0].load()
     gathered = data_iter[idx_tile, 0].load(oob_mode=nisa.oob_mode.skip)
-    out_iter[0, 0].store(gathered.ap())
+    out_iter[0, 0].store(gathered.data)
     return out
 
 
@@ -67,7 +67,7 @@ def indirect_gather_oob_value(data, indices):
         oob_mode=nisa.oob_mode.skip,
         oob_value=0.0,
     )
-    out_iter[0, 0].store(gathered.ap())
+    out_iter[0, 0].store(gathered.data)
     return out
 
 
@@ -117,7 +117,7 @@ def is_remainder_guard(data, indices):
     else:
         gathered = indirect_view.load()
 
-    out_iter[0, 0].store(gathered.ap())
+    out_iter[0, 0].store(gathered.data)
     return out
 
 
@@ -142,7 +142,7 @@ def multi_tile_gather_oob(data, indices):
             gathered = view.load(oob_mode=nisa.oob_mode.skip, oob_value=0.0)
         else:
             gathered = view.load()
-        out_iter[i, 0].store(gathered.ap())
+        out_iter[i, 0].store(gathered.data)
 
     return out
 

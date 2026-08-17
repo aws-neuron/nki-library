@@ -63,40 +63,40 @@ def _attach_qk_norm_weights(cfg, q_gamma, k_gamma, q_beta, k_beta):
     experimental_flags="skip-non-top-level-shared-hbm-check",
 )
 def qkv(
-    input: nl.ndarray,
-    fused_qkv_weights: nl.ndarray,
+    input: nl.NkiTensor,
+    fused_qkv_weights: nl.NkiTensor,
     output_layout: QKVOutputLayout = QKVOutputLayout.BSD,
     # -- Bias
-    bias: Optional[nl.ndarray] = None,
+    bias: Optional[nl.NkiTensor] = None,
     # -- Quantization
     quantization_type: QuantizationType = QuantizationType.NONE,
-    qkv_w_scale: Optional[nl.ndarray] = None,
-    qkv_in_scale: Optional[nl.ndarray] = None,
+    qkv_w_scale: Optional[nl.NkiTensor] = None,
+    qkv_in_scale: Optional[nl.NkiTensor] = None,
     # -- Fused Residual Add
     fused_residual_add: Optional[bool] = False,
-    mlp_prev: Optional[nl.ndarray] = None,
-    attention_prev: Optional[nl.ndarray] = None,
+    mlp_prev: Optional[nl.NkiTensor] = None,
+    attention_prev: Optional[nl.NkiTensor] = None,
     # --- Fused Norm Related
     fused_norm_type: NormType = NormType.NO_NORM,
-    gamma_norm_weights: Optional[nl.ndarray] = None,
-    layer_norm_bias: Optional[nl.ndarray] = None,
+    gamma_norm_weights: Optional[nl.NkiTensor] = None,
+    layer_norm_bias: Optional[nl.NkiTensor] = None,
     norm_eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     # --- Fused RoPE Related
     fused_rope: Optional[bool] = False,
-    cos_cache: Optional[nl.ndarray] = None,
-    sin_cache: Optional[nl.ndarray] = None,
+    cos_cache: Optional[nl.NkiTensor] = None,
+    sin_cache: Optional[nl.NkiTensor] = None,
     # Fused RoPE + QK-norm: K-specific gamma-fused caches
-    k_cos_cache: Optional[nl.ndarray] = None,
-    k_sin_cache: Optional[nl.ndarray] = None,
+    k_cos_cache: Optional[nl.NkiTensor] = None,
+    k_sin_cache: Optional[nl.NkiTensor] = None,
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
     # --- FP8 KV Cache Quantization Related
-    k_cache: Optional[nl.ndarray] = None,
-    v_cache: Optional[nl.ndarray] = None,
-    k_scale: Optional[nl.ndarray] = None,
-    v_scale: Optional[nl.ndarray] = None,
+    k_cache: Optional[nl.NkiTensor] = None,
+    v_cache: Optional[nl.NkiTensor] = None,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
     fp8_max: Optional[float] = None,
     fp8_min: Optional[float] = None,
     kv_dtype: Optional[type] = None,
@@ -105,7 +105,7 @@ def qkv(
     transpose_k_cache: bool = False,
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
-    slot_mapping: Optional[nl.ndarray] = None,
+    slot_mapping: Optional[nl.NkiTensor] = None,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -123,20 +123,24 @@ def qkv(
     # --- QK-Norm Related
     qk_norm_pre_rope: Optional[QKNormConfig] = None,
     qk_norm_post_rope: Optional[QKNormConfig] = None,
-    qk_norm_pre_rope_q_gamma: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_k_gamma: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_q_gamma: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_k_gamma: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_q_beta: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_k_beta: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_q_beta: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_k_beta: Optional[nl.ndarray] = None,
+    qk_norm_pre_rope_q_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_k_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_q_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_k_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_q_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_k_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_q_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_k_beta: Optional[nl.NkiTensor] = None,
     # --- Strided Input
     strided_input_config: Optional[StridedInputConfig] = None,
     # --- Output
-    output_hbm: Optional[nl.ndarray] = None,
+    output_hbm: Optional[nl.NkiTensor] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
-) -> nl.ndarray:
+    # --- Optional per-segment sum-of-squares outputs (each [B, S, 1]); qkv_cte only
+    q_squared_sum_out: Optional[nl.NkiTensor] = None,
+    k_squared_sum_out: Optional[nl.NkiTensor] = None,
+    v_squared_sum_out: Optional[nl.NkiTensor] = None,
+) -> nl.NkiTensor:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
 
@@ -171,36 +175,36 @@ def qkv(
 
     Parameters:
     -----------
-    input : nl.ndarray
+    input : nl.NkiTensor
         Input hidden states tensor of shape [B, S, H] where B=batch, S=sequence_length, H=hidden_dim.
         We name it 'input' and not 'hidden' to avoid ambiguity with the size of "hidden dimension".
-    fused_qkv_weights : nl.ndarray
-        Fused QKV weight matrix of shape [H, I] or [H//4, I] for MX where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
+    fused_qkv_weights : nl.NkiTensor
+        Fused QKV weight matrix of shape [H, I] or [H//4, I, 4] for MX where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
     output_layout : QKVOutputLayout, default=QKVOutputLayout.BSD
         Output tensor layout: QKVOutputLayout.BSD=[B, S, I] or QKVOutputLayout.NBSd=[num_heads, B, S, d_head]
-    bias : Optional[nl.ndarray], default=None
+    bias : Optional[nl.NkiTensor], default=None
         Bias tensor of shape [1, I] to add to QKV projection output
     quantization_type (QuantizationType):
         Type of quantization to apply (NONE, ROW, STATIC, MX). Default: QuantizationType.NONE.
         Note: For MX quantization, is only supported in QKV CTE kernel.
-    qkv_w_scale (nl.ndarray, optional):
+    qkv_w_scale (nl.NkiTensor, optional):
         QKV weight scale tensor in HBM for QKV projection.
         Shape:    [1, I] or [128, I] if row quantization, [1, 3] or [128, 3] if static quantization, [H//32, I] if MX quantization
-    qkv_in_scale (nl.ndarray, optional):
+    qkv_in_scale (nl.NkiTensor, optional):
         QKV input scale tensor in HBM for QKV projection. Only required for static quantization.
         Shape:    [1, 1] or [128, 1]
     fused_residual_add : Optional[bool], default=False
         Whether to perform residual addition: input = input + mlp_prev + attention_prev
-    mlp_prev : Optional[nl.ndarray], default=None
+    mlp_prev : Optional[nl.NkiTensor], default=None
         Previous MLP output tensor of shape [B, S, H] for residual addition
-    attention_prev : Optional[nl.ndarray], default=None
+    attention_prev : Optional[nl.NkiTensor], default=None
         Previous attention output tensor of shape [B, S, H] for residual addition
     fused_norm_type : NormType, default=NormType.NO_NORM
         Type of normalization: NormType.NO_NORM, NormType.RMS_NORM, NormType.RMS_NORM_SKIP_GAMMA, or NormType.LAYER_NORM
         NormType.RMS_NORM_SKIP_GAMMA assumes fused_qkv_weights have been pre-multiplied with gamma vector, so its skipped here.
-    gamma_norm_weights : Optional[nl.ndarray], default=None
+    gamma_norm_weights : Optional[nl.NkiTensor], default=None
         Normalization gamma/scale weights of shape [1, H] (required for NormType.RMS_NORM and NormType.LAYER_NORM)
-    layer_norm_bias : Optional[nl.ndarray], default=None
+    layer_norm_bias : Optional[nl.NkiTensor], default=None
         Layer normalization beta/bias weights of shape [1, H] (only for NormType.LAYER_NORM)
         Using layer norm bias is optional.
     norm_eps : float, default=1e-6
@@ -209,9 +213,9 @@ def qkv(
         Actual hidden dimension for padded tensors (if H contains padding)
     fused_rope : Optional[bool], default=False
         Whether to apply RoPE rotation to Query and Key heads after QKV projection
-    cos_cache : Optional[nl.ndarray], default=None
+    cos_cache : Optional[nl.NkiTensor], default=None
         Cosine cache for RoPE of shape [B, S, d_head] (required if fused_rope=True)
-    sin_cache : Optional[nl.ndarray], default=None
+    sin_cache : Optional[nl.NkiTensor], default=None
         Sine cache for RoPE of shape [B, S, d_head] (required if fused_rope=True)
     d_head : Optional[int], default=None
         Dimension per attention head (required for QKVOutputLayout.NBSd and RoPE)
@@ -224,8 +228,8 @@ def qkv(
         in the block KV cache or [B, kv_dim, max_seq_len] for flat KV cache.
     fp8_packed (bool), Default: False
         Enable packed FP8 K cache layout for block KV. Packs 2 consecutive FP8 sequence
-        positions into one row: k_cache shape [num_blocks, block_size // 2, kv_dim, 2] fp8,
-        where dim 3 index 0 = even positions and index 1 = odd positions. Enables DMA
+        positions into one row: k_cache shape [num_blocks, num_kv_heads, block_size // 2, d_head, 2] fp8,
+        where dim 4 index 0 = even positions and index 1 = odd positions. Enables DMA
         transpose on decode. Requires block KV, FP8 quantization, even block_size, and
         d_head <= 128. Mutually exclusive with transpose_k_cache.
     store_output_in_sbuf : bool, default=False
@@ -265,7 +269,7 @@ def qkv(
         - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
     Returns:
     --------
-    nl.ndarray
+    nl.NkiTensor
         QKV projection output tensor:
         - If output_layout=QKVOutputLayout.BSD: shape [B, S, I]
         - If output_layout=QKVOutputLayout.NBSd: shape [num_heads, B, S, d_head]
@@ -389,6 +393,9 @@ def qkv(
             strided_input_config=strided_input_config,
             output_hbm=output_hbm,
             dtype_mode=dtype_mode,
+            q_squared_sum_out=q_squared_sum_out,
+            k_squared_sum_out=k_squared_sum_out,
+            v_squared_sum_out=v_squared_sum_out,
         )
 
     else:

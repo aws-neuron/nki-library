@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integration tests for sliced HBM sources with root= in neurotile.
+"""Integration tests for sliced HBM sources in neurotile.
 
 Covers the case where source is a rank-reducing slice of a higher-rank
-tensor (e.g. weights[expert] from a 3D tensor), passed with root= to
-nt.tiles() or nt.blocks(). The DMA strides must match the slice's rank,
-not the root's rank.
+tensor (e.g. weights[expert] from a 3D tensor) passed directly to
+nt.tiles() / nt.blocks(): the slice self-addresses, so the DMA strides
+match the slice's rank, not the parent's rank.
 """
 
 import ml_dtypes
@@ -26,8 +26,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -51,30 +51,30 @@ TILE_S, TILE_D = 128, 128
 
 @nki.jit
 def _kernel_tiles_leading_index_slice(weights):
-    """Load a 2D slice weights[1] from a 3D tensor using nt.tiles + root=."""
+    """Load a 2D slice weights[1] from a 3D tensor using nt.tiles (self-addressing)."""
     w_slice = weights[1]
     out = nl.ndarray((K, N), dtype=weights.dtype, buffer=nl.shared_hbm)
-    w_tiles = nt.tiles(w_slice, tile_size=(TILE_K, TILE_N), root=weights)
+    w_tiles = nt.tiles(w_slice, tile_size=(TILE_K, TILE_N))
     out_tiles = nt.tiles(out, tile_size=(TILE_K, TILE_N))
     for i in range(w_tiles.shape[0]):
         for j in range(w_tiles.shape[1]):
             tile = w_tiles[i, j].load()
-            out_tiles[i, j].store(tile.ap())
+            out_tiles[i, j].store(tile.data)
     return out
 
 
 @nki.jit
 def _kernel_tiles_leading_index_slice_stream(weights):
-    """Stream a 2D slice weights[2] from a 3D tensor using nt.tiles + root=."""
+    """Stream a 2D slice weights[2] from a 3D tensor using nt.tiles (self-addressing)."""
     w_slice = weights[2]
     out = nl.ndarray((K, N), dtype=weights.dtype, buffer=nl.shared_hbm)
-    w_tiles = nt.tiles(w_slice, tile_size=(TILE_K, TILE_N), root=weights)
+    w_tiles = nt.tiles(w_slice, tile_size=(TILE_K, TILE_N))
     out_tiles = nt.tiles(out, tile_size=(TILE_K, TILE_N))
     for j in range(w_tiles.shape[1]):
         stream = w_tiles[:, j].stream(buffer_count=2)
         for i in nl.affine_range(w_tiles.shape[0]):
             tile = stream.load(i)
-            out_tiles[i, j].store(tile.ap())
+            out_tiles[i, j].store(tile.data)
     return out
 
 
@@ -85,15 +85,15 @@ def _kernel_tiles_leading_index_slice_stream(weights):
 
 @nki.jit
 def _kernel_blocks_leading_index_slice(weights):
-    """Block-load a 2D slice weights[1] from a 3D tensor using nt.blocks + root=."""
+    """Block-load a 2D slice weights[1] from a 3D tensor using nt.blocks (self-addressing)."""
     w_slice = weights[1]
     out = nl.ndarray((K, N), dtype=weights.dtype, buffer=nl.shared_hbm)
-    w_blocks = nt.blocks(w_slice, tile_size=(TILE_K, TILE_N), block_size=(K_BLK, 1), root=weights)
+    w_blocks = nt.blocks(w_slice, tile_size=(TILE_K, TILE_N), block_size=(K_BLK, 1))
     out_blocks = nt.blocks(out, tile_size=(TILE_K, TILE_N), block_size=(K_BLK, 1))
     for bi in range(w_blocks.shape[0]):
         for bj in range(w_blocks.shape[1]):
             block = w_blocks[bi, bj].load()
-            out_blocks[bi, bj].store(block.ap())
+            out_blocks[bi, bj].store(block.data)
     return out
 
 
@@ -102,12 +102,12 @@ def _kernel_blocks_leading_index_slice_stream(weights):
     """Stream blocks from a 2D slice weights[0] of a 3D tensor."""
     w_slice = weights[0]
     out = nl.ndarray((K, N), dtype=weights.dtype, buffer=nl.shared_hbm)
-    w_blocks = nt.blocks(w_slice, tile_size=(TILE_K, TILE_N), block_size=(K_BLK, 1), root=weights)
+    w_blocks = nt.blocks(w_slice, tile_size=(TILE_K, TILE_N), block_size=(K_BLK, 1))
     out_blocks = nt.blocks(out, tile_size=(TILE_K, TILE_N), block_size=(K_BLK, 1))
     stream = w_blocks[:, 0].stream(buffer_count=2)
     for bi in nl.affine_range(w_blocks.shape[0]):
         block = stream.load(bi)
-        out_blocks[bi, 0].store(block.ap())
+        out_blocks[bi, 0].store(block.data)
     return out
 
 
@@ -121,12 +121,12 @@ def _kernel_tiles_4d_double_leading_index(weights):
     """Load from weights[0, 1] -- a 2D slice of a 4D tensor."""
     w_slice = weights[0, 1]
     out = nl.ndarray((S, D), dtype=weights.dtype, buffer=nl.shared_hbm)
-    w_tiles = nt.tiles(w_slice, tile_size=(TILE_S, TILE_D), root=weights)
+    w_tiles = nt.tiles(w_slice, tile_size=(TILE_S, TILE_D))
     out_tiles = nt.tiles(out, tile_size=(TILE_S, TILE_D))
     for i in range(w_tiles.shape[0]):
         for j in range(w_tiles.shape[1]):
             tile = w_tiles[i, j].load()
-            out_tiles[i, j].store(tile.ap())
+            out_tiles[i, j].store(tile.data)
     return out
 
 
@@ -139,7 +139,7 @@ def _kernel_tiles_4d_single_leading_index(weights):
     """
     w_slice = weights[1]
     out = nl.ndarray((H, S, D), dtype=weights.dtype, buffer=nl.shared_hbm)
-    w_tiles = nt.tiles(w_slice, tile_size=(TILE_S, TILE_D), root=weights)
+    w_tiles = nt.tiles(w_slice, tile_size=(TILE_S, TILE_D))
     out_tiles = nt.tiles(out, tile_size=(TILE_S, TILE_D))
     for h in range(H):
         w_slab = w_tiles[h]
@@ -147,7 +147,7 @@ def _kernel_tiles_4d_single_leading_index(weights):
         for i in range(w_slab.shape[0]):
             for j in range(w_slab.shape[1]):
                 tile = w_slab[i, j].load()
-                out_slab[i, j].store(tile.ap())
+                out_slab[i, j].store(tile.data)
     return out
 
 
@@ -210,11 +210,11 @@ def _output_3d_HSD(kernel_input):
 
 @pytest_marks(["neurotile"])
 class TestSlicedSourceLeadingIndex:
-    """Tests for leading-index slices (rank-reducing) with root=."""
+    """Tests for leading-index slices (rank-reducing), tiled directly."""
 
     @pytest.mark.fast
     def test_tiles_3d_leading_index(self, test_manager: Orchestrator, platform_target: Platforms):
-        """nt.tiles on weights[1] from [E, K, N] with root=weights."""
+        """nt.tiles on weights[1] from [E, K, N], tiled directly."""
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=_kernel_tiles_leading_index_slice,
@@ -231,7 +231,7 @@ class TestSlicedSourceLeadingIndex:
 
     @pytest.mark.fast
     def test_tiles_3d_leading_index_stream(self, test_manager: Orchestrator, platform_target: Platforms):
-        """nt.tiles streaming on weights[2] from [E, K, N] with root=weights."""
+        """nt.tiles streaming on weights[2] from [E, K, N], tiled directly."""
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=_kernel_tiles_leading_index_slice_stream,
@@ -248,7 +248,7 @@ class TestSlicedSourceLeadingIndex:
 
     @pytest.mark.fast
     def test_blocks_3d_leading_index(self, test_manager: Orchestrator, platform_target: Platforms):
-        """nt.blocks on weights[1] from [E, K, N] with root=weights."""
+        """nt.blocks on weights[1] from [E, K, N], tiled directly."""
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=_kernel_blocks_leading_index_slice,
@@ -265,7 +265,7 @@ class TestSlicedSourceLeadingIndex:
 
     @pytest.mark.fast
     def test_blocks_3d_leading_index_stream(self, test_manager: Orchestrator, platform_target: Platforms):
-        """nt.blocks streaming on weights[0] from [E, K, N] with root=weights."""
+        """nt.blocks streaming on weights[0] from [E, K, N], tiled directly."""
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=_kernel_blocks_leading_index_slice_stream,
@@ -282,7 +282,7 @@ class TestSlicedSourceLeadingIndex:
 
     @pytest.mark.fast
     def test_tiles_4d_double_leading_index(self, test_manager: Orchestrator, platform_target: Platforms):
-        """nt.tiles on weights[0, 1] from [B, H, S, D] with root=weights."""
+        """nt.tiles on weights[0, 1] from [B, H, S, D], tiled directly."""
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=_kernel_tiles_4d_double_leading_index,
@@ -299,7 +299,7 @@ class TestSlicedSourceLeadingIndex:
 
     @pytest.mark.fast
     def test_tiles_4d_single_leading_index(self, test_manager: Orchestrator, platform_target: Platforms):
-        """nt.tiles on weights[1] from [B, H, S, D] with root=weights -- 3D result."""
+        """nt.tiles on weights[1] from [B, H, S, D], tiled directly -- 3D result."""
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=_kernel_tiles_4d_single_leading_index,

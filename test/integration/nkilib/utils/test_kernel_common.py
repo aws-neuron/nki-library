@@ -17,10 +17,10 @@ import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import torch
-from scipy.special import erf, expit
-
 from nkilib_src.nkilib.core.subkernels.norm_torch_dispatch import norm_name2func_torch as _norm_name2func_torch_src
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, DtypeMode, NormType
+from scipy.special import erf, expit
+
 from test.utils.common_dataclasses import Platforms
 
 
@@ -132,7 +132,7 @@ def convert_to_torch(tensor: Optional[np.ndarray]) -> Any:
     # Torch cannot directly convert some types such as bf16
     try:
         result = torch.from_numpy(tensor)
-    except:
+    except TypeError:
         if tensor.dtype == nl.float8_e4m3:
             result = torch.from_numpy(dt.static_cast(tensor, np.float32))
         elif tensor.dtype == nl.bfloat16:

@@ -14,6 +14,8 @@
 
 """Global Level variables for using SbufManager"""
 
+import functools
+
 from ....core.utils.allocator import SbufManager
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.logging import get_logger
@@ -42,3 +44,29 @@ def create_and_set_active_sbm(
 
 def get_active_sbm():
     return _state["sbm"]
+
+
+def clear_active_sbm():
+    _state["sbm"] = None
+
+
+def with_active_sbm(func):
+    """Cleanup-only RAII for the module-global active SbufManager.
+
+    The parser frontend ignores decorators, so this wrapper executes only on the
+    real-execution (tracer) path. SBM setup stays in the kernel body so the parser
+    path still has its manager; this wrapper releases the SBM on exit -- even if the
+    body raises -- but only if this call created it. Computing ownership at entry
+    keeps nested sub-kernels (which inherit a parent's SBM) from clearing it.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        owns = get_active_sbm() is None
+        try:
+            return func(*args, **kwargs)
+        finally:
+            if owns:
+                clear_active_sbm()
+
+    return wrapper

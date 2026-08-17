@@ -41,16 +41,16 @@ from .output_projection_cte_quantization import (
 
 @nki.jit
 def output_projection_cte(
-    attention: nl.ndarray,
-    weight: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    input_scales: Optional[nl.ndarray] = None,
-    weight_scales: Optional[nl.ndarray] = None,
+    input_scales: Optional[nl.NkiTensor] = None,
+    weight_scales: Optional[nl.NkiTensor] = None,
     output_dtype: Optional[type] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     compact_weight_scales: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Output projection kernel optimized for Context Encoding (CTE/Prefill) scenarios.
 
@@ -66,12 +66,12 @@ def output_projection_cte(
         D: Head dimension size
 
     Args:
-        attention (nl.ndarray): [B, N, D, S], Input tensor in HBM from attention block.
-        weight (nl.ndarray): [N * D, H], Weight tensor in HBM.
-        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
+        attention (nl.NkiTensor): [B, N, D, S], Input tensor in HBM from attention block.
+        weight (nl.NkiTensor): [N * D, H], Weight tensor in HBM.
+        bias (Optional[nl.NkiTensor]): [1, H], Optional bias tensor in HBM.
         quantization_type (QuantizationType): Type of quantization (NONE, STATIC for FP8, or MX).
-        input_scales (Optional[nl.ndarray]): [128, 1], Input scale tensor for FP8 quantization.
-        weight_scales (Optional[nl.ndarray]): [128, 1], Weight scale tensor for FP8 quantization.
+        input_scales (Optional[nl.NkiTensor]): [128, 1], Input scale tensor for FP8 quantization.
+        weight_scales (Optional[nl.NkiTensor]): [128, 1], Weight scale tensor for FP8 quantization.
         output_dtype (Optional[type]): Output data type. Defaults to attention.dtype for non-MX,
             or nl.bfloat16 for MX quantization. Can be set to nl.float16 for higher precision.
         dtype_mode (DtypeMode): Quantization dtype policy for STATIC/ROW
@@ -86,7 +86,7 @@ def output_projection_cte(
             MX layout on-device. Defaults to False (block-32 dense layout).
 
     Returns:
-        out (nl.ndarray): [B, S, H], Output tensor in HBM.
+        out (nl.NkiTensor): [B, S, H], Output tensor in HBM.
 
     Notes:
         - Product B * S must not exceed 131072.

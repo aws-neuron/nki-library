@@ -20,7 +20,6 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.kernel_helpers import get_max_positive_value_for_dtype
-from ...utils.tensor_view import TensorView
 from .output_projection_cte_parameters import (
     P_MAX,
     QuantizationConfig,
@@ -47,12 +46,12 @@ from .output_projection_cte_tensor_io import (
 
 
 def perform_static_quantized_projection(
-    attention_hbm: nl.ndarray,
-    weight_hbm: nl.ndarray,
-    output_hbm: nl.ndarray,
-    bias_hbm: Optional[nl.ndarray],
-    input_scale_hbm: nl.ndarray,
-    weight_scale_hbm: nl.ndarray,
+    attention_hbm: nl.NkiTensor,
+    weight_hbm: nl.NkiTensor,
+    output_hbm: nl.NkiTensor,
+    bias_hbm: Optional[nl.NkiTensor],
+    input_scale_hbm: nl.NkiTensor,
+    weight_scale_hbm: nl.NkiTensor,
     prg_id: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
@@ -75,12 +74,12 @@ def perform_static_quantized_projection(
         - Result SBUF: P_MAX * h_block_size * dtype_size per subtile
 
     Args:
-        attention_hbm (nl.ndarray): [B, N, D, S], Input attention tensor.
-        weight_hbm (nl.ndarray): [N, D, H], Quantized weight tensor.
-        output_hbm (nl.ndarray): [B, S, H], Output tensor.
-        bias_hbm (Optional[nl.ndarray]): [1, H], Optional bias tensor.
-        input_scale_hbm (nl.ndarray): [128, 1], Input quantization scales.
-        weight_scale_hbm (nl.ndarray): [128, 1], Weight quantization scales.
+        attention_hbm (nl.NkiTensor): [B, N, D, S], Input attention tensor.
+        weight_hbm (nl.NkiTensor): [N, D, H], Quantized weight tensor.
+        output_hbm (nl.NkiTensor): [B, S, H], Output tensor.
+        bias_hbm (Optional[nl.NkiTensor]): [1, H], Optional bias tensor.
+        input_scale_hbm (nl.NkiTensor): [128, 1], Input quantization scales.
+        weight_scale_hbm (nl.NkiTensor): [128, 1], Weight quantization scales.
         prg_id (int): Program ID for LNC sharding.
         cfg (TilingConfig): Tiling configuration.
         quant_config (QuantizationConfig): Quantization configuration.
@@ -105,12 +104,12 @@ def perform_static_quantized_projection(
         h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
 
-        weight_view = TensorView(weight_hbm).slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
+        weight_view = weight_hbm.slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
         w_sbuf_list = load_quantized_weights(weight_view=weight_view, cfg=cfg, quant_config=quant_config)
 
         bias_sbuf = None
         if bias_hbm != None:
-            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_view = bias_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
         for batch_idx in range(cfg.b_size):
@@ -118,15 +117,11 @@ def perform_static_quantized_projection(
                 curr_s_tile_size = cfg.s_tile.get_tile_bound(s_block_idx)
                 s_start = s_block_idx * cfg.s_tile.tile_size
 
-                attention_view = (
-                    TensorView(attention_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=2, start=s_start, end=s_start + curr_s_tile_size)
+                attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=2, start=s_start, end=s_start + curr_s_tile_size
                 )
-                output_view = (
-                    TensorView(output_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                output_view = output_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=1, start=h_start, end=h_start + curr_h_block_size
                 )
 
                 _process_quantized_batch_tile(
@@ -144,12 +139,12 @@ def perform_static_quantized_projection(
 
 
 def _process_quantized_batch_tile(
-    attention_view: TensorView,
-    output_view: TensorView,
-    w_sbuf_list: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
-    input_scale_sbuf: nl.ndarray,
-    weight_scale_sbuf: nl.ndarray,
+    attention_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    w_sbuf_list: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
+    input_scale_sbuf: nl.NkiTensor,
+    weight_scale_sbuf: nl.NkiTensor,
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
@@ -159,12 +154,12 @@ def _process_quantized_batch_tile(
     Process a single batch tile with quantization and double row matmul.
 
     Args:
-        attention_view (TensorView): View of attention tensor for current batch/s_block [N, D, curr_s_tile_size].
-        output_view (TensorView): View of output tensor for current batch/h_block [S, h_block_size].
-        w_sbuf_list (List[nl.ndarray]): List of quantized weight tensors in SBUF.
-        bias_sbuf (Optional[nl.ndarray]): Bias tensor in SBUF.
-        input_scale_sbuf (nl.ndarray): Input quantization scales in SBUF.
-        weight_scale_sbuf (nl.ndarray): Weight quantization scales in SBUF.
+        attention_view (NkiTensor): View of attention tensor for current batch/s_block [N, D, curr_s_tile_size].
+        output_view (NkiTensor): View of output tensor for current batch/h_block [S, h_block_size].
+        w_sbuf_list (List[nl.NkiTensor]): List of quantized weight tensors in SBUF.
+        bias_sbuf (Optional[nl.NkiTensor]): Bias tensor in SBUF.
+        input_scale_sbuf (nl.NkiTensor): Input quantization scales in SBUF.
+        weight_scale_sbuf (nl.NkiTensor): Weight quantization scales in SBUF.
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         cfg (TilingConfig): Tiling configuration.
@@ -219,24 +214,24 @@ def _process_quantized_batch_tile(
 
 
 def _quantize_attention_tensors(
-    attention_sb: List[nl.ndarray],
-    input_scale_sbuf: nl.ndarray,
+    attention_sb: List[nl.NkiTensor],
+    input_scale_sbuf: nl.NkiTensor,
     curr_s_tile_size: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """
     Quantize loaded attention tensors to FP8.
 
     Args:
-        attention_sb (List[nl.ndarray]): Loaded attention tensors in SBUF.
-        input_scale_sbuf (nl.ndarray): Inverted input scales in SBUF.
+        attention_sb (List[nl.NkiTensor]): Loaded attention tensors in SBUF.
+        input_scale_sbuf (nl.NkiTensor): Inverted input scales in SBUF.
         curr_s_tile_size (int): Current S tile size.
         cfg (TilingConfig): Tiling configuration.
         quant_config (QuantizationConfig): Quantization configuration.
 
     Returns:
-        List[nl.ndarray]: Quantized attention tensors in SBUF.
+        List[nl.NkiTensor]: Quantized attention tensors in SBUF.
     """
     num_heads_to_process = cfg.n_size // 2 if quant_config.use_double_row else cfg.n_size
     quant_attention_sb = []
@@ -278,25 +273,25 @@ def _quantize_attention_tensors(
 
 
 def _compute_matmul_dequantize(
-    quant_attention_sb: List[nl.ndarray],
-    w_sbuf_list: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
-    weight_scale_sbuf: nl.ndarray,
+    quant_attention_sb: List[nl.NkiTensor],
+    w_sbuf_list: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
+    weight_scale_sbuf: nl.NkiTensor,
     s_block_idx: int,
     h_block_idx: int,
     curr_h_block_size: int,
     attention_dtype,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """
     Compute matmul across heads and dequantize results.
 
     Args:
-        quant_attention_sb (List[nl.ndarray]): Quantized attention tensors in SBUF.
-        w_sbuf_list (List[nl.ndarray]): Quantized weight tensors in SBUF.
-        bias_sbuf (Optional[nl.ndarray]): Bias tensor in SBUF.
-        weight_scale_sbuf (nl.ndarray): Weight scales for dequantization.
+        quant_attention_sb (List[nl.NkiTensor]): Quantized attention tensors in SBUF.
+        w_sbuf_list (List[nl.NkiTensor]): Quantized weight tensors in SBUF.
+        bias_sbuf (Optional[nl.NkiTensor]): Bias tensor in SBUF.
+        weight_scale_sbuf (nl.NkiTensor): Weight scales for dequantization.
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         curr_h_block_size (int): Current H block size.
@@ -305,7 +300,7 @@ def _compute_matmul_dequantize(
         quant_config (QuantizationConfig): Quantization configuration.
 
     Returns:
-        List[nl.ndarray]: Result tensors in SBUF after matmul and dequantization.
+        List[nl.NkiTensor]: Result tensors in SBUF after matmul and dequantization.
     """
     num_heads_to_process = cfg.n_size // 2 if quant_config.use_double_row else cfg.n_size
 
@@ -391,8 +386,8 @@ def _compute_matmul_dequantize(
 
 
 def _write_results_to_output(
-    result_sb: List[nl.ndarray],
-    output_view: TensorView,
+    result_sb: List[nl.NkiTensor],
+    output_view: nl.NkiTensor,
     s_start: int,
     s_block_idx: int,
     curr_h_block_size: int,
@@ -402,8 +397,8 @@ def _write_results_to_output(
     Write result tensors to output HBM.
 
     Args:
-        result_sb (List[nl.ndarray]): Result tensors in SBUF.
-        output_view (TensorView): View of output tensor.
+        result_sb (List[nl.NkiTensor]): Result tensors in SBUF.
+        output_view (NkiTensor): View of output tensor.
         s_start (int): Start offset in S dimension.
         s_block_idx (int): Current S block index.
         curr_h_block_size (int): Current H block size.
@@ -416,22 +411,22 @@ def _write_results_to_output(
         s_offset = s_start + s_subtile_idx * P_MAX
 
         out_subtile_view = output_view.slice(dim=0, start=s_offset, end=s_offset + curr_s_subtile_size)
-        nisa.dma_copy(out_subtile_view.get_view(), result_sb[s_subtile_idx][:curr_s_subtile_size, :curr_h_block_size])
+        nisa.dma_copy(out_subtile_view, result_sb[s_subtile_idx][:curr_s_subtile_size, :curr_h_block_size])
 
 
 def _perform_input_static_quantization(
-    input_sbuf: nl.ndarray,
-    inverse_input_scale_sbuf: nl.ndarray,
-    quant_res_sbuf: nl.ndarray,
+    input_sbuf: nl.NkiTensor,
+    inverse_input_scale_sbuf: nl.NkiTensor,
+    quant_res_sbuf: nl.NkiTensor,
     quant_config: QuantizationConfig,
 ) -> None:
     """
     Quantize input activation using scales.
 
     Args:
-        input_sbuf (nl.ndarray): Input tensor in SBUF (2D or 3D for double-row).
-        inverse_input_scale_sbuf (nl.ndarray): Inverted input scales in SBUF.
-        quant_res_sbuf (nl.ndarray): Output quantized tensor in SBUF (same shape as input).
+        input_sbuf (nl.NkiTensor): Input tensor in SBUF (2D or 3D for double-row).
+        inverse_input_scale_sbuf (nl.NkiTensor): Inverted input scales in SBUF.
+        quant_res_sbuf (nl.NkiTensor): Output quantized tensor in SBUF (same shape as input).
         quant_config (QuantizationConfig): Quantization configuration.
 
     Returns:
@@ -468,11 +463,11 @@ _ROW_QUANT_MIN_SCALE = 1e-5
 
 
 def perform_row_quantized_projection(
-    attention_hbm: nl.ndarray,
-    weight_hbm: nl.ndarray,
-    output_hbm: nl.ndarray,
-    bias_hbm: Optional[nl.ndarray],
-    weight_scale_hbm: nl.ndarray,
+    attention_hbm: nl.NkiTensor,
+    weight_hbm: nl.NkiTensor,
+    output_hbm: nl.NkiTensor,
+    bias_hbm: Optional[nl.NkiTensor],
+    weight_scale_hbm: nl.NkiTensor,
     prg_id: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
@@ -509,7 +504,7 @@ def perform_row_quantized_projection(
         h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
 
-        weight_view = TensorView(weight_hbm).slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
+        weight_view = weight_hbm.slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
         w_sbuf_list = load_quantized_weights(weight_view=weight_view, cfg=cfg, quant_config=quant_config)
 
         weight_row_scale_sbuf = load_row_weight_dequant_scales(
@@ -521,7 +516,7 @@ def perform_row_quantized_projection(
 
         bias_sbuf = None
         if bias_hbm != None:
-            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_view = bias_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
         for batch_idx in range(cfg.b_size):
@@ -530,15 +525,11 @@ def perform_row_quantized_projection(
                 s_start = s_block_idx * cfg.s_tile.tile_size
 
                 # attention_hbm is [B, S, N, D] — select batch, slice S
-                attention_view = (
-                    TensorView(attention_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=0, start=s_start, end=s_start + curr_s_tile_size)
+                attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=0, start=s_start, end=s_start + curr_s_tile_size
                 )
-                output_view = (
-                    TensorView(output_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                output_view = output_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=1, start=h_start, end=h_start + curr_h_block_size
                 )
 
                 _process_row_quantized_batch_tile(
@@ -557,11 +548,11 @@ def perform_row_quantized_projection(
 
 
 def _process_row_quantized_batch_tile(
-    attention_view: TensorView,
-    output_view: TensorView,
-    w_sbuf_list: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
-    weight_row_scale_sbuf: nl.ndarray,
+    attention_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    w_sbuf_list: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
+    weight_row_scale_sbuf: nl.NkiTensor,
     s_block_idx: int,
     h_block_idx: int,
     n_orig: int,
@@ -617,7 +608,7 @@ def _process_row_quantized_batch_tile(
         # Load [S_sub, N*D] bf16
         attn_sub = nl.ndarray((P_MAX, h_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
         sub_view = attn_flat_view.slice(dim=0, start=s_sub_start, end=s_sub_start + curr_s_sub)
-        nisa.dma_copy(attn_sub[:curr_s_sub, :h_dim], sub_view.get_view())
+        nisa.dma_copy(attn_sub[:curr_s_sub, :h_dim], sub_view)
 
         # Row-quantize: absmax, scale, clamp — stays bf16
         quant_sub, dequant_scale = _perform_input_row_quantization(
@@ -640,10 +631,7 @@ def _process_row_quantized_batch_tile(
                     buffer=nl.psum,
                 )
                 nisa.nc_transpose(
-                    dst=xpose_psum.ap(
-                        [[curr_s_sub * _FP8_PSUM_STEP, d_orig], [_FP8_PSUM_STEP, curr_s_sub]],
-                        offset=0,
-                    ),
+                    dst=xpose_psum.select(dim=2, index=0),
                     data=fp8_head,
                 )
                 nisa.tensor_copy(
@@ -717,7 +705,7 @@ def _process_row_quantized_batch_tile(
 
 
 def _perform_input_row_quantization(
-    input_sbuf: nl.ndarray,
+    input_sbuf: nl.NkiTensor,
     quant_dtype,
 ) -> tuple:
     """Row-quantize input per token: absmax over free dim, scale, quantize.
@@ -773,18 +761,18 @@ def _perform_input_row_quantization(
 
 
 def _compute_row_matmul_dequantize(
-    quant_attention_sb: List[nl.ndarray],
-    w_sbuf_list: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
-    weight_row_scale_sbuf: nl.ndarray,
-    input_dequant_scale_sb: List[nl.ndarray],
+    quant_attention_sb: List[nl.NkiTensor],
+    w_sbuf_list: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
+    weight_row_scale_sbuf: nl.NkiTensor,
+    input_dequant_scale_sb: List[nl.NkiTensor],
     s_block_idx: int,
     h_block_idx: int,
     curr_h_block_size: int,
     attention_dtype,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """Compute matmul across heads and apply two-step ROW dequant.
 
     After matmul accumulation:
@@ -806,7 +794,7 @@ def _compute_row_matmul_dequantize(
         quant_config: Quantization configuration.
 
     Returns:
-        List[nl.ndarray]: Result tensors per s_subtile.
+        List[nl.NkiTensor]: Result tensors per s_subtile.
     """
     zero_bias = get_zero_bias_vector_sbuf(P_MAX)
 
@@ -912,12 +900,12 @@ def _compute_row_matmul_dequantize(
 
 
 def perform_mx_quantized_projection(
-    attention_hbm: nl.ndarray,
-    weight_hbm: nl.ndarray,
-    output_hbm: nl.ndarray,
-    bias_hbm: Optional[nl.ndarray],
-    weight_scale_hbm: nl.ndarray,
-    input_scale_hbm: Optional[nl.ndarray],
+    attention_hbm: nl.NkiTensor,
+    weight_hbm: nl.NkiTensor,
+    output_hbm: nl.NkiTensor,
+    bias_hbm: Optional[nl.NkiTensor],
+    weight_scale_hbm: nl.NkiTensor,
+    input_scale_hbm: Optional[nl.NkiTensor],
     prg_id: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
@@ -953,14 +941,14 @@ def perform_mx_quantized_projection(
         - Result SBUF: s_subtile_count * P_MAX * h_block_size * 2 bytes (bf16)
 
     Args:
-        attention_hbm (nl.ndarray): Input attention tensor in HBM.
+        attention_hbm (nl.NkiTensor): Input attention tensor in HBM.
             - Online: [B, D/512, 128_D, 4_D, S] (bf16/fp16)
             - Pre-quantized: [B, D_packed, S], 4_D x4 packed in dtype (float8_e4m3fn_x4)
-        weight_hbm (nl.ndarray): [D, H], Pre-quantized weights (float4_e2m1fn_x4).
-        output_hbm (nl.ndarray): [B, S, H], Output tensor.
-        bias_hbm (Optional[nl.ndarray]): [1, H], Optional bias tensor.
-        weight_scale_hbm (nl.ndarray): [D//_q_height, H], Weight scales for MX.
-        input_scale_hbm (Optional[nl.ndarray]): [B, D//_q_height, S], Input scales for pre-quantized mode.
+        weight_hbm (nl.NkiTensor): [D, H], Pre-quantized weights (float4_e2m1fn_x4).
+        output_hbm (nl.NkiTensor): [B, S, H], Output tensor.
+        bias_hbm (Optional[nl.NkiTensor]): [1, H], Optional bias tensor.
+        weight_scale_hbm (nl.NkiTensor): [D//_q_height, H], Weight scales for MX.
+        input_scale_hbm (Optional[nl.NkiTensor]): [B, D//_q_height, S], Input scales for pre-quantized mode.
         prg_id (int): Program ID for LNC sharding.
         cfg (TilingConfig): Tiling config with PaddedTileInfo for d_tile.
         quant_config (QuantizationConfig): Quantization configuration.
@@ -981,7 +969,7 @@ def perform_mx_quantized_projection(
     for h_block_idx in range(cfg.h_tile.tile_count):
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
         h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
-        weight_view = TensorView(weight_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+        weight_view = weight_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
 
         w_sbuf_list = load_mx_quantized_weights(weight_view, quant_config.quant_data_type, cfg, quant_config)
         if quant_config.compact_weight_scales:
@@ -994,14 +982,12 @@ def perform_mx_quantized_projection(
                 cfg=cfg,
             )
         else:
-            weight_scale_view = TensorView(weight_scale_hbm).slice(
-                dim=1, start=h_start, end=h_start + curr_h_block_size
-            )
+            weight_scale_view = weight_scale_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             w_scale_sbuf_list = load_mx_weight_scales(weight_scale_view, cfg)
 
         bias_sbuf = None
         if bias_hbm != None:
-            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_view = bias_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
         for batch_idx in range(cfg.b_size):
@@ -1012,29 +998,21 @@ def perform_mx_quantized_projection(
                 # Slice attention based on input format
                 if quant_config.input_quantized:
                     # Pre-quantized: [D, S*_q_width(but packed as S)] - slice on dim=1 (S dimension)
-                    attention_view = (
-                        TensorView(attention_hbm)
-                        .select(dim=0, index=batch_idx)
-                        .slice(dim=1, start=s_start, end=s_start + curr_s_tile_size)
+                    attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                        dim=1, start=s_start, end=s_start + curr_s_tile_size
                     )
-                    input_scale_view = (
-                        TensorView(input_scale_hbm)
-                        .select(dim=0, index=batch_idx)
-                        .slice(dim=1, start=s_start, end=s_start + curr_s_tile_size)
+                    input_scale_view = input_scale_hbm.select(dim=0, index=batch_idx).slice(
+                        dim=1, start=s_start, end=s_start + curr_s_tile_size
                     )
                 else:
                     # Online quantization: [D, _q_width, S] - slice on dim=2 (S dimension)
-                    attention_view = (
-                        TensorView(attention_hbm)
-                        .select(dim=0, index=batch_idx)
-                        .slice(dim=2, start=s_start, end=s_start + curr_s_tile_size)
+                    attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                        dim=2, start=s_start, end=s_start + curr_s_tile_size
                     )
                     input_scale_view = None
 
-                output_view = (
-                    TensorView(output_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                output_view = output_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=1, start=h_start, end=h_start + curr_h_block_size
                 )
 
                 _process_mx_quantized_batch_tile(
@@ -1052,16 +1030,16 @@ def perform_mx_quantized_projection(
 
 
 def _process_mx_quantized_batch_tile(
-    attention_view: TensorView,
-    output_view: TensorView,
-    w_sbuf_list: List[nl.ndarray],
-    w_scale_sbuf_list: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
+    attention_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    w_sbuf_list: List[nl.NkiTensor],
+    w_scale_sbuf_list: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
-    input_scale_view: Optional[TensorView] = None,
+    input_scale_view: Optional[nl.NkiTensor] = None,
 ) -> None:
     """Process a single batch tile with MX quantization and matmul.
 
@@ -1131,10 +1109,10 @@ def _process_mx_quantized_batch_tile(
 
 
 def _quantize_mx_attention_tensors(
-    attn_sbuf_list: List[nl.ndarray],
+    attn_sbuf_list: List[nl.NkiTensor],
     padded_s_tile_size: int,
     cfg: TilingConfig,
-) -> Tuple[List[nl.ndarray], List[nl.ndarray]]:
+) -> Tuple[List[nl.NkiTensor], List[nl.NkiTensor]]:
     """Quantize attention tensors using nisa.quantize_mx.
 
     Args:
@@ -1167,17 +1145,17 @@ def _quantize_mx_attention_tensors(
 
 
 def _compute_mx_matmul(
-    quant_attn_list: List[nl.ndarray],
-    attn_scale_list: List[nl.ndarray],
-    w_sbuf_list: List[nl.ndarray],
-    w_scale_sbuf_list: List[nl.ndarray],
-    bias_sbuf: Optional[nl.ndarray],
+    quant_attn_list: List[nl.NkiTensor],
+    attn_scale_list: List[nl.NkiTensor],
+    w_sbuf_list: List[nl.NkiTensor],
+    w_scale_sbuf_list: List[nl.NkiTensor],
+    bias_sbuf: Optional[nl.NkiTensor],
     s_block_idx: int,
     h_block_idx: int,
     curr_h_block_size: int,
     attention_dtype,
     cfg: TilingConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """Compute MX matmul across d_tiles and apply optional bias.
 
     Args:
@@ -1263,12 +1241,12 @@ def _compute_mx_matmul(
 
 
 def perform_static_mx_quantized_projection(
-    attention_hbm: nl.ndarray,
-    weight_hbm: nl.ndarray,
-    output_hbm: nl.ndarray,
-    bias_hbm: Optional[nl.ndarray],
-    input_scale_hbm: nl.ndarray,
-    weight_scale_hbm: nl.ndarray,
+    attention_hbm: nl.NkiTensor,
+    weight_hbm: nl.NkiTensor,
+    output_hbm: nl.NkiTensor,
+    bias_hbm: Optional[nl.NkiTensor],
+    input_scale_hbm: nl.NkiTensor,
+    weight_scale_hbm: nl.NkiTensor,
     prg_id: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
@@ -1288,12 +1266,12 @@ def perform_static_mx_quantized_projection(
         Loop order: h_block -> batch -> s_block
 
     Args:
-        attention_hbm (nl.ndarray): [B, N, D, S], Input attention tensor.
-        weight_hbm (nl.ndarray): [N*D, H], Pre-quantized weights (float8_e4m3fn_x4).
-        output_hbm (nl.ndarray): [B, S, H], Output tensor.
-        bias_hbm (Optional[nl.ndarray]): [1, H], Optional bias tensor.
-        input_scale_hbm (nl.ndarray): [128, 1], Input quantization scales.
-        weight_scale_hbm (nl.ndarray): [128, 1], Weight quantization scales.
+        attention_hbm (nl.NkiTensor): [B, N, D, S], Input attention tensor.
+        weight_hbm (nl.NkiTensor): [N*D, H], Pre-quantized weights (float8_e4m3fn_x4).
+        output_hbm (nl.NkiTensor): [B, S, H], Output tensor.
+        bias_hbm (Optional[nl.NkiTensor]): [1, H], Optional bias tensor.
+        input_scale_hbm (nl.NkiTensor): [128, 1], Input quantization scales.
+        weight_scale_hbm (nl.NkiTensor): [128, 1], Weight quantization scales.
         prg_id (int): Program ID for LNC sharding.
         cfg (TilingConfig): Tiling configuration.
         quant_config (QuantizationConfig): Quantization configuration.
@@ -1322,12 +1300,12 @@ def perform_static_mx_quantized_projection(
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
 
         # Load pre-quantized weights as FP8
-        weight_view = TensorView(weight_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+        weight_view = weight_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
         w_sbuf_list = load_mx_quantized_weights(weight_view, nl.float8_e4m3fn, cfg, quant_config)
 
         bias_sbuf = None
         if bias_hbm != None:
-            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_view = bias_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
         for batch_idx in range(cfg.b_size):
@@ -1336,15 +1314,11 @@ def perform_static_mx_quantized_projection(
                 s_start = s_block_idx * cfg.s_tile.tile_size
 
                 # [D, _q_width, curr_s_tile_size] for interleaved loading
-                attention_view = (
-                    TensorView(attention_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=2, start=s_start, end=s_start + curr_s_tile_size)
+                attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=2, start=s_start, end=s_start + curr_s_tile_size
                 )
-                output_view = (
-                    TensorView(output_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                output_view = output_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=1, start=h_start, end=h_start + curr_h_block_size
                 )
 
                 _process_static_mx_batch_tile(
@@ -1365,15 +1339,15 @@ def perform_static_mx_quantized_projection(
 
 
 def _process_static_mx_batch_tile(
-    attention_view: TensorView,
-    output_view: TensorView,
-    w_sbuf_list: List[nl.ndarray],
-    w_scale_sbuf: nl.ndarray,
-    attn_scale_sbuf: nl.ndarray,
-    bias_sbuf: Optional[nl.ndarray],
-    input_scale_sbuf: nl.ndarray,
-    weight_scale_sbuf: nl.ndarray,
-    zero_bias_sbuf: nl.ndarray,
+    attention_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    w_sbuf_list: List[nl.NkiTensor],
+    w_scale_sbuf: nl.NkiTensor,
+    attn_scale_sbuf: nl.NkiTensor,
+    bias_sbuf: Optional[nl.NkiTensor],
+    input_scale_sbuf: nl.NkiTensor,
+    weight_scale_sbuf: nl.NkiTensor,
+    zero_bias_sbuf: nl.NkiTensor,
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
@@ -1383,15 +1357,15 @@ def _process_static_mx_batch_tile(
     Process a single batch tile with static MX quantization.
 
     Args:
-        attention_view (TensorView): View of attention [D//4, 4, curr_s_tile_size].
-        output_view (TensorView): View of output [S, curr_h_block_size].
-        w_sbuf_list (List[nl.ndarray]): Weight tensors per d_tile.
-        w_scale_sbuf (nl.ndarray): Constant MX weight scales.
-        attn_scale_sbuf (nl.ndarray): Constant MX attention scales.
-        bias_sbuf (Optional[nl.ndarray]): Bias tensor in SBUF.
-        input_scale_sbuf (nl.ndarray): Inverted input scales for quantization.
-        weight_scale_sbuf (nl.ndarray): Combined dequantization scales.
-        zero_bias_sbuf (nl.ndarray): Pre-allocated zero bias vector.
+        attention_view (NkiTensor): View of attention [D//4, 4, curr_s_tile_size].
+        output_view (NkiTensor): View of output [S, curr_h_block_size].
+        w_sbuf_list (List[nl.NkiTensor]): Weight tensors per d_tile.
+        w_scale_sbuf (nl.NkiTensor): Constant MX weight scales.
+        attn_scale_sbuf (nl.NkiTensor): Constant MX attention scales.
+        bias_sbuf (Optional[nl.NkiTensor]): Bias tensor in SBUF.
+        input_scale_sbuf (nl.NkiTensor): Inverted input scales for quantization.
+        weight_scale_sbuf (nl.NkiTensor): Combined dequantization scales.
+        zero_bias_sbuf (nl.NkiTensor): Pre-allocated zero bias vector.
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         cfg (TilingConfig): Tiling configuration.
@@ -1441,13 +1415,13 @@ def _process_static_mx_batch_tile(
 
 
 def _quantize_static_mx_attention(
-    attn_sbuf_list: List[nl.ndarray],
-    input_scale_sbuf: nl.ndarray,
-    zero_bias_sbuf: nl.ndarray,
+    attn_sbuf_list: List[nl.NkiTensor],
+    input_scale_sbuf: nl.NkiTensor,
+    zero_bias_sbuf: nl.NkiTensor,
     padded_s_tile_size: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """
     Quantize attention to FP8 and pack to x4 format for static MX.
 
@@ -1457,15 +1431,15 @@ def _quantize_static_mx_attention(
     - d_tile_count == 1: Use vector engine (scalar engine handled the load's second half).
 
     Args:
-        attn_sbuf_list (List[nl.ndarray]): Attention tensors per d_tile [D, S, 4].
-        input_scale_sbuf (nl.ndarray): Inverted input scales.
-        zero_bias_sbuf (nl.ndarray): Pre-allocated zero bias vector.
+        attn_sbuf_list (List[nl.NkiTensor]): Attention tensors per d_tile [D, S, 4].
+        input_scale_sbuf (nl.NkiTensor): Inverted input scales.
+        zero_bias_sbuf (nl.NkiTensor): Pre-allocated zero bias vector.
         padded_s_tile_size (int): Padded S tile size.
         cfg (TilingConfig): Tiling configuration.
         quant_config (QuantizationConfig): Quantization configuration.
 
     Returns:
-        List[nl.ndarray]: Quantized attention tensors per d_tile.
+        List[nl.NkiTensor]: Quantized attention tensors per d_tile.
     """
     quant_attn_list = []
     quant_dtype = quant_config.weight_data_type
@@ -1511,32 +1485,32 @@ def _quantize_static_mx_attention(
 
 
 def _compute_static_mx_matmul(
-    quant_attn_list: List[nl.ndarray],
-    attn_scale_sbuf: nl.ndarray,
-    w_sbuf_list: List[nl.ndarray],
-    w_scale_sbuf: nl.ndarray,
-    bias_sbuf: Optional[nl.ndarray],
-    weight_scale_sbuf: nl.ndarray,
-    zero_bias_sbuf: nl.ndarray,
+    quant_attn_list: List[nl.NkiTensor],
+    attn_scale_sbuf: nl.NkiTensor,
+    w_sbuf_list: List[nl.NkiTensor],
+    w_scale_sbuf: nl.NkiTensor,
+    bias_sbuf: Optional[nl.NkiTensor],
+    weight_scale_sbuf: nl.NkiTensor,
+    zero_bias_sbuf: nl.NkiTensor,
     s_block_idx: int,
     h_block_idx: int,
     curr_h_block_size: int,
     padded_s_tile_size: int,
     cfg: TilingConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """
     Compute MX matmul and dequantize with static scales.
 
     Uses alternating scalar/vector engines for dequantization to balance load.
 
     Args:
-        quant_attn_list (List[nl.ndarray]): Quantized attention per d_tile (x4 packed).
-        attn_scale_sbuf (nl.ndarray): Constant MX attention scales.
-        w_sbuf_list (List[nl.ndarray]): Weight tensors per d_tile.
-        w_scale_sbuf (nl.ndarray): Constant MX weight scales.
-        bias_sbuf (Optional[nl.ndarray]): Bias tensor.
-        weight_scale_sbuf (nl.ndarray): Combined dequantization scale.
-        zero_bias_sbuf (nl.ndarray): Pre-allocated zero bias vector.
+        quant_attn_list (List[nl.NkiTensor]): Quantized attention per d_tile (x4 packed).
+        attn_scale_sbuf (nl.NkiTensor): Constant MX attention scales.
+        w_sbuf_list (List[nl.NkiTensor]): Weight tensors per d_tile.
+        w_scale_sbuf (nl.NkiTensor): Constant MX weight scales.
+        bias_sbuf (Optional[nl.NkiTensor]): Bias tensor.
+        weight_scale_sbuf (nl.NkiTensor): Combined dequantization scale.
+        zero_bias_sbuf (nl.NkiTensor): Pre-allocated zero bias vector.
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         curr_h_block_size (int): Current H block size.
@@ -1544,7 +1518,7 @@ def _compute_static_mx_matmul(
         cfg (TilingConfig): Tiling configuration.
 
     Returns:
-        List[nl.ndarray]: Result tensors per s_subtile.
+        List[nl.NkiTensor]: Result tensors per s_subtile.
     """
     result_sb = []
     for s_subtile_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
@@ -1570,19 +1544,15 @@ def _compute_static_mx_matmul(
             # Accumulate matmul across all d_tiles
             for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
                 curr_d_tile_size, _ = cfg.d_tile.get_bounds(d_tile_idx)
-                # quant_attn_list has shape [D, S*4] as float8_e4m3fn, use .ap() to view as [D, S] float8_e4m3fn_x4
-                attn_slice = quant_attn_list[d_tile_idx].ap(
-                    pattern=[[padded_s_tile_size, curr_d_tile_size], [1, padded_s_subtile_size]],
-                    offset=s_subtile_start,
-                    dtype=nl.float8_e4m3fn_x4,
-                )
+                # quant_attn_list has shape [D, S*4] as float8_e4m3fn, use .view() to reinterpret as [D, S] float8_e4m3fn_x4
+                attn_slice = quant_attn_list[d_tile_idx].view(nl.float8_e4m3fn_x4)[
+                    :, s_subtile_start : s_subtile_start + padded_s_subtile_size
+                ]
                 attn_scale_slice = attn_scale_sbuf[:, :padded_s_subtile_size]
-                # w_sbuf_list has shape [D, H*4] as float8_e4m3fn, use .ap() to view as [D, H] float8_e4m3fn_x4
-                w_slice = w_sbuf_list[d_tile_idx].ap(
-                    pattern=[[cfg.h_tile.tile_size, curr_d_tile_size], [1, curr_h_subtile_size]],
-                    offset=h_subtile_start,
-                    dtype=nl.float8_e4m3fn_x4,
-                )
+                # w_sbuf_list has shape [D, H*4] as float8_e4m3fn, use .view() to reinterpret as [D, H] float8_e4m3fn_x4
+                w_slice = w_sbuf_list[d_tile_idx].view(nl.float8_e4m3fn_x4)[
+                    :, h_subtile_start : h_subtile_start + curr_h_subtile_size
+                ]
                 w_scale_slice = w_scale_sbuf[:, :curr_h_subtile_size]
                 nisa.nc_matmul_mx(
                     dst=res_psum[:padded_s_subtile_size, :curr_h_subtile_size],
@@ -1620,12 +1590,12 @@ def _compute_static_mx_matmul(
 
 
 def perform_row_mx_quantized_projection(
-    attention_hbm: nl.ndarray,
-    weight_hbm: nl.ndarray,
-    output_hbm: nl.ndarray,
-    bias_hbm: Optional[nl.ndarray],
-    input_scale_hbm: nl.ndarray,
-    weight_scale_hbm: nl.ndarray,
+    attention_hbm: nl.NkiTensor,
+    weight_hbm: nl.NkiTensor,
+    output_hbm: nl.NkiTensor,
+    bias_hbm: Optional[nl.NkiTensor],
+    input_scale_hbm: nl.NkiTensor,
+    weight_scale_hbm: nl.NkiTensor,
     prg_id: int,
     cfg: TilingConfig,
     quant_config: QuantizationConfig,
@@ -1639,12 +1609,12 @@ def perform_row_mx_quantized_projection(
     per-row weight dequant scale after matmul.
 
     Args:
-        attention_hbm (nl.ndarray): [B, N, D, S], Input attention tensor (bf16).
-        weight_hbm (nl.ndarray): [N*D, H], Pre-quantized FP8 weights (float8_e4m3fn).
-        output_hbm (nl.ndarray): [B, S, H], Output tensor.
-        bias_hbm (Optional[nl.ndarray]): [1, H], Optional bias tensor.
-        input_scale_hbm (nl.ndarray): Unused for ROW_MX (input quantized on-device).
-        weight_scale_hbm (nl.ndarray): [128, H], Per-row weight dequant scale.
+        attention_hbm (nl.NkiTensor): [B, N, D, S], Input attention tensor (bf16).
+        weight_hbm (nl.NkiTensor): [N*D, H], Pre-quantized FP8 weights (float8_e4m3fn).
+        output_hbm (nl.NkiTensor): [B, S, H], Output tensor.
+        bias_hbm (Optional[nl.NkiTensor]): [1, H], Optional bias tensor.
+        input_scale_hbm (nl.NkiTensor): Unused for ROW_MX (input quantized on-device).
+        weight_scale_hbm (nl.NkiTensor): [128, H], Per-row weight dequant scale.
         prg_id (int): Program ID for LNC sharding.
         cfg (TilingConfig): Tiling configuration.
         quant_config (QuantizationConfig): Quantization configuration.
@@ -1662,7 +1632,7 @@ def perform_row_mx_quantized_projection(
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
 
         # Load FP8 weights (same loader as STATIC_MX)
-        weight_view = TensorView(weight_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+        weight_view = weight_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
         w_sbuf_list = load_mx_quantized_weights(weight_view, nl.float8_e4m3fn, cfg, quant_config)
 
         # Load per-row weight dequant scales for this h_block
@@ -1675,7 +1645,7 @@ def perform_row_mx_quantized_projection(
 
         bias_sbuf = None
         if bias_hbm != None:
-            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_view = bias_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
         for batch_idx in range(cfg.b_size):
@@ -1683,15 +1653,11 @@ def perform_row_mx_quantized_projection(
                 curr_s_tile_size = cfg.s_tile.get_tile_bound(s_block_idx)
                 s_start = s_block_idx * cfg.s_tile.tile_size
 
-                attention_view = (
-                    TensorView(attention_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=2, start=s_start, end=s_start + curr_s_tile_size)
+                attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=2, start=s_start, end=s_start + curr_s_tile_size
                 )
-                output_view = (
-                    TensorView(output_hbm)
-                    .select(dim=0, index=batch_idx)
-                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                output_view = output_hbm.select(dim=0, index=batch_idx).slice(
+                    dim=1, start=h_start, end=h_start + curr_h_block_size
                 )
 
                 _process_row_mx_batch_tile(
@@ -1709,12 +1675,12 @@ def perform_row_mx_quantized_projection(
 
 
 def _process_row_mx_batch_tile(
-    attention_view: TensorView,
-    output_view: TensorView,
-    w_sbuf_list: List[nl.ndarray],
-    w_scale_sbuf: nl.ndarray,
-    bias_sbuf: Optional[nl.ndarray],
-    weight_row_scale_sbuf: nl.ndarray,
+    attention_view: nl.NkiTensor,
+    output_view: nl.NkiTensor,
+    w_sbuf_list: List[nl.NkiTensor],
+    w_scale_sbuf: nl.NkiTensor,
+    bias_sbuf: Optional[nl.NkiTensor],
+    weight_row_scale_sbuf: nl.NkiTensor,
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
@@ -1777,18 +1743,18 @@ def _process_row_mx_batch_tile(
 
 
 def _compute_row_mx_matmul(
-    quant_attn_list: List[nl.ndarray],
-    attn_scale_list: List[nl.ndarray],
-    w_sbuf_list: List[nl.ndarray],
-    w_scale_sbuf: nl.ndarray,
-    bias_sbuf: Optional[nl.ndarray],
-    weight_row_scale_sbuf: nl.ndarray,
+    quant_attn_list: List[nl.NkiTensor],
+    attn_scale_list: List[nl.NkiTensor],
+    w_sbuf_list: List[nl.NkiTensor],
+    w_scale_sbuf: nl.NkiTensor,
+    bias_sbuf: Optional[nl.NkiTensor],
+    weight_row_scale_sbuf: nl.NkiTensor,
     s_block_idx: int,
     h_block_idx: int,
     curr_h_block_size: int,
     padded_s_tile_size: int,
     cfg: TilingConfig,
-) -> List[nl.ndarray]:
+) -> List[nl.NkiTensor]:
     """Compute MX matmul with FP8 x4 weights and per-row weight dequant.
 
     Matmul uses nc_matmul_mx with real attention MX scales and constant 127
@@ -1806,11 +1772,11 @@ def _compute_row_mx_matmul(
         s_block_idx: Current S block index.
         h_block_idx: Current H block index.
         curr_h_block_size: Current H block size.
-        padded_s_tile_size: Padded S tile size (for .ap() access pattern).
+        padded_s_tile_size: Padded S tile size (for the .view() reinterpret).
         cfg: Tiling configuration.
 
     Returns:
-        List[nl.ndarray]: Result tensors per s_subtile.
+        List[nl.NkiTensor]: Result tensors per s_subtile.
     """
     result_sb = []
     for s_subtile_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
@@ -1842,12 +1808,10 @@ def _compute_row_mx_matmul(
                 attn_scale_slice = attn_scale_list[d_tile_idx][
                     :, s_subtile_start : s_subtile_start + padded_s_subtile_size
                 ]
-                # Weights: FP8 x4 packed, use .ap() to reinterpret
-                w_slice = w_sbuf_list[d_tile_idx].ap(
-                    pattern=[[cfg.h_tile.tile_size, curr_d_tile_size], [1, curr_h_subtile_size]],
-                    offset=h_subtile_start,
-                    dtype=nl.float8_e4m3fn_x4,
-                )
+                # Weights: FP8 x4 packed, use .view() to reinterpret
+                w_slice = w_sbuf_list[d_tile_idx].view(nl.float8_e4m3fn_x4)[
+                    :, h_subtile_start : h_subtile_start + curr_h_subtile_size
+                ]
                 w_scale_slice = w_scale_sbuf[:, :curr_h_subtile_size]
 
                 nisa.nc_matmul_mx(

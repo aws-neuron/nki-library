@@ -16,15 +16,21 @@
 
 import numpy as np
 import pytest
-from scipy.stats import chi2 as chi2_dist
-
-from nkilib_src.nkilib.experimental.rng import generate_random, get_rng_state_gpsimd, set_rng_state_gpsimd
+from nkilib_src.nkilib.experimental.rng import (
+    generate_random,
+    generate_random_fast,
+    get_rng_state_gpsimd,
+    set_rng_state_gpsimd,
+)
 from nkilib_src.nkilib.experimental.rng.rng import NUM_RNG_SEEDS
 from nkilib_src.nkilib.experimental.rng.rng_torch import (
+    generate_random_fast_torch_ref,
     generate_random_torch_ref,
     get_rng_state_gpsimd_torch_ref,
     set_rng_state_gpsimd_torch_ref,
 )
+from scipy.stats import chi2 as chi2_dist
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,
@@ -239,6 +245,69 @@ class TestRngKernels:
             test_manager=test_manager,
             kernel_entry=generate_random,
             torch_ref=torch_ref_wrapper(generate_random_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_random_output,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            custom_validation_args=validation_args,
+        )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize(FAST_RANDOM_PARAMS, FAST_RANDOM_VALUES)
+    def test_generate_random_fast_multilane_fast(
+        self, test_manager: Orchestrator, platform_target: Platforms, n_elements
+    ):
+        """Test that generate_random_fast (all-128-lane) produces output of the correct shape."""
+
+        def input_generator(test_config):
+            return _generate_random_input(n_elements)
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=generate_random_fast,
+            torch_ref=torch_ref_wrapper(generate_random_fast_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_random_output,
+        )
+        # Random values won't match torch ref — use very loose tolerance.
+        # This primarily validates compilation and correct output shape.
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            atol=2**31,
+            rtol=1.0,
+        )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize(STATISTICAL_RANDOM_PARAMS, STATISTICAL_RANDOM_VALUES)
+    def test_generate_random_fast_multilane_statistical(
+        self, test_manager: Orchestrator, platform_target: Platforms, n_elements
+    ):
+        """Validate that generate_random_fast produces uniformly distributed int32 values.
+
+        This exercises the per-lane seeding: if the 128 GPSIMD lanes were not seeded
+        distinctly the output would be 128-periodic and fail the chi-squared uniformity
+        check.
+        """
+
+        def input_generator(test_config):
+            return _generate_random_input(n_elements)
+
+        validation_args = ValidationArgs(
+            golden_output={
+                "output_0": CustomValidatorWithOutputTensorData(
+                    validator=_uniform_int32_validator(n_elements),
+                    output_ndarray=np.zeros((1, n_elements), dtype=np.int32),
+                ),
+            },
+        )
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=generate_random_fast,
+            torch_ref=torch_ref_wrapper(generate_random_fast_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=_random_output,
         )

@@ -35,29 +35,28 @@ import nki.language as nl
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil
-from ..utils.tensor_view import TensorView
 
 _FLOAT32_MIN: float = -3.4028235e38  # Value for masked attention positions
 
 
 @nki.jit
 def attention_bwd(
-    q_ref: nl.ndarray,
-    k_ref: nl.ndarray,
-    v_ref: nl.ndarray,
-    o_ref: nl.ndarray,
-    dy_ref: nl.ndarray,
-    lse_ref: nl.ndarray,
-    sinks_ref: Optional[nl.ndarray] = None,
-    bound_min: Optional[nl.ndarray] = None,
-    bound_max: Optional[nl.ndarray] = None,
+    q_ref: nl.NkiTensor,
+    k_ref: nl.NkiTensor,
+    v_ref: nl.NkiTensor,
+    o_ref: nl.NkiTensor,
+    dy_ref: nl.NkiTensor,
+    lse_ref: nl.NkiTensor,
+    sinks_ref: Optional[nl.NkiTensor] = None,
+    bound_min: Optional[nl.NkiTensor] = None,
+    bound_max: Optional[nl.NkiTensor] = None,
     use_causal_mask: bool = False,
     mixed_precision: bool = False,
     softmax_scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
     transpose_dv: bool = False,
     cp_offset: int = 0,
-) -> Tuple[nl.ndarray, nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     Flash Attention backward pass kernel.
 
@@ -78,18 +77,18 @@ def attention_bwd(
         seq_len_k (seqlen_k): Key/value sequence length
 
     Args:
-        q_ref (nl.ndarray): [bs, nheads, d_head_qk, seq_len_q], Query tensor in HBM
-        k_ref (nl.ndarray): [bs, nheads_kv, d_head_qk, seq_len_k], Key tensor in HBM
-        v_ref (nl.ndarray): [bs, nheads_kv, d_head_v, seq_len_k], Value tensor in HBM
-        o_ref (nl.ndarray): [bs, nheads, d_head_v, seq_len_q], Forward pass output in HBM
-        dy_ref (nl.ndarray): [bs, nheads, d_head_v, seq_len_q], Upstream gradient in HBM
-        lse_ref (nl.ndarray): [bs, nheads, tile_size, seq_len_q // tile_size],
+        q_ref (nl.NkiTensor): [bs, nheads, d_head_qk, seq_len_q], Query tensor in HBM
+        k_ref (nl.NkiTensor): [bs, nheads_kv, d_head_qk, seq_len_k], Key tensor in HBM
+        v_ref (nl.NkiTensor): [bs, nheads_kv, d_head_v, seq_len_k], Value tensor in HBM
+        o_ref (nl.NkiTensor): [bs, nheads, d_head_v, seq_len_q], Forward pass output in HBM
+        dy_ref (nl.NkiTensor): [bs, nheads, d_head_v, seq_len_q], Upstream gradient in HBM
+        lse_ref (nl.NkiTensor): [bs, nheads, tile_size, seq_len_q // tile_size],
             Log-sum-exp from forward pass in HBM
-        sinks_ref (Optional[nl.ndarray]): [bs, nheads] or [bs, nheads, num_sinks], Attention sinks tensor in HBM.
-        bound_min (Optional[nl.ndarray]): [bs, seq_len_q], float32. For sequence packing: per-batch
+        sinks_ref (Optional[nl.NkiTensor]): [bs, nheads] or [bs, nheads, num_sinks], Attention sinks tensor in HBM.
+        bound_min (Optional[nl.NkiTensor]): [bs, seq_len_q], float32. For sequence packing: per-batch
             K-index where the sequence containing each Q token starts. Pre-expanded from cu_seqlens
             on CPU. Each batch can have different segment boundaries.
-        bound_max (Optional[nl.ndarray]): [bs, seq_len_q], float32. For sequence packing: per-batch
+        bound_max (Optional[nl.NkiTensor]): [bs, seq_len_q], float32. For sequence packing: per-batch
             K-index where the sequence containing each Q token ends (exclusive). Must span the full
             packed sequence length to avoid nan in output. For causal masking, clamped to
             min(bound_max[b, i], i+1) on device.
@@ -110,11 +109,11 @@ def attention_bwd(
             the given offset. Default is 0 (no offset).
 
     Returns:
-        dq (nl.ndarray): [bs, nheads, d_head_qk, seq_len_q], Gradient with respect to Q in HBM
-        dk (nl.ndarray): [bs, nheads_kv, d_head_qk, seq_len_k], Gradient with respect to K in HBM
-        dv (nl.ndarray): [bs, nheads_kv, d_head_v, seq_len_k] (default) or
+        dq (nl.NkiTensor): [bs, nheads, d_head_qk, seq_len_q], Gradient with respect to Q in HBM
+        dk (nl.NkiTensor): [bs, nheads_kv, d_head_qk, seq_len_k], Gradient with respect to K in HBM
+        dv (nl.NkiTensor): [bs, nheads_kv, d_head_v, seq_len_k] (default) or
             [bs, seq_len_k, nheads_kv, d_head_v] (if transpose_dv=True), Gradient with respect to V in HBM
-        dsinks (Optional[nl.ndarray]): [bs, nheads] or [bs, nheads, num_sinks], Gradient with respect to sinks in HBM
+        dsinks (Optional[nl.NkiTensor]): [bs, nheads] or [bs, nheads, num_sinks], Gradient with respect to sinks in HBM
 
     Notes:
         - Supports standard multi-head attention, GQA, and MQA
@@ -219,15 +218,15 @@ def attention_bwd(
 
 
 def validate_inputs(
-    q_ref: nl.ndarray,
-    k_ref: nl.ndarray,
-    v_ref: nl.ndarray,
-    o_ref: nl.ndarray,
-    dy_ref: nl.ndarray,
-    lse_ref: nl.ndarray,
-    sinks_ref: Optional[nl.ndarray],
-    bound_min: Optional[nl.ndarray],
-    bound_max: Optional[nl.ndarray],
+    q_ref: nl.NkiTensor,
+    k_ref: nl.NkiTensor,
+    v_ref: nl.NkiTensor,
+    o_ref: nl.NkiTensor,
+    dy_ref: nl.NkiTensor,
+    lse_ref: nl.NkiTensor,
+    sinks_ref: Optional[nl.NkiTensor],
+    bound_min: Optional[nl.NkiTensor],
+    bound_max: Optional[nl.NkiTensor],
     use_causal_mask: bool,
     sliding_window: int,
     cp_offset: int = 0,
@@ -236,13 +235,13 @@ def validate_inputs(
     Validate input tensor shapes for attention backward pass.
 
     Args:
-        q_ref (nl.ndarray): Query tensor, shape (bs, nheads, d_head_qk, seqlen_q).
-        k_ref (nl.ndarray): Key tensor, shape (bs, nheads_kv, d_head_qk, seqlen_k).
-        v_ref (nl.ndarray): Value tensor, shape (bs, nheads_kv, d_head_v, seqlen_k).
-        o_ref (nl.ndarray): Forward output tensor, shape (bs, nheads, d_head_v, seqlen_q).
-        dy_ref (nl.ndarray): Gradient tensor, shape (bs, nheads, d_head_v, seqlen_q).
-        lse_ref (nl.ndarray): Log-sum-exp tensor, shape (bs, nheads, pmax, seqlen_q // pmax).
-        sinks_ref (Optional[nl.ndarray]): Attention sinks, shape (bs, nheads) or (bs, nheads, num_sinks).
+        q_ref (nl.NkiTensor): Query tensor, shape (bs, nheads, d_head_qk, seqlen_q).
+        k_ref (nl.NkiTensor): Key tensor, shape (bs, nheads_kv, d_head_qk, seqlen_k).
+        v_ref (nl.NkiTensor): Value tensor, shape (bs, nheads_kv, d_head_v, seqlen_k).
+        o_ref (nl.NkiTensor): Forward output tensor, shape (bs, nheads, d_head_v, seqlen_q).
+        dy_ref (nl.NkiTensor): Gradient tensor, shape (bs, nheads, d_head_v, seqlen_q).
+        lse_ref (nl.NkiTensor): Log-sum-exp tensor, shape (bs, nheads, pmax, seqlen_q // pmax).
+        sinks_ref (Optional[nl.NkiTensor]): Attention sinks, shape (bs, nheads) or (bs, nheads, num_sinks).
         use_causal_mask (bool): Whether causal masking is enabled.
         sliding_window (int): Sliding window size for local attention.
 
@@ -410,10 +409,10 @@ class AttentionBwdConfig(nl.NKIObject):
 
 
 def setup_config(
-    q_ref: nl.ndarray,
-    k_ref: nl.ndarray,
-    v_ref: nl.ndarray,
-    sinks_ref: Optional[nl.ndarray],
+    q_ref: nl.NkiTensor,
+    k_ref: nl.NkiTensor,
+    v_ref: nl.NkiTensor,
+    sinks_ref: Optional[nl.NkiTensor],
     mixed_precision: bool,
     softmax_scale: float,
     use_sequence_packing: bool = False,
@@ -591,7 +590,7 @@ def ndarray(
         buffer (Any): NKI buffer type (default: nl.sbuf).
 
     Returns:
-        List: Nested list of nl.ndarray tiles with structure matching block_dim.
+        List: Nested list of nl.NkiTensor tiles with structure matching block_dim.
 
     Notes:
         - Creates a flattened list of tiles then reshapes to nested structure
@@ -630,8 +629,8 @@ def ndarray(
 
 
 def transpose_tiles(
-    src_tensor: nl.ndarray,
-    dst_tensor: nl.ndarray,
+    src_tensor: nl.NkiTensor,
+    dst_tensor: nl.NkiTensor,
     src_tile_size: int,
     engine: Optional[Any] = None,
 ) -> None:
@@ -641,8 +640,8 @@ def transpose_tiles(
     Performs nc_transpose: (P, src_tile_size) -> (src_tile_size, P) for each tile.
 
     Args:
-        src_tensor (nl.ndarray): Source tensor, shape (P, src_tile_size * num_tiles).
-        dst_tensor (nl.ndarray): Destination tensor, shape (src_tile_size, P * num_tiles).
+        src_tensor (nl.NkiTensor): Source tensor, shape (P, src_tile_size * num_tiles).
+        dst_tensor (nl.NkiTensor): Destination tensor, shape (src_tile_size, P * num_tiles).
         src_tile_size (int): Size of each tile in source's free dimension.
         engine (Optional[Any]): Optional engine for tensor_copy (e.g., nisa.scalar_engine).
 
@@ -687,9 +686,9 @@ def transpose_tiles(
 
 
 def compute_rowsum_single_tile(
-    o_tile: nl.ndarray,
-    dy_transposed: nl.ndarray,
-    dy_o_partial: List[nl.ndarray],
+    o_tile: nl.NkiTensor,
+    dy_transposed: nl.NkiTensor,
+    dy_o_partial: List[nl.NkiTensor],
     i_d_head_tile: int,
     q_seq_tile_size: int,
     d_head_v_tile_size: int,
@@ -702,9 +701,9 @@ def compute_rowsum_single_tile(
     the head dimension, and stores into dy_o_partial.
 
     Args:
-        o_tile (nl.ndarray): O tensor tile, shape (d_head_v_tile_size, q_seq_tile_size * num_tiles).
-        dy_transposed (nl.ndarray): Transposed dY, shape (q_seq_tile_size, d_head_v_tile_size * num_tiles).
-        dy_o_partial (List[nl.ndarray]): Output list of tiles, each (q_seq_tile_size, d_head_v_n_tiles).
+        o_tile (nl.NkiTensor): O tensor tile, shape (d_head_v_tile_size, q_seq_tile_size * num_tiles).
+        dy_transposed (nl.NkiTensor): Transposed dY, shape (q_seq_tile_size, d_head_v_tile_size * num_tiles).
+        dy_o_partial (List[nl.NkiTensor]): Output list of tiles, each (q_seq_tile_size, d_head_v_n_tiles).
             Results written to dy_o_partial[i][:, i_d_head_tile].
         i_d_head_tile (int): Column index in dy_o_partial to write results.
         q_seq_tile_size (int): Query sequence tile size.
@@ -731,8 +730,8 @@ def compute_rowsum_single_tile(
 
 
 def load_kv(
-    k_ref_hbm_tile: nl.ndarray,
-    v_ref_hbm_tile: nl.ndarray,
+    k_ref_hbm_tile: nl.NkiTensor,
+    v_ref_hbm_tile: nl.NkiTensor,
     dtype: Any,
     d_head_qk_n_tiles: int,
     d_head_v_n_tiles: int,
@@ -742,13 +741,13 @@ def load_kv(
     seqlen_k: int,
     offset_k: int,
     offset_v: int,
-) -> Tuple[List[nl.ndarray], List[nl.ndarray]]:
+) -> Tuple[List[nl.NkiTensor], List[nl.NkiTensor]]:
     """
     Load K and V tiles from HBM with potentially different head dimensions.
 
     Args:
-        k_ref_hbm_tile (nl.ndarray): HBM reference for K tensor.
-        v_ref_hbm_tile (nl.ndarray): HBM reference for V tensor.
+        k_ref_hbm_tile (nl.NkiTensor): HBM reference for K tensor.
+        v_ref_hbm_tile (nl.NkiTensor): HBM reference for V tensor.
         dtype (Any): Data type for tiles.
         d_head_qk_n_tiles (int): Number of tiles along K head dimension.
         d_head_v_n_tiles (int): Number of tiles along V head dimension.
@@ -760,7 +759,7 @@ def load_kv(
         offset_v (int): HBM byte offset for V.
 
     Returns:
-        Tuple[List[nl.ndarray], List[nl.ndarray]]: Tuple of (k_local, v_local).
+        Tuple[List[nl.NkiTensor], List[nl.NkiTensor]]: Tuple of (k_local, v_local).
             k_local has length d_head_qk_n_tiles with tiles of shape (d_head_qk_tile_size, k_seq_tile_size).
             v_local has length d_head_v_n_tiles with tiles of shape (d_head_v_tile_size, k_seq_tile_size).
     """
@@ -789,8 +788,8 @@ def load_kv(
 
 
 def load_q_dy(
-    q_ref_hbm_tile: nl.ndarray,
-    dy_ref_hbm_tile: nl.ndarray,
+    q_ref_hbm_tile: nl.NkiTensor,
+    dy_ref_hbm_tile: nl.NkiTensor,
     dtype: Any,
     d_head_qk_n_tiles: int,
     d_head_v_n_tiles: int,
@@ -800,13 +799,13 @@ def load_q_dy(
     seqlen_q: int,
     offset_q: int,
     offset_dy: int,
-) -> Tuple[List[nl.ndarray], List[nl.ndarray]]:
+) -> Tuple[List[nl.NkiTensor], List[nl.NkiTensor]]:
     """
     Load Q and dY tiles from HBM with potentially different head dimensions.
 
     Args:
-        q_ref_hbm_tile (nl.ndarray): HBM reference for Q tensor.
-        dy_ref_hbm_tile (nl.ndarray): HBM reference for dY tensor.
+        q_ref_hbm_tile (nl.NkiTensor): HBM reference for Q tensor.
+        dy_ref_hbm_tile (nl.NkiTensor): HBM reference for dY tensor.
         dtype (Any): Data type for tiles.
         d_head_qk_n_tiles (int): Number of tiles along Q head dimension.
         d_head_v_n_tiles (int): Number of tiles along dY head dimension.
@@ -818,7 +817,7 @@ def load_q_dy(
         offset_dy (int): HBM byte offset for dY.
 
     Returns:
-        Tuple[List[nl.ndarray], List[nl.ndarray]]: Tuple of (q_local, dy_local).
+        Tuple[List[nl.NkiTensor], List[nl.NkiTensor]]: Tuple of (q_local, dy_local).
             q_local has length d_head_qk_n_tiles with tiles of shape (d_head_qk_tile_size, q_seq_tile_size).
             dy_local has length d_head_v_n_tiles with tiles of shape (d_head_v_tile_size, q_seq_tile_size).
     """
@@ -905,10 +904,10 @@ def get_required_tiles_mask(
 
 def recompute_qk_softmax(
     cfg: AttentionBwdConfig,
-    q_local: List[nl.ndarray],
-    k_local: List[nl.ndarray],
-    softmax_exp_bias: nl.ndarray,
-    softmax_y: List[nl.ndarray],
+    q_local: List[nl.NkiTensor],
+    k_local: List[nl.NkiTensor],
+    softmax_exp_bias: nl.NkiTensor,
+    softmax_y: List[nl.NkiTensor],
     use_causal_mask: bool,
     sliding_window: int,
     tile_required: List[bool],
@@ -917,8 +916,8 @@ def recompute_qk_softmax(
     local_i_k_seq_tile: int,
     global_k_seq_offset: int = 0,
     range_select_bounds=None,
-    bound_min_sbuf: Optional[nl.ndarray] = None,
-    bound_max_sbuf: Optional[nl.ndarray] = None,
+    bound_min_sbuf: Optional[nl.NkiTensor] = None,
+    bound_max_sbuf: Optional[nl.NkiTensor] = None,
     cp_offset: int = 0,
 ) -> None:
     """
@@ -932,11 +931,11 @@ def recompute_qk_softmax(
 
     Args:
         cfg (AttentionBwdConfig): Attention backward configuration.
-        q_local (List[nl.ndarray]): List of Q tiles, length d_head_qk_n_tiles.
-        k_local (List[nl.ndarray]): List of K tiles, length d_head_qk_n_tiles.
-        softmax_exp_bias (nl.ndarray): Negative LSE values for stable softmax,
+        q_local (List[nl.NkiTensor]): List of Q tiles, length d_head_qk_n_tiles.
+        k_local (List[nl.NkiTensor]): List of K tiles, length d_head_qk_n_tiles.
+        softmax_exp_bias (nl.NkiTensor): Negative LSE values for stable softmax,
             shape (q_seq_tile_size, q_seq_n_tiles).
-        softmax_y (List[nl.ndarray]): Output list for softmax results, length q_tile_group_size,
+        softmax_y (List[nl.NkiTensor]): Output list for softmax results, length q_tile_group_size,
             each (q_seq_tile_size, k_seq_tile_size).
         use_causal_mask (bool): Whether to apply causal masking.
         sliding_window (int): Sliding window size.
@@ -945,9 +944,9 @@ def recompute_qk_softmax(
         local_i_q_seq_tile (int): Current Q sequence tile index.
         local_i_k_seq_tile (int): Current K sequence tile index.
         global_k_seq_offset (int): Global offset for K sequence (for tiled impl).
-        bound_min_sbuf (Optional[nl.ndarray]): Sequence packing lower bounds in SBUF,
+        bound_min_sbuf (Optional[nl.NkiTensor]): Sequence packing lower bounds in SBUF,
             shape (q_seq_tile_size, q_seq_n_tiles). None if not using sequence_packing.
-        bound_max_sbuf (Optional[nl.ndarray]): Sequence packing upper bounds in SBUF (clamped for causal),
+        bound_max_sbuf (Optional[nl.NkiTensor]): Sequence packing upper bounds in SBUF (clamped for causal),
             shape (q_seq_tile_size, q_seq_n_tiles). None if not using sequence_packing.
 
     Returns:
@@ -1070,13 +1069,13 @@ def recompute_qk_softmax(
 
 def compute_softmax_backward_dx(
     cfg: AttentionBwdConfig,
-    dy_local: List[nl.ndarray],
-    v_local: List[nl.ndarray],
-    softmax_y: List[nl.ndarray],
-    dy_o_sum: nl.ndarray,
+    dy_local: List[nl.NkiTensor],
+    v_local: List[nl.NkiTensor],
+    softmax_y: List[nl.NkiTensor],
+    dy_o_sum: nl.NkiTensor,
     tile_required: List[bool],
     q_tile_group_size: int,
-    softmax_dx_local: List[nl.ndarray],
+    softmax_dx_local: List[nl.NkiTensor],
 ) -> None:
     """
     Compute gradients through softmax for flash attention backward.
@@ -1087,16 +1086,16 @@ def compute_softmax_backward_dx(
 
     Args:
         cfg (AttentionBwdConfig): Attention backward configuration.
-        dy_local (List[nl.ndarray]): List of dY tiles, length d_head_v_n_tiles,
+        dy_local (List[nl.NkiTensor]): List of dY tiles, length d_head_v_n_tiles,
             each (d_head_v_tile_size, q_seq_tile_size * q_tile_group_size).
-        v_local (List[nl.ndarray]): List of V tiles, length d_head_v_n_tiles,
+        v_local (List[nl.NkiTensor]): List of V tiles, length d_head_v_n_tiles,
             each (d_head_v_tile_size, k_seq_tile_size).
-        softmax_y (List[nl.ndarray]): Recomputed attention weights, length q_tile_group_size,
+        softmax_y (List[nl.NkiTensor]): Recomputed attention weights, length q_tile_group_size,
             each (q_seq_tile_size, k_seq_tile_size).
-        dy_o_sum (nl.ndarray): D = rowsum(dO ⊙ O), shape (q_seq_tile_size, q_tile_group_size).
+        dy_o_sum (nl.NkiTensor): D = rowsum(dO ⊙ O), shape (q_seq_tile_size, q_tile_group_size).
         tile_required (List[bool]): Boolean mask indicating which tiles to compute.
         q_tile_group_size (int): Number of Q tiles being processed.
-        softmax_dx_local (List[nl.ndarray]): Output list for gradients, length q_tile_group_size,
+        softmax_dx_local (List[nl.NkiTensor]): Output list for gradients, length q_tile_group_size,
             each (q_seq_tile_size, k_seq_tile_size).
 
     Returns:
@@ -1135,19 +1134,19 @@ def compute_softmax_backward_dx(
 
 
 def flash_attn_bwd(
-    out_dq_ref: nl.ndarray,
-    out_dk_ref: nl.ndarray,
-    out_dv_ref: nl.ndarray,
-    out_dsinks_ref: Optional[nl.ndarray],
-    q_ref: nl.ndarray,
-    k_ref: nl.ndarray,
-    v_ref: nl.ndarray,
-    o_ref: nl.ndarray,
-    dy_ref: nl.ndarray,
-    lse_ref: nl.ndarray,
-    sinks_ref: Optional[nl.ndarray],
-    bound_min: Optional[nl.ndarray],
-    bound_max: Optional[nl.ndarray],
+    out_dq_ref: nl.NkiTensor,
+    out_dk_ref: nl.NkiTensor,
+    out_dv_ref: nl.NkiTensor,
+    out_dsinks_ref: Optional[nl.NkiTensor],
+    q_ref: nl.NkiTensor,
+    k_ref: nl.NkiTensor,
+    v_ref: nl.NkiTensor,
+    o_ref: nl.NkiTensor,
+    dy_ref: nl.NkiTensor,
+    lse_ref: nl.NkiTensor,
+    sinks_ref: Optional[nl.NkiTensor],
+    bound_min: Optional[nl.NkiTensor],
+    bound_max: Optional[nl.NkiTensor],
     use_causal_mask: bool,
     mixed_precision: bool,
     softmax_scale: float,
@@ -1222,11 +1221,11 @@ def flash_attn_bwd(
         bound_max_sbuf = nl.ndarray((q_seq_tile_size, bs * q_seq_n_tiles), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(
             dst=bound_min_sbuf,
-            src=TensorView(bound_min).reshape((bs * q_seq_n_tiles, q_seq_tile_size)).permute((1, 0)).get_view(),
+            src=bound_min.reshape((bs * q_seq_n_tiles, q_seq_tile_size)).permute((1, 0)),
         )
         nisa.dma_copy(
             dst=bound_max_sbuf,
-            src=TensorView(bound_max).reshape((bs * q_seq_n_tiles, q_seq_tile_size)).permute((1, 0)).get_view(),
+            src=bound_max.reshape((bs * q_seq_n_tiles, q_seq_tile_size)).permute((1, 0)),
         )
         # Causal/SWA clamping: iota pattern repeats per batch, so clamp each batch slice separately
         causal_ub = None
@@ -1356,7 +1355,10 @@ def flash_attn_bwd(
                 next_v_buf = kv_v_bufs[nxt]
                 for i_d_head_tile in range(d_head_qk_n_tiles):
                     nisa.dma_copy(
-                        dst=next_k_buf[i_d_head_tile],
+                        # Slice dst to the actual transfer width: the final tail section can be
+                        # shorter than the full-size buffer (max_section_len) when seqlen_k is not
+                        # a multiple of k_seq_section_len, so dst must match src's element count.
+                        dst=next_k_buf[i_d_head_tile][:, :next_section_len],
                         src=k_ref.ap(
                             pattern=[[seqlen_k, d_head_qk_tile_size], [1, next_section_len]],
                             offset=kv_k_offset_base + i_d_head_tile * d_head_qk_tile_size * seqlen_k + next_k_start,
@@ -1364,7 +1366,7 @@ def flash_attn_bwd(
                     )
                 for i_d_head_tile in range(d_head_v_n_tiles):
                     nisa.dma_copy(
-                        dst=next_v_buf[i_d_head_tile],
+                        dst=next_v_buf[i_d_head_tile][:, :next_section_len],
                         src=v_ref.ap(
                             pattern=[[seqlen_k, d_head_v_tile_size], [1, next_section_len]],
                             offset=kv_v_offset_base + i_d_head_tile * d_head_v_tile_size * seqlen_k + next_k_start,
@@ -1677,17 +1679,17 @@ def flash_attn_bwd(
 
 def _flash_attn_bwd_core(
     cfg: AttentionBwdConfig,
-    q_local: List[nl.ndarray],
-    k_local: List[nl.ndarray],
-    v_local: List[nl.ndarray],
-    dy_local: List[nl.ndarray],
-    dk_local_reduced: List[nl.ndarray],
-    dv_local_reduced: List[nl.ndarray],
-    dq_local: List[nl.ndarray],
-    softmax_exp_bias: nl.ndarray,
-    dy_o_sum: nl.ndarray,
-    trans_q_local: nl.ndarray,
-    trans_dy: nl.ndarray,
+    q_local: List[nl.NkiTensor],
+    k_local: List[nl.NkiTensor],
+    v_local: List[nl.NkiTensor],
+    dy_local: List[nl.NkiTensor],
+    dk_local_reduced: List[nl.NkiTensor],
+    dv_local_reduced: List[nl.NkiTensor],
+    dq_local: List[nl.NkiTensor],
+    softmax_exp_bias: nl.NkiTensor,
+    dy_o_sum: nl.NkiTensor,
+    trans_q_local: nl.NkiTensor,
+    trans_dy: nl.NkiTensor,
     local_i_q_seq_tile: int,
     local_i_k_seq_tile: int,
     use_causal_mask: bool,
@@ -1696,8 +1698,8 @@ def _flash_attn_bwd_core(
     q_tile_group_size: int = 1,
     global_k_seq_offset: int = 0,
     range_select_bounds=None,
-    bound_min_sbuf: Optional[nl.ndarray] = None,
-    bound_max_sbuf: Optional[nl.ndarray] = None,
+    bound_min_sbuf: Optional[nl.NkiTensor] = None,
+    bound_max_sbuf: Optional[nl.NkiTensor] = None,
     cp_offset: int = 0,
 ) -> None:
     """

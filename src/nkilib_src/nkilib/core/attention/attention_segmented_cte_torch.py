@@ -82,15 +82,16 @@ def attention_segmented_cte_torch_ref(
     v_cache = v_cache.float()
 
     if fp8_packed:
-        # Unpack: (num_blocks, block_size//2, kv_dim, 2) -> (num_blocks, num_kv_heads, block_size, head_dim)
-        num_kv_heads = v_cache.shape[1]
-        head_dim_val = v_cache.shape[3]
+        # Unpack head-major packed layout:
+        #   (num_blocks, num_kv_heads, block_size//2, head_dim, 2) -> (num_blocks, num_kv_heads, block_size, head_dim)
+        # Last axis indexes the 2 consecutive seq positions packed into a row. Move it next to
+        # block_size//2 and fold the pair back into the sequence dimension.
         n_blocks = k_cache.shape[0]
-        block_size_half = k_cache.shape[1]
-        kv_dim = num_kv_heads * head_dim_val
-        k_cache = k_cache.permute(0, 1, 3, 2).reshape(n_blocks, block_size_half * 2, kv_dim)
-        k_cache = k_cache.reshape(n_blocks, block_size_half * 2, num_kv_heads, head_dim_val)
-        k_cache = k_cache.permute(0, 2, 1, 3)  # -> (N, H, block_size, D)
+        num_kv_heads = k_cache.shape[1]
+        block_size_half = k_cache.shape[2]
+        head_dim_val = k_cache.shape[3]
+        k_cache = k_cache.permute(0, 1, 2, 4, 3)  # (N, H, bs//2, 2, D)
+        k_cache = k_cache.reshape(n_blocks, num_kv_heads, block_size_half * 2, head_dim_val)  # (N, H, bs, D)
     elif k_pre_transposed:
         num_kv_heads = v_cache.shape[1]
         block_size_val = k_cache.shape[2]

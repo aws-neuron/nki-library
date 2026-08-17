@@ -23,17 +23,16 @@ from typing import Optional, Tuple
 import nki
 import nki.isa as nisa
 import nki.language as nl
-import numpy as np
 
 from ..max.cascaded_max_utils import predicated_folded_load, unfolded_store
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.rotation_matrix import build_rotation_matrix
 from .rotational_topk_utils import (
     HW_PARAMS,
-    RotationalConstants,
     RotationalTopkConfig,
     TopkConfig,
-    _generate_stage_offsets_interleaved,
+    build_stage_offsets,
     create_rotational_topk_config,
     create_topk_config,
     insert,
@@ -56,7 +55,7 @@ class SupportedTopkMethods(Enum):
 
 
 @nki.jit
-def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.ndarray, nl.ndarray]:
+def rotational_topk(inp: nl.NkiTensor, config: RotationalTopkConfig) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Find the k largest elements along the last dimension using rotational algorithm.
 
@@ -71,11 +70,11 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
         k: Number of top elements to retrieve
 
     Args:
-        inp (nl.ndarray): [B, S, V] or [BxS, V], Input tensor in HBM
+        inp (nl.NkiTensor): [B, S, V] or [BxS, V], Input tensor in HBM
         config (RotationalTopkConfig): Configuration object containing algorithm parameters
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - topk_values: [B, S, k], Top-k values with original shape preserved
             - topk_indices: [B, S, k], Global indices of top-k elements
 
@@ -187,6 +186,33 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
     n_bxs_tiles = config.n_bxs_tiles
     lnc_batch_start = prg_id * config.per_lnc_BxS
 
+    # Hoist tile-invariant constants out of the loop
+    n_stages = config.n_stages
+    stage_free_size = config.stage_free_size
+    total_partition_dim = n_stages * tile_size
+    concatenated_stage_free_dim = stage_free_size + (n_stages * config.local_top_k_per_stage)
+
+    indices = nl.ndarray((total_partition_dim, concatenated_stage_free_dim), dtype=nl.float32)
+    nisa.iota(
+        dst=indices[:, nl.ds(0, stage_free_size)],
+        pattern=[[1, stage_free_size]],
+        offset=0,
+    )
+
+    stage_offsets = build_stage_offsets(n_stages, tile_size, stage_free_size)
+
+    rotation = build_rotation_matrix(n_stages, tile_size, dtype=inp.dtype)
+    rotation_f32 = nl.ndarray((total_partition_dim, total_partition_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=rotation_f32, src=rotation, engine=nisa.vector_engine)
+
+    nisa.tensor_scalar(
+        dst=indices[:, nl.ds(0, stage_free_size)],
+        data=indices[:, nl.ds(0, stage_free_size)],
+        op0=nl.add,
+        operand0=stage_offsets,
+        engine=nisa.vector_engine,
+    )
+
     for tile_idx in nl.sequential_range(n_bxs_tiles):
         tile_batch_start = lnc_batch_start + tile_idx * tile_size
         tile_batch_end = min(tile_batch_start + tile_size, min(lnc_batch_start + config.per_lnc_BxS, BxS))
@@ -196,6 +222,9 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
             config=config,
             batch_start=tile_batch_start,
             batch_end=tile_batch_end,
+            rotation=rotation,
+            rotation_f32=rotation_f32,
+            indices=indices,
         )
 
         tile_bxs = tile_batch_end - tile_batch_start
@@ -232,11 +261,14 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
 
 
 def _topk_rotated_core(
-    inp: nl.ndarray,
+    inp: nl.NkiTensor,
     config: RotationalTopkConfig,
     batch_start: int,
     batch_end: int,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+    rotation: nl.ndarray,
+    rotation_f32: nl.ndarray,
+    indices: nl.ndarray,
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Core rotational top-k algorithm implementation.
 
@@ -246,13 +278,13 @@ def _topk_rotated_core(
     fast_folded_load with targeted padding, and skips rotation on the last stage.
 
     Args:
-        inp (nl.ndarray): [BxS, V], Input tensor in HBM
+        inp (nl.NkiTensor): [BxS, V], Input tensor in HBM
         config (RotationalTopkConfig): Configuration with algorithm parameters
         batch_start (int): Start index for batch tile
         batch_end (int): End index for batch tile
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - value: [total_partition_dim, local_top_k_per_stage], Top-k values
             - global_index: [total_partition_dim, local_top_k_per_stage], Global indices
 
@@ -283,32 +315,7 @@ def _topk_rotated_core(
     total_partition_dim = n_stages * BxS_size
     concatenated_stage_free_dim = stage_free_size + (n_stages * local_top_k_per_stage)
 
-    rotation_matrix_file = config._shared_const_cache[f"{n_stages}_{BxS_size}"]
-    rotate_hbm = nl.shared_constant(rotation_matrix_file)
-
     values = nl.ndarray((total_partition_dim, concatenated_stage_free_dim), dtype=inp.dtype)
-    indices = nl.ndarray((total_partition_dim, concatenated_stage_free_dim), dtype=nl.float32)
-
-    # On-chip index generation via iota + tensor_scalar (no DMA of precomputed indices)
-    nisa.iota(
-        dst=indices[:, nl.ds(0, stage_free_size)],
-        pattern=[[1, stage_free_size]],
-        offset=0,
-    )
-
-    offset_key = f"offsets_interleaved_{n_stages}_{stage_free_size}_{BxS_size}"
-    stage_offsets = nl.ndarray((total_partition_dim, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=stage_offsets,
-        src=nl.shared_constant(config._shared_const_cache[offset_key]),
-    )
-
-    nisa.tensor_scalar(
-        dst=indices[:, nl.ds(0, stage_free_size)],
-        data=indices[:, nl.ds(0, stage_free_size)],
-        op0=nl.add,
-        operand0=stage_offsets,
-    )
 
     predicated_folded_load(
         data_hbm=inp,
@@ -318,13 +325,18 @@ def _topk_rotated_core(
         batch_end=batch_end,
     )
 
-    partition_slice = nl.ds(0, total_partition_dim)
-    free_slice = nl.ds(0, total_partition_dim)
-    rotation = nl.ndarray(rotate_hbm.shape, dtype=inp.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=rotation, src=rotate_hbm[partition_slice, free_slice])
-
-    rotation_f32 = nl.ndarray(rotate_hbm.shape, dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=rotation_f32, src=rotation)
+    # predicated_folded_load only writes this shard's valid BxS elements, which
+    # occupy partitions [0:valid_pdim] (n_stages consecutive partitions per
+    # element). Restrict every downstream op to those partitions so none reads
+    # the padding partitions [valid_pdim:total_partition_dim] that the load
+    # leaves uninitialized. The rotation matrix is block-diagonal with
+    # one n_stages-wide block per element, so its [0:valid_pdim, 0:valid_pdim]
+    # sub-block is exactly the rotation for the valid partitions.
+    valid_pdim = (batch_end - batch_start) * n_stages
+    values = values[0:valid_pdim, :]
+    indices = indices[0:valid_pdim, :]
+    rotation = rotation[0:valid_pdim, 0:valid_pdim]
+    rotation_f32 = rotation_f32[0:valid_pdim, 0:valid_pdim]
 
     for stage_idx in nl.static_range(n_stages):
         offset = stage_free_size + (local_top_k_per_stage * stage_idx)
@@ -396,12 +408,12 @@ def _kernel(fn):
 
 @_kernel
 def topk(
-    inp: nl.ndarray,
+    inp: nl.NkiTensor,
     k: int,
     sorted_flag: bool = True,
     method: SupportedTopkMethods = SupportedTopkMethods.ROTATIONAL,
     lnc: Optional[int] = None,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Find the k largest elements along the last dimension of input tensor.
 
@@ -416,14 +428,14 @@ def topk(
         k: Number of top elements to retrieve
 
     Args:
-        inp (nl.ndarray): [B, S, V], Input tensor in HBM
+        inp (nl.NkiTensor): [B, S, V], Input tensor in HBM
         k (int): Number of top elements to retrieve
         sorted_flag (bool): Whether to sort the output (default: True)
         method (SupportedTopkMethods): Algorithm to use (default: ROTATIONAL)
         lnc (Optional[int]): Number of logical cores to use (default: None, auto-detect)
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - topk_values: [B, S, k], Top-k values
             - topk_indices: [B, S, k], Indices of top-k elements
 
@@ -455,7 +467,7 @@ def topk(
         # Reshape outputs to original shape
         return topk_values.reshape(original_shape), topk_indices.reshape(original_shape)
     """
-    if method not in SupportedTopkMethods:
+    if method not in SupportedTopkMethods:  # pragma: no cover - arg validation, not a functional branch
         raise ValueError(f"Unsupported method '{method}'. Supported methods are: {list(SupportedTopkMethods)}")
 
     topk_config = create_topk_config(
@@ -474,39 +486,11 @@ def topk(
     selected_topk_method = SUPPORTED_TOPK_METHOD_MAPPING[method]
 
     config = create_rotational_topk_config(inp_shape=inp.shape, topk_config=topk_config)
-    config = prepare_rotational_constants(config)
     config.log_strategy()
     grid = config.n_prgs
     topk_values, topk_indices = selected_topk_method[grid](inp=inp, config=config)
 
     topk_values = topk_values.reshape(topk_config.out_shape)
     topk_indices = topk_indices.reshape(topk_config.out_shape)
-    cleanup_rotational_constants()
 
     return topk_values, topk_indices
-
-
-def prepare_rotational_constants(config: RotationalTopkConfig) -> RotationalTopkConfig:
-    """Prepare rotational constants and return the config with the shared cache populated.
-
-    Generates the rotation permutation matrix and interleaved stage offsets for
-    on-chip index generation. Clears the shared cache first to avoid stale entries
-    from prior test runs.
-
-    Args:
-        config: RotationalTopkConfig with kernel parameters
-
-    Returns:
-        RotationalTopkConfig: Same config with _shared_const_cache populated
-    """
-    RotationalConstants._shared_const_cache.clear()
-    const_dtype = np.float32
-    RotationalConstants._get_permutation_matrix(config.n_stages, config.tile_size, const_dtype)
-    _generate_stage_offsets_interleaved(config.n_stages, config.stage_free_size, config.tile_size)
-    object.__setattr__(config, '_shared_const_cache', dict(RotationalConstants._shared_const_cache))
-    return config
-
-
-def cleanup_rotational_constants() -> None:
-    """Cleanup rotational constants after topk kernel execution."""
-    RotationalConstants.cleanup()

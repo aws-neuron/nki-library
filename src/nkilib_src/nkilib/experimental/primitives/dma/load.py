@@ -14,14 +14,13 @@
 
 """Load primitive: HBM to SBUF TileStream."""
 
-from typing import Optional, Union
+from typing import Optional
 
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa import oob_mode
 
 from ....core.utils.kernel_assert import kernel_assert
-from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import HBMStream, TileStream, get_logical_shape, tile_hbm
@@ -59,8 +58,8 @@ class Load(nl.NKIObject):
         self,
         dst: TileStream,
         src: HBMStream,
-        scalar_index: Optional[nl.ndarray] = None,
-        vector_index: Optional[nl.ndarray] = None,
+        scalar_index: Optional[nl.NkiTensor] = None,
+        vector_index: Optional[nl.NkiTensor] = None,
         index_dim: Optional[int] = None,
         transpose: bool = False,
     ) -> None:
@@ -174,7 +173,7 @@ class Load(nl.NKIObject):
             f"Load '{self._name}': tile count mismatch - dst={dst.get_num_tiles()}, src={self._src.get_num_tiles()}",
         )
 
-    def _find_pattern_dim_by_stride(self, tile_view: TensorView, target_stride: int) -> int:
+    def _find_pattern_dim_by_stride(self, tile_view: nl.NkiTensor, target_stride: int) -> int:
         """Find which pattern dimension has the target stride.
 
         Args:
@@ -202,7 +201,7 @@ class Load(nl.NKIObject):
             src_tile = self._src.get_tile()
 
             if self._transpose:
-                nisa.dma_transpose(dst=dst_tile.get_view(), src=src_tile.get_view())
+                nisa.dma_transpose(dst=dst_tile, src=src_tile)
             elif self._vector_index is not None:
                 # Vector DGE: each partition row uses its own index
                 physical_index_dim = self._find_pattern_dim_by_stride(src_tile, self._indexed_stride)
@@ -220,8 +219,8 @@ class Load(nl.NKIObject):
                         modified_pattern.append((stride, size))
 
                 nisa.dma_copy(
-                    dst=dst_tile.get_view(),
-                    src=src_tile.base_tensor.ap(
+                    dst=dst_tile,
+                    src=src_tile.ap(
                         pattern=modified_pattern,
                         offset=ap_offset,
                         vector_offset=self._vector_index,
@@ -231,29 +230,29 @@ class Load(nl.NKIObject):
                     oob_mode=oob_mode.skip,
                 )
             else:
-                # No DGE or Scalar DGE (scalar_offset already in TensorView)
-                nisa.dma_copy(dst=dst_tile.get_view(), src=src_tile.get_view())
+                # No DGE or Scalar DGE (scalar_offset already in nl.NkiTensor)
+                nisa.dma_copy(dst=dst_tile, src=src_tile)
 
         self._dst.reset_cur_tile()
         self._src.reset_cur_tile()
 
 
 def load(
-    dst: Union[TensorView, nl.ndarray],
-    src: Union[TensorView, nl.ndarray],
+    dst: nl.NkiTensor,
+    src: nl.NkiTensor,
 ) -> None:
     """Compact load: HBM to SBUF. Whole tensor, no tiling.
 
     Wraps src in a single-tile HBMStream and dst in a single-tile TileStream.
 
     Args:
-        dst: Destination tensor in SBUF (from alloc_logical or nl.ndarray)
-        src: Source tensor in HBM (nl.ndarray or TensorView)
+        dst: Destination tensor in SBUF (from alloc_logical or nl.NkiTensor)
+        src: Source tensor in HBM (nl.NkiTensor or nl.NkiTensor)
     """
     logical_shape = get_logical_shape(dst)
     dst_ts = tile_stream.tile(dst, logical_shape, iter_order=RowMajor())
 
-    src_view = src if isinstance(src, TensorView) else TensorView(src)
+    src_view = src
     src_hbm = tile_hbm(src_view, tuple(src_view.shape), iter_order=RowMajor())
 
     Load(dst=dst_ts, src=src_hbm).execute()

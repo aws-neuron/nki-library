@@ -41,6 +41,8 @@ def attention_kv_parallel_segmented_cte_torch_ref(
     sliding_window: int = 0,
     kvp_rank_id: Optional[np.ndarray] = None,
     kvp_group_size: int = 0,
+    apc_mode: bool = False,
+    valid_num_prior_tokens: np.ndarray = None,
 ) -> dict:
     """PyTorch reference for attention_kv_parallel_segmented_cte. Same signature as the kernel.
 
@@ -48,25 +50,25 @@ def attention_kv_parallel_segmented_cte_torch_ref(
     then computes full-context causal attention and returns this rank's output.
 
     Args:
-        q: [lnc_degree, seq_len, head_dim] - this rank's Q heads
+        q: [q_heads_per_rank, seq_len, head_dim] - this rank's Q heads
         k_cache: [num_blocks, num_kv_heads, block_size, head_dim] - this rank's KV shard
         v_cache: [num_blocks, num_kv_heads, block_size, head_dim] - this rank's KV shard
         block_tables: [1, num_blocks] - block indices (sequential)
         kvp_offset: [1, 1] - causal offset for this rank
         replica_groups: ReplicaGroup defining the collective topology
-        group_size: number of ranks per replica group
+        group_size: number of logical ranks in the replica group
         block_size: KV cache block size
         seg_size: segment size for attention iteration
         scale: softmax scale factor
         global_q_offset: prior tokens offset
-        tp_out: if True, transpose output to [lnc_degree, head_dim, seq_len]
+        tp_out: if True, transpose output to [q_heads_per_rank, head_dim, seq_len]
     """
     rank_id = get_rank()
     pg = get_pg(replica_groups)
     num_physical_ranks = pg.size()
     my_worker_idx = pg.rank()
 
-    lnc_degree = q.shape[0]
+    q_heads_per_rank = q.shape[0]
     seq_len = q.shape[1]
     head_dim = q.shape[2]
 
@@ -88,8 +90,8 @@ def attention_kv_parallel_segmented_cte_torch_ref(
 
     # Compute attention for each of this rank's Q heads
     outputs = []
-    for nc in range(lnc_degree):
-        q_vec = q[nc].astype(np.float32)  # [seq_len, head_dim]
+    for head_idx in range(q_heads_per_rank):
+        q_vec = q[head_idx].astype(np.float32)  # [seq_len, head_dim]
 
         # Compute attention scores
         scores = np.matmul(q_vec, k_full.T)  # [seq_len, total_kv_len]

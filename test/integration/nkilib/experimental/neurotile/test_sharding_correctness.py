@@ -25,8 +25,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -50,7 +50,7 @@ def _write_shard_id_block(dummy):
     fill_sb = nl.ndarray((TILE_P, N), dtype=out.dtype, buffer=nl.sbuf)
     nisa.memset(fill_sb, value=0)
     nisa.tensor_scalar(dst=fill_sb, data=fill_sb, op0=nl.add, operand0=shard_id)
-    fill_view = nt.tiles(fill_sb, tile_size=(TILE_P, N), buffer_type=nl.sbuf)
+    fill_view = nt.tiles(fill_sb, tile_size=(TILE_P, N))
 
     for out_view in out_tiles.tolist():
         out_view.store(fill_view[0, 0].data)
@@ -72,7 +72,7 @@ def _write_shard_id_interleaved(dummy):
     fill_sb = nl.ndarray((TILE_P, N), dtype=out.dtype, buffer=nl.sbuf)
     nisa.memset(fill_sb, value=0)
     nisa.tensor_scalar(dst=fill_sb, data=fill_sb, op0=nl.add, operand0=shard_id)
-    fill_view = nt.tiles(fill_sb, tile_size=(TILE_P, N), buffer_type=nl.sbuf)
+    fill_view = nt.tiles(fill_sb, tile_size=(TILE_P, N))
 
     for out_view in out_tiles.tolist():
         out_view.store(fill_view[0, 0].data)
@@ -91,7 +91,7 @@ def _identity_block_sharded(src):
     out_tiles = nt.tiles(out, tile_size=(TILE_P, F))[own, :]
 
     for i in range(src_tiles.shape[0]):
-        out_tiles[i].store(src_tiles[i].load().ap())
+        out_tiles[i].store(src_tiles[i].load().data)
 
     return out
 
