@@ -62,14 +62,14 @@ def _load_single_tensor(
     if load_td == None:
         return
 
-    if load_td.is_unswizzled_bf16 or load_td.load_with_PE_swizzle:
+    if load_td.is_unswizzled_bf16:
         # Unswizzled BF16: use DGT or PE swizzle path (dispatched by load_tile)
         # Detect remainder: if remaining K from k_global is less than LOAD_TILE_K
         f_effective = load_td.effective_f_dim if load_td.effective_f_dim is not None else load_td.logical_shape[1]
         if f_global + f_offset >= f_effective:
             return
 
-        if load_td.load_with_PE_swizzle and load_td.indirect_dma_vector_offset is not None:
+        if load_td.uses_pe_swizzle and load_td.indirect_dma_vector_offset is not None:
             indirect_start_col = (f_global + f_offset) // TILE_128
             indirect_num_cols = LOAD_TILE_F // TILE_128
             indirect_vector_offset = load_td.indirect_dma_vector_offset[
@@ -84,6 +84,10 @@ def _load_single_tensor(
         is_remainder = remaining_k < LOAD_TILE_K
         INTERLEAVE_FACTOR = quantize_mxfp8_utils.INTERLEAVE_FACTOR
 
+        # guard against loading 0-sized tiles
+        if remaining_k <= 0:
+            return
+
         if not is_remainder:
             # Full tile load
             load_loc = TileLocation(
@@ -97,6 +101,24 @@ def _load_single_tensor(
             data_store_loc = TileLocation(
                 tensor=store_td,
                 tile_k=LOAD_TILE_K,
+                tile_f=LOAD_TILE_F,
+                k_offset=tile_idx_k,
+                f_offset=f_sbuf_start,
+            )
+            load_tile(load_loc, data_store_loc=data_store_loc)
+        elif load_td.fast_dma_transpose:
+            # Fast DMA gathers the whole (32-aligned) remainder in one op — no 256/128
+            # decomposition. SBUF is pre-zeroed so any masked K contributes zero.
+            load_loc = TileLocation(
+                tensor=load_td,
+                tile_k=remaining_k,
+                tile_f=LOAD_TILE_F,
+                k_offset=k_global,
+                f_offset=f_global + f_offset,
+            )
+            data_store_loc = TileLocation(
+                tensor=store_td,
+                tile_k=remaining_k,
                 tile_f=LOAD_TILE_F,
                 k_offset=tile_idx_k,
                 f_offset=f_sbuf_start,
@@ -496,7 +518,7 @@ def load_lhs_and_rhs(
         )
         _zero_sbuf(lhs_sbuf, lhs_data_sbuf, lhs_scales_sbuf, lhs_td.is_quantized, needs_masking)
 
-        if lhs_td.is_unswizzled_bf16 and not lhs_td.load_with_PE_swizzle and not lhs_td.fast_dma_transpose:
+        if lhs_td.is_unswizzled_bf16 and not lhs_td.uses_pe_swizzle and not lhs_td.fast_dma_transpose:
             lhs_td.set_vector_offset_patterns(LHS_LOAD_TILE_K, LHS_LOAD_TILE_M)
 
         # Build SBUF TD for load destination
@@ -522,7 +544,7 @@ def load_lhs_and_rhs(
         )
         _zero_sbuf(rhs_sbuf, rhs_data_sbuf, rhs_scales_sbuf, rhs_td.is_quantized, needs_masking)
 
-        if rhs_td.is_unswizzled_bf16 and not rhs_td.load_with_PE_swizzle and not rhs_td.fast_dma_transpose:
+        if rhs_td.is_unswizzled_bf16 and not rhs_td.uses_pe_swizzle and not rhs_td.fast_dma_transpose:
             rhs_td.set_vector_offset_patterns(RHS_LOAD_TILE_K, RHS_LOAD_TILE_N)
 
         # Build SBUF TD for load destination
@@ -575,8 +597,8 @@ def load_lhs_and_rhs(
     for tile_m in range(LOAD_TILES_IN_M_RANGE):
         for tile_n in range(LOAD_TILES_IN_N_RANGE):
             for tile_k in range(max_tiles_in_k):
-                # Load LHS tile when K index aligns with LHS tile boundaries
-                if lhs_td != None:
+                # LHS is invariant in tile_n; load (and swizzle) once on tile_n == 0.
+                if lhs_td != None and tile_n == 0:
                     if lhs_is_max_tiles or (tile_k % min_tiles_per_max_tile == 0):
                         lhs_tile_k = tile_k if lhs_is_max_tiles else tile_k // min_tiles_per_max_tile
                         global_tile_k_idx = block_idx_k * LOAD_TILES_IN_K_LHS + lhs_tile_k
@@ -598,7 +620,8 @@ def load_lhs_and_rhs(
                             global_tile_k_idx,
                         )
 
-                if rhs_td != None:
+                # RHS is invariant in tile_m; load (and swizzle) once on tile_m == 0.
+                if rhs_td != None and tile_m == 0:
                     if (not lhs_is_max_tiles) or (tile_k % min_tiles_per_max_tile == 0):
                         rhs_tile_k = tile_k if not lhs_is_max_tiles else tile_k // min_tiles_per_max_tile
                         global_tile_k_idx = block_idx_k * LOAD_TILES_IN_K_RHS + rhs_tile_k

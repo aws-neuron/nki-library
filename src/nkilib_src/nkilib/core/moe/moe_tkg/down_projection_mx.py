@@ -40,6 +40,7 @@ from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ...utils.tensor_view import as_nki_tensor
 from .all_expert_mx_utils import SUPPORTED_MOE_SHARDING_STRATEGIES
 
 # Shared MX constants
@@ -120,12 +121,12 @@ def load_broadcast_down_weight_scale_bias(
         weight_view = base_weight.select(dim=0, index=expert_idx).slice(
             dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=weight_view, dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
     else:
         weight_view = base_weight.select(dim=0, index=expert_idx).slice(
             dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=weight_view, dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -199,7 +200,7 @@ def load_broadcast_down_weight_scale_bias(
         bias_view = bias.slice(dim=0, start=expert_idx, end=expert_idx + 1).slice(
             dim=1, start=H_offset, end=H_offset + H_size_local
         )
-        nisa.dma_copy(src=bias_view, dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(bias_view), dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
 
         # Broadcast bias using PE
         if use_PE_bias_broadcast:
@@ -473,6 +474,7 @@ def down_projection_mx(
                 reduction into the HBM. We currently do not have the ability
                 to sync between PNC cores to do atomic write. As a result, PNC0 will
                 serially accumulate the data into HBM for both cores.
+                When LNC=1 (n_prgs==1), skip sendrecv/core_barrier and write directly.
                 """
                 out_src = out_sb[:tile_T_actual, tile_t : tile_t + 1, :H]
                 dst_ap = out_hbm.ap(
@@ -489,6 +491,21 @@ def down_projection_mx(
                     or sharding_strategy == MoELNCShardingStrategy.SHARD_E,
                     "Blockwise down_projection_mx must use shard_on_I, shard_on_T, or shard_on_E",
                 )
+
+                if n_prgs == 1:
+                    # Single core: write directly without cross-NC synchronization.
+                    if is_first_expert:
+                        nisa.dma_copy(src=out_src, dst=dst_ap, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge)
+                    else:
+                        nisa.dma_compute(
+                            dst=dst_ap,
+                            srcs=[dst_ap, out_src],
+                            scales=[1.0, 1.0],
+                            reduce_op=nl.add,
+                            oob_mode=oob_mode.skip,
+                        )
+                    continue
+
                 out_src_other = nl.ndarray((tile_T_actual, 1, H), dtype=out_sb.dtype, buffer=nl.sbuf)
                 nisa.sendrecv(
                     src=out_src,

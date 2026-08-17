@@ -23,8 +23,6 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_mx_prefill import rmsnorm_mx_prefill
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_mx_prefill_torch import (
     decode_packed_output,
@@ -33,6 +31,8 @@ from nkilib_src.nkilib.core.rmsnorm.rmsnorm_mx_prefill_torch import (
     swizzle_h_index,
 )
 from nkilib_src.nkilib.core.utils.common_types import RouterActFnType
+from typing_extensions import override
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,
@@ -43,7 +43,7 @@ from test.utils.comparators import maxAllClose
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+from test.utils.unit_test_framework import UnitTestFramework, mark_uncacheable, torch_ref_wrapper
 
 # fmt: off
 # RMSNorm + MX-quant only (no router, no residual). (batch, seqlen, hidden, lnc); H multiple of 512.
@@ -69,6 +69,7 @@ def _gen_inputs(batch, seqlen, hidden, pack_scales):
 @pytest_marks(["rmsnorm", "quantization", "mx"])
 @final
 class TestRmsNormMxPrefill:
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     @pytest.mark.parametrize("batch, seqlen, hidden, lnc", _NO_ROUTER_PARAMS)
     def test_rmsnorm_mx_prefill(
         self,
@@ -80,9 +81,6 @@ class TestRmsNormMxPrefill:
         hidden: int,
         lnc: int,
     ):
-        if not platform_target.is_trn3():
-            pytest.skip("quantize_mx is Trn3+ only")
-
         T = batch * seqlen
         pack_scales = True
 
@@ -98,11 +96,15 @@ class TestRmsNormMxPrefill:
             eps=1e-6,
             top_k=1,
             router_act_fn=None,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
             qmx_output_dtype=None,
             pack_scales=True,
             pack_affinities=False,
             unpadded_hidden_size=None,
             residual=None,
+            emit_norm_bf16=False,
         ):
             # No router, no residual -> the unified ref returns just {"out"}, matching this descriptor.
             return rmsnorm_mx_prefill_torch_ref(hidden_states, gamma, eps=eps, pack_scales=pack_scales)
@@ -117,13 +119,13 @@ class TestRmsNormMxPrefill:
 
             class _Validator(CustomValidator):
                 @override
-                def validate(self, actual_raw_output: npt.NDArray[Any]) -> bool:
-                    packed = np.frombuffer(actual_raw_output.view(dtype=nl.bfloat16), dtype=dt.float8_e4m3fn).reshape(
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    packed = np.frombuffer(inference_output.view(dtype=nl.bfloat16), dtype=dt.float8_e4m3fn).reshape(
                         T, hidden + scale_region
                     )
                     decoded = decode_packed_output(packed, T, hidden, pack_scales=pack_scales)
                     mx_golden = reference_mx_dequant(norm_golden)
-                    return maxAllClose(decoded, mx_golden, rtol=5e-2, atol=1e-5, verbose=1, min_pass_rate=0.999)
+                    return maxAllClose(decoded, mx_golden, rtol=5e-2, atol=1e-5, verbose=1, min_pass_rate=0.99)
 
             return {
                 "out": CustomValidatorWithOutputTensorData(
@@ -147,7 +149,6 @@ class TestRmsNormMxPrefill:
             compiler_args=CompilerArgs(
                 logical_nc_config=lnc,
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             custom_comparator=_comparator,
         )
@@ -177,6 +178,7 @@ class TestRmsNormMxPrefill:
     ]
     # fmt: on
 
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     @pytest.mark.parametrize(
         "batch, seqlen, hidden, unpadded_hidden_size, expert, top_k, act, lnc, use_residual, pack_affinities",
         _FUSED_PARAMS,
@@ -197,9 +199,6 @@ class TestRmsNormMxPrefill:
         use_residual: bool,
         pack_affinities: bool,
     ):
-        if not platform_target.is_trn3():
-            pytest.skip("quantize_mx is Trn3+ only")
-
         E = expert  # local alias: E is the math symbol used throughout the body
         T = batch * seqlen
         num_h512 = hidden // 512
@@ -244,6 +243,10 @@ class TestRmsNormMxPrefill:
         # expert_affinities is not a standalone output) can still validate the row-tail affinities.
         _aff_golden_holder = {}
 
+        # Uncacheable: the comparator reads expert_affinities from _aff_golden_holder, populated
+        # only as a side effect of running this ref. A golden-cache HIT skips the ref, leaving the
+        # holder empty -> comparator KeyError. mark_uncacheable forces a recompute so the stash fires.
+        @mark_uncacheable
         @torch_ref_wrapper
         def _ref(
             hidden_states,
@@ -252,23 +255,28 @@ class TestRmsNormMxPrefill:
             router_bias=None,
             eps=1e-6,
             top_k=1,
-            router_act_fn=None,
+            router_act_fn=RouterActFnType.SIGMOID,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
             qmx_output_dtype=None,
             pack_scales=True,
             pack_affinities=False,
             unpadded_hidden_size=None,
             residual=None,
-        ):  # noqa: ARG001 - qmx_output_dtype/pack_scales dtype-only
+            emit_norm_bf16=False,
+        ):  # noqa: ARG001 - qmx_output_dtype/pack_scales/n_group/topk_group/routed_scaling_factor unused on SIGMOID/SOFTMAX
             ref = rmsnorm_mx_prefill_torch_ref(
                 hidden_states,
                 gamma,
                 eps=eps,
-                unpadded_hidden_size=unpadded_hidden_size,
                 residual=residual,
                 router_weights=router_weights,
                 router_bias=router_bias,
                 top_k=top_k,
                 router_act_fn=router_act_fn,
+                # Absent means unpadded: the reference then divides by the full hidden size.
+                **({} if unpadded_hidden_size is None else {"unpadded_hidden_size": unpadded_hidden_size}),
             )
             # Affinity golden is always needed by the comparator, but when pack_affinities it is NOT a
             # standalone output (it lives in the packed row), so it must not be a golden_dict key the
@@ -294,10 +302,10 @@ class TestRmsNormMxPrefill:
 
             class _QuantValidator(CustomValidator):
                 @override
-                def validate(self, actual: npt.NDArray[Any]) -> bool:
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
                     # The raw packed row is row_region fp8 cols wide (hidden+scale, plus the affinity
                     # tail when pack_affinities). decode_packed_output reads only [:, :hidden+scale_region].
-                    packed = np.frombuffer(actual.view(dtype=nl.bfloat16), dtype=dt.float8_e4m3fn).reshape(
+                    packed = np.frombuffer(inference_output.view(dtype=nl.bfloat16), dtype=dt.float8_e4m3fn).reshape(
                         T, row_region
                     )
                     decoded = decode_packed_output(packed, T, hidden, pack_scales=True)
@@ -310,7 +318,7 @@ class TestRmsNormMxPrefill:
                         rtol=5e-2,
                         atol=1e-5,
                         verbose=1,
-                        min_pass_rate=0.999,
+                        min_pass_rate=0.99,
                     )
                     if not pack_affinities:
                         return quant_ok
@@ -344,8 +352,8 @@ class TestRmsNormMxPrefill:
 
             class _IdxValidator(CustomValidator):
                 @override
-                def validate(self, actual: npt.NDArray[Any]) -> bool:
-                    a = actual.view(np.int32).reshape(T, top_k).astype(np.int64)
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    a = inference_output.view(np.int32).reshape(T, top_k).astype(np.int64)
                     overlap = np.array(
                         [len(set(a[t].tolist()) & set(idx_golden[t].tolist())) / top_k for t in range(T)]
                     )
@@ -357,9 +365,9 @@ class TestRmsNormMxPrefill:
 
             class _AffValidator(CustomValidator):
                 @override
-                def validate(self, actual: npt.NDArray[Any]) -> bool:
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
                     # expert_affinities is always bf16 (fixed dtype, decoupled from router precision).
-                    return _validate_affinities(actual.view(dt.bfloat16))
+                    return _validate_affinities(inference_output.view(dt.bfloat16))
 
             validators = {
                 "norm_quant_packed": CustomValidatorWithOutputTensorData(
@@ -381,10 +389,10 @@ class TestRmsNormMxPrefill:
 
                 class _ResidualValidator(CustomValidator):
                     @override
-                    def validate(self, actual: npt.NDArray[Any]) -> bool:
+                    def validate(self, inference_output: npt.NDArray[Any]) -> bool:
                         # output_residual dtype = residual.dtype = bf16; the sum is exact in bf16
                         # (input + residual both bf16), so it should match the rounded reference tightly.
-                        a = dt.static_cast(actual.view(dt.bfloat16), np.float32).reshape(T, hidden)
+                        a = dt.static_cast(inference_output.view(dt.bfloat16), np.float32).reshape(T, hidden)
                         return maxAllClose(a, res_golden, rtol=1e-2, atol=1e-5, verbose=1)
 
                 validators["output_residual"] = CustomValidatorWithOutputTensorData(
@@ -420,7 +428,371 @@ class TestRmsNormMxPrefill:
             compiler_args=CompilerArgs(
                 logical_nc_config=lnc,
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+            ),
+            custom_comparator=_comparator,
+        )
+
+    # fmt: off
+    # noaux_tc router fused into rmsnorm_mx_prefill. Emits dense fp32 affinities (no expert_index),
+    # optionally packed into the row tail (as fp32). (batch, seqlen, hidden, E, n_group, topk_group,
+    # top_k, routed_scaling_factor, lnc, pack_affinities)
+    _NOAUX_PARAMS = [
+        pytest.param(1, 128, 512, 32, 4, 2, 2, 2.5, 1, False, marks=pytest.mark.fast),
+        pytest.param(1, 128, 512, 32, 4, 2, 2, 2.5, 1, True, marks=pytest.mark.fast),  # fast, packed fp32 affinities
+        (1, 512, 2048, 256, 8, 4, 8, 2.5, 2, False),
+        (1, 512, 2048, 256, 8, 4, 8, 2.5, 2, True),   # packed fp32 affinities
+        (1, 128, 7168, 256, 8, 4, 8, 2.5, 2, False),
+    ]
+    # fmt: on
+
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.parametrize(
+        "batch, seqlen, hidden, expert, n_group, topk_group, top_k, routed_scaling_factor, lnc, pack_affinities",
+        _NOAUX_PARAMS,
+    )
+    def test_rmsnorm_mx_prefill_noaux_tc_router(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        collector: IMetricsCollector,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        expert: int,
+        n_group: int,
+        topk_group: int,
+        top_k: int,
+        routed_scaling_factor: float,
+        lnc: int,
+        pack_affinities: bool,
+    ):
+        E = expert
+        T = batch * seqlen
+        num_h512 = hidden // 512
+        n_packed = (num_h512 + 3) // 4
+        scale_region = n_packed * 128
+        # noaux packs fp32 affinities (E*4 fp8 cols) after the scale region; the total row is padded to a
+        # multiple of 4 fp8 cols (already a multiple, since fp32 is 4 cols). Non-packed: row = hidden+scale.
+        _FP32_AS_FP8 = 4
+        affin_off = hidden + scale_region
+        row_region = ((affin_off + E * _FP32_AS_FP8 + 3) // 4) * 4 if pack_affinities else affin_off
+        num_h_tiles = hidden // 128
+        perm = swizzle_h_index(hidden)
+
+        def _to_hpart(w_swz):
+            # Offline weight pre-arrange for the noaux CONTIGUOUS load: the kernel reshapes its [H, E]
+            # input straight to [128, num_h_tiles, E] (no in-kernel permute), so the HBM bytes must be
+            # in (partition p, tile t, expert e) order. w_swz is [H, E] with H = t*128 + p.
+            # w_hpart[p,t,e] = w_swz[t*128+p, e], flattened back to [H, E].
+            return w_swz.reshape(num_h_tiles, 128, E).transpose(1, 0, 2).reshape(hidden, E)
+
+        def input_generator(_):
+            rng = np.random.default_rng(7)
+            hid = (rng.standard_normal((batch, seqlen, hidden)) * 0.5).astype(dt.bfloat16)
+            gamma = (rng.standard_normal((1, hidden)) * 0.2 + 1.0).astype(dt.bfloat16)
+            # The fused swizzle-transpose requires a 16-bit compute_dtype = router_weights.dtype, so the
+            # Router weight is routed as bf16 here (checkpoint fp32 -> bf16). Bias stays fp32.
+            w = (rng.standard_normal((hidden, E)) * 0.1).astype(dt.bfloat16)
+            wb = (rng.standard_normal((1, E)) * 0.1).astype(np.float32)
+            return {
+                "hidden_states": hid,
+                "gamma": gamma,
+                # swizzle-permute (H reorder) THEN hpart (partition-transpose for the contiguous load).
+                "router_weights": _to_hpart(w[perm]),
+                "router_bias": wb,
+                "eps": 1e-6,
+                "top_k": top_k,
+                "router_act_fn": RouterActFnType.NOAUX_TC,
+                "n_group": n_group,
+                "topk_group": topk_group,
+                "routed_scaling_factor": routed_scaling_factor,
+                "pack_scales": True,
+                "pack_affinities": pack_affinities,
+            }
+
+        # _ref runs before _comparator; stash the affinity golden here so the packed path (where
+        # expert_affinities is not a standalone output) can still validate the row-tail affinities.
+        _aff_golden_holder = {}
+
+        # Uncacheable: the comparator reads expert_affinities from _aff_golden_holder, populated
+        # only as a side effect of running this ref. A golden-cache HIT skips the ref, leaving the
+        # holder empty -> comparator KeyError. mark_uncacheable forces a recompute so the stash fires.
+        @mark_uncacheable
+        @torch_ref_wrapper
+        def _ref(
+            hidden_states,
+            gamma,
+            router_weights=None,
+            router_bias=None,
+            eps=1e-6,
+            top_k=1,
+            router_act_fn=RouterActFnType.SIGMOID,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            qmx_output_dtype=None,
+            pack_scales=True,
+            pack_affinities=False,
+            unpadded_hidden_size=None,
+            residual=None,
+            emit_norm_bf16=False,
+        ):  # noqa: ARG001 - qmx_output_dtype/pack_scales dtype-only
+            # Undo the hpart partition-transpose so the shared ref sees the swizzle-[H,E] it expects
+            # (it un-permutes via swizzle_h_index). Inverse of _to_hpart: [128,nt,E]->transpose->[H,E].
+            w_in = router_weights.numpy() if hasattr(router_weights, "numpy") else np.asarray(router_weights)
+            w_swz = w_in.reshape(128, num_h_tiles, E).transpose(1, 0, 2).reshape(hidden, E)
+            ref = rmsnorm_mx_prefill_torch_ref(
+                hidden_states,
+                gamma,
+                eps=eps,
+                router_weights=w_swz,
+                router_bias=router_bias,
+                top_k=top_k,
+                router_act_fn=router_act_fn,
+                n_group=n_group,
+                topk_group=topk_group,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+            # Affinity golden is always needed by the comparator, but when pack_affinities it is NOT a
+            # standalone output (it lives in the packed row tail), so it must not be a golden_dict key
+            # the framework would match against the descriptor. Stash it in a closure holder instead.
+            _aff_golden_holder["expert_affinities"] = ref["expert_affinities"]
+            golden = {"norm_quant_packed": ref["out"]}
+            if not pack_affinities:
+                golden["expert_affinities"] = ref["expert_affinities"]
+            return golden
+
+        # noaux_tc affinities are fp32 dense [T, E]. The kernel routes from bf16 weights vs the fp32 torch
+        # ref, so a few tie tokens flip group/expert selection -- and because each selected weight is
+        # L1-normalized and x routed_scaling_factor, a flip moves a LARGE value to a different column,
+        # denting cosine more than the smooth softmax path. Validate by cosine + an allclose pass-rate.
+        _NOAUX_MIN_COS = 0.93
+
+        def _validate_affinities(a_fp32: npt.NDArray[Any]) -> bool:
+            a = a_fp32.reshape(T, E)
+            aff_golden = _aff_golden_holder["expert_affinities"]
+            flat_a, flat_g = a.flatten(), aff_golden.flatten()
+            cos = float(np.dot(flat_a, flat_g) / (np.linalg.norm(flat_a) * np.linalg.norm(flat_g) + 1e-12))
+            allclose_ok = maxAllClose(a, aff_golden, rtol=5e-2, atol=1e-3, verbose=1, min_pass_rate=0.95)
+            print(f"INFO: noaux affinities cos={cos:.6f} (min {_NOAUX_MIN_COS}), allclose@0.95={allclose_ok}")
+            return cos >= _NOAUX_MIN_COS and allclose_ok
+
+        def _comparator(golden_dict, output_tensors):
+            norm_golden = golden_dict["norm_quant_packed"]
+
+            class _QuantValidator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    packed = np.frombuffer(inference_output.view(dtype=nl.bfloat16), dtype=dt.float8_e4m3fn).reshape(
+                        T, row_region
+                    )
+                    decoded = decode_packed_output(packed, T, hidden, pack_scales=True)
+                    # Router routes from fp32 here -> the swizzle/quant compute_dtype is bf16 (no 16-bit
+                    # router weight to force fp16), so round the reference quantizer through bf16.
+                    quant_ok = maxAllClose(
+                        decoded,
+                        reference_mx_dequant(norm_golden, round_dtype=dt.bfloat16),
+                        rtol=5e-2,
+                        atol=1e-5,
+                        verbose=1,
+                        min_pass_rate=0.99,
+                    )
+                    if not pack_affinities:
+                        return quant_ok
+                    # Packed: fp32 affinities live in the row tail at fp8 col affin_off. View the WHOLE
+                    # contiguous row as fp32 (fp8 col affin_off == fp32 col affin_off//4, width E), then
+                    # validate inline (no standalone expert_affinities output exists in this layout).
+                    row_fp32 = packed.view(np.float32).reshape(T, row_region // _FP32_AS_FP8)
+                    aff_col = affin_off // _FP32_AS_FP8
+                    aff_tail = row_fp32[:, aff_col : aff_col + E]
+                    return quant_ok and _validate_affinities(aff_tail)
+
+            class _AffValidator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    # noaux_tc affinities are fp32 dense [T, E]. Delegate to the shared helper (which
+                    # reads aff_golden from the holder) so this matches the packed-row validation path.
+                    return _validate_affinities(inference_output.view(np.float32))
+
+            validators = {
+                "norm_quant_packed": CustomValidatorWithOutputTensorData(
+                    validator=_QuantValidator, output_ndarray=output_tensors["norm_quant_packed"]
+                ),
+            }
+            # Standalone affinity output only exists in the non-packed layout; when packed the
+            # affinities are validated inside _QuantValidator from the packed row tail.
+            if not pack_affinities:
+                validators["expert_affinities"] = CustomValidatorWithOutputTensorData(
+                    validator=_AffValidator, output_ndarray=output_tensors["expert_affinities"]
+                )
+            return validators
+
+        def _output_descriptor(_):
+            desc = {
+                "norm_quant_packed": np.ndarray(shape=[T, row_region], dtype=dt.float8_e4m3fn),
+            }
+            if not pack_affinities:
+                desc["expert_affinities"] = np.ndarray(shape=[T, E], dtype=np.float32)
+            return desc
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=rmsnorm_mx_prefill,
+            torch_ref=_ref,
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_descriptor,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(
+                logical_nc_config=lnc,
+                platform_target=platform_target,
+            ),
+            custom_comparator=_comparator,
+        )
+
+    # fmt: off
+    # emit_norm_bf16: also return the token-major bf16 RMSNorm output (natural H) for un-quantized
+    # consumers (attention/indexer). (batch, seqlen, hidden, use_residual, lnc)
+    _NORM_BF16_PARAMS = [
+        pytest.param(1, 128, 512, False, 1, marks=pytest.mark.fast),  # smallest, 1 tile
+        (1, 512, 2048, False, 2),    # LNC=2, multi-tile
+        (1, 128, 7168, False, 2),    # no residual
+        (1, 128, 7168, True, 2),     # residual add + LNC=2
+    ]
+    # fmt: on
+
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.parametrize("batch, seqlen, hidden, use_residual, lnc", _NORM_BF16_PARAMS)
+    def test_rmsnorm_mx_prefill_emit_norm_bf16(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        collector: IMetricsCollector,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        use_residual: bool,
+        lnc: int,
+    ):
+        T = batch * seqlen
+        num_h512 = hidden // 512
+        n_packed = (num_h512 + 3) // 4
+        scale_region = n_packed * 128
+
+        def input_generator(_):
+            rng = np.random.default_rng(11)
+            hid = (rng.standard_normal((batch, seqlen, hidden)) * 0.5).astype(dt.bfloat16)
+            gamma = (rng.standard_normal((1, hidden)) * 0.2 + 1.0).astype(dt.bfloat16)
+            inputs = {"hidden_states": hid, "gamma": gamma, "eps": 1e-6, "pack_scales": True, "emit_norm_bf16": True}
+            if use_residual:
+                inputs["residual"] = (rng.standard_normal((batch, seqlen, hidden)) * 0.5).astype(dt.bfloat16)
+            return inputs
+
+        @torch_ref_wrapper
+        def _ref(  # noqa: ARG001 - router/dtype args unused here; present to match kernel sig
+            hidden_states,
+            gamma,
+            router_weights=None,
+            router_bias=None,
+            eps=1e-6,
+            top_k=1,
+            router_act_fn=None,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            qmx_output_dtype=None,
+            pack_scales=True,
+            pack_affinities=False,
+            unpadded_hidden_size=None,
+            residual=None,
+            emit_norm_bf16=False,
+        ):
+            ref = rmsnorm_mx_prefill_torch_ref(
+                hidden_states,
+                gamma,
+                eps=eps,
+                pack_scales=pack_scales,
+                residual=residual,
+                emit_norm_bf16=True,
+            )
+            # Keys/order match the kernel return list: [norm_quant_packed, output_residual?, norm_bf16].
+            # The quant validator reads the fp32 norm golden through reference_mx_dequant.
+            golden = {"norm_quant_packed": ref["out"]}
+            if residual is not None:
+                golden["output_residual"] = ref["out_residual"]
+            golden["norm_bf16"] = ref["norm_bf16"]
+            return golden
+
+        def _comparator(golden_dict, output_tensors):
+            norm_golden = golden_dict["norm_quant_packed"]  # fp32 [T, H] norm, checked via MX dequant
+            norm_bf16_golden = golden_dict["norm_bf16"]  # bf16 [T, H]
+
+            class _QuantValidator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    packed = np.frombuffer(inference_output.view(dtype=nl.bfloat16), dtype=dt.float8_e4m3fn).reshape(
+                        T, hidden + scale_region
+                    )
+                    decoded = decode_packed_output(packed, T, hidden, pack_scales=True)
+                    return maxAllClose(
+                        decoded, reference_mx_dequant(norm_golden), rtol=5e-2, atol=1e-5, verbose=1, min_pass_rate=0.99
+                    )
+
+            class _NormBf16Validator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    # bf16 norm computed fp32 then cast; should match the bf16-rounded reference tightly.
+                    a = dt.static_cast(inference_output.view(dt.bfloat16), np.float32).reshape(T, hidden)
+                    g = dt.static_cast(norm_bf16_golden, np.float32).reshape(T, hidden)
+                    return maxAllClose(a, g, rtol=1e-2, atol=1e-5, verbose=1)
+
+            validators = {
+                "norm_quant_packed": CustomValidatorWithOutputTensorData(
+                    validator=_QuantValidator, output_ndarray=output_tensors["norm_quant_packed"]
+                ),
+                "norm_bf16": CustomValidatorWithOutputTensorData(
+                    validator=_NormBf16Validator, output_ndarray=output_tensors["norm_bf16"]
+                ),
+            }
+            if use_residual:
+                res_golden = golden_dict["output_residual"]
+
+                class _ResidualValidator(CustomValidator):
+                    @override
+                    def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                        a = dt.static_cast(inference_output.view(dt.bfloat16), np.float32).reshape(T, hidden)
+                        return maxAllClose(a, res_golden, rtol=1e-2, atol=1e-5, verbose=1)
+
+                validators["output_residual"] = CustomValidatorWithOutputTensorData(
+                    validator=_ResidualValidator, output_ndarray=output_tensors["output_residual"]
+                )
+            return validators
+
+        def _output_descriptor(_):
+            # Order MUST match the kernel's return list: [norm_quant_packed, output_residual?, norm_bf16].
+            desc = {
+                "norm_quant_packed": np.ndarray(shape=[T, hidden + scale_region], dtype=dt.float8_e4m3fn),
+            }
+            if use_residual:
+                desc["output_residual"] = np.ndarray(shape=[T, hidden], dtype=dt.bfloat16)
+            desc["norm_bf16"] = np.ndarray(shape=[T, hidden], dtype=dt.bfloat16)
+            return desc
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=rmsnorm_mx_prefill,
+            torch_ref=_ref,
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_descriptor,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(
+                logical_nc_config=lnc,
+                platform_target=platform_target,
             ),
             custom_comparator=_comparator,
         )

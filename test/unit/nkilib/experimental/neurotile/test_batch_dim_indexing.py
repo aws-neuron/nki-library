@@ -25,12 +25,12 @@ On-device tests live in test/integration/.../test_batch_dim_indexing.py.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import contiguous_strides
 from nkilib_src.nkilib.experimental.neurotile.core.axis import IndirectKind, IndirectOffset
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
 from nkilib_src.nkilib.experimental.neurotile.core.layout_hbm import HBMLayout
 from nkilib_src.nkilib.experimental.neurotile.core.ndslice import NDSlice
+
 from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 
@@ -40,7 +40,7 @@ def make_view_3d(shape, tile_size_2d):
     ndim = len(shape)
     n_batch = ndim - len(tile_size_2d)
     padded = []
-    for d in range(n_batch):
+    for _d in range(n_batch):
         padded.append(1)
     for d in range(len(tile_size_2d)):
         padded.append(tile_size_2d[d])

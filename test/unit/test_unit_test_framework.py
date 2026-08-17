@@ -487,7 +487,7 @@ class TestUnitTestFramework:
         lazy_golden = kernel_args.validation_args.golden_output
         # Output key mismatch should raise when .golden is accessed
         with pytest.raises(ValueError, match="Output tensor mismatch"):
-            lazy_golden.golden
+            _ = lazy_golden.golden
 
     def test_run_test_lazy_golden_validates_extra_output_keys(self):
         """Lazy golden should catch extra keys in output_tensor_descriptor."""
@@ -511,7 +511,7 @@ class TestUnitTestFramework:
         framework.run_test(test_config=None, compiler_args=MagicMock())
         kernel_args = mock_manager.execute.call_args[0][0]
         with pytest.raises(ValueError, match="Output tensor mismatch"):
-            kernel_args.validation_args.golden_output.golden
+            _ = kernel_args.validation_args.golden_output.golden
 
     def test_run_test_calls_collector_with_metadata(self):
         """run_test should call collector.match_and_add_metadata_dimensions when metadata is provided."""
@@ -603,7 +603,7 @@ class TestUnitTestFramework:
 
         # Trigger lazy golden to invoke comparator
         kernel_args = mock_manager.execute.call_args[0][0]
-        kernel_args.validation_args.golden_output.golden
+        _ = kernel_args.validation_args.golden_output.golden
         np.testing.assert_array_equal(received["out"], [6.0])
 
     def test_custom_comparator_result_used_as_validation(self):
@@ -682,8 +682,7 @@ class TestUnitTestFramework:
             trace_only=True,
         )
         assert framework.trace_only is True
-        assert framework.torch_ref is None
-        assert framework.output_tensor_descriptor is None
+        assert framework.reference is None
 
     def test_trace_only_false_without_torch_ref_raises(self):
         """trace_only=False (default) with torch_ref=None should raise."""

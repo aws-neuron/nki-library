@@ -869,6 +869,7 @@ class TiledTensor(nl.NKIObject):
         new_tile_size[dim] = size
         return TiledTensor(new_source, tuple(new_tile_size))
 
+    @staticmethod
     def alloc(
         grid, tile_size, dtype, buffer=nl.sbuf, sbm=None, align=None, heap=False, rotate=None, num_banks=None, name=None
     ):
@@ -931,6 +932,7 @@ class TiledTensor(nl.NKIObject):
 
         return TiledTensor._make_tile_list(tiles, grid, tile_size, rotate_dim=rotate_dim, rotate_count=rotate_count)
 
+    @staticmethod
     def _make_tile_list(tiles, grid, tile_size, num_banks=None, rotate_dim=None, rotate_count=None):
         """Create a list-backed TiledTensor.
 

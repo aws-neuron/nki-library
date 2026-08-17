@@ -21,7 +21,7 @@ import nki.language as nl
 import numpy as np
 import torch
 
-from ...utils.common_types import DtypeMode, QuantizationType
+from ...utils.common_types import DtypeMode, OProjAttentionLayout, QuantizationType
 from ...utils.mx_torch_common import (
     mx_matmul,
     quantize_to_mx,
@@ -161,6 +161,7 @@ def output_projection_cte_torch_ref(
     output_dtype=torch.float32,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     compact_weight_scales: bool = False,  # noqa: ARG001 — accepted for kernel signature parity (only used by MX-compact ref)
+    attention_layout: Optional[OProjAttentionLayout] = None,
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of output projection for CTE.
@@ -176,7 +177,11 @@ def output_projection_cte_torch_ref(
         H: Hidden dimension
 
     Args:
-        attention (torch.Tensor): [B, N, D, S], Input tensor from attention block.
+        attention (torch.Tensor): Input tensor from attention block, laid out as declared
+            by ``attention_layout``: [B, N, D, S] for BNdS, [B, S, N, D] for BSNd,
+            [B, N, S, D] for BNSd. ``attention_layout=None`` takes the layout
+            ``quantization_type`` implies — BSNd for ROW, BNdS otherwise. Only the
+            non-quantized path implements all three.
         weight (torch.Tensor): [N * D, H], Weight tensor.
         bias (Optional[torch.Tensor]): [1, H], Optional bias tensor.
         input_scales (Optional[torch.Tensor]): [128, 1], Input quantization scale (for STATIC).
@@ -215,14 +220,23 @@ def output_projection_cte_torch_ref(
     attention = attention.float()
     weight = weight.float()
 
-    if quantization_type == QuantizationType.ROW:
-        # ROW: attention is [B, S, N, D]
+    # None mirrors the kernel: each quantized path's fixed layout, BNdS for float.
+    if attention_layout is None:
+        attention_layout = (
+            OProjAttentionLayout.BSNd if quantization_type == QuantizationType.ROW else OProjAttentionLayout.BNdS
+        )
+
+    if attention_layout == OProjAttentionLayout.BSNd:
+        # [B, S, N, D] — N and D adjacent, so a plain reshape.
         batch_size, seq_len, num_heads, head_dim = attention.shape
         attn_reshaped = attention.reshape(batch_size, seq_len, num_heads * head_dim)
+    elif attention_layout == OProjAttentionLayout.BNSd:
+        # [B, N, S, D] -> [B, S, N*D]
+        batch_size, num_heads, seq_len, head_dim = attention.shape
+        attn_reshaped = attention.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads * head_dim)
     else:
-        # All other paths: attention is [B, N, D, S]
+        # [B, N, D, S] -> [B, S, N*D]
         batch_size, num_heads, head_dim, seq_len = attention.shape
-        # Reshape attention from [B, N, D, S] to [B, S, N*D]
         attn_reshaped = attention.permute(0, 3, 1, 2).reshape(batch_size, seq_len, num_heads * head_dim)
 
     # STATIC_MX weight is pre-shuffled for kernel; reverse to logical layout
@@ -307,6 +321,7 @@ def output_projection_cte_mx_torch_ref(
     output_dtype=None,  # noqa: ARG001 — unused (output is bf16/fp32 to match kernel)
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for framework signature parity (MX is structurally OCP)
     compact_weight_scales: bool = False,
+    attention_layout: Optional[OProjAttentionLayout] = None,  # noqa: ARG001 — accepted for kernel signature parity (MX requires BNdS)
 ) -> dict[str, np.ndarray]:
     """PyTorch reference for MX output projection CTE.
 

@@ -188,7 +188,6 @@ from ..mlp_parameters import (
 from .mlp_tkg_constants import MLPTKGConstants
 from .mlp_tkg_utils import (
     adaptive_dge_mode,
-    alloc_tensor_view,
     prepare_gate_up_bias_and_scale,
 )
 
@@ -249,15 +248,13 @@ def run_gate_up_projection_lhs_rhs_swap(
     gate_dequant_tile = up_dequant_tile = None
     if params.quant_params.is_quant_static():
         par_dim = dims.I0
-        gate_dequant_tile = alloc_tensor_view(
-            sbm,
+        gate_dequant_tile = sbm.alloc_stack(
             (par_dim, 1),
             dtype=gate_w_scale.dtype,
             name="gate_w_scale_sb",
             align=4,
         )
-        up_dequant_tile = alloc_tensor_view(
-            sbm,
+        up_dequant_tile = sbm.alloc_stack(
             (par_dim, 1),
             dtype=up_w_scale.dtype,
             name="up_w_scale_sb",
@@ -274,15 +271,13 @@ def run_gate_up_projection_lhs_rhs_swap(
 
     elif params.quant_params.is_quant_row():
         row_dequant_shape = (dims.I0, div_ceil(I_shard_size, dims.I0))
-        gate_dequant_tile = alloc_tensor_view(
-            sbm,
+        gate_dequant_tile = sbm.alloc_stack(
             row_dequant_shape,
             dtype=gate_w_scale.dtype,
             name="gate_w_scale_sb",
             align=32,
         )
-        up_dequant_tile = alloc_tensor_view(
-            sbm,
+        up_dequant_tile = sbm.alloc_stack(
             row_dequant_shape,
             dtype=up_w_scale.dtype,
             name="up_w_scale_sb",
@@ -291,8 +286,7 @@ def run_gate_up_projection_lhs_rhs_swap(
 
     # ---------------- bias ----------------
     if mlpp_has_gate_projection_bias(params) or mlpp_has_up_projection_bias(params):
-        bias_tile = alloc_tensor_view(
-            sbm,
+        bias_tile = sbm.alloc_stack(
             (dims.I0, div_ceil(I_shard_size, dims.I0)),
             dtype=nl.float32 if gate_b.is_indirect() else gate_b.dtype,
             name="gate_up_bias",
@@ -317,8 +311,7 @@ def run_gate_up_projection_lhs_rhs_swap(
     weight_shape = (dims.H0, HTile_h1, dims.I) if use_old_sharding_shape else (dims.H0, HTile_h1, tiles.I_shard_size)
     _fp8_e4m3_tile_dtype = resolve_fp8_e4m3_dtype(params.dtype_mode)
     for w_tile_idx in range(tiles.num_allocated_w_tile):
-        weight_tile = alloc_tensor_view(
-            sbm,
+        weight_tile = sbm.alloc_stack(
             weight_shape,
             name=f"gate_up_w_tile_{w_tile_idx}",
             dtype=_fp8_e4m3_tile_dtype if str(up_w.dtype) == "float8e4" else up_w.dtype,

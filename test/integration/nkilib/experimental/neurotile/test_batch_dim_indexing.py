@@ -25,8 +25,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -36,7 +36,7 @@ from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 @nki.jit
 def _kernel_expert_select_3key(weights, expert_ids):
     """3D expert select: w_iter[eid, 0, f] with 3 keys."""
-    E, P, F = weights.shape[0], weights.shape[1], weights.shape[2]
+    _, P, F = weights.shape[0], weights.shape[1], weights.shape[2]
     T_F = 128
     N = expert_ids.shape[0]
     out = nl.ndarray((N, P, F), dtype=weights.dtype, buffer=nl.shared_hbm)

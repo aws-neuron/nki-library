@@ -13,7 +13,15 @@
 # limitations under the License.
 """Unit tests for pytest_test_metadata helpers."""
 
-from ..utils.pytest_test_metadata import derive_labeled_kernel_name
+from unittest.mock import patch
+
+from ..utils.pytest_test_metadata import (
+    TestMetadataInfo as MetadataInfo,  # alias avoids pytest collecting the dataclass as a test
+)
+from ..utils.pytest_test_metadata import (
+    derive_labeled_kernel_name,
+    resolve_file_kernel_name,
+)
 
 
 def test_core_kernel_returns_bare_name():
@@ -49,3 +57,59 @@ def test_file_directly_under_nkilib_falls_back_to_bare_name():
     """CDK treats this case (pathParts length 1) as having no family prefix; mirror that."""
     path = "/repo/test/integration/nkilib/test_x.py"
     assert derive_labeled_kernel_name(path, "X") == "X"
+
+
+# ── resolve_file_kernel_name: file-scoped resolution ──
+# Metadata is defined once per file; the KernelName must resolve from the file,
+# not the running class, so a second-or-later class in a multi-class file still
+# gets named. The file's classes are stubbed so these stay pure-logic unit tests
+# (no filesystem, no real kernel names).
+
+
+def _classes(path, *metadata_names):
+    """Build the extractor's return for a file: one TestMetadataInfo per class.
+
+    A None entry models a class without @pytest_test_metadata.
+    """
+    return [
+        MetadataInfo(
+            file_path=path,
+            class_name=f"TestClass{i}",
+            line_number=i,
+            metadata={"name": name} if name is not None else None,
+        )
+        for i, name in enumerate(metadata_names)
+    ]
+
+
+@patch("test.utils.pytest_test_metadata.extract_pytest_test_metadata_from_file")
+def test_file_scoped_name_resolves_for_all_classes(mock_extract):
+    """The file's single @pytest_test_metadata names the file regardless of running class.
+
+    The multi-class file case that previously dropped KernelName for every class
+    after the first: the annotated class is first, a metadata-less class second.
+    """
+    path = "/repo/test/integration/nkilib/core/kernel/test_x.py"
+    mock_extract.return_value = _classes(path, "Widget", None)
+    resolve_file_kernel_name.cache_clear()
+    assert resolve_file_kernel_name(path) == "Widget"
+
+
+@patch("test.utils.pytest_test_metadata.extract_pytest_test_metadata_from_file")
+def test_file_without_metadata_returns_none(mock_extract):
+    """A file whose classes carry no @pytest_test_metadata resolves to None."""
+    path = "/repo/test/integration/nkilib/core/kernel/test_x.py"
+    mock_extract.return_value = _classes(path, None)
+    resolve_file_kernel_name.cache_clear()
+    assert resolve_file_kernel_name(path) is None
+
+
+def test_directory_path_resolves_to_none(tmp_path):
+    """A directory path degrades to None instead of raising IsADirectoryError.
+
+    Exercises the real extractor (not the mock): opening a directory raises
+    IsADirectoryError, which must be swallowed so a bad path never aborts the
+    metadata lookup.
+    """
+    resolve_file_kernel_name.cache_clear()
+    assert resolve_file_kernel_name(tmp_path) is None

@@ -24,12 +24,12 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from neuronxcc.nki._private.private_api import float8_e4m3fn_x4, float8_e5m2_x4
-from neuronxcc.nki._private.test import mx_util
-from typing_extensions import override
-
+from neuronxcc.nki._private.private_api import float8_e4m3fn_x4, float8_e5m2_x4  # ty: ignore[unresolved-import]
+from neuronxcc.nki._private.test import mx_util  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_kernel
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import (
     config_helper,
     constants,
@@ -75,7 +75,7 @@ def get_mx_max_exp(dst_dtype: Any) -> int:
     return max_exp_values.get(dst_dtype)
 
 
-def get_dists(num: int = 10, edge_rate: float = 0.3, seed: int = None):
+def get_dists(num: int = 10, edge_rate: float = 0.3, seed: int | None = None):
     """Get random distributions for test input generation.
 
     Args:
@@ -1178,11 +1178,94 @@ GRID_K_BY_F = [
         lhs_is_f_by_k=False,
         rhs_is_f_by_k=False,
     ),
-    # NOTE: K-by-F currently requires F (M for LHS, N for RHS) to be a multiple of 512 (the F
-    # load-tile size) — see the F%512 kernel_assert in matmul_mxfp8(). Non-512 F (e.g. F%128)
-    # is not yet supported by the PE-transpose load and is rejected by that assert; it will be
-    # enabled once the DMA gather-transpose API can mask partial F-tiles. All shapes here keep
-    # M and N multiples of 512.
+    # Partial-F K-by-F: F multiple of 128 but partial vs the 512-wide load-tile (N=768 RHS, M=768 LHS).
+    config_helper.TestConfig(
+        M=512,
+        K=512,
+        N=768,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: N%512=256 partial F load-tile",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    config_helper.TestConfig(
+        M=768,
+        K=512,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: M%512=256 partial F load-tile",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # Sub-128 partial-F K-by-F: F multiple of 8 but not 128, so the loader reads a partial (<128)
+    # final sub-tile (N=520 RHS, M=520 LHS).
+    config_helper.TestConfig(
+        M=512,
+        K=512,
+        N=520,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: N=520 sub-128 partial F",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    config_helper.TestConfig(
+        M=520,
+        K=512,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: M=520 sub-128 partial F",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # NOTE: K-by-F requires F (M for LHS, N for RHS) to be a multiple of MIN_F_FOR_QUANTIZATION (8).
 ]
 
 
@@ -1232,14 +1315,30 @@ def build_matmul_inputs(conf):
         conf.seed,
     )
 
-    # Create swizzled versions
-    lhs_swizzled = matmul_utils.swizzle_tensor(lhs_fp32.numpy().astype(nl.bfloat16).T)
-    rhs_swizzled = matmul_utils.swizzle_tensor(rhs_fp32.numpy().astype(nl.bfloat16))
+    # Create swizzled versions. The quant scheme selects the interleave layout:
+    # wrapX scatters a feature's K into four quarters; 1x32 packs four consecutive
+    # K values per feature. Pre-quantized operands are quantized from this layout,
+    # so it must match the scheme the kernel loads with.
+    # wrapX must also match the DGT loader the kernel uses: fast DMA reads a K remainder
+    # as one partial tile, the legacy path decomposes it into 256/128 sub-tiles. These are
+    # different (both valid) K permutations at remainder 384, so a pre-swizzled operand
+    # built with the wrong one mispairs k-terms against a DGT-loaded operand.
+    if conf.quant_scheme == "1x32":
+        swizzle = matmul_utils.swizzle_tensor_1x32
+    else:
+
+        def swizzle(src_tensor):
+            return matmul_utils.swizzle_tensor(
+                src_tensor, fast_dma_transpose=getattr(conf, 'fast_dma_transpose', False)
+            )
+
+    lhs_swizzled = swizzle(lhs_fp32.numpy().astype(nl.bfloat16).T)
+    rhs_swizzled = swizzle(rhs_fp32.numpy().astype(nl.bfloat16))
 
     # For kernel input, use swizzled or unswizzled based on config
     if conf.lhs_is_swizzled:
         lhs = lhs_swizzled
-    elif getattr(conf, 'lhs_is_f_by_k', True) == False:
+    elif not getattr(conf, 'lhs_is_f_by_k', True):
         # K-by-F: [K, M] layout
         lhs = lhs_fp32.numpy().astype(nl.bfloat16).T
     else:
@@ -1247,7 +1346,7 @@ def build_matmul_inputs(conf):
 
     if conf.rhs_is_swizzled:
         rhs = rhs_swizzled
-    elif getattr(conf, 'rhs_is_f_by_k', True) == False:
+    elif not getattr(conf, 'rhs_is_f_by_k', True):
         # K-by-F: [K, N] layout
         rhs = rhs_fp32.numpy().astype(nl.bfloat16)
     else:
@@ -1321,7 +1420,6 @@ def build_matmul_inputs(conf):
             else {}
         ),
         **({"lnc_2_shard_rhs": conf.lnc_2_shard_rhs} if conf.lnc_2_shard_rhs is not None else {}),
-        **({"fast_dma_transpose": True} if getattr(conf, 'fast_dma_transpose', False) else {}),
         "quant_scheme": conf.quant_scheme,
         "enable_psum_copy_in": conf.enable_psum_copy_in,
     }
@@ -1369,6 +1467,81 @@ def generate_chain(dimension):
             temp = dummy_config._generate_k_dimension_tile_configs()
             temp = [(k_value, *each) for each in temp]
             chain += random.sample(temp, 1)
+    else:
+        raise ValueError(f"Unknown dimension: {dimension}")
+
+    return chain
+
+
+# Number of shape values sampled per dimension for the PE-swizzle sweeps. With
+# coverage="singles" the case count is driven by the largest parameter cardinality,
+# so this also bounds the sweep length. Kept small (short sweep) per KTK PE-swizzle
+# coverage; bump to widen coverage once the short sweeps are green.
+PE_SWIZZLE_SWEEP_NUM_VALUES = 8
+
+# TODO: expand divisibility coverage in the F (M/N) and K dimensions. generate_pe_swizzle_chain
+# currently constrains M and N to multiples of 512 because the folded PE-swizzle load DMA cannot
+# express a partial F-tile (non-512 F shards are rejected by the static bounds checker,
+# NCC_IBIR243), and for the 1x32 path K to multiples of 512 because the FP32-reinterpret transpose
+# asserts tile_k == 512. Once the loaders gain partial-F-tile / K-remainder support, relax these to
+# M/N % 128 and (for 1x32) K % 128 so these sweeps cover non-tile-aligned F and K like
+# test_matmul_mxfp8_sweep does. See also filter_pe_swizzle_combinations' LNC2 N%1024/M%1024 rule,
+# which exists for the same partial-F-tile reason and can be loosened at the same time.
+
+
+def generate_pe_swizzle_chain(dimension, num_values=PE_SWIZZLE_SWEEP_NUM_VALUES, seed=52, k_multiple_of_512=False):
+    """Generate a reduced dimension chain for the PE-swizzle (wrapX / 1x32) sweeps.
+
+    Tile sizes are pinned to the values the unswizzled PE-swizzle load path
+    requires so every generated combination survives filter_illegal_combinations
+    and the kernel's own asserts instead of being pruned or failing to compile:
+
+      - tile_m=128, TILES_IN_BLOCK_M=4, TILES_IN_LOAD_M=4 (LOAD_M must be <= BLOCK_M
+        and BLOCK_M % LOAD_M == 0, and the unswizzled filter requires LOAD_M == 4).
+      - tile_n=512, TILES_IN_LOAD_N=1 (unswizzled filter requires LOAD_N == 1);
+        TILES_IN_BLOCK_N varies (any value is a multiple of LOAD_N == 1).
+      - tile_k=512; TILES_IN_BLOCK_K varies.
+
+    M and N are sampled as multiples of 512 because the folded PE-swizzle load DMA
+    cannot express a partial F-tile (a non-512 M/N shard is rejected by the static
+    bounds checker, NCC_IBIR243). K is sampled on the 128 grid (unswizzled load only
+    requires K % 128 == 0), so non-512-divisible K still provides remainder coverage.
+    Each dimension uses its own RNG seed so M, N, and K differ, and the local RNG
+    keeps collection deterministic without disturbing generate_chain()'s global sampling.
+
+    Args:
+        dimension: Dimension to generate the chain for ("M", "N", or "K").
+        num_values: Number of shape values to sample (bounds the sweep length).
+        seed: Base seed for the local RNG (offset per dimension for distinct shapes).
+
+    Returns:
+        list: chain tuples matching generate_chain()'s layout:
+            - "M": (M, tile_m, TILES_IN_BLOCK_M, TILES_IN_LOAD_M)
+            - "N": (N, tile_n, TILES_IN_BLOCK_N, TILES_IN_LOAD_N)
+            - "K": (K, tile_k, TILES_IN_BLOCK_K)
+    """
+    chain = []
+    if dimension == "M":
+        rng = random.Random(seed)
+        # tile_m=128, TILES_IN_BLOCK_M=4, TILES_IN_LOAD_M=4 (block covers 512 rows).
+        for m_value in rng.sample(range(512, 4609, 512), num_values):
+            chain.append((m_value, 128, 4, 4))
+    elif dimension == "N":
+        rng = random.Random(seed + 1)
+        for n_value in rng.sample(range(512, 4609, 512), num_values):
+            dummy_config = config_helper.TestConfig(M=1024, N=n_value, K=1024, tile_n=512, TILES_IN_LOAD_N=1)
+            temp = dummy_config._generate_n_dimension_tile_configs()
+            chain.append((n_value, *rng.choice(temp)))
+    elif dimension == "K":
+        rng = random.Random(seed + 2)
+        # wrapX handles a K remainder tile (tile_k < 512), so sample on the 128 grid for
+        # remainder coverage. The 1x32 FP32-reinterpret transpose requires every K-tile to
+        # be a full 512 (asserts tile_k == 512), so for it sample multiples of 512 only.
+        k_population = range(512, 4609, 512) if k_multiple_of_512 else range(128, 2561, 128)
+        for k_value in rng.sample(k_population, num_values):
+            dummy_config = config_helper.TestConfig(M=1024, N=1024, K=k_value, tile_k=512)
+            temp = dummy_config._generate_k_dimension_tile_configs()
+            chain.append((k_value, *rng.choice(temp)))
     else:
         raise ValueError(f"Unknown dimension: {dimension}")
 
@@ -1424,7 +1597,7 @@ def filter_illegal_combinations(
     K, tile_k, TILES_IN_BLOCK_K = k_chain
 
     # partial combination
-    if lhs_is_swizzled == None or rhs_is_swizzled == None:
+    if lhs_is_swizzled is None or rhs_is_swizzled is None:
         return coverage_parametrized_tests.FilterResult.VALID
 
     # swizzling shape constraints
@@ -1441,7 +1614,7 @@ def filter_illegal_combinations(
         return coverage_parametrized_tests.FilterResult.INVALID
 
     # LNC2 sharding requires at least 2 blocks in the sharded dimension
-    if lnc_2_shard_rhs != None and run_with_lnc2 != None and run_with_lnc2:
+    if lnc_2_shard_rhs is not None and run_with_lnc2 is not None and run_with_lnc2:
         if not lnc_2_shard_rhs:
             num_blocks_in_m = M // (tile_m * TILES_IN_BLOCK_M) if (tile_m * TILES_IN_BLOCK_M) > 0 else 0
             if num_blocks_in_m < 2:
@@ -1452,7 +1625,7 @@ def filter_illegal_combinations(
                 return coverage_parametrized_tests.FilterResult.INVALID
 
     # Prune early once lhs_dtype, rhs_dtype, and enable_scale_packing are known
-    if lhs_dtype != None and rhs_dtype != None and enable_scale_packing != None:
+    if lhs_dtype is not None and rhs_dtype is not None and enable_scale_packing is not None:
         """
         Pre-quantized MXFP8 with packed scales requires tile_k=512 (tile_k=Q_TILE_K=128)
         because the packed scales format uses Q_TILE_K-sized tile indexing that doesn't
@@ -1468,12 +1641,12 @@ def filter_illegal_combinations(
                 return coverage_parametrized_tests.FilterResult.INVALID
 
     if (
-        lhs_dtype == None
-        or rhs_dtype == None
-        or output_dtype == None
-        or tile_loop_order == None
-        or block_loop_order == None
-        or run_with_lnc2 == None
+        lhs_dtype is None
+        or rhs_dtype is None
+        or output_dtype is None
+        or tile_loop_order is None
+        or block_loop_order is None
+        or run_with_lnc2 is None
     ):
         return coverage_parametrized_tests.FilterResult.VALID
 
@@ -1505,6 +1678,92 @@ def filter_illegal_combinations(
         if config.fits_in_sbuf()
         else coverage_parametrized_tests.FilterResult.INVALID
     )
+
+
+def filter_pe_swizzle_combinations(
+    m_chain,
+    n_chain,
+    k_chain,
+    lhs_is_swizzled=None,
+    rhs_is_swizzled=None,
+    lnc_2_shard_rhs=None,
+    run_with_lnc2=None,
+    lhs_dtype=None,
+    rhs_dtype=None,
+    enable_scale_packing=None,
+    output_dtype=None,
+    tile_loop_order=None,
+    block_loop_order=None,
+    float8_dtype='float8_e4m3fn',
+    lhs_dist=None,
+    rhs_dist=None,
+    spill_reload=None,
+) -> coverage_parametrized_tests.FilterResult:
+    """Filter for the PE-swizzle (wrapX / 1x32) sweeps.
+
+    Delegates to filter_illegal_combinations (identical argument order, so partial
+    combinations prune in the same order), then adds three PE-swizzle-specific rules:
+
+    1. Prequantized operands (MXFP8 / MXFP8_X4) are pre-swizzled offline, so they must
+       carry is_swizzled=True; a prequantized-but-unswizzled operand is nonsensical.
+    2. These sweeps target the on-chip PE-swizzle load, which only fires on a BF16
+       *unswizzled* operand. Require at least one such operand so every case exercises
+       the loader (this also produces the mixed "prequantized + BF16 unswizzled" case
+       when the other operand is prequantized-swizzled).
+    3. The folded PE-swizzle load DMA cannot express a partial F-tile. Under LNC2 the
+       sharded free dim is halved per core, so it must stay a multiple of the 512 load
+       tile or the static bounds checker rejects the load (NCC_IBIR243): N % 1024 == 0
+       when sharding RHS, M % 1024 == 0 when sharding LHS. Applied conservatively
+       regardless of which operand is sharded (never rejects a compilable config).
+    """
+    base = filter_illegal_combinations(
+        m_chain,
+        n_chain,
+        k_chain,
+        lhs_is_swizzled,
+        rhs_is_swizzled,
+        lnc_2_shard_rhs,
+        run_with_lnc2,
+        lhs_dtype,
+        rhs_dtype,
+        enable_scale_packing,
+        output_dtype,
+        tile_loop_order,
+        block_loop_order,
+        float8_dtype,
+        lhs_dist,
+        rhs_dist,
+        spill_reload,
+    )
+    if base == coverage_parametrized_tests.FilterResult.INVALID:
+        return coverage_parametrized_tests.FilterResult.INVALID
+
+    prequant_dtypes = (constants.MatrixPrecision.MXFP8, constants.MatrixPrecision.MXFP8_X4)
+
+    # Rule 1: prequantized operands must be pre-swizzled.
+    if lhs_dtype in prequant_dtypes and lhs_is_swizzled is False:
+        return coverage_parametrized_tests.FilterResult.INVALID
+    if rhs_dtype in prequant_dtypes and rhs_is_swizzled is False:
+        return coverage_parametrized_tests.FilterResult.INVALID
+
+    # Rule 2: at least one BF16 unswizzled operand (the one loaded via PE swizzle).
+    # Only enforceable once dtypes and swizzled flags are all known (full combination).
+    if lhs_dtype is not None and rhs_dtype is not None and lhs_is_swizzled is not None and rhs_is_swizzled is not None:
+        lhs_pe_swizzled = lhs_dtype == constants.MatrixPrecision.BFLOAT16 and not lhs_is_swizzled
+        rhs_pe_swizzled = rhs_dtype == constants.MatrixPrecision.BFLOAT16 and not rhs_is_swizzled
+        if not (lhs_pe_swizzled or rhs_pe_swizzled):
+            return coverage_parametrized_tests.FilterResult.INVALID
+
+    # Rule 3: PE-swizzle partial-F-tile constraint under LNC2 sharding (see docstring).
+    if run_with_lnc2 and lnc_2_shard_rhs is not None:
+        M = m_chain[0]
+        N = n_chain[0]
+        if lnc_2_shard_rhs and N % 1024 != 0:
+            return coverage_parametrized_tests.FilterResult.INVALID
+        if not lnc_2_shard_rhs and M % 1024 != 0:
+            return coverage_parametrized_tests.FilterResult.INVALID
+
+    return coverage_parametrized_tests.FilterResult.VALID
 
 
 def _mxfp8_comparator(conf, output_dtype, gpu_golden_enabled=False):
@@ -1578,24 +1837,24 @@ def _mxfp8_comparator(conf, output_dtype, gpu_golden_enabled=False):
 
 
 _ABBREVS = {
-    "lhs_is_swizzled": "lsw",
-    "rhs_is_swizzled": "rsw",
-    "lhs_dtype": "ldt",
-    "rhs_dtype": "rdt",
-    "output_dtype": "odt",
-    "tile_loop_order": "tlo",
-    "block_loop_order": "blo",
-    "float8_dtype": "f8",
-    "lhs_dist": "ld",
-    "rhs_dist": "rd",
+    "lhs_is_swizzled": "lw",
+    "rhs_is_swizzled": "rw",
+    "lhs_dtype": "ld",
+    "rhs_dtype": "rd",
+    "output_dtype": "od",
+    "tile_loop_order": "tl",
+    "block_loop_order": "bl",
+    "float8_dtype": "f",
+    "lhs_dist": "x",
+    "rhs_dist": "y",
     "m_chain": "m",
     "n_chain": "n",
     "k_chain": "k",
-    "spill_reload": "sr",
-    "enable_scale_packing": "sp",
-    "enable_psum_copy_in": "pci",
-    "lnc_2_shard_rhs": "ls",
-    "run_with_lnc2": "lnc",
+    "spill_reload": "s",
+    "enable_scale_packing": "p",
+    "enable_psum_copy_in": "c",
+    "lnc_2_shard_rhs": "h",
+    "run_with_lnc2": "l",
 }
 
 # TODO: Add quant_scheme=["wrapX", "1x32"] to test_matmul_mxfp8_sweep once pre-quantized/pre-swizzled
@@ -2096,8 +2355,8 @@ class TestMatmulMxfp8GenericKernel:
         M, tile_m, TILES_IN_BLOCK_M, TILES_IN_LOAD_M = m_chain
         N, tile_n, TILES_IN_BLOCK_N, TILES_IN_LOAD_N = n_chain
         K, tile_k, TILES_IN_BLOCK_K = k_chain
-        dists = lhs_dist[0], rhs_dist[0]
-        params = json.loads(lhs_dist[1]), json.loads(rhs_dist[1])
+        dists = [lhs_dist[0], rhs_dist[0]]
+        params = [json.loads(lhs_dist[1]), json.loads(rhs_dist[1])]
         conf = config_helper.TestConfig(
             M=M,
             N=N,
@@ -2134,35 +2393,256 @@ class TestMatmulMxfp8GenericKernel:
             test_manager, compiler_args, conf, is_negative_test=is_negative_test_case, gpu_golden_enabled=False
         )
 
-    @pytest.mark.xfail(reason="fast_dma_transpose compilation fails due to unmerged dependencies", strict=True)
-    def test_matmul_mxfp8_fast_dma_transpose(self, test_manager, platform_target):
-        """Test matmul with fast_dma_transpose enabled - expected to fail until dependencies are merged."""
-        if not platform_target.is_trn3():
-            pytest.skip("MX is only supported on TRN3.")
+    def _run_pe_swizzle_sweep_case(
+        self,
+        test_manager,
+        platform_target,
+        m_chain,
+        n_chain,
+        k_chain,
+        run_with_lnc2,
+        tile_loop_order,
+        block_loop_order,
+        float8_dtype,
+        lhs_dtype,
+        rhs_dtype,
+        enable_scale_packing,
+        output_dtype,
+        lhs_dist,
+        rhs_dist,
+        is_negative_test_case,
+        lhs_is_swizzled,
+        rhs_is_swizzled,
+        spill_reload,
+        lnc_2_shard_rhs,
+        enable_psum_copy_in,
+        *,
+        load_with_PE_swizzle=False,
+        quant_scheme="wrapX",
+    ):
+        """Build the TestConfig for a PE-swizzle sweep case and run it.
+
+        Mirrors test_matmul_mxfp8_sweep's config construction, adding the load-path
+        discriminator (load_with_PE_swizzle for wrapX, quant_scheme="1x32" for 1x32).
+        fast_dma_transpose is intentionally never set so these sweeps stay A0-safe.
+        """
+        M, tile_m, TILES_IN_BLOCK_M, TILES_IN_LOAD_M = m_chain
+        N, tile_n, TILES_IN_BLOCK_N, TILES_IN_LOAD_N = n_chain
+        K, tile_k, TILES_IN_BLOCK_K = k_chain
+        dists = [lhs_dist[0], rhs_dist[0]]
+        params = [json.loads(lhs_dist[1]), json.loads(rhs_dist[1])]
         conf = config_helper.TestConfig(
-            M=512,
-            K=512,
-            N=512,
-            lhs_dtype=constants.MatrixPrecision.BFLOAT16,
-            rhs_dtype=constants.MatrixPrecision.BFLOAT16,
-            lhs_is_swizzled=False,
-            rhs_is_swizzled=False,
-            tile_m=128,
-            tile_n=512,
-            tile_k=512,
-            TILES_IN_BLOCK_K=1,
-            TILES_IN_BLOCK_M=4,
-            TILES_IN_BLOCK_N=1,
-            TILES_IN_LOAD_M=4,
-            TILES_IN_LOAD_N=1,
-            seed=42,
+            M=M,
+            N=N,
+            K=K,
+            TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
+            TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
+            TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
+            TILES_IN_LOAD_M=TILES_IN_LOAD_M,
+            TILES_IN_LOAD_N=TILES_IN_LOAD_N,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            tile_loop_order=tile_loop_order,
+            block_loop_order=block_loop_order,
+            run_with_lnc2=run_with_lnc2,
+            float8_dtype=float8_dtype,
+            lhs_dtype=lhs_dtype,
+            rhs_dtype=rhs_dtype,
+            output_dtype=output_dtype,
+            dists=dists,
+            params=params,
+            lhs_is_swizzled=lhs_is_swizzled,
+            rhs_is_swizzled=rhs_is_swizzled,
+            spill_reload=spill_reload,
+            enable_scale_packing=enable_scale_packing,
+            lnc_2_shard_rhs=lnc_2_shard_rhs,
+            load_with_PE_swizzle=load_with_PE_swizzle,
+            quant_scheme=quant_scheme,
         )
-        conf.fast_dma_transpose = True
+        conf.enable_psum_copy_in = enable_psum_copy_in
         compiler_args = common_dataclasses.CompilerArgs(
-            logical_nc_config=1,
+            logical_nc_config=2 if run_with_lnc2 else 1,
             platform_target=platform_target,
         )
-        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf)
+        self.run_matmul_mxfp8_generic_test(
+            test_manager, compiler_args, conf, is_negative_test=is_negative_test_case, gpu_golden_enabled=False
+        )
+
+    @pytest.mark.coverage_parametrize(
+        m_chain=generate_pe_swizzle_chain("M"),
+        n_chain=generate_pe_swizzle_chain("N"),
+        k_chain=generate_pe_swizzle_chain("K"),
+        lhs_is_swizzled=[True, False],
+        rhs_is_swizzled=[True, False],
+        lnc_2_shard_rhs=[True, False],
+        run_with_lnc2=[True, False],
+        lhs_dtype=[
+            constants.MatrixPrecision.BFLOAT16,
+            constants.MatrixPrecision.MXFP8,
+            constants.MatrixPrecision.MXFP8_X4,
+        ],
+        rhs_dtype=[
+            constants.MatrixPrecision.BFLOAT16,
+            constants.MatrixPrecision.MXFP8,
+            constants.MatrixPrecision.MXFP8_X4,
+        ],
+        output_dtype=[constants.MatrixPrecision.FP32, constants.MatrixPrecision.BFLOAT16],
+        tile_loop_order=['mnk'],
+        block_loop_order=['mnk'],
+        float8_dtype=['float8_e4m3fn', 'float8_e5m2'],
+        lhs_dist=get_dists(num=3, edge_rate=0.3),
+        rhs_dist=get_dists(num=3, edge_rate=0.3),
+        spill_reload=[True, False],
+        enable_scale_packing=[True, False],
+        enable_psum_copy_in=[True, False],
+        filter=filter_pe_swizzle_combinations,
+        coverage="singles",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+        abbrev=_ABBREVS,
+    )
+    def test_matmul_mxfp8_sweep_wrapx(
+        self,
+        test_manager: test_orchestrator.Orchestrator,
+        platform_target,
+        m_chain,
+        n_chain,
+        k_chain,
+        run_with_lnc2,
+        tile_loop_order,
+        block_loop_order,
+        float8_dtype,
+        lhs_dtype,
+        rhs_dtype,
+        enable_scale_packing,
+        output_dtype,
+        lhs_dist,
+        rhs_dist,
+        is_negative_test_case,
+        lhs_is_swizzled,
+        rhs_is_swizzled,
+        spill_reload,
+        lnc_2_shard_rhs,
+        enable_psum_copy_in,
+    ):
+        """Coverage sweep for the wrapX PE-swizzle load path (unswizzled BF16, on-chip
+        nc_transpose). Same parameter order as test_matmul_mxfp8_sweep, restricted to
+        BF16 unswizzled operands so the PE-swizzle loader is exercised. No fast_dma_transpose
+        (A0-safe)."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        self._run_pe_swizzle_sweep_case(
+            test_manager,
+            platform_target,
+            m_chain,
+            n_chain,
+            k_chain,
+            run_with_lnc2,
+            tile_loop_order,
+            block_loop_order,
+            float8_dtype,
+            lhs_dtype,
+            rhs_dtype,
+            enable_scale_packing,
+            output_dtype,
+            lhs_dist,
+            rhs_dist,
+            is_negative_test_case,
+            lhs_is_swizzled,
+            rhs_is_swizzled,
+            spill_reload,
+            lnc_2_shard_rhs,
+            enable_psum_copy_in,
+            load_with_PE_swizzle=True,
+        )
+
+    @pytest.mark.coverage_parametrize(
+        m_chain=generate_pe_swizzle_chain("M"),
+        n_chain=generate_pe_swizzle_chain("N"),
+        k_chain=generate_pe_swizzle_chain("K", k_multiple_of_512=True),
+        lhs_is_swizzled=[True, False],
+        rhs_is_swizzled=[True, False],
+        lnc_2_shard_rhs=[True, False],
+        run_with_lnc2=[True, False],
+        lhs_dtype=[
+            constants.MatrixPrecision.BFLOAT16,
+            constants.MatrixPrecision.MXFP8,
+            constants.MatrixPrecision.MXFP8_X4,
+        ],
+        rhs_dtype=[
+            constants.MatrixPrecision.BFLOAT16,
+            constants.MatrixPrecision.MXFP8,
+            constants.MatrixPrecision.MXFP8_X4,
+        ],
+        output_dtype=[constants.MatrixPrecision.FP32, constants.MatrixPrecision.BFLOAT16],
+        tile_loop_order=['mnk'],
+        block_loop_order=['mnk'],
+        float8_dtype=['float8_e4m3fn', 'float8_e5m2'],
+        lhs_dist=get_dists(num=3, edge_rate=0.3),
+        rhs_dist=get_dists(num=3, edge_rate=0.3),
+        spill_reload=[True, False],
+        enable_scale_packing=[True, False],
+        enable_psum_copy_in=[True, False],
+        filter=filter_pe_swizzle_combinations,
+        coverage="singles",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+        abbrev=_ABBREVS,
+    )
+    def test_matmul_mxfp8_sweep_1x32(
+        self,
+        test_manager: test_orchestrator.Orchestrator,
+        platform_target,
+        m_chain,
+        n_chain,
+        k_chain,
+        run_with_lnc2,
+        tile_loop_order,
+        block_loop_order,
+        float8_dtype,
+        lhs_dtype,
+        rhs_dtype,
+        enable_scale_packing,
+        output_dtype,
+        lhs_dist,
+        rhs_dist,
+        is_negative_test_case,
+        lhs_is_swizzled,
+        rhs_is_swizzled,
+        spill_reload,
+        lnc_2_shard_rhs,
+        enable_psum_copy_in,
+    ):
+        """Coverage sweep for the 1x32 PE-swizzle load path (unswizzled BF16, FP32-reinterpret
+        nc_transpose). Same parameter order as test_matmul_mxfp8_sweep, restricted to BF16
+        unswizzled operands with quant_scheme="1x32". No fast_dma_transpose (A0-safe)."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        self._run_pe_swizzle_sweep_case(
+            test_manager,
+            platform_target,
+            m_chain,
+            n_chain,
+            k_chain,
+            run_with_lnc2,
+            tile_loop_order,
+            block_loop_order,
+            float8_dtype,
+            lhs_dtype,
+            rhs_dtype,
+            enable_scale_packing,
+            output_dtype,
+            lhs_dist,
+            rhs_dist,
+            is_negative_test_case,
+            lhs_is_swizzled,
+            rhs_is_swizzled,
+            spill_reload,
+            lnc_2_shard_rhs,
+            enable_psum_copy_in,
+            quant_scheme="1x32",
+        )
 
     @pytest.mark.parametrize("conf", populate_tests(GRID_1X32))
     def test_matmul_mxfp8_1x32(self, test_manager, conf, platform_target):

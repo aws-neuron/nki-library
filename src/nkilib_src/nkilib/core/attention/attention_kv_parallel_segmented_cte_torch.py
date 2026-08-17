@@ -43,6 +43,9 @@ def attention_kv_parallel_segmented_cte_torch_ref(
     kvp_group_size: int = 0,
     apc_mode: bool = False,
     valid_num_prior_tokens: np.ndarray = None,
+    fp8_packed: bool = False,
+    k_scale: Optional[np.ndarray] = None,
+    v_scale: Optional[np.ndarray] = None,
 ) -> dict:
     """PyTorch reference for attention_kv_parallel_segmented_cte. Same signature as the kernel.
 
@@ -51,7 +54,9 @@ def attention_kv_parallel_segmented_cte_torch_ref(
 
     Args:
         q: [q_heads_per_rank, seq_len, head_dim] - this rank's Q heads
-        k_cache: [num_blocks, num_kv_heads, block_size, head_dim] - this rank's KV shard
+        k_cache: This rank's K shard. Standard shape is
+            [num_blocks, num_kv_heads, block_size, head_dim]; with fp8_packed,
+            [num_blocks, num_kv_heads, block_size // 2, head_dim, 2].
         v_cache: [num_blocks, num_kv_heads, block_size, head_dim] - this rank's KV shard
         block_tables: [1, num_blocks] - block indices (sequential)
         kvp_offset: [1, 1] - causal offset for this rank
@@ -62,6 +67,11 @@ def attention_kv_parallel_segmented_cte_torch_ref(
         scale: softmax scale factor
         global_q_offset: prior tokens offset
         tp_out: if True, transpose output to [q_heads_per_rank, head_dim, seq_len]
+        fp8_packed: whether K uses the packed FP8 layout
+        k_scale: optional K-cache dequantization scale, shape [128, 1]
+        v_scale: optional V-cache dequantization scale, shape [128, 1]. All
+            entries must repeat one scalar because the kernel applies it along
+            the query partition, not the head dimension.
     """
     rank_id = get_rank()
     pg = get_pg(replica_groups)
@@ -72,10 +82,42 @@ def attention_kv_parallel_segmented_cte_torch_ref(
     seq_len = q.shape[1]
     head_dim = q.shape[2]
 
+    if fp8_packed:
+        num_blocks, num_kv_heads, block_size_half, cache_head_dim, pair = k_cache.shape
+        if pair != 2:
+            raise ValueError(f"packed K trailing dimension must be 2, got {pair}")
+        k_cache = k_cache.transpose(0, 1, 2, 4, 3).reshape(
+            num_blocks, num_kv_heads, block_size_half * 2, cache_head_dim
+        )
+
     # Gather all ranks' K/V via all_gather
     # Flatten k_cache to [local_kv_len, head_dim] for gathering
     k_local = k_cache[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
     v_local = v_cache[:, 0, :, :].reshape(-1, head_dim).astype(np.float32)
+
+    def _expand_scale(
+        scale: np.ndarray,
+        name: str,
+        *,
+        require_replicated_scalar: bool = False,
+    ) -> np.ndarray:
+        values = np.asarray(scale, dtype=np.float32).reshape(-1)
+        if values.size == 1:
+            return values
+        if values.size != nl.tile_size.pmax:
+            raise ValueError(f"{name} must be scalar or have {nl.tile_size.pmax} values, got {values.size}")
+        if require_replicated_scalar and not np.all(values == values[0]):
+            raise ValueError(f"{name} must contain one scalar replicated {nl.tile_size.pmax} times")
+        return np.resize(values, head_dim)
+
+    if k_scale is not None:
+        k_local *= _expand_scale(k_scale, "k_scale")
+    if v_scale is not None:
+        v_local *= _expand_scale(
+            v_scale,
+            "v_scale",
+            require_replicated_scalar=True,
+        )
 
     k_t = torch.from_numpy(k_local)
     v_t = torch.from_numpy(v_local)

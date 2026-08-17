@@ -31,9 +31,13 @@ import json
 import logging
 import secrets
 import shlex
-from typing import Any, Callable
+from types import FunctionType
+from typing import TYPE_CHECKING, Any
 
-import paramiko  # type: ignore[import-untyped]
+from .host_communication import SshChannelOpenError
+
+if TYPE_CHECKING:
+    from .host_communication import HostCommunication
 
 logger = logging.getLogger(__name__)
 
@@ -99,29 +103,27 @@ class RemoteExecutorError(Exception):
 class RemoteExecutor:
     """Persistent remote Python process for low-latency command execution over SSH."""
 
-    def __init__(self, connection):
+    def __init__(self, client: "HostCommunication"):
         """Start a persistent Python server on the remote host.
 
         Args:
-            connection: A fabric2.Connection (must be open or openable).
+            client: A HostCommunication (must be open or openable).
         """
-        self._connection = connection
+        self._client = client
         self._next_id = 0
         self._channel = None
         self._explicitly_closed = False
         self._start()
 
     def _start(self):
-        transport = self._connection.transport
-        if transport is None or not transport.is_active():
-            self._connection.open()
-            transport = self._connection.transport
+        if not self._client.is_active():
+            self._client.open()
         self._token = secrets.token_hex(16)
+        server_code = inspect.getsource(_server_main) + "\n_server_main()\n"
+        server_cmd = f"_EXECUTOR_TOKEN={self._token} python3 -u -c {shlex.quote(server_code)}"
         try:
-            channel = transport.open_session()
-            server_code = inspect.getsource(_server_main) + "\n_server_main()\n"
-            channel.exec_command(f"_EXECUTOR_TOKEN={self._token} python3 -u -c {shlex.quote(server_code)}")
-        except paramiko.SSHException as e:
+            channel = self._client.open_channel(server_cmd)
+        except SshChannelOpenError as e:
             raise RemoteExecutorError(f"Failed to open remote executor channel: {e}") from e
         self._channel = channel
         self._recv_buf = b""
@@ -165,11 +167,13 @@ class RemoteExecutor:
             if self._explicitly_closed:
                 raise RemoteExecutorError("Executor is closed")
             self._start()
+        channel = self._channel
+        assert channel is not None, "a started executor holds an open channel"
         req_id = self._next_id
         self._next_id += 1
         request = {"id": req_id, "token": self._token, "method": method, "params": params}
         try:
-            self._channel.sendall((json.dumps(request) + "\n").encode())
+            channel.sendall((json.dumps(request) + "\n").encode())
             response_line = self._recv_line()
         except RemoteExecutorError:
             self._channel = None
@@ -182,11 +186,12 @@ class RemoteExecutor:
             raise RemoteExecutorError(f"Remote error: {resp['error']}")
         return resp.get("result")
 
-    def call_function(self, func: Callable, **kwargs) -> Any:
+    def call_function(self, func: FunctionType, **kwargs) -> Any:
         """Send a Python function to execute remotely and return its result.
 
-        The function must be self-contained: all imports inside the body,
-        no closures or references to local state.
+        The function's source is shipped via ``inspect.getsource`` and exec'd on
+        the remote, so it must not close over local state. It may ``import``
+        modules available on the remote (e.g. a previously deployed helper).
 
         Args:
             func: A Python function. Its source is sent via inspect.getsource().

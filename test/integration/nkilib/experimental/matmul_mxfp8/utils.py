@@ -32,19 +32,32 @@ from test.integration.nkilib.experimental.matmul_mxfp8.constants import (
 # ============================================================================
 
 
-def swizzle_tensor(src_tensor, TILE_P=512):
+def swizzle_tensor(src_tensor, TILE_P=512, fast_dma_transpose=False):
     """
     Golden reference for interleave loading.
 
-    When P is not divisible by TILE_P, the remainder is decomposed into 256
-    and/or 128 sub-tiles to match the DGT hardware's remainder handling in
-    load_block.py. Without this, the interleaving pattern would differ from
-    what DGT produces, causing mismatched quantization groups in matmuls
-    where one operand is pre-swizzled and the other is DGT-loaded.
+    A K remainder (P not divisible by TILE_P) is laid out differently by the two
+    DGT loaders, so the golden must follow whichever one the kernel used:
+
+    - Legacy DGT (``fast_dma_transpose=False``) is bounded by the nc_transpose
+      chunk size, so load_block.py decomposes the remainder into 256 and/or 128
+      sub-tiles, each gathered with its own interleave stride.
+    - Fast DMA (``fast_dma_transpose=True``) gathers the whole
+      MX_PARTITION_SIZE-aligned remainder in one dma_transpose, so its sub-tile
+      stride is remainder // INTERLEAVE_FACTOR and the general loop below handles
+      it directly as a single partial tile.
+
+    The two layouts agree for every 32-aligned remainder except 384 — the only
+    value that decomposes into both a 256 and a 128 sub-tile. Using the legacy
+    decomposition for a fast-DMA load (or vice versa) mismatches the quantization
+    groups in matmuls where one operand is pre-swizzled and the other is
+    DGT-loaded, producing a ~100% relative error.
 
     Args:
         src_tensor (np.ndarray): Source tensor of shape (P, F).
         TILE_P (int): Tile size in P dimension.
+        fast_dma_transpose (bool): Match the fast-DMA single-partial-tile
+            remainder layout instead of the legacy 256/128 decomposition.
 
     Returns:
         np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
@@ -56,7 +69,7 @@ def swizzle_tensor(src_tensor, TILE_P=512):
         raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({INTERLEAVE_FACTOR})")
 
     remainder = P % TILE_P
-    if remainder != 0 and remainder % 128 == 0:
+    if not fast_dma_transpose and remainder != 0 and remainder % 128 == 0:
         # Decompose into full tiles + DGT-compatible remainder sub-tiles (256 and/or 128)
         full_p = P - remainder
         parts = []
@@ -91,6 +104,39 @@ def swizzle_tensor(src_tensor, TILE_P=512):
                         dst_tensor[dst_p, f * INTERLEAVE_FACTOR + sub_tp] = src_tensor[src_p, f]
 
     return dst_tensor.astype(src_tensor.dtype)
+
+
+def swizzle_tensor_1x32(src_tensor):
+    """
+    Golden reference for the 1x32 (contiguous-K) interleave layout.
+
+    Unlike wrapX (``swizzle_tensor``), which splits a feature's K into four
+    far-apart quarters, the 1x32 layout packs four *consecutive* K values of a
+    feature into its four adjacent output columns:
+
+        dst[p, f * INTERLEAVE_FACTOR + c] = src[INTERLEAVE_FACTOR * p + c, f]
+
+    This matches the layout produced by the hardware ``load_tile_PE_Swizzle_1x32``
+    loader (fp32-reinterpret PE transpose). The mapping is local to each group of
+    INTERLEAVE_FACTOR rows and independent of tile boundaries, so no TILE_P
+    remainder decomposition is needed.
+
+    Args:
+        src_tensor (np.ndarray): Source tensor of shape (P, F).
+
+    Returns:
+        np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
+    """
+    P, F = src_tensor.shape
+
+    if P % INTERLEAVE_FACTOR != 0:
+        raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({INTERLEAVE_FACTOR})")
+
+    return (
+        src_tensor.reshape(P // INTERLEAVE_FACTOR, INTERLEAVE_FACTOR, F)
+        .transpose(0, 2, 1)
+        .reshape(P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR)
+    )
 
 
 def unswizzle_tensor(src_tensor, TILE_P=512):
@@ -209,7 +255,7 @@ def check_correctness(kernel_result, golden_result, rtol=1e-3):
     Returns:
         tuple: (passed boolean, metrics dict).
     """
-    if type(kernel_result) != type(golden_result):
+    if type(kernel_result) is not type(golden_result):
         raise TypeError(f"Inputs must be of the same type. {type(kernel_result)=} && {type(golden_result)=}")
 
     kernel_result_flat = kernel_result.flatten().astype(np.float32)

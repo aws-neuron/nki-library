@@ -55,6 +55,9 @@ def attention_kv_parallel_segmented_cte(
     kvp_group_size: int = 0,
     apc_mode: bool = False,
     valid_num_prior_tokens: nl.NkiTensor = None,
+    fp8_packed: bool = False,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     """
     KV-parallel segmented prefill attention.
@@ -71,7 +74,9 @@ def attention_kv_parallel_segmented_cte(
 
     Args:
         q (nl.NkiTensor): [q_heads_per_rank, S, D], This rank's Q heads.
-        k_cache (nl.NkiTensor): [num_blocks, num_kv_heads, block_size, D], Local KV cache (K).
+        k_cache (nl.NkiTensor): Local KV cache (K). Shape depends on fp8_packed:
+            - False: [num_blocks, num_kv_heads, block_size, D]
+            - True: [num_blocks, num_kv_heads, block_size // 2, D, 2]
         v_cache (nl.NkiTensor): [num_blocks, num_kv_heads, block_size, D], Local KV cache (V).
         block_tables (nl.NkiTensor): [1, max_blocks] int32, Block indices for paged KV.
         kvp_q_offset (nl.NkiTensor): [1, 1] int32, Causal mask offset.
@@ -103,6 +108,11 @@ def attention_kv_parallel_segmented_cte(
             The number of fully-visible local prior tokens for Q chunk 0 on this rank.
             Must be a multiple of block_size. The kernel increments this per chunk by
             seg_size // kvp_group_size as later chunks see more local KV.
+        fp8_packed (bool): If True, K uses the packed FP8 layout described above.
+        k_scale (nl.NkiTensor): Optional K-cache dequantization scale, shape [128, 1].
+        v_scale (nl.NkiTensor): Optional V-cache dequantization scale, shape [128, 1].
+            All entries must repeat one scalar; the kernel applies this tensor
+            along the query partition, not as per-head-dimension values.
 
     Returns:
         out (nl.NkiTensor): [q_heads_per_rank, S, D], Merged attention output for this rank's Q heads.
@@ -147,10 +157,19 @@ def attention_kv_parallel_segmented_cte(
         q.shape[2] == k_cache.shape[3],
         f"head_dim mismatch: q has {q.shape[2]}, k_cache has {k_cache.shape[3]}",
     )
-    kernel_assert(
-        k_cache.shape[2] == block_size,
-        f"k_cache block_size dim ({k_cache.shape[2]}) must match block_size ({block_size})",
-    )
+    if fp8_packed:
+        kernel_assert(len(k_cache.shape) == 5, "fp8_packed K cache must be 5-dimensional")
+        kernel_assert(k_cache.shape[4] == 2, "fp8_packed K cache trailing dimension must be 2")
+        kernel_assert(
+            k_cache.shape[2] * 2 == block_size,
+            f"packed k_cache block_size dim ({k_cache.shape[2]} * 2) must match block_size ({block_size})",
+        )
+    else:
+        kernel_assert(len(k_cache.shape) == 4, "non-packed K cache must be 4-dimensional")
+        kernel_assert(
+            k_cache.shape[2] == block_size,
+            f"k_cache block_size dim ({k_cache.shape[2]}) must match block_size ({block_size})",
+        )
 
     # All-gather Q across ranks.
     # Collectives cannot read/write I/O tensors directly, so each NC DMAs its slice into shared_hbm first.
@@ -289,6 +308,9 @@ def attention_kv_parallel_segmented_cte(
             kvp_seg_block_offset_int=chunk_kvp_seg_block_offset_int,
             kvp_prior_load_blocks=kvp_prior_load_blocks,
             kvp_prior_fully_visible=prior_fully_visible,
+            fp8_packed=fp8_packed,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
         nisa.dma_copy(

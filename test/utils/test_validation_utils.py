@@ -24,6 +24,7 @@ Usage:
         IntegrationFileCollector,
         ValidationErrorReporter,
         extract_ast_value,
+        fail_with_report,
     )
 """
 
@@ -32,7 +33,26 @@ import functools
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Set
+
+import pytest
+
+# =============================================================================
+# Failure reporting
+# =============================================================================
+
+
+def fail_with_report(report: str) -> NoReturn:
+    """
+    Fail the calling test with a pre-formatted multi-line validation report.
+
+    Raises the same exception ``pytest.fail`` raises, so the reported outcome and
+    message are identical, and hides this frame from the traceback so the failure
+    points at the caller.
+    """
+    __tracebackhide__ = True
+    raise pytest.fail.Exception(report)
+
 
 # =============================================================================
 # AST Utilities
@@ -62,7 +82,11 @@ def extract_ast_value(node: ast.expr) -> Any:
     elif isinstance(node, ast.Tuple):
         return tuple(extract_ast_value(elt) for elt in node.elts)
     elif isinstance(node, ast.Dict):
-        return {extract_ast_value(k): extract_ast_value(v) for k, v in zip(node.keys, node.values)}
+        # A missing key marks ``**`` unpacking, which contributes no literal key.
+        return {
+            (extract_ast_value(k) if k is not None else None): extract_ast_value(v)
+            for k, v in zip(node.keys, node.values, strict=True)
+        }
     else:
         return None
 

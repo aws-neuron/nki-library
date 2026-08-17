@@ -16,9 +16,16 @@ from typing import Optional
 import nki.isa as nisa
 import nki.language as nl
 
-from ._helpers import nki_strided_view, replace_at, sbuf_buffer_type, validate_index_key
+from ._helpers import (
+    nki_strided_view,
+    reachable_dim_extent,
+    replace_at,
+    sbuf_buffer_type,
+    validate_index_key,
+)
 from .axis import Axis, AxisLabel, IndirectKind
 from .grid import Grid
+from .indexing import ElementOffset, assert_valid_element_offset_value, is_scalar_shape
 from .layout_hbm import HBMLayout
 from .layout_psum import PSUMLayout
 from .layout_sbuf import SBUFLayout
@@ -89,6 +96,36 @@ def _is_partition_leaf_only(grid, dim):
     """
     axes = grid.axes_for(dim)
     return len(axes) == 1 and axes[0].label == AxisLabel.PARTITION
+
+
+def _element_offset_value(value):
+    """Return raw scalar data for an ElementOffset value."""
+    if isinstance(value, NDSlice):
+        assert isinstance(value._layout, SBUFLayout), (
+            "nt.element_offset(NDSlice): value must be an SBUF-backed scalar view."
+        )
+        assert is_scalar_shape(value.element_shape), (
+            "nt.element_offset(NDSlice): value must be scalar-shaped; got element_shape=" + str(value.element_shape)
+        )
+        value = value._layout.source
+    assert_valid_element_offset_value(value)
+    return value
+
+
+def _assert_static_element_offset_in_bounds(offset, grid, layout, dim):
+    """Validate static ElementOffset bounds for the current view."""
+    if not isinstance(offset, int):
+        return
+    extent = reachable_dim_extent(grid, layout, dim)
+    assert offset < extent, (
+        "nt.element_offset(value): static offset "
+        + str(offset)
+        + " out of range on dim "
+        + str(dim)
+        + " (valid range: [0, "
+        + str(extent)
+        + "))."
+    )
 
 
 # DMA quality-of-service priority range (nisa: lower value = higher priority).
@@ -289,6 +326,9 @@ class NDSlice(nl.NKIObject):
             of the whole view: ``element_shape`` divided by ``tile_size`` and rounded
             up. Unlike ``shape``, it always reflects the complete tile grid and does
             not change as the view is indexed. ``None`` for an untiled view.
+        index_stride_elements (tuple[int, ...]): For each current public index dim,
+            the number of source elements advanced by one logical index step. Use it
+            to maintain runtime counters passed through ``nt.element_offset(...)``.
         block_size (tuple[int, ...] | None): The number of tiles per block along each
             dimension, for a view created by ``blocks`` / ``alloc_blocks``. ``None``
             when the view has no block grouping.
@@ -329,6 +369,7 @@ class NDSlice(nl.NKIObject):
         self.tile_shape = grid.tile_shape if grid.is_tiled() else None
         self.block_size = grid.block_size
         self.block_shape = grid.block_shape
+        self.index_stride_elements = grid.index_stride_elements()
         self.is_tiled = grid.is_tiled()
         self.is_blocked = grid.is_blocked()
         self.ndim = grid.ndim
@@ -535,6 +576,17 @@ class NDSlice(nl.NKIObject):
             row = data_iter[pos, 0].load()       # dynamic row   -> (1, D)
             col = data_iter[0, pos].load()       # dynamic column -> (N, 1)
 
+        A plain runtime scalar key is a logical coordinate at the current view level. On
+        tile/block axes, NeuroTile may scale an SBUF scalar internally to produce the
+        source-element ``scalar_offset``. If the runtime value is already an element offset
+        (for example a counter incremented by ``view.index_stride_elements[dim]``), wrap it
+        with ``nt.element_offset(offset)`` so NeuroTile passes it through without scaling:
+
+        .. code-block:: python
+
+            tile = data_iter[tile_idx, j].load()                 # logical tile coordinate
+            tile = data_iter[nt.element_offset(row_offset), j].load()  # element offset
+
         Mixing fixed and dynamic indices
         --------------------------------
         Static indices (an ``int`` or loop variable) and one runtime index combine in a
@@ -675,7 +727,7 @@ class NDSlice(nl.NKIObject):
             # batched view consumes the slab regardless of cursor.
             if (
                 len(keys) == 1
-                and isinstance(k, int)
+                and isinstance(k, (int, ElementOffset))
                 and grid.n_batch_dims <= dim < grid.cursor
                 and grid.cursor < grid.ndim
             ):
@@ -719,6 +771,16 @@ class NDSlice(nl.NKIObject):
                     else:
                         p_consumed = layout.dim_offset_elements(dim, grid.element_shape)
                     grid = grid.truncate_to_source(dim, p_consumed)
+                consumed_dims.append(dim)
+
+            elif isinstance(k, ElementOffset):
+                assert hasattr(layout, "advance_by_element_offset"), (
+                    "nt.element_offset(...) indexing is only supported on HBM-backed views before load/store."
+                )
+                element_offset_value = _element_offset_value(k.value)
+                _assert_static_element_offset_in_bounds(element_offset_value, grid, layout, dim)
+                grid = grid.consume(dim)
+                layout = layout.advance_by_element_offset(dim, element_offset_value)
                 consumed_dims.append(dim)
 
             elif isinstance(k, slice):
@@ -2344,6 +2406,10 @@ class BlockStream(nl.NKIObject):
         """
         child_grid = self._consumed_grid_for_step()
         child_layout = self._view._layout.advance(self._dim, i, self._step)
+        # Clamp the child grid for the last step if it's a partial (remainder) block.
+        child_grid = child_grid.truncate_to_source(
+            self._dim, child_layout.dim_offset_elements(self._dim, child_grid.element_shape)
+        )
         return NDSlice(child_grid, child_layout)
 
     def _bound_child(self, i):
@@ -2352,6 +2418,10 @@ class BlockStream(nl.NKIObject):
         self._ensure_buffers_for_access()
         child_grid = self._consumed_grid_for_step()
         child_layout = self._view._layout.advance(self._dim, i, self._step)
+        # Clamp the child grid for the last step if it's a partial (remainder) block.
+        child_grid = child_grid.truncate_to_source(
+            self._dim, child_layout.dim_offset_elements(self._dim, child_grid.element_shape)
+        )
         return NDSlice(
             child_grid,
             child_layout,

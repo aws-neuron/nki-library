@@ -25,18 +25,34 @@ Config format: [vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum,
 
 import math
 
+from typing import TypedDict
+
 from test.utils.common_dataclasses import ModelTestType
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, MLPGateUpWeightLayout, NormType, QuantizationType
 
+
+class MlpModelConfig(TypedDict, total=False):
+    TP_CP_CONFIGS: list[tuple[int, int, int]]
+    SEQLENS: list[int]
+    QUANT_TYPES: list[QuantizationType]
+
+
+class DenseModelSpec(TypedDict):
+    hidden: int
+    intermediate: int
+    act_fn: ActFnType
+    bias: bool
+
+
 # Only dense (non-MoE) models
-MODELS = {
+MODELS: dict[str, DenseModelSpec] = {
     "llama3_70b": {"hidden": 8192, "intermediate": 28672, "act_fn": ActFnType.SiLU, "bias": False},
     "qwen3_32b": {"hidden": 5120, "intermediate": 25600, "act_fn": ActFnType.SiLU, "bias": False},
     "gemma3_27b": {"hidden": 5376, "intermediate": 21504, "act_fn": ActFnType.GELU, "bias": False},
 }
 
 # (world_size, tp, cp)
-DEFAULT_TP_CP = [
+DEFAULT_TP_CP: list[tuple[int, int, int]] = [
     (64, 64, 1),
     (16, 16, 1),
     (8, 8, 1),
@@ -48,9 +64,9 @@ DEFAULT_TP_CP = [
     (64, 4, 16),
 ]
 
-DEFAULT_SEQLENS = [1024, 10240, 32768]
+DEFAULT_SEQLENS: list[int] = [1024, 10240, 32768]
 
-DEFAULT_QUANT_TYPES = [
+DEFAULT_QUANT_TYPES: list[QuantizationType] = [
     QuantizationType.NONE,
     QuantizationType.STATIC,
     QuantizationType.ROW,
@@ -59,7 +75,7 @@ DEFAULT_QUANT_TYPES = [
     QuantizationType.ROW_MX,
 ]
 
-OPTIMAL_CONFIGS = {name: {'TP_CP_CONFIGS': DEFAULT_TP_CP, 'SEQLENS': DEFAULT_SEQLENS, 'QUANT_TYPES': DEFAULT_QUANT_TYPES} for name in MODELS}
+OPTIMAL_CONFIGS: dict[str, MlpModelConfig] = {name: {'TP_CP_CONFIGS': DEFAULT_TP_CP, 'SEQLENS': DEFAULT_SEQLENS, 'QUANT_TYPES': DEFAULT_QUANT_TYPES} for name in MODELS}
 
 def _align_intermediate(inter_raw, quant_type=None):
     """Align intermediate dim. STATIC_MX requires I % 512 == 0."""

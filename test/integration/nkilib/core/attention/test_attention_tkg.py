@@ -49,8 +49,6 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.attention.attention_tkg import (
     AttnTKGConfig,
     TileConstants,
@@ -63,11 +61,14 @@ from nkilib_src.nkilib.core.attention.attention_tkg import (
 )
 from nkilib_src.nkilib.core.attention.attention_tkg_torch import attention_tkg_torch_ref
 from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
+    is_qk_swapped,
     uses_batch_tiling,
 )
 from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
 from nkilib_src.nkilib.core.utils.allocator import SbufManager, create_auto_alloc_manager, sizeinbytes
 from nkilib_src.nkilib.core.utils.logging import Logger
+from typing_extensions import override
+
 from test.integration.nkilib.utils.tensor_generators import np_random_sample, np_random_sample_fp8
 from test.utils.common_dataclasses import (
     MODEL_TEST_TYPE,
@@ -279,6 +280,9 @@ def run_attention_tkg_test(
     else:
         relative_tolerance, absolute_tolerance = 1e-2, 1e-5
 
+    # KV cache dtype for this config (used to derive the is_2byte_kv arg of is_qk_swapped).
+    kv_dtype = FP8_TEST_DTYPE if fp8_kv else dtype
+
     # Shapes that differ base on config
     q_shape = (
         (cfg.d_head, cfg.bs * cfg.q_head * cfg.s_active)
@@ -286,7 +290,6 @@ def run_attention_tkg_test(
         else (cfg.bs, cfg.q_head, cfg.s_active, cfg.d_head)
     )
     k_active_shape = (cfg.d_head, cfg.bs * cfg.s_active) if cfg.qk_in_sb else (cfg.bs, 1, cfg.s_active, cfg.d_head)
-    resize_factor = None
     if is_block_kv:
         assumed_num_cache_blocks = cfg.bs * cfg.curr_sprior // cfg.block_len
         if cfg.fp8_packed:
@@ -330,7 +333,7 @@ def run_attention_tkg_test(
             kv_random_gen = random_gen
             kv_dtype = dtype
 
-        q = random_gen(shape=q_shape, dtype=dtype, name='q').astype(kv_dtype)
+        q = random_gen(shape=q_shape, dtype=dtype, name='q')
         k_active = kv_random_gen(shape=k_active_shape, dtype=kv_dtype, name='k_active').astype(kv_dtype)
         v_active = kv_random_gen(shape=(cfg.bs, 1, cfg.s_active, cfg.d_head), dtype=kv_dtype, name='v_active').astype(
             kv_dtype
@@ -345,6 +348,9 @@ def run_attention_tkg_test(
                 .astype(np.bool_)
             )
         else:
+            # TODO: migrate to gen_mask_tkg_hbm_torch_ref so this test shares the
+            # same swap-aware mask reference as attention_block_tkg.
+            # This requires flat-KV support for non-strided MM1 in the HBM reference.
             cache_lens_torch = torch.from_numpy(np.asarray(pos_id).flatten()).to(torch.float32)
             active_mask = (
                 build_full_attention_mask(
@@ -363,6 +369,20 @@ def run_attention_tkg_test(
                 .numpy()
                 .astype(np.bool_)
             )
+            if is_qk_swapped(
+                bs=cfg.bs,
+                q_head=cfg.q_head,
+                d_head=cfg.d_head,
+                s_active=cfg.s_active,
+                curr_sprior=cfg.curr_sprior,
+                lnc=lnc,
+                p_max=P_MAX,
+                is_block_kv=is_block_kv,
+                is_2byte_kv=sizeinbytes(kv_dtype) == 2,
+                fp8_packed=cfg.fp8_packed,
+                fuse_rope=cfg.fuse_rope,
+            ):
+                active_mask = np.ascontiguousarray(active_mask.transpose(1, 2, 3, 0))  # [s_ctx,B,N,S]->[B,N,S,s_ctx]
         active_mask = active_mask.astype(np.uint8)
 
         inv_freqs = np.random.random(size=(cfg.d_head // 2, 1)).astype(np.float32) if cfg.fuse_rope else None
@@ -470,13 +490,32 @@ def run_attention_tkg_test(
                 )
                 DBG_TENSORS = DBG_TENSORS + (DBG_ACTIVE_TABLE,)
 
+        # input_generator hands the kernel the swap (bqh-major) mask [B, N, s_active, s_ctx] for swap
+        # configs. attention_tkg_torch_ref only implements the canonical s_prior-major [s_ctx, B, N, s_active]
+        # layout, so un-swap here.
+        golden_mask = mask
+        if not cfg.use_pos_id and is_qk_swapped(
+            bs=cfg.bs,
+            q_head=cfg.q_head,
+            d_head=cfg.d_head,
+            s_active=cfg.s_active,
+            curr_sprior=cfg.curr_sprior,
+            lnc=lnc,
+            p_max=P_MAX,
+            is_block_kv=is_block_kv,
+            is_2byte_kv=sizeinbytes(kv_dtype) == 2,
+            fp8_packed=cfg.fp8_packed,
+            fuse_rope=cfg.fuse_rope,
+        ):
+            golden_mask = mask.permute(3, 0, 1, 2)  # [B, N, s_active, s_ctx] -> [s_ctx, B, N, s_active]
+
         out, k_out = attention_tkg_torch_ref[lnc](
             q=q,
             k_active=k_active,
             v_active=v_active,
             k_prior=k_prior,
             v_prior=v_prior,
-            mask=mask,
+            mask=golden_mask,
             out=out,
             cfg=cfg,
             sbm=None,
@@ -543,6 +582,7 @@ def run_attention_tkg_test(
 
         golds = {'golden_out': dt.static_cast(out.numpy(), dtype)}
         if cfg.fuse_rope:
+            assert k_out is not None, "the fused-rope path produces a k_out tensor"
             golds['golden_k_out'] = dt.static_cast(k_out.numpy(), dtype)
         if DBG:
             DBG_QK_NP = DBG_QK.numpy()
@@ -652,26 +692,26 @@ def run_attention_tkg_test(
 
 
 def filter_invalid_tests(
-    batch_size: int = None,
-    q_head: int = None,
-    s_active: int = None,
-    s_prior: int = None,
-    s_prior_full_multiple: int = None,
-    d_head: int = None,
-    block_len: int = None,
-    tp_k_prior: bool = None,
-    strided_mm1: bool = None,
-    use_pos_id: bool = None,
-    fuse_rope: bool = None,
-    out_in_sb: bool = None,
-    k_out_in_sb: bool = None,
-    qk_in_sb: bool = None,
-    dtype: str = None,
-    sink: bool = None,
-    fp8_kv: bool = None,
-    fp8_packed: bool = None,
-    sliding_window: int = None,
-    lnc: int = None,
+    batch_size: int | None = None,
+    q_head: int | None = None,
+    s_active: int | None = None,
+    s_prior: int | None = None,
+    s_prior_full_multiple: int | None = None,
+    d_head: int | None = None,
+    block_len: int | None = None,
+    tp_k_prior: bool | None = None,
+    strided_mm1: bool | None = None,
+    use_pos_id: bool | None = None,
+    fuse_rope: bool | None = None,
+    out_in_sb: bool | None = None,
+    k_out_in_sb: bool | None = None,
+    qk_in_sb: bool | None = None,
+    dtype: str | None = None,
+    sink: bool | None = None,
+    fp8_kv: bool | None = None,
+    fp8_packed: bool | None = None,
+    sliding_window: int | None = None,
+    lnc: int | None = None,
 ) -> FilterResult:
     # Memory concern restrictions
     if s_prior is not None and s_prior_full_multiple is not None:
@@ -708,6 +748,8 @@ def filter_invalid_tests(
             return FilterResult.INVALID
         if qk_in_sb is not None and not qk_in_sb:
             return FilterResult.INVALID
+        if dtype is not None and dtype == nl.float32:
+            return FilterResult.INVALID
 
     # fp8_packed constraints
     if fp8_packed is not None and fp8_packed:
@@ -716,8 +758,26 @@ def filter_invalid_tests(
         if block_len is not None and block_len == 0:
             return FilterResult.INVALID
 
-    # Partial combination, allow further exploration
-    if lnc is None:
+    # Partial combination, allow further exploration. The checks below build a full config,
+    # so defer until every parameter they read is concrete.
+    if (
+        lnc is None
+        or batch_size is None
+        or q_head is None
+        or s_active is None
+        or s_prior is None
+        or s_prior_full_multiple is None
+        or d_head is None
+        or block_len is None
+        or tp_k_prior is None
+        or strided_mm1 is None
+        or use_pos_id is None
+        or fuse_rope is None
+        or out_in_sb is None
+        or k_out_in_sb is None
+        or qk_in_sb is None
+        or fp8_packed is None
+    ):
         return FilterResult.VALID
 
     # Full combination checks that need AttnTKGConfig
@@ -921,6 +981,10 @@ attention_tkg_fast_configs = [
 
     #################### Test sprior_sharding when s_active_bqh > 128####################
     [AttnTKGConfig(5, 7, 7, 24576, 24576, 64, 0, use_pos_id=True, qk_in_sb=True), AttnTKGTestParams(test_sink=True)],
+
+    #################### QK-swap + SWA ####################
+    pytest.param(AttnTKGConfig(4, 16, 8, 2048, 2048, 64, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True, sliding_window=128), marks=pytest.mark.fast),
+    [AttnTKGConfig(4, 16, 8, 2048, 2048, 64, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True, sliding_window=256)],
 
     #################### d_head = 256 (num_d_tiles=2, Qwen3.5 decode path) ####################
     # Flat KV, single active token

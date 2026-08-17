@@ -48,6 +48,7 @@ class RouterActFnType(Enum):
 
     SIGMOID = 0
     SOFTMAX = 1
+    NOAUX_TC = 2
 
     def __str__(self):
         return self.name.lower()
@@ -182,6 +183,26 @@ class MLPGateUpWeightLayout(Enum):
     CONTIGUOUS = 0
     H_X4_INNERMOST = 1
     H_X4_MIDDLE = 2
+
+
+class OProjAttentionLayout(Enum):
+    """Layout of the attention tensor passed to the output projection CTE kernel.
+
+    BNdS:
+        [B, N, D, S]. Attention is in transposed layout.
+
+    BSNd:
+        [B, S, N, D], Attention is in native untransposed layout.
+
+    BNSd:
+        [B, N, S, D], Attention is untransposed with heads outer. This is the
+        attention CTE output when heads are folded into the batch dimension and
+        ``tp_out=False``, i.e. [B * N, S, D] viewed as 4D.
+    """
+
+    BNdS = 0
+    BSNd = 1
+    BNSd = 2
 
 
 class HiddenLayout(Enum):

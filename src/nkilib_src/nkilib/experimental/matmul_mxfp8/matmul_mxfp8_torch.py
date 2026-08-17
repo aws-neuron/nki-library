@@ -32,21 +32,50 @@ def _get_mx_max_exp(dst_dtype):
     return {float8_e5m2_x4: 14, float8_e4m3fn_x4: 7}[dst_dtype]
 
 
+def _raw_exponent_scale(scale):
+    """Return the MX scale tensor's raw biased exponent bytes as uint8.
+
+    MX scales encode a biased exponent as one byte. ``mx_util.nc_matmul_mx_golden``
+    expects the integer byte value (0-255) via ``.astype``. When the pre-quantized
+    scale input is float8_e8m0fnu, ``.astype`` would convert the represented value
+    (2^(byte-127)) rather than the byte, corrupting the golden scale factors.
+    Reinterpret the bytes via ``.view(uint8)``; no-op for scales already uint8.
+    """
+    import nki.language as nl
+
+    if scale.dtype == nl.float8_e8m0fnu:
+        return scale.view(np.uint8)
+    return scale
+
+
 # NOTE: This duplicates test/integration/.../matmul_mxfp8/utils.py:swizzle_tensor
 # intentionally — src/ modules must not import from test/.
-def _swizzle(src_tensor, TILE_P=512):
+def _swizzle(src_tensor, TILE_P=512, fast_dma_transpose=False):
     """
     Golden reference for interleave loading.
 
-    When P is not divisible by TILE_P, the remainder is decomposed into 256
-    and/or 128 sub-tiles to match the DGT hardware's remainder handling in
-    load_block.py. Without this, the interleaving pattern would differ from
-    what DGT produces, causing mismatched quantization groups in matmuls
-    where one operand is pre-swizzled and the other is DGT-loaded.
+    A K remainder (P not divisible by TILE_P) is laid out differently by the two
+    DGT loaders, so the golden must follow whichever one the kernel used:
+
+    - Legacy DGT (``fast_dma_transpose=False``) is bounded by the nc_transpose
+      chunk size, so load_block.py decomposes the remainder into 256 and/or 128
+      sub-tiles, each gathered with its own interleave stride.
+    - Fast DMA (``fast_dma_transpose=True``) gathers the whole
+      MX_PARTITION_SIZE-aligned remainder in one dma_transpose, so its sub-tile
+      stride is remainder // INTERLEAVE_FACTOR and the general loop below handles
+      it directly as a single partial tile.
+
+    The two layouts agree for every 32-aligned remainder except 384 — the only
+    value that decomposes into both a 256 and a 128 sub-tile. Using the legacy
+    decomposition for a fast-DMA load (or vice versa) mismatches the quantization
+    groups in matmuls where one operand is pre-swizzled and the other is
+    DGT-loaded, producing a ~100% relative error.
 
     Args:
         src_tensor (np.ndarray): Source tensor of shape (P, F).
         TILE_P (int): Tile size in P dimension.
+        fast_dma_transpose (bool): Match the fast-DMA single-partial-tile
+            remainder layout instead of the legacy 256/128 decomposition.
 
     Returns:
         np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
@@ -58,7 +87,7 @@ def _swizzle(src_tensor, TILE_P=512):
         raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({_INTERLEAVE_FACTOR})")
 
     remainder = P % TILE_P
-    if remainder != 0 and remainder % 128 == 0:
+    if not fast_dma_transpose and remainder != 0 and remainder % 128 == 0:
         # Decompose into full tiles + DGT-compatible remainder sub-tiles (256 and/or 128)
         full_p = P - remainder
         parts = []
@@ -93,6 +122,38 @@ def _swizzle(src_tensor, TILE_P=512):
                         dst_tensor[dst_p, f * _INTERLEAVE_FACTOR + sub_tp] = src_tensor[src_p, f]
 
     return dst_tensor.astype(src_tensor.dtype)
+
+
+# NOTE: This duplicates test/integration/.../matmul_mxfp8/utils.py:swizzle_tensor_1x32
+# intentionally — src/ modules must not import from test/.
+def _swizzle_1x32(src_tensor):
+    """
+    Golden reference for the 1x32 (contiguous-K) interleave layout.
+
+    Packs INTERLEAVE_FACTOR consecutive K values of a feature into its four
+    adjacent output columns (contrast with wrapX ``_swizzle``, which scatters
+    K into four quarters):
+
+        dst[p, f * INTERLEAVE_FACTOR + c] = src[INTERLEAVE_FACTOR * p + c, f]
+
+    Matches the hardware ``load_tile_PE_Swizzle_1x32`` loader. The mapping is
+    local to each group of INTERLEAVE_FACTOR rows, so no tile-remainder handling
+    is needed.
+
+    Args:
+        src_tensor (np.ndarray): Source tensor of shape (P, F).
+
+    Returns:
+        np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
+    """
+    P, F = src_tensor.shape
+    if P % _INTERLEAVE_FACTOR != 0:
+        raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({_INTERLEAVE_FACTOR})")
+    return (
+        src_tensor.reshape(P // _INTERLEAVE_FACTOR, _INTERLEAVE_FACTOR, F)
+        .transpose(0, 2, 1)
+        .reshape(P // _INTERLEAVE_FACTOR, F * _INTERLEAVE_FACTOR)
+    )
 
 
 def _resolve_x4_dtype(float8_dtype_str):
@@ -151,6 +212,17 @@ def matmul_mxfp8_torch_ref(
     compute_dtype_x4 = _resolve_x4_dtype(float8_dtype)
     out_dt = output_dtype if output_dtype is not None else nl.float32
 
+    # Both operands' K axis must use the same permutation for the matmul to be
+    # valid, so a single quant_scheme selects the swizzle for every BF16 operand.
+    # wrapX must also follow the DGT loader the kernel used: the fast-DMA and legacy
+    # paths interleave a K remainder differently (see _swizzle).
+    if quant_scheme == "1x32":
+        swizzle = _swizzle_1x32
+    else:
+
+        def swizzle(src_tensor):
+            return _swizzle(src_tensor, fast_dma_transpose=fast_dma_transpose)
+
     lhs_prequantized = lhs_scales is not None
     rhs_prequantized = rhs_scales is not None
 
@@ -166,26 +238,26 @@ def matmul_mxfp8_torch_ref(
             lhs_sw = lhs
         elif not lhs_is_f_by_k:
             # lhs is [K, M] already (K-by-F); swizzle directly
-            lhs_sw = _swizzle(lhs.copy())
+            lhs_sw = swizzle(lhs.copy())
         else:
             # lhs is [M, K] unswizzled (F-by-K, the default); transpose to [K, M] then swizzle
-            lhs_sw = _swizzle(lhs.T.copy())
+            lhs_sw = swizzle(lhs.T.copy())
 
         if rhs_is_swizzled:
             rhs_sw = rhs
         elif not rhs_is_f_by_k:
             # rhs is [K, N] already (K-by-F); swizzle directly
-            rhs_sw = _swizzle(rhs.copy())
+            rhs_sw = swizzle(rhs.copy())
         else:
             # rhs is [N, K] unswizzled (F-by-K, the default); transpose to [K, N] then swizzle
-            rhs_sw = _swizzle(rhs.T.copy())
+            rhs_sw = swizzle(rhs.T.copy())
 
         result = golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
     else:
         # At least one operand is pre-quantized.
         # For BF16 operands, swizzle and quantize. For pre-quantized, use directly.
         if not lhs_prequantized:
-            lhs_sw = lhs if lhs_is_swizzled else (_swizzle(lhs.copy()) if not lhs_is_f_by_k else _swizzle(lhs.T.copy()))
+            lhs_sw = lhs if lhs_is_swizzled else (swizzle(lhs.copy()) if not lhs_is_f_by_k else swizzle(lhs.T.copy()))
             a_data, a_scale = mx_util.quantize_mx_golden(lhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             # Pre-quantized: data may be non-x4 dtype, view as x4
@@ -198,9 +270,10 @@ def matmul_mxfp8_torch_ref(
                 a_scale = _unpack_packed_scales(lhs_scales, K, F)
             else:
                 a_scale = _compact_scales(lhs_scales)
+            a_scale = _raw_exponent_scale(a_scale)
 
         if not rhs_prequantized:
-            rhs_sw = rhs if rhs_is_swizzled else (_swizzle(rhs.copy()) if not rhs_is_f_by_k else _swizzle(rhs.T.copy()))
+            rhs_sw = rhs if rhs_is_swizzled else (swizzle(rhs.copy()) if not rhs_is_f_by_k else swizzle(rhs.T.copy()))
             b_data, b_scale = mx_util.quantize_mx_golden(rhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             b_data = rhs
@@ -212,6 +285,7 @@ def matmul_mxfp8_torch_ref(
                 b_scale = _unpack_packed_scales(rhs_scales, K, F)
             else:
                 b_scale = _compact_scales(rhs_scales)
+            b_scale = _raw_exponent_scale(b_scale)
 
         result = mx_util.nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
 

@@ -40,7 +40,6 @@ from .mlp_tkg_constants import MLPTKGConstants
 from .mlp_tkg_down_projection import process_down_projection
 from .mlp_tkg_gate_up_projection import process_gate_up_projection
 from .mlp_tkg_utils import (
-    alloc_tensor_view,
     input_fused_add,
     input_norm_load,
     transpose_store_sbuf_copy,
@@ -184,8 +183,7 @@ def _mlp_tkg_impl(
 
     # ---------- Process gate/up projection, silu, gate/up multiplication ----------
     # Allocate SBUF tile for gate/up projection output
-    gate_up_sb = alloc_tensor_view(
-        sbm,
+    gate_up_sb = sbm.alloc_stack(
         (dims.I0, div_ceil(dims.I, dims.I0), dims.T),
         dtype=io_dtype,
         buffer=nl.sbuf,
@@ -207,16 +205,14 @@ def _mlp_tkg_impl(
     # ---------- Process down projection ----------
     # Allocate SBUF tile for down projection output
     if params.use_tkg_down_proj_column_tiling:
-        down_sb = alloc_tensor_view(
-            sbm,
+        down_sb = sbm.alloc_stack(
             (dims.T, dims.H_per_shard),
             dtype=io_dtype,
             buffer=nl.sbuf,
             name="down_sbuf",
         )
     else:
-        down_sb = alloc_tensor_view(
-            sbm,
+        down_sb = sbm.alloc_stack(
             (dims.H0, dims.H1_shard, dims.T),
             dtype=io_dtype,
             buffer=nl.sbuf,

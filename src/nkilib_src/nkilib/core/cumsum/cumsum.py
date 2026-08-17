@@ -25,6 +25,11 @@ from ..utils.tiled_range import TiledRange
 P_MAX = 128  # Partition dimension max (nl.tile_size.pmax returns non-int, compiler requires Python int for shapes)
 F_TILE_SIZE = 2048
 
+# tensor_scalar_cumulative rejects int32/uint32 src dtypes (ISA limitation), so
+# those fall back to the tensor_tensor_scan path. Every other supported dtype
+# uses the faster single-operand tensor_scalar_cumulative scan.
+_TSCR_DISALLOWED_DTYPES = (nl.int32, nl.uint32)
+
 
 @nki.jit
 def cumsum(x: nl.NkiTensor, axis: int = -1) -> nl.NkiTensor:
@@ -65,8 +70,10 @@ def cumsum(x: nl.NkiTensor, axis: int = -1) -> nl.NkiTensor:
             init = 0  # carry from previous free tile
             for f_tile_idx in range(num_free_tiles):
                 tile = load(x_2d[p_tile, f_tile])
-                # cumsum: result[i] = result[i-1] + tile[i]
-                result = tensor_tensor_scan(ones, tile, init, multiply, add)
+                # cumsum: result[i] = result[i-1] + tile[i], via
+                # tensor_scalar_cumulative (fp/bf16/int8/16) or tensor_tensor_scan
+                # (int32/uint32 fallback)
+                result = scan(tile, init)
                 store(y_2d[p_tile, f_tile], result)
                 init = result[:, -1]  # carry forward last column
 
@@ -95,16 +102,24 @@ def cumsum(x: nl.NkiTensor, axis: int = -1) -> nl.NkiTensor:
 
     num_f_tiles = div_ceil(last_dim, F_TILE_SIZE)
 
+    # tensor_scalar_cumulative is the faster single-operand scan, but its ISA
+    # rejects int32/uint32 src dtypes; those fall back to tensor_tensor_scan
+    # (which needs an all-ones operand tile). Selected once at trace time from
+    # the concrete input dtype, so the branch folds away at compile.
+    use_tscr = x.dtype not in _TSCR_DISALLOWED_DTYPES
+
     # Process partition tiles
     for p_tile in TiledRange(outer_dim, P_MAX):
         # Initialize carry for this partition tile
-        # Note: float32 used for numerical stability; tensor_tensor_scan auto-casts to float32 internally
+        # Note: float32 used for numerical stability; the scan auto-casts to float32 internally
         init_sb = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=init_sb, value=0.0)
 
-        # Allocate ones tensor for scan (data0 * prev + data1)
-        ones_sb = nl.ndarray((P_MAX, F_TILE_SIZE), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=ones_sb, value=1.0)
+        # tensor_tensor_scan needs an all-ones operand (data0 * prev + data1);
+        # tensor_scalar_cumulative does not, so only allocate it on the fallback.
+        if not use_tscr:
+            ones_sb = nl.ndarray((P_MAX, F_TILE_SIZE), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=ones_sb, value=1.0)
 
         # Sequential loop over free dimension tiles (must be sequential for cumsum)
         for f_tile_idx in nl.sequential_range(num_f_tiles):
@@ -119,17 +134,29 @@ def cumsum(x: nl.NkiTensor, axis: int = -1) -> nl.NkiTensor:
                 src=x_2d[p_tile.start_offset : p_tile.start_offset + p_tile.size, f_start:f_end],
             )
 
-            # Compute cumsum using tensor_tensor_scan
-            # result[i] = ones[i] * result[i-1] + data[i] = result[i-1] + data[i]
+            # Compute cumsum: result[i] = result[i-1] + data[i]
             result_sb = nl.ndarray((P_MAX, F_TILE_SIZE), dtype=x.dtype, buffer=nl.sbuf)
-            nisa.tensor_tensor_scan(
-                dst=result_sb[0 : p_tile.size, 0:f_size],
-                data0=ones_sb[0 : p_tile.size, 0:f_size],
-                data1=data_sb[0 : p_tile.size, 0:f_size],
-                initial=init_sb[0 : p_tile.size, 0:1],
-                op0=nl.multiply,
-                op1=nl.add,
-            )
+            if use_tscr:
+                # result[i] = (data[i] + 0) + result[i-1]
+                nisa.tensor_scalar_cumulative(
+                    dst=result_sb[0 : p_tile.size, 0:f_size],
+                    src=data_sb[0 : p_tile.size, 0:f_size],
+                    op0=nl.add,
+                    op1=nl.add,
+                    imm0=0.0,
+                    imm1=init_sb[0 : p_tile.size, 0:1],
+                    reduce_cmd=nisa.reduce_cmd.load_reduce,
+                )
+            else:
+                # result[i] = ones[i] * result[i-1] + data[i] = result[i-1] + data[i]
+                nisa.tensor_tensor_scan(
+                    dst=result_sb[0 : p_tile.size, 0:f_size],
+                    data0=ones_sb[0 : p_tile.size, 0:f_size],
+                    data1=data_sb[0 : p_tile.size, 0:f_size],
+                    initial=init_sb[0 : p_tile.size, 0:1],
+                    op0=nl.multiply,
+                    op1=nl.add,
+                )
 
             # Store result to HBM
             nisa.dma_copy(

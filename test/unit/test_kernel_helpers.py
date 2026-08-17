@@ -13,9 +13,10 @@
 # limitations under the License.
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import ActFnType
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_nl_act_fn_from_type
+
+from test.utils.negative_test_helpers import call_with_invalid_argument
 
 
 class TestGetNlActFnFromType:
@@ -33,4 +34,4 @@ class TestGetNlActFnFromType:
 
     def test_raises_on_invalid_type(self):
         with pytest.raises(AssertionError):
-            get_nl_act_fn_from_type("invalid")
+            call_with_invalid_argument(get_nl_act_fn_from_type, "invalid")

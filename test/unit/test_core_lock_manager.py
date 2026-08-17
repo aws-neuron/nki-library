@@ -13,7 +13,6 @@
 # limitations under the License.
 """Unit tests for core_lock_manager module."""
 
-import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -51,108 +50,23 @@ class TestLockVersionError:
 
 
 class TestCheckLockVersion:
-    """Tests for check_lock_version function."""
+    """Tests for the check_lock_version guard (pure version comparison)."""
 
-    def _mock_conn_with_file(self, file_content: str) -> MagicMock:
-        """Create mock connection where version file exists with given content."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
+    def test_passes_when_equal(self):
+        """Returns None (does not raise) when host version == client's supported version."""
+        assert check_lock_version(DEFAULT_LOCKING_PROTOCOL_VERSION) is None
 
-        # First call: test -f (file exists)
-        test_result = MagicMock()
-        test_result.ok = True
+    def test_passes_when_host_requires_lower(self):
+        """Returns None (does not raise) when the host requires an older version."""
+        assert check_lock_version(DEFAULT_LOCKING_PROTOCOL_VERSION - 1) is None
 
-        # Second call: cat (returns content)
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = file_content
-
-        mock_conn.run.side_effect = [test_result, cat_result]
-        return mock_conn
-
-    def _mock_conn_without_file(self) -> MagicMock:
-        """Create mock connection where version file doesn't exist."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
-
-        # First call: test -f (file doesn't exist)
-        test_result = MagicMock()
-        test_result.ok = False
-
-        # Second call: mkdir && echo (create file)
-        write_result = MagicMock()
-        write_result.failed = False
-
-        mock_conn.run.side_effect = [test_result, write_result]
-        return mock_conn
-
-    def test_version_check_passes_when_compatible(self):
-        """Test that version check passes when client version is sufficient."""
-        mock_conn = self._mock_conn_with_file(json.dumps({"minClientLockingVersion": 1}))
-        # Should not raise
-        check_lock_version(mock_conn)
-
-    def test_version_check_fails_when_client_too_old(self):
-        """Test that version check fails when client version is too old."""
-        mock_conn = self._mock_conn_with_file(json.dumps({"minClientLockingVersion": 99}))
-
+    def test_fails_when_client_too_old(self):
+        """Raise LockVersionError when the host requires a newer version than the client."""
         with pytest.raises(LockVersionError) as exc_info:
-            check_lock_version(mock_conn)
+            check_lock_version(99)
 
         assert exc_info.value.required_version == 99
         assert exc_info.value.current_version == DEFAULT_LOCKING_PROTOCOL_VERSION
-
-    def test_version_check_handles_missing_file(self):
-        """Test that version check creates file when missing."""
-        mock_conn = self._mock_conn_without_file()
-        # Should not raise - creates file with default version
-        check_lock_version(mock_conn)
-
-    def test_version_check_handles_missing_key(self):
-        """Test that version check recreates file when key is missing."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
-
-        # First call: test -f (file exists)
-        test_result = MagicMock()
-        test_result.ok = True
-
-        # Second call: cat (returns content without key)
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = json.dumps({"someOtherKey": 123})
-
-        # Third call: mkdir && echo (recreate file)
-        write_result = MagicMock()
-        write_result.failed = False
-
-        mock_conn.run.side_effect = [test_result, cat_result, write_result]
-
-        # Should not raise - recreates file
-        check_lock_version(mock_conn)
-
-    def test_version_check_handles_corrupted_json(self):
-        """Test that version check recreates file when JSON is corrupted."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
-
-        # First call: test -f (file exists)
-        test_result = MagicMock()
-        test_result.ok = True
-
-        # Second call: cat (returns corrupted content)
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = "not valid json {{{"
-
-        # Third call: mkdir && echo (recreate file)
-        write_result = MagicMock()
-        write_result.failed = False
-
-        mock_conn.run.side_effect = [test_result, cat_result, write_result]
-
-        # Should not raise - recreates file
-        check_lock_version(mock_conn)
 
 
 class TestCalculateTotalNeededPhysicalCores:
@@ -555,6 +469,7 @@ def test_manager_acquire_enqueue_then_commit(tmp_path):
     assert first.position == 0
 
     # Release the blocker's cores; the head's next polls open a window and commit.
+    assert blocked.physical_cores is not None, "an ALLOCATED outcome carries its physical cores"
     blocker.release(blocked.physical_cores)
 
     final = None

@@ -23,7 +23,8 @@ from ....utils.allocator import SbufManager
 from ....utils.kernel_helpers import get_max_positive_value_for_dtype
 from ....utils.tiled_range import TiledRange
 from ...mlp_parameters import MLPParameters
-from ..mlp_cte_constants import MLPCTEConstants
+from ..mlp_cte_constants import MlpBxsIndices, MLPCTEConstants
+from .mlp_cte_basic_allocation import allocate_intermediate_tensor_tile
 from .mlp_cte_basic_tile_info import MLPCTEBasicTileInfo
 
 _MINVAL = 1e-6
@@ -33,6 +34,7 @@ def perform_intermediate_quantization(
     mlp_params: MLPParameters,
     tile_info: MLPCTEBasicTileInfo,
     constants: MLPCTEConstants,
+    indices: MlpBxsIndices,
     bxs_tile_idx: int,
     src_proj_res_sbuf_list: list[nl.NkiTensor],
     quantized_output_sbuf_list: list[nl.NkiTensor],
@@ -55,6 +57,7 @@ def perform_intermediate_quantization(
             mlp_params,
             tile_info,
             constants,
+            indices,
             bxs_tile_idx,
             src_proj_res_sbuf_list,
             quantized_output_sbuf_list,
@@ -117,6 +120,7 @@ def _perform_intermediate_row_quantization(
     mlp_params: MLPParameters,
     tile_info: MLPCTEBasicTileInfo,
     constants: MLPCTEConstants,
+    indices: MlpBxsIndices,
     bxs_tile_idx: int,
     src_proj_res_sbuf_list: list[nl.NkiTensor],
     quantized_output_sbuf_list: list[nl.NkiTensor],
@@ -130,18 +134,26 @@ def _perform_intermediate_row_quantization(
     max_pos_val = get_max_positive_value_for_dtype(constants.down_proj_quant_data_type)
     rounded_intermediate_dim = int_dim_tile.tile_count * int_dim_tile.tile_size
 
+    if sbm != None:
+        sbm.open_scope("row_quantization")
+
     quant_abs_sbuf_list = []
+    allocate_intermediate_tensor_tile(
+        mlp_params,
+        tile_info,
+        constants,
+        indices,
+        'row_quant_reduction_res',
+        constants.compute_data_type,
+        quant_abs_sbuf_list,
+        sbm.alloc_stack,
+    )
     quant_scales_sbuf_list = []
     for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
-        alloc_stack = sbm.alloc_stack if sbm else nl.NkiTensor
-        quant_abs_sbuf = alloc_stack(
-            (bxs_dim_tile.subtile_dim_info.tile_size, rounded_intermediate_dim),
-            dtype=constants.compute_data_type,
-        )
-        quant_abs_sbuf_list.append(quant_abs_sbuf)
-        quant_scales_sbuf = alloc_stack(
+        quant_scales_sbuf = sbm.alloc_stack(
             (bxs_dim_tile.subtile_dim_info.tile_size, 1),
             dtype=nl.float32,
+            name=indices.get_tensor_name('intermediate_quant_scale_tensor', f'subbxs{bxs_subtile_idx}'),
         )
         quant_scales_sbuf_list.append(quant_scales_sbuf)
 
@@ -204,3 +216,6 @@ def _perform_intermediate_row_quantization(
             scale=quant_scales_sbuf_list[bxs_subtile_idx][:p_bxs_size, 0:1],
             bias=bias_vector[:p_bxs_size, 0:1],
         )
+
+    if sbm != None:
+        sbm.close_scope()  # row_quantization

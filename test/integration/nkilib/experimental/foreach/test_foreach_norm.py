@@ -17,7 +17,6 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.foreach.foreach_norm import (
     l1_norm_kernel,
     l2_norm_kernel,
@@ -28,6 +27,7 @@ from nkilib_src.nkilib.experimental.foreach.foreach_norm_torch import (
     l2_norm_torch_ref,
     linf_norm_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator

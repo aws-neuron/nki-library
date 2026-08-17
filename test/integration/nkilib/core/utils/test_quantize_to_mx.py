@@ -21,13 +21,13 @@ via UnitTestFramework (end-to-end on Trainium).
 from typing import final
 
 import neuron_dtypes as dt
-import neuronxcc.nki.typing as nt
+import neuronxcc.nki.typing as nt  # ty: ignore[unresolved-import]
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils import mx_torch_common
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -41,7 +41,7 @@ def quantize_mx_kernel(
     src_hbm: nl.ndarray,
     out_data_hbm: nt.mutable_tensor,
     out_scale_hbm: nt.mutable_tensor,
-) -> None:
+) -> tuple[nt.mutable_tensor, nt.mutable_tensor]:
     """Quantize input to MX x4 format via nisa.quantize_mx.
 
     Output dtype is inferred from out_data_hbm.dtype.
@@ -56,7 +56,8 @@ def quantize_mx_kernel(
         out_scale_hbm (nt.mutable_tensor): [P, F//4], uint8 scale output in HBM.
 
     Returns:
-        None (outputs written in-place via nisa.dma_copy).
+        (out_data_hbm, out_scale_hbm): the same output tensors passed in, written
+        in-place via nisa.dma_copy and returned so the compiler IR gets output names.
 
     Notes:
         - P must be divisible by 32 for nisa.quantize_mx, max 128.
@@ -97,13 +98,16 @@ def quantize_mx_kernel(
 
     dst_data_sb = nl.ndarray((P, F // 4), dtype=out_x4_dtype, buffer=nl.sbuf)
     dst_scale_sb = nl.ndarray((P, F // 4), dtype=nl.uint8, buffer=nl.sbuf)
+    # nisa.quantize_mx writes only 4 of 32 scale partitions per quadrant; zero-init so the
+    # unwritten padding reads as 0 (matching the golden reference) rather than an uninitialized value.
+    nisa.memset(dst_scale_sb, value=0)
     nisa.quantize_mx(src=src_sb, dst=dst_data_sb, dst_scale=dst_scale_sb)
 
     nisa.dma_copy(dst=out_data_hbm, src=dst_data_sb)
     nisa.dma_copy(dst=out_scale_hbm, src=dst_scale_sb)
 
     # Explicitly return the mutable output tensors so the compiler generates
-    # proper output_names in the KLIR/penguin IR.
+    # proper output_names in the compiler IR.
     return out_data_hbm, out_scale_hbm
 
 
@@ -171,7 +175,6 @@ class TestQuantizeToMxHardware:
             test_config=None,
             compiler_args=CompilerArgs(
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             rtol=2e-2,
             atol=1e-5,

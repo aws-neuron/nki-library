@@ -20,10 +20,10 @@ from dataclasses import dataclass
 import neuron_dtypes as ndtype
 import numpy as np
 import numpy.typing as npt
-from neuronxcc.nki._private.test import mx_util
-
+from neuronxcc.nki._private.test import mx_util  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
 from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import DGT_MIN_K
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.integration.nkilib.experimental.matmul_mxfp8.utils import (
     resize_scales_compact_to_oversized_2d,

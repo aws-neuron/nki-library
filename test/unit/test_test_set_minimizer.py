@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from ..utils.test_set_minimizer import (
+    Arc,
     MinimizationResult,
     _lookup,
     load_csv_metric,
@@ -38,7 +39,7 @@ class TestGreedyAlgorithm:
 
     def test_picks_higher_arcs_per_second(self):
         # Both cover the same number of arcs but A is 2x faster.
-        test_arcs = {"A": {(1, 1, 2), (1, 2, 3), (1, 3, 4)}, "B": {(1, 4, 5)}}
+        test_arcs = {"A": {Arc(1, 1, 2), Arc(1, 2, 3), Arc(1, 3, 4)}, "B": {Arc(1, 4, 5)}}
         durations = {"A": 1.0, "B": 2.0}
         result = minimize_test_set(test_arcs, durations)
         # A picked first (3 arcs / 1s vs 1 arc / 2s).
@@ -46,7 +47,7 @@ class TestGreedyAlgorithm:
 
     def test_drops_redundant_test(self):
         # B is a strict subset of A — never picked.
-        test_arcs = {"A": {(1, 1, 2), (1, 2, 3)}, "B": {(1, 1, 2)}}
+        test_arcs = {"A": {Arc(1, 1, 2), Arc(1, 2, 3)}, "B": {Arc(1, 1, 2)}}
         durations = {"A": 1.0, "B": 1.0}
         result = minimize_test_set(test_arcs, durations)
         chosen_ids = {c.nodeid for c in result.chosen}
@@ -56,8 +57,8 @@ class TestGreedyAlgorithm:
     def test_keeps_one_slow_when_uniquely_covers(self):
         # Slow test owns the only path to arc (1, 9, 9).
         test_arcs = {
-            "fast_a": {(1, 1, 2)},
-            "slow_unique": {(1, 9, 9)},
+            "fast_a": {Arc(1, 1, 2)},
+            "slow_unique": {Arc(1, 9, 9)},
         }
         durations = {"fast_a": 1.0, "slow_unique": 60.0}
         result = minimize_test_set(test_arcs, durations)
@@ -67,9 +68,9 @@ class TestGreedyAlgorithm:
     def test_replaces_one_slow_with_many_fast(self):
         # A=60s covers {1,2,3}; B+C=20s covers {1,2,3} together — pick B+C.
         test_arcs = {
-            "A": {(1, 1, 2), (1, 2, 3), (1, 3, 4)},
-            "B": {(1, 1, 2), (1, 2, 3)},
-            "C": {(1, 3, 4)},
+            "A": {Arc(1, 1, 2), Arc(1, 2, 3), Arc(1, 3, 4)},
+            "B": {Arc(1, 1, 2), Arc(1, 2, 3)},
+            "C": {Arc(1, 3, 4)},
         }
         durations = {"A": 60.0, "B": 10.0, "C": 10.0}
         result = minimize_test_set(test_arcs, durations)
@@ -82,7 +83,7 @@ class TestGreedyAlgorithm:
         # from the analysis (neither chosen nor redundant) and reported. Its
         # arcs leave the universe entirely, so uncovered_arcs stays empty —
         # the missing_duration set is the signal to rerun.
-        test_arcs = {"A": {(1, 1, 2)}, "B": {(1, 2, 3)}}
+        test_arcs = {"A": {Arc(1, 1, 2)}, "B": {Arc(1, 2, 3)}}
         durations = {"A": 1.0}  # B missing
         result = minimize_test_set(test_arcs, durations)
         assert result.missing_duration == {"B"}
@@ -92,7 +93,7 @@ class TestGreedyAlgorithm:
 
     def test_redundant_tests_reported(self):
         # B is a strict subset of A and has a duration → redundant, not chosen.
-        test_arcs = {"A": {(1, 1, 2), (1, 2, 3)}, "B": {(1, 1, 2)}}
+        test_arcs = {"A": {Arc(1, 1, 2), Arc(1, 2, 3)}, "B": {Arc(1, 1, 2)}}
         durations = {"A": 1.0, "B": 1.0}
         result = minimize_test_set(test_arcs, durations)
         assert {c.nodeid for c in result.chosen} == {"A"}
@@ -100,7 +101,7 @@ class TestGreedyAlgorithm:
         assert not result.missing_duration
 
     def test_total_duration_sums_chosen(self):
-        test_arcs = {"A": {(1, 1, 2)}, "B": {(1, 2, 3)}, "C": {(1, 3, 4)}}
+        test_arcs = {"A": {Arc(1, 1, 2)}, "B": {Arc(1, 2, 3)}, "C": {Arc(1, 3, 4)}}
         durations = {"A": 1.0, "B": 2.0, "C": 4.0}
         result = minimize_test_set(test_arcs, durations)
         assert result.total_duration_s == sum(c.duration_s for c in result.chosen)
@@ -112,7 +113,7 @@ class TestGreedyAlgorithm:
         assert result.total_duration_s == 0.0
 
     def test_returns_minimization_result_instance(self):
-        result = minimize_test_set({"A": {(1, 1, 2)}}, {"A": 1.0})
+        result = minimize_test_set({"A": {Arc(1, 1, 2)}}, {"A": 1.0})
         assert isinstance(result, MinimizationResult)
 
     def test_chosen_set_and_order_stable_across_dict_orderings(self):
@@ -120,14 +121,14 @@ class TestGreedyAlgorithm:
         # not depend on dict insertion order. A, B, C all have score =
         # 1 arc / 1 sec.
         arcs_in_order_1 = {
-            "A": {(1, 1, 2)},
-            "B": {(1, 2, 3)},
-            "C": {(1, 3, 4)},
+            "A": {Arc(1, 1, 2)},
+            "B": {Arc(1, 2, 3)},
+            "C": {Arc(1, 3, 4)},
         }
         arcs_in_order_2 = {
-            "C": {(1, 3, 4)},
-            "A": {(1, 1, 2)},
-            "B": {(1, 2, 3)},
+            "C": {Arc(1, 3, 4)},
+            "A": {Arc(1, 1, 2)},
+            "B": {Arc(1, 2, 3)},
         }
         durations = {"A": 1.0, "B": 1.0, "C": 1.0}
         r1 = minimize_test_set(arcs_in_order_1, durations)
@@ -147,7 +148,7 @@ class TestMemoryTiebreak:
     def test_lighter_test_wins_a_tie(self):
         # Both cover the same single arc at the same cost — equal score.
         # The lower-memory test should be chosen.
-        test_arcs = {"heavy": {(1, 1, 2)}, "light": {(1, 1, 2)}}
+        test_arcs = {"heavy": {Arc(1, 1, 2)}, "light": {Arc(1, 1, 2)}}
         durations = {"heavy": 1.0, "light": 1.0}
         peak = {"heavy": 3000.0, "light": 500.0}
         result = minimize_test_set(test_arcs, durations, peak_memory_mb=peak)
@@ -157,7 +158,7 @@ class TestMemoryTiebreak:
     def test_heavy_test_still_eligible_and_chosen_when_unique(self):
         # A high-memory test that uniquely covers an arc is NOT excluded —
         # memory is not a cap. Both arcs must be covered.
-        test_arcs = {"light": {(1, 1, 2)}, "heavy_uniq": {(1, 4, 5)}}
+        test_arcs = {"light": {Arc(1, 1, 2)}, "heavy_uniq": {Arc(1, 4, 5)}}
         durations = {"light": 1.0, "heavy_uniq": 1.0}
         peak = {"light": 500.0, "heavy_uniq": 3000.0}
         result = minimize_test_set(test_arcs, durations, peak_memory_mb=peak)
@@ -168,7 +169,7 @@ class TestMemoryTiebreak:
     def test_memory_does_not_override_score(self):
         # A heavier test with a strictly better arcs/sec score still wins —
         # memory only matters on an exact score tie.
-        test_arcs = {"heavy_better": {(1, 1, 2), (1, 2, 3)}, "light_worse": {(1, 1, 2)}}
+        test_arcs = {"heavy_better": {Arc(1, 1, 2), Arc(1, 2, 3)}, "light_worse": {Arc(1, 1, 2)}}
         durations = {"heavy_better": 1.0, "light_worse": 1.0}
         peak = {"heavy_better": 3000.0, "light_worse": 100.0}
         result = minimize_test_set(test_arcs, durations, peak_memory_mb=peak)
@@ -178,7 +179,7 @@ class TestMemoryTiebreak:
     def test_no_peak_memory_falls_back_to_nodeid_order(self):
         # Without peak data, an exact tie breaks by sorted nodeid (the
         # deterministic default) — "A" before "B".
-        test_arcs = {"B": {(1, 1, 2)}, "A": {(1, 1, 2)}}
+        test_arcs = {"B": {Arc(1, 1, 2)}, "A": {Arc(1, 1, 2)}}
         durations = {"A": 1.0, "B": 1.0}
         result = minimize_test_set(test_arcs, durations, peak_memory_mb=None)
         assert {c.nodeid for c in result.chosen} == {"A"}
@@ -186,7 +187,7 @@ class TestMemoryTiebreak:
     def test_missing_memory_entry_does_not_exclude(self):
         # A test absent from the peak dict is still fully eligible; it just
         # doesn't win ties on memory.
-        test_arcs = {"measured": {(1, 1, 2)}, "unmeasured": {(1, 4, 5)}}
+        test_arcs = {"measured": {Arc(1, 1, 2)}, "unmeasured": {Arc(1, 4, 5)}}
         durations = {"measured": 1.0, "unmeasured": 1.0}
         peak = {"measured": 500.0}  # unmeasured intentionally absent
         result = minimize_test_set(test_arcs, durations, peak_memory_mb=peak)
@@ -204,7 +205,7 @@ class TestMandatoryInclusion:
 
     def test_mandatory_test_force_included(self):
         # B is strictly redundant with A but mandatory keeps it.
-        test_arcs = {"A": {(1, 1, 2), (1, 2, 3)}, "B": {(1, 1, 2)}}
+        test_arcs = {"A": {Arc(1, 1, 2), Arc(1, 2, 3)}, "B": {Arc(1, 1, 2)}}
         durations = {"A": 1.0, "B": 1.0}
         result = minimize_test_set(test_arcs, durations, mandatory={"B"})
         chosen_ids = {c.nodeid for c in result.chosen}
@@ -213,9 +214,9 @@ class TestMandatoryInclusion:
     def test_mandatory_arcs_removed_before_greedy(self):
         # After mandatory adds A, the greedy shouldn't pick C (already covered).
         test_arcs = {
-            "A": {(1, 1, 2), (1, 2, 3)},
-            "C": {(1, 1, 2)},  # subset of A
-            "D": {(1, 9, 9)},  # genuinely new arc
+            "A": {Arc(1, 1, 2), Arc(1, 2, 3)},
+            "C": {Arc(1, 1, 2)},  # subset of A
+            "D": {Arc(1, 9, 9)},  # genuinely new arc
         }
         durations = {"A": 1.0, "C": 0.5, "D": 1.0}
         result = minimize_test_set(test_arcs, durations, mandatory={"A"})
@@ -224,7 +225,7 @@ class TestMandatoryInclusion:
 
     def test_unknown_mandatory_nodeid_ignored(self):
         # Nodeid in mandatory but not in test_arcs — silently skipped.
-        test_arcs = {"A": {(1, 1, 2)}}
+        test_arcs = {"A": {Arc(1, 1, 2)}}
         durations = {"A": 1.0}
         result = minimize_test_set(test_arcs, durations, mandatory={"does_not_exist"})
         chosen_ids = {c.nodeid for c in result.chosen}
@@ -272,7 +273,7 @@ class TestLoadPerTestArcs:
             },
         )
         cov = load_per_test_arcs(db, "widget")
-        test_arcs, all_arcs, outcomes = cov.test_arcs, cov.all_arcs, cov.test_outcomes
+        test_arcs, all_arcs, _ = cov.test_arcs, cov.all_arcs, cov.test_outcomes
         assert len(test_arcs) == 2  # test_a and test_b
         assert all(nodeid in test_arcs for nodeid in ("test_a", "test_b"))
         assert all_arcs  # something landed

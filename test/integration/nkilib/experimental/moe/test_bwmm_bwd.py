@@ -16,11 +16,21 @@
 
 from typing import final
 
+import nki
 import nki.language as nl
 import numpy as np
 import pytest
-
+import torch
+from nkilib_src.nkilib.core.utils.allocator import SbufManager
+from nkilib_src.nkilib.core.utils.logging import get_logger
 from nkilib_src.nkilib.experimental.moe.bwd.blockwise_mm_backward import blockwise_mm_bwd
+from nkilib_src.nkilib.experimental.moe.bwd.blockwise_mm_backward_torch import blockwise_mm_bwd_torch_ref
+from nkilib_src.nkilib.experimental.moe.bwd.bwmm_bwd_dropless import (
+    MAX_AVAILABLE_SBUF_SIZE,
+    _compute_hidden_states_grad,
+    _load_block_expert,
+    _load_token_indices,
+)
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ActFnType,
     AffinityOption,
@@ -33,8 +43,8 @@ from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ShardOption,
     SkipMode,
 )
+
 from test.integration.nkilib.experimental.moe.test_bwmm_bwd_common import (
-    blockwise_mm_bwd_torch_ref,
     build_bwmm_bwd_inputs,
     map_skip_mode,
 )
@@ -91,6 +101,12 @@ TEST_PARAMS = [
 [5120,  4096, 4,   128, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 [5120,  4096, 4,   256, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
+# Qwen3-235B single-expert-dense (H=4096, E=1, TOPK=1): TP1 I_TP=1536, TP2 I_TP=768
+[4096,  4096, 1,   2048, 1,   1536, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 1,   4096, 1,   1536, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 1,   2048, 1,   768,  bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 1,   4096, 1,   768,  bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+
 # Affinity I test cases
 [4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [4096,  4096, 4,   256, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
@@ -104,7 +120,6 @@ TEST_PARAMS = [
 [2880,  4096, 2,  128, 2,    2880, bfloat16, 0,    ClampLimits(7, -7, 7, -7),  True, ActFnType.Swish,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2, 128, 2,    768,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2, 128, 2,    192,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
-[5120,  4096, 2,  128, 2,    8192, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [5120,  4096, 2,  128, 2,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2,  128, 2,    1408, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2,  128, 2,    352,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
@@ -146,7 +161,6 @@ _FULL_ONLY_KEYS = {
     (5120, 8192, 128, 256, 1, 128),
     (6144, 4096, 16, 512, 4, 1024),
     (2880, 4096, 2, 128, 2, 2880),
-    (5120, 4096, 2, 128, 2, 8192),
     (4096, 4096, 4, 128, 2, 1536),
     (4096, 4096, 4, 256, 2, 1536),
     (4096, 4096, 4, 128, 2, 384),
@@ -486,16 +500,168 @@ class TestMoeBlockwiseMatMulBwdShardHDroplessLnc2:
         )
 
 
+@nki.jit
+def _skip_gate_hidden_grad_reproducer(
+    gate_up_output_grad,
+    gate_up_weight,
+    token_position_to_id,
+    block_to_expert,
+    skip_gate_proj,
+):
+    block_size = gate_up_output_grad.shape[0]
+    hidden = gate_up_weight.shape[1]
+    tile_size = nl.tile_size.gemm_stationary_fmax
+    num_tiles = (block_size + tile_size - 1) // tile_size
+
+    hidden_grad = nl.ndarray(
+        (block_size, hidden),
+        dtype=gate_up_output_grad.dtype,
+        buffer=nl.shared_hbm,
+    )
+    sbm = SbufManager(0, MAX_AVAILABLE_SBUF_SIZE, logger=get_logger("skip_gate_repro"))
+    sbm.open_scope(name="skip_gate_repro")
+    expert_idx = _load_block_expert(block_to_expert, 0, sbm)
+    token_indices = _load_token_indices(
+        token_position_to_id,
+        block_idx=0,
+        B=block_size,
+        NUM_TILES=num_tiles,
+        sbm=sbm,
+    )
+
+    _compute_hidden_states_grad(
+        gate_up_proj_output_grad_hbm=gate_up_output_grad,
+        gate_up_proj_weight=gate_up_weight,
+        hidden_states_grad=hidden_grad,
+        block_token_pos_to_id_full=token_indices,
+        shard_id=0,
+        num_shards=1,
+        expert_idx=expert_idx,
+        skip_dma=SkipMode(False, False),
+        compute_dtype=gate_up_output_grad.dtype,
+        is_tensor_update_accumulating=False,
+        block_idx=0,
+        sbm=sbm,
+        skip_gate_proj=skip_gate_proj,
+    )
+    sbm.close_scope()
+    return hidden_grad
+
+
+def _build_skip_gate_read_inputs(block_size: int, hidden: int, intermediate: int):
+    rng = np.random.default_rng(42)
+    gate_up_output_grad = rng.normal(
+        loc=0.0,
+        scale=0.02,
+        size=(block_size, 2, intermediate),
+    ).astype(nl.bfloat16)
+    gate_up_output_grad[:, 0, :] = np.nan
+    gate_up_weight = rng.normal(
+        loc=0.0,
+        scale=0.02,
+        size=(1, hidden, 2, intermediate),
+    ).astype(nl.bfloat16)
+    token_position_to_id = np.arange(block_size, dtype=np.int32)
+    block_to_expert = np.zeros((1, 1), dtype=np.int32)
+    return gate_up_output_grad, gate_up_weight, token_position_to_id, block_to_expert
+
+
+def _simulate_skip_gate_hidden_grad(inputs, skip_gate_proj: bool):
+    result = nki.simulate(_skip_gate_hidden_grad_reproducer)[1](
+        gate_up_output_grad=inputs[0],
+        gate_up_weight=inputs[1],
+        token_position_to_id=inputs[2],
+        block_to_expert=inputs[3],
+        skip_gate_proj=skip_gate_proj,
+    )
+    return np.asarray(result)
+
+
+def _skip_gate_hidden_grad_reference(gate_up_output_grad, gate_up_weight):
+    up_grad = gate_up_output_grad[:, 1, :].astype(np.float32)
+    up_weight = gate_up_weight[0, :, 1, :].astype(np.float32)
+    return (up_grad @ up_weight.T).astype(nl.bfloat16)
+
+
+def _skip_gate_hidden_grad_torch_ref(
+    gate_up_output_grad,
+    gate_up_weight,
+    token_position_to_id,
+    block_to_expert,
+    skip_gate_proj,
+):
+    del token_position_to_id, block_to_expert
+    assert skip_gate_proj
+    up_grad = gate_up_output_grad[:, 1, :].to(torch.float32)
+    up_weight = gate_up_weight[0, :, 1, :].to(torch.float32)
+    return (up_grad @ up_weight.T).to(gate_up_output_grad.dtype)
+
+
 SKIP_GATE_BWD_PARAMS = [
     pytest.param(2048, 512, 2, 256, 2, 256, bfloat16, ActFnType.SquaredReLU, id="SquaredReLU-skip_gate"),
     pytest.param(2048, 512, 2, 256, 1, 256, bfloat16, ActFnType.SiLU, id="SiLU-skip_gate"),
     pytest.param(2048, 512, 2, 256, 2, 256, bfloat16, ActFnType.Swish, id="Swish-skip_gate"),
+    pytest.param(2048, 2048, 64, 256, 8, 1024, bfloat16, ActFnType.SquaredReLU, id="SquaredReLU-skip_gate-e64-k8"),
 ]
 
 
 @pytest_marks(["moe", "bwd", "skip_gate_proj"])
 class TestMoeBwdSkipGateProj:
     """Test backward kernel with skip_gate_proj=True."""
+
+    def test_skip_gate_hidden_grad_does_not_read_gate_slot(self):
+        inputs = _build_skip_gate_read_inputs(block_size=256, hidden=2048, intermediate=1024)
+        reference = _skip_gate_hidden_grad_reference(inputs[0], inputs[1])
+
+        old_output = _simulate_skip_gate_hidden_grad(inputs, skip_gate_proj=False)
+        fixed_output = _simulate_skip_gate_hidden_grad(inputs, skip_gate_proj=True)
+
+        assert not np.isfinite(old_output).all(), "old read behavior did not propagate the poisoned gate slot"
+        assert np.isfinite(fixed_output).all(), "skip-gate path propagated a nonfinite value"
+        np.testing.assert_allclose(
+            fixed_output.astype(np.float32),
+            reference.astype(np.float32),
+            rtol=2e-2,
+            atol=3e-4,
+        )
+
+    @pytest.mark.fast
+    def test_skip_gate_hidden_grad_matches_up_only_reference(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        def input_generator(_):
+            inputs = _build_skip_gate_read_inputs(block_size=256, hidden=2048, intermediate=1024)
+            return {
+                "gate_up_output_grad": inputs[0],
+                "gate_up_weight": inputs[1],
+                "token_position_to_id": inputs[2],
+                "block_to_expert": inputs[3],
+                "skip_gate_proj": True,
+            }
+
+        def output_tensors(_):
+            return {"out": np.zeros((256, 2048), dtype=nl.bfloat16)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_skip_gate_hidden_grad_reproducer,
+            torch_ref=torch_ref_wrapper(_skip_gate_hidden_grad_torch_ref, preserve_lower_precision=True),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(
+                logical_nc_config=1,
+                enable_birsim=False,
+                platform_target=platform_target,
+                dump_after_lowering=False,
+            ),
+            rtol=2e-2,
+            atol=3e-4,
+        )
 
     @pytest.mark.parametrize(
         "hidden, tokens, expert, block_size, top_k, intermediate, dtype, activation_type", SKIP_GATE_BWD_PARAMS

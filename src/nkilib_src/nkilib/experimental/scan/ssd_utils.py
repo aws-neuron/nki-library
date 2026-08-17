@@ -63,12 +63,10 @@ def transpose_row_to_column(row: nl.ndarray, seq_len: int) -> nl.ndarray:
     Returns:
         nl.ndarray: [seq_len, 1], SBUF tensor (column in partition dimension).
     """
-    padded = nl.ndarray((seq_len, seq_len), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=padded[0:1, 0:seq_len], src=row[0:1, 0:seq_len])
-    transposed_psum = nl.ndarray((seq_len, seq_len), dtype=nl.float32, buffer=nl.psum)
+    transposed_psum = nl.ndarray((seq_len, 1), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(
-        dst=transposed_psum[0:seq_len, 0:seq_len],
-        data=padded[0:seq_len, 0:seq_len],
+        dst=transposed_psum[0:seq_len, 0:1],
+        data=row[0:1, 0:seq_len],
     )
     column = nl.ndarray((seq_len, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=column[0:seq_len, 0:1], src=transposed_psum[0:seq_len, 0:1])

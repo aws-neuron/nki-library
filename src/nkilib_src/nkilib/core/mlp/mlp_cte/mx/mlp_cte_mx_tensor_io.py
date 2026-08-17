@@ -25,6 +25,7 @@ from ....utils.tiled_range import TiledRange
 from ...mlp_parameters import (
     MLPParameters,
     mlpp_has_dma_xpose,
+    mlpp_input_has_mx_block_scale,
     mlpp_input_has_packed_scale,
 )
 from ..mlp_cte_constants import MlpBxsIndices, MLPCTEConstants
@@ -93,6 +94,8 @@ def load_hidden_tensor_tile(
                     :H_SUBTILE_SIZE,
                     :h_subtile_count,
                 ],
+                dge_mode=nisa.dge_mode.hwdge,
+                engine=nisa.engine.sync if h_tile.index % 2 == 0 else nisa.engine.scalar,
             )
 
 
@@ -193,6 +196,97 @@ def load_packed_hidden_scales(
             )
 
 
+def load_mx_block_hidden_scales(
+    mlp_params: MLPParameters,
+    tile_info: MLPCTEMXTileInfo,
+    constants: MLPCTEConstants,
+    indices: MlpBxsIndices,
+    output_tile_scales_sbuf_list: list[nl.NkiTensor],
+    sbm: SbufManager,
+):
+    """Load MX per-block scales from the packed hidden tensor (rmsnorm_mx_prefill format).
+
+    The hidden tensor layout is [B, S, H + n_packed*128] in fp8. The scale region starts at
+    offset H and contains n_packed contiguous 128-wide blocks (each holding 4 H512 tiles in
+    quadrant-fold packing). Transposes [BxS, 128_H] into [128_H, n_packed, BxS] in SBUF.
+
+    Uses DMA copy (flat) to load scale bytes into a staging SBUF (128 tokens at a time due to
+    SBUF partition limit), then PE transpose (nc_transpose with fp8_e5m2 view) through PSUM to
+    the final scale buffer. dma_transpose requires 2-byte dtype so cannot handle uint8 directly;
+    nc_transpose supports fp8_e5m2 (1-byte) with a stride-of-2 output constraint.
+    """
+    bxs_dim_tile = tile_info.src_proj_bxs_dim_tile
+    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size  # 256
+    TILE_H = nl.tile_size.pmax  # 128
+    PMAX = nl.tile_size.pmax  # 128 — max partition dimension for SBUF
+    _FP8_TP_OUT_STEP = 2  # PE fp8 transpose output interleave factor
+    _UINT8_TP_VIEW_DTYPE = nl.float8_e5m2  # Same byte width as uint8
+
+    n_H512 = mlp_params.hidden_size // 512
+    n_packed = math.ceil(n_H512 / 4)
+
+    bxs_tiles = TiledRange(constants.get_bxs_size(mlp_params), bxs_dim_tile.tile_size)
+    current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
+    tensor_bxs_offset = constants.get_bxs_offset()
+
+    hidden_size_hbm = mlp_params.hidden_tensor.shape[-1]
+    scale_region_size = n_packed * TILE_H  # Total scale bytes per token row
+
+    # Staging SBUF: partition dim is capped at 128 (PMAX), so we process 128 tokens at a time.
+    stack_alloc = sbm.alloc_stack if sbm else nl.NkiTensor
+    staging_sbuf = stack_alloc(
+        (PMAX, scale_region_size),
+        dtype=_UINT8_TP_VIEW_DTYPE,
+        buffer=nl.sbuf,
+        name=indices.get_tensor_name('mx_scale_staging', ''),
+    )
+
+    # PSUM buffer for PE transpose: [128_H, 1, 128_BxS, 2_interleave]
+    scale_psum = nl.ndarray(
+        (TILE_H, 1, PMAX, _FP8_TP_OUT_STEP),
+        dtype=_UINT8_TP_VIEW_DTYPE,
+        buffer=nl.psum,
+    )
+
+    for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):
+        # Process 128 tokens at a time (SBUF partition limit)
+        for chunk in TiledRange(bxs_subtile.size, PMAX):
+            chunk_bxs_offset = bxs_subtile.start_offset + chunk.start_offset
+
+            # Step 1: DMA copy scale bytes from HBM → staging SBUF (flat, no transpose)
+            nisa.dma_copy(
+                src=mlp_params.hidden_tensor.ap(
+                    pattern=[
+                        [hidden_size_hbm, chunk.size],
+                        [1, scale_region_size],
+                    ],
+                    dtype=_UINT8_TP_VIEW_DTYPE,
+                    offset=(tensor_bxs_offset + chunk_bxs_offset) * hidden_size_hbm + mlp_params.hidden_size,
+                ),
+                dst=staging_sbuf[: chunk.size, :scale_region_size],
+            )
+
+            # Step 2: PE transpose each pack block [chunk_size, 128] → [128, chunk_size] via PSUM
+            for pack_idx in range(n_packed):
+                nisa.nc_transpose(
+                    data=staging_sbuf.ap(
+                        pattern=[[scale_region_size, chunk.size], [1, TILE_H]],
+                        offset=pack_idx * TILE_H,
+                        dtype=_UINT8_TP_VIEW_DTYPE,
+                    ),
+                    dst=scale_psum[:, 0, : chunk.size, 0],
+                )
+                # Step 3: Copy from PSUM to final scale buffer at the correct BxS offset
+                nisa.tensor_copy(
+                    src=scale_psum[:, 0, : chunk.size, 0],
+                    dst=output_tile_scales_sbuf_list[bxs_subtile.index].ap(
+                        pattern=[[n_packed * BXS_SUBTILE_SIZE, TILE_H], [1, chunk.size]],
+                        offset=pack_idx * BXS_SUBTILE_SIZE + chunk.start_offset,
+                        dtype=_UINT8_TP_VIEW_DTYPE,
+                    ),
+                )
+
+
 def store_hidden_tensor_tile(
     mlp_params: MLPParameters,
     tile_info: MLPCTEMXTileInfo,
@@ -260,12 +354,15 @@ def load_hidden_tensor_tile_and_scales(
     indices: MlpBxsIndices,
     output_tile_sbuf_list: list[nl.NkiTensor],
     output_tile_scales_sbuf_list: Optional[nl.NkiTensor],
+    sbm: SbufManager = None,
 ):
     if mlpp_has_dma_xpose(mlp_params):
         load_and_transpose_hidden_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
     else:
         load_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
-    if mlpp_input_has_packed_scale(mlp_params):
+    if mlpp_input_has_mx_block_scale(mlp_params):
+        load_mx_block_hidden_scales(mlp_params, tile_info, constants, indices, output_tile_scales_sbuf_list, sbm)
+    elif mlpp_input_has_packed_scale(mlp_params):
         load_packed_hidden_scales(mlp_params, tile_info, constants, indices, output_tile_scales_sbuf_list)
 
 
@@ -274,24 +371,13 @@ def load_source_projection_weight_scales(
     tile_info: MLPCTEMXTileInfo,
     constants: MLPCTEConstants,
     src_proj_scales_hbm: nl.NkiTensor,
-    sbm: SbufManager,
-    tensor_name: str,
+    src_proj_scales_sbuf: nl.NkiTensor,
 ) -> nl.NkiTensor:
-    alloc_heap = sbm.alloc_heap if sbm else nl.NkiTensor
-
     if mlp_params.quant_params.is_quant_row_mx():
         int_dim_tile = tile_info.intermediate_dim_tile
         INT_TILE_COUNT = int_dim_tile.tile_count  # I / 512
         INT_SUBTILE_SIZE = int_dim_tile.subtile_dim_info.tile_size  # 4
         INT_SUBTILE_COUNT = int_dim_tile.subtile_dim_info.tile_count  # 128
-
-        src_proj_scales_sbuf = alloc_heap(
-            (INT_SUBTILE_COUNT, INT_TILE_COUNT, INT_SUBTILE_SIZE),
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-            name=tensor_name,
-            align=16,
-        )
 
         nisa.dma_copy(
             dst=src_proj_scales_sbuf[:INT_SUBTILE_COUNT, :INT_TILE_COUNT, :INT_SUBTILE_SIZE],
@@ -314,37 +400,47 @@ def load_source_projection_weight_scales(
         QUADRANT_SIZE = 32
         PARTITIONS_PER_SLOT = 4  # how many partitions to load per quadrant
         NUM_SLOTS = 4
-
-        src_proj_scales_sbuf = alloc_heap(
-            (H_SUBTILE_COUNT, math.ceil(H_TILE_COUNT / NUM_SLOTS), mlp_params.intermediate_size),
-            dtype=nl.uint8,
-            buffer=nl.sbuf,
-            name=tensor_name,
-        )
-        # Scale HBM shape: [16, H/512, I/512, 4, 128] — already in physical I order
-        src_proj_scales_hbm_view = src_proj_scales_hbm.reshape(
-            (
-                src_proj_scales_hbm.shape[0],
-                H_TILE_COUNT,
-                src_proj_scales_hbm.shape[2] * I_SUBTILE_SIZE * I_SUBTILE_COUNT,
-            )
-        )
         I_SHARD_OFFSET = constants.get_intermediate_offset()
-        for quadrant_idx in range(math.ceil(H_SUBTILE_COUNT / QUADRANT_SIZE)):
-            for h_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):
-                slot_idx = h_tile.index % NUM_SLOTS
-                nisa.dma_copy(
-                    dst=src_proj_scales_sbuf[
-                        nl.ds(quadrant_idx * QUADRANT_SIZE + slot_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
-                        h_tile.index // NUM_SLOTS,
-                        : mlp_params.intermediate_size,
-                    ],
-                    src=src_proj_scales_hbm_view[
-                        nl.ds(quadrant_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
-                        h_tile.index,
-                        nl.ds(I_SHARD_OFFSET, mlp_params.intermediate_size),
-                    ],
+
+        if mlp_params.quant_params.use_folded_mx_scales:
+            # Scales are pre-folded into the physical SBUF layout [128, ceil((H/512)/4), I].
+            # A single DMA fills the whole buffer; only the I dimension is sliced for sharding.
+            nisa.dma_copy(
+                dst=src_proj_scales_sbuf[
+                    :H_SUBTILE_COUNT,
+                    :,
+                    : mlp_params.intermediate_size,
+                ],
+                src=src_proj_scales_hbm[
+                    :H_SUBTILE_COUNT,
+                    :,
+                    nl.ds(I_SHARD_OFFSET, mlp_params.intermediate_size),
+                ],
+            )
+        else:
+            # Scale HBM shape: [16, H/512, I/512, 4, 128] — already in physical I order
+            src_proj_scales_hbm_view = src_proj_scales_hbm.reshape(
+                (
+                    src_proj_scales_hbm.shape[0],
+                    H_TILE_COUNT,
+                    src_proj_scales_hbm.shape[2] * I_SUBTILE_SIZE * I_SUBTILE_COUNT,
                 )
+            )
+            for quadrant_idx in range(math.ceil(H_SUBTILE_COUNT / QUADRANT_SIZE)):
+                for h_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):
+                    slot_idx = h_tile.index % NUM_SLOTS
+                    nisa.dma_copy(
+                        dst=src_proj_scales_sbuf[
+                            nl.ds(quadrant_idx * QUADRANT_SIZE + slot_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
+                            h_tile.index // NUM_SLOTS,
+                            : mlp_params.intermediate_size,
+                        ],
+                        src=src_proj_scales_hbm_view[
+                            nl.ds(quadrant_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
+                            h_tile.index,
+                            nl.ds(I_SHARD_OFFSET, mlp_params.intermediate_size),
+                        ],
+                    )
     return src_proj_scales_sbuf
 
 

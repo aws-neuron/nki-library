@@ -20,20 +20,24 @@ Pure Python -- no NKI, no tracer, no device required.
 
 import inspect
 
+import nki as _nki
+import nki.language as _nl
 import nki.language as nl
 import pytest
 from nki.isa import dge_mode, engine, oob_mode
-
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import (
     contiguous_strides as _contiguous_strides,
 )
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import (
     product,
 )
+from nkilib_src.nkilib.experimental.neurotile.core.factories import tiles as _tiles
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+from nkilib_src.nkilib.experimental.neurotile.core.indexing import element_offset
 from nkilib_src.nkilib.experimental.neurotile.core.layout_hbm import HBMLayout
 from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
 from nkilib_src.nkilib.experimental.neurotile.core.ndslice import BlockStream, NDSlice
+
 from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 
@@ -56,7 +60,7 @@ def make_view(element_shape, tile_size, block_size=None, offset=0):
     # Pad tile_size for batch dims
     if n_batch_dims > 0:
         padded = []
-        for d in range(n_batch_dims):
+        for _d in range(n_batch_dims):
             padded.append(1)
         for d in range(len(tile_size)):
             padded.append(tile_size[d])
@@ -69,7 +73,7 @@ def make_view(element_shape, tile_size, block_size=None, offset=0):
     full_block = None
     if block_size is not None:
         padded_b = []
-        for d in range(n_batch_dims):
+        for _d in range(n_batch_dims):
             padded_b.append(1)
         for d in range(len(block_size)):
             padded_b.append(block_size[d])
@@ -89,7 +93,6 @@ def make_view(element_shape, tile_size, block_size=None, offset=0):
 
 def make_untiled_view(element_shape, offset=0):
     """Create an untiled NDSlice (tensor_view semantics)."""
-    ndim = len(element_shape)
     strides = _contiguous_strides(element_shape)
 
     grid = Grid.from_shape(element_shape, None)
@@ -465,8 +468,8 @@ class TestChainedIndexing:
     def test_sequential_indexing(self):
         """view[0][1] == view[0, 1] in terms of offset."""
         v = make_view((256, 1024), (128, 512))
-        chained = v[0][1]
-        direct = v[0, 1]
+        v[0][1]
+        v[0, 1]
         # Both should reach the same offset
         # v[0]: descend dim 0, element_shape=(128, 1024), offset=0
         # v[0][1]: descend dim 1 of the result... but iter_dim matters
@@ -1468,6 +1471,169 @@ class TestIndirectOffsetCombine:
 
 
 # ============================================================================
+# Runtime element-offset indexing metadata and dispatch
+# ============================================================================
+
+
+@pytest_marks(["neurotile"])
+class TestRuntimeElementOffsetIndexing:
+    @pytest.mark.fast
+    def test_index_stride_elements_on_tile_view(self):
+        view = make_view((512, 2048), (128, 512))
+        assert view.index_stride_elements == (128, 512)
+
+    def test_index_stride_elements_on_block_view(self):
+        view = make_view((512, 2048), (128, 512), block_size=(2, 2))
+        assert view.index_stride_elements == (256, 1024)
+
+    def test_index_stride_elements_after_partial_index(self):
+        view = make_view((512, 2048), (128, 512))
+        row = view[1, :]
+        assert row.index_stride_elements == (512,)
+
+    def test_index_stride_elements_after_selected_block(self):
+        view = make_view((512, 2048), (128, 512), block_size=(2, 2))
+        block = view[0, 0]
+        assert block.index_stride_elements == (128, 512)
+
+    def test_static_element_offset_folds_without_tile_scaling(self):
+        view = make_view((512, 2048), (128, 512))
+        shifted = view[element_offset(128), 0]
+        assert shifted._layout.offset == 128 * 2048
+        assert shifted._layout.indirect is None
+
+    def test_element_offset_is_relative_to_sliced_view(self):
+        view = make_view((512, 2048), (128, 512))
+        tail = view[1:, :]
+        shifted = tail[element_offset(128), 0]
+        assert shifted._layout.offset == (128 + 128) * 2048
+
+    def test_runtime_element_offset_passes_through(self):
+        view = make_view((512, 2048), (128, 512))
+        offset = MockTensor((1, 1), dtype=nl.int32)
+        shifted = view[element_offset(offset), 0]
+        assert shifted._layout.indirect.value is offset
+        assert shifted._layout.indirect.dim == 0
+
+    @pytest.mark.parametrize("shape", [(1,), (1, 1)])
+    def test_runtime_element_offset_accepts_scalar_tensor_shapes(self, shape):
+        view = make_view((512, 2048), (128, 512))
+        offset = MockTensor(shape, dtype=nl.int32)
+        shifted = view[element_offset(offset), 0]
+        assert shifted._layout.indirect.value is offset
+
+    @pytest.mark.parametrize("shape", [(2,), (2, 1), (1, 2)])
+    def test_runtime_element_offset_rejects_vector_tensor_shapes(self, shape):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="tensor value must be an SBUF scalar"):
+            view[element_offset(MockTensor(shape, dtype=nl.int32)), 0]
+
+    @pytest.mark.parametrize(
+        "offset",
+        [
+            True,
+            False,
+            1.0,
+            None,
+            [1],
+            (1,),
+            {"offset": 1},
+            {1},
+            "1",
+            b"1",
+            object(),
+        ],
+    )
+    def test_runtime_element_offset_rejects_invalid_payloads(self, offset):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="nt.element_offset"):
+            view[element_offset(offset), 0]
+
+    @pytest.mark.parametrize("buffer", [nl.shared_hbm, nl.psum])
+    def test_runtime_element_offset_rejects_non_sbuf_tensor(self, buffer):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="tensor value must be an SBUF scalar"):
+            view[element_offset(MockTensor((1, 1), dtype=nl.int32, buffer=buffer)), 0]
+
+    def test_static_element_offset_rejects_negative_offsets(self):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="must be non-negative"):
+            view[element_offset(-1), 0]
+
+    def test_static_element_offset_rejects_out_of_range_offsets(self):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="static offset 512 out of range"):
+            view[element_offset(512), 0]
+
+    def test_static_element_offset_bounds_are_relative_to_sliced_view(self):
+        view = make_view((512, 2048), (128, 512))
+        tail = view[1:, :]
+        with pytest.raises(AssertionError, match="static offset 384 out of range"):
+            tail[element_offset(384), 0]
+
+    def test_runtime_element_offset_accepts_sbuf_scalar_ndslice(self):
+        view = make_view((512, 2048), (128, 512))
+        offset = make_sbuf_view((1, 1))
+        shifted = view[element_offset(offset), 0]
+        assert shifted._layout.indirect.value is offset._layout.source
+
+    def test_runtime_element_offset_rejects_hbm_ndslice(self):
+        view = make_view((512, 2048), (128, 512))
+        offset = make_view((1, 1), (1, 1))
+        with pytest.raises(AssertionError, match="SBUF-backed scalar view"):
+            view[element_offset(offset), 0]
+
+    def test_runtime_element_offset_rejects_vector_sbuf_ndslice(self):
+        view = make_view((512, 2048), (128, 512))
+        offset = make_sbuf_view((1, 2))
+        with pytest.raises(AssertionError, match="value must be scalar-shaped"):
+            view[element_offset(offset), 0]
+
+    def test_runtime_element_offset_rejects_sbuf_target_view(self):
+        view = make_sbuf_view((128, 512))
+        with pytest.raises(AssertionError, match="only supported on HBM-backed views"):
+            view[element_offset(MockTensor((1, 1), dtype=nl.int32)), 0]
+
+    def test_runtime_logical_stride_1_index_does_not_scale(self, monkeypatch):
+        view = make_view((8, 128, 64), (128, 64))
+        logical_index = MockTensor((1, 1), dtype=nl.int32)
+
+        def fail_if_called(value, scale):
+            raise AssertionError("unexpected scaling")
+
+        monkeypatch.setattr(HBMLayout, "_materialize_scaled_scalar_offset", staticmethod(fail_if_called))
+        shifted = view[logical_index, 0, 0]
+        assert shifted._layout.indirect.value is logical_index
+        assert shifted._layout.indirect.dim == 0
+
+    def test_runtime_logical_vector_tensor_index_rejects(self):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="requires an SBUF scalar index"):
+            view[MockTensor((1, 2), dtype=nl.int32), 0]
+
+    def test_runtime_logical_hbm_tensor_index_rejects(self):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="requires an SBUF scalar index"):
+            view[MockTensor((1, 1), dtype=nl.int32, buffer=nl.shared_hbm), 0]
+
+    def test_runtime_logical_sbuf_scalar_index_is_scaled(self, monkeypatch):
+        view = make_view((512, 2048), (128, 512))
+        logical_index = MockTensor((1, 1), dtype=nl.int32)
+        monkeypatch.setattr(
+            HBMLayout,
+            "_materialize_scaled_scalar_offset",
+            staticmethod(lambda value, scale: ("scaled", value, scale)),
+        )
+        shifted = view[logical_index, 0]
+        assert shifted._layout.indirect.value == ("scaled", logical_index, 128)
+
+    def test_runtime_logical_loop_var_with_stride_gt_one_rejects(self):
+        view = make_view((512, 2048), (128, 512))
+        with pytest.raises(AssertionError, match="requires an SBUF scalar index"):
+            view[object(), 0]
+
+
+# ============================================================================
 # N-D SBUF tile_shape computation
 # ============================================================================
 
@@ -1744,13 +1910,6 @@ class TestTolistAlongDim:
             assert child.element_shape[0] == 512
 
 
-import nki as _nki
-import nki.language as _nl
-
-from nkilib_src.nkilib.experimental.neurotile.core.factories import tiles as _tiles
-from test.utils.pytest_test_metadata import pytest_marks
-
-
 @_nki.jit
 def _stream_dim0_probe():
     src = _nl.ndarray((512, 2048), dtype=_nl.float32, buffer=_nl.shared_hbm)
@@ -1847,7 +2006,6 @@ class TestLoadDstRouting:
         from nkilib_src.nkilib.experimental.neurotile.core.layout_hbm import HBMLayout
 
         recorded = []
-        original = HBMLayout.load
 
         def spy(
             self,
@@ -2333,7 +2491,7 @@ class TestTransposedGridShape:
         packed = v._layout.transposed_sbuf_shape_for(v._grid)
         per_tile = v._layout.transposed_tile_size_for(v._grid)
         assert len(packed) == len(per_tile)
-        for whole, one in zip(packed, per_tile):
+        for whole, one in zip(packed, per_tile, strict=True):
             assert one > 0 and whole % one == 0
 
     def test_dst_shape_matches_packed_shape(self):
@@ -2667,7 +2825,7 @@ def _nki_view(shape):
     in place before tiling. Its native .slice/.squeeze_dim/.flatten_dims/
     .reshape_dim chain is what nt.tiles() / nisa ops consume directly now that
     nt.tensor_view is gone."""
-    from nki.language.tensor import NkiTensor
+    from nki.language.tensor import NkiTensor  # ty: ignore[unresolved-import]
 
     return NkiTensor(shape=tuple(shape), dtype="float32", storage=None, buffer=nl.shared_hbm)
 

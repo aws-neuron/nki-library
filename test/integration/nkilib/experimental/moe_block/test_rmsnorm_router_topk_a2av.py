@@ -17,10 +17,10 @@
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import RouterActFnType
 from nkilib_src.nkilib.experimental.moe_block.rmsnorm_router_topk_a2av import rmsnorm_router_topk_a2av
 from nkilib_src.nkilib.experimental.moe_block.rmsnorm_router_topk_a2av_torch import rmsnorm_router_topk_a2av_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator

@@ -14,7 +14,6 @@
 
 import nki.isa as nisa
 import nki.language as nl
-
 from nkilib_src.nkilib.core.moe import moe_tkg
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
@@ -34,10 +33,10 @@ def moe_tkg_sbuf_io_wrapper(
     down_weights_bias: nl.ndarray = None,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
     activation_fn: ActFnType = ActFnType.SiLU,
-    gate_clamp_upper_limit: float = None,
-    gate_clamp_lower_limit: float = None,
-    up_clamp_upper_limit: float = None,
-    up_clamp_lower_limit: float = None,
+    gate_clamp_upper_limit: float | None = None,
+    gate_clamp_lower_limit: float | None = None,
+    up_clamp_upper_limit: float | None = None,
+    up_clamp_lower_limit: float | None = None,
     mask_unselected_experts: bool = False,
 ) -> nl.ndarray:
     """Wrapper to test all-expert MoE with SBUF input."""

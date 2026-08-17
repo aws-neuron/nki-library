@@ -433,7 +433,11 @@ def moe_block_tkg(
             use_column_tiling=True,
             return_eager_affi=False,
             use_PE_broadcast_w_bias=is_mxfp_all_expert and not is_dynamic,
-            shard_on_tokens=True,
+            # Token-sharding is a 2-core (LNC=2) split; router_topk asserts
+            # n_prgs>1 and emits a cross-core sendrecv when it is set. Gate on
+            # n_prgs so the single-core (LNC=1) tiled STATIC_MX path processes
+            # all tokens on the one core (no sendrecv). No-op at LNC=2.
+            shard_on_tokens=(dims.n_prgs > 1),
             skip_store_expert_index=skip_store_expert_index,
             skip_store_router_logits=True,
         )
@@ -650,10 +654,10 @@ def _moe_block_tkg_no_t_tiling(
     else:
         router_x_sb_layout = XSBLayout_tp2013__1
 
-    shard_on_tokens = is_mxfp_all_expert and dims.T > 1
+    shard_on_tokens = dims.n_prgs > 1 and is_mxfp_all_expert and dims.T > 1
     if not expert_config.is_all_expert:
         # shard if selective_expert (non mxfp) will be used for >1 tokens
-        shard_on_tokens = dims.T > 1 and (not quant_config.is_moe_weight_mx)
+        shard_on_tokens = dims.n_prgs > 1 and dims.T > 1 and (not quant_config.is_moe_weight_mx)
 
     router_outputs = _router_topk(
         x=router_in,

@@ -15,13 +15,13 @@
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._04_precision import (
     _01_mixed_precision as mp_mod,
 )
 from nkilib_src.nkilib.experimental.neurotile.examples._04_precision import (
     _01_mixed_precision_torch as mp_refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator

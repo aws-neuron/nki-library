@@ -172,10 +172,10 @@ def max_all_close_with_accuracy(
 
     if not is_finiteness_matching:
         if verbose >= 1:
-            sf += f"ERROR: There are indices with finite-infinite mismatches\n"
+            sf += "ERROR: There are indices with finite-infinite mismatches\n"
 
             if verbose >= 3:
-                indices = zip(*np.where(finiteness_mismatch_tensor))
+                indices = zip(*np.where(finiteness_mismatch_tensor), strict=True)
                 for index in indices:
                     sf += f"{index}: {a[index]} vs {b[index]}\n"
 

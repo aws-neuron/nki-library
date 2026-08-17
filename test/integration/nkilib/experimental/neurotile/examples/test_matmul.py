@@ -16,7 +16,6 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._02_matmul import (
     _01_matmul_patterns as patterns_mod,
 )
@@ -29,6 +28,7 @@ from nkilib_src.nkilib.experimental.neurotile.examples._02_matmul import (
 from nkilib_src.nkilib.experimental.neurotile.examples._02_matmul import (
     _02_matmul_coalesced_torch as coalesced_refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator

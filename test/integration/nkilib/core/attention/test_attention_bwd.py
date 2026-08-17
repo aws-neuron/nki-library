@@ -23,10 +23,10 @@ import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.attention.attention_bwd import attention_bwd
 from nkilib_src.nkilib.core.attention.attention_bwd_torch import attention_bwd_torch_ref, compute_o_lse
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.integration.nkilib.utils.test_kernel_common import convert_to_torch
 from test.utils.common_dataclasses import CompilerArgs, Platforms
@@ -69,7 +69,7 @@ def generate_inputs(
     dtype: Any,
     causal: bool,
     mixed_precision: bool = True,
-    sliding_window: int = -1,
+    sliding_window: Optional[int] = -1,
     num_sinks: int = 0,
     softmax_scale: Optional[float] = None,
     seqlens_list: Optional[list] = None,

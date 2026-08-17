@@ -31,24 +31,25 @@ from typing import Callable, Optional
 
 import torch
 from nki.collectives import ReplicaGroup
-from torch.distributed import ProcessGroup, Work
-
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import (
     SimDistAdapter,
     replica_group_key,
     set_adapter,
 )
+from torch.distributed import ProcessGroup, Work
 
 from .common_dataclasses import (
     CompilerArgs,
     InferenceArgs,
     KernelArgs,
+    NamedCallable,
+    PerRankGenerator,
     PerRankLazyGoldenGenerator,
     PerRankLazyInputGenerator,
     ValidationArgs,
 )
 from .metadata_loader import load_model_configs
-from .metrics_collector import IMetricsCollector
+from .metrics_collector import IMetricsCollector, MetricName
 from .test_orchestrator import Orchestrator
 from .unit_test_framework import (
     check_unused_parameters,
@@ -91,10 +92,13 @@ class _MPSimProcessGroup(ProcessGroup):
         world_size: int,
         coll_dir: str,
         group_id: str,
-        stop_after_call: int = None,
-        global_counter: list = None,
+        global_counter: list,
+        stop_after_call: int | None = None,
     ):
-        super().__init__(rank, world_size)
+        # The base class declares only a longer form whose first parameter is a store. The
+        # two-positional form used here is the one the runtime accepts for a Python subclass;
+        # constructing it the declared way fails at runtime.
+        super().__init__(rank, world_size)  # ty: ignore[missing-argument, invalid-argument-type]
         self._coll_dir = coll_dir
         self._group_id = group_id
         self._call_idx = 0
@@ -105,7 +109,6 @@ class _MPSimProcessGroup(ProcessGroup):
         return os.path.join(self._coll_dir, f"{self._group_id}_c{call_id}_r{r}.pkl")
 
     def _put_and_sync(self, data):
-        call_id = self._call_idx
         self._call_idx += 1
 
         # Use global counter for file naming (consistent across all PGs)
@@ -145,34 +148,43 @@ class _MPSimProcessGroup(ProcessGroup):
                 results[r] = pickle.load(f)
         return results
 
-    def allreduce(self, tensors, opts=None):
+    # The collective methods below override overload sets on the base class: each op declares a
+    # list-of-tensors form and a single-tensor convenience form whose parameters differ in both
+    # name and type. One implementation cannot be compatible with every overload, so the type
+    # checker reports these overrides. They implement the list-based positional form, which is the
+    # only form the collective wrappers and the torch reference kernels dispatch through -- for
+    # example all_reduce calls allreduce([tensor], opts), and all_gather calls
+    # allgather([tensor_list], [tensor], opts). No caller passes these arguments by keyword.
+    def allreduce(self, tensors, opts=None):  # ty: ignore[invalid-method-override]
         call_id = self._put_and_sync(tensors[0].clone())
         data = self._read_all(call_id)
         tensors[0].copy_(sum(data[r] for r in range(self.size())))
         return _SimWork()
 
-    def allgather(self, output_tensors_list, input_tensors, opts=None):
+    def allgather(self, output_tensors_list, input_tensors, opts=None):  # ty: ignore[invalid-method-override]
         call_id = self._put_and_sync(input_tensors[0].clone())
         data = self._read_all(call_id)
         for r in range(self.size()):
             output_tensors_list[0][r].copy_(data[r])
         return _SimWork()
 
-    def reduce_scatter(self, output_tensors, input_tensors_list, opts=None):
+    def reduce_scatter(self, output_tensors, input_tensors_list, opts=None):  # ty: ignore[invalid-method-override]
         call_id = self._put_and_sync([t.clone() for t in input_tensors_list[0]])
         data = self._read_all(call_id)
         result = sum(data[src][self.rank()] for src in range(self.size()))
         output_tensors[0].copy_(result)
         return _SimWork()
 
-    def alltoall(self, output_tensors, input_tensors, opts=None):
+    def alltoall(self, output_tensors, input_tensors, opts=None):  # ty: ignore[invalid-method-override]
         call_id = self._put_and_sync([t.clone() for t in input_tensors])
         data = self._read_all(call_id)
         for r in range(self.size()):
             output_tensors[r].copy_(data[r][self.rank()])
         return _SimWork()
 
-    def alltoall_base(self, output, input, output_split_sizes=None, input_split_sizes=None, opts=None):
+    def alltoall_base(  # ty: ignore[invalid-method-override]
+        self, output, input, output_split_sizes=None, input_split_sizes=None, opts=None
+    ):
         """Variable-length all-to-all (backing dist.all_to_all_single)."""
         if not input_split_sizes:
             chunk_size = input.size(0) // self.size()
@@ -218,7 +230,7 @@ class SimDistRunner:
     MAX_PARALLEL_RANKS = 8  # default; reduced dynamically if per-rank memory is high
     PARALLEL_RANK_MEMORY_THRESHOLD_MB = 500  # if per-rank peak > this, reduce to 4 parallel
 
-    def __init__(self, num_ranks: int, replica_groups: list = None):
+    def __init__(self, num_ranks: int, replica_groups: list | None = None):
         self._num_ranks = num_ranks
         if replica_groups is None:
             replica_groups = [ReplicaGroup([list(range(num_ranks))])]
@@ -349,7 +361,7 @@ class SimDistRunner:
                     p = ctx.Process(target=_worker_record, args=(rank, pass_idx, error_dict))
                     processes.append((rank, p))
                     p.start()
-                for rank, p in processes:
+                for _rank, p in processes:
                     p.join()
                 if p.exitcode and p.exitcode < 0:
                     import signal
@@ -416,7 +428,9 @@ class SimDistRunner:
 # ==================== Validation Helpers ====================
 
 
-def validate_cross_rank_consistency(per_rank_input_generator, rank0_input: dict, num_ranks: int) -> None:
+def validate_cross_rank_consistency(
+    per_rank_input_generator: PerRankGenerator, rank0_input: dict, num_ranks: int
+) -> None:
     """Validate input tensor shapes/dtypes are consistent across all ranks."""
     import numpy as np
 
@@ -481,9 +495,9 @@ class CollectiveUnitTestFramework:
     def __init__(
         self,
         test_manager: Orchestrator,
-        kernel_entry: Callable,
+        kernel_entry: NamedCallable,
         torch_ref: Callable,
-        per_rank_input_generator: Callable[[int], dict],
+        per_rank_input_generator: PerRankGenerator,
         collective_ranks: int,
         check_unused_params: bool = True,
         collector: Optional[IMetricsCollector] = None,
@@ -497,7 +511,9 @@ class CollectiveUnitTestFramework:
         self.torch_ref = torch_ref
         self.per_rank_input_generator = per_rank_input_generator
         self.collective_ranks = collective_ranks
-        self.collector = collector
+        # Default to the orchestrator's collector, which is a NoopMetricsCollector
+        # when metrics are disabled.
+        self.collector = collector if collector is not None else test_manager.collector
 
     def run_test(
         self,
@@ -510,8 +526,10 @@ class CollectiveUnitTestFramework:
         custom_comparator: Optional[Callable] = None,
         metadata: Optional[dict] = None,
         golden_only: bool = False,
+        profile_only: bool = False,
+        input_artifacts_directory: Optional[str] = None,
     ):
-        if self.collector is not None and metadata is not None:
+        if metadata is not None:
             metadata_list = load_model_configs(metadata["config_name"])
             self.collector.match_and_add_metadata_dimensions(metadata["key"], metadata_list)
 
@@ -520,7 +538,7 @@ class CollectiveUnitTestFramework:
         validate_input_keys(rank0_input, self.kernel_entry)
 
         # Cross-rank shape/dtype consistency check
-        if self.collective_ranks >= 2:
+        if self.collective_ranks >= 2 and not profile_only:
             validate_cross_rank_consistency(self.per_rank_input_generator, rank0_input, self.collective_ranks)
 
         # Build per-rank input generator with .must_alias_input filtering
@@ -537,16 +555,23 @@ class CollectiveUnitTestFramework:
             raw_input = self.per_rank_input_generator(rank_id=rank_id)
             return filter_ref_input(raw_input, torch_ref)
 
-        per_rank_ref_inputs = {r: _build_ref_input(r) for r in range(self.collective_ranks)}
+        if not profile_only:
+            per_rank_ref_inputs = {r: _build_ref_input(r) for r in range(self.collective_ranks)}
 
-        def _generate_all_golden():
-            """Lazy: only run multi-process golden gen when first rank is requested."""
-            result = _run_torch_refs_parallel(torch_ref, per_rank_ref_inputs, self.collective_ranks)
-            if custom_comparator is not None:
-                result = {r: custom_comparator(r, g) for r, g in result.items()}
-            return result
+            def _generate_all_golden():
+                """Lazy: only run multi-process golden gen when first rank is requested."""
+                # Time just the reference compute as GoldenComputationTime (the collective
+                # path has no golden cache, so this always runs). The comparator wrapping
+                # below is validation, not golden compute, so it stays outside the timer.
+                with self.collector.timer(MetricName.GOLDEN_COMPUTATION_TIME):
+                    result = _run_torch_refs_parallel(torch_ref, per_rank_ref_inputs, self.collective_ranks)
+                if custom_comparator is not None:
+                    result = {r: custom_comparator(r, g) for r, g in result.items()}
+                return result
 
         if golden_only:
+            if profile_only:
+                raise ValueError("golden_only and profile_only cannot be enabled together")
             return _generate_all_golden()
 
         # Resolve validation args.
@@ -559,7 +584,7 @@ class CollectiveUnitTestFramework:
             TraceMode.CompileOnly,
             TraceMode.TraceOnly,
         )
-        if is_compile_only and output_keys:
+        if profile_only or (is_compile_only and output_keys):
             validation_args = None
         else:
             _cached_golden = {}
@@ -576,7 +601,10 @@ class CollectiveUnitTestFramework:
                 absolute_accuracy=atol,
             )
 
-        per_rank_input = PerRankLazyInputGenerator(_filtered_input_generator)
+        per_rank_input = PerRankLazyInputGenerator(
+            _filtered_input_generator,
+            input_artifacts_directory=input_artifacts_directory,
+        )
         per_rank_input.base_input = rank0_input
 
         kernel_args = KernelArgs(

@@ -28,7 +28,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import SkipMode
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import (
     P_MAX,
@@ -46,6 +45,7 @@ from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.load_apis import (
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
     INTERLEAVE_FACTOR,
 )
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.utils import common_dataclasses
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -109,11 +109,9 @@ def pe_transpose_load_kernel(
     sbm.open_scope("PE_TRANSPOSE_LOAD")
 
     physical_tile_k = tile_k // INTERLEAVE_FACTOR
-    physical_f = tile_f * INTERLEAVE_FACTOR
     total_physical_f = (store_f_offset + tile_f) * INTERLEAVE_FACTOR
 
     # Create TensorDescriptor for the input
-    use_indirect = row_indices != None
     td = TensorDescriptor(
         data=tensor_fk,
         load_with_PE_swizzle=True,
@@ -122,7 +120,7 @@ def pe_transpose_load_kernel(
 
     # If row_indices provided, load them to SBUF
     indices_sbuf = None
-    if row_indices != None:
+    if row_indices is not None:
         NUM_SUB_TILES = tile_f // P_MAX
         indices_sbuf = nl.ndarray((P_MAX, NUM_SUB_TILES), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=indices_sbuf, src=row_indices)
@@ -137,7 +135,7 @@ def pe_transpose_load_kernel(
     for k_idx in nl.affine_range(tiles_in_k):
         current_k_offset = k_offset + k_idx * tile_k
 
-        if indices_sbuf != None:
+        if indices_sbuf is not None:
             load_loc = TileLocation(
                 tensor=td,
                 tile_k=tile_k,
@@ -891,9 +889,6 @@ def pe_transpose_kf_torch_ref(
     Takes [K, F] input, extracts [tile_k, tile_f] slice, transposes to [tile_k, tile_f]
     (which is already K-major), then swizzles to interleaved layout.
     """
-    physical_tile_k = tile_k // INTERLEAVE_FACTOR
-    physical_f = tile_f * INTERLEAVE_FACTOR
-
     # Extract tile from [K, F] and transpose to [tile_k, tile_f] (K on rows)
     tile_kf = tensor_kf[k_offset : k_offset + tile_k, f_offset : f_offset + tile_f]
     # tile_kf is already [tile_k, tile_f] = [K-rows, F-cols]
@@ -1017,8 +1012,8 @@ def pe_transpose_load_kf_indirect_kernel(
     K: int,
     tile_f: int,
     tile_k: int,
+    row_indices,
     k_offset: int = 0,
-    row_indices=None,
     skip_token: bool = False,
 ):
     """Load a K-by-F tile using indirect DMA gather and copy swizzled result to HBM.
@@ -1034,9 +1029,9 @@ def pe_transpose_load_kf_indirect_kernel(
         K: K dimension size (first dim, e.g. sequence/tokens).
         tile_f: Tile size in F dimension (number of rows to gather).
         tile_k: Tile size in K dimension (number of elements per row to read).
-        k_offset: Starting offset in F dimension (default 0).
         row_indices: [P_MAX, NUM_SUB_TILES] int32 tensor in HBM holding
             global K-row indices for indirect DMA gather.
+        k_offset: Starting offset in F dimension (default 0).
         skip_token: If True, uses oob_mode.skip for DMA (default False).
 
     Returns:
@@ -1120,10 +1115,8 @@ def pe_transpose_kf_indirect_torch_ref(
     When skip_token=True, indices with value -1 are treated as zero rows
     (matching oob_mode.skip behavior).
     """
-    physical_tile_k = tile_k // INTERLEAVE_FACTOR
-    physical_f = tile_f * INTERLEAVE_FACTOR
-
     # row_indices is (P_MAX, NUM_SUB_TILES) in column-major (Fortran) order
+    assert row_indices is not None, "the indirect transpose reference requires row_indices"
     indices = row_indices.flatten(order='F').astype(np.int64)
 
     if skip_token:

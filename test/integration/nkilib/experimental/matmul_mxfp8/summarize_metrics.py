@@ -79,9 +79,9 @@ def matches_config(row, criteria):
 
 def fmt_cell(speedup, mfu):
     """Format speedup and MFU into a summary cell string."""
-    if speedup == None:
+    if speedup is None:
         return "N/A"
-    mfu_str = f"{mfu:.2f}%" if mfu != None else "N/A"
+    mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
     return f"{speedup:.2f}x ({mfu_str})"
 
 
@@ -120,11 +120,11 @@ def main():
                 asp = parse_metric(row.get("Active Speedup vs BF16"))
                 mfu = parse_metric(row.get("MFU (%)"))
 
-                if sp != None:
+                if sp is not None:
                     speedups.append(sp)
-                if asp != None:
+                if asp is not None:
                     active_speedups.append(asp)
-                if mfu != None:
+                if mfu is not None:
                     mfus.append(mfu)
 
             avg_sp = sum(speedups) / len(speedups) if speedups else None
@@ -141,7 +141,7 @@ def main():
         bf16_mfus = []
         for row in group_rows:
             mfu = parse_metric(row.get("BF16 MFU (%)"))
-            if mfu != None:
+            if mfu is not None:
                 bf16_mfus.append(mfu)
         bf16_baseline[group_name] = sum(bf16_mfus) / len(bf16_mfus) if bf16_mfus else None
 

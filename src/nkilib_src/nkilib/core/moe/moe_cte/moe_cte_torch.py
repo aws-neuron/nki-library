@@ -389,6 +389,8 @@ def moe_cte_torch_ref(
     up_clamp_lower_limit=None,
     gate_up_in_scale=None,
     down_in_scale=None,
+    # shard_on_block_mx only: packed-affinity EP rank; no-op in the reference (see below).
+    ep_rank=None,
     accumulation_dtype=None,
     skip_gate_proj: bool = False,
 ) -> dict:
@@ -408,6 +410,10 @@ def moe_cte_torch_ref(
     """
     from .bwmm_func import BWMMFunc
     from .moe_cte import MoECTEImplementation
+
+    # ep_rank only affects the kernel's packed-affinity ROW gather offset; the reference
+    # receives affinities already sliced to local experts, so it is a no-op. Present for the signature contract.
+    _ = ep_rank
 
     # Map MoECTEImplementation -> BWMMFunc
     impl_to_bwmm = {

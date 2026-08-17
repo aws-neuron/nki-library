@@ -18,7 +18,6 @@ import ml_dtypes
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental.foreach.foreach_elementwise import (
     add_scalar_kernel,
     add_tensor_kernel,
@@ -47,6 +46,7 @@ from nkilib_src.nkilib.experimental.foreach.foreach_elementwise_torch import (
     sub_scalar_torch_ref,
     sub_tensor_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -134,26 +134,43 @@ def _output_three_tensor(kernel_input):
     return {"out": np.zeros(kernel_input["data"].shape, dtype=ml_dtypes.bfloat16)}
 
 
-# Torch ref wrappers matching kernel signatures
+# Torch ref wrappers matching kernel signatures.
+#
+# Each wrapper factory returns a nested ``wrapped`` closure. The torch-ref golden
+# cache keys an S3 entry partly on the reference's ``__qualname__`` (see
+# test/utils/torch_ref_cache.py). Because ``torch_ref_wrapper`` copies the inner
+# closure's ``__qualname__`` via functools.wraps, every op built from the same
+# factory would otherwise share the identical qualname
+# (e.g. ``_wrap_scalar_ref.<locals>.wrapped``). Combined with the identical
+# dep_hash (same test module) and identical input hash (seed-42 inputs are the
+# same across ops), add/sub/mul/div would collide on one cache key and be served
+# the FIRST op's golden on a HIT. Stamp a distinct qualname per wrapped ref so the
+# cache key differs per op.
+def _stamp(wrapped, factory_name, ref_fn):
+    wrapped.__qualname__ = f"{factory_name}.<locals>.wrapped[{ref_fn.__name__}]"
+    wrapped.__name__ = f"wrapped_{ref_fn.__name__}"
+    return wrapped
+
+
 def _wrap_scalar_ref(ref_fn):
     def wrapped(data: torch.Tensor, scalar_tensor: torch.Tensor, numel: int) -> torch.Tensor:
         return ref_fn(data.float(), _SCALAR_VALUE).to(data.dtype)
 
-    return wrapped
+    return _stamp(wrapped, "_wrap_scalar_ref", ref_fn)
 
 
 def _wrap_tensor_ref(ref_fn):
     def wrapped(data1: torch.Tensor, data2: torch.Tensor, numel: int) -> torch.Tensor:
         return ref_fn(data1.float(), data2.float()).to(data1.dtype)
 
-    return wrapped
+    return _stamp(wrapped, "_wrap_tensor_ref", ref_fn)
 
 
 def _wrap_tensor_alpha_ref(ref_fn):
     def wrapped(data1: torch.Tensor, data2: torch.Tensor, alpha_tensor: torch.Tensor, numel: int) -> torch.Tensor:
         return ref_fn(data1.float(), data2.float(), alpha_tensor=_ALPHA_VALUE).to(data1.dtype)
 
-    return wrapped
+    return _stamp(wrapped, "_wrap_tensor_alpha_ref", ref_fn)
 
 
 def _wrap_addcdiv_ref():
@@ -251,10 +268,16 @@ class TestForeachElementwise:
     )
     def test_tensor_ops(self, test_manager: Orchestrator, platform_target: Platforms, shape, kernel, ref, uses_alpha):
         if uses_alpha:
-            gen = lambda _: _tensor_alpha_inputs(shape)
+
+            def gen(_):
+                return _tensor_alpha_inputs(shape)
+
             wrapped_ref = _wrap_tensor_alpha_ref(ref)
         else:
-            gen = lambda _: _tensor_inputs(shape)
+
+            def gen(_):
+                return _tensor_inputs(shape)
+
             wrapped_ref = _wrap_tensor_ref(ref)
         framework = UnitTestFramework(
             test_manager=test_manager,

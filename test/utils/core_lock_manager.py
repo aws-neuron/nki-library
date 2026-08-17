@@ -27,8 +27,6 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
-import fabric2
-
 from . import core_lock_client as lock_client
 from .metrics_collector import IMetricsCollector, MetricName
 from .scripts.remote_lock_scripts import LockStatus
@@ -70,6 +68,7 @@ class AllocationOutcome:
     physical_cores: list[int] | None = None
     position: int | None = None
     worst_case_eta: int | None = None
+    should_reset_cores: bool | None = None
 
 
 @dataclass
@@ -89,6 +88,7 @@ class CoreAllocation:
     host_id: str
     logical_core_ids: list[int]
     lnc_config: int
+    should_reset_cores: bool = True
 
     def get_core_list_str(self) -> str:
         """Get comma-separated logical core IDs for NEURON_RT_VISIBLE_CORES."""
@@ -137,21 +137,19 @@ class InsufficientCoreCountError(LockAcquisitionError):
         self.retryable = False
 
 
-def check_lock_version(conn: fabric2.Connection) -> None:
+def check_lock_version(host_locking_version: int) -> None:
     """
     Check if the host's locking protocol version is compatible with this client.
 
     Args:
-        conn: Active fabric2 Connection to the remote host
+        host_locking_version: The host's required minimum client locking version
 
     Raises:
-        LockVersionError: If the host requires a newer locking protocol
+        LockVersionError: If the host requires a newer locking protocol than this client supports
     """
-    required_version = lock_client.get_host_locking_version(conn)
-
-    if required_version > lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION:
+    if host_locking_version > lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION:
         raise LockVersionError(
-            required_version=required_version,
+            required_version=host_locking_version,
             current_version=lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION,
         )
 
@@ -327,10 +325,11 @@ class CoreLockManager:
                     self.host_locking_version,
                     self._entry_id,
                     ready,
+                    lnc_config,
                     caller_id=self._caller_id,
                 )
         except Exception as e:
-            raise LockAcquisitionError(str(e))
+            raise LockAcquisitionError(str(e)) from e
 
         if lock_result.status == LockStatus.ALLOCATED:
             if lock_result.cores is None:
@@ -347,6 +346,7 @@ class CoreLockManager:
                 status=AllocationStatus.ALLOCATED,
                 logical_cores=logical_cores,
                 physical_cores=allocated_physical_cores,
+                should_reset_cores=lock_result.should_reset_cores,
             )
 
         if lock_result.status in (LockStatus.DRAINING, LockStatus.IN_QUEUE):
@@ -419,7 +419,7 @@ class CoreLockManager:
                 self.host_locking_version,
             )
         except Exception as e:
-            raise LockAcquisitionError(str(e))
+            raise LockAcquisitionError(str(e)) from e
 
         if lock_result.status in (LockStatus.DRAINING, LockStatus.IN_QUEUE):
             draining = lock_result.status == LockStatus.DRAINING

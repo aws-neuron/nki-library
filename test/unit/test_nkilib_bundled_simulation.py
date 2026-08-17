@@ -247,6 +247,7 @@ class BundledSimulator:
         return root
 
     def __exit__(self, *args):
+        assert self.tmpdir is not None, "__enter__ must have created the temporary directory"
         self.tmpdir.cleanup()
 
     def run_python(self, code: str, root: Path) -> subprocess.CompletedProcess:

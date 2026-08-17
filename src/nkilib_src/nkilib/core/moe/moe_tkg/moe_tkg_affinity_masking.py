@@ -190,7 +190,8 @@ def _slice_affinities_hbm(expert_affinities, expert_offset_sbuf, E_L, T, io_dtyp
         dst=expert_affinities_masked[nl.ds(T_offset, T_shard), :],
         dge_mode=dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else dge_mode.swdge,
     )
-    nisa.core_barrier(expert_affinities_masked, (0, 1))
+    if n_prgs > 1:
+        nisa.core_barrier(expert_affinities_masked, (0, 1))
 
     return expert_affinities_masked
 

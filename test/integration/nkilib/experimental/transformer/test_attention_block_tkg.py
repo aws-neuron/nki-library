@@ -25,24 +25,24 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 from nki.collectives import ReplicaGroup
-from typing_extensions import override
-
-from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
-from nkilib_src.nkilib.core.utils.allocator import SbufManager
+from nkilib_src.nkilib.core.attention.attention_tkg import INACTIVE_BLOCK_IDX
+from nkilib_src.nkilib.core.attention.attention_tkg_utils import is_qk_swapped
+from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import gen_mask_tkg_hbm_torch_ref
+from nkilib_src.nkilib.core.utils.allocator import SbufManager, sizeinbytes
 from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_helpers import (
     get_max_positive_value_for_dtype,
     get_program_sharding_info,
     is_hbm_buffer,
 )
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from nkilib_src.nkilib.experimental.transformer.attention_block_tkg import (
     attention_block_tkg,
 )
-from nkilib_src.nkilib.experimental.transformer.attention_block_tkg_sharding import KVDPCollectiveMode
+from nkilib_src.nkilib.experimental.transformer.attention_block_tkg_sharding import CPCollectiveMode, KVDPCollectiveMode
 from nkilib_src.nkilib.experimental.transformer.attention_block_tkg_torch import (
     AttentionBlockTkgTorchRef,
 )
+from typing_extensions import override
 
 try:
     from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_model_config import (
@@ -120,6 +120,309 @@ def _generate_mx_weights_and_scales(
     return weights, weight_scale, input_scale
 
 
+def _cp_owning_rank(position: int, interleave_size: int, cp_world_size: int) -> int:
+    """Return the CP rank that stores the token at the given sequence position.
+
+    Implements the vLLM CP slot mapping formula:
+        owner = (position // interleave_size) % cp_world_size
+
+    interleave_size controls the assignment granularity:
+      interleave_size=32 (=block_size), cp_world_size=4:
+        positions 0..31 -> rank 0, 32..63 -> rank 1, etc.
+      interleave_size=1, cp_world_size=4:
+        position 0 -> rank 0, 1 -> rank 1, 2 -> rank 2, 3 -> rank 3, 4 -> rank 0, ...
+    """
+    return (position // interleave_size) % cp_world_size
+
+
+def _generate_cp_cache_lens(B_attn: int, cp_world_size: int, interleave_size: int, s_max: int) -> np.ndarray:
+    """Per-batch cache_len for CP tests, spreading active tokens across all ranks.
+
+    Each batch has one active token, whose sequence position determines its owning CP rank
+    (owner = (position // interleave_size) % cp_world_size). We choose each batch's cache_len so
+    these active tokens fall across all ranks, for test coverage.
+
+    Args:
+        B_attn: Per-rank batch size.
+        cp_world_size: CP degree.
+        interleave_size: Token-ownership granularity (see _cp_owning_rank).
+        s_max: Exclusive upper bound on the active-token position (S_ctx - S_tkg).
+
+    Returns:
+        cache_len: [B_attn, 1] int64 append positions, one per batch element.
+    """
+    if B_attn >= cp_world_size:
+        ranks = np.arange(cp_world_size)
+        ranks = np.concatenate([ranks, np.random.randint(0, cp_world_size, size=B_attn - cp_world_size)])
+        np.random.shuffle(ranks)
+    else:
+        ranks = np.random.choice(cp_world_size, size=B_attn, replace=False)
+    cache_len = np.empty(B_attn, dtype=np.int64)
+    for b in range(B_attn):
+        first_owned = ranks[b] * interleave_size
+        group_stride = cp_world_size * interleave_size
+        group_starts = np.arange(first_owned, s_max, group_stride)
+        grp = group_starts[np.random.randint(0, len(group_starts))]
+        cache_len[b] = grp + np.random.randint(0, min(interleave_size, s_max - grp))
+    return cache_len[:, np.newaxis].astype(np.int64)
+
+
+def _cp_owned_global_positions(cp_rank: int, S_ctx: int, interleave_size: int, cp_world_size: int) -> list:
+    """Global sequence positions owned by ``cp_rank`` under the CP slot mapping, in ascending order.
+
+    A position ``p`` is owned by ``(p // interleave_size) % cp_world_size``. With
+    ``interleave_size == block_len`` this reduces to whole-block round-robin; with
+    ``interleave_size == 1`` it stripes individual tokens across ranks. The returned list has
+    length ``S_ctx // cp_world_size`` and the ranks together partition ``range(S_ctx)``; the
+    index of a position within this list is its rank-local sequence position.
+    """
+    return [p for p in range(S_ctx) if _cp_owning_rank(p, interleave_size, cp_world_size) == cp_rank]
+
+
+def _flatten_block_kv_mask(full_mask, block_len, lnc):
+    """Undo the block-KV mask reshape to a flat ``[B, H, S_tkg, S_ctx]`` view.
+
+    The kernel consumes the attention mask in block-KV layout (the reshape+swapaxes applied
+    in ``generate_kernel_inputs``). To slice/gather it per CP rank we first undo that reshape
+    back to a flat, sequence-position-ordered mask. Inverse of the reshape done by
+    :func:`_reblock_cp_mask`.
+
+    Args:
+        full_mask: shared mask ``[S_ctx, B, H, S_tkg]`` (as stored in ``shared_input``).
+    Returns:
+        Flat mask ``[B, H, S_tkg, S_ctx]``.
+    """
+    from nkilib_src.nkilib.core.attention.attention_tkg_utils import is_s_prior_sharded as _is_sps
+    from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
+        resize_cache_block_len_for_attention_tkg_kernel,
+    )
+
+    B, H, S_tkg, S_ctx = full_mask.shape[1], full_mask.shape[2], full_mask.shape[3], full_mask.shape[0]
+    num_blocks = S_ctx // block_len
+    m = np.asarray(full_mask).transpose(1, 2, 3, 0)  # [B, H, S_tkg, S_ctx]
+    n_prgs = lnc if lnc > 1 and _is_sps(B, H, S_tkg, S_ctx, 128) else 1
+    reduced_blk_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
+        num_blocks, block_len, lnc, 128, bs=B, q_head=H, s_active=S_tkg, full_sprior=S_ctx
+    )
+    m = m.reshape(B, H, S_tkg, n_prgs, -1, reduced_blk_len, 128)
+    m = np.swapaxes(m, -1, -2)
+    return m.reshape(B, H, S_tkg, S_ctx)
+
+
+def _reblock_cp_mask(rank_mask_flat, block_len, lnc):
+    """Re-apply the block-KV mask reshape to a rank's flat mask -> ``[S_local, B, H, S_tkg]``.
+
+    Given a rank's flat mask ``[B, H, S_tkg, S_local]`` (owned positions in rank-local order),
+    reproduce the block-KV layout the kernel expects for the rank's local ``S_local`` shard, so
+    the mask's within-block ordering matches the rank's local KV cache. Inverse of
+    :func:`_flatten_block_kv_mask`; shared by the whole-block and sub-block CP paths.
+    """
+    from nkilib_src.nkilib.core.attention.attention_tkg_utils import is_s_prior_sharded as _is_sps
+    from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
+        resize_cache_block_len_for_attention_tkg_kernel,
+    )
+
+    B, H, S_tkg, S_local = rank_mask_flat.shape
+    num_blocks_local = S_local // block_len
+    n_prgs = lnc if lnc > 1 and _is_sps(B, H, S_tkg, S_local, 128) else 1
+    reduced_blk_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
+        num_blocks_local, block_len, lnc, 128, bs=B, q_head=H, s_active=S_tkg, full_sprior=S_local
+    )
+    m = rank_mask_flat.reshape(B, H, S_tkg, n_prgs, -1, 128, reduced_blk_len)
+    m = np.swapaxes(m, -1, -2)
+    return np.ascontiguousarray(m.reshape(B, H, S_tkg, S_local).transpose(3, 0, 1, 2))
+
+
+def _build_cp_block_kv_rank_inputs(
+    shared_input, cp_rank, CP, block_len, S_ctx, S_tkg, B_attn, interleave_size, lnc, kv_heads=1
+):
+    """Build one CP rank's block-KV cache, table, mask, and update index by gathering owned tokens.
+
+    Used when ``interleave_size < block_len`` (per-token / sub-block striping), where a rank's
+    owned tokens are scattered across physical blocks, so the rank's local cache must be gathered
+    rather than block-sliced. Each rank owns ``S_local = S_ctx // CP`` global positions
+    (see :func:`_cp_owned_global_positions`); position ``owned[lp]`` maps to rank-local position
+    ``lp``, packed into ``num_blocks_local = S_local // block_len`` contiguous local blocks.
+
+    Returns a dict with keys ``K_cache``, ``V_cache``, ``active_blocks_table``,
+    ``attention_mask``, ``kv_cache_update_idx`` for this rank.
+
+    NOTE: ``kv_heads > 1`` is not yet supported on this per-token-interleave gather path. The 3D
+    ``[B, kv_heads, num_blocks]`` table and the per-head shared block pool would each need a
+    per-head gather; this is deferred. The whole-block CP path (``interleave_size == block_len``)
+    does support ``kv_heads > 1``.
+    """
+    if kv_heads > 1:
+        pytest.skip(
+            f"CP per-token-interleave (cp_interleave_size={interleave_size} < block_len={block_len}) "
+            f"with kv_heads={kv_heads} is not yet supported by the test harness; use the whole-block "
+            "CP path (cp_interleave_size == block_len) for CP x kv_heads."
+        )
+    S_local = S_ctx // CP
+    num_blocks_local = S_local // block_len
+    owned = _cp_owned_global_positions(cp_rank, S_ctx, interleave_size, CP)
+    assert len(owned) == S_local, f"rank {cp_rank} owns {len(owned)} != {S_local}"
+
+    full_K = np.asarray(shared_input['K_cache'])  # [num_blocks, block_len, d_head] (+ optional kv-head axis)
+    full_V = np.asarray(shared_input['V_cache'])
+    full_table = np.asarray(shared_input['active_blocks_table'])  # [B_attn, S_ctx // block_len]
+    has_kv_head = full_K.ndim == 4
+
+    # Fresh per-rank block pool: B_attn * num_blocks_local local blocks, local table is identity.
+    local_blocks = B_attn * num_blocks_local
+    K_local = np.zeros((local_blocks,) + full_K.shape[1:], dtype=full_K.dtype)
+    V_local = np.zeros((local_blocks,) + full_V.shape[1:], dtype=full_V.dtype)
+    local_table = np.full((B_attn, num_blocks_local), INACTIVE_BLOCK_IDX, dtype=np.int32)
+
+    # Gather the rank's owned tokens (scattered across physical blocks under sub-block interleave)
+    # into contiguous, ascending-order local blocks: owned[lp] -> local position lp. This matches
+    # the serving stack's slot mapping, which packs a rank's owned tokens into dense local slots
+    # via block_offset = (vbo // (CP * I)) * I + (vbo % I) (see compute_slot_mapping in
+    # neuron_model_runner.py). The kernel thus sees a normal dense block cache (no interleaving
+    # inside a local block) and needs no CP-awareness; softmax is permutation-invariant over KV
+    # positions, so any consistent (cache, mask) ordering is valid as long as the two agree.
+    for b in range(B_attn):
+        for local_blk in range(num_blocks_local):
+            local_table[b, local_blk] = b * num_blocks_local + local_blk
+        for lp, gp in enumerate(owned):
+            logical_blk = gp // block_len
+            phys_blk = int(full_table[b, logical_blk])
+            if phys_blk == INACTIVE_BLOCK_IDX:
+                continue
+            slot = gp % block_len
+            lphys = b * num_blocks_local + lp // block_len
+            lslot = lp % block_len
+            if has_kv_head:
+                K_local[lphys, :, lslot] = full_K[phys_blk, :, slot]
+                V_local[lphys, :, lslot] = full_V[phys_blk, :, slot]
+            else:
+                K_local[lphys, lslot] = full_K[phys_blk, slot]
+                V_local[lphys, lslot] = full_V[phys_blk, slot]
+
+    # Mask: select this rank's owned global positions (ascending == local order) into a flat
+    # [B, H, S_tkg, S_local] view, then re-apply the block-KV reshape the kernel expects (shared
+    # with the whole-block path) so the mask's within-block ordering matches the gathered local cache.
+    full_mask = shared_input['attention_mask']  # [S_ctx, B_attn, heads, S_tkg]
+    mask_bhss = np.asarray(full_mask).transpose(1, 2, 3, 0)  # [B, H, S_tkg, S_ctx]
+    rank_mask_flat = mask_bhss[:, :, :, owned]  # [B, H, S_tkg, S_local] (flat, contiguous local order)
+    rank_mask = _reblock_cp_mask(rank_mask_flat, block_len, lnc)
+
+    # Update index: map each batch's active token (global) to its rank-local physical slot, or oob.
+    pos_to_local = {gp: lp for lp, gp in enumerate(owned)}
+    upd = np.asarray(shared_input['kv_cache_update_idx']).copy()
+    rank_upd = upd.copy()
+    for b in range(B_attn):
+        idx = int(upd[b, 0])
+        # Reverse the global physical slot back to a global sequence position via the full table.
+        phys_blk = idx // block_len
+        slot = idx % block_len
+        matches = np.where(full_table[b] == phys_blk)[0]
+        if len(matches) == 0 or _cp_owning_rank(int(matches[0]) * block_len + slot, interleave_size, CP) != cp_rank:
+            rank_upd[b, 0] = np.iinfo(np.uint32).max  # not this rank's token -> oob (skipped)
+            continue
+        gp = int(matches[0]) * block_len + slot
+        lp = pos_to_local[gp]
+        local_phys = b * num_blocks_local + lp // block_len
+        rank_upd[b, 0] = local_phys * block_len + lp % block_len
+
+    return {
+        'K_cache': K_local,
+        'V_cache': V_local,
+        'active_blocks_table': local_table,
+        'attention_mask': dt.static_cast(rank_mask, dtype=np.uint8),
+        'kv_cache_update_idx': rank_upd.astype(np.uint32),
+    }
+
+
+def _build_cp_flat_rank_inputs(shared_input, cp_rank, CP, S_ctx, S_tkg, B_attn, lnc, K_cache_transposed):
+    """Build one CP rank's flat-KV cache, mask, and update index (contiguous shard + padding).
+
+    Flat (non-paged) KV shards the sequence contiguously: rank ``r`` owns global positions
+    ``[r * S_local, (r + 1) * S_local)`` where ``S_local = S_ctx // CP``. Each batch element's active
+    token is owned by one rank, ``owner = (position // S_local) % CP`` (varies per batch element).
+
+    ``attention_tkg`` overwrites the last ``S_tkg`` positions of each rank's local cache with the
+    active tokens (on every rank), so a rank whose shard is full of real prior data would lose a
+    genuine token. To prevent that, the cache is zero-padded on the sequence axis to
+    ``S_ext = ceil((S_local + S_tkg) / (lnc * P_MAX)) * (lnc * P_MAX)`` (the next ``lnc * P_MAX``
+    boundary — ``P_MAX`` = 128, the s_prior tiling unit — which reserves room for the overwrite and
+    keeps a valid kernel geometry).
+
+    The mask is sliced and padded to match: its real tail (the active token's global column) is
+    zeroed so the token is attended only via the padding entry, which is set only on the owning rank.
+    ``kv_cache_update_idx`` is remapped to the local offset on the owning rank and set out-of-bounds
+    (``>= B_attn * S_ext``) elsewhere so the kernel's ``oob_mode.skip`` drops the write. (The padding
+    is the attention-read slot; the update index is the separate cache-write slot.)
+
+    Args:
+        shared_input (dict): Shared kernel inputs; reads ``K_cache``/``V_cache``, ``attention_mask``
+            (``[S_ctx, B, heads, S_tkg]``), and ``kv_cache_update_idx`` (``[B, 1]``).
+        cp_rank (int): This rank's index within its CP group (0 .. CP-1).
+        CP (int): Context parallelism degree.
+        S_ctx (int): Full (unsharded) prior context length.
+        S_tkg (int): Active sequence length (new tokens per batch element).
+        B_attn (int): Batch size seen by attention on this rank (B // KVDP, or B when KVDP=1).
+        lnc (int): Logical NeuronCore count; sets the ``lnc * P_MAX`` padding alignment.
+        K_cache_transposed (bool): ``[B, 1, d, S_max]`` (True) vs ``[B, 1, S_max, d]`` (False);
+            selects which axis is padded.
+
+    Returns:
+        dict: Per-rank ``K_cache``, ``V_cache``, ``attention_mask``, ``kv_cache_update_idx``.
+    """
+    S_local = S_ctx // CP
+    S_ext = -(-(S_local + S_tkg) // (lnc * _P_MAX)) * (lnc * _P_MAX)  # ceil to next lnc * P_MAX
+    pad = S_ext - S_local
+
+    # Cache: contiguous [r*S_local, (r+1)*S_local) slice + zero padding on the sequence dim.
+    K_full = shared_input['K_cache']  # [B, 1, S_max, d] or [B, 1, d, S_max] (transposed)
+    V_full = shared_input['V_cache']  # [B, 1, S_max, d]
+    if K_cache_transposed:
+        rank_k = K_full[:, :, :, cp_rank * S_local : (cp_rank + 1) * S_local]
+        k_pad = np.zeros((*rank_k.shape[:3], pad), dtype=rank_k.dtype)
+        K_cache = np.concatenate([rank_k, k_pad], axis=3).copy()
+    else:
+        rank_k = K_full[:, :, cp_rank * S_local : (cp_rank + 1) * S_local, :]
+        k_pad = np.zeros((*rank_k.shape[:2], pad, rank_k.shape[3]), dtype=rank_k.dtype)
+        K_cache = np.concatenate([rank_k, k_pad], axis=2).copy()
+    rank_v = V_full[:, :, cp_rank * S_local : (cp_rank + 1) * S_local, :]
+    v_pad = np.zeros((*rank_v.shape[:2], pad, rank_v.shape[3]), dtype=rank_v.dtype)
+    V_cache = np.concatenate([rank_v, v_pad], axis=2).copy()
+
+    # Mask: slice this rank's positions; the active token's real column is at the global tail
+    # (S_ctx-1, in the last rank's slice) — zero it there so it is not double-attended, and enable
+    # it in the padding only for batch elements this rank owns (owner = (pos // S_local) % CP).
+    full_mask = shared_input['attention_mask']  # [S_ctx, B, heads, S_tkg]
+    rank_mask = full_mask[cp_rank * S_local : (cp_rank + 1) * S_local, :, :, :].copy()
+    if cp_rank == CP - 1:
+        rank_mask[-S_tkg:, :, :, :] = 0
+    num_heads_total = full_mask.shape[2]
+    upd_full = np.asarray(shared_input['kv_cache_update_idx'])
+    mask_pad = np.zeros((pad, B_attn, num_heads_total, S_tkg), dtype=rank_mask.dtype)
+    for b in range(B_attn):
+        idx = int(upd_full[b, 0])
+        if idx < S_ctx and _cp_owning_rank(idx, S_local, CP) == cp_rank:
+            mask_pad[-S_tkg:, b, :, :] = 1
+    attention_mask = np.ascontiguousarray(np.concatenate([rank_mask, mask_pad], axis=0))
+
+    # Update index: map each batch's active token to its rank-local offset, or oob (>= B * S_ext so
+    # oob_mode.skip drops the write) on ranks that do not own it.
+    oob_idx = B_attn * S_ext
+    rank_upd = upd_full.copy()
+    for b in range(rank_upd.shape[0]):
+        idx = int(rank_upd[b, 0])
+        if cp_rank * S_local <= idx < (cp_rank + 1) * S_local:
+            rank_upd[b, 0] = idx - cp_rank * S_local
+        else:
+            rank_upd[b, 0] = oob_idx
+
+    return {
+        'K_cache': K_cache,
+        'V_cache': V_cache,
+        'attention_mask': attention_mask,
+        'kv_cache_update_idx': rank_upd,
+    }
+
+
 def estimate_test_memory_bytes(cfg: AttnBlkTestConfig) -> int:
     """Estimate total host memory (bytes) for a test config without allocating tensors.
 
@@ -158,7 +461,8 @@ def estimate_test_memory_bytes(cfg: AttnBlkTestConfig) -> int:
         total += I * elem  # bias_qkv
         total += H * elem  # bias_out
     if not cfg.skip_rope:
-        total += 2 * (d_head // 2) * batch * S_tkg * elem  # cos + sin
+        rotary_half = (cfg.rotary_dim or d_head) // 2
+        total += 2 * rotary_half * batch * S_tkg * elem  # cos + sin
     if cfg.qk_norm_pre_rope_gamma:
         total += 2 * d_head * elem  # W_rmsnorm_Q/K_pre_rope
     if cfg.qk_norm_post_rope_gamma:
@@ -330,7 +634,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     num_kv_heads = cfg.kv_heads
     # KVDP: X uses full batch, K/V cache and mask use local batch
     B_attn = batch // cfg.KVDP if cfg.KVDP > 1 else batch
-    num_mask_heads = cfg.KVDP * num_q_heads if cfg.KVDP > 1 else num_q_heads
+    num_mask_heads = cfg.KVDP * cfg.CP * num_q_heads if (cfg.KVDP > 1 or cfg.CP > 1) else num_q_heads
 
     # Seed global RNG for generate_cache_lens / gen_deterministic_active_block_table
     np.random.seed(seed)
@@ -488,9 +792,11 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     # -- rmsnorm QK pre RoPE gamma weights
     W_rmsnorm_Q_pre_rope = near_unity((1, d_head), dtype) if cfg.qk_norm_pre_rope_gamma else None
     W_rmsnorm_K_pre_rope = near_unity((1, d_head), dtype) if cfg.qk_norm_pre_rope_gamma else None
-    # -- RoPE: cos/sin are bounded to [-1, 1] by definition
-    cos = None if cfg.skip_rope else uniform_activation((d_head // 2, batch, S_tkg), dtype)
-    sin = None if cfg.skip_rope else uniform_activation((d_head // 2, batch, S_tkg), dtype)
+    # -- RoPE: cos/sin are bounded to [-1, 1] by definition. Partial rotary (rotary_dim > 0)
+    # sizes them to rotary_dim // 2; full rotary (rotary_dim == 0) uses d_head // 2.
+    rotary_half = (cfg.rotary_dim or d_head) // 2
+    cos = None if cfg.skip_rope else uniform_activation((rotary_half, batch, S_tkg), dtype)
+    sin = None if cfg.skip_rope else uniform_activation((rotary_half, batch, S_tkg), dtype)
 
     # -- rmsnorm QK post RoPE
     W_rmsnorm_Q_post_rope = near_unity((1, d_head), dtype) if cfg.qk_norm_post_rope_gamma else None
@@ -507,7 +813,13 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     if is_block_kv:
         assert not cfg.K_cache_transposed
         assert S_ctx % cfg.block_len == 0
-        assumed_num_cache_blocks = B_attn * num_kv_heads * S_ctx // cfg.block_len
+        logical_blocks_per_head = B_attn * S_ctx // cfg.block_len
+        blocks_per_head_pool = (
+            cfg.physical_cache_blocks_per_head
+            if cfg.physical_cache_blocks_per_head is not None
+            else logical_blocks_per_head
+        )
+        assumed_num_cache_blocks = blocks_per_head_pool * num_kv_heads
         if cfg.fp8_packed:
             K_cache_shape = (assumed_num_cache_blocks, cfg.block_len // 2, d_head, 2)
         else:
@@ -559,22 +871,27 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
         v_scale = None
 
     # pos_id (shape=(batch, 1)) defines the first position to append new KV to cache, per batch element
-    cache_len_kwargs = {}
-    if cfg.cache_lens_mean is not None:
-        cache_len_kwargs["mean_frac"] = cfg.cache_lens_mean
-    elif cfg.max_context_len is not None:
-        cache_len_kwargs["mean_frac"] = cfg.max_context_len / (2 * (S_ctx - S_tkg))
-    if cfg.cache_lens_stddev is not None:
-        cache_len_kwargs["stddev_frac"] = cfg.cache_lens_stddev
-    cache_len = generate_cache_lens(B_attn, S_ctx, S_tkg, **cache_len_kwargs)
-    assert cache_len.max() <= (S_ctx - S_tkg)
-    if cfg.max_context_len is not None:
-        max_cache = cfg.max_context_len - S_tkg
-        cache_len = np.clip(cache_len, 0, max_cache)
-        cache_len[0] = max_cache
+    if cfg.CP > 1:
+        np.random.seed(seed)
+        S_max = S_ctx - S_tkg
+        bl = cfg.block_len if cfg.block_len > 0 else (S_ctx // cfg.CP)
+        interleave_size = cfg.cp_interleave_size if cfg.cp_interleave_size is not None else bl
+        cache_len = _generate_cp_cache_lens(B_attn, cfg.CP, interleave_size, S_max)
+    else:
+        cache_len_kwargs = {}
+        if cfg.cache_lens_mean is not None:
+            cache_len_kwargs["mean_frac"] = cfg.cache_lens_mean
+        elif cfg.max_context_len is not None:
+            cache_len_kwargs["mean_frac"] = cfg.max_context_len / (2 * (S_ctx - S_tkg))
+        if cfg.cache_lens_stddev is not None:
+            cache_len_kwargs["stddev_frac"] = cfg.cache_lens_stddev
+        cache_len = generate_cache_lens(B_attn, S_ctx, S_tkg, **cache_len_kwargs)
+        assert cache_len.max() <= (S_ctx - S_tkg)
+        if cfg.max_context_len is not None:
+            max_cache = cfg.max_context_len - S_tkg
+            cache_len = np.clip(cache_len, 0, max_cache)
+            cache_len[0] = max_cache
     import torch
-
-    cache_lens_torch = torch.from_numpy(cache_len.flatten()).to(torch.float32)
 
     if cfg.use_pos_id:
         # In-kernel mask generation: pass pos_ids instead of attention_mask
@@ -606,18 +923,41 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     else:
         pos_ids = None
         swa_start_pos_ids = None
-        attention_mask = build_full_attention_mask(
-            cache_lens=cache_lens_torch,
+        pos_ids_hbm = torch.from_numpy(
+            np.broadcast_to(cache_len, (B_attn, S_tkg)).astype(np.float32)
+            + (np.arange(S_tkg, dtype=np.float32)[np.newaxis, :] if S_tkg > 1 else 0.0)
+        ).reshape(1, B_attn * S_tkg)
+        active_mask_hbm = build_active_attention_mask(
             batch=B_attn,
             num_heads=num_mask_heads,
             s_active=S_tkg,
-            s_ctx=S_ctx,
-            lnc=cfg.lnc,
-            block_len=cfg.block_len,
-            include_active_mask=True,
             transposed=True,
+        )  # [S_tkg, B, N, S]
+        transposed_out = is_qk_swapped(
+            bs=B_attn,
+            q_head=num_mask_heads,
+            d_head=d_head,
+            s_active=S_tkg,
+            curr_sprior=S_ctx,
+            lnc=cfg.lnc,
+            p_max=_P_MAX,
+            is_block_kv=is_block_kv,
+            is_2byte_kv=sizeinbytes(kv_cache_dtype) == 2,
+            fp8_packed=cfg.fp8_packed,
+            fuse_rope=False,
+            kv_heads=num_kv_heads,
+        )
+        attention_mask = gen_mask_tkg_hbm_torch_ref[cfg.lnc](
+            pos_ids_hbm=pos_ids_hbm,
+            bs=B_attn,
+            q_head=num_mask_heads,
+            s_active=S_tkg,
+            s_prior=S_ctx,
+            block_len=cfg.block_len,
+            active_mask=active_mask_hbm,
             enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
-        ).numpy()  # mask: (S_ctx, batch, num_heads, S_tkg)
+            transposed_out=transposed_out,
+        ).numpy()  # default: (S_ctx, B, N, S); QK-swap: (B, N, S, S_ctx)
         attention_mask = dt.static_cast(np.ascontiguousarray(attention_mask), dtype=np.uint8)
 
     # Attention sink: one scalar per (KVDP-expanded) query head, [q_heads_attn, 1] @ HBM.
@@ -626,7 +966,6 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     # active_blocks_table holds GLOBAL block indices into the flattened ``num_blocks * kv_heads`` dimension.
     # Reuse the same indices between heads shifted to their global indices.
     if is_block_kv:
-        blocks_per_head_pool = B_attn * S_ctx // cfg.block_len
         base = gen_deterministic_active_block_table(
             B_attn, S_ctx, S_tkg, cache_len, cfg.block_len, blocks_per_head_pool
         ).astype(np.int32)  # [B, num_blocks]; INACTIVE padding = -1
@@ -643,11 +982,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     # kv_cache_update_idx: (B, S_tkg) for block KV (kv_heads==1) with per-token physical positions,
     #                      (B, kv_heads, S_tkg) for block KV with kv_heads>1 (per-head physical positions),
     #                      (B, 1) for flat KV with start position (consecutive tokens assumed).
-    def generate_kv_cache_update_idx():
-        if cfg.block_len == 0:
-            # Flat KV: only start position needed, consecutive tokens assumed
-            return cache_len.astype(np.uint32)
-
+    def generate_block_kv_cache_update_idx(abt: npt.NDArray[np.int32]):
         # Block KV: translate each token's logical position to physical slot_mapping.
         # Generated per-(batch, kv_head, token); squeeze kv axis at end to match kernel contract:
         # (B, S_tkg) for kv_heads==1, (B, kv_heads, S_tkg) otherwise.
@@ -655,7 +990,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
         logical_blks = logical_positions // cfg.block_len
         offset_in_blk = logical_positions % cfg.block_len
         # Wrap a 2D active_blocks_table to 3D for a uniform per-head gather.
-        abt_3d = active_blocks_table if num_kv_heads > 1 else active_blocks_table[:, np.newaxis, :]
+        abt_3d = abt if num_kv_heads > 1 else abt[:, np.newaxis, :]
         # physical_blks[b, h, t] = abt_3d[b, h, logical_blks[b, t]]
         physical_blks = abt_3d[
             np.arange(B_attn)[:, None, None],
@@ -670,7 +1005,11 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
             physical_kv_cache_update_idx = physical_kv_cache_update_idx.squeeze(1)  # (B, S_tkg)
         return physical_kv_cache_update_idx.astype(np.uint32)
 
-    kv_cache_update_idx = generate_kv_cache_update_idx()
+    if active_blocks_table is None:
+        # Flat KV: only start position needed, consecutive tokens assumed
+        kv_cache_update_idx = cache_len.astype(np.uint32)
+    else:
+        kv_cache_update_idx = generate_block_kv_cache_update_idx(active_blocks_table)
 
     # Output projection
     weight_dequant_scale_out = None
@@ -733,6 +1072,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     # The caller must always fuse v_scale into W_out.
     softmax_scale_adjusted = cfg.softmax_scale
     if cfg.kv_quant:
+        assert k_scale is not None and v_scale is not None, "the quantized KV path generates cache scales"
         _k_scale_scalar = float(k_scale.flat[0])
         _v_scale_scalar = float(v_scale.flat[0])
 
@@ -747,6 +1087,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
                 W_out = dt.static_cast(W_out.astype(np.float32) / _v_scale_scalar, dtype)
             elif cfg.quantization_type in (QuantizationType.ROW, QuantizationType.STATIC):
                 # FP8 weights with dequant scale: absorb v_scale into the scale
+                assert weight_dequant_scale_out is not None, "FP8 output weights carry a dequant scale"
                 weight_dequant_scale_out = (weight_dequant_scale_out.astype(np.float32) / _v_scale_scalar).astype(
                     np.float32
                 )
@@ -892,6 +1233,10 @@ def attention_block_tkg_kernel_test_wrapper(
     is_h_transposed_by_4: bool = False,
     max_context_len=None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    # -- Context parallelism
+    CP: int = 1,
+    CP_replica_group=None,
+    CP_collective_mode=None,
 ):
     if transposed_in:
         # X is already in transposed layout [H0, n_prgs, H1_shard, BxS] from generate_kernel_inputs
@@ -922,10 +1267,8 @@ def attention_block_tkg_kernel_test_wrapper(
         SBUF input and constrains attention_block_tkg() SBUF input layout.
         """
         nisa.dma_copy(
-            dst=TensorView(X_sb).reshape_dim(2, (lnc, -1)).get_view(),
-            src=TensorView(X_hbm)
-            .rearrange(('BS', 'lnc', 'H0', 'H1 // lnc'), ('H0', 'BS', 'lnc', 'H1 // lnc'))
-            .get_view(),
+            dst=X_sb.reshape_dim(2, (lnc, -1)),
+            src=X_hbm.rearrange(("BS", "lnc", "H0", "H1 // lnc"), ("H0", "BS", "lnc", "H1 // lnc")),
         )
 
         X = X_sb
@@ -985,6 +1328,9 @@ def attention_block_tkg_kernel_test_wrapper(
         is_h_transposed_by_4=is_h_transposed_by_4,
         max_context_len=max_context_len,
         dtype_mode=dtype_mode,
+        CP=CP,
+        CP_replica_group=CP_replica_group,
+        CP_collective_mode=CP_collective_mode,
     )
 
     assert is_hbm_buffer(K_hbm_out)
@@ -1073,6 +1419,7 @@ def make_cosine_similarity_validator(
                 f"Validating {_name}: cosine_similarity={cos_sim:.6f} (min={_min_cos}), "
                 f"allclose(pass_rate>={_min_pass_rate})={allclose_pass}"
             )
+
             return cos_sim >= _min_cos and allclose_pass
 
     return CosineValidator
@@ -1092,7 +1439,11 @@ def _golden_ref_via_torch(kernel_input: dict, lnc: int) -> dict:
     ignored.discard("X_in_sb")
     assert not ignored, f"kernel_input keys not consumed by torch ref: {ignored}"
     ref_input = {k: v for k, v in kernel_input.items() if k in ref_params}
-    ref_output = torch_ref_wrapper(torch_ref)(**ref_input)
+    # preserve_lower_precision=True so bf16 KV reaches the ref as torch.bfloat16 (not the float32 upcast),
+    # letting its is_qk_swapped call read the true 2-byte KV dtype for the swap-mask layout decision.
+    # (fp8 still arrives as float32 by the wrapper's existing contract.) The per-output .astype below
+    # re-casts to the exact kernel dtypes, so the wrapper's cast-back does not change golden values.
+    ref_output = torch_ref_wrapper(torch_ref, preserve_lower_precision=True)(**ref_input)
     x_dtype = kernel_input['X'].dtype
     output_dtypes = {
         "X_out": x_dtype,
@@ -1216,8 +1567,8 @@ def _run_attention_block_test(
         cfg.kv_quant, cfg.quantization_type, get_max_positive_value_for_dtype(cfg.kv_quant_dtype)
     )
 
-    if cfg.KVDP > 1:
-        _run_kvdp_test(test_manager, platform_target, cfg, tolerances)
+    if cfg.KVDP > 1 or cfg.CP > 1:
+        _run_multi_rank_test(test_manager, platform_target, cfg, tolerances)
     else:
         _run_single_rank_test(test_manager, platform_target, cfg, tolerances)
 
@@ -1258,8 +1609,11 @@ def _run_single_rank_test(
         kernel_entry=nki.jit(attention_block_tkg_kernel_test_wrapper),
         torch_ref=torch_ref_wrapper(AttentionBlockTkgTorchRef(cfg.lnc, kv_quant_dtype=cfg.kv_quant_dtype)),
         kernel_input_generator=input_generator,
+        # Output shapes come from the torch ref, which needs the LOGICAL mask — use the un-banded
+        # kernel_input, not the banded ki handed to the kernel (banding only changes the mask layout,
+        # not output shapes).
         output_tensor_descriptor=lambda ki: _infer_output_shapes_and_dtypes(
-            {k.removesuffix(".must_alias_input"): v for k, v in ki.items()}, cfg.lnc
+            {k.removesuffix(".must_alias_input"): v for k, v in kernel_input.items()}, cfg.lnc
         ),
     )
     framework.run_test(
@@ -1268,7 +1622,6 @@ def _run_single_rank_test(
             logical_nc_config=cfg.lnc,
             enable_birsim=False,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         ),
         inference_args=replace(
             TKG_INFERENCE_ARGS,
@@ -1279,34 +1632,82 @@ def _run_single_rank_test(
     )
 
 
-def _run_kvdp_test(
+def _run_multi_rank_test(
     test_manager: Orchestrator,
     platform_target: Platforms,
     cfg: AttnBlkTestConfig,
     tolerances: dict,
 ):
-    """Run multi-rank KVDP test using CollectiveUnitTestFramework.
+    """Run multi-rank test (KVDP, CP, or combined KVDP+CP) using CollectiveUnitTestFramework.
 
     The torch reference receives the same per-rank input as the kernel,
     runs collectives internally, and generates golden data for each rank.
     """
+    KVDP = cfg.KVDP
+    CP = cfg.CP
+    total_ranks = KVDP * CP
 
-    # Replica group and rank mapping
-    replica_group_list = cfg.kvdp_replica_group if cfg.kvdp_replica_group is not None else [list(range(cfg.KVDP))]
-    replica_group = ReplicaGroup(replica_group_list)
-    collective_ranks = sum(len(g) for g in replica_group_list)
+    # Replica groups
+    if KVDP > 1 and CP > 1:
+        # Combined KVDP+CP: use explicit groups if provided, otherwise generate default layout
+        if cfg.kvdp_replica_group is not None and cfg.cp_replica_group is not None:
+            kvdp_replica_group = ReplicaGroup(cfg.kvdp_replica_group)
+            cp_replica_group = ReplicaGroup(cfg.cp_replica_group)
+        else:
+            # Default: KVDP groups are contiguous chunks of CP ranks
+            # e.g. KVDP=2, CP=2: [[0,1], [2,3]] — ranks 0,1 are KVDP group 0
+            kvdp_groups = [list(range(i * CP, (i + 1) * CP)) for i in range(KVDP)]
+            kvdp_replica_group = ReplicaGroup(kvdp_groups)
+            # CP groups span across KVDP groups: [[0,2], [1,3]]
+            cp_groups = [list(range(j, total_ranks, CP)) for j in range(CP)]
+            cp_replica_group = ReplicaGroup(cp_groups)
+    elif KVDP > 1:
+        replica_group_list = cfg.kvdp_replica_group if cfg.kvdp_replica_group is not None else [list(range(KVDP))]
+        kvdp_replica_group = ReplicaGroup(replica_group_list)
+        cp_replica_group = None
+    else:
+        kvdp_replica_group = None
+        cp_replica_group = ReplicaGroup(cfg.cp_replica_group if cfg.cp_replica_group is not None else [list(range(CP))])
+
+    # For strided KVDP groups, collective_ranks = total ranks across all groups
+    if KVDP > 1 and CP <= 1 and cfg.kvdp_replica_group is not None:
+        collective_ranks = sum(len(g) for g in cfg.kvdp_replica_group)
+    else:
+        collective_ranks = total_ranks
+
     # Map each global rank to its group-local index (KVDP_rank).
     # Example: ReplicaGroup([[0,8,16,24], [1,9,17,25], ...])
     #          kvdp_rank:     0,1, 2, 3    0,1, 2, 3   ...
     rank_to_kvdp_rank = {}
-    for group in replica_group_list:
-        for kvdp_rank, global_rank in enumerate(group):
-            rank_to_kvdp_rank[global_rank] = kvdp_rank
+    if KVDP > 1:
+        if KVDP > 1 and CP > 1:
+            kvdp_groups_list = cfg.kvdp_replica_group if cfg.kvdp_replica_group is not None else kvdp_groups
+        else:
+            kvdp_groups_list = cfg.kvdp_replica_group if cfg.kvdp_replica_group is not None else [list(range(KVDP))]
+        for group in kvdp_groups_list:
+            for kvdp_rank, global_rank in enumerate(group):
+                rank_to_kvdp_rank[global_rank] = kvdp_rank
+    else:
+        for r in range(total_ranks):
+            rank_to_kvdp_rank[r] = 0
+
+    # Map each global rank to its CP rank (position within its CP group)
+    rank_to_cp_rank = {}
+    if CP > 1:
+        if cfg.cp_replica_group is not None:
+            cp_groups_list = cfg.cp_replica_group
+        elif KVDP > 1:
+            cp_groups_list = [list(range(j, total_ranks, CP)) for j in range(CP)]
+        else:
+            cp_groups_list = [list(range(CP))]
+        for group in cp_groups_list:
+            for cp_rank, global_rank in enumerate(group):
+                rank_to_cp_rank[global_rank] = cp_rank
 
     # Generate one shared input set — X, cos/sin, norms, scales are identical across ranks.
     shared_input = generate_kernel_inputs(cfg)
 
-    # Per-rank: weights (sharded Q heads), cache/mask/positions (at B_attn).
+    # Per-rank: weights (sharded Q heads), cache/mask/positions.
     def create_per_rank_input(rank_id):
         per_rank = generate_kernel_inputs(cfg, seed=rank_id)
         result = shared_input.copy()
@@ -1326,10 +1727,76 @@ def _run_kvdp_test(
             'swa_start_pos_ids',
         ):
             result[key] = per_rank[key]
+
+        # CP cache sharding: each rank gets S_ctx/CP portion
+        if CP > 1:
+            cp_rank = rank_to_cp_rank[rank_id]
+            block_len = cfg.block_len
+            cp_interleave = cfg.cp_interleave_size if cfg.cp_interleave_size is not None else block_len
+            B_attn_cp = cfg.batch // cfg.KVDP if cfg.KVDP > 1 else cfg.batch
+            if block_len == 0:
+                # Flat KV: contiguous shard + cache/mask padding for the active-token overwrite.
+                rank_inputs = _build_cp_flat_rank_inputs(
+                    shared_input, cp_rank, CP, cfg.S_ctx, cfg.S_tkg, B_attn_cp, cfg.lnc, cfg.K_cache_transposed
+                )
+                for _k, _v in rank_inputs.items():
+                    result[_k] = _v
+            elif cp_interleave < block_len:
+                # Block KV with sub-block (per-token) interleaving: a rank's owned tokens are
+                # scattered across physical blocks, so gather them into a fresh local block cache.
+                rank_inputs = _build_cp_block_kv_rank_inputs(
+                    shared_input,
+                    cp_rank,
+                    CP,
+                    block_len,
+                    cfg.S_ctx,
+                    cfg.S_tkg,
+                    B_attn_cp,
+                    cp_interleave,
+                    cfg.lnc,
+                    kv_heads=cfg.kv_heads,
+                )
+                for _k, _v in rank_inputs.items():
+                    result[_k] = _v
+            else:
+                # Block KV, whole-block interleave: keep the full cache pool, slice both the
+                # active_blocks_table and the mask to this rank's round-robin blocks.
+                # Table is [B, num_blocks] (kv_heads==1) or [B, kv_heads, num_blocks] (kv_heads>1);
+                # the block axis (logical position) is the LAST axis in both cases, and the table
+                # values are global indices into the shared B*kv_heads pool — slicing the block axis
+                # leaves those global indices intact.
+                num_blocks_per_batch = cfg.S_ctx // block_len
+                rank_logical_blocks = list(range(cp_rank, num_blocks_per_batch, CP))
+                full_table = shared_input['active_blocks_table']
+                if full_table.ndim == 3:
+                    result['active_blocks_table'] = full_table[:, :, rank_logical_blocks].copy()
+                else:
+                    result['active_blocks_table'] = full_table[:, rank_logical_blocks].copy()
+                # Use shared KV cache (full block pool) — table indexes into it
+                result['K_cache'] = shared_input['K_cache']
+                result['V_cache'] = shared_input['V_cache']
+                # Flatten the block-KV mask, select the rank's block positions, then re-block —
+                # shared helpers with the sub-block path (_build_cp_block_kv_rank_inputs).
+                if not cfg.use_pos_id:
+                    mask_flat = _flatten_block_kv_mask(shared_input['attention_mask'], block_len, cfg.lnc)
+                    positions = []
+                    for blk_idx in rank_logical_blocks:
+                        blk_start = blk_idx * block_len
+                        positions.extend(range(blk_start, blk_start + block_len))
+                    rank_mask = _reblock_cp_mask(mask_flat[:, :, :, positions], block_len, cfg.lnc)
+                    result['attention_mask'] = dt.static_cast(np.ascontiguousarray(rank_mask), dtype=np.uint8)
+
         # KVDP params
-        result['KVDP'] = cfg.KVDP
-        result['KVDP_replica_group'] = replica_group
-        result['KVDP_rank'] = np.array([rank_to_kvdp_rank[rank_id]], dtype=np.uint32)
+        if KVDP > 1:
+            result['KVDP'] = KVDP
+            result['KVDP_replica_group'] = kvdp_replica_group
+            result['KVDP_rank'] = np.array([rank_to_kvdp_rank[rank_id]], dtype=np.uint32)
+        # CP params
+        if CP > 1:
+            result['CP'] = CP
+            result['CP_replica_group'] = cp_replica_group
+            if cfg.CP_collective_mode is not None:
+                result['CP_collective_mode'] = cfg.CP_collective_mode
         if cfg.update_cache:
             result['K_cache.must_alias_input'] = result.pop('K_cache')
             result['V_cache.must_alias_input'] = result.pop('V_cache')
@@ -1360,26 +1827,30 @@ def _run_kvdp_test(
     framework = CollectiveUnitTestFramework(
         test_manager=test_manager,
         kernel_entry=nki.jit(attention_block_tkg_kernel_test_wrapper),
-        torch_ref=torch_ref_wrapper(AttentionBlockTkgTorchRef(cfg.lnc, kv_quant_dtype=cfg.kv_quant_dtype)),
+        # preserve_lower_precision=True so bf16 KV reaches the ref as torch.bfloat16 (not the float32 upcast),
+        # letting its is_qk_swapped call read the true 2-byte KV dtype for the swap-mask layout decision.
+        # (fp8 still arrives as float32 by the wrapper's existing contract.) The comparator's per-output
+        # .astype re-casts to the exact kernel dtypes, so the wrapper's cast-back does not change golden
+        # values.
+        torch_ref=torch_ref_wrapper(
+            AttentionBlockTkgTorchRef(cfg.lnc, kv_quant_dtype=cfg.kv_quant_dtype), preserve_lower_precision=True
+        ),
         per_rank_input_generator=create_per_rank_input,
         collective_ranks=collective_ranks,
     )
     golden_only = os.environ.get("GOLDEN_ONLY", "0") == "1"
-    kvdp_output_keys = (
-        ["X_out", "K_cache_updated", "V_cache_updated"] if cfg.update_cache else ["X_out", "K_tkg", "V_tkg"]
-    )
+    output_keys = ["X_out", "K_cache_updated", "V_cache_updated"] if cfg.update_cache else ["X_out", "K_tkg", "V_tkg"]
     framework.run_test(
         test_config=None,
         compiler_args=CompilerArgs(
             logical_nc_config=cfg.lnc,
             enable_birsim=False,
             platform_target=platform_target,
-            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
         ),
         inference_args=replace(TKG_INFERENCE_ARGS, collective_ranks=collective_ranks, enable_determinism_check=False),
         custom_comparator=comparator,
         golden_only=golden_only,
-        output_keys=kvdp_output_keys,
+        output_keys=output_keys,
     )
 
 
@@ -1418,11 +1889,23 @@ RANGE_ATTN_BLK_CFGS = [
     # MXFP, KVDP=1
     AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=6144, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
                       block_len=64, test_bias=True, cache_lens_mean=0.2, cache_lens_stddev=0.01, kv_quant=False,
-                      quantization_type=QuantizationType.MX, supported_platforms={Platforms.TRN3, Platforms.TRN3_A0}),
+                      quantization_type=QuantizationType.MX, supported_platforms={Platforms.TRN3, Platforms.TRN3_A0},
+                      xfail_reason="alt-emax input distribution flips peaky softmax argmax at long context"),
     # MXPF, KVDP>1
     AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=6144, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
                       block_len=64, test_bias=True, cache_lens_mean=0.2, cache_lens_stddev=0.01, KVDP=4, kv_quant=False,
-                      quantization_type=QuantizationType.MX, supported_platforms={Platforms.TRN3, Platforms.TRN3_A0}),                
+                      quantization_type=QuantizationType.MX, supported_platforms={Platforms.TRN3, Platforms.TRN3_A0},
+                      xfail_reason="alt-emax input distribution flips peaky softmax argmax at long context"),
+    # High-heads model.
+    # BF16 versions of the same config.
+    AttnBlkTestConfig(batch=128, q_heads=32, d_head=64, H=6144, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1, 
+                      block_len=64, test_bias=True, cache_lens_mean=0.2, cache_lens_stddev=0.01, KVDP=4, kv_quant=False),
+    AttnBlkTestConfig(batch=128, q_heads=64, d_head=64, H=6144, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1, 
+                      block_len=64, test_bias=True, cache_lens_mean=0.2, cache_lens_stddev=0.01, KVDP=4, kv_quant=False),
+    # Passing MXFP case so far. 
+    AttnBlkTestConfig(batch=8, q_heads=16, d_head=64, H=6144, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                      block_len=64, test_bias=True, cache_lens_mean=0.2, cache_lens_stddev=0.01, kv_quant=False,
+                      quantization_type=QuantizationType.MX, supported_platforms={Platforms.TRN3, Platforms.TRN3_A0}),
     # Qwen3
     AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
                         qk_norm_pre_rope=True),
@@ -1776,6 +2259,24 @@ RANGE_ATTN_BLK_CFGS = [
                         block_len=32, transposed_in=True),
 
     # ===== In-kernel mask generation (use_pos_id=True) =====
+    # QK-swap partition banding + in-kernel gen_mask: b16 batch-sharded -> bs_per_nc=8 < batches_per_psum=16,
+    # s_active_qh=8, band_factor=2. Exercises the banded gen_mask_tkg swap layout (per-band token offset).
+    # block_len=64 single-fold tile (S_ctx=8192) so the band split aligns to the fold's p_slot axis.
+    AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True),
+    # QK-swap banding + S_PRIOR sharding (b8: bs_per_nc=8 -> band_factor=2, s_prior sharded across NCs).
+    # Exercises a query whose cache_len is shorter than one NC's s_prior shard, so that shard is fully
+    # masked -> per-position max stays -inf; the swap path must clamp it to finite (else exp -> NaN).
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True),
+    # Same, with an attention sink (sink fold on the s_prior-sharded banded swap path).
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True, test_sink=True),
+    # QK-swap banding fold-MISALIGNMENT fallback (b8, S_ctx=10240 -> block_len resizes to 8 -> 5 folds per
+    # band-pair, 5 % band_factor(2) != 0). is_qk_swapped must reject banding here so it runs on the
+    # non-swap path; a mid-fold band boundary would otherwise break the constant per-band token shift.
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True),
     # Block KV, basic causal mask
     AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                         block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, use_pos_id=True),
@@ -1891,6 +2392,160 @@ RANGE_ATTN_BLK_CFGS = [
     # d_head=128 (k_row_tile_factor=1) with fold-batching + stitching
     AttnBlkTestConfig(batch=16, q_heads=8, d_head=128, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
                         block_len=32, cache_lens_mean=0.01, cache_lens_stddev=0.0),
+
+    # CP tests (CP=4, GPT-OSS-like)
+    # flat KV S_ctx=1k B=8
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # flat KV S_tkg=4 B=4: multiple active tokens exercise the per-rank cache padding.
+    AttnBlkTestConfig(batch=4, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=4,
+                        rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # flat KV S_ctx=1k B=8, q_heads=2 (general transpose path)
+    AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=1k B=8, block_len=32
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # CP=4 with kv_heads=2: kv_heads=2 folded into batch, then CP combine over the fold
+    # (q_heads_attn=q_heads*CP=8, q_per_group=8//kv_heads=4, per-CP-rank folded heads=4//CP=1).
+    # Both CP output collective modes are covered: ALL_TO_ALL (default) and REDUCE_SCATTER.
+    AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, kv_heads=2, cache_has_kv_head_dim=True, rmsnorm_X=False, CP=4,
+                        CP_collective_mode=CPCollectiveMode.ALL_TO_ALL,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, kv_heads=2, cache_has_kv_head_dim=True, rmsnorm_X=False, CP=4,
+                        CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # KVDP=2 CP=4 (8 ranks) with kv_heads>1: strided KVDP groups, consecutive CP groups.
+    # KVDP uses ALL_GATHER_SLICE; CP uses default ALL_TO_ALL.
+    AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, kv_heads=2, cache_has_kv_head_dim=True, rmsnorm_X=False, KVDP=2, CP=4,
+                        KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE,
+                        kvdp_replica_group=[[0, 4], [1, 5], [2, 6], [3, 7]],
+                        cp_replica_group=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # flat KV S_ctx=2k B=8
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                        rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=2k B=8, block_len=128
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                        block_len=128, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=2k B=8, block_len=32
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=1k B=32, block_len=32
+    AttnBlkTestConfig(batch=32, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=1k B=64, block_len=32
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # CP long context tests (S_ctx >= 64k, slower)
+    # flat KV S_ctx=73k B=8
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=73728, S_max_ctx=73728, S_tkg=1,
+                        rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=128k B=8, block_len=32
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # flat KV S_ctx=512k B=8
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                        rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=512k B=8, block_len=32
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=524288, S_max_ctx=524288, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # flat KV S_ctx=1M B=8
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1048576, S_max_ctx=1048576, S_tkg=1,
+                        rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=1M B=8, block_len=32
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1048576, S_max_ctx=1048576, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # CP B=64 tests
+    # Llama3 70B CP=8 TP8 B=8 S_ctx=10k (short context, precision baseline)
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT, CP=8,
+),
+    # Llama3 70B CP=8 TP8 B=8 S_ctx=128k block KV FP8 KV (per-core: q_heads=1 as if TP=64)
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                        block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT, CP=8,
+),
+    # flat KV S_ctx=128k B=64
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                        rmsnorm_X=False, CP=4,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # block KV S_ctx=128k B=64, block_len=32
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # CP REDUCE_SCATTER tests
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER, kv_quant=True),
+    # CP ALL_TO_ALL tests
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, CP_collective_mode=CPCollectiveMode.ALL_TO_ALL, kv_quant=True),
+    # CP ALL_TO_ALL batch sharding: B=64
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, CP_collective_mode=CPCollectiveMode.ALL_TO_ALL, kv_quant=True),
+    # CP REDUCE_SCATTER batch sharding test: B=64 triggers LNC batch sharding with CP=4
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=128, rmsnorm_X=False, CP=4, CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER, kv_quant=True),
+    # CP REDUCE_SCATTER batch sharding: B=64 block_len=32
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER, kv_quant=True),
+    # CP REDUCE_SCATTER batch sharding: B=64 S_ctx=4096
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=4096, S_max_ctx=4096, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER, kv_quant=True),
+    # CP REDUCE_SCATTER batch sharding: B=64 flat KV
+    AttnBlkTestConfig(batch=64, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=0, rmsnorm_X=False, CP=4, CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER, kv_quant=True),
+    # CP interleave_size=1: per-token interleaving (kernel-transparent, only affects ownership mapping)
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, cp_interleave_size=1, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # ===== CP + in-kernel mask generation (use_pos_id=True) =====
+    # The fused mask path generates the per-rank mask on-chip from pos_ids (local filled slots).
+    # TODO: enable once the per-rank simulation harness supports pos_ids under CP.
+    # AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+    #                     block_len=32, rmsnorm_X=False, CP=4, use_pos_id=True, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # CP B=1: low-batch CP (batch < CP, only 1 rank has an active token)
+    AttnBlkTestConfig(batch=1, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # CP S_tkg=4: speculative decode with CP (multiple active tokens per batch)
+    AttnBlkTestConfig(batch=4, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=4,
+                        block_len=32, rmsnorm_X=False, CP=4, kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # Combined KVDP+CP: KVDP=2 CP=2 (4 ranks total, batch sliced + sequence sliced)
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        rmsnorm_X=False, KVDP=2, CP=2,
+                        KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE,
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # Combined KVDP=4 CP=2 (8 ranks) with KVDP ALL_TO_ALL + CP REDUCE_SCATTER.
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        rmsnorm_X=False, KVDP=4, CP=2,
+                        KVDP_collective_mode=KVDPCollectiveMode.ALL_TO_ALL,
+                        CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER,
+                        kvdp_replica_group=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                        cp_replica_group=[[0, 4], [1, 5], [2, 6], [3, 7]],
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # Combined KVDP=4 CP=2 (8 ranks): explicit replica groups
+    # KVDP groups (consecutive): [(0,1,2,3), (4,5,6,7)]
+    # CP groups (strided within KVDP): [(0,4), (1,5), (2,6), (3,7)]
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        rmsnorm_X=False, KVDP=4, CP=2,
+                        KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE,
+                        CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER,
+                        kvdp_replica_group=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                        cp_replica_group=[[0, 4], [1, 5], [2, 6], [3, 7]],
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
+    # KVDP=2 CP=4 (8 ranks): strided KVDP groups, consecutive CP groups — the KVDP=4 CP=2
+    # arrangement above with the degrees swapped.
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        rmsnorm_X=False, KVDP=2, CP=4,
+                        KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE,
+                        CP_collective_mode=CPCollectiveMode.REDUCE_SCATTER,
+                        kvdp_replica_group=[[0, 4], [1, 5], [2, 6], [3, 7]],
+                        cp_replica_group=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                        kv_quant=True, kv_scale=KVScaleTest.DEFAULT),
 ]
 # fmt: on
 
@@ -1898,6 +2553,28 @@ RANGE_ATTN_BLK_CFGS = [
 def _low_rank_cfgs(cfgs: list[AttnBlkTestConfig]) -> list[AttnBlkTestConfig]:
     """Filter configs that need at most 4 NeuronCores (non-high-rank)."""
     return [c for c in cfgs if not c.is_high_rank()]
+
+
+def _attn_blk_fast_marks(cfg: AttnBlkTestConfig) -> list:
+    """Per-config marks for the fast attn-block parametrization.
+
+    - Collective (KVDP>1 / CP>1) configs use multi-rank inputs / collective ops the
+      simulator backend does not support, so they skip the simulation lane.
+    - The q_heads=8, S_ctx=1024 block-KV configs trigger the token-gen block-length
+      reduction (block_len 32 -> 4, 256 blocks/batch). The torch golden that
+      _infer_output_shapes_and_dtypes runs for shape inference then costs >240s CPU,
+      exceeding the compile-only fast lane's --cpu-timeout. Mark them `slow` (not
+      `fast`) so they are excluded from the -m fast lane but still run in the full
+      suite.
+    """
+    marks = []
+    if cfg.KVDP > 1 or cfg.CP > 1:
+        marks.append(pytest.mark.skip_simulation)
+    if cfg.q_heads == 8 and cfg.S_ctx == 1024 and cfg.block_len > 0:
+        marks.append(pytest.mark.slow)
+    else:
+        marks.append(pytest.mark.fast)
+    return marks
 
 
 @pytest_test_metadata(name="Attention Block TKG", tags=["model"])
@@ -1912,6 +2589,16 @@ class TestRangeAttnBlk:
         # Block KV cache
         AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
                             block_len=32),
+        # Physical cache pool smaller than logically required; repeated iota is sliced to the table width.
+        AttnBlkTestConfig(batch=1, q_heads=4, d_head=64, H=3072, H_actual=2880, S_ctx=6144, S_max_ctx=6144, S_tkg=1,
+                            block_len=8, rmsnorm_X=False, test_bias=True, cache_has_kv_head_dim=True,
+                            physical_cache_blocks_per_head=256, use_pos_id=True,
+                            cache_lens_mean=0.16, cache_lens_stddev=0.0),
+        # Physical cache pool smaller than logically required for full context length (with block resize).
+        AttnBlkTestConfig(batch=1, q_heads=4, d_head=64, H=3072, H_actual=2880, S_ctx=6144, S_max_ctx=6144, S_tkg=1,
+                            block_len=32, rmsnorm_X=False, test_bias=True, cache_has_kv_head_dim=True,
+                            physical_cache_blocks_per_head=32, use_pos_id=True,
+                            cache_lens_mean=0.16, cache_lens_stddev=0.0),
         # FP8 static weight quantization
         AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                             block_len=32, quantization_type=QuantizationType.STATIC),
@@ -1921,6 +2608,31 @@ class TestRangeAttnBlk:
         # QK norm pre-rope with gamma (Qwen3/Gemma3 path)
         AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                             block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+        # d_head=256 partial rotary (rotary_dim=64), n_d_tiles=2. For d>128 the kernel uses the
+        # external-projection / external-KV-update path: skip_output_projection=True and
+        # update_cache=False (in-kernel out-proj and block-KV update both need D<=128).
+        AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, rotary_dim=64, skip_output_projection=True, update_cache=False),
+        AttnBlkTestConfig(batch=1, q_heads=1, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, rotary_dim=64, skip_output_projection=True, update_cache=False),
+        # Same d=256 partial-rope configs WITH qk-layernorm pre-rope (hardware/compile lanes only;
+        # the RMSNorm-TKG subkernel is not CPU-simulable).
+        AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, rotary_dim=64, skip_output_projection=True, update_cache=False,
+                            qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+        # Gemma-style d_head=256 with FULL rotary (rotary_dim=0 -> 256, n_d_tiles=2). Unlike Qwen3.5
+        # (rotary_dim=64, confined to d-tile 0), the rotary channels here SPAN both d-tiles: the even
+        # half [0:128] is d-tile 0 and the odd half [128:256] is d-tile 1, exercising the
+        # cross-d-tile RoPE path (_rope_d_tiled_spanning). d>128 uses external proj / external KV
+        # update: skip_output_projection=True, update_cache=False.
+        AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, skip_output_projection=True, update_cache=False),
+        AttnBlkTestConfig(batch=1, q_heads=1, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, kv_heads=1, skip_output_projection=True, update_cache=False),
+        # Gemma d=256 full rotary WITH qk-layernorm pre-rope (hardware/compile lanes only).
+        AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, skip_output_projection=True, update_cache=False,
+                            qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
         # Transposed in+out layout
         AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                             block_len=32, transposed_in=True, transposed_out=True),
@@ -2021,16 +2733,9 @@ class TestRangeAttnBlk:
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(
         "attn_blk_cfg",
-        [
-            # Collective (KVDP>1 / DCP>1) configs use multi-rank inputs and collective
-            # ops that the simulator backend does not support, so skip them in the
-            # simulation lane while keeping them in the fast hardware lane.
-            pytest.param(cfg, marks=pytest.mark.skip_simulation) if cfg.KVDP > 1 or cfg.DCP > 1 else cfg
-            for cfg in FAST_ATTN_BLK_CFGS
-        ],
+        [pytest.param(cfg, marks=_attn_blk_fast_marks(cfg)) for cfg in FAST_ATTN_BLK_CFGS],
         ids=lambda p: p.test_id(),
     )
     def test_attn_blk_fast(
@@ -2058,7 +2763,9 @@ class TestRangeAttnBlk:
         attn_blk_cfg: AttnBlkTestConfig
     ):
         assert not attn_blk_cfg.is_high_rank(), \
-            f"High-rank config (KVDP={attn_blk_cfg.KVDP}, DCP={attn_blk_cfg.DCP}) belongs in test_attention_block_tkg_high_rank.py"
+            f"High-rank config (KVDP={attn_blk_cfg.KVDP}, CP={attn_blk_cfg.CP}) belongs in test_attention_block_tkg_high_rank.py"
+        if attn_blk_cfg.xfail_reason:
+            pytest.xfail(attn_blk_cfg.xfail_reason)
         _run_attention_block_test(
             test_manager=test_manager,
             platform_target=platform_target,
@@ -2076,7 +2783,7 @@ class TestAttnBlkModel:
     - test_optimal: Optimal performance configs
     - test_generality: Generality/coverage configs
 
-    High-rank model configs (KVDP/DCP > 4) are in test_attention_block_tkg_high_rank.py.
+    High-rank model configs (KVDP/CP > 4) are in test_attention_block_tkg_high_rank.py.
     """
 
     def _run_model_test(
@@ -2088,7 +2795,7 @@ class TestAttnBlkModel:
     ):
         """Common test logic for all model tiers."""
         assert not cfg.is_high_rank(), (
-            f"High-rank config (KVDP={cfg.KVDP}, DCP={cfg.DCP}) belongs in test_attention_block_tkg_high_rank.py"
+            f"High-rank config (KVDP={cfg.KVDP}, CP={cfg.CP}) belongs in test_attention_block_tkg_high_rank.py"
         )
         attn_blk_metadata_list = _get_attention_block_metadata()
         test_metadata_key = {
@@ -2101,7 +2808,7 @@ class TestAttnBlkModel:
             "kv_quant": cfg.kv_quant,
             "KVDP": cfg.KVDP,
             "transposed_in": cfg.transposed_in,
-            "DCP": cfg.DCP,
+            "DCP": cfg.CP,  # JSON metadata uses "DCP" key
         }
         collector.match_and_add_metadata_dimensions(test_metadata_key, attn_blk_metadata_list)
         _run_attention_block_test(

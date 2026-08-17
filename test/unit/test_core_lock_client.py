@@ -31,6 +31,7 @@ TOTAL_CORES = 16
 NUM_PHYSICAL = 4
 TIMEOUT = 60
 VERSION = 3
+LNC_CONFIG = 2
 
 
 # =============================================================================
@@ -50,7 +51,7 @@ class TestPollWrapperUnit:
             "position": 3,
             "worst_case_eta": 1234567890,
         }
-        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False)
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
         assert result.status == LockStatus.IN_QUEUE
         assert result.position == 3
         assert result.worst_case_eta == 1234567890
@@ -63,7 +64,7 @@ class TestPollWrapperUnit:
             "cores": [0, 1, 2, 3],
             "expiry": 999,
         }
-        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", True)
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", True, LNC_CONFIG)
         assert result.status == LockStatus.ALLOCATED
         assert result.cores == [0, 1, 2, 3]
         assert result.expiry == 999
@@ -78,7 +79,7 @@ class TestPollWrapperUnit:
             "position": 0,
             "worst_case_eta": 42,
         }
-        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", True)
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", True, LNC_CONFIG)
         assert result.status == LockStatus.DRAINING
         assert result.position == 0
         assert result.worst_case_eta == 42
@@ -92,14 +93,14 @@ class TestPollWrapperUnit:
             "worst_case_eta": 1,
             "bumped": True,
         }
-        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False)
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
         assert result.bumped is True
 
     def test_poll_bumped_defaults_false_when_absent(self) -> None:
         """A response without bumped (older helper) maps to bumped=False."""
         executor = MagicMock()
         executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "worst_case_eta": 1}
-        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False)
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
         assert result.bumped is False
 
     def test_poll_maps_re_enqueued_flag(self) -> None:
@@ -111,20 +112,20 @@ class TestPollWrapperUnit:
             "worst_case_eta": 1,
             "re_enqueued": True,
         }
-        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False)
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
         assert result.re_enqueued is True
 
     def test_poll_re_enqueued_defaults_false_when_absent(self) -> None:
         """A response without re_enqueued (older helper) maps to re_enqueued=False."""
         executor = MagicMock()
         executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "worst_case_eta": 1}
-        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False)
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
         assert result.re_enqueued is False
 
     def test_poll_forwards_expected_args(self) -> None:
         executor = MagicMock()
         executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "worst_case_eta": 1}
-        poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-9", True, caller_id="gw1:test")
+        poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-9", True, LNC_CONFIG, caller_id="gw1:test")
         _, kwargs = executor.call_function.call_args
         assert kwargs["command"] == "poll"
         assert kwargs["args"] == [
@@ -135,6 +136,7 @@ class TestPollWrapperUnit:
             VERSION,
             "entry-9",
             True,
+            LNC_CONFIG,
         ]
         assert kwargs["kwargs"] == {"caller_id": "gw1:test"}
 
@@ -243,13 +245,13 @@ def test_poll_round_trip_enqueue_then_allocate(tmp_path) -> None:
     executor = _FakeExecutor(helpers_file, lock_file, locks_json)
 
     # First poll: not ready -> should enqueue and report IN_QUEUE at head.
-    r1 = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False)
+    r1 = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
     assert r1.status == LockStatus.IN_QUEUE
     assert r1.position == 0
     assert r1.worst_case_eta is not None
 
     # Second poll: ready -> head with an open window commits and gets cores.
-    r2 = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", True)
+    r2 = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", True, LNC_CONFIG)
     assert r2.status == LockStatus.ALLOCATED
     assert r2.cores is not None
     assert len(r2.cores) == NUM_PHYSICAL
@@ -301,6 +303,50 @@ class TestGetHostLockingVersionRecreateWarns:
         write_result = MagicMock()
         write_result.failed = False
         mock_conn.run.side_effect = [test_result, write_result]
+
+        with caplog.at_level(logging.WARNING, logger=core_lock_client.logger.name):
+            version = core_lock_client.get_host_locking_version(mock_conn)
+
+        assert version == core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION
+        assert any(
+            "Recreating infra_version.json" in rec.message and rec.levelno == logging.WARNING for rec in caplog.records
+        )
+
+    def test_recreate_when_key_missing_warns_and_returns_constant(self, caplog) -> None:
+        mock_conn = MagicMock()
+        mock_conn.host = "test-host"
+
+        # File exists but lacks the version key -> recreate with the default.
+        test_result = MagicMock()
+        test_result.ok = True
+        cat_result = MagicMock()
+        cat_result.failed = False
+        cat_result.stdout = json.dumps({"someOtherKey": 123})
+        write_result = MagicMock()
+        write_result.failed = False
+        mock_conn.run.side_effect = [test_result, cat_result, write_result]
+
+        with caplog.at_level(logging.WARNING, logger=core_lock_client.logger.name):
+            version = core_lock_client.get_host_locking_version(mock_conn)
+
+        assert version == core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION
+        assert any(
+            "Recreating infra_version.json" in rec.message and rec.levelno == logging.WARNING for rec in caplog.records
+        )
+
+    def test_recreate_when_json_corrupted_warns_and_returns_constant(self, caplog) -> None:
+        mock_conn = MagicMock()
+        mock_conn.host = "test-host"
+
+        # File exists but contains corrupted JSON -> recreate with the default.
+        test_result = MagicMock()
+        test_result.ok = True
+        cat_result = MagicMock()
+        cat_result.failed = False
+        cat_result.stdout = "not valid json {{{"
+        write_result = MagicMock()
+        write_result.failed = False
+        mock_conn.run.side_effect = [test_result, cat_result, write_result]
 
         with caplog.at_level(logging.WARNING, logger=core_lock_client.logger.name):
             version = core_lock_client.get_host_locking_version(mock_conn)
@@ -378,11 +424,11 @@ class TestScriptVersionBumpGuard:
     def test_script_version_was_bumped_past_one(self) -> None:
         assert remote_lock_scripts.SCRIPT_VERSION > 1
 
-    def test_script_version_bumped_for_cooperative_placement(self) -> None:
-        # The cooperative-placement change redeploys the helper; the bump is the
-        # deploy gate. The client-facing locking protocol version stays pinned.
-        assert remote_lock_scripts.SCRIPT_VERSION == 4
-        assert core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION == 4
+    def test_script_version_bumped_for_lnc_reset_tracking(self) -> None:
+        # The LNC reset-tracking change (poll gains lnc_config, LockResult gains
+        # should_reset_cores) redeploys the helper; the bump is the deploy gate.
+        assert remote_lock_scripts.SCRIPT_VERSION == 5
+        assert core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION == 5
 
 
 class TestRemoteInitializeStaleRedeployIntegration:
@@ -421,11 +467,15 @@ class TestRemoteInitializeStaleRedeployIntegration:
 
             # The preserved deployed helper must still expose the poll verb.
             spec = importlib.util.spec_from_file_location("deployed_helper", helpers_file)
+            assert spec is not None, "the preserved helper file must be loadable as a module"
+            loader = spec.loader
+            assert loader is not None, "a file-based module spec has a loader"
+            module_name = spec.name
             module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
+            sys.modules[module_name] = module
             try:
-                spec.loader.exec_module(module)
+                loader.exec_module(module)
                 assert hasattr(module, "poll") and callable(module.poll)
                 assert module.SCRIPT_VERSION == 999
             finally:
-                sys.modules.pop(spec.name, None)
+                sys.modules.pop(module_name, None)

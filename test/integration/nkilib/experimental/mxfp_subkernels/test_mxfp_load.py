@@ -22,13 +22,13 @@ from typing import final
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.mxfp_subkernels.mxfp_load_utils import (
     mxfp_load_performance_wrapper,
 )
 from nkilib_src.nkilib.experimental.mxfp_subkernels.mxfp_load_utils_torch import (
     mxfp_load_performance_wrapper_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -40,7 +40,7 @@ K_BLOCK_SIZE = 512
 
 
 @pytest_test_metadata(name="MxfpLoadPerformance")
-@pytest_marks(["mxfp", "performance"])
+@pytest_marks(["mx", "mxfp8", "performance"])
 @final
 @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 class TestMxfpLoadPerformance:
@@ -69,7 +69,9 @@ class TestMxfpLoadPerformance:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(platform_target=platform_target),
+            compiler_args=CompilerArgs(
+                platform_target=platform_target,
+            ),
             rtol=0.0,
             atol=0.0,
         )

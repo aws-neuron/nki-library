@@ -39,6 +39,21 @@ def rel_path(filepath: str):
     return str(Path(filepath).relative_to(_SRC_DIR))
 
 
+def statement_source_end(body: list[ast.stmt], index: int, num_lines: int):
+    """Return the exclusive 0-based end line of the statement at ``index`` in ``body``.
+
+    The statement's source runs up to the start of the following statement, or up to that
+    statement's first decorator when it has one, so decorators are attributed to the
+    definition they belong to. ``num_lines`` is used for the last statement in the module.
+    """
+    if index + 1 >= len(body):
+        return num_lines
+    next_node = body[index + 1]
+    if isinstance(next_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and next_node.decorator_list:
+        return next_node.decorator_list[0].lineno - 1
+    return next_node.lineno - 1
+
+
 def _uses_external_lib(node: ast.AST):
     """Check if AST node calls torch.X or np.X() (np constants like np.float32 are allowed)."""
     called_attrs: set[int] = set()
@@ -78,7 +93,7 @@ _FuncInfo = dict[_FuncKey, tuple[int, ast.FunctionDef]]
 
 def _topological_sort(func_info: _FuncInfo, dependencies: dict[_FuncKey, set[_FuncKey]]):
     """Topologically sort functions. Returns sorted list or raises error with cycle."""
-    in_degree: dict[_FuncKey, int] = {name: 0 for name in func_info}
+    in_degree: dict[_FuncKey, int] = dict.fromkeys(func_info, 0)
     dependents: dict[_FuncKey, set[_FuncKey]] = {name: set() for name in func_info}
 
     for name, deps in dependencies.items():
@@ -114,7 +129,8 @@ def _topological_sort(func_info: _FuncInfo, dependencies: dict[_FuncKey, set[_Fu
                 cycle.append(start)
                 break
             curr = next_node
-        raise ValueError(f"Cycle detected: {' -> '.join(cycle)}")
+        cycle_desc = " -> ".join(f"{fpath}:{name}" for fpath, name in cycle)
+        raise ValueError(f"Cycle detected: {cycle_desc}")
 
     return result
 
@@ -153,18 +169,18 @@ def _compute_nki_functions_with_violators():
 
     # Mark functions that directly use torch/np
     uses_external: set[_FuncKey] = set()
-    for key, (line, node) in all_funcs.items():
+    for key, (_line, node) in all_funcs.items():
         if _uses_external_lib(node):
             uses_external.add(key)
 
     # Build call graph: callee key -> set of caller keys
-    all_names: set[str] = set(k[1] for k in all_funcs)
+    all_names: set[str] = {k[1] for k in all_funcs}
     name_to_keys: dict[str, list[_FuncKey]] = {}
     for key in all_funcs:
         name_to_keys.setdefault(key[1], []).append(key)
 
     callers_of: dict[_FuncKey, set[_FuncKey]] = {key: set() for key in all_funcs}
-    for key, (line, node) in all_funcs.items():
+    for key, (_line, node) in all_funcs.items():
         for called_name in _get_called_functions(node, all_names):
             candidates = name_to_keys.get(called_name, [])
             same_file = [k for k in candidates if k[0] == key[0] and k != key]
@@ -198,9 +214,9 @@ def _compute_nki_functions_with_violators():
     for key in func_info:
         name_to_keys.setdefault(key[1], []).append(key)
 
-    filtered_names: set[str] = set(k[1] for k in func_info)
+    filtered_names: set[str] = {k[1] for k in func_info}
     dependencies: dict[_FuncKey, set[_FuncKey]] = {}
-    for key, (line, node) in func_info.items():
+    for key, (_line, node) in func_info.items():
         called_names = _get_called_functions(node, filtered_names)
         deps: set[_FuncKey] = set()
         for name in called_names:

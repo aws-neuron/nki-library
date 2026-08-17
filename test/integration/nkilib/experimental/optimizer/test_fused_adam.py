@@ -17,12 +17,12 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.optimizer.fused_adam import adam_kernel, adamw_kernel
 from nkilib_src.nkilib.experimental.optimizer.fused_adam_torch import (
     adam_torch_ref,
     adamw_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata

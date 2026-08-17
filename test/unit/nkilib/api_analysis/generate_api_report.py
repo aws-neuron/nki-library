@@ -75,7 +75,7 @@ def generate_report():
     public_kernels, _, _ = get_nki_kernels_split()
     all_violators = _collect_all_violators()
 
-    proven_names: set[str] = set(proof.name for proof in HBM_SAFE_PROOF)
+    proven_names: set[str] = {proof.name for proof in HBM_SAFE_PROOF}
     framework_ready = get_nki_framework_kernels(proven_names)
     framework_ready_set: set[KernelLocation] = set(framework_ready)
     other_public = [loc for loc in public_kernels if loc not in framework_ready_set]

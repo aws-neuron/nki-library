@@ -92,6 +92,7 @@ class SQSEmitter(IMetricsEmitter):
         self,
         tests_passed: int,
         tests_total: int,
+        run_duration_sec: float,
         tests_skipped: int = 0,
         tests_xfailed: int = 0,
         coverage_data: CoverageData | None = None,
@@ -107,6 +108,7 @@ class SQSEmitter(IMetricsEmitter):
                 "TestsTotal": tests_total,
                 "TestsSkipped": tests_skipped,
                 "TestsXfailed": tests_xfailed,
+                "RunDurationSec": run_duration_sec,
                 "Timestamp": datetime.now(timezone.utc).isoformat(),
             }
             if coverage_data:
@@ -141,6 +143,7 @@ class SQSEmitter(IMetricsEmitter):
         return {
             **self._session.to_dimensions(),
             **dimensions,
+            "PytestMarks": collector.get_pytest_marks(),
             "Params": params,
             "Metrics": metrics,
             "Timestamp": datetime.now(timezone.utc).isoformat(),

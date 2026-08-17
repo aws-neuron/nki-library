@@ -150,7 +150,7 @@ class OutputValidator:
             golden = params.golden_output.for_rank(rank_id)
             if rank_id in params.golden_output.computation_times:
                 metrics_collector.record_timer(
-                    MetricName.GOLDEN_COMPUTATION_TIME, params.golden_output.computation_times[rank_id]
+                    MetricName.GOLDEN_ACQUISITION_TIME, params.golden_output.computation_times[rank_id]
                 )
             return golden, None
         elif isinstance(params.golden_output, LazyGoldenGenerator):
@@ -158,13 +158,13 @@ class OutputValidator:
             assert golden
             if params.golden_output.computation_time is not None:
                 metrics_collector.record_timer(
-                    MetricName.GOLDEN_COMPUTATION_TIME, params.golden_output.computation_time
+                    MetricName.GOLDEN_ACQUISITION_TIME, params.golden_output.computation_time
                 )
             return golden, params.golden_output.output_ndarray
         elif isinstance(params.golden_output, dict):
             return params.golden_output, None
         else:
-            assert False, f"Unknown golden generator/validator found"
+            raise AssertionError("Unknown golden generator/validator found")
 
     def _compare_raw_byte(
         self,

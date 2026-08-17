@@ -15,13 +15,16 @@
 """Shared utilities for MoE CTE blockwise matrix multiplication tests."""
 
 import math
-from typing import Optional
+from typing import Any, Optional
 
 import ml_dtypes
 import nki.language as nl
 import numpy as np
-from typing_extensions import override
+import numpy.typing as npt
 
+# BWMMFunc and _mx_internal_data live in src/ so torch_refs can import them
+# without depending on test/. Re-exported here for existing test callers.
+from nkilib_src.nkilib.core.moe.moe_cte.bwmm_func import BWMMFunc  # noqa: F401
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block import bwmm_shard_on_block
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I import (
     SkipMode,
@@ -39,6 +42,8 @@ from nkilib_src.nkilib.experimental.moe.moe_cte.bwmm_shard_on_block_v2 import (
 from nkilib_src.nkilib.experimental.moe.moe_cte.bwmm_shard_on_block_v2 import (
     bwmm_shard_on_block_hybrid,
 )
+from typing_extensions import override
+
 from test.utils.common_dataclasses import CustomValidator
 from test.utils.mx_utils import is_mx_quantize
 
@@ -46,6 +51,10 @@ from test.utils.mx_utils import is_mx_quantize
 _pmax = 128
 _q_height = 8
 _q_width = 4
+
+# Constructed once at module load and reused as the shared default for `skip_dma`
+# parameters below; SkipMode instances are not mutated by any callee in this module.
+_DEFAULT_SKIP_MODE = SkipMode(False, False)
 
 # Dimension name constants
 BWMM_CONFIG = "cfg"
@@ -70,12 +79,7 @@ UP_CLAMP_UPPER_DIM_NAME = "ucu"
 UP_CLAMP_LOWER_DIM_NAME = "ucl"
 EXPERT_AFFINITY_MULTIPLY_ON_I_DIM_NAME = "eamoi"
 
-dtype2dtype_range = {nl.int8: (-127, 127), nl.float8_e4m3: (-240.0, 240.0)}
-
-
-# BWMMFunc and _mx_internal_data live in src/ so torch_refs can import them
-# without depending on test/. Re-exported here for existing test callers.
-from nkilib_src.nkilib.core.moe.moe_cte.bwmm_func import BWMMFunc  # noqa: F401
+dtype2dtype_range = {nl.int8: (-127, 127), nl.float8_e4m3: (-240, 240)}
 
 
 def get_n_blocks(T, TOPK, E, B, n_block_per_iter=1):
@@ -139,13 +143,13 @@ def map_skip_mode(skip_mode: int) -> SkipMode:
 
 def quantize_strategy2scale_shapes(quantize_strategy, E, I_TP, H):
     if quantize_strategy == 0:
-        assert False, "no scales for no quant"
+        raise AssertionError("no scales for no quant")
     elif quantize_strategy == 1:
         return [1, 1, 2 * 1], [1, 1, 1]
     elif quantize_strategy == 2:
         return [1, 1, 2 * I_TP], [1, 1, H]
     elif quantize_strategy == 3:
-        assert False, "per block quantize not supported yet"
+        raise AssertionError("per block quantize not supported yet")
     elif quantize_strategy == 4:
         return [E, 1, 2 * 1], [E, 1, 1]
     elif quantize_strategy == 5:
@@ -157,7 +161,7 @@ def quantize_strategy2scale_shapes(quantize_strategy, E, I_TP, H):
 
 
 def get_router_with_controlled_distribution(
-    T: int, TOPK: int, E: int, alpha: np.float32 = None, non_overlapping_shards: bool = False
+    T: int, TOPK: int, E: int, alpha: float | None = None, non_overlapping_shards: bool = False
 ):
     """Generate a uniform or controlled probability distribution over E experts for tokens."""
     actual_k = min(E, TOPK)
@@ -202,7 +206,7 @@ def generate_token_position_to_id_and_experts(
     use_split_padding: bool = False,
     n_block_per_iter: int = 1,
     vnc_degree: int = 1,
-    alpha: np.float32 = None,
+    alpha: float | None = None,
     is_block_parallel: bool = False,
     quantize=None,
     non_overlapping_shards: bool = False,
@@ -253,7 +257,7 @@ def generate_token_position_to_id_and_experts(
         conditions[-(n_padding_block + 1) :] = 0
     else:
         if is_mx_quantize(quantize):
-            assert n_block_per_iter == 1, f"BWMM MXFP4 shard on block only support n_block_per_iter=1"
+            assert n_block_per_iter == 1, "BWMM MXFP4 shard on block only support n_block_per_iter=1"
             conditions = np.ones((N + 2,), dtype=np.int32)
             conditions[-(n_padding_block + 2) :] = 0
         else:
@@ -296,7 +300,7 @@ def build_bwmm_inputs(
     gate_clamp_upper_limit=None,
     up_clamp_lower_limit=None,
     up_clamp_upper_limit=None,
-    alpha: np.float32 = None,
+    alpha: float | None = None,
     expert_affinity_multiply_on_I: bool = False,
     is_dropping: bool = False,
     rtype: int = 1,
@@ -491,7 +495,7 @@ def moe_cte_kernel_wrapper(
     is_block_quant=False,
     is_per_tensor=False,
     activation_function: ActFnType = ActFnType.SiLU,
-    skip_dma: SkipMode = SkipMode(False, False),
+    skip_dma: SkipMode = _DEFAULT_SKIP_MODE,
     compute_dtype=nl.bfloat16,
     is_tensor_update_accumulating: bool = True,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
@@ -692,7 +696,7 @@ def moe_cte_kernel_wrapper(
             accumulation_dtype=accumulation_dtype,
         )
     else:
-        assert False, f"Unsupported bwmm_func: {bwmm_func}"
+        assert False, f"Unsupported bwmm_func: {bwmm_func}"  # noqa: B011  # NKI kernels forbid raise; this wrapper is traced as a kernel
 
 
 def moe_cte_torch_wrapper(
@@ -715,7 +719,7 @@ def moe_cte_torch_wrapper(
     is_block_quant=False,
     is_per_tensor=False,
     activation_function: ActFnType = ActFnType.SiLU,
-    skip_dma: SkipMode = SkipMode(False, False),
+    skip_dma: SkipMode = _DEFAULT_SKIP_MODE,
     compute_dtype=None,
     is_tensor_update_accumulating: bool = True,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
@@ -817,7 +821,6 @@ def generate_moe_cte_inputs(
         BWMMFunc.SHARD_ON_BLOCK_V2,
         BWMMFunc.SHARD_ON_BLOCK_HW,
     )
-    is_dropping = bwmm_func_enum == BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING
 
     dma_skip = map_skip_mode(skip)
     quantize_strategy = 6 if quantize else 0
@@ -942,13 +945,11 @@ def _shard_on_block_output_validator(
     """Create a CustomValidator that compares only [:T, 0, :H] of the (T_out, 2, H+E) output."""
     from test.utils.comparators import maxAllClose
 
-    T = T_out - 1 if T_out > tokens else tokens  # Real token count excluding padding
-
     class ShardOnBlockOutputValidator(CustomValidator):
         @override
-        def validate(self, actual_raw_output):
+        def validate(self, inference_output: npt.NDArray[Any]) -> bool:
             actual = (
-                np.frombuffer(actual_raw_output, dtype=ml_dtypes.bfloat16)
+                np.frombuffer(inference_output, dtype=ml_dtypes.bfloat16)
                 .reshape(T_out, 2, hidden + expert)
                 .astype(np.float32)
             )
@@ -1002,6 +1003,7 @@ def _shard_on_block_mx_output_validator(
     from inspect import signature
 
     from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx_torch import bwmm_shard_on_block_mx_torch_ref
+
     from test.integration.nkilib.core.moe.moe_cte.test_utils import (
         gather_from_packed_down,
         gather_from_packed_gate_up,
@@ -1035,9 +1037,9 @@ def _shard_on_block_mx_output_validator(
 
     class ShardOnBlockMxOutputValidator(CustomValidator):
         @override
-        def validate(self, actual_raw_output):
+        def validate(self, inference_output: npt.NDArray[Any]) -> bool:
             actual = (
-                np.frombuffer(actual_raw_output, dtype=ml_dtypes.bfloat16)
+                np.frombuffer(inference_output, dtype=ml_dtypes.bfloat16)
                 .reshape(lnc_degree, -1, hidden)
                 .astype(np.float32)
             )
@@ -1180,6 +1182,7 @@ def generate_moe_cte_unified_inputs(
         ShardOnBlockConfig,
         ShardOnIConfig,
     )
+
     from test.integration.nkilib.core.moe.moe_cte.test_utils import build_moe_bwmm_mx_cte
     from test.utils.mx_utils import is_mx_quantize
 
@@ -1314,7 +1317,6 @@ def generate_moe_cte_unified_inputs(
         BWMMFunc.SHARD_ON_BLOCK_V2,
         BWMMFunc.SHARD_ON_BLOCK_HW,
     )
-    is_dropping = bwmm_func_enum == BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING
     quantize_strategy = 6 if quantize else 0
 
     raw = build_bwmm_inputs(

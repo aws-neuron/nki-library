@@ -21,8 +21,8 @@ import pytest
 import torch
 import torch.distributed as dist
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import get_pg, get_rank
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,
@@ -326,17 +326,17 @@ class TestCollectiveUnitTestFramework:
         def torch_ref(a):
             return {"out": a}
 
-        mock_manager = MagicMock()
         mock_collector = MagicMock()
+        mock_manager = MagicMock()
         metadata_list = [{"test_settings": {"k": 1}}]
 
         framework = CollectiveUnitTestFramework(
             test_manager=mock_manager,
+            collector=mock_collector,
             kernel_entry=kernel,
             torch_ref=torch_ref,
             per_rank_input_generator=lambda rank_id: {"a": np.array([1.0])},
             collective_ranks=2,
-            collector=mock_collector,
         )
 
         with patch("test.utils.unit_test_framework.load_model_configs", return_value=metadata_list):
@@ -571,6 +571,42 @@ class TestRunTorchRefsParallel:
             kernel_args = mock_manager.execute.call_args[0][0]
             assert kernel_args.validation_args is None
 
+    def test_profile_only_skips_rank_scans_and_golden_inputs(self, tmp_path):
+        rg = ReplicaGroup([[0, 1]])
+        calls = []
+
+        def kernel(x, replica_group):
+            return x, replica_group
+
+        def torch_ref(x, replica_group):
+            return {"out": x.copy()}
+
+        def input_gen(rank_id):
+            calls.append(rank_id)
+            return {"x": np.array([float(rank_id)], dtype=np.float32), "replica_group": rg}
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=input_gen,
+            collective_ranks=2,
+        )
+
+        framework.run_test(
+            test_config=None,
+            compiler_args=MagicMock(),
+            output_keys=["out"],
+            profile_only=True,
+            input_artifacts_directory=str(tmp_path),
+        )
+
+        assert calls == [0]
+        kernel_args = mock_manager.execute.call_args[0][0]
+        assert kernel_args.validation_args is None
+        assert kernel_args.kernel_input.input_artifacts_directory == str(tmp_path)
+
     def test_multiple_replica_groups(self):
         """Kernels with multiple ReplicaGroups should get separate SimProcessGroups per group."""
 
@@ -741,17 +777,6 @@ class TestSimDistRunnerMultiPass:
         results = runner.run(torch_ref, inputs)
         assert torch.allclose(results[0]["out"], torch.tensor([6.0]))
         assert torch.allclose(results[1]["out"], torch.tensor([6.0]))
-
-        # Verify the optimization works by running again with a spy on os.rename
-        # (os.rename is only called for actual writes, not skipped ones)
-        rename_log = tempfile.mktemp(suffix=".log")
-        original_rename = os.rename
-
-        def spy_rename(src, dst):
-            if dst.endswith(".pkl"):
-                with open(rename_log, "a") as f:
-                    f.write(dst + "\n")
-            return original_rename(src, dst)
 
         # Run a second time — but SimDistRunner uses fresh tempdir each time,
         # so we can't test cross-run skipping. Instead verify that within a single

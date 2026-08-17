@@ -325,6 +325,19 @@ def _topk_rotated_core(
         batch_end=batch_end,
     )
 
+    # predicated_folded_load only writes this shard's valid BxS elements, which
+    # occupy partitions [0:valid_pdim] (n_stages consecutive partitions per
+    # element). Restrict every downstream op to those partitions so none reads
+    # the padding partitions [valid_pdim:total_partition_dim] that the load
+    # leaves uninitialized. The rotation matrix is block-diagonal with
+    # one n_stages-wide block per element, so its [0:valid_pdim, 0:valid_pdim]
+    # sub-block is exactly the rotation for the valid partitions.
+    valid_pdim = (batch_end - batch_start) * n_stages
+    values = values[0:valid_pdim, :]
+    indices = indices[0:valid_pdim, :]
+    rotation = rotation[0:valid_pdim, 0:valid_pdim]
+    rotation_f32 = rotation_f32[0:valid_pdim, 0:valid_pdim]
+
     for stage_idx in nl.static_range(n_stages):
         offset = stage_free_size + (local_top_k_per_stage * stage_idx)
 
@@ -454,7 +467,7 @@ def topk(
         # Reshape outputs to original shape
         return topk_values.reshape(original_shape), topk_indices.reshape(original_shape)
     """
-    if method not in SupportedTopkMethods:
+    if method not in SupportedTopkMethods:  # pragma: no cover - arg validation, not a functional branch
         raise ValueError(f"Unsupported method '{method}'. Supported methods are: {list(SupportedTopkMethods)}")
 
     topk_config = create_topk_config(

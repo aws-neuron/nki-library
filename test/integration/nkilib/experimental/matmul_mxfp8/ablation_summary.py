@@ -105,12 +105,12 @@ def avg_metrics(rows):
 
 def fmt(val, suffix=""):
     """Format a float value with suffix, or return N/A."""
-    return f"{val:.2f}{suffix}" if val != None else "N/A"
+    return f"{val:.2f}{suffix}" if val is not None else "N/A"
 
 
 def delta(a, b):
     """Return percentage change from a to b."""
-    if a == None or b == None or a == 0:
+    if a is None or b is None or a == 0:
         return "N/A"
     pct = (b - a) / a * 100
     sign = "+" if pct >= 0 else ""
@@ -136,7 +136,6 @@ def main():
         stats[name] = avg_metrics(config_rows)
 
     baseline_name = "BF16 Swizzled (no scale pack, no spill)"
-    base = stats[baseline_name]
 
     # Build ablation table rows
     ablation_rows = []

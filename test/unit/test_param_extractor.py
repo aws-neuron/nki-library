@@ -15,8 +15,10 @@
 Unit tests for param_extractor module.
 """
 
+import json
 from dataclasses import dataclass
 from enum import Enum
+from functools import wraps
 from unittest.mock import Mock
 
 import pytest
@@ -84,7 +86,7 @@ class TestNormalizeParamValue:
         assert normalize_param_value(obj) == "CustomObj(123)"
 
     def test_homogeneous_list_kept_native(self):
-        """Homogeneous lists are kept as native arrays for correct OpenSearch mapping."""
+        """Homogeneous lists are kept as native arrays for correct metric mapping."""
         assert normalize_param_value([1, 2, 3]) == [1, 2, 3]
 
     def test_mixed_type_tuple_stringified(self):
@@ -98,6 +100,47 @@ class TestNormalizeParamValue:
     def test_empty_list_kept_native(self):
         """Empty lists are kept as native arrays."""
         assert normalize_param_value([]) == []
+
+    def test_object_nested_in_list_is_stringified(self):
+        """A complex object inside a list is stringified, not left raw."""
+
+        class CustomObj:
+            def __str__(self):
+                return "CustomObj"
+
+        result = normalize_param_value([CustomObj(), CustomObj()])
+        assert result == ["CustomObj", "CustomObj"]
+        json.dumps(result)
+
+    def test_object_nested_in_dict_is_stringified(self):
+        """A dict param with a complex value is normalized then JSON-stringified."""
+
+        class CustomObj:
+            def __str__(self):
+                return "CustomObj"
+
+        result = normalize_param_value({"k": CustomObj()})
+        assert result == '{"k": "CustomObj"}'
+        json.dumps(result)
+
+    def test_normalized_values_are_always_json_serializable(self):
+        """Every normalized value must survive json.dumps."""
+
+        class CustomObj:
+            def __str__(self):
+                return "obj"
+
+        cases = [
+            CustomObj(),
+            [CustomObj()],
+            (CustomObj(),),
+            {"nested": CustomObj()},
+            [1, "a", 2.0],
+            SampleEnum.VALUE_A,
+            [128, 256, 512],
+        ]
+        for case in cases:
+            json.dumps(normalize_param_value(case))
 
 
 class TestUnwrapKernelFunc:
@@ -113,7 +156,10 @@ class TestUnwrapKernelFunc:
 
     def test_unwraps_func_attribute(self):
         """Objects with 'func' attribute are unwrapped."""
-        original = lambda: None
+
+        def original():
+            return None
+
         mock_kernel = Mock()
         mock_kernel.func = original
 
@@ -122,19 +168,27 @@ class TestUnwrapKernelFunc:
 
     def test_unwraps_wrapped_attribute(self):
         """Decorated functions with __wrapped__ are unwrapped."""
-        original = lambda: None
-        decorated = lambda: None
-        decorated.__wrapped__ = original
+
+        def original():
+            return None
+
+        @wraps(original)
+        def decorated():
+            return None
 
         assert _unwrap_kernel_func(decorated) is original
 
     def test_recursive_unwrap(self):
         """Nested wrappers are unwrapped recursively."""
-        original = lambda: None
+
+        def original():
+            return None
 
         # Create nested wrapper: GenericKernel(decorated(original))
-        decorated = lambda: None
-        decorated.__wrapped__ = original
+        @wraps(original)
+        def decorated():
+            return None
+
         mock_kernel = Mock()
         mock_kernel.func = decorated
 
@@ -205,7 +259,7 @@ class TestNormalizeParamNames:
         assert normalize_param_names({"hidden_dim": 8192}) == {"hidden": 8192}
 
     def test_head_names_normalized_to_n_prefix(self):
-        """num_* head names normalize to n_* for OpenSearch consistency."""
+        """num_* head names normalize to n_* for metric consistency."""
         assert normalize_param_names({"num_q_heads": 8}) == {"n_q_heads": 8}
         assert normalize_param_names({"num_kv_heads": 4}) == {"n_kv_heads": 4}
         assert normalize_param_names({"num_heads": 64}) == {"n_heads": 64}
@@ -313,7 +367,7 @@ class TestStableParamValue:
     def test_dataclass_with_set_field(self):
         @dataclass
         class Config:
-            dims: set = None
+            dims: set | None = None
 
             def __post_init__(self):
                 if self.dims is None:

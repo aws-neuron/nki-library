@@ -22,9 +22,9 @@ from typing import final
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.embeddings.rope_hf import rope_hf
 from nkilib_src.nkilib.core.embeddings.rope_hf_torch import rope_hf_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata

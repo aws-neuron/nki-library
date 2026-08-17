@@ -141,12 +141,16 @@ class InputTensors(nl.NKIObject):
         expert_affinities_masked (nl.NkiTensor): [(T+1)*E, 1], Expert affinities per token.
         gate_up_proj_scale (nl.NkiTensor): [E, 16, 2, n_H512_tile, I], Gate/up dequant scales.
         down_proj_scale (nl.NkiTensor): [E, 16, n_I512_tile, H], Down projection dequant scales.
+        local_expert_start_idx (nl.NkiTensor): [1, 1] int32 SBUF, this instance's first global expert id, derived on-device as ep_rank * E_local; packed-affinity path only.
         p_gup_idx_vector (nl.NkiTensor): [128, 1], Reusable index vector for gate/up scale DGE.
         p_gup_idx_vector_int32 (nl.NkiTensor): [128, 1], Persistent int32 cache of gate/up index vector.
         p_down_idx_vector (nl.NkiTensor): [128, 1], Reusable index vector for down scale DGE.
         gup_scales_sb (nl.NkiTensor): [128, 2, n_H512_tile, I], Gate/up scales buffer in SBUF.
         activation_bias (nl.NkiTensor): [128, 1], Activation bias buffer in SBUF.
         conditions (nl.NkiTensor): [N+1], Block validity conditions for dynamic loops.
+        arange_4H (nl.NkiTensor): [1, 4], Persistent [0,1,2,3] H-fold offset vector, hoisted once at entry.
+        gup_scale_lut_sb (nl.NkiTensor): fp32 [128, E, 3], STATIC_MX per-expert gate/up table (1/in_scale, in_scale*gate_w_scale, in_scale*up_w_scale), broadcast across partitions.
+        down_scale_lut_sb (nl.NkiTensor): fp32 [128, E, 2], STATIC_MX per-expert down table (1/down_in_scale, down_in_scale*down_w_scale), broadcast across partitions.
     """
 
     token_position_to_id: nl.NkiTensor
@@ -159,21 +163,16 @@ class InputTensors(nl.NKIObject):
     expert_affinities_masked: nl.NkiTensor
     gate_up_proj_scale: nl.NkiTensor
     down_proj_scale: nl.NkiTensor
+    local_expert_start_idx: nl.NkiTensor = None
     p_gup_idx_vector: nl.NkiTensor = None
     p_gup_idx_vector_int32: nl.NkiTensor = None
     p_down_idx_vector: nl.NkiTensor = None
     gup_scales_sb: nl.NkiTensor = None
     activation_bias: nl.NkiTensor = None
     conditions: nl.NkiTensor = None
-    # Persistent [0,1,2,3] vector for H-folding in compute_hidden_index_vector,
-    # hoisted once at kernel entry to avoid per-block iota allocation.
     arange_4H: nl.NkiTensor = None
-    # STATIC_MX: per-expert packed tables loaded once at top of kernel, broadcast across partitions.
-    # gup_scale_lut_sb [_pmax, E, 3]: per expert e, slot 0 = 1/gate_up_in_scale[e], slot 1 = in_scale[e]*gate_w_scale[e,0],
-    #   slot 2 = in_scale[e]*gate_w_scale[e,1]. One scalar_offset gather pulls all three for a block in one tensor_copy.
-    # down_scale_lut_sb [_pmax, E, 2]: per expert e, slot 0 = 1/down_in_scale[e], slot 1 = down_in_scale[e]*down_w_scale[e].
-    gup_scale_lut_sb: nl.NkiTensor = None  # fp32 [_pmax, E, 3]
-    down_scale_lut_sb: nl.NkiTensor = None  # fp32 [_pmax, E, 2]
+    gup_scale_lut_sb: nl.NkiTensor = None
+    down_scale_lut_sb: nl.NkiTensor = None
 
 
 @dataclass
@@ -505,10 +504,14 @@ class BWMMMXConfigs(nl.NKIObject):
     # quantize_mx) via load_fp8_hidden_states_mx. Only supported with QuantizationType.MX.
     is_fp8_hidden: bool = False
     # When True (only with is_fp8_hidden), the concat row also carries the dense [T, E] expert
-    # affinities (bf16) after the scale region. Each block extracts its expert's affinity column from packed hidden
+    # affinities after the scale region, in expert_affinities_dtype. Each block extracts its expert's
+    # affinity column from the packed hidden.
     # affinities_col_offset is the fp8 column where the affinity region begins.
     is_affinities_packed: bool = False
     affinities_col_offset: int = 0
+    # dtype the packed affinity tail is stored in (== the incoming hidden_states dtype). Used to
+    # reinterpret the tail: sizeinbytes(this) fp8 columns per affinity element.
+    expert_affinities_dtype: Any = nl.bfloat16
 
 
 # --- HIDDEN STATE LOADING AND TRANSFORMATION ---

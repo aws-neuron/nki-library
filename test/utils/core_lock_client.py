@@ -24,8 +24,11 @@ import functools
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import fabric2
+# fabric2 is imported lazily (see _is_fabric_connection)
+if TYPE_CHECKING:
+    import fabric2
 
 # Redundant aliases on the timing constants mark them as intentional re-exports
 # so the client reads identical values without redefining them. The deployed
@@ -49,6 +52,21 @@ from .scripts.remote_lock_scripts import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+
+def _is_fabric_connection(executor: object) -> bool:
+    """True if `executor` is a ``fabric2.Connection``.
+
+    Imports fabric2 lazily so this module stays importable where fabric2 is
+    absent.
+    """
+    # TODO: remove Connection support once host patcher uses RemoteExecutor
+    try:
+        import fabric2
+    except ImportError:
+        return False
+    return isinstance(executor, fabric2.Connection)
+
+
 # Remote paths for lock files
 REMOTE_LOCK_DIR = "/tmp/neuronx-cc/core_locks"
 REMOTE_VERSION_JSON = f"{REMOTE_LOCK_DIR}/infra_version.json"
@@ -57,12 +75,12 @@ REMOTE_FLOCK_FILE = f"{REMOTE_LOCK_DIR}/atomic_lock"
 REMOTE_LOCK_HELPERS = f"{REMOTE_LOCK_DIR}/lock_helpers.py"
 
 # Default locking protocol version for hosts without version file
-DEFAULT_LOCKING_PROTOCOL_VERSION = 4
+DEFAULT_LOCKING_PROTOCOL_VERSION = 5
 
-# Build-time guard: this constant and the deployed v4 queue verbs must move
+# Build-time guard: this constant and the deployed v5 queue verbs must move
 # together. Fail fast at import if the constant drifts from the protocol the
 # verbs implement, rather than silently regressing hosts.
-assert DEFAULT_LOCKING_PROTOCOL_VERSION == 4, "locking protocol constant must stay pinned to v4"
+assert DEFAULT_LOCKING_PROTOCOL_VERSION == 5, "locking protocol constant must stay pinned to v5"
 
 # JSON key in version file
 MIN_CLIENT_VERSION_KEY = "minClientLockingVersion"
@@ -83,11 +101,11 @@ def get_lock_helpers_content() -> str:
     """Load the lock helpers script content from the local filesystem."""
     try:
         return _LOCAL_LOCK_HELPERS_PATH.read_text()
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         raise FileNotFoundError(
             f"Lock helpers script not found at {_LOCAL_LOCK_HELPERS_PATH}. "
             f"Ensure {_LOCAL_LOCK_HELPERS_PATH.name} is present in the same directory."
-        )
+        ) from e
 
 
 # =============================================================================
@@ -131,9 +149,9 @@ def _remote_initialize(
             try:
                 fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except BlockingIOError:
+            except BlockingIOError as e:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"flock timed out after {flock_timeout}s")
+                    raise TimeoutError(f"flock timed out after {flock_timeout}s") from e
                 time.sleep(0.1 + random.uniform(0, 0.025))
         try:
             # Version-gate the deploy under the held flock (read + decide + write
@@ -180,9 +198,9 @@ def _remote_lock_operation(lock_file, helpers_file, command, args, kwargs=None, 
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except BlockingIOError:
+            except BlockingIOError as e:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"flock timed out after {flock_timeout}s")
+                    raise TimeoutError(f"flock timed out after {flock_timeout}s") from e
                 time.sleep(0.1 + random.uniform(0, 0.025))
         try:
             lr = fn(*args, **kwargs)
@@ -198,6 +216,7 @@ def _remote_lock_operation(lock_file, helpers_file, command, args, kwargs=None, 
         "worst_case_eta": lr.worst_case_eta,
         "bumped": lr.bumped,
         "re_enqueued": lr.re_enqueued,
+        "should_reset_cores": lr.should_reset_cores,
     }
     return result
 
@@ -299,6 +318,7 @@ def _run_lock_helper(executor, command: str, *args, **kwargs) -> LockResult:
         worst_case_eta=resp.get("worst_case_eta"),
         bumped=resp.get("bumped", False),
         re_enqueued=resp.get("re_enqueued", False),
+        should_reset_cores=resp.get("should_reset_cores", True),
     )
 
 
@@ -325,6 +345,7 @@ def poll(
     version: int,
     entry_id: str,
     ready: bool,
+    lnc_config: int,
     caller_id: str | None = None,
 ) -> LockResult:
     """Poll the FIFO core-allocation queue (fast-path / enqueue / commit)."""
@@ -338,6 +359,7 @@ def poll(
         version,
         entry_id,
         ready,
+        lnc_config,
         caller_id=caller_id,
     )
 
@@ -413,24 +435,21 @@ def is_draining(executor, version: int) -> bool:
 
 def drain(executor, timeout_seconds: int, version: int) -> LockResult:
     """Enable drain mode. Accepts executor or fabric2.Connection (for host patcher compat)."""
-    # TODO: remove Connection support once host patcher uses RemoteExecutor
-    if isinstance(executor, fabric2.Connection):
+    if _is_fabric_connection(executor):
         return _conn_run_lock_helper(executor, "drain", REMOTE_LOCKS_JSON, timeout_seconds, version)
     return _run_lock_helper(executor, "drain", REMOTE_LOCKS_JSON, timeout_seconds, version)
 
 
 def undrain(executor, version: int) -> LockResult:
     """Disable drain mode. Accepts executor or fabric2.Connection (for host patcher compat)."""
-    # TODO: remove Connection support once host patcher uses RemoteExecutor
-    if isinstance(executor, fabric2.Connection):
+    if _is_fabric_connection(executor):
         return _conn_run_lock_helper(executor, "undrain", REMOTE_LOCKS_JSON, version)
     return _run_lock_helper(executor, "undrain", REMOTE_LOCKS_JSON, version)
 
 
 def initialize(executor) -> None:
     """Create lock dir, deploy helpers, read version. Accepts executor or Connection (host patcher compat)."""
-    # TODO: remove Connection support once host patcher uses RemoteExecutor
-    if isinstance(executor, fabric2.Connection):
+    if _is_fabric_connection(executor):
         conn = executor
         conn.run(
             f"mkdir -p -m 777 {REMOTE_LOCK_DIR} && touch {REMOTE_FLOCK_FILE} && chmod 666 {REMOTE_FLOCK_FILE} 2>/dev/null || true",

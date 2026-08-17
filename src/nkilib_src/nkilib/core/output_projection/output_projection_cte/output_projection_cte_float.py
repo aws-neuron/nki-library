@@ -19,11 +19,14 @@ from typing import List, Optional
 import nki.isa as nisa
 import nki.language as nl
 
+from ...utils.common_types import OProjAttentionLayout
 from .output_projection_cte_parameters import P_MAX, TilingConfig
 from .output_projection_cte_tensor_io import (
     load_bias,
     load_float_weights,
     load_input_tensor_float,
+    load_input_tensor_float_heads_outer,
+    load_input_tensor_float_transposed,
 )
 
 
@@ -34,6 +37,7 @@ def perform_float_projection(
     out_hbm: nl.NkiTensor,
     cfg: TilingConfig,
     prg_id: int,
+    attention_layout: OProjAttentionLayout,
 ) -> None:
     """
     Perform float (non-quantized) output projection: out = attention @ weight + bias.
@@ -51,12 +55,16 @@ def perform_float_projection(
         - Result SBUF: P_MAX * h_block_size * dtype_size per subtile
 
     Args:
-        attention_hbm (nl.NkiTensor): [B, N, D, S], Input attention tensor in HBM.
+        attention_hbm (nl.NkiTensor): Input attention tensor in HBM, laid out as declared
+            by ``attention_layout``: [B, N, D, S] for BNdS, [B, S, N, D] for BSNd,
+            [B, N, S, D] for BNSd.
         weight_hbm (nl.NkiTensor): [N, D, H], Weight tensor in HBM (reshaped in main kernel).
         bias_hbm (Optional[nl.NkiTensor]): [1, H], Optional bias tensor in HBM.
         out_hbm (nl.NkiTensor): [B, S, H], Output tensor in HBM to write results.
         cfg (TilingConfig): Tiling configuration with dimension sizes.
         prg_id (int): Program ID for LNC sharding.
+        attention_layout (OProjAttentionLayout): Dimension order of ``attention_hbm``. For
+            BSNd and BNSd the D-on-partition layout is produced by a DMA transpose on load.
 
     Returns:
         None: Writes results to out tensor.
@@ -67,8 +75,35 @@ def perform_float_projection(
     """
     weight_hbm = weight_hbm.reshape((cfg.n_size, cfg.d_size, cfg.h_size))
 
-    if cfg.group_size > 1:
-        attention_hbm = attention_hbm.reshape((cfg.b_size, cfg.n_size, cfg.d_size, cfg.s_size))
+    attn_tp = attention_layout == OProjAttentionLayout.BNdS
+    heads_outer = attention_layout == OProjAttentionLayout.BNSd
+
+    # Head packing is a pure reshape when N and D are adjacent: [N, D, S] folds N into D
+    # directly, and [S, N, D] keeps them adjacent so the trailing N*D split is free. In
+    # [N, S, D] they are separated by S, so the packed tiles are assembled on load instead.
+    if cfg.group_size > 1 and not heads_outer:
+        if attn_tp:
+            attention_hbm = attention_hbm.reshape((cfg.b_size, cfg.n_size, cfg.d_size, cfg.s_size))
+        else:
+            attention_hbm = attention_hbm.reshape((cfg.b_size, cfg.s_size, cfg.n_size, cfg.d_size))
+
+    if attn_tp:
+        s_dim = 2
+    elif heads_outer:
+        s_dim = 1
+    else:
+        s_dim = 0
+
+    if attn_tp:
+        load_attention = load_input_tensor_float
+    elif heads_outer:
+        load_attention = load_input_tensor_float_heads_outer
+    else:
+        load_attention = load_input_tensor_float_transposed
+
+    tiles = [
+        (batch_idx, s_block_idx) for batch_idx in range(cfg.b_size) for s_block_idx in range(cfg.s_tile.tile_count)
+    ]
 
     for h_block_idx in range(cfg.h_tile.tile_count):
         h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
@@ -82,52 +117,56 @@ def perform_float_projection(
             bias_view = bias_hbm.slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
 
-        for batch_idx in range(cfg.b_size):
-            for s_block_idx in range(cfg.s_tile.tile_count):
-                curr_s_tile_size = cfg.s_tile.get_tile_bound(s_block_idx)
-                s_start = s_block_idx * cfg.s_tile.tile_size
+        for batch_idx, s_block_idx in tiles:
+            s_start = s_block_idx * cfg.s_tile.tile_size
+            curr_s_tile_size = cfg.s_tile.get_tile_bound(s_block_idx)
+            attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
+                dim=s_dim, start=s_start, end=s_start + curr_s_tile_size
+            )
+            output_view = out_hbm.select(dim=0, index=batch_idx).slice(
+                dim=1, start=h_start, end=h_start + curr_h_block_size
+            )
 
-                attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
-                    dim=2, start=s_start, end=s_start + curr_s_tile_size
-                )
-                output_view = out_hbm.select(dim=0, index=batch_idx).slice(
-                    dim=1, start=h_start, end=h_start + curr_h_block_size
-                )
+            attention_sb = load_attention(
+                attention_view=attention_view,
+                cfg=cfg,
+                target_dtype=weight_hbm.dtype,
+            )
 
-                _process_batch_tile(
-                    attention_view=attention_view,
-                    output_view=output_view,
-                    w_sbuf=w_sbuf,
-                    bias_sbuf=bias_sbuf,
-                    s_block_idx=s_block_idx,
-                    h_block_idx=h_block_idx,
-                    cfg=cfg,
-                    weight_dtype=weight_hbm.dtype,
-                )
+            _process_batch_tile(
+                attention_sb=attention_sb,
+                output_view=output_view,
+                w_sbuf=w_sbuf,
+                bias_sbuf=bias_sbuf,
+                s_block_idx=s_block_idx,
+                h_block_idx=h_block_idx,
+                cfg=cfg,
+                attention_dtype=attention_hbm.dtype,
+            )
 
 
 def _process_batch_tile(
-    attention_view: nl.NkiTensor,
+    attention_sb: List[nl.NkiTensor],
     output_view: nl.NkiTensor,
     w_sbuf: List[nl.NkiTensor],
     bias_sbuf: Optional[nl.NkiTensor],
     s_block_idx: int,
     h_block_idx: int,
     cfg: TilingConfig,
-    weight_dtype,
+    attention_dtype,
 ) -> None:
     """
     Process a single batch tile for one h_block: computes attention @ weight + bias.
 
     Args:
-        attention_view (NkiTensor): View of attention tensor for current batch/s_block [N, D, curr_s_tile_size].
+        attention_sb (List[nl.NkiTensor]): [n_size][d_size, s_block_size], SBUF Attention tiles
         output_view (NkiTensor): View of output tensor for current batch/h_block [S, h_block_size].
         w_sbuf (List[nl.NkiTensor]): List of weight tensors in SBUF (one per head).
         bias_sbuf (Optional[nl.NkiTensor]): Bias tensor in SBUF.
         s_block_idx (int): Current S block index.
         h_block_idx (int): Current H block index.
         cfg (TilingConfig): Tiling configuration.
-        weight_dtype: Weight tensor dtype (attention is cast to this to avoid mixed precision errors).
+        attention_dtype: Attention tensor dtype.
 
     Returns:
         None: Writes results to output tensor via output_view.
@@ -135,10 +174,7 @@ def _process_batch_tile(
     curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
     s_start = s_block_idx * cfg.s_tile.tile_size
 
-    # Step 1: Load attention tensors (cast to weight dtype to avoid mixed precision matmul error)
-    attention_sb = load_input_tensor_float(attention_view=attention_view, cfg=cfg, target_dtype=weight_dtype)
-
-    # Step 2: Compute matmul and add bias
+    # Step 1: Compute matmul and add bias
     result_sb = _compute_matmul_add_bias(
         attention_sb=attention_sb,
         w_sbuf=w_sbuf,
@@ -146,11 +182,11 @@ def _process_batch_tile(
         s_block_idx=s_block_idx,
         h_block_idx=h_block_idx,
         curr_h_block_size=curr_h_block_size,
-        attention_dtype=attention_view.dtype,
+        attention_dtype=attention_dtype,
         cfg=cfg,
     )
 
-    # Step 3: Write results to output
+    # Step 2: Write results to output
     _write_results_to_output(
         result_sb=result_sb,
         output_view=output_view,

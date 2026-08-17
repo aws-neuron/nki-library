@@ -18,8 +18,8 @@ from typing import final
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     BWMMFunc,
     generate_moe_cte_inputs,
@@ -619,33 +619,83 @@ class TestMoeCteModel:
 
 
 SKIP_GATE_PROJ_PARAMS = [
-    pytest.param(ActFnType.SquaredReLU, ExpertAffinityScaleMode.POST_SCALE, id="SquaredReLU-POST_SCALE"),
-    pytest.param(ActFnType.SquaredReLU, ExpertAffinityScaleMode.PRE_SCALE, id="SquaredReLU-PRE_SCALE"),
-    pytest.param(ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, id="SiLU-POST_SCALE"),
+    pytest.param(
+        ActFnType.SquaredReLU,
+        ExpertAffinityScaleMode.POST_SCALE,
+        512,
+        1024,
+        512,
+        2,
+        256,
+        2,
+        id="SquaredReLU-POST_SCALE",
+    ),
+    pytest.param(
+        ActFnType.SquaredReLU,
+        ExpertAffinityScaleMode.PRE_SCALE,
+        512,
+        1024,
+        512,
+        2,
+        256,
+        2,
+        id="SquaredReLU-PRE_SCALE",
+    ),
+    pytest.param(
+        ActFnType.SiLU,
+        ExpertAffinityScaleMode.POST_SCALE,
+        512,
+        1024,
+        512,
+        2,
+        256,
+        2,
+        id="SiLU-POST_SCALE",
+    ),
+    pytest.param(
+        ActFnType.SquaredReLU,
+        ExpertAffinityScaleMode.POST_SCALE,
+        2048,
+        2048,
+        1024,
+        64,
+        256,
+        8,
+        id="SquaredReLU-POST_SCALE-e64-k8",
+    ),
 ]
 
 
 class TestMoeBwmmSkipGateProj:
     """Test skip_gate_proj=True for non-gated MLP in BWMM shard-on-I."""
 
-    @pytest.mark.parametrize("act_fn, scaling_mode", SKIP_GATE_PROJ_PARAMS)
+    @pytest.mark.parametrize(
+        "act_fn, scaling_mode, tokens, hidden, intermediate, expert, block_size, top_k",
+        SKIP_GATE_PROJ_PARAMS,
+    )
     def test_bwmm_shard_I_skip_gate_proj(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
         act_fn: ActFnType,
         scaling_mode: ExpertAffinityScaleMode,
+        tokens: int,
+        hidden: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
         platform_target: Platforms,
     ):
         def input_generator(test_config):
             return generate_moe_cte_inputs(
                 bwmm_func_enum=BWMMFunc.SHARD_ON_INTERMEDIATE,
-                tokens=512,
-                hidden=1024,
-                intermediate=512,
-                expert=2,
-                block_size=256,
-                top_k=2,
+                tokens=tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
                 dtype=nl.bfloat16,
                 skip=0,
                 bias=False,
@@ -660,12 +710,12 @@ class TestMoeBwmmSkipGateProj:
         def output_tensors(kernel_input):
             return moe_cte_output_tensors(
                 kernel_input=kernel_input,
-                tokens=512,
-                hidden=1024,
-                intermediate=512,
-                expert=2,
-                block_size=256,
-                top_k=2,
+                tokens=tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
                 dtype=nl.bfloat16,
                 bwmm_func_enum=BWMMFunc.SHARD_ON_INTERMEDIATE,
                 training=False,

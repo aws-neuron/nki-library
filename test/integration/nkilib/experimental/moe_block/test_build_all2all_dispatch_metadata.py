@@ -16,13 +16,13 @@
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.moe_block.build_all2all_dispatch_metadata import (
     build_all2all_dispatch_metadata,
 )
 from nkilib_src.nkilib.experimental.moe_block.build_all2all_dispatch_metadata_torch import (
     build_all2all_dispatch_metadata_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator

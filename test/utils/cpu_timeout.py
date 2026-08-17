@@ -30,7 +30,7 @@ import resource
 import signal
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 import pytest
 import pytest_timeout
@@ -38,6 +38,18 @@ import pytest_timeout
 from .feature_flag_helper import get_feature_flag
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class _CancellableItem(Protocol):
+    """A collected test whose timeout has been armed, exposing the disarm hook.
+
+    The hook is a plain attribute on the item by convention of the wall-clock
+    timeout plugin, which both sets and later looks it up by that name, so the
+    CPU-time layer has to extend it in place rather than keep its own copy.
+    """
+
+    cancel_timeout: Callable[[], None]
 
 
 def _get_total_cpu() -> float:
@@ -135,13 +147,18 @@ def prepare_timeout_watchdog(item: pytest.Item, settings: pytest_timeout.Setting
 
         # Overwrite pytest-timeout's handler; ITIMER_REAL keeps ticking
         _ = signal.signal(signal.SIGALRM, handler)
-        trigger: Callable[[], None] = lambda: os.kill(os.getpid(), signal.SIGALRM)
+
+        def trigger() -> None:
+            os.kill(os.getpid(), signal.SIGALRM)
     else:
-        trigger = lambda: pytest_timeout.timeout_timer(item, settings)
+
+        def trigger() -> None:
+            pytest_timeout.timeout_timer(item, settings)
 
     watchdog: CPUTimeWatchdog = CPUTimeWatchdog(cpu_limit, start_cpu, trigger)
 
     # Extend pytest-timeout's cancel to also stop watchdog
+    assert isinstance(item, _CancellableItem), "the wall-clock timer must be armed before the CPU watchdog"
     original_cancel: Callable[[], None] = item.cancel_timeout
 
     def cancel() -> None:

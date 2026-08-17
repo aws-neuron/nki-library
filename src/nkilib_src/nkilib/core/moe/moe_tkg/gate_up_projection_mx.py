@@ -33,6 +33,7 @@ import nki.language as nl
 from ...utils.common_types import ActFnType
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type
+from ...utils.tensor_view import as_nki_tensor
 
 # Shared MX constants
 from .projection_mx_constants import (
@@ -531,9 +532,9 @@ def load_gate_up_weight_scale_bias(
     )
     if needs_padding:
         nisa.memset(dst=weight_sb[...], value=0, engine=nisa.gpsimd_engine)
-        nisa.dma_copy(src=weight_view, dst=weight_sb[:, :, :I_local], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:, :, :I_local], dge_mode=nisa.dge_mode.none)
     else:
-        nisa.dma_copy(src=weight_view, dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -592,7 +593,7 @@ def load_gate_up_weight_scale_bias(
             .slice(dim=1, start=tile_offset, end=tile_offset + n_I512_tiles_local)
         )
         nisa.dma_copy(
-            src=bias_view,
+            src=as_nki_tensor(bias_view),
             dst=bias_sb[:I_p_bias_in_hbm, :, :],
             dge_mode=nisa.dge_mode.none,
         )

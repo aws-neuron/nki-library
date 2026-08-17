@@ -36,6 +36,7 @@ from test.unit.nkilib.api_analysis.framework_ready_api_spec import HBM_SAFE_PROO
 from test.unit.nkilib.api_analysis.get_nki_functions import rel_path
 from test.unit.nkilib.api_analysis.get_nki_integration_kernels import get_nki_framework_kernels
 from test.utils.pytest_test_metadata import pytest_test_metadata
+from test.utils.test_validation_utils import fail_with_report
 
 
 def _get_framework_ready_kernels():
@@ -43,7 +44,7 @@ def _get_framework_ready_kernels():
 
     Uses the same logic as generate_api_report.py to identify framework-ready kernels.
     """
-    proven_names = set(proof.name for proof in HBM_SAFE_PROOF)
+    proven_names = {proof.name for proof in HBM_SAFE_PROOF}
     framework_ready = get_nki_framework_kernels(proven_names)
 
     result = []
@@ -159,7 +160,7 @@ class TestKernelParamTypes:
         violations = _check_kernel_signature(module_path, name)
         if violations:
             details = "\n".join(f"  - {p}: {a}" for p, a in violations)
-            pytest.fail(
+            fail_with_report(
                 f"Kernel {module_path}.{name} has parameters with disallowed types:\n{details}\n"
                 f"Allowed: primitives (int/float/bool/str), enums, frozen dataclasses, "
                 f"nl.ndarray, Optional[T] for any T, Tuple/Union wrappers of allowed types."

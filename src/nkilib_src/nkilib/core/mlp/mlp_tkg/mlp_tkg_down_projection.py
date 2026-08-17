@@ -29,7 +29,7 @@ from .mlp_tkg_constants import (
     MLPTKGConstantsGateUpTileCounts,
 )
 from .mlp_tkg_down_projection_lhs_rhs_swap import down_projection_lhs_rhs_swap
-from .mlp_tkg_utils import adaptive_dge_mode, alloc_tensor_view, prepare_down_bias_and_scale
+from .mlp_tkg_utils import adaptive_dge_mode, prepare_down_bias_and_scale
 
 _DGE_MODE_UNKNOWN = 0  # Compiler decides best DMA mode internally
 _DGE_MODE_NONE = 3  # Use STATIC DMA mode
@@ -239,8 +239,7 @@ def process_down_projection(
     # ---------------- Allocate and Load Bias Tile ----------------
     bias_tile = None
     if mlpp_has_down_projection_bias(params):
-        bias_tile = alloc_tensor_view(
-            sbm,
+        bias_tile = sbm.alloc_stack(
             down_b.shape,
             dtype=down_b.dtype,
             name=f"down_bias",
@@ -255,8 +254,7 @@ def process_down_projection(
     dequant_tile = None
     # ---------------- Quantization Scale ----------------
     if params.quant_params.is_quant():
-        dequant_tile = alloc_tensor_view(
-            sbm,
+        dequant_tile = sbm.alloc_stack(
             down_w_scale.shape,
             dtype=down_w_scale.dtype,
             name=f"down_w_scale_sb",
@@ -275,8 +273,7 @@ def process_down_projection(
 
     weight_tiles = []
     for w_tile_idx in range(tiles.num_allocated_w_tile):
-        weight_tile = alloc_tensor_view(
-            sbm,
+        weight_tile = sbm.alloc_stack(
             (dims.I0, tiles.HTile),
             name=f"down_w_tile_{w_tile_idx}",
             dtype=_fp8_e4m3_tile_dtype if str(down_w.dtype) == "float8e4" else down_w.dtype,

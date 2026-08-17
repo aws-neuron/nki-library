@@ -58,6 +58,9 @@ More details can be found in the [NKI Library Documentation](https://awsdocs-neu
 | [MSDeformableAttention Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/deformable_attention/ms_deformable_attention.py)  | The kernel implements multi-scale deformable attention with an indirect DMA transpose strategy.|
 | [MSDeformableAttentionBwd Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/deformable_attention/ms_deformable_attention.py)  | The kernel implements multi-scale deformable attention backward with an indirect DMA transpose and combined bilinear corner scatter-add strategy.|
 | [GpSIMD Top-K Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/topk/gpsimd_topk.py) | The kernel computes top-k over the last dimension using the GpSIMD nisa.topk instruction (bfloat16, gen3+). |
+| [MXFP8 Attention TKG Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/attention_mxfp8/attention_mxfp8_tkg.py) | The kernel implements MXFP8 flash decode attention for token generation. |
+| [Sparse Attention Indexer Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/sparse_attention_indexer/sparse_attention_indexer_mx_bf16score.py) | The kernel implements the DeepSeek sparse attention indexer: MX-quantized Q/K/W projections, a BF16 score matmul, and hardware top-K selection of the most relevant KV positions per query. |
+| [DeepSeek V3.2 MX MLP Kernel](https://github.com/aws-neuron/nki-library/blob/main/src/nkilib_src/nkilib/experimental/deepseekv32_mlp/mlp_deepseek_mx.py) | The kernel implements the DeepSeek V3.2 MLP for shared-experts and first dense layers with MX-prequantized packed block-scale input, auto-selecting hoisted or tiled weights with token or intermediate LNC sharding. |
 
 ## Integration with the Neuron Compiler
 

@@ -21,7 +21,7 @@ import nki.language as nl
 from ...core.utils.kernel_assert import kernel_assert
 from ..mxfp_utils.mxfp8_utils import quantize_mxfp8_block, quantize_mxfp8_utils
 from ..mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor, TileLocation
-from ..mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm
+from ..mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
 from ..mxfp_utils.mxfp8_utils.load_apis import load_tile
 
 
@@ -95,7 +95,7 @@ def _process_tile(
     if enable_scale_packing and slot_idx == 0 and k_idx_within_tile == 0:
         quantized_scales = sbm.alloc_stack(
             shape=(quantize_mxfp8_utils.Q_TILE_K, 1, current_tile_f),
-            dtype=nl.uint8,
+            dtype=nl.float8_e8m0fnu,
             buffer=nl.sbuf,
         )
 
@@ -185,6 +185,7 @@ def _process_tile(
 
 
 @nki.jit
+@with_active_sbm
 def quantize_block_mxfp8_kernel(
     src_tensor: nl.ndarray,
     return_fp8_dtype: str,
@@ -213,7 +214,7 @@ def quantize_block_mxfp8_kernel(
         enable_scale_packing (bool): Enable scale packing optimization (default: True)
 
     Returns:
-        quantized_scales_hbm (nl.ndarray): [K // 4, F], Scales in uint8 format on HBM
+        quantized_scales_hbm (nl.ndarray): [K // 4, F], Scales in float8_e8m0fnu format on HBM
         quantized_data_hbm (nl.ndarray): [K // 4, F * INTERLEAVE_FACTOR], Quantized data in FP8 format on HBM
 
     Notes:
@@ -226,7 +227,7 @@ def quantize_block_mxfp8_kernel(
     Pseudocode:
         # Allocate output tensors
         quantized_data_hbm = allocate([K // 4, F * INTERLEAVE_FACTOR], fp8_dtype)
-        quantized_scales_hbm = allocate([K // 4, F], uint8)
+        quantized_scales_hbm = allocate([K // 4, F], float8_e8m0fnu)
 
         # Generate vector offsets for DMA gather transpose
         vector_offsets = generate_vector_offsets(K, L_TILE_K, L_TILE_F)
@@ -277,7 +278,7 @@ def quantize_block_mxfp8_kernel(
     )
 
     K_scales, F_scales = quantize_mxfp8_utils.get_scale_output_shape(K, F, enable_scale_packing=enable_scale_packing)
-    quantized_scales_hbm = nl.ndarray((K_scales, F_scales), dtype=nl.uint8, buffer=nl.shared_hbm)
+    quantized_scales_hbm = nl.ndarray((K_scales, F_scales), dtype=nl.float8_e8m0fnu, buffer=nl.shared_hbm)
 
     NUM_TILES_IN_F_TOTAL = (F + L_TILE_F - 1) // L_TILE_F
 

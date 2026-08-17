@@ -37,10 +37,18 @@ Segmented prefill sharding:
 
 import math
 
+from typing import TypedDict
+
 import nki.language as nl
 
 from test.integration.nkilib.core.attention.model_config_utils import get_sharded_head_counts
 from test.utils.common_dataclasses import ModelTestType
+
+
+class SegmentedAttnModelConfig(TypedDict, total=False):
+    TP_KVP_CONFIGS: list[tuple[int, int]]
+    BLK_SIZE: list[int]
+    MAX_LENS: list[int]
 
 MODELS = {
     "qwen3_235b": {
@@ -51,7 +59,7 @@ MODELS = {
     },
 }
 
-OPTIMAL_CONFIGS = {
+OPTIMAL_CONFIGS: dict[str, SegmentedAttnModelConfig] = {
     "qwen3_235b": {
         "TP_KVP_CONFIGS": [
             # (tp, kvp)

@@ -20,7 +20,6 @@ If you need a tuple for pytest parametrize, convert in the generate_* function.
 """
 
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 
 CONFIG_FUNCTIONS = []

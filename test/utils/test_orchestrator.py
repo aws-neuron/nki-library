@@ -30,6 +30,7 @@ import numpy as np
 from _pytest.config import Config
 
 from . import feature_flag_helper
+from .bir_neff_cache import CompiledKernel
 from .common_dataclasses import (
     INF_ARTIFACT_DIR_NAME,
     KernelArgs,
@@ -49,11 +50,16 @@ from .host_management import Host, HostManager
 from .metrics_collector import IMetricsCollector, MetricName
 from .negative_test_helpers import is_in_negative_test_context
 from .output_validator import OutputValidator
+from .persistent_input_cache import link_raw_memmap
 from .profiler_utils import (
+    NEURON_RT_DBG_SEQ_IRAM_BLOCK_SIZES_KB,
     NEURON_RT_ENABLE_DGE_NOTIFICATIONS,
+    NEURON_RT_INSTR_FETCH_ON_H2D,
+    NEURON_RT_UCODE_LIB_PATH,
     ProfilerCommands,
     extract_and_filter_output_files,
 )
+from .s3_utils import parse_s3_uri
 
 
 def _resolve_neuronx_cc_jobs(config) -> int | None:
@@ -148,8 +154,8 @@ def run_separated_perf_analysis(test_dir: str, target_instance_family: str, prof
         test_dir: Path to the test output directory containing trace files and infer_result/.
         target_instance_family: Instance family (e.g. 'trn2', 'trn3') for DMA bandwidth selection.
     """
-    test_dir = Path(test_dir)
-    artifacts_dir = test_dir / "artifacts"
+    test_root = Path(test_dir)
+    artifacts_dir = test_root / "artifacts"
     trace_configs = [
         # vnc_2 (LNC2): one trace per NeuronCore (files directly in artifacts/)
         # BB name varies by compiler version (e.g. "bb", "Block1"), so use glob.
@@ -169,9 +175,9 @@ def run_separated_perf_analysis(test_dir: str, target_instance_family: str, prof
 
             analyze_trace(
                 input_file=input_file,
-                profiled_file=test_dir / INF_ARTIFACT_DIR_NAME / profiled_file,
+                profiled_file=test_root / INF_ARTIFACT_DIR_NAME / profiled_file,
                 subgraph=subgraph,
-                base_dir=test_dir,
+                base_dir=test_root,
                 output_filename=output_filename,
                 target_instance_family=target_instance_family,
             )
@@ -189,7 +195,7 @@ class Orchestrator:
         nki_compilation_mode: NKICompilationMode,
         perf_analysis_enabled: bool = False,
         hw_profile_enabled: bool = True,
-        kernel_name: str = None,
+        kernel_name: str | None = None,
     ):
         # Perf analysis reads NTFF artifacts, so it requires HW profiling enabled.
         if perf_analysis_enabled and not hw_profile_enabled:
@@ -207,14 +213,16 @@ class Orchestrator:
         self.trace_mode: TraceMode = trace_mode
         self.collector = collector
         self.kernel_under_test: Optional[KernelArgs] = None
+        self._compiled_kernel: Optional[CompiledKernel] = None
         self.perf_analysis_enabled: bool = perf_analysis_enabled
         self.hw_profile_enabled: bool = hw_profile_enabled
-        self.kernel_name: str = kernel_name
+        self.kernel_name: str | None = kernel_name
 
         self.profiler_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-explorer")
         self.explorer_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-explorer")
         self.neuron_ls_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-ls")
         self.enable_kernel_debugging: bool = feature_flag_helper.get_feature_flag(config, "debug_kernels", False)
+        self.skip_core_reset: bool = feature_flag_helper.get_feature_flag(config, "skip_core_reset", False)
         self.enable_dge_notifs: bool = feature_flag_helper.get_feature_flag(config, "enable_dge_notifs", False)
         self.enable_validation_histograms: bool = feature_flag_helper.get_feature_flag(
             config, "validation_histograms", False
@@ -227,11 +235,19 @@ class Orchestrator:
         self.neuronx_cc_cache_path: str | None = feature_flag_helper.get_feature_flag(
             config, "s3_neuronx_cc_cache_path"
         )
+        self.torch_ref_cache_path: str | None = feature_flag_helper.get_feature_flag(config, "s3_torch_ref_cache_path")
+        # Validate the URI up front so a malformed path fails loudly instead of
+        # silently becoming a cache miss. Empty/unset disables caching.
+        if self.torch_ref_cache_path:
+            parse_s3_uri(self.torch_ref_cache_path)
         self.upload_profile_to_explorer: Optional[UploadProfileMode] = (
             UploadProfileMode.from_str(val)
             if (val := feature_flag_helper.get_feature_flag(config, "upload_profile_to_explorer", None))
             else None
         )
+        self.ucode_lib_path: Optional[str] = feature_flag_helper.get_feature_flag(config, "ucode_lib_path", None)
+        if self.ucode_lib_path and not os.path.isfile(self.ucode_lib_path):
+            raise ValueError(f"--ucode-lib-path does not exist: {self.ucode_lib_path}")
         if self.upload_profile_to_explorer and not hw_profile_enabled:
             raise ValueError(
                 "--upload-profile-to-explorer requires --enable-hw-profile=True; "
@@ -314,7 +330,7 @@ class Orchestrator:
             # earlier would make a rotation retry ship an archive missing the
             # inputs (neuron-explorer "open inp-*.bin: no such file or directory").
             if self.fs_config.force_local_cleanup:
-                from .resources import cleanup_input_bins
+                from .host_io import cleanup_input_bins
 
                 cleanup_input_bins(self.fs_config.artifacts_output_directory_path)
 
@@ -328,8 +344,19 @@ class Orchestrator:
                 if kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE:
                     self._record_separation_pass_metrics(self.collector, self.fs_config.artifacts_output_directory_path)
 
-            # Run validation or debugger
-            if is_debugger:
+            # single compile separation pass: hoist DMAs from the compiled unseparated NEFF and re-run on hardware, without needing to re-compile to get a separated NEFF
+            if self.trace_mode == TraceMode.CompileAndInferAndSeparate:
+                try:
+                    from .single_compile_separation_private import run_single_compile_separation_pass
+                except ImportError:
+                    logging.warning(
+                        "single_compile_separation_private not available, skipping single compile separation pass"
+                    )
+                    return
+
+                run_single_compile_separation_pass(self, kernel_under_test, input_file_paths)
+                logging.info("Skipping output validation in compile-and-infer-and-separate mode")
+            elif is_debugger:
                 # Restore breakpoints after compile+infer, before nki.debug()
                 self._restore_breakpoint(saved_breakpoint)
                 self._run_debugger_inference(kernel_under_test, local_artifact_download_path)
@@ -366,7 +393,9 @@ class Orchestrator:
             # Record -1 for phases that didn't run (must happen AFTER parse_artifacts)
             self._record_missing_phase_metrics(self.collector)
 
-            # Upload profile to Neuron Explorer if requested
+            # Upload profile to Neuron Explorer if requested. A separation run in ALWAYS
+            # mode has already uploaded the separated pair (and disabled further uploads),
+            # so this block only fires when no separation upload occurred.
             if self.upload_profile_to_explorer:
                 should_upload = self.upload_profile_to_explorer == UploadProfileMode.ALWAYS or (
                     self.upload_profile_to_explorer == UploadProfileMode.ON_FAIL_ONLY and status != TestStatus.SUCCESS
@@ -398,6 +427,7 @@ class Orchestrator:
             MetricName.VALIDATION_TIME,
             MetricName.SIMULATION_TIME,
             MetricName.HOST_ARCH_VALIDATION_TIME,
+            MetricName.FRONTEND_TRACE_TIME,
             MetricName.MLIR_TO_BIR_TIME,
             MetricName.BIR_TO_NEFF_TIME,
             MetricName.INPUT_DUMP_TIME,
@@ -405,6 +435,7 @@ class Orchestrator:
             MetricName.DETERMINISM_CHECK_TIME,
             MetricName.VALIDATION_OUTPUT_LOAD_TIME,
             MetricName.VALIDATION_COMPARE_TIME,
+            MetricName.GOLDEN_ACQUISITION_TIME,
             MetricName.GOLDEN_COMPUTATION_TIME,
         ]
 
@@ -444,7 +475,12 @@ class Orchestrator:
             logging.warning("explorer_upload_private not available, skipping explorer upload")
             return
 
-        profile_url = upload_profile_to_explorer(self.fs_config.artifacts_output_directory_path)
+        artifact_dir = self.fs_config.artifacts_output_directory_path
+        if artifact_dir is None:
+            logging.warning("No artifact directory available, skipping explorer upload")
+            return
+
+        profile_url = upload_profile_to_explorer(artifact_dir)
         if profile_url:
             self.collector.add_dimension({MetricName.EXPLORER_PROFILE_URL: profile_url})
 
@@ -472,12 +508,15 @@ class Orchestrator:
                 if kernel_under_test.compiler_input.enable_birsim or _has_user_birsim_flag(additional_cmd_args):
                     self._dump_birsim_artifacts(kernel_under_test)
 
+                # A test may pin the frontend via CompilerArgs.nki_compilation_mode;
+                # otherwise fall back to the session/CLI default (--nki-compilation-mode).
+                frontend_mode = kernel_under_test.compiler_input.nki_compilation_mode or self.nki_compilation_mode
                 self._compiled_kernel = trace_kernel(
                     kernel_under_test=kernel_under_test,
                     mode=self.trace_mode,
                     output_directory=self.fs_config.artifacts_output_directory_path,
                     output_names=output_names,
-                    frontendMode=self.nki_compilation_mode,
+                    frontendMode=frontend_mode,
                     neuronx_cc_cache_path=self.neuronx_cc_cache_path,
                     collector=collector,
                 )
@@ -510,6 +549,12 @@ class Orchestrator:
 
         if self.trace_mode == TraceMode.Simulator:
             return self._run_simulator_inference(kernel_under_test)
+
+        # Stage uCode lib into the artifacts dir
+        if self.ucode_lib_path:
+            dest = os.path.join(self.fs_config.artifacts_output_directory_path, os.path.basename(self.ucode_lib_path))
+            shutil.copy(self.ucode_lib_path, dest)
+            logging.info(f"Staged uCode lib for upload: {dest}")
 
         try:
             with closing(
@@ -576,10 +621,12 @@ class Orchestrator:
 
         env_vars: Optional[dict[str, str]] = kernel_under_test.inference_args.env_vars
         separation_pass_enabled = kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE
+        single_compile_separation_enabled = self.trace_mode == TraceMode.CompileAndInferAndSeparate
         if (
             self.enable_kernel_debugging
             or self.enable_dge_notifs
             or separation_pass_enabled
+            or single_compile_separation_enabled
             or self.perf_analysis_enabled
         ):
             if env_vars is None:
@@ -592,7 +639,29 @@ class Orchestrator:
             if env_vars is None:
                 env_vars = {}
 
-            env_vars["NEURON_RT_ALLOW_LEGACY_NEFF"] = 1
+            env_vars["NEURON_RT_ALLOW_LEGACY_NEFF"] = "1"
+
+        # Point the runtime at the uploaded uCode lib
+        if self.ucode_lib_path:
+            if env_vars is None:
+                env_vars = {}
+            env_vars[NEURON_RT_UCODE_LIB_PATH] = f"./{os.path.basename(self.ucode_lib_path)}"
+
+        # Forward the IRAM cache block size config to the execution host if set locally.
+        # Value-only passthrough — no file to stage.
+        iram_block_size = os.environ.get(NEURON_RT_DBG_SEQ_IRAM_BLOCK_SIZES_KB)
+        if iram_block_size:
+            if env_vars is None:
+                env_vars = {}
+            env_vars[NEURON_RT_DBG_SEQ_IRAM_BLOCK_SIZES_KB] = iram_block_size
+
+        # Forward the instruction-fetch-on-H2D toggle to the execution host if set locally.
+        # Value-only passthrough — no file to stage.
+        instr_fetch_on_h2d = os.environ.get(NEURON_RT_INSTR_FETCH_ON_H2D)
+        if instr_fetch_on_h2d is not None:
+            if env_vars is None:
+                env_vars = {}
+            env_vars[NEURON_RT_INSTR_FETCH_ON_H2D] = instr_fetch_on_h2d
 
         # Save and download all outputs when determinism check or profile all runs is enabled.
         # Otherwise, only save/download the last execution's outputs.
@@ -608,11 +677,13 @@ class Orchestrator:
         )
 
         profiler_cmds = ProfilerCommands(
-            num_runs=kernel_under_test.inference_args.num_runs,
+            num_runs=kernel_under_test.inference_args.resolved_num_runs,
             profile_all_runs=kernel_under_test.inference_args.profile_all_runs,
             profiler_binary_path=self.profiler_binary_path,
             kernel_input_args=kernel_input_args,
-            metrics_enabled=self.collector.metrics_enabled or separation_pass_enabled,
+            metrics_enabled=self.collector.metrics_enabled
+            or separation_pass_enabled
+            or single_compile_separation_enabled,
             collective_ranks=kernel_under_test.inference_args.collective_ranks,
             profile_all_ranks=kernel_under_test.inference_args.profile_all_ranks,
             env_vars=env_vars,
@@ -620,7 +691,7 @@ class Orchestrator:
             hw_profile_enabled=self.hw_profile_enabled,
             save_all_outputs=save_all_outputs,
             force_clean_input_writes=force_clean_input_writes,
-            separation_pass_enabled=separation_pass_enabled,
+            separation_pass_enabled=separation_pass_enabled or single_compile_separation_enabled,
             explorer_binary_path=self.explorer_binary_path,
         )
 
@@ -652,6 +723,7 @@ class Orchestrator:
             get_list_of_files_to_copy=get_list_of_files_to_copy,
             collector=collector,
             post_lock_command=(f"( {post_lock_cmd} ) 2>&1 | tee -a log-infer.txt" if post_lock_cmd else None),
+            skip_core_reset=self.skip_core_reset,
         )
 
     def _dump_output_tensors(self, output_tensors: dict[str, np.ndarray]) -> str:
@@ -659,6 +731,7 @@ class Orchestrator:
 
         Returns path to output directory.
         """
+        assert self.fs_config.artifacts_output_directory_path, "Test has to be executed first"
         output_path = os.path.join(self.fs_config.artifacts_output_directory_path, INF_ARTIFACT_DIR_NAME)
         self.__dump_tensors__(output_path, output_tensors, lambda name: name)
         return output_path
@@ -706,7 +779,7 @@ class Orchestrator:
         logging.info(f"Running nki.debug for {dump_dir}")
         run_debugger_inference(
             kernel_under_test.kernel_func,
-            kernel_under_test.kernel_input or {},
+            self._single_core_kernel_input(kernel_under_test),
             dump_dir,
             core_id=self.debugger_core_id,
             interactive=self.debugger_interactive,
@@ -716,15 +789,16 @@ class Orchestrator:
             platform_target=platform_target,
         )
 
-    def _rename_neff_outputs_to_python_names(self, artifact_path: str, output_names: list[str] | None) -> None:
+    def _rename_neff_outputs_to_python_names(self, artifact_path: str | None, output_names: list[str] | None) -> None:
         """Rename NEFF output files (output_N) to Python-level names.
 
         When using neuron-explorer with a CompiledKernel that has output_specs,
         the NEFF uses generic names like output_0 but the validator expects
         the Python-level names (e.g. 'y'). This renames the files to match.
         """
-        if not getattr(self, "_compiled_kernel", None) or not output_names:
-            # The simulation mode does not compile kernel, thus the field _compiled_kernel won't be set.
+        if artifact_path is None or self._compiled_kernel is None or not output_names:
+            # The simulation mode does not compile the kernel and produces no
+            # downloaded artifact directory, so there is nothing to rename.
             return
 
         aliases = self._compiled_kernel.input_output_aliases or {}
@@ -798,7 +872,7 @@ class Orchestrator:
                             checker = DeterminismChecker(
                                 kernel_under_test,
                                 path,
-                                kernel_under_test.inference_args.num_runs,
+                                kernel_under_test.inference_args.resolved_num_runs,
                                 self.collector,
                                 logfile_path=validation_log_filepath,
                                 rank_id=rank,
@@ -878,6 +952,17 @@ class Orchestrator:
             return ""
         return " ".join(f"{arg_name} {os.path.basename(file_path)}" for arg_name, file_path in input_file_paths.items())
 
+    @staticmethod
+    def _single_core_kernel_input(kernel_under_test: KernelArgs) -> dict[str, Any]:
+        """Kernel inputs as a plain mapping, for paths that inspect a single core.
+
+        Per-rank inputs are materialised for rank 0, the rank these paths look at.
+        """
+        kernel_input = kernel_under_test.kernel_input
+        if isinstance(kernel_input, PerRankLazyInputGenerator):
+            return kernel_input.for_rank(0)
+        return kernel_input or {}
+
     def __dump_tensors__(
         self,
         target_directory: str,
@@ -902,8 +987,9 @@ class Orchestrator:
                     # Save as raw binary for neuron-explorer
                     file_name = name_fn(name) + ".bin"
                     file_path = os.path.join(target_directory, file_name)
-                    with open(file_path, "wb") as f:
-                        f.write(value.tobytes())
+                    if not link_raw_memmap(value, file_path):
+                        with open(file_path, "wb") as f:
+                            value.tofile(f)
 
                 dumped_files[name] = file_path
             else:
@@ -925,7 +1011,7 @@ class Orchestrator:
             # Birsim requires naming convention: value_{name}.npy
             if kernel_under_test.kernel_input:
                 _ = self.__dump_tensors__(
-                    birsim_dir, kernel_under_test.kernel_input, lambda name: f"value_{name}", True
+                    birsim_dir, self._single_core_kernel_input(kernel_under_test), lambda name: f"value_{name}", True
                 )
             if kernel_under_test.validation_args:
                 if (
@@ -947,7 +1033,7 @@ class Orchestrator:
                         # have to be numpy files, not binary files
                         _ = self.__dump_tensors__(birsim_dir, output_golden, lambda name: f"value_{name}", True)
                 else:
-                    assert False, (
+                    raise AssertionError(
                         "Birsim does not support custom validator as golden output! Please disable bir sim or switch to a different golden generator"
                     )
 
@@ -990,6 +1076,9 @@ class Orchestrator:
         assert isinstance(kernel_under_test.kernel_input, PerRankLazyInputGenerator)
         num_ranks = kernel_under_test.inference_args.collective_ranks
 
+        if source_directory := kernel_under_test.kernel_input.input_artifacts_directory:
+            return self.__reuse_per_rank_inputs__(target_directory, source_directory, num_ranks)
+
         multi_input_lines = []
 
         for rank_id in range(num_ranks):
@@ -1014,6 +1103,39 @@ class Orchestrator:
 
         logging.info(f"Created multi-input file: {multi_input_file}")
         return {"--multi-input": multi_input_filename}
+
+    @staticmethod
+    def __reuse_per_rank_inputs__(
+        target_directory: str,
+        source_directory: str,
+        num_ranks: int,
+    ) -> dict[str, str]:
+        """Reuse a prior profile's inputs without recreating FSx hard links."""
+        source_directory = os.path.abspath(source_directory)
+        source_manifest = os.path.join(source_directory, f"{num_ranks}rank_inputs.txt")
+        with open(source_manifest) as f:
+            source_lines = [line.strip() for line in f if line.strip()]
+        if len(source_lines) != num_ranks:
+            raise ValueError(
+                f"Expected {num_ranks} entries in reused input manifest, got {len(source_lines)}: {source_manifest}"
+            )
+
+        output_lines = []
+        for line in source_lines:
+            parts = line.split()
+            if len(parts) % 2:
+                raise ValueError(f"Invalid reused input manifest line: {line}")
+            for index in range(1, len(parts), 2):
+                if not os.path.isabs(parts[index]):
+                    parts[index] = os.path.join(source_directory, parts[index])
+            output_lines.append(" ".join(parts))
+
+        output_filename = f"{num_ranks}rank_inputs.txt"
+        output_manifest = os.path.join(target_directory, output_filename)
+        with open(output_manifest, "w") as f:
+            f.write("\n".join(output_lines) + "\n")
+        logging.info("Reused per-rank inputs from %s", source_manifest)
+        return {"--multi-input": output_filename}
 
     def __prepare_output_directory(self):
         self.fs_config.test_directory_name = feature_flag_helper.construct_test_output_directory_name()

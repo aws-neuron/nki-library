@@ -14,13 +14,11 @@
 
 import nki.isa as nisa
 import nki.language as nl
-
 from nkilib_src.nkilib.core.moe import moe_tkg
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
     ExpertAffinityScaleMode,
 )
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 
 
 def moe_tkg_sbuf_io_wrapper(
@@ -35,10 +33,10 @@ def moe_tkg_sbuf_io_wrapper(
     down_weights_bias: nl.ndarray = None,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
     activation_fn: ActFnType = ActFnType.SiLU,
-    gate_clamp_upper_limit: float = None,
-    gate_clamp_lower_limit: float = None,
-    up_clamp_upper_limit: float = None,
-    up_clamp_lower_limit: float = None,
+    gate_clamp_upper_limit: float | None = None,
+    gate_clamp_lower_limit: float | None = None,
+    up_clamp_upper_limit: float | None = None,
+    up_clamp_lower_limit: float | None = None,
     mask_unselected_experts: bool = False,
 ) -> nl.ndarray:
     """Wrapper to test all-expert MoE with SBUF input."""
@@ -59,14 +57,13 @@ def moe_tkg_sbuf_io_wrapper(
     hidden_sb = nl.ndarray((H0, T, H1_shard), dtype=hidden_input.dtype, buffer=nl.sbuf, name="hidden_sb")
 
     # Load this shard's portion: (T, H) -> (T, h_num_shards, H0, H1_shard) -> select shard -> (H0, T, H1_shard)
-    input_view = TensorView(hidden_input)
     input_view = (
-        input_view.reshape_dim(dim=1, shape=[h_num_shards, H0, H1_shard])
+        hidden_input.reshape_dim(dim=1, shape=[h_num_shards, H0, H1_shard])
         .permute(dims=[2, 0, 1, 3])
         .select(dim=2, index=h_shard_id)
     )
 
-    nisa.dma_copy(hidden_sb, input_view.get_view())
+    nisa.dma_copy(hidden_sb, input_view)
 
     # For all-expert mode, pass HBM affinities directly (mask_expert_affinities handles the load)
     # For selective mode, pre-load affinities to SBUF
@@ -110,12 +107,11 @@ def moe_tkg_sbuf_io_wrapper(
     # Copy SBUF output to HBM for validation
     # (T, H) -> (T, h_num_shards, H0, H1_shard) -> (H0, T, h_num_shards, H1_shard) -> (H0, T, H1_shard)
     output = nl.ndarray((T, H), dtype=hidden_input.dtype, buffer=nl.shared_hbm)
-    output_view = TensorView(output)
     output_view = (
-        output_view.reshape_dim(dim=1, shape=[h_num_shards, H0, H1_shard])  # (T, h_num_shards, H0, H1_shard)
+        output.reshape_dim(dim=1, shape=[h_num_shards, H0, H1_shard])  # (T, h_num_shards, H0, H1_shard)
         .permute(dims=[2, 0, 1, 3])  # (H0, T, h_num_shards, H1_shard)
         .select(dim=2, index=h_shard_id)  # (H0, T, H1_shard)
         .slice(dim=1, start=T_offset, end=T_offset + T_shard)  # (H0, T_shard, H1_shard)
     )
-    nisa.dma_copy(output_view.get_view(), output_sb[:, nl.ds(T_offset, T_shard), :])
+    nisa.dma_copy(output_view, output_sb[:, nl.ds(T_offset, T_shard), :])
     return output

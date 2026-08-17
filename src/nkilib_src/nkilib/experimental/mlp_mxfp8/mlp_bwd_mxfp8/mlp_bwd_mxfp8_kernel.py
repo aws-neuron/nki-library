@@ -23,7 +23,7 @@ from ....core.utils.kernel_helpers import div_ceil
 from ...matmul_mxfp8.matmul_mxfp8_config import MatmulMxfp8KernelConfig
 from ...matmul_mxfp8.matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
 from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
-from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm
+from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
 from ...mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import INTERLEAVE_FACTOR
 from ..common_utils import (
     DGT_MIN_K,
@@ -934,6 +934,7 @@ def mlp_backward_mxfp8_base_nki(
     return hidden_states_grad_td.data, weight_grad_td.data, down_weight_grad_td.data
 
 
+@with_active_sbm
 def mlp_backward_mxfp8_nki(
     # Output gradient (always BF16)
     output_grad: nl.ndarray,

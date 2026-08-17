@@ -54,7 +54,7 @@ def _high_rank_cfgs(cfgs: list[AttnBlkTestConfig]) -> list[AttnBlkTestConfig]:
 @final
 @pytest.mark.high_rank
 class TestRangeAttnBlkHighRank:
-    """Attention block TKG tests requiring >4 NeuronCores (KVDP/DCP > 4)."""
+    """Attention block TKG tests requiring >4 NeuronCores (KVDP/CP > 4)."""
 
     # fmt: off
     @pytest.mark.parametrize("attn_blk_cfg",
@@ -69,7 +69,9 @@ class TestRangeAttnBlkHighRank:
         attn_blk_cfg: AttnBlkTestConfig,
     ):
         assert attn_blk_cfg.is_high_rank(), \
-            f"Low-rank config (KVDP={attn_blk_cfg.KVDP}, DCP={attn_blk_cfg.DCP}) belongs in test_attention_block_tkg.py"
+            f"Low-rank config (KVDP={attn_blk_cfg.KVDP}, CP={attn_blk_cfg.CP}) belongs in test_attention_block_tkg.py"
+        if attn_blk_cfg.xfail_reason:
+            pytest.xfail(attn_blk_cfg.xfail_reason)
         _run_attention_block_test(
             test_manager=test_manager,
             platform_target=platform_target,
@@ -92,7 +94,7 @@ class TestAttnBlkModelHighRank:
         cfg: AttnBlkTestConfig,
     ):
         assert cfg.is_high_rank(), (
-            f"Low-rank config (KVDP={cfg.KVDP}, DCP={cfg.DCP}) belongs in test_attention_block_tkg.py"
+            f"Low-rank config (KVDP={cfg.KVDP}, CP={cfg.CP}) belongs in test_attention_block_tkg.py"
         )
         attn_blk_metadata_list = _get_attention_block_metadata()
         test_metadata_key = {
@@ -105,7 +107,7 @@ class TestAttnBlkModelHighRank:
             "kv_quant": cfg.kv_quant,
             "KVDP": cfg.KVDP,
             "transposed_in": cfg.transposed_in,
-            "DCP": cfg.DCP,
+            "DCP": cfg.CP,
         }
         collector.match_and_add_metadata_dimensions(test_metadata_key, attn_blk_metadata_list)
         _run_attention_block_test(

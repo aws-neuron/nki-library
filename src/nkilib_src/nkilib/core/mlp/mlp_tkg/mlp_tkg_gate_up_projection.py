@@ -38,7 +38,6 @@ from .mlp_tkg_gate_up_projection_lhs_rhs_swap import (
 from .mlp_tkg_utils import (
     _clamp_lower_upper_limit,
     adaptive_dge_mode,
-    alloc_tensor_view,
     prepare_gate_up_bias_and_scale,
 )
 
@@ -301,10 +300,8 @@ def run_gate_up_projection_non_lhs_rhs_swap(
     gate_dequant_tile = up_dequant_tile = None
     if params.quant_params.is_quant_static():
         par_dim = dims.T
-        gate_dequant_tile = alloc_tensor_view(
-            sbm, (par_dim, 1), dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4
-        )
-        up_dequant_tile = alloc_tensor_view(sbm, (par_dim, 1), dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4)
+        gate_dequant_tile = sbm.alloc_stack((par_dim, 1), dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4)
+        up_dequant_tile = sbm.alloc_stack((par_dim, 1), dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4)
         gate_w_scale_view = gate_w_scale.slice(dim=0, start=0, end=par_dim)
         up_w_scale_view = up_w_scale.slice(dim=0, start=0, end=par_dim)
         nisa.dma_copy(
@@ -316,17 +313,14 @@ def run_gate_up_projection_non_lhs_rhs_swap(
 
     elif params.quant_params.is_quant_row():
         row_dequant_shape = (dims.T, I_shard_size)
-        gate_dequant_tile = alloc_tensor_view(
-            sbm, row_dequant_shape, dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4
+        gate_dequant_tile = sbm.alloc_stack(
+            row_dequant_shape, dtype=gate_w_scale.dtype, name="gate_w_scale_sb", align=4
         )
-        up_dequant_tile = alloc_tensor_view(
-            sbm, row_dequant_shape, dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4
-        )
+        up_dequant_tile = sbm.alloc_stack(row_dequant_shape, dtype=up_w_scale.dtype, name="up_w_scale_sb", align=4)
 
     # ---------------- bias ----------------
     if mlpp_has_gate_projection_bias(params) or mlpp_has_up_projection_bias(params):
-        bias_tile = alloc_tensor_view(
-            sbm,
+        bias_tile = sbm.alloc_stack(
             (dims.T, I_shard_size),
             dtype=gate_b.dtype,
             name="gate_up_broadcasted_bias",
@@ -354,8 +348,7 @@ def run_gate_up_projection_non_lhs_rhs_swap(
 
     weight_tiles = []
     for w_tile_idx in range(tiles.num_allocated_w_tile):
-        weight_tile = alloc_tensor_view(
-            sbm,
+        weight_tile = sbm.alloc_stack(
             (dims.H0, div_ceil(tiles.HTile, dims.H0), tiles.I_shard_size),
             name=f"gate_up_w_tile_{w_tile_idx}",
             dtype=_fp8_e4m3_tile_dtype if str(up_w.dtype) == "float8e4" else up_w.dtype,

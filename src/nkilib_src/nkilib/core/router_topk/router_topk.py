@@ -73,6 +73,8 @@ def router_topk(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
+    skip_store_expert_affinities: bool = False,
+    expert_affinities_eager_out: nt.mutable_tensor = None,
 ):
     """
     Router top-K kernel for Mixture of Experts (MoE) models.
@@ -115,6 +117,18 @@ def router_topk(
         shard_on_tokens (bool): Enable LNC sharding across token dimension
         skip_store_expert_index (bool): Skip storing expert indices to HBM
         skip_store_router_logits (bool): Skip storing router logits to HBM
+        skip_store_expert_affinities (bool): Skip scattering/storing the dense [T, E] expert
+                        affinities. Only valid with return_eager_affi=True, where the dense [T, k]
+                        eager affinities carry all the affinity values the caller needs. Avoids the
+                        [T, E] HBM allocation, the zero-init, and the indirect-DMA scatter.
+        expert_affinities_eager_out (nt.mutable_tensor): Optional [T, k] HBM output for the dense
+                        eager affinities. When provided (requires return_eager_affi=True), each LNC
+                        core writes ONLY its own T_local slice directly to
+                        expert_affinities_eager_out[T_offset : T_offset + T_local] — the two cores'
+                        disjoint slices compose in shared HBM with no cross-core sendrecv or
+                        cross-partition assembly (mirrors the direct expert_index store). This is
+                        strictly cheaper than assembling the full [T, k] in SBUF and is the
+                        preferred path when the eager consumer reads from HBM.
 
     Returns:
         outputs (list): [router_logits, expert_index, expert_affinities, optional: expert_affinities_topk]
@@ -183,7 +197,8 @@ def router_topk(
 
     # Detect buffer types from tensor attributes
     x_input_in_sbuf = x.buffer == nl.sbuf
-    expert_affin_in_sb = expert_affinities.buffer == nl.sbuf
+    # When skip_store_expert_affinities, the caller may pass expert_affinities=None (no [T, E] output).
+    expert_affin_in_sb = expert_affinities is not None and expert_affinities.buffer == nl.sbuf
     expert_index_in_sb = expert_index.buffer == nl.sbuf
 
     T: int = -1
@@ -536,6 +551,17 @@ def router_topk(
         ),
     )
 
+    # skip_store_expert_affinities is only valid alongside return_eager_affi: the caller must have
+    # the dense [T, k] eager affinities to compensate for the dropped [T, E] scatter.
+    kernel_assert(
+        not skip_store_expert_affinities or return_eager_affi,
+        "skip_store_expert_affinities requires return_eager_affi=True",
+    )
+
+    # Whether to build/store the dense [T, E] expert affinities. The eager [T, k] output is computed
+    # independently (by the ACT2 activation and the eager assembly below), so it is unaffected.
+    do_scatter = pipeline_enable_scatter and not skip_store_expert_affinities
+
     """ACT1 -- Activation Function on router-logits."""
 
     if pipeline_enable_act1:
@@ -552,7 +578,7 @@ def router_topk(
                 input_dtype=input_dtype,
             )
 
-        if not pipeline_enable_scatter:
+        if not pipeline_enable_scatter and not skip_store_expert_affinities:
             # Store the full expert_affinities.
             # expert_affinities = [T,E] whereas expert_affinities_full_sb = [128, T/128, E]
 
@@ -567,7 +593,8 @@ def router_topk(
                     dst=_hbm_remainder_store_view(expert_affinities, T_offset, num_t_whole_tiles, t_p_dim, t_remainder),
                 )
 
-            core_barrier(expert_affinities, (0, 1))
+            if n_prgs > 1:
+                core_barrier(expert_affinities, (0, 1))
 
     """topK."""
 
@@ -729,7 +756,7 @@ def router_topk(
     # When we have T>128 and not divisible by 128, init buffer with zeros.
     expert_affinities_one_hot_scattered_sb = nl.ndarray((t_p_dim, num_t_tiles, E), dtype=nl.float32, buffer=nl.sbuf)
 
-    if pipeline_enable_scatter:
+    if do_scatter:
         # In case of using indirect DMA for storing expert_affinities, we need to memset the output buffer on HBM to zero
         # We need to init this zero tile here and keep reusing them
         expert_affinities_zero_tile = nl.ndarray(shape=(t_p_dim, E), dtype=input_dtype)
@@ -746,9 +773,12 @@ def router_topk(
         """ACT2 -- Activation."""
         if pipeline_enable_act2:
             if return_eager_affi or use_indirect_dma_scatter:
+                # The T<=128 limit only applies to the SBUF-return eager path, whose output is a
+                # [T,k] SBUF tensor (T on the partition axis, capped at 128). The HBM-direct path
+                # (expert_affinities_eager_out provided) tiles the store over T, so any T is fine.
                 kernel_assert(
-                    (not return_eager_affi or (T <= PE_COLUMN_TILE_128)),
-                    "If return_eager_affi, then T must be <=128 because expert_affinities shape is [T,k]",
+                    (not return_eager_affi or expert_affinities_eager_out is not None or (T <= PE_COLUMN_TILE_128)),
+                    "return_eager_affi without an HBM output (SBUF [T,k]) requires T <= 128",
                 )
                 # Compute complete activation, optionally preserving intermediates
                 compute_activation(
@@ -814,7 +844,7 @@ def router_topk(
 
         """Scatter -- expert_affinities."""
 
-        if pipeline_enable_scatter:
+        if do_scatter:
             # At this point we either fully (if return_eager_affi or use_indirect_dma_scatter) or partially (if !use_indirect_dma_scatter) have the
             # topK expert-affinities and their indexes.
             # Now we create the final expert_affinities by scattering the topK values into their index positions, with zeroes everywhere else.
@@ -1040,7 +1070,7 @@ def router_topk(
                     )
 
     # when using one-hot scatter method, spill expert affinities to HBM outside of t_tile loop
-    if pipeline_enable_scatter:
+    if do_scatter:
         if (not use_indirect_dma_scatter) and (not expert_affin_in_sb):
             if num_t_whole_tiles > 0:
                 nisa.dma_copy(
@@ -1053,7 +1083,8 @@ def router_topk(
                     dst=_hbm_remainder_store_view(expert_affinities, T_offset, num_t_whole_tiles, t_p_dim, t_remainder),
                 )
 
-            core_barrier(expert_affinities, cores=[0, 1])
+            if n_prgs > 1:
+                core_barrier(expert_affinities, cores=[0, 1])
 
         # When expert_affin_in_sb and shard_on_tokens, exchange data between cores via sendrecv
         if expert_affin_in_sb and shard_on_tokens and (not use_indirect_dma_scatter):
@@ -1111,7 +1142,24 @@ def router_topk(
     outputs = [router_logits, expert_index, expert_affinities]
 
     if return_eager_affi:
-        if shard_on_tokens:
+        # HBM-direct eager store: each core writes only its own T_local slice directly to the
+        # shared-HBM output at T_offset, mirroring the direct expert_index store above. The two
+        # cores' disjoint slices compose with no sendrecv / cross_partition_copy / SBUF assembly.
+        if expert_affinities_eager_out is not None:
+            if num_t_whole_tiles > 0:
+                nisa.dma_copy(
+                    src=expert_affinities_topk_sb[:t_p_dim, :num_t_whole_tiles, :k],
+                    dst=_hbm_tiled_store_view(expert_affinities_eager_out, T_offset, num_t_whole_tiles, t_p_dim),
+                )
+            if t_remainder > 0:
+                nisa.dma_copy(
+                    src=expert_affinities_topk_sb[:t_remainder, num_t_whole_tiles, :k],
+                    dst=_hbm_remainder_store_view(
+                        expert_affinities_eager_out, T_offset, num_t_whole_tiles, t_p_dim, t_remainder
+                    ),
+                )
+            outputs.append(expert_affinities_eager_out)
+        elif shard_on_tokens:
             kernel_assert(
                 T <= PE_COLUMN_TILE_128,
                 "If return_eager_affi with shard_on_tokens, then T must be <=128",

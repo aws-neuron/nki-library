@@ -136,4 +136,5 @@ def transpose_source_tensor_tile(
                             : bxs_subtile.size,
                             :H_SUBTILE_SIZE,
                         ],
+                        engine=nisa.vector_engine if bxs_subtile.index % 2 == 0 else nisa.scalar_engine,
                     )

@@ -32,12 +32,12 @@ Pure Python -- no NKI tracer, no device.
 
 import nki.language as nl
 import pytest
-from nki.language.tensor import NkiTensor
-
+from nki.language.tensor import NkiTensor  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import (
     nki_strided_view,
     physical_row_width,
 )
+
 from test.utils.pytest_test_metadata import pytest_marks
 
 

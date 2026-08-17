@@ -23,10 +23,10 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
-
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType, RouterActFnType
 from nkilib_src.nkilib.experimental.moe_block.rmsnorm_router_topk_tkg import rmsnorm_router_topk_tkg
 from nkilib_src.nkilib.experimental.moe_block.rmsnorm_router_topk_tkg_torch import rmsnorm_router_topk_tkg_torch_ref
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,
@@ -133,6 +133,7 @@ def generate_inputs(
     quantization_type,
     router_act_fn,
     hidden_actual=None,
+    store_eager_affi_only=False,
 ):
     """Build inputs for rmsnorm_router_topk_tkg. Reuses small-range uniforms used by
     the rmsnorm and router_topk tests to avoid sigmoid saturation and bf16 top-K ties."""
@@ -146,6 +147,8 @@ def generate_inputs(
         "router_mm_dtype": router_mm_dtype,
         "router_act_fn": router_act_fn,
     }
+    if store_eager_affi_only:
+        inputs["store_eager_affi_only"] = True
     if has_bias:
         # Tiebreak offset reduces near-ties that flip top-K under bf16 matmul.
         tiebreak = np.linspace(0, 1.0, num_experts).reshape(1, num_experts)
@@ -162,6 +165,7 @@ def output_tensor_descriptor(kernel_input):
     top_k = kernel_input["top_k"]
     qtype = kernel_input["quantization_type"]
     router_mm_dtype = kernel_input["router_mm_dtype"]
+    store_eager_affi_only = kernel_input.get("store_eager_affi_only", False)
 
     if qtype == QuantizationType.MX:
         norm_shape = (T, H + H // 4)
@@ -170,10 +174,14 @@ def output_tensor_descriptor(kernel_input):
         norm_shape = (T, H)
         norm_dtype = router_mm_dtype
 
+    # Eager: expert_affinities is the dense [T, K] bf16 tensor (co-indexed with expert_index),
+    # not the sparse [T, E] tensor.
+    affinities_shape = (T, top_k) if store_eager_affi_only else (T, E)
+
     return {
         "norm_output": np.zeros(norm_shape, dtype=norm_dtype),
         "expert_index": np.zeros((T, top_k), dtype=np.int32),
-        "expert_affinities": np.zeros((T, E), dtype=nl.bfloat16),
+        "expert_affinities": np.zeros(affinities_shape, dtype=nl.bfloat16),
     }
 
 
@@ -201,7 +209,7 @@ def _format_value(val):
 
 def _make_test_id(params):
     values = params.values if hasattr(params, "values") else params
-    return "_".join(f"{_ABBREVS[name]}-{_format_value(val)}" for name, val in zip(_PARAM_NAMES, values))
+    return "_".join(f"{_ABBREVS[name]}-{_format_value(val)}" for name, val in zip(_PARAM_NAMES, values, strict=True))
 
 # NONE: T must be a multiple of 256 (DLoC tiling); H must be divisible by 128.
 # MX:   T can be small (>=1); H must be divisible by 512 (MX block size).
@@ -239,6 +247,7 @@ TEST_CASES = [
 @final
 class TestRmsNormRouterTopkTkg:
     @pytest.mark.fast
+    @pytest.mark.parametrize("lnc", [1, 2], ids=["lnc-1", "lnc-2"])
     @pytest.mark.parametrize(PARAMS, TEST_CASES, ids=[_make_test_id(p) for p in TEST_CASES])
     def test_rmsnorm_router_topk_tkg(
         self,
@@ -255,7 +264,12 @@ class TestRmsNormRouterTopkTkg:
         quant_type,
         router_act_fn,
         hidden_actual,
+        lnc,
     ):
+        # LNC=1 support was added for the NONE (DLoC RMSNorm) path; the MX
+        # small-T path is validated at LNC=2 only (out of scope for this change).
+        if quant_type == QuantizationType.MX and lnc == 1:
+            pytest.skip("MX router path is validated at LNC=2 only.")
         if quant_type == QuantizationType.MX and not platform_target.is_trn3():
             pytest.skip("MX quantization only supported on TRN3.")
 
@@ -331,8 +345,103 @@ class TestRmsNormRouterTopkTkg:
         use_custom = is_low_precision or is_mx
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
             rtol=5e-2 if is_low_precision else 2e-2,
             atol=1e-3,
             custom_comparator=_custom_comparator if use_custom else None,
+        )
+
+    # MX-only: matches the gpt-oss-120b decode config (H=3072, E=128, K=4, SOFTMAX).
+    @pytest.mark.trn3
+    @pytest.mark.parametrize(
+        "batch, seqlen, hidden, num_experts, top_k, router_act_fn",
+        [
+            (1, 16, 3072, 128, 4, RouterActFnType.SOFTMAX),
+            (1, 64, 3072, 128, 4, RouterActFnType.SOFTMAX),
+            (1, 128, 3072, 128, 4, RouterActFnType.SOFTMAX),
+        ],
+        ids=lambda v: _format_value(v),
+    )
+    def test_rmsnorm_router_topk_tkg_eager(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        seqlen,
+        hidden,
+        num_experts,
+        top_k,
+        router_act_fn,
+    ):
+        """Eager MX path: store_eager_affi_only=True returns dense [T, K] bf16 affinities
+        (co-indexed with expert_index) instead of the sparse [T, E] tensor; matches torch ref."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX quantization only supported on TRN3.")
+
+        input_dtype = np.float16
+        router_mm_dtype = nl.bfloat16
+
+        def input_generator(test_config):
+            return generate_inputs(
+                batch=batch,
+                seqlen=seqlen,
+                hidden=hidden,
+                num_experts=num_experts,
+                top_k=top_k,
+                has_bias=True,
+                input_dtype=input_dtype,
+                router_mm_dtype=router_mm_dtype,
+                quantization_type=QuantizationType.MX,
+                router_act_fn=router_act_fn,
+                store_eager_affi_only=True,
+            )
+
+        # Re-narrow rmsnorm operands to the test's input dtype to mimic the kernel's
+        # precision flow (the wrapper auto-promotes bf16/fp16 to fp32, losing this).
+        narrow_dtype = _INPUT_DTYPE_TO_TORCH[input_dtype]
+
+        @functools.wraps(rmsnorm_router_topk_tkg_torch_ref)
+        def narrowed_torch_ref(**kwargs):
+            kwargs["hidden_states"] = kwargs["hidden_states"].to(narrow_dtype).float()
+            kwargs["gamma"] = kwargs["gamma"].to(narrow_dtype).float()
+            kwargs["store_eager_affi_only"] = True
+            return rmsnorm_router_topk_tkg_torch_ref(**kwargs)
+
+        def _custom_comparator(golden_dict, output_tensors):
+            return {
+                "norm_output": CustomValidatorWithOutputTensorData(
+                    validator=_make_packed_scale_validator(golden_dict["norm_output"], H=hidden),
+                    output_ndarray=output_tensors["norm_output"],
+                ),
+                "expert_index": CustomValidatorWithOutputTensorData(
+                    validator=_make_topk_set_validator(golden_dict["expert_index"], "expert_index", min_overlap=0.9),
+                    output_ndarray=output_tensors["expert_index"],
+                ),
+                "expert_affinities": CustomValidatorWithOutputTensorData(
+                    validator=_make_cosine_validator(
+                        golden_dict["expert_affinities"],
+                        output_tensors["expert_affinities"].dtype,
+                        "expert_affinities_eager",
+                        rtol=5e-2,
+                        atol=1e-3,
+                        min_cos=0.98,
+                        min_pass_rate=0.95,
+                    ),
+                    output_ndarray=output_tensors["expert_affinities"],
+                ),
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=rmsnorm_router_topk_tkg,
+            torch_ref=torch_ref_wrapper(narrowed_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensor_descriptor,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-3,
+            custom_comparator=_custom_comparator,
         )

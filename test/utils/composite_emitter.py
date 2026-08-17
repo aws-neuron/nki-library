@@ -58,12 +58,3 @@ class CompositeEmitter(IMetricsEmitter):
                 emitter.emit(collector)
             except Exception as e:
                 self._logger.error(f"Emitter {type(emitter).__name__} failed: {e}")
-
-    def emit_run_complete(self, kernel_name: str, tests_passed: int, tests_total: int) -> None:
-        """Fan out run_complete to emitters that support it."""
-        for emitter in self._emitters:
-            if hasattr(emitter, "emit_run_complete"):
-                try:
-                    emitter.emit_run_complete(kernel_name, tests_passed, tests_total)
-                except Exception as e:
-                    self._logger.error(f"emit_run_complete failed for {type(emitter).__name__}: {e}")

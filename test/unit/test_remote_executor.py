@@ -20,6 +20,10 @@ import pytest
 
 from test.utils.remote_executor import RemoteExecutor, RemoteExecutorError
 
+# A mis-stubbed channel can make _recv_line() loop forever accumulating data;
+# bound every test so a regression fails fast instead of exhausting memory.
+pytestmark = pytest.mark.timeout(60)
+
 
 class FakeChannel:
     """Simulates a paramiko channel running the JSON-RPC server."""
@@ -70,13 +74,11 @@ class FakeChannel:
 
 def _make_executor():
     """Create a RemoteExecutor with a fake channel (no SSH)."""
-    conn = MagicMock()
-    transport = MagicMock()
+    client = MagicMock()
     channel = FakeChannel()
-    conn.transport = transport
-    transport.is_active.return_value = True
-    transport.open_session.return_value = channel
-    return RemoteExecutor(conn), channel
+    client.is_active.return_value = True
+    client.open_channel.return_value = channel
+    return RemoteExecutor(client), channel
 
 
 def _add(a, b):
@@ -153,26 +155,22 @@ class TestRemoteExecutor:
     def test_call_reconnects_after_channel_crash(self):
         """A crashed channel (set to None by a prior I/O failure, NOT close()) is
         transparently re-established on the next call()."""
-        conn = MagicMock()
-        transport = MagicMock()
-        channel1 = FakeChannel()
-        channel2 = FakeChannel()
-        conn.transport = transport
-        transport.is_active.return_value = True
-        # First open_session builds the initial channel (during __init__/_start);
+        client = MagicMock()
+        client.is_active.return_value = True
+        # First open_channel builds the initial channel (during __init__/_start);
         # the second is the fresh channel after the simulated crash.
-        transport.open_session.side_effect = [channel1, channel2]
-        executor = RemoteExecutor(conn)
+        client.open_channel.side_effect = [FakeChannel(), FakeChannel()]
+        executor = RemoteExecutor(client)
         assert executor.call("ping") == "ok"
-        open_session_calls_before = transport.open_session.call_count
+        open_channel_calls_before = client.open_channel.call_count
 
         # Simulate a transient reset: prior call's I/O failure set _channel = None
         # WITHOUT an explicit close().
         executor._channel = None
 
-        # Next call should self-heal by opening a fresh session and serving the request.
+        # Next call should self-heal by opening a fresh channel and serving the request.
         assert executor.call("ping") == "ok"
-        assert transport.open_session.call_count > open_session_calls_before
+        assert client.open_channel.call_count > open_channel_calls_before
 
     def test_call_after_close_does_not_reconnect(self):
         """Regression: explicit close() keeps call() raising; no self-heal."""
@@ -186,13 +184,11 @@ class TestRemoteExecutor:
         close()d must stay closed: a later call() raises and does NOT resurrect a
         session. Guards the contract that close() marks _explicitly_closed even when
         the channel was already gone."""
-        conn = MagicMock()
-        transport = MagicMock()
-        conn.transport = transport
-        transport.is_active.return_value = True
-        transport.open_session.side_effect = [FakeChannel(), FakeChannel()]
-        executor = RemoteExecutor(conn)
-        open_session_calls_after_init = transport.open_session.call_count
+        client = MagicMock()
+        client.is_active.return_value = True
+        client.open_channel.side_effect = [FakeChannel(), FakeChannel()]
+        executor = RemoteExecutor(client)
+        open_channel_calls_after_init = client.open_channel.call_count
 
         # Simulate a transient reset (channel nulled), then dispose via close().
         executor._channel = None
@@ -200,8 +196,8 @@ class TestRemoteExecutor:
 
         with pytest.raises(RemoteExecutorError, match="closed"):
             executor.call("ping")
-        # No fresh session was opened -- the closed executor did not self-heal.
-        assert transport.open_session.call_count == open_session_calls_after_init
+        # No fresh channel was opened -- the closed executor did not self-heal.
+        assert client.open_channel.call_count == open_channel_calls_after_init
 
     def test_start_nulls_channel_when_ping_fails(self):
         """If the freshly opened channel's server answers ping with a non-\"ok\"
@@ -215,10 +211,8 @@ class TestRemoteExecutor:
                     return {"id": req["id"], "result": "not-ok"}
                 return super()._handle(req)
 
-        conn = MagicMock()
-        transport = MagicMock()
-        conn.transport = transport
-        transport.is_active.return_value = True
-        transport.open_session.return_value = _BadPingChannel()
+        client = MagicMock()
+        client.is_active.return_value = True
+        client.open_channel.return_value = _BadPingChannel()
         with pytest.raises(RemoteExecutorError, match="ping failed"):
-            RemoteExecutor(conn)
+            RemoteExecutor(client)

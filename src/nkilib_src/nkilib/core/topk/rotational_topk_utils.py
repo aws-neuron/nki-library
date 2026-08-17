@@ -110,6 +110,10 @@ def reduce(op: str = 'mul', input_list: Optional[List] = None, initial_value=Non
             initial_value = min(initial_value, element)
         elif op == 'max':
             initial_value = max(initial_value, element)
+        # This else only absorbs the phantom false-arc coverage flags off the last
+        # elif; it is unreachable given the supported_ops assert above.
+        else:  # pragma: no cover - unreachable: op validated against supported_ops above
+            kernel_assert(False, f"reduce: no handler for op '{op}' despite passing supported_ops check")
     return initial_value
 
 
@@ -567,7 +571,9 @@ def _find_optimal_tile_size_baseline(
             continue
 
         stage_free_size = div_ceil(vocab_size, n_stages)
-        if stage_free_size > HW_PARAMS.max_free_dim:
+        if (
+            stage_free_size > HW_PARAMS.max_free_dim
+        ):  # pragma: no cover - unreachable: n_stages>=ceil(vocab/max_free) forces stage_free=ceil(vocab/n_stages)<=max_free
             continue
         k_per_stage = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
         if stage_free_size + n_stages * k_per_stage > HW_PARAMS.max_free_dim:
@@ -725,10 +731,13 @@ def build_stage_offsets(n_stages: int, bxs_size: int, stage_free_size: int):
     lhs = nl.ndarray((1, padded), dtype=nl.float32, buffer=nl.sbuf)
     nisa.iota(lhs[:, 0:total_partition_dim], pattern=[[0, bxs_size], [stage_free_size, n_stages]])
     offsets = nl.ndarray((padded, 1), dtype=nl.float32, buffer=nl.sbuf)
-    for i in nl.affine_range(padded // 32):
-        nisa.nc_transpose(
-            dst=offsets[nl.ds(i * 32, 32), 0:1], data=lhs[0:1, nl.ds(i * 32, 32)], engine=nisa.vector_engine
-        )
+    # Transpose in <=32-wide chunks, clamping the last chunk to total_partition_dim
+    # so it never reads the alignment padding that iota does not fill.
+    n_chunks = (total_partition_dim + 31) // 32
+    for i in nl.affine_range(n_chunks):
+        chunk = min(32, total_partition_dim - i * 32)
+        chunk_slice = nl.ds(i * 32, chunk)
+        nisa.nc_transpose(dst=offsets[chunk_slice, 0:1], data=lhs[0:1, chunk_slice], engine=nisa.vector_engine)
     return offsets[0:total_partition_dim, 0:1]
 
 
@@ -931,7 +940,9 @@ def sort(data_sbuf, indices, true_k):
     for pass_num in nl.sequential_range(num_pass):
         cur_slice = nl.ds(pass_num * HW_PARAMS.dve_max_alus, HW_PARAMS.dve_max_alus)
         nisa.max8(dst=topk_val_buf[:, cur_slice], src=data_sbuf)
-        if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        if (
+            nisa.get_nc_version() <= nisa.nc_version.gen2
+        ):  # pragma: no cover - gen2/TRN1 legacy path; coverage targets trn2(gen3) and trn3_a0(gen4)
             nisa.nc_find_index8(dst=topk_idx_buf[:, cur_slice], data=data_sbuf[...], vals=topk_val_buf[:, cur_slice])
             nisa.nc_match_replace8(
                 dst=data_sbuf[...], data=data_sbuf[...], vals=topk_val_buf[:, cur_slice], imm=float("-inf")

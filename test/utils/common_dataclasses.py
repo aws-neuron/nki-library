@@ -18,7 +18,8 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional, Protocol, TextIO, runtime_checkable
+from types import CodeType
+from typing import Any, Callable, Mapping, Optional, Protocol, TextIO, runtime_checkable
 
 from typing_extensions import override
 
@@ -43,10 +44,6 @@ else:
             return hash(self.value)
 
 
-try:
-    import nki.isa as nisa
-except ModuleNotFoundError:
-    nisa = None  # nki not available; get_nc_gen() will raise if called
 import numpy.typing as npt
 
 from .metrics_collector import IMetricsCollector
@@ -54,9 +51,40 @@ from .metrics_collector import IMetricsCollector
 # Directory name for inference artifacts
 INF_ARTIFACT_DIR_NAME = "infer_result"
 
+# Directory name for profiler parquet output
+PROFILER_DB_DIR_NAME = "profiler_db"
+
+# The compiled NEFF and separated NEFF derived from the single compile version separated pass.
+# Hoisting writes a new file rather than modifying NEFF_NAME in place, so each NEFF stays
+# paired with the NTFF of the inference that ran against it.
+NEFF_NAME = "file.neff"
+SEPARATED_NEFF_NAME = "file-separated.neff"
+
 # Test type constants for parametrized test filtering
 # MODEL_TEST_TYPE is used to identify model-derived test configs for weekly regression runs
 MODEL_TEST_TYPE = "MODEL_WIP"
+
+
+# Env var pytest-xdist sets in each worker process (value is the worker id, e.g. "gw0");
+# absent in the controller/master process.
+PYTEST_XDIST_WORKER_ENV = "PYTEST_XDIST_WORKER"
+
+
+def is_xdist_worker() -> bool:
+    """True if running inside a pytest-xdist worker process (False in the controller, or
+    when not running under xdist at all)."""
+    return PYTEST_XDIST_WORKER_ENV in os.environ
+
+
+def resolve_probe_worker_count(num_hosts: int, max_probe_workers: int | None = None) -> int:
+    """Thread-pool size for probing ``num_hosts`` hosts concurrently over SSH.
+
+    Bounds the pool by the run's parallelism (``max_probe_workers`` — the xdist
+    ``--maxprocesses`` cap threaded in from config), falling back to the CPU count when it is
+    unset or non-positive, and never exceeds ``num_hosts`` nor drops below 1."""
+    if not max_probe_workers or max_probe_workers <= 0:
+        max_probe_workers = os.cpu_count() or 1
+    return max(1, min(num_hosts, max_probe_workers))
 
 
 class ModelTestType(Enum):
@@ -158,7 +186,9 @@ def prepare_model_parametrize(configs, id_formatter=None):
     import pytest
 
     if id_formatter is None:
-        id_formatter = lambda params: "-".join(str(p.value) if hasattr(p, "value") else str(p) for p in params)
+
+        def id_formatter(params):
+            return "-".join(str(p.value) if hasattr(p, "value") else str(p) for p in params)
 
     params_list = []
     ids_list = []
@@ -185,6 +215,7 @@ def unpack_model_config(entry):
 
 class TraceMode(Enum):
     CompileAndInfer = "compile_and_infer"
+    CompileAndInferAndSeparate = "compile_and_infer_and_separate"
     CompileOnly = "compile_only"
     TraceOnly = "trace_only"
     Simulator = "simulation"
@@ -195,6 +226,34 @@ class TraceMode(Enum):
     @staticmethod
     def create(mode: str):
         return TraceMode(mode.lower().replace("-", "_"))
+
+
+class HostProvisioningMode(StrEnum):
+    """How a run obtains the hosts its tests execute on."""
+
+    LOCAL = "local"
+    """tests run on this machine's own Neuron chip (no --target-* given)."""
+    STATIC_HOSTS = "static_hosts"
+    """a fixed host list via --target-host; the test process drives them
+       over SSH locally (no controller-side store bootstrap)."""
+    STATIC_FILE = "static_file"
+    """a fixed, possibly-heterogeneous host list via --target-host-file;
+       a remote run whose membership the workers initialize from the file."""
+    PLUGIN_PROVISIONED = "plugin_provisioned"
+    """hosts supplied by a provisioning plug-in, which reports it via
+       HostProvisioningResult.plugin_provisioned (see maybe_setup_shared_fleet)."""
+
+
+@dataclass(frozen=True)
+class HostProvisioningResult:
+    """What a host-provisioning plug-in did for this run, returned to the controller."""
+
+    plugin_provisioned: bool
+    """A provisioning plug-in claimed this run's host pool (supplied a remote, store-backed
+    set of hosts). Drives HostProvisioningMode.PLUGIN_PROVISIONED."""
+    recoverable: bool = False
+    """The host pool can regain hosts mid-run (a background refresher re-resolves it), so a
+    failed claim should wait for a host rather than fail immediately."""
 
 
 class NKICompilationMode(Enum):
@@ -281,11 +340,17 @@ class LazyGoldenGenerator:
         return self.__cached_golden__
 
 
+class PerRankGenerator(Protocol):
+    """A callable that produces a per-rank input mapping, keyed by a named ``rank_id``."""
+
+    def __call__(self, *, rank_id: int) -> dict[str, Any]: ...
+
+
 @dataclass
 class PerRankLazyGenerator:
     """Base class for per-rank lazy generators with caching."""
 
-    generator: Callable[[int], dict[str, Any]]
+    generator: PerRankGenerator
     __cache__: dict[int, dict[str, Any]] = field(init=False, default_factory=dict)
     computation_times: dict[int, float] = field(init=False, default_factory=dict)
 
@@ -297,16 +362,15 @@ class PerRankLazyGenerator:
             except TypeError as e:
                 # Only catch TypeError from wrong parameter name, not from inside the generator
                 if "unexpected keyword argument" in str(e) and "rank_id" in str(e):
-                    location = ""
-                    if hasattr(self.generator, "__code__"):
-                        code = self.generator.__code__
-                        location = f" at {code.co_filename}:{code.co_firstlineno}"
+                    code = getattr(self.generator, "__code__", None)
+                    location = f" at {code.co_filename}:{code.co_firstlineno}" if isinstance(code, CodeType) else ""
                     raise TypeError(f"Generator{location} must use 'rank_id' as parameter name") from e
                 raise
             self.computation_times[rank_id] = time.perf_counter() - start
         return self.__cache__[rank_id]
 
 
+@dataclass
 class PerRankLazyInputGenerator(PerRankLazyGenerator):
     """Generates inputs per rank for collectives tests.
 
@@ -316,6 +380,12 @@ class PerRankLazyInputGenerator(PerRankLazyGenerator):
 
         kernel_input=PerRankLazyInputGenerator(create_inputs)
     """
+
+    # Set by the collective harness to the rank-0 input mapping, for callers that
+    # need a representative shape/dtype without materialising every rank. Defaults
+    # to empty so the harness can construct first and assign it right after.
+    base_input: dict[str, Any] = field(default_factory=dict)
+    input_artifacts_directory: str | None = None
 
 
 @dataclass
@@ -338,13 +408,15 @@ class PerRankLazyGoldenGenerator(PerRankLazyGenerator):
 
 
 # Type aliases for golden output handling:
-# - GoldenTensorDict: The normalized form - a dict mapping output names to tensors or validators
-# - GoldenOutputType: All possible input forms that can be normalized to GoldenTensorDict
-GoldenTensorDict = dict[str, npt.NDArray[Any] | CustomValidatorWithOutputTensorData]
-GoldenOutputType = LazyGoldenGenerator | PerRankLazyGoldenGenerator | GoldenTensorDict
+# - GoldenTensorMapping: The normalized form - output names mapped to tensors or validators.
+#   A read-only Mapping rather than a dict, because Mapping is covariant in its value type
+#   and so also accepts a narrower dict (e.g. one holding only validators).
+# - GoldenOutputType: All possible input forms that can be normalized to GoldenTensorMapping
+GoldenTensorMapping = Mapping[str, npt.NDArray[Any] | CustomValidatorWithOutputTensorData]
+GoldenOutputType = LazyGoldenGenerator | PerRankLazyGoldenGenerator | GoldenTensorMapping
 
 
-def normalize_golden_output(golden_output: GoldenOutputType, rank_id: int = 0) -> GoldenTensorDict:
+def normalize_golden_output(golden_output: GoldenOutputType, rank_id: int = 0) -> GoldenTensorMapping:
     """Normalize golden_output to a dict of output name -> tensor.
 
     Handles all golden output types consistently:
@@ -383,7 +455,7 @@ class ValidationArgs:
             for key, value in self.golden_output.items():
                 assert isinstance(key, str) and isinstance(value, CustomValidatorWithOutputTensorData), error_message
         else:
-            assert False, error_message
+            raise AssertionError(error_message)
 
 
 class Platforms(StrEnum):
@@ -406,6 +478,16 @@ class Platforms(StrEnum):
     def __str__(self) -> str:
         return self.value
 
+    @classmethod
+    def from_str_safe(cls, value: str) -> "Platforms | None":
+        """Parse a platform string, returning None (with a warning) for an
+        unrecognized value. Use ``Platforms(value)`` for strict."""
+        try:
+            return cls(value)
+        except ValueError:
+            logging.getLogger(__name__).warning("Unknown platform %r; treating as None", value)
+            return None
+
     def is_trn3(self) -> bool:
         return self in (Platforms.TRN3, Platforms.TRN3_A0, Platforms.TRN3_PDS, Platforms.TRN3_PDS_A0)
 
@@ -418,8 +500,12 @@ class Platforms(StrEnum):
             return self.value
 
     def get_nc_gen(self) -> str:
-        if nisa is None:
-            raise ImportError("nki.isa is required for get_nc_gen() but is not installed")
+        # Imported lazily: nki is not installed in every environment that imports this module.
+        try:
+            import nki.isa as nisa
+        except ModuleNotFoundError as exc:
+            raise ImportError("nki.isa is required for get_nc_gen() but is not installed") from exc
+
         gen_map = {
             Platforms.TRN1: nisa.nc_version.gen2,
             Platforms.TRN2: nisa.nc_version.gen3,
@@ -455,6 +541,60 @@ class TargetHost:
     host_type: Platforms
 
 
+@dataclass(frozen=True)
+class ResolvedHost:
+    """A single provisioned host.
+
+    ``ssh_host`` is the SSH alias the test harness connects to (e.g. the host's
+    public IP). ``host_type`` is the platform that this host supports.
+    ``num_physical_cores`` is the host's total physical-core capacity, probed by the
+    source when it resolves the host (0 if unknown / not probed); it drives capacity-based
+    routing in the host-state store — a host with fewer cores than a request needs is
+    ineligible for it.
+    """
+
+    ssh_host: str
+    host_type: Platforms
+    num_physical_cores: int = 0
+
+
+class InstanceSize(StrEnum):
+    """A fleet host's instance size.
+
+    ``UNKNOWN`` covers a size not enumerated here (or an absent one)."""
+
+    X_48XLARGE = "48xlarge"
+    X_3XLARGE = "3xlarge"
+    UNKNOWN = "unknown"
+
+    @override
+    def __str__(self) -> str:
+        return self.value
+
+    @classmethod
+    def from_str(cls, value: str | None) -> "InstanceSize":
+        """Parse an instance-size string, mapping an unrecognized/absent value to ``UNKNOWN``
+        (with a warning) so a new size is flagged for a real core-count assignment rather than
+        silently mis-weighted."""
+        try:
+            return cls(value)
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                "Unknown instance size %r; treating as UNKNOWN (1 core). Add it to InstanceSize "
+                "with its real core count so the capacity gate weights it correctly",
+                value,
+            )
+            return cls.UNKNOWN
+
+    def get_core_count(self) -> int:
+        """Nominal physical cores for this size. UNKOWN is treated as 1 (assumed to have at least 1 core)."""
+        return {
+            InstanceSize.X_48XLARGE: 128,
+            InstanceSize.X_3XLARGE: 8,
+            InstanceSize.UNKNOWN: 1,
+        }[self]
+
+
 class CompilerArgs:
     logical_nc_config: int
     platform_target: Platforms
@@ -464,6 +604,10 @@ class CompilerArgs:
     dump_after_lowering: bool
     separation_pass_mode: SeparationPassMode
     enable_device_dump: bool  # Inserts a device_print after each ISA instruction to dump intermediate tensors. WARNING: Local debug only. High disk/perf impact.
+    # Per-test NKI compiler frontend override. None => use the session/CLI default
+    # (--nki-compilation-mode, default parser). Set to NKICompilationMode.tracer to
+    # pin the tracer frontend for a test regardless of how the suite is invoked.
+    nki_compilation_mode: "NKICompilationMode | None"
 
     def __init__(
         self,
@@ -475,6 +619,7 @@ class CompilerArgs:
         dump_after_lowering: bool = False,
         separation_pass_mode: SeparationPassMode = SeparationPassMode.NONE,
         enable_device_dump: bool = False,
+        nki_compilation_mode: "NKICompilationMode | None" = None,
     ):
         self.platform_target = platform_target
         self.additional_cmd_args = additional_cmd_args if additional_cmd_args is not None else []
@@ -483,6 +628,7 @@ class CompilerArgs:
         self.dump_after_lowering = dump_after_lowering
         self.separation_pass_mode = separation_pass_mode
         self.enable_device_dump = enable_device_dump
+        self.nki_compilation_mode = nki_compilation_mode
         if os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS"):
             sep_mode = os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS")
             if sep_mode == "serialize":
@@ -522,9 +668,7 @@ class InferenceArgs:
 
     def __post_init__(self):
         """Set default num_runs based on enable_determinism_check"""
-        if self.num_runs is None:
-            # Default: 2 for determinism check, 1 otherwise
-            self.num_runs = 2 if self.enable_determinism_check else 1
+        self.num_runs = self.resolved_num_runs
 
         # Validate collective_ranks - NRT only supports 1, 2, 4, 8, 16 or multiples of 32
         valid_ranks = {1, 2, 4, 8, 16}
@@ -534,15 +678,34 @@ class InferenceArgs:
                 f"Supported values are 1, 2, 4, 8, 16 or multiples of 32."
             )
 
+    @property
+    def resolved_num_runs(self) -> int:
+        """Number of executions: 2 when checking determinism, 1 otherwise, unless set explicitly."""
+        if self.num_runs is None:
+            return 2 if self.enable_determinism_check else 1
+        return self.num_runs
+
 
 # Pre-configured InferenceArgs for TKG kernels with determinism checking
 TKG_INFERENCE_ARGS = InferenceArgs(enable_determinism_check=True, num_runs=10)
 
 
+class NamedCallable(Protocol):
+    """A callable that also carries a name, as every plain function does.
+
+    Used where the harness reports which entry point it is working on: a bare
+    callable type promises no name, but a function does.
+    """
+
+    __name__: str
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
 @dataclass
 class KernelArgs:
-    kernel_func: Callable  # pyright: ignore[reportMissingTypeArgument]
-    compiler_input: CompilerArgs = field(default_factory=CompilerArgs)
+    kernel_func: NamedCallable
+    compiler_input: CompilerArgs
     # Kernel inputs: either a dict (same for all ranks) or PerRankLazyInputGenerator (per-rank)
     kernel_input: dict[str, Any] | PerRankLazyInputGenerator | None = None
     validation_args: ValidationArgs | None = None
@@ -561,7 +724,7 @@ class NeuronDeviceInfo:
     memory_size: int
     neuroncore_ids: list[int]
     neuron_processes: list[dict[str, Any]]
-    instance_type: str
+    instance_type: str = ""
     logical_neuroncore_config: int = (
         2  # future version of compiler and runtime simply default to lnc 2 without explicitly specifying it
     )
@@ -580,7 +743,7 @@ class NeuronDeviceInfo:
             memory_size=data["memory_size"],
             neuroncore_ids=data["neuroncore_ids"],
             neuron_processes=data.get("neuron_processes", []),
-            instance_type=data["instance_type"],
+            instance_type=data.get("instance_type", ""),
         )
 
     def get_memory_size_gb(self) -> float:

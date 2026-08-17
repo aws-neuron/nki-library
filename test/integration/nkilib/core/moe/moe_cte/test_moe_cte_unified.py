@@ -18,13 +18,13 @@ from typing import final
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.moe.moe_cte import (
     MoECTEImplementation,
     moe_cte,
 )
 from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_torch import moe_cte_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     _shard_on_block_mx_output_validator,
     _shard_on_block_output_validator,

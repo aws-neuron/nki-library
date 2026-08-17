@@ -21,7 +21,6 @@ Pure Python -- no NKI, no tracer, no device required.
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import buffer_space
 from nkilib_src.nkilib.experimental.neurotile.core.factories import (
     NDSlice,
@@ -30,7 +29,9 @@ from nkilib_src.nkilib.experimental.neurotile.core.factories import (
     blocks,
     tiles,
 )
+
 from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
+from test.utils.negative_test_helpers import call_with_invalid_argument
 from test.utils.pytest_test_metadata import pytest_marks
 
 # ============================================================================
@@ -312,7 +313,7 @@ class TestAllocTilesMisuseGuards:
     @pytest.mark.fast
     def test_tile_size_must_be_tuple(self):
         with pytest.raises(AssertionError, match="tile_size= must be a tuple"):
-            alloc_tiles(tile_size=128, buffer_type=nl.sbuf, dtype="float32")
+            call_with_invalid_argument(alloc_tiles, tile_size=128, buffer_type=nl.sbuf, dtype="float32")
 
     def test_tile_size_rank_at_least_2(self):
         with pytest.raises(AssertionError, match="at least 2 dims"):
@@ -338,7 +339,7 @@ class TestAllocTilesMisuseGuards:
 
     def test_buffer_type_string_rejected(self):
         with pytest.raises(AssertionError, match="buffer_type= must be an nl.MemoryRegion"):
-            alloc_tiles(tile_size=(128, 256), buffer_type="sbuf", dtype="float32")
+            call_with_invalid_argument(alloc_tiles, tile_size=(128, 256), buffer_type="sbuf", dtype="float32")
 
     # grid xor element_shape.
 
@@ -374,7 +375,8 @@ class TestAllocTilesMisuseGuards:
 
     def test_grid_entry_must_be_int(self):
         with pytest.raises(AssertionError, match=r"grid\[0\] must be int"):
-            alloc_tiles(
+            call_with_invalid_argument(
+                alloc_tiles,
                 tile_size=(128, 256),
                 grid=(2.0, 2),
                 buffer_type=nl.sbuf,
@@ -442,7 +444,8 @@ class TestAllocBlocksMisuseGuards:
 
     def test_block_size_must_be_tuple(self):
         with pytest.raises(AssertionError, match="block_size= must be a tuple"):
-            alloc_blocks(
+            call_with_invalid_argument(
+                alloc_blocks,
                 tile_size=(128, 256),
                 block_size=2,
                 buffer_type=nl.sbuf,
@@ -543,7 +546,7 @@ class TestInputValidation:
     def test_size_must_be_tuple(self):
         src = MockTensor(512, 1024)
         with pytest.raises(AssertionError, match="tile_size= must be a tuple"):
-            tiles(src, tile_size=128)
+            call_with_invalid_argument(tiles, src, tile_size=128)
 
     def test_size_rank_at_least_2(self):
         src = MockTensor(512, 1024)
@@ -591,7 +594,7 @@ class TestInputValidation:
     def test_remainder_wrong_type(self):
         src = MockTensor(512, 1024)
         with pytest.raises(AssertionError, match="remainder=42"):
-            tiles(src, tile_size=(128, 256), remainder=42)
+            call_with_invalid_argument(tiles, src, tile_size=(128, 256), remainder=42)
 
     def test_ap_level_wrong_length(self):
         src = MockTensor(512, 1024)
@@ -1224,26 +1227,10 @@ class TestBlocksRequiresBlockSize:
     """block_size= is mandatory; no form of nt.blocks() returns a tile-level view."""
 
     @pytest.mark.fast
-    def test_raw_hbm_no_block_size_rejects(self):
-        src = MockTensor(512, 2048)
-        with pytest.raises(TypeError, match="block_size"):
-            blocks(src, tile_size=(128, 512))
-
-    def test_ndslice_no_block_size_rejects(self):
-        src = MockTensor(512, 2048)
-        v = tiles(src, tile_size=(128, 512))
-        with pytest.raises(TypeError, match="block_size"):
-            blocks(v)
-
-    def test_raw_sbuf_no_block_size_rejects(self):
-        sbuf = MockTensor((128, 1024), buffer=nl.sbuf)
-        with pytest.raises(TypeError, match="block_size"):
-            blocks(sbuf, tile_size=(128, 512))
-
     def test_explicit_none_block_size_rejects(self):
         src = MockTensor(512, 2048)
         with pytest.raises(AssertionError, match="block_size= is required"):
-            blocks(src, tile_size=(128, 512), block_size=None)
+            call_with_invalid_argument(blocks, src, tile_size=(128, 512), block_size=None)
 
 
 @pytest_marks(["neurotile"])
@@ -1257,7 +1244,7 @@ class TestBlocksMisuseGuards:
     def test_block_size_must_be_tuple(self):
         src = MockTensor(512, 1024)
         with pytest.raises(AssertionError, match="block_size= must be a tuple"):
-            blocks(src, tile_size=(128, 256), block_size=2)
+            call_with_invalid_argument(blocks, src, tile_size=(128, 256), block_size=2)
 
     def test_block_size_rank_at_least_2(self):
         src = MockTensor(512, 1024)
@@ -1446,7 +1433,7 @@ def _axis_tuples_equal(a, b):
     """Structural equality on axis tuples (NKIObject lacks __eq__)."""
     if len(a) != len(b):
         return False
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=True):
         if (x.count, x.step, x.dim, x.label) != (y.count, y.step, y.dim, y.label):
             return False
     return True

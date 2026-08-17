@@ -34,7 +34,7 @@ _H0 = 128
 _Q_WIDTH = 4
 _K_BLOCK = 512
 _SCALES_PER_BLOCK = 4
-_FP8_E4M3_MAX_EXP = 8  # quantize_to_mx max_exp for float8_e4m3fn
+_FP8_E4M3_MAX_EXP = 7  # quantize_to_mx max_exp for float8_e4m3fn
 
 
 def _to_torch_dtype(dtype) -> torch.dtype:
@@ -75,11 +75,15 @@ def rmsnorm_mx_prefill_torch_ref(
     eps: float = 1e-6,
     top_k: int = 1,
     router_act_fn: RouterActFnType = RouterActFnType.SIGMOID,
+    n_group: int = 1,
+    topk_group: int = 1,
+    routed_scaling_factor: float = 1.0,
     qmx_output_dtype=nl.float8_e4m3fn_x4,  # noqa: ARG001 - dtype-only; ref works in fp32, signature parity with kernel
     pack_scales: bool = True,  # noqa: ARG001 - layout-only; does not change the float reference
     pack_affinities: bool = False,  # noqa: ARG001 - output-layout-only; does not change the float reference
     unpadded_hidden_size: int = None,
     residual=None,
+    emit_norm_bf16: bool = False,
 ):
     """Reference for ``rmsnorm_mx_prefill``, with toggles mirroring the kernel's optional outputs.
 
@@ -156,6 +160,9 @@ def rmsnorm_mx_prefill_torch_ref(
     result = {"out": norm.numpy().astype(np.float32)}
     if residual is not None:
         result["out_residual"] = hidden.numpy().astype(np.float32)  # pre-norm sum (input + residual)
+    if emit_norm_bf16:
+        # Token-major bf16 RMSNorm output (natural H) = hidden * inv_rms * gamma, cast to bf16.
+        result["norm_bf16"] = dt.static_cast(norm.numpy().astype(np.float32), dt.bfloat16)
 
     if router_weights is not None:
         wperm = router_weights.numpy() if hasattr(router_weights, "numpy") else np.asarray(router_weights)
@@ -170,15 +177,36 @@ def rmsnorm_mx_prefill_torch_ref(
         if router_bias is not None:
             wb = router_bias.numpy() if hasattr(router_bias, "numpy") else np.asarray(router_bias)
             logits = logits + torch.from_numpy(dt.static_cast(wb, np.float32).reshape(1, E))
-        # argsort descending; take the top-K expert ids per token.
-        expert_index = torch.argsort(-logits, dim=1)[:, :top_k].to(torch.int32)
-        topk_logits = torch.gather(logits, 1, expert_index.long())
-        is_softmax = router_act_fn != RouterActFnType.SIGMOID
-        topk_aff = torch.softmax(topk_logits, dim=1) if is_softmax else torch.sigmoid(topk_logits)
-        affinities = torch.zeros((T, E), dtype=torch.float32)
-        affinities.scatter_(1, expert_index.long(), topk_aff)
-        result["expert_index"] = expert_index.numpy().astype(np.int32)
-        result["expert_affinities"] = affinities.numpy().astype(np.float32)
+        if router_act_fn == RouterActFnType.NOAUX_TC:
+            # Group-limited noaux_tc: sigmoid(logits) scores, +bias for selection only,
+            # per-group top-2 gating, keep top-`topk_group` groups, final top-`top_k` experts by the
+            # biased score, then L1-normalize the PRE-bias selected scores and scale.
+            experts_per_group = E // n_group
+            scores = torch.sigmoid(logits)  # PRE-bias affinity source
+            scores_for_choice = scores + torch.from_numpy(dt.static_cast(wb, np.float32).reshape(1, E))
+            grp = scores_for_choice.reshape(T, n_group, experts_per_group)
+            group_score = grp.topk(2, dim=2).values.sum(dim=2)  # [T, n_group]
+            kept_groups = group_score.topk(topk_group, dim=1).indices  # [T, topk_group]
+            group_mask = torch.zeros((T, n_group), dtype=torch.float32)
+            group_mask.scatter_(1, kept_groups, 1.0)
+            expert_mask = group_mask.unsqueeze(-1).expand(T, n_group, experts_per_group).reshape(T, E)
+            masked = scores_for_choice.masked_fill(expert_mask == 0, float("-inf"))
+            expert_index = masked.topk(top_k, dim=1).indices  # [T, top_k]
+            sel = torch.zeros((T, E), dtype=torch.float32)
+            sel.scatter_(1, expert_index, torch.gather(scores, 1, expert_index))  # PRE-bias scores
+            denom = sel.sum(dim=1, keepdim=True) + 1e-20
+            affinities = sel / denom * routed_scaling_factor
+            result["expert_affinities"] = affinities.numpy().astype(np.float32)  # dense only, no expert_index
+        else:
+            # argsort descending; take the top-K expert ids per token.
+            expert_index = torch.argsort(-logits, dim=1)[:, :top_k].to(torch.int32)
+            topk_logits = torch.gather(logits, 1, expert_index.long())
+            is_softmax = router_act_fn != RouterActFnType.SIGMOID
+            topk_aff = torch.softmax(topk_logits, dim=1) if is_softmax else torch.sigmoid(topk_logits)
+            affinities = torch.zeros((T, E), dtype=torch.float32)
+            affinities.scatter_(1, expert_index.long(), topk_aff)
+            result["expert_index"] = expert_index.numpy().astype(np.int32)
+            result["expert_affinities"] = affinities.numpy().astype(np.float32)
 
     return result
 
@@ -205,7 +233,7 @@ def reference_mx_dequant(norm_fp32: np.ndarray, round_dtype=dt.bfloat16) -> np.n
     x = dt.static_cast(dt.static_cast(norm_fp32, round_dtype), np.float32)
     n_blocks = H // 32
     blocks = x.reshape(T, n_blocks, 32)
-    # Per 32-wide block: scale exponent = max block exponent - e4m3 max_exp (8).
+    # Per 32-wide block: scale exponent = max block exponent - e4m3 max_exp (7).
     exp_field = (blocks.astype(np.float32).view(np.uint32) >> 23) & 0xFF
     block_max_exp = exp_field.max(axis=2, keepdims=True)  # [T, n_blocks, 1]
     scale_uint8 = np.clip(block_max_exp - _FP8_E4M3_MAX_EXP, 0, 255)

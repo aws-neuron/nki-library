@@ -21,7 +21,7 @@ explicit flag.
 
 import contextvars
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Callable, Optional
 
 # Context variable to track if we're in a negative test case
 # This allows Orchestrator.execute() to automatically detect negative tests
@@ -35,6 +35,16 @@ def is_in_negative_test_context() -> bool:
     without requiring tests to explicitly pass is_negative_test to KernelArgs.
     """
     return _is_negative_test_context.get()
+
+
+def call_with_invalid_argument(fn: Callable[..., object], *args: Any, **kwargs: Any) -> object:
+    """Call ``fn`` with arguments that deliberately violate its declared parameter types.
+
+    Use this only inside a ``pytest.raises`` block that asserts the callee rejects the
+    bad value, so that the intent is explicit at the call site rather than looking like
+    an accidental mistake.
+    """
+    return fn(*args, **kwargs)
 
 
 def assert_kernel_validation_exception(expected_validation_error: Optional[str], exception: Exception):

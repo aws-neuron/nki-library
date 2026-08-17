@@ -16,13 +16,13 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples.kernels.mlp_cte import (
     mlp_cte_nt as kernel_mod,
 )
 from nkilib_src.nkilib.experimental.neurotile.examples.kernels.mlp_cte import (
     mlp_cte_nt_torch as refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator

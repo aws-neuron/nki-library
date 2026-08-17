@@ -1,0 +1,588 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+PyTorch reference for attention_tkg kernel
+"""
+
+import math
+from typing import Optional, Protocol, Tuple, Union
+
+import torch
+
+from ..utils.allocator import SbufManager
+from ..utils.common_types import DtypeMode
+from ..utils.kernel_assert import kernel_assert
+from ..utils.lnc_subscriptable import LncSubscriptable
+from .attention_tkg import INACTIVE_BLOCK_IDX
+from .attention_tkg_utils import (
+    AttnTKGConfig,
+    get_total_n_prgs,
+    is_batch_sharded,
+    is_s_prior_sharded,
+    resize_cache_block_len_for_attention_tkg_kernel,
+)
+from .gen_mask_tkg_torch import build_full_attention_mask, build_swa_attention_mask
+
+attention_tkg_torch_ref: "LncSubscriptable[_AttentionTkgTorchRefFn]"
+"""
+PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
+
+Usage:
+    attention_tkg_torch_ref[lnc](q=..., k_active=..., ...)
+
+Args:
+    q: Query tensor
+    k_active: Active key tensor
+    v_active: Active value tensor
+    k_prior: Prior key cache tensor
+    v_prior: Prior value cache tensor
+    mask: Attention mask tensor
+    out: Output tensor (modified in-place)
+    cfg: Attention TKG configuration
+    sbm: SBUF manager (unused in torch ref)
+    inv_freqs: Inverse frequencies for RoPE
+    rope_pos_ids: Position IDs for RoPE
+    start_pos_ids: Per-query SWA window start positions
+    sink: Sink tensor for attention sink
+    active_blocks_table: Block table for block KV cache
+    k_out: Output tensor for RoPE'd keys (modified in-place)
+    DBG_TENSORS: Debug tensors tuple
+    max_context_len: Optional int32 array [1] for dynamic FA early exit. Limits KV context processed.
+    dtype_mode: Quantization dtype policy (accepted for kernel signature parity; unused on CPU).
+
+Returns:
+    Tuple of (out, k_out) tensors. When cfg.return_cp_softmax_stats=True, out is unnormalized and
+    the local softmax stats are written into the cp_softmax_stats_out dict.
+"""
+
+
+def _attention_tkg_torch_ref_impl(
+    q: torch.Tensor,
+    k_active: torch.Tensor,
+    v_active: torch.Tensor,
+    k_prior: torch.Tensor,
+    v_prior: torch.Tensor,
+    mask: torch.Tensor,
+    out: torch.Tensor,
+    cfg: AttnTKGConfig,
+    sbm: SbufManager,
+    inv_freqs: Optional[torch.Tensor] = None,
+    rope_pos_ids: Optional[torch.Tensor] = None,
+    start_pos_ids: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    active_blocks_table: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    cp_softmax_stats_out: Optional[dict] = None,
+    DBG_TENSORS: Optional[tuple] = None,
+    max_context_len=None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for kernel signature parity (no FP8 tile allocations on CPU)
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor | None], Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]
+]:
+    """Reference implementation for attention_tkg. See attention_tkg_torch_ref for the full contract."""
+    LNC = attention_tkg_torch_ref.lnc
+    """
+    Hardcode P_MAX to 128. The kernel derives P_MAX from nl.tile_size.pmax,
+    which is unavailable in the torch golden reference.
+    TODO: Configure this dynamically instead of hardcoding.
+    """
+    P_MAX = 128
+
+    batch = cfg.bs
+    q_head = cfg.q_head
+    d_head = cfg.d_head
+    s_prior = cfg.curr_sprior
+    s_prior_full = cfg.full_sprior
+    s_active = cfg.s_active
+    block_len = cfg.block_len
+    is_block_kv = active_blocks_table is not None
+    out_in_sb = cfg.out_in_sb
+    k_out_in_sb = cfg.k_out_in_sb
+    attn_out_shape = (d_head, batch * q_head * s_active) if out_in_sb else (batch, q_head, d_head, s_active)
+    k_out_shape = (d_head, batch * s_active) if k_out_in_sb else (batch, 1, d_head, s_active)
+
+    if DBG_TENSORS:
+        expected_len = 4 + (1 if is_block_kv else 0)
+        kernel_assert(
+            len(DBG_TENSORS) == expected_len,
+            f"Received {len(DBG_TENSORS)} debug tensors, when {expected_len} are expected.",
+        )
+
+    # Convert to float32 because CPU doesn't support half precision
+    q = q.to(torch.float32)
+    k_active = k_active.to(torch.float32)
+    v_active = v_active.to(torch.float32)
+    k_prior = k_prior.to(torch.float32)
+    v_prior = v_prior.to(torch.float32)
+    mask = mask.to(torch.uint8)
+
+    active_mask = mask
+
+    reduced_blk_len = None
+    DBG_ACTIVE_TABLE = None
+    if is_block_kv:
+        kernel_assert(s_prior % block_len == 0, "s_prior must be divisible by block_len")
+        kernel_assert(active_blocks_table is not None, "active_blocks_table must be provided for block KV")
+        # fp8_packed: unpack [num_blocks, block_len//2, d_head, 2] -> [num_blocks, block_len, d_head]
+        if cfg.fp8_packed and k_prior.dim() == 4:
+            num_blocks, half_bl, d_head_k, _ = k_prior.shape
+            k_prior = k_prior.permute(0, 1, 3, 2).reshape(num_blocks, half_bl * 2, d_head_k)
+        k_prior = _gather_block_kv_to_flat(k_prior, active_blocks_table, batch, s_prior_full, d_head, block_len)
+        v_prior = _gather_block_kv_to_flat(v_prior, active_blocks_table, batch, s_prior_full, d_head, block_len)
+        k_prior = k_prior.unsqueeze(1)
+        v_prior = v_prior.unsqueeze(1)
+
+        reduced_blk_len, resize_factor = resize_cache_block_len_for_attention_tkg_kernel(
+            s_prior // block_len,
+            block_len,
+            LNC,
+            P_MAX,
+            cfg.bs,
+            cfg.q_head,
+            cfg.s_active,
+            full_sprior=s_prior_full,
+            enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+            fuse_rope=cfg.fuse_rope,
+        )
+
+        # Only reshape mask if NOT using use_pos_id (i.e., pre-computed full cache mask)
+        # When use_pos_id=True, the mask is a small active mask that will be expanded in _attention_tkg_fwd_ref
+        if not cfg.use_pos_id:
+            """
+            Unshuffle the pre-generated mask from n_sprior_tile-major HBM layout to linear token order.
+            flat index i -> (f = i // P_MAX, p = i % P_MAX)
+            where fold = f // block_len, blk_offset = f % block_len
+            token = fold * P_MAX * block_len + p * block_len + blk_offset
+            """
+            active_mask = (
+                active_mask.permute(1, 2, 3, 0)
+                .reshape((-1, reduced_blk_len, P_MAX))
+                .permute(0, 2, 1)
+                .reshape((batch, q_head, s_active, s_prior))
+                .permute(3, 0, 1, 2)
+            )
+
+        DBG_ACTIVE_TABLE = _get_dbg_active_table(active_blocks_table, resize_factor, batch, P_MAX)
+
+    active_mask = active_mask.permute(1, 2, 0, 3)  # [b, n, s_prior, s_active]
+    q, k_active = _reshape_q_and_k_active(q, k_active, cfg)
+    k_prior, v_prior = _slice_and_reshape_kv_prior(k_prior, v_prior, cfg)
+
+    inv_freqs = inv_freqs.to(torch.float32) if inv_freqs is not None else None
+    rope_pos_ids = rope_pos_ids.to(torch.float32) if rope_pos_ids is not None else None
+    start_pos_ids = start_pos_ids.to(torch.float32) if start_pos_ids is not None else None
+    sink = sink.to(torch.float32) if sink is not None else None
+
+    attn_out, attn_k_out, softmax_max, softmax_sum, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM = (
+        _attention_tkg_fwd_ref(
+            q=q,
+            k_active=k_active,
+            v_active=v_active,
+            k_prior=k_prior,
+            v_prior=v_prior,
+            active_mask=active_mask,
+            inv_freqs=inv_freqs,
+            rope_pos_ids=rope_pos_ids,
+            start_pos_ids=start_pos_ids,
+            sink=sink,
+            cfg=cfg,
+        )
+    )
+
+    # Need to transpose and reshape if output is in sbuf
+    if out_in_sb:
+        attn_out = attn_out.permute(2, 0, 1, 3).reshape(attn_out_shape)
+    if k_out_in_sb:
+        attn_k_out = attn_k_out.permute(2, 0, 1, 3).reshape(k_out_shape)
+
+    kernel_assert(
+        out.shape == attn_out.shape, f"Output shape mismatch: out.shape={out.shape}, attn_out.shape={attn_out.shape}"
+    )
+    out.copy_(attn_out)
+
+    if k_out is not None:
+        kernel_assert(
+            k_out.shape == attn_k_out.shape,
+            f"Output shape mismatch: k_out.shape={k_out.shape}, attn_k_out.shape={attn_k_out.shape}",
+        )
+        k_out.copy_(attn_k_out)
+
+    if DBG_TENSORS:
+        n_prgs = get_total_n_prgs(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, LNC, P_MAX, cfg.fuse_rope)
+        DBG_QK = _reshape_debug_tensor(DBG_QK, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
+        DBG_QK_EXP = _reshape_debug_tensor(DBG_QK_EXP, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
+
+        DBG_RESULTS = [
+            DBG_QK,
+            DBG_QK_MAX,
+            DBG_QK_EXP,
+            DBG_EXP_SUM,
+        ]
+        if is_block_kv:
+            DBG_RESULTS.append(DBG_ACTIVE_TABLE)
+
+        for dst_tensor, dbg_result in zip(DBG_TENSORS, DBG_RESULTS):
+            dst_tensor.view(dbg_result.shape).copy_(dbg_result)
+
+    if cfg.return_cp_softmax_stats:
+        # out is unnormalized (not divided by softmax_sum) — caller handles global normalization.
+        kernel_assert(
+            cp_softmax_stats_out is not None,
+            "cp_softmax_stats_out dict is required when cfg.return_cp_softmax_stats=True",
+        )
+        cp_softmax_stats_out["fa_running_max"] = softmax_max
+        cp_softmax_stats_out["fa_running_sum"] = softmax_sum
+        cp_softmax_stats_out["max_negated"] = False
+    return out, k_out
+
+
+def _reshape_q_and_k_active(
+    q: torch.Tensor, k_active: torch.Tensor, cfg: AttnTKGConfig
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reshape/transpose q and k_active into the layout the torch reference expects."""
+    # attention_tkg supports qk tensors starting out in sbuf instead of hbm
+    # in this case, we need to transpose them into dimension config that torch expects
+    d_head, batch, q_head, s_active = cfg.d_head, cfg.bs, cfg.q_head, cfg.s_active
+
+    if cfg.qk_in_sb:
+        # Need to reshape first because these tensors will be flattened if in sb
+        q = q.reshape(d_head, batch, q_head, s_active).permute((1, 2, 0, 3))
+        k_active = k_active.reshape(d_head, 1, batch, s_active).permute((2, 1, 0, 3))
+    else:
+        q = q.permute(0, 1, 3, 2)
+        k_active = k_active.permute(0, 1, 3, 2)
+
+    return q, k_active
+
+
+def _slice_and_reshape_kv_prior(
+    k_prior: torch.Tensor, v_prior: torch.Tensor, cfg: AttnTKGConfig
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Slice prior KV to the active batch and reshape into the layout the torch reference expects."""
+    batch, s_prior = cfg.bs, cfg.curr_sprior
+
+    k_prior = k_prior[:batch, ...]  # when has_cache_buffer, there is an extra buffer batch in the end
+    v_prior = v_prior[:batch, ...]  # when has_cache_buffer, there is an extra buffer batch in the end
+
+    if cfg.tp_k_prior:
+        k_prior = k_prior[..., :s_prior, :].permute(0, 1, 3, 2)
+    else:
+        k_prior = k_prior[..., :s_prior]
+    v_prior = v_prior[..., :s_prior, :]
+
+    return k_prior, v_prior
+
+
+def _gather_block_kv_to_flat(
+    block_cache: torch.Tensor,
+    active_blocks_table: torch.Tensor,
+    batch: int,
+    S_max_ctx: int,
+    d_head: int,
+    block_len: int,
+) -> torch.Tensor:
+    '''Gather block cache to flat layout, skipping inactive blocks (INACTIVE_BLOCK_IDX).'''
+    flat_cache = torch.zeros((batch, S_max_ctx, d_head), dtype=block_cache.dtype)
+    for batch_idx in range(batch):
+        valid_mask = active_blocks_table[batch_idx] != INACTIVE_BLOCK_IDX
+        valid_indices = active_blocks_table[batch_idx][valid_mask]
+        num_valid_tokens = len(valid_indices) * block_len
+        flat_cache[batch_idx][:num_valid_tokens, :] = block_cache[valid_indices].reshape((-1, d_head))
+    return flat_cache
+
+
+def _get_dbg_active_table(
+    active_blocks_table: torch.Tensor, resize_factor: int, batch: int, p_max: int
+) -> torch.Tensor:
+    '''Build debug active table to verify the active-blocks reshape and load to SBUF.'''
+    table_repeated = torch.repeat_interleave(active_blocks_table, resize_factor, axis=1) * resize_factor
+    increment_pattern = torch.arange(resize_factor).repeat(active_blocks_table.shape[1])
+    table_incremented = table_repeated + increment_pattern[None, :]
+    dbg_active_table = table_incremented.reshape((batch, table_incremented.shape[1] // p_max, p_max)).permute(2, 1, 0)
+
+    return dbg_active_table
+
+
+def _gen_rope_coeff(inv_freq: torch.Tensor, pos_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate the cos/sin RoPE coefficients from inverse frequencies and position ids."""
+    d_head_half, _ = inv_freq.shape
+    batch, seqlen = pos_ids.shape
+
+    inv_freq_expanded = inv_freq[:, None, :].expand(d_head_half, batch, seqlen)
+    pos_ids_expanded = pos_ids[None, :, :].expand(d_head_half, batch, seqlen)
+
+    freqs = inv_freq_expanded * pos_ids_expanded
+    emb = torch.cat([freqs, freqs], axis=0)
+
+    freqs_cos = torch.cos(emb)
+    freqs_sin = torch.sin(emb)
+
+    return freqs_cos, freqs_sin
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, d_head: int) -> torch.Tensor:
+    """Apply RoPE to x using precomputed cos/sin, returning the rotated tensor in BNdS layout."""
+
+    def _rotate_half(x):
+        x1 = x[: d_head // 2, ...]
+        x2 = x[d_head // 2 :, ...]
+        return torch.cat((-x2, x1), axis=0)
+
+    # Reshape x from BNdS to dBNS
+    x = x.permute(2, 0, 1, 3)
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
+
+    embed = (x * cos) + (_rotate_half(x) * sin)
+    embed = embed.permute(1, 2, 0, 3)
+
+    return embed
+
+
+def _attention_tkg_fwd_ref(
+    q: torch.Tensor,
+    k_active: torch.Tensor,
+    v_active: torch.Tensor,
+    k_prior: torch.Tensor,
+    v_prior: torch.Tensor,
+    active_mask: torch.Tensor,
+    inv_freqs: Optional[torch.Tensor],
+    rope_pos_ids: Optional[torch.Tensor],
+    start_pos_ids: Optional[torch.Tensor],
+    sink: Optional[torch.Tensor],
+    cfg: AttnTKGConfig,
+) -> Tuple[torch.Tensor, ...]:
+    """Core forward reference: optional RoPE, masked QK^T, online-softmax stats, and softmax @ V.
+
+    Returns (out, k_active, score_max, score_sum, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM).
+    """
+    batch, q_head, s_active, s_prior, d_head = cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, cfg.d_head
+
+    # clone to avoid inplace modification
+    k_prior = k_prior.clone()
+    v_prior = v_prior.clone()
+
+    if cfg.fuse_rope:
+        freq_cos, freq_sin = _gen_rope_coeff(inv_freqs, rope_pos_ids)
+        q = _apply_rope(q, freq_cos, freq_sin, d_head)
+        q = q / math.sqrt(d_head)
+        k_active = _apply_rope(k_active, freq_cos, freq_sin, d_head)
+
+    # If use_pos_id, generate the prior mask with pos_id, then overwrite the last portion with active_mask
+    if cfg.use_pos_id:
+        if start_pos_ids is not None:
+            # SWA path: use build_swa_attention_mask for per-query windowed masks.
+
+            # Build causal active mask [batch, q_head, s_active, s_active]
+            causal_active = torch.tril(torch.ones(s_active, s_active, dtype=torch.float32, device=start_pos_ids.device))
+            causal_active = causal_active[None, None, :, :].expand(batch, q_head, s_active, s_active).clone()
+
+            # start_pos_ids and rope_pos_ids are [batch, s_active]
+            start_vals = start_pos_ids.reshape(batch * s_active)
+            end_vals = rope_pos_ids.reshape(batch * s_active)
+
+            mask = (
+                build_swa_attention_mask(
+                    start_vals=start_vals,
+                    end_vals=end_vals,
+                    batch=batch,
+                    num_heads=q_head,
+                    s_active=s_active,
+                    s_ctx=s_prior,
+                    active_mask=causal_active,
+                )
+                .permute(0, 1, 3, 2)
+                .to(active_mask.dtype)
+            )  # [batch, q_head, s_ctx, s_active] -> [batch, q_head, s_prior, s_active]
+        else:
+            # Standard path: build_full_attention_mask returns [batch, num_heads, s_active, s_ctx]
+            # We need [batch, q_head, s_prior, s_active], so permute dims 2 and 3
+            mask = (
+                build_full_attention_mask(
+                    cache_lens=rope_pos_ids[:, 0],  # pos_id for each batch
+                    batch=batch,
+                    num_heads=q_head,
+                    s_active=s_active,
+                    s_ctx=s_prior,
+                    include_active_mask=True,
+                )
+                .permute(0, 1, 3, 2)
+                .to(active_mask.dtype)
+            )  # [batch, q_head, s_ctx, s_active] -> [batch, q_head, s_prior, s_active]
+    else:
+        mask = active_mask
+
+    # Overwrite active onto last portion of prior
+    k_prior[..., -s_active:] = k_active
+    v_prior[..., -s_active:, :] = v_active
+
+    # K @ Q^T (note that k_prior and q here are both already transposed)
+    score = k_prior.permute(0, 1, 3, 2) @ q  # [b, n, s_prior, s_active]
+
+    score[mask == 0] = -torch.inf
+
+    DBG_QK = torch.clone(score)
+
+    # Pad sink to the end of s_prior dimension.
+    if sink is not None:
+        kv_heads = sink.numel() // q_head
+        B_attn = batch // kv_heads  # batch is the folded B_attn*kv_heads axis
+        sink = sink.reshape(kv_heads, q_head, 1, 1)  # [kv_heads * n] -> [kv_heads, n, 1, 1]
+        sink = sink.repeat(B_attn, 1, 1, s_active)  # [kv_heads, n, 1, 1] -> [b, n, 1, s_active]
+        score = torch.cat([score, sink], axis=2)  # [b, n, s_prior, s_active] -> [b, n, s_prior + 1, s_active]
+
+    # Take column wise max
+    score_max = torch.max(score, dim=2, keepdim=True).values  # [b, n, 1, s_active]
+    # Clamp -inf to finite min to prevent NaN from exp(-inf - (-inf)) on fully-masked positions
+    score_max = torch.clamp(score_max, min=torch.finfo(torch.float32).min)
+
+    DBG_QK_MAX = -score_max  # The debug tensor is always negated
+
+    # Subtract max from score, exp activate
+    score -= score_max  # [b, n, s_prior, s_active]
+    score = torch.exp(score)  # [b, n, s_prior, s_active]
+
+    DBG_QK_EXP = score[:, :, :-1, :] if sink is not None else score  # drop the sink
+
+    # Take column wise sum
+    score_sum = torch.sum(score, dim=2, keepdim=True)  # [b, n, 1, s_active]
+
+    DBG_EXP_SUM = score_sum
+
+    # Normalize (skip for CP — caller handles global normalization)
+    if not cfg.return_cp_softmax_stats:
+        score = score / score_sum  # [b, n, s_prior, s_active]
+
+    # Remove sink from the end of s_prior dimension.
+    if sink is not None:
+        score = score[:, :, :-1, :]
+
+    # Softmax @ V, transpose out
+    out = score.permute(0, 1, 3, 2) @ v_prior  # [b, n, s_active, d_head]
+    out = out.permute(0, 1, 3, 2)  # [b, n, d_head, s_active]
+
+    score_max = score_max.squeeze(2)  # [b, n, 1, s_active] -> [b, n, s_active]
+    score_sum = score_sum.squeeze(2)  # [b, n, 1, s_active] -> [b, n, s_active]
+    return out, k_active, score_max, score_sum, DBG_QK, DBG_QK_MAX, DBG_QK_EXP, DBG_EXP_SUM
+
+
+def _reshape_debug_tensor(
+    tensor: torch.Tensor,
+    cfg: AttnTKGConfig,
+    p_max: int,
+    n_prgs: int,
+    is_block_kv: bool,
+    reduced_blk_len: int = None,
+) -> torch.Tensor:
+    """Reshape a debug tensor from linear [b, n, s_prior, s_active] to the kernel's tiled SBUF layout.
+
+    is_block_kv or bs_n_prgs == 1: [b, n, s_prior, s_active] ->
+        [P_MAX, n_prgs, sprior_tiles, [reduced_blk_len,] b, n, s_active]
+    bs_n_prgs > 1: [b, n, s_prior, s_active] -> [s_prior, b, n, s_active]
+    """
+    batch, q_head, s_prior, s_active = cfg.bs, cfg.q_head, cfg.curr_sprior, cfg.s_active
+    batch_sharded = is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max, cfg.fuse_rope)
+    sprior_n_prgs = (
+        n_prgs if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max, cfg.fuse_rope) else 1
+    )
+    if is_block_kv:
+        kernel_assert(reduced_blk_len is not None, "reduced_blk_len must be provided for block KV")
+        return tensor.reshape(
+            (
+                batch,
+                q_head,
+                sprior_n_prgs,
+                s_prior // sprior_n_prgs // p_max // reduced_blk_len,
+                p_max,
+                reduced_blk_len,
+                s_active,
+            )
+        ).permute(4, 2, 3, 5, 0, 1, 6)
+    elif batch_sharded:
+        if cfg.strided_mm1:
+            return tensor.reshape((batch, q_head, s_prior, s_active)).permute(2, 0, 1, 3)
+        else:
+            return tensor.reshape((batch, q_head, s_prior // p_max, p_max, s_active)).permute(3, 2, 0, 1, 4)
+    elif cfg.strided_mm1:
+        return tensor.reshape(
+            (batch, q_head, sprior_n_prgs, p_max, s_prior // sprior_n_prgs // p_max, s_active)
+        ).permute(3, 2, 4, 0, 1, 5)
+    else:
+        return tensor.reshape(
+            (batch, q_head, sprior_n_prgs, s_prior // sprior_n_prgs // p_max, p_max, s_active)
+        ).permute(4, 2, 3, 0, 1, 5)
+
+
+# NOTE: This Protocol must match the signature of _attention_tkg_torch_ref_impl above.
+# It exists solely for IDE parameter hints when using attention_tkg_torch_ref[lnc](...).
+class _AttentionTkgTorchRefFn(Protocol):
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k_active: torch.Tensor,
+        v_active: torch.Tensor,
+        k_prior: torch.Tensor,
+        v_prior: torch.Tensor,
+        mask: torch.Tensor,
+        out: torch.Tensor,
+        cfg: AttnTKGConfig,
+        sbm: SbufManager,
+        inv_freqs: Optional[torch.Tensor] = None,
+        rope_pos_ids: Optional[torch.Tensor] = None,
+        start_pos_ids: Optional[torch.Tensor] = None,
+        sink: Optional[torch.Tensor] = None,
+        active_blocks_table: Optional[torch.Tensor] = None,
+        k_out: Optional[torch.Tensor] = None,
+        cp_softmax_stats_out: Optional[dict] = None,
+        DBG_TENSORS: Optional[tuple] = None,
+        max_context_len=None,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor | None], Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]
+    ]:
+        """
+        PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
+
+        Usage:
+            attention_tkg_torch_ref[lnc](q=..., k_active=..., ...)
+
+        Args:
+            q: Query tensor
+            k_active: Active key tensor
+            v_active: Active value tensor
+            k_prior: Prior key cache tensor
+            v_prior: Prior value cache tensor
+            mask: Attention mask tensor
+            out: Output tensor (modified in-place)
+            cfg: Attention TKG configuration
+            sbm: SBUF manager (unused in torch ref)
+            inv_freqs: Inverse frequencies for RoPE
+            rope_pos_ids: Position IDs for RoPE
+            start_pos_ids: Per-query SWA window start positions
+            sink: Sink tensor for attention sink
+            active_blocks_table: Block table for block KV cache
+            k_out: Output tensor for RoPE'd keys (modified in-place)
+            DBG_TENSORS: Debug tensors tuple
+            max_context_len: Optional int32 array [1] for dynamic FA early exit. Limits KV context processed.
+            dtype_mode: Quantization dtype policy (accepted for kernel signature parity; unused on CPU).
+
+        Returns:
+            Tuple of (out, k_out) tensors. When cfg.return_cp_softmax_stats=True, out is unnormalized and
+            the local softmax stats are written into the cp_softmax_stats_out dict.
+        """
+        ...
+
+
+attention_tkg_torch_ref = LncSubscriptable(_attention_tkg_torch_ref_impl, _AttentionTkgTorchRefFn)

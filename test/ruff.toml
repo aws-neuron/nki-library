@@ -1,0 +1,34 @@
+# Ruff configuration for test files.
+#
+# Inherits everything from the repo-root pyproject.toml (line-length, format,
+# base `select`, per-file-ignores, extend-exclude, etc.) and layers an extended
+# lint ruleset on top. Ruff applies this automatically to files under test/ via
+# hierarchical config discovery; src/ continues to use the root config.
+extend = "../pyproject.toml"
+
+[lint]
+# `extend-select` ADDS to the inherited base select (S101, I, F401, F821)
+# rather than replacing it.
+# Starting small: high-signal, low-noise families. Grow this list over time
+# (candidates: SIM, PT, UP, RUF) as the existing findings get burned down.
+extend-select = [
+    "B",   # flake8-bugbear (likely bugs & design problems)
+    "C4",  # flake8-comprehensions (comprehension quality)
+    "E",
+    "F"
+]
+
+# Let the ruff formatter be the sole authority on layout. These rules are
+# either owned by the formatter (E101/W191) or fully governed by the shared
+# `line-length` the formatter already enforces (E501), so linting them just
+# creates linter/formatter friction.
+ignore = [
+    "E101",  # mixed-spaces-and-tabs — formatter-owned
+    "W191",  # tab-indentation — formatter-owned
+    "E501",  # line-too-long — formatter is sole line-length authority
+    # E741: `I` (intermediate dimension) is the intentional domain name shared
+    # with the src/ kernel and torch-ref APIs (which this ruleset does not lint
+    # and we do not modify). Renaming it in tests breaks the test<->src
+    # signature contract, so `I` is allowed here.
+    "E741",  # ambiguous-variable-name — `I` is a deliberate domain convention
+]

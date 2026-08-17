@@ -27,7 +27,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.mlp.mlp_tkg.down_projection_mx_shard_H import down_projection_mx_shard_H
 from nkilib_src.nkilib.core.mlp.mlp_tkg.gate_up_projection_mx_shard_H import gate_up_projection_mx_tp_shard_H
 from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_proj_mx_torch import (
@@ -36,6 +35,7 @@ from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_proj_mx_torch import (
 )
 from nkilib_src.nkilib.core.mlp.mlp_tkg.projection_mx_constants import ProjConfig, _pmax, _q_height, _q_width
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
+
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
@@ -52,7 +52,6 @@ def build_gate_up_proj_mxfp4_input(BxS: int, H: int, I: int) -> dict:
     """Build input tensors for gate/up projection MXFP4 test."""
     np.random.seed(42)
 
-    n_H512_tile = H // 512
     n_I512_tile = div_ceil(I, 512)
 
     _, hidden_qtz, hidden_scale = generate_stabilized_mx_data(nl.float8_e5m2_x4, (128, H // 128 * BxS))

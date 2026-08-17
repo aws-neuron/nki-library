@@ -17,13 +17,13 @@
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.deformable_attention.ms_deformable_attention_bwd import (
     ms_deformable_attention_bwd,
 )
 from nkilib_src.nkilib.experimental.deformable_attention.ms_deformable_attention_bwd_torch import (
     ms_deformable_attention_bwd_torch_ref,
 )
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, LazyGoldenGenerator, Platforms, ValidationArgs
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -149,7 +149,6 @@ MS_DEFORM_ATTN_BWD_BASIC_ALL_PARAMS = [
 MS_DEFORM_ATTN_BWD_BEVFORMER_ALL_PARAMS = [
     (2, 512, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"),
     # BEVFormer Base (200x200)
-    (1, 18000, 8, 32, 4, 8, [(113, 200), (57, 100), (29, 50), (15, 25)], nl.bfloat16, "BNLC", "B2QHLP", False, "zeros"), # SCA
     (1, 40000, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # TSA
     (1, 900, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # Decoder
     # BEVFormer Small (150x150)

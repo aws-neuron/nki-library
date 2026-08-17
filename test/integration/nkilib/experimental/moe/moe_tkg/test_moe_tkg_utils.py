@@ -19,11 +19,11 @@ from typing import Callable
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
-
 from nkilib_src.nkilib.core.utils.common_types import (
     ExpertAffinityScaleMode,
     QuantizationType,
 )
+
 from test.integration.nkilib.core.mlp.test_mlp_common import gen_moe_mx_weights
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
 from test.integration.nkilib.utils.test_kernel_common import is_dtype_mx
@@ -50,12 +50,12 @@ def build_moe_tkg(
     expert_affinities_dtype=nl.bfloat16,
     bias=False,
     clamp=False,
-    tensor_generator: Callable = None,
+    tensor_generator: Callable | None = None,
     rank_id: int = 0,
     mask_unselected_experts: bool = False,
     is_all_expert_dynamic: bool = False,
     routed_token_ratio: float = 1.0,
-    block_size: int = None,
+    block_size: int | None = None,
 ):
     """Build input tensors for MoE TKG kernel testing.
 

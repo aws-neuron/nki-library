@@ -27,8 +27,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.core.utils.rotation_matrix import build_rotation_matrix
+
 from test.utils.common_dataclasses import CompilerArgs
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -91,7 +91,6 @@ def rotation_matrix_torch_ref(
     use_scalar_engine,
 ):
     """Torch reference: apply circular shift with optional negation per block."""
-    N = block_size * num_blocks
     result = torch.zeros_like(input_data)
     for block_idx in range(num_blocks):
         base = block_idx * block_size

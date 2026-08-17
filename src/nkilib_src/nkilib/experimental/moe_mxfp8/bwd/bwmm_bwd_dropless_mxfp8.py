@@ -18,6 +18,7 @@ This module implements the core backward pass logic for Mixture of Experts using
 MXFP8 quantized matrix multiplication. It combines:
 - Block-loop structure from BF16 MOE BWD (per-expert iteration, indirect token indexing)
 - MXFP8 matmul infrastructure (TensorDescriptor, generic_matmul_mxfp8_api, spill/reload)
+- A single-expert path for inputs already packed in contiguous token order
 
 Architecture:
     For each block b (expert e = block_to_expert[b]):
@@ -37,7 +38,6 @@ from ....core.utils.kernel_helpers import div_ceil, get_program_sharding_info
 from ....core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ...matmul_mxfp8.matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
 from ...mlp_mxfp8.common_utils import (
-    L_TILE_K,
     MATMUL_TILE_K_PHYSICAL,
     TILE_M,
     TILE_N,
@@ -45,7 +45,7 @@ from ...mlp_mxfp8.common_utils import (
     _build_matmul_params,
     _compute_load_tile_shape,
     apply_gradient_clamp,
-    get_tile_sizes,
+    build_tile_sizes,
 )
 from ...moe.bwd.bwmm_bwd_dropless import (
     _compute_down_proj_bias_grad,
@@ -54,21 +54,23 @@ from ...moe.bwd.bwmm_bwd_dropless import (
     _initialize_gradient_outputs_shard,
 )
 from ...moe.bwd.moe_bwd_parameters import AffinityOption, ClampLimits
-from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
-from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm
-from .moe_bwd_mxfp8_config import MXFP8MOEBwdConfig
-
-# Total SBUF available minus reserved regions
-MAX_AVAILABLE_SBUF_SIZE = 224 * 1024 - 16384 - 8 - 520
+from ...mxfp_utils.mxfp8_utils.common_dataclasses import QuantScheme, SwizzleMode, TensorDescriptor
+from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
+from .config import MXFP8MOEBwdConfig, TransposeMode
 
 
-def _load_token_indices_dgt(token_position_to_id, block_idx, B, NUM_TILES, sbm=None, dst=None):
+def _valid_tiles_in_block(total_tiles, block_idx, tiles_per_block):
+    """Return a full block's tile count, trimmed for the final partial block."""
+    return min(tiles_per_block, total_tiles - block_idx * tiles_per_block)
+
+
+def _load_token_indices_dgt(token_position_to_id, block_idx, B, NUM_TILES, sbm=None, dst=None, src_token_offset=0):
     """Load and transpose token indices for the current block using DGT.
 
     Single hardware-accelerated `nisa.dma_transpose` (DGT) — no PE, no PSUM —
-    to gather-transpose tokens [block_idx*B : (block_idx+1)*B] into SBUF in
-    [TILE_M, NUM_TILES] partition-major layout. Lets prefetch overlap freely
-    with PE/PSUM compute in the block loop.
+    to gather-transpose tokens [block_idx*B + src_token_offset : ... + NUM_TILES*TILE_M]
+    into SBUF in [TILE_M, NUM_TILES] partition-major layout. Lets prefetch
+    overlap freely with PE/PSUM compute in the block loop.
 
     Local copy of `core.moe.moe_cte.moe_cte_utils.load_token_indices` extended
     with an optional pre-allocated `dst` so the MXFP8 caller can reuse a
@@ -79,10 +81,16 @@ def _load_token_indices_dgt(token_position_to_id, block_idx, B, NUM_TILES, sbm=N
         token_position_to_id (nl.ndarray): [N*B] full token position map.
         block_idx (int): Current block index.
         B (int): Block size.
-        NUM_TILES (int): Number of TILE_M-sized tiles in a block (B // TILE_M).
+        NUM_TILES (int): Number of TILE_M-sized tiles to load. Normally B // TILE_M
+            (the whole block); a half-block tail (MXFP8 fwd, odd N) passes
+            (B // TILE_M) // 2 to load only its half of the block's tokens.
         sbm (SbufManager, optional): Used for the internal allocation when dst is None.
         dst (nl.ndarray, optional): Pre-allocated [TILE_M, NUM_TILES] SBUF buffer.
             When provided, no internal allocation happens.
+        src_token_offset (int): Token offset within the block to start loading at
+            (default 0 = start of block). The MXFP8 fwd half-block tail passes
+            shard_id * (B // 2) so each core loads its contiguous half of the tail
+            block's tokens into a compact [TILE_M, NUM_TILES] buffer.
 
     Returns:
         nl.ndarray: [TILE_M, NUM_TILES] transposed token indices in SBUF (== dst when provided).
@@ -97,7 +105,7 @@ def _load_token_indices_dgt(token_position_to_id, block_idx, B, NUM_TILES, sbm=N
     else:
         result = dst
 
-    offset = block_idx * B
+    offset = block_idx * B + src_token_offset
     nisa.dma_transpose(
         dst=result.ap(pattern=[[NUM_TILES, TILE_M], [1, 1], [1, 1], [1, NUM_TILES]]),
         src=token_position_to_id.ap(
@@ -132,6 +140,8 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
     expert_idx_broadcast,
     clamp_limits: ClampLimits = ClampLimits(),
     scaled_intermediate_checkpoint_T_td=None,
+    cache_weight=False,
+    store_d_gate_up_transpose=True,
 ):
     """Phase 1: Compute gradient through down projection + SwiGLU backward.
 
@@ -149,13 +159,18 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
             d_up = d_intermediate * gate_act
         C) Store d_gate, d_up into the interleaved d_gate_up
            [B, 2, I_TP] (Phase 2's input).
-        D) Transpose d_gate, d_up into d_gate_up_T [2*I_TP, B] (Phase 3's input).
+        D) For routed execution, transpose d_gate and d_up into
+           d_gate_up_T [2*I_TP, B] when requested by Phase 3. Dense execution
+           can instead feed d_gate_up [B, 2*I_TP] directly to the wrapX
+           PE-swizzle loader.
         E) core_barrier both outputs to make cross-shard writes visible.
 
     Args:
         output_grad_td (TensorDescriptor): Global [T, H] output gradient. The matmul
             LHS is gathered per-block via indirect DMA — no caller-side gather needed.
         down_weight_td (TensorDescriptor): Down weight descriptor ([E, I_TP, H] slice for expert).
+        cache_weight (bool): Keep the quantized down weight for reuse by later
+            dense blocks. A quantized input under this policy is block-local.
         gate_up_proj_act_checkpoint_T (nl.ndarray): [N, 2, I_TP, B], Checkpointed activations.
         block_idx (int): Current block index.
         expert_idx: Expert index (dynamic).
@@ -166,7 +181,7 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
         shard_id (int): LNC shard ID.
         num_shards (int): Number of LNC shards.
         blocking (MatmulMxfp8KernelConfig): Blocking parameters for this phase.
-        config (MXFP8MOEBwdConfig): Kernel configuration.
+    config (MXFP8MOEBwdConfig): Kernel configuration.
         sbm (SbufManager): SBUF memory manager.
         block_token_pos_to_id_full (nl.ndarray): [TILE_M=128, NUM_B_TILES] SBUF int32
             tensor of global token indices for this block. Used as the indirect-DMA
@@ -198,26 +213,23 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
               Phase 4 RHS source. Returns None when the caller passed
               scaled_intermediate_checkpoint_T_td — the kernel body's Phase 4
               RHS dispatch reads from the user-provided tensor instead.
-            - d_gate_up_T (nl.ndarray): [2*I_TP, B] shared_hbm with the
-              transposed d_gate||d_up for Phase 3.
+            - d_gate_up_T (nl.ndarray or None): [2*I_TP, B] shared_hbm with
+              the transposed d_gate||d_up for routed Phase 3. None for
+              dense PE-swizzle execution, where Phase 3 loads d_gate_up as
+              K-by-F.
+            - down_weightq_td (TensorDescriptor or None): Quantized down weight
+              for reuse by later dense blocks.
 
-    NOTE: BF16's F1 only produces the first two outputs. The third tensor
-    (d_gate_up_T) is structurally required by this kernel because we
-    reuse generic_matmul_mxfp8_api for all four phases:
+    NOTE: The routed path keeps the transposed Phase 3 operand because its
+    gathered execution uses the F-by-K DGT path:
       - Phase 2 contracts over I_TP, so its LHS must have I_TP at data.shape[1]
         — d_gate_up[B, 2, I_TP] (or [B, 2*I_TP]) has B at
         dim 0 and works.
       - Phase 3 contracts over B, so its LHS must have B at data.shape[1]
         — that's d_gate_up_T[2*I_TP, B].
-    The two contractions on the same logical data have opposite orientations,
-    and generic_matmul_mxfp8_api hardcodes K=data.shape[1] for unswizzled BF16,
-    so a transposed copy is the only way to satisfy both phases without
-    hand-rolling either matmul. d_gate_up_T is not a temporary —
-    it follows the same precedent as MLP MXFP8 BWD's `scratch_td[2I, S]`
-    (see experimental/mlp_mxfp8/mlp_bwd_mxfp8/mlp_bwd_mxfp8_kernel.py:
-    `compute_phase1_down_proj_mm_grad_mxfp8` produces both the direct
-    [S, I] gradients and the transposed [2I, S] scratch for the same
-    contraction-orientation reason).
+    Dense execution instead describes d_gate_up[B, 2*I_TP] as K-by-F. The
+    generic loader then uses load_tile_PE_swizzle_wrapX to transpose and
+    interleave at load time, avoiding the transposed HBM copy.
     """
     # Allocate per-block HBM outputs. Names follow the BF16 BWD kernel
     # convention so the scheduler can identify them per block.
@@ -243,17 +255,19 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
             buffer=nl.shared_hbm,
             name=f"scaled_intermediate_shared_block_{block_idx}",
         )
-    d_gate_up_T = nl.ndarray(
-        (2 * I_TP, B),
-        dtype=config.compute_dtype,
-        buffer=nl.shared_hbm,
-        name=f"d_gate_up_T_shared_block_{block_idx}",
-    )
+    if store_d_gate_up_transpose:
+        d_gate_up_T = nl.ndarray(
+            (2 * I_TP, B),
+            dtype=config.compute_dtype,
+            buffer=nl.shared_hbm,
+            name=f"d_gate_up_T_shared_block_{block_idx}",
+        )
+    else:
+        d_gate_up_T = None
 
     TILES_IN_BLOCK_M = blocking.TILES_IN_BLOCK_M
     TILES_IN_BLOCK_N = blocking.TILES_IN_BLOCK_N
     TILES_IN_BLOCK_K = blocking.TILES_IN_BLOCK_K
-
     """
     SHARD_ON_FREE: split I_TP across LNC cores. Each core processes only its
     half of the I_TP free dim — matmul, SwiGLU bwd, and HBM stores all use
@@ -263,12 +277,15 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
     """
     I_TP_PER_SHARD = I_TP // num_shards
     I_TP_SHARD_OFFSET = I_TP_PER_SHARD * shard_id
+    rhs_n_offset = 0 if cache_weight and down_weight_td.is_quantized else I_TP_SHARD_OFFSET
 
-    # TODO: tile size for K is currently hardcoded to L_TILE_K due to regression in compiler, undo the change after fix.
-    tiles = get_tile_sizes(L_TILE_K, L_TILE_K, L_TILE_K)
-    tile_m = tiles['tile_m']
-    tile_n = tiles['tile_n']
-    l_tile_k = tiles['l_tile_k']
+    # Tile shapes are normalized on the phase config at the kernel boundary.
+    # Phase 1: d_intermediate = output_grad[B,H] @ W_down[H,I].T
+    #   -> M=B, K=H, N=I_TP_PER_SHARD.
+    tile_m = blocking.tile_m
+    tile_n = blocking.tile_n
+    l_tile_k = blocking.tile_k
+    tiles = build_tile_sizes(tile_m=tile_m, l_tile_k=l_tile_k, tile_n=tile_n)
 
     BLOCK_N = TILES_IN_BLOCK_N * tile_n
     NUM_B_TILES = div_ceil(B, tile_m)
@@ -290,12 +307,14 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
         tiles=tiles,
     )
 
-    # Spill/reload buffers
+    # Spill/reload buffers. Weight storage can outlive this phase and become
+    # the primary descriptor for later dense blocks.
     output_gradq_td = None
     down_weightq_td = None
-    if config.phase1_config.spill_reload:
+    spill_reload = config.phase1_config.spill_reload
+    if spill_reload or cache_weight:
         data_buffer = nl.private_hbm if config.phase1_config.run_with_lnc2 else nl.hbm
-        if not output_grad_td.is_quantized:
+        if spill_reload and not output_grad_td.is_quantized and NUM_N_BLOCKS > 1:
             output_gradq_td = _allocate_spill_buffer(
                 num_k_blocks=NUM_K_BLOCKS,
                 num_f_blocks=NUM_M_BLOCKS,
@@ -304,7 +323,7 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
                 use_scale_packing=config.phase1_config.enable_scale_packing,
                 data_buffer=data_buffer,
             )
-        if not down_weight_td.is_quantized:
+        if not down_weight_td.is_quantized and (NUM_M_BLOCKS > 1 or cache_weight):
             down_weightq_td = _allocate_spill_buffer(
                 num_k_blocks=NUM_K_BLOCKS,
                 num_f_blocks=NUM_N_BLOCKS,
@@ -337,7 +356,8 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
     is_affinity_i = config.affinity_option == AffinityOption.AFFINITY_ON_I
 
     if is_affinity_i:
-        ea_expert_idx_tensor = expert_idx_broadcast[0:tile_m, block_idx : block_idx + 1]
+        if not config.single_expert_dense:
+            ea_expert_idx_tensor = expert_idx_broadcast[0:tile_m, block_idx : block_idx + 1]
         ea_tiles_all = sbm.alloc_stack(
             (tile_m, NUM_B_TILES),
             dtype=nl.float32,
@@ -348,47 +368,53 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
         ea_grad_accum_list = []
         ea_grad_reduced_list = []
         for b_tile in range(NUM_B_TILES):
-            token_off = sbm.alloc_stack(
-                (tile_m, 1),
-                dtype=nl.int32,
-                name=f"ea_off_{block_idx}_{b_tile}",
-                align=32,
-            )
-            addr_tmp = sbm.alloc_stack(
-                (tile_m, 1),
-                dtype=nl.int32,
-                name=f"ea_addr_{block_idx}_{b_tile}",
-                align=32,
-            )
-            _generate_dynamic_offsets(
-                block_token_pos_to_id_full,
-                ea_expert_idx_tensor,
-                token_off,
-                addr_tmp,
-                b_tile,
-                config.skip_dma,
-                E,
-            )
-            ea_offsets_all.append(token_off)
-
             ea_dst = sbm.alloc_stack(
                 (tile_m, 1),
                 dtype=nl.float32,
                 name=f"ea_load_{block_idx}_{b_tile}",
                 align=32,
             )
-            if config.skip_dma.skip_token:
-                nisa.memset(ea_dst, value=0.0)
-            nisa.dma_copy(
-                dst=ea_dst,
-                src=expert_affinities_masked.ap(
-                    pattern=[[expert_affinities_masked.shape[1], tile_m], [1, 1]],
-                    offset=0,
-                    vector_offset=token_off,
-                    indirect_dim=0,
-                ),
-                oob_mode=oob_mode.skip if config.skip_dma.skip_token else oob_mode.error,
-            )
+            if config.single_expert_dense:
+                token_start = block_idx * B + b_tile * tile_m
+                nisa.dma_copy(
+                    dst=ea_dst,
+                    src=expert_affinities_masked[token_start : token_start + tile_m, 0:1],
+                )
+            else:
+                token_off = sbm.alloc_stack(
+                    (tile_m, 1),
+                    dtype=nl.int32,
+                    name=f"ea_off_{block_idx}_{b_tile}",
+                    align=32,
+                )
+                addr_tmp = sbm.alloc_stack(
+                    (tile_m, 1),
+                    dtype=nl.int32,
+                    name=f"ea_addr_{block_idx}_{b_tile}",
+                    align=32,
+                )
+                _generate_dynamic_offsets(
+                    block_token_pos_to_id_full,
+                    ea_expert_idx_tensor,
+                    token_off,
+                    addr_tmp,
+                    b_tile,
+                    config.skip_dma,
+                    E,
+                )
+                ea_offsets_all.append(token_off)
+                if config.skip_dma.skip_token:
+                    nisa.memset(ea_dst, value=0.0)
+                nisa.dma_copy(
+                    dst=ea_dst,
+                    src=expert_affinities_masked.ap(
+                        pattern=[[expert_affinities_masked.shape[1], tile_m], [1, 1]],
+                        offset=0,
+                        vector_offset=token_off,
+                        indirect_dim=0,
+                    ),
+                    oob_mode=oob_mode.skip if config.skip_dma.skip_token else oob_mode.error,
+                )
             nisa.tensor_copy(dst=ea_tiles_all[:, b_tile], src=ea_dst)
 
             acc = sbm.alloc_stack(
@@ -428,9 +454,9 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
                     block_idx_n=(n_block_idx, n_block_idx + 1),
                     block_idx_k=(k_block_idx, k_block_idx + 1),
                     lhs_m_offset=0,  # Block-local: output_grad is [B, H] per-block
-                    rhs_n_offset=I_TP_SHARD_OFFSET,  # SHARD_ON_FREE: each core's I_TP slice
-                    TILES_IN_LOAD_M=min(TILES_IN_BLOCK_M, 8),
-                    TILES_IN_LOAD_N=1,
+                    rhs_n_offset=rhs_n_offset,
+                    TILES_IN_LOAD_M=blocking.TILES_IN_LOAD_M,
+                    TILES_IN_LOAD_N=blocking.TILES_IN_LOAD_N,
                     lhs_matmul_tile_shape_physical=tiles['lhs_matmul_tile_physical'],
                     rhs_matmul_tile_shape_physical=tiles['rhs_matmul_tile_physical'],
                     lhs_load_tile_shape=lhs_load_tile_shape,
@@ -438,21 +464,21 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
                     lhs_quantize_tile_shape=tiles['lhs_quantize_tile'],
                     rhs_quantize_tile_shape=tiles['rhs_quantize_tile'],
                     initialize_accumulator=(k_block_idx == 0),
-                    spill_reload=config.phase1_config.spill_reload,
+                    spill_reload=spill_reload,
                     lhsq_td=output_gradq_td,
                     rhsq_td=down_weightq_td,
                     use_scale_packing=config.phase1_config.enable_scale_packing,
                 )
 
             # SwiGLU backward: compute d_gate and d_up from matmul result
-            num_m_tiles_in_block = min(TILES_IN_BLOCK_M, div_ceil(B - m_block_start * tile_m, tile_m))
-            num_n_tiles_in_block = min(TILES_IN_BLOCK_N, div_ceil(I_TP_PER_SHARD - n_block_start * tile_n, tile_n))
-            for tile_m_idx in nl.affine_range(num_m_tiles_in_block):
+            m_tiles_in_block = _valid_tiles_in_block(NUM_B_TILES, m_block_idx, TILES_IN_BLOCK_M)
+            n_tiles_in_block = _valid_tiles_in_block(NUM_I_TILES, n_block_idx, TILES_IN_BLOCK_N)
+            for tile_m_idx in nl.affine_range(m_tiles_in_block):
                 m_idx = m_block_start + tile_m_idx
                 local_s = m_idx * tile_m  # offset within the block
                 actual_m = min(tile_m, B - local_s)
 
-                for tile_n_idx in nl.affine_range(num_n_tiles_in_block):
+                for tile_n_idx in nl.affine_range(n_tiles_in_block):
                     n_idx = n_block_start + tile_n_idx
                     actual_n = min(tile_n, I_TP_PER_SHARD - n_idx * tile_n)
                     # Global I_TP position for this tile: per-shard local index
@@ -667,16 +693,31 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
                             src=scaled_intermediate_tile,
                         )
 
-                    """
-                    Transpose d_gate and d_up into scratch for Phase 3
-                    d_gate_up_T: [2*I_TP, B]
-                    d_gate.T → rows [i_off:i_off+TILE_N] of scratch
-                    d_up.T → rows [I_TP+i_off:I_TP+i_off+TILE_N] of scratch
-                    """
-                    _transpose_tile_to_scratch(d_gate, d_gate_up_T, local_s, i_off, I_TP, B, config.compute_dtype, sbm)
-                    _transpose_tile_to_scratch(
-                        d_up, d_gate_up_T, local_s, I_TP + i_off, I_TP, B, config.compute_dtype, sbm
-                    )
+                    if store_d_gate_up_transpose:
+                        """
+                        Transpose d_gate and d_up into scratch for routed Phase 3.
+                        Dense Phase 3 consumes d_gate_up directly as K-by-F.
+                        """
+                        _transpose_tile_to_scratch(
+                            d_gate,
+                            d_gate_up_T,
+                            local_s,
+                            i_off,
+                            I_TP,
+                            B,
+                            config.compute_dtype,
+                            sbm,
+                        )
+                        _transpose_tile_to_scratch(
+                            d_up,
+                            d_gate_up_T,
+                            local_s,
+                            I_TP + i_off,
+                            I_TP,
+                            B,
+                            config.compute_dtype,
+                            sbm,
+                        )
 
     """
     ------------------------------------------------------------------------
@@ -729,25 +770,35 @@ def _compute_phase1_down_proj_output_grad_mxfp8(
                 src=ea_grad_accum_list[tile_idx],
                 engine=nisa.scalar_engine,
             )
-            nisa.dma_copy(
-                dst=expert_affinities_masked_grad.ap(
-                    pattern=[[1, tile_m], [1, 1]],
-                    offset=0,
-                    vector_offset=ea_offsets_all[tile_idx],
-                    indirect_dim=0,
-                ),
-                src=ea_grad_reduced_list[tile_idx],
-                oob_mode=oob_mode.skip if config.skip_dma.skip_token else oob_mode.error,
-            )
+            if config.single_expert_dense:
+                token_start = block_idx * B + tile_idx * tile_m
+                nisa.dma_copy(
+                    dst=expert_affinities_masked_grad[token_start : token_start + tile_m, 0:1],
+                    src=ea_grad_reduced_list[tile_idx],
+                )
+            else:
+                nisa.dma_copy(
+                    dst=expert_affinities_masked_grad.ap(
+                        pattern=[[1, tile_m], [1, 1]],
+                        offset=0,
+                        vector_offset=ea_offsets_all[tile_idx],
+                        indirect_dim=0,
+                    ),
+                    src=ea_grad_reduced_list[tile_idx],
+                    oob_mode=oob_mode.skip if config.skip_dma.skip_token else oob_mode.error,
+                )
 
     # Make per-shard writes visible to the other LNC core before any consumer
     # phase reads these tensors.
     nisa.core_barrier(d_gate_up, (0, 1))
     if not skip_scaled_intermediate_compute:
         nisa.core_barrier(scaled_intermediate, (0, 1))
-    nisa.core_barrier(d_gate_up_T, (0, 1))
+    if store_d_gate_up_transpose:
+        nisa.core_barrier(d_gate_up_T, (0, 1))
 
-    return d_gate_up, scaled_intermediate, d_gate_up_T
+    if cache_weight and down_weight_td.is_quantized:
+        down_weightq_td = down_weight_td
+    return d_gate_up, scaled_intermediate, d_gate_up_T, down_weightq_td if cache_weight else None
 
 
 def _transpose_tile_to_scratch(src_sbuf, dst_scratch, s_offset, dst_row_offset, I, B, dtype, sbm):
@@ -803,20 +854,26 @@ def _compute_phase2_hidden_states_grad_mxfp8(
     blocking,
     config,
     sbm,
+    block_token_offset,
+    cache_weight=False,
 ):
-    """Phase 2: Compute hidden states gradient and scatter to output.
+    """Phase 2: Compute hidden states gradient and write it to the output.
 
     Computes: partial_hidden_grad = d_gate_up[B, 2*I_TP] @ W[E*H, 2*I_TP].T → [B, H_shard]
     This is equivalent to d_gate @ W_gate.T + d_up @ W_up.T in a single matmul
     because [d_gate|d_up] @ [W_gate|W_up].T = d_gate @ W_gate.T + d_up @ W_up.T.
-    Then scatters to hidden_states_grad[token_ids, H_shard] using token indices.
+    The general path scatters to hidden_states_grad[token_ids, H_shard]. The
+    single-expert dense path writes directly to its contiguous block slice.
 
     Args:
         d_gate_up_td (TensorDescriptor): [B, 2*I_TP], Combined gate/up gradient (block-local).
         gate_up_weight_td (TensorDescriptor): [E*H, 2*I_TP], Combined gate/up weights with
             scalar_offset set for per-expert indexing.
+        cache_weight (bool): Keep the quantized gate/up weight for reuse by
+            later dense blocks. A quantized input under this policy is local.
         hidden_states_grad (nl.ndarray): [T, H], Global output tensor.
-        block_token_pos_to_id_full (nl.ndarray): [TILE_M, NUM_B_TILES], Token indices for this block.
+        block_token_pos_to_id_full (nl.ndarray): [TILE_M, NUM_B_TILES] token
+            indices, or None for single_expert_dense.
         B (int): Block size.
         H (int): Hidden dimension.
         I_TP (int): Intermediate dimension.
@@ -829,15 +886,16 @@ def _compute_phase2_hidden_states_grad_mxfp8(
     TILES_IN_BLOCK_M = blocking.TILES_IN_BLOCK_M
     TILES_IN_BLOCK_N = blocking.TILES_IN_BLOCK_N
     TILES_IN_BLOCK_K = blocking.TILES_IN_BLOCK_K
-
     H_PER_SHARD = H // num_shards
     H_SHARD_OFFSET = H_PER_SHARD * shard_id
+    rhs_n_offset = 0 if cache_weight and gate_up_weight_td.is_quantized else H_SHARD_OFFSET
 
-    # TODO: tile size for K is currently hardcoded to L_TILE_K due to regression in compiler, undo the change after fix.
-    tiles = get_tile_sizes(L_TILE_K, L_TILE_K, L_TILE_K)
-    tile_m = tiles['tile_m']
-    tile_n = tiles['tile_n']
-    l_tile_k = tiles['l_tile_k']
+    # Tile shapes: phase config tile_* FIRST, else shape-derived (exp-one config.py pattern).
+    # Phase 2: hidden_states_grad = d_gate_up[B,2I] @ W_gate_up[2I,H].T -> M=B, K=2*I_TP, N=H_PER_SHARD.
+    tile_m = blocking.tile_m
+    tile_n = blocking.tile_n
+    l_tile_k = blocking.tile_k
+    tiles = build_tile_sizes(tile_m=tile_m, l_tile_k=l_tile_k, tile_n=tile_n)
 
     BLOCK_N = TILES_IN_BLOCK_N * tile_n
     NUM_B_TILES = div_ceil(B, tile_m)
@@ -859,20 +917,23 @@ def _compute_phase2_hidden_states_grad_mxfp8(
         tiles=tiles,
     )
 
-    # Spill/reload buffers
+    # Spill/reload buffers. Weight storage can outlive this phase and become
+    # the primary descriptor for later dense blocks.
     d_gate_upq_td = None
     gate_up_weightq_td = None
-    if config.phase2_config.spill_reload:
+    spill_reload = config.phase2_config.spill_reload
+    if spill_reload or cache_weight:
         data_buffer = nl.private_hbm if config.phase2_config.run_with_lnc2 else nl.hbm
-        d_gate_upq_td = _allocate_spill_buffer(
-            num_k_blocks=NUM_K_BLOCKS,
-            num_f_blocks=NUM_M_BLOCKS,
-            block_f_logical=bd.BLOCK_M_LOGICAL,
-            tiles_in_block_k=TILES_IN_BLOCK_K,
-            use_scale_packing=config.phase2_config.enable_scale_packing,
-            data_buffer=data_buffer,
-        )
-        if not gate_up_weight_td.is_quantized:
+        if spill_reload and NUM_N_BLOCKS > 1:
+            d_gate_upq_td = _allocate_spill_buffer(
+                num_k_blocks=NUM_K_BLOCKS,
+                num_f_blocks=NUM_M_BLOCKS,
+                block_f_logical=bd.BLOCK_M_LOGICAL,
+                tiles_in_block_k=TILES_IN_BLOCK_K,
+                use_scale_packing=config.phase2_config.enable_scale_packing,
+                data_buffer=data_buffer,
+            )
+        if not gate_up_weight_td.is_quantized and (NUM_M_BLOCKS > 1 or cache_weight):
             gate_up_weightq_td = _allocate_spill_buffer(
                 num_k_blocks=NUM_K_BLOCKS,
                 num_f_blocks=NUM_N_BLOCKS,
@@ -896,16 +957,16 @@ def _compute_phase2_hidden_states_grad_mxfp8(
                 block_idx_m=(idx_m, idx_m + 1),
                 block_idx_n=(idx_n, idx_n + 1),
                 lhs_m_offset=0,
-                rhs_n_offset=H_SHARD_OFFSET,
-                TILES_IN_LOAD_M=min(TILES_IN_BLOCK_M, 8),
-                TILES_IN_LOAD_N=1,
+                rhs_n_offset=rhs_n_offset,
+                TILES_IN_LOAD_M=blocking.TILES_IN_LOAD_M,
+                TILES_IN_LOAD_N=blocking.TILES_IN_LOAD_N,
                 lhs_matmul_tile_shape_physical=tiles['lhs_matmul_tile_physical'],
                 rhs_matmul_tile_shape_physical=tiles['rhs_matmul_tile_physical'],
                 lhs_load_tile_shape=lhs_load_tile_shape,
                 rhs_load_tile_shape=rhs_load_tile_shape,
                 lhs_quantize_tile_shape=tiles['lhs_quantize_tile'],
                 rhs_quantize_tile_shape=tiles['rhs_quantize_tile'],
-                spill_reload=config.phase2_config.spill_reload,
+                spill_reload=spill_reload,
                 lhsq_td=d_gate_upq_td,
                 rhsq_td=gate_up_weightq_td,
                 use_scale_packing=config.phase2_config.enable_scale_packing,
@@ -913,7 +974,7 @@ def _compute_phase2_hidden_states_grad_mxfp8(
 
             """
             Scatter result to hidden_states_grad via token indices.
-            When is_tensor_update_accumulating=True, multiple experts contribute
+            When accumulate_hidden_states_grad=True, multiple experts contribute
             to the same token's hidden grad (top-K > 1 routing): the existing
             value at hidden_states_grad[token_id, :] is gathered, summed with
             this block's contribution, and scattered back. When False, we
@@ -922,8 +983,8 @@ def _compute_phase2_hidden_states_grad_mxfp8(
             """
             actual_n = min(BLOCK_N, H_PER_SHARD - idx_n * BLOCK_N)
             sbuf_step = TILES_IN_BLOCK_M * BLOCK_N
-            num_m_tiles_in_block_p2 = min(TILES_IN_BLOCK_M, div_ceil(B - idx_m * TILES_IN_BLOCK_M * tile_m, tile_m))
-            for tile_m_idx in nl.affine_range(num_m_tiles_in_block_p2):
+            m_tiles_in_block = _valid_tiles_in_block(NUM_B_TILES, idx_m, TILES_IN_BLOCK_M)
+            for tile_m_idx in nl.affine_range(m_tiles_in_block):
                 b_tile_idx = idx_m * TILES_IN_BLOCK_M + tile_m_idx
                 h_col_base = idx_n * BLOCK_N + H_SHARD_OFFSET
                 actual_m = min(tile_m, B - b_tile_idx * tile_m)
@@ -936,48 +997,62 @@ def _compute_phase2_hidden_states_grad_mxfp8(
                     src=output_sbuf.ap(pattern=[[sbuf_step, actual_m], [1, actual_n]], offset=sbuf_offset),
                 )
 
-                # Build the token-index vector for this B-tile (one int32 per partition).
-                token_indices_col = block_token_pos_to_id_full[:, b_tile_idx : b_tile_idx + 1]
-
-                if config.is_tensor_update_accumulating:
-                    """
-                    Read-modify-write: gather existing grad, add this block's
-                    contribution, then scatter back. Out-of-bounds tokens are
-                    zeroed first so masked-out lanes contribute nothing.
-                    """
-                    existing_tile = sbm.alloc_stack(
-                        shape=(actual_m, actual_n), dtype=config.compute_dtype, buffer=nl.sbuf
-                    )
-                    if config.skip_dma.skip_token:
-                        nisa.memset(existing_tile, value=0)
+                if config.single_expert_dense:
+                    token_start = block_token_offset + b_tile_idx * tile_m
                     nisa.dma_copy(
-                        dst=existing_tile,
-                        src=hidden_states_grad.ap(
+                        dst=hidden_states_grad[
+                            token_start : token_start + actual_m,
+                            h_col_base : h_col_base + actual_n,
+                        ],
+                        src=result_tile,
+                    )
+                else:
+                    # Build the token-index vector for this B-tile (one int32 per partition).
+                    token_indices_col = block_token_pos_to_id_full[:, b_tile_idx : b_tile_idx + 1]
+
+                    if config.accumulate_hidden_states_grad:
+                        """
+                        Read-modify-write: gather existing grad, add this block's
+                        contribution, then scatter back. Out-of-bounds tokens are
+                        zeroed first so masked-out lanes contribute nothing.
+                        """
+                        existing_tile = sbm.alloc_stack(
+                            shape=(actual_m, actual_n), dtype=config.compute_dtype, buffer=nl.sbuf
+                        )
+                        if config.skip_dma.skip_token:
+                            nisa.memset(existing_tile, value=0)
+                        nisa.dma_copy(
+                            dst=existing_tile,
+                            src=hidden_states_grad.ap(
+                                pattern=[[H, actual_m], [1, actual_n]],
+                                offset=h_col_base,
+                                vector_offset=token_indices_col,
+                                indirect_dim=0,
+                            ),
+                            oob_mode=oob_mode.skip if config.skip_dma.skip_token else oob_mode.error,
+                        )
+                        nisa.tensor_tensor(
+                            dst=result_tile,
+                            op=nl.add,
+                            data1=result_tile,
+                            data2=existing_tile,
+                        )
+
+                    # Scatter using token indices (indirect DMA).
+                    nisa.dma_copy(
+                        dst=hidden_states_grad.ap(
                             pattern=[[H, actual_m], [1, actual_n]],
                             offset=h_col_base,
                             vector_offset=token_indices_col,
                             indirect_dim=0,
                         ),
+                        src=result_tile,
                         oob_mode=oob_mode.skip if config.skip_dma.skip_token else oob_mode.error,
                     )
-                    nisa.tensor_tensor(
-                        dst=result_tile,
-                        op=nl.add,
-                        data1=result_tile,
-                        data2=existing_tile,
-                    )
 
-                # Scatter using token indices (indirect DMA).
-                nisa.dma_copy(
-                    dst=hidden_states_grad.ap(
-                        pattern=[[H, actual_m], [1, actual_n]],
-                        offset=h_col_base,
-                        vector_offset=token_indices_col,
-                        indirect_dim=0,
-                    ),
-                    src=result_tile,
-                    oob_mode=oob_mode.skip if config.skip_dma.skip_token else oob_mode.error,
-                )
+    if cache_weight and gate_up_weight_td.is_quantized:
+        gate_up_weightq_td = gate_up_weight_td
+    return gate_up_weightq_td if cache_weight else None
 
 
 def _transpose_accumulate_weight_grad_tile(
@@ -988,15 +1063,18 @@ def _transpose_accumulate_weight_grad_tile(
     base_offset,
     dtype,
     sbm,
+    accumulate,
 ):
-    """Transpose an [actual_m, actual_n] matmul result and accumulate into an expert's weight grad.
+    """Transpose an [actual_m, actual_n] matmul result and write an expert's weight grad.
 
     For each actual_m x actual_m sub-tile of acc_tile:
       1. nc_transpose to PSUM (PE route for tiles up to 128x128)
       2. tensor_copy PSUM → SBUF
-      3. DMA load existing grad from HBM (scalar_offset + hwdge)
-      4. Add new grad to existing
-      5. DMA store back to HBM
+      3. When requested, load and accumulate the existing gradient
+      4. DMA store back to HBM
+
+    ``accumulate`` controls whether the existing gradient is loaded and added
+    before the result is stored.
 
     The transpose swaps partition and free dims so the DMA access pattern's
     pair 0 stride > 1 (required by HWDGE hardware).
@@ -1028,38 +1106,33 @@ def _transpose_accumulate_weight_grad_tile(
         nisa.tensor_copy(dst=sub_t, src=sub_t_psum, engine=nisa.scalar_engine)
 
         offset = base_offset + sub_idx * actual_m * pair0_stride
-        existing = sbm.alloc_stack((sub_width, actual_m), dtype=dtype, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=existing,
-            src=weight_grad_hbm.ap(
+        if expert_idx is None:
+            weight_grad_ap = weight_grad_hbm.ap(
+                pattern=[[pair0_stride, sub_width], [1, actual_m]],
+                offset=offset,
+            )
+        else:
+            weight_grad_ap = weight_grad_hbm.ap(
                 pattern=[[pair0_stride, sub_width], [1, actual_m]],
                 offset=offset,
                 scalar_offset=expert_idx,
                 indirect_dim=0,
-            ),
-            dge_mode=dge_mode.hwdge,
-        )
+            )
 
-        nisa.tensor_tensor(dst=sub_t, op=nl.add, data1=sub_t, data2=existing)
+        if accumulate:
+            existing = sbm.alloc_stack((sub_width, actual_m), dtype=dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=existing, src=weight_grad_ap, dge_mode=dge_mode.hwdge)
+            nisa.tensor_tensor(dst=sub_t, op=nl.add, data1=sub_t, data2=existing)
 
-        nisa.dma_copy(
-            dst=weight_grad_hbm.ap(
-                pattern=[[pair0_stride, sub_width], [1, actual_m]],
-                offset=offset,
-                scalar_offset=expert_idx,
-                indirect_dim=0,
-            ),
-            src=sub_t,
-            dge_mode=dge_mode.hwdge,
-        )
+        nisa.dma_copy(dst=weight_grad_ap, src=sub_t, dge_mode=dge_mode.hwdge)
 
 
 # Phase 3: Gate/Up Weight Gradient (accumulated across blocks)
 
 
 def _compute_phase3_gate_up_weight_grad_mxfp8(
-    d_gate_up_T_td,
-    hidden_states_T_td,
+    lhs_td,
+    rhs_td,
     gate_up_proj_weight_grad,
     expert_idx,
     B,
@@ -1070,19 +1143,23 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
     blocking,
     config,
     sbm,
+    accumulate_weight_grad,
 ):
     """Phase 3: Compute gate/up weight gradient.
 
     Computes: dW_gate_up[expert] += d_gate_up.T @ hidden_states[block]  → [I_TP, H]
     Accumulates into the expert's weight gradient slice.
 
-    The LHS is d_gate_up_T [2*I_TP, B] (transposed gradients from Phase 1).
-    The RHS is hidden_states_T [H, B] (transposed block hidden states).
+    Routed execution uses d_gate_up_T [2*I_TP, B] and hidden_states_T
+    [H, B]. Dense execution passes the natural [B, 2*I_TP] and [B, H]
+    tensors as K-by-F operands to load_tile_PE_swizzle_wrapX.
     Output is accumulated into gate_up_proj_weight_grad[expert, :, :, :].
 
     Args:
-        d_gate_up_T_td (TensorDescriptor): [2*I_TP, B], Transposed d_gate||d_up.
-        hidden_states_T_td (TensorDescriptor): [H, B], Transposed hidden states for block.
+        lhs_td (TensorDescriptor): Routed [2*I_TP, B] F-by-K or dense
+            [B, 2*I_TP] K-by-F d_gate||d_up.
+        rhs_td (TensorDescriptor): Routed [H, B] F-by-K or dense
+            [B, H] K-by-F hidden states.
         gate_up_proj_weight_grad (nl.ndarray): [E, H, 2, I_TP], Output weight gradient tensor.
         expert_idx: Expert index (dynamic).
         B (int): Block size.
@@ -1093,23 +1170,25 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
         blocking (MatmulMxfp8KernelConfig): Phase 3 blocking parameters.
         config (MXFP8MOEBwdConfig): Kernel configuration.
         sbm (SbufManager): SBUF memory manager.
+        accumulate_weight_grad (bool): Add this block to an existing gradient.
     """
     TILES_IN_BLOCK_M = blocking.TILES_IN_BLOCK_M
     TILES_IN_BLOCK_N = blocking.TILES_IN_BLOCK_N
     TILES_IN_BLOCK_K = blocking.TILES_IN_BLOCK_K
-
     H_PER_SHARD = H // num_shards
     H_SHARD_OFFSET = H_PER_SHARD * shard_id
 
-    # TODO: tile size for K is currently hardcoded to L_TILE_K due to regression in compiler, undo the change after fix.
-    tiles = get_tile_sizes(L_TILE_K, L_TILE_K, L_TILE_K)
-    tile_m = tiles['tile_m']
-    tile_n = tiles['tile_n']
-    l_tile_k = tiles['l_tile_k']
+    # Tile shapes: phase config tile_* FIRST, else shape-derived (exp-one config.py pattern).
+    # The routed path computes gate/up separately with M=I_TP. The dense path
+    # follows the exp-one/k3g shape and computes both in one M=2*I_TP matmul.
+    tile_m = blocking.tile_m
+    tile_n = blocking.tile_n
+    l_tile_k = blocking.tile_k
+    tiles = build_tile_sizes(tile_m=tile_m, l_tile_k=l_tile_k, tile_n=tile_n)
 
     BLOCK_N = TILES_IN_BLOCK_N * tile_n
-    BLOCK_M = TILES_IN_BLOCK_M * tile_m
-    NUM_I_TILES = div_ceil(I_TP, tile_m)
+    phase3_m = 2 * I_TP if config.single_expert_dense else I_TP
+    NUM_I_TILES = div_ceil(phase3_m, tile_m)
     NUM_H_TILES = div_ceil(H_PER_SHARD, tile_n)
     NUM_K_TILES = div_ceil(B, l_tile_k)
     # Clamp TILES_IN_BLOCK_K to actual K-tiles available to prevent OOB loads
@@ -1119,8 +1198,8 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
     NUM_K_BLOCKS = max(1, div_ceil(NUM_K_TILES, TILES_IN_BLOCK_K))
 
     # Build block descriptor
-    lhs_load_tile_shape = _compute_load_tile_shape(d_gate_up_T_td, tiles, tile_m)
-    rhs_load_tile_shape = _compute_load_tile_shape(hidden_states_T_td, tiles, tile_n)
+    lhs_load_tile_shape = _compute_load_tile_shape(lhs_td, tiles, tile_m)
+    rhs_load_tile_shape = _compute_load_tile_shape(rhs_td, tiles, tile_n)
     bd = _build_matmul_params(
         TILES_IN_BLOCK_M,
         TILES_IN_BLOCK_N,
@@ -1131,34 +1210,35 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
     )
 
     """
-    Spill/reload buffers — gate and up need SEPARATE LHS spill buffers
-    because both matmuls share the same source tensor (d_gate_up_T) but at
+    Spill/reload buffers — gate and up need separate LHS spill buffers
+    because both matmuls share the same source tensor but use
     different M offsets (0 vs I_TP). A single shared buffer gets overwritten
     by the up matmul before the gate matmul can reload on subsequent N-blocks.
     """
-    d_gate_Tq_td = None
-    d_up_Tq_td = None
-    hidden_Tq_td = None
+    gate_lhsq_td = None
+    up_lhsq_td = None
+    rhsq_td = None
     if config.phase3_config.spill_reload and NUM_K_BLOCKS > 0:
         data_buffer = nl.private_hbm if config.phase3_config.run_with_lnc2 else nl.hbm
-        d_gate_Tq_td = _allocate_spill_buffer(
-            num_k_blocks=NUM_K_BLOCKS,
-            num_f_blocks=NUM_M_BLOCKS,
-            block_f_logical=bd.BLOCK_M_LOGICAL,
-            tiles_in_block_k=TILES_IN_BLOCK_K,
-            use_scale_packing=config.phase3_config.enable_scale_packing,
-            data_buffer=data_buffer,
-        )
-        d_up_Tq_td = _allocate_spill_buffer(
-            num_k_blocks=NUM_K_BLOCKS,
-            num_f_blocks=NUM_M_BLOCKS,
-            block_f_logical=bd.BLOCK_M_LOGICAL,
-            tiles_in_block_k=TILES_IN_BLOCK_K,
-            use_scale_packing=config.phase3_config.enable_scale_packing,
-            data_buffer=data_buffer,
-        )
-        if not hidden_states_T_td.is_quantized:
-            hidden_Tq_td = _allocate_spill_buffer(
+        if not config.single_expert_dense and NUM_N_BLOCKS > 1:
+            gate_lhsq_td = _allocate_spill_buffer(
+                num_k_blocks=NUM_K_BLOCKS,
+                num_f_blocks=NUM_M_BLOCKS,
+                block_f_logical=bd.BLOCK_M_LOGICAL,
+                tiles_in_block_k=TILES_IN_BLOCK_K,
+                use_scale_packing=config.phase3_config.enable_scale_packing,
+                data_buffer=data_buffer,
+            )
+            up_lhsq_td = _allocate_spill_buffer(
+                num_k_blocks=NUM_K_BLOCKS,
+                num_f_blocks=NUM_M_BLOCKS,
+                block_f_logical=bd.BLOCK_M_LOGICAL,
+                tiles_in_block_k=TILES_IN_BLOCK_K,
+                use_scale_packing=config.phase3_config.enable_scale_packing,
+                data_buffer=data_buffer,
+            )
+        if not rhs_td.is_quantized and NUM_M_BLOCKS > 1:
+            rhsq_td = _allocate_spill_buffer(
                 num_k_blocks=NUM_K_BLOCKS,
                 num_f_blocks=NUM_N_BLOCKS,
                 block_f_logical=bd.BLOCK_N_LOGICAL,
@@ -1171,22 +1251,22 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
         m_block_start = m_block_idx * TILES_IN_BLOCK_M
 
         for n_block_idx in range(NUM_N_BLOCKS):
-            # Compute gate weight grad: d_gate.T[i_base:, :] @ hidden_states.T
             gate_acc_sbuf = sbm.alloc_stack(
                 shape=(tile_m, TILES_IN_BLOCK_M * BLOCK_N), dtype=nl.float32, buffer=nl.sbuf
             )
             gate_acc_td = TensorDescriptor(data=gate_acc_sbuf)
-
-            # Compute up weight grad: d_up.T[I_TP+i_base:, :] @ hidden_states.T
-            up_acc_sbuf = sbm.alloc_stack(shape=(tile_m, TILES_IN_BLOCK_M * BLOCK_N), dtype=nl.float32, buffer=nl.sbuf)
-            up_acc_td = TensorDescriptor(data=up_acc_sbuf)
+            if not config.single_expert_dense:
+                up_acc_sbuf = sbm.alloc_stack(
+                    shape=(tile_m, TILES_IN_BLOCK_M * BLOCK_N), dtype=nl.float32, buffer=nl.sbuf
+                )
+                up_acc_td = TensorDescriptor(data=up_acc_sbuf)
 
             for k_block_idx in nl.sequential_range(NUM_K_BLOCKS):
-                # Gate grad: d_gate.T @ hidden.T (rows 0:I_TP of d_gate_up_T)
-
+                # Dense uses the full [2I,B] operand. Routed execution retains
+                # separate gate/up calls because each block accumulates by expert.
                 generic_matmul_mxfp8_api(
-                    lhs_hbm_td=d_gate_up_T_td,
-                    rhs_hbm_td=hidden_states_T_td,
+                    lhs_hbm_td=lhs_td,
+                    rhs_hbm_td=rhs_td,
                     bd=bd,
                     output_td=gate_acc_td,
                     block_idx_m=(m_block_idx, m_block_idx + 1),
@@ -1194,8 +1274,8 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
                     block_idx_k=(k_block_idx, k_block_idx + 1),
                     lhs_m_offset=0,  # Gate rows start at 0
                     rhs_n_offset=H_SHARD_OFFSET,  # SHARD_ON_FREE: each core's H slice
-                    TILES_IN_LOAD_M=min(TILES_IN_BLOCK_M, 8),
-                    TILES_IN_LOAD_N=1,
+                    TILES_IN_LOAD_M=blocking.TILES_IN_LOAD_M,
+                    TILES_IN_LOAD_N=blocking.TILES_IN_LOAD_N,
                     lhs_matmul_tile_shape_physical=tiles['lhs_matmul_tile_physical'],
                     rhs_matmul_tile_shape_physical=tiles['rhs_matmul_tile_physical'],
                     lhs_load_tile_shape=lhs_load_tile_shape,
@@ -1204,36 +1284,37 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
                     rhs_quantize_tile_shape=tiles['rhs_quantize_tile'],
                     initialize_accumulator=(k_block_idx == 0),
                     spill_reload=config.phase3_config.spill_reload,
-                    lhsq_td=d_gate_Tq_td,
-                    rhsq_td=hidden_Tq_td,
+                    lhsq_td=gate_lhsq_td,
+                    rhsq_td=rhsq_td,
                     use_scale_packing=config.phase3_config.enable_scale_packing,
                 )
 
-                # Up grad: d_up.T @ hidden.T (rows I_TP:2*I_TP of d_gate_up_T)
-                generic_matmul_mxfp8_api(
-                    lhs_hbm_td=d_gate_up_T_td,
-                    rhs_hbm_td=hidden_states_T_td,
-                    bd=bd,
-                    output_td=up_acc_td,
-                    block_idx_m=(m_block_idx, m_block_idx + 1),
-                    block_idx_n=(n_block_idx, n_block_idx + 1),
-                    block_idx_k=(k_block_idx, k_block_idx + 1),
-                    lhs_m_offset=I_TP,  # Up rows start at I_TP
-                    rhs_n_offset=H_SHARD_OFFSET,  # SHARD_ON_FREE: each core's H slice
-                    TILES_IN_LOAD_M=min(TILES_IN_BLOCK_M, 8),
-                    TILES_IN_LOAD_N=1,
-                    lhs_matmul_tile_shape_physical=tiles['lhs_matmul_tile_physical'],
-                    rhs_matmul_tile_shape_physical=tiles['rhs_matmul_tile_physical'],
-                    lhs_load_tile_shape=lhs_load_tile_shape,
-                    rhs_load_tile_shape=rhs_load_tile_shape,
-                    lhs_quantize_tile_shape=tiles['lhs_quantize_tile'],
-                    rhs_quantize_tile_shape=tiles['rhs_quantize_tile'],
-                    initialize_accumulator=(k_block_idx == 0),
-                    spill_reload=config.phase3_config.spill_reload,
-                    lhsq_td=d_up_Tq_td,
-                    rhsq_td=hidden_Tq_td,
-                    use_scale_packing=config.phase3_config.enable_scale_packing,
-                )
+                if not config.single_expert_dense:
+                    # Up grad: d_up.T @ hidden.T (rows I_TP:2*I_TP of d_gate_up_T)
+                    generic_matmul_mxfp8_api(
+                        lhs_hbm_td=lhs_td,
+                        rhs_hbm_td=rhs_td,
+                        bd=bd,
+                        output_td=up_acc_td,
+                        block_idx_m=(m_block_idx, m_block_idx + 1),
+                        block_idx_n=(n_block_idx, n_block_idx + 1),
+                        block_idx_k=(k_block_idx, k_block_idx + 1),
+                        lhs_m_offset=I_TP,
+                        rhs_n_offset=H_SHARD_OFFSET,
+                        TILES_IN_LOAD_M=blocking.TILES_IN_LOAD_M,
+                        TILES_IN_LOAD_N=blocking.TILES_IN_LOAD_N,
+                        lhs_matmul_tile_shape_physical=tiles['lhs_matmul_tile_physical'],
+                        rhs_matmul_tile_shape_physical=tiles['rhs_matmul_tile_physical'],
+                        lhs_load_tile_shape=lhs_load_tile_shape,
+                        rhs_load_tile_shape=rhs_load_tile_shape,
+                        lhs_quantize_tile_shape=tiles['lhs_quantize_tile'],
+                        rhs_quantize_tile_shape=tiles['rhs_quantize_tile'],
+                        initialize_accumulator=(k_block_idx == 0),
+                        spill_reload=config.phase3_config.spill_reload,
+                        lhsq_td=up_lhsq_td,
+                        rhsq_td=rhsq_td,
+                        use_scale_packing=config.phase3_config.enable_scale_packing,
+                    )
 
             """
             Accumulate gate and up weight grads into output
@@ -1243,12 +1324,12 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
             Must transpose 128x128 sub-tiles so partition maps to H for DMA.
             """
             sbuf_step = TILES_IN_BLOCK_M * BLOCK_N
-            num_m_tiles_in_block = min(TILES_IN_BLOCK_M, div_ceil(I_TP - m_block_start * tile_m, tile_m))
-            num_n_tiles_in_block = min(TILES_IN_BLOCK_N, div_ceil(H_PER_SHARD - n_block_idx * BLOCK_N, tile_n))
-            for tile_m_idx in nl.affine_range(num_m_tiles_in_block):
+            m_tiles_in_block = _valid_tiles_in_block(NUM_I_TILES, m_block_idx, TILES_IN_BLOCK_M)
+            n_tiles_in_block = _valid_tiles_in_block(NUM_H_TILES, n_block_idx, TILES_IN_BLOCK_N)
+            for tile_m_idx in nl.affine_range(m_tiles_in_block):
                 i_off = (m_block_start + tile_m_idx) * tile_m
-                actual_m = min(tile_m, I_TP - i_off)
-                for tile_n_idx in nl.affine_range(num_n_tiles_in_block):
+                actual_m = min(tile_m, phase3_m - i_off)
+                for tile_n_idx in nl.affine_range(n_tiles_in_block):
                     h_base = H_SHARD_OFFSET + n_block_idx * BLOCK_N + tile_n_idx * tile_n
                     actual_n = min(tile_n, H_PER_SHARD - (n_block_idx * BLOCK_N + tile_n_idx * tile_n))
                     sbuf_offset = tile_m_idx * BLOCK_N + tile_n_idx * tile_n
@@ -1259,15 +1340,9 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
                         dst=acc_tile,
                         src=gate_acc_sbuf.ap(pattern=[[sbuf_step, actual_m], [1, actual_n]], offset=sbuf_offset),
                     )
-                    up_acc_tile = sbm.alloc_stack((actual_m, actual_n), dtype=config.compute_dtype, buffer=nl.sbuf)
-                    nisa.tensor_copy(
-                        dst=up_acc_tile,
-                        src=up_acc_sbuf.ap(pattern=[[sbuf_step, actual_m], [1, actual_n]], offset=sbuf_offset),
-                    )
-
-                    # Gate grad: acc_tile is [actual_m=I, actual_n=H]
-                    # gate_up_proj_weight_grad[E, H, 2, I_TP]: gate is at slot 0
-                    gate_grad_base_offset = h_base * 2 * I_TP + 0 * I_TP + i_off
+                    # Dense i_off spans [0,2I), matching the flattened [gate,up]
+                    # dimension of gate_up_proj_weight_grad[E,H,2,I].
+                    gate_grad_base_offset = h_base * 2 * I_TP + i_off
                     _transpose_accumulate_weight_grad_tile(
                         acc_tile=acc_tile,
                         weight_grad_hbm=gate_up_proj_weight_grad,
@@ -1276,28 +1351,41 @@ def _compute_phase3_gate_up_weight_grad_mxfp8(
                         base_offset=gate_grad_base_offset,
                         dtype=config.compute_dtype,
                         sbm=sbm,
+                        accumulate=accumulate_weight_grad,
                     )
 
-                    # Up grad: up_acc_tile is [actual_m=I, actual_n=H]
-                    # gate_up_proj_weight_grad[E, H, 2, I_TP]: up is at slot 1
-                    up_grad_base_offset = h_base * 2 * I_TP + 1 * I_TP + i_off
-                    _transpose_accumulate_weight_grad_tile(
-                        acc_tile=up_acc_tile,
-                        weight_grad_hbm=gate_up_proj_weight_grad,
-                        expert_idx=expert_idx,
-                        pair0_stride=2 * I_TP,
-                        base_offset=up_grad_base_offset,
-                        dtype=config.compute_dtype,
-                        sbm=sbm,
-                    )
+                    if not config.single_expert_dense:
+                        up_acc_tile = sbm.alloc_stack(
+                            (actual_m, actual_n),
+                            dtype=config.compute_dtype,
+                            buffer=nl.sbuf,
+                        )
+                        nisa.tensor_copy(
+                            dst=up_acc_tile,
+                            src=up_acc_sbuf.ap(
+                                pattern=[[sbuf_step, actual_m], [1, actual_n]],
+                                offset=sbuf_offset,
+                            ),
+                        )
+                        up_grad_base_offset = h_base * 2 * I_TP + I_TP + i_off
+                        _transpose_accumulate_weight_grad_tile(
+                            acc_tile=up_acc_tile,
+                            weight_grad_hbm=gate_up_proj_weight_grad,
+                            expert_idx=expert_idx,
+                            pair0_stride=2 * I_TP,
+                            base_offset=up_grad_base_offset,
+                            dtype=config.compute_dtype,
+                            sbm=sbm,
+                            accumulate=accumulate_weight_grad,
+                        )
 
 
 # Phase 4: Down Projection Weight Gradient (accumulated across blocks)
 
 
 def _compute_phase4_down_weight_grad_mxfp8(
-    output_grad_T_td,
-    scaled_intermediate_T_td,
+    lhs_td,
+    rhs_td,
     down_proj_weight_grad,
     expert_idx,
     B,
@@ -1308,6 +1396,7 @@ def _compute_phase4_down_weight_grad_mxfp8(
     blocking,
     config,
     sbm,
+    accumulate_weight_grad,
 ):
     """Phase 4: Compute down projection weight gradient.
 
@@ -1316,14 +1405,16 @@ def _compute_phase4_down_weight_grad_mxfp8(
     the RHS is the post-EA scaled intermediate (gate_act * up * EA), matching the
     forward operand of the down projection.
 
-    LHS is output_grad.T [H, B] (transposed block output gradient, H-sharded).
-    RHS is scaled_intermediate.T [I_TP, B] (transposed post-EA scaled intermediate).
+    Routed execution uses output_grad.T [H, B] and scaled_intermediate.T
+    [I_TP, B]. Dense execution passes their natural [B, H] and [B, I_TP]
+    layouts as K-by-F operands to load_tile_PE_swizzle_wrapX.
     Output accumulates into down_proj_weight_grad[expert, :, :].
 
     Args:
-        output_grad_T_td (TensorDescriptor): [H, B], Transposed output grad for block.
-        scaled_intermediate_T_td (TensorDescriptor): [I_TP, B], Transposed post-EA
-            scaled intermediate for block (gate_act * up * EA under AFFINITY_ON_I).
+        lhs_td (TensorDescriptor): Routed [H, B] F-by-K or dense
+            [B, H] K-by-F output gradient.
+        rhs_td (TensorDescriptor): Routed [I_TP, B] F-by-K
+            or dense [B, I_TP] K-by-F post-EA scaled intermediate.
         down_proj_weight_grad (nl.ndarray): [E, I_TP, H], Output weight gradient tensor.
         expert_idx: Expert index (dynamic).
         B (int): Block size.
@@ -1334,19 +1425,21 @@ def _compute_phase4_down_weight_grad_mxfp8(
         blocking (MatmulMxfp8KernelConfig): Phase 4 blocking parameters.
         config (MXFP8MOEBwdConfig): Kernel configuration.
         sbm (SbufManager): SBUF memory manager.
+        accumulate_weight_grad (bool): Add this block to an existing gradient.
     """
     TILES_IN_BLOCK_M = blocking.TILES_IN_BLOCK_M
     TILES_IN_BLOCK_N = blocking.TILES_IN_BLOCK_N
     TILES_IN_BLOCK_K = blocking.TILES_IN_BLOCK_K
-
     H_PER_SHARD = H // num_shards
     H_SHARD_OFFSET = H_PER_SHARD * shard_id
 
-    # TODO: tile size for K is currently hardcoded to L_TILE_K due to regression in compiler, undo the change after fix.
-    tiles = get_tile_sizes(L_TILE_K, L_TILE_K, L_TILE_K)
-    tile_m = tiles['tile_m']
-    tile_n = tiles['tile_n']
-    l_tile_k = tiles['l_tile_k']
+    # Tile shapes: phase config tile_* FIRST, else shape-derived (exp-one config.py pattern).
+    # Phase 4: dW_down = output_grad_T[H,B] @ scaled_intermediate_T[B,I] (contract over B)
+    #   -> M=H_PER_SHARD, K=B, N=I_TP.
+    tile_m = blocking.tile_m
+    tile_n = blocking.tile_n
+    l_tile_k = blocking.tile_k
+    tiles = build_tile_sizes(tile_m=tile_m, l_tile_k=l_tile_k, tile_n=tile_n)
 
     BLOCK_N = TILES_IN_BLOCK_N * tile_n
     BLOCK_M = TILES_IN_BLOCK_M * tile_m
@@ -1360,8 +1453,8 @@ def _compute_phase4_down_weight_grad_mxfp8(
     NUM_K_BLOCKS = max(1, div_ceil(NUM_K_TILES, TILES_IN_BLOCK_K))
 
     # Build block descriptor
-    lhs_load_tile_shape = _compute_load_tile_shape(output_grad_T_td, tiles, tile_m)
-    rhs_load_tile_shape = _compute_load_tile_shape(scaled_intermediate_T_td, tiles, tile_n)
+    lhs_load_tile_shape = _compute_load_tile_shape(lhs_td, tiles, tile_m)
+    rhs_load_tile_shape = _compute_load_tile_shape(rhs_td, tiles, tile_n)
     bd = _build_matmul_params(
         TILES_IN_BLOCK_M,
         TILES_IN_BLOCK_N,
@@ -1372,12 +1465,12 @@ def _compute_phase4_down_weight_grad_mxfp8(
     )
 
     # Spill/reload buffers
-    output_grad_Tq_td = None
-    scaled_intermediate_Tq_td = None
+    lhsq_td = None
+    rhsq_td = None
     if config.phase4_config.spill_reload and NUM_K_BLOCKS > 0:
         data_buffer = nl.private_hbm if config.phase4_config.run_with_lnc2 else nl.hbm
-        if not output_grad_T_td.is_quantized:
-            output_grad_Tq_td = _allocate_spill_buffer(
+        if not lhs_td.is_quantized:
+            lhsq_td = _allocate_spill_buffer(
                 num_k_blocks=NUM_K_BLOCKS,
                 num_f_blocks=NUM_M_BLOCKS,
                 block_f_logical=bd.BLOCK_M_LOGICAL,
@@ -1385,8 +1478,8 @@ def _compute_phase4_down_weight_grad_mxfp8(
                 use_scale_packing=config.phase4_config.enable_scale_packing,
                 data_buffer=data_buffer,
             )
-        if not scaled_intermediate_T_td.is_quantized:
-            scaled_intermediate_Tq_td = _allocate_spill_buffer(
+        if not rhs_td.is_quantized:
+            rhsq_td = _allocate_spill_buffer(
                 num_k_blocks=NUM_K_BLOCKS,
                 num_f_blocks=NUM_N_BLOCKS,
                 block_f_logical=bd.BLOCK_N_LOGICAL,
@@ -1401,15 +1494,15 @@ def _compute_phase4_down_weight_grad_mxfp8(
             output_sbuf_td = TensorDescriptor(data=output_sbuf)
 
             generic_matmul_mxfp8_api(
-                lhs_hbm_td=output_grad_T_td,
-                rhs_hbm_td=scaled_intermediate_T_td,
+                lhs_hbm_td=lhs_td,
+                rhs_hbm_td=rhs_td,
                 bd=bd,
                 output_td=output_sbuf_td,
                 block_idx_m=(idx_m, idx_m + 1),
                 block_idx_n=(idx_n, idx_n + 1),
                 lhs_m_offset=H_SHARD_OFFSET,  # SHARD_ON_FREE: each core's H slice
-                TILES_IN_LOAD_M=min(TILES_IN_BLOCK_M, 8),
-                TILES_IN_LOAD_N=1,
+                TILES_IN_LOAD_M=blocking.TILES_IN_LOAD_M,
+                TILES_IN_LOAD_N=blocking.TILES_IN_LOAD_N,
                 lhs_matmul_tile_shape_physical=tiles['lhs_matmul_tile_physical'],
                 rhs_matmul_tile_shape_physical=tiles['rhs_matmul_tile_physical'],
                 lhs_load_tile_shape=lhs_load_tile_shape,
@@ -1417,8 +1510,8 @@ def _compute_phase4_down_weight_grad_mxfp8(
                 lhs_quantize_tile_shape=tiles['lhs_quantize_tile'],
                 rhs_quantize_tile_shape=tiles['rhs_quantize_tile'],
                 spill_reload=config.phase4_config.spill_reload,
-                lhsq_td=output_grad_Tq_td,
-                rhsq_td=scaled_intermediate_Tq_td,
+                lhsq_td=lhsq_td,
+                rhsq_td=rhsq_td,
                 use_scale_packing=config.phase4_config.enable_scale_packing,
             )
 
@@ -1430,12 +1523,12 @@ def _compute_phase4_down_weight_grad_mxfp8(
             Must transpose tile_m x tile_m sub-tiles so partition maps to I_TP for DMA.
             """
             sbuf_step = TILES_IN_BLOCK_M * BLOCK_N
-            num_m_tiles_in_block = min(TILES_IN_BLOCK_M, div_ceil(H_PER_SHARD - idx_m * BLOCK_M, tile_m))
-            num_n_tiles_in_block = min(TILES_IN_BLOCK_N, div_ceil(I_TP - idx_n * BLOCK_N, tile_n))
-            for tile_m_idx in nl.affine_range(num_m_tiles_in_block):
+            m_tiles_in_block = _valid_tiles_in_block(NUM_H_TILES, idx_m, TILES_IN_BLOCK_M)
+            n_tiles_in_block = _valid_tiles_in_block(NUM_I_TILES, idx_n, TILES_IN_BLOCK_N)
+            for tile_m_idx in nl.affine_range(m_tiles_in_block):
                 h_off = H_SHARD_OFFSET + idx_m * BLOCK_M + tile_m_idx * tile_m
                 actual_m = min(tile_m, H_PER_SHARD - (idx_m * BLOCK_M + tile_m_idx * tile_m))
-                for tile_n_idx in nl.affine_range(num_n_tiles_in_block):
+                for tile_n_idx in nl.affine_range(n_tiles_in_block):
                     i_base = idx_n * BLOCK_N + tile_n_idx * tile_n
                     actual_n = min(tile_n, I_TP - i_base)
                     sbuf_offset = tile_m_idx * BLOCK_N + tile_n_idx * tile_n
@@ -1454,6 +1547,7 @@ def _compute_phase4_down_weight_grad_mxfp8(
                         base_offset=i_base * H + h_off,
                         dtype=config.compute_dtype,
                         sbm=sbm,
+                        accumulate=accumulate_weight_grad,
                     )
 
 
@@ -1524,9 +1618,9 @@ def _set_expert_offset_on_td(
 # Main Kernel Implementation
 
 
+@with_active_sbm
 def blockwise_mm_bwd_dropless_mxfp8(
-    # --- Input TensorDescriptors (passed flat — NKI does not allow tensor-bearing
-    #     dataclasses to cross function boundaries inside a traced kernel). ---
+    # --- Input TensorDescriptors (constructed from raw tensors at kernel entry) ---
     hidden_states_td: TensorDescriptor,
     output_grad_td: TensorDescriptor,
     gate_up_weight_td: TensorDescriptor,
@@ -1546,6 +1640,13 @@ def blockwise_mm_bwd_dropless_mxfp8(
     E: int,
     N: int,
     block_size: int,
+    # --- Tensor-local layout conversion modes ---
+    output_grad_swizzle_mode: SwizzleMode,
+    d_gate_up_swizzle_mode: SwizzleMode,
+    d_gate_up_t_swizzle_mode: SwizzleMode,
+    hidden_states_t_swizzle_mode: SwizzleMode,
+    output_grad_t_swizzle_mode: SwizzleMode,
+    scaled_intermediate_t_swizzle_mode: SwizzleMode,
     # --- Config and output gradient buffers ---
     config: MXFP8MOEBwdConfig,
     hidden_states_grad: nl.ndarray,
@@ -1615,8 +1716,9 @@ def blockwise_mm_bwd_dropless_mxfp8(
     _, num_shards, shard_id = get_program_sharding_info()
     H_PER_SHARD = H // num_shards
 
-    # Initialize gradient outputs to zero.
-    if not config.skip_grad_initialization:
+    # Dense execution writes token gradients directly and initializes weight
+    # gradients from block 0 before accumulating any later blocks.
+    if not config.skip_grad_initialization and not config.single_expert_dense:
         _initialize_gradient_outputs_shard(
             hidden_states_grad=hidden_states_grad,
             gate_up_proj_weight_grad=gate_up_proj_weight_grad,
@@ -1636,40 +1738,47 @@ def blockwise_mm_bwd_dropless_mxfp8(
         if down_proj_bias_grad is not None:
             nisa.core_barrier(down_proj_bias_grad, (0, 1))
 
-    # Bulk-load all expert indices into SBUF
-    expert_idx_bufs = sbm.alloc_stack((1, N), dtype=nl.int32, buffer=nl.sbuf, align=32)
-    block_to_expert_2d = block_to_expert_td.data.reshape((1, N))
-    nisa.dma_copy(expert_idx_bufs[0, 0:N], block_to_expert_2d[0, 0:N])
+    if config.single_expert_dense:
+        expert_idx_bufs = None
+        expert_idx_broadcast = None
+        iota_vec = None
+        token_indices_bufs = None
+    else:
+        # Bulk-load all expert indices into SBUF.
+        expert_idx_bufs = sbm.alloc_stack((1, N), dtype=nl.int32, buffer=nl.sbuf, align=32)
+        block_to_expert_2d = block_to_expert_td.data.reshape((1, N))
+        nisa.dma_copy(expert_idx_bufs[0, 0:N], block_to_expert_2d[0, 0:N])
 
-    """
-    iota_vec: [TILE_M, 1] partition-channel iota (0..127). Used by
-    _generate_dynamic_offsets to derive per-partition addresses from a
-    broadcast scalar.
-    """
-    iota_vec = sbm.alloc_stack((TILE_M, 1), dtype=nl.int32, buffer=nl.sbuf, name="iota_vec", align=32)
-    nisa.iota(dst=iota_vec, pattern=[[0, 1]], offset=0, channel_multiplier=1)
+        """
+        iota_vec: [TILE_M, 1] partition-channel iota (0..127). Used by
+        _generate_dynamic_offsets to derive per-partition addresses from a
+        broadcast scalar.
+        """
+        iota_vec = sbm.alloc_stack((TILE_M, 1), dtype=nl.int32, buffer=nl.sbuf, name="iota_vec", align=32)
+        nisa.iota(dst=iota_vec, pattern=[[0, 1]], offset=0, channel_multiplier=1)
 
-    """
-    Broadcast all expert indices from (1, N) to (TILE_M, N) once, so each
-    partition holds the same expert ID for every block. Phase 1's EA gather
-    slices column block_idx out of this tensor per block.
-    """
-    expert_idx_broadcast = sbm.alloc_stack(
-        (TILE_M, N), dtype=nl.int32, buffer=nl.sbuf, name="expert_idx_broadcast", align=32
-    )
-    stream_shuffle_broadcast(src=expert_idx_bufs, dst=expert_idx_broadcast)
+        """
+        Broadcast all expert indices from (1, N) to (TILE_M, N) once, so each
+        partition holds the same expert ID for every block. Phase 1's EA gather
+        slices column block_idx out of this tensor per block.
+        """
+        expert_idx_broadcast = sbm.alloc_stack(
+            (TILE_M, N), dtype=nl.int32, buffer=nl.sbuf, name="expert_idx_broadcast", align=32
+        )
+        stream_shuffle_broadcast(src=expert_idx_bufs, dst=expert_idx_broadcast)
 
-    # Double-buffer token indices
-    token_indices_bufs = [
-        sbm.alloc_stack((TILE_M, NUM_B_TILES), dtype=nl.int32, align=32),
-        sbm.alloc_stack((TILE_M, NUM_B_TILES), dtype=nl.int32, align=32),
-    ]
+        # Double-buffer token indices.
+        token_indices_bufs = [
+            sbm.alloc_stack((TILE_M, NUM_B_TILES), dtype=nl.int32, align=32),
+            sbm.alloc_stack((TILE_M, NUM_B_TILES), dtype=nl.int32, align=32),
+        ]
 
     dims = DimensionSizes(T=T, H=H, B=block_size, E=E, N=N, I_TP=I_TP)
     dims.derive_all_dims()
 
-    # Prefetch block 0 token indices
-    _load_token_indices_dgt(token_position_to_id_td.data, 0, B, NUM_B_TILES, dst=token_indices_bufs[0])
+    if not config.single_expert_dense:
+        # Prefetch block 0 token indices.
+        _load_token_indices_dgt(token_position_to_id_td.data, 0, B, NUM_B_TILES, dst=token_indices_bufs[0])
 
     """
     Per-block expert offset for the down weight DGT load is allocated
@@ -1686,61 +1795,69 @@ def blockwise_mm_bwd_dropless_mxfp8(
         DOWN_EXPERT_STRIDE_IN_VS = down_weight_td.data.shape[0] // E
         DOWN_SCALES_EXPERT_STRIDE = down_weight_td.scales.shape[0] // E
 
+    # Phase 3 can consume natural [B, 2*I_TP] through the K-by-F PE loader and
+    # avoid d_gate_up_T when 2*I_TP is divisible by 512. Routing itself does not
+    # prevent this, but routed test shapes such as I_TP=128/384/640 do not meet
+    # that loader constraint and still require the explicit transpose.
+    p3_lhs_pe = config.single_expert_dense and d_gate_up_t_swizzle_mode == SwizzleMode.PE
+    p3_rhs_pe = config.single_expert_dense and hidden_states_t_swizzle_mode == SwizzleMode.PE
+    p4_lhs_pe = config.single_expert_dense and output_grad_t_swizzle_mode == SwizzleMode.PE
+    p4_rhs_pe = config.single_expert_dense and scaled_intermediate_t_swizzle_mode == SwizzleMode.PE
+
+    # Cached quantized weights become the primary operands after dense block 0.
+    # Routed spill buffers remain phase-local because experts can change.
+    down_weightq_td = None
+    gate_up_weightq_td = None
+    cache_down_weight = config.single_expert_dense and N > 1 and not down_weight_td.is_quantized
+    cache_gate_up_weight = config.single_expert_dense and N > 1 and not gate_up_weight_td.is_quantized
+
     # Block Loop
     for block_idx in range(N):
         sbm.open_scope(name=f"Block {block_idx}")
-        expert_idx = expert_idx_bufs[0, block_idx]
-        cur = block_idx % 2
-        block_token_pos_to_id_full = token_indices_bufs[cur]
+        accumulate_weight_grad = not config.single_expert_dense or block_idx > 0
+        if config.single_expert_dense:
+            expert_idx = None
+            block_token_pos_to_id_full = None
+        else:
+            expert_idx = expert_idx_bufs[0, block_idx]
+            cur = block_idx % 2
+            block_token_pos_to_id_full = token_indices_bufs[cur]
 
-        _set_expert_offset_on_td(
-            td=down_weight_td,
-            expert_idx_broadcast=expert_idx_broadcast,
-            block_idx=block_idx,
-            expert_stride=DOWN_EXPERT_STRIDE_IN_VS,
-            scales_stride=DOWN_SCALES_EXPERT_STRIDE,
-            effective_f_dim=I_TP if down_weight_td.scales is None else H // 4,
-            name_prefix="down",
-            sbm=sbm,
-        )
+            _set_expert_offset_on_td(
+                td=down_weight_td,
+                expert_idx_broadcast=expert_idx_broadcast,
+                block_idx=block_idx,
+                expert_stride=DOWN_EXPERT_STRIDE_IN_VS,
+                scales_stride=DOWN_SCALES_EXPERT_STRIDE,
+                effective_f_dim=I_TP if down_weight_td.scales is None else H // 4,
+                name_prefix="down",
+                sbm=sbm,
+            )
 
         """
-        Per-block HBM scratch — fresh allocations each iteration so the
-        scheduler can overlap block N+1 with block N (a single reused tensor
-        would create false RAW/WAR edges that serialize the loop).
-        NOTE: Phase 1's outputs (d_gate_up and
-        d_gate_up_T) are now allocated inside Phase 1 itself and
-        returned. The remaining tensors below are still owned by the kernel
-        body until the producing helpers are folded into their consumer phases.
+        Per-block HBM transpose scratch. A dense operand configured with PE
+        swizzle stays in natural [B, F] layout and skips its scratch allocation.
         """
-
-        # hidden_states_block_T [H, B] — gathered + transposed hidden states (Phase 3 RHS)
-        hidden_states_block_T = nl.ndarray(
-            (H, B),
-            dtype=config.compute_dtype,
-            buffer=nl.shared_hbm,
-            name=f"hidden_states_block_T_shared_block_{block_idx}",
-        )
-        # output_grad_block_T [H, B] — gathered + transposed output grad (Phase 4 LHS)
-        output_grad_block_T = nl.ndarray(
-            (H, B),
-            dtype=config.compute_dtype,
-            buffer=nl.shared_hbm,
-            name=f"output_grad_block_T_shared_block_{block_idx}",
-        )
-        """
-        scaled_intermediate_T [I_TP, B] — Phase 4 RHS. The post-EA scaled
-        intermediate (gate_act * up * EA under AFFINITY_ON_I), which is the
-        forward operand of the down projection. Two sources:
-          - If the caller saved scaled_intermediate from forward, slice the
-            per-block view directly (no compute, no transpose).
-          - Otherwise transpose Phase 1's scaled_intermediate [B, I_TP]
-            into a fresh per-block [I_TP, B] tensor. Phase 1 produces
-            scaled_intermediate with the same post-EA scaled value
-            under AFFINITY_ON_I — see Phase 1's pre-scale step.
-        """
-        if scaled_intermediate_checkpoint_T_td != None:
-            scaled_intermediate_T = scaled_intermediate_checkpoint_T_td.data[block_idx]
+        if p3_rhs_pe:
+            hidden_states_block_T = None
+        else:
+            hidden_states_block_T = nl.ndarray(
+                (H, B),
+                dtype=config.compute_dtype,
+                buffer=nl.shared_hbm,
+                name=f"hidden_states_block_T_shared_block_{block_idx}",
+            )
+        if p4_lhs_pe:
+            output_grad_block_T = None
+        else:
+            output_grad_block_T = nl.ndarray(
+                (H, B),
+                dtype=config.compute_dtype,
+                buffer=nl.shared_hbm,
+                name=f"output_grad_block_T_shared_block_{block_idx}",
+            )
+        if p4_rhs_pe:
+            scaled_intermediate_T = None
         else:
             scaled_intermediate_T = nl.ndarray(
                 (I_TP, B),
@@ -1750,35 +1867,58 @@ def blockwise_mm_bwd_dropless_mxfp8(
             )
 
         # Prefetch next block's token indices
-        if block_idx < N - 1:
+        if not config.single_expert_dense and block_idx < N - 1:
             nxt = (block_idx + 1) % 2
             _load_token_indices_dgt(
                 token_position_to_id_td.data, block_idx + 1, B, NUM_B_TILES, dst=token_indices_bufs[nxt]
             )
 
-        # --- Gather + transpose hidden states for Phase 3 RHS ---
-        # hidden_states_td.data[token_ids, :] → transposed to hidden_states_block_T[H, B]
-        _gather_block_tokens_transposed(
-            src=hidden_states_td.data,
-            dst=hidden_states_block_T,
-            token_indices=block_token_pos_to_id_full,
-            B=B,
-            feature_dim=H,
-            skip_dma=config.skip_dma,
-            sbm=sbm,
-        )
+        if config.single_expert_dense:
+            token_start = block_idx * B
+            hidden_states_block = hidden_states_td.data[nl.ds(token_start, B), 0:H]
+            output_grad_block = output_grad_td.data[nl.ds(token_start, B), 0:H]
+            if not p3_rhs_pe:
+                _load_contiguous_block_transposed(
+                    src=hidden_states_block,
+                    dst=hidden_states_block_T,
+                    B=B,
+                    feature_dim=H,
+                    sbm=sbm,
+                    transpose_mode=config.phase3_transpose_mode,
+                )
+            if not p4_lhs_pe:
+                _load_contiguous_block_transposed(
+                    src=output_grad_block,
+                    dst=output_grad_block_T,
+                    B=B,
+                    feature_dim=H,
+                    sbm=sbm,
+                    transpose_mode=config.phase4_transpose_mode,
+                )
+        else:
+            # --- Phase 3 RHS: hidden states, transposed to [H, B] ---
+            _gather_block_tokens_transposed(
+                src=hidden_states_td.data,
+                dst=hidden_states_block_T,
+                token_indices=block_token_pos_to_id_full,
+                B=B,
+                feature_dim=H,
+                skip_dma=config.skip_dma,
+                sbm=sbm,
+                transpose_mode=config.phase3_transpose_mode,
+            )
 
-        # --- Gather + transpose output grad for Phase 4 LHS ---
-        # output_grad_td.data[token_ids, :] → transposed to output_grad_block_T[H, B]
-        _gather_block_tokens_transposed(
-            src=output_grad_td.data,
-            dst=output_grad_block_T,
-            token_indices=block_token_pos_to_id_full,
-            B=B,
-            feature_dim=H,
-            skip_dma=config.skip_dma,
-            sbm=sbm,
-        )
+            # --- Gather + transpose output grad for Phase 4 LHS ---
+            _gather_block_tokens_transposed(
+                src=output_grad_td.data,
+                dst=output_grad_block_T,
+                token_indices=block_token_pos_to_id_full,
+                B=B,
+                feature_dim=H,
+                skip_dma=config.skip_dma,
+                sbm=sbm,
+                transpose_mode=config.phase4_transpose_mode,
+            )
 
         """
         TODO: current version of compiler/nki is giving issues when TILES_IN_LOAD_M!=4, hence we cannot use:
@@ -1787,42 +1927,45 @@ def blockwise_mm_bwd_dropless_mxfp8(
         a plain F-by-K tensor so Phase 1 uses the conventional DGT path.
         """
 
-        output_grad_block = nl.ndarray(
-            (B, H),
-            dtype=config.compute_dtype,
-            buffer=nl.shared_hbm,
-            name=f"output_grad_block_shared_block_{block_idx}",
+        if not config.single_expert_dense:
+            output_grad_block = nl.ndarray(
+                (B, H),
+                dtype=config.compute_dtype,
+                buffer=nl.shared_hbm,
+                name=f"output_grad_block_shared_block_{block_idx}",
+            )
+            _gather_block_tokens(
+                src=output_grad_td.data,
+                dst=output_grad_block,
+                token_indices=block_token_pos_to_id_full,
+                B=B,
+                feature_dim=H,
+                skip_dma=config.skip_dma,
+                sbm=sbm,
+            )
+        output_grad_block_td = TensorDescriptor(
+            data=output_grad_block,
+            swizzle_mode=output_grad_swizzle_mode,
+            fast_dma_transpose=config.fast_dma_transpose,
         )
-        _gather_block_tokens(
-            src=output_grad_td.data,
-            dst=output_grad_block,
-            token_indices=block_token_pos_to_id_full,
-            B=B,
-            feature_dim=H,
-            skip_dma=config.skip_dma,
-            sbm=sbm,
-        )
-        output_grad_block_td = TensorDescriptor(data=output_grad_block)
 
         # Phase 1: Down projection output grad + SwiGLU backward
         """
-        Phase 1 produces three HBM outputs:
+        Phase 1 always produces these natural-layout HBM outputs:
           - d_gate_up [B, 2, I_TP]: Phase 2 LHS (K=I_TP).
           - scaled_intermediate   [B, I_TP]:    Phase 4 RHS source.
-          - d_gate_up_T          [2*I_TP, B]:  Phase 3 LHS (K=B).
-        The third tensor is the transposed view of the first; it exists so
-        Phase 3 can use generic_matmul_mxfp8_api (which contracts over
-        data.shape[1]) on the same data that Phase 2 contracts over the
-        opposite axis. See Phase 1's docstring NOTE.
+        Phase 1 also produces d_gate_up_T [2*I_TP, B] unless dense Phase 3
+        selects PE swizzle and consumes d_gate_up as K-by-F.
         """
 
         (
             d_gate_up,
             scaled_intermediate,
             d_gate_up_T,
+            down_weightq_td,
         ) = _compute_phase1_down_proj_output_grad_mxfp8(
             output_grad_td=output_grad_block_td,
-            down_weight_td=down_weight_td,
+            down_weight_td=down_weightq_td if down_weightq_td is not None else down_weight_td,
             gate_up_proj_act_checkpoint_T=gate_up_proj_act_checkpoint_T_td.data,
             block_idx=block_idx,
             expert_idx=expert_idx,
@@ -1841,6 +1984,8 @@ def blockwise_mm_bwd_dropless_mxfp8(
             expert_affinities_masked_grad=expert_affinities_masked_grad,
             expert_idx_broadcast=expert_idx_broadcast,
             scaled_intermediate_checkpoint_T_td=scaled_intermediate_checkpoint_T_td,
+            cache_weight=cache_down_weight,
+            store_d_gate_up_transpose=not p3_lhs_pe,
         )
 
         # Phase 2: Hidden states gradient (scatter to output)
@@ -1848,7 +1993,12 @@ def blockwise_mm_bwd_dropless_mxfp8(
         Use combined d_gate_up[B, 2*I_TP] @ gate_up_weight[E*H, 2*I_TP].T → [B, H]
         This computes d_gate @ W_gate.T + d_up @ W_up.T in a single matmul.
         """
-        d_gate_up_2d_td = TensorDescriptor(data=d_gate_up.reshape((B, 2 * I_TP)))
+        d_gate_up_2d_td = TensorDescriptor(
+            data=d_gate_up.reshape((B, 2 * I_TP)),
+            swizzle_mode=d_gate_up_swizzle_mode,
+            quant_scheme=config.phase2_config.quant_scheme,
+            fast_dma_transpose=config.fast_dma_transpose,
+        )
 
         """
         Per-expert indexing for gate_up_weight [E*H, 2*I_TP]:
@@ -1864,20 +2014,21 @@ def blockwise_mm_bwd_dropless_mxfp8(
             GATE_UP_EXPERT_STRIDE_IN_VS = gate_up_weight_td.data.shape[0] // E
             GATE_UP_SCALES_EXPERT_STRIDE = gate_up_weight_td.scales.shape[0] // E
 
-        _set_expert_offset_on_td(
-            td=gate_up_weight_td,
-            expert_idx_broadcast=expert_idx_broadcast,
-            block_idx=block_idx,
-            expert_stride=GATE_UP_EXPERT_STRIDE_IN_VS,
-            scales_stride=GATE_UP_SCALES_EXPERT_STRIDE,
-            effective_f_dim=H if gate_up_weight_td.scales is None else 2 * I_TP // 4,
-            name_prefix="gate_up",
-            sbm=sbm,
-        )
+        if not config.single_expert_dense:
+            _set_expert_offset_on_td(
+                td=gate_up_weight_td,
+                expert_idx_broadcast=expert_idx_broadcast,
+                block_idx=block_idx,
+                expert_stride=GATE_UP_EXPERT_STRIDE_IN_VS,
+                scales_stride=GATE_UP_SCALES_EXPERT_STRIDE,
+                effective_f_dim=H if gate_up_weight_td.scales is None else 2 * I_TP // 4,
+                name_prefix="gate_up",
+                sbm=sbm,
+            )
 
-        _compute_phase2_hidden_states_grad_mxfp8(
+        gate_up_weightq_td = _compute_phase2_hidden_states_grad_mxfp8(
             d_gate_up_td=d_gate_up_2d_td,
-            gate_up_weight_td=gate_up_weight_td,
+            gate_up_weight_td=gate_up_weightq_td if gate_up_weightq_td is not None else gate_up_weight_td,
             hidden_states_grad=hidden_states_grad,
             block_token_pos_to_id_full=block_token_pos_to_id_full,
             B=B,
@@ -1888,15 +2039,42 @@ def blockwise_mm_bwd_dropless_mxfp8(
             blocking=config.phase2_config,
             config=config,
             sbm=sbm,
+            block_token_offset=block_idx * B,
+            cache_weight=cache_gate_up_weight,
         )
 
         # Phase 3: Gate/up weight gradient (accumulate)
-        d_gate_up_T_td = TensorDescriptor(data=d_gate_up_T)
-        hidden_states_T_td = TensorDescriptor(data=hidden_states_block_T)
+        if p3_lhs_pe:
+            phase3_lhs_td = TensorDescriptor(
+                data=d_gate_up.reshape((B, 2 * I_TP)),
+                is_f_by_k=False,
+                swizzle_mode=SwizzleMode.PE,
+                quant_scheme=QuantScheme.WRAPX,
+            )
+        else:
+            phase3_lhs_td = TensorDescriptor(
+                data=d_gate_up_T,
+                swizzle_mode=d_gate_up_t_swizzle_mode,
+                quant_scheme=config.phase3_config.quant_scheme,
+                fast_dma_transpose=config.fast_dma_transpose,
+            )
+        if p3_rhs_pe:
+            phase3_rhs_td = TensorDescriptor(
+                data=hidden_states_block,
+                is_f_by_k=False,
+                swizzle_mode=SwizzleMode.PE,
+                quant_scheme=QuantScheme.WRAPX,
+            )
+        else:
+            phase3_rhs_td = TensorDescriptor(
+                data=hidden_states_block_T,
+                swizzle_mode=hidden_states_t_swizzle_mode,
+                fast_dma_transpose=config.fast_dma_transpose,
+            )
 
         _compute_phase3_gate_up_weight_grad_mxfp8(
-            d_gate_up_T_td=d_gate_up_T_td,
-            hidden_states_T_td=hidden_states_T_td,
+            lhs_td=phase3_lhs_td,
+            rhs_td=phase3_rhs_td,
             gate_up_proj_weight_grad=gate_up_proj_weight_grad,
             expert_idx=expert_idx,
             B=B,
@@ -1907,19 +2085,16 @@ def blockwise_mm_bwd_dropless_mxfp8(
             blocking=config.phase3_config,
             config=config,
             sbm=sbm,
+            accumulate_weight_grad=accumulate_weight_grad,
         )
 
         # Phase 4: Down projection weight gradient (accumulate)
         """
-        Prepare scaled_intermediate_T (Phase 4 RHS, [I_TP, B], post-EA scaled).
-        When the caller saved scaled_intermediate_checkpoint_T from the forward
-        pass, scaled_intermediate_T already aliases that per-block slice
-        (set above) — nothing to do. Otherwise transpose Phase 1's
-        scaled_intermediate [B, I_TP] into the freshly-allocated
-        [I_TP, B] tensor (also set above). Both branches yield the same
-        post-EA scaled intermediate value.
+        Phase 4 normally prepares scaled_intermediate_T [I_TP, B] for an
+        F-by-K load. Dense PE mode consumes scaled_intermediate [B, I_TP]
+        directly through the wrapX K-by-F loader.
         """
-        if scaled_intermediate_checkpoint_T_td == None:
+        if not p4_rhs_pe:
             _transpose_block_to_hbm(
                 src=scaled_intermediate,
                 dst=scaled_intermediate_T,
@@ -1927,17 +2102,43 @@ def blockwise_mm_bwd_dropless_mxfp8(
                 feature_dim=I_TP,
                 shard_offset=0,
                 sbm=sbm,
+                transpose_mode=config.phase4_transpose_mode,
             )
             nisa.core_barrier(scaled_intermediate_T, (0, 1))
 
-        nisa.core_barrier(output_grad_block_T, (0, 1))
-
-        output_grad_T_td = TensorDescriptor(data=output_grad_block_T)
-        scaled_intermediate_T_td = TensorDescriptor(data=scaled_intermediate_T)
+        if not p4_lhs_pe:
+            nisa.core_barrier(output_grad_block_T, (0, 1))
+        if p4_lhs_pe:
+            phase4_lhs_td = TensorDescriptor(
+                data=output_grad_block,
+                is_f_by_k=False,
+                swizzle_mode=SwizzleMode.PE,
+                quant_scheme=QuantScheme.WRAPX,
+            )
+        else:
+            phase4_lhs_td = TensorDescriptor(
+                data=output_grad_block_T,
+                swizzle_mode=output_grad_t_swizzle_mode,
+                fast_dma_transpose=config.fast_dma_transpose,
+            )
+        if p4_rhs_pe:
+            phase4_rhs_td = TensorDescriptor(
+                data=scaled_intermediate,
+                is_f_by_k=False,
+                swizzle_mode=SwizzleMode.PE,
+                quant_scheme=QuantScheme.WRAPX,
+            )
+        else:
+            phase4_rhs_td = TensorDescriptor(
+                data=scaled_intermediate_T,
+                swizzle_mode=scaled_intermediate_t_swizzle_mode,
+                quant_scheme=config.phase4_config.quant_scheme,
+                fast_dma_transpose=config.fast_dma_transpose,
+            )
 
         _compute_phase4_down_weight_grad_mxfp8(
-            output_grad_T_td=output_grad_T_td,
-            scaled_intermediate_T_td=scaled_intermediate_T_td,
+            lhs_td=phase4_lhs_td,
+            rhs_td=phase4_rhs_td,
             down_proj_weight_grad=down_proj_weight_grad,
             expert_idx=expert_idx,
             B=B,
@@ -1948,6 +2149,7 @@ def blockwise_mm_bwd_dropless_mxfp8(
             blocking=config.phase4_config,
             config=config,
             sbm=sbm,
+            accumulate_weight_grad=accumulate_weight_grad,
         )
 
         # Bias gradients: reduce over B dimension and accumulate per-expert.
@@ -2044,13 +2246,11 @@ def _gather_block_tokens(src, dst, token_indices, B, feature_dim, skip_dma, sbm)
             )
 
 
-def _gather_block_tokens_transposed(src, dst, token_indices, B, feature_dim, skip_dma, sbm):
+def _gather_block_tokens_transposed(src, dst, token_indices, B, feature_dim, skip_dma, sbm, transpose_mode=None):
     """Gather tokens from src and store transposed: src[token_ids, :].T → dst[feature_dim, B].
 
-    Uses dma_copy (int32 vector_offset) to gather rows, then nc_transpose on PE
-    to transpose each tile before storing to the transposed HBM destination.
-    This avoids dma_transpose which requires uint32 vector_offset and causes
-    -1 padding indices to saturate to 0 during the int32→uint32 conversion.
+    Uses dma_copy with int32 vector offsets to gather rows, then selects the
+    configured transpose engine before storing to transposed HBM.
 
     Args:
         src (nl.ndarray): [T, feature_dim], Source tensor in HBM.
@@ -2060,9 +2260,11 @@ def _gather_block_tokens_transposed(src, dst, token_indices, B, feature_dim, ski
         feature_dim (int): Feature dimension (H).
         skip_dma (SkipMode): OOB handling.
         sbm (SbufManager): SBUF memory manager.
+        transpose_mode (TransposeMode): Transpose engine.
     """
     NUM_B_TILES = div_ceil(B, TILE_M)
     NUM_F_TILES = div_ceil(feature_dim, TILE_M)
+    use_dma = transpose_mode == TransposeMode.DMA
 
     for b_tile_idx in range(NUM_B_TILES):
         actual_b = min(TILE_M, B - b_tile_idx * TILE_M)
@@ -2091,23 +2293,61 @@ def _gather_block_tokens_transposed(src, dst, token_indices, B, feature_dim, ski
                 oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
             )
 
-            # Step 2: Transpose [actual_b, actual_f] → [actual_f, actual_b] via PE
-            tile_t_psum = nl.ndarray((actual_f, actual_b), dtype=src.dtype, buffer=nl.psum)
-            nisa.nc_transpose(dst=tile_t_psum, data=tile)
-
-            # Step 3: PSUM → SBUF (HBM cannot read from PSUM directly)
             tile_t = sbm.alloc_stack((actual_f, actual_b), dtype=src.dtype, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=tile_t, src=tile_t_psum, engine=nisa.scalar_engine)
+            if use_dma:
+                nisa.dma_transpose(dst=tile_t, src=tile)
+            else:
+                tile_t_psum = nl.ndarray((actual_f, actual_b), dtype=src.dtype, buffer=nl.psum)
+                nisa.nc_transpose(dst=tile_t_psum, data=tile)
+                nisa.tensor_copy(dst=tile_t, src=tile_t_psum, engine=nisa.scalar_engine)
 
-            # Step 4: Store transposed tile to HBM
             nisa.dma_copy(
                 dst=dst[f_off : f_off + actual_f, col_offset : col_offset + actual_b],
                 src=tile_t,
             )
 
 
-def _transpose_block_to_hbm(src, dst, B, feature_dim, shard_offset, sbm):
+def _load_contiguous_block_transposed(src, dst, B, feature_dim, sbm, transpose_mode=None):
+    """Load contiguous [B, feature_dim] tiles and store them as [feature_dim, B]."""
+    NUM_B_TILES = div_ceil(B, TILE_M)
+    NUM_F_TILES = div_ceil(feature_dim, TILE_M)
+    use_dma = transpose_mode == TransposeMode.DMA
+
+    for b_tile_idx in range(NUM_B_TILES):
+        b_off = b_tile_idx * TILE_M
+        actual_b = min(TILE_M, B - b_off)
+        for f_tile_idx in range(NUM_F_TILES):
+            f_off = f_tile_idx * TILE_M
+            actual_f = min(TILE_M, feature_dim - f_off)
+            tile = sbm.alloc_stack((actual_b, actual_f), dtype=src.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=tile,
+                src=src[b_off : b_off + actual_b, f_off : f_off + actual_f],
+            )
+
+            tile_t = sbm.alloc_stack((actual_f, actual_b), dtype=src.dtype, buffer=nl.sbuf)
+            if use_dma:
+                nisa.dma_transpose(dst=tile_t, src=tile)
+            else:
+                tile_t_psum = nl.ndarray((actual_f, actual_b), dtype=src.dtype, buffer=nl.psum)
+                nisa.nc_transpose(dst=tile_t_psum, data=tile)
+                nisa.tensor_copy(dst=tile_t, src=tile_t_psum, engine=nisa.scalar_engine)
+
+            nisa.dma_copy(
+                dst=dst[f_off : f_off + actual_f, b_off : b_off + actual_b],
+                src=tile_t,
+            )
+
+
+def _transpose_block_to_hbm(src, dst, B, feature_dim, shard_offset, sbm, transpose_mode=None):
     """Transpose a [B, feature_dim] block to [feature_dim, B] in HBM.
+
+    transpose_mode selects the mechanism:
+      NC  (default): load [B,F]->SBUF, nc_transpose->PSUM, copy PSUM->SBUF, store [F,B]->HBM.
+                     Uses the PE array for the transpose (burns PE cycles).
+      DMA          : load [B,F]->SBUF, then a SINGLE dma_transpose writes [F,B]->HBM on the
+                     DMA engine — no nc_transpose, no PSUM hop. Moves the transpose off the
+                     PE onto the (often idle) DMA engine.
 
     Args:
         src (nl.ndarray): [B, feature_dim], Source block in HBM.
@@ -2116,28 +2356,38 @@ def _transpose_block_to_hbm(src, dst, B, feature_dim, shard_offset, sbm):
         feature_dim (int): Feature dimension.
         shard_offset (int): Offset for sharding (unused currently).
         sbm (SbufManager): SBUF memory manager.
+        transpose_mode (TransposeMode): Transpose engine.
     """
     NUM_B_TILES = div_ceil(B, TILE_M)
     NUM_F_TILES = div_ceil(feature_dim, TILE_M)
+    use_dma = transpose_mode == TransposeMode.DMA
 
     for b_tile_idx in range(NUM_B_TILES):
         b_off = b_tile_idx * TILE_M
         actual_b = min(TILE_M, B - b_off)
+        row_tile = sbm.alloc_stack((actual_b, feature_dim), dtype=src.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=row_tile, src=src[b_off : b_off + actual_b, 0:feature_dim])
         for f_tile_idx in range(NUM_F_TILES):
             f_off = f_tile_idx * TILE_M
             actual_f = min(TILE_M, feature_dim - f_off)
-            # Load [actual_b, actual_f] from src
-            tile = sbm.alloc_stack((actual_b, actual_f), dtype=src.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=tile, src=src[b_off : b_off + actual_b, f_off : f_off + actual_f])
+            sub = row_tile[:, f_off : f_off + actual_f]
 
-            # Transpose on PE (PSUM dst routes to PE; SBUF dst routes to DVE
-            # which caps at 32x32). Tiles up to 128x128 use PE.
-            tile_t_psum = nl.ndarray((actual_f, actual_b), dtype=src.dtype, buffer=nl.psum)
-            nisa.nc_transpose(dst=tile_t_psum, data=tile)
-
-            # PSUM -> SBUF before DMA (HBM cannot read directly from PSUM)
-            tile_t = sbm.alloc_stack((actual_f, actual_b), dtype=src.dtype, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=tile_t, src=tile_t_psum, engine=nisa.scalar_engine)
-
-            # Store to dst
-            nisa.dma_copy(dst=dst[f_off : f_off + actual_f, b_off : b_off + actual_b], src=tile_t)
+            if use_dma:
+                # DMA-engine transpose OFF the PE. dma_transpose requires an SBUF dst, so
+                # transpose SBUF->SBUF then dma_copy the [f,b] tile to HBM. No PE, no PSUM.
+                tile_t = sbm.alloc_stack((actual_f, actual_b), dtype=src.dtype, buffer=nl.sbuf)
+                nisa.dma_transpose(dst=tile_t, src=sub)
+                nisa.dma_copy(dst=dst[f_off : f_off + actual_f, b_off : b_off + actual_b], src=tile_t)
+            else:
+                # NC path: transpose on PE (PSUM dst routes to PE; SBUF dst routes to DVE
+                # which caps at 32x32). Tiles up to 128x128 use PE.
+                tile_t_psum = nl.ndarray((actual_f, actual_b), dtype=src.dtype, buffer=nl.psum)
+                nisa.nc_transpose(dst=tile_t_psum, data=sub)
+                # PSUM -> SBUF before DMA (HBM cannot read directly from PSUM). Alternate the
+                # copy across scalar/vector engines to relieve the scalar-COPY bottleneck.
+                tile_t = sbm.alloc_stack((actual_f, actual_b), dtype=src.dtype, buffer=nl.sbuf)
+                # TODO: Use the base nc_transpose wrapper's ratio-based Scalar/Vector drain selection.
+                _cp_eng = nisa.scalar_engine if (f_tile_idx % 2 == 0) else nisa.vector_engine
+                nisa.tensor_copy(dst=tile_t, src=tile_t_psum, engine=_cp_eng)
+                # Store to dst
+                nisa.dma_copy(dst=dst[f_off : f_off + actual_f, b_off : b_off + actual_b], src=tile_t)

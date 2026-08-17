@@ -29,8 +29,7 @@ import math
 import neuron_dtypes as ndtype
 import nki.language as nl
 import numpy as np
-from neuronxcc.nki._private.test import mx_util
-
+from neuronxcc.nki._private.test import mx_util  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ActFnType,
@@ -39,6 +38,7 @@ from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ShardOption,
     SkipMode,
 )
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.integration.nkilib.experimental.matmul_mxfp8.utils import (
     resize_scales_compact_to_oversized_2d,
@@ -143,19 +143,25 @@ def build_mxfp8_moe_bwd_inputs(
     top_k,
     dtype=nl.bfloat16,
     run_with_lnc2=True,
-    blocking_params=None,
+    moe_bwd_config=None,
     spill_reload=False,
     use_scale_packing=False,
     bias=False,
     clamp_limits=None,
     prequantize_weights=False,
+    single_expert_dense=False,
+    fast_dma_transpose=False,
 ):
     T, H, I_TP, E, B = tokens, hidden, intermediate, expert, block_size
+    if single_expert_dense:
+        assert E == 1, f"single_expert_dense requires expert=1, got {E}"
+        assert top_k == 1, f"single_expert_dense requires top_k=1, got {top_k}"
+        assert T % B == 0, f"single_expert_dense requires tokens divisible by block_size, got {T} and {B}"
     N = _get_n_blocks(T, top_k, E, B)
 
-    dma_skip = SkipMode(True, False)
+    skip_dma = SkipMode(True, False)
     token_experts, token_position_to_id, block_to_expert = generate_token_position_to_id_and_experts(
-        T, top_k, E, B, dma_skip, N
+        T, top_k, E, B, skip_dma, N
     )
 
     param_string = f"{T}_{top_k}_{B}_{E}_{I_TP}_{H}_mxfp8"
@@ -190,7 +196,7 @@ def build_mxfp8_moe_bwd_inputs(
         E=E,
         I_TP=I_TP,
         dtype=dtype,
-        dma_skip=dma_skip,
+        dma_skip=skip_dma,
         activation_function=ActFnType.SiLU,
         gate_up_proj_bias=gate_up_proj_bias,
         down_proj_bias=down_proj_bias,
@@ -221,10 +227,12 @@ def build_mxfp8_moe_bwd_inputs(
         "affinity_option": AffinityOption.AFFINITY_ON_I,
         "shard_option": ShardOption.SHARD_ON_FREE,
         "activation_type": ActFnType.SiLU,
-        "is_tensor_update_accumulating": top_k != 1,
+        "accumulate_hidden_states_grad": top_k != 1,
+        "single_expert_dense": single_expert_dense,
+        "fast_dma_transpose": fast_dma_transpose,
         "spill_reload": spill_reload,
         "use_scale_packing": use_scale_packing,
-        "skip_dma": SkipMode(True, False),
+        "skip_dma": skip_dma,
         "bias": bias,
         "clamp_limits": clamp_limits,
     }
@@ -234,11 +242,17 @@ def build_mxfp8_moe_bwd_inputs(
     if down_scales is not None:
         inputs["down_weight_scales"] = down_scales
 
-    if blocking_params is not None:
-        inputs["phase1_config"] = blocking_params.phase1
-        inputs["phase2_config"] = blocking_params.phase2
-        inputs["phase3_config"] = blocking_params.phase3
-        inputs["phase4_config"] = blocking_params.phase4
+    if moe_bwd_config is not None:
+        inputs.update(
+            {
+                "phase1_config": moe_bwd_config.phase1_config,
+                "phase2_config": moe_bwd_config.phase2_config,
+                "phase3_config": moe_bwd_config.phase3_config,
+                "phase4_config": moe_bwd_config.phase4_config,
+                "phase3_transpose_mode": moe_bwd_config.phase3_transpose_mode,
+                "phase4_transpose_mode": moe_bwd_config.phase4_transpose_mode,
+            }
+        )
 
     if prequantize_weights:
         return inputs, gate_and_up_proj_weights, down_proj_weights

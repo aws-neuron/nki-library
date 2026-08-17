@@ -20,8 +20,7 @@ Pure Python -- no NKI, no tracer, no device required.
 
 import nki.language as nl
 import pytest
-from nki.language.tensor import NkiTensor
-
+from nki.language.tensor import NkiTensor  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import contiguous_ap_pattern as _contiguous_ap_pattern
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import contiguous_strides as _contiguous_strides
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import reachable_dim_extent
@@ -29,6 +28,7 @@ from nkilib_src.nkilib.experimental.neurotile.core.axis import IndirectKind, Ind
 from nkilib_src.nkilib.experimental.neurotile.core.layout_hbm import HBMLayout
 from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
 from nkilib_src.nkilib.experimental.neurotile.core.transforms import compute_fold
+
 from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 
@@ -165,20 +165,88 @@ class TestAdvanceIndirect:
         assert result.indirect.dim == 0
         assert result.offset == 0
 
-    def test_step_gt_1_scaled(self):
-        """Runtime k with step>1: scaled by step (not strides)."""
+    def test_step_1_sbuf_scalar_does_not_scale(self, monkeypatch):
+        """Even tensor-like scalar indices pass through unchanged when step=1."""
+        layout = make_layout((8, 128, 64))
+        runtime_k = MockTensor((1, 1), dtype=nl.int32)
+
+        def fail_if_called(value, scale):
+            raise AssertionError("unexpected scaling")
+
+        monkeypatch.setattr(HBMLayout, "_materialize_scaled_scalar_offset", staticmethod(fail_if_called))
+        result = layout.advance(dim=0, k=runtime_k, step=1)
+        assert result.indirect.value is runtime_k
+        assert result.indirect.dim == 0
+
+    def test_step_gt_1_sbuf_scalar_scaled(self, monkeypatch):
+        """SBUF scalar logical index with step>1 is materialized once."""
         layout = make_layout((512, 2048))
-        runtime_k = 3.0
+        runtime_k = MockTensor((1, 1), dtype=nl.int32)
+        monkeypatch.setattr(
+            HBMLayout,
+            "_materialize_scaled_scalar_offset",
+            staticmethod(lambda value, scale: ("scaled", value, scale)),
+        )
         result = layout.advance(dim=0, k=runtime_k, step=128)
-        # 3.0 * 128 = 384.0 (in source-element units; stride applied later).
-        assert result.indirect.value == 384.0
+        assert result.indirect.value == ("scaled", runtime_k, 128)
         assert result.indirect.dim == 0
         assert result.offset == 0
+
+    def test_step_gt_1_buffered_sbuf_scalar_scaled(self, monkeypatch):
+        """Scalar NKI tensors are accepted only when they are SBUF-backed."""
+        layout = make_layout((512, 2048))
+        runtime_k = MockTensor((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        monkeypatch.setattr(
+            HBMLayout,
+            "_materialize_scaled_scalar_offset",
+            staticmethod(lambda value, scale: ("scaled", value, scale)),
+        )
+        result = layout.advance(dim=0, k=runtime_k, step=128)
+        assert result.indirect.value == ("scaled", runtime_k, 128)
+
+    def test_step_gt_1_loop_var_rejects(self):
+        """Loop-variable-like runtime values cannot be scaled internally."""
+        layout = make_layout((8, 128, 64))
+        with pytest.raises(AssertionError, match="requires an SBUF scalar index"):
+            layout.advance(dim=1, k=object(), step=128)
+
+    def test_step_gt_1_vector_shaped_scalar_rejects(self):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="requires an SBUF scalar index"):
+            layout.advance(dim=0, k=MockTensor((1, 2), dtype=nl.int32), step=128)
+
+    def test_step_1_vector_shaped_scalar_rejects(self):
+        layout = make_layout((8, 128, 64))
+        with pytest.raises(AssertionError, match="requires an SBUF scalar index"):
+            layout.advance(dim=0, k=MockTensor((1, 2), dtype=nl.int32), step=1)
+
+    def test_runtime_logical_bool_index_rejects(self):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="does not accept bool"):
+            layout.advance(dim=0, k=True, step=128)
+
+    @pytest.mark.parametrize("step", [1, 128])
+    def test_hbm_scalar_tensor_rejects(self, step):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="requires an SBUF scalar index"):
+            layout.advance(dim=0, k=MockTensor((1, 1), dtype=nl.int32, buffer=nl.shared_hbm), step=step)
+
+    @pytest.mark.parametrize("step", [0, -1, 1.5, True])
+    def test_invalid_index_stride_rejects(self, step):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="index_stride_elements must be a positive int"):
+            layout.advance(dim=0, k=0, step=step)
+
+    @pytest.mark.parametrize("dim", [-1, 2, 1.0, True])
+    def test_invalid_dim_rejects(self, dim):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="dim must be an int"):
+            layout.advance(dim=dim, k=0, step=128)
 
     def test_indirect_dim_is_surviving_dim(self):
         """IndirectOffset dim is the dim parameter."""
         layout = make_layout((8, 128, 64))
-        result = layout.advance(dim=1, k=2.0, step=128)
+        result = layout.advance(dim=1, k=2.0, step=1)
         assert result.indirect.dim == 1
 
     def test_indirect_replaces_vector(self):
@@ -193,6 +261,37 @@ class TestAdvanceIndirect:
         result = layout.advance(dim=0, k=2.0, step=1)
         assert result.indirect.kind == IndirectKind.SCALAR
         assert result.indirect.value == 2.0
+
+    def test_element_offset_static_folds_without_logical_stride(self):
+        layout = make_layout((512, 2048))
+        result = layout.advance_by_element_offset(dim=0, offset=128)
+        assert result.offset == 128 * 2048
+        assert result.indirect is None
+
+    def test_element_offset_negative_static_rejects(self):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="must be non-negative"):
+            layout.advance_by_element_offset(dim=0, offset=-1)
+
+    @pytest.mark.parametrize("offset", [True, 1.0, None, [1], object()])
+    def test_element_offset_invalid_payload_rejects(self, offset):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="nt.element_offset"):
+            layout.advance_by_element_offset(dim=0, offset=offset)
+
+    @pytest.mark.parametrize("buffer", [nl.shared_hbm, nl.psum])
+    def test_element_offset_non_sbuf_tensor_rejects(self, buffer):
+        layout = make_layout((512, 2048))
+        with pytest.raises(AssertionError, match="SBUF scalar"):
+            layout.advance_by_element_offset(dim=0, offset=MockTensor((1, 1), dtype=nl.int32, buffer=buffer))
+
+    def test_element_offset_runtime_passes_through_without_scaling(self):
+        layout = make_layout((512, 2048))
+        runtime_offset = MockTensor((1, 1), dtype=nl.int32)
+        result = layout.advance_by_element_offset(dim=0, offset=runtime_offset)
+        assert result.indirect.kind == IndirectKind.SCALAR
+        assert result.indirect.value is runtime_offset
+        assert result.indirect.dim == 0
 
 
 # ============================================================================

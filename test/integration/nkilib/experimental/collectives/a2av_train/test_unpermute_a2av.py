@@ -17,9 +17,9 @@ import ml_dtypes
 import numpy as np
 import pytest
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.experimental.collectives.a2av_train import unpermute_a2av
 from nkilib_src.nkilib.experimental.collectives.a2av_train.unpermute_a2av_torch import unpermute_a2av_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -53,7 +53,7 @@ def _generate_variable_per_rank(tokens, ep_size, multiples_of=32, seed=42):
     rng = np.random.RandomState(seed)
     choices = np.arange(0, tokens + 1, multiples_of)
     all_sc, all_si = [], []
-    for rank in range(ep_size):
+    for _rank in range(ep_size):
         sc = rng.choice(choices, size=(1, ep_size)).astype(np.int32)
         while int(sc[0].sum()) > tokens:
             idx = int(sc[0].argmax())
@@ -70,6 +70,12 @@ def _generate_variable_per_rank(tokens, ep_size, multiples_of=32, seed=42):
 PARAM_NAMES_SYM = "tokens, hidden, expert, ep_size"
 TEST_PARAMS_SYM = [
     (256, 128, 64, 8),
+    # tokens NOT a multiple of TILE_SIZE=128 -> exercises the partial tail tile
+    # (tsize < 128). Regression for the combine dma_copy src/dst mismatch
+    # (src=TILE_SIZE*H, dst=tsize*H). tokens=64 arises when the per-device token
+    # count b_local*s_local < 128 (e.g. batch fully sharded over DP_FSDP).
+    (64, 128, 64, 8),
+    (192, 128, 64, 8),
 ]
 PARAM_NAMES_VAR = "tokens, hidden, ep_size, dtype"
 
@@ -78,6 +84,9 @@ TEST_PARAMS_VAR = [
     (256, 128, 8, ml_dtypes.bfloat16),
     (256, 128, 32, ml_dtypes.bfloat16),
     (256, 128, 64, ml_dtypes.bfloat16),
+    # partial-tail tile regression (tokens % 128 != 0):
+    (64, 128, 8, ml_dtypes.bfloat16),
+    (192, 128, 8, ml_dtypes.bfloat16),
 ]
 
 

@@ -22,7 +22,6 @@ from nki.language import NKIObject
 
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info
-from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
     MLPParameters,
     mlpp_has_projection_bias,
@@ -33,7 +32,7 @@ from ..mlp_parameters import (
 # Calculate the type of sharding we should do given the MLP parameters
 # NOTE: Sharding on just batch * sequence length is supported through the code but is never activated.
 #       But we leave the infrastructure in place in case we need it in the future.
-# Returns a tuple (sharded_dim, shards) instead of ShardInfo to work around KLIR tracing limitations
+# Returns a tuple (sharded_dim, shards) instead of ShardInfo to work around compiler tracing limitations
 # @throws AssertionError: If no valid tile size can be found that divides the bxs evenly, or
 #                         if the bxs is not divisible by a power of 2 >= 256
 def calculate_sharding(mlp_params: MLPParameters):
@@ -73,7 +72,7 @@ def calculate_sharding(mlp_params: MLPParameters):
     if mlp_params.hidden_size < 7168 or mlp_params.intermediate_size < 1024:
         shard_on_inter = False
 
-    if mlp_params.intermediate_size > 4096:
+    if mlp_params.intermediate_size >= 4096:
         shard_on_inter = True
 
     if shard_on_inter:
@@ -84,58 +83,6 @@ def calculate_sharding(mlp_params: MLPParameters):
         shards = _calculate_bxs_sharding(mlp_params, program_id, num_shard_workers)
 
     return ShardInfo(sharded_dim, shards)
-
-
-def _get_bxs_shard_size(
-    bxs: int,
-    num_shards: int,
-    default_tile_size: int = 512,
-    default_tiling_factor: int = 16,
-) -> int:
-    """
-    This function calculates an appropriate shard size based on the batch * sequence length (bxs)
-    against number of shards.
-    For bxs size <= 16K, it uses a default tile size. For larger bxs, it attempts to find
-    a tile size that enables efficient fusion with the cc_pipeline and lnc degrees.
-
-    @param bxs: The dimension of batch * sequence length to be tiled
-    @param num_shards: Number of shards for parallel processing
-    @param default_tile_size: Default tile size to use for bxs <= 16K (default: 512)
-    @param default_tiling_factor: Default tiling factor when num_shards <= 2 (default: 16)
-
-    @return: The calculated bxs tile size
-    """
-
-    # Choose bxs tile size for CTE cases
-    bxs_tile_size = None
-    tile_size_candidates = [
-        32 * 1024,
-        16 * 1024,
-        8 * 1024,
-        4 * 1024,
-        2 * 1024,
-        1024,
-        512,
-        256,
-    ]
-    if num_shards > 2:
-        # If num_shards > 2 then the user is passing additional tiling axis (e.g., cc_pipeline) in
-        # the SPMD grid, and we can just tile accordingly, i.e., make num_tile == num_shards.
-        return bxs // num_shards
-
-    if bxs <= 16 * 1024:
-        bxs_tile_size = default_tile_size
-        if bxs <= (num_shards * bxs_tile_size):
-            bxs_tile_size = bxs // num_shards
-    else:
-        ignore_divisibility = bxs % tile_size_candidates[-1] != 0
-        for c_idx in range(len(tile_size_candidates)):
-            candidate = tile_size_candidates[c_idx]
-            if (bxs / candidate >= default_tiling_factor) and (ignore_divisibility or bxs % candidate == 0):
-                bxs_tile_size = candidate
-                break
-
-    return bxs_tile_size
 
 
 #
@@ -224,14 +171,9 @@ def _calculate_bxs_sharding(
         bxs % num_shard_workers == 0,
         f"Batch times sequence length {bxs} must be a multiple of the number of shards {num_shard_workers}",
     )
-    bxs_shard_size = _get_bxs_shard_size(bxs, num_shard_workers)
-    bxs_size_per_worker = bxs // num_shard_workers
-    bxs_tiles = TiledRange(bxs_size_per_worker, bxs_shard_size)
 
-    shard_list = []
-    for bxs_tile in bxs_tiles:
-        shard_list.append(DimShard(bxs_size_per_worker * program_id + bxs_tile.start_offset, bxs_tile.size, mlp_params))
-    return shard_list
+    bxs_shard_size = bxs // num_shard_workers
+    return [DimShard(bxs_shard_size * program_id, bxs_shard_size, mlp_params)]
 
 
 def is_launch_grid_valid_for_mlp() -> bool:

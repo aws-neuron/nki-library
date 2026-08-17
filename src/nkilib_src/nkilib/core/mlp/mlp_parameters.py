@@ -17,6 +17,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 from nki.language import NKIObject
@@ -111,6 +112,7 @@ class MLPQuantizationParameters(NKIObject):
     down_in_scale: Optional[nl.NkiTensor]
     clipping_bound: float
     mx_dummy_scale_hbm: Optional[nl.NkiTensor]
+    use_folded_mx_scales: bool
 
     def __init__(
         self,
@@ -122,6 +124,7 @@ class MLPQuantizationParameters(NKIObject):
         down_in_scale: Optional[nl.NkiTensor],
         clipping_bound: float,
         mx_dummy_scale_hbm: Optional[nl.NkiTensor] = None,
+        use_folded_mx_scales: bool = False,
     ):
         self.quantization_type = quantization_type
         self.gate_w_scale = gate_w_scale
@@ -131,6 +134,7 @@ class MLPQuantizationParameters(NKIObject):
         self.down_in_scale = down_in_scale
         self.clipping_bound = clipping_bound
         self.mx_dummy_scale_hbm = mx_dummy_scale_hbm
+        self.use_folded_mx_scales = use_folded_mx_scales
 
     def _validate_dtype(self):
         kernel_assert(
@@ -192,6 +196,12 @@ class MLPQuantizationParameters(NKIObject):
             kernel_assert(
                 self.down_w_scale != None and resolve_dtype_to_nki(self.down_w_scale.dtype) == nl.uint8,
                 f"Unsupported down_w_scale dtype: got {self.down_w_scale.dtype}, expected nl.uint8.",
+            )
+
+        if self.use_folded_mx_scales:
+            kernel_assert(
+                self.quantization_type == QuantizationType.MX,
+                f"use_folded_mx_scales is only supported for QuantizationType.MX, got {self.quantization_type}.",
             )
 
     def _validate_shapes(self, params):
@@ -518,6 +528,7 @@ class MLPParameters(NKIObject):
         transposed_out: bool = False,
         dtype_mode: DtypeMode = DtypeMode.NON_OCP,
         gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
+        use_folded_mx_scales: bool = False,
     ):
         self.transposed_in = transposed_in
         self.transposed_out = transposed_out
@@ -601,6 +612,7 @@ class MLPParameters(NKIObject):
             down_in_scale,
             quant_clipping_bound,
             mx_dummy_scale_hbm=mx_dummy_scale_hbm,
+            use_folded_mx_scales=use_folded_mx_scales,
         )
 
         if gate_up_w_layout == MLPGateUpWeightLayout.CONTIGUOUS:
@@ -660,6 +672,22 @@ def mlpp_input_has_packed_scale(params: MLPParameters) -> bool:
     )
 
 
+def mlpp_input_has_mx_block_scale(params: MLPParameters) -> bool:
+    """True when hidden_tensor carries full MX per-block scales (rmsnorm_mx_prefill packed output).
+
+    Discriminated from the ROW-scale path by the scale region size: the ROW path appends only
+    4 fp8 bytes (1 fp32 scalar per token), while the MX block-scale path appends
+    ceil(n_H512/4)*128 bytes (>= 128 for any H >= 512).
+    """
+    if not mlpp_has_quantized_input(params) or not params.quant_params.is_quant_mx():
+        return False
+    n_H512 = params.hidden_size // 512
+    n_packed = math.ceil(n_H512 / 4)
+    expected_scale_region = n_packed * 128
+    actual_tail = params.hidden_tensor.shape[-1] - params.hidden_size
+    return actual_tail >= expected_scale_region
+
+
 def mlpp_has_fused_add(params: MLPParameters) -> bool:
     return params.fused_add_params.fused_add_tensor != None
 
@@ -709,11 +737,28 @@ def mlpp_has_normalization_bias(params: MLPParameters) -> bool:
 
 
 def mlpp_has_dma_xpose(params: MLPParameters) -> bool:
-    return (
+    """
+    There are two cases where we can use the DMA engines to transpose the hidden tensor:
+        1. In the MX kernel if we're using H_X4_INNERMOST layout. If the X4 dimension is the
+           fastest-moving dimension then we can view the hidden tensor from fp8 to fp32 and perform
+           a 4-byte DMA transpose to get the X4 dimension on free.
+        2. In the basic kernel if the hidden tensor is not quantized. We can do a straightfoward
+           DMA transpose to land H on partition and BxS on free. If normalization or fused add is
+           enabled then we actually must use PE transpose because we need H on free during those
+           operations. We must also check that the compilation target is TRN2 or newer.
+    """
+    mx_kernel_has_dma_xpose = (
         params.quant_params.is_dtype_mx()
         and mlpp_has_quantized_input(params)
         and params.gate_up_w_layout == MLPGateUpWeightLayout.H_X4_INNERMOST
     )
+    basic_kernel_has_dma_xpose = (
+        not mlpp_has_quantized_input(params)
+        and not mlpp_has_normalization(params)
+        and not mlpp_has_fused_add(params)
+        and nisa.get_nc_version() >= nisa.nc_version.gen3
+    )
+    return mx_kernel_has_dma_xpose or basic_kernel_has_dma_xpose
 
 
 def override_seq_len(mlp_params: MLPParameters, seq_len: int) -> MLPParameters:

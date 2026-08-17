@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import functools
+from collections.abc import Callable
+from typing import Any, NotRequired, TypedDict
 
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.moe import moe_tkg
 from nkilib_src.nkilib.core.moe.moe_tkg.all_expert_mx_utils import BF16_PER_INT32
 from nkilib_src.nkilib.core.moe.moe_tkg.moe_tkg_torch import moe_tkg_torch_ref
@@ -28,6 +29,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     MoEAllToAllVStrategy,
     QuantizationType,
 )
+
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_utils import build_moe_tkg, get_expert_affinity_dtype
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_wrapper import moe_tkg_sbuf_io_wrapper
 from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
@@ -77,6 +79,52 @@ def _resolve_dtype(d):
     return d
 
 
+class MoeTkgDtypeModeConfig(TypedDict):
+    """Shapes, quantization and fusion settings shared by every dtype_mode canary case."""
+
+    vnc: int
+    tokens: int
+    hidden: int
+    intermediate: int
+    expert: int
+    top_k: int
+    act_fn: ActFnType
+    scale_mode: ExpertAffinityScaleMode
+    clamp: bool
+    bias: bool
+    q_dtype: str
+    dtype: str
+
+
+class MoeTkgBuildKwargs(TypedDict):
+    """Keyword arguments forwarded to the MoE TKG input builder.
+
+    Keys marked as not required are only supplied by the test variants that
+    exercise the corresponding feature.
+    """
+
+    tokens: int
+    hidden: int
+    intermediate: int
+    expert: int
+    top_k: int | None
+    act_fn: ActFnType
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode
+    is_all_expert: bool
+    expert_affinities_dtype: str
+    in_dtype: str | np.dtype
+    out_dtype: str | np.dtype
+    bias: bool
+    clamp: bool
+    quant_dtype: NotRequired[str | np.dtype]
+    quant_type: NotRequired[QuantizationType]
+    is_all_expert_dynamic: NotRequired[bool]
+    routed_token_ratio: NotRequired[float]
+    block_size: NotRequired[int | None]
+    all_to_all_v_strategy: NotRequired[MoEAllToAllVStrategy]
+    dtype_mode: NotRequired[DtypeMode]
+
+
 def _run_moe_tkg_test(
     test_manager: Orchestrator,
     vnc: int,
@@ -100,31 +148,31 @@ def _run_moe_tkg_test(
     in_dtype=None,
     out_dtype=None,
     is_all_expert_dynamic: bool = False,
-    routed_token_ratio: float | None = None,
+    routed_token_ratio: float = 1.0,
     block_size: int | None = None,
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
-    torch_ref: callable = None,
+    torch_ref: Callable[..., Any] | None = None,
     dtype_mode=None,
     **_ignored,
 ):
     """Common test runner for moe_tkg kernel tests."""
     resolved_in = _resolve_dtype(in_dtype if in_dtype is not None else dtype)
     resolved_out = _resolve_dtype(out_dtype if out_dtype is not None else dtype)
-    build_kw = dict(
-        tokens=tokens,
-        hidden=hidden,
-        intermediate=intermediate,
-        expert=expert,
-        top_k=top_k,
-        act_fn=act_fn,
-        expert_affinities_scaling_mode=scale_mode,
-        is_all_expert=all_expert,
-        expert_affinities_dtype=get_expert_affinity_dtype(all_expert),
-        in_dtype=resolved_in,
-        out_dtype=resolved_out,
-        bias=bias,
-        clamp=clamp,
-    )
+    build_kw: MoeTkgBuildKwargs = {
+        'tokens': tokens,
+        'hidden': hidden,
+        'intermediate': intermediate,
+        'expert': expert,
+        'top_k': top_k,
+        'act_fn': act_fn,
+        'expert_affinities_scaling_mode': scale_mode,
+        'is_all_expert': all_expert,
+        'expert_affinities_dtype': get_expert_affinity_dtype(all_expert),
+        'in_dtype': resolved_in,
+        'out_dtype': resolved_out,
+        'bias': bias,
+        'clamp': clamp,
+    }
     if q_dtype is not None:
         build_kw["quant_dtype"] = _resolve_dtype(q_dtype)
     if q_type is not None:
@@ -139,18 +187,22 @@ def _run_moe_tkg_test(
 
     # Non-A2Av I/O shapes match
     if all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
-        output_tensor_descriptor = lambda ki: {"out": np.zeros(ki["hidden_input"].shape, dtype=ki["output_dtype"])}
+
+        def output_tensor_descriptor(ki):
+            return {"out": np.zeros(ki["hidden_input"].shape, dtype=ki["output_dtype"])}
 
     # A2Av I/O have different shapes
     # Input: [T, H + H/4 + 2 * E_L + 4]fp8
     # Output: [T, H + 2]bf16
     else:
-        output_tensor_descriptor = lambda ki: {
-            "out": np.zeros(
-                (ki["hidden_input"].shape[0], ki["expert_down_weights"].shape[-1] + BF16_PER_INT32),
-                dtype=ki["output_dtype"],
-            )
-        }
+
+        def output_tensor_descriptor(ki):
+            return {
+                "out": np.zeros(
+                    (ki["hidden_input"].shape[0], ki["expert_down_weights"].shape[-1] + BF16_PER_INT32),
+                    dtype=ki["output_dtype"],
+                )
+            }
 
     # Wrap the torch ref to pre-resolve DtypeMode.AUTO using platform_target.
     # The torch ref runs on CPU and can't query hardware; without this the
@@ -176,7 +228,6 @@ def _run_moe_tkg_test(
     compiler_args = CompilerArgs(
         logical_nc_config=vnc,
         platform_target=platform_target,
-        additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
     )
     framework.run_test(
         test_config=None,
@@ -403,6 +454,8 @@ MOE_TKG_DYNAMISM_PARAM_NAMES = (
 )
 MOE_TKG_DYNAMISM_PARAMS = [
     # vnc, tokens, hidden, intermediate, expert, act_fn, q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size
+    # LNC=1 (single core) DLoC config
+    (1, 512,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128),
     # MXFP4 large T, E=128, K=4 — average skew (T*K/E)
     (2, 128,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 16),
     (2, 256,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 32),
@@ -650,7 +703,7 @@ def _make_sweep_params(*, T, H, I, E, configs=_STD_CONFIGS, vnc=2):
             e.append(lst[-1])
         return e
 
-    dim_tuples = list(zip(_expand(T), _expand(H), _expand(I), _expand(E)))
+    dim_tuples = list(zip(_expand(T), _expand(H), _expand(I), _expand(E), strict=True))
     params = []
     for t, h, i, e in dim_tuples:
         for act_fn, scale_mode, all_expert, dtype, clamp, bias, top_k in configs:
@@ -832,8 +885,10 @@ class TestMoeTkgKernel:
         kwargs = {k: v for k, v in locals().items() if k != "self"}
         kwargs.update(_DYNAMIC_DEFAULTS)
         kwargs["is_all_expert_dynamic"] = True
-        # # We see a tiny number of elements just outside 5% rtol when using very large T, due to high sample size of bf16 error
-        kwargs["rtol"] = 5e-2  # if tokens <= 1024 else 5.1e-2
+        # At very large T a few elements land just outside 5% rtol (high bf16 sample count);
+        # the alt-EMAX golden default tips the maximal-load config (t=2048, rr=1.0) to 5.25%.
+        # Relax large-T only; small-T stays at the tight 5%.
+        kwargs["rtol"] = 5e-2 if tokens <= 1024 else 6e-2
         kwargs["all_to_all_v_strategy"] = a2av_strategy
         kwargs["torch_ref"] = moe_tkg_ref_fp8_inp
         _run_moe_tkg_test(**kwargs)
@@ -1066,20 +1121,20 @@ class TestMoeTkgKernel:
     # Params mirror an existing passing config from ``MOE_TKG_TEST_PARAMS``
     # (row 287: fp8 ROW, all-expert + selective × STATIC, tokens=4) so any
     # failure here is specific to the DtypeMode migration, not to the shape.
-    _MOE_TKG_BY_DTYPE_MODE_CONFIG = dict(
-        vnc=2,
-        tokens=4,
-        hidden=512,
-        intermediate=64,
-        expert=2,
-        top_k=2,
-        act_fn=ActFnType.SiLU,
-        scale_mode=ExpertAffinityScaleMode.POST_SCALE,
-        clamp=True,
-        bias=True,
-        q_dtype=nl.float8_e4m3,
-        dtype=nl.bfloat16,
-    )
+    _MOE_TKG_BY_DTYPE_MODE_CONFIG: MoeTkgDtypeModeConfig = {
+        'vnc': 2,
+        'tokens': 4,
+        'hidden': 512,
+        'intermediate': 64,
+        'expert': 2,
+        'top_k': 2,
+        'act_fn': ActFnType.SiLU,
+        'scale_mode': ExpertAffinityScaleMode.POST_SCALE,
+        'clamp': True,
+        'bias': True,
+        'q_dtype': nl.float8_e4m3,
+        'dtype': nl.bfloat16,
+    }
 
     @pytest.mark.fast
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])

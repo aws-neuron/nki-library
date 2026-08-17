@@ -32,9 +32,6 @@ T_FULL_TILE_SIZE = 512
 # DMA engine mode
 _DGE_MODE_NONE = 3
 
-# Heuristic threshold for sharding on T to halve computation at the cost of extra local collective
-SHARDING_THRESHOLD = 10
-
 
 def layernorm_tkg(
     input: nl.NkiTensor,
@@ -108,23 +105,21 @@ def layernorm_tkg(
     else:
         # HBM input path
         _T = input.shape[0] * input.shape[1] if len(input.shape) == 3 else input.shape[0]
-        _H = input.shape[-1]
-        _H1 = _H // _H0
 
-        if _lnc == 1:
-            shard_on_h = False
-        else:
-            shard_on_h = (_H1 % _lnc == 0) and (SHARDING_THRESHOLD <= _T)
+        # Reduce over the full hidden dim locally on every core instead of exchanging partial
+        # sum(x) and sum(x^2) across cores. The cross-core exchange (two nisa.sendrecv plus a
+        # per-partial reduction matmul into an auto-allocated PSUM tile) carries a latent
+        # non-determinism that the backend's PSUM address-rotation can expose under certain
+        # schedules, producing intermittent divergence in the top tokens of the output. Reducing
+        # locally is numerically equivalent and race-free, and the extra reduction work is
+        # negligible relative to the MLP projections.
+        shard_on_h = False
 
         # Determine shard_H1 from output shape
         if len(output.shape) == 2:
             _shard_H1 = output.shape[1] // _T
         else:
             _shard_H1 = output.shape[1] if output.shape[2] == _T else output.shape[2]
-
-        # T-sharding: output covers full H, no H-sharding needed
-        if _shard_H1 == _H1:
-            shard_on_h = False
 
         if _T >= _H0:
             # _th path: output is [H0, H1_shard, T]

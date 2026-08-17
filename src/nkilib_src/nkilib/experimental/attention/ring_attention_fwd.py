@@ -34,6 +34,7 @@ from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 # Maximum number of Q groups to process per output tile in the reduction
 # and normalization loops.
 _MAX_GRPS_PER_TILE = 128
+_FULLY_MASKED_LSE_THRESHOLD = -1.0e30
 
 
 def _load_rank_sb(iota_nw, scalar_rank, qts):
@@ -44,7 +45,7 @@ def _load_rank_sb(iota_nw, scalar_rank, qts):
     directly into SBUF, then stream_shuffle_broadcast to replicate across all
     partitions. This pattern (matching ring_attention_bwd) avoids register_store,
     whose scheduling can be reordered across ring steps on trn3 cp=4 lnc=2
-    striped causal — see steering_private/trn3_ring_id_investigation.md.
+    striped causal.
 
     Args:
         iota_nw (nl.NkiTensor): [1, num_workers] HBM iota table containing [0, 1, ..., num_workers-1].
@@ -700,6 +701,19 @@ def _normalize_one_batch(
         """
         if has_partial and grp_end == num_grps:
             nisa.memset(lse_tile[last_grp_rows:sb_p, num_grps - 1 : num_grps], 0.0)
+
+        """
+        A fully masked row retains the LSE sentinel, which overflows when backward reconstructs probabilities.
+        Zeroing that LSE lets the existing score mask produce zero probability.
+        """
+        nisa.scalar_tensor_tensor(
+            dst=lse_tile,
+            data=lse_tile,
+            op0=nl.greater,
+            operand0=_FULLY_MASKED_LSE_THRESHOLD,
+            op1=nl.multiply,
+            operand1=lse_tile,
+        )
 
         # Write only our groups' LSE using ap() on the raw tensor
         lse_ap_pat = [[num_grps, sb_p], [1, grp_count]]

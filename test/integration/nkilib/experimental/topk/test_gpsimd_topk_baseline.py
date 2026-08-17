@@ -36,7 +36,13 @@ from typing import final
 import nki.language as nl
 import pytest
 
-from test.integration.nkilib.core.topk.test_topk import TestTopKKernel
+# Alias with a leading underscore so pytest does NOT re-collect TestTopKKernel in this
+# module. A bare `import TestTopKKernel` makes pytest collect the entire test_topk_unit
+# suite a second time under this module; those duplicate nodes derive the same local
+# output directory (derive_pytest_test_id strips the module path), so under pytest-xdist
+# they race on one directory and clobber each other's file.neff, producing an intermittent
+# "NEFF file not found" compile failure. We only need the class to reuse run_topk_test.
+from test.integration.nkilib.core.topk.test_topk import TestTopKKernel as _TestTopKKernel
 from test.utils.common_dataclasses import Platforms
 from test.utils.metrics_collector import MetricsCollector
 from test.utils.pytest_parametrize import pytest_parametrize
@@ -92,7 +98,7 @@ class TestRotationalTopKGptOssBaseline:
         dtype,
     ):
         """Rotational top-k at a GPT-OSS decode shape (baseline for the GpSIMD A/B)."""
-        TestTopKKernel().run_topk_test(
+        _TestTopKKernel().run_topk_test(
             test_manager=test_manager,
             platform_target=platform_target,
             lnc_degree=lnc_degree,

@@ -31,26 +31,26 @@ from .pad_modes import PadMode
 from .pad_params import PadParams
 
 
-def _fill_dim(padded_sb: nl.NkiTensor, pad_mode: PadMode, params: PadParams, dim: int) -> None:
+def _fill_dim(view: nl.NkiTensor, pad_mode: PadMode, params: PadParams, dim: int) -> None:
     """Fill the padding region along one spatial dimension in the SBUF tile.
 
-    Copies data from the interior (non-padded) region of *padded_sb* into
-    the before- and after-padding positions, using the PadMode callback to
-    determine the source index for each padded element.
+    Copies data from the interior (non-padded) region of *view* into the
+    before- and after-padding positions along *dim*, using the PadMode
+    callback to determine the source index for each padded element.
     """
     axis = dim + 1
     pad_before = params.before(dim)
     pad_after = params.after(dim)
-    interior_size = padded_sb.shape[axis] - pad_before - pad_after
+    interior_size = view.shape[axis] - pad_before - pad_after
 
-    interior = padded_sb.slice(axis, pad_before, pad_before + interior_size)
+    interior = view.slice(axis, pad_before, pad_before + interior_size)
 
     for i in range(pad_before):
-        dst = padded_sb.select(axis, i)
+        dst = view.select(axis, i)
         pad_mode.fill(dst, interior, dim, -(pad_before - i))
 
     for i in range(pad_after):
-        dst = padded_sb.select(axis, pad_before + interior_size + i)
+        dst = view.select(axis, pad_before + interior_size + i)
         pad_mode.fill(dst, interior, dim, i)
 
 
@@ -70,12 +70,15 @@ def pad_compute(src_sb: nl.NkiTensor, padded_sb: nl.NkiTensor, params: PadParams
     d_before, h_before, w_before = params.before(0), params.before(1), params.before(2)
     _, d_count, h_count, w_count = src_sb.shape
 
-    interior = padded_sb.slice(1, d_before, d_before + d_count)
-    interior = interior.slice(2, h_before, h_before + h_count)
-    interior = interior.slice(3, w_before, w_before + w_count)
-    nisa.tensor_copy(dst=interior, src=src_sb)
+    # Build progressively narrower views for each dimension.
+    d_interior_view = padded_sb.slice(1, d_before, d_before + d_count)
+    dh_interior_view = d_interior_view.slice(2, h_before, h_before + h_count)
+    dhw_interior_view = dh_interior_view.slice(3, w_before, w_before + w_count)
+
+    # Copy source into the innermost interior region
+    nisa.tensor_copy(dst=dhw_interior_view, src=src_sb)
 
     # Fill padding inner-to-outer: W → H → D
-    _fill_dim(padded_sb, pad_mode, params, 2)
-    _fill_dim(padded_sb, pad_mode, params, 1)
-    _fill_dim(padded_sb, pad_mode, params, 0)
+    _fill_dim(dh_interior_view, pad_mode, params, 2)  # W pad filling
+    _fill_dim(d_interior_view, pad_mode, params, 1)  # H pad filling
+    _fill_dim(padded_sb, pad_mode, params, 0)  # D pad filling

@@ -14,11 +14,10 @@
 
 """MLP CTE basic (non-MX) kernel implementation for NONE, ROW, and STATIC quantization types."""
 
-from typing import Callable
-
 import nki.language as nl
 
 from ....utils.allocator import SbufManager
+from ....utils.common_types import GateUpDim
 from ....utils.kernel_assert import kernel_assert
 from ....utils.kernel_helpers import get_program_sharding_info, is_launched_as_spmd
 from ....utils.logging import get_logger
@@ -30,8 +29,6 @@ from ...mlp_parameters import (
     mlpp_has_normalization,
     mlpp_has_normalization_bias,
     mlpp_has_normalization_weights,
-    mlpp_has_quantized_input,
-    mlpp_has_quantized_weights,
     mlpp_has_up_projection_bias,
 )
 from ..mlp_cte_constants import (
@@ -51,6 +48,7 @@ from .mlp_cte_basic_allocation import (
     allocate_down_projection_weights,
     allocate_hidden_tensor_tile,
     allocate_intermediate_tensor_tile,
+    allocate_output_tensor_tile,
     allocate_src_projection_weights,
 )
 from .mlp_cte_basic_norm import (
@@ -59,8 +57,8 @@ from .mlp_cte_basic_norm import (
 )
 from .mlp_cte_basic_projection import (
     perform_down_projection,
-    perform_gate_projection_if_necessary,
-    perform_up_projection,
+    perform_gate_up_projection,
+    sync_down_proj_results_across_int_dim,
 )
 from .mlp_cte_basic_quantization import perform_intermediate_quantization
 from .mlp_cte_basic_tensor_io import (
@@ -95,15 +93,13 @@ def mlp_cte_basic(
         "Launch grid is not valid. MLP CTE only supports sharding on 1 dimension.",
     )
 
-    top_level_interleave_degree = 1 if mlp_params.hidden_size >= 8192 else 2
+    top_level_interleave_degree = 1  # if mlp_params.hidden_size >= 8192 else 2
     sbm = SbufManager(
         sb_lower_bound=0,
         sb_upper_bound=MAX_AVAILABLE_SBUF_SIZE,
         logger=get_logger("mlp_cte"),
     )
-    sbm.open_scope(interleave_degree=top_level_interleave_degree)
-
-    heap_alloc = sbm.alloc_heap
+    sbm.open_scope(interleave_degree=top_level_interleave_degree, name='mlp_cte_basic')
 
     if is_launched_as_spmd():
         _, total_programs, program_id = get_program_sharding_info()
@@ -119,7 +115,6 @@ def mlp_cte_basic(
                 program_id,
                 shard_idx,
                 sbm,
-                heap_alloc,
                 output_tensor_hbm,
                 output_stored_add_tensor_hbm,
             )
@@ -138,13 +133,11 @@ def mlp_cte_basic(
             0,
             0,
             sbm,
-            heap_alloc,
             output_tensor_hbm,
             output_stored_add_tensor_hbm,
         )
 
-    if sbm != None:
-        sbm.close_scope()
+    sbm.close_scope()  # mlp_cte_basic
 
 
 def _execute_on_shard(
@@ -155,11 +148,9 @@ def _execute_on_shard(
     program_id: int,
     shard_idx: int,
     sbm: SbufManager,
-    heap_alloc: Callable,
     output_tensor_hbm: nl.NkiTensor,
     output_stored_add_tensor_hbm: nl.NkiTensor,
 ):
-    tile_info = build_mlp_cte_basic_tile_info(shard_mlp_params, sharded_dim, dim_shard)
     constants = build_mlp_cte_constants(
         shard_mlp_params,
         sharded_dim,
@@ -168,8 +159,8 @@ def _execute_on_shard(
         shard_idx,
         program_id,
         dim_shard,
-        heap_alloc,
     )
+    tile_info = build_mlp_cte_basic_tile_info(shard_mlp_params, constants, sbm.get_free_space(), sharded_dim, dim_shard)
     _mlp_cte_single_shard(
         program_id,
         shard_idx,
@@ -198,13 +189,11 @@ def _mlp_cte_single_shard(
     else:
         batch_range = mlp_params.batch_size
 
-    heap_alloc = sbm.alloc_heap if sbm else nl.NkiTensor
-    stack_alloc = sbm.alloc_stack if sbm else nl.NkiTensor
     gate_proj_bias_tensor_sbuf = (
         load_bias_vector(
             mlp_params.bias_params.gate_proj_bias_tensor,
             constants.compute_data_type,
-            heap_alloc,
+            sbm.alloc_heap,
         )
         if mlpp_has_gate_projection_bias(mlp_params)
         else None
@@ -213,7 +202,7 @@ def _mlp_cte_single_shard(
         load_bias_vector(
             mlp_params.bias_params.up_proj_bias_tensor,
             constants.compute_data_type,
-            heap_alloc,
+            sbm.alloc_heap,
         )
         if mlpp_has_up_projection_bias(mlp_params)
         else None
@@ -222,7 +211,7 @@ def _mlp_cte_single_shard(
         load_bias_vector(
             mlp_params.bias_params.down_proj_bias_tensor,
             constants.compute_data_type,
-            heap_alloc,
+            sbm.alloc_heap,
         )
         if mlpp_has_down_projection_bias(mlp_params)
         else None
@@ -258,28 +247,28 @@ def _mlp_cte_single_shard(
     up_proj_static_weight_scales_sbuf = None
     down_proj_static_weight_scales_sbuf = None
     if mlp_params.quant_params.is_logical_quant_static():
-        gate_up_proj_static_input_scales_sbuf = heap_alloc(
+        gate_up_proj_static_input_scales_sbuf = sbm.alloc_heap(
             (nl.tile_size.pmax, 1),
             dtype=nl.float32,
             name=f'gate_up_proj_static_input_scales__shard{shard_idx}__prog{program_id}',
         )
-        down_proj_static_input_scales_sbuf = heap_alloc(
+        down_proj_static_input_scales_sbuf = sbm.alloc_heap(
             (nl.tile_size.pmax, 1),
             dtype=nl.float32,
             name=f'down_proj_static_input_scales__shard{shard_idx}__prog{program_id}',
         )
         if not mlp_params.skip_gate_proj:
-            gate_proj_static_weight_scales_sbuf = heap_alloc(
+            gate_proj_static_weight_scales_sbuf = sbm.alloc_heap(
                 (nl.tile_size.pmax, 1),
                 dtype=nl.float32,
                 name=f'gate_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
             )
-        up_proj_static_weight_scales_sbuf = heap_alloc(
+        up_proj_static_weight_scales_sbuf = sbm.alloc_heap(
             (nl.tile_size.pmax, 1),
             dtype=nl.float32,
             name=f'up_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
         )
-        down_proj_static_weight_scales_sbuf = heap_alloc(
+        down_proj_static_weight_scales_sbuf = sbm.alloc_heap(
             (nl.tile_size.pmax, 1),
             dtype=nl.float32,
             name=f'down_proj_static_weight_scales__shard{shard_idx}__prog{program_id}',
@@ -298,7 +287,7 @@ def _mlp_cte_single_shard(
         load_vector_across_partitions(
             mlp_params.norm_params.normalization_weights_tensor,
             constants.norm_weights_bias_data_type,
-            heap_alloc,
+            sbm.alloc_heap,
             tensor_name=f"norm_weights_tensor__shard{shard_idx}__prog{program_id}",
         )
         if mlpp_has_normalization_weights(mlp_params)
@@ -308,7 +297,7 @@ def _mlp_cte_single_shard(
         load_vector_across_partitions(
             mlp_params.norm_params.normalization_bias_tensor,
             constants.norm_weights_bias_data_type,
-            heap_alloc,
+            sbm.alloc_heap,
             tensor_name=f"norm_bias_tensor__shard{shard_idx}__prog{program_id}",
         )
         if mlpp_has_normalization_bias(mlp_params)
@@ -319,18 +308,10 @@ def _mlp_cte_single_shard(
         for bxs_tile_idx in range(tile_info.bxs_dim_tile.tile_count):
             indices = MlpBxsIndices(program_id, shard_idx, batch_idx, bxs_tile_idx)
 
-            hidden_tile_sbuf_list = []
-            hidden_tile_scales_sbuf_list = []
-
-            allocate_hidden_tensor_tile(
-                mlp_params,
-                tile_info,
-                constants,
-                indices,
-                hidden_tile_sbuf_list,
-                hidden_tile_scales_sbuf_list,
-                sbm,
-            )
+            # This is the alive range of the src_proj_res_sbuf tensor. In the quantized flow, it
+            # can be deallocated after intermediate quantization. In the non-quantized flow, it
+            # needs to stay alive until after down projection.
+            sbm.open_scope(name='intermediate_alive')
 
             src_proj_res_sbuf_list = []
             allocate_intermediate_tensor_tile(
@@ -341,7 +322,22 @@ def _mlp_cte_single_shard(
                 "src_proj_res_sbuf",
                 constants.compute_data_type,
                 src_proj_res_sbuf_list,
-                sbm,
+                sbm.alloc_stack,
+            )
+
+            sbm.open_scope(name='gate_up_projection')
+
+            hidden_tile_sbuf_list = []
+            hidden_tile_scales_sbuf_list = []
+            allocate_hidden_tensor_tile(
+                mlp_params,
+                tile_info,
+                constants,
+                indices,
+                hidden_tile_sbuf_list,
+                hidden_tile_scales_sbuf_list,
+                sbm.alloc_stack,
+                sbm.alloc_stack,
             )
 
             load_hidden_tensor_tile_opt_fused_add(
@@ -353,6 +349,7 @@ def _mlp_cte_single_shard(
                 hidden_tile_scales_sbuf_list,
                 output_stored_add_tensor_hbm,
             )
+
             apply_normalization_if_necessary(
                 mlp_params,
                 tile_info,
@@ -360,7 +357,7 @@ def _mlp_cte_single_shard(
                 indices,
                 hidden_tile_sbuf_list,
                 hidden_tile_sbuf_list,
-                heap_alloc,
+                sbm.alloc_heap,
             )
 
             if mlpp_has_normalization(mlp_params):
@@ -373,6 +370,7 @@ def _mlp_cte_single_shard(
                 constants,
                 indices,
                 src_proj_weights_sbuf_list,
+                sbm.alloc_stack,
                 sbm,
             )
 
@@ -389,48 +387,58 @@ def _mlp_cte_single_shard(
                     sbm,
                 )
 
-            perform_gate_projection_if_necessary(
-                mlp_params,
-                tile_info,
-                constants,
-                indices,
-                hidden_tile_sbuf_list,
-                src_proj_weights_sbuf_list,
-                gate_proj_bias_tensor_sbuf,
-                gate_proj_row_weight_scales_sbuf,
-                gate_proj_static_weight_scales_sbuf,
-                hidden_tile_scales_sbuf_list,
-                src_proj_res_sbuf_list,
-                sbm,
-            )
+            if not mlp_params.skip_gate_proj:
+                perform_gate_up_projection(
+                    mlp_params,
+                    tile_info,
+                    constants,
+                    indices,
+                    GateUpDim.GATE,
+                    hidden_tile_sbuf_list,
+                    src_proj_weights_sbuf_list,
+                    gate_proj_bias_tensor_sbuf,
+                    gate_proj_static_weight_scales_sbuf,
+                    gate_proj_row_weight_scales_sbuf,
+                    hidden_tile_scales_sbuf_list,
+                    src_proj_res_sbuf_list,
+                    sbm,
+                )
 
-            perform_up_projection(
+            perform_gate_up_projection(
                 mlp_params,
                 tile_info,
                 constants,
                 indices,
+                GateUpDim.UP,
                 hidden_tile_sbuf_list,
                 src_proj_weights_sbuf_list,
                 up_proj_bias_tensor_sbuf,
-                up_proj_row_weight_scales_sbuf,
                 up_proj_static_weight_scales_sbuf,
+                up_proj_row_weight_scales_sbuf,
                 hidden_tile_scales_sbuf_list,
                 src_proj_res_sbuf_list,
                 sbm,
             )
 
-            if sbm != None:
-                for weight_buffer_idx in range(len(src_proj_weights_sbuf_list)):
-                    sbm.pop_heap()  # src_proj_weights_sbuf
-                if mlpp_has_quantized_input(mlp_params):
-                    for bxs_subtile_idx in range(len(hidden_tile_sbuf_list)):
-                        sbm.pop_heap()  # hidden_tile_sbuf
+            sbm.close_scope()  # gate_up_projection (free hidden_tile_scales_sbuf)
 
-            if mlpp_has_quantized_weights(mlp_params):
+            # This has to be allocated so early so that the quantized intermediate tensor and its
+            # dequantization scale can be freed before this tensor gets freed.
+            output_tile_sbuf_list = []
+            allocate_output_tensor_tile(
+                mlp_params,
+                tile_info,
+                constants,
+                indices,
+                output_tile_sbuf_list,
+                sbm.alloc_heap,
+            )
+
+            if mlp_params.quant_params.is_quant():
                 intermediate_dequant_scales_sbuf_list = []
                 for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                     if mlp_params.quant_params.is_quant_row():
-                        intermediate_dequant_scales_sbuf = stack_alloc(
+                        intermediate_dequant_scales_sbuf = sbm.alloc_heap(
                             (tile_info.bxs_dim_tile.subtile_dim_info.tile_size, 1),
                             dtype=nl.float32,
                             name=indices.get_tensor_name('intermediate_scale_tensor', f'subbxs{bxs_subtile_idx}'),
@@ -445,12 +453,13 @@ def _mlp_cte_single_shard(
                     'intermediate_tensor',
                     constants.down_proj_quant_data_type,
                     intermediate_tensor_sbuf_list,
-                    sbm,
+                    sbm.alloc_heap,
                 )
                 perform_intermediate_quantization(
                     mlp_params,
                     tile_info,
                     constants,
+                    indices,
                     bxs_tile_idx,
                     src_proj_res_sbuf_list,
                     intermediate_tensor_sbuf_list,
@@ -458,18 +467,19 @@ def _mlp_cte_single_shard(
                     down_proj_static_input_scales_sbuf,
                     sbm,
                 )
+                sbm.close_scope()  # intermediate_alive (free src_proj_res_sbuf)
             else:
                 intermediate_dequant_scales_sbuf_list = None
                 intermediate_tensor_sbuf_list = src_proj_res_sbuf_list
 
-            down_proj_weights_sbuf = []
+            down_proj_weights_sbuf_list = []
             allocate_down_projection_weights(
                 mlp_params,
                 tile_info,
                 constants,
                 indices,
-                down_proj_weights_sbuf,
-                sbm,
+                down_proj_weights_sbuf_list,
+                sbm.alloc_heap,
             )
 
             transpose_intermediate_tensor_tile(
@@ -482,21 +492,6 @@ def _mlp_cte_single_shard(
                 sbm,
             )
 
-            if mlpp_has_quantized_input(mlp_params):
-                output_tile_sbuf_list = []
-                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
-                    output_tile_sbuf = stack_alloc(
-                        (
-                            tile_info.bxs_dim_tile.subtile_dim_info.tile_size,
-                            mlp_params.hidden_size,
-                        ),
-                        dtype=constants.compute_data_type,
-                        name=indices.get_tensor_name('output_tensor', f'subbxs{bxs_subtile_idx}'),
-                    )
-                    output_tile_sbuf_list.append(output_tile_sbuf)
-            else:
-                output_tile_sbuf_list = hidden_tile_sbuf_list
-
             perform_down_projection(
                 mlp_params,
                 tile_info,
@@ -504,7 +499,7 @@ def _mlp_cte_single_shard(
                 indices,
                 intermediate_tensor_sbuf_list,
                 mlp_params.down_proj_weights_tensor,
-                down_proj_weights_sbuf,
+                down_proj_weights_sbuf_list,
                 down_proj_bias_tensor_sbuf,
                 down_proj_static_weight_scales_sbuf,
                 intermediate_dequant_scales_sbuf_list,
@@ -512,7 +507,27 @@ def _mlp_cte_single_shard(
                 sbm,
             )
 
+            for weight_buffer_idx in range(len(down_proj_weights_sbuf_list)):
+                sbm.pop_heap()
+            if mlp_params.quant_params.is_quant():
+                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                    sbm.pop_heap()  # intermediate_tensor_sbuf
+            if mlp_params.quant_params.is_quant_row():
+                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                    sbm.pop_heap()  # intermediate_dequant_scales_sbuf
+
+            if not mlp_params.quant_params.is_quant():
+                sbm.close_scope()  # intermediate_alive (free src_proj_res_sbuf)
+
             if constants.sharded_dim == ShardedDim.INTERMEDIATE:
+                sync_down_proj_results_across_int_dim(
+                    mlp_params,
+                    tile_info,
+                    constants,
+                    indices,
+                    output_tile_sbuf_list,
+                    sbm,
+                )
                 store_half_hidden_tensor_tile(
                     mlp_params,
                     tile_info,
@@ -531,30 +546,27 @@ def _mlp_cte_single_shard(
                     output_tensor_hbm,
                 )
 
-            if sbm != None and not mlpp_has_quantized_input(mlp_params):
-                for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
-                    sbm.pop_heap()  # output_tile_sbuf aka hidden_tile_sbuf
+            for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                sbm.pop_heap()  # output_tile_sbuf
 
-            if sbm != None:
-                sbm.increment_section()
+            sbm.increment_section()  # mlp_cte_basic
 
-    if sbm != None:
-        if mlpp_has_normalization_bias(mlp_params):
-            sbm.pop_heap()  # norm_bias_tensor_sbuf
-        if mlpp_has_normalization_weights(mlp_params):
-            sbm.pop_heap()  # norm_weights_tensor_sbuf
-        if mlp_params.quant_params.is_logical_quant_row():
-            sbm.pop_heap()  # gate_proj_row_weight_scales_sbuf
-            sbm.pop_heap()  # up_proj_row_weight_scales_sbuf
-        elif mlp_params.quant_params.is_logical_quant_static():
-            sbm.pop_heap()  # gate_up_proj_static_input_scales_sbuf
-            sbm.pop_heap()  # down_proj_static_input_scales_sbuf
-            sbm.pop_heap()  # gate_proj_static_weight_scales_sbuf
-            sbm.pop_heap()  # up_proj_static_weight_scales_sbuf
-            sbm.pop_heap()  # down_proj_static_weight_scales_sbuf
-        if mlpp_has_down_projection_bias(mlp_params):
-            sbm.pop_heap()  # down_proj_bias_tensor_sbuf
-        if mlpp_has_up_projection_bias(mlp_params):
-            sbm.pop_heap()  # up_proj_bias_tensor_sbuf
-        if mlpp_has_gate_projection_bias(mlp_params):
-            sbm.pop_heap()  # gate_proj_bias_tensor_sbuf
+    if mlpp_has_normalization_bias(mlp_params):
+        sbm.pop_heap()  # norm_bias_tensor_sbuf
+    if mlpp_has_normalization_weights(mlp_params):
+        sbm.pop_heap()  # norm_weights_tensor_sbuf
+    if mlp_params.quant_params.is_logical_quant_row():
+        sbm.pop_heap()  # gate_proj_row_weight_scales_sbuf
+        sbm.pop_heap()  # up_proj_row_weight_scales_sbuf
+    elif mlp_params.quant_params.is_logical_quant_static():
+        sbm.pop_heap()  # gate_up_proj_static_input_scales_sbuf
+        sbm.pop_heap()  # down_proj_static_input_scales_sbuf
+        sbm.pop_heap()  # gate_proj_static_weight_scales_sbuf
+        sbm.pop_heap()  # up_proj_static_weight_scales_sbuf
+        sbm.pop_heap()  # down_proj_static_weight_scales_sbuf
+    if mlpp_has_down_projection_bias(mlp_params):
+        sbm.pop_heap()  # down_proj_bias_tensor_sbuf
+    if mlpp_has_up_projection_bias(mlp_params):
+        sbm.pop_heap()  # up_proj_bias_tensor_sbuf
+    if mlpp_has_gate_projection_bias(mlp_params):
+        sbm.pop_heap()  # gate_proj_bias_tensor_sbuf

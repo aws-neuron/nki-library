@@ -27,13 +27,12 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
+from nkilib_src.nkilib.core.moe.moe_tkg.moe_tkg_torch import moe_tkg_torch_ref
+from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEAllToAllVStrategy
 
 from test.utils.rng import NKITestsRNG
 
 _rng = NKITestsRNG()
-
-from nkilib_src.nkilib.core.moe.moe_tkg.moe_tkg_torch import moe_tkg_torch_ref
-from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEAllToAllVStrategy
 
 # ---------------------------------------------------------------------------
 # Constants — keep dimensions tiny for speed

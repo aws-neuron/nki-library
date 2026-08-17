@@ -29,8 +29,9 @@ Layout conventions (see swa_fused_cte.py):
   op_weight     : [num_q_heads*d_head, H]
   qkv_bias      : [1, I]                    added to the QKV projection (before RoPE/scale)
   op_bias       : [1, H]                    added to the output projection
-  k_cache       : [num_blocks, num_kv_heads, block_size, d_head]  (post-RoPE K)
-  v_cache       : [num_blocks, num_kv_heads, block_size, d_head]  (plain V)
+  k_cache       : [num_blocks, num_kv_heads, block_size, d_head]  (post-RoPE K; FP8: packed to
+                  [num_blocks, num_kv_heads, block_size//2, d_head, 2])
+  v_cache       : [num_blocks, num_kv_heads, block_size, d_head]  (plain V; FP8: same shape, fp8 dtype)
   block_tables  : [B, max_blocks_per_seq]  int32, logical->physical block map
   cos_cache     : [B, S, d_head]           RoPE cos for the ACTIVE tokens
   sin_cache     : [B, S, d_head]           RoPE sin for the ACTIVE tokens
@@ -43,11 +44,11 @@ Returns dict with:
   v_cache : updated cache (active plain V scattered into blocks n_prior_blocks.. via block_tables)
 """
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import torch
 import torch.nn.functional as F
-from neuronxcc.starfish.support import dtype as dt
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
@@ -61,7 +62,7 @@ def _fp8_max(dtype):
 
 
 def _unpack_dequant_cache(cache, num_kv_heads, block_size, d_head, scale):
-    """Packed-FP8 cache (num_blocks, num_kv_heads, block_size//2, d_head, 2) fp8 -> float
+    """Packed-FP8 K cache (num_blocks, num_kv_heads, block_size//2, d_head, 2) fp8 -> float
     (num_blocks, num_kv_heads, block_size, d_head), dequantized by *scale. Inverse of _quant_pack_cache.
     Token 2i lives at [...,0], 2i+1 at [...,1]."""
     num_blocks = cache.shape[0]
@@ -73,8 +74,15 @@ def _unpack_dequant_cache(cache, num_kv_heads, block_size, d_head, scale):
     return tok * scale
 
 
+def _dequant_cache_unpacked(cache, scale):
+    """Unpacked FP8 V cache (num_blocks, num_kv_heads, block_size, d_head) fp8 -> float, dequantized by
+    *scale. V is stored token-major (same layout as the bf16 cache, only the dtype differs), so this is
+    just a cast + scale -- no token-pair unpack. Inverse of _quant_cache_unpacked."""
+    return cache.float() * scale
+
+
 def _quant_pack_cache(cache_f, num_kv_heads, block_size, d_head, scale, nl_fp8_dtype):
-    """Float (num_blocks, num_kv_heads, block_size, d_head) -> packed-FP8 numpy
+    """Float (num_blocks, num_kv_heads, block_size, d_head) -> packed-FP8 K numpy
     (num_blocks, num_kv_heads, block_size//2, d_head, 2). Quantize clamp(x / scale, +-fp8_max) then
     pack 2 consecutive tokens into the trailing axis. Returns a numpy array cast to the FP8 dtype via
     dt.static_cast so the framework can compare against the kernel's FP8 cache (torch fp8 can't .numpy())."""
@@ -85,6 +93,17 @@ def _quant_pack_cache(cache_f, num_kv_heads, block_size, d_head, scale, nl_fp8_d
     q = np.clip(f / scale, -fp8_max, fp8_max)  # (nb, n_kv, bs, d)
     packed = np.stack([q[:, :, 0::2, :], q[:, :, 1::2, :]], axis=-1)  # (nb, n_kv, bs//2, d, 2)
     return dt.static_cast(packed, nl_fp8_dtype)
+
+
+def _quant_cache_unpacked(cache_f, scale, nl_fp8_dtype):
+    """Float (num_blocks, num_kv_heads, block_size, d_head) -> UNPACKED FP8 V numpy of the same
+    (token-major) shape. Quantize clamp(x / scale, +-fp8_max) with no token-pair pack. Returns a numpy
+    array cast to the FP8 dtype via dt.static_cast. Inverse of _dequant_cache_unpacked."""
+    fp8_max = 448.0 if nl_fp8_dtype == nl.float8_e4m3fn else 240.0
+    # Round the ref's fp32 values through bf16 first so the quantization input matches the kernel's bf16.
+    f = cache_f.to(torch.bfloat16).float().detach().cpu().numpy().astype(np.float32)
+    q = np.clip(f / scale, -fp8_max, fp8_max)  # (nb, n_kv, bs, d)
+    return dt.static_cast(q, nl_fp8_dtype)
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -122,13 +141,14 @@ def swa_fused_cte_torch_ref(
     k_scale: torch.Tensor = None,
     v_scale: torch.Tensor = None,
 ) -> dict:
-    # Packed-FP8 KV cache: caches arrive packed (num_blocks, num_kv_heads, block_size//2, d_head, 2) fp8.
-    # Dequantize to float for attention; the returned golden caches are re-quantized + packed to match
-    # the kernel's FP8 write bit-for-bit. k_scale/v_scale are per-tensor [.,.] fp32 (a single scalar).
-    # Detect packed-FP8 by the cache rank/trailing-axis (the framework may hand the ref a float view of
-    # the fp8 tensor, so don't rely on dtype): packed is 5D (num_blocks, num_kv_heads, block_size//2,
-    # d_head, 2) with trailing axis 2, vs the bf16 cache (num_blocks, num_kv_heads, block_size, d_head)
-    # which is 4D. k_scale present is the decisive signal.
+    # FP8 KV cache: the K cache arrives PACKED (num_blocks, num_kv_heads, block_size//2, d_head, 2) fp8;
+    # the V cache arrives UNPACKED, token-major (num_blocks, num_kv_heads, block_size, d_head) fp8 (same
+    # layout as the bf16 cache, only the dtype differs). Dequantize both to float for attention; the
+    # returned golden caches are re-quantized (K packed, V unpacked) to match the kernel's FP8 write
+    # bit-for-bit. k_scale/v_scale are per-tensor [.,.] fp32 (a single scalar). Detect FP8 by the K cache
+    # rank/trailing-axis (the framework may hand the ref a float view of the fp8 tensor, so don't rely on
+    # dtype): packed K is 5D with trailing axis 2, vs the bf16 K cache which is 4D. k_scale present is the
+    # decisive signal.
     fp8_packed = k_scale is not None and k_cache.dim() == 5 and k_cache.shape[-1] == 2
     if fp8_packed:
         # nl FP8 dtype for the returned golden cache (e5m2 if the input was that, else e4m3fn).
@@ -137,12 +157,12 @@ def swa_fused_cte_torch_ref(
         k_s = float(k_scale.flatten()[0].item())
         v_s = float(v_scale.flatten()[0].item())
         num_blocks = k_cache.shape[0]
-        # Keep the ORIGINAL packed-fp8 prior bytes: the kernel never rewrites prior blocks, so the golden
-        # must reuse them verbatim (re-quantizing would double-round and mismatch by a ULP).
+        # Keep the ORIGINAL fp8 prior bytes: the kernel never rewrites prior blocks, so the golden must
+        # reuse them verbatim (re-quantizing would double-round and mismatch by a ULP). K packed, V unpacked.
         k_packed_in = dt.static_cast(k_cache.float().detach().cpu().numpy(), k_nl_dtype)
         v_packed_in = dt.static_cast(v_cache.float().detach().cpu().numpy(), v_nl_dtype)
         k_cache = _unpack_dequant_cache(k_cache, num_kv_heads, block_size, d_head, k_s)
-        v_cache = _unpack_dequant_cache(v_cache, num_kv_heads, block_size, d_head, v_s)
+        v_cache = _dequant_cache_unpacked(v_cache, v_s)
 
     hidden_states = hidden_states.float()
     qkv_weight = qkv_weight.float()
@@ -237,11 +257,12 @@ def swa_fused_cte_torch_ref(
         out[b] = torch.matmul(attn_flat, op_weight) + op_bias
 
     if fp8_packed:
-        # Golden cache = original packed prior bytes (unchanged by the kernel) with the ACTIVE blocks
-        # [n_prior_blocks:] overwritten by the quantized+packed write-back. Only the active region is
+        # Golden cache = original fp8 prior bytes (unchanged by the kernel) with the ACTIVE blocks
+        # [n_prior_blocks:] overwritten by the quantized write-back. Only the active region is
         # re-quantized; the prior region keeps the input bytes verbatim (the kernel never rewrites it).
+        # K is re-packed (5D); V is re-quantized token-major (unpacked, 4D).
         k_out = _quant_pack_cache(k_out, num_kv_heads, block_size, d_head, k_s, k_nl_dtype)
-        v_out = _quant_pack_cache(v_out, num_kv_heads, block_size, d_head, v_s, v_nl_dtype)
+        v_out = _quant_cache_unpacked(v_out, v_s, v_nl_dtype)
         k_out[:n_prior_blocks] = k_packed_in[:n_prior_blocks]
         v_out[:n_prior_blocks] = v_packed_in[:n_prior_blocks]
 

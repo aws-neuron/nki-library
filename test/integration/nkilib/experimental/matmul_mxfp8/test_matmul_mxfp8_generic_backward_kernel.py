@@ -20,9 +20,9 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
+from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_backward_kernel
 from typing_extensions import override
 
-from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_backward_kernel
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.utils import common_dataclasses
 from test.utils.unit_test_framework import UnitTestFramework
@@ -105,6 +105,15 @@ BACKWARD_CONFIGS = [
     (1024, 1024, 1024, "Square_medium"),
     (2048, 1024, 512, "Nonsquare_M_gt_N"),
     (512, 1024, 2048, "Nonsquare_N_gt_M"),
+    # Partial-F regression for the K-by-F loader. N_2560 (%512 but partial vs LOAD_TILE_F) caught
+    # the original OOB; N_768/N_2304 were rejected by the old %512 guard.
+    (512, 512, 768, "N_768_ctrl"),
+    (512, 768, 512, "K_768_ctrl"),
+    (512, 512, 2304, "N_2304_partial"),
+    (512, 512, 2560, "N_2560_partial"),
+    # Sub-128 partial-F via K (a free/output dim of dW/dX). N is not used here: in backward N is
+    # the dX contraction dim and independently needs %128; sub-128 free dims are covered forward.
+    (512, 520, 512, "K_520_subtile"),
 ]
 
 

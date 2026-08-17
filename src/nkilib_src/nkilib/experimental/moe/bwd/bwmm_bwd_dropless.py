@@ -21,7 +21,6 @@ from nki.isa.constants import dge_mode, oob_mode
 
 from ....core.utils.allocator import SbufManager, align_to, sizeinbytes
 from ....core.utils.kernel_helpers import (
-    NUM_HW_PSUM_BANKS,
     PSUM_BANK_SIZE,
     apply_activation,
     apply_activation_dx,
@@ -1584,7 +1583,7 @@ def _compute_gate_up_projection_output_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             transpose_psum_idx += 1
-                            transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+                            transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
 
                             down_proj_weight_transposed_psum = nl.ndarray(
                                 (H_TILE_SIZE, TILE_SIZE),
@@ -1639,7 +1638,7 @@ def _compute_gate_up_projection_output_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             transpose_psum_idx += 1
-                            transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+                            transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
                             grad_transpose_psum = nl.ndarray(
                                 (H_TILE_SIZE, B_TILE_SIZE),
                                 dtype=compute_dtype,
@@ -1686,7 +1685,7 @@ def _compute_gate_up_projection_output_grad(
 
                         # Psum address after transpose buffers (use separate bank range)
                         matmul_psum_idx += 1
-                        matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                        matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
                         result_psum = nl.ndarray(
                             (B_TILE_SIZE, I_TP_TILE_SIZE),
                             dtype=nl.float32,
@@ -2173,7 +2172,7 @@ def _compute_down_projection_weight_grad(
                             break
 
                         matmul_psum_idx += 1
-                        matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                        matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
 
                         valid_i_tile = min(I_TP_TILE_SIZE, valid_i_block - i_tile_start)
                         result_psum = nl.ndarray(
@@ -2306,6 +2305,7 @@ def _compute_hidden_states_grad(
     BLOCK_I_TP=2,
     manage_scope=True,
     BUFFER_DEGREE=3,
+    skip_gate_proj=False,
 ):
     """
     Compute hidden states gradient with H-dimension sharding.
@@ -2329,6 +2329,7 @@ def _compute_hidden_states_grad(
         BLOCK_H (int): H dimension blocking factor.
         BLOCK_B (int): B dimension blocking factor.
         BLOCK_I_TP (int): I dimension blocking factor.
+        skip_gate_proj (bool): Whether to omit the gate-projection contribution.
 
     Returns:
         None: Hidden states gradient is written/accumulated in-place.
@@ -2430,7 +2431,11 @@ def _compute_hidden_states_grad(
                     )
 
                     # Load lhs_tiles from gate_up_proj_output_grad_hbm [B, 2, I_TP] with dma_transpose
+                    if skip_gate_proj and gate_or_up == 0:
+                        nisa.memset(lhs_tiles[:, :, :], value=0.0)
                     for i_tile_idx in range(NUM_I_TP_TILES):
+                        if skip_gate_proj and gate_or_up == 0:
+                            break
                         i_tile_start = i_tile_idx * I_TP_TILE_SIZE
                         if i_tile_start >= valid_i_block:
                             break
@@ -2516,7 +2521,7 @@ def _compute_hidden_states_grad(
                                     break
                                 valid_i_tile = min(I_TP_TILE_SIZE, valid_i_block - i_tile_start)
                                 transpose_psum_idx += 1
-                                transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+                                transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
                                 rhs_transposed_psum = nl.ndarray(
                                     (I_TP_TILE_SIZE, TILE_SIZE),
                                     dtype=compute_dtype,
@@ -2546,7 +2551,7 @@ def _compute_hidden_states_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             matmul_psum_idx += 1
-                            matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                            matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
                             result_psum = nl.ndarray(
                                 (B_TILE_SIZE, H_TILE_SIZE),
                                 buffer=nl.psum,
@@ -2563,7 +2568,7 @@ def _compute_hidden_states_grad(
                                     stationary=lhs_tiles[0:valid_i_tile, i_tile_idx, nl.ds(b_tile_start, B_TILE_SIZE)],
                                     moving=rhs_tiles[0:valid_i_tile, i_tile_idx, nl.ds(h_tile_start, valid_h_tile)],
                                 )
-                            if i_block_idx == 0 and gate_or_up == 0:
+                            if i_block_idx == 0 and (gate_or_up == 0 or (skip_gate_proj and gate_or_up == 1)):
                                 nisa.tensor_copy(
                                     dst=result_tiles[result_buffer_idx][
                                         :, b_tile_idx, nl.ds(h_tile_start, valid_h_tile)
@@ -2650,6 +2655,7 @@ def _compute_gate_up_projection_weight_grad(
     BLOCK_I_TP=1,
     manage_scope=True,
     BUFFER_DEGREE=3,
+    skip_gate_proj=False,
 ):
     """
     Compute gate and up projection weight gradient with H-dimension sharding.
@@ -2672,6 +2678,7 @@ def _compute_gate_up_projection_weight_grad(
         BLOCK_H (int): H dimension blocking factor.
         BLOCK_B (int): B dimension blocking factor.
         BLOCK_I_TP (int): I dimension blocking factor.
+        skip_gate_proj (bool): Whether to omit the gate-projection contribution.
 
     Returns:
         None: Weight gradient is accumulated in-place.
@@ -2752,19 +2759,27 @@ def _compute_gate_up_projection_weight_grad(
                     if skip_dma.skip_token:
                         nisa.memset(block_hidden_states[:, :, 0:valid_h_block], value=0.0)
 
+                    if skip_gate_proj and gate_or_up == 0:
+                        nisa.memset(gate_up_proj_output_grad[:, :, 0:valid_i_block], value=0.0)
+
                     for b_tile_idx in range(NUM_B_TILES):
                         # Load gate_up_proj_output_grad for this tile
                         global_tile_idx = b_block_idx * NUM_B_TILES + b_tile_idx
                         b_offset = b_block_idx * B_BLOCK_SIZE + b_tile_idx * B_TILE_SIZE
-                        nisa.dma_copy(
-                            dst=gate_up_proj_output_grad[:, b_tile_idx, 0:valid_i_block],
-                            src=gate_up_proj_output_grad_hbm.ap(
-                                pattern=[[GATE_UP_WEIGHT_COUNT * I_TP_DIM, B_TILE_SIZE], [1, 1], [1, valid_i_block]],
-                                offset=b_offset * GATE_UP_WEIGHT_COUNT * I_TP_DIM
-                                + gate_or_up * I_TP_DIM
-                                + i_block_start,
-                            ),
-                        )
+                        if not (skip_gate_proj and gate_or_up == 0):
+                            nisa.dma_copy(
+                                dst=gate_up_proj_output_grad[:, b_tile_idx, 0:valid_i_block],
+                                src=gate_up_proj_output_grad_hbm.ap(
+                                    pattern=[
+                                        [GATE_UP_WEIGHT_COUNT * I_TP_DIM, B_TILE_SIZE],
+                                        [1, 1],
+                                        [1, valid_i_block],
+                                    ],
+                                    offset=b_offset * GATE_UP_WEIGHT_COUNT * I_TP_DIM
+                                    + gate_or_up * I_TP_DIM
+                                    + i_block_start,
+                                ),
+                            )
 
                         nisa.dma_copy(
                             dst=block_hidden_states[:, b_tile_idx, 0:valid_h_block],
@@ -2792,7 +2807,7 @@ def _compute_gate_up_projection_weight_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             matmul_psum_idx += 1
-                            matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                            matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
 
                             result_psum = nl.ndarray(
                                 (H_TILE_SIZE, I_TP_TILE_SIZE),
@@ -2966,7 +2981,7 @@ def _load_token_indices(token_position_to_id, block_idx, B, NUM_TILES, sbm, dst=
         )
         transpose_psum_idx += 1
 
-        transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+        transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
         transposed_token_pos_to_id_fp32 = nl.ndarray(
             (TILE_SIZE, 1),
             dtype=nl.float32,
@@ -3432,11 +3447,12 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             params.is_tensor_update_accumulating,
             block_idx,
             sbm=sbm,
-            BLOCK_H=bp.hidden_grad.block_h,
+            BLOCK_H=bp.hidden_grad.get_block_h(hidden_grad_dtype),
             BLOCK_B=bp.hidden_grad.block_b,
             BLOCK_I_TP=bp.hidden_grad.block_i,
             manage_scope=ms_flags[2],
-            BUFFER_DEGREE=bp.hidden_grad.buffer_degree,
+            BUFFER_DEGREE=bp.hidden_grad.get_buffer_degree(hidden_grad_dtype),
+            skip_gate_proj=params.skip_gate_proj,
         )
 
         if inc_after[2]:
@@ -3465,6 +3481,7 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             BLOCK_I_TP=bp.gate_up_weight_grad.block_i,
             manage_scope=ms_flags[3],
             BUFFER_DEGREE=bp.gate_up_weight_grad.get_buffer_degree(gate_up_wgrad_dtype),
+            skip_gate_proj=params.skip_gate_proj,
         )
 
         if inc_after[3]:

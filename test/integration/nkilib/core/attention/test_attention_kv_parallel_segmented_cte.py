@@ -13,16 +13,16 @@
 # limitations under the License.
 """Tests for KV-parallel segmented prefill attention kernel."""
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-from neuronxcc.starfish.support import dtype as dt
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.core.attention.attention_kv_parallel_segmented_cte import (
     attention_kv_parallel_segmented_cte,
 )
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import get_rank
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     ModelTestType,
@@ -397,6 +397,9 @@ class TestKVParallelSegmentedPrefill:
             kvp_group_size=0,
             apc_mode=False,
             valid_num_prior_tokens=None,
+            fp8_packed=False,
+            k_scale=None,
+            v_scale=None,
         ):
             return create_golden(get_rank())
 
@@ -566,6 +569,9 @@ class TestKVParallelSegmentedPrefill:
             kvp_group_size=0,
             apc_mode=False,
             valid_num_prior_tokens=None,
+            fp8_packed=False,
+            k_scale=None,
+            v_scale=None,
         ):
             return create_golden(get_rank())
 
@@ -582,6 +588,170 @@ class TestKVParallelSegmentedPrefill:
             output_keys=["out"],
             rtol=5e-2,
             atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_kv_parallel_segmented_prefill_interleaved_fp8_packed(
+        self,
+        test_manager: Orchestrator,
+    ):
+        """Packed FP8 KV uses dequant scales through the interleaved CP path."""
+        np.random.seed(42)
+
+        group_size = 2
+        q_heads_per_rank = 2
+        seqlen = 512
+        head_dim = 128
+        block_size = 128
+        seg_size = 512
+        prior_tokens = 512
+        num_global_blocks = 16
+        lnc_degree = 2
+        num_kv_heads = 1
+        k_dequant_scale = np.full(head_dim, 0.25, dtype=np.float32)
+        v_dequant_scale = np.full(head_dim, 0.5, dtype=np.float32)
+        k_scale_broadcast = k_dequant_scale.reshape(1, 1, 1, head_dim)
+        v_scale_broadcast = v_dequant_scale.reshape(1, 1, 1, head_dim)
+
+        softmax_scale = 1.0 / np.sqrt(head_dim)
+        q_global = np.random.randn(
+            group_size * q_heads_per_rank,
+            1,
+            seqlen,
+            head_dim,
+        ).astype(nl.bfloat16)
+        q_global = dt.static_cast(
+            q_global.astype(np.float32) * softmax_scale,
+            nl.bfloat16,
+        )
+        k_real = np.random.uniform(
+            -0.5,
+            0.5,
+            (num_global_blocks, num_kv_heads, block_size, head_dim),
+        ).astype(np.float32)
+        v_real = np.random.uniform(
+            -0.5,
+            0.5,
+            (num_global_blocks, num_kv_heads, block_size, head_dim),
+        ).astype(np.float32)
+        k_quantized = dt.static_cast(k_real / k_scale_broadcast, nl.float8_e4m3)
+        v_quantized = dt.static_cast(v_real / v_scale_broadcast, nl.float8_e4m3)
+        k_dequantized = dt.static_cast(k_quantized, np.float32) * k_scale_broadcast
+        v_dequantized = dt.static_cast(v_quantized, np.float32) * v_scale_broadcast
+
+        replica_groups = ReplicaGroup([list(range(group_size))])
+
+        def create_inputs(rank_id: int):
+            local_global_block_ids = list(range(rank_id, num_global_blocks, group_size))
+            k_local = k_quantized[local_global_block_ids]
+            k_packed = np.stack(
+                [k_local[:, :, 0::2, :], k_local[:, :, 1::2, :]],
+                axis=-1,
+            )
+            v_local = v_quantized[local_global_block_ids]
+            num_local_blocks = len(local_global_block_ids)
+
+            stride = group_size * block_size
+            rank_offset = rank_id * block_size
+            threshold = prior_tokens - rank_offset - block_size + 1
+            num_fully_visible_blocks = max(0, threshold // stride + 1) if threshold >= 0 else 0
+            valid_prior = num_fully_visible_blocks * block_size
+
+            return {
+                "q": q_global[
+                    rank_id * q_heads_per_rank : (rank_id + 1) * q_heads_per_rank,
+                    0,
+                    :,
+                    :,
+                ],
+                "k_cache": dt.static_cast(k_packed, nl.float8_e4m3),
+                "v_cache": dt.static_cast(v_local, nl.float8_e4m3),
+                "block_tables": dt.static_cast(
+                    np.arange(num_local_blocks, dtype=np.int32).reshape(1, num_local_blocks),
+                    nl.int32,
+                ),
+                "kvp_q_offset": dt.static_cast(np.array([[prior_tokens]], dtype=np.int32), nl.int32),
+                "replica_groups": replica_groups,
+                "group_size": group_size,
+                "block_size": block_size,
+                "seg_size": seg_size,
+                # KVP uses the prefix-caching mask path, which requires scale=1.
+                # Production similarly folds the softmax scale into Q.
+                "scale": 1.0,
+                "global_q_offset": 0,
+                "tp_out": False,
+                "sliding_window": 0,
+                "kvp_rank_id": dt.static_cast(np.array([[rank_id]], dtype=np.int32), nl.int32),
+                "kvp_group_size": group_size,
+                "apc_mode": True,
+                "valid_num_prior_tokens": dt.static_cast(np.array([[valid_prior]], dtype=np.int32), nl.int32),
+                "fp8_packed": True,
+                "k_scale": k_dequant_scale.reshape(128, 1),
+                "v_scale": v_dequant_scale.reshape(128, 1),
+            }
+
+        def create_golden(rank_id: int):
+            k_full = k_dequantized[:, 0, :, :].reshape(-1, head_dim)
+            v_full = v_dequantized[:, 0, :, :].reshape(-1, head_dim)
+            k_pos = np.arange(num_global_blocks * block_size).reshape(1, -1)
+            q_pos = np.arange(prior_tokens, prior_tokens + seqlen).reshape(-1, 1)
+
+            outputs = []
+            q_start = rank_id * q_heads_per_rank
+            for head_idx in range(q_heads_per_rank):
+                q = q_global[q_start + head_idx, 0].astype(np.float32)
+                scores = np.matmul(q, k_full.T)
+                scores = np.where(q_pos < k_pos, -np.inf, scores)
+                max_scores = np.max(scores, axis=-1, keepdims=True)
+                max_scores = np.where(np.isinf(max_scores), 0, max_scores)
+                exp_scores = np.exp(scores - max_scores)
+                attn_weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+                outputs.append(np.matmul(attn_weights, v_full))
+
+            return {
+                "out": np.stack(outputs, axis=0).astype(nl.bfloat16),
+            }
+
+        def _torch_ref(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            kvp_q_offset,
+            replica_groups,
+            group_size,
+            block_size,
+            seg_size,
+            scale=1.0,
+            global_q_offset=0,
+            tp_out=False,
+            sliding_window=0,
+            kvp_rank_id=None,
+            kvp_group_size=0,
+            apc_mode=False,
+            valid_num_prior_tokens=None,
+            fp8_packed=False,
+            k_scale=None,
+            v_scale=None,
+        ):
+            return create_golden(get_rank())
+
+        framework = CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_kv_parallel_segmented_cte,
+            torch_ref=_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=group_size,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(
+                platform_target=Platforms.TRN2,
+                logical_nc_config=lnc_degree,
+            ),
+            output_keys=["out"],
+            rtol=5e-2,
+            atol=2e-2,
         )
 
     _APC_PARAM_NAMES = "group_size,q_heads_per_rank,seqlen,head_dim,block_size,seg_size,prior_tokens,num_global_blocks,lnc_degree,tp_out"
@@ -838,6 +1008,9 @@ class TestKVParallelSegmentedPrefill:
             kvp_group_size=0,
             apc_mode=False,
             valid_num_prior_tokens=None,
+            fp8_packed=False,
+            k_scale=None,
+            v_scale=None,
         ):
             return create_golden(get_rank())
 
@@ -1013,6 +1186,9 @@ class TestKVParallelSegmentedPrefillModelConfigs:
             kvp_group_size=0,
             apc_mode=False,
             valid_num_prior_tokens=None,
+            fp8_packed=False,
+            k_scale=None,
+            v_scale=None,
         ):
             return create_golden(get_rank())
 

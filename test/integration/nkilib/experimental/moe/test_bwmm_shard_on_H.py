@@ -22,7 +22,6 @@ from typing import final
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils.common_types import ExpertAffinityScaleMode
 from nkilib_src.nkilib.experimental.moe.forward.bwmm_shard_on_H import (
     SkipMode,
@@ -31,6 +30,7 @@ from nkilib_src.nkilib.experimental.moe.forward.bwmm_shard_on_H import (
 from nkilib_src.nkilib.experimental.moe.forward.bwmm_shard_on_H_torch import (
     blockwise_mm_baseline_shard_hidden_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata

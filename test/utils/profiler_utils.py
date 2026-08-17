@@ -22,6 +22,9 @@ from typing import Optional
 from .core_lock_client import DEFAULT_LOCK_TIMEOUT_SECONDS
 
 NEURON_RT_ENABLE_DGE_NOTIFICATIONS: str = "NEURON_RT_ENABLE_DGE_NOTIFICATIONS"
+NEURON_RT_UCODE_LIB_PATH: str = "NEURON_RT_UCODE_LIB_PATH"
+NEURON_RT_DBG_SEQ_IRAM_BLOCK_SIZES_KB: str = "NEURON_RT_DBG_SEQ_IRAM_BLOCK_SIZES_KB"
+NEURON_RT_INSTR_FETCH_ON_H2D: str = "NEURON_RT_INSTR_FETCH_ON_H2D"
 
 
 def extract_and_filter_output_files(stdout: str, download_all: bool) -> list[str]:

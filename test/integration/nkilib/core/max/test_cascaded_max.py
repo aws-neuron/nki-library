@@ -30,9 +30,9 @@ Test Coverage:
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.max.cascaded_max import cascaded_max
 from nkilib_src.nkilib.core.max.cascaded_max_torch import cascaded_max_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
 from test.utils.pytest_parametrize import pytest_parametrize

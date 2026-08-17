@@ -16,10 +16,10 @@
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8 import (
     quantize_block_mxfp8_kernel,
 )
+
 from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_utils import (
     build_custom_validation_args,
     build_output_tensors,

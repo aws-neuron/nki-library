@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .common_dataclasses import PYTEST_XDIST_WORKER_ENV
+
 
 def _parse_fields(row: str, num_fields: int) -> tuple[str, list[str]]:
     """Split a CSV row into (test_id, [field1, field2, ...]).
@@ -67,7 +69,7 @@ class CSVMonitor:
     def append(self, output_dir: Path, row: str) -> None:
         """Append a raw CSV row (no header, no newline) to the current worker's file."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
+        worker_id = os.environ.get(PYTEST_XDIST_WORKER_ENV, "master")
         with open(output_dir / f"{self.prefix}_{worker_id}.csv", "a") as f:
             f.write(row + "\n")
 

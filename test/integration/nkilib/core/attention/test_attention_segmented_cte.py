@@ -16,11 +16,10 @@
 
 from typing import final
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-from neuronxcc.starfish.support import dtype as dt
-
 from nkilib_src.nkilib.core.attention.attention_segmented_cte import attention_segmented_cte
 from nkilib_src.nkilib.core.attention.attention_segmented_cte_torch import attention_segmented_cte_torch_ref
 
@@ -56,15 +55,15 @@ def generate_inputs(
     tp_q: bool,
     tp_out: bool,
     dtype,
-    sliding_window: int = None,
-    seqlen_q: int = None,
+    sliding_window: int | None = None,
+    seqlen_q: int | None = None,
     use_sink: bool = False,
-    sink_value: float = None,
-    active_seqlen: int = None,
+    sink_value: float | None = None,
+    active_seqlen: int | None = None,
     k_pre_transposed: bool = False,
     fp8_packed: bool = False,
-    k_scale_val: float = None,
-    v_scale_val: float = None,
+    k_scale_val: float | None = None,
+    v_scale_val: float | None = None,
     kv_dtype=None,
 ):
     """Generate input tensors for segmented attention test.
@@ -89,7 +88,6 @@ def generate_inputs(
     if seqlen_q is None:
         seqlen_q = prior_seg_size
     active_tokens = seqlen_q
-    total_tokens = prior_tokens + active_tokens
 
     # Calculate total blocks needed
     num_prior_blocks = prior_tokens // block_size
@@ -102,7 +100,6 @@ def generate_inputs(
     num_blocks_per_seg = prior_seg_size // block_size
     num_active_blocks_per_seg = seqlen_q // block_size
     prior_segs = (prior_tokens + prior_seg_size - 1) // prior_seg_size if prior_tokens > 0 else 0
-    total_segs = max(prior_segs + 1, 1)
     max_blocks_per_seq = prior_segs * num_blocks_per_seg + num_active_blocks_per_seg
 
     # Generate Q tensor
@@ -312,16 +309,16 @@ def _build_perms(
                 for block_size in block_sizes:
                     for num_q_heads, num_kv_heads in head_ratios:
                         for head_dim in head_dims:
-                            ctx = dict(
-                                q_active=q_active,
-                                prior_seg_size=prior_seg_size,
-                                prior_tokens=prior_tokens,
-                                block_size=block_size,
-                                num_q_heads=num_q_heads,
-                                num_kv_heads=num_kv_heads,
-                                head_dim=head_dim,
-                                lnc=lnc,
-                            )
+                            ctx = {
+                                "q_active": q_active,
+                                "prior_seg_size": prior_seg_size,
+                                "prior_tokens": prior_tokens,
+                                "block_size": block_size,
+                                "num_q_heads": num_q_heads,
+                                "num_kv_heads": num_kv_heads,
+                                "head_dim": head_dim,
+                                "lnc": lnc,
+                            }
                             if skip(**ctx):
                                 continue
                             base_row = [
@@ -341,7 +338,7 @@ def _build_perms(
                                 row = list(base_row)
                                 if extra is not None:
                                     row.extend(extra)
-                                variant_ctx = ctx | dict(zip(extra_col_names, extra)) if extra else ctx
+                                variant_ctx = ctx | dict(zip(extra_col_names, extra, strict=True)) if extra else ctx
                                 if is_fast(**variant_ctx):
                                     rows.append(pytest.param(*row, marks=pytest.mark.fast))
                                 else:
@@ -1203,6 +1200,16 @@ class TestSegmentedAttentionCTE:
             pytest.param(2, 8, 1, 128, 2048, 128, 2048, True, True, nl.bfloat16, 512, None),
             # Non-SWA, bs=2, GQA 8:1, no prior
             pytest.param(2, 8, 1, 128, 2048, 128, 0, True, True, nl.bfloat16, 512, None),
+            # Non-SWA, bs=2, GQA 8:1, num_full=2 prior (prior_tokens=1024, prior_seg_size=512
+            # -> floor(1024/512)=2, partial=0). Exercises the opt5 peeled Region C on the
+            # multihead path: 1 accumulate-only segment + 1 final accumulate+normalize
+            # segment. Kept non-SWA on purpose: SWA returns early and never reaches Region C.
+            pytest.param(2, 8, 1, 128, 512, 64, 1024, True, True, nl.bfloat16, 512, None),
+            # Non-SWA, bs=2, GQA 8:1, num_full=4 prior (prior_tokens=2048, prior_seg_size=512
+            # -> floor(2048/512)=4, partial=0). Deeper guard for the opt5 peel: 3
+            # accumulate-only segments + 1 final accumulate+normalize segment; the
+            # interleaved normalize must fire exactly once (on the last prior segment).
+            pytest.param(2, 8, 1, 128, 512, 64, 2048, True, True, nl.bfloat16, 512, None),
             # SWA, bs=2, GQA 8:1, with prior
             pytest.param(2, 8, 1, 128, 512, 64, 512, True, True, nl.bfloat16, 512, 128),
             # SWA, bs=2, GQA 8:1, no prior

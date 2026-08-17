@@ -242,8 +242,8 @@ def _profile_neff(key, neff_path):
     return {
         "inference_time": float(infer_sec) if infer_sec and infer_sec > 0 else -1.0,
         "active_inference_time": float(active_infer_sec),
-        "mfu_percent": float(mfu_raw * 100) if mfu_raw != None and mfu_raw >= 0 else -1.0,
-        "mbu_percent": float(mbu_raw * 100) if mbu_raw != None and mbu_raw >= 0 else -1.0,
+        "mfu_percent": float(mfu_raw * 100) if mfu_raw is not None and mfu_raw >= 0 else -1.0,
+        "mbu_percent": float(mbu_raw * 100) if mbu_raw is not None and mbu_raw >= 0 else -1.0,
     }
 
 

@@ -26,6 +26,13 @@ class QuantScheme(Enum):
     _1x32 = "1x32"
 
 
+class SwizzleMode(Enum):
+    """Mechanism used to convert one unswizzled tensor to matmul layout."""
+
+    DGT = "dgt"
+    PE = "pe"
+
+
 import nki.isa as nisa
 import nki.language as nl
 
@@ -60,13 +67,19 @@ class TensorDescriptor(nl.NKIObject):
         is_x4 (bool): True if data is in _x4 packed format.
         scales_are_packed (bool): True if scales are packed.
         is_col_parallel_sharded (bool): True if tensor is sharded across 2 cores (LNC2).
-        load_with_PE_swizzle (bool): When True, use PE transpose
-            (load_tile_PE_swizzle_wrapX) instead of DGT for loading unswizzled bf16.
+        swizzle_mode (SwizzleMode): Conversion mechanism for unswizzled BF16.
+        load_with_PE_swizzle (bool): Legacy PE transpose selector retained for
+            compatibility. When True, use PE transpose
+            (load_tile_PE_swizzle_wrapX) instead of DGT.
             Supports both direct (contiguous) and indirect (scattered) DMA modes;
             indirect mode is activated when indirect_dma_vector_offset is set.
         indirect_dma_vector_offset (Optional[nl.ndarray]): SBUF
             int32 tensor of shape (P_MAX, NUM_SUB_TILES) holding global F-row indices
             for indirect DMA gather when load_with_PE_swizzle=True.
+        psum_drain_engine_ratio (Tuple[int, int]): (num_scalar, num_vector) split of the
+            PE swizzle PSUM copy-outs across the Scalar and Vector engines. Only applies
+            when load_with_PE_swizzle=True. Defaults to (1, 1) (alternate). Both entries
+            must be >= 0 and at least one must be non-zero.
         scalar_offset (Optional[nl.ndarray]): Currently unsupported. Runtime scalar
             offset added to every DGT vector_offset entry for per-expert weight slicing.
             Must be float32 dtype, pre-scaled into vector_size units.
@@ -104,16 +117,19 @@ class TensorDescriptor(nl.NKIObject):
     # _1x32: 1x32 contiguous block layout (load_tile_PE_Swizzle_1x32 / load_tile_bf16_xbar_transpose)
     quant_scheme: QuantScheme = QuantScheme.WRAPX
 
-    # When True, use PE swizzle (load_tile_PE_swizzle_wrapX) instead of DGT
-    # for loading unswizzled bf16 tensors. Supports both:
+    # Tensor-local conversion instruction for unswizzled BF16.
+    swizzle_mode: SwizzleMode = SwizzleMode.DGT
+
+    # Legacy selector retained during migration to swizzle_mode.
+    load_with_PE_swizzle: bool = False
+
+    # PE swizzle supports both:
     #   - Direct DMA (contiguous rows): when indirect_dma_vector_offset is None
     #   - Indirect DMA (scattered token gather): when indirect_dma_vector_offset
     #     is set to an SBUF int32 tensor of shape (P_MAX, NUM_SUB_TILES) holding
     #     global F-row indices.
     # Whether indirect or direct is determined by the presence of vector_offset
     # on the TileLocation at load time.
-    load_with_PE_swizzle: bool = False
-
     # When True, use a direct access pattern on the source tensor for DMA
     # gather-transpose instead of flattening + vector offsets. This avoids
     # generating vector_offset_pattern buffers in SBUF and simplifies the DGT
@@ -122,6 +138,15 @@ class TensorDescriptor(nl.NKIObject):
     #   offset=f_offset * K + k_offset
     fast_dma_transpose: bool = False
     indirect_dma_vector_offset: Optional[nl.ndarray] = None
+
+    # How to split the PE swizzle PSUM copy-outs (drains) between the Scalar and
+    # Vector engines, as (num_scalar, num_vector) per repeating group of drains.
+    # Draining entirely on Vector saturates it and stalls the transpose, so the
+    # work is spread across both engines. Examples:
+    #   (1, 1) -> alternate, half on each engine (default)
+    #   (2, 1) -> two thirds on Scalar
+    #   (0, 1) -> everything on Vector
+    psum_drain_engine_ratio: Tuple[int, int] = (1, 1)
 
     # Runtime scalar offset added uniformly to every DGT vector_offset entry
     # at TileLocation construction time. Used to select per-expert weight
@@ -170,6 +195,9 @@ class TensorDescriptor(nl.NKIObject):
         return (K_logical, second_logical)
 
     def __post_init__(self):
+        if not isinstance(self.swizzle_mode, SwizzleMode):
+            raise TypeError("swizzle_mode must be a SwizzleMode")
+
         self.is_quantized = self.scales != None
         # Auto-detect x4 format from dtype when quantized
         if self.is_quantized and not self.is_x4 and self.data != None:
@@ -196,6 +224,12 @@ class TensorDescriptor(nl.NKIObject):
         if self.is_f_by_k is None:
             self.is_f_by_k = False
 
+        num_scalar, num_vector = self.psum_drain_engine_ratio
+        kernel_assert(
+            num_scalar >= 0 and num_vector >= 0 and (num_scalar + num_vector) > 0,
+            f"psum_drain_engine_ratio must be non-negative and not both zero, got {self.psum_drain_engine_ratio}",
+        )
+
         # Compute shapes
         if self.data != None and len(self.data.shape) == 2:
             self.physical_shape = self._get_physical_shape(self.data, self.is_quantized, self.is_x4, self.is_swizzled)
@@ -207,6 +241,11 @@ class TensorDescriptor(nl.NKIObject):
             else:
                 self.sharded_physical_shape = self.physical_shape
                 self.sharded_logical_shape = self.logical_shape
+
+    @property
+    def uses_pe_swizzle(self):
+        """Whether this tensor uses PE swizzle conversion."""
+        return self.load_with_PE_swizzle or self.swizzle_mode == SwizzleMode.PE
 
     def shard_col_parallel(self):
         """Enable column-parallel sharding, halving the second (F/M/N) dimension."""
@@ -449,14 +488,14 @@ class TileLocation(nl.NKIObject):
     def __post_init__(self):
         """Auto-generate vector_offset and access_pattern for unswizzled F-by-K tensors.
 
-        Skipped when load_with_PE_swizzle=True, since PE transpose uses either
+        Skipped when PE swizzle is selected, since PE transpose uses either
         user-provided row indices (indirect) or contiguous DMA (direct), and
         does not need DGT vector offsets.
 
         Skipped when fast_dma_transpose=True, since the fast path uses a direct
         access pattern on the source tensor without vector offsets.
         """
-        if self.tensor.load_with_PE_swizzle:
+        if self.tensor.uses_pe_swizzle:
             return
 
         if self.tensor.fast_dma_transpose:

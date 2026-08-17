@@ -28,17 +28,19 @@ active tokens back into the cache, and returns the attention output. The test ve
 three outputs (``out``, ``k_cache``, ``v_cache``) against the torch reference.
 """
 
-from typing import final
+from typing import Any, final
 
+import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
+import numpy.typing as npt
 import pytest
-from neuronxcc.starfish.support import dtype as dt
-
 from nkilib_src.nkilib.experimental.attention.swa_fused_cte import swa_fused_cte
 from nkilib_src.nkilib.experimental.attention.swa_fused_cte_torch import swa_fused_cte_torch_ref
+
 from test.integration.nkilib.utils.tensor_generators import np_random_sample
-from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.common_dataclasses import CompilerArgs, CustomValidator, CustomValidatorWithOutputTensorData, Platforms
+from test.utils.comparators import maxAllClose
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -93,7 +95,6 @@ def generate_inputs(
     gen = np_random_sample()
 
     S = q_active
-    W = sliding_window
     q_dim = num_q_heads * head_dim
     kv_dim = num_kv_heads * head_dim
     fused_i = q_dim + 2 * kv_dim
@@ -104,7 +105,6 @@ def generate_inputs(
     n_prior_blocks = (prior_tokens + block_size - 1) // block_size
     num_active_blocks = S // block_size
     total_blocks = n_prior_blocks + num_active_blocks
-    max_blocks_per_seq = total_blocks
 
     hidden_states = gen(shape=(bs, S, hidden), dtype=dtype)
     qkv_weight = gen(shape=(hidden, fused_i), dtype=dtype)
@@ -128,22 +128,28 @@ def generate_inputs(
     k_cache = dt.static_cast(kc, dtype)
     v_cache = dt.static_cast(vc, dtype)
 
-    # Packed-FP8 KV cache: quantize (x / scale) and pack 2 consecutive tokens into the trailing
-    # length-2 axis: (num_blocks, num_kv_heads, block_size, head_dim) -> (num_blocks, num_kv_heads,
-    # block_size//2, head_dim, 2) fp8 (token 2i -> [...,0], 2i+1 -> [...,1]). The kernel dequantizes the
-    # prior on load and re-quantizes its active write-back.
+    # FP8 KV cache. K is quantized (x / scale) and PACKED, 2 consecutive tokens into a trailing length-2
+    # axis: (num_blocks, num_kv_heads, block_size, head_dim) -> (num_blocks, num_kv_heads, block_size//2,
+    # head_dim, 2) fp8 (token 2i -> [...,0], 2i+1 -> [...,1]). V is quantized but UNPACKED, staying
+    # token-major (num_blocks, num_kv_heads, block_size, head_dim) fp8 (same layout as bf16, only the
+    # dtype differs). The kernel dequantizes the prior on load and re-quantizes its active write-back.
     k_scale = v_scale = None
     if fp8_packed:
+        fp8_max = 448.0 if cache_dtype == nl.float8_e4m3fn else 240.0
 
-        def _pack(cache_bf16, sval):
+        def _pack_k(cache_bf16, sval):
             f = dt.static_cast(cache_bf16, np.float32).reshape(total_blocks, num_kv_heads, block_size, head_dim)
-            fp8_max = 448.0 if cache_dtype == nl.float8_e4m3fn else 240.0
             q = np.clip(f / sval, -fp8_max, fp8_max)  # (nb, n_kv, bs, d)
             packed = np.stack([q[:, :, 0::2, :], q[:, :, 1::2, :]], axis=-1)  # (nb, n_kv, bs//2, d, 2)
             return dt.static_cast(packed, cache_dtype)
 
-        k_cache = _pack(k_cache, k_scale_val)
-        v_cache = _pack(v_cache, v_scale_val)
+        def _quant_v(cache_bf16, sval):
+            f = dt.static_cast(cache_bf16, np.float32).reshape(total_blocks, num_kv_heads, block_size, head_dim)
+            q = np.clip(f / sval, -fp8_max, fp8_max)  # (nb, n_kv, bs, d) -- token-major, no pack
+            return dt.static_cast(q, cache_dtype)
+
+        k_cache = _pack_k(k_cache, k_scale_val)
+        v_cache = _quant_v(v_cache, v_scale_val)
         k_scale = np.full((1, 1), k_scale_val, dtype=np.float32)
         v_scale = np.full((1, 1), v_scale_val, dtype=np.float32)
 
@@ -265,8 +271,9 @@ class TestSwaFusedCTE:
             if fp8_packed:
                 return {
                     "out": np.zeros((bs, S, _HIDDEN), dtype=nl.bfloat16),
+                    # K packed (5D); V unpacked token-major (4D), same shape as bf16 with fp8 dtype.
                     "k_cache": np.zeros((total_blocks, num_kv_heads, block_size // 2, _HEAD_DIM, 2), dtype=cache_dtype),
-                    "v_cache": np.zeros((total_blocks, num_kv_heads, block_size // 2, _HEAD_DIM, 2), dtype=cache_dtype),
+                    "v_cache": np.zeros((total_blocks, num_kv_heads, block_size, _HEAD_DIM), dtype=cache_dtype),
                 }
             return {
                 "out": np.zeros((bs, S, _HIDDEN), dtype=nl.bfloat16),
@@ -399,9 +406,10 @@ class TestSwaFusedCTE:
             total_blocks = n_prior_blocks + 256 // block_size
             return {
                 "out": np.zeros((1, 256, 256), dtype=nl.bfloat16),
-                # Packed-FP8 cache shape: (num_blocks, num_kv_heads, block_size//2, d_head, 2).
+                # FP8 cache shape: K packed (num_blocks, num_kv_heads, block_size//2, d_head, 2); V
+                # unpacked token-major (num_blocks, num_kv_heads, block_size, d_head), fp8 dtype.
                 "k_cache": np.zeros((total_blocks, n_kv_heads, block_size // 2, 64, 2), dtype=cache_dtype),
-                "v_cache": np.zeros((total_blocks, n_kv_heads, block_size // 2, 64, 2), dtype=cache_dtype),
+                "v_cache": np.zeros((total_blocks, n_kv_heads, block_size, 64), dtype=cache_dtype),
             }
 
         framework = UnitTestFramework(
@@ -501,4 +509,120 @@ class TestSwaFusedCTE:
             v_scale_val=0.5,
             rtol=0.15,
             atol=0.15,
+        )
+
+    # Padded sub-bucket request with a -1-padded block table (production layout).
+    # A real prompt shorter than the compiled prefill bucket allocates blocks only for the
+    # real tokens; the runtime maps the unallocated active tail to -1 (a DMA-skip sentinel),
+    # but the kernel still runs all q_active rows, so padded rows read/scatter a -1 block via
+    # the indirect (scalar-DGE) K/V gathers. Without oob_mode.skip on those gathers a -1 index
+    # (== 2^32-1) is an out-of-bound DMA -> nrta status=1006. Repro'd on the packed-FP8 path
+    # (the FP8 scatter write-back is the faulting site). Only the real-token output slice and
+    # the real cache blocks are validated: the golden reference indexes block_tables directly,
+    # so the padded rows/blocks (which read -1) are not meaningfully comparable.
+    @pytest_marks(["model"])
+    @pytest.mark.parametrize("n_q_heads, n_kv_heads", SHARD_CONFIGS)
+    @pytest.mark.parametrize("fp8_packed", [False, True], ids=["bf16", "fp8"])
+    def test_swa_fused_cte_padded_block_table_neg1(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        n_q_heads,
+        n_kv_heads,
+        fp8_packed,
+    ):
+        """GPT-OSS SWA fused block, padded sub-bucket: real_len < q_active, active block-table tail = -1."""
+        bs = 1
+        q_active = 512  # compiled prefill bucket
+        real_len = 256  # real prompt tokens (< bucket) -> padded rows attend a -1 block
+        block_size = _BLOCK
+        prior_tokens = 0
+        real_active_blocks = real_len // block_size  # blocks holding real tokens
+        cache_dtype = nl.float8_e4m3fn if fp8_packed else None
+        k_scale_val, v_scale_val = (1.5, 0.5) if fp8_packed else (None, None)
+
+        def input_generator(test_config, input_tensor_def=None):
+            inputs = generate_inputs(
+                bs=bs,
+                num_q_heads=n_q_heads,
+                num_kv_heads=n_kv_heads,
+                head_dim=_HEAD_DIM,
+                hidden=_HIDDEN,
+                q_active=q_active,
+                prior_tokens=prior_tokens,
+                sliding_window=_SWA,
+                block_size=block_size,
+                sink_value=_SINK,
+                dtype=nl.bfloat16,
+                fp8_packed=fp8_packed,
+                cache_dtype=cache_dtype,
+                k_scale_val=k_scale_val,
+                v_scale_val=v_scale_val,
+            )
+            # Zero-fill the padded query rows [real_len:] so they contribute no real work, then
+            # map the padded active blocks [real_active_blocks:] to -1 (production sentinel).
+            hs = dt.static_cast(inputs["hidden_states"], np.float32)
+            hs[:, real_len:, :] = 0.0
+            inputs["hidden_states"] = dt.static_cast(hs, nl.bfloat16)
+            bt = dt.static_cast(inputs["block_tables"], np.int32)
+            bt[:, real_active_blocks:] = -1
+            inputs["block_tables"] = dt.static_cast(bt, nl.int32)
+            return inputs
+
+        def output_tensor_descriptor(kernel_input):
+            total_blocks = q_active // block_size  # prior_tokens=0 -> all blocks are active
+            if fp8_packed:
+                return {
+                    "out": np.zeros((bs, q_active, _HIDDEN), dtype=nl.bfloat16),
+                    "k_cache": np.zeros((total_blocks, n_kv_heads, block_size // 2, _HEAD_DIM, 2), dtype=cache_dtype),
+                    "v_cache": np.zeros((total_blocks, n_kv_heads, block_size, _HEAD_DIM), dtype=cache_dtype),
+                }
+            return {
+                "out": np.zeros((bs, q_active, _HIDDEN), dtype=nl.bfloat16),
+                "k_cache": np.zeros((total_blocks, n_kv_heads, block_size, _HEAD_DIM), dtype=nl.bfloat16),
+                "v_cache": np.zeros((total_blocks, n_kv_heads, block_size, _HEAD_DIM), dtype=nl.bfloat16),
+            }
+
+        # Validate only the real region: `out` rows [0:real_len] and the real cache blocks
+        # [0:real_active_blocks]. The reference's -1 wrapping makes the padded rows/blocks
+        # incomparable, but the real rows attend only real blocks so their golden is exact.
+        def _comparator(golden, output_tensors):
+            def _slice_validator(key, real_out, real_blocks):
+                g = golden[key]
+
+                class _V(CustomValidator):
+                    def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                        a = np.frombuffer(
+                            inference_output.view(dtype=output_tensors[key].dtype), dtype=output_tensors[key].dtype
+                        ).reshape(output_tensors[key].shape)
+                        if key == "out":
+                            gg, aa = g[:, :real_len, :], a[:, :real_len, :]
+                        else:
+                            gg, aa = g[:real_active_blocks], a[:real_active_blocks]
+                        self._print_with_log(f"Results for {key} (real slice):")
+                        return maxAllClose(
+                            np.asarray(gg, dtype=np.float32),
+                            np.asarray(aa, dtype=np.float32),
+                            rtol=0.15 if fp8_packed else 4e-2,
+                            atol=0.15 if fp8_packed else 1e-2,
+                            verbose=1,
+                            logfile=self.logfile,
+                        )
+
+                return CustomValidatorWithOutputTensorData(validator=_V, output_ndarray=output_tensors[key])
+
+            return {k: _slice_validator(k, real_len, real_active_blocks) for k in ("out", "k_cache", "v_cache")}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=swa_fused_cte,
+            torch_ref=torch_ref_wrapper(swa_fused_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensor_descriptor,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            custom_comparator=_comparator,
         )

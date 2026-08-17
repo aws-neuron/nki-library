@@ -16,8 +16,6 @@
 
 import numpy as np
 import pytest
-from scipy.stats import chi2 as chi2_dist
-
 from nkilib_src.nkilib.experimental.rng import (
     generate_random,
     generate_random_fast,
@@ -31,6 +29,8 @@ from nkilib_src.nkilib.experimental.rng.rng_torch import (
     get_rng_state_gpsimd_torch_ref,
     set_rng_state_gpsimd_torch_ref,
 )
+from scipy.stats import chi2 as chi2_dist
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,

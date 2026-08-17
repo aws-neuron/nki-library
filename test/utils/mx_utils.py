@@ -54,14 +54,50 @@ def get_mx_fp_max(dst_dtype):
     return max_values.get(dst_dtype)
 
 
-def get_mx_max_exp(dst_dtype):
-    max_exp_values = {nl.float8_e5m2_x4: 15, nl.float8_e4m3fn_x4: 8, nl.float4_e2m1fn_x4: 2}
+def get_mx_max_exp(dst_dtype, mx_alt_emax=True):
+    """Return the max biased exponent for a given MX x4 dtype.
+
+    Args:
+        dst_dtype: One of nl.float8_e5m2_x4, nl.float8_e4m3fn_x4, nl.float4_e2m1fn_x4.
+        mx_alt_emax: When True (default), returns the alternative emax MX scale
+            computation that avoids an OCP rounding bias where large values in a
+            scale group are clamped down rather than rounded up to the next
+            representable value, which can degrade training convergence and
+            inference accuracy. When False, returns the original OCP-compliant
+            max exponent.
+    """
+    if mx_alt_emax:
+        max_exp_values = {nl.float8_e5m2_x4: 14, nl.float8_e4m3fn_x4: 7, nl.float4_e2m1fn_x4: 2}
+    else:
+        max_exp_values = {nl.float8_e5m2_x4: 15, nl.float8_e4m3fn_x4: 8, nl.float4_e2m1fn_x4: 2}
     assert dst_dtype in max_exp_values, f"no max exp value provided for {dst_dtype}"
-    return max_exp_values.get(dst_dtype)
+    return max_exp_values[dst_dtype]
 
 
-def quantize_mx_golden(in_tensor, out_x4_dtype, ocp_saturation=True, reverse_dst_fdim_group=0, custom_mx_max_exp=None):
-    max_exp = custom_mx_max_exp(out_x4_dtype) if custom_mx_max_exp else get_mx_max_exp(out_x4_dtype)
+def quantize_mx_golden(
+    in_tensor,
+    out_x4_dtype,
+    ocp_saturation=True,
+    reverse_dst_fdim_group=0,
+    custom_mx_max_exp=None,
+    mx_alt_emax=True,
+):
+    """Quantize a float32/float16 tensor to MX x4 format.
+
+    Args:
+        in_tensor: (P, F) float input tensor.
+        out_x4_dtype: Target MX x4 dtype (e.g., nl.float8_e5m2_x4).
+        ocp_saturation: Whether to clip to the MX format's max representable value.
+        reverse_dst_fdim_group: If > 0, reverse free dimension by groups of this size.
+        custom_mx_max_exp: Optional callable(out_x4_dtype) -> max_exp. When
+            provided, overrides mx_alt_emax.
+        mx_alt_emax: When True (default), uses the alternative emax, matching the
+            neuronxcc compiler default. Set to False to restore the original
+            OCP-compliant behavior.
+    """
+    max_exp = (
+        custom_mx_max_exp(out_x4_dtype) if custom_mx_max_exp else get_mx_max_exp(out_x4_dtype, mx_alt_emax=mx_alt_emax)
+    )
     max_val = get_mx_fp_max(out_x4_dtype)
     float32_exp_bias = 127
 

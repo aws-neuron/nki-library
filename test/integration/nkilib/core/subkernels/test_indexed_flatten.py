@@ -16,9 +16,9 @@
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.subkernels.indexed_flatten import indexed_flatten
 from nkilib_src.nkilib.core.subkernels.indexed_flatten_torch import indexed_flatten_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata

@@ -23,7 +23,7 @@ import sys
 
 import numpy as np
 
-from .common_dataclasses import GoldenTensorDict, normalize_golden_output
+from .common_dataclasses import GoldenTensorMapping, is_xdist_worker, normalize_golden_output
 from .simulation_constants import SIMULATION_RUN_ALL_ENV_VAR
 
 # Patterns to identify tests with large shapes that are slow on CPU simulation
@@ -34,7 +34,7 @@ def setup_simulation_mode():
     """Setup simulation mode"""
 
     # Limit BLAS threading in xdist workers to avoid contention
-    if "PYTEST_XDIST_WORKER" in os.environ:
+    if is_xdist_worker():
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -109,7 +109,7 @@ def run_simulator_inference(kernel_under_test) -> dict[str, np.ndarray]:
         raise ValueError("Simulation mode requires validation_args to verify outputs")
 
     golden_output = kernel_under_test.validation_args.golden_output
-    golden_tensors: GoldenTensorDict = normalize_golden_output(golden_output)
+    golden_tensors: GoldenTensorMapping = normalize_golden_output(golden_output)
     output_names: list[str] = list(golden_tensors.keys())
 
     if len(kernel_outputs) != len(output_names):
@@ -124,4 +124,4 @@ def run_simulator_inference(kernel_under_test) -> dict[str, np.ndarray]:
     # would crash on packed x4 dtypes (e.g. float8_e4m3fn_x4), which can only be
     # bit-reinterpreted, and is unnecessary since the same OutputValidator runs
     # downstream on the dumped sim outputs and already handles dtype reconciliation.
-    return {name: np.asarray(output) for name, output in zip(output_names, kernel_outputs)}
+    return {name: np.asarray(output) for name, output in zip(output_names, kernel_outputs, strict=True)}

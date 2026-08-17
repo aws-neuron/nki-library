@@ -16,7 +16,6 @@
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
     _01_reshape_permute as reshape_mod,
 )
@@ -41,6 +40,7 @@ from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
 from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
     _04_transpose_torch as transpose_refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -343,7 +343,7 @@ class TestNeurotileTranspose:
         )
 
     @pytest.mark.fast
-    def test_transpose_coalesced_single_store(self, test_manager, platform_target):
+    def test_transpose_coalesced_single_store_example(self, test_manager, platform_target):
         # One transpose DMA per tile-row AND one store DMA per row via rearrange scatter.
         _run(
             test_manager,
@@ -460,7 +460,6 @@ class TestNeurotileTranspose:
         the single-DMA contract must reject it at trace time and point at the split."""
         import nki
         import nki.language as nl
-
         from nkilib_src.nkilib.experimental import neurotile as nt
 
         @nki.jit

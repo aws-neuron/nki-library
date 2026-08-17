@@ -45,9 +45,16 @@ def pytest_parametrize(param_names, param_values, abbrevs=None, prefix=None, tes
     overhead = len(test_func_name) + 2 if test_func_name else 0
 
     def make_id(params):
-        values = params.values if hasattr(params, "values") and not isinstance(params, dict) else params
+        if hasattr(params, "values") and not isinstance(params, dict):
+            values = params.values
+        elif len(names) == 1:
+            # Single-name parametrize passes bare scalars (not tuples); wrap so a
+            # scalar (e.g. a dtype string) isn't iterated character-by-character.
+            values = (params,)
+        else:
+            values = params
         parts = []
-        for name, val in zip(names, values):
+        for name, val in zip(names, values, strict=True):
             short = abbrevs.get(name, name) if abbrevs else name
             parts.append(f"{short}-{format_param_value(val)}")
         id_str = "_".join(parts)

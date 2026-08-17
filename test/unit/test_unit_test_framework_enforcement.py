@@ -27,7 +27,7 @@ import ast
 from pathlib import Path
 from typing import List, Set
 
-import pytest
+from test.utils.test_validation_utils import fail_with_report
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 INTEGRATION_TEST_DIR = REPO_ROOT / "test" / "integration"
@@ -101,7 +101,7 @@ def test_all_integration_tests_use_unit_test_framework():
                 all_violations.append(f"    - {v}")
 
     if all_violations:
-        pytest.fail(
+        fail_with_report(
             "\n\nFiles violating UnitTestFramework guidelines:\n"
             + "\n".join(all_violations)
             + "\n\nFix: migrate to UnitTestFramework (see test/docs/unit_test_guide.md)\n"
@@ -123,4 +123,4 @@ def test_legacy_allowlist_no_stale_entries():
             stale.append(f"  {rel}  (no violations remaining)")
 
     if stale:
-        pytest.fail("\n\nStale LEGACY_ALLOWLIST entries — remove these:\n" + "\n".join(stale) + "\n")
+        fail_with_report("\n\nStale LEGACY_ALLOWLIST entries — remove these:\n" + "\n".join(stale) + "\n")

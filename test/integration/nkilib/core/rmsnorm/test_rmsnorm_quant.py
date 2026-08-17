@@ -19,8 +19,6 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant import (
     RmsNormQuantKernelArgs,
     rmsnorm_quant_kernel,
@@ -28,6 +26,7 @@ from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant import (
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant_torch import rmsnorm_quant_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import DtypeMode, NormType, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+from typing_extensions import override
 
 try:
     from test.integration.nkilib.core.rmsnorm.test_rmsnorm_quant_cte_model_config import (
@@ -56,7 +55,7 @@ from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+from test.utils.unit_test_framework import UnitTestFramework, mark_uncacheable, torch_ref_wrapper
 
 
 def static_scale_wrapper(default_tensor_generator):
@@ -107,7 +106,7 @@ def _build_kernel_input(
     batch: int,
     seqlen: int,
     hidden_dim: int,
-    dtype: type,
+    dtype: str,
     lower_bound: float,
     tensor_gen: Callable,
     quant_type: QuantizationType,
@@ -256,7 +255,7 @@ class TestRmsNormQuantKernel:
         batch: int,
         seqlen: int,
         hidden: int,
-        dtype: type,
+        dtype: str,
         lnc_degree: int,
         lower_bound: float,
         tensor_gen: Callable,
@@ -276,7 +275,6 @@ class TestRmsNormQuantKernel:
         # concrete dtype. The kernel receives the original mode and resolves
         # at trace time.
         resolved_dtype_mode = resolve_dtype_mode_for_torch_ref(dtype_mode, platform_target)
-        quant_nki_dtype = nl.float8_e4m3fn if resolved_dtype_mode == DtypeMode.OCP else nl.float8_e4m3
         quant_np_dtype = dt.float8_e4m3fn if resolved_dtype_mode == DtypeMode.OCP else dt.float8_e4m3
 
         def input_generator(_):
@@ -298,6 +296,10 @@ class TestRmsNormQuantKernel:
         # Wrap torch_ref to return {"out": norm_quant} and stash dequant_scale for the comparator
         ref_extras: dict[str, Any] = {}
 
+        # Uncacheable: the comparator reads dequant_scale from ref_extras, populated only as a
+        # side effect of running this ref. A golden-cache HIT skips the ref, leaving ref_extras
+        # empty -> comparator KeyError. mark_uncacheable forces a recompute so the stash fires.
+        @mark_uncacheable
         @torch_ref_wrapper
         def _torch_ref_with_remap(
             hidden,
@@ -312,10 +314,18 @@ class TestRmsNormQuantKernel:
                 hidden=hidden,
                 ln_w=ln_w,
                 kargs=kargs,
-                input_dequant_scale=input_dequant_scale,
-                pre_norm_gamma=pre_norm_gamma,
-                residual=residual,
                 dtype_mode=resolved_dtype_mode,
+                # The optional tensors are only present for the flags this case enables;
+                # forward just the ones the input generator produced.
+                **{
+                    name: tensor
+                    for name, tensor in (
+                        ("input_dequant_scale", input_dequant_scale),
+                        ("pre_norm_gamma", pre_norm_gamma),
+                        ("residual", residual),
+                    )
+                    if tensor is not None
+                },
             )
             ref_extras["dequant_scale"] = result["dequant_scale"]
             out = {"out": result["norm_quant"]}
@@ -328,17 +338,17 @@ class TestRmsNormQuantKernel:
 
             class _Validator(CustomValidator):
                 @override
-                def validate(self, actual_raw_output: npt.NDArray[Any]) -> bool:
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
                     if quant_type == QuantizationType.ROW:
                         full_fp8 = np.frombuffer(
-                            actual_raw_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
+                            inference_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
                         ).reshape(batch, seqlen, hidden + 4)
                         norm_out_hw_fp8 = full_fp8[:, :, :hidden]
                         last_4_contiguous = np.ascontiguousarray(full_fp8[:, :, hidden : hidden + 4])
                         norm_deq_scale_hw = last_4_contiguous.view(dtype=np.float32).reshape(batch, seqlen, 1)
                     else:
                         norm_out_hw_fp8 = np.frombuffer(
-                            actual_raw_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
+                            inference_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
                         ).reshape(batch, seqlen, hidden)
 
                     passed = maxAllClose(
@@ -368,8 +378,8 @@ class TestRmsNormQuantKernel:
 
                 class _ResidualValidator(CustomValidator):
                     @override
-                    def validate(self, actual_raw_output: npt.NDArray[Any]) -> bool:
-                        hw_residual = np.frombuffer(actual_raw_output.view(dtype=nl.bfloat16), dtype=dtype).reshape(
+                    def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                        hw_residual = np.frombuffer(inference_output.view(dtype=nl.bfloat16), dtype=dtype).reshape(
                             batch, seqlen, hidden
                         )
                         return maxAllClose(

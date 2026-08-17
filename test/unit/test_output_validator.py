@@ -207,11 +207,11 @@ class TestOutputValidatorCustomValidator:
         # NOT NameError for undefined 'expected_output'
         try:
             validator.validate(logfile_path=logfile_path)
-            assert False, "Expected AssertionError to be raised"
+            raise AssertionError("Expected AssertionError to be raised")
         except AssertionError as e:
             assert "Validation failed" in str(e), f"Expected 'Validation failed' error, got: {e}"
         except NameError as e:
-            assert False, f"Got NameError instead of AssertionError - this is the bug: {e}"
+            raise AssertionError(f"Got NameError instead of AssertionError - this is the bug: {e}") from e
 
         # Verify that no golden-*.bin file was created (since custom validators
         # don't have expected_output to save)

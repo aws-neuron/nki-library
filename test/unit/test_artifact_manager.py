@@ -34,60 +34,60 @@ from ..utils.artifact_manager import (
 def test_should_upload_artifacts():
     """Test should_upload_artifacts() decision logic with both enum and string values."""
     # Empty config should never upload
-    assert should_upload_artifacts("passed", "") == False
-    assert should_upload_artifacts("failed", "") == False
-    assert should_upload_artifacts("skipped", "") == False
+    assert not should_upload_artifacts("passed", "")
+    assert not should_upload_artifacts("failed", "")
+    assert not should_upload_artifacts("skipped", "")
 
     # "all" should always upload
-    assert should_upload_artifacts("passed", "all") == True
-    assert should_upload_artifacts("failed", "all") == True
-    assert should_upload_artifacts("skipped", "all") == True
-    assert should_upload_artifacts("passed", UploadOutcome.ALL) == True
-    assert should_upload_artifacts("failed", UploadOutcome.ALL) == True
-    assert should_upload_artifacts("skipped", UploadOutcome.ALL) == True
+    assert should_upload_artifacts("passed", "all")
+    assert should_upload_artifacts("failed", "all")
+    assert should_upload_artifacts("skipped", "all")
+    assert should_upload_artifacts("passed", UploadOutcome.ALL)
+    assert should_upload_artifacts("failed", UploadOutcome.ALL)
+    assert should_upload_artifacts("skipped", UploadOutcome.ALL)
 
     # "success" should only upload on passed
-    assert should_upload_artifacts("passed", "success") == True
-    assert should_upload_artifacts("failed", "success") == False
-    assert should_upload_artifacts("skipped", "success") == False
-    assert should_upload_artifacts("passed", UploadOutcome.SUCCESS) == True
+    assert should_upload_artifacts("passed", "success")
+    assert not should_upload_artifacts("failed", "success")
+    assert not should_upload_artifacts("skipped", "success")
+    assert should_upload_artifacts("passed", UploadOutcome.SUCCESS)
 
     # "fail" should only upload on failed
-    assert should_upload_artifacts("passed", "fail") == False
-    assert should_upload_artifacts("failed", "fail") == True
-    assert should_upload_artifacts("skipped", "fail") == False
-    assert should_upload_artifacts("failed", UploadOutcome.FAIL) == True
+    assert not should_upload_artifacts("passed", "fail")
+    assert should_upload_artifacts("failed", "fail")
+    assert not should_upload_artifacts("skipped", "fail")
+    assert should_upload_artifacts("failed", UploadOutcome.FAIL)
 
 
 def test_should_include_file_in_upload():
     """Test should_include_file_in_upload() file filtering logic."""
     # Files that should be included
-    assert should_include_file_in_upload("test.neff") == True
-    assert should_include_file_in_upload("test.log") == True
-    assert should_include_file_in_upload("test.txt") == True
-    assert should_include_file_in_upload("test.csv") == True
-    assert should_include_file_in_upload("/path/to/test.neff") == True
-    assert should_include_file_in_upload("/path/to/test.log") == True
-    assert should_include_file_in_upload("/path/to/test.txt") == True
-    assert should_include_file_in_upload("/path/to/test.csv") == True
+    assert should_include_file_in_upload("test.neff")
+    assert should_include_file_in_upload("test.log")
+    assert should_include_file_in_upload("test.txt")
+    assert should_include_file_in_upload("test.csv")
+    assert should_include_file_in_upload("/path/to/test.neff")
+    assert should_include_file_in_upload("/path/to/test.log")
+    assert should_include_file_in_upload("/path/to/test.txt")
+    assert should_include_file_in_upload("/path/to/test.csv")
 
     # Case insensitive
-    assert should_include_file_in_upload("TEST.NEFF") == True
-    assert should_include_file_in_upload("TEST.LOG") == True
-    assert should_include_file_in_upload("TEST.TXT") == True
-    assert should_include_file_in_upload("TEST.CSV") == True
+    assert should_include_file_in_upload("TEST.NEFF")
+    assert should_include_file_in_upload("TEST.LOG")
+    assert should_include_file_in_upload("TEST.TXT")
+    assert should_include_file_in_upload("TEST.CSV")
 
     # Files that should be excluded
-    assert should_include_file_in_upload("test.ntff") == False
-    assert should_include_file_in_upload("metrics.json") == False
-    assert should_include_file_in_upload("ntff.json") == False
-    assert should_include_file_in_upload("k_out") == False
-    assert should_include_file_in_upload("v_out") == False
-    assert should_include_file_in_upload("test_out") == False
-    assert should_include_file_in_upload("test.py") == False
-    assert should_include_file_in_upload("test.c") == False
-    assert should_include_file_in_upload("test") == False  # No extension
-    assert should_include_file_in_upload("/path/to/test.ntff") == False
+    assert not should_include_file_in_upload("test.ntff")
+    assert not should_include_file_in_upload("metrics.json")
+    assert not should_include_file_in_upload("ntff.json")
+    assert not should_include_file_in_upload("k_out")
+    assert not should_include_file_in_upload("v_out")
+    assert not should_include_file_in_upload("test_out")
+    assert not should_include_file_in_upload("test.py")
+    assert not should_include_file_in_upload("test.c")
+    assert not should_include_file_in_upload("test")  # No extension
+    assert not should_include_file_in_upload("/path/to/test.ntff")
 
 
 @patch("test.utils.artifact_manager.get_s3_client_and_session")

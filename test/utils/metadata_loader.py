@@ -83,7 +83,7 @@ def load_model_configs(test_key: str) -> list[dict[str, Any]]:
         logger.warning(f"No metadata files found matching: {metadata_dir / pattern}")
         return []
 
-    all_metadata = []
+    all_metadata: list[dict[str, Any]] = []
     for metadata_file in metadata_files:
         try:
             with open(metadata_file, "r") as f:

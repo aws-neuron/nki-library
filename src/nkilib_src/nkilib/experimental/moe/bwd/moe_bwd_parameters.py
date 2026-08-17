@@ -47,16 +47,20 @@ class ClampLimits(nl.NKIObject):
     Gradient clamping limits for numerical stability.
 
     Args:
-        linear_clamp_upper_limit (float): Upper clamp limit for linear operations.
-        linear_clamp_lower_limit (float): Lower clamp limit for linear operations.
-        non_linear_clamp_upper_limit (float): Upper clamp limit for non-linear operations.
-        non_linear_clamp_lower_limit (float): Lower clamp limit for non-linear operations.
+        linear_clamp_upper_limit (float | None): Upper clamp limit for linear operations.
+            ``None`` means no upper clamping is applied to linear operations.
+        linear_clamp_lower_limit (float | None): Lower clamp limit for linear operations.
+            ``None`` means no lower clamping is applied to linear operations.
+        non_linear_clamp_upper_limit (float | None): Upper clamp limit for non-linear operations.
+            ``None`` means no upper clamping is applied to non-linear operations.
+        non_linear_clamp_lower_limit (float | None): Lower clamp limit for non-linear operations.
+            ``None`` means no lower clamping is applied to non-linear operations.
     """
 
-    linear_clamp_upper_limit: float = None
-    linear_clamp_lower_limit: float = None
-    non_linear_clamp_upper_limit: float = None
-    non_linear_clamp_lower_limit: float = None
+    linear_clamp_upper_limit: float | None = None
+    linear_clamp_lower_limit: float | None = None
+    non_linear_clamp_upper_limit: float | None = None
+    non_linear_clamp_lower_limit: float | None = None
 
     def __repr__(self):
         return (
@@ -67,15 +71,20 @@ class ClampLimits(nl.NKIObject):
 
 class ShardOption(Enum):
     """
-    Sharding strategies for blockwise backward kernel.
+    Sharding strategies for blockwise kernels.
 
     Attributes:
         SHARD_ON_FREE: Shard across the free (output) dimension of each matmul.
         SHARD_ON_HIDDEN: Shard across hidden dimension for all functions.
+        SHARD_ON_BLOCK: Partition whole token-blocks across cores — each core
+            computes a disjoint subset of the N blocks end-to-end and writes its
+            own output slab; the per-shard slabs are reduced at the end. Used by
+            the MXFP8 MoE forward kernel (blockwise_mm_fwd_mxfp8).
     """
 
     SHARD_ON_FREE = 0
     SHARD_ON_HIDDEN = 1
+    SHARD_ON_BLOCK = 2
 
 
 class AffinityOption(Enum):
@@ -401,7 +410,29 @@ class HiddenGradBlocking(nl.NKIObject):
     block_h: int = 2
     block_b: int = 4
     block_i: int = 8
-    buffer_degree: int = 3  # not reduced for fp32: this pipelined tile's peak SBUF is non-monotonic in degree
+    buffer_degree: int = 3
+    block_h_fp32: int = 4  # fp32: widen block_h so H fits in fewer H-blocks -> fewer grad-out scatter intervals
+    buffer_degree_fp32: int = 2  # fp32: less buffering to offset the wider block_h and stay in SBUF
+
+    def get_buffer_degree(self, grad_accum_dtype):
+        """Return the dtype-appropriate buffer degree (fp32 accumulators are 2x bytes)."""
+        return self.buffer_degree_fp32 if grad_accum_dtype == nl.float32 else self.buffer_degree
+
+    def set_buffer_degree(self, buffer_degree, buffer_degree_fp32=None):
+        """Configure the bf16 (default) and optional fp32 buffer degrees."""
+        self.buffer_degree = buffer_degree
+        if buffer_degree_fp32 is not None:
+            self.buffer_degree_fp32 = buffer_degree_fp32
+
+    def get_block_h(self, grad_accum_dtype):
+        """Return the dtype-appropriate block_h (fp32 grad-out is 2x bytes)."""
+        return self.block_h_fp32 if grad_accum_dtype == nl.float32 else self.block_h
+
+    def set_block_h(self, block_h, block_h_fp32=None):
+        """Configure the bf16 (default) and optional fp32 block_h."""
+        self.block_h = block_h
+        if block_h_fp32 is not None:
+            self.block_h_fp32 = block_h_fp32
 
     def estimate_sbuf_usage(
         self,
@@ -440,7 +471,10 @@ class HiddenGradBlocking(nl.NKIObject):
         H_TILE_SIZE = min(PSUM_SIZE, H_SHARDED)
         I_TP_TILE_SIZE = min(TILE_SIZE, I_TP)
 
-        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H_SHARDED)
+        _bh = self.get_block_h(grad_accum_dtype)
+        _bd = self.get_buffer_degree(grad_accum_dtype)
+
+        H_BLOCK_SIZE = min(_bh * H_TILE_SIZE, H_SHARDED)
         I_TP_BLOCK_SIZE = min(self.block_i * I_TP_TILE_SIZE, I_TP)
         B_BLOCK_SIZE = min(self.block_b * B_TILE_SIZE, B)
 
@@ -454,14 +488,14 @@ class HiddenGradBlocking(nl.NKIObject):
         # rhs_temp stays compute_dtype; the result/existing accumulators follow the grad-output dtype.
         grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
         result_count = 2 if is_tensor_update_accumulating else 1
-        persistent_bytes = self.buffer_degree * (
+        persistent_bytes = _bd * (
             NUM_H_INNER_TILES * I_TP_BLOCK_SIZE * elem + result_count * NUM_B_TILES * H_BLOCK_SIZE * grad_elem
         )
 
         # Inner section: lhs_tiles (I_TP_TILE, NUM_I_TP_TILES, B_BLOCK) + rhs_tiles (I_TP_TILE, NUM_I_TP_TILES, H_BLOCK)
         inner_section_bytes = NUM_I_TP_TILES * (B_BLOCK_SIZE + H_BLOCK_SIZE) * elem
 
-        return persistent_bytes + self.buffer_degree * inner_section_bytes
+        return persistent_bytes + _bd * inner_section_bytes
 
 
 @dataclass
@@ -610,7 +644,7 @@ class MOEBwdParameters(nl.NKIObject):
         token_position_to_id (nl.ndarray): [N * B], Token position mapping.
         block_to_expert (nl.ndarray): [N, 1], Expert index per block.
         output_hidden_states_grad (nl.ndarray): [T, H], Upstream gradient.
-        block_size (int): Tokens per block (128, 256, 512, or 1024).
+        block_size (int): Tokens per block (128, 256, 512, 1024, 2048, or 4096).
         skip_dma (SkipMode): OOB handling mode.
         compute_dtype (nki.dtype): Computation dtype (default: nl.bfloat16).
         is_tensor_update_accumulating (bool): Accumulate into existing gradients.
@@ -621,7 +655,7 @@ class MOEBwdParameters(nl.NKIObject):
         blocking_params (MOEBwdDroplessBlockingParams): Blocking hyperparameters.
 
     Notes:
-        - block_size must be one of: 128, 256, 512, 1024.
+        - block_size must be one of: 128, 256, 512, 1024, 2048, 4096.
         - H must be divisible by num_shards for LNC sharding.
         - Derived dimensions (T, H, I_TP, E, N) are computed in __post_init__.
     """
@@ -696,8 +730,8 @@ class MOEBwdParameters(nl.NKIObject):
             AssertionError: If any validation check fails.
         """
         kernel_assert(
-            self.block_size in (128, 256, 512, 1024),
-            f"block_size must be 128, 256, 512, or 1024, got {self.block_size}",
+            self.block_size in (128, 256, 512, 1024, 2048, 4096),
+            f"block_size must be 128, 256, 512, 1024, 2048, or 4096, got {self.block_size}",
         )
         kernel_assert(self.I_TP % 2 == 0, f"I_TP must be divisible by 2, got {self.I_TP}")
         kernel_assert(self.H % 2 == 0, f"H must be divisible by 2, got {self.H}")

@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Remote lock helper functions for atomic core locking.
+"""Remote lock helper functions for atomic core locking.
 
 This file is deployed to remote hosts and executed under flock for atomic
 read-modify-write operations on locks.json. The functions are documented
@@ -66,7 +65,7 @@ from typing import Any, NamedTuple
 # overwrites the deployed helper when its SCRIPT_VERSION is strictly newer than
 # the version already on the host, so a stale client can never downgrade a
 # newer deployed helper out from under concurrent newer clients.
-SCRIPT_VERSION = 4
+SCRIPT_VERSION = 5
 EVENTS_LOG_PREFIX = "events-"
 
 # When this env var is truthy on the host, reconcile-driven grants emit a
@@ -98,7 +97,7 @@ STALE_THRESHOLD = 12 * POLL_PERIOD
 # remaining entries. The contended large-request set is tiny in practice, so
 # the solver terminates well under this cap; it only guards pathological queue
 # depth from making a reconcile pass expensive.
-SOLVER_NODE_CAP = 5000
+SOLVER_NODE_CAP: int = 5000
 # Max ready, region-less entries placed via recursive branch-and-bound in one
 # reconcile pass. Beyond this, fall back to the iterative greedy completion so a
 # very deep ready-queue degrades gracefully instead of exceeding the interpreter
@@ -154,7 +153,7 @@ class LockStatus(Enum):
     IN_QUEUE = ("IN_QUEUE", 15)
     ERROR = ("ERROR", 99)
 
-    def __new__(cls, value: str, exit_code: int) -> "LockStatus":
+    def __new__(cls, value: str, exit_code: int) -> LockStatus:
         obj = object.__new__(cls)
         obj._value_ = value
         return obj
@@ -163,7 +162,7 @@ class LockStatus(Enum):
         self.exit_code = exit_code
 
     @classmethod
-    def from_exit_code(cls, exit_code: int) -> "LockStatus | None":
+    def from_exit_code(cls, exit_code: int) -> LockStatus | None:
         """Look up a LockStatus by exit code, or None if not found."""
         for member in cls:
             if member.exit_code == exit_code:
@@ -200,6 +199,10 @@ class LockResult:
     # Serialized only when True; absent/False defaults keep the wire backward
     # compatible (no locking-protocol version change).
     re_enqueued: bool = False
+    # Core reset can take up to ~7s of active inference time.
+    # We want to opportunistically skip it to reduce inference time.
+    # Due to NRT limitation we can only do so when the LNC config is the same across runs on all cores.
+    should_reset_cores: bool = True
 
     def to_json(self) -> str:
         """Convert to JSON string for file output."""
@@ -220,10 +223,12 @@ class LockResult:
             result["bumped"] = self.bumped
         if self.re_enqueued:
             result["re_enqueued"] = self.re_enqueued
+        if not self.should_reset_cores:
+            result["should_reset_cores"] = self.should_reset_cores
         return json.dumps(result)
 
     @classmethod
-    def from_json(cls, json_str: str) -> "LockResult":
+    def from_json(cls, json_str: str) -> LockResult:
         """Parse from JSON string."""
         data = json.loads(json_str)
         return cls(
@@ -236,6 +241,7 @@ class LockResult:
             worst_case_eta=data.get("worst_case_eta"),
             bumped=data.get("bumped", False),
             re_enqueued=data.get("re_enqueued", False),
+            should_reset_cores=data.get("should_reset_cores", True),
         )
 
 
@@ -273,7 +279,7 @@ class QueueEntry:
         return result
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "QueueEntry":
+    def from_dict(cls, data: dict[str, Any]) -> QueueEntry:
         """Parse a queue entry from a JSON dict."""
         return cls(
             entry_id=data["entry_id"],
@@ -294,25 +300,28 @@ class LockState:
     draining_enabled_with_timeout: int | None  # Unix timestamp or None
     physical_neuron_cores_lock_timeout: dict[str, int]  # core_id -> expiry timestamp
     queue: list[QueueEntry] = field(default_factory=list)  # FIFO waiters
+    last_lnc_config_per_core: dict[int, int] = field(default_factory=dict)
 
     @classmethod
-    def empty(cls, version: int) -> "LockState":
+    def empty(cls, version: int) -> LockState:
         """Create an empty lock state with given protocol version."""
         return cls(
             version=version,
             draining_enabled_with_timeout=None,
             physical_neuron_cores_lock_timeout={},
+            last_lnc_config_per_core={},
             queue=[],
         )
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], default_version: int) -> "LockState":
+    def from_dict(cls, data: dict[str, Any], default_version: int) -> LockState:
         """Parse lock state from JSON dict."""
         return cls(
             version=data.get("version", default_version),
             draining_enabled_with_timeout=data.get("draining_enabled_with_timeout"),
             physical_neuron_cores_lock_timeout=data.get("physical_neuron_cores_lock_timeout", {}),
             queue=[QueueEntry.from_dict(e) for e in data.get("queue", [])],
+            last_lnc_config_per_core={int(k): v for k, v in data.get("last_lnc_config_per_core", {}).items()},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -325,6 +334,8 @@ class LockState:
             result["draining_enabled_with_timeout"] = self.draining_enabled_with_timeout
         if self.queue:
             result["queue"] = [e.to_dict() for e in self.queue]
+        if self.last_lnc_config_per_core:
+            result["last_lnc_config_per_core"] = self.last_lnc_config_per_core
         return result
 
     def is_draining(self, now: int) -> bool:
@@ -389,6 +400,7 @@ def append_event(locks_file: str, event: str | EventType, caller_id: str | None 
         event: Event type (e.g., ACQUIRE, RELEASE, DRAIN, UNDRAIN)
         caller_id: Optional caller identifier (e.g., "gw7:test_qkv_tkg_sweep")
         **fields: Additional fields to include in the event
+
     """
     log_dir = str(Path(locks_file).parent)
     today = datetime.date.today().isoformat()
@@ -437,9 +449,10 @@ def load_state(locks_file: str, default_version: int) -> LockState:
 
     Returns:
         LockState object
+
     """
     try:
-        with open(locks_file, "r") as f:
+        with open(locks_file) as f:
             data = json.load(f)
             return LockState.from_dict(data, default_version)
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
@@ -459,6 +472,7 @@ def save_state(locks_file: str, state: LockState) -> None:
     Args:
         locks_file: Path to locks.json
         state: LockState object to save
+
     """
     with open(locks_file, "w") as f:
         json.dump(state.to_dict(), f)
@@ -470,6 +484,7 @@ def write_result(result_file: str, result: LockResult) -> None:
     Args:
         result_file: Path to write result JSON
         result: LockResult to write
+
     """
     Path(result_file).write_text(result.to_json())
 
@@ -495,6 +510,7 @@ def find_contiguous_cores(
 
     Returns:
         List of contiguous physical core IDs, or None if not found
+
     """
     if len(available) < num_physical:
         return None
@@ -539,6 +555,7 @@ def _build_free_at(state: LockState, now: int, total_cores: int) -> dict[int, in
     Returns:
         Mapping from placement-eligible core id to the timestamp at which it
         becomes free. Cores held by an entry's reserved_region are omitted.
+
     """
     held = {c for e in state.queue for c in e.reserved_region}
     free_at: dict[int, int] = {}
@@ -574,6 +591,7 @@ def _candidate_blocks(
         List of ``(block, assembly_time)`` where ``assembly_time`` is the time
         the whole block is free (``max free_at`` over the block); a fully-free
         block assembles at ``now``.
+
     """
     out: list[tuple[list[int], int]] = []
     if k <= 0:
@@ -651,7 +669,11 @@ def _solve_placement(
             best["assign"] = list(assign)
 
     def greedy_complete(
-        i: int, used: set[int], assign: list[list[int] | None], assembly: list[int], idle_total: int
+        i: int,
+        used: set[int],
+        assign: list[list[int] | None],
+        assembly: list[int],
+        idle_total: int,
     ) -> None:
         assign = list(assign)
         assembly = list(assembly)
@@ -716,7 +738,13 @@ def _solve_placement(
 
 
 def reconcile(
-    state: LockState, now: int, total_cores: int, *, draining: bool, debug: bool = False
+    state: LockState,
+    now: int,
+    total_cores: int,
+    *,
+    draining: bool,
+    debug: bool = False,
+    node_cap: int = SOLVER_NODE_CAP,
 ) -> list[ReconcileEvent]:
     """Side-effect-free FIFO-queue reconcile pass with concurrent reservations.
 
@@ -776,6 +804,7 @@ def reconcile(
         Ordered list of ``ReconcileEvent`` for the caller to log (PRUNE,
         RESERVE_EXPIRED, BUMP, plus a verbose RESERVE carrying region cores and
         assembly time in ``extra`` when ``debug`` is True).
+
     """
     events: list[ReconcileEvent] = []
 
@@ -842,9 +871,14 @@ def reconcile(
     ready_regionless = [e for e in state.queue if e.ready and not e.reserved_region]
     solver_stats: dict[str, Any] = {}
     blocks = _solve_placement(
-        [e.request_cores for e in ready_regionless], free_at, total_cores, now, stats=solver_stats
+        [e.request_cores for e in ready_regionless],
+        free_at,
+        total_cores,
+        now,
+        node_cap=node_cap,
+        stats=solver_stats,
     )
-    assignment = {id(e): block for e, block in zip(ready_regionless, blocks)}
+    assignment = {id(e): block for e, block in zip(ready_regionless, blocks, strict=True)}
 
     if debug and solver_stats.get("greedy_fallback"):
         # Pass-level diagnostic: the solver fell back to greedy completion (lost
@@ -855,7 +889,7 @@ def reconcile(
                 EventType.SOLVER_OVERFLOW,
                 "",
                 {k: solver_stats[k] for k in ("reason", "queue_len", "nodes") if k in solver_stats},
-            )
+            ),
         )
 
     # Free-now pool used only to decide which not-ready entries earn a readiness
@@ -907,8 +941,10 @@ def reconcile(
             # region never re-emits on a later pass.
             events.append(
                 ReconcileEvent(
-                    EventType.RESERVE, e.entry_id, {"cores": list(block), "assembly_ts": max(free_at[c] for c in block)}
-                )
+                    EventType.RESERVE,
+                    e.entry_id,
+                    {"cores": list(block), "assembly_ts": max(free_at[c] for c in block)},
+                ),
             )
         if max(free_at[c] for c in block) <= now:
             # fully free now -> open the commit window immediately.
@@ -985,6 +1021,7 @@ def estimate_eta(
         Earliest unix timestamp at which ``request_cores`` cores are estimated
         to be free for the caller. Empty queue with enough free cores now
         returns ``now``.
+
     """
     if request_cores <= 0:
         return now
@@ -1068,6 +1105,7 @@ def poll(
     version: int,
     entry_id: str,
     ready: bool,
+    lnc_config: int,
     caller_id: str | None = None,
 ) -> LockResult:
     """Single mutating FIFO-queue verb: enqueue/refresh/commit.
@@ -1114,6 +1152,7 @@ def poll(
     Returns:
         LockResult: ALLOCATED (with cores/expiry) on commit, else
         IN_QUEUE with position + worst_case_eta (relative seconds from now).
+
     """
     # Read wall-clock once at the verb boundary; pure helpers receive it as a param.
     now = int(time.time())
@@ -1168,6 +1207,7 @@ def poll(
             version=state.version,
             draining_enabled_with_timeout=state.draining_enabled_with_timeout,
             physical_neuron_cores_lock_timeout=state.physical_neuron_cores_lock_timeout,
+            last_lnc_config_per_core=state.last_lnc_config_per_core,
             queue=state.queue[:position],
         )
         return estimate_eta(ahead, num_physical, now, total_cores, hold_window=timeout_seconds)
@@ -1176,10 +1216,14 @@ def poll(
         # Reuse acquire's expiry/lock/append_event mechanics for commit.
         expiry = now + timeout_seconds
         state.lock_cores(block, expiry)
+        # Skip reset only when every allocated core previously ran at this lnc_config.
+        # Any LNC change (up or down) or first use (None) requires reset.
+        should_reset = not all(state.last_lnc_config_per_core.get(core) == lnc_config for core in block)
+        state.last_lnc_config_per_core.update(dict.fromkeys(block, lnc_config))
         save_state(locks_file, state)
         _flush_reconcile_events()
         append_event(locks_file, event, caller_id, cores=block, expiry=expiry)
-        return LockResult(status=LockStatus.ALLOCATED, cores=block, expiry=expiry)
+        return LockResult(status=LockStatus.ALLOCATED, cores=block, expiry=expiry, should_reset_cores=should_reset)
 
     # Step 2: not yet queued -> enqueue a NEW tail entry WITH its readiness. A
     # new entry never commits same-exec (two-phase: ENQUEUE now, COMMIT on a
@@ -1271,6 +1315,7 @@ def probe(
     Returns:
         LockResult with DRAINING status while draining else IN_QUEUE, carrying
         ``worst_case_eta`` (relative seconds from now until estimated acquire).
+
     """
     # Read wall-clock once at the verb boundary; estimate_eta stays clock-free.
     now = int(time.time())
@@ -1313,6 +1358,7 @@ def dequeue(
 
     Returns:
         LockResult with RELEASED status.
+
     """
     # Read wall-clock once at the verb boundary; reconcile stays clock-free.
     now = int(time.time())
@@ -1366,6 +1412,7 @@ def release(
 
     Returns:
         LockResult with RELEASED status
+
     """
     state = load_state(locks_file, version)
 
@@ -1403,6 +1450,7 @@ def drain(locks_file: str, timeout_seconds: int, version: int) -> LockResult:
 
     Returns:
         LockResult with DRAINED status
+
     """
     # Use local time on the inference host to avoid clock drift issues
     now = int(time.time())
@@ -1430,6 +1478,7 @@ def undrain(locks_file: str, version: int) -> LockResult:
 
     Returns:
         LockResult with UNDRAINED status
+
     """
     state = load_state(locks_file, version)
     state.draining_enabled_with_timeout = None
@@ -1449,6 +1498,7 @@ def is_host_draining(locks_file: str, version: int) -> LockResult:
 
     Returns:
         LockResult with DRAINING if draining, UNDRAINED otherwise
+
     """
     now = int(time.time())
     state = load_state(locks_file, version)
@@ -1465,6 +1515,7 @@ def main(args: list[str]) -> LockResult:
 
     Returns:
         LockResult from the command (also written to result file if specified)
+
     """
     parser = argparse.ArgumentParser(prog="lock_helpers.py", description="Core lock management")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1479,6 +1530,7 @@ def main(args: list[str]) -> LockResult:
     p_poll.add_argument("version", type=int, help="Lock protocol version")
     p_poll.add_argument("entry_id", help="Stable per-attempt queue identity")
     p_poll.add_argument("--ready", dest="ready", action="store_true", help="Caller is ready to commit")
+    p_poll.add_argument("--lnc-config", dest="lnc_config", type=int, default=2, help="LNC configuration (1 or 2)")
     p_poll.add_argument("--caller-id", dest="caller_id", help="Caller identifier for event logging")
 
     # probe subcommand
@@ -1547,6 +1599,7 @@ def main(args: list[str]) -> LockResult:
                 parsed.version,
                 parsed.entry_id,
                 parsed.ready,
+                parsed.lnc_config,
                 caller_id=parsed.caller_id,
             )
         elif parsed.command == "probe":

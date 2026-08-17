@@ -21,7 +21,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import torch
-
 from nkilib_src.nkilib.core.mlp.mlp import mlp
 from nkilib_src.nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
 from nkilib_src.nkilib.core.mlp.mlp_tkg.projection_mx_constants import (
@@ -45,6 +44,7 @@ from nkilib_src.nkilib.core.utils.kernel_helpers import (
     get_verified_program_sharding_info,
 )
 from nkilib_src.nkilib.core.utils.logging import Logger
+
 from test.integration.nkilib.utils.tensor_generators import (
     TensorTemplate,
     gaussian_tensor_generator,
@@ -149,7 +149,6 @@ def _run_mlp_test(
     lnc = compiler_args.logical_nc_config
     kernel_fn = kernel_entry if kernel_entry is not None else mlp
     transposed_out = kernel_input.get("transposed_out", False)
-    transposed_in = kernel_input.get("transposed_in", False)
 
     # Pre-resolve DtypeMode.AUTO for the torch ref using the platform target.
     # The kernel still receives the original dtype_mode and resolves at trace
@@ -241,6 +240,8 @@ def build_fused_norm_mlp(
     gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
     tensor_generator: Callable = gaussian_tensor_generator(),
     mode: ComputationMode = ComputationMode.AUTO,
+    use_mx_block_scale_input: bool = False,
+    use_folded_mx_scales=False,
 ):
     np.random.seed(42)
     rng = np.random.default_rng(42)
@@ -276,6 +277,13 @@ def build_fused_norm_mlp(
             hidden_states.reshape(tokens, n_H512_tile, _pmax, _q_width).transpose(0, 3, 1, 2).reshape(tokens, hidden)
         )
         hidden_input = dt.static_cast(hidden_states, dtype).reshape(batch, seqlen, hidden)
+    elif is_input_quantized and use_mx_block_scale_input:
+        from test.integration.nkilib.core.moe.moe_cte.test_utils import build_prequantized_hidden_concat
+
+        tokens = batch * seqlen
+        n_H512_tile = hidden // (_pmax * _q_width)
+        hidden_concat, _mx_block_hidden_fp32 = build_prequantized_hidden_concat(tokens, n_H512_tile, hidden)
+        hidden_input = dt.static_cast(hidden_concat.reshape(batch, seqlen, -1), quant_dtype)
     elif is_input_quantized:
         if quantization_type.is_logical_row() or quantization_type == QuantizationType.MX:
             hidden_input = tensor_generator(
@@ -444,7 +452,15 @@ def build_fused_norm_mlp(
             up_w_scale = mx_weights.up_w_scale.reshape(16, hidden // 512, n_I512_tile, _pmax, _q_width).transpose(
                 0, 1, 2, 4, 3
             )
-        down_w_scale = mx_weights.down_w_scale
+            if use_folded_mx_scales:
+                # Pre-fold gate/up/down scales into the kernel's physical SBUF layout so the
+                # kernel loads them with a single large DMA. The torch ref unfolds them.
+                gate_w_scale = fold_mx_gate_up_scale(gate_w_scale)
+                up_w_scale = fold_mx_gate_up_scale(up_w_scale)
+        if use_folded_mx_scales and not is_tkg_mode:
+            down_w_scale = fold_mx_down_scale(mx_weights.down_w_scale)
+        else:
+            down_w_scale = mx_weights.down_w_scale
         gate_up_in_scale = None
         down_in_scale = None
     elif quantization_type == QuantizationType.STATIC_MX:
@@ -556,6 +572,7 @@ def build_fused_norm_mlp(
         "up_clamp_lower_limit": up_clamp_lower_limit,
         "mode": mode,
         "gate_up_w_layout": gate_up_w_layout,
+        "use_folded_mx_scales": use_folded_mx_scales,
     }
     if transposed_in:
         kernel_input["transposed_in"] = transposed_in
@@ -666,6 +683,56 @@ def gen_mlp_mxfp_weights(hidden, intermediate, mx_dtype):
         down_w_scale[:n_rows_scale, i_I512_tile, :] = tmp_w_scale[i_I512_tile * 16 : i_I512_tile * 16 + n_rows_scale, :]
 
     return MlpMxWeights(gate_w_qtz, gate_w_scale, up_w_qtz, up_w_scale, down_w_qtz, down_w_scale)
+
+
+# Physical fold constants for CTE MX weight scales (mirror the kernel's load-time fold).
+_QUADRANT_SIZE = 32
+_PARTITIONS_PER_SLOT = 4
+_NUM_SLOTS = 4
+
+
+def fold_mx_gate_up_scale(scale):
+    """Pre-fold a CTE MX gate/up weight scale into the kernel's physical SBUF layout.
+
+    Input: standard CTE gate/up scale [16, H/512, I/512, 4, 128] (physical I order).
+    Output: [128, ceil((H/512)/4), I] where H/512 tile ``k`` is folded into buffer
+    ``k // 4`` at partitions ``q*32 + (k%4)*4 : +4`` for each quadrant ``q`` in 0..3.
+    Unused partitions/slots stay zero. This reproduces exactly the bytes the kernel's
+    quadrant-fold DMA loop writes to SBUF.
+    """
+    n_H_scales, n_H512, n_I512, q_w, i_sub = scale.shape  # [16, H/512, I/512, 4, 128]
+    assert n_H_scales == 16 and q_w == _PARTITIONS_PER_SLOT and i_sub == _pmax
+    I = n_I512 * q_w * i_sub
+    scale_flat = scale.reshape(n_H_scales, n_H512, I)  # [16, H/512, I]
+    n_packed = math.ceil(n_H512 / _NUM_SLOTS)
+    folded = np.zeros((_pmax, n_packed, I), dtype=scale.dtype)
+    for q in range(_pmax // _QUADRANT_SIZE):
+        for k in range(n_H512):
+            slot = k % _NUM_SLOTS
+            dst_p = q * _QUADRANT_SIZE + slot * _PARTITIONS_PER_SLOT
+            src_p = q * _PARTITIONS_PER_SLOT
+            folded[dst_p : dst_p + _PARTITIONS_PER_SLOT, k // _NUM_SLOTS, :] = scale_flat[
+                src_p : src_p + _PARTITIONS_PER_SLOT, k, :
+            ]
+    return folded
+
+
+def fold_mx_down_scale(scale):
+    """Pre-fold a CTE MX down weight scale into the kernel's physical SBUF layout.
+
+    Input: standard CTE down scale [16, I/512, H]. Output: [128, I/512, H] where the
+    16 scale rows are scattered to partitions ``q*32 : q*32+4`` (q in 0..3); the
+    remaining partitions stay zero. Reproduces the kernel's quadrant-fold DMA bytes.
+    """
+    n_I_scales, n_I512, H = scale.shape  # [<=16, I/512, H]
+    folded = np.zeros((_pmax, n_I512, H), dtype=scale.dtype)
+    for q in range(_pmax // _QUADRANT_SIZE):
+        src_p = q * _PARTITIONS_PER_SLOT
+        rows = max(0, min(_PARTITIONS_PER_SLOT, n_I_scales - src_p))
+        if rows:
+            dst_p = q * _QUADRANT_SIZE
+            folded[dst_p : dst_p + rows, :, :] = scale[src_p : src_p + rows, :, :]
+    return folded
 
 
 MxAllTokensWeights = namedtuple(

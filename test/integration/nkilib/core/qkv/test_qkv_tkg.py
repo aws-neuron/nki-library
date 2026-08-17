@@ -13,15 +13,13 @@
 # limitations under the License.
 
 import enum
-from typing import Optional, final
+from typing import Optional, TypedDict, final
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.qkv.qkv_tkg import qkv_tkg
 from nkilib_src.nkilib.core.qkv.qkv_torch import qkv_torch_ref
 from nkilib_src.nkilib.core.subkernels.layernorm_tkg import (
@@ -40,6 +38,8 @@ from nkilib_src.nkilib.core.utils.common_types import (
 )
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib_src.nkilib.core.utils.logging import Logger
+from typing_extensions import override
+
 from test.integration.nkilib.core.qkv.test_qkv_common import build_qkv_input, run_qkv_test
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
@@ -87,7 +87,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     qkv_w_scale: Optional[nl.ndarray] = None,
     qkv_in_scale: Optional[nl.ndarray] = None,
     # -- Fused Residual Add
-    fused_residual_add: Optional[bool] = False,
+    fused_residual_add: bool = False,
     mlp_prev: Optional[nl.ndarray] = None,
     attention_prev: Optional[nl.ndarray] = None,
     # --- Fused Norm Related
@@ -234,6 +234,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
         sbm=sbm,
     )
 
+    assert not isinstance(output_sb, tuple), "fused_residual_add is not supported by this wrapper"
     assert output_sb.shape == (BxS, I)
 
     # Allocate output tensor with layout-specific shape
@@ -242,6 +243,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
         output_pattern = [[I, BxS], [1, I]]
         nisa.dma_copy(dst=output_hbm.ap(pattern=output_pattern, offset=0), src=output_sb)
     elif output_layout == QKVOutputLayout.NBSd:
+        assert d_head is not None, "output_layout NBSd requires d_head"
         nh = I // d_head
         output_hbm = nl.ndarray((nh, BxS, d_head), dtype=hidden_sb.dtype, buffer=nl.shared_hbm)
         # output_sb_pattern = [[d_head, nh], [I, BxS], [1, d_head]]
@@ -296,6 +298,23 @@ def filter_qkv_tkg_combinations(
                 return FilterResult.INVALID
 
     return FilterResult.VALID
+
+
+class QkvTkgDtypeModeConfig(TypedDict):
+    """Shapes and fusion settings shared by every dtype_mode canary case."""
+
+    B: int
+    H: int
+    S: int
+    dtype: str
+    eps: float
+    fused_add: bool
+    lnc_degree: int
+    norm_type: NormType
+    output_layout: QKVOutputLayout
+    n_q_heads: int
+    n_kv_heads: int
+    d_head: int
 
 
 @pytest_test_metadata(name="QKV TKG")
@@ -1073,20 +1092,23 @@ class TestQkvTkgKernel:
     # FP8 quant mode canary for QKV TKG.
     # Tests NON_OCP, OCP, AUTO across STATIC and ROW.
     ####################################################################################################################
-    _QKV_TKG_BY_DTYPE_MODE_CONFIG = dict(
-        B=1,
-        H=8192,
-        S=1,
-        dtype=nl.bfloat16,
-        eps=1e-6,
-        fused_add=False,
-        lnc_degree=2,
-        norm_type=NormType.RMS_NORM,
-        output_layout=QKVOutputLayout.BSD,
-        n_q_heads=8,
-        n_kv_heads=1,
-        d_head=128,
-    )
+    _DTYPE_MODE_D_HEAD = 128
+    _DTYPE_MODE_N_Q_HEADS = 8
+    _DTYPE_MODE_N_KV_HEADS = 1
+    _QKV_TKG_BY_DTYPE_MODE_CONFIG: QkvTkgDtypeModeConfig = {
+        "B": 1,
+        "H": 8192,
+        "S": 1,
+        "dtype": nl.bfloat16,
+        "eps": 1e-6,
+        "fused_add": False,
+        "lnc_degree": 2,
+        "norm_type": NormType.RMS_NORM,
+        "output_layout": QKVOutputLayout.BSD,
+        "n_q_heads": _DTYPE_MODE_N_Q_HEADS,
+        "n_kv_heads": _DTYPE_MODE_N_KV_HEADS,
+        "d_head": _DTYPE_MODE_D_HEAD,
+    }
 
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
     @pytest.mark.parametrize(
@@ -1110,8 +1132,7 @@ class TestQkvTkgKernel:
             pytest.skip("OCP dtype_mode requires TRN3")
         compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
         cfg = self._QKV_TKG_BY_DTYPE_MODE_CONFIG
-        n_q_heads, n_kv_heads, d_head = cfg["n_q_heads"], cfg["n_kv_heads"], cfg["d_head"]
-        fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
+        fused_qkv_dim = (self._DTYPE_MODE_N_Q_HEADS + 2 * self._DTYPE_MODE_N_KV_HEADS) * self._DTYPE_MODE_D_HEAD
         self.run_qkv_tkg_test(
             test_manager=test_manager,
             compiler_args=compiler_args,

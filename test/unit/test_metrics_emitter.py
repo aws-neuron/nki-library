@@ -17,12 +17,14 @@ Unit tests for metrics_emitter module.
 
 import json
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from aws_embedded_metrics.logger.metrics_context import MetricsContext
 
 from ..utils.metrics_collector import MetricName, MetricsCollector
 from ..utils.metrics_emitter import MetricsEmitter, OutputMode
+from ..utils.param_extractor import extract_pytest_params, normalize_param_names
 
 
 class TestMetricsEmitter:
@@ -166,3 +168,38 @@ class TestMetricsEmitter:
                 data = json.load(f)
 
             assert data["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "CustomNamespace"
+
+    def test_kernel_param_with_nested_object_emits_without_failure(self):
+        """A complex object nested in a kernel-param container emits without failure.
+
+        Drives the real params -> collector -> emitter chain; a raw nested object
+        would fail json.dumps in the emitter and drop every metric for the test.
+        """
+
+        @dataclass(frozen=True)
+        class _Clamp:
+            lo: float | None = None
+            hi: float | None = None
+
+            def __repr__(self):
+                return f"clamp_{self.lo}_{self.hi}"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            collector = MetricsCollector()
+            collector.set_namespace("NeuronCompiler")
+            collector.start_test()
+            collector.add_dimension({"TestName": "test_nested_param", "Target": "trn3_a0"})
+            collector.set_output_dir(tmpdir)
+
+            raw_params = {"feature_kwargs": {"clamp_limits": _Clamp(-0.5, 0.5)}, "hidden": 4096}
+            collector.set_kernel_params(normalize_param_names(extract_pytest_params(raw_params)))
+            collector.record_metric(MetricName.COMPILATION_TIME, 1.23, "Seconds")
+
+            MetricsEmitter(output_mode=OutputMode.FILE).emit(collector)
+
+            files = list(Path(tmpdir).joinpath("metrics").glob("*.json"))
+            assert len(files) == 1, "emitter dropped the metrics (nested object not serialized)"
+            with open(files[0], "r") as f:
+                data = json.load(f)
+            assert data["hidden"] == 4096
+            assert "clamp" in data["feature_kwargs"]

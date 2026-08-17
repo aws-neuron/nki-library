@@ -51,7 +51,7 @@ def test_ruff_format_check():
             f"{ruff_diff.stdout}\n\n"
             "To fix formatting issues, run: ruff format ."
         )
-        assert False, error_message
+        raise AssertionError(error_message)
 
     assert result.returncode == 0, "ruff format --check should return 0 for properly formatted code"
 
@@ -82,6 +82,6 @@ def test_ruff_check():
             f"{result.stderr}\n\n"
             "To fix auto-fixable issues, run: ruff check --fix ."
         )
-        assert False, error_message
+        raise AssertionError(error_message)
 
     assert result.returncode == 0, "ruff check should return 0 for code that passes all linting rules"

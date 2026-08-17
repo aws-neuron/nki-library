@@ -35,77 +35,146 @@ import logging
 import os
 import random
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import pytest
 from _pytest.config import Config
+from _pytest.mark import Mark
 from _pytest.python import Metafunc
+from _pytest.stash import Stash, StashKey
 
 from .common_dataclasses import (
+    HostProvisioningMode,
+    HostProvisioningResult,
     NKICompilationMode,
     PlatformAware,
     Platforms,
+    ResolvedHost,
     TargetHost,
     TraceMode,
     UploadProfileMode,
     get_test_tier,
 )
 from .coverage_parametrized_tests import extract_parametrize_args, generate_parametrized_test_case
-from .feature_flag_helper import derive_pytest_test_id, get_feature_flag, resolve_base_output_directory
+from .feature_flag_helper import (
+    derive_pytest_test_id,
+    get_feature_flag,
+    get_platform_targets,
+    resolve_base_output_directory,
+    resolve_ssh_config_path,
+)
 from .host_management import HostManager, detect_local_neuron_devices
+from .host_state import HostStateStore
 from .metrics_collector import IMetricsCollector, MetricsCollector, NoopMetricsCollector
-from .metrics_emitter import IMetricsEmitter, MetricsEmitter, NoopMetricsEmitter, OutputMode
+from .metrics_emitter import IMetricsEmitter, MetricsEmitter, NoopMetricsEmitter, OutputMode, SessionContext
 from .param_extractor import compute_params_hash, derive_test_method_id, extract_pytest_params, normalize_param_names
-from .pytest_test_metadata import derive_labeled_kernel_name, discover_pytest_test_metadata_marks
+from .pytest_test_metadata import discover_pytest_test_metadata_marks, resolve_file_kernel_name
 from .s3_utils import S3ArtifactUploadConfig
 from .simulation_setup import setup_simulation_mode
+from .suite_chunking import get_chunked_tests
 from .test_orchestrator import Orchestrator
 
 _RNG_SEED_ENV_KEY = "NEURON_PYTHONHASHSEED"
 
+logging.getLogger("paramiko.transport").setLevel(logging.WARNING)
+
+
+@runtime_checkable
+class _CallSpec(Protocol):
+    """The parameter mapping of one parametrized case."""
+
+    params: dict[str, Any]
+
+
+@runtime_checkable
+class _ParametrizedItem(Protocol):
+    """A collected test produced by parametrization, which carries its case's parameters.
+
+    Non-parametrized tests do not have this attribute at all, so presence of the
+    attribute is exactly the "is parametrized" test.
+    """
+
+    callspec: _CallSpec
+
+
+class _StashHolder(Protocol):
+    """The only thing session-state writers need from a pytest config: its stash."""
+
+    @property
+    def stash(self) -> Stash: ...
+
+
+class _MarkerSource(Protocol):
+    """The only thing marker inspection needs from a collected test: its resolved markers."""
+
+    def iter_markers(self, name: str | None = None) -> Iterator[Mark]: ...
+
+
+# ─── Session state on ``config`` ───
+# All per-session state we attach to pytest's ``config`` object lives here as typed ``StashKey``s.
+SESSION_TRACE_MODE_KEY: StashKey[TraceMode] = StashKey()
+"""Resolved once from --test-mode + host mode; the trace mode the session runs and reports."""
+HOST_PROVISIONING_MODE_KEY: StashKey[HostProvisioningMode] = StashKey()
+"""How the run obtains hosts. Lazily CLI-derived; a provisioning plug-in overrides it to
+PLUGIN_PROVISIONED (see apply_host_provisioning_result)."""
+HOST_RECOVERABLE_KEY: StashKey[bool] = StashKey()
+"""Whether the host pool can regain hosts mid-run (only ever set on the plug-in path)."""
+TESTRUN_UID_KEY: StashKey[str] = StashKey()
+"""Controller-generated session id, propagated to xdist workers via --testrunuid."""
+QOR_SESSION_ID_KEY: StashKey[str] = StashKey()
+"""Timestamp id grouping this run's QoR CSV output (controller-set, bridged to workers)."""
+SESSION_CONTEXT_KEY: StashKey[SessionContext] = StashKey()
+"""Immutable session-level metric dimensions (target, trace mode, run type, …)."""
+RELEVANT_TEST_DIRS_KEY: StashKey[set[str] | None] = StashKey()
+"""When --run-relevant-tests is active, the dir set to filter collection to (None = all)."""
+CONTROLLER_SETUP_COLLECTOR_KEY: StashKey[IMetricsCollector] = StashKey()
+"""Controller-side metrics collector for work done during session setup, before workers spawn.
+The controller has no per-test emit cycle, so setup-phase metrics are recorded here."""
+
+
 # ─── Helper functions ───
 
 
-def get_platform_targets(config: Config) -> list[Platforms]:
-    """Return the list of target platforms from CLI (or default to [TRN2])."""
-    valid_names = [p.value for p in Platforms]
-    raw = get_feature_flag(config, "platform_target", None)
-    if raw is None:
-        return [Platforms.TRN2]
-    platforms: list[Platforms] = []
-    for token in raw.split(","):
-        name = token.strip()
-        if not name:
-            continue
-        try:
-            platforms.append(Platforms(name))
-        except ValueError:
-            raise pytest.UsageError(f"Unknown platform target '{name}'. Valid options: {', '.join(valid_names)}")
-    if not platforms:
-        raise pytest.UsageError(f"--platform-target resolved to an empty list. Valid options: {', '.join(valid_names)}")
-    return platforms
+def _single_compile_separation_requested() -> bool:
+    """Whether this run requested the single compile DMA-hoisting separation flow.
+
+    The request is an env var rather than a pytest flag. When the implementing module is
+    unavailable, the import fails and the request degrades to False.
+    """
+    try:
+        from .single_compile_separation_private import separation_requested
+    except ImportError:
+        return False
+    return separation_requested()
 
 
 def resolve_session_trace_mode(config: Config) -> TraceMode:
     """Resolve session trace mode from CLI flags. Result is cached on config."""
-    if hasattr(config, "_session_trace_mode"):
-        return config._session_trace_mode
+    if SESSION_TRACE_MODE_KEY in config.stash:
+        return config.stash[SESSION_TRACE_MODE_KEY]
 
     test_mode = get_feature_flag(config, "test_mode")
-    if test_mode:
-        config._session_trace_mode = TraceMode.create(test_mode)
-    elif get_feature_flag(config, "target_host"):
-        config._session_trace_mode = TraceMode.CompileAndInfer
+    if _single_compile_separation_requested():
+        if test_mode:
+            raise pytest.UsageError("The single compile separation pass flow cannot be combined with --test-mode")
+        mode = TraceMode.CompileAndInferAndSeparate
+    elif test_mode:
+        mode = TraceMode.create(test_mode)
+    elif not is_local_run(config):
+        mode = TraceMode.CompileAndInfer
     else:
         neuron_installation_path = get_feature_flag(config, "neuron_tools_bin_path")
         if detect_local_neuron_devices(neuron_installation_path):
-            config._session_trace_mode = TraceMode.CompileAndInfer
+            mode = TraceMode.CompileAndInfer
             logging.info("Local Neuron devices detected, using CompileAndInfer mode")
         else:
-            config._session_trace_mode = TraceMode.CompileOnly
+            mode = TraceMode.CompileOnly
 
-    return config._session_trace_mode
+    config.stash[SESSION_TRACE_MODE_KEY] = mode
+    return mode
 
 
 def is_simulation_mode(config: Config) -> bool:
@@ -116,6 +185,65 @@ def is_simulation_mode(config: Config) -> bool:
 def is_debugger_mode(config: Config) -> bool:
     """Check if debugger mode is active."""
     return resolve_session_trace_mode(config) == TraceMode.Debugger
+
+
+def apply_host_provisioning_result(config: _StashHolder, result: HostProvisioningResult) -> None:
+    """Decompose a plug-in's :class:`HostProvisioningResult` onto ``config`` — the single place
+    config learns what a plug-in did. Folds ``plugin_provisioned`` into the provisioning mode
+    (so there is one representation of it, not a separate flag) and records recoverability.
+    A non-provisioning result is a no-op: the mode stays lazily CLI-derived and the run keeps
+    its non-recoverable default."""
+    if result.plugin_provisioned:
+        config.stash[HOST_PROVISIONING_MODE_KEY] = HostProvisioningMode.PLUGIN_PROVISIONED
+        config.stash[HOST_RECOVERABLE_KEY] = result.recoverable
+
+
+def resolve_host_provisioning_mode(config: Config) -> HostProvisioningMode:
+    """Classify how this run obtains its hosts, once (cached on config). This is the
+    single source of truth that the run-mode predicates below project from, so the
+    classification logic isn't duplicated across conftest helpers and make_host_manager.
+
+    Derived from the public CLI signals.
+
+    Precedence among the CLI signals: a static host file wins over a static host list, which
+    wins over local. A plug-in claim (the override) supersedes all of them, matching the
+    controller layering (a provisioning plug-in claims the run before static hosts)."""
+    if HOST_PROVISIONING_MODE_KEY in config.stash:
+        return config.stash[HOST_PROVISIONING_MODE_KEY]
+
+    if get_feature_flag(config, "target_host_file"):
+        mode = HostProvisioningMode.STATIC_FILE
+    elif get_feature_flag(config, "target_host", []):
+        mode = HostProvisioningMode.STATIC_HOSTS
+    else:
+        mode = HostProvisioningMode.LOCAL
+
+    config.stash[HOST_PROVISIONING_MODE_KEY] = mode
+    return mode
+
+
+def is_local_run(config: Config) -> bool:
+    """True when tests run on this machine's own chip (no remote hosts of any kind)."""
+    return resolve_host_provisioning_mode(config) is HostProvisioningMode.LOCAL
+
+
+def is_remote_bootstrap_run(config: Config) -> bool:
+    """True when the controller bootstraps host_state.json before workers run: the
+    static-file path, or a plug-in-provisioned pool. NOT the --target-host list (that
+    drives a fixed set over SSH from a local-style session with no controller-side store
+    setup), and NOT plain local. All bootstrap paths imply CompileAndInfer."""
+    return resolve_host_provisioning_mode(config) in (
+        HostProvisioningMode.STATIC_FILE,
+        HostProvisioningMode.PLUGIN_PROVISIONED,
+    )
+
+
+def is_recoverable_run(config: Config) -> bool:
+    """True when the host pool can gain or regain hosts mid-run, so a failed claim should
+    wait rather than fail immediately. Set by the provisioning plug-in (which runs the
+    background re-resolver) via apply_host_provisioning_result; only a plug-in-provisioned
+    run is ever recoverable, so recoverability is stored only on that path (default False)."""
+    return config.stash.get(HOST_RECOVERABLE_KEY, False)
 
 
 @functools.lru_cache(maxsize=None)
@@ -149,6 +277,11 @@ def resolve_git_short_sha(default: str | None = None) -> str | None:
         return default
 
 
+def get_pytest_mark_names(node: _MarkerSource) -> list[str]:
+    """Return all resolved pytest marker names in deterministic order."""
+    return sorted({marker.name for marker in node.iter_markers()})
+
+
 def make_collector(
     request: pytest.FixtureRequest,
     metric_output_mode: OutputMode | None,
@@ -173,6 +306,8 @@ def make_collector(
     # Emit stable test method identifier: module::class::method
     collector.add_dimension({"TestMethodId": derive_test_method_id(request.node)})
 
+    collector.set_pytest_marks(get_pytest_mark_names(request.node))
+
     # Set TestName from nodeid (same derivation as orchestrator)
     collector.set_test_name(derive_pytest_test_id())
 
@@ -181,10 +316,7 @@ def make_collector(
     if tier is not None:
         collector.add_dimension({"TestTier": tier.value})
 
-    metadata_name = None
-    if request.cls and hasattr(request.cls, "__pytest_test_metadata__"):
-        metadata_name = request.cls.__pytest_test_metadata__.get("name")
-    labeled_kernel = derive_labeled_kernel_name(request.fspath, metadata_name)
+    labeled_kernel = resolve_file_kernel_name(request.path)
     if labeled_kernel:
         collector.add_dimension({"KernelName": labeled_kernel})
 
@@ -200,6 +332,46 @@ def make_emitter(
     return MetricsEmitter(output_mode=metric_output_mode)
 
 
+def resolve_testrun_uid(config: Config) -> str:
+    """Session id identical across the controller and all xdist workers.
+
+    Workers return the uid xdist injects via ``workerinput``. The controller
+    seeds xdist's ``--testrunuid`` option before NodeManager starts (our
+    sessionstart hook runs before xdist's trylast one), so xdist adopts our
+    uid and propagates that same value to every worker. A random uid is only
+    ever generated for that controller seed or in explicit non-xdist mode;
+    any other xdist state raises rather than risk a controller/worker
+    mismatch.
+    """
+    workerinput = getattr(config, "workerinput", None)
+    if workerinput is not None:
+        uid = workerinput.get("testrunuid")
+        if uid is None:
+            raise RuntimeError("xdist worker is missing 'testrunuid' in workerinput")
+        return uid
+    dist = getattr(config.option, "dist", "no")
+    if dist != "no":
+        # xdist controller. If NodeManager exists its uid is authoritative;
+        # otherwise seed the --testrunuid option NodeManager will adopt.
+        dsession = config.pluginmanager.getplugin("dsession")
+        nodemanager = getattr(dsession, "nodemanager", None) if dsession else None
+        if nodemanager is not None:
+            return nodemanager.testrunuid
+        uid = getattr(config.option, "testrunuid", None)
+        if uid is None:
+            import uuid
+
+            uid = uuid.uuid4().hex
+            config.option.testrunuid = uid
+        return uid
+    # Non-xdist: stable per-session id cached on config.
+    if config.stash.get(TESTRUN_UID_KEY, None) is None:
+        import uuid
+
+        config.stash[TESTRUN_UID_KEY] = uuid.uuid4().hex
+    return config.stash[TESTRUN_UID_KEY]
+
+
 def make_host_manager(
     config: Config,
     *,
@@ -208,22 +380,28 @@ def make_host_manager(
 ) -> HostManager:
     """Create a HostManager from shared CLI options.
 
+    Local/remote and recoverability are derived from the run's host-provisioning mode
+    (see resolve_host_provisioning_mode), so callers don't thread those booleans in.
+
     Args:
-        target_hosts: Override host list (default: built from --target-host CLI).
+        target_hosts: Override host list (default: built from --target-host CLI). A
+            plug-in-provisioned or static-file caller passes its own (possibly filtered)
+            list; membership for those still flows through the host-state store separately.
         s3_config: Override S3 config (default: built from --artifact-upload-s3-* CLI).
     """
     neuron_installation_path: str = get_feature_flag(config, "neuron_tools_bin_path")
-    ssh_config_path: str = os.path.expanduser(get_feature_flag(config, "ssh_config_path", "~/.ssh/config"))
+    ssh_config_path: str = resolve_ssh_config_path(config)
 
     if s3_config is None:
         s3_config = S3ArtifactUploadConfig(
             bucket=get_feature_flag(config, "artifact_upload_s3_bucket"),
             prefix=get_feature_flag(config, "artifact_upload_s3_prefix"),
             profile=get_feature_flag(config, "aws_profile"),
+            region=get_feature_flag(config, "artifact_upload_s3_region"),
         )
 
     if target_hosts is None:
-        target_hosts_cli: list[str] = get_feature_flag(config, "target_host", list())
+        target_hosts_cli: list[str] = get_feature_flag(config, "target_host", [])
         if target_hosts_cli:
             platforms = get_platform_targets(config)
             assert len(platforms) == 1, f"--target-host requires a single --platform-target, got {platforms}"
@@ -231,19 +409,40 @@ def make_host_manager(
         else:
             target_hosts = []
 
+    state_store = HostStateStore(resolve_base_output_directory(config))
+    if target_hosts:
+        bootstrap = [ResolvedHost(ssh_host=th.ssh_host, host_type=th.host_type) for th in target_hosts]
+        state_store.initialize(bootstrap)
+
+    # A local host is needed only for a local run that actually executes on the Neuron device.
+    runs_on_hardware = resolve_session_trace_mode(config) in (
+        TraceMode.CompileAndInfer,
+        TraceMode.CompileAndInferAndSeparate,
+        TraceMode.Debugger,
+    )
+
     hm = HostManager(
-        base_host_info_path=resolve_base_output_directory(config),
+        state_store=state_store,
         neuron_installation_path=neuron_installation_path,
-        target_hosts=target_hosts,
         ssh_config_path=ssh_config_path,
+        testrun_uid=resolve_testrun_uid(config),
+        needs_local_host=is_local_run(config) and runs_on_hardware,
         s3_config=s3_config,
+        transport=get_feature_flag(config, "transport", "paramiko"),
         host_rotation_patience_seconds=get_feature_flag(config, "ssh_host_rotation_patience_seconds"),
+        hosts_recoverable=is_recoverable_run(config),
     )
-    hm.initialize_host_stats(
-        # Bound concurrent init-time capacity probes by the xdist worker cap so we
-        # never spawn more parallel SSH probes than the configured test parallelism.
-        max_probe_workers=config.getoption("maxprocesses", default=None),
-    )
+
+    # Static --target-host hosts enter the store with unknown (0) capacity, which makes them
+    # ineligible for capacity-based routing. Probe their real core counts once here (bounded
+    # by the xdist worker cap) and persist them. The plug-in/fleet path instead probes at
+    # resolution time, so it needs no probe here. Local runs bypass the store entirely.
+    if target_hosts and not is_local_run(config):
+        hm.probe_and_record_capacity(
+            [th.ssh_host for th in target_hosts],
+            max_probe_workers=config.getoption("maxprocesses", default=None),
+        )
+
     return hm
 
 
@@ -282,6 +481,12 @@ def pytest_addoption(parser):
         help="Hostname(s) of MLA accelerator hosts to execute tests on remotely",
     )
     group.addoption(
+        "--target-host-file",
+        action="store",
+        default=None,
+        help="Path to JSON file containing MLA accelerator host definitions.  This is used in place of --target-host if the set of hosts are not homogeneous with respect to host type.",
+    )
+    group.addoption(
         "--output-directory",
         default="neuron_test_output",
         help="Base directory for artifacts produced by test cases",
@@ -318,13 +523,19 @@ def pytest_addoption(parser):
     group.addoption(
         "--test-mode",
         action="store",
-        choices=["trace-only", "compile-only", "compile-and-infer", "simulation", "debugger"],
+        choices=[
+            "trace-only",
+            "compile-only",
+            "compile-and-infer",
+            "simulation",
+            "debugger",
+        ],
         help="Override default trace mode (markers take precedence)",
     )
     group.addoption(
         "--nki-compilation-mode",
         action="store",
-        default=NKICompilationMode.parser.value,
+        default=NKICompilationMode.tracer.value,
         choices=[m.value for m in NKICompilationMode],
         help="NKI compiler frontend to use",
     )
@@ -392,6 +603,13 @@ def pytest_addoption(parser):
         help="Enable DGE Notifications during profiling",
     )
     group.addoption(
+        "--ucode-lib-path",
+        action="store",
+        default=None,
+        help="Path to a custom uCode library (.so). Uploaded to the remote host "
+        "alongside the NEFF; NEURON_RT_UCODE_LIB_PATH is set for the profile run.",
+    )
+    group.addoption(
         "--artifact-upload-s3-bucket",
         action="store",
         default=None,
@@ -402,6 +620,17 @@ def pytest_addoption(parser):
         action="store",
         default="artifacts_tmp",
         help="S3 prefix for artifact file transfer (default: artifacts_tmp)",
+    )
+    group.addoption(
+        "--artifact-upload-s3-region",
+        action="store",
+        default=None,
+        help=(
+            "Region of the artifact-transfer S3 bucket. Optional; if unset it is "
+            "resolved from the bucket. Passed as --region to the remote 'aws s3 cp' "
+            "so it signs for the bucket's region rather than the host's (required "
+            "for hosts in Local Zones with no S3 endpoint)."
+        ),
     )
     group.addoption(
         "--aws-profile",
@@ -441,6 +670,29 @@ def pytest_addoption(parser):
         help="S3 URI for BIR-to-NEFF compilation cache (e.g. s3://my-bucket/neff-cache). "
         "When set, reuses cached NEFFs when neuronxcc version and BIR are unchanged.",
     )
+    group.addoption(
+        "--s3-torch-ref-cache-path",
+        action="store",
+        default="",
+        help="S3 URI for the torch-reference (golden) output cache (e.g. s3://my-bucket/torch-ref-cache). "
+        "When set, reuses cached goldens when the reference's transitive source and inputs are unchanged. "
+        "Off by default.",
+    )
+    group.addoption(
+        "--transport",
+        action="store",
+        default=None,
+        choices=["ssh", "paramiko"],
+        help="Remote-host transport: 'paramiko' (default; persistent fabric2/paramiko connection "
+        "per worker) or 'ssh' (native ssh subprocess per command, multiplexed via ControlMaster).",
+    )
+
+    group.addoption(
+        "--skip-core-reset",
+        action="store_true",
+        default=False,
+        help="Opportunistically skip neuron core reset behavior",
+    )
 
     group.addoption(
         "--ssh-host-rotation-patience-seconds",
@@ -463,6 +715,20 @@ def pytest_addoption(parser):
         "--skip-coverage-parametrize",
         action="store_true",
         help="Exclude coverage_parametrize tests from collection",
+    )
+
+    chunking_group = parser.getgroup("suite-chunking")
+    chunking_group.addoption(
+        "--suite-chunk-total-count",
+        action="store",
+        default=None,
+        help="Total number of suite chunks. Used when splitting a single test suite into multiple chunks to be executed concurrently.",
+    )
+    chunking_group.addoption(
+        "--suite-chunk-number",
+        action="store",
+        default=None,
+        help="Desired index of the current suite chunk. Has to be in range of 1 <= chunk_num <= total_chunk_count. To be used with --suite-chunk-total-count",
     )
 
 
@@ -555,10 +821,7 @@ def test_manager(
     hw_profile_enabled: bool,
 ) -> Orchestrator:
     """Standard kernel test orchestrator."""
-    metadata_name = None
-    if request.cls and hasattr(request.cls, "__pytest_test_metadata__"):
-        metadata_name = request.cls.__pytest_test_metadata__.get("name")
-    kernel_name = derive_labeled_kernel_name(request.fspath, metadata_name)
+    kernel_name = resolve_file_kernel_name(request.path)
     return make_test_manager(
         request.config,
         trace_mode,
@@ -604,9 +867,9 @@ def pytest_configure(config: Config):
     _set_neuron_tag_defaults(config)
 
     # Discover marks from @pytest_test_metadata decorators
-    # Use config.rootdir so discovery works whether the plugin is loaded from
+    # Use config.rootpath so discovery works whether the plugin is loaded from
     # the source tree or from the installed nkilib_testing wheel.
-    test_root = Path(config.rootdir) / "test"
+    test_root = config.rootpath / "test"
     if test_root.is_dir():
         discovered_marks = discover_pytest_test_metadata_marks(test_root)
         for mark_name, description in discovered_marks.items():
@@ -653,8 +916,22 @@ def pytest_collection_finish(session):
         np.random.set_state(session._original_numpy_state)
 
 
+@pytest.hookimpl(hookwrapper=True)
 def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
-    """Apply platform marks to tests and skip slow tests in simulation mode."""
+    """Apply platform marks, skip slow simulation tests, and chunk the eligible suite.
+
+    Implemented as a hookwrapper so the two phases straddle pytest's builtin
+    deselect_by_mark (a plain hookimpl that runs during the yield):
+
+      * Pre-yield: add platform marks so deselect_by_mark can honour the
+        platform markexpr set in pytest_configure, plus coverage_parametrize
+        and simulation-skip handling.
+      * Post-yield: `items` now reflects -m/-k deselection, so it is the truly
+        eligible set. Chunk it here and fire pytest_deselected for the dropped
+        tests so the collected/deselected counts (and --collect-only output,
+        which the terminal reporter emits later) stay accurate.
+    """
+
     # Deselect coverage_parametrize tests when --skip-coverage-parametrize is set
     if get_feature_flag(config, "skip_coverage_parametrize", default_value=False):
         items[:] = [item for item in items if not item.get_closest_marker("coverage_parametrize")]
@@ -663,14 +940,14 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
         platforms_marker = item.get_closest_marker("platforms")
         excluded = set(platforms_marker.kwargs.get("exclude") or []) if platforms_marker else set()
 
-        if hasattr(item, "callspec"):
+        if isinstance(item, _ParametrizedItem):
             for param_val in item.callspec.params.values():
                 if isinstance(param_val, PlatformAware) and param_val.supported_platforms is not None:
                     excluded |= set(Platforms) - param_val.supported_platforms
 
         supported = set(Platforms) - excluded
 
-        if hasattr(item, "callspec") and "platform_target" in item.callspec.params:
+        if isinstance(item, _ParametrizedItem) and "platform_target" in item.callspec.params:
             supported &= {item.callspec.params["platform_target"]}
 
         for p in supported:
@@ -699,6 +976,27 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
         for item in items:
             if item.get_closest_marker("skip_simulation"):
                 item.add_marker(skip_incompatible)
+
+    # Let builtin deselect_by_mark (and -k) run; afterwards `items` is the eligible set.
+    yield
+
+    # Break the eligible suite into chunks, if requested.
+    current_chunk_number: int | None = get_feature_flag(config, "suite_chunk_number", default_value=None)
+    total_chunk_count: int | None = get_feature_flag(config, "suite_chunk_total_count", default_value=None)
+    if current_chunk_number is not None and total_chunk_count is not None and items:
+        logging.info(
+            f"Test suite chunking detected! Current chunk is {current_chunk_number} out of {total_chunk_count}"
+        )
+        kept = get_chunked_tests(
+            current_chunk_number=int(current_chunk_number),
+            total_chunk_count=int(total_chunk_count),
+            tests=items,
+        )
+        kept_ids = {id(item) for item in kept}
+        dropped = [item for item in items if id(item) not in kept_ids]
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
+        items[:] = kept
 
 
 # =========================
@@ -766,7 +1064,7 @@ def pytest_generate_tests(metafunc: Metafunc):
     if _RNG_SEED_ENV_KEY in os.environ:
         random.seed(int(os.environ[_RNG_SEED_ENV_KEY]))
 
-    params = coverage_marker.kwargs.copy()
+    params = dict(coverage_marker.kwargs)
     assert params, "No parameters defined for coverage_parametrize"
     coverage_override = params.pop("coverage", None)
     filter_func = params.pop("filter", None)

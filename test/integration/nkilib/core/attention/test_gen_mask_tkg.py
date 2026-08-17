@@ -26,6 +26,7 @@ covering all code paths:
 The golden function uses gen_mask_tkg_torch_ref from gen_mask_tkg_torch.py.
 """
 
+import os
 from typing import Optional, final
 
 import nki.isa as nisa
@@ -33,7 +34,6 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
     AttnTKGConfig,
     is_s_prior_sharded,
@@ -45,8 +45,9 @@ from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
 from nkilib_src.nkilib.core.attention.gen_mask_tkg import gen_mask_tkg, gen_mask_tkg_hbm
 from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import gen_mask_tkg_hbm_torch_ref, gen_mask_tkg_torch_ref
 from nkilib_src.nkilib.core.utils.allocator import SbufManager
-from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
+from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info, reduce
 from nkilib_src.nkilib.core.utils.logging import Logger
+
 from test.integration.nkilib.core.attention.test_attention_tkg import build_active_attention_mask, build_swa_positions
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
@@ -56,8 +57,9 @@ from test.utils.common_dataclasses import (
 from test.utils.metrics_collector import MetricsCollector
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.simulation_setup import simulate_kernel
 from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+from test.utils.unit_test_framework import UnitTestFramework, filter_kernel_input, torch_ref_wrapper
 
 # Hardware constants
 P_MAX = 128
@@ -75,6 +77,7 @@ _ABBREVS = {
     "lnc": "lnc",
     "batch_offset": "bo",
     "bs_full": "bsf",
+    "cp_seq_offset": "cpso",
 }
 
 
@@ -93,29 +96,29 @@ def gen_mask_tkg_wrapper(
     active_mask_hbm: nl.ndarray = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
+    transposed_out: bool = False,
 ) -> nl.ndarray:
     """Wrapper kernel that handles HBM↔SBUF transfers for testing gen_mask_tkg.
 
-    For LNC=1: Output shape is [P_MAX, n_sprior_tile, bs, q_head, s_active]
-    For LNC=2: Output shape is [2, P_MAX, n_sprior_tile_per_shard, bs, q_head, s_active]
+    transposed_out=False:
+        LNC=1: Output shape is [P_MAX, n_sprior_tile, bs, q_head, s_active]
+        LNC=2: Output shape is [2, P_MAX, n_sprior_tile_per_shard, bs, q_head, s_active]
+
+    transposed_out=True:
+        LNC=1: [P_MAX, n_bsq_tiles_shard, s_prior_this]
+        LNC=2: [lnc, P_MAX, n_bsq_tiles_shard, s_prior_this] (each shard writes golden[shard_id])
     """
     _, lnc, shard_id = get_verified_program_sharding_info("gen_mask_wrapper", (0, 1))
 
-    if lnc == 1:
-        # Shape: [P_MAX, n_sprior_tile, bs, q_head, s_active]
-        _, n_sprior_tile_per_shard, _, _, _ = mask_out_hbm.shape
-    else:
-        # Shape: [lnc, P_MAX, n_sprior_tile_per_shard, bs, q_head, s_active]
-        _, _, n_sprior_tile_per_shard, _, _, _ = mask_out_hbm.shape
+    mask_out_sbuf_shape = mask_out_hbm.shape if lnc == 1 else mask_out_hbm.shape[1:]
+    num_elts = reduce('mul', mask_out_sbuf_shape, 1)
 
-    sbm = SbufManager(
-        0, P_MAX * n_sprior_tile_per_shard * bs * q_head * s_active * 8, Logger("gen_mask_wrapper"), use_auto_alloc=True
-    )
+    sbm = SbufManager(0, num_elts * 8, Logger("gen_mask_wrapper"), use_auto_alloc=True)
     sbm.open_scope(name="gen_mask_wrapper")
 
     pos_ids_sbuf = sbm.alloc_stack((P_MAX, bs * s_active), dtype=pos_ids_hbm.dtype, buffer=nl.sbuf, name="pos_ids_sbuf")
     mask_out_sbuf = sbm.alloc_stack(
-        (P_MAX, n_sprior_tile_per_shard, bs, q_head, s_active),
+        mask_out_sbuf_shape,
         dtype=mask_out_hbm.dtype,
         buffer=nl.sbuf,
         name="mask_out_sbuf",
@@ -146,16 +149,17 @@ def gen_mask_tkg_wrapper(
         sbm=sbm,
         is_batch_sharded=is_batch_sharded,
         batch_offset=batch_offset,
+        transposed_out=transposed_out,
     )
 
     if lnc == 1:
         golden_mask = nl.ndarray(
-            mask_out_sbuf.shape, dtype=mask_out_sbuf.dtype, buffer=nl.shared_hbm, name="golden_mask"
+            mask_out_sbuf_shape, dtype=mask_out_sbuf.dtype, buffer=nl.shared_hbm, name="golden_mask"
         )
         nisa.dma_copy(dst=golden_mask, src=mask_out_sbuf)
     else:
         golden_mask = nl.ndarray(mask_out_hbm.shape, dtype=mask_out_hbm.dtype, buffer=nl.shared_hbm, name="golden_mask")
-        nisa.dma_copy(dst=golden_mask[shard_id, :, :, :, :, :], src=mask_out_sbuf)
+        nisa.dma_copy(dst=golden_mask.select(0, shard_id), src=mask_out_sbuf)
 
     sbm.close_scope()
 
@@ -170,33 +174,32 @@ def gen_mask_tkg_torch_ref_adapter(
     s_active: int,
     is_s_prior_sharded: bool,
     s_prior_per_shard: int,
-    start_pos_hbm: torch.Tensor = None,
+    start_pos_hbm: torch.Tensor | None = None,
     s_prior_offset: int = 0,
     block_len: int = 0,
     strided_mm1: bool = True,
-    active_mask_hbm: torch.Tensor = None,
+    active_mask_hbm: torch.Tensor | None = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
+    transposed_out: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Torch ref adapter matching gen_mask_tkg_wrapper signature.
 
     Bridges the LncSubscriptable gen_mask_tkg_torch_ref to the flat-call
     interface expected by torch_ref_wrapper / UnitTestFramework.
     """
-    if mask_out_hbm.dim() == 5:
-        lnc = 1
-        _, n_sprior_tile, _, _, _ = mask_out_hbm.shape
-    else:
-        lnc = mask_out_hbm.shape[0]
-        _, _, n_sprior_tile, _, _, _ = mask_out_hbm.shape
-
     pos_ids = pos_ids_hbm.float()
     active_mask = active_mask_hbm.float() if active_mask_hbm is not None else None
     start_pos = start_pos_hbm.float() if start_pos_hbm is not None else None
 
-    if lnc == 1:
-        mask_out = torch.zeros((P_MAX, n_sprior_tile, bs, q_head, s_active), dtype=torch.float32)
-        gen_mask_tkg_torch_ref.shard_id = 0
+    # hacky LNC check since UnitTestFramework does not allow deviating APIs
+    if transposed_out:
+        lnc = mask_out_hbm.shape[0] if mask_out_hbm.dim() == 4 else 1
+    else:
+        lnc = mask_out_hbm.shape[0] if mask_out_hbm.dim() == 6 else 1
+
+    def gen_mask(mask_out: torch.Tensor, shard_id: int) -> None:
+        gen_mask_tkg_torch_ref.shard_id = shard_id
         gen_mask_tkg_torch_ref[lnc](
             pos_ids=pos_ids,
             mask_out=mask_out,
@@ -212,28 +215,18 @@ def gen_mask_tkg_torch_ref_adapter(
             active_mask=active_mask,
             is_batch_sharded=is_batch_sharded,
             batch_offset=batch_offset,
+            transposed_out=transposed_out,
         )
+
+    if lnc == 1:
+        mask_out = torch.zeros(mask_out_hbm.shape, dtype=torch.float32)
+        gen_mask(mask_out, 0)
         return {"golden_mask": mask_out}
     else:
-        result = torch.zeros((lnc, P_MAX, n_sprior_tile, bs, q_head, s_active), dtype=torch.float32)
+        result = torch.zeros(mask_out_hbm.shape, dtype=torch.float32)
         for shard_idx in range(lnc):
-            mask_out = torch.zeros((P_MAX, n_sprior_tile, bs, q_head, s_active), dtype=torch.float32)
-            gen_mask_tkg_torch_ref.shard_id = shard_idx
-            gen_mask_tkg_torch_ref[lnc](
-                pos_ids=pos_ids,
-                mask_out=mask_out,
-                bs=bs,
-                q_head=q_head,
-                s_active=s_active,
-                is_s_prior_sharded=is_s_prior_sharded,
-                s_prior_per_shard=s_prior_per_shard,
-                start_pos=start_pos,
-                s_prior_offset=s_prior_offset,
-                block_len=block_len,
-                strided_mm1=strided_mm1,
-                active_mask=active_mask,
-                is_batch_sharded=is_batch_sharded,
-            )
+            mask_out = torch.zeros(mask_out_hbm.shape[1:], dtype=torch.float32)
+            gen_mask(mask_out, shard_idx)
             result[shard_idx] = mask_out
         return {"golden_mask": result}
 
@@ -251,11 +244,13 @@ def gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc: int):
         q_head: int,
         s_active: int,
         s_prior: int,
-        start_pos_hbm: torch.Tensor = None,
+        start_pos_hbm: torch.Tensor | None = None,
         block_len: int = 0,
-        active_mask: torch.Tensor = None,
+        active_mask: torch.Tensor | None = None,
         enable_fa_s_prior_tiling: bool = True,
         fuse_rope: bool = False,
+        transposed_out: bool = False,
+        cp_seq_offset: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Torch ref adapter matching gen_mask_tkg_hbm kernel signature."""
         mask = gen_mask_tkg_hbm_torch_ref[lnc](
@@ -269,9 +264,22 @@ def gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc: int):
             active_mask=active_mask,
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
             fuse_rope=fuse_rope,
+            transposed_out=transposed_out,
+            cp_seq_offset=cp_seq_offset,
         )
-        return {"mask_out_hbm": mask}
+        # gen_mask_tkg_hbm emits its HBM output as uint8 (binary 0/1 mask);
+        # cast the fp32 reference to uint8 so the exact-match comparison lines
+        # up with the kernel's uint8 output edge.
+        return {"mask_out_hbm": mask.to(torch.uint8)}
 
+    # The torch-ref golden cache keys on the ref's __qualname__ (plus dep/input
+    # hashes). lnc is captured in this closure and is NOT part of the adapter's
+    # kwargs, so without stamping it here the lnc=1 and lnc=2 arms share one
+    # cache key while producing different goldens (block_len resizes per lnc) ->
+    # a warm cache serves the wrong sibling's golden. Stamp lnc into the qualname
+    # so each lnc keys a distinct cache entry.
+    gen_mask_tkg_hbm_torch_ref_adapter.__qualname__ += f"[lnc{lnc}]"
+    gen_mask_tkg_hbm_torch_ref_adapter.__name__ += f"_lnc{lnc}"
     return gen_mask_tkg_hbm_torch_ref_adapter
 
 
@@ -284,7 +292,10 @@ def generate_gen_mask_hbm_inputs(
     strided_mm1: bool,
     sliding_window: int = 0,
     include_active_mask: bool = False,
+    lnc: int = 2,
+    cp_seq_offset: int = 0,
     dtype=np.float32,
+    transposed_out: bool = False,
 ):
     """Build kernel inputs for gen_mask_tkg_hbm test, compatible with UnitTestFramework.
 
@@ -315,6 +326,7 @@ def generate_gen_mask_hbm_inputs(
         "s_active": s_active,
         "s_prior": s_prior,
         "block_len": block_len,
+        "transposed_out": transposed_out,
     }
 
     if "start_pos_hbm" in sbuf_inp:
@@ -322,6 +334,11 @@ def generate_gen_mask_hbm_inputs(
 
     if "active_mask_hbm" in sbuf_inp:
         result["active_mask"] = sbuf_inp["active_mask_hbm"]
+
+    # Only surface cp_seq_offset when nonzero so the default (non-CP) call is
+    # byte-identical to before this parameter existed.
+    if cp_seq_offset != 0:
+        result["cp_seq_offset"] = cp_seq_offset
 
     return result
 
@@ -367,10 +384,14 @@ def generate_gen_mask_inputs(
     include_active_mask: bool = False,
     batch_offset: int = 0,
     bs_full: Optional[int] = None,
+    transposed_out: bool = False,
 ):
     """Build kernel inputs for gen_mask_tkg test, compatible with UnitTestFramework.
 
     Returns dict with keys matching gen_mask_tkg_wrapper signature.
+
+    transposed_out=True builds the QK-swap layout inputs: mask_out_hbm is 3D
+    [P_MAX, n_bsq_tiles, s_prior] (s_active_bqh on partition, s_prior on free).
     """
     cfg = AttnTKGConfig(bs=batch, q_head=q_head, s_active=s_active, curr_sprior=s_ctx)
     sprior_sharded = is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX) if lnc > 1 else False
@@ -380,13 +401,24 @@ def generate_gen_mask_inputs(
     else:
         s_prior_per_shard = s_ctx
 
-    if fa_tile_size > 0:
-        n_sprior_tile_per_shard = fa_tile_size // P_MAX
-        assert s_prior_offset + fa_tile_size <= s_prior_per_shard, (
-            f"FA tile (offset={s_prior_offset}, size={fa_tile_size}) exceeds s_prior_per_shard ({s_prior_per_shard})"
+    if transposed_out:
+        s_active_bqh = batch * q_head * s_active
+        assert s_active_bqh % P_MAX == 0, (
+            f"transposed_out requires batch*q_head*s_active ({s_active_bqh}) divisible by P_MAX ({P_MAX})"
         )
+        n_bsq_tiles = s_active_bqh // P_MAX
+        mask_out_base_shape = (P_MAX, n_bsq_tiles, s_prior_per_shard)
     else:
-        n_sprior_tile_per_shard = s_prior_per_shard // P_MAX
+        if fa_tile_size > 0:
+            n_sprior_tile_per_shard = fa_tile_size // P_MAX
+            assert s_prior_offset + fa_tile_size <= s_prior_per_shard, (
+                f"FA tile (offset={s_prior_offset}, size={fa_tile_size}) exceeds s_prior_per_shard ({s_prior_per_shard})"
+            )
+        else:
+            n_sprior_tile_per_shard = s_prior_per_shard // P_MAX
+        mask_out_base_shape = (P_MAX, n_sprior_tile_per_shard, batch, q_head, s_active)
+
+    mask_out_shape = mask_out_base_shape if lnc == 1 else (lnc,) + mask_out_base_shape
 
     adjusted_block_len = block_len
     if block_len > 0:
@@ -431,10 +463,7 @@ def generate_gen_mask_inputs(
     else:
         start_pos_data = None
 
-    if lnc == 1:
-        mask_out_data = np.zeros((P_MAX, n_sprior_tile_per_shard, batch, q_head, s_active), dtype=dtype)
-    else:
-        mask_out_data = np.zeros((lnc, P_MAX, n_sprior_tile_per_shard, batch, q_head, s_active), dtype=dtype)
+    mask_out_data = np.zeros(mask_out_shape, dtype=dtype)
 
     result = {
         "pos_ids_hbm": pos_ids_data,
@@ -447,6 +476,7 @@ def generate_gen_mask_inputs(
         "s_prior_offset": s_prior_offset,
         "block_len": adjusted_block_len,
         "strided_mm1": strided_mm1,
+        "transposed_out": transposed_out,
     }
 
     if start_pos_data is not None:
@@ -841,7 +871,7 @@ class TestGenMaskTkg:
         # Batch-sharded LNC=2 with s_active=1 (only load1 path with stride fix)
         (80, 8, 256, 1, True, 0, 0, 256, 2, 0, None), # bs_full=160, load1_nrows=1, load2_nrows=0
 
-        # Non-strided MM1 with batch-sharded LNC=2 (tests the TensorView slice path)
+        # Non-strided MM1 with batch-sharded LNC=2 (tests the strided slice path)
         (80, 8, 256, 8, False, 0, 0, 256, 2, 0, None), # Batch-sharded, non-strided, BQS=5120>128
         (32, 8, 256, 5, False, 0, 0, 256, 2, 0, None), # Batch-sharded, non-strided, BQS=1280>128
 
@@ -1025,6 +1055,69 @@ class TestGenMaskTkg:
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
+    # ============================================================================
+    # TRANSPOSED (transposed_out) MASK TESTS - the s_active_bqh-partition layout
+    # (s_active_bqh on partition, s_prior on free), the transposed counterpart of the default
+    # s_prior-partition layout. Covers LNC=1 and LNC=2 (both s_prior- and batch-sharded).
+    # ============================================================================
+
+    # fmt: off
+    transposed_test_params = "batch, q_head, s_ctx, s_active, block_len, sliding_window, lnc"
+    transposed_test_perms = [
+        # s_active_qh = q_head * s_active; batch * s_active_qh a multiple of P_MAX.
+        # LNC=1
+        (4, 16, 2048, 8, 32, 0, 1),      # s_active_qh=128, full causal
+        (4, 16, 2048, 8, 32, 128, 1),    # s_active_qh=128, SWA
+        (4, 16, 2048, 8, 32, 256, 1),    # s_active_qh=128, wider window
+        (8, 16, 4096, 8, 32, 0, 1),      # more folds
+        (8, 16, 4096, 8, 32, 128, 1),    # more folds, SWA
+        (16, 8, 2048, 4, 32, 0, 1),      # s_active_qh=32
+        (16, 8, 2048, 4, 32, 128, 1),    # s_active_qh=32, SWA
+        # LNC=2 s_prior-sharded (large s_ctx, small bs*s_active_bqh -> shards s_prior on the free axis)
+        (4, 16, 4096, 8, 32, 0, 2),      # sprior-sharded, full causal
+        (4, 16, 4096, 8, 32, 128, 2),    # sprior-sharded, SWA
+        # LNC=2 batch-sharded (bs*s_active_bqh large -> shards batch on the partition/grp axis)
+        (16, 8, 2048, 4, 32, 0, 2),      # batch-sharded, full causal
+        (16, 8, 2048, 4, 32, 128, 2),    # batch-sharded, SWA
+        # Flat KV (block_len=0): contiguous s_prior on the free axis.
+        (4, 16, 2048, 8, 0, 0, 1),       # flat KV, full causal
+        (4, 16, 2048, 8, 0, 128, 1),     # flat KV, SWA
+        (4, 16, 4096, 8, 0, 0, 2),       # flat KV, sprior-sharded
+        (16, 8, 2048, 4, 0, 0, 2),       # flat KV, batch-sharded
+    ]
+    # fmt: on
+
+    @pytest_parametrize(transposed_test_params, transposed_test_perms, abbrevs=_ABBREVS)
+    def test_transposed_mask_generation(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        sliding_window: int,
+        lnc: int,
+    ):
+        """Directly test the transposed_out (s_active_bqh-partition) mask layout, kernel vs torch ref."""
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                lnc=lnc,
+                strided_mm1=False,
+                sliding_window=sliding_window,
+                transposed_out=True,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
+
 
 # ============================================================================
 # HBM WRAPPER TESTS
@@ -1055,7 +1148,16 @@ class TestGenMaskTkgHbm:
             bs = kernel_input["bs"]
             q_head = kernel_input["q_head"]
             s_active = kernel_input["s_active"]
-            return {"mask_out_hbm": np.zeros((s_prior, bs, q_head, s_active), dtype=np.float32)}
+            # gen_mask_tkg_hbm emits its HBM output as uint8 (binary 0/1 mask),
+            # not fp32.  The descriptor dtype tells the validator how to
+            # reinterpret the kernel's raw HBM bytes, so it must be uint8: with
+            # the exact-match comparison below (rtol=0/atol=0), a regression back
+            # to an fp32 output would misalign the raw bytes and fail hard.
+            if kernel_input["transposed_out"]:
+                shape = (bs, q_head, s_active, s_prior)
+            else:
+                shape = (s_prior, bs, q_head, s_active)
+            return {"mask_out_hbm": np.zeros(shape, dtype=np.uint8)}
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -1068,10 +1170,67 @@ class TestGenMaskTkgHbm:
         framework.run_test(
             test_config=None,
             compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            # Exact match: the mask is binary (0/1), so no tolerance is allowed.
+            # This transitively verifies the kernel's uint8 output equals the
+            # uint8-cast reference byte-for-byte (dtype + value equivalence).
             rtol=0,
             atol=0,
             inference_args=TKG_INFERENCE_ARGS,
         )
+
+    # ========================================================================
+    # OUTPUT DTYPE + VALUE-RANGE REGRESSION (uint8 mask)
+    # ========================================================================
+
+    # fmt: off
+    output_dtype_test_params = "batch, q_head, s_ctx, s_active, block_len, sliding_window, strided_mm1"
+    output_dtype_test_perms = [
+        (4, 1, 256, 1, 0, 0, True),      # full-context, flat KV
+        (4, 1, 256, 5, 0, 256, True),    # SWA (sliding_window=256), flat KV
+        (4, 1, 2048, 5, 128, 0, False),  # full-context, block KV
+    ]
+    # fmt: on
+
+    @pytest_parametrize(output_dtype_test_params, output_dtype_test_perms, abbrevs=_ABBREVS)
+    def test_output_dtype_and_range(
+        self,
+        platform_target: Platforms,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        sliding_window: int,
+        strided_mm1: bool,
+    ):
+        """Regression guard: gen_mask_tkg_hbm emits a uint8 binary (0/1) mask.
+
+        Directly simulates the kernel (mirroring the framework's sim path) and
+        asserts the HBM output tensor is uint8 (was fp32) and that every value
+        is in {0, 1}.  This pins the dtype narrowing and proves it did not
+        corrupt the mask contents, independent of the golden comparison.
+        """
+        kernel_input = generate_gen_mask_hbm_inputs(
+            batch=batch,
+            q_head=q_head,
+            s_ctx=s_ctx,
+            s_active=s_active,
+            block_len=block_len,
+            strided_mm1=strided_mm1,
+            sliding_window=sliding_window,
+            lnc=1,
+        )
+        os.environ["NKI_NC_VERSION"] = platform_target.get_nc_gen()
+        outputs = simulate_kernel(
+            gen_mask_tkg_hbm,
+            filter_kernel_input(kernel_input, gen_mask_tkg_hbm),
+            1,  # lnc=1
+        )
+        assert len(outputs) == 1, f"expected 1 output tensor, got {len(outputs)}"
+        mask = np.asarray(outputs[0])
+        assert mask.dtype == np.uint8, f"mask HBM output dtype must be uint8, got {mask.dtype}"
+        unique_vals = np.unique(mask)
+        assert np.all(np.isin(unique_vals, [0, 1])), f"uint8 mask must be binary (0/1); found values {unique_vals}"
 
     # ========================================================================
     # FLAT KV CACHE TESTS (block_len = 0)
@@ -1122,6 +1281,7 @@ class TestGenMaskTkgHbm:
                 s_active=s_active,
                 block_len=0,
                 strided_mm1=strided_mm1,
+                lnc=lnc,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
@@ -1173,6 +1333,7 @@ class TestGenMaskTkgHbm:
                 s_active=s_active,
                 block_len=block_len,
                 strided_mm1=False,
+                lnc=lnc,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
@@ -1235,6 +1396,7 @@ class TestGenMaskTkgHbm:
                 block_len=block_len,
                 strided_mm1=strided_mm1,
                 include_active_mask=True,
+                lnc=lnc,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
@@ -1246,6 +1408,11 @@ class TestGenMaskTkgHbm:
     # fmt: off
     hbm_swa_test_params = "batch, q_head, s_ctx, s_active, sliding_window, block_len, strided_mm1, lnc"
     hbm_swa_test_perms = [
+        # Production gpt-oss-120b decode SWA shape: sliding_window=256 over a
+        # large context.  Pairs with the full-context ctx=10240 case in
+        # test_fa_tiling to cover both mask variants the commit verified.
+        (8, 8, 10240, 1, 256, 0, True, 1),
+        (8, 8, 10240, 1, 256, 128, False, 1),  # block KV variant
         # Flat KV strided, LNC=1
         (4, 1, 1024, 5, 128, 0, True, 1),
         (4, 1, 1024, 5, 256, 0, True, 1),
@@ -1292,6 +1459,74 @@ class TestGenMaskTkgHbm:
                 block_len=block_len,
                 strided_mm1=strided_mm1,
                 sliding_window=sliding_window,
+                lnc=lnc,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
+
+    # ========================================================================
+    # CONTEXT-PARALLEL SEQUENCE OFFSET TESTS (cp_seq_offset)
+    # ========================================================================
+    # A context-parallel decode rank holds a disjoint global slice
+    # [cp_seq_offset, cp_seq_offset + s_prior) of the prior KV context, so the
+    # shard-local mask iota must be shifted by cp_seq_offset into global
+    # coordinates before the causal iota < pos_ids compare. These tests pass a
+    # nonzero cp_seq_offset to both the kernel and the torch reference and
+    # require an exact match. Because slot k = cache_len - 1 lies inside the
+    # prior region for every batch element, a dropped or wrong offset flips at
+    # least that bit, so the nonzero case fails if the offset is not applied.
+    # The cp_seq_offset=0 rows re-confirm the non-CP path stays byte-identical.
+
+    # fmt: off
+    cp_seq_offset_test_params = "batch, q_head, s_ctx, s_active, block_len, strided_mm1, cp_seq_offset, lnc"
+    cp_seq_offset_test_perms = [
+        # Flat KV strided, LNC=1 — 0 (no-op) then a nonzero global offset
+        (4, 1, 1024, 5, 0, True, 0, 1),
+        pytest.param(4, 1, 1024, 5, 0, True, 256, 1, marks=pytest.mark.fast),
+        (4, 2, 2048, 7, 0, True, 512, 1),
+        # Flat KV non-strided, LNC=1
+        (4, 1, 1024, 5, 0, False, 256, 1),
+        # Block KV, LNC=1 — offset applied before the block shuffle reshape
+        (4, 1, 2048, 5, 16, False, 512, 1),
+        # LNC=2 s_prior-sharded — offset added on top of the per-shard base
+        (4, 1, 4096, 5, 0, True, 1024, 2),
+        # LNC=2 batch-sharded
+        (8, 8, 4096, 5, 0, True, 1024, 2),
+    ]
+    # fmt: on
+
+    @pytest_parametrize(cp_seq_offset_test_params, cp_seq_offset_test_perms, abbrevs=_ABBREVS)
+    def test_cp_seq_offset(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        strided_mm1: bool,
+        cp_seq_offset: int,
+        lnc: int,
+    ):
+        """Test context-parallel global sequence offset (cp_seq_offset).
+
+        Regression test for the CP mask offset: the kernel shifts the prior
+        mask into global coordinates, and the torch reference must apply the
+        same shift. A nonzero offset that is dropped or misapplied produces a
+        mismatch against the reference (rtol=atol=0).
+        """
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+                cp_seq_offset=cp_seq_offset,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
@@ -1303,6 +1538,10 @@ class TestGenMaskTkgHbm:
     # fmt: off
     fa_tiling_test_params = "batch, q_head, s_ctx, s_active, block_len, strided_mm1, lnc"
     fa_tiling_test_perms = [
+        # Production gpt-oss-120b decode shape: full-context s_prior=10240.
+        # Pins the uint8 mask on the exact context length the commit verified.
+        (8, 8, 10240, 1, 0, True, 1),     # full-context, ctx=10240 (gpt-oss decode)
+        (8, 8, 10240, 1, 128, False, 1),  # full-context, ctx=10240, block KV
         # LNC=1 (strided uses batch tiling, non-strided uses s_prior tiling)
         (8, 8, 8192, 5, 0, True, 1),
         (8, 8, 8192, 7, 0, True, 1),      # last tile reduced
@@ -1343,6 +1582,7 @@ class TestGenMaskTkgHbm:
                 s_active=s_active,
                 block_len=block_len,
                 strided_mm1=strided_mm1,
+                lnc=lnc,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
@@ -1394,6 +1634,7 @@ class TestGenMaskTkgHbm:
                 block_len=block_len,
                 strided_mm1=strided_mm1,
                 include_active_mask=True,
+                lnc=lnc,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
@@ -1440,6 +1681,7 @@ class TestGenMaskTkgHbm:
                 strided_mm1=strided_mm1,
                 sliding_window=sliding_window,
                 include_active_mask=True,
+                lnc=lnc,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
@@ -1509,6 +1751,66 @@ class TestGenMaskTkgHbm:
                 block_len=block_len,
                 strided_mm1=strided_mm1,
                 sliding_window=sliding_window,
+                lnc=lnc,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
+
+    # ========================================================================
+    # TRANSPOSED (transposed_out) HBM TESTS
+    # ========================================================================
+    # The QK-swap HBM layout [bs, q_head, s_active, s_prior] (s_active_bqh-major),
+    # the transposed counterpart of the default [s_prior, bs, q_head, s_active].
+    # Covers block KV (the production swap path), flat KV (free-axis P_MAX tiling),
+    # SWA, and both LNC sharding modes.
+
+    # fmt: off
+    transposed_hbm_test_params = "batch, q_head, s_ctx, s_active, block_len, sliding_window, lnc"
+    transposed_hbm_test_perms = [
+        # block KV, LNC=1 (batch * s_active_qh a multiple of P_MAX)
+        (4, 16, 2048, 8, 32, 0, 1),      # s_active_qh=128, full causal
+        (4, 16, 2048, 8, 32, 128, 1),    # s_active_qh=128, SWA
+        (8, 16, 4096, 8, 32, 0, 1),      # more folds
+        (16, 8, 2048, 4, 32, 128, 1),    # s_active_qh=32, SWA
+        # flat KV, LNC=1 (free-axis P_MAX tiling)
+        (4, 16, 2048, 8, 0, 0, 1),       # flat KV, full causal
+        (4, 16, 2048, 8, 0, 128, 1),     # flat KV, SWA
+        # LNC=2 s_prior-sharded (large s_ctx, small bs*s_active_bqh)
+        (4, 16, 4096, 8, 32, 0, 2),      # block KV, sprior-sharded
+        (4, 16, 4096, 8, 0, 0, 2),       # flat KV, sprior-sharded
+        # LNC=2 batch-sharded (bs*s_active_bqh large)
+        (16, 8, 2048, 4, 32, 0, 2),      # block KV, batch-sharded
+        (16, 8, 2048, 4, 0, 128, 2),     # flat KV, batch-sharded, SWA
+    ]
+    # fmt: on
+
+    @pytest_parametrize(transposed_hbm_test_params, transposed_hbm_test_perms, abbrevs=_ABBREVS)
+    def test_transposed_hbm(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        sliding_window: int,
+        lnc: int,
+    ):
+        """Test the transposed_out (QK-swap) HBM mask layout, kernel vs torch ref."""
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=False,
+                sliding_window=sliding_window,
+                lnc=lnc,
+                transposed_out=True,
             )
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)

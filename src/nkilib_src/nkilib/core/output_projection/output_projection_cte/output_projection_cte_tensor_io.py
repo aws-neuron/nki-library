@@ -110,7 +110,7 @@ def load_bias(
     """
     Load bias into SBUF and broadcast to [P_MAX, h_block_size].
 
-    Uses tensorview.broadcast on the HBM tensor and loads directly into the
+    Uses broadcast on the HBM tensor and loads directly into the
     broadcasted array for better DMA utilization.
 
     Args:
@@ -168,6 +168,144 @@ def load_input_tensor_float(
         )
         attn_head_view = attention_view.select(dim=0, index=head_idx)
         nisa.dma_copy(attention_tensor[: cfg.d_size, :curr_s_tile_size], attn_head_view)
+        attention_sb.append(attention_tensor)
+
+    return attention_sb
+
+
+def load_input_tensor_float_transposed(
+    attention_view: nl.NkiTensor,
+    cfg: TilingConfig,
+    target_dtype=None,
+) -> List[nl.NkiTensor]:
+    """
+    Load attention for the float path from the untransposed [S, N, D] layout, producing
+    the same D-on-partition SBUF tiles as ``load_input_tensor_float``.
+
+    N and D are adjacent here, so the view flattens to [S, N*D] and each packed head is one
+    contiguous [S, d_size] column band, loaded by a single transpose.
+
+    Args:
+        attention_view (NkiTensor): View of attention for current batch/s_block
+            [curr_s_tile_size, n_size, d_size].
+        cfg (TilingConfig): Tiling configuration.
+        target_dtype: Target dtype for tensor. If None, uses attention_view.dtype.
+
+    Returns:
+        List[nl.NkiTensor]: [n_size][d_size, s_block_size], Attention tensors in SBUF.
+    """
+    curr_s_tile_size = attention_view.shape[0]
+    dtype = target_dtype if target_dtype != None else attention_view.dtype
+    attention_sb = []
+
+    # [S, N, D] -> [S, N*D]: heads become contiguous column bands of width d_size.
+    flat_view = attention_view.reshape((curr_s_tile_size, cfg.n_size * cfg.d_size))
+
+    for head_idx in range(cfg.n_size):
+        attention_tensor = nl.ndarray(
+            (cfg.d_size, cfg.s_tile.tile_size),
+            dtype=dtype,
+            buffer=nl.sbuf,
+        )
+        d_start = head_idx * cfg.d_size
+        head_view = flat_view.slice(dim=1, start=d_start, end=d_start + cfg.d_size)
+        # One transpose covers the whole S tile: the <=128 limit is on src's minor axis (D),
+        # and S lands on dst's free axis, which is unconstrained.
+        nisa.dma_transpose(dst=attention_tensor[: cfg.d_size, :curr_s_tile_size], src=head_view)
+        attention_sb.append(attention_tensor)
+
+    return attention_sb
+
+
+def _is_legal_transpose_start_partition(start_partition: int, num_partitions: int) -> bool:
+    """
+    Whether a transpose DMA may write ``num_partitions`` rows starting at ``start_partition``.
+
+    Transpose DMA inherits the SBUF start-partition rule: a tensor access spanning
+    ``num_partitions`` partitions must begin on a quadrant/half boundary wide enough to hold
+    it. Violating it fails compilation with ``NCC_IDMA007`` (illegal starting partition).
+
+    Args:
+        start_partition (int): First partition the access writes.
+        num_partitions (int): Number of partitions the access spans.
+
+    Returns:
+        bool: True when the access is legal.
+    """
+    if num_partitions > 64:
+        return start_partition == 0
+    if num_partitions > 32:
+        return start_partition % 64 == 0
+    return start_partition % _SBUF_QUADRANT_SIZE == 0
+
+
+def load_input_tensor_float_heads_outer(
+    attention_view: nl.NkiTensor,
+    cfg: TilingConfig,
+    target_dtype=None,
+) -> List[nl.NkiTensor]:
+    """
+    Load attention for the float path from the untransposed heads-outer [N, S, D] layout,
+    producing the same D-on-partition SBUF tiles as ``load_input_tensor_float``.
+
+    Unlike [S, N, D], N and D are not adjacent here, so head packing cannot be a reshape of
+    the HBM view — a packed tile is assembled from up to ``group_size`` separate head slices.
+    Each packed tile's partition rows map onto the flattened N*D axis at
+    ``packed_head_idx * d_size + row``, which resolves to original head ``flat // d_orig``
+    at column offset ``flat % d_orig``. That covers both packing directions: N folded into D
+    (``d_size`` spans whole heads) and D folded back into N (``d_size`` is a column band of
+    one head).
+
+    A band starting at a partition the transpose DMA cannot address directly (see
+    ``_is_legal_transpose_start_partition``) is staged through a scratch tile based at
+    partition 0 and then copied into place, which a plain DMA can do at any offset.
+
+    Args:
+        attention_view (NkiTensor): View of attention for current batch/s_block
+            [n_orig, curr_s_tile_size, d_orig].
+        cfg (TilingConfig): Tiling configuration.
+        target_dtype: Target dtype for tensor. If None, uses attention_view.dtype.
+
+    Returns:
+        List[nl.NkiTensor]: [n_size][d_size, s_block_size], Attention tensors in SBUF.
+    """
+    curr_s_tile_size = attention_view.shape[1]
+    d_orig = attention_view.shape[2]
+    dtype = target_dtype if target_dtype != None else attention_view.dtype
+    attention_sb = []
+
+    for packed_head_idx in range(cfg.n_size):
+        attention_tensor = nl.ndarray(
+            (cfg.d_size, cfg.s_tile.tile_size),
+            dtype=dtype,
+            buffer=nl.sbuf,
+        )
+        # Walk the packed tile's partition rows, one original-head column band at a time.
+        row = 0
+        while row < cfg.d_size:
+            flat_idx = packed_head_idx * cfg.d_size + row
+            head_idx = flat_idx // d_orig
+            d_offset = flat_idx % d_orig
+            chunk = min(d_orig - d_offset, cfg.d_size - row)
+            head_view = attention_view.select(dim=0, index=head_idx).slice(dim=1, start=d_offset, end=d_offset + chunk)
+            if _is_legal_transpose_start_partition(row, chunk):
+                dst_tile = attention_tensor
+                dst_row = row
+            else:
+                # Transpose into a partition-0 scratch tile, then relocate with a plain copy.
+                dst_tile = nl.ndarray((chunk, cfg.s_tile.tile_size), dtype=dtype, buffer=nl.sbuf)
+                dst_row = 0
+
+            nisa.dma_transpose(
+                dst=dst_tile[dst_row : dst_row + chunk, :curr_s_tile_size],
+                src=head_view,
+            )
+            if dst_tile is not attention_tensor:
+                nisa.dma_copy(
+                    dst=attention_tensor[row : row + chunk, :curr_s_tile_size],
+                    src=dst_tile[:chunk, :curr_s_tile_size],
+                )
+            row += chunk
         attention_sb.append(attention_tensor)
 
     return attention_sb

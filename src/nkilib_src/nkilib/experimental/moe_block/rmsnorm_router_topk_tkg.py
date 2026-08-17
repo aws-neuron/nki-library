@@ -27,6 +27,7 @@ from ...core.subkernels.rmsnorm_mx_quantize_tkg import rmsnorm_mx_quantize_tkg a
 from ...core.subkernels.rmsnorm_tkg import _rmsnorm_tkg_dloc
 from ...core.utils.common_types import QuantizationType, RouterActFnType
 from ...core.utils.kernel_assert import kernel_assert
+from ...core.utils.kernel_helpers import get_verified_program_sharding_info
 
 
 @nki.jit
@@ -41,6 +42,7 @@ def rmsnorm_router_topk_tkg(
     quantization_type: QuantizationType = QuantizationType.NONE,
     router_mm_dtype=nl.bfloat16,
     router_act_fn: RouterActFnType = RouterActFnType.SIGMOID,
+    store_eager_affi_only: bool = False,
 ):
     """Fused RMSNorm (+ optional MX quantize) + Router TopK.
 
@@ -55,14 +57,21 @@ def rmsnorm_router_topk_tkg(
         quantization_type (QuantizationType): NONE or MX. Default NONE.
         router_mm_dtype: Dtype for router matmul. Default nl.bfloat16.
         router_act_fn (RouterActFnType): SOFTMAX or SIGMOID. Default SIGMOID.
+        store_eager_affi_only (bool): If True, skip building/storing the sparse [T, E] expert
+                        affinities (no [T, E] HBM allocation, no indirect-DMA scatter) and instead
+                        return the dense [T, K] eager affinities. Requires T <= 128. Downstream
+                        consumers must read affinities in the dense [T, K] form (co-indexed with
+                        expert_index) rather than the sparse [T, E] form.
 
     Returns:
         norm_output: [T, H] (NONE) or [T, H + H/4] FP8 packed quant‖scales (MX).
         expert_index: [T, K] int32 top-K indices.
-        expert_affinities: [T, E] bfloat16 masked top-K affinities (zero elsewhere).
+        expert_affinities: when store_eager_affi_only=False, the sparse [T, E] bfloat16 masked top-K
+            affinities (zero elsewhere); when store_eager_affi_only=True, the dense [T, K] bf16 eager
+            affinities co-indexed with expert_index.
 
     Notes:
-        - Requires LNC=2 sharding.
+        - Supports LNC=1 (single core, no token sharding) and LNC=2 (token-sharded).
         - NONE: H must be divisible by 128; T must be a multiple of 256 (DLoC tiling).
         - MX: H must be divisible by 512 (MX block size).
     """
@@ -71,8 +80,17 @@ def rmsnorm_router_topk_tkg(
     _, E = router_weights.shape
     H_free = H // _pmax
 
+    # Logical-NC config (number of SPMD cores): drives token-sharding decisions.
+    # LNC=1 runs everything on a single core (no sendrecv / core_barrier).
+    _, n_prgs, _ = get_verified_program_sharding_info("rmsnorm_router_topk_tkg", (0, 1))
+
     expert_index = nl.ndarray((T, top_k), dtype=nl.int32, buffer=nl.shared_hbm)
-    expert_affinities = nl.ndarray((T, E), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    if store_eager_affi_only:
+        expert_affinities = None
+        expert_affinities_eager = nl.ndarray((T, top_k), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    else:
+        expert_affinities = nl.ndarray((T, E), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+        expert_affinities_eager = None
 
     rmsnorm_out_sb = nl.ndarray((_pmax, T, H_free), dtype=hidden_states.dtype, buffer=nl.sbuf)
 
@@ -132,9 +150,18 @@ def rmsnorm_router_topk_tkg(
         use_column_tiling=True,
         use_indirect_dma_scatter=True,
         use_PE_broadcast_w_bias=True,
-        shard_on_tokens=T > 1,
+        # Token-sharding needs >1 core; router_topk asserts n_prgs>1 when this is
+        # set. At LNC=1 the single core processes all T tokens (no sharding).
+        shard_on_tokens=T > 1 and n_prgs > 1,
         skip_store_expert_index=False,
         skip_store_router_logits=True,
+        return_eager_affi=store_eager_affi_only,
+        skip_store_expert_affinities=store_eager_affi_only,
+        expert_affinities_eager_out=expert_affinities_eager if store_eager_affi_only else None,
     )
+
+    if store_eager_affi_only:
+        # _router_topk wrote the dense [T, k] eager affinities directly into expert_affinities_eager.
+        return norm_output, expert_index, expert_affinities_eager
 
     return norm_output, expert_index, expert_affinities

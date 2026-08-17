@@ -15,6 +15,7 @@
 
 from .core._helpers import ceiling_div, largest_divisor
 from .core.factories import alloc_blocks, alloc_tiles, blocks, tiles
+from .core.indexing import element_offset
 from .core.ndslice import BlockStream, NDSlice  # noqa: F401  -- importable for docs, not in __all__
 from .core.psum_pool import psum_pool
 from .core.shard_helpers import (
@@ -32,6 +33,8 @@ __all__ = [
     "alloc_tiles",
     "alloc_blocks",
     "psum_pool",
+    # Index markers
+    "element_offset",
     # Sharding helpers (each returns a Python slice)
     "block_range",
     "uneven_block_range",

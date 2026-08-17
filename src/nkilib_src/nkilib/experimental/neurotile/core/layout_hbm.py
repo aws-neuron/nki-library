@@ -24,6 +24,7 @@ from ._helpers import (
 from .ap_emitter import APEmitter
 from .axis import IndirectKind, IndirectOffset
 from .grid import Grid
+from .indexing import assert_valid_element_offset_value, is_sbuf_scalar_value
 from .layout_sbuf import SBUFLayout
 
 
@@ -93,12 +94,20 @@ class HBMLayout(nl.NKIObject):
         """Advance offset along `dim` by `k` items at `step` source-units per item.
 
         For compile-time int `k`, folds k * step * strides[dim] into self.offset.
-        For runtime k, stashes k * step (source-element units, unscaled by
-        stride) in self.indirect -- the AP emitter multiplies by stride at
-        the time it issues `.ap(scalar_offset=...)`.
+        For runtime k, lower the logical index to a source-element scalar
+        offset. SBUF scalar indices with step > 1 are scaled internally;
+        loop variables with step > 1 are rejected because NKI cannot
+        currently materialize that scale.
         """
-        if isinstance(k, int):
-            new_offset = self.offset + k * step * self.strides[dim]
+        return self.advance_by_logical_index(dim, k, step)
+
+    def advance_by_logical_index(self, dim, index, index_stride_elements):
+        """Advance by a logical grid index on `dim`."""
+        self._assert_valid_dim(dim)
+        HBMLayout._assert_positive_index_stride(index_stride_elements)
+        assert not isinstance(index, bool), "Runtime logical indexing does not accept bool indices."
+        if isinstance(index, int):
+            new_offset = self.offset + index * index_stride_elements * self.strides[dim]
             return HBMLayout(
                 self.source,
                 new_offset,
@@ -108,20 +117,79 @@ class HBMLayout(nl.NKIObject):
                 self.indirect,
                 self.root_source,
             )
-        # Runtime k -> indirect (in source-element units).
-        scaled = k if step == 1 else k * step
+
+        if index_stride_elements == 1:
+            assert not hasattr(index, "shape") or is_sbuf_scalar_value(index), (
+                "Runtime logical indexing requires an SBUF scalar index; got shape=" + str(tuple(index.shape))
+            )
+            element_offset = index
+        else:
+            assert is_sbuf_scalar_value(index), (
+                "Runtime logical indexing with index stride "
+                + str(index_stride_elements)
+                + " requires an SBUF scalar index so NeuroTile can materialize "
+                + "the source-element offset. Use nt.element_offset(offset) "
+                + "with a counter already in source-element units for loop variables."
+            )
+            element_offset = HBMLayout._materialize_scaled_scalar_offset(index, index_stride_elements)
+
         if self.indirect is not None and self.indirect.kind == IndirectKind.SCALAR and self.indirect.dim == dim:
-            scaled = self.indirect.value + scaled
-        new_indirect = IndirectOffset(kind=IndirectKind.SCALAR, value=scaled, dim=dim)
+            element_offset = self.indirect.value + element_offset
+        return self._with_scalar_indirect(element_offset, dim)
+
+    def advance_by_element_offset(self, dim, offset):
+        """Advance by a source-element offset relative to this view."""
+        self._assert_valid_dim(dim)
+        assert_valid_element_offset_value(offset)
+        if isinstance(offset, int):
+            new_offset = self.offset + offset * self.strides[dim]
+            return HBMLayout(
+                self.source,
+                new_offset,
+                self.strides,
+                self.dtype,
+                self.buffer_type,
+                self.indirect,
+                self.root_source,
+            )
+        if self.indirect is not None and self.indirect.kind == IndirectKind.SCALAR and self.indirect.dim == dim:
+            offset = self.indirect.value + offset
+        return self._with_scalar_indirect(offset, dim)
+
+    def _with_scalar_indirect(self, value, dim):
+        """Return a layout with a scalar indirect source-element offset."""
         return HBMLayout(
             self.source,
             self.offset,
             self.strides,
             self.dtype,
             self.buffer_type,
-            new_indirect,
+            IndirectOffset(kind=IndirectKind.SCALAR, value=value, dim=dim),
             self.root_source,
         )
+
+    def _assert_valid_dim(self, dim):
+        """Validate a source-tensor dimension index."""
+        assert not isinstance(dim, bool) and isinstance(dim, int) and 0 <= dim < len(self.strides), (
+            "dim must be an int in [0, " + str(len(self.strides)) + "); got " + str(dim)
+        )
+
+    @staticmethod
+    def _assert_positive_index_stride(index_stride_elements):
+        """Validate the logical-index stride metadata."""
+        assert (
+            not isinstance(index_stride_elements, bool)
+            and isinstance(index_stride_elements, int)
+            and index_stride_elements > 0
+        ), "index_stride_elements must be a positive int; got " + str(index_stride_elements)
+
+    @staticmethod
+    def _materialize_scaled_scalar_offset(value, scale):
+        """Materialize value * scale as an SBUF scalar."""
+        dtype = value.dtype if hasattr(value, "dtype") else nl.int32
+        scaled = nl.ndarray((1, 1), dtype=dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=scaled, data=value, op0=nl.multiply, operand0=scale)
+        return scaled
 
     def set_indirect(self, kind, value, dim):
         """Replace self.indirect with a new tagged offset."""

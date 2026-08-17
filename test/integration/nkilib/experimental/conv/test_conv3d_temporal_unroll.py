@@ -19,9 +19,9 @@ from typing import final
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.conv.conv3d_temporal_unroll import conv3d_temporal_unroll
-from nkilib_src.nkilib.experimental.conv.conv3d_torch import conv3d_torch_ref
+from nkilib_src.nkilib.experimental.conv.conv3d_temporal_unroll_torch import conv3d_temporal_unroll_torch_ref
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -182,7 +182,7 @@ class TestConv3DTemporalUnroll:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=conv3d_temporal_unroll,
-            torch_ref=torch_ref_wrapper(conv3d_torch_ref),
+            torch_ref=torch_ref_wrapper(conv3d_temporal_unroll_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
         )

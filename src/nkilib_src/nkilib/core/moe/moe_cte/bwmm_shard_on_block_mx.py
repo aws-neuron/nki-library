@@ -111,6 +111,8 @@ def bwmm_shard_on_block_mx(
     # quantize scales
     gate_up_proj_scale: nl.NkiTensor = None,
     down_proj_scale: nl.NkiTensor = None,
+    # [1, 1] int32 expert-parallel rank of this instance; required on the packed-affinity path.
+    ep_rank: nl.NkiTensor = None,
     # Non-tensor args
     block_size=None,
     n_static_blocks: int = -1,
@@ -285,30 +287,43 @@ def bwmm_shard_on_block_mx(
     gate_up_proj_weight, target_dtype = convert_to_mxfp_dtype(gate_up_proj_weight, weight_dtype)
     down_proj_weight, _ = convert_to_mxfp_dtype(down_proj_weight, target_dtype)
 
-    # Pre-quantized fp8 hidden states (real MX): hidden_states arrives as a concatenated
-    # [T, H_concat] tensor = [hidden_quant (H fp8) | hidden_scale (H/4 uint8)] from a prior
-    # QMX layer. We skip on-device quantization and gather+transpose both regions. The true
-    # hidden dim H is recovered from the gate/up weight (concat dim hides it on the input).
-    is_fp8_hidden = hidden_states.dtype in (nl.float8_e4m3fn, nl.float8_e5m2)
-
     T = hidden_states.shape[0]
     B = block_size
     E, _Hp, _, _n_H512, I = gate_up_proj_weight.shape
-    # When the producer fused expert affinities into the row, the concat is
-    # [hidden (H fp8) | scale (scale_region uint8) | affinities (E bf16) | pad]. Detect this by the
-    # concat being wider than hidden+scale, and extract the affinity for this block. affinities_col_offset is the fp8 column
-    # where the affinity region starts (= the end of the hidden+scale region).
-    is_affinities_packed = False
+
+    """
+    Pre-quantized hidden states (real MX): hidden_states arrives as a concatenated row from a prior
+    QMX layer, so we skip on-device quantization and gather+transpose the regions instead.
+    
+      [hidden_quant (H fp8) | hidden_scale (scale_region uint8)]                        (unpacked)
+      [hidden_quant (H fp8) | hidden_scale (scale_region uint8) | affinities (E) | pad] (packed)
+    
+    The packed producer fuses the dense [T, E] expert affinities into the row and returns the tensor
+    VIEWED as the affinity dtype (a >=2-byte float). Detection:
+      - expert_affinities_masked is None  -> affinities are PACKED in the row; the affinity dtype is hidden_states.dtype.
+      - else fp8 dtype                    -> prequant, unpacked (affinities via the standalone tensor).
+      - else                              -> plain online-quant [T, H] input (not prequant).
+    H is recovered from the gate/up weight (the concat/scale/affinity tail hides it on the input).
+    """
+    is_affinities_packed = expert_affinities_masked == None
+    kernel_assert(
+        not is_affinities_packed or ep_rank != None,
+        "ep_rank is required when affinities are packed (dense global tail, local block_expert)",
+    )
+    expert_affinities_dtype = hidden_states.dtype  # affinity tail dtype (only meaningful when packed)
+    is_fp8_hidden = is_affinities_packed or hidden_states.dtype in (nl.float8_e4m3fn, nl.float8_e5m2)
     affinities_col_offset = 0
     if is_fp8_hidden:
-        H = _Hp * _n_H512 * _q_width  # real hidden dimension that's not concatted with scales
+        H = _Hp * _n_H512 * _q_width  # real hidden dimension that's not concatted with scales/affinities
         kernel_assert(
             quantization_type == QuantizationType.MX,
-            f"fp8 pre-quantized hidden states only support QuantizationType.MX, got {quantization_type}",
+            f"pre-quantized hidden states only support QuantizationType.MX, got {quantization_type}",
         )
-        hidden_scale_width = H + div_ceil(_n_H512, SLOTS_PER_PACKED_BUFFER) * _pmax
-        is_affinities_packed = hidden_states.shape[-1] > hidden_scale_width
-        affinities_col_offset = hidden_scale_width
+        # Reinterpret the row as fp8 (a no-op when already fp8) so every hidden+scale byte-column
+        # computation below is dtype-agnostic; shape[-1] becomes the fp8 column count (row_region), and
+        # the affinity region (when packed) starts at the fp8 column just past hidden+scale.
+        hidden_states = hidden_states.view(nl.float8_e4m3fn)
+        affinities_col_offset = H + div_ceil(_n_H512, SLOTS_PER_PACKED_BUFFER) * _pmax
     else:
         _, H = hidden_states.shape
     cond_vec_len = conditions.shape[0] if conditions != None else 0
@@ -510,6 +525,20 @@ def bwmm_shard_on_block_mx(
     arange_4H = sbm.alloc_stack((1, _q_width), dtype=nl.float32, name="arange_4H", align=SBUF_QUADRANT_SIZE)
     nisa.iota(arange_4H, [[1, _q_width]], offset=0)
 
+    # Packed-affinity path: DMA this rank's ep_rank into SBUF once, then derive the block-invariant
+    # global expert base (ep_rank * E_local)
+    local_expert_start_idx_sb = None
+    if is_affinities_packed:
+        local_expert_start_idx_sb = sbm.alloc_stack(
+            (1, 1), dtype=nl.int32, name="local_expert_start_idx_sb", align=SBUF_QUADRANT_SIZE
+        )
+        nisa.dma_copy(dst=local_expert_start_idx_sb[0, 0], src=ep_rank.ap(pattern=[[1, 1], [1, 1]], offset=0))
+        e_local_sb = sbm.alloc_stack((1, 1), dtype=nl.int32, name="e_local_sb", align=SBUF_QUADRANT_SIZE)
+        nisa.memset(dst=e_local_sb, value=E)
+        nisa.tensor_tensor(
+            dst=local_expert_start_idx_sb, data1=local_expert_start_idx_sb, data2=e_local_sb, op=nl.multiply
+        )
+
     # fp8 path keeps the raw concat [T, H_concat] view; the gather helper does its own .ap().
     # bf16 path reshapes to the H-folded layout consumed by load_hidden_states_mx.
     _hidden_states_view = (
@@ -527,6 +556,7 @@ def bwmm_shard_on_block_mx(
         token_position_to_id=token_position_to_id,
         block_to_expert=block_to_expert,
         expert_affinities_masked=expert_affinities_masked,
+        local_expert_start_idx=local_expert_start_idx_sb,
         p_gup_idx_vector=p_gup_idx_vector,
         p_gup_idx_vector_int32=p_gup_idx_vector_int32,
         p_down_idx_vector=p_down_idx_vector,
@@ -554,13 +584,33 @@ def bwmm_shard_on_block_mx(
         _block_hs_bytes = (dims.B // SBUF_QUADRANT_SIZE) * prj_cfg.n_H512_tile * _pmax * sizeinbytes(compute_dtype)
         _block_old_bytes = div_ceil(dims.B, _pmax) * dims.H * sizeinbytes(compute_dtype)
         _dp_out_bytes = 2 * dims.H * sizeinbytes(compute_dtype)
+        # Persistent uint8 weight-scale buffers (gup_scales_sb + down_scale_sb). Their size varies by
+        # path and, on the standard MX path, is the single largest term this estimate previously
+        # omitted (it was calibrated for STATIC_MX only):
+        #   - STATIC_MX: a tiny shared all-127 dummy is reused -> ~128 B.
+        #   - packed:    4 H512/I512 tiles fold into one 128-wide block -> ~4x smaller.
+        #   - standard:  full per-tile scales (uint8, 1 B/elt) co-resident with gup_full.
+        # Count them so full-resident gup falls back to per-tile streaming when they don't fit.
+        if is_static_quant:
+            _scale_bytes = _pmax
+        elif use_packed_scales:
+            _n_packed_down = div_ceil(prj_cfg.n_total_I512_tile, SLOTS_PER_PACKED_BUFFER)
+            _scale_bytes = n_packed_gup * 2 * dims.I + _n_packed_down * prj_cfg.H_sharded
+        else:
+            _scale_bytes = 2 * prj_cfg.n_H512_tile_sharded * dims.I + prj_cfg.n_total_I512_tile * prj_cfg.H_sharded
         _big_bufs_bytes = (
-            _gup_full_bytes + _down_w_bytes + _hidden_qtz_bytes + 2 * _block_hs_bytes + _block_old_bytes + _dp_out_bytes
+            _gup_full_bytes
+            + _down_w_bytes
+            + _hidden_qtz_bytes
+            + 2 * _block_hs_bytes
+            + _block_old_bytes
+            + _dp_out_bytes
+            + _scale_bytes
         )
         _sbuf_threshold = (nl.tile_size.total_available_sbuf_size * 85) // 100
         if _big_bufs_bytes > _sbuf_threshold:
             logger.info(
-                f"Disabling gup_full_persistent for STATIC_MX: big buffers={_big_bufs_bytes} B > 85% per-partition SBUF "
+                f"Disabling gup_full_persistent: big buffers={_big_bufs_bytes} B > 85% per-partition SBUF "
                 f"({_sbuf_threshold} B). Falling back to per-tile-0 weight skipping."
             )
             _gup_full_persistent = False
@@ -589,6 +639,7 @@ def bwmm_shard_on_block_mx(
         is_fp8_hidden=is_fp8_hidden,
         is_affinities_packed=is_affinities_packed,
         affinities_col_offset=affinities_col_offset,
+        expert_affinities_dtype=expert_affinities_dtype,
     )
 
     check_kernel_compatibility(dims, configs)
@@ -642,7 +693,7 @@ def bwmm_shard_on_block_mx(
         )
 
     # fp8 pre-quantized path: persistent buffer holding one block's gathered concat rows
-    # ([hidden_quant (H fp8) | hidden_scale (packed: n_packed*128 uint8)] [| affinities (E bf16) | pad]
+    # ([hidden_quant (H fp8) | hidden_scale (packed: n_packed*128 uint8)] [| affinities (E) | pad]
     # when affinities are fused) between the prefetch (DMA) and transpose (PE) stages. H and the packed
     # scale region are both multiples of 4, so the row is fp32-aligned for the transpose's fp8->fp32
     # reinterpret; the affinity tail (when present) is the full remaining concat width.
@@ -1402,54 +1453,63 @@ def load_prev_block(output, token_indices, block_old, NUM_TILES, dtype, shard_id
     return block_old
 
 
-def _extract_block_affinity(block_hidden_concat, block_expert, dims, kernel_cfg, sbm, name_prefix="aff"):
+def _extract_block_affinity(
+    block_hidden_concat, block_expert, local_expert_start_idx, dims, kernel_cfg, sbm, name_prefix="aff"
+):
     """Extract this block's expert-affinity column from the gathered fp8 concat rows (packed path).
 
     When the producer fused the dense [T, E] affinities into the row (is_affinities_packed), each
-    gathered row is [hidden | scale | affinities (E bf16) | pad]. The affinity this block needs is the
-    block_expert column of every token's affinity vector. This is a pure on-chip op (one tensor_copy
-    with scalar_offset=block_expert) -- NOT a DMA -- so it replaces the separate indirect affinity
-    gather (calculate_expert_affinities) and removes a SWDGE pass per B128 tile.
+    gathered row is [hidden | scale | affinities (E_global * kernel_cfg.expert_affinities_dtype) | pad].
+    The affinity region is dense over ALL experts because the producer's router runs BEFORE the EP
+    shard, but this rank holds only local experts and block_expert is a LOCAL id
+    (0..E_local-1). The global column is block_expert + local_expert_start_idx (== ep_rank * E_local).
 
     block_hidden_concat is [_pmax, n_B_tiles, concat_free_size] fp8. The affinity region starts at fp8
-    column kernel_cfg.affinities_col_offset; viewed as bf16 that is column affinities_col_offset // 2,
-    and the per-token row stride in bf16 is concat_free_size // 2.
+    column kernel_cfg.affinities_col_offset. Viewed as the affinity dtype, that is column
+    affinities_col_offset // affin_as_fp8, and the per-token row stride is
+    concat_free_size // affin_as_fp8 -- affin_as_fp8 = sizeinbytes(dtype) fp8 columns per element.
 
-    Returns a list of n_B_tiles tensors, each [_pmax, 1] fp32 -- the same shape contract as
-    calculate_expert_affinities, so the per-block compute consumes expert_affinity[n] identically.
+    Returns a list of n_B_tiles tensors, each [_pmax, 1] fp32.
     """
-    _bf16_as_fp8 = 2  # bf16 occupies 2 fp8 columns
+    affin_dtype = kernel_cfg.expert_affinities_dtype
+    affin_as_fp8 = sizeinbytes(affin_dtype)  # bf16 -> 2, fp32 -> 4 fp8 columns per affinity element
     n_B_tiles = dims.B // _pmax
-    aff_col_bf16 = kernel_cfg.affinities_col_offset // _bf16_as_fp8
+    aff_col = kernel_cfg.affinities_col_offset // affin_as_fp8
 
-    # bf16 view of the fp8 concat: [_pmax, n_B_tiles, concat_free_size // 2]. Indexing through the
-    # nl.NkiTensor makes the dynamic expert select operate in bf16 element units
-    # and avoids the fp8-vs-bf16 scalar_offset unit
+    # Affinity-dtype view of the fp8 concat: [_pmax, n_B_tiles, concat_free_size // affin_as_fp8].
+    # Indexing through the nl.NkiTensor makes the dynamic expert select operate in affinity-element
+    # units and avoids the fp8-vs-affinity scalar_offset unit.
+    concat_view = block_hidden_concat.view(affin_dtype)
+    # Slice the whole affinity tail to end-of-row: [aff_col, free_affin) spans all E_global affinity
+    # columns plus trailing pad. The dynamic global index always lands in the affinity region, so the
+    # pad is never selected
+    free_affin = concat_view.shape[-1]
 
-    concat_bf16 = block_hidden_concat.view(nl.bfloat16)
-
-    # Dynamic select requires a uint32 index (TensorCopyDynamicSrc verifier). block_expert is int32;
-    # experts are 0..E-1 (always positive) so the bit pattern is identical -- reinterpret in place.
-    block_expert_u32 = block_expert.view(nl.uint32)
+    # Global affinity column = local block_expert + this rank's expert base (ep_rank * E_local).
+    global_expert = _sbm_alloc(
+        sbm, (1, 1), dtype=nl.int32, name=f"{name_prefix}_global_expert", align=SBUF_QUADRANT_SIZE
+    )
+    nisa.tensor_tensor(dst=global_expert, data1=block_expert, data2=local_expert_start_idx, op=nl.add)
+    global_expert_u32 = global_expert.view(nl.uint32)
 
     expert_affinity = []
     for n in range(n_B_tiles):
         affinity_f32 = _sbm_alloc(
             sbm, (_pmax, 1), dtype=nl.float32, name=f"{name_prefix}_affinity_t{n}", align=SBUF_QUADRANT_SIZE
         )
-        # [_pmax, n_B_tiles, free_bf16] -> pick B-tile n -> [_pmax, free_bf16]
-        #   -> slice affinity cols [aff_col_bf16, +E] -> [_pmax, E]
-        #   -> dynamic-select this block's expert column -> [_pmax]
+        # [_pmax, n_B_tiles, free_affin] -> pick B-tile n -> [_pmax, free_affin]
+        #   -> slice affinity cols [aff_col, end) -> [_pmax, E_global(+pad)]
+        #   -> dynamic-select this block's GLOBAL expert column -> [_pmax]
         #   -> expand to [_pmax, 1] for the fp32 affinity contract.
         aff_tv = (
-            concat_bf16.slice(1, n, n + 1)
+            concat_view.slice(1, n, n + 1)
             .squeeze_dim(1)
-            .slice(1, aff_col_bf16, aff_col_bf16 + dims.E)
-            .select(dim=1, index=block_expert_u32)
+            .slice(1, aff_col, free_affin)
+            .select(dim=1, index=global_expert_u32)
             .expand_dim(1)
         )
-        # tensor_copy bf16 -> fp32 (compute consumes fp32 affinity).
-        nisa.tensor_copy(dst=affinity_f32, src=aff_tv)
+        # tensor_copy affinity dtype -> fp32 (compute consumes fp32 affinity; fp32 in is a no-op cast).
+        nisa.tensor_copy(dst=affinity_f32, src=aff_tv, engine=nisa.vector_engine)
         expert_affinity.append(affinity_f32)
     return expert_affinity
 
@@ -2426,10 +2486,13 @@ def compute_one_block(
             block_new[:, n, :] += block_old[:, n, :]
             dma_copy block_new[:, n, :] to output[shard_id, token_indices_2D[:, n], :]
     """
+    # Per-block disambiguator for op/alloc names. In the dynamic path block_idx is a
+    # runtime SBUF tensor (not a Python int), so f"b{block_idx}" is identical across
+    # iterations; callers pass a distinct name_tag (e.g. "chunk_0", "rem") for uniqueness.
+    tag = name_tag if name_tag else f"b{block_idx}"
     if sbm != None:
         sbm.open_scope(name="compute_block_scope")
         prev_prefix = sbm.get_name_prefix()
-        tag = name_tag if name_tag else f"b{block_idx}"
         sbm.set_name_prefix(f"{prev_prefix}{tag}_")
 
     block_expert = load_block_expert(inps.block_to_expert, block_idx, sbm=sbm)
@@ -2633,7 +2696,9 @@ def compute_one_block(
 
     if kernel_cfg.is_affinities_packed:
         # Extract expert affinities for this block expert
-        expert_affinity = _extract_block_affinity(buffers.block_hidden_concat, block_expert, dims, kernel_cfg, sbm=sbm)
+        expert_affinity = _extract_block_affinity(
+            buffers.block_hidden_concat, block_expert, inps.local_expert_start_idx, dims, kernel_cfg, sbm=sbm
+        )
     else:
         expert_affinity = calculate_expert_affinities(
             inps.expert_affinities_masked,
@@ -2750,16 +2815,28 @@ def compute_one_block(
             )
         )
 
-        # TODO: Remove this unecessary allocation when full weight skipping.
-        # Currently keeping because we get a worse schedule without it
-        gup_wt_b = _sbm_alloc(
-            sbm,
-            (tile_buf_shape),
-            dtype=wt_dtype,
-            name="gup_wt_b",
-            align=SBUF_QUADRANT_SIZE,
-        )  # scope-local
-        gup_wt_bufs = [gup_wt_a, gup_wt_b]
+        # Single-buffering aliases both ping-pong slots, which is only correct when the
+        # regime-3 inter-tile prefetch (the sole nxt_buf write, gated `not _use_h_chunked`)
+        # is disabled — i.e. the H-chunked regime (H >= 3072). Allocate the second buffer
+        # unless we're both in that regime AND out of SBUF room.
+        _h_chunked_active = dims.H >= 3072 and not kernel_cfg.gup_full_persistent
+        _tile_buf_bytes = 2 * prj_cfg.n_H512_tile_sharded * _I_TILE_SZ * sizeinbytes(wt_dtype)
+        _can_double_buffer = sbm == None or sbm.get_free_space() >= _tile_buf_bytes
+        if _h_chunked_active and not _can_double_buffer:
+            logger.info(
+                f"Single-buffering gate/up tile weights (free={sbm.get_free_space()} B, "
+                f"need={_tile_buf_bytes} B for gup_wt_b)."
+            )
+            gup_wt_bufs = [gup_wt_a, gup_wt_a]
+        else:
+            gup_wt_b = _sbm_alloc(
+                sbm,
+                (tile_buf_shape),
+                dtype=wt_dtype,
+                name="gup_wt_b",
+                align=SBUF_QUADRANT_SIZE,
+            )
+            gup_wt_bufs = [gup_wt_a, gup_wt_b]
 
         # Load full scales once into pre-allocated inps.gup_scales_sb (skip if prefetched).
         # STATIC_MX skips entirely: inps.gup_scales_sb holds persistent dummy 127 from top-level memset.
@@ -2785,7 +2862,7 @@ def compute_one_block(
                         ),
                         oob_mode=oob_mode.skip,
                         dge_mode=dge_mode.hwdge,
-                        name=f"dma_gup_scales_packed_tile0_b{block_idx}",
+                        name=f"dma_gup_scales_packed_tile0_{tag}",
                     )
                 else:
                     nisa.dma_copy(
@@ -2802,7 +2879,7 @@ def compute_one_block(
                         ),
                         oob_mode=oob_mode.error,
                         dge_mode=dge_mode.hwdge,
-                        name=f"dma_gate_scales_packed_tile0_b{block_idx}",
+                        name=f"dma_gate_scales_packed_tile0_{tag}",
                     )
                     nisa.dma_copy(
                         dst=inps.gup_scales_sb[:_pmax, :n_packed_gup, 1:2, : prj_cfg.I],
@@ -2818,7 +2895,7 @@ def compute_one_block(
                         ),
                         oob_mode=oob_mode.error,
                         dge_mode=dge_mode.hwdge,
-                        name=f"dma_up_scales_packed_tile0_b{block_idx}",
+                        name=f"dma_up_scales_packed_tile0_{tag}",
                     )
             else:
                 scale_shape = inps.gate_up_proj_scale.shape
@@ -3522,7 +3599,7 @@ def compute_one_block(
                 (_pmax, n_BxS_tile, dims.H),
                 dtype=nl.bfloat16,
                 buffer=nl.sbuf,
-                name=f"dp_out_sb_reuse_b{block_idx}",
+                name=f"dp_out_sb_reuse_{tag}",
                 address=(0, _gup_wt_addr),
             )
 
@@ -3736,12 +3813,6 @@ def process_static_blocks(
     # prefetch the first block of each core
     first_block_idx = n_blocks_per_shard * dims.shard_id
 
-    # fp8 pre-quantized hidden gathers + transposes in-block (no bf16 prefetch buffers, no
-    # init quantize). Only the persistent hidden_qtz_sb/hidden_scale_sb view shape is set up.
-    if not configs.is_fp8_hidden:
-        # Heap-allocate hidden state buffers for first block load
-        _alloc_hidden_bufs(sbm, buffers, dims, prj_cfg, configs, tag=f"sb{first_block_idx}_")
-
     # Allocate zeros on heap (on top of hidden bufs) for output init, then free
     if is_tensor_update_accumulating:
         H = dims.H
@@ -3749,6 +3820,12 @@ def process_static_blocks(
         nisa.memset(zeros, value=0.0)
         output_initialization(outs.output, dims, sbm=sbm, zeros=zeros)
         sbm.pop_heap()  # free zeros, hidden bufs remain
+
+    # fp8 pre-quantized hidden gathers + transposes in-block (no bf16 prefetch buffers, no
+    # init quantize). Only the persistent hidden_qtz_sb/hidden_scale_sb view shape is set up.
+    if not configs.is_fp8_hidden:
+        # Heap-allocate hidden state buffers for first block load
+        _alloc_hidden_bufs(sbm, buffers, dims, prj_cfg, configs, tag=f"sb{first_block_idx}_")
 
     if configs.is_fp8_hidden:
         # fp8: persistent hidden buffers stay in the [_pmax, n_H512_tile, B] matmul layout.

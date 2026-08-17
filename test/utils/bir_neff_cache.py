@@ -20,7 +20,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import neuronxcc
 
@@ -28,6 +28,16 @@ from .metrics_collector import IMetricsCollector, MetricName
 from .s3_utils import S3Uri, get_s3_client_and_session, parse_s3_uri
 
 log = logging.getLogger(__name__)
+
+
+class CompiledKernel(Protocol):
+    """The compiled-kernel surface the harness consumes, whether the NEFF was just
+    built or restored from the cache."""
+
+    neff_path: str
+    mlir_time: float
+    neuronx_cc_time: float
+    input_output_aliases: dict
 
 
 @dataclass

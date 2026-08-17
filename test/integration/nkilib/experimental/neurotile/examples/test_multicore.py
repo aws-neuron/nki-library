@@ -20,7 +20,6 @@ tutorial's `kernel[2](...)` invocation. Single-core kernels run at LNC=1.
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._06_multicore import (
     _01_tensor_add as add_mod,
 )
@@ -33,6 +32,7 @@ from nkilib_src.nkilib.experimental.neurotile.examples._06_multicore import (
 from nkilib_src.nkilib.experimental.neurotile.examples._06_multicore import (
     _02_matmul_torch as matmul_refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator

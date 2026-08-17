@@ -73,14 +73,18 @@ Final sendrecv exchanges output between NCs (if out_in_sb) so both have full res
 │  ┌─────────────────────────────────────────────────────────────────────┐       │
 │  │                    _finalize_and_store()                            │       │
 │  ├─────────────────────────────────────────────────────────────────────┤       │
-│  │  1. reciprocal(running_sum)                                         │       │
-│  │  2. running_output *= sum_recip  (normalize)                        │       │
-│  │  3. Store to out[bs_prg_id portion]                                 │       │
+│  │ if return_cp_softmax_stats:                                         │       │
+│  │     1. export running_max and running_sum to cp_softmax_stats_out   │       │
+│  │     2. return out[bs_prg_id portion] in SB (unnormalized)           │       │
+│  │ else:                                                               │       │
+│  │     1. reciprocal(running_sum)                                      │       │
+│  │     2. running_output *= sum_recip  (normalize)                     │       │
+│  │     3. Store to out[bs_prg_id portion]                              │       │
 │  │                                                                     │       │
-│  │  4. ════════════════ SENDRECV (if out_in_sb) ════════════════       │       │
-│  │     NC0 ◄──────────────────────────────────────────────────► NC1    │       │
-│  │         sendrecv(out[0:bs/2] ↔ out[bs/2:bs])                        │       │
-│  │     Result: Both NCs have full output                               │       │
+│  │     4. ════════════════ SENDRECV (if out_in_sb) ════════════════    │       │
+│  │        NC0 ◄──────────────────────────────────────────────► NC1     │       │
+│  │             sendrecv(out[0:bs/2] ↔ out[bs/2:bs])                    │       │
+│  │        Result: Both NCs have full output                            │       │
 │  └─────────────────────────────────────────────────────────────────────┘       │
 │                                                                                │
 └────────────────────────────────────────────────────────────────────────────────┘
@@ -209,17 +213,20 @@ scope-local buffer) and folded into the global max + sum during the sync block.
 │  │     running_sum += sink_values.                                     │        │
 │  │                                                                     │        │
 │  │  Normalization and output gather:                                   │        │
-│  │  1. reciprocal(running_sum)                                         │        │
-│  │  2. running_output *= sum_recip_bc (normalize)                      │        │
+│  │  1. if return_cp_softmax_stats:                                     │        │
+│  │          export running_max, running_sum to cp_softmax_stats_out    │        │
+│  │     else:                                                           │        │
+│  │          reciprocal(running_sum)                                    │        │
+│  │          running_output *= sum_recip_bc (normalize)                 │        │
 │  │                                                                     │        │
-│  │  3. ═════════ SENDRECV (running_output) ═══════════════════         │        │
+│  │  2. ═════════ SENDRECV (running_output) ═══════════════════         │        │
 │  │     NC0 ◄─────────────────────────────────────► NC1                 │        │
-│  │         Exchange normalized partial outputs                         │        │
+│  │         Exchange partial outputs                                    │        │
 │  │                                                                     │        │
-│  │  4. NC0: output = local_output + recv_output                        │        │
+│  │  3. NC0: output = local_output + recv_output                        │        │
 │  │     (NC0 combines both halves; NC1 discards unless out_in_sb)       │        │
 │  │                                                                     │        │
-│  │  5. NC0 stores final output to HBM                                  │        │
+│  │  4. NC0 stores final output to HBM                                  │        │
 │  └─────────────────────────────────────────────────────────────────────┘        │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -288,8 +295,12 @@ attention_tkg()
     │   ├── sendrecv(running_sum); running_sum += remote
     │   └── sink_values = exp(sink - M); running_sum += sink_values
     │
-    ├── reciprocal(running_sum)
-    ├── running_output *= sum_recip_bc
+    ├── if return_cp_softmax_stats:
+    │   └── _copy_and_export_softmax_stats(running_max, running_sum)
+    ├── else:
+    │   ├── reciprocal(running_sum)
+    │   └── running_output *= sum_recip_bc
+    │
     └── _gather_and_store_output()  # Gather outputs across NCs, store to HBM
 ```
 ## Batch tiling
@@ -335,3 +346,16 @@ for batch_tile_idx in range(num_batch_tiles):       # NEW: batch outer loop
 
     _finalize_and_store(...)                      # per batch tile
 ```
+
+### Context Parallel (CP) Support
+
+Context Parallel (CP) attention shards the KV cache across ranks. Each rank
+runs attention_tkg on its s_prior/CP shard with return_cp_softmax_stats=True to:
+    1. Skip output normalization 
+    2. Update the cp_softmax_stats_out dict for cross-rank softmax correction:
+           "running_max": [s_active_bqh_tile, n_bsq_tiles] @ SBUF
+           "running_sum": [s_active_bqh_tile, n_bsq_tiles] @ SBUF
+           "max_negated": bool — when True, max is stored as -max
+           "atp", "TC": tile params for broadcast in CP correction
+
+See: attention_block_tkg_sharding_design_spec.md

@@ -644,6 +644,13 @@ def qkv_cte(
             qkv_in_scale=qkv_in_scale,
             k_cos_cache_hbm=k_cos_cache,
             k_sin_cache_hbm=k_sin_cache,
+            # In-kernel KV cache write (mirrors _qkv_cte_impl); None when unused.
+            q_tensor_hbm=q_tensor_hbm,
+            k_cache_hbm=k_cache,
+            v_cache_hbm=v_cache,
+            k_scale_hbm=k_scale,
+            v_scale_hbm=v_scale,
+            slot_mapping_hbm=slot_mapping,
         )
     else:
         _qkv_cte_impl(
@@ -735,6 +742,199 @@ def _compute_and_store_squared_sum(segment_sb, squared_scratch_sb, squared_sum_s
         reduce_res=squared_sum_sb,
     )
     nisa.dma_copy(dst=squared_sum_dst, src=squared_sum_sb, dge_mode=dge_mode.swdge)
+
+
+def _store_kv_cache(
+    output_sb: List[nl.NkiTensor],
+    k_cache_hbm: nl.NkiTensor,
+    v_cache_hbm: nl.NkiTensor,
+    k_scale_sb: Optional[nl.NkiTensor],
+    v_scale_sb: Optional[nl.NkiTensor],
+    k_inv_scale_sb: Optional[nl.NkiTensor],
+    slot_mapping_hbm: Optional[nl.NkiTensor],
+    num_output_s_tiles: int,
+    i_block_S: int,
+    i_batch: int,
+    S_BLOCK_SIZE: int,
+    S_shard: int,
+    s_block_sz: int,
+    cfg: QKV_CTE_Config,
+    dims: QKV_CTE_Dims,
+    sbm: SbufManager,
+):
+    """In-kernel Step 6 KV-cache write: scatter K/V into the paged caches.
+
+    Shared by _qkv_cte_impl and _qkv_cte_mx_impl (the projection differs, but the
+    post-projection K/V store is identical). The Q store is left to each caller as
+    it is a plain per-tile DMA. For each S tile in the current S block:
+      - write K via the fp8_packed / transpose_k_cache / plain path,
+      - write V via the plain path.
+
+    Plain scatter — CP/DCP ownership (non-owned tokens clamped to the reserved null
+    block) is handled caller-side in the slot_mapping values.
+
+    Args:
+        output_sb: Per-S-tile projection outputs, each [s_tile_sz, I] = [q_dim | kv_dim | kv_dim].
+        k_cache_hbm / v_cache_hbm: Paged K/V caches to scatter into.
+        k_scale_sb / v_scale_sb: Per-tensor K/V quant scales (None for bf16 cache).
+        k_inv_scale_sb: Precomputed 1/k_scale for the packed / transpose_k_cache paths.
+        slot_mapping_hbm: Block-KV slot mapping ([B*S] or [B, S]); None for flat KV.
+        num_output_s_tiles: Number of S tiles to iterate in this block.
+        i_block_S / i_batch: Current S-block and batch indices.
+        S_BLOCK_SIZE / S_shard / s_block_sz: S tiling bounds for this shard/block.
+    """
+    P_MAX = nl.tile_size.pmax
+
+    # slot_mapping arrives 1-D [B*S] from vLLM (or stays 1-D when use_BxS_input_reshape
+    # is off for large-S prefill); fold (B,S)->(B*S) only when it is actually 2-D.
+    slot_mapping_flat = None
+    if slot_mapping_hbm is not None:
+        slot_mapping_flat = (
+            slot_mapping_hbm.flatten_dims(start_dim=0, end_dim=1)
+            if len(slot_mapping_hbm.shape) > 1
+            else slot_mapping_hbm
+        )
+
+    # fp8_packed tile-pairing accumulator. Disable two-tile pairing if any tile in this
+    # block is partial (< pmax), to avoid mixing different s_tile_sz values in a paired call.
+    fp8_pack_pending_tiles = []
+    fp8_pack_first_tile_offset = None
+    fp8_packed_two_tile_opt = cfg.fp8_packed and (s_block_sz % P_MAX == 0)
+
+    for i_tile_S in range(num_output_s_tiles):
+        s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX
+        s_tile_sz = min(P_MAX, S_shard - s_tile_local_offset)
+        s_tile_global_offset = dims.S_shard_offset + s_tile_local_offset
+
+        # Load slot_mapping tile for block KV cache (used by the plain / transpose_k_cache
+        # K store and the V store; the fp8_packed K path loads its own packed slot indices).
+        slot_mapping_tile_sb = None
+        if cfg.use_block_kv:
+            slot_mapping_tile_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=slot_mapping_tile_sb[0:s_tile_sz, 0:1],
+                src=slot_mapping_flat.slice(
+                    0,
+                    i_batch * dims.S + s_tile_global_offset,
+                    i_batch * dims.S + s_tile_global_offset + s_tile_sz,
+                ),
+                dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
+            )
+
+        if cfg.fp8_packed:
+            # Accumulate tiles for paired processing (full 128-partition transpose+DMA).
+            # Flush when we have 2 tiles, on the last tile, or when two-tile opt is disabled.
+            fp8_pack_pending_tiles.append(output_sb[i_tile_S])
+            if fp8_pack_first_tile_offset is None:
+                fp8_pack_first_tile_offset = s_tile_global_offset
+            if len(fp8_pack_pending_tiles) == 2 or i_tile_S == num_output_s_tiles - 1 or not fp8_packed_two_tile_opt:
+                pair_count = len(fp8_pack_pending_tiles)
+
+                # Load packed slot indices for all tiles in one DMA (stride 2 across
+                # contiguous tiles). Both tiles' even-indexed slots are contiguous in HBM.
+                num_packed_rows = pair_count * (s_tile_sz // 2)
+                packed_slot_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=packed_slot_sb[0:num_packed_rows, 0:1],
+                    src=slot_mapping_flat.slice(
+                        0,
+                        i_batch * dims.S + fp8_pack_first_tile_offset,
+                        i_batch * dims.S + fp8_pack_first_tile_offset + 2 * num_packed_rows,
+                        step=2,
+                    ),
+                    dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
+                )
+                # slot_mapping holds flat indices into [num_blocks * block_size].
+                # Right-shift by 1 (= divide by 2) converts to packed row indices
+                # into [num_blocks * block_size // 2], since each packed row holds
+                # two consecutive sequence positions. This yields
+                # block * block_size_half + pair.
+                nisa.tensor_scalar(
+                    dst=packed_slot_sb[0:num_packed_rows, 0:1],
+                    data=packed_slot_sb[0:num_packed_rows, 0:1],
+                    op0=nl.right_shift,
+                    operand0=1,
+                )
+                # Head-major cache layout [num_blocks, num_kv_heads, block_size//2, d_head, 2]:
+                # the row for (block, head, pair) is
+                #   block * num_kv_heads * block_size_half + head * block_size_half + pair.
+                # The per-head term is added via a static offset inside the store fn; here we
+                # promote the block term's stride from block_size_half to
+                # num_kv_heads * block_size_half by adding block_idx * (num_kv_heads-1) * block_size_half.
+                # No-op when num_kv_heads == 1 (matches the original single-row layout).
+                if dims.num_kv_heads > 1:
+                    block_size_half = cfg.block_size // 2
+                    log2_block_size_half = int(math.log2(block_size_half))
+                    block_idx_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.int32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(
+                        dst=block_idx_sb[0:num_packed_rows, 0:1],
+                        data=packed_slot_sb[0:num_packed_rows, 0:1],
+                        op0=nl.right_shift,
+                        operand0=log2_block_size_half,
+                    )
+                    nisa.scalar_tensor_tensor(
+                        dst=packed_slot_sb[0:num_packed_rows, 0:1],
+                        data=block_idx_sb[0:num_packed_rows, 0:1],
+                        op0=nl.multiply,
+                        operand0=float(block_size_half * (dims.num_kv_heads - 1)),
+                        op1=nl.add,
+                        operand1=packed_slot_sb[0:num_packed_rows, 0:1],
+                    )
+                _quantize_and_store_k_fp8_packed(
+                    output_sb_tiles=fp8_pack_pending_tiles,
+                    inv_scale_sb=k_inv_scale_sb,
+                    cache_hbm=k_cache_hbm,
+                    kv_offset=dims.q_dim,
+                    s_tile_sz=s_tile_sz,
+                    cfg=cfg,
+                    dims=dims,
+                    sbm=sbm,
+                    packed_slot_sb=packed_slot_sb,
+                )
+                fp8_pack_pending_tiles = []
+                fp8_pack_first_tile_offset = None
+        elif cfg.transpose_k_cache:
+            _quantize_and_store_k_transposed(
+                output_sb=output_sb[i_tile_S],
+                inv_scale_sb=k_inv_scale_sb,
+                cache_hbm=k_cache_hbm,
+                kv_offset=dims.q_dim,
+                s_tile_sz=s_tile_sz,
+                cfg=cfg,
+                dims=dims,
+                sbm=sbm,
+                slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
+                i_batch=i_batch,
+                s_tile_global_offset=s_tile_global_offset,
+            )
+        else:
+            _quantize_and_store_kv(
+                output_sb=output_sb[i_tile_S],
+                scale_sb=k_scale_sb,
+                cache_hbm=k_cache_hbm,
+                kv_offset=dims.q_dim,
+                i_batch=i_batch,
+                s_tile_global_offset=s_tile_global_offset,
+                s_tile_sz=s_tile_sz,
+                cfg=cfg,
+                dims=dims,
+                sbm=sbm,
+                slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
+            )
+
+        _quantize_and_store_kv(
+            output_sb=output_sb[i_tile_S],
+            scale_sb=v_scale_sb,
+            cache_hbm=v_cache_hbm,
+            kv_offset=dims.q_dim + dims.kv_dim,
+            i_batch=i_batch,
+            s_tile_global_offset=s_tile_global_offset,
+            s_tile_sz=s_tile_sz,
+            cfg=cfg,
+            dims=dims,
+            sbm=sbm,
+            slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
+        )
 
 
 def _quantize_and_store_kv(
@@ -2365,19 +2565,12 @@ def _qkv_cte_impl(
             # This parts reads from output_matmult_sbuf and writes to out_tensor.
 
             if cfg.use_kv_cache and cfg.output_layout == QKVOutputLayout.BSD:
-                # KV cache mode: store Q separately, optionally quantize and store K/V to caches
-                fp8_pack_pending_tiles = []  # accumulator for fp8_packed tile pairing
-                fp8_pack_first_tile_offset = None
-                # Disable two-tile optimization if any tile in this block is partial (< pmax).
-                # This avoids mixing different s_tile_sz values in a single paired call.
-                fp8_packed_two_tile_opt = cfg.fp8_packed and (s_block_sz % nl.tile_size.pmax == 0)
-                for i_tile_S in range(num_S_tiles_in_block):
-                    s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * nl.tile_size.pmax
-                    s_tile_sz = min(nl.tile_size.pmax, S_shard - s_tile_local_offset)
-                    s_tile_global_offset = dims.S_shard_offset + s_tile_local_offset
-
-                    # Store Q output to HBM (skip when q_dim == 0, i.e. KV-only projection)
-                    if dims.q_dim > 0:
+                # Store Q output (skip when q_dim == 0, i.e. KV-only projection).
+                if dims.q_dim > 0:
+                    for i_tile_S in range(num_S_tiles_in_block):
+                        s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * nl.tile_size.pmax
+                        s_tile_sz = min(nl.tile_size.pmax, S_shard - s_tile_local_offset)
+                        s_tile_global_offset = dims.S_shard_offset + s_tile_local_offset
                         nisa.dma_copy(
                             dst=q_tensor_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
                                 0,
@@ -2387,139 +2580,25 @@ def _qkv_cte_impl(
                             src=output_sb[i_tile_S][0:s_tile_sz, 0 : dims.q_dim],
                             dge_mode=dge_mode.swdge,
                         )
-
-                    # Load slot_mapping for block KV cache
-                    if cfg.use_block_kv:
-                        slot_mapping_tile_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
-                        # slot_mapping shape: (batch, seqlen)
-                        # Access continuous elements: slot_mapping[i_batch, s_tile_global_offset:s_tile_global_offset+s_tile_sz]
-                        nisa.dma_copy(
-                            dst=slot_mapping_tile_sb[0:s_tile_sz, 0:1],
-                            src=slot_mapping_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
-                                0,
-                                i_batch * dims.S + s_tile_global_offset,
-                                i_batch * dims.S + s_tile_global_offset + s_tile_sz,
-                            ),
-                            dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
-                        )
-                    if cfg.fp8_packed:
-                        # Accumulate tiles for paired processing (full 128-partition transpose+DMA).
-                        # Flush when we have 2 tiles, on the last tile, or when two-tile opt is disabled.
-                        fp8_pack_pending_tiles.append(output_sb[i_tile_S])
-                        if fp8_pack_first_tile_offset is None:
-                            fp8_pack_first_tile_offset = s_tile_global_offset
-                        if (
-                            len(fp8_pack_pending_tiles) == 2
-                            or i_tile_S == num_S_tiles_in_block - 1
-                            or not fp8_packed_two_tile_opt
-                        ):
-                            pair_count = len(fp8_pack_pending_tiles)
-
-                            # Load packed slot indices for all tiles in one DMA (stride 2 across
-                            # contiguous tiles). Both tiles' even-indexed slots are contiguous in HBM.
-                            num_packed_rows = pair_count * (s_tile_sz // 2)
-                            packed_slot_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
-                            nisa.dma_copy(
-                                dst=packed_slot_sb[0:num_packed_rows, 0:1],
-                                src=slot_mapping_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
-                                    0,
-                                    i_batch * dims.S + fp8_pack_first_tile_offset,
-                                    i_batch * dims.S + fp8_pack_first_tile_offset + 2 * num_packed_rows,
-                                    step=2,
-                                ),
-                                dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
-                            )
-                            # slot_mapping holds flat indices into [num_blocks * block_size].
-                            # Right-shift by 1 (= divide by 2) converts to packed row indices
-                            # into [num_blocks * block_size // 2], since each packed row holds
-                            # two consecutive sequence positions. This yields
-                            # block * block_size_half + pair.
-                            nisa.tensor_scalar(
-                                dst=packed_slot_sb[0:num_packed_rows, 0:1],
-                                data=packed_slot_sb[0:num_packed_rows, 0:1],
-                                op0=nl.right_shift,
-                                operand0=1,
-                            )
-                            # Head-major cache layout [num_blocks, num_kv_heads, block_size//2, d_head, 2]:
-                            # the row for (block, head, pair) is
-                            #   block * num_kv_heads * block_size_half + head * block_size_half + pair.
-                            # The per-head term is added via a static offset inside the store fn; here we
-                            # promote the block term's stride from block_size_half to
-                            # num_kv_heads * block_size_half by adding block_idx * (num_kv_heads-1) * block_size_half.
-                            # No-op when num_kv_heads == 1 (matches the original single-row layout).
-                            if dims.num_kv_heads > 1:
-                                block_size_half = cfg.block_size // 2
-                                log2_block_size_half = int(math.log2(block_size_half))
-                                block_idx_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
-                                nisa.tensor_scalar(
-                                    dst=block_idx_sb[0:num_packed_rows, 0:1],
-                                    data=packed_slot_sb[0:num_packed_rows, 0:1],
-                                    op0=nl.right_shift,
-                                    operand0=log2_block_size_half,
-                                )
-                                nisa.scalar_tensor_tensor(
-                                    dst=packed_slot_sb[0:num_packed_rows, 0:1],
-                                    data=block_idx_sb[0:num_packed_rows, 0:1],
-                                    op0=nl.multiply,
-                                    operand0=float(block_size_half * (dims.num_kv_heads - 1)),
-                                    op1=nl.add,
-                                    operand1=packed_slot_sb[0:num_packed_rows, 0:1],
-                                )
-                            _quantize_and_store_k_fp8_packed(
-                                output_sb_tiles=fp8_pack_pending_tiles,
-                                inv_scale_sb=k_inv_scale_sb,
-                                cache_hbm=k_cache_hbm,
-                                kv_offset=dims.q_dim,
-                                s_tile_sz=s_tile_sz,
-                                cfg=cfg,
-                                dims=dims,
-                                sbm=sbm,
-                                packed_slot_sb=packed_slot_sb,
-                            )
-                            fp8_pack_pending_tiles = []
-                            fp8_pack_first_tile_offset = None
-                    elif cfg.transpose_k_cache:
-                        _quantize_and_store_k_transposed(
-                            output_sb=output_sb[i_tile_S],
-                            inv_scale_sb=k_inv_scale_sb,
-                            cache_hbm=k_cache_hbm,
-                            kv_offset=dims.q_dim,
-                            s_tile_sz=s_tile_sz,
-                            cfg=cfg,
-                            dims=dims,
-                            sbm=sbm,
-                            slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
-                            i_batch=i_batch,
-                            s_tile_global_offset=s_tile_global_offset,
-                        )
-                    else:
-                        _quantize_and_store_kv(
-                            output_sb=output_sb[i_tile_S],
-                            scale_sb=k_scale_sb,
-                            cache_hbm=k_cache_hbm,
-                            kv_offset=dims.q_dim,
-                            i_batch=i_batch,
-                            s_tile_global_offset=s_tile_global_offset,
-                            s_tile_sz=s_tile_sz,
-                            cfg=cfg,
-                            dims=dims,
-                            sbm=sbm,
-                            slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
-                        )
-
-                    _quantize_and_store_kv(
-                        output_sb=output_sb[i_tile_S],
-                        scale_sb=v_scale_sb,
-                        cache_hbm=v_cache_hbm,
-                        kv_offset=dims.q_dim + dims.kv_dim,
-                        i_batch=i_batch,
-                        s_tile_global_offset=s_tile_global_offset,
-                        s_tile_sz=s_tile_sz,
-                        cfg=cfg,
-                        dims=dims,
-                        sbm=sbm,
-                        slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
-                    )
+                # In-kernel KV cache write (shared with _qkv_cte_mx_impl Step 6).
+                _store_kv_cache(
+                    output_sb=output_sb,
+                    k_cache_hbm=k_cache_hbm,
+                    v_cache_hbm=v_cache_hbm,
+                    k_scale_sb=k_scale_sb,
+                    v_scale_sb=v_scale_sb,
+                    k_inv_scale_sb=k_inv_scale_sb,
+                    slot_mapping_hbm=slot_mapping_hbm,
+                    num_output_s_tiles=num_S_tiles_in_block,
+                    i_block_S=i_block_S,
+                    i_batch=i_batch,
+                    S_BLOCK_SIZE=S_BLOCK_SIZE,
+                    S_shard=S_shard,
+                    s_block_sz=s_block_sz,
+                    cfg=cfg,
+                    dims=dims,
+                    sbm=sbm,
+                )
 
             elif cfg.output_layout == QKVOutputLayout.BSD:
                 # output_tensor shape: [B, S, I].
@@ -2646,6 +2725,14 @@ def _qkv_cte_mx_impl(
     qkv_in_scale: Optional[nl.NkiTensor] = None,
     k_cos_cache_hbm: Optional[nl.NkiTensor] = None,
     k_sin_cache_hbm: Optional[nl.NkiTensor] = None,
+    # In-kernel KV cache write (block KV). When provided, the MX impl stores Q to
+    # q_tensor_hbm and scatters K/V into the paged caches, mirroring _qkv_cte_impl.
+    q_tensor_hbm: Optional[nl.NkiTensor] = None,
+    k_cache_hbm: Optional[nl.NkiTensor] = None,
+    v_cache_hbm: Optional[nl.NkiTensor] = None,
+    k_scale_hbm: Optional[nl.NkiTensor] = None,
+    v_scale_hbm: Optional[nl.NkiTensor] = None,
+    slot_mapping_hbm: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     """
     MX Quantization implementation of QKV CTE kernel.
@@ -2692,6 +2779,23 @@ def _qkv_cte_mx_impl(
             scale for static-quant FP8 models routed through MX engine. When provided,
             qkv_w_scale is interpreted as per-tensor dequant w_scale ([1,3] or [128,3])
             and the combined scale (in_scale * w_scale) is applied post-matmul.
+        q_tensor_hbm (Optional[nl.NkiTensor]): [B, S, q_dim], Destination for Q output when
+            in-kernel KV cache write is enabled. When provided, the MX impl stores Q here and
+            scatters K/V into the paged caches, mirroring _qkv_cte_impl.
+        k_cache_hbm (Optional[nl.NkiTensor]): K cache on HBM to scatter K into (paged/block KV).
+        v_cache_hbm (Optional[nl.NkiTensor]): V cache on HBM to scatter V into (paged/block KV).
+        k_scale_hbm (Optional[nl.NkiTensor]): [128, 1], Static (offline-calibrated, not derived
+            from runtime values) per-tensor K quantization scale on HBM. A single scalar
+            broadcast across all 128 partitions; K is divided by it and clamped to fp8 before the
+            cache write. Required when cfg.use_kv_quantization.
+        v_scale_hbm (Optional[nl.NkiTensor]): [128, 1], Static (offline-calibrated, not derived
+            from runtime values) per-tensor V quantization scale on HBM. A single scalar
+            broadcast across all 128 partitions; V is divided by it and clamped to fp8 before the
+            cache write. Required when cfg.use_kv_quantization.
+        slot_mapping_hbm (Optional[nl.NkiTensor]): [B*S] (or [B, S]), Block KV slot mapping from
+            vLLM giving each token's destination slot in the paged cache. CP/DCP ownership
+            (non-owned tokens clamped to the reserved null block) is handled caller-side in the
+            slot_mapping values. Required when cfg.use_block_kv.
 
     Returns:
         nl.NkiTensor: Output tensor (same as output_hbm parameter)
@@ -2721,13 +2825,31 @@ def _qkv_cte_mx_impl(
         for each weight_block:
             output_psum += nc_matmul_mx(hidden_qtz, weights, scales)
 
-        # Step 5: Apply optional RoPE and bias, copy to output
+        # Step 5: Apply optional RoPE and bias
         for each S_tile:
             if fused_rope:
                 apply_rope(output_tile)
             if add_bias:
                 output_tile += bias
-            store output_tile to HBM
+
+        # Step 6: Store output to HBM
+        for each S_tile:
+            if use_kv_cache (BSD layout):
+                # In-kernel KV cache write: output_tile is [s_tile, I] = [q_dim | kv_dim | kv_dim]
+                if q_dim > 0:
+                    store output_tile[:, :q_dim] to q_tensor_hbm   # Q output
+                if use_block_kv:
+                    load slot_mapping_tile   # per-token destination slot in paged cache
+                if fp8_packed:
+                    # K only: pair 2 consecutive tokens per packed row, store swizzled
+                    # into [num_blocks, kv_heads, block_size//2, d_head, 2]. Always quantized.
+                    quantize + pack + scatter K (paired tiles)
+                for kv, cache, scale in [(K, k_cache), (V, v_cache)]:   # skip K if fp8_packed
+                    if use_kv_quantization:   # else bf16 cache stores directly (scale is None)
+                        kv = clamp(kv / scale, fp8_min, fp8_max)   # static per-tensor scale
+                    scatter kv into cache at slot_mapping (or [B, seq, kv_dim] if not block KV)
+            else:
+                store output_tile to HBM   # plain BSD / NBSd output
     """
 
     S_shard = dims.S_shard
@@ -2828,6 +2950,23 @@ def _qkv_cte_mx_impl(
             layer_norm_bias_sb = _load_norm_weights_mx(
                 norm_weights_hbm=layer_norm_bias_hbm, cfg=cfg, dims=dims, sbm=sbm
             )
+
+    # In-kernel KV cache write: precompute K/V (inverse) quantization scales once.
+    # Mirrors the non-MX _qkv_cte_impl setup; K/V are stored after Step 5 eviction,
+    # where output_sb holds the [s_tile_sz, I] BSD tile (q_dim | kv_dim | kv_dim).
+    k_scale_sb = None
+    v_scale_sb = None
+    k_inv_scale_sb = None
+    v_inv_scale_sb = None
+    if cfg.use_kv_cache and cfg.use_kv_quantization:
+        k_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        v_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_scale_sb[0:P_MAX, 0:1], src=k_scale_hbm[0:P_MAX, 0:1], dge_mode=dge_mode.swdge)
+        nisa.dma_copy(dst=v_scale_sb[0:P_MAX, 0:1], src=v_scale_hbm[0:P_MAX, 0:1], dge_mode=dge_mode.swdge)
+        k_inv_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        v_inv_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=k_inv_scale_sb, data=k_scale_sb)
+        nisa.reciprocal(dst=v_inv_scale_sb, data=v_scale_sb)
 
     # Replace the manual multi-buffering calculation with:
     s_multi_buffer_degree, projected_sbuf_taken_space = _multi_buffering_degree_for_seqlen_mx(
@@ -3441,7 +3580,42 @@ def _qkv_cte_mx_impl(
                 )
 
             # Step 6: Store output to HBM
-            if cfg.output_layout == QKVOutputLayout.BSD:
+            if cfg.use_kv_cache and cfg.output_layout == QKVOutputLayout.BSD:
+                # Store Q output (skip when q_dim == 0, i.e. KV-only projection).
+                if dims.q_dim > 0:
+                    for i_tile_S in range(num_output_s_tiles):
+                        s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX
+                        s_tile_sz = min(P_MAX, S_shard - s_tile_local_offset)
+                        s_tile_global_offset = dims.S_shard_offset + s_tile_local_offset
+                        nisa.dma_copy(
+                            dst=q_tensor_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
+                                0,
+                                i_batch * dims.S + s_tile_global_offset,
+                                i_batch * dims.S + s_tile_global_offset + s_tile_sz,
+                            ),
+                            src=output_sb[i_tile_S][0:s_tile_sz, 0 : dims.q_dim],
+                            dge_mode=dge_mode.swdge,
+                        )
+                # In-kernel KV cache write (shared with _qkv_cte_impl Step 6).
+                _store_kv_cache(
+                    output_sb=output_sb,
+                    k_cache_hbm=k_cache_hbm,
+                    v_cache_hbm=v_cache_hbm,
+                    k_scale_sb=k_scale_sb,
+                    v_scale_sb=v_scale_sb,
+                    k_inv_scale_sb=k_inv_scale_sb,
+                    slot_mapping_hbm=slot_mapping_hbm,
+                    num_output_s_tiles=num_output_s_tiles,
+                    i_block_S=i_block_S,
+                    i_batch=i_batch,
+                    S_BLOCK_SIZE=S_BLOCK_SIZE,
+                    S_shard=S_shard,
+                    s_block_sz=s_block_sz,
+                    cfg=cfg,
+                    dims=dims,
+                    sbm=sbm,
+                )
+            elif cfg.output_layout == QKVOutputLayout.BSD:
                 for i_tile_S in nl.affine_range(num_output_s_tiles):
                     s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX
                     s_tile_sz = min(P_MAX, S_shard - s_tile_local_offset)
@@ -4419,6 +4593,10 @@ def _multi_buffering_degree_for_seqlen_mx(cfg: QKV_CTE_Config, dims: QKV_CTE_Dim
     # ROW_MX: global weight channel scale [P_MAX, I] float32
     if _is_row_mx:
         sbuf_tile_space_non_buffered += dims.I * sizeinbytes(nl.float32)  # row_mx_w_channel_scale_sb
+
+    # In-kernel KV cache write: k/v scale + inverse-scale buffers, each [P_MAX, 1] float32.
+    if cfg.use_kv_cache and cfg.use_kv_quantization:
+        sbuf_tile_space_non_buffered += 4 * sizeinbytes(nl.float32)  # k/v_scale_sb + k/v_inv_scale_sb
 
     # Per-S-tile space: input_sb + output_sb + norm buffers + rope buffers
     sbuf_tile_space_per_s_tile = _get_sbuf_space_taken_by_tensors_about_to_be_multi_buffered(

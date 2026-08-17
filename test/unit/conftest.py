@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from test.utils.relevant_test_finder import RelevantTestFinder
+from test.utils.relevant_test_selection.finder import RelevantTestFinder
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
@@ -30,5 +30,4 @@ def relevant_test_finder_index() -> dict[str, set[str]]:
     cross-test mutation while skipping the ~1.3s-per-test AST rebuild.
     """
     finder = RelevantTestFinder(repo_root=_REPO_ROOT)
-    finder._build_reverse_import_index()
-    return finder._reverse_deps
+    return finder._build_reverse_import_index()

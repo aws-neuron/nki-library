@@ -18,12 +18,11 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import nkilib_src.nkilib.experimental.collectives.distributed_adapter as adapter_mod
 import numpy as np
 import torch
 import torch.distributed as dist
 from nki.collectives import ReplicaGroup
-
-import nkilib_src.nkilib.experimental.collectives.distributed_adapter as adapter_mod
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import (
     SimDistAdapter,
     TorchDistAdapter,
@@ -32,6 +31,7 @@ from nkilib_src.nkilib.experimental.collectives.distributed_adapter import (
     get_rank,
     set_adapter,
 )
+
 from test.utils.unit_test_collective_framework import SimDistRunner
 
 
@@ -66,7 +66,7 @@ class TestDistributedAdapterThreadSafety:
         rg = ReplicaGroup([list(range(num_ranks))])
         runner = SimDistRunner(num_ranks=num_ranks, replica_groups=[rg])
 
-        def torch_ref(replica_groups=None):
+        def torch_ref(replica_groups: ReplicaGroup):
             rank = get_rank()
             pg = get_pg(replica_groups)
             assert pg.rank() == rank
@@ -85,7 +85,7 @@ class TestDistributedAdapterThreadSafety:
         rg = ReplicaGroup([[0, 1], [2, 3]])
         runner = SimDistRunner(num_ranks=4, replica_groups=[rg])
 
-        def torch_ref(replica_groups=None):
+        def torch_ref(replica_groups: ReplicaGroup):
             rank = get_rank()
             pg = get_pg(replica_groups)
             # Each sub-group has size 2
@@ -133,7 +133,7 @@ class TestDistributedAdapterThreadSafety:
         results = {}
 
         def run1():
-            def torch_ref(replica_groups=None):
+            def torch_ref(replica_groups: ReplicaGroup):
                 import time
 
                 time.sleep(0.02)
@@ -142,7 +142,7 @@ class TestDistributedAdapterThreadSafety:
             results["r1"] = runner1.run(torch_ref, {r: {"replica_groups": rg1} for r in range(2)})
 
         def run2():
-            def torch_ref(replica_groups=None):
+            def torch_ref(replica_groups: ReplicaGroup):
                 import time
 
                 time.sleep(0.02)
@@ -173,9 +173,10 @@ class TestDistributedAdapterThreadSafety:
         rg = ReplicaGroup([list(range(num_ranks))])
         runner = SimDistRunner(num_ranks=num_ranks, replica_groups=[rg])
 
-        def torch_ref(data=None, replica_groups=None):
-            rank = get_rank()
+        def torch_ref(replica_groups: ReplicaGroup, data=None):
+            get_rank()
             pg = get_pg(replica_groups)
+            assert data is not None, "the reference requires its input array"
             t = torch.from_numpy(data.astype(np.float32))
             gathered = [torch.zeros_like(t) for _ in range(num_ranks)]
             dist.all_gather(gathered, t, group=pg)
@@ -237,7 +238,7 @@ class TestDistributedAdapterThreadSafety:
 
     def test_write_write_same_thread_last_wins(self):
         """If set_adapter is called twice on same thread, last write wins."""
-        rg = ReplicaGroup([[0, 1, 2, 3]])
+        ReplicaGroup([[0, 1, 2, 3]])
 
         # Manually test that overwriting adapter on same thread works correctly
         results = {}

@@ -2155,6 +2155,106 @@ expert_data = w_iter[eid_tile].load()               # scalar_offset on dim 0 -> 
 does not shift as you consume dims during indexing. At most one indirect index per `[]`;
 `vector_offset` is restricted to position 0, while `scalar_offset` works at any position.
 
+## Runtime tile positions and element offsets
+
+
+Runtime indexing shows up whenever the next tile is chosen by data rather than by the
+Python loop nest: a dynamic sequence tile, an expert id, a generated block id, or a scalar
+counter maintained in SBUF. In raw NKI you usually turn that value into an address offset
+by hand before using it in the DMA. NeuroTile keeps the same mental model as the rest of
+the guide: index the view by the thing your algorithm means, and let the view's metadata
+connect that index to the source tensor layout.
+
+
+The most direct form is a **logical coordinate**. If `tiles` is a tile view, then
+`tiles[m, h]` means "tile row `m`, tile column `h`" even when `m` is a runtime scalar:
+
+
+```python
+tiles = nt.tiles(src, tile_size=(128, 512))
+m_tile_idx = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+
+tile = tiles[m_tile_idx, h].load()                 # m_tile_idx is a tile coordinate
+```
+
+
+At the DMA boundary, hardware still needs a source-element offset. NeuroTile derives that
+offset from the current view: one step in dimension 0 advances by the view's dim-0 index
+stride, one step in dimension 1 advances by the dim-1 stride, and so on. If the runtime
+coordinate is already stride-1, no arithmetic is emitted. If it is an SBUF scalar and the
+stride is larger than 1, NeuroTile inserts the scalar multiply needed to convert the
+logical coordinate into source elements before the load or store.
+
+
+That compact form is the right default when the index is used once. When the same runtime
+position drives several tensors, compute the source-element offset once and reuse it. Mark
+the value with `nt.element_offset(...)` to tell NeuroTile that the runtime value is already
+scaled:
+
+
+```python
+q_tiles = nt.tiles(q, tile_size=(128, 512))
+k_tiles = nt.tiles(k, tile_size=(128, 512))
+v_tiles = nt.tiles(v, tile_size=(128, 512))
+
+m_offset = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+nisa.memset(dst=m_offset, value=0)
+
+def body(_):
+    q_tile = q_tiles[nt.element_offset(m_offset), h].load()
+    k_tile = k_tiles[nt.element_offset(m_offset), h].load()
+    v_tile = v_tiles[nt.element_offset(m_offset), h].load()
+
+    nisa.tensor_scalar(
+        dst=m_offset,
+        data=m_offset,
+        op0=nl.add,
+        operand0=q_tiles.index_stride_elements[0],
+    )
+```
+
+
+`nt.element_offset(m_offset)` changes only the interpretation of that one bracket entry.
+The bracket position still selects the dimension. The offset is relative to the current
+view, and NeuroTile does not scale it again. The stride you need to update such a counter
+is available as metadata on the view:
+
+
+```python
+q_tiles.index_stride_elements[0]    # source elements per logical step in dim 0
+```
+
+
+Reading `index_stride_elements` emits no instruction; it is a compile-time value derived
+from the view. That matters for sliced and blocked views. If the view already starts at an
+offset, keep your runtime counter relative to that view and let NeuroTile carry the static
+origin in the layout metadata:
+
+
+```python
+tail = tiles[2:, :]
+tile = tail[nt.element_offset(m_offset), h].load()  # m_offset is relative to tail
+```
+
+
+So the choice is simple:
+
+
+- pass the runtime scalar directly when your algorithm has a logical tile or block
+  coordinate and the value is used once;
+- pass `nt.element_offset(counter)` when you have already converted the runtime value into
+  source elements, especially when that counter is shared by several loads or stores.
+
+
+Today, keep scaled runtime loop counters in SBUF when you need them as dynamic tile
+coordinates. If you maintain the counter in source-element units, use
+`nt.element_offset(counter)`.
+
+
+Concrete examples live under `examples/_05_indirect/`: `_02_dynamic_select.py` shows
+stride-1 logical runtime indexing, while `_07_runtime_element_offset.py` shows SBUF scalar
+logical tile indexing side by side with a reusable element-offset counter.
+
 
 
 ## Mixed static & indirect indexing

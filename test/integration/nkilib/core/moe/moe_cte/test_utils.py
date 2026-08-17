@@ -27,7 +27,6 @@ from typing import Optional
 
 import nki.language as nl
 import numpy as np
-
 from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_utils import SkipMode
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
@@ -35,6 +34,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     QuantizationType,
 )
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     generate_token_position_to_id_and_experts,
     get_n_blocks,
@@ -65,7 +65,9 @@ def n_packed_buffers_for(n_tiles: int) -> int:
     return (n_tiles + SLOTS_PER_PACKED_BUFFER - 1) // SLOTS_PER_PACKED_BUFFER
 
 
-def build_prequantized_hidden_concat(hidden_T: int, n_H512_tile: int, H: int, expert_affinities=None):
+def build_prequantized_hidden_concat(
+    hidden_T: int, n_H512_tile: int, H: int, expert_affinities=None, affinities_dtype=nl.bfloat16
+):
     """Build the pre-quantized fp8 hidden-state concat tensor for the fp8-hidden kernel path.
 
     Mirrors the packed layout rmsnorm_mx_prefill produces: each token row is
@@ -74,11 +76,11 @@ def build_prequantized_hidden_concat(hidden_T: int, n_H512_tile: int, H: int, ex
     AND 4 H512 tiles per 128-wide block (tile k at within-quadrant offset (k%4)*4 in pack k//4),
     matching the kernel's packed transpose_fp8_hidden_states + is_packed_moving_scale matmul.
 
-    When expert_affinities ([hidden_T, E] bf16) is given, the dense affinity vector is appended after
-    the scale region as bf16 reinterpreted into fp8 columns, and the whole row is padded to a multiple
-    of 4 fp8 columns (the kernel's hidden fp32-reinterpret transpose requires it) -- exactly the
-    rmsnorm_mx_prefill pack_affinities layout. The kernel then extracts each block's expert column
-    on-chip instead of a separate affinity gather.
+    When expert_affinities ([hidden_T, E]) is given, the dense affinity vector is appended after the
+    scale region as affinities_dtype (bf16 for SIGMOID/SOFTMAX top-K, fp32 for NOAUX_TC) reinterpreted
+    into fp8 columns, and the whole row is padded to a multiple of 4 fp8 columns (the kernel's hidden
+    fp32-reinterpret transpose requires it) -- exactly the rmsnorm_mx_prefill pack_affinities layout.
+    The kernel then extracts each block's expert column on-chip instead of a separate affinity gather.
 
     Returns:
         hidden_concat (np.ndarray): [hidden_T, H + scale_region (+ affin tail)] viewed as fp8_e4m3fn.
@@ -128,9 +130,10 @@ def build_prequantized_hidden_concat(hidden_T: int, n_H512_tile: int, H: int, ex
     hidden_concat = np.concatenate((hidden_quant, hidden_scale), axis=1)
 
     if expert_affinities is not None:
-        # Append the dense [hidden_T, E] affinities as bf16 reinterpreted into fp8 columns, then pad
-        # the whole row to a multiple of 4 fp8 cols (matches rmsnorm_mx_prefill pack_affinities).
-        affin_fp8 = expert_affinities.astype(nl.bfloat16).view(mx_unpacked_dtype)  # [hidden_T, E*2]
+        # Append the dense [hidden_T, E] affinities as affinities_dtype reinterpreted into fp8 columns
+        # (bf16 -> E*2 cols, fp32 -> E*4 cols), then pad the whole row to a multiple of 4 fp8 cols
+        # (matches rmsnorm_mx_prefill pack_affinities).
+        affin_fp8 = expert_affinities.astype(affinities_dtype).view(mx_unpacked_dtype)  # [hidden_T, E*aff_as_fp8]
         row = np.concatenate((hidden_concat, affin_fp8), axis=1)
         pad = (-row.shape[1]) % 4
         if pad:
@@ -393,6 +396,7 @@ _SHARD_ON_BLOCK_MX_ORDER = [
     'down_proj_bias',
     'gate_up_proj_scale',
     'down_proj_scale',
+    'ep_rank',
     'block_size',
     'n_static_blocks',
     'n_dynamic_blocks',
@@ -554,7 +558,7 @@ def _generate_token_experts_by_count(
     T: int,
     E: int,
     num_non_zero: int,
-    alpha: np.float32 = None,
+    alpha: float | None = None,
 ) -> np.ndarray:
     """Generate a [T, E] binary matrix with exactly num_non_zero ones.
 
@@ -772,6 +776,9 @@ def build_moe_bwmm_mx_cte(
     quantization_type: QuantizationType = QuantizationType.MX,
     use_prequant_hidden: bool = False,
     pack_affinities_into_hidden: bool = False,
+    packed_affinities_dtype=nl.bfloat16,
+    ep_degree: int = 1,
+    ep_rank: int = 0,
 ) -> dict:
     """
     Build input tensors for MoE BWMM MXFP4/MXFP8 CTE kernel testing.
@@ -885,6 +892,9 @@ def build_moe_bwmm_mx_cte(
         quantization_type=quantization_type,
         use_prequant_hidden=use_prequant_hidden,
         pack_affinities_into_hidden=pack_affinities_into_hidden,
+        packed_affinities_dtype=packed_affinities_dtype,
+        ep_degree=ep_degree,
+        ep_rank=ep_rank,
     )
 
     # Cache the generated inputs for future reuse
@@ -932,6 +942,9 @@ def _build_kernel_input_from_routing(
     quantization_type: QuantizationType = QuantizationType.MX,
     use_prequant_hidden: bool = False,
     pack_affinities_into_hidden: bool = False,
+    packed_affinities_dtype=nl.bfloat16,
+    ep_degree: int = 1,
+    ep_rank: int = 0,
 ) -> dict:
     """Build kernel input tensors and dict from pre-computed routing assignments.
 
@@ -985,18 +998,35 @@ def _build_kernel_input_from_routing(
         "pack_affinities_into_hidden requires use_prequant_hidden",
     )
 
+    # EP: widen the packed tail to global width E*ep_degree, real affinities at this rank's slot
+    # [start:start+E], random decoys elsewhere. Decoys make the first-E-cols pre-fix bug fail the golden.
+    kernel_assert(0 <= ep_rank < ep_degree, f"ep_rank {ep_rank} must be in [0, {ep_degree})")
+    local_expert_start = ep_rank * E
+    if pack_affinities_into_hidden and ep_degree > 1 and expert_affinities_masked is not None:
+        _global_aff = np.random.random_sample([expert_affinities_masked.shape[0], E * ep_degree]).astype(
+            expert_affinities_masked.dtype
+        )
+        _global_aff[:, local_expert_start : local_expert_start + E] = expert_affinities_masked
+        expert_affinities_masked = _global_aff
+
     hidden_states_ref_fp32 = None
     if use_prequant_hidden:
         # Pre-quantized fp8 hidden (real MX): kernel gets the concat [T, H + scale_region (+ affinity
-        # tail)] fp8 tensor; the reference gets the dequantized fp32 hidden (same numbers the kernel's
+        # tail)] tensor; the reference gets the dequantized fp32 hidden (same numbers the kernel's
         # matmul sees). When pack_affinities_into_hidden, the dense affinities ride the row tail.
         _packed_affin = expert_affinities_masked if pack_affinities_into_hidden else None
         hidden_states, hidden_states_ref_fp32 = build_prequantized_hidden_concat(
-            hidden_T, n_H512_tile, H, expert_affinities=_packed_affin
+            hidden_T, n_H512_tile, H, expert_affinities=_packed_affin, affinities_dtype=packed_affinities_dtype
         )
         if not dma_skip.skip_token:
             hidden_states[T, :] = 0
             hidden_states_ref_fp32[T, :] = 0
+        if pack_affinities_into_hidden:
+            # The packed producer returns the row VIEWED as the affinity dtype (bf16 for SIGMOID/SOFTMAX,
+            # fp32 for NOAUX_TC); the consumer detects the packed path by expert_affinities_masked being
+            # None (the standalone tensor is redundant on this path) and reads the tail at that dtype.
+            hidden_states = hidden_states.view(packed_affinities_dtype)
+            expert_affinities_masked = None
     else:
         hidden_states_fp32, _, _ = generate_stabilized_mx_data(
             mx_dtype=nl.float8_e4m3fn_x4,
@@ -1046,7 +1076,7 @@ def _build_kernel_input_from_routing(
         down_proj_weights[:, n_par_r:, -1, :] = 0
         down_proj_scale[:, n_par_r // _q_height :, -1, :] = 0
 
-    # Build kernel input dictionary in exact KLIR test order
+    # Build kernel input dictionary in exact compiler test order
     # Order must match build_blockwise_mm input_list:
     # [hidden_states, expert_affinities, gate_and_up_proj_weights, down_proj_weights,
     #  token_position_to_id, block_to_expert]
@@ -1054,7 +1084,10 @@ def _build_kernel_input_from_routing(
 
     kernel_input = {
         'hidden_states': hidden_states,
-        'expert_affinities_masked': expert_affinities_masked.reshape(-1, 1),
+        # None when affinities are packed into the hidden row (the kernel's packed-path signal).
+        'expert_affinities_masked': expert_affinities_masked.reshape(-1, 1)
+        if expert_affinities_masked is not None
+        else None,
         'gate_up_proj_weight': gate_up_proj_weights,
         'down_proj_weight': down_proj_weights,
         'block_size': B,
@@ -1065,6 +1098,11 @@ def _build_kernel_input_from_routing(
         'is_tensor_update_accumulating': is_tensor_update_accumulating,
         'expert_affinities_scaling_mode': expert_affinities_scaling_mode,
     }
+
+    # Packed path: kernel requires ep_rank (it derives the local_expert_start = ep_rank * E_local
+    # offset on-device to index the dense global affinity tail). ep_degree==1 -> ep_rank 0 (no shard).
+    if pack_affinities_into_hidden:
+        kernel_input['ep_rank'] = np.array([[ep_rank]], dtype=np.int32)
 
     if is_dynamic and not is_shard_on_I:
         kernel_input['n_dynamic_blocks'] = n_dynamic_blocks

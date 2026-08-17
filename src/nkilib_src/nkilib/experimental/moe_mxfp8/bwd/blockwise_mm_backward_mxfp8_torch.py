@@ -21,15 +21,13 @@ The math is identical — only quantization-aware arguments differ.
 
 import torch
 
-from test.integration.nkilib.experimental.moe.test_bwmm_bwd_common import (
-    blockwise_mm_bwd_torch_ref,
-)
-
+from ...moe.bwd.blockwise_mm_backward_torch import blockwise_mm_bwd_torch_ref
 from ...moe.bwd.moe_bwd_parameters import (
     ActFnType,
     AffinityOption,
     SkipMode,
 )
+from ...mxfp_utils.mxfp8_utils.common_dataclasses import SwizzleMode
 
 
 def blockwise_mm_bwd_mxfp8_torch_ref(
@@ -63,10 +61,22 @@ def blockwise_mm_bwd_mxfp8_torch_ref(
     compute_dtype=None,
     skip_dma=None,
     skip_grad_initialization: bool = False,
-    is_tensor_update_accumulating: bool = True,
+    single_expert_dense: bool = False,
+    fast_dma_transpose: bool = False,
+    output_grad_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    down_weight_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    d_gate_up_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    gate_up_weight_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    d_gate_up_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    hidden_states_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    output_grad_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    scaled_intermediate_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
+    accumulate_hidden_states_grad: bool = True,
     clamp_limits=None,
     activation_type=None,
     bias: bool = False,
+    phase3_transpose_mode=None,
+    phase4_transpose_mode=None,
 ) -> dict:
     """PyTorch reference for ``blockwise_mm_bwd_mxfp8``.
 
@@ -90,5 +100,5 @@ def blockwise_mm_bwd_mxfp8_torch_ref(
         activation_type=ActFnType.SiLU,
         clamp_limits=clamp_limits,
         bias=bias,
-        is_tensor_update_accumulating=is_tensor_update_accumulating,
+        is_tensor_update_accumulating=accumulate_hidden_states_grad,
     )

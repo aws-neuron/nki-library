@@ -18,9 +18,9 @@ from typing import final
 
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.scan.ssd import ssd
 from nkilib_src.nkilib.experimental.scan.ssd_torch import ssd_torch_ref
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import FilterResult

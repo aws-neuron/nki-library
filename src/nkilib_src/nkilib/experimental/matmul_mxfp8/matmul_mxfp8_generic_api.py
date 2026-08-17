@@ -325,6 +325,7 @@ def generic_matmul_mxfp8_api(
     tile_loop_order: str = 'mnk',
     float8_dtype: str = "float8_e4m3fn",
     use_scale_packing: bool = False,
+    psum_drain_engine_ratio: Optional[Tuple[int, int]] = None,
     # --- Spill Reload --- #
     spill_reload: bool = False,
     lhsq_td: Optional[TensorDescriptor] = None,
@@ -374,9 +375,16 @@ def generic_matmul_mxfp8_api(
         tile_loop_order: Tile loop order within matmul_mxfp8_blocks ('mnk', 'nmk', 'mkn').
         float8_dtype: FP8 dtype for quantization.
         use_scale_packing: Enable scale packing.
+        psum_drain_engine_ratio: (num_scalar, num_vector) split of the PE swizzle PSUM
+            copy-outs across the Scalar and Vector engines, applied to both operands.
+            Only affects operands loaded with PE swizzle. None (default) keeps whatever
+            each TensorDescriptor already specifies — set it per-operand on the
+            TensorDescriptor when LHS and RHS need different ratios.
         spill_reload: Spill quantized blocks to HBM for reuse.
-        lhsq_td: Pre-allocated spill/reload buffer for LHS. Required if spill_reload=True.
-        rhsq_td: Pre-allocated spill/reload buffer for RHS. Required if spill_reload=True.
+        lhsq_td: Pre-allocated quantized spill/reload buffer for LHS. Its
+            presence enables LHS spill/reload independently of RHS.
+        rhsq_td: Pre-allocated quantized spill/reload buffer for RHS. Its
+            presence enables RHS spill/reload independently of LHS.
         lhs_sbuf_td: If provided, skip LHS loading — use this pre-loaded SBUF data
             (already swizzled and quantized).
         rhs_sbuf_td: If provided, skip RHS loading — use this pre-loaded SBUF data
@@ -422,7 +430,22 @@ def generic_matmul_mxfp8_api(
         use_scale_packing = use_scale_packing or config.enable_scale_packing
         spill_reload = spill_reload or config.spill_reload
 
+    # Spill storage is an explicit alternate representation. Presence of a
+    # spill TD enables that operand independently, which also supports
+    # materializing one operand for reuse without spilling the other.
+    spill_lhs = lhsq_td != None
+    spill_rhs = rhsq_td != None
+
     kernel_assert(lhs_matmul_tile_shape_physical != None, "lhs_matmul_tile_shape_physical is required")
+
+    if psum_drain_engine_ratio is not None:
+        num_scalar, num_vector = psum_drain_engine_ratio
+        kernel_assert(
+            num_scalar >= 0 and num_vector >= 0 and (num_scalar + num_vector) > 0,
+            f"psum_drain_engine_ratio must be non-negative and not both zero, got {psum_drain_engine_ratio}",
+        )
+        lhs_hbm_td.psum_drain_engine_ratio = psum_drain_engine_ratio
+        rhs_hbm_td.psum_drain_engine_ratio = psum_drain_engine_ratio
 
     MATMUL_TILE_K, LHS_MATMUL_TILE_M = lhs_matmul_tile_shape_physical
 
@@ -486,8 +509,8 @@ def generic_matmul_mxfp8_api(
 
             for idx_k in range(k_start, k_end):
                 # --- Determine effective TDs (original vs spill-reload) ---
-                lhs_load_from_hbm = idx_n == 0 or (not spill_reload) or lhs_hbm_td.is_quantized
-                rhs_load_from_hbm = idx_m == 0 or (not spill_reload) or rhs_hbm_td.is_quantized
+                lhs_load_from_hbm = lhs_hbm_td.is_quantized or not spill_lhs or idx_n == 0
+                rhs_load_from_hbm = rhs_hbm_td.is_quantized or not spill_rhs or idx_m == 0
 
                 eff_lhs_td = lhs_hbm_td if lhs_load_from_hbm else lhsq_td
                 eff_rhs_td = rhs_hbm_td if rhs_load_from_hbm else rhsq_td
@@ -549,7 +572,7 @@ def generic_matmul_mxfp8_api(
                         float8_dtype=float8_dtype,
                         use_scale_packing=use_scale_packing,
                         TILES_IN_BLOCK_K=bd.TILES_IN_BLOCK_K,
-                        spill_reload=spill_reload,
+                        spill_reload=spill_lhs,
                         spill_td=lhsq_td,
                         idx_k=idx_k,
                         idx_f=idx_m,
@@ -568,7 +591,7 @@ def generic_matmul_mxfp8_api(
                         float8_dtype=float8_dtype,
                         use_scale_packing=use_scale_packing,
                         TILES_IN_BLOCK_K=bd.TILES_IN_BLOCK_K,
-                        spill_reload=spill_reload,
+                        spill_reload=spill_rhs,
                         spill_td=rhsq_td,
                         idx_k=idx_k,
                         idx_f=idx_n,

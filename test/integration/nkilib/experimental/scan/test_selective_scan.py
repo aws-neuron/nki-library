@@ -19,9 +19,9 @@ from typing import final
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.scan import selective_scan
 from nkilib_src.nkilib.experimental.scan.selective_scan_torch import selective_scan_torch_ref
+
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import FilterResult

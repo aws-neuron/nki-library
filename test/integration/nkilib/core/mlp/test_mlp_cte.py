@@ -14,18 +14,19 @@
 
 import math
 
+from test.utils.model_test_configs import no_model_configs
+
 try:
     from test.integration.nkilib.core.mlp.test_mlp_cte_model_config import (
         mlp_cte_model_configs,
     )
 except ImportError:
-    mlp_cte_model_configs = []
+    mlp_cte_model_configs = no_model_configs()
 
 from typing import Any, final
 
 import nki.language as nl
 import pytest
-
 from nkilib_src.nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
@@ -34,6 +35,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     NormType,
     QuantizationType,
 )
+
 from test.integration.nkilib.core.mlp.test_mlp_common import (
     _run_mlp_test,
     build_fused_norm_mlp,
@@ -233,7 +235,8 @@ MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_TRUE = [
     [2, 1, 578, 1408, 352, 88505279, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.GELU, True, True, True, False],
 ]
 
-ceilalign = lambda n, a: math.ceil(n / a) * a
+def ceilalign(n, a):
+    return math.ceil(n / a) * a
 
 MLP_CTE_UNIT_TEST_CASES_ROW_QUANT = [
     [2, 1, 1024, 16384, ceilalign(896, 128), 5.42e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
@@ -445,6 +448,7 @@ class TestMlpCteKernel:
             mode=ComputationMode.PREFILL,
             gate_up_w_layout=d["gate_up_w_layout"],
             tensor_generator=tensor_generator,
+            use_folded_mx_scales=d.get("use_folded_mx_scales", False),
         )
         # Add missing params that mlp() kernel accepts but build_fused_norm_mlp doesn't produce
         kernel_input["quant_clipping_bound"] = 0.0
@@ -480,25 +484,25 @@ class TestMlpCteKernel:
         if quant_type in [QuantizationType.STATIC_MX, QuantizationType.ROW_MX] and not platform_target.is_trn3():
             pytest.skip("STATIC_MX and ROW_MX quantization are only supported on TRN3")
 
-        vec_dict = dict(
-            vnc_degree=vnc_degree,
-            batch=batch,
-            seqlen=seqlen,
-            hidden=hidden,
-            intermediate=intermediate,
-            rtol=rtol,
-            norm_type=norm_type,
-            quant_type=quant_type,
-            gate_up_w_layout=gate_up_w_layout,
-            fused_add=fused_add,
-            store_add=store_add,
-            skip_gate=skip_gate,
-            act_fn_type=act_fn_type,
-            gate_bias=gate_bias,
-            up_bias=up_bias,
-            down_bias=down_bias,
-            norm_bias=norm_bias,
-        )
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "rtol": rtol,
+            "norm_type": norm_type,
+            "quant_type": quant_type,
+            "gate_up_w_layout": gate_up_w_layout,
+            "fused_add": fused_add,
+            "store_add": store_add,
+            "skip_gate": skip_gate,
+            "act_fn_type": act_fn_type,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": norm_bias,
+        }
         compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
 
         _run_mlp_test(
@@ -507,6 +511,113 @@ class TestMlpCteKernel:
             compiler_args=compiler_args,
             output_tensor_descriptor=mlp_output_tensor_descriptor,
             rtol=rtol,
+        )
+
+    @pytest_parametrize(CTE_UNIT_PARAM_NAMES, MLP_CTE_UNIT_TEST_CASES_MX_QUANT, abbrevs=_CTE_ABBREVS)
+    def test_mlp_cte_unit_folded_mx_scales(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree,
+        batch,
+        seqlen,
+        hidden,
+        intermediate,
+        tpbSgCyclesSum,
+        rtol,
+        norm_type,
+        quant_type,
+        gate_up_w_layout,
+        fused_add,
+        store_add,
+        skip_gate,
+        act_fn_type,
+        gate_bias,
+        up_bias,
+        down_bias,
+        norm_bias,
+    ):
+        # Pre-folded MX weight scales are an MX-only, TRN3-only feature.
+        if not platform_target.is_trn3():
+            pytest.skip("MX quantization is only supported on TRN3")
+
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "rtol": rtol,
+            "norm_type": norm_type,
+            "quant_type": quant_type,
+            "gate_up_w_layout": gate_up_w_layout,
+            "fused_add": fused_add,
+            "store_add": store_add,
+            "skip_gate": skip_gate,
+            "act_fn_type": act_fn_type,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": norm_bias,
+            "use_folded_mx_scales": True,
+        }
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
+
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=self._kernel_input_generator(vec_dict),
+            compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            rtol=rtol,
+        )
+
+    # ============================================================================
+    # CTE MX Block-Scale Pre-Quantized Input Tests
+    # ============================================================================
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.parametrize(
+        "seqlen, hidden, intermediate",
+        [
+            (1024, 2048, 2048),
+            (256, 4096, 2048),
+            (512, 8192, 3584),
+            (8192, 7168, 512),
+        ],
+    )
+    def test_mlp_cte_mx_block_scale_input(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        seqlen,
+        hidden,
+        intermediate,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+
+        kernel_input = build_fused_norm_mlp(
+            batch=1,
+            seqlen=seqlen,
+            hidden=hidden,
+            intermediate=intermediate,
+            dtype=nl.bfloat16,
+            quantization_type=QuantizationType.MX,
+            quant_dtype=nl.float8_e4m3fn,
+            is_input_quantized=True,
+            norm_type=NormType.NO_NORM,
+            gate_up_w_layout=MLPGateUpWeightLayout.H_X4_INNERMOST,
+            mode=ComputationMode.PREFILL,
+            use_mx_block_scale_input=True,
+        )
+        kernel_input["quant_clipping_bound"] = 0.0
+        kernel_input["force_cte_mode"] = False
+        kernel_input["sbm"] = None
+
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            rtol=5e-2,
         )
 
     # ============================================================================
@@ -758,6 +869,10 @@ class TestMlpCteModel:
             pytest.skip("ROW quant with very small seqlen is a known kernel limitation")
         if quant_type == QuantizationType.STATIC_MX and not platform_target.is_trn3():
             pytest.skip("STATIC_MX only supported on TRN3")
+        # MX/ROW_MX are TRN3 (gen4) features; their quantize_mx path exceeds the gen3
+        # 512 moving-dim limit at compile time. (STATIC_MX handled by the guard above.)
+        if quant_type in (QuantizationType.MX, QuantizationType.ROW_MX) and not platform_target.is_trn3():
+            pytest.skip(f"{quant_type.name} is a TRN3 (gen4) feature; not supported on {platform_target.value}")
         if quant_type in (QuantizationType.STATIC, QuantizationType.ROW) and platform_target.is_trn3():
             pytest.skip("STATIC/ROW fp8 not supported on TRN3")
 

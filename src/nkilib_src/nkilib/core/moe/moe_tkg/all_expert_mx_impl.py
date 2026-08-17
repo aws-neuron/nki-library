@@ -26,7 +26,6 @@ from ...quantization.fp8_quantize import pre_combine_dequant_scales, row_quantiz
 from ...utils.common_types import MoEAllToAllVStrategy, MoELNCShardingStrategy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
-from ...utils.tensor_view import TensorView
 from .all_expert_mx_utils import (
     BF16_PER_FP32,
     BF16_PER_INT32,
@@ -155,9 +154,16 @@ def _all_expert_moe_tkg_mx(
         The trade off is that each core would load twice the amount of weight than shard-on-I.
 
         The DLoC loop's overhead is around 15us at the moment, making shard on E more efficient.
-        """
 
-        if (dims.E_L % 2 == 0) and dims.T >= 128:
+        SHARD_E is a cross-core (LNC=2) optimization: it splits experts across
+        the two PNCs. At LNC=1 (n_prgs==1) there is no second core to split
+        across, and the SHARD_E path emits cross-core sendrecv/core_barrier that
+        are invalid on a single core. So gate SHARD_E on n_prgs>1 and route the
+        single-core case through SHARD_I (the LNC=1-validated dynamic path).
+        """
+        _, n_prgs, _ = get_verified_program_sharding_info()
+
+        if n_prgs > 1 and (dims.E_L % 2 == 0) and dims.T >= 128:
             # Force reinitialize with SHARD_E
             input_tensors, kernel_cfg, dims, dynamism_cfg = init_all_expert_mx_configs(
                 mlp_params=mlp_params, output=output, sharding_strategy=MoELNCShardingStrategy.SHARD_E
@@ -514,12 +520,11 @@ def _all_expert_static_mx(
         # Step 3.3: Load per-expert gate_up_in_scale and quantize
         gate_up_in_scale_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
         gate_up_in_view = (
-            TensorView(input_tensors.gate_up_in_scale)
-            .select(dim=0, index=expert_idx)
+            input_tensors.gate_up_in_scale.select(dim=0, index=expert_idx)
             .broadcast(dim=0, size=pmax)
             .reshape_dim(dim=0, shape=(pmax, 1))
         )
-        nisa.dma_copy(dst=gate_up_in_scale_sb, src=gate_up_in_view.get_view())
+        nisa.dma_copy(dst=gate_up_in_scale_sb, src=gate_up_in_view)
 
         # Flatten swizzled bf16 and apply static_quantization (modifies in-place)
         total_free = n_H512_tiles * T_load * _q_width
@@ -544,20 +549,15 @@ def _all_expert_static_mx(
         gate_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
         up_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
         down_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        gate_w_view = TensorView(input_tensors.gate_up_weights_scale).select(dim=0, index=expert_idx)
-        nisa.dma_copy(
-            dst=gate_w_dequant_sb, src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=pmax).get_view()
-        )
-        nisa.dma_copy(
-            dst=up_w_dequant_sb, src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=pmax).get_view()
-        )
+        gate_w_view = input_tensors.gate_up_weights_scale.select(dim=0, index=expert_idx)
+        nisa.dma_copy(dst=gate_w_dequant_sb, src=gate_w_view.slice(dim=0, start=0, end=1).broadcast(dim=0, size=pmax))
+        nisa.dma_copy(dst=up_w_dequant_sb, src=gate_w_view.slice(dim=0, start=1, end=2).broadcast(dim=0, size=pmax))
         down_w_view = (
-            TensorView(input_tensors.down_weights_scale)
-            .select(dim=0, index=expert_idx)
+            input_tensors.down_weights_scale.select(dim=0, index=expert_idx)
             .broadcast(dim=0, size=pmax)
             .reshape_dim(dim=0, shape=(pmax, 1))
         )
-        nisa.dma_copy(dst=down_w_dequant_sb, src=down_w_view.get_view())
+        nisa.dma_copy(dst=down_w_dequant_sb, src=down_w_view)
 
         weights.gate_dequant_scale_sb = pre_combine_dequant_scales(input_dequant_scale, gate_w_dequant_sb)
         weights.up_dequant_scale_sb = pre_combine_dequant_scales(input_dequant_scale, up_w_dequant_sb)
@@ -565,12 +565,11 @@ def _all_expert_static_mx(
         # down: down_in_scale[expert_idx] * down_w_dequant
         down_in_scale_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
         down_in_view = (
-            TensorView(input_tensors.down_in_scale)
-            .select(dim=0, index=expert_idx)
+            input_tensors.down_in_scale.select(dim=0, index=expert_idx)
             .broadcast(dim=0, size=pmax)
             .reshape_dim(dim=0, shape=(pmax, 1))
         )
-        nisa.dma_copy(dst=down_in_scale_sb, src=down_in_view.get_view())
+        nisa.dma_copy(dst=down_in_scale_sb, src=down_in_view)
         weights.down_dequant_scale_sb = pre_combine_dequant_scales(down_in_scale_sb, down_w_dequant_sb)
 
         # Step 3.5: Compute MLP for this expert
@@ -825,27 +824,26 @@ def _all_expert_mx_dynamic_shard_on_E(
     # Step 1: Prepare buffers shared across all experts
     # Step 1.1: Memset output to 0, using u32 memset for 2x perf
     _, n_prgs, prg_id = get_verified_program_sharding_info()
-    zero_sb = nl.ndarray((dims.tile_T, dims.H // (2 * BF16_PER_INT32)), dtype=nl.uint32, buffer=nl.sbuf)
+    # FIXME[perf]: the following buffer zeroing is a conservative, unsharded zeroing for correctness,
+    # we might want to shard this to 2 LNC cores if necessary.
+    zero_sb = nl.ndarray((dims.tile_T, dims.H // BF16_PER_INT32), dtype=nl.uint32, buffer=nl.sbuf)
     nisa.memset(zero_sb, 0, engine=nisa.vector_engine)
-    # On the profile, the dma_copy is being moved around, causing ineffiency,
-    # might need to remove this when running E2E.
-    local_tiles = div_ceil(dims.n_tiles_in_T, n_prgs)
-    t_tile_start = prg_id * local_tiles
-    local_tiles_clamped = min(local_tiles, dims.n_tiles_in_T - t_tile_start)
     with nl.no_reorder():
-        for t_tile in nl.sequential_range(local_tiles_clamped):
-            t_tile = t_tile_start + t_tile
+        for t_tile in nl.sequential_range(dims.n_tiles_in_T):
             tile_T_actual = min(dims.tile_T, dims.T_local - dims.tile_T * t_tile)
             nisa.dma_copy(
                 src=zero_sb[:tile_T_actual, :],
                 dst=input_tensors.output.ap(
-                    [[dims.H // 4, tile_T_actual], [1, dims.H // 4]],
-                    offset=t_tile * dims.tile_T * (dims.H // 4),
+                    [[dims.H // 2, tile_T_actual], [1, dims.H // 2]],
+                    offset=t_tile * dims.tile_T * (dims.H // 2),
                     dtype=nl.uint32,
                 ),
                 dge_mode=dge_mode.none,
             )
-    nisa.core_barrier(input_tensors.output, cores=[0, 1])
+    # LNC=1 (n_prgs==1): a single core zeroed the whole output; no cross-core
+    # ordering needed. core_barrier requires LNC degree >= 2.
+    if n_prgs > 1:
+        nisa.core_barrier(input_tensors.output, cores=[0, 1])
 
     # Step 1.2: Arange [0, 1, 2, 3] for token indices broadcast, when input is not prequantized
     if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
@@ -2123,6 +2121,10 @@ def _compute_block(
     H_pad = 0 if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED else BF16_PER_INT32
     output_shape = (dynamism_cfg.blk_tile_T, dynamism_cfg.blk_n_T_tiles, dims.H + H_pad)
     output_sb = nl.ndarray(output_shape, dtype=kernel_cfg.activation_compute_dtype, buffer=nl.sbuf)
+    # Zero output buffer to prevent uninitialized SBUF memory from leaking to HBM
+    # for unrouted token positions via the indirect DMA scatter (oob_mode.skip does
+    # not fully suppress writes when the source is a sub-tensor view).
+    nisa.memset(output_sb, 0, engine=nisa.vector_engine)
 
     # Compute expert MLP for this block
     _compute_expert_mlp(

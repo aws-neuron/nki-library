@@ -1596,6 +1596,8 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                 num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
 
                 for gate_or_up in range(2):
+                    if cfg.skip_gate_proj and gate_or_up == 0:
+                        continue
                     offset = (
                         block_idx * (2 * activation_I_TP * activation_B)
                         + gate_or_up * (activation_I_TP * activation_B)

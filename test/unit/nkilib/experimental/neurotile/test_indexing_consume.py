@@ -20,18 +20,17 @@ deep imports (Grid, NDSlice, HBMLayout) per the §3.5 exception.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import contiguous_strides
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
 from nkilib_src.nkilib.experimental.neurotile.core.layout_hbm import HBMLayout
 from nkilib_src.nkilib.experimental.neurotile.core.ndslice import NDSlice
+
 from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 
 
 def _make_view(element_shape, tile_size_2d, block_size=None, n_batch=0):
     """Build an NDSlice over a mock HBM layout for attribute checks."""
-    ndim = len(element_shape)
     full_tile = tuple([1] * n_batch) + tuple(tile_size_2d)
     full_block = None
     if block_size is not None:

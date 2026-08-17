@@ -27,9 +27,9 @@ have submitted.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
 from nkilib_src.nkilib.experimental.neurotile.core.layout_sbuf import SBUFLayout
+
 from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 

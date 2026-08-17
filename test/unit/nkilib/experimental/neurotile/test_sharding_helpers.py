@@ -27,13 +27,14 @@ NKI Beta 3 caveats relevant here:
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core.shard_helpers import (
     block_range,
     get_shard_info,
     interleaved_range,
     uneven_block_range,
 )
+
+from test.utils.negative_test_helpers import call_with_invalid_argument
 from test.utils.pytest_test_metadata import pytest_marks
 
 # ============================================================================
@@ -90,7 +91,7 @@ class TestBlockRange:
                 return _MulResult()
 
         rt = _RuntimeScalar()
-        s = block_range(rank=rt, num_shards=2, total=4)
+        block_range(rank=rt, num_shards=2, total=4)
         # owned = 2 -> rt * 2 was computed
         assert rt.mul_called_with == 2
 
@@ -174,7 +175,7 @@ class TestUnevenBlockRange:
                 return _MulResult()
 
         rt = _RuntimeScalar()
-        s = uneven_block_range(rank=rt, num_shards=2, total=8)
+        uneven_block_range(rank=rt, num_shards=2, total=8)
         # owned = 4 -> start = rt * 4
         assert rt.mul_called_with == 4
 
@@ -205,11 +206,11 @@ class TestShardArgValidation:
 
     def test_block_range_num_shards_must_be_int(self):
         with pytest.raises(AssertionError, match="num_shards must be an int"):
-            block_range(rank=0, num_shards=2.5, total=8)
+            call_with_invalid_argument(block_range, rank=0, num_shards=2.5, total=8)
 
     def test_block_range_total_must_be_int(self):
         with pytest.raises(AssertionError, match="total must be an int"):
-            block_range(rank=0, num_shards=2, total=8.0)
+            call_with_invalid_argument(block_range, rank=0, num_shards=2, total=8.0)
 
     def test_interleaved_range_num_shards_zero_rejected(self):
         with pytest.raises(AssertionError, match="num_shards must be >= 1"):
@@ -258,7 +259,8 @@ class TestGetShardInfo:
 
     def test_tensor_shape_must_be_tuple_or_list(self):
         with pytest.raises(AssertionError, match="tensor_shape must be a tuple"):
-            get_shard_info(
+            call_with_invalid_argument(
+                get_shard_info,
                 tensor_shape=1024,
                 tile_size=(128, 512),
                 num_shards=2,
@@ -267,7 +269,8 @@ class TestGetShardInfo:
 
     def test_tile_size_must_be_tuple_or_list(self):
         with pytest.raises(AssertionError, match="tile_size must be a tuple"):
-            get_shard_info(
+            call_with_invalid_argument(
+                get_shard_info,
                 tensor_shape=(1024, 4096),
                 tile_size=128,
                 num_shards=2,
@@ -285,7 +288,8 @@ class TestGetShardInfo:
 
     def test_shard_dim_must_be_int(self):
         with pytest.raises(AssertionError, match="shard_dim must be an int"):
-            get_shard_info(
+            call_with_invalid_argument(
+                get_shard_info,
                 tensor_shape=(1024, 4096),
                 tile_size=(128, 512),
                 shard_dim="0",

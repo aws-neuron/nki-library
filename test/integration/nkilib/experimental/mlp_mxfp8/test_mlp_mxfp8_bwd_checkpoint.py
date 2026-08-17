@@ -19,11 +19,11 @@ from typing import Any, final
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_bwd_mxfp8.mlp_bwd_mxfp8_kernel import (
     mlp_backward_mxfp8_nki,
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils import (
     ALL_CHECKPOINT_COMBOS,
     ALL_CHECKPOINTS_ENABLED,

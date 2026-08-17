@@ -20,8 +20,8 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils.tp_broadcast import tp_broadcast
+
 from test.integration.nkilib.utils.tensor_generators import np_random_sample
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
@@ -39,7 +39,7 @@ def tp_broadcast_hbm(src_hbm, src_offset, broadcast_count, src_select_index):
     nisa.dma_copy(src_sbuf, src_hbm)
 
     # check that some modification to the tensor to make it 2d works
-    if src_select_index != None:
+    if src_select_index is not None:
         src_in = src_sbuf.select(1, src_select_index)
     else:
         src_in = src_sbuf
@@ -50,7 +50,7 @@ def tp_broadcast_hbm(src_hbm, src_offset, broadcast_count, src_select_index):
 
 
 def tp_broadcast_torch(src_hbm, src_offset, broadcast_count, src_select_index):
-    if src_select_index != None:
+    if src_select_index is not None:
         src_hbm = src_hbm.select(1, src_select_index)
     return src_hbm.reshape(src_hbm.shape[0], -1)[:, src_offset].unsqueeze(0).repeat(broadcast_count, 1)
 

@@ -20,8 +20,6 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import torch
-from typing_extensions import override
-
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
     INTERLEAVE_FACTOR,
     get_fp8_dtype,
@@ -36,6 +34,8 @@ from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8_torch import (
     _quantize_mx_alt_emax,
     quantize_block_mxfp8_torch_ref,  # noqa: F401 - re-exported for test_quantize_mxfp8
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.matmul_mxfp8.random_input_generator import (
     DistributionRegistry,
     get_random_distributions,
@@ -86,7 +86,7 @@ def _get_non_padded_rows(K: int, F: int, enable_scale_packing: bool) -> list[int
             packed_row = (row_idx // 4) * 32 + (row_idx % 4)
             non_padded_rows.append(scale_p_start + slot_partition_offset + packed_row)
 
-    for i in range(NUM_TILES_IN_K):
+    for _i in range(NUM_TILES_IN_K):
         _collect(L_TILE_K, tile_idx)
         tile_idx += 1
 
@@ -139,14 +139,15 @@ class _ScalesValidator(CustomValidator):
     @override
     def validate(self, inference_output: npt.NDArray[Any]) -> bool:
         scale_P, scale_F = get_scale_output_shape(self.K, self.F, Q_TILE_K, self.enable_scale_packing)
-        output_scales = inference_output.view(dtype=np.uint8).reshape(scale_P, scale_F)
+        output_scales = inference_output.reshape(scale_P, scale_F)
 
-        passed = np.array_equal(output_scales[self.non_padded_rows], self.golden_scales[self.non_padded_rows])
+        # Compare raw bytes to avoid NaN != NaN issues with float8_e8m0fnu
+        # (value 255 encodes NaN, and np.array_equal would return False for NaN==NaN)
+        output_bytes = output_scales[self.non_padded_rows].view(np.uint8)
+        golden_bytes = self.golden_scales[self.non_padded_rows].view(np.uint8)
+        passed = np.array_equal(output_bytes, golden_bytes)
         if not passed:
-            diff = np.abs(
-                output_scales[self.non_padded_rows].astype(np.int32)
-                - self.golden_scales[self.non_padded_rows].astype(np.int32)
-            )
+            diff = np.abs(output_bytes.astype(np.int32) - golden_bytes.astype(np.int32))
             self._print_with_log(f"Scales mismatch: max diff={np.max(diff)}")
         return passed
 
@@ -189,7 +190,7 @@ def build_output_tensors(kernel_input: dict) -> dict:
     scale_P, scale_F = get_scale_output_shape(K, F, Q_TILE_K, enable_scale_packing)
 
     return {
-        "quantized_scales_hbm": np.zeros((scale_P, scale_F), dtype=np.uint8),
+        "quantized_scales_hbm": np.zeros((scale_P, scale_F), dtype=nl.float8_e8m0fnu),
         "quantized_data_hbm": np.zeros((K // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR), dtype=non_x4_dtype),
     }
 
@@ -208,16 +209,24 @@ def build_custom_validation_args(kernel_input: dict) -> ValidationArgs:
     golden_scales = _pack_scales(golden_scales_raw, K, F, enable_scale_packing)
     non_padded_rows = _get_non_padded_rows(K, F, enable_scale_packing)
 
+    # The validation contract takes a validator class constructed with just the logfile,
+    # so bind this test case's expectations into subclasses.
+    class _BoundScalesValidator(_ScalesValidator):
+        def __init__(self, logfile: TextIO | None = None):
+            super().__init__(logfile, golden_scales, K, F, enable_scale_packing, non_padded_rows)
+
+    class _BoundDataValidator(_DataValidator):
+        def __init__(self, logfile: TextIO | None = None):
+            super().__init__(logfile, golden_data, return_fp8_dtype)
+
     return ValidationArgs(
         golden_output={
             "quantized_scales_hbm": CustomValidatorWithOutputTensorData(
-                validator=lambda logfile: _ScalesValidator(
-                    logfile, golden_scales, K, F, enable_scale_packing, non_padded_rows
-                ),
-                output_ndarray=np.ndarray(shape=(scale_P, scale_F), dtype=np.uint8),
+                validator=_BoundScalesValidator,
+                output_ndarray=np.ndarray(shape=(scale_P, scale_F), dtype=nl.float8_e8m0fnu),
             ),
             "quantized_data_hbm": CustomValidatorWithOutputTensorData(
-                validator=lambda logfile: _DataValidator(logfile, golden_data, return_fp8_dtype),
+                validator=_BoundDataValidator,
                 output_ndarray=np.ndarray(shape=(K // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR), dtype=non_x4_dtype),
             ),
         },

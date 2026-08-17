@@ -24,13 +24,12 @@ Files can opt-out of this check by including the comment @IGNORE_FAST anywhere i
 import ast
 from typing import List
 
-import pytest
-
 from test.utils.test_validation_utils import (
     IntegrationFileCollector,
     ParsedFileInfo,
     ValidationErrorReporter,
     ValidationViolation,
+    fail_with_report,
     get_decorator_args,
     get_decorator_name,
 )
@@ -296,7 +295,7 @@ def test_all_integration_test_files_have_fast_marker():
 
     # If there are violations, fail with detailed message
     if reporter.has_violations():
-        pytest.fail(reporter.build())
+        fail_with_report(reporter.build())
 
     # Report success
     print(f"\n✓ All {len(test_files)} test files in integration/nkilib/core have @pytest.mark.fast annotations")

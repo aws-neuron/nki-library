@@ -45,6 +45,7 @@ from .quantize_mxfp8_utils import (
     L_TILE_K,
     MIN_F_FOR_QUANTIZATION,
     MIN_K_FOR_QUANTIZATION,
+    MX_PARTITION_SIZE,
     Q_TILE_K,
     get_fp8_dtype_x4,
 )
@@ -55,6 +56,9 @@ NUM_TRANSPOSE_CHUNKS = P_MAX // TRANSPOSE_CHUNK_SIZE  # Number of chunks in one 
 SUB_TILE = 128  # Max rows processed per sub-tile (matches P_MAX for partition alignment)
 L_TILE_K_FP32 = L_TILE_K // 2  # 256, fp32 reinterpret halves the K dimension
 BF16_TO_FP32_RATIO = 2  # Two bf16 elements pack into one fp32 element
+# Sub-tiles folded into one bulk DMA. More than this at a nonzero offset trips the
+# compiler's bounds checker (NCC_IBIR243), so we split into ceil(NUM_SUB_TILES / 4) DMAs.
+MAX_SUBTILES_PER_DMA = 4
 
 """
 FP32 PE swizzle constants.
@@ -132,7 +136,7 @@ def load_tile(
         load_tile_PE_Swizzle_1x32(load_loc, data_store_loc)
     # bf16/fp16, unswizzled with PE swizzle: use PE transpose (indirect or direct
     # determined by vector_offset presence inside load_tile_PE_swizzle_wrapX).
-    elif load_loc.tensor.load_with_PE_swizzle:
+    elif load_loc.tensor.uses_pe_swizzle:
         load_tile_PE_swizzle_wrapX(load_loc, data_store_loc)
     # bf16/fp16, unswizzled with direct dma loads use DGT.
     else:
@@ -368,9 +372,14 @@ def load_tile_dgt(
         src_data.dtype in (nl.bfloat16, nl.float16),
         f"DGT input tensor must be bfloat16 or float16, got {src_data.dtype}.",
     )
+    # The fast DMA transpose path gathers any tile_k that is a multiple of
+    # MX_PARTITION_SIZE (the quantization scale granularity) in a single op, so it only
+    # needs K aligned to MX_PARTITION_SIZE. The legacy vector-offset path still requires
+    # the coarser MIN_K_FOR_QUANTIZATION alignment.
+    min_k_alignment = MX_PARTITION_SIZE if load_loc.tensor.fast_dma_transpose else MIN_K_FOR_QUANTIZATION
     kernel_assert(
-        K % MIN_K_FOR_QUANTIZATION == 0,
-        f"K dimension must be divisible by {MIN_K_FOR_QUANTIZATION} for mxfp8 quantization, got {K=}",
+        K % min_k_alignment == 0,
+        f"K dimension must be divisible by {min_k_alignment} for mxfp8 quantization, got {K=}",
     )
     kernel_assert(
         F % MIN_F_FOR_QUANTIZATION == 0,
@@ -407,26 +416,15 @@ def load_tile_dgt(
     # instead of flattening + vector offsets
     if load_loc.tensor.fast_dma_transpose:
         vector_size = load_loc.tile_k // INTERLEAVE_FACTOR
-        # dst must match transposed src shape: (vector_size, 1, actual_tile_f, INTERLEAVE_FACTOR)
-        fast_dst = nl.ndarray(
-            (vector_size, 1, actual_tile_f, INTERLEAVE_FACTOR),
-            dtype=nl.bfloat16,
-            buffer=nl.sbuf,
-        )
         src_ap = src_data.ap(
             pattern=[[vector_size, INTERLEAVE_FACTOR], [1, 1], [K, actual_tile_f], [1, vector_size]],
             offset=load_loc.f_offset * K + load_loc.k_offset,
         )
         nisa.dma_transpose(
-            dst=fast_dst,
+            dst=dst_slice.reshape((vector_size, 1, actual_tile_f, INTERLEAVE_FACTOR)),
             src=src_ap,
             axes=(3, 1, 2, 0),
             dge_mode=dge_mode.hwdge,
-        )
-        # Reshape to match the expected flat layout and copy into store destination
-        nisa.tensor_copy(
-            dst=dst_slice,
-            src=fast_dst.reshape((vector_size, 1, 1, actual_tile_f * INTERLEAVE_FACTOR)),
         )
     else:
         # Legacy path: flatten source and use vector offsets
@@ -439,12 +437,20 @@ def load_tile_dgt(
             "Must set load location access pattern and vector offset before ",
         )
 
+        # Slice vector offsets for remainder tiles. The access pattern gathers
+        # actual_tile_f * INTERLEAVE_FACTOR rows and each offset column holds P_MAX
+        # entries, so round the column count up - DGT requires the offsets to cover
+        # every gathered row.
+        flattened_rows = actual_tile_f * INTERLEAVE_FACTOR
+        num_active_partitions = (flattened_rows + P_MAX - 1) // P_MAX
+        vector_offset = load_loc.vector_offset[:, nl.ds(0, num_active_partitions)]
+
         # Perform DMA gather transpose
         nisa.dma_transpose(
             dst=dst_slice,
             src=src_flattened.ap(
                 pattern=load_loc.access_pattern,
-                vector_offset=load_loc.vector_offset,
+                vector_offset=vector_offset,
             ),
             axes=(3, 1, 2, 0),
         )
@@ -558,8 +564,11 @@ def load_tile_PE_Swizzle_1x32(
     The output is a swizzled bf16 buffer — NOT quantized. Quantization (if needed)
     should be done separately downstream via nisa.quantize_mx on the output.
 
-    For each SUB_TILE (128) rows of the tile:
-      1. dma_copy [SUB_TILE, L_TILE_K] bf16 as [SUB_TILE, L_TILE_K//2] fp32
+    Loading strategy:
+      1. Bulk dma_copy(s) load the whole bf16 tile as fp32, sub-tile i at free-axis
+         offset i * L_TILE_K//2. Tiles that fit use a folded gather (a few sub-tiles
+         per DMA); a tile that overruns the tensor loads one sub-tile per DMA.
+    Then, for each SUB_TILE (128) rows of the tile:
       2. 2x nc_transpose with stride-2 src/dst APs in fp32 space
       3. tensor_copy PSUM -> destination with AP reinterpret as bf16
 
@@ -575,8 +584,8 @@ def load_tile_PE_Swizzle_1x32(
     Pseudocode:
         validate input is F-by-K bf16, tile_k == L_TILE_K
         allocate data SBUF if not provided
+        bulk dma_copy(s) of the whole tile, HBM bf16 as fp32 (reinterpret)
         for each sub-tile of SUB_TILE rows:
-            dma_copy HBM bf16 as fp32 (reinterpret)
             2x nc_transpose stride-2 in fp32 -> PSUM
             tensor_copy PSUM -> destination with bf16 reinterpret AP
     """
@@ -623,22 +632,45 @@ def load_tile_PE_Swizzle_1x32(
     K_fp32 = K // BF16_TO_FP32_RATIO
     k_fp32_offset = k_offset // BF16_TO_FP32_RATIO
 
+    # Load the whole tile as FP32 into SBUF, sub-tile i at free-axis offset i * L_TILE_K_FP32.
+    row_stride_fp32 = NUM_SUB_TILES * L_TILE_K_FP32
+    sbuf_fp32 = sbm.alloc_stack(shape=(P_MAX, row_stride_fp32), dtype=nl.float32, buffer=nl.sbuf)
+    if f_offset + tile_f <= F:
+        # Tile fits: grab up to MAX_SUBTILES_PER_DMA sub-tiles per DMA with one folded gather.
+        # More than that at a nonzero offset trips the compiler's bounds checker (NCC_IBIR243).
+        for chunk_start in range(0, NUM_SUB_TILES, MAX_SUBTILES_PER_DMA):
+            chunk_subtiles = min(MAX_SUBTILES_PER_DMA, NUM_SUB_TILES - chunk_start)
+            nisa.dma_copy(
+                dst=sbuf_fp32.ap(
+                    pattern=[[row_stride_fp32, P_MAX], [1, chunk_subtiles * L_TILE_K_FP32]],
+                    offset=chunk_start * L_TILE_K_FP32,
+                ),
+                src=src_data.ap(
+                    pattern=[[K_fp32, P_MAX], [K_fp32 * SUB_TILE, chunk_subtiles], [1, L_TILE_K_FP32]],
+                    offset=(f_offset + chunk_start * SUB_TILE) * K_fp32 + k_fp32_offset,
+                    dtype=nl.float32,
+                ),
+            )
+    else:
+        # Tile runs off the end of the tensor: a folded gather would read past it, so fall
+        # back to one simple DMA per sub-tile, which the bounds checker accepts.
+        for subtile_idx in nl.affine_range(NUM_SUB_TILES):
+            f_sub = f_offset + subtile_idx * SUB_TILE
+            nisa.dma_copy(
+                dst=sbuf_fp32.ap(
+                    pattern=[[row_stride_fp32, SUB_TILE], [1, L_TILE_K_FP32]],
+                    offset=subtile_idx * L_TILE_K_FP32,
+                ),
+                src=src_data.ap(
+                    pattern=[[K_fp32, SUB_TILE], [1, L_TILE_K_FP32]],
+                    offset=f_sub * K_fp32 + k_fp32_offset,
+                    dtype=nl.float32,
+                ),
+            )
+
     for subtile_idx in nl.affine_range(NUM_SUB_TILES):
-        f_sub = f_offset + subtile_idx * SUB_TILE
-
-        # Step 1: Load [SUB_TILE, L_TILE_K] bf16 as [SUB_TILE, L_TILE_K_FP32] fp32
-        sbuf_fp32 = sbm.alloc_stack(shape=(SUB_TILE, L_TILE_K_FP32), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=sbuf_fp32,
-            src=src_data.ap(
-                pattern=[[K_fp32, SUB_TILE], [1, L_TILE_K_FP32]],
-                offset=f_sub * K_fp32 + k_fp32_offset,
-                dtype=nl.float32,
-            ),
-        )
-
-        # Step 2: Stride-2 nc_transpose in fp32 space (2 passes)
-        # Each pass handles alternating partitions via stride-2 AP
+        # Step 2: transpose this sub-tile in fp32 with two stride-2 passes (one per
+        # alternating partition group), reading it from offset subtile_idx * L_TILE_K_FP32.
         psum_fp32 = nl.ndarray((SUB_TILE, L_TILE_K_FP32), dtype=nl.float32, buffer=nl.psum)
         for interleave_pass_idx in nl.affine_range(FP32_NUM_TRANSPOSE_PASSES):
             nisa.nc_transpose(
@@ -647,14 +679,13 @@ def load_tile_PE_Swizzle_1x32(
                     offset=interleave_pass_idx,
                 ),
                 data=sbuf_fp32.ap(
-                    pattern=[[L_TILE_K_FP32, SUB_TILE], [FP32_INTERLEAVE_STRIDE, SUB_TILE]],
-                    offset=interleave_pass_idx,
+                    pattern=[[row_stride_fp32, SUB_TILE], [FP32_INTERLEAVE_STRIDE, SUB_TILE]],
+                    offset=subtile_idx * L_TILE_K_FP32 + interleave_pass_idx,
                 ),
             )
 
-        # Step 3: Copy PSUM -> destination with bf16 reinterpret AP
-        # psum_fp32 is (P_MAX=128, L_TILE_K_FP32=256) fp32 = (128, 512) bf16 when reinterpreted
-        # This is the same [K//4, F*4] = [physical_tile_k, SUB_TILE*INTERLEAVE_FACTOR] layout
+        # Step 3: copy PSUM -> destination, reinterpreting the fp32 result as bf16. The
+        # (128, 256) fp32 tile reads back as the (128, 512) bf16 swizzled [K//4, F*4] layout.
         physical_tile_k = L_TILE_K // INTERLEAVE_FACTOR  # 512 // 4 = 128
         tile_idx = data_store_loc.k_offset
         f_start = (data_store_loc.f_offset + subtile_idx * SUB_TILE) * INTERLEAVE_FACTOR
@@ -781,6 +812,15 @@ def load_tile_PE_swizzle_wrapX(
     NUM_SUB_TILES = tile_f // SUB_TILE
     physical_tile_k = tile_k // INTERLEAVE_FACTOR
 
+    # Partial final F load-tile (load_block always passes the full LOAD_TILE_F): load the full
+    # 128-wide sub-tiles that fit plus a partial (<128) tail of remainder_f cols, masking the
+    # pre-zeroed SBUF remainder. remainder_f stays x4-pack aligned, so the swizzle is correct.
+    F_effective = load_loc.tensor.effective_f_dim if load_loc.tensor.effective_f_dim is not None else F
+    actual_tile_f = min(tile_f, F_effective - f_offset)
+    num_full_sub_tiles = actual_tile_f // SUB_TILE
+    remainder_f = actual_tile_f - num_full_sub_tiles * SUB_TILE
+    has_partial_f = actual_tile_f < tile_f
+
     # Determine DMA mode: indirect if vector_offset is provided, direct otherwise.
     use_indirect_dma = load_loc.vector_offset is not None
 
@@ -807,23 +847,44 @@ def load_tile_PE_swizzle_wrapX(
         # Groups of P_MAX=128 consecutive F-rows map to partitions; successive groups
         # are placed at increasing free-axis offsets (tile_k apart).
         sbuf_tile = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES * tile_k), dtype=original_dtype, buffer=nl.sbuf)
-        if skip_token:
+        if skip_token or has_partial_f:
             nisa.memset(sbuf_tile, value=0.0)
-        nisa.dma_copy(
-            dst=sbuf_tile,
-            src=src_data.ap(
-                pattern=[[K, P_MAX], [K * P_MAX, NUM_SUB_TILES], [1, tile_k]],
-                offset=f_offset * K + k_offset,
-                dtype=original_dtype,
-            ),
-        )
+        # Full 128-row sub-tile groups in one DMA.
+        if num_full_sub_tiles > 0:
+            nisa.dma_copy(
+                dst=sbuf_tile[:, nl.ds(0, num_full_sub_tiles * tile_k)],
+                src=src_data.ap(
+                    pattern=[[K, P_MAX], [K * P_MAX, num_full_sub_tiles], [1, tile_k]],
+                    offset=f_offset * K + k_offset,
+                    dtype=original_dtype,
+                ),
+            )
+        # Partial final sub-tile: remainder_f F-rows into the first remainder_f partitions.
+        if remainder_f > 0:
+            f_sub = f_offset + num_full_sub_tiles * SUB_TILE
+            nisa.dma_copy(
+                dst=sbuf_tile[nl.ds(0, remainder_f), nl.ds(num_full_sub_tiles * tile_k, tile_k)],
+                src=src_data.ap(
+                    pattern=[[K, remainder_f], [1, tile_k]],
+                    offset=f_sub * K + k_offset,
+                    dtype=original_dtype,
+                ),
+            )
 
     elif is_f_by_k and use_indirect_dma:
         # --- F-by-K indirect: one DMA per sub-tile (128 partition limit) ---
         sbuf_tile = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES * tile_k), dtype=original_dtype, buffer=nl.sbuf)
-        if skip_token:
+        if skip_token or has_partial_f:
             nisa.memset(sbuf_tile, value=0.0)
-        for subtile_idx in nl.affine_range(NUM_SUB_TILES):
+        # Gather is whole-128-sub-tile granular; partial-F is not expressible and routes through
+        # the direct branch (this is the MoE token-gather path).
+        kernel_assert(
+            skip_token or remainder_f == 0,
+            f"Indirect PE-swizzle load requires F aligned to {SUB_TILE}, got partial {remainder_f}.",
+        )
+        # skip_token over-reads and relies on oob_mode.skip; otherwise clamp to the in-bounds sub-tiles.
+        n_sub_tiles = NUM_SUB_TILES if skip_token else num_full_sub_tiles
+        for subtile_idx in nl.affine_range(n_sub_tiles):
             nisa.dma_copy(
                 dst=sbuf_tile[:, nl.ds(subtile_idx * tile_k, tile_k)],
                 src=src_data.ap(
@@ -839,10 +900,11 @@ def load_tile_PE_swizzle_wrapX(
         # --- K-by-F direct: 4x fast DMA direct transpose (one per 128-F sub-tile) ---
         # Each reads [tile_k, SUB_TILE] from HBM and transposes to [SUB_TILE=128P, tile_k F].
         sbuf_tile_4d = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES, 1, tile_k), dtype=original_dtype, buffer=nl.sbuf)
-        if skip_token:
+        if skip_token or has_partial_f:
             nisa.memset(sbuf_tile_4d, value=0.0)
 
-        for subtile_idx in nl.affine_range(NUM_SUB_TILES):
+        # Full 128-wide sub-tiles within F; a sub-tile past F would OOB-read HBM.
+        for subtile_idx in nl.affine_range(num_full_sub_tiles):
             f_sub = f_offset + subtile_idx * SUB_TILE
             nisa.dma_transpose(
                 dst=sbuf_tile_4d[:, nl.ds(subtile_idx, 1), :, :],
@@ -853,14 +915,32 @@ def load_tile_PE_swizzle_wrapX(
                 axes=(3, 1, 2, 0),
             )
 
+        # Partial final sub-tile: transpose remainder_f F-columns into the first remainder_f partitions.
+        if remainder_f > 0:
+            f_sub = f_offset + num_full_sub_tiles * SUB_TILE
+            nisa.dma_transpose(
+                dst=sbuf_tile_4d[nl.ds(0, remainder_f), nl.ds(num_full_sub_tiles, 1), :, :],
+                src=src_data.ap(
+                    pattern=[[F, tile_k], [1, 1], [1, 1], [1, remainder_f]],
+                    offset=k_offset * F + f_sub,
+                ),
+                axes=(3, 1, 2, 0),
+            )
+
         sbuf_tile = sbuf_tile_4d.reshape((P_MAX, NUM_SUB_TILES * tile_k))
 
     elif not is_f_by_k and use_indirect_dma:
         # --- K-by-F indirect: one DMA per sub-tile (gather token rows from [K, F]) ---
         sbuf_tile = sbm.alloc_stack(shape=(P_MAX, NUM_SUB_TILES * tile_k), dtype=original_dtype, buffer=nl.sbuf)
-        if skip_token:
+        if skip_token or has_partial_f:
             nisa.memset(sbuf_tile, value=0.0)
-        for subtile_idx in nl.affine_range(NUM_SUB_TILES):
+        # See F-by-K indirect: whole-128-sub-tile granular; partial-F uses the direct branch.
+        kernel_assert(
+            skip_token or remainder_f == 0,
+            f"Indirect PE-swizzle load requires F aligned to {SUB_TILE}, got partial {remainder_f}.",
+        )
+        n_sub_tiles = NUM_SUB_TILES if skip_token else num_full_sub_tiles
+        for subtile_idx in nl.affine_range(n_sub_tiles):
             nisa.dma_copy(
                 dst=sbuf_tile[:, nl.ds(subtile_idx * tile_k, tile_k)],
                 src=src_data.ap(
@@ -875,10 +955,15 @@ def load_tile_PE_swizzle_wrapX(
     else:
         kernel_assert(False, "Unsupported DMA load configuration for load_tile_PE_swizzle_wrapX.")
 
+    # Drains are assigned per repeating group of drain_group_size sub-tiles: the first
+    # num_vector_drains go to Vector, the rest to Scalar.
+    num_scalar_drains, num_vector_drains = load_loc.tensor.psum_drain_engine_ratio
+    drain_group_size = num_scalar_drains + num_vector_drains
+
     # ========================================================================
     # Step 2-3: PE swizzle loop — operates on sbuf_tile sub-tile slices.
     # ========================================================================
-    for subtile_idx in nl.affine_range(NUM_SUB_TILES):
+    for subtile_idx in range(NUM_SUB_TILES):
         # Step 2: nc_transpose in bf16 space (4 passes)
         # Source reads from sbuf_tile at free-axis offset subtile_idx * tile_k.
         psum_interleaved = nl.ndarray(
@@ -907,7 +992,11 @@ def load_tile_PE_swizzle_wrapX(
             dtype=original_dtype,
         )
 
-        nisa.tensor_copy(dst=dst_slice, src=src_psum_ap)
+        # Alternate using Vector/Scalar engine to drain PSUM to avoid bottleneck caused by all of them being scheduled on vector engine
+        drain_engine = (
+            nisa.vector_engine if (subtile_idx % drain_group_size) < num_vector_drains else nisa.scalar_engine
+        )
+        nisa.tensor_copy(dst=dst_slice, src=src_psum_ap, engine=drain_engine)
 
 
 def load_tile_bf16_xbar_transpose(

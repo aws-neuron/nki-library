@@ -204,7 +204,7 @@ class MetricsEmitter(IMetricsEmitter):
             else:
                 self._write_to_file(emf_data, output_dir)
 
-    def _write_to_file(self, emf_data: dict[str, Any], output_dir: str) -> None:
+    def _write_to_file(self, emf_data: dict[str, Any], output_dir: str | None) -> None:
         """
         Write EMF JSON to metrics subdirectory under the test artifact directory.
         Filename format: <test_name>_<timestamp>.json

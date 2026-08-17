@@ -29,6 +29,7 @@ import nki.language as nl
 import numpy as np
 import torch
 
+from ..rmsnorm.rmsnorm_mx_prefill_torch import decode_packed_output
 from ..subkernels.norm_torch_dispatch import norm_name2func_torch
 from ..utils.common_types import (
     ActFnType,
@@ -310,6 +311,48 @@ def _undo_mx_down_w_reshape(weight: torch.Tensor) -> torch.Tensor:
     return weight
 
 
+# Physical fold constants for CTE MX weight scales (mirror the kernel's load-time fold).
+_MX_QUADRANT_SIZE = 32
+_MX_PARTITIONS_PER_SLOT = 4
+_MX_NUM_SLOTS = 4
+
+
+def _unfold_mx_gate_up_scale(folded: torch.Tensor, H: int, I: int) -> torch.Tensor:
+    """Recover standard gate/up MX scale [16, H/512, I/512, 4, 128] from folded [128, n_packed, I].
+
+    Inverse of the kernel's quadrant fold: partition ``q*32 + (k%4)*4 + r`` of buffer ``k//4``
+    holds standard scale row ``q*4 + r`` of H/512 tile ``k``. The recovered ``[16, H/512, I]``
+    already carries the physical I order (n_I512, 4, 128), so the final reshape splits I in that
+    order without a further transpose.
+    """
+    n_H512 = H // 512
+    n_I512 = math.ceil(I / (_pmax * _q_width))
+    scale_flat = torch.zeros((16, n_H512, I), dtype=folded.dtype)
+    for q in range(_pmax // _MX_QUADRANT_SIZE):
+        for k in range(n_H512):
+            slot = k % _MX_NUM_SLOTS
+            dst_p = q * _MX_QUADRANT_SIZE + slot * _MX_PARTITIONS_PER_SLOT
+            src_p = q * _MX_PARTITIONS_PER_SLOT
+            scale_flat[src_p : src_p + _MX_PARTITIONS_PER_SLOT, k, :] = folded[
+                dst_p : dst_p + _MX_PARTITIONS_PER_SLOT, k // _MX_NUM_SLOTS, :
+            ]
+    return scale_flat.reshape(16, n_H512, n_I512, _q_width, _pmax)
+
+
+def _unfold_mx_down_scale(folded: torch.Tensor) -> torch.Tensor:
+    """Recover standard down MX scale [16, I/512, H] from folded [128, I/512, H].
+
+    Inverse of the kernel's quadrant fold: partition ``q*32 + r`` holds standard row ``q*4 + r``.
+    """
+    _, n_I512, H = folded.shape
+    scale = torch.zeros((16, n_I512, H), dtype=folded.dtype)
+    for q in range(_pmax // _MX_QUADRANT_SIZE):
+        dst_p = q * _MX_PARTITIONS_PER_SLOT
+        src_p = q * _MX_QUADRANT_SIZE
+        scale[dst_p : dst_p + _MX_PARTITIONS_PER_SLOT, :, :] = folded[src_p : src_p + _MX_PARTITIONS_PER_SLOT, :, :]
+    return scale
+
+
 def _undo_mx_gate_up_sc_reshape(scale: torch.Tensor, layout: MLPGateUpWeightLayout, H: int, I: int) -> torch.Tensor:
     """Undo MX gate/up scale swizzle for MX quant and broadcast to full [H, I]."""
     # Gate/up scale shape: [16, H/512, I/512, 4, 128] (physical I order)
@@ -380,6 +423,7 @@ def _mlp_ref_standard(
     mode: ComputationMode = ComputationMode.AUTO,
     fp8_max: float = _FP8_E4M3_MAX,
     fp8_round_trip_dtype=nl.float8_e4m3,
+    use_folded_mx_scales: bool = False,
 ):
     """Standard MLP projection path for NONE / ROW / STATIC / STATIC_MX quantization.
 
@@ -463,18 +507,37 @@ def _mlp_ref_standard(
                 quant_dtype=fp8_round_trip_dtype,
             )
     elif quantization_type == QuantizationType.MX:
+        if use_folded_mx_scales:
+            # The kernel receives pre-folded MX weight scales; recover the standard
+            # layout the dequant reshape helpers below expect.
+            if not skip_gate_proj:
+                gate_w_scale = _unfold_mx_gate_up_scale(gate_w_scale, H, I)
+            up_w_scale = _unfold_mx_gate_up_scale(up_w_scale, H, I)
+            down_w_scale = _unfold_mx_down_scale(down_w_scale)
         gate_w_scale = _undo_mx_gate_up_sc_reshape(gate_w_scale, gate_up_w_layout, H, I) if not skip_gate_proj else None
         up_w_scale = _undo_mx_gate_up_sc_reshape(up_w_scale, gate_up_w_layout, H, I)
         down_w_scale = _undo_mx_down_sc_reshape(down_w_scale, H, I)
         H_up = up_w.shape[0]
         is_input_prequantized = hidden.shape[-1] > H_up
         if is_input_prequantized:
-            if hidden.shape[-1] != H_up + 4:
+            n_H512 = H_up // 512
+            n_packed = math.ceil(n_H512 / 4)
+            mx_block_scale_region = n_packed * 128
+            tail_size = hidden.shape[-1] - H_up
+            if tail_size >= mx_block_scale_region:
+                hidden_np = hidden.numpy().reshape(BxS, hidden.shape[-1])
+                hidden_fp8 = dt.static_cast(hidden_np, nl.float8_e4m3fn)
+                hidden_fp32 = decode_packed_output(hidden_fp8, BxS, H_up, pack_scales=True)
+                hidden = torch.from_numpy(hidden_fp32).reshape(BxS, H_up)
+                gate_up_in_scale = torch.ones(BxS, H_up)
+            elif tail_size == 4:
+                hidden, gate_up_in_scale = _extract_precomputed_row_scale(hidden, H_up)
+                gate_up_in_scale = gate_up_in_scale.broadcast_to((BxS, H)).to(torch.float32)
+            else:
                 raise ValueError(
-                    f"Pre-quantized ROW input must include 4 scale bytes: expected {H_up + 4}, got {hidden.shape[-1]}"
+                    f"Pre-quantized MX input tail size {tail_size} doesn't match "
+                    f"ROW (4) or MX block-scale ({mx_block_scale_region}) format"
                 )
-            hidden, gate_up_in_scale = _extract_precomputed_row_scale(hidden, H_up)
-            gate_up_in_scale = gate_up_in_scale.broadcast_to((BxS, H)).to(torch.float32)
     else:
         gate_w_scale = torch.ones(H, I)
         up_w_scale = torch.ones(H, I)
@@ -1231,6 +1294,7 @@ def _mlp_torch_ref_impl(
     # NON_OCP (default) → 240 clip, OCP → 448.
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
+    use_folded_mx_scales=False,
 ) -> dict:
     # --- Input validation ---
     is_tkg = _is_tkg(hidden_tensor.shape[0] * hidden_tensor.shape[1], mode)
@@ -1394,6 +1458,7 @@ def _mlp_torch_ref_impl(
             mode=mode,
             fp8_max=_fp8_max,
             fp8_round_trip_dtype=_fp8_round_trip_dtype,
+            use_folded_mx_scales=use_folded_mx_scales,
         )
     else:
         output = _mlp_ref_mx(
@@ -1478,6 +1543,7 @@ class _MlpTorchRefFn(Protocol):
         transposed_out=False,
         dtype_mode: DtypeMode = DtypeMode.NON_OCP,
         gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
+        use_folded_mx_scales=False,
     ) -> dict:
         """
         PyTorch reference implementation for the MLP kernel (mlp.mlp.mlp).

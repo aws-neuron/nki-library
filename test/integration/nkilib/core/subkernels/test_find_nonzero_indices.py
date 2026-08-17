@@ -15,10 +15,11 @@
 """Integration tests for find_nonzero_indices kernel."""
 
 import numpy as np
+import numpy.typing as npt
 import pytest
-
 from nkilib_src.nkilib.core.subkernels.find_nonzero_indices import find_nonzero_indices
 from nkilib_src.nkilib.core.subkernels.find_nonzero_indices_torch import find_nonzero_indices_torch_ref
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -26,7 +27,7 @@ from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
-def generate_sparse_input(T: int, E: int, top_k: int, dtype: np.dtype, seed: int = 42) -> np.ndarray:
+def generate_sparse_input(T: int, E: int, top_k: int, dtype: npt.DTypeLike, seed: int = 42) -> np.ndarray:
     """Generate sparse input tensor matching the original test's sparsity pattern.
 
     Args:

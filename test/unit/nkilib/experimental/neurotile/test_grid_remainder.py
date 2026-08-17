@@ -30,9 +30,9 @@ The PSUM new-API tests live in ``test_psum_pool_api.py``.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core.axis import Axis, AxisLabel
 from nkilib_src.nkilib.experimental.neurotile.core.grid import Grid
+
 from test.utils.pytest_test_metadata import pytest_marks
 
 # ============================================================================

@@ -29,7 +29,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
     MatmulMxfp8KernelConfig,
     auto_generate_default,
@@ -60,6 +59,7 @@ from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
     get_fp8_dtype_x4,
 )
+
 from test.integration.nkilib.experimental.matmul_mxfp8 import config_helper, constants
 from test.integration.nkilib.experimental.matmul_mxfp8.test_matmul_mxfp8_generic_kernel import (
     _mxfp8_comparator,
@@ -73,13 +73,6 @@ from test.utils.unit_test_framework import UnitTestFramework
 # ---------------------------------------------------------------------------
 # Common: build TDs + shapes from kernel args (same as matmul_mxfp8 entry)
 # ---------------------------------------------------------------------------
-
-
-class _SbufOutputTd(nl.NKIObject):
-    """Lightweight output TD for 3D SBUF tensors (avoids TensorDescriptor shape computation)."""
-
-    def __init__(self, data):
-        self.data = data
 
 
 def _setup(
@@ -121,8 +114,12 @@ def _setup(
         is_f_by_k=rhs_is_f_by_k,
     )
 
-    K_logical, M_logical = lhs_td.sharded_logical_shape
-    _, N_logical = rhs_td.sharded_logical_shape
+    # Full dims: auto_generate_default applies the LNC2 shard itself.
+    lhs_shape = lhs_td.logical_shape
+    rhs_shape = rhs_td.logical_shape
+    assert lhs_shape is not None and rhs_shape is not None, "descriptors built from 2-D data have logical shapes"
+    K_logical, M_logical = lhs_shape
+    _, N_logical = rhs_shape
     lhs_precision = (
         PRECISION_BFLOAT16 if not lhs_td.is_quantized else (PRECISION_MXFP8_X4 if lhs_td.is_x4 else PRECISION_MXFP8)
     )
@@ -240,6 +237,7 @@ def _kernel_hbm_k_loop(
     rhs_is_f_by_k=None,
     enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    psum_drain_engine_ratio=None,
 ):
     create_and_set_active_sbm()
     sbm = get_active_sbm()
@@ -319,7 +317,7 @@ def _kernel_hbm_k_loop(
             dtype=output_dtype,
             buffer=nl.sbuf,
         )
-        out_td = _SbufOutputTd(output_sbuf)
+        out_td = TensorDescriptor(data=output_sbuf)
     else:
         out_td = TensorDescriptor(data=output_sharded)
 
@@ -347,6 +345,7 @@ def _kernel_hbm_k_loop(
         lhsq_td=lhsq_td,
         rhsq_td=rhsq_td,
         rhs_n_offset=rhs_n_offset,
+        psum_drain_engine_ratio=psum_drain_engine_ratio,
     )
 
     if output_to_sbuf:
@@ -393,6 +392,7 @@ def _kernel_sbuf_preloaded(
     rhs_is_f_by_k=None,
     enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    psum_drain_engine_ratio=None,
 ):
     create_and_set_active_sbm()
     sbm = get_active_sbm()
@@ -446,14 +446,14 @@ def _kernel_sbuf_preloaded(
     )
 
     # Quantize if BF16 input
-    if lhs_loaded != None:
+    if lhs_loaded is not None:
         lhs_data_loaded, lhs_scales_loaded = quantize_mxfp8_block.quantize_mxfp8_block(
             lhs_loaded,
             shapes['lhs_quantize_tile_shape'],
             True,
             float8_dtype,
         )
-    if rhs_loaded != None:
+    if rhs_loaded is not None:
         rhs_data_loaded, rhs_scales_loaded = quantize_mxfp8_block.quantize_mxfp8_block(
             rhs_loaded,
             shapes['rhs_quantize_tile_shape'],
@@ -480,7 +480,7 @@ def _kernel_sbuf_preloaded(
             dtype=output_dtype,
             buffer=nl.sbuf,
         )
-        out_td = _SbufOutputTd(output_sbuf)
+        out_td = TensorDescriptor(data=output_sbuf)
     else:
         out_td = TensorDescriptor(data=output_sharded)
 
@@ -552,6 +552,7 @@ def _kernel_sbuf_empty_td_fill(
     rhs_is_f_by_k=None,
     enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    psum_drain_engine_ratio=None,
 ):
     """Pass empty TDs, API loads and fills them. Then use the filled TDs
     in a second API call (which skips loading). If the second call produces
@@ -696,6 +697,7 @@ def _kernel_lhs_m_sharded(
     rhs_is_f_by_k=None,
     enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    psum_drain_engine_ratio=None,
 ):
     """M-sharded LNC2: LHS is col_parallel_sharded (halves M), RHS is full."""
     create_and_set_active_sbm()
@@ -706,8 +708,12 @@ def _kernel_lhs_m_sharded(
     lhs_td = TensorDescriptor(data=lhs, scales=lhs_scales, is_swizzled=lhs_is_swizzled, is_col_parallel_sharded=True)
     rhs_td = TensorDescriptor(data=rhs, scales=rhs_scales, is_swizzled=rhs_is_swizzled, is_col_parallel_sharded=False)
 
-    K_logical, M_logical = lhs_td.sharded_logical_shape
-    _, N_logical = rhs_td.sharded_logical_shape
+    # Full dims: auto_generate_default applies the LNC2 shard itself.
+    lhs_shape = lhs_td.logical_shape
+    rhs_shape = rhs_td.logical_shape
+    assert lhs_shape is not None and rhs_shape is not None, "descriptors built from 2-D data have logical shapes"
+    K_logical, M_logical = lhs_shape
+    _, N_logical = rhs_shape
     lhs_precision = (
         PRECISION_BFLOAT16 if not lhs_td.is_quantized else (PRECISION_MXFP8_X4 if lhs_td.is_x4 else PRECISION_MXFP8)
     )
@@ -736,35 +742,56 @@ def _kernel_lhs_m_sharded(
     auto_generate_default(config, lhs_precision, rhs_precision, PRECISION_FP32)
     validate_shapes(config, lhs_td, rhs_td)
 
-    shapes = {
-        'bd': config.bd,
-        'BLOCKS_IN_M': config.BLOCKS_IN_M,
-        'BLOCKS_IN_N': config.BLOCKS_IN_N,
-        'BLOCKS_IN_K': config.BLOCKS_IN_K,
-        'lhs_matmul_tile_shape_physical': config.lhs_matmul_tile_shape_physical,
-        'rhs_matmul_tile_shape_physical': config.rhs_matmul_tile_shape_physical,
-        'lhs_load_tile_shape': config.lhs_load_tile_shape,
-        'rhs_load_tile_shape': config.rhs_load_tile_shape,
-        'lhs_quantize_tile_shape': config.lhs_quantize_tile_shape,
-        'rhs_quantize_tile_shape': config.rhs_quantize_tile_shape,
-    }
-    bd = shapes['bd']
+    bd = config.bd
+    BLOCKS_IN_M = config.BLOCKS_IN_M
+    BLOCKS_IN_N = config.BLOCKS_IN_N
+    BLOCKS_IN_K = config.BLOCKS_IN_K
     TILES_IN_LOAD_M = config.TILES_IN_LOAD_M
     TILES_IN_LOAD_N = config.TILES_IN_LOAD_N
+    lhs_matmul_tile_shape_physical = config.lhs_matmul_tile_shape_physical
+    rhs_matmul_tile_shape_physical = config.rhs_matmul_tile_shape_physical
+    lhs_load_tile_shape = config.lhs_load_tile_shape
+    rhs_load_tile_shape = config.rhs_load_tile_shape
+    lhs_quantize_tile_shape = config.lhs_quantize_tile_shape
+    rhs_quantize_tile_shape = config.rhs_quantize_tile_shape
+    assert (
+        bd is not None
+        and BLOCKS_IN_M is not None
+        and BLOCKS_IN_N is not None
+        and BLOCKS_IN_K is not None
+        and TILES_IN_LOAD_M is not None
+        and TILES_IN_LOAD_N is not None
+        and lhs_matmul_tile_shape_physical is not None
+        and rhs_matmul_tile_shape_physical is not None
+        and lhs_load_tile_shape is not None
+        and rhs_load_tile_shape is not None
+        and lhs_quantize_tile_shape is not None
+        and rhs_quantize_tile_shape is not None
+    ), "auto-generation and shape validation populate the block geometry and every tile shape"
 
     # Output: shared HBM, full [M, N]
-    M_LOGICAL = lhs_td.logical_shape[1]
-    N_LOGICAL = rhs_td.logical_shape[1]
+    lhs_logical = lhs_td.logical_shape
+    rhs_logical = rhs_td.logical_shape
+    lhs_sharded_logical = lhs_td.sharded_logical_shape
+    lhs_sharded_physical = lhs_td.sharded_physical_shape
+    assert (
+        lhs_logical is not None
+        and rhs_logical is not None
+        and lhs_sharded_logical is not None
+        and lhs_sharded_physical is not None
+    ), "descriptors built from 2-D data have logical and sharded shapes"
+    M_LOGICAL = lhs_logical[1]
+    N_LOGICAL = rhs_logical[1]
     output_hbm = nl.ndarray((M_LOGICAL, N_LOGICAL), dtype=output_dtype, buffer=nl.shared_hbm)
 
     # Per-core M sharding
-    M_LOGICAL_SHARDED = lhs_td.sharded_logical_shape[1]
-    M_PHYSICAL_SHARDED = lhs_td.sharded_physical_shape[1]
+    M_LOGICAL_SHARDED = lhs_sharded_logical[1]
+    M_PHYSICAL_SHARDED = lhs_sharded_physical[1]
     LNC_ID = nl.program_id(axis=0)
     out_row = LNC_ID * M_LOGICAL_SHARDED
     output_sharded = output_hbm[out_row : out_row + M_LOGICAL_SHARDED, :]
     lhs_m_offset = LNC_ID * M_PHYSICAL_SHARDED
-    BLOCKS_IN_M_sharded = (shapes['BLOCKS_IN_M'] + 1) // 2
+    BLOCKS_IN_M_sharded = (BLOCKS_IN_M + 1) // 2
 
     generic_matmul_mxfp8_api(
         lhs_hbm_td=lhs_td,
@@ -775,14 +802,14 @@ def _kernel_lhs_m_sharded(
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
         block_idx_m=(0, BLOCKS_IN_M_sharded),
-        block_idx_n=(0, shapes['BLOCKS_IN_N']),
-        block_idx_k=(0, shapes['BLOCKS_IN_K']),
-        lhs_matmul_tile_shape_physical=shapes['lhs_matmul_tile_shape_physical'],
-        rhs_matmul_tile_shape_physical=shapes['rhs_matmul_tile_shape_physical'],
-        lhs_load_tile_shape=shapes['lhs_load_tile_shape'],
-        rhs_load_tile_shape=shapes['rhs_load_tile_shape'],
-        lhs_quantize_tile_shape=shapes['lhs_quantize_tile_shape'],
-        rhs_quantize_tile_shape=shapes['rhs_quantize_tile_shape'],
+        block_idx_n=(0, BLOCKS_IN_N),
+        block_idx_k=(0, BLOCKS_IN_K),
+        lhs_matmul_tile_shape_physical=lhs_matmul_tile_shape_physical,
+        rhs_matmul_tile_shape_physical=rhs_matmul_tile_shape_physical,
+        lhs_load_tile_shape=lhs_load_tile_shape,
+        rhs_load_tile_shape=rhs_load_tile_shape,
+        lhs_quantize_tile_shape=lhs_quantize_tile_shape,
+        rhs_quantize_tile_shape=rhs_quantize_tile_shape,
         tile_loop_order=tile_loop_order,
         float8_dtype=float8_dtype,
         use_scale_packing=use_scale_packing,
@@ -990,6 +1017,7 @@ def _api_torch_ref(
     rhs_is_f_by_k=None,
     enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    psum_drain_engine_ratio=None,
 ):
     """Torch ref for API test kernels — delegates to matmul_mxfp8_torch_ref."""
     return matmul_mxfp8_torch_ref(
@@ -1106,6 +1134,25 @@ class TestGenericMatmulMxfp8Api:
             conf,
             _kernel_hbm_k_loop,
             extra_kernel_args={"lhs_load_with_PE_swizzle": True, "rhs_load_with_PE_swizzle": False},
+        )
+
+    # --- PE swizzle drain split: PSUM copy-outs spread across Scalar and Vector ---
+    @pytest.mark.fast
+    @pytest.mark.parametrize("conf", GRID_PE_SWIZZLE_MIXED)
+    @pytest.mark.parametrize(
+        "psum_drain_engine_ratio", [(1, 1), (2, 1), (1, 0), (0, 1)], ids=["1s1v", "2s1v", "all_scalar", "all_vector"]
+    )
+    def test_pe_swizzle_drain_engine_ratio(self, test_manager, conf, psum_drain_engine_ratio, platform_target):
+        self._run(
+            test_manager,
+            platform_target,
+            conf,
+            _kernel_hbm_k_loop,
+            extra_kernel_args={
+                "lhs_load_with_PE_swizzle": True,
+                "rhs_load_with_PE_swizzle": False,
+                "psum_drain_engine_ratio": psum_drain_engine_ratio,
+            },
         )
 
     # --- K-by-F: Input in [K, F] layout, PE swizzle auto-forced ---

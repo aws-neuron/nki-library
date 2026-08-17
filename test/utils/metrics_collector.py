@@ -46,8 +46,15 @@ class MetricName:
     # ==========================================================================
     # Top-level timing metrics
     # ==========================================================================
+
     ELAPSED_ALL_SEC = "ElapsedAllSec"
     COMPILATION_TIME = "CompilationTime"
+    # Wall-clock time spent in the NKI front-end (compile_to_bir): Python->MLIR
+    # trace, MLIR emission/serialization, and first-call backend imports. This
+    # runs on every execution regardless of the NEFF cache, since the cache key
+    # is derived from the traced BIR. Distinct from MLIR_TO_BIR_TIME, which is
+    # the compiler's self-reported inner MLIR->BIR pass time.
+    FRONTEND_TRACE_TIME = "FrontendTraceTime"
     MLIR_TO_BIR_TIME = "MlirToBirTime"
     BIR_TO_NEFF_TIME = "BirToNeffTime"
     INFERENCE_TIME_TOTAL = "InferenceTimeTotal"
@@ -71,11 +78,14 @@ class MetricName:
     CORE_LOCK_DEPLOY_TIME = "CoreLockDeployTime"
     CORE_LOCK_ACQUIRE_TIME = "CoreLockAcquireTime"
     CORE_LOCK_VERSION_CHECK_TIME = "CoreLockVersionCheckTime"
+    CORE_LOCK_RELEASE_FAILED_COUNT = "CoreLockReleaseFailedCount"
     # Core lock contention metrics
     CORE_LOCK_NO_CORES_COUNT = "CoreLockNoCoresCount"
     CORE_LOCK_CONTENTION_WAIT_TIME = "CoreLockContentionWaitTime"
     CORE_LOCK_HOLD_TIME = "CoreLockHoldTime"
     FAILED_HOSTS_COUNT = "FailedHostsCount"
+    RECOVERABLE_HOST_WAIT_TIME = "RecoverableHostWaitTime"
+    FLEET_STARTUP_WAIT_TIME = "FleetStartupWaitTime"
     INSTANCE_TYPE = "InstanceType"
     # Core lock FIFO-queue fairness metrics
     CORE_LOCK_QUEUE_WAIT_TIME = "CoreLockQueueWaitTime"
@@ -165,6 +175,12 @@ class MetricName:
     # ==========================================================================
     # Validation metrics
     # ==========================================================================
+    # Total wall time to acquire the golden at validation time, from any source
+    # (a fresh reference compute, or a torch-ref cache download). Parent of
+    # GOLDEN_COMPUTATION_TIME — do not sum the two.
+    GOLDEN_ACQUISITION_TIME = "GoldenAcquisitionTime"
+    # Wall time of the reference compute itself. Recorded only when the golden is
+    # actually computed (cache miss or caching disabled); absent on a cache hit.
     GOLDEN_COMPUTATION_TIME = "GoldenComputationTime"
     VALIDATION_OUTPUT_LOAD_TIME = "ValidationOutputLoadTime"
     VALIDATION_COMPARE_TIME = "ValidationCompareTime"
@@ -185,6 +201,10 @@ class MetricName:
     NEFF_CACHE_STORE_TIME = "NeffCacheStoreTime"
     NEFF_CACHE_HIT = "NeffCacheHit"
 
+    TORCH_REF_CACHE_LOOKUP_TIME = "TorchRefCacheLookupTime"
+    TORCH_REF_CACHE_STORE_TIME = "TorchRefCacheStoreTime"
+    TORCH_REF_CACHE_HIT = "TorchRefCacheHit"
+
     # ==========================================================================
     # Explorer upload metrics
     # ==========================================================================
@@ -193,6 +213,20 @@ class MetricName:
 
 # Truncate the captured failure reason to keep it queryable as a doc field.
 MAX_FAILURE_REASON_LEN = 240
+
+
+def sanitize_dimension_value(value: str) -> str:
+    """Coerce an arbitrary string into a valid CloudWatch/EMF dimension value.
+
+    The EMF library rejects a dimension value that is non-ASCII or empty/whitespace-only
+    (aws_embedded_metrics.validator.validate_dimension_set), and a raised
+    InvalidDimensionError aborts the whole metrics emit — which would drop the real
+    FailureReason and spam errors. Failure messages routinely contain non-ASCII (e.g. an
+    em-dash) and newlines, so normalize here: collapse whitespace, drop non-ASCII, truncate.
+    Returns "" if nothing usable remains (caller then skips the dimension)."""
+    ascii_only = value.encode("ascii", "ignore").decode("ascii")
+    collapsed = " ".join(ascii_only.split())  # also strips newlines/leading/trailing ws
+    return collapsed[:MAX_FAILURE_REASON_LEN]
 
 
 def add_rerun_dimensions(
@@ -211,8 +245,8 @@ def add_rerun_dimensions(
     """
     collector.add_dimension({"AttemptNumber": str(attempt_number)})
     if failed:
-        reason = (failure_reason or "").replace("\n", " ")[:MAX_FAILURE_REASON_LEN]
-        if reason:
+        reason = sanitize_dimension_value(failure_reason or "")
+        if reason:  # skip if nothing usable remains — an empty value would fail EMF validation
             collector.add_dimension({"FailureReason": reason})
 
 
@@ -344,6 +378,16 @@ class IMetricsCollector(ABC):
         raise UnimplementedException()
 
     @abstractmethod
+    def set_pytest_marks(self, marks: list[str]) -> None:
+        """Store resolved pytest marker names for metrics emission."""
+        raise UnimplementedException()
+
+    @abstractmethod
+    def get_pytest_marks(self) -> list[str]:
+        """Get resolved pytest marker names."""
+        raise UnimplementedException()
+
+    @abstractmethod
     def set_output_dir(self, output_dir: str) -> None:
         """Set the output directory of the test."""
         raise UnimplementedException()
@@ -383,6 +427,9 @@ class MetricsCollector(IMetricsCollector):
 
     kernel_params: dict[str, Any] = field(default_factory=dict)
     """Kernel test parameters (scalars only) for metrics emission"""
+
+    pytest_marks: list[str] = field(default_factory=list)
+    """Resolved pytest marker names for the test"""
 
     output_dir: str | None = field(default=None)
     """Output directory of the test"""
@@ -515,6 +562,8 @@ class MetricsCollector(IMetricsCollector):
             for key, value in self.kernel_params.items():
                 self._metrics_context.set_property(key, value)
 
+        self._metrics_context.set_property("PytestMarks", self.pytest_marks)
+
         # Add total elapsed time
         if self._start_time > 0:
             elapsed = time.time() - self._start_time
@@ -575,6 +624,14 @@ class MetricsCollector(IMetricsCollector):
     @override
     def get_kernel_params(self) -> dict[str, Any]:
         return self.kernel_params
+
+    @override
+    def set_pytest_marks(self, marks: list[str]) -> None:
+        self.pytest_marks = list(marks)
+
+    @override
+    def get_pytest_marks(self) -> list[str]:
+        return self.pytest_marks
 
     @override
     def set_output_dir(self, output_dir: str) -> None:
@@ -729,11 +786,8 @@ class MetricsCollector(IMetricsCollector):
                 self.record_metric(MetricName.INFERENCE_TIME, -1.0, "Seconds")
 
             # Getting the MBU from profiler directly
-            mbu = (
-                profiler_summary.get("mbu_estimated_percent")
-                if profiler_summary.get("mbu_estimated_percent") >= 0
-                else -1
-            )
+            mbu_estimated = profiler_summary.get("mbu_estimated_percent")
+            mbu = mbu_estimated if mbu_estimated is not None and mbu_estimated >= 0 else -1
             self.record_metric(MetricName.MBU_ESTIMATED_PERCENT, float(mbu * 100), "Percent")
 
             # MFU Calculation
@@ -986,9 +1040,21 @@ class NoopMetricsCollector(IMetricsCollector):
         return {}
 
     @override
+    def set_pytest_marks(self, marks: list[str]) -> None:
+        pass
+
+    @override
+    def get_pytest_marks(self) -> list[str]:
+        return []
+
+    @override
     def set_output_dir(self, output_dir: str) -> None:
         pass
 
     @override
     def get_output_dir(self) -> str | None:
         return None
+
+
+# Default no metrics collector
+NOOP_METRICS_COLLECTOR = NoopMetricsCollector()

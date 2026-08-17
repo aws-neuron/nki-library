@@ -21,9 +21,9 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib_src.nkilib.core.utils.tiled_tensor import TiledTensor
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
 )
@@ -267,7 +267,7 @@ def kernel_test_construction_negative(
 ):
     """Test kernel for construction failures."""
     src = nl.ndarray(source_shape, nl.bfloat16, buffer)
-    tt = TiledTensor(src, tile_size)
+    TiledTensor(src, tile_size)
     return dummy_out
 
 

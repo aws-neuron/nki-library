@@ -17,7 +17,6 @@ import enum
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import (
     output_projection_tkg_torch_ref,
 )
@@ -26,6 +25,7 @@ from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib_src.nkilib.experimental.output_projection.output_projection_tkg_primitives import (
     output_projection_primitives,
 )
+
 from test.integration.nkilib.utils.tensor_generators import (
     FP8_E4M3_MAX,
     gaussian_tensor_generator,
@@ -219,7 +219,7 @@ def _filter_sweep_params(B, n_heads=None, S_tkg=None, d_head=None, H=None, trans
     Strategy 2 (tp=F): n_heads*d_head<=4096, n_heads<=64, d_head<=128, B<=4, S_tkg<=8, H mult 128
     Strategy 3 (tp=T): S_tkg*B<=512, B<=128, S_tkg<=8, n_heads<=10, d_head<=128, H mult 128
     """
-    if any(v is None for v in [n_heads, S_tkg, d_head, H, transpose_out]):
+    if n_heads is None or S_tkg is None or d_head is None or H is None or transpose_out is None:
         return FilterResult.VALID
 
     if H % 128 != 0:

@@ -23,7 +23,6 @@ comparator.
 import ml_dtypes
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.examples._05_indirect import (
     _01_gather_scatter as gather_mod,
 )
@@ -60,6 +59,7 @@ from nkilib_src.nkilib.experimental.neurotile.examples._05_indirect import (
 from nkilib_src.nkilib.experimental.neurotile.examples._05_indirect import (
     _06_coalesced_remainder_torch as coalesced_refs,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator

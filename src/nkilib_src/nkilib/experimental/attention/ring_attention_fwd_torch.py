@@ -85,12 +85,23 @@ def ref_attention_fwd(q, k, v, scale, causal=False, extra_mask=None):
             scores[:, pack_mask] = -float("inf")
 
         row_max = scores.max(axis=-1, keepdims=True)
-        exp_scores = np.exp(scores - row_max)
+        # Fully-masked rows (all scores -inf) have row_max = -inf, which would make
+        # exp/divide produce nan. The kernel writes o=0 and lse=0 for these rows, so
+        # mirror that contract. For any row that attends to >=1 key this is a no-op.
+        fully_masked = np.isneginf(row_max)
+        row_max_safe = np.where(fully_masked, 0.0, row_max)
+        exp_scores = np.exp(scores - row_max_safe)
         row_sum = exp_scores.sum(axis=-1, keepdims=True)
-        softmax_weights = exp_scores / row_sum
+        row_sum_safe = np.where(fully_masked, 1.0, row_sum)
+        softmax_weights = exp_scores / row_sum_safe
 
-        o[:, q_start:q_end, :] = softmax_weights @ v
-        lse[:, q_start:q_end] = (row_max + np.log(row_sum)).squeeze(-1)
+        o_chunk = softmax_weights @ v
+        o[:, q_start:q_end, :] = np.where(fully_masked, 0.0, o_chunk)
+        lse[:, q_start:q_end] = np.where(
+            fully_masked.squeeze(-1),
+            0.0,
+            (row_max_safe + np.log(row_sum_safe)).squeeze(-1),
+        )
 
     return o, lse
 

@@ -13,9 +13,7 @@
 # limitations under the License.
 import subprocess
 from enum import Enum
-from typing import final
-
-import fabric2
+from typing import Protocol, final
 
 
 @final
@@ -30,8 +28,22 @@ class TestStatus(str, Enum):
     TEST_EXECUTION_FAILURE = "TEST_EXECUTION_FAILURE"
 
 
+class CommandOutput(Protocol):
+    """The output surface an execution failure message reads from a result.
+
+    Satisfied by ``fabric2.Result``, by the backend-neutral result type the
+    native transport returns, and by ``subprocess.CompletedProcess``.
+    """
+
+    @property
+    def stdout(self) -> str: ...
+
+    @property
+    def stderr(self) -> str: ...
+
+
 class RemoteExecutionException(Exception):
-    def __init__(self, message: str, result: fabric2.Result, *args: object) -> None:
+    def __init__(self, message: str, result: CommandOutput, *args: object) -> None:
         super().__init__(
             f"{message}\n===STDOUT===\n{result.stdout}\n===STDERR===\n{result.stderr}\n",
             *args,
@@ -81,10 +93,30 @@ class InferenceException(Exception):
     status = TestStatus.INFERENCE_FAILURE
 
 
+class FleetEmptyError(InferenceException):
+    """Raised when a host claim is attempted while the fleet is poisoned — no hosts
+    are available and the fleet stayed empty long enough, so an individual claim must fail
+    fast. Unretriable.
+
+    Subclasses ``InferenceException`` so the orchestrator surfaces it as a clean
+    inference failure."""
+
+
+class RequestTooLargeError(FleetEmptyError):
+    """Raised when a claim needs more physical cores than the largest single host that
+    could ever be provisioned.
+
+    Subclasses ``FleetEmptyError`` since it reprends the same kind of error."""
+
+
 class ValidationException(Exception):
     """Raised when output validation fails."""
 
     status = TestStatus.VALIDATION_FAILURE
+
+
+class HostsBusyError(Exception):
+    """Raised when no host could be reserved for an exclusive session."""
 
 
 class UnimplementedException(Exception):

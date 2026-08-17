@@ -14,10 +14,8 @@
 import functools
 from typing import Literal, Optional
 
-import nki.dtype as nt
 import nki.language as nl
 import numpy as np
-
 from nkilib_src.nkilib.core.qkv.qkv import qkv
 from nkilib_src.nkilib.core.qkv.qkv_torch import qkv_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import (
@@ -29,6 +27,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
     QuantizationType,
 )
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_max_positive_value_for_dtype
+
 from test.integration.nkilib.utils.tensor_generators import (
     gaussian_tensor_generator,
     generate_stabilized_mx_data,
@@ -36,6 +35,10 @@ from test.integration.nkilib.utils.tensor_generators import (
 )
 from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+
+# Constructed once at module load and shared across all callers that rely on the default,
+# matching the previous behavior where the default argument expression was evaluated once.
+_DEFAULT_TENSOR_GEN = gaussian_tensor_generator()
 
 DUMMY_TENSOR_NAME = "dummy"
 
@@ -104,7 +107,7 @@ def build_qkv_input(
     fused_rope: Optional[bool] = False,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
-    tensor_gen=gaussian_tensor_generator(),
+    tensor_gen=_DEFAULT_TENSOR_GEN,
     fp8_kv_cache: bool = False,
     bf16_kv_cache: bool = False,
     transpose_k_cache: bool = False,
@@ -204,7 +207,7 @@ def build_qkv_input(
             else None
         )
 
-        if is_h_dim_4h_transposed and norm_type in [NormType.RMS_NORM, NormType.LAYER_NORM]:
+        if is_h_dim_4h_transposed and gamma_norm_weights is not None:
             gamma_norm_weights = (
                 gamma_norm_weights.reshape(1, hidden_dim // (p_max * _q_width), p_max, _q_width)
                 .transpose(0, 3, 1, 2)
@@ -229,12 +232,22 @@ def build_qkv_input(
     kv_dtype = None
     kv_dim = num_kv_heads * d_head if num_kv_heads and d_head else None
     if fp8_kv_cache or bf16_kv_cache:
-        cache_np_dtype = nt.bfloat16 if bf16_kv_cache else nt.float8_e4m3
-        kv_dtype = nl.bfloat16 if bf16_kv_cache else nt.float8_e4m3
+        assert num_kv_heads is not None and d_head is not None and kv_dim is not None, (
+            "KV cache requires num_kv_heads and d_head"
+        )
+        # MX weights are OCP float8_e4m3fn; the compiler rejects mixing OCP and
+        # legacy (float8_e4m3) fp8 in one kernel (NCC_EOCP001), so the KV cache
+        # must use the OCP dtype whenever the projection is MX.
+        _fp8_kv_dtype = nl.float8_e4m3fn if quantization_type.is_mx() else nl.float8_e4m3
+        cache_np_dtype = nl.bfloat16 if bf16_kv_cache else _fp8_kv_dtype
+        kv_dtype = nl.bfloat16 if bf16_kv_cache else _fp8_kv_dtype
         if not bf16_kv_cache:
             k_scale = np.full((128, 1), k_scale_val, dtype=np.float32)
             v_scale = np.full((128, 1), v_scale_val, dtype=np.float32)
         if use_block_kv:
+            assert num_blocks is not None and block_size is not None, (
+                "block KV cache requires num_blocks and block_size"
+            )
             if fp8_packed:
                 k_cache = np.zeros((num_blocks, num_kv_heads, block_size // 2, d_head, 2), dtype=cache_np_dtype)
             elif transpose_k_cache:
@@ -247,6 +260,7 @@ def build_qkv_input(
             else:
                 v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_np_dtype)
         else:
+            assert max_seq_len is not None, "contiguous KV cache requires max_seq_len"
             if transpose_k_cache:
                 k_cache = np.zeros((batch, kv_dim, max_seq_len), dtype=cache_np_dtype)
             else:
@@ -376,9 +390,13 @@ def build_qkv_mla_input(
     if variant == "v32":
         if qk_nope_head_dim is None or v_head_dim is None:
             raise ValueError("variant='v32' requires qk_nope_head_dim and v_head_dim")
+        q_out_dim = n_heads * (qk_nope_head_dim + qk_rope_head_dim)
+        kv_b_out_dim = n_heads * (qk_nope_head_dim + v_head_dim)
     elif variant == "v4":
         if head_dim is None:
             raise ValueError("variant='v4' requires head_dim")
+        q_out_dim = n_heads * head_dim
+        kv_b_out_dim = 0  # v4 has no second KV matmul
     else:
         raise ValueError(f"Unknown variant: {variant!r}")
 
@@ -394,11 +412,6 @@ def build_qkv_mla_input(
     )
 
     # ---- Common: wq_a (first Q projection) and wq_b (second Q projection) ----
-    if variant == "v32":
-        q_out_dim = n_heads * (qk_nope_head_dim + qk_rope_head_dim)
-    else:
-        q_out_dim = n_heads * head_dim
-
     _, wq_a, wq_a_scale = generate_stabilized_mx_data(
         nl.float8_e4m3fn_x4, (hidden_dim // 4, qk_lora_rank * 4), val_range=5
     )
@@ -413,7 +426,6 @@ def build_qkv_mla_input(
 
     if variant == "v32":
         kv_a_out_dim = kv_lora_rank + qk_rope_head_dim
-        kv_b_out_dim = n_heads * (qk_nope_head_dim + v_head_dim)
         fused_qkv_dim = qk_lora_rank + kv_a_out_dim
 
         _, wkv_a, wkv_a_scale = generate_stabilized_mx_data(
@@ -755,10 +767,16 @@ def run_qkv_test(
 
     def output_tensor_descriptor(kernel_input):
         if fp8_kv_cache or bf16_kv_cache:
+            assert n_q_heads is not None and n_kv_heads is not None and d_head is not None, (
+                "KV cache requires n_q_heads, n_kv_heads and d_head"
+            )
             q_dim = n_q_heads * d_head
             kv_dim = n_kv_heads * d_head
             cache_dtype = nl.bfloat16 if bf16_kv_cache else nl.float8_e4m3
             if use_block_kv:
+                assert num_blocks is not None and block_size is not None, (
+                    "block KV cache requires num_blocks and block_size"
+                )
                 if fp8_packed:
                     k_cache = np.zeros((num_blocks, n_kv_heads, block_size // 2, d_head, 2), dtype=cache_dtype)
                 elif not transpose_k_cache:
@@ -775,6 +793,7 @@ def run_qkv_test(
                     "v_cache": v_cache,
                 }
             else:
+                assert max_seq_len is not None, "contiguous KV cache requires max_seq_len"
                 if not transpose_k_cache:
                     k_cache = np.zeros((B, max_seq_len, kv_dim), dtype=cache_dtype)
                 else:

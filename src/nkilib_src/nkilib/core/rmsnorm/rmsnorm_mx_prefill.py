@@ -66,6 +66,7 @@ _QUADRANT = 32  # MX scale quadrant size (HW quadrant layout: 4 valid scales per
 _F_MAX = 512  # gemm moving free-dim max (router E <= 512)
 _SBUF_SCRATCH_RESERVE = 1024  # bytes reserved below the SbufManager upper bound
 _NEG_FLT_MAX = -3.4028235e38  # most negative finite fp32; fills top-K padding so it never wins
+_NOAUX_NEG_SENTINEL = 30000.0  # finite "-inf" for noaux_tc group/expert masking (fp32-safe, far below any score)
 _MAX_TILE_INTERLEAVE = 4  # Maximum x Buffering Degree
 
 
@@ -78,11 +79,15 @@ def rmsnorm_mx_prefill(
     eps: float = 1e-6,
     top_k: int = 1,
     router_act_fn: RouterActFnType = RouterActFnType.SIGMOID,
+    n_group: int = 1,
+    topk_group: int = 1,
+    routed_scaling_factor: float = 1.0,
     qmx_output_dtype=nl.float8_e4m3fn_x4,
     pack_scales: bool = True,
     pack_affinities: bool = False,
     unpadded_hidden_size: int = None,
     residual: nl.NkiTensor = None,
+    emit_norm_bf16: bool = False,
 ):
     """Fused RMSNorm [T,H] + MX quantization (+ optional router top-K) for prefill.
 
@@ -119,10 +124,24 @@ def rmsnorm_mx_prefill(
 
                 router_weights_permuted = natural_router_weights[swizzle_h_index(H)]   # [H, E]
 
-        router_bias (nl.NkiTensor): [1, E] or [E] optional router bias on HBM.
+            For router_act_fn == NOAUX_TC, the SAME swizzle-permute applies -- the noaux_tc
+            router still scores against the swizzle-transposed activations, so its weight must be permuted
+            the same way.
+        router_bias (nl.NkiTensor): [1, E] or [E] optional router bias on HBM. For NOAUX_TC this is the
+            e_score_correction_bias (added to the sigmoid scores for group/expert SELECTION only; the
+            returned affinity is normalized from the PRE-bias sigmoid scores). Required for NOAUX_TC.
         eps (float): epsilon for numerical stability.
         top_k (int): number of experts to select per token (<= 8). Only used when router_weights set.
-        router_act_fn (RouterActFnType): SIGMOID or SOFTMAX. Only used when router_weights set.
+        router_act_fn (RouterActFnType): SIGMOID, SOFTMAX, or NOAUX_TC. Only used when router_weights set.
+            NOAUX_TC - group-limited router (see n_group/topk_group/routed_scaling_factor)
+            and emits ONLY the dense fp32 expert_affinities [T, E] (no expert_index tensor); these may
+            be packed into the row tail via pack_affinities (as fp32) like the top-K path.
+        n_group (int): NOAUX_TC only. Number of expert groups (E must be divisible by n_group; <= 8 for
+            the max8-based per-group selection). Ignored for SIGMOID/SOFTMAX.
+        topk_group (int): NOAUX_TC only. Number of groups kept after group-level gating (<= 8). Ignored
+            for SIGMOID/SOFTMAX.
+        routed_scaling_factor (float): NOAUX_TC only. Final multiplier on the L1-normalized top-k
+            affinities. Ignored for SIGMOID/SOFTMAX.
         qmx_output_dtype: packed MX output dtype (float8_e4m3fn_x4 default).
         pack_scales (bool): controls how the per-block MX scales are laid out in the scale region of
             each packed output row. quantize_mx emits one uint8 scale per (32-partition quadrant x
@@ -134,11 +153,13 @@ def rmsnorm_mx_prefill(
             - pack_scales=False ("unfolded"): one 128-wide block per H512 tile, no folding, so
               scale_region = num_H512*128 (= H/4 columns) -- ~4x larger
         pack_affinities (bool): router only. If True, the dense [T, E] expert affinities are
-            concatenated into each packed row after the scale region (as bf16 reinterpreted into the
-            fp8 row) instead of returned as a separate HBM tensor, so a downstream block gather pulls
-            [hidden | scale | affinities] in one indirect DMA. The total row is padded to a multiple
-            of 4 fp8 columns (the hidden region's fp32-reinterpret transpose requires it). When False
-            (default), expert_affinities is returned as its own [T, E] tensor (legacy layout).
+            concatenated into each packed row after the scale region (reinterpreted into the fp8 row at
+            the affinity dtype -- bf16 for SIGMOID/SOFTMAX, fp32 for NOAUX_TC) instead of returned as a
+            separate HBM tensor, so a downstream block gather pulls [hidden | scale | affinities] in one
+            indirect DMA. The total row is padded to a multiple of 4 fp8 columns (the hidden region's
+            fp32-reinterpret transpose requires it). The kernel then returns norm_quant_packed viewed as
+            the affinity dtype (so the caller reads affinities directly; re-view to fp8 for hidden+scale).
+            When False (default), expert_affinities is returned as its own [T, E] tensor (legacy layout).
         unpadded_hidden_size (int): actual (unpadded) hidden size for the RMS mean denominator. When the
             input H is zero-padded offline (e.g. up to a multiple of 512), the sum-of-squares is taken
             over the full padded H (the zero pad contributes 0), but the mean divides by unpadded_hidden_size
@@ -147,6 +168,12 @@ def rmsnorm_mx_prefill(
             hidden_states before RMSNorm (hidden = hidden_states + residual); the norm/quant/router
             all consume the sum. The pre-norm sum is also written out (output_residual) for the next
             layer's residual stream. If None, no residual add is performed.
+        emit_norm_bf16 (bool): when True, additionally return the token-major bf16 RMSNorm output
+            norm_bf16 [T, H] = (hidden [+ residual]) * inv_rms * gamma, in NATURAL H order -- the same
+            value a standalone RMSNorm produces. This lets one fused launch feed both the MX-quant
+            consumers AND bf16 consumers (attention wq_a/wkv_a, the sparse indexer wk/weights_proj) that
+            need the normed activation un-quantized. Computed fp32 and cast to bf16 on store (matches a
+            torch RMSNorm reference); orthogonal to the router and to residual.
 
     Returns:
         list of HBM tensors, always starting with norm_quant_packed (nl.NkiTensor): [T, row_region]
@@ -154,7 +181,8 @@ def rmsnorm_mx_prefill(
         (router only). Then appended in order when the corresponding input is set: expert_index
         [T,top_k] int32 (when router_weights is set), then expert_affinities [T,E] (when router_weights
         is set AND not pack_affinities -- when pack_affinities the affinities live inside the packed
-        row, so no separate tensor is returned), then output_residual [T,H] (when residual is set).
+        row, so no separate tensor is returned), then output_residual [T,H] (when residual is set),
+        then norm_bf16 [T,H] bf16 (when emit_norm_bf16 is set).
 
     Pseudocode:
         for each token tile of 128 tokens (padded to 128, store n_tok):
@@ -185,24 +213,42 @@ def rmsnorm_mx_prefill(
     in_dtype = hidden_states.dtype
     has_router = router_weights != None
     compute_dtype = router_weights.dtype if has_router else in_dtype
+    has_noaux = has_router and router_act_fn == RouterActFnType.NOAUX_TC
+
+    # Affinity dtype is fixed by the router type, decoupled from compute_dtype: bf16 for the top-K
+    # (SIGMOID/SOFTMAX) affinities, fp32 for the NOAUX_TC L1-normalized dense affinities. The packed
+    # row tail is sized by these actual affinity bytes (NOT compute_dtype).
+    if has_router:
+        E = router_weights.shape[1]
+        affinities_dtype = nl.float32 if has_noaux else nl.bfloat16
+    else:
+        E = 0
+        affinities_dtype = None
 
     """Affinity packing (router only): the dense [T, E] affinities are appended to each packed row as
-    bf16 reinterpreted into the fp8 columns (E bf16 == E*_BF16_AS_FP8 fp8 cols). The downstream
-    transpose reinterprets the hidden region as fp32, so the TOTAL row must be a multiple of
-    _Q_WIDTH fp8 cols; pad the row accordingly (div_ceil(row, 4)*4)."""
-    _BF16_AS_FP8 = sizeinbytes(compute_dtype)  # bf16 -> 2 fp8 columns
+    affinities_dtype reinterpreted into the fp8 columns (E affinities == E*_affin_as_fp8 fp8 cols). The
+    downstream transpose reinterprets the hidden region as fp32, so the TOTAL row must be a multiple of
+    _Q_WIDTH fp8 cols; pad the row accordingly (div_ceil(row, 4)*4). affin_off (= H + scale_region) is a
+    multiple of _Q_WIDTH, so it is aligned for both the bf16 (2-col) and fp32 (4-col) tail views."""
     pack_affinities = pack_affinities and has_router
     if pack_affinities:
-        E = router_weights.shape[1]
+        _affin_as_fp8 = sizeinbytes(affinities_dtype)  # bf16 -> 2, fp32 -> 4 fp8 columns
         affin_off = H + scale_region  # fp8-column offset of the affinity region in the row
-        row_region = div_ceil(affin_off + E * _BF16_AS_FP8, _Q_WIDTH) * _Q_WIDTH
+        row_region = div_ceil(affin_off + E * _affin_as_fp8, _Q_WIDTH) * _Q_WIDTH
     else:
         affin_off = 0
         row_region = H + scale_region
 
     in_view = hidden_states.reshape((T, H))
     gamma_view = gamma.reshape((1, H))
-    out_packed = nl.ndarray((T, row_region), dtype=nl.float8_e4m3fn, buffer=nl.shared_hbm)
+    # Packed affinities: allocate the output in the affinity dtype and view it as fp8 for the internal
+    # hidden/scale/affinity writes (which address the row in fp8 columns).
+    if pack_affinities:
+        out_packed_affin = nl.ndarray((T, row_region // _affin_as_fp8), dtype=affinities_dtype, buffer=nl.shared_hbm)
+        out_packed = out_packed_affin.view(nl.float8_e4m3fn)
+    else:
+        out_packed_affin = None
+        out_packed = nl.ndarray((T, row_region), dtype=nl.float8_e4m3fn, buffer=nl.shared_hbm)
 
     has_residual = residual != None
     if has_residual:
@@ -215,15 +261,30 @@ def rmsnorm_mx_prefill(
         residual_view = None
         output_residual = None
 
+    # Optional token-major bf16 RMSNorm output (natural H) for un-quantized consumers (attention/indexer).
+    norm_bf16 = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm) if emit_norm_bf16 else None
+
     if has_router:
-        E = router_weights.shape[1]
         kernel_assert(E <= _F_MAX, f"E ({E}) must be <= {_F_MAX}")
         kernel_assert(top_k <= 8, f"top_k ({top_k}) must be <= 8")
         num_h_tiles = num_H512 * _Q_WIDTH
-        expert_index = nl.ndarray((T, top_k), dtype=nl.int32, buffer=nl.shared_hbm)
-        expert_affinities = None if pack_affinities else nl.ndarray((T, E), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+        if has_noaux:
+            # noaux_tc: group-limited selection + L1-normalized affinity.
+            kernel_assert(router_bias != None, "NOAUX_TC requires router_bias (e_score_correction_bias)")
+            kernel_assert(topk_group <= 8, f"topk_group ({topk_group}) must be <= 8")
+            kernel_assert(n_group <= 8, f"n_group ({n_group}) must be <= 8 for max8-based selection")
+            kernel_assert(E % n_group == 0, f"E ({E}) must be divisible by n_group ({n_group})")
+            expert_index = None
+            # noaux emits fp32 affinities; packed -> live in the row tail, else a standalone [T, E] tensor.
+            expert_affinities = (
+                None if pack_affinities else nl.ndarray((T, E), dtype=affinities_dtype, buffer=nl.shared_hbm)
+            )
+        else:
+            expert_index = nl.ndarray((T, top_k), dtype=nl.int32, buffer=nl.shared_hbm)
+            expert_affinities = (
+                None if pack_affinities else nl.ndarray((T, E), dtype=affinities_dtype, buffer=nl.shared_hbm)
+            )
     else:
-        E = 0
         expert_index = None
         expert_affinities = None
 
@@ -250,7 +311,14 @@ def rmsnorm_mx_prefill(
     if has_router:
         # Router weights [128, num_h_tiles, E] (partition=H). Source is ht-major so permute axes 0/1.
         router_weights_sb = sbm.alloc_stack((_H0, num_h_tiles, E), dtype=router_weights.dtype, name="router_weights_sb")
-        router_weights_src = router_weights.reshape((num_h_tiles, _H0, E)).permute((1, 0, 2))
+        if has_noaux:
+            # noaux path: the weight is offline pre-arranged (swizzle-permuted AND partition-transposed)
+            # so its [H, E] bytes are already in (p, t, e) order
+            router_weights_src = router_weights.reshape((_H0, num_h_tiles, E))
+        else:
+            # topk (SIGMOID/SOFTMAX) path: swizzle-only [H, E] weight; transpose the tile/partition axes
+            # in-kernel (strided DMA)
+            router_weights_src = router_weights.reshape((num_h_tiles, _H0, E)).permute((1, 0, 2))
         nisa.dma_copy(dst=router_weights_sb, src=router_weights_src, dge_mode=nisa.dge_mode.hwdge)
 
         # Loop-invariant expert-number iota [128, E] for the one-hot scatter.
@@ -273,7 +341,9 @@ def rmsnorm_mx_prefill(
     # Free space here already excludes the invariants allocated above; divide by the per-tile section
     # footprint to find how many buffer sets fit.
 
-    per_tile_bytes = _tile_section_bytes(H, num_H512, E, top_k, compute_dtype, qmx_output_dtype, in_dtype)
+    per_tile_bytes = _tile_section_bytes(
+        H, num_H512, E, top_k, compute_dtype, qmx_output_dtype, in_dtype, emit_norm_bf16=emit_norm_bf16
+    )
     tile_interleave = max(1, min(_MAX_TILE_INTERLEAVE, sbm.get_free_space() // per_tile_bytes))
 
     sbm.open_scope(interleave_degree=tile_interleave)
@@ -337,8 +407,31 @@ def rmsnorm_mx_prefill(
             router_logits_psum=logits_psum,
         )
 
-        # Stage 5b: per-tile router top-K + activation + scatter (real n_tok rows only).
-        if has_router:
+        # Stage 5b: per-tile router selection (real n_tok rows only).
+        if has_noaux:
+            # Group-limited noaux_tc router. Emits dense fp32 affinities (standalone tensor, or the
+            # packed row tail when pack_affinities).
+            _router_noaux_tc_from_logits(
+                sbm,
+                logits_psum,
+                bias_bcast,
+                expert_affinities,
+                tok_off,
+                n_tok,
+                E,
+                top_k,
+                n_group,
+                topk_group,
+                E // n_group,
+                routed_scaling_factor,
+                expert_ids,
+                inv_rms,
+                tile_idx,
+                out_packed=out_packed if pack_affinities else None,
+                affin_off=affin_off,
+                row_region=row_region,
+            )
+        elif has_router:
             _router_topk_from_logits(
                 sbm,
                 logits_psum,
@@ -358,6 +451,26 @@ def rmsnorm_mx_prefill(
                 row_region=row_region,
             )
 
+        # Stage 5c: optional bf16 RMSNorm output, token-major natural H. inv_rms[:,1] is finalized by
+        # the fused call above; recompute the norm directly from the live token-major tiles (in_tile is
+        # hidden [+ residual], gamma_bc is gamma) instead of deswizzling swizzled_all. One fused
+        # scalar_tensor_tensor: (in_tile * inv_rms[t]) * gamma -> bf16, then one wide DMA out.
+        if emit_norm_bf16:
+            norm_out_tile = sbm.alloc_stack((_H0, H), dtype=nl.bfloat16, name=f"norm_out_t{tile_idx}")
+            nisa.scalar_tensor_tensor(
+                dst=norm_out_tile[0:n_tok, 0:H],
+                data=in_tile[0:n_tok, 0:H],
+                op0=nl.multiply,
+                operand0=inv_rms[0:n_tok, 1:2],
+                op1=nl.multiply,
+                operand1=gamma_bc[0:n_tok, 0:H],
+            )
+            nisa.dma_copy(
+                dst=norm_bf16[tok_off : tok_off + n_tok, 0:H],
+                src=norm_out_tile[0:n_tok, 0:H],
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+
         # Stage 6: transpose quant + scales back to token-major and spill packed row.
         _spill_packed(
             sbm, quant_swz_sb, scale_swz_sb, out_packed, tok_off, n_tok, H, num_H512, n_packed, pack_scales, tile_idx
@@ -369,12 +482,20 @@ def rmsnorm_mx_prefill(
 
     outputs = [out_packed]
     if has_router:
-        outputs.append(expert_index)
+        # NOAUX_TC returns dense affinities only (no expert_index).
+        if expert_index != None:
+            outputs.append(expert_index)
         # When pack_affinities, the affinities live inside out_packed -> no standalone tensor.
         if expert_affinities != None:
             outputs.append(expert_affinities)
     if has_residual:
         outputs.append(output_residual)
+    if emit_norm_bf16:
+        outputs.append(norm_bf16)
+    # Packed affinities: return the affinity-dtype allocation; the caller re-views it to fp8 to read
+    # the hidden + scale regions.
+    if pack_affinities:
+        outputs[0] = out_packed_affin
     return outputs
 
 
@@ -698,8 +819,8 @@ def _router_topk_from_logits(
     )
     if out_packed != None:
         """Packed: write affinities into the bf16-viewed tail of the fp8 row. The row stride is
-        row_region fp8 cols == row_region/_BF16_AS_FP8 bf16 cols; the affinity region starts at fp8
-        col affin_off == affin_off/_BF16_AS_FP8 bf16 cols (affin_off is even by construction)."""
+        row_region fp8 cols == row_region/_bf16_as_fp8 bf16 cols; the affinity region starts at fp8
+        col affin_off == affin_off/_bf16_as_fp8 bf16 cols (affin_off is even by construction)."""
         _bf16_as_fp8 = sizeinbytes(nl.bfloat16)  # 2 fp8 cols per bf16
         row_bf16 = row_region // _bf16_as_fp8  # bf16 cols per row
         affin_tail = out_packed.ap(
@@ -716,6 +837,204 @@ def _router_topk_from_logits(
         nisa.dma_copy(
             dst=expert_affinities[tok_off : tok_off + n_tok, 0:E],
             src=affin_full[0:n_tok, 0:E],
+            dge_mode=nisa.dge_mode.hwdge,
+        )
+
+
+def _router_noaux_tc_from_logits(
+    sbm,
+    logits_psum,
+    bias_bcast,
+    expert_affinities,
+    tok_off,
+    n_tok,
+    E,
+    top_k,
+    n_group,
+    topk_group,
+    experts_per_group,
+    routed_scaling_factor,
+    expert_ids,
+    inv_rms,
+    tile_idx,
+    out_packed=None,
+    affin_off=0,
+    row_region=0,
+):
+    """Group-limited noaux_tc router from accumulated logits; store this tile's affinities.
+
+    logits_psum is [128, E] (first n_tok rows real) holding raw = sum_h in*gamma*W (inv_rms factored out
+    by the fused norm/transpose). The true logit is inv_rms[t]*raw, applied BEFORE sigmoid here (sigmoid
+    is nonlinear, so the scale cannot be deferred past it like the plain top-K path does).
+
+    Affinity destination: when out_packed is None the dense fp32 affinities are DMA'd to the standalone
+    expert_affinities[tok_off:tok_off+n_tok] tensor. When out_packed is given (pack_affinities), they are
+    written into an fp32 view of out_packed's row tail at fp8-column offset affin_off (row stride =
+    row_region fp8 cols), so a downstream block gather pulls them with hidden+scale.
+
+    Math:
+      scores = sigmoid(inv_rms * raw)
+      scores_for_choice = scores + bias                       (SELECTION only)
+      group_score[g] = sum of top-2 scores_for_choice in group g
+      keep top-`topk_group` groups -> expert mask
+      masked = scores_for_choice + (mask-1)*SENTINEL
+      final top-`top_k` experts by masked
+      affinity = scale * scores[selected] / (sum scores[selected] + eps)   (PRE-bias scores)
+    scattered to expert columns, zero elsewhere -> dense [n_tok, E] fp32.
+    """
+    P = _H0
+
+    # scores = sigmoid(inv_rms * raw). activation fuses the per-partition inv_rms scale INTO the sigmoid
+    scores_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_scores_t{tile_idx}")
+    nisa.activation(
+        dst=scores_sb[0:n_tok, 0:E],
+        op=nl.sigmoid,
+        data=logits_psum[0:n_tok, 0:E],
+        scale=inv_rms[0:n_tok, 1:2],
+    )
+
+    # scores_for_choice = scores + bias (bias_bcast is the loop-invariant [128, E] broadcast).
+    scores_for_choice_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_sfc_t{tile_idx}")
+    nisa.tensor_tensor(
+        dst=scores_for_choice_sb[0:n_tok, 0:E],
+        data1=scores_sb[0:n_tok, 0:E],
+        data2=bias_bcast[0:n_tok, 0:E],
+        op=nl.add,
+    )
+
+    # group_score[t, g] = sum of top-2 scores_for_choice within group g. Pad the group axis to >= 8
+    # columns (max8/find_index8 need >= 8); the pad columns are -SENTINEL so they never win.
+    grp_pad = max(experts_per_group, 8)
+    n_group_pad = max(n_group, 8)
+    group_score_sb = sbm.alloc_stack((P, n_group_pad), dtype=nl.float32, name=f"noaux_grpscore_t{tile_idx}")
+    if n_group_pad > n_group:
+        nisa.memset(dst=group_score_sb, value=-_NOAUX_NEG_SENTINEL)
+    for g in range(n_group):
+        grp_top8 = sbm.alloc_stack((P, 8), dtype=nl.float32, name=f"noaux_grptop8_t{tile_idx}_g{g}")
+        if experts_per_group >= 8:
+            grp_src = scores_for_choice_sb[0:P, g * experts_per_group : (g + 1) * experts_per_group]
+        else:
+            grp_buf = sbm.alloc_stack((P, grp_pad), dtype=nl.float32, name=f"noaux_grpbuf_t{tile_idx}_g{g}")
+            nisa.memset(dst=grp_buf, value=-_NOAUX_NEG_SENTINEL)
+            nisa.tensor_copy(
+                dst=grp_buf[0:P, 0:experts_per_group],
+                src=scores_for_choice_sb[0:P, g * experts_per_group : (g + 1) * experts_per_group],
+            )
+            grp_src = grp_buf
+        nisa.max8(dst=grp_top8, src=grp_src)
+        nisa.tensor_reduce(
+            dst=group_score_sb[0:P, g : g + 1], op=nl.add, data=grp_top8[0:P, 0:2], axis=1, keepdims=True
+        )
+
+    # top-`topk_group` groups: max8 + nc_find_index8 -> group indices (descending).
+    group_top8_vals = sbm.alloc_stack((P, 8), dtype=nl.float32, name=f"noaux_gtop8v_t{tile_idx}")
+    nisa.max8(dst=group_top8_vals, src=group_score_sb)
+    group_top8_idx = sbm.alloc_stack((P, 8), dtype=nl.uint32, name=f"noaux_gtop8i_t{tile_idx}")
+    nisa.nc_find_index8(dst=group_top8_idx, data=group_score_sb, vals=group_top8_vals)
+    group_idx_fp32 = sbm.alloc_stack((P, 8), dtype=nl.float32, name=f"noaux_gidxf_t{tile_idx}")
+    nisa.tensor_copy(dst=group_idx_fp32, src=group_top8_idx, engine=nisa.scalar_engine)
+
+    # score_mask[t, E]: 1 for experts in a kept group, else 0. expert_group_idx maps each expert col to
+    # its group index via iota (n_group blocks of experts_per_group).
+    expert_group_idx_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_egidx_t{tile_idx}")
+    nisa.iota(dst=expert_group_idx_sb, pattern=[[1, n_group], [0, experts_per_group]], offset=0, channel_multiplier=0)
+    score_mask_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_smask_t{tile_idx}")
+    nisa.memset(dst=score_mask_sb, value=0.0)
+    for k in range(topk_group):
+        # Fuse the equality test and the running accumulate into ONE Vector op:
+        # score_mask = (expert_group_idx == group_idx[k]) + score_mask.
+        nisa.scalar_tensor_tensor(
+            dst=score_mask_sb,
+            data=expert_group_idx_sb,
+            op0=nl.equal,
+            operand0=group_idx_fp32[0:P, k : k + 1],
+            op1=nl.add,
+            operand1=score_mask_sb,
+        )
+
+    # masked = scores_for_choice + (score_mask - 1) * SENTINEL (experts outside kept groups -> -inf).
+    inv_mask_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_invmask_t{tile_idx}")
+    # Two-op tensor_scalar (subtract, multiply) is Vector-only (NCC_IBIR444 on Activation for dual-op).
+    nisa.tensor_scalar(
+        dst=inv_mask_sb,
+        data=score_mask_sb,
+        op0=nl.subtract,
+        operand0=1.0,
+        op1=nl.multiply,
+        operand1=_NOAUX_NEG_SENTINEL,
+    )
+    masked_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_masked_t{tile_idx}")
+    nisa.tensor_tensor(dst=masked_sb, data1=scores_for_choice_sb, data2=inv_mask_sb, op=nl.add)
+
+    # final top-`top_k` experts: max8 + nc_find_index8.
+    final_top8_vals = sbm.alloc_stack((P, 8), dtype=nl.float32, name=f"noaux_ftop8v_t{tile_idx}")
+    nisa.max8(dst=final_top8_vals, src=masked_sb)
+    final_top8_idx = sbm.alloc_stack((P, 8), dtype=nl.uint32, name=f"noaux_ftop8i_t{tile_idx}")
+    nisa.nc_find_index8(dst=final_top8_idx, data=masked_sb, vals=final_top8_vals)
+    topk_idx_fp32 = sbm.alloc_stack((P, 8), dtype=nl.float32, name=f"noaux_tkidxf_t{tile_idx}")
+    nisa.tensor_copy(dst=topk_idx_fp32, src=final_top8_idx, engine=nisa.scalar_engine)
+
+    # one-hot over E for the selected top_k experts, then gather PRE-bias scores.
+    onehot_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_onehot_t{tile_idx}")
+    nisa.memset(dst=onehot_sb, value=0.0)
+    for k in range(top_k):
+        # Fuse equality + accumulate into ONE Vector op: onehot = (expert_ids == topk_idx[k]) + onehot.
+        nisa.scalar_tensor_tensor(
+            dst=onehot_sb,
+            data=expert_ids[0:P, 0:E],
+            op0=nl.equal,
+            operand0=topk_idx_fp32[0:P, k : k + 1],
+            op1=nl.add,
+            operand1=onehot_sb,
+        )
+
+    gathered_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_gathered_t{tile_idx}")
+    nisa.tensor_tensor(dst=gathered_sb, data1=scores_sb, data2=onehot_sb, op=nl.multiply)
+
+    # L1 normalize the selected scores, then scale by routed_scaling_factor. Fold the scale INTO the
+    # reciprocal (a tiny [P,1] op) so the final full-width affinity becomes a SINGLE-op multiply that
+    # can run on the Scalar engine (a two-op mult,mult tensor_scalar is Vector-only, NCC_IBIR444).
+    sum_w_sb = sbm.alloc_stack((P, 1), dtype=nl.float32, name=f"noaux_sumw_t{tile_idx}")
+    nisa.tensor_reduce(dst=sum_w_sb, op=nl.add, data=gathered_sb[0:P, 0:E], axis=1, keepdims=True)
+    nisa.tensor_scalar(dst=sum_w_sb, data=sum_w_sb, op0=nl.add, operand0=1e-20, engine=nisa.scalar_engine)
+    nisa.reciprocal(dst=sum_w_sb, data=sum_w_sb)
+    # recip *= routed_scaling_factor  ([P,1], negligible) -> affinity multiply carries the full scale.
+    nisa.tensor_scalar(
+        dst=sum_w_sb,
+        data=sum_w_sb,
+        op0=nl.multiply,
+        operand0=float(routed_scaling_factor),
+        engine=nisa.scalar_engine,
+    )
+
+    affin_sb = sbm.alloc_stack((P, E), dtype=nl.float32, name=f"noaux_affin_t{tile_idx}")
+    nisa.tensor_scalar(
+        dst=affin_sb[0:n_tok, 0:E],
+        data=gathered_sb[0:n_tok, 0:E],
+        op0=nl.multiply,
+        operand0=sum_w_sb[0:n_tok, 0:1],
+        engine=nisa.scalar_engine,
+    )
+    if out_packed != None:
+        """Packed: write the fp32 affinities into the fp32-viewed tail of the fp8 row. The row stride is
+        row_region fp8 cols == row_region/_FP32_AS_FP8 fp32 cols; the affinity region starts at fp8 col
+        affin_off == affin_off/_FP32_AS_FP8 fp32 cols (both multiples of _Q_WIDTH by construction)."""
+        _fp32_as_fp8 = sizeinbytes(nl.float32)  # 4 fp8 cols per fp32
+        row_fp32 = row_region // _fp32_as_fp8  # fp32 cols per row
+        affin_tail = out_packed.ap(
+            pattern=[[row_fp32, n_tok], [1, E]],
+            offset=tok_off * row_fp32 + affin_off // _fp32_as_fp8,
+            dtype=nl.float32,
+        )
+        nisa.dma_copy(
+            dst=affin_tail[0:n_tok, 0:E],
+            src=affin_sb[0:n_tok, 0:E],
+            dge_mode=nisa.dge_mode.hwdge,
+        )
+    else:
+        nisa.dma_copy(
+            dst=expert_affinities[tok_off : tok_off + n_tok, 0:E],
+            src=affin_sb[0:n_tok, 0:E],
             dge_mode=nisa.dge_mode.hwdge,
         )
 
@@ -914,7 +1233,9 @@ def _scatter_one_hot(expert_affinities, affin_topk, idx_topk, T, E, k, idx_fp32,
         )
 
 
-def _tile_section_bytes(H: int, num_H512: int, E: int, top_k: int, compute_dtype, qmx_output_dtype, in_dtype) -> int:
+def _tile_section_bytes(
+    H: int, num_H512: int, E: int, top_k: int, compute_dtype, qmx_output_dtype, in_dtype, emit_norm_bf16=False
+) -> int:
     """Per-partition SBUF bytes one per-tile section consumes (one buffer set the interleave rotates).
 
     Used to budget the tile interleave degree against free SBUF: degree = free_space // this. The
@@ -949,4 +1270,6 @@ def _tile_section_bytes(H: int, num_H512: int, E: int, top_k: int, compute_dtype
     # spill staging
     total += f8 * H  # quant_tok_major
     total += fp32 * (div_ceil(num_H512, _SCALES_PER_BLOCK) * _H0 // 4)  # scale_tok_major_i32
+    if emit_norm_bf16:
+        total += bf16 * H  # norm_out_tile
     return total

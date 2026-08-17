@@ -19,13 +19,14 @@ from typing import Optional
 import nki
 import nki.language as nl
 
-from ...utils.common_types import DtypeMode, QuantizationType
-from ...utils.kernel_assert import kernel_assert
+from ...utils.common_types import DtypeMode, OProjAttentionLayout, QuantizationType
 from ...utils.kernel_helpers import get_program_sharding_info
 from .output_projection_cte_float import perform_float_projection
 from .output_projection_cte_parameters import (
     build_quantization_config,
     build_tiling_config,
+    resolve_attention_layout,
+    unpack_attention_shape,
     validate_output_projection_inputs,
 )
 from .output_projection_cte_quantization import (
@@ -50,6 +51,7 @@ def output_projection_cte(
     output_dtype: Optional[type] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     compact_weight_scales: bool = False,
+    attention_layout: Optional[OProjAttentionLayout] = None,
 ) -> nl.NkiTensor:
     """
     Output projection kernel optimized for Context Encoding (CTE/Prefill) scenarios.
@@ -84,6 +86,19 @@ def output_projection_cte(
             layout ``[N*D // 128, H // 128]`` uint8, with one scale per 128x128
             weight block. The kernel expands the compact scales to the hardware
             MX layout on-device. Defaults to False (block-32 dense layout).
+        attention_layout (Optional[OProjAttentionLayout]): Dimension order of ``attention``.
+            When declared it is taken as-is, asserted to be supported by ``quantization_type``.
+            Every layout is 4D, so a tag that does not describe the tensor passed in
+            permutes N, D, and S rather than failing; the caller owns getting this right.
+            - ``None`` (default): the layout ``quantization_type`` implies — [B, S, N, D]
+              for ``QuantizationType.ROW``, [B, N, D, S] for every other type.
+            - ``OProjAttentionLayout.BNdS``: ``attention`` is [B, N, D, S]. Supported by
+              every ``quantization_type`` except ROW.
+            - ``OProjAttentionLayout.BSNd``: ``attention`` is [B, S, N, D]. Supported by
+              ``QuantizationType.NONE`` and ``QuantizationType.ROW``.
+            - ``OProjAttentionLayout.BNSd``: ``attention`` is [B, N, S, D] — the attention
+              CTE output with heads folded into batch and ``tp_out=False``. Supported by
+              ``QuantizationType.NONE``.
 
     Returns:
         out (nl.NkiTensor): [B, S, H], Output tensor in HBM.
@@ -113,16 +128,8 @@ def output_projection_cte(
                             out[b, s_block, h_block] = res_psum + bias_sbuf
         return out
     """
-    if quantization_type == QuantizationType.ROW:
-        # ROW: attention is [B, S, N, D]
-        kernel_assert(
-            len(attention.shape) == 4,
-            f"ROW quantization expects attention shape [B, S, N, D], got {len(attention.shape)}D tensor",
-        )
-        b_size, s_size, n_size, d_size = attention.shape
-    else:
-        # All other paths: attention is [B, N, D, S]
-        b_size, n_size, d_size, s_size = attention.shape
+    attention_layout = resolve_attention_layout(attention_layout, quantization_type)
+    b_size, n_size, d_size, s_size = unpack_attention_shape(attention, attention_layout)
     _, h_size = weight.shape
 
     _, n_prgs, prg_id = get_program_sharding_info()
@@ -246,6 +253,7 @@ def output_projection_cte(
             out_hbm=out,
             cfg=tiling_config,
             prg_id=prg_id,
+            attention_layout=attention_layout,
         )
 
     return out

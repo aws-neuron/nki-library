@@ -15,6 +15,7 @@
 
 import pytest
 
+from ..utils.common_dataclasses import PYTEST_XDIST_WORKER_ENV
 from ..utils.csv_monitor import CSVMonitor
 
 
@@ -33,13 +34,13 @@ def monitor():
 
 class TestAppend:
     def test_creates_output_dir(self, tmp_path, monitor, monkeypatch):
-        monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+        monkeypatch.delenv(PYTEST_XDIST_WORKER_ENV, raising=False)
         output_dir = tmp_path / "nested" / "output"
         monitor.append(output_dir, "foo,1.0")
         assert output_dir.exists()
 
     def test_appends_rows_to_worker_file(self, tmp_path, monitor, monkeypatch):
-        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw3")
+        monkeypatch.setenv(PYTEST_XDIST_WORKER_ENV, "gw3")
         monitor.append(tmp_path, "a,1.0")
         monitor.append(tmp_path, "b,2.0")
         content = (tmp_path / "test_monitor_gw3.csv").read_text()

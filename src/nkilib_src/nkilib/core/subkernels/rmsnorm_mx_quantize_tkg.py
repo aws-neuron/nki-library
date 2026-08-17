@@ -169,6 +169,9 @@ def rmsnorm_mx_quantize_tkg(
         output_scale_sb = nl.ndarray(
             (dims.H0, dims.num_H512_tiles, cfg.shard_size), dtype=_MX_SCALE_DTYPE, buffer=nl.sbuf
         )
+        # nisa.quantize_mx writes only 4 of 32 scale partitions per quadrant; zero-init so the
+        # unwritten padding reads as 0 (matching the golden reference) rather than an uninitialized value.
+        nisa.memset(output_scale_sb, value=0)
 
     nisa.memset(zero_bias, value=0.0)
     nisa.memset(reduction_const_matrix, value=1.0)

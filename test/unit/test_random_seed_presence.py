@@ -25,13 +25,12 @@ Files can opt-out by including the comment @IGNORE_RANDOM_SEED anywhere in the f
 import ast
 from typing import List, Set
 
-import pytest
-
 from test.utils.test_validation_utils import (
     IntegrationFileCollector,
     ParsedFileInfo,
     ValidationErrorReporter,
     ValidationViolation,
+    fail_with_report,
 )
 
 IGNORE_MARKER = "@IGNORE_RANDOM_SEED"
@@ -174,6 +173,6 @@ def test_random_seed_presence():
             )
 
     if reporter.has_violations():
-        pytest.fail(reporter.build())
+        fail_with_report(reporter.build())
 
     print(f"\n✓ All {len(all_files)} integration test files have seeded random calls")

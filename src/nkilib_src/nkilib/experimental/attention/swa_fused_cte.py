@@ -46,11 +46,8 @@ _FP8_DTYPES = (nl.float8_e4m3, nl.float8_e4m3fn, nl.float8_e5m2)
 # Width of the wide projection+RoPE tile: Q/K projection + RoPE run at this free width to amortize
 # their per-op fixed overhead (fewer, wider vector/scalar ops); V-proj + attention + OP + reduce stay
 # per-128 sub-tile (tokens on the partition axis, capped at 128). 128 = no widening.
-# SHARD-GATED (measured on trn3): TP4 (8 q-heads) optimum is 256 -- 512 crowds the compiler's rotation
-# headroom on the wider live SBUF (q/k/hidden at 512 = 4x the 128 width) and regresses +5.9%. TP8 (4
-# q-heads) has more SBUF headroom and wins big at 512 (-11.7% vs -1.8% at 256). Pick by q_count.
-_PROJ_TILE_W_WIDE = 512  # TP8 (q_count < 8)
-_PROJ_TILE_W_NARROW = 256  # TP4 (q_count >= 8)
+# 256 is a good balance to have the overlapping perf gain with small sbuf pressure
+_PROJ_TILE_W = 256
 
 
 def _fp8_max(dtype):
@@ -59,11 +56,11 @@ def _fp8_max(dtype):
     return 448.0 if dtype == nl.float8_e4m3fn else 240.0
 
 
-def _proj_tile_width(S, q_count):
-    """Shard-gated wide-tile width, reduced to the largest power-of-2 that still divides S (so the wide
-    tile splits into whole 128-subtiles and tiles S evenly). Falls back to 128 (no widening) for short
-    S like the tiny sim config."""
-    tw = _PROJ_TILE_W_NARROW if q_count >= 8 else _PROJ_TILE_W_WIDE
+def _proj_tile_width(S):
+    """Wide-tile width, reduced to the largest power-of-2 that still divides S (so the wide tile splits
+    into whole 128-subtiles and tiles S evenly). Falls back to 128 (no widening) for short S like the
+    tiny sim config."""
+    tw = _PROJ_TILE_W
     while tw > _PMAX and S % tw != 0:
         tw //= 2
     return tw if S % tw == 0 else _PMAX
@@ -106,14 +103,15 @@ def _qkv_head_split(num_q_heads, num_kv_heads, num_shard, shard_id):
     return q_start, q_count, kv_start, kv_count
 
 
-@nki.jit(experimental_flags="skip-non-top-level-shared-hbm-check")
+@nki.jit
 def swa_fused_cte(
     hidden_states: nl.NkiTensor,  # [B, S, H] bf16
     qkv_weight: nl.NkiTensor,  # [H, I]  I=(num_q_heads + 2*num_kv_heads)*d_head
     op_weight: nl.NkiTensor,  # [num_q_heads*d_head, H]
     k_cache: nl.NkiTensor,  # bf16: [num_blocks, num_kv_heads, block_size, d_head] (post-RoPE K);
     #                       FP8:  [num_blocks, num_kv_heads, block_size // 2, d_head, 2] (packed)
-    v_cache: nl.NkiTensor,  # bf16: [num_blocks, num_kv_heads, block_size, d_head] (plain V); FP8: packed like K
+    v_cache: nl.NkiTensor,  # bf16: [num_blocks, num_kv_heads, block_size, d_head] (plain V);
+    #                       FP8:  [num_blocks, num_kv_heads, block_size, d_head] fp8 (UNPACKED, token-major)
     block_tables: nl.NkiTensor,  # [B, max_blocks_per_seq] int32 (logical->physical block map)
     cos_cache: nl.NkiTensor,  # [B, S, d_head] fp32 (active-token RoPE cos, pre-duplicated halves)
     sin_cache: nl.NkiTensor,  # [B, S, d_head] fp32
@@ -132,11 +130,14 @@ def swa_fused_cte(
 ):
     """Fused GPT-OSS SWA block. Returns (out [B,S,H], k_cache, v_cache) with caches updated in place.
 
-    Packed-FP8 KV cache: when k_cache/v_cache are an FP8 dtype, the caches are stored packed as
+    Packed-FP8 KV cache: when k_cache/v_cache are an FP8 dtype, the K cache is stored PACKED as
     (num_blocks, num_kv_heads, block_size // 2, d_head, 2) -- two consecutive tokens in the trailing
-    length-2 axis so the cache views as bf16 (2 fp8 = 1 bf16 width) for DMA. The prior window is
-    dequantized to bf16 on load (carry stays bf16, attention math unchanged); freshly-computed K/V are
-    quantized + packed on the write-back scatter. Dequant/quant use the per-tensor static k_scale/v_scale.
+    length-2 axis so the K cache views as bf16 (2 fp8 = 1 bf16 width) for DMA. The V cache is UNPACKED,
+    token-major (num_blocks, num_kv_heads, block_size, d_head) fp8 -- same layout as the bf16 V cache,
+    only the dtype differs (so V is loaded straight as fp8 with no implicit cast, then dequantized). The
+    prior window is dequantized to bf16 on load (carry stays bf16, attention math unchanged);
+    freshly-computed K is quantized + packed and V is quantized (token-major, no pack) on the write-back
+    scatter. Dequant/quant use the per-tensor static k_scale/v_scale.
     """
     B, S, H = hidden_states.shape
 
@@ -485,7 +486,7 @@ def _swa_fused_one_batch(
     # WIDE PROJECTION+RoPE TILING: project Q/K and run their RoPE at width `tw` (>=128) to amortize the
     # per-op fixed overhead, then loop the inner 128-subtiles for V-proj + attention + OP + reduce
     # (those have tokens on the partition axis, capped at 128).
-    tw = _proj_tile_width(S, q_count)
+    tw = _proj_tile_width(S)
     n_sub = tw // _PMAX
     num_w_tiles = S // tw
 
@@ -660,15 +661,18 @@ def _swa_fused_one_batch(
         # Persistent per-wide-tile buffers for BOTH subtiles' write-back. The cache scatter WRITES are
         # deferred + batched after the subtile loop, so the whole attention region stays DMA-free --
         # freeing those Sync slots for next-tile prefetch. bf16 path: token-major K (kt_wide) + plain V
-        # (v_wide). FP8 path: the freshly-computed K/V are quantized + packed INSIDE the subtile loop
-        # (overlapping attention's Tensor-idle softmax gaps) into k_pk_wide/v_pk_wide ([64, ...] bf16
-        # view of the fp8 pack); the deferred scatter is then DMA-only. v_wide is still needed (fp8 packs
-        # from it); kt_wide is bf16-only (fp8 K packs straight from the d-major k_tile).
+        # (v_wide). FP8 path: K is quantized + PACKED before the subtile loop into k_pk_wide ([64, ...]
+        # bf16 view of the fp8 pack); V is UNPACKED (token-major fp8, same layout as bf16 V) so it is just
+        # quantized in place INSIDE the subtile loop into v_fp8_wide (a [128, ...] fp8 tile, no transpose/
+        # pack), overlapping attention's Tensor-idle softmax gaps. The deferred scatter is DMA-only. v_wide
+        # (bf16) is still needed as the fp8 V quantize source; kt_wide is bf16-only.
         v_wide = alloc.alloc_sbuf_tensor(shape=(_PMAX, n_sub, kv_count, d_head), dtype=dt, align_to=32)
         if fp8_packed:
             n_pk = _PMAX // 2
             k_pk_wide = alloc.alloc_sbuf_tensor(shape=(n_pk, n_sub, kv_count, d_head), dtype=dt, align_to=32)
-            v_pk_wide = alloc.alloc_sbuf_tensor(shape=(n_pk, n_sub, kv_count, d_head), dtype=dt, align_to=32)
+            v_fp8_wide = alloc.alloc_sbuf_tensor(
+                shape=(_PMAX, n_sub, kv_count, d_head), dtype=v_cache.dtype, align_to=32
+            )
             # K is fully projected+RoPE'd (d-major [d, tw]) before the subtile loop, so quantize + pack
             # the WHOLE wide K at once -- one nc_transpose per <=256-token chunk vs one per 128-subtile.
             _quantize_pack_k_wide(
@@ -692,11 +696,12 @@ def _swa_fused_one_batch(
             # This subtile's K view (already projected+RoPE'd in the wide tile above).
             k_sub = k_tile[:, :, cs : cs + _PMAX]
             if fp8_packed:
-                # K was already quantized + packed wide before the loop; here pack only this subtile's V
-                # (token-major, projected per-subtile) into v_pk_wide for the deferred DMA-only scatter.
-                # Emitted here so the V pack-transpose overlaps attention's Tensor-idle softmax gaps.
-                _pack_v_subtile(
-                    v_wide, v_pk_wide, sub, kv_count, d_head, inv_v_scale_sb, k_fp8_max, v_cache.dtype, alloc
+                # K was already quantized + packed wide before the loop; here quantize only this subtile's
+                # V into v_fp8_wide for the deferred DMA-only scatter. V is token-major fp8 (UNPACKED,
+                # like the bf16 cache), so this is a single in-place quantize -- no transpose/pack.
+                # Emitted here so it overlaps attention's Tensor-idle softmax gaps.
+                _quantize_v_subtile(
+                    v_wide, v_fp8_wide, sub, kv_count, d_head, inv_v_scale_sb, k_fp8_max, v_cache.dtype, alloc
                 )
             else:
                 # Transpose post-RoPE K (d-major [d,128]) -> token-major [128,d] into kt_wide for the
@@ -821,10 +826,10 @@ def _swa_fused_one_batch(
         # gathered to its physical block via block_tables. bpt=1 reduces to one write per subtile.
         sc_save = alloc.get_current_address()
         if fp8_packed:
-            # DMA-only: quant + pack already ran in the subtile loop (k_pk_wide/v_pk_wide).
+            # DMA-only: K quant+pack ran before the loop (k_pk_wide), V quant ran in the loop (v_fp8_wide).
             _scatter_wide_fp8(
                 k_pk_wide,
-                v_pk_wide,
+                v_fp8_wide,
                 k_cache,
                 v_cache,
                 block_tables,
@@ -864,6 +869,7 @@ def _swa_fused_one_batch(
                             ),
                             src=kt_wide[r0 : r0 + block_size, sub, g, :],
                             dge_mode=nisa.dge_mode.hwdge,
+                            oob_mode=nisa.oob_mode.skip,
                         )
                         nisa.dma_copy(
                             dst=v_cache.ap(
@@ -874,6 +880,7 @@ def _swa_fused_one_batch(
                             ),
                             src=v_wide[r0 : r0 + block_size, sub, g, :],
                             dge_mode=nisa.dge_mode.hwdge,
+                            oob_mode=nisa.oob_mode.skip,
                         )
             alloc.set_current_address(sc_save)
 
@@ -1257,6 +1264,7 @@ def _phys_blk(block_tables, b, logical_blk_sb, alloc):
             pattern=[[1, 1], [1, 1]], offset=b * max_blocks, scalar_offset=logical_blk_sb, indirect_dim=1
         ),
         dge_mode=nisa.dge_mode.hwdge,
+        oob_mode=nisa.oob_mode.skip,
     )
     return phys
 
@@ -1325,6 +1333,7 @@ def _load_prior_block_indirect(
                     pattern=[[d_head, block_size], [1, d_head]], offset=head_off, scalar_offset=blk_phys, indirect_dim=0
                 ),
                 dge_mode=nisa.dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip,
             )
             ktmp = alloc.alloc_sbuf_tensor(shape=(block_size, d_head), dtype=prior_k.dtype, align_to=32)
             nisa.dma_copy(
@@ -1333,6 +1342,7 @@ def _load_prior_block_indirect(
                     pattern=[[d_head, block_size], [1, d_head]], offset=head_off, scalar_offset=blk_phys, indirect_dim=0
                 ),
                 dge_mode=nisa.dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip,
             )
             kt_psum = nl.ndarray((d_head, block_size), dtype=prior_k.dtype, buffer=nl.psum)
             nisa.nc_transpose(dst=kt_psum, data=ktmp[:, :])
@@ -1358,53 +1368,71 @@ def _load_prior_block_fp8(
     v_scale_sb,
     alloc,
 ):
-    """Packed-FP8 prior load. The W=128 window spans bpt = 128//block_size physical cache blocks; each
-    block holds block_size//2 packed rows (2 tokens per row in the trailing length-2 axis).
+    """Packed-FP8 prior load. The W=128 window spans bpt = 128//block_size physical cache blocks.
 
-    Cache (num_blocks, num_kv_heads, block_size//2, d_head, 2) fp8 -> view bf16
-    (num_blocks, num_kv_heads*block_size//2*d_head): per (block, head) a [bs/2, d_head] bf16 tile whose
-    element [r, c] is the byte-pair (token 2r, token 2r+1) of dim c. num_blocks is the leading axis, so
-    the indirect DMA uses scalar_offset=phys + indirect_dim=0 directly; the head is a static offset.
-    UNPACK to token order via a transpose: DMA the [bs/2, d] bf16 tile, nc_transpose to [d, bs/2] bf16
-    (packed pair on the FREE axis), reinterpret bf16->fp8 to expand free to [d, block_size] (free pos t
-    = token t). For sub-block i the dequantized block_size tokens land in carry rows
-    [i*block_size, (i+1)*block_size): K d-major (free axis), V token-major (partition axis).
+    K cache is PACKED (num_blocks, num_kv_heads, block_size//2, d_head, 2) fp8: each physical block holds
+    block_size//2 packed rows (2 tokens per row in the trailing length-2 axis). V cache is UNPACKED,
+    token-major (num_blocks, num_kv_heads, block_size, d_head) fp8 -- same layout as the bf16 cache, only
+    the dtype differs -- so V is DMA'd straight into an fp8 SBUF tile (NO implicit cast) then dequantized
+    to bf16, exactly like the bf16 path. num_blocks is the leading axis on both, so the indirect DMA uses
+    scalar_offset=phys + indirect_dim=0 directly; the head is a static offset.
+
+    K unpack: view the packed cache as bf16 (num_blocks, num_kv_heads*block_size//2*d_head) -- per
+    (block, head) a [bs/2, d_head] bf16 tile whose element [r, c] is the byte-pair (token 2r, token 2r+1)
+    of dim c. DMA the [bs/2, d] bf16 tile, nc_transpose to [d, bs/2] bf16 (packed pair on the FREE axis),
+    reinterpret bf16->fp8 to expand free to [d, block_size] (free pos t = token t), dequant. For sub-block
+    i the dequantized block_size tokens land in carry rows [i*block_size, (i+1)*block_size): K d-major
+    (free axis), V token-major (partition axis).
     """
-    bsz_half = block_size // 2  # packed rows per physical block
+    bsz_half = block_size // 2  # packed rows per physical K block
     num_kv_total = k_cache.shape[1]
     k_flat = k_cache.reshape((k_cache.shape[0], num_kv_total * bsz_half * d_head * 2))
-    v_flat = v_cache.reshape((v_cache.shape[0], num_kv_total * bsz_half * d_head * 2))
     k_bf16 = k_flat.view(nl.bfloat16)  # (num_blocks, num_kv*bs/2*d)
-    v_bf16 = v_flat.view(nl.bfloat16)
-    head_stride = bsz_half * d_head  # bf16 elements per head within a block
-    n_pk = _PMAX // 2  # total packed rows for the 128-token window (bpt * bsz_half)
+    k_head_stride = bsz_half * d_head  # bf16 elements per head within a packed K block
+    v_head_stride = block_size * d_head  # fp8 elements per head within a token-major V block
+    n_pk = _PMAX // 2  # total packed rows for the 128-token K window (bpt * bsz_half)
     for g in range(kv_count):
-        col = (kv_start + g) * head_stride  # head's static offset in the bf16 view
+        k_col = (kv_start + g) * k_head_stride  # K head's static offset in the bf16 view
+        v_head_off = (kv_start + g) * v_head_stride  # V head's static offset (fp8 token-major)
         gsave = alloc.get_current_address()
-        # DMA all bpt physical blocks into ONE packed [64, d] bf16 buffer (block i -> rows
-        # [i*bsz_half, (i+1)*bsz_half)), then unpack+dequant the FULL window ONCE. The transpose +
-        # dequant are bpt-independent; only the DMA splits per physical block (distinct scalar_offset).
+        # DMA all bpt physical blocks' K into ONE packed [64, d] bf16 buffer (block i -> rows
+        # [i*bsz_half, (i+1)*bsz_half)), then unpack+dequant the FULL K window ONCE (transpose + dequant
+        # are bpt-independent). V is loaded token-major per sub-block straight into an fp8 tile and
+        # dequanted in place -- no transpose (it is already token-major in the cache, like bf16 V).
         k_pk_full = alloc.alloc_sbuf_tensor(shape=(n_pk, d_head), dtype=nl.bfloat16, align_to=32)
-        v_pk_full = alloc.alloc_sbuf_tensor(shape=(n_pk, d_head), dtype=nl.bfloat16, align_to=32)
         for i in range(bpt):
             save = alloc.get_current_address()
             lblk_i = alloc.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.int32, align_to=32)
             nisa.tensor_scalar(dst=lblk_i[0:1, 0:1], data=win_lblk_sb[0:1, 0:1], op0=nl.add, operand0=float(i))
             blk_phys = _phys_blk(block_tables, b, lblk_i, alloc)
-            pr0 = i * bsz_half  # packed-row offset for physical sub-block i
+            pr0 = i * bsz_half  # packed-row offset for physical sub-block i (K)
             nisa.dma_copy(
                 dst=k_pk_full[pr0 : pr0 + bsz_half, :],
                 src=k_bf16.ap(
-                    pattern=[[d_head, bsz_half], [1, d_head]], offset=col, scalar_offset=blk_phys, indirect_dim=0
+                    pattern=[[d_head, bsz_half], [1, d_head]], offset=k_col, scalar_offset=blk_phys, indirect_dim=0
                 ),
                 dge_mode=nisa.dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip,
             )
+            # V: token-major fp8, DMA straight into an fp8 tile (NO implicit cast), then dequant to bf16.
+            r0 = i * block_size  # sub-block i's carry rows [r0, r0+block_size)
+            v_fp8 = alloc.alloc_sbuf_tensor(shape=(block_size, d_head), dtype=v_cache.dtype, align_to=32)
             nisa.dma_copy(
-                dst=v_pk_full[pr0 : pr0 + bsz_half, :],
-                src=v_bf16.ap(
-                    pattern=[[d_head, bsz_half], [1, d_head]], offset=col, scalar_offset=blk_phys, indirect_dim=0
+                dst=v_fp8[:, :],
+                src=v_cache.ap(
+                    pattern=[[d_head, block_size], [1, d_head]],
+                    offset=v_head_off,
+                    scalar_offset=blk_phys,
+                    indirect_dim=0,
                 ),
                 dge_mode=nisa.dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip,
+            )
+            nisa.tensor_scalar(
+                dst=prior_v[r0 : r0 + block_size, g, :],
+                data=v_fp8[:, :],
+                op0=nl.multiply,
+                operand0=v_scale_sb[0:block_size, 0:1],
             )
             alloc.set_current_address(save)
         # ---- K: [64, d] bf16 -> nc_transpose [d, 64] bf16 -> reinterpret [d, 128] fp8 -> dequant ----
@@ -1419,54 +1447,7 @@ def _load_prior_block_fp8(
             op0=nl.multiply,
             operand0=k_scale_sb[0:d_head, 0:1],
         )
-        # ---- V: same unpack to d-major [d,128] bf16, dequant, then transpose to token-major [128,d] ----
-        vt_ps = nl.ndarray((d_head, n_pk), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(dst=vt_ps, data=v_pk_full[:, :])
-        vt_sb = alloc.alloc_sbuf_tensor(shape=(d_head, n_pk), dtype=nl.bfloat16, align_to=32)
-        nisa.tensor_copy(dst=vt_sb[:, :], src=vt_ps)
-        vt_fp8 = vt_sb.view(v_cache.dtype)  # [d, 128] fp8, free=token
-        v_dmaj_full = alloc.alloc_sbuf_tensor(shape=(d_head, _PMAX), dtype=prior_v.dtype, align_to=32)
-        nisa.tensor_scalar(
-            dst=v_dmaj_full[:, :],
-            data=vt_fp8[:, :],
-            op0=nl.multiply,
-            operand0=v_scale_sb[0:d_head, 0:1],
-        )
-        vtok_ps = nl.ndarray((_PMAX, d_head), dtype=prior_v.dtype, buffer=nl.psum)
-        nisa.nc_transpose(dst=vtok_ps, data=v_dmaj_full[:, :])
-        nisa.tensor_copy(dst=prior_v[0:_PMAX, g, :], src=vtok_ps)
         alloc.set_current_address(gsave)
-
-
-def _quantize_pack_block(dmaj_bf16, n_tok, inv_scale_sb, fp8_max, fp8_dtype, d_head, alloc, dst=None):
-    """Quantize a D-MAJOR [d_head, n_tok] bf16 tile (free axis = token) to packed-FP8 cache rows
-    [n_tok//2, d_head] (bf16 view of the (n_tok//2, d_head, 2) fp8 pack). Writes into ``dst`` (a
-    [n_tok//2, d_head] bf16 tile) if given, else allocates + returns a fresh one.
-
-    quantize: q = clamp(x * (1/scale), -fp8_max, +fp8_max) -> fp8 [d, n_tok]. The HW fp8 nc_transpose
-    has a packed-output-step-2 constraint, so do NOT transpose fp8 directly: reinterpret the d-major
-    fp8 [d, n_tok] as bf16 [d, n_tok//2] (free collapses the token pair into one bf16's two bytes --
-    token 2r low, 2r+1 high), then ONE bf16 nc_transpose -> [n_tok//2, d] bf16 packed rows. Inverse of
-    the load unpack. The scale operand is applied along the partition (d) axis (d-broadcast column).
-    """
-    n_half = n_tok // 2
-    q_fp8 = alloc.alloc_sbuf_tensor(shape=(d_head, n_tok), dtype=fp8_dtype, align_to=32)
-    qf = alloc.alloc_sbuf_tensor(shape=(d_head, n_tok), dtype=nl.float32, align_to=32)
-    nisa.tensor_scalar(
-        dst=qf[:, :],
-        data=dmaj_bf16[:, :],
-        op0=nl.multiply,
-        operand0=inv_scale_sb[0:d_head, 0:1],
-        op1=nl.minimum,
-        operand1=fp8_max,
-    )
-    nisa.tensor_scalar(dst=q_fp8[:, :], data=qf[:, :], op0=nl.maximum, operand0=-fp8_max)  # cast to fp8 on write
-    qb16 = q_fp8.view(nl.bfloat16)  # [d, n_tok//2] bf16 (token pair -> 1 elem)
-    pk_ps = nl.ndarray((n_half, d_head), dtype=nl.bfloat16, buffer=nl.psum)
-    nisa.nc_transpose(dst=pk_ps, data=qb16[:, :])
-    pk_sb = dst if dst is not None else alloc.alloc_sbuf_tensor(shape=(n_half, d_head), dtype=nl.bfloat16, align_to=32)
-    nisa.tensor_copy(dst=pk_sb[:, :], src=pk_ps)
-    return pk_sb
 
 
 def _quantize_pack_k_wide(k_tile, k_pk_wide, n_sub, kv_count, d_head, inv_k_scale_sb, k_fp8_max, k_dtype, alloc):
@@ -1504,25 +1485,33 @@ def _quantize_pack_k_wide(k_tile, k_pk_wide, n_sub, kv_count, d_head, inv_k_scal
             alloc.set_current_address(csave)
 
 
-def _pack_v_subtile(v_wide, v_pk_wide, sub, kv_count, d_head, inv_v_scale_sb, v_fp8_max, v_dtype, alloc):
-    """Quantize + pack this 128-token subtile's V into v_pk_wide[:, sub, g, :] (bf16 view of the fp8
-    pack). V is token-major [128, d] -> transpose to d-major [d, 128] first, then the standard
-    quantize+reinterpret+pack-transpose. Per-subtile (V is projected per-subtile, unlike the wide K)."""
+def _quantize_v_subtile(v_wide, v_fp8_wide, sub, kv_count, d_head, inv_v_scale_sb, v_fp8_max, v_dtype, alloc):
+    """Quantize this 128-token subtile's V into v_fp8_wide[:, sub, g, :] (token-major fp8). The V cache is
+    UNPACKED (token-major [num_blocks, num_kv_heads, block_size, d_head] fp8, same layout as the bf16
+    cache), so no transpose/pack is needed: V is already token-major [128, d] in v_wide, so quantize
+    straight into the fp8 tile. quantize: q = clamp(x * (1/scale), -fp8_max, +fp8_max) -> fp8. The scale
+    operand is per-token (partition axis), so use the [128, 1] broadcast column. Per-subtile (V is
+    projected per-subtile, unlike the wide K)."""
     for g in range(kv_count):
         gsave = alloc.get_current_address()
-        v_ps = nl.ndarray((d_head, _PMAX), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(dst=v_ps, data=v_wide[0:_PMAX, sub, g, :])
-        v_dmaj = alloc.alloc_sbuf_tensor(shape=(d_head, _PMAX), dtype=nl.bfloat16, align_to=32)
-        nisa.tensor_copy(dst=v_dmaj[:, :], src=v_ps)
-        _quantize_pack_block(
-            v_dmaj[:, :], _PMAX, inv_v_scale_sb, v_fp8_max, v_dtype, d_head, alloc, dst=v_pk_wide[:, sub, g, :]
+        qf = alloc.alloc_sbuf_tensor(shape=(_PMAX, d_head), dtype=nl.float32, align_to=32)
+        nisa.tensor_scalar(
+            dst=qf[:, :],
+            data=v_wide[0:_PMAX, sub, g, :],
+            op0=nl.multiply,
+            operand0=inv_v_scale_sb[0:_PMAX, 0:1],
+            op1=nl.minimum,
+            operand1=v_fp8_max,
         )
+        nisa.tensor_scalar(
+            dst=v_fp8_wide[:, sub, g, :], data=qf[:, :], op0=nl.maximum, operand0=-v_fp8_max
+        )  # cast to fp8 on write
         alloc.set_current_address(gsave)
 
 
 def _scatter_wide_fp8(
     k_pk_wide,
-    v_pk_wide,
+    v_fp8_wide,
     k_cache,
     v_cache,
     block_tables,
@@ -1537,27 +1526,32 @@ def _scatter_wide_fp8(
     bpt,
     alloc,
 ):
-    """DMA-only packed-FP8 write-back. The quantize + pack already ran before/inside the subtile loop
-    (_quantize_pack_k_wide for K + _pack_v_subtile for V -> k_pk_wide/v_pk_wide,
-    [64, n_sub, kv_count, d_head] bf16 packed rows).
-    Each 128-token subtile spans bpt = 128//block_size physical blocks; sub-block i is packed rows
-    [i*bsz_half, (i+1)*bsz_half) and writes to logical block n_prior_blocks + gst*bpt + i, gathered to
-    its physical block. DMAs into the bf16 view of (num_blocks, num_kv_heads, block_size//2, d_head, 2);
-    num_blocks is the leading axis so the indirect DMA uses scalar_offset=phys + indirect_dim=0."""
+    """DMA-only FP8 write-back. The quantize (+ pack for K) already ran before/inside the subtile loop
+    (_quantize_pack_k_wide -> k_pk_wide [64, n_sub, kv_count, d_head] bf16 packed rows;
+    _quantize_v_subtile -> v_fp8_wide [128, n_sub, kv_count, d_head] token-major fp8).
+    Each 128-token subtile spans bpt = 128//block_size physical blocks; sub-block i writes to logical
+    block n_prior_blocks + gst*bpt + i, gathered to its physical block. num_blocks is the leading axis on
+    both caches so the indirect DMA uses scalar_offset=phys + indirect_dim=0.
+
+    K is PACKED: DMA into the bf16 view of (num_blocks, num_kv_heads, block_size//2, d_head, 2); sub-block
+    i is packed rows [i*bsz_half, (i+1)*bsz_half). V is UNPACKED token-major fp8
+    (num_blocks, num_kv_heads, block_size, d_head): DMA the fp8 tile straight in, sub-block i is token
+    rows [i*block_size, (i+1)*block_size) -- identical to the bf16 V scatter, only the dtype differs."""
     bsz_half = block_size // 2
     num_kv_total = k_cache.shape[1]
     k_flat = k_cache.reshape((k_cache.shape[0], num_kv_total * bsz_half * d_head * 2))
-    v_flat = v_cache.reshape((v_cache.shape[0], num_kv_total * bsz_half * d_head * 2))
-    k_bf16 = k_flat.view(nl.bfloat16)  # (num_blocks, num_kv*bs/2*d)
-    v_bf16 = v_flat.view(nl.bfloat16)
-    head_stride = bsz_half * d_head  # bf16 elements per head within a block
+    k_bf16 = k_flat.view(nl.bfloat16)  # (num_blocks, num_kv*bs/2*d) packed-K bf16 view
+    k_head_stride = bsz_half * d_head  # bf16 elements per head within a packed K block
+    v_head_stride = block_size * d_head  # fp8 elements per head within a token-major V block
     for g in range(kv_count):
-        col_g = (kv_start + g) * head_stride
+        k_col_g = (kv_start + g) * k_head_stride
+        v_head_off = (kv_start + g) * v_head_stride
         for sub in range(n_sub):
             gst = wt * n_sub + sub
             for i in range(bpt):
                 save = alloc.get_current_address()
-                pr0 = i * bsz_half  # packed-row offset for physical sub-block i
+                pr0 = i * bsz_half  # packed-row offset for physical sub-block i (K)
+                r0 = i * block_size  # token-row offset for physical sub-block i (V)
                 active_lblk = alloc.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.int32, align_to=32)
                 nisa.tensor_scalar(
                     dst=active_lblk[0:1, 0:1],
@@ -1569,22 +1563,24 @@ def _scatter_wide_fp8(
                 nisa.dma_copy(
                     dst=k_bf16.ap(
                         pattern=[[d_head, bsz_half], [1, d_head]],
-                        offset=col_g,
+                        offset=k_col_g,
                         scalar_offset=scatter_phys,
                         indirect_dim=0,
                     ),
                     src=k_pk_wide[pr0 : pr0 + bsz_half, sub, g, :],
                     dge_mode=nisa.dge_mode.hwdge,
+                    oob_mode=nisa.oob_mode.skip,
                 )
                 nisa.dma_copy(
-                    dst=v_bf16.ap(
-                        pattern=[[d_head, bsz_half], [1, d_head]],
-                        offset=col_g,
+                    dst=v_cache.ap(
+                        pattern=[[d_head, block_size], [1, d_head]],
+                        offset=v_head_off,
                         scalar_offset=scatter_phys,
                         indirect_dim=0,
                     ),
-                    src=v_pk_wide[pr0 : pr0 + bsz_half, sub, g, :],
+                    src=v_fp8_wide[r0 : r0 + block_size, sub, g, :],
                     dge_mode=nisa.dge_mode.hwdge,
+                    oob_mode=nisa.oob_mode.skip,
                 )
                 alloc.set_current_address(save)
 

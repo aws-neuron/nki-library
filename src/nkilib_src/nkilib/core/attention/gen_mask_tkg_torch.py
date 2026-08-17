@@ -51,8 +51,12 @@ Usage:
     gen_mask_tkg_torch_ref[lnc](pos_ids=..., mask_out=..., ...)
 
 Args:
-    pos_ids: [P_MAX, bs * s_active] position IDs. P_MAX dim is broadcasted.
-    mask_out: [P_MAX, n_sprior_tile, bs, q_head, s_active] output mask buffer.
+    pos_ids: position IDs.
+        - transposed_out=False: [P_MAX, bs * s_active] with values broadcasted.
+        - transposed_out=True: [1, bs * s_active] or [P_MAX, bs * s_active] for consistency.
+    mask_out: output mask buffer.
+        - transposed_out=False: [P_MAX, n_sprior_tile, bs, q_head, s_active]
+        - transposed_out=True: [P_MAX, n_bsq_tiles, s_prior]
     bs: Batch size.
     q_head: Number of query heads.
     s_active: Active sequence length.
@@ -65,6 +69,7 @@ Args:
     active_mask: Optional [s_active, bs_full, q_head, s_active] active mask.
     is_batch_sharded: Whether batch is sharded across LNCs. Default: False.
     batch_offset: Shard-local batch offset into active_mask. Default: 0.
+    transposed_out: Emit the transposed layout detailed in mask_out. Default: False.
 
 Returns:
     mask_out with generated mask.
@@ -86,6 +91,7 @@ def _gen_mask_tkg_torch_ref_impl(
     active_mask: Optional[torch.Tensor] = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
+    transposed_out: bool = False,
 ) -> torch.Tensor:
     """Generate mask matching gen_mask_tkg kernel output format.
 
@@ -98,7 +104,6 @@ def _gen_mask_tkg_torch_ref_impl(
     if shard_id < 0 or shard_id >= LNC:
         raise ValueError(f"shard_id {shard_id} must be in range [0, {LNC})")
 
-    _, n_sprior_tile, _bs, _q_head, _s_active = mask_out.shape
     mask_out.zero_()
 
     # Determine the batch slice this shard is responsible for
@@ -114,6 +119,7 @@ def _gen_mask_tkg_torch_ref_impl(
     # When s_prior is sharded, each shard covers a different global range
     shard_offset = shard_id * s_prior_per_shard if is_s_prior_sharded else 0
 
+    # Build the natural [bs, q_head, s_active, s_prior_per_shard] mask (shared by both layouts).
     if start_pos is not None:
         # SWA path: per-query windowed mask
         # Extract per-query start and end values from kernel's packed format
@@ -143,13 +149,18 @@ def _gen_mask_tkg_torch_ref_impl(
         )
     # mask shape: [bs, q_head, s_active, s_prior_per_shard]
 
-    # Slice the FA tile window from the shard's s_prior
-    tile_size = n_sprior_tile * P_MAX
-    tile_mask = mask[:, :, :, s_prior_offset : s_prior_offset + tile_size]
-    # tile_mask shape: [bs, q_head, s_active, tile_size]
-
-    # Reshape tile_size -> [P_MAX, n_sprior_tile] based on layout
-    mask_out.copy_(_reshape_to_kernel_format(tile_mask, bs, q_head, s_active, n_sprior_tile, block_len, strided_mm1))
+    # Slice the FA tile window, then reshape tile_size -> [P_MAX, n_sprior_tile].
+    if transposed_out:
+        _, _n_bsq_tiles, tile_size = mask_out.shape
+        tile_mask = mask[:, :, :, s_prior_offset : s_prior_offset + tile_size]
+        mask_out.copy_(_reshape_to_kernel_format_tp(tile_mask, bs, q_head, s_active, tile_size, block_len))
+    else:
+        _, n_sprior_tile, _bs, _q_head, _s_active = mask_out.shape
+        tile_size = n_sprior_tile * P_MAX
+        tile_mask = mask[:, :, :, s_prior_offset : s_prior_offset + tile_size]
+        mask_out.copy_(
+            _reshape_to_kernel_format(tile_mask, bs, q_head, s_active, n_sprior_tile, block_len, strided_mm1)
+        )
 
     return mask_out
 
@@ -322,6 +333,25 @@ def build_full_attention_mask(
     return mask
 
 
+def _reshape_to_kernel_format_tp(
+    mask: torch.Tensor,
+    bs: int,
+    q_head: int,
+    s_active: int,
+    sprior_tile: int,
+    block_len: int,
+) -> torch.Tensor:
+    """Reshape mask from [bs, q_head, s_active, sprior_tile] to tp kernel format [P_MAX, n_bsq_tiles, sprior_tile]."""
+    if block_len > 0:
+        # Block-fold shuffle on the s_prior axis: reorder each fold's [P_MAX, block_len] to
+        # [block_len, P_MAX] to match the kernel's swap iota fold order.
+        num_folds = sprior_tile // (P_MAX * block_len)
+        mask = mask.reshape(bs, q_head, s_active, num_folds, P_MAX, block_len).permute(0, 1, 2, 3, 5, 4)
+    # Fold s_active_bqh onto the partition axis: linear query k -> (p=k % P_MAX, grp=k // P_MAX).
+    n_bsq_tiles = (bs * q_head * s_active) // P_MAX
+    return mask.reshape(n_bsq_tiles, P_MAX, sprior_tile).permute(1, 0, 2).contiguous()
+
+
 def _reshape_to_kernel_format(
     mask: torch.Tensor,
     bs: int,
@@ -378,6 +408,7 @@ class _GenMaskTkgTorchRefFn(Protocol):
         active_mask: Optional[torch.Tensor] = None,
         is_batch_sharded: bool = False,
         batch_offset: int = 0,
+        transposed_out: bool = False,
     ) -> torch.Tensor:
         """
         PyTorch reference for NKI kernel gen_mask_tkg.
@@ -387,8 +418,12 @@ class _GenMaskTkgTorchRefFn(Protocol):
             gen_mask_tkg_torch_ref[lnc](pos_ids=..., mask_out=..., ...)
 
         Args:
-            pos_ids: [P_MAX, bs * s_active] position IDs. P_MAX dim is broadcasted.
-            mask_out: [P_MAX, n_sprior_tile, bs, q_head, s_active] output mask buffer.
+            pos_ids: position IDs.
+                - transposed_out=False: [P_MAX, bs * s_active] with values broadcasted.
+                - transposed_out=True: [1, bs * s_active] or [P_MAX, bs * s_active] for consistency.
+            mask_out: output mask buffer.
+                - transposed_out=False: [P_MAX, n_sprior_tile, bs, q_head, s_active]
+                - transposed_out=True: [P_MAX, n_bsq_tiles, s_prior]
             bs: Batch size.
             q_head: Number of query heads.
             s_active: Active sequence length.
@@ -401,6 +436,7 @@ class _GenMaskTkgTorchRefFn(Protocol):
             active_mask: Optional [s_active, bs_full, q_head, s_active] active mask.
             is_batch_sharded: Whether batch is sharded across LNCs. Default: False.
             batch_offset: Shard-local batch offset into active_mask. Default: 0.
+            transposed_out: Emit the transposed layout detailed in mask_out. Default: False.
 
         Returns:
             mask_out with generated mask.
@@ -431,9 +467,14 @@ Args:
     start_pos_hbm: Optional [1, bs * s_active] SWA start positions.
     block_len: Block length for block KV cache (0 = flat). Default: 0.
     active_mask: Optional [s_active, bs, q_head, s_active] active mask.
+    enable_fa_s_prior_tiling: Whether FA s_prior tiling is enabled. Default: True.
+    fuse_rope: Whether RoPE is fused into the kernel. Default: False.
+    transposed_out: Emit the transposed layout detailed in Returns. Default: False.
 
 Returns:
-    [s_prior, bs, q_head, s_active] generated mask.
+    Generated mask. Shape depends on transposed_out:
+        - transposed_out=False: [s_prior, bs, q_head, s_active]
+        - transposed_out=True: [bs, q_head, s_active, s_prior]
 """
 
 
@@ -448,12 +489,19 @@ def _gen_mask_tkg_hbm_torch_ref_impl(
     active_mask: Optional[torch.Tensor] = None,
     enable_fa_s_prior_tiling: bool = True,
     fuse_rope: bool = False,
+    transposed_out: bool = False,
+    cp_seq_offset: int = 0,
 ) -> torch.Tensor:
     """Generate mask matching gen_mask_tkg_hbm kernel output format.
 
-    Builds the full mask over all s_prior positions, reshapes to the kernel's
-    5D tiled layout, then handles batch-sharded LNC by zeroing non-owned
-    batch slices.
+    Builds the full mask over all s_prior positions, then emits the layout selected by transposed_out
+    (the caller decides via is_qk_swapped, matching the kernel):
+      - transposed_out=True (QK-swap): [bs, q_head, s_active, s_prior] (s_active_bqh-major),
+        with the block-fold shuffle applied to s_prior.
+      - transposed_out=False (default): [s_prior, bs, q_head, s_active] (s_prior-major).
+        For flat KV, mask row k belongs to KV token k. Block KV uses the kernel's 5D folded tile reshape.
+        Batch-sharded LNC is modeled by zeroing the batch slices that each NC does not own.
+    Returns the combined all-NC mask, so it is layout-identical regardless of the kernel's sharding mode.
     """
     lnc = gen_mask_tkg_hbm_torch_ref.lnc
 
@@ -494,52 +542,72 @@ def _gen_mask_tkg_hbm_torch_ref_impl(
         # [s_active, bs, q_head, s_active] → [bs, q_head, s_active, s_active]
         active_standard = active_mask[:, :bs, :, :].permute(1, 2, 3, 0).float()
 
+    # Build the natural [bs, q_head, s_active, s_prior] mask (SWA or standard causal), shared by both
+    # output layouts; only the final reshape differs.
+    # cp_seq_offset shifts every prior k-index into global coordinates before the
+    # causal compare, mirroring the kernel's (P_MAX, 1) iota bias (gen_mask_tkg.py).
+    # It is added to k_indices unconditionally for both the standard and SWA paths,
+    # exactly as the kernel adds it before the SWA/standard split. 0 = no shift.
     if start_pos_hbm is not None:
-        start_vals = start_pos_hbm[0, : bs * s_active].to(torch.float32)
-        end_vals = pos_ids_hbm[0, : bs * s_active].to(torch.float32)
         full_mask = build_swa_attention_mask(
-            start_vals=start_vals,
-            end_vals=end_vals,
+            start_vals=start_pos_hbm[0, : bs * s_active].to(torch.float32),
+            end_vals=pos_ids_hbm[0, : bs * s_active].to(torch.float32),
             batch=bs,
             num_heads=q_head,
             s_active=s_active,
             s_ctx=s_prior,
             active_mask=active_standard,
+            s_prior_start_offset=cp_seq_offset,
         )
     else:
-        cache_lens = pos_ids_hbm[0, ::s_active][:bs].to(torch.float32)
         full_mask = build_attention_mask(
-            cache_lens=cache_lens,
+            cache_lens=pos_ids_hbm[0, ::s_active][:bs].to(torch.float32),
             batch=bs,
             num_heads=q_head,
             s_active=s_active,
             s_ctx=s_prior,
             active_mask=active_standard,
+            s_prior_start_offset=cp_seq_offset,
         )
     # full_mask: [bs, q_head, s_active, s_prior]
 
-    # Reshape to 5D tiled kernel format using the global tile count
-    full_mask_5d = _reshape_to_kernel_format(full_mask, bs, q_head, s_active, n_sprior_tile, block_len, strided_mm1)
-    # full_mask_5d: [P_MAX, n_sprior_tile, bs, q_head, s_active]
+    if transposed_out:
+        # QK-swap path, reshaped to the swap kernel's tiled layout.
+        full_mask_tp = _reshape_to_kernel_format_tp(full_mask, bs, q_head, s_active, s_prior, block_len)
+        # full_mask_tp: [P_MAX, n_bsq_tiles, s_prior]
 
-    # For batch-sharded LNC=2, each shard only writes its own batch slice;
-    # the other slice stays zero. Combine both shards' contributions.
-    if batch_sharded:
-        bs_per_shard = bs // lnc
-        combined = torch.zeros_like(full_mask_5d)
-        for shard_id in range(lnc):
-            b_start = shard_id * bs_per_shard
-            b_end = b_start + bs_per_shard
-            combined[:, :, b_start:b_end, :, :] = full_mask_5d[:, :, b_start:b_end, :, :]
-        full_mask_5d = combined
+        # Undo the query fold back to HBM output format: [bs, q_head, s_active, s_prior]. The block-fold
+        # shuffle on the s_prior axis stays baked in. This is the combined all-NC output (layout-identical
+        # whether the kernel batch-shards or s_prior-shards).
+        return full_mask_tp.permute(1, 0, 2).reshape(bs, q_head, s_active, s_prior).contiguous()
+    else:
+        # Default s_prior-major output.
+        if block_len == 0:
+            # Return flat KV so HBM mask row k belongs to KV token k.
+            return full_mask.permute(3, 0, 1, 2).contiguous()
 
-    # Transpose to n_sprior_tile-major: [n_sprior_tile, P_MAX, bs, q_head, s_active]
-    # The kernel stores in n_sprior_tile-major order (row width = P_MAX) so that
-    # flat slicing at multiples of P_MAX always lands on row boundaries.
-    full_mask_5d = full_mask_5d.permute(1, 0, 2, 3, 4).contiguous()
+        # Block KV uses the kernel's 5D folded layout with the global tile count.
+        full_mask_5d = _reshape_to_kernel_format(full_mask, bs, q_head, s_active, n_sprior_tile, block_len, strided_mm1)
+        # full_mask_5d: [P_MAX, n_sprior_tile, bs, q_head, s_active]
 
-    # Flatten to HBM output format: [s_prior, bs, q_head, s_active]
-    return full_mask_5d.reshape(s_prior, bs, q_head, s_active)
+        # For batch-sharded LNC=2, each shard only writes its own batch slice;
+        # the other slice stays zero. Combine both shards' contributions.
+        if batch_sharded:
+            bs_per_shard = bs // lnc
+            combined = torch.zeros_like(full_mask_5d)
+            for shard_id in range(lnc):
+                b_start = shard_id * bs_per_shard
+                b_end = b_start + bs_per_shard
+                combined[:, :, b_start:b_end, :, :] = full_mask_5d[:, :, b_start:b_end, :, :]
+            full_mask_5d = combined
+
+        # Transpose to n_sprior_tile-major: [n_sprior_tile, P_MAX, bs, q_head, s_active]
+        # The kernel stores in n_sprior_tile-major order (row width = P_MAX) so that
+        # flat slicing at multiples of P_MAX always lands on row boundaries.
+        full_mask_5d = full_mask_5d.permute(1, 0, 2, 3, 4).contiguous()
+
+        # Flatten to HBM output format: [s_prior, bs, q_head, s_active]
+        return full_mask_5d.reshape(s_prior, bs, q_head, s_active)
 
 
 class _GenMaskTkgHbmTorchRefFn(Protocol):
@@ -555,6 +623,8 @@ class _GenMaskTkgHbmTorchRefFn(Protocol):
         active_mask: Optional[torch.Tensor] = None,
         enable_fa_s_prior_tiling: bool = True,
         fuse_rope: bool = False,
+        transposed_out: bool = False,
+        cp_seq_offset: int = 0,
     ) -> torch.Tensor:
         """
         PyTorch reference for NKI kernel gen_mask_tkg_hbm.
@@ -571,9 +641,14 @@ class _GenMaskTkgHbmTorchRefFn(Protocol):
             start_pos_hbm: Optional [1, bs * s_active] SWA start positions.
             block_len: Block length for block KV cache (0 = flat). Default: 0.
             active_mask: Optional [s_active, bs, q_head, s_active] active mask.
+            enable_fa_s_prior_tiling: Whether FA s_prior tiling is enabled. Default: True.
+            fuse_rope: Whether RoPE is fused into the kernel. Default: False.
+            transposed_out: Emit the transposed layout detailed in Returns. Default: False.
 
         Returns:
-            [s_prior, bs, q_head, s_active] generated mask.
+            Generated mask. Shape depends on transposed_out:
+                - transposed_out=False: [s_prior, bs, q_head, s_active]
+                - transposed_out=True: [bs, q_head, s_active, s_prior]
         """
         ...
 

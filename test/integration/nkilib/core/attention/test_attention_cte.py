@@ -13,10 +13,12 @@
 # limitations under the License.
 import math
 
+from test.utils.model_test_configs import no_model_configs
+
 try:
     from test.integration.nkilib.core.attention.test_attention_cte_model_config import attention_cte_model_configs
 except ImportError:
-    attention_cte_model_configs = []
+    attention_cte_model_configs = no_model_configs()
 
 from functools import lru_cache
 from typing import Any, Optional, final
@@ -24,8 +26,8 @@ from typing import Any, Optional, final
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
+import numpy.typing as npt
 import pytest
-
 from nkilib_src.nkilib.core.attention.attention_cte import (
     _MAX_BS,
     _MAX_BS_TIMES_SEQLEN_QK,
@@ -38,6 +40,7 @@ from nkilib_src.nkilib.core.attention.attention_cte import (
 from nkilib_src.nkilib.core.attention.attention_cte_torch import (
     attention_cte_torch_ref,
 )
+
 from test.integration.nkilib.utils.tensor_generators import np_random_sample
 from test.utils.common_dataclasses import (
     CompilerArgs,
@@ -408,9 +411,9 @@ class TestRangedAttentionCTEKernels:
         bs: int,
         bs_kv: int,
         cache_softmax: bool,
-        cp_degree: int,
+        cp_degree: Optional[int],
         d: int,
-        dtype: str,
+        dtype: npt.DTypeLike,
         seqlen_kv: int,
         seqlen_kv_prior,
         seqlen_q: int,
@@ -1444,15 +1447,13 @@ class TestRangedAttentionCTEKernels:
         # Context parallel or regular seqlen_q
         if context_parallel:
             config[CP_DEGREE_DIM_NAME] = BoundedRange(
-                list(
-                    map(
-                        lambda n: 2**n,
-                        filter(
-                            lambda n: _MIN_GLOBAL_CP_DEGREE <= 2**n <= _MAX_GLOBAL_CP_DEGREE,
-                            range(_MIN_GLOBAL_CP_DEGREE - 1, _MAX_GLOBAL_CP_DEGREE),
-                        ),
+                [
+                    2**n
+                    for n in filter(
+                        lambda n: _MIN_GLOBAL_CP_DEGREE <= 2**n <= _MAX_GLOBAL_CP_DEGREE,
+                        range(_MIN_GLOBAL_CP_DEGREE - 1, _MAX_GLOBAL_CP_DEGREE),
                     )
-                ),
+                ],
                 boundary_values=[],
             )
             config[CP_STRIDED_Q_DIM_NAME] = BoundedRange([0, 1], boundary_values=[])
@@ -1475,7 +1476,9 @@ class TestRangedAttentionCTEKernels:
         return config
 
     # Global state for reproducible random sampling
-    _filter_state = {"max_tests": None, "seed": 42, "sample_rate": 1.0}
+    _max_tests: int | None = None
+    _sample_seed: int = 42
+    _sample_rate: float = 1.0
 
     @classmethod
     def set_test_limit(cls, max_tests=None, seed=42):
@@ -1489,11 +1492,11 @@ class TestRangedAttentionCTEKernels:
             # Limit to 100 tests with reproducible sampling
             TestRangedAttentionCTEKernels.set_test_limit(max_tests=100, seed=42)
         """
-        cls._filter_state["max_tests"] = max_tests
-        cls._filter_state["seed"] = seed
+        cls._max_tests = max_tests
+        cls._sample_seed = seed
         # Estimate sample rate (rough heuristic: ~10k valid combinations with pairs coverage)
         if max_tests:
-            cls._filter_state["sample_rate"] = min(1.0, max_tests / 10000.0)
+            cls._sample_rate = min(1.0, max_tests / 10000.0)
 
     def filter_attention_cte_combinations(
         bs,
@@ -1534,13 +1537,13 @@ class TestRangedAttentionCTEKernels:
             return FilterResult.INVALID
 
         # Reproducible random sampling
-        sample_rate = TestRangedAttentionCTEKernels._filter_state.get("sample_rate", 1.0)
+        sample_rate = TestRangedAttentionCTEKernels._sample_rate
         if sample_rate < 1.0:
             import hashlib
 
             # Create deterministic hash from all parameters
             param_str = f"{bs}_{gqa}_{d}_{s_kv}_{tp_q}_{tp_k}_{tp_out}_{sink}_{dtype}_{causal}_{s_q}_{cp_deg}_{cp_strided}_{sw}_{s_kv_prior}"
-            seed = TestRangedAttentionCTEKernels._filter_state.get("seed", 42)
+            seed = TestRangedAttentionCTEKernels._sample_seed
             hash_val = int(hashlib.md5(f"{seed}_{param_str}".encode()).hexdigest(), 16)
 
             # Use hash to decide if we keep this combination

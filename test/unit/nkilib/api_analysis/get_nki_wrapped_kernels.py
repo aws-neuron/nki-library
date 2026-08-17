@@ -16,7 +16,7 @@
 
 import ast
 
-from .get_nki_functions import CORE_DIR, ISA_PATTERN, KernelLocation
+from .get_nki_functions import CORE_DIR, ISA_PATTERN, KernelLocation, statement_source_end
 from .get_nki_kernels import get_nki_kernels_split
 
 
@@ -147,7 +147,7 @@ def _compute_nki_wrapped_kernels():
     reaches a return statement.
     """
     public, _, _ = get_nki_kernels_split()
-    public_names: set[str] = set(loc.name for loc in public)
+    public_names: set[str] = {loc.name for loc in public}
     public_info: dict[str, KernelLocation] = {loc.name: loc for loc in public}
 
     # Build func bodies for public kernels
@@ -164,14 +164,7 @@ def _compute_nki_wrapped_kernels():
         for i, node in enumerate(tree.body):
             if isinstance(node, ast.FunctionDef) and node.name in public_names:
                 start = node.lineno - 1
-                if i + 1 < len(tree.body):
-                    next_node = tree.body[i + 1]
-                    if hasattr(next_node, 'decorator_list') and next_node.decorator_list:
-                        end = next_node.decorator_list[0].lineno - 1
-                    else:
-                        end = next_node.lineno - 1
-                else:
-                    end = len(lines)
+                end = statement_source_end(tree.body, i, len(lines))
                 func_bodies[(fpath, node.name)] = '\n'.join(lines[start:end])
 
     wrapped: dict[KernelLocation, KernelLocation] = {}

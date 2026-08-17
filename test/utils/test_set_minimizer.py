@@ -295,7 +295,8 @@ def minimize_test_set(
             new = len(arcs & remaining)
             if new == 0:
                 continue
-            d = _lookup(t, durations)  # guaranteed present (eligible pool)
+            d = _lookup(t, durations)
+            assert d is not None, "every eligible candidate has a duration"
             score = new / max(d, 0.1)
             mem = _lookup(t, peak_memory_mb) if peak_memory_mb is not None else None
             if score > best_score:
@@ -306,6 +307,7 @@ def minimize_test_set(
         if best is None:
             break
         d = _lookup(best, durations)
+        assert d is not None, "every eligible candidate has a duration"
         chosen.append(ChosenTest(nodeid=best, duration_s=d, new_arcs=best_new))
         remaining -= candidates[best]
         del candidates[best]

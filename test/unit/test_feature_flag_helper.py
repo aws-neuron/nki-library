@@ -11,73 +11,100 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from unittest.mock import MagicMock
+import os
+from typing import Any
 
 from test.utils.feature_flag_helper import (
     NEURON_NEV_PREFIX,
     derive_pytest_test_id,
+    env_flag_enabled,
     get_feature_flag,
+    resolve_ssh_config_path,
 )
+
+
+class _OptionStub:
+    """Stands in for a pytest config: any option lookup returns the same preset value."""
+
+    def __init__(self, option_value: Any = None) -> None:
+        self._option_value = option_value
+
+    def getoption(self, name: str) -> Any:
+        return self._option_value
+
+
+class TestEnvFlagEnabled:
+    """Boolean env parsing: only recognized truthy strings enable; "0"/"false"/unset do not
+    (so setting a flag to "0" to disable it doesn't silently enable via bare truthiness)."""
+
+    _KEY = "NEURON_TEST_FLAG_XYZ"
+
+    def test_unset_is_false(self, monkeypatch):
+        monkeypatch.delenv(self._KEY, raising=False)
+        assert env_flag_enabled(self._KEY) is False
+
+    def test_truthy_values_enable(self, monkeypatch):
+        for val in ("1", "true", "TRUE", "yes", "on", " 1 "):
+            monkeypatch.setenv(self._KEY, val)
+            assert env_flag_enabled(self._KEY) is True, val
+
+    def test_falsy_values_do_not_enable(self, monkeypatch):
+        for val in ("0", "false", "no", "off", "", "  "):
+            monkeypatch.setenv(self._KEY, val)
+            assert env_flag_enabled(self._KEY) is False, val
 
 
 class TestGetFeatureFlag:
     def test_returns_config_value_when_set(self):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = "config_value"
+        config = _OptionStub("config_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "config_value"
 
     def test_returns_env_value_when_config_is_none(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = None
+        config = _OptionStub(None)
         monkeypatch.setenv(f"{NEURON_NEV_PREFIX}TEST_KEY", "env_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "env_value"
 
     def test_returns_default_when_no_config_or_env(self):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = None
+        config = _OptionStub(None)
 
-        result = get_feature_flag(mock_config, "test-key", default_value="default")
+        result = get_feature_flag(config, "test-key", default_value="default")
 
         assert result == "default"
 
     def test_config_takes_precedence_over_env(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = "config_value"
+        config = _OptionStub("config_value")
         monkeypatch.setenv(f"{NEURON_NEV_PREFIX}TEST_KEY", "env_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "config_value"
 
     def test_resolves_env_reference_in_config_value(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = "$MY_VAR"
+        config = _OptionStub("$MY_VAR")
         monkeypatch.setenv("MY_VAR", "resolved_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "resolved_value"
 
     def test_converts_dashes_to_underscores_in_env_key(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = None
+        config = _OptionStub(None)
         monkeypatch.setenv(f"{NEURON_NEV_PREFIX}MY_TEST_KEY", "env_value")
 
-        result = get_feature_flag(mock_config, "my-test-key")
+        result = get_feature_flag(config, "my-test-key")
 
         assert result == "env_value"
 
     def test_zero_config_value_is_returned_not_treated_as_falsy(self):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = 0
+        config = _OptionStub(0)
 
-        result = get_feature_flag(mock_config, "test-key", default_value="default")
+        result = get_feature_flag(config, "test-key", default_value="default")
 
         assert result == 0
 
@@ -90,3 +117,17 @@ class TestDerivePytestTestId:
         result = derive_pytest_test_id()
 
         assert result == "test_sweep_3648_128_1024_512"
+
+
+class TestResolveSshConfigPath:
+    """resolve_ssh_config_path is the single source of truth shared by make_host_manager
+    (worker connections) and the fleet reachability probe — so they can't drift apart."""
+
+    def test_defaults_to_user_ssh_config(self, monkeypatch):
+        monkeypatch.delenv(f"{NEURON_NEV_PREFIX}SSH_CONFIG_PATH", raising=False)
+        config = _OptionStub(None)  # no CLI flag
+        assert resolve_ssh_config_path(config) == os.path.expanduser("~/.ssh/config")
+
+    def test_uses_and_expands_configured_path(self):
+        config = _OptionStub("~/custom/ssh_config")
+        assert resolve_ssh_config_path(config) == os.path.expanduser("~/custom/ssh_config")

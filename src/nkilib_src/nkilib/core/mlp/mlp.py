@@ -91,6 +91,7 @@ def mlp(
     transposed_out: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
+    use_folded_mx_scales: bool = False,
 ) -> list[nl.NkiTensor]:
     """
     MLP (Multi-Layer Perceptron) Kernel implementation.
@@ -209,6 +210,14 @@ def mlp(
             - CONTIGUOUS: Use if quantization_type is not one of MX, ROW_MX, or STATIC_MX
             - H_X4_INNERMOST: One of two alternative MX weight layouts. More optimal if hidden_tensor is already quantized.
             - H_X4_MIDDLE: One of two alternative MX weight layouts. More optimal if hidden_tensor is not quantized.
+        use_folded_mx_scales (bool): CTE MX only. When True, gate_w_scale, up_w_scale, and down_w_scale are
+            supplied pre-folded into the physical SBUF layout the kernel consumes, allowing the scales to be
+            loaded with a single large DMA per operand instead of many small quadrant-fold copies:
+            - gate/up: uint8 [128, ceil((H/512)/4), I]. Four H/512 tiles are folded into one 128-partition
+              buffer; tile k occupies partitions (q*32 + (k%4)*4 : +4) for each quadrant q, at buffer index k//4.
+            - down:    uint8 [128, I/512, H]. The 16 scale rows of each I/512 tile are scattered to partitions
+              q*32 : q*32+4 (q in 0..3); the remaining partitions are zero.
+            Producers must emit all three scales folded. (default: False)
 
     Returns:
         list:
@@ -284,6 +293,7 @@ def mlp(
         transposed_out=transposed_out,
         dtype_mode=dtype_mode,
         gate_up_w_layout=gate_up_w_layout,
+        use_folded_mx_scales=use_folded_mx_scales,
     )
 
     # Validate MLP arguments

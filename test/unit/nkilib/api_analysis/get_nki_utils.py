@@ -18,7 +18,7 @@ import ast
 import re
 from pathlib import Path
 
-from .get_nki_functions import CORE_DIR, ISA_PATTERN, KernelLocation, get_nki_functions
+from .get_nki_functions import CORE_DIR, ISA_PATTERN, KernelLocation, get_nki_functions, statement_source_end
 
 # Allowed nisa calls that don't make something a kernel
 ALLOWED_ISA_PATTERNS = [
@@ -90,14 +90,7 @@ def _compute_nki_utils_with_violators():
                 func_nodes[(fpath, node.name)] = node
                 # Extract source text for regex-based ISA check
                 start = node.lineno - 1
-                if i + 1 < len(tree.body):
-                    next_node = tree.body[i + 1]
-                    if hasattr(next_node, 'decorator_list') and next_node.decorator_list:
-                        end = next_node.decorator_list[0].lineno - 1
-                    else:
-                        end = next_node.lineno - 1
-                else:
-                    end = len(lines)
+                end = statement_source_end(tree.body, i, len(lines))
                 func_sources[(fpath, node.name)] = '\n'.join(lines[start:end])
             elif isinstance(node, ast.Assign) and len(node.targets) == 1:
                 target = node.targets[0]

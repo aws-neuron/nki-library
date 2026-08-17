@@ -327,6 +327,13 @@ class Grid(nl.NKIObject):
         outer = self.outer_axis(dim)
         return 1 if outer is None else outer.step
 
+    def index_stride_elements(self):
+        """Source-element stride for each current public index dim."""
+        result = []
+        for d in range(self.cursor, self.ndim):
+            result.append(self.current_step(d))
+        return tuple(result)
+
     def current_count(self, dim):
         """Outermost-axis count on dim, or 1."""
         return self._outer_count(dim)

@@ -23,8 +23,10 @@ import nki.language as nl
 from ....utils.allocator import SbufManager
 from ....utils.kernel_assert import kernel_assert
 from ....utils.kernel_helpers import get_ceil_quotient
+from ....utils.tiled_range import TiledRange
 from ...mlp_parameters import (
     MLPParameters,
+    mlpp_has_dma_xpose,
     mlpp_has_fused_add,
     mlpp_input_has_packed_scale,
     mlpp_store_fused_add,
@@ -51,6 +53,39 @@ def _reshape_io_tensor(constants: MLPCTEConstants, tensor: nl.NkiTensor) -> nl.N
         shape_list.append(tensor.shape[i])
     new_shape = tuple(shape_list)
     return tensor.reshape(new_shape)
+
+
+def load_and_transpose_hidden_tensor_tile(
+    mlp_params: MLPParameters,
+    tile_info: MLPCTEBasicTileInfo,
+    constants: MLPCTEConstants,
+    indices: MlpBxsIndices,
+    output_tile_sbuf_list: list[nl.NkiTensor],
+):
+    bxs_dim_tile = tile_info.bxs_dim_tile
+    hidden_dim_tile = tile_info.src_proj_hidden_dim_tile
+    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
+    H_TILE_COUNT = hidden_dim_tile.tile_count
+    H_TILE_SIZE = hidden_dim_tile.tile_size
+
+    bxs_tiles = TiledRange(constants.get_bxs_size(mlp_params), bxs_dim_tile.tile_size)
+    current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
+    tensor_bxs_offset = constants.get_bxs_offset()
+
+    hidden_tensor_hbm_view = _reshape_io_tensor(constants, mlp_params.hidden_tensor)
+    new_shape = tuple([hidden_tensor_hbm_view.shape[0], hidden_tensor_hbm_view.shape[1], H_TILE_COUNT, H_TILE_SIZE])
+    hidden_tensor_hbm_view = hidden_tensor_hbm_view.reshape(new_shape)
+
+    for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):
+        output_tile_sbuf_view = output_tile_sbuf_list[bxs_subtile.index].reshape(
+            (BXS_SUBTILE_SIZE, H_TILE_COUNT, H_TILE_SIZE)
+        )
+        nisa.dma_transpose(
+            dst=output_tile_sbuf_view[:H_TILE_SIZE, :H_TILE_COUNT, : bxs_subtile.size],
+            src=hidden_tensor_hbm_view[
+                0, nl.ds(tensor_bxs_offset + bxs_subtile.start_offset, bxs_subtile.size), :H_TILE_COUNT, :H_TILE_SIZE
+            ],
+        )
 
 
 def load_hidden_tensor_tile(
@@ -196,7 +231,10 @@ def load_hidden_tensor_tile_opt_fused_add(
                 output_stored_add_tensor_hbm,
             )
     else:
-        load_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
+        if mlpp_has_dma_xpose(mlp_params):
+            load_and_transpose_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
+        else:
+            load_hidden_tensor_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
         if mlpp_input_has_packed_scale(mlp_params):
             load_packed_hidden_scales(mlp_params, tile_info, constants, indices, output_tile_scales_sbuf_list)
 

@@ -20,7 +20,6 @@ from typing import final
 import numpy as np
 import pytest
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.experimental.collectives.batch_shard import (
     AttnQBatchShardLayout,
     attn_q_batch_shard,
@@ -44,6 +43,7 @@ from nkilib_src.nkilib.experimental.collectives.collectives_torch import (
     rank_id_torch_ref,
     reduce_scatter_hbm_torch_ref,
 )
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     InferenceArgs,

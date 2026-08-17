@@ -40,8 +40,8 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.experimental import neurotile as nt
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
@@ -60,7 +60,7 @@ def _stream_partial_tile_kernel(src):
     for k_block_idx in range(src_partial.shape[0]):
         loaded = src_stream.load(k_block_idx)
         tiles = nt.tiles(loaded)
-        for k in range(tiles.shape[0]):
+        for _k in range(tiles.shape[0]):
             psum = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
             nisa.memset(psum, 0.0)
 

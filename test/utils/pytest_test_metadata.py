@@ -38,6 +38,7 @@ The pytest_marks decorator:
 from __future__ import annotations
 
 import ast
+import functools
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,10 +206,29 @@ def extract_pytest_test_metadata_from_file(file_path: Union[str, Path]) -> List[
                     )
                 )
 
-    except (SyntaxError, FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
+    except (SyntaxError, OSError, UnicodeDecodeError) as e:
+        # OSError covers a missing file, a permission error, or a directory
+        # being passed instead of a file (IsADirectoryError). Any unreadable
+        # path degrades to "no metadata" rather than aborting the caller.
         logging.debug(f"Could not parse {file_path} for test metadata: {e}")
 
     return results
+
+
+@functools.lru_cache(maxsize=None)
+def resolve_file_kernel_name(test_path: Path | str) -> str | None:
+    """Resolve the KernelName for a test file from its single @pytest_test_metadata.
+
+    Metadata is defined once per file because it drives the per-file approval
+    step, so the runtime KernelName must be file-scoped, not class-scoped —
+    otherwise a second-or-later class in a multi-class file emits no KernelName.
+    Cached because it re-parses the file.
+    """
+    metadata_name = next(
+        (tc.metadata["name"] for tc in extract_pytest_test_metadata_from_file(test_path) if tc.metadata),
+        None,
+    )
+    return derive_labeled_kernel_name(test_path, metadata_name)
 
 
 def discover_pytest_test_metadata_marks(test_root: Path) -> dict[str, str]:

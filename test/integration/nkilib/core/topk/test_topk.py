@@ -20,14 +20,13 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from typing_extensions import override
-
 from nkilib_src.nkilib.core.topk.rotational_topk import (
     create_rotational_topk_config,
     create_topk_config,
     rotational_topk,
 )
 from nkilib_src.nkilib.core.topk.rotational_topk_torch import rotational_topk_torch_ref
+from typing_extensions import override
 
 try:
     from test.integration.nkilib.core.topk.test_topk_model_config import rotational_topk_model_configs
@@ -81,9 +80,6 @@ class TopkEdgeCaseValidator:
             return FilterResult.INVALID
         if vocab_size == k:
             return FilterResult.INVALID
-
-        n_prgs = 1 if BxS == 1 else lnc_degree
-        per_lnc_BxS = (BxS + n_prgs - 1) // n_prgs
 
         max_n_stages = TopkEdgeCaseValidator.PMAX
         if max_n_stages < 1:
@@ -216,10 +212,10 @@ class TestTopKKernel:
 
             class ValuesValidator(CustomValidator):
                 @override
-                def validate(self, actual_raw_output: npt.NDArray[Any]):
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
                     BxS, _ = input_tensor.shape
                     k = inputs["config"].topk_config.k
-                    output = np.frombuffer(actual_raw_output, dtype=input_tensor.dtype).reshape(BxS, k)
+                    output = np.frombuffer(inference_output, dtype=input_tensor.dtype).reshape(BxS, k)
                     self._print_with_log("Results for topk_values:")
                     values_correct = maxAllClose(
                         np.sort(output, axis=-1),
@@ -460,6 +456,42 @@ class TestTopKKernel:
             sorted=False,
         )
 
+    # Trivial k == vocab_size fast-return path: the kernel returns the input unchanged
+    # with sequential indices, tiling index generation over the partition limit (128).
+    # Two configs cover both tiling branches: BxS <= 128 (single full tile, no remainder)
+    # and BxS > 128 (full 128-row tile + partial remainder DMA). sorted=False is required
+    # (the kernel asserts sorted output is unsupported when k == vocab_size).
+    topk_trivial_perms = [
+        pytest.param(2, 8, 1, 8, 8, nl.float32, marks=pytest.mark.fast),
+        pytest.param(2, 129, 1, 8, 8, nl.float32, marks=pytest.mark.fast),
+    ]
+
+    @pytest_parametrize(topk_unit_params, topk_trivial_perms, abbrevs=_ABBREVS)
+    def test_topk_trivial_k_equals_vocab(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        vocab_size,
+        K,
+        dtype,
+    ):
+        """k == vocab_size returns the input with sequential indices."""
+        self.run_topk_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            lnc_degree=lnc_degree,
+            batch=batch,
+            seqlen=seqlen,
+            vocab=vocab_size,
+            k=K,
+            dtype=dtype,
+            sorted=False,
+        )
+
     @pytest.mark.coverage_parametrize(
         **sweep_topk_config(),
         filter=filter_topk_combinations,
@@ -501,7 +533,7 @@ def _make_model_id(params):
             return v.value
         return v
 
-    return "_".join(f"{k}-{fmt(v)}" for k, v in zip(abbrevs, params))
+    return "_".join(f"{k}-{fmt(v)}" for k, v in zip(abbrevs, params, strict=True))
 
 
 # MODEL TESTING ENTRY POINT

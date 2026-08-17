@@ -296,7 +296,7 @@ def _apply_scale_bias_if_necessary(
                         if operand1 != None
                         else None
                     ),
-                    engine=nisa.vector_engine,
+                    engine=nisa.vector_engine if hidden_tile_idx % 2 == 0 else nisa.scalar_engine,
                 )
     else:
         hidden_subtile_bound = min(hidden_tile_rest, hidden_dim_tile.tile_size)
@@ -311,7 +311,7 @@ def _apply_scale_bias_if_necessary(
                 offset=hidden_tile_idx * hidden_dim_tile.tile_size,
             ),
             src=res_psum_view[:BXS_SUBTILE_SIZE, :hidden_subtile_bound, 0],
-            engine=nisa.vector_engine,
+            engine=nisa.vector_engine if hidden_tile_idx % 2 == 0 else nisa.scalar_engine,
         )
 
 

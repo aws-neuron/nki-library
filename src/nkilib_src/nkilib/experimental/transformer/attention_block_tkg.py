@@ -55,11 +55,11 @@ except ImportError:
 from nki.isa.constants import oob_mode
 
 from ...core.attention.attention_tkg import AttnTKGConfig, attention_tkg
-from ...core.attention.attention_tkg_utils import is_fp8_e4m3
+from ...core.attention.attention_tkg_utils import is_batch_sharded, is_fp8_e4m3, is_qk_swapped
 from ...core.embeddings.rope import RoPE_sbuf
 from ...core.output_projection.output_projection_tkg import output_projection_tkg
 from ...core.qkv.qkv import qkv
-from ...core.utils.allocator import SbufManager, create_auto_alloc_manager
+from ...core.utils.allocator import SbufManager, create_auto_alloc_manager, sizeinbytes
 from ...core.utils.common_types import DtypeMode, NormType, QKVOutputLayout, QuantizationType
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import (
@@ -71,7 +71,10 @@ from ...core.utils.kernel_helpers import (
 )
 from ...core.utils.logging import get_logger
 from .attention_block_tkg_sharding import (
+    CPCollectiveMode,
     KVDPCollectiveMode,
+    _CP_attention_input_collectives,
+    _CP_attention_output_collectives,
     _KVDP_attention_input_collectives,
     _KVDP_attention_output_collectives,
 )
@@ -148,6 +151,10 @@ def attention_block_tkg(
     S_ctx: Optional[int] = None,
     max_context_len: Optional[nl.NkiTensor] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    # -- Context parallelism (KV cache sharded on sequence dimension)
+    CP: int = 1,
+    CP_replica_group: Optional[ReplicaGroup] = None,
+    CP_collective_mode: Optional[CPCollectiveMode] = None,
 ):
     """
     Fused Attention Block for Token Generation (TKG).
@@ -238,8 +245,14 @@ def attention_block_tkg(
                 kv_heads == 1: [num_blocks, block_len, d_head] or [num_blocks, 1, block_len, d_head].
                 kv_heads >  1: [num_blocks, kv_heads, block_len, d_head].
         attention_mask (nl.NkiTensor): Attention mask @ HBM.
-            When pos_ids is None: [S_ctx, B, q_heads_attn, S_tkg], full pre-generated attention mask.
-            When pos_ids is provided: [S_tkg, B, q_heads_attn, S_tkg], active-only portion of the mask.
+            When pos_ids is provided: [S_tkg, B, q_heads_attn, S_tkg], active-only portion of the mask
+            (the prior mask is generated in-kernel; layout is the same for swap and default).
+            When pos_ids is None (full pre-generated mask): the layout MUST match the QK-swap decision.
+            Determine it with is_qk_swapped(...) first (see attention_tkg / attention_tkg_utils for the
+            full mask-shape guidance), then supply the matching layout:
+              - default (K-stationary): [S_ctx, B, q_heads_attn, S_tkg]
+              - QK-swap (Q-stationary): [B, q_heads_attn, S_tkg, S_ctx]
+            gen_mask_tkg_hbm produces the correct layout when given the same transposed_out flag.
         sink (Optional[nl.NkiTensor]): [q_heads_attn, 1] @ HBM, one value per attention (Q) head.
             ``q_heads_attn = q_heads * KVDP`` (= ``kv_heads * q_per_group``).
         softmax_scale (Optional[float]): Scaling factor for attention scores. If None, defaults to (1/√D) / k_scale.
@@ -330,6 +343,15 @@ def attention_block_tkg(
             - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
             - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
 
+        CP (int): Context parallelism degree - number of ranks that shard the KV cache
+            along the sequence (context) dimension (1 = disabled). Each rank holds an
+            S_ctx/CP slice of the prior KV cache and runs local flash attention; the
+            distributed softmax results are combined across ranks by the CP collectives.
+        CP_replica_group (Optional[ReplicaGroup]): Replica group for CP collective ops.
+            Required when CP > 1.
+        CP_collective_mode (Optional[CPCollectiveMode]): Collective mode for CP output
+            redistribution (ALL_TO_ALL or REDUCE_SCATTER). Defaults to ALL_TO_ALL when None.
+
     KV Data Parallelism (KVDP > 1):
         KV-DP partitions the KV cache across ranks along the batch dimension. Each rank holds
         B/KVDP batches of the KV cache. Before attention: all_gather Q heads, slice Q/K/V batch.
@@ -351,6 +373,18 @@ def attention_block_tkg(
             kv_heads == 1: [d_head, B_attn, S_tkg]
             kv_heads >  1: [d_head, B_attn, kv_heads, S_tkg]
         - V_out: [B_attn, kv_heads, S_tkg, d_head]
+
+    Context Parallelism (CP > 1):
+        CP partitions the prior KV cache across ranks along the sequence (context) dimension.
+        Each rank holds an S_ctx/CP slice and runs local flash attention, returning unnormalized
+        output plus per-rank softmax stats (running max/sum). Before attention: all_gather Q heads
+        (q_heads -> q_heads*CP, no K/V slicing since each rank owns its context shard). After
+        attention: distributed-softmax correction + reduce_scatter/all_to_all to combine the
+        partial results and slice heads back down (q_heads*CP -> q_heads). The KV cache update
+        uses oob_mode.skip so only the owning rank writes new tokens.
+
+        CP composes with KVDP: head reduction is q_heads*KVDP*CP -> q_heads*KVDP (CP reduce)
+        -> q_heads (KVDP reduce). Combined KVDP+CP works with either KVDP collective mode.
 
     Returns:
         out (nl.NkiTensor): Output tensor with shape depending on projection and output location:
@@ -444,6 +478,7 @@ def attention_block_tkg(
         quantization_type_qkv,
         is_h_transposed_by_4,
         dtype_mode,
+        CP,
     )
 
     B, S_tkg = config['B'], config['S_tkg']
@@ -463,10 +498,32 @@ def attention_block_tkg(
     B, B_attn, q_heads_attn = config['B'], config['B_attn'], config['q_heads_attn']
     is_KVDP = config['is_KVDP']
     use_pos_id = config['use_pos_id']
+    transposed_mask = config['transposed_mask']
     n_bxs_tiles = config['n_bxs_tiles']
     bxs_tile = config['bxs_tile']
     kv_heads = config['kv_heads']
+    is_CP = config['is_CP']
+    if is_CP:
+        kernel_assert(CP_replica_group is not None, "CP_replica_group is required when CP > 1")
     I = d_head * (q_heads + 2 * kv_heads)
+
+    # d_head > pmax: in-kernel output projection is not supported (output_projection_tkg requires
+    # D <= 128). Callers must pass W_out=None and apply the output projection externally, consuming
+    # the returned per-head attention output [B, q_heads, d_head, S]. Attention/QKV/KV for d>128 are
+    # supported (see _process_head_group's n_d_tiles > 1 path).
+    kernel_assert(
+        not do_out_proj or d_head <= nl.tile_size.pmax,
+        f"In-kernel output projection (W_out != None) is not supported for d_head > {nl.tile_size.pmax} "
+        f"(got d_head={d_head}); pass W_out=None and project externally.",
+    )
+    # d_head > pmax: the in-kernel block-KV cache update transposes K over the D dim
+    # (_update_block_cache_vectorized), which requires D <= 128. Callers must pass update_cache=False
+    # and scatter the returned new K/V into the cache externally.
+    kernel_assert(
+        not update_cache or d_head <= nl.tile_size.pmax,
+        f"In-kernel KV cache update (update_cache=True) is not supported for d_head > {nl.tile_size.pmax} "
+        f"(got d_head={d_head}); pass update_cache=False and update the cache externally.",
+    )
 
     sbm = sbm if sbm != None else create_auto_alloc_manager(logger=get_logger("attn-block-tkg"))
     sbm.open_scope(name="attn-blk-tkg-scope")
@@ -567,11 +624,30 @@ def attention_block_tkg(
             dynamic_KVDP_rank_sb=dynamic_KVDP_rank_sb,
         )
 
+    # ========== Context Parallelism: Input Collectives ==========
+    if is_CP:
+        # Gather Q heads across CP ranks (no K/V slicing — each rank has local s_prior/CP shard).
+        # Consumes the post-KVDP Q layout, so use B_attn and the post-KVDP head count:
+        #   q_heads*KVDP -> q_heads*KVDP*CP
+        # Q: [d, B_attn*(q_heads*KVDP)*S] @ SBUF -> [d, B_attn*(q_heads*KVDP*CP)*S] @ SBUF
+        cp_in_q_heads = q_heads * KVDP if is_KVDP else q_heads
+        Q_tkg_sb = _CP_attention_input_collectives(
+            Q_tkg_sb,
+            cp_in_q_heads,
+            d_head,
+            CP,
+            B_attn,
+            S_tkg,
+            CP_replica_group,
+            sbm,
+        )
+
     # ========== Attention Computation ==========
     # Input:  Q_tkg_sb [d_head, B_attn*q_heads_attn*S_tkg] @ SBUF
     #         K_tkg_sb [d_head, B_attn*S_tkg] @ SBUF
     #         V_tkg_hbm [B_attn, 1, S_tkg, d_head] @ HBM
     # Output: attn_out [d_head, B_attn*q_heads_attn*S_tkg] @ SBUF or [B_attn, q_heads_attn, d_head, S_tkg] @ HBM
+
     if skip_attention:
         attn_out = Q_tkg_sb
     else:
@@ -607,7 +683,7 @@ def attention_block_tkg(
         B_folded = B_attn * kv_heads
 
         # Allocate attention output buffer
-        allocate_attn_out_on_HBM = not do_out_proj and not out_in_sb and not is_KVDP
+        allocate_attn_out_on_HBM = not do_out_proj and not out_in_sb and not is_KVDP and not is_CP
         if allocate_attn_out_on_HBM:
             attn_out = nl.ndarray(
                 (B_folded, q_per_group, d_head, S_tkg),
@@ -626,11 +702,21 @@ def attention_block_tkg(
             k_prior = K_cache.reshape(k_shape)
             v_prior = V_cache.reshape((B_folded, 1, S_max_ctx, d_head))
 
-        # Q/K/V/mask reshapes
-        Q_folded = Q_tkg_sb.reshape((d_head, B_folded * q_per_group * S_tkg))
-        K_folded = K_tkg_sb.reshape((d_head, B_folded * S_tkg))
+        # Q/K/V/mask reshapes. d>128: Q_tkg_sb/K_tkg_sb are already the tiled
+        # [nl.tile_size.pmax, n_d_tiles*B*H*S] layout attention_tkg's native d>128 path expects; pass through.
+        if d_head > nl.tile_size.pmax:
+            Q_folded = Q_tkg_sb
+            K_folded = K_tkg_sb
+        else:
+            Q_folded = Q_tkg_sb.reshape((d_head, B_folded * q_per_group * S_tkg))
+            K_folded = K_tkg_sb.reshape((d_head, B_folded * S_tkg))
         V_folded = V_tkg_hbm.reshape((B_folded, 1, S_tkg, d_head))
-        mask_folded = attention_mask.reshape((attention_mask.shape[0], B_folded, q_per_group, S_tkg))
+        # Swap consumes the mask bqh-major with s_prior last ([B, N, S, S_ctx]); default is s_prior-major
+        # ([S_ctx, B, N, S]). attention_tkg's swap _load_mask reshapes from [.., full_s_active_bqh, S_ctx].
+        if transposed_mask:
+            mask_folded = attention_mask.reshape((B_folded, q_per_group, S_tkg, attention_mask.shape[-1]))
+        else:
+            mask_folded = attention_mask.reshape((attention_mask.shape[0], B_folded, q_per_group, S_tkg))
         if is_block_kv and active_blocks_table is not None:
             active_blocks_table_folded = active_blocks_table.reshape((B_folded, active_blocks_table.shape[-1]))
         else:
@@ -689,10 +775,30 @@ def attention_block_tkg(
             use_gpsimd_sb2sb=True,
             qk_in_sb=True,
             k_out_in_sb=False,
-            out_in_sb=do_out_proj or out_in_sb or is_KVDP,
+            # For d>128, attention_tkg's native d-tiled store only targets HBM (out_in_sb=False),
+            # writing the de-tiled [B_folded, q_per_group, d_head, S] layout directly.
+            out_in_sb=(do_out_proj or out_in_sb or is_KVDP or is_CP) and (d_head <= nl.tile_size.pmax),
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
             fp8_packed=fp8_packed,
+            return_cp_softmax_stats=is_CP,
         )
+
+        # Allocate softmax stats output tensors for CP (compact tile layout, not broadcast)
+        cp_softmax_stats_out = None
+        if is_CP:
+            BQS = B_attn * q_heads_attn * S_tkg
+            # Stats are per-NC: with LNC batch sharding, each NC processes B/2 batches
+            pmax = nl.tile_size.pmax
+            batch_sharded = is_batch_sharded(B_attn, q_heads_attn, S_tkg, S_ctx, pmax)
+            bs_n_prgs = 2 if batch_sharded else 1
+            BQS_per_nc = BQS // bs_n_prgs
+            s_active_bqh_tile = min(BQS_per_nc, pmax)
+            n_bsq_tiles = (BQS_per_nc + pmax - 1) // pmax
+            stats_shape = (s_active_bqh_tile, n_bsq_tiles)
+            cp_softmax_stats_out = {
+                "fa_running_max": sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf),
+                "fa_running_sum": sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf),
+            }
 
         attention_tkg(
             q=Q_folded,
@@ -710,6 +816,32 @@ def attention_block_tkg(
             active_blocks_table=active_blocks_table_folded,
             max_context_len=max_context_len,
             dtype_mode=dtype_mode,
+            cp_softmax_stats_out=cp_softmax_stats_out,
+        )
+
+    # ========== Context Parallelism: Output Collectives ==========
+    # CP output runs before KVDP output so that head reduction is:
+    #   q_heads * KVDP * CP → q_heads * KVDP (CP reduce) → q_heads (KVDP reduce)
+    if is_CP:
+        # Distributed softmax correction + reduce_scatter + head slice
+        #   q_heads_attn (q_heads*KVDP*CP) -> q_heads*KVDP (or q_heads if no KVDP)
+        # attn_out: [d, B_attn*q_heads_attn*S] @ SBUF (unnormalized) -> [d, B_attn*q_heads_kvdp*S] @ SBUF (corrected)
+        q_heads_after_cp = q_heads * KVDP if is_KVDP else q_heads
+        attn_out = _CP_attention_output_collectives(
+            attn_out,
+            cp_softmax_stats_out["fa_running_max"],
+            cp_softmax_stats_out["fa_running_sum"],
+            CP,
+            B_attn,
+            q_heads_after_cp,
+            d_head,
+            S_tkg,
+            CP_replica_group,
+            sbm,
+            max_negated=cp_softmax_stats_out["max_negated"],
+            atp=cp_softmax_stats_out["atp"],
+            TC=cp_softmax_stats_out["TC"],
+            collective_mode=CP_collective_mode or CPCollectiveMode.ALL_TO_ALL,
         )
 
     # ========== KV Data Parallelism: Output Gather ==========
@@ -765,6 +897,9 @@ def attention_block_tkg(
         # V_tkg from SBUF (small batch) or HBM. The reshape is an identity when kv_heads == 1.
         V_tkg_folded = V_tkg_sb if V_tkg_sb is not None else V_tkg_hbm.reshape((B_folded, 1, S_tkg, d_head))
 
+        # In-kernel KV cache update requires d_head <= pmax (asserted above), so this path is
+        # only reached for d<=128, where K_tkg_sb is the untiled [d_head, B*kv*S] layout
+        # _kv_cache_update expects.
         _kv_cache_update(
             K_cache=K_cache_folded,
             V_cache=V_cache_folded,
@@ -778,6 +913,7 @@ def attention_block_tkg(
             K_cache_transposed=K_cache_transposed,
             is_block_kv=is_block_kv,
             fp8_packed=fp8_packed,
+            oob_skip=is_CP,
         )
         K_cache, V_cache = __internal_unsqueeze_head_dim(K_cache, V_cache, cache_had_head_dim, kv_heads)
     else:  # No cache update: return new K/V tokens
@@ -787,7 +923,20 @@ def attention_block_tkg(
             )
         else:
             K_tkg_hbm = sbm.alloc((d_head, B_attn, S_tkg), dtype=K_tkg_sb.dtype, buffer=nl.shared_hbm, name="K_hbm")
-        nisa.dma_copy(K_tkg_hbm.reshape(K_tkg_sb.shape), K_tkg_sb)
+        # d>128: K_tkg_sb is tiled [nl.tile_size.pmax, n_d_tiles*B*kv*S]; reassemble to [d_head, ...] HBM by
+        # placing each d-tile into its d_head partition slice (ref qqdong/qwen3.5). A plain reshape
+        # would reinterpret the tiled layout as flat and return garbled K_new. n_d_tiles==1 → identity.
+        _n_d_tiles = d_head // nl.tile_size.pmax
+        if _n_d_tiles > 1:
+            K_hbm_flat = K_tkg_hbm.reshape((d_head, B_attn * kv_heads * S_tkg))
+            k_free = K_tkg_sb.shape[1] // _n_d_tiles
+            for i_d in range(_n_d_tiles):
+                nisa.dma_copy(
+                    K_hbm_flat[nl.ds(i_d * nl.tile_size.pmax, nl.tile_size.pmax), :],
+                    K_tkg_sb[:, nl.ds(i_d * k_free, k_free)],
+                )
+        else:
+            nisa.dma_copy(K_tkg_hbm.reshape(K_tkg_sb.shape), K_tkg_sb)
 
     # ========== Output Projection (Optional) ==========
     # Input:  attn_out [d_head, B, q_heads, S_tkg] @ SBUF/HBM
@@ -872,6 +1021,7 @@ def _validate_and_extract_config(
     quantization_type_qkv: QuantizationType = QuantizationType.NONE,
     is_h_transposed_by_4: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    CP: int = 1,
 ) -> Dict[str, Any]:
     """
     Validate inputs and extract configuration parameters for attention block.
@@ -996,6 +1146,18 @@ def _validate_and_extract_config(
             KVDP_rank.dtype == nl.uint32,
             f"KVDP_rank must have dtype uint32, got {KVDP_rank.dtype}",
         )
+    is_CP = CP > 1
+    # CP + in-kernel mask generation (use_pos_id) is supported, but the CALLER
+    # owns the CP semantics — the kernel generates a plain per-rank causal mask:
+    #   - prior slots: gen_mask_tkg produces iota < pos_ids. Under CP the cache is
+    #     rank-local (each rank stores only its owned tokens, contiguously), so the
+    #     caller must pass pos_ids = local_filled (this rank's filled-slot count),
+    #     NOT the global position — then iota < local_filled is the correct prior mask.
+    #   - active slot: gen_mask_tkg has no per-rank active-token owner gate, so the
+    #     caller must supply the active-only `attention_mask` overlay already gated by
+    #     ownership (active token zeroed on ranks that do not own it), mirroring the
+    #     external path's dcp_active_mask. Without this the active token is counted on
+    #     every rank and double-counted in the CP LSE combine.
 
     # Compute tiling for large batch support (B * S_tkg > pmax)
     pmax = nl.tile_size.pmax
@@ -1032,6 +1194,8 @@ def _validate_and_extract_config(
     else:
         B_attn = B
         q_heads_attn = q_heads
+    if is_CP:
+        q_heads_attn = q_heads_attn * CP
 
     kernel_assert(
         q_heads_attn % kv_heads == 0,
@@ -1092,11 +1256,32 @@ def _validate_and_extract_config(
             tuple(pos_ids.shape) == (B_attn, S_tkg),
             f"pos_ids shape mismatch: expected ({B_attn}, {S_tkg}), got {pos_ids.shape}",
         )
-    expected_mask_dim0 = S_tkg if use_pos_id else S_ctx
-    expected_mask_shape = (expected_mask_dim0, B_attn, q_heads_attn, S_tkg)
+    qk_swapped = is_qk_swapped(
+        bs=B_attn,
+        q_head=q_heads_attn,
+        d_head=d_head,
+        s_active=S_tkg,
+        curr_sprior=S_ctx,
+        lnc=nl.num_programs(0),
+        p_max=nl.tile_size.pmax,
+        is_block_kv=is_block_kv,
+        is_2byte_kv=sizeinbytes(K_cache.dtype) == 2,
+        fp8_packed=fp8_packed,
+        fuse_rope=False,
+        kv_heads=kv_heads,
+    )
+    transposed_mask = qk_swapped and not use_pos_id
+    if transposed_mask:
+        expected_mask_shape = (B_attn, q_heads_attn, S_tkg, S_ctx)
+    else:
+        expected_mask_dim0 = S_tkg if use_pos_id else S_ctx
+        expected_mask_shape = (expected_mask_dim0, B_attn, q_heads_attn, S_tkg)
+    mask_layout = "transposed (QK-swap)" if transposed_mask else "default"
     kernel_assert(
         tuple(attention_mask.shape) == expected_mask_shape,
-        f"attention_mask shape mismatch: expected {expected_mask_shape}, got {attention_mask.shape}",
+        f"attention_mask shape mismatch for {mask_layout} layout: expected {expected_mask_shape}, "
+        f"got {attention_mask.shape}. QK-swap (pre-generated mask) expects the transposed "
+        f"[B, N, S, S_ctx] mask; the default path expects [S_ctx, B, N, S] (or [S_tkg, B, N, S] with pos_ids).",
     )
     if swa_start_pos_ids is not None:
         kernel_assert(
@@ -1115,15 +1300,18 @@ def _validate_and_extract_config(
             f"rmsnorm_X_gamma must be (1, {H}), got {rmsnorm_X_gamma.shape}",
         )
 
-    # Validate RoPE embeddings
+    # Validate RoPE embeddings. Partial rotary (rotary_dim < d_head) carries rotary_half =
+    # rotary_dim//2 <= half_d entries, so accept any rotary_half in [1, half_d]; rotary_dim
+    # is derived from cos.shape[0] * 2.
     if cos != None and sin != None:
+        rotary_half = cos.shape[0]
         kernel_assert(
-            tuple(cos.shape) == (half_d, B, S_tkg),
-            f"cos shape mismatch: expected ({half_d}, {B}, {S_tkg}), got {cos.shape}",
+            tuple(cos.shape) == (rotary_half, B, S_tkg) and 0 < rotary_half <= half_d,
+            f"cos shape mismatch: expected (rotary_half<={half_d}, {B}, {S_tkg}), got {cos.shape}",
         )
         kernel_assert(
-            tuple(sin.shape) == (half_d, B, S_tkg),
-            f"sin shape mismatch: expected ({half_d}, {B}, {S_tkg}), got {sin.shape}",
+            tuple(sin.shape) == (rotary_half, B, S_tkg) and 0 < rotary_half <= half_d,
+            f"sin shape mismatch: expected (rotary_half<={half_d}, {B}, {S_tkg}), got {sin.shape}",
         )
 
     # KV Quantization
@@ -1164,8 +1352,10 @@ def _validate_and_extract_config(
         'kv_heads': kv_heads,
         'is_KVDP': is_KVDP,
         'use_pos_id': use_pos_id,
+        'transposed_mask': transposed_mask,
         'n_bxs_tiles': n_bxs_tiles,
         'bxs_tile': bxs_tile,
+        'is_CP': is_CP,
     }
 
 
@@ -1256,6 +1446,61 @@ def _to_sbuf(buf: nl.NkiTensor, sbm: SbufManager) -> nl.NkiTensor:
         return sb
 
 
+def _rope_d_tiled_spanning(
+    out: nl.NkiTensor,
+    sb_cos: nl.NkiTensor,
+    sb_sin: nl.NkiTensor,
+    rotary_half: int,
+    B: int,
+    n_heads: int,
+    S: int,
+    sbm: SbufManager,
+) -> None:
+    """
+    Apply RoPE in-place when the rotary channels span more than one d-tile of the tiled Q/K
+    buffer (e.g. Gemma d_head=256 with full rotary_dim=256).
+
+    out is [pmax, n_d_tiles*B*n_heads*S] with d-tile outermost, so d-tile t occupies free columns
+    [t*BnS : (t+1)*BnS] (BnS = B*n_heads*S). RoPE pairs channel c ("even" half [0:rotary_half])
+    with channel c+rotary_half ("odd" half). With rotary_half == pmax the even half is exactly
+    d-tile 0 and the odd half is exactly d-tile 1, each [pmax, BnS]; RoPE_sbuf's partition-dim
+    split does not apply, so we compute the rotation directly on the two tiles:
+
+        out_even = even*cos - odd*sin
+        out_odd  = odd*cos + even*sin
+
+    cos/sin are [rotary_half, B, S], broadcast across n_heads.
+    """
+    kernel_assert(
+        rotary_half == nl.tile_size.pmax,
+        f"_rope_d_tiled_spanning expects rotary_half == pmax (got {rotary_half}); "
+        "rotary spanning a partial second d-tile is not supported",
+    )
+    BnS = B * n_heads * S
+    even = out[:, nl.ds(0, BnS)].reshape((rotary_half, B, n_heads, S))
+    odd = out[:, nl.ds(BnS, BnS)].reshape((rotary_half, B, n_heads, S))
+
+    # Snapshot the odd half before overwriting even (in-place safety).
+    sb_odd = sbm.alloc_stack((rotary_half, B, n_heads, S), dtype=out.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=sb_odd, src=odd)
+
+    cos_b = sb_cos.expand_dim(2).broadcast(2, n_heads)
+    sin_b = sb_sin.expand_dim(2).broadcast(2, n_heads)
+
+    even_cos = sbm.alloc_stack((rotary_half, B, n_heads, S), dtype=out.dtype, buffer=nl.sbuf)
+    odd_cos = sbm.alloc_stack((rotary_half, B, n_heads, S), dtype=out.dtype, buffer=nl.sbuf)
+    even_sin = sbm.alloc_stack((rotary_half, B, n_heads, S), dtype=out.dtype, buffer=nl.sbuf)
+    odd_sin = sbm.alloc_stack((rotary_half, B, n_heads, S), dtype=out.dtype, buffer=nl.sbuf)
+
+    nisa.tensor_tensor(even_cos, even, cos_b, nl.multiply)
+    nisa.tensor_tensor(odd_cos, sb_odd, cos_b, nl.multiply)
+    nisa.tensor_tensor(even_sin, even, sin_b, nl.multiply)
+    nisa.tensor_tensor(odd_sin, sb_odd, sin_b, nl.multiply)
+
+    nisa.tensor_tensor(even, even_cos, odd_sin, nl.subtract)
+    nisa.tensor_tensor(odd, odd_cos, even_sin, nl.add)
+
+
 def _process_head_group(
     dst_4d: nl.NkiTensor,
     QKV: nl.NkiTensor,
@@ -1271,58 +1516,117 @@ def _process_head_group(
     rmsnorm_post_eps: float,
     rmsnorm_post_W: Optional[nl.NkiTensor],
     sbm: SbufManager,
+    n_d_tiles: int = 1,
+    d_tiled_out: Optional[nl.NkiTensor] = None,
+    n_heads: Optional[int] = None,
+    d: Optional[int] = None,
+    B: Optional[int] = None,
+    S: Optional[int] = None,
 ) -> None:
     """
-    Process Q or K for a single tile: extract heads into dst_4d with layout [d, B, n_heads, S],
-    apply optional RMSNorm pre/post and RoPE in-place on dst_4d.
-    For Q: n_heads=q_heads, qkv_offset=0
-    For K: n_heads=1, qkv_offset=d*q_heads
+    Process Q or K for a single tile: transpose heads, apply optional RMSNorm pre/post and RoPE
+    in-place. For Q: n_heads=q_heads, qkv_offset=0. For K: n_heads=1, qkv_offset=d*q_heads.
+
+    Two head-dim layouts, selected by n_d_tiles (= d_head // pmax):
+    - n_d_tiles == 1 (d_head <= pmax): keep d_head in the partition dim; write dst_4d
+      [d, B, n_heads, S].
+    - n_d_tiles > 1 (d_head > pmax): tile d_head into n_d_tiles pmax-wide chunks laid out in
+      the free dim (d-tile outermost), writing d_tiled_out [pmax, n_d_tiles*B*n_heads*S] — the
+      layout attention_tkg's native d>128 path consumes.
+
+    Partial rotary is driven by the cos/sin shape (rotary_dim = sb_cos.shape[0]*2): RoPE rotates
+    only the first rotary_dim channels; dims [rotary_dim:] pass through untouched. When rotary_dim
+    == d_head this is full rotary.
 
     Args:
-        dst_4d: [d, B, n_heads, S] @ SBUF — pre-allocated output buffer (or sliced view of
-            a larger buffer). Written in place. Must be contiguous along (B, n_heads, S) so
-            the flattened (d, B*n_heads*S) view used by RMSNorm is well-formed. Use nl.NkiTensor
-            so slices work properly for AP creation.
+        dst_4d: [d, B, n_heads, S] @ SBUF output buffer for the n_d_tiles==1 path (in-place).
+            Must be contiguous along (B, n_heads, S). Ignored when n_d_tiles > 1.
+        d_tiled_out: [pmax, n_d_tiles*B*n_heads*S] @ SBUF output buffer for the n_d_tiles > 1 path
+            (in-place); each d-tile occupies [pmax, B*n_heads*S] at offset i_d*B*n_heads*S.
+            n_heads/d/B/S must be supplied in this mode.
         QKV: [B*S, I] @ SBUF where B*S <= pmax.
     """
-    d, B, n_heads, S = dst_4d.shape
-    # Interleaved RoPE internally reshapes its input to (d, B*n_heads*S) for an nc_matmul,
-    # which fails BIR partition-step verification when dst_4d is a sliced view of a larger
-    # buffer. In that case, stage RoPE through a fresh contiguous buffer.
-    needs_rope_staging = enable_rope and not rope_contiguous_layout
-
-    if needs_rope_staging:
-        out = sbm.alloc_stack(shape=(d, B, n_heads, S), dtype=QKV.dtype, buffer=nl.sbuf)
-        out_tv = out
+    if n_d_tiles > 1:
+        out = d_tiled_out
+        # Transpose heads from [B*S, n_heads*d] into out, tiling d into n_d_tiles free-dim chunks.
+        for head_idx in range(n_heads):
+            for i_d in range(n_d_tiles):
+                psum = nl.ndarray((nl.tile_size.pmax, B * S), dtype=QKV.dtype, buffer=nl.psum)
+                nisa.nc_transpose(
+                    psum, QKV[:, nl.ds(qkv_offset + head_idx * d + i_d * nl.tile_size.pmax, nl.tile_size.pmax)]
+                )
+                dst_offset = i_d * (B * n_heads * S) + head_idx * (B * S)
+                nisa.tensor_copy(out[:, nl.ds(dst_offset, B * S)], psum)
+        out_2d = out  # already [pmax, n_d_tiles*B*n_heads*S]
     else:
-        out = dst_4d
-        out_tv = dst_4d
+        d, B, n_heads, S = dst_4d.shape
+        # Interleaved RoPE internally reshapes its input to (d, B*n_heads*S) for an nc_matmul,
+        # which fails BIR partition-step verification when dst_4d is a sliced view of a larger
+        # buffer. In that case, stage RoPE through a fresh contiguous buffer.
+        needs_rope_staging = enable_rope and not rope_contiguous_layout
 
-    # Transpose heads from [B*S, n_heads*d] into out[:, :, head_idx, :]
-    for head_idx in range(n_heads):
-        psum = nl.ndarray((d, B * S), dtype=QKV.dtype, buffer=nl.psum)
-        nisa.nc_transpose(psum, QKV[:, nl.ds(qkv_offset + head_idx * d, d)])
-        nisa.tensor_copy(out[:, :, head_idx, :], psum.reshape((d, B, S)))
+        if needs_rope_staging:
+            out = sbm.alloc_stack(shape=(d, B, n_heads, S), dtype=QKV.dtype, buffer=nl.sbuf)
+            out_tv = out
+        else:
+            out = dst_4d
+            out_tv = dst_4d
 
-    # 2D view for RMSNorm. nl.NkiTensor.reshape preserves parent strides,
-    # generating correct ap patterns even when dst is a slice of a larger buffer.
-    out_2d = out_tv.reshape((d, B * n_heads * S))
+        # Transpose heads from [B*S, n_heads*d] into out[:, :, head_idx, :]
+        for head_idx in range(n_heads):
+            psum = nl.ndarray((d, B * S), dtype=QKV.dtype, buffer=nl.psum)
+            nisa.nc_transpose(psum, QKV[:, nl.ds(qkv_offset + head_idx * d, d)])
+            nisa.tensor_copy(out[:, :, head_idx, :], psum.reshape((d, B, S)))
 
-    # Pre-RoPE RMSNorm
+        # 2D view for RMSNorm. nl.NkiTensor.reshape preserves parent strides,
+        # generating correct ap patterns even when dst is a slice of a larger buffer.
+        out_2d = out_tv.reshape((d, B * n_heads * S))
+
+    # Pre-RoPE RMSNorm (variance spans all n_d_tiles per position; n_d_tiles=1 is the plain case).
     if rmsnorm_pre_enabled:
-        _rms_norm_inplace(out_2d, rmsnorm_pre_eps, w=rmsnorm_pre_W, sbm=sbm)
+        _rms_norm_inplace(out_2d, rmsnorm_pre_eps, n_d_tiles=n_d_tiles, w=rmsnorm_pre_W, sbm=sbm)
 
-    # RoPE (in-place: x_in_sb == x_out_sb == out)
+    # RoPE (in-place). rotary_dim = cos.shape[0]*2. RoPE pairs channel c (first "even" half
+    # [0:rotary_dim/2]) with channel c+rotary_dim/2 (second "odd" half); channels [rotary_dim:]
+    # pass through. rotary_dim == d_head is full rotary; rotary_dim < d_head is partial.
     if enable_rope:
-        rope_cos = sb_cos
-        rope_sin = sb_sin
-        RoPE_sbuf(out, rope_cos, rope_sin, out, convert_from_interleaved=not rope_contiguous_layout)
+        rotary_half = sb_cos.shape[0]
+        rotary_dim = rotary_half * 2
+        pmax = nl.tile_size.pmax
+        if n_d_tiles == 1:
+            # d_head <= pmax: rotary channels are contiguous in the partition dim.
+            if rotary_dim < out_2d.shape[0]:
+                rope_view = out_2d[:rotary_dim, :].reshape((rotary_dim, B, n_heads, S))
+                RoPE_sbuf(rope_view, sb_cos, sb_sin, rope_view, convert_from_interleaved=not rope_contiguous_layout)
+            else:
+                RoPE_sbuf(out, sb_cos, sb_sin, out, convert_from_interleaved=not rope_contiguous_layout)
+        elif rotary_dim <= pmax:
+            # d_head > pmax but rotary confined to d-tile 0 (e.g. Qwen3.5 rotary_dim=64): d-tile 0
+            # occupies the first B*n_heads*S free columns and the rotary channels are its first
+            # rotary_dim partitions.
+            rope_view = out[:rotary_dim, : B * n_heads * S].reshape((rotary_dim, B, n_heads, S))
+            RoPE_sbuf(rope_view, sb_cos, sb_sin, rope_view, convert_from_interleaved=not rope_contiguous_layout)
+        else:
+            # d_head > pmax with rotary spanning d-tiles (e.g. Gemma d_head=256, full rotary_dim=256):
+            # the even half [0:rotary_half] and odd half [rotary_half:rotary_dim] land in different
+            # d-tiles laid out along the free dim, so RoPE_sbuf's partition-dim split does not apply.
+            # Rotate the affected tiles directly (contiguous layout only; the tiled Q/K producer
+            # always emits contiguous halves).
+            kernel_assert(
+                rope_contiguous_layout,
+                "d_head>pmax rotary spanning d-tiles requires rope_contiguous_layout=True",
+            )
+            kernel_assert(
+                rotary_dim <= 2 * pmax,
+                f"rotary_dim={rotary_dim} > 2*pmax not supported (rotary may span at most 2 d-tiles)",
+            )
+            _rope_d_tiled_spanning(out, sb_cos, sb_sin, rotary_half, B, n_heads, S, sbm)
 
     # Post-RoPE RMSNorm
     if rmsnorm_post_enabled:
-        _rms_norm_inplace(out_2d, rmsnorm_post_eps, rmsnorm_post_W, sbm)
+        _rms_norm_inplace(out_2d, rmsnorm_post_eps, n_d_tiles=n_d_tiles, w=rmsnorm_post_W, sbm=sbm)
 
-    if needs_rope_staging:
+    if n_d_tiles == 1 and enable_rope and not rope_contiguous_layout:
         nisa.tensor_copy(dst_4d, out)
 
 
@@ -1394,9 +1698,22 @@ def _QKV_processing(
     """
     I = d_head * (q_heads + 2 * kv_heads)
 
-    # Allocate full output buffers
-    Q_sb = sbm.alloc_stack((d_head, B * q_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
-    K_sb = sbm.alloc_stack((d_head, B * kv_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
+    # d_head > 128: Q/K are produced in the tiled [nl.tile_size.pmax, n_d_tiles*B*H*S] layout that
+    # mainline attention_tkg's native d>128 path consumes (d-tile outermost). The tiled
+    # producer fills the FULL-batch buffer in one shot, so it requires a single BxS tile.
+    n_d_tiles = d_head // nl.tile_size.pmax
+    is_d_tiled = n_d_tiles > 1
+    if is_d_tiled:
+        kernel_assert(
+            n_bxs_tiles == 1,
+            f"d_head>128 tiled Q/K path requires B*S_tkg <= pmax (single tile), got n_bxs_tiles={n_bxs_tiles}",
+        )
+        Q_sb = sbm.alloc_stack((nl.tile_size.pmax, n_d_tiles * B * q_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
+        K_sb = sbm.alloc_stack((nl.tile_size.pmax, n_d_tiles * B * kv_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
+    else:
+        # Allocate full output buffers
+        Q_sb = sbm.alloc_stack((d_head, B * q_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
+        K_sb = sbm.alloc_stack((d_head, B * kv_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
     V_hbm = nl.ndarray(
         (B, kv_heads, S_tkg, d_head),
         dtype=kv_quant_dtype if kv_quant else io_dtype,
@@ -1412,8 +1729,10 @@ def _QKV_processing(
         sb_cos = _to_sbuf(cos, sbm)
         sb_sin = _to_sbuf(sin, sbm)
 
-    Q_4d = Q_sb.reshape((d_head, B, q_heads, S_tkg))
-    K_4d = K_sb.reshape((d_head, B, kv_heads, S_tkg))
+    # Q_4d/K_4d are only used by the d<=128 (non-d-tiled) _process_head_group path below.
+    if not is_d_tiled:
+        Q_4d = Q_sb.reshape((d_head, B, q_heads, S_tkg))
+        K_4d = K_sb.reshape((d_head, B, kv_heads, S_tkg))
 
     for tile_idx in range(n_bxs_tiles):
         tile_start = tile_idx * bxs_tile
@@ -1436,41 +1755,89 @@ def _QKV_processing(
             tile_cos = sb_cos.slice(1, start=tile_b_start, end=tile_b_start + tile_B)
             tile_sin = sb_sin.slice(1, start=tile_b_start, end=tile_b_start + tile_B)
 
-        # Process Q tile directly into Q_sb's [:, tile_b_start:tile_b_start+tile_B, :, :] slice
-        _process_head_group(
-            dst_4d=Q_4d.slice(1, start=tile_b_start, end=tile_b_start + tile_B),
-            QKV=qkv_sb,
-            qkv_offset=0,
-            rmsnorm_pre_enabled=rmsnorm_pre_enabled,
-            rmsnorm_pre_eps=rmsnorm_pre_eps,
-            rmsnorm_pre_W=rmsnorm_pre_W_Q,
-            enable_rope=enable_rope,
-            sb_cos=tile_cos,
-            sb_sin=tile_sin,
-            rope_contiguous_layout=rope_contiguous_layout,
-            rmsnorm_post_enabled=rmsnorm_post_enabled,
-            rmsnorm_post_eps=rmsnorm_post_eps,
-            rmsnorm_post_W=rmsnorm_post_W_Q,
-            sbm=sbm,
-        )
+        # Process Q. d>128 uses the tiled producer (writes full-batch tiled Q_sb); else the
+        # mainline per-tile head group.
+        if is_d_tiled:
+            _process_head_group(
+                dst_4d=None,
+                QKV=qkv_sb,
+                qkv_offset=0,
+                rmsnorm_pre_enabled=rmsnorm_pre_enabled,
+                rmsnorm_pre_eps=rmsnorm_pre_eps,
+                rmsnorm_pre_W=rmsnorm_pre_W_Q,
+                enable_rope=enable_rope,
+                sb_cos=tile_cos,
+                sb_sin=tile_sin,
+                rope_contiguous_layout=rope_contiguous_layout,
+                rmsnorm_post_enabled=rmsnorm_post_enabled,
+                rmsnorm_post_eps=rmsnorm_post_eps,
+                rmsnorm_post_W=rmsnorm_post_W_Q,
+                sbm=sbm,
+                n_d_tiles=n_d_tiles,
+                d_tiled_out=Q_sb,
+                n_heads=q_heads,
+                d=d_head,
+                B=B,
+                S=S_tkg,
+            )
+            _process_head_group(
+                dst_4d=None,
+                QKV=qkv_sb,
+                qkv_offset=d_head * q_heads,
+                rmsnorm_pre_enabled=rmsnorm_pre_enabled,
+                rmsnorm_pre_eps=rmsnorm_pre_eps,
+                rmsnorm_pre_W=rmsnorm_pre_W_K,
+                enable_rope=enable_rope,
+                sb_cos=tile_cos,
+                sb_sin=tile_sin,
+                rope_contiguous_layout=rope_contiguous_layout,
+                rmsnorm_post_enabled=rmsnorm_post_enabled,
+                rmsnorm_post_eps=rmsnorm_post_eps,
+                rmsnorm_post_W=rmsnorm_post_W_K,
+                sbm=sbm,
+                n_d_tiles=n_d_tiles,
+                d_tiled_out=K_sb,
+                n_heads=kv_heads,
+                d=d_head,
+                B=B,
+                S=S_tkg,
+            )
+        else:
+            # Process Q tile directly into Q_sb's [:, tile_b_start:tile_b_start+tile_B, :, :] slice
+            _process_head_group(
+                dst_4d=Q_4d.slice(1, start=tile_b_start, end=tile_b_start + tile_B),
+                QKV=qkv_sb,
+                qkv_offset=0,
+                rmsnorm_pre_enabled=rmsnorm_pre_enabled,
+                rmsnorm_pre_eps=rmsnorm_pre_eps,
+                rmsnorm_pre_W=rmsnorm_pre_W_Q,
+                enable_rope=enable_rope,
+                sb_cos=tile_cos,
+                sb_sin=tile_sin,
+                rope_contiguous_layout=rope_contiguous_layout,
+                rmsnorm_post_enabled=rmsnorm_post_enabled,
+                rmsnorm_post_eps=rmsnorm_post_eps,
+                rmsnorm_post_W=rmsnorm_post_W_Q,
+                sbm=sbm,
+            )
 
-        # Process K tile directly into K_sb's [:, tile_b_start:tile_b_start+tile_B, :, :] slice
-        _process_head_group(
-            dst_4d=K_4d.slice(1, start=tile_b_start, end=tile_b_start + tile_B),
-            QKV=qkv_sb,
-            qkv_offset=d_head * q_heads,
-            rmsnorm_pre_enabled=rmsnorm_pre_enabled,
-            rmsnorm_pre_eps=rmsnorm_pre_eps,
-            rmsnorm_pre_W=rmsnorm_pre_W_K,
-            enable_rope=enable_rope,
-            sb_cos=tile_cos,
-            sb_sin=tile_sin,
-            rope_contiguous_layout=rope_contiguous_layout,
-            rmsnorm_post_enabled=rmsnorm_post_enabled,
-            rmsnorm_post_eps=rmsnorm_post_eps,
-            rmsnorm_post_W=rmsnorm_post_W_K,
-            sbm=sbm,
-        )
+            # Process K tile directly into K_sb's [:, tile_b_start:tile_b_start+tile_B, :, :] slice
+            _process_head_group(
+                dst_4d=K_4d.slice(1, start=tile_b_start, end=tile_b_start + tile_B),
+                QKV=qkv_sb,
+                qkv_offset=d_head * q_heads,
+                rmsnorm_pre_enabled=rmsnorm_pre_enabled,
+                rmsnorm_pre_eps=rmsnorm_pre_eps,
+                rmsnorm_pre_W=rmsnorm_pre_W_K,
+                enable_rope=enable_rope,
+                sb_cos=tile_cos,
+                sb_sin=tile_sin,
+                rope_contiguous_layout=rope_contiguous_layout,
+                rmsnorm_post_enabled=rmsnorm_post_enabled,
+                rmsnorm_post_eps=rmsnorm_post_eps,
+                rmsnorm_post_W=rmsnorm_post_W_K,
+                sbm=sbm,
+            )
 
         # Extract V from QKV to SBUF, then copy to HBM for attention_tkg.
         if kv_heads == 1:
@@ -1508,57 +1875,80 @@ def _QKV_processing(
 
 
 def _rms_norm_inplace(
-    x: nl.NkiTensor, eps: float, w: Optional[nl.NkiTensor] = None, sbm: Optional[SbufManager] = None
+    x: nl.NkiTensor, eps: float, n_d_tiles: int = 1, w: Optional[nl.NkiTensor] = None, sbm: Optional[SbufManager] = None
 ) -> None:
     """
     RMS normalization in-place: x / sqrt(mean(x^2) + eps), optionally scaled by w.
     Computed in fp32, result written back to x in original dtype.
 
+    Supports d_head > pmax via d-tiling: x is (nl.tile_size.pmax, n_d_tiles * BnS) where
+    each d-tile's BnS elements are contiguous. The variance is computed across
+    all d-tiles for each (batch, head, seq) position. For d_head <= pmax the caller
+    leaves n_d_tiles=1 and this is the plain [d_head, BnS] normalization.
+
     Args:
-        x: [d_head, BnS] @ SBUF - input tensor (d_head must be nl.tile_size.pmax), modified in-place
+        x: [nl.tile_size.pmax, n_d_tiles * BnS] @ SBUF - input tensor, modified in-place.
+            For d_head <= pmax, n_d_tiles=1 and this is [d_head, BnS].
         eps: epsilon for numerical stability
-        w: [d_head, 1] @ HBM - optional scale weights
+        n_d_tiles: number of d-tiles = d_head // pmax (1 for d_head <= pmax).
+        w: [d_head, 1] @ HBM - optional scale gamma weights (d_head = n_d_tiles * pmax).
         sbm: SBUF memory manager
     """
-    d_head, BnS = x.shape
-    kernel_assert(d_head == nl.tile_size.pmax, f"d_head must be {nl.tile_size.pmax}, got {d_head}")
+    p_dim, total_free = x.shape
+    kernel_assert(p_dim == nl.tile_size.pmax, f"partition dim must be {nl.tile_size.pmax}, got {p_dim}")
+
+    d_head = n_d_tiles * nl.tile_size.pmax
+    BnS = total_free // n_d_tiles
 
     # Setup constants
-    ones_sb = sbm.alloc_stack((d_head, d_head), dtype=nl.float32, buffer=nl.sbuf)
+    ones_sb = sbm.alloc_stack((nl.tile_size.pmax, nl.tile_size.pmax), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(ones_sb, 1.0)
-    eps_sb = sbm.alloc_stack((d_head, 1), dtype=nl.float32, buffer=nl.sbuf)
+    eps_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(eps_sb, eps)
 
-    # Compute x^2 in fp32
-    x_squared = sbm.alloc_stack((d_head, BnS), dtype=nl.float32, buffer=nl.sbuf)
+    fmax = nl.tile_size.gemm_moving_fmax
+
+    # Compute x^2 in fp32 (elementwise, no cross-position/tile dependency, so done in one shot
+    # over the full [pmax, n_d_tiles * BnS] input).
+    x_squared = sbm.alloc_stack((nl.tile_size.pmax, total_free), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(x_squared, x, x, nl.multiply)
 
-    total_free_dim = BnS
-    fmax = nl.tile_size.gemm_moving_fmax
-    rsqrt_sb = sbm.alloc_stack((d_head, BnS), dtype=nl.float32, buffer=nl.sbuf)
-    for t_start in range(0, total_free_dim, fmax):
-        t_size = min(fmax, total_free_dim - t_start)
-        # Compute sum(x^2) via matmul with all-ones matrix
-        psum_sb = nl.ndarray((d_head, t_size), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(psum_sb, stationary=ones_sb, moving=x_squared[:, nl.ds(t_start, t_size)])
+    rsqrt_sb = sbm.alloc_stack((nl.tile_size.pmax, BnS), dtype=nl.float32, buffer=nl.sbuf)
+    for t_start in range(0, BnS, fmax):
+        t_size = min(fmax, BnS - t_start)
+        # Compute sum(x^2) via matmul with all-ones matrix. For n_d_tiles>1 the d channels span
+        # n_d_tiles free-dim tiles, so accumulate their partial sums in PSUM (n_d_tiles==1 is a
+        # single matmul, identical to the non-tiled path).
+        psum_sb = nl.ndarray((nl.tile_size.pmax, t_size), dtype=nl.float32, buffer=nl.psum)
+        for i_d in range(n_d_tiles):
+            # Repeated matmuls into the same PSUM auto-accumulate; leave the accumulate flag
+            # unset (let the compiler decide) so it is consistent across all d-tile matmuls
+            # (mixing set/unset flags into one PSUM is rejected by NCC_ILMM003).
+            nisa.nc_matmul(
+                psum_sb,
+                stationary=ones_sb,
+                moving=x_squared[:, nl.ds(i_d * BnS + t_start, t_size)],
+            )
 
-        # Compute rsqrt(mean(x^2) + eps)
+        # Compute rsqrt(mean(x^2) + eps); mean divides by d_head (across all d-tiles).
         nisa.activation(
             dst=rsqrt_sb[:, nl.ds(t_start, t_size)], op=nl.rsqrt, data=psum_sb, bias=eps_sb, scale=1.0 / d_head
         )
 
-    # Normalize: x * rsqrt
-    out_sb = sbm.alloc_stack((d_head, BnS), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(out_sb, x, rsqrt_sb, nl.multiply)
+    # Normalize each d-tile: x * rsqrt, optionally scaled by w
+    for i_d in range(n_d_tiles):
+        x_tile_view = x[:, nl.ds(i_d * BnS, BnS)]
+        out_sb = sbm.alloc_stack((nl.tile_size.pmax, BnS), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out_sb, x_tile_view, rsqrt_sb, nl.multiply)
 
-    # Optional scaling by weights
-    if w != None:
-        w_sb = sbm.alloc_stack((d_head, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(w_sb, w.reshape((d_head, 1)))
-        nisa.tensor_scalar(dst=out_sb, data=out_sb, op0=nl.multiply, operand0=w_sb)
+        # Optional scaling by weights (this d-tile's pmax-wide slice of the [d_head, 1] gamma)
+        if w is not None:
+            w_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(w_sb, w.reshape((d_head, 1))[nl.ds(i_d * nl.tile_size.pmax, nl.tile_size.pmax), :])
+            nisa.tensor_scalar(dst=out_sb, data=out_sb, op0=nl.multiply, operand0=w_sb)
 
-    # Copy result back to x with original dtype
-    nisa.tensor_copy(dst=x, src=out_sb)
+        # Copy result back to x with original dtype
+        nisa.tensor_copy(dst=x_tile_view, src=out_sb)
 
 
 ############################# KV cache update logic #############################
@@ -1577,6 +1967,7 @@ def _kv_cache_update(
     K_cache_transposed: bool,
     is_block_kv: bool,
     fp8_packed: bool = False,
+    oob_skip: bool = False,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Update KV cache with new tokens for token generation.
@@ -1603,12 +1994,12 @@ def _kv_cache_update(
         is_block_kv: block KV cache flag
         fp8_packed: when True with block KV, K_cache is fp8 [num_blocks, block_len // 2, d_head, 2];
             uses parity-split load-modify-store DMA.
+        oob_skip: when True, flat-cache write DMAs use oob_mode.skip so out-of-bounds update
+            indices drop the write instead of erroring. Set by CP. Defaults to oob_mode.error.
 
     Returns:
         Updated (K_cache, V_cache) - modified in-place
     """
-
-    # TODO: oob_mode.skip not supported for flat cache. Using oob_mode.skip causes accuracy failures (root cause unknown).
 
     if is_block_kv:
         kernel_assert(
@@ -1636,6 +2027,7 @@ def _kv_cache_update(
             B,
             d_head,
             K_cache_transposed=K_cache_transposed,
+            oob_skip=oob_skip,
         )
     else:
         # per-batch scalar DMA
@@ -1650,6 +2042,7 @@ def _kv_cache_update(
             S_max_ctx,
             B,
             d_head,
+            oob_skip=oob_skip,
         )
 
 
@@ -1664,6 +2057,7 @@ def _update_flat_cache_batched(
     B: int,
     d_head: int,
     K_cache_transposed: bool = False,
+    oob_skip: bool = False,
 ) -> None:
     """
     Update flat (non-block) KV cache with new tokens using batched DMA operations.
@@ -1683,7 +2077,11 @@ def _update_flat_cache_batched(
         S_max_ctx: maximum cache sequence length
         B: batch size
         d_head: head dimension
+        oob_skip: when True, write DMAs use oob_mode.skip so out-of-bounds indices
+            (CP non-owning ranks) silently drop the write. Defaults to oob_mode.error.
     """
+    dma_oob_mode = oob_mode.skip if oob_skip else oob_mode.error
+
     # Validate sharding configuration
     _, n_prgs, prg_id = get_verified_program_sharding_info("kv_cache update", (0, 1), 2)
     kernel_assert(n_prgs <= 2, f"Expected lnc in [1,2], got {n_prgs}")
@@ -1751,6 +2149,7 @@ def _update_flat_cache_batched(
                     indirect_dim=0,
                 ),
                 src=v_tile.ap(pattern=[[S_tkg * d_head, tile_B], [d_head, S_tkg], [1, d_head]]),
+                oob_mode=dma_oob_mode,
             )
 
         # Update K_cache on lnc=1
@@ -1778,6 +2177,7 @@ def _update_flat_cache_batched(
                         indirect_dim=0,
                     ),
                     src=K_tile_sb.ap(pattern=[[d_head, tile_B], [1, d_head], [1, S_tkg]]),
+                    oob_mode=dma_oob_mode,
                 )
             else:
                 # K_cache [B, S_max_ctx, d_head] — same pattern as V
@@ -1789,6 +2189,7 @@ def _update_flat_cache_batched(
                         indirect_dim=0,
                     ),
                     src=K_tile_sb.ap(pattern=[[S_tkg * d_head, tile_B], [d_head, S_tkg], [1, d_head]]),
+                    oob_mode=dma_oob_mode,
                 )
 
 
@@ -1803,6 +2204,7 @@ def _update_flat_cache(
     S_max_ctx: int,
     B: int,
     d_head: int,
+    oob_skip: bool = False,
 ) -> None:
     """
     Update flat (non-block) KV cache with new tokens using per-batch scalar_offset.
@@ -1822,7 +2224,11 @@ def _update_flat_cache(
         S_max_ctx: maximum cache sequence length
         B: batch size
         d_head: head dimension
+        oob_skip: when True, write DMAs use oob_mode.skip so out-of-bounds indices
+            (CP non-owning ranks) silently drop the write. Defaults to oob_mode.error.
     """
+    dma_oob_mode = oob_mode.skip if oob_skip else oob_mode.error
+
     _, n_prgs, prg_id = get_verified_program_sharding_info("kv_cache update", (0, 1), 2)
     kernel_assert(n_prgs <= 2, f"Expected lnc in [1,2], got {n_prgs}")
 
@@ -1859,6 +2265,7 @@ def _update_flat_cache(
                     indirect_dim=1,
                 ),
                 src=v_src,
+                oob_mode=dma_oob_mode,
             )
 
     # Update K_cache on lnc=1
@@ -1880,6 +2287,7 @@ def _update_flat_cache(
                         indirect_dim=2,
                     ),
                     src=K_tkg[:, nl.ds(batch_idx * S_tkg, S_tkg)],
+                    oob_mode=dma_oob_mode,
                 )
         else:
             kernel_assert(
@@ -1899,6 +2307,7 @@ def _update_flat_cache(
                         indirect_dim=1,
                     ),
                     src=k_src,
+                    oob_mode=dma_oob_mode,
                 )
 
 

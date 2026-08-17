@@ -23,9 +23,9 @@ helpers directly.
 """
 
 import pytest
-
 from nkilib_src.nkilib.experimental.neurotile.core._validation import _validate_psum_pool_grid_args
 from nkilib_src.nkilib.experimental.neurotile.core.layout_psum import PSUMLayout
+
 from test.unit.nkilib.experimental.neurotile._mocks import MockTensor
 from test.utils.pytest_test_metadata import pytest_marks
 

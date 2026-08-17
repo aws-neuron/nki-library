@@ -62,6 +62,7 @@ class TestSQSEmitter:
                 "seq_len": 1024,
             }
         )
+        collector.set_pytest_marks(["fast", "rmsnorm"])
         collector.record_metric(MetricName.COMPILATION_TIME, 3.74, "Seconds")
         collector.record_metric(MetricName.MBU_ESTIMATED_PERCENT, 85.5, "Percent")
         collector.record_metric(MetricName.INFERENCE_TIME, 1.2, "Milliseconds")
@@ -102,6 +103,7 @@ class TestSQSEmitter:
         assert payload["TestName"] == "test_rmsnorm[batch=32-seq=1024]"
         assert payload["KernelName"] == "rmsnorm"
         assert payload["Status"] == "PASSED"
+        assert payload["PytestMarks"] == ["fast", "rmsnorm"]
 
         # Verify params from collector.set_kernel_params()
         assert payload["Params"]["batch_size"] == 32
@@ -119,6 +121,7 @@ class TestSQSEmitter:
         emitter.emit_run_complete(
             tests_passed=95,
             tests_total=100,
+            run_duration_sec=1234.56,
         )
 
         mock_sqs.send_message.assert_called_once()
@@ -140,6 +143,7 @@ class TestSQSEmitter:
         assert payload["IsRelease"] is False
         assert payload["TestsPassed"] == 95
         assert payload["TestsTotal"] == 100
+        assert payload["RunDurationSec"] == pytest.approx(1234.56)
         assert "Timestamp" in payload
 
     def test_emit_with_custom_run_type_and_is_release(self, mock_sqs, collector_with_metrics):
@@ -162,6 +166,7 @@ class TestSQSEmitter:
         emitter.emit_run_complete(
             tests_passed=10,
             tests_total=10,
+            run_duration_sec=42.0,
         )
         message = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])
         payload = message["payload"]
@@ -187,7 +192,7 @@ class TestSQSEmitter:
         assert "VersionSetEid" not in test_result_payload
 
         mock_sqs.send_message.reset_mock()
-        emitter.emit_run_complete(tests_passed=3, tests_total=3)
+        emitter.emit_run_complete(tests_passed=3, tests_total=3, run_duration_sec=1.0)
         run_complete_payload = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])["payload"]
         assert run_complete_payload["RunType"] == "user"
         assert run_complete_payload["Username"] == "alice"
@@ -207,7 +212,7 @@ class TestSQSEmitter:
         assert test_result_payload["VersionSetEid"] == "6446448844"
 
         mock_sqs.send_message.reset_mock()
-        emitter.emit_run_complete(tests_passed=5, tests_total=5)
+        emitter.emit_run_complete(tests_passed=5, tests_total=5, run_duration_sec=1.0)
         run_complete_payload = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])["payload"]
         assert run_complete_payload["VersionSetEid"] == "6446448844"
 
@@ -218,7 +223,7 @@ class TestSQSEmitter:
 
         # Should not raise
         emitter.emit(collector)
-        emitter.emit_run_complete(10, 10)
+        emitter.emit_run_complete(10, 10, run_duration_sec=1.0)
 
     def test_get_metrics_enabled(self, mock_sqs):
         """Verify get_metrics_enabled() returns correct value."""
@@ -261,6 +266,7 @@ class TestSQSEmitter:
             "Target",
             "TraceMode",
             "NkiCompilationMode",
+            "PytestMarks",
         ]
         for field in required_fields:
             assert field in payload, f"Missing required field: {field}"
@@ -272,6 +278,15 @@ class TestSQSEmitter:
         assert isinstance(payload["Status"], str)
         assert isinstance(payload["Params"], dict)
         assert isinstance(payload["Metrics"], dict)
+        assert isinstance(payload["PytestMarks"], list)
+
+    def test_emit_includes_empty_pytest_marks(self, mock_sqs, collector_with_metrics):
+        collector_with_metrics.set_pytest_marks([])
+
+        SQSEmitter(session=_SESSION).emit(collector_with_metrics)
+
+        payload = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])["payload"]
+        assert payload["PytestMarks"] == []
 
     def test_emit_skipped_test_via_collector(self, mock_sqs):
         """Verify skipped tests emit via emit(collector) with Status=skipped dimension."""
@@ -311,6 +326,7 @@ class TestSQSEmitter:
         emitter.emit_run_complete(
             tests_passed=80,
             tests_total=100,
+            run_duration_sec=987.65,
             tests_skipped=15,
             tests_xfailed=5,
             coverage_data=coverage_data,
@@ -327,6 +343,7 @@ class TestSQSEmitter:
         assert payload["TestsTotal"] == 100
         assert payload["TestsSkipped"] == 15
         assert payload["TestsXfailed"] == 5
+        assert payload["RunDurationSec"] == pytest.approx(987.65)
 
         # Coverage fields must be merged into the top-level payload
         assert payload["BranchRate"] == pytest.approx(0.85)

@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""3D Convolution Transpose kernel for NeuronCore.
-
-This module is intentionally self-contained: it embeds a full copy of the
-3D convolution core implementation (as private helpers) so that
-conv3d_transpose has no dependency on conv3d.py and can evolve independently.
-"""
+"""3D Convolution Transpose kernel for NeuronCore."""
 
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -63,6 +58,7 @@ def _conv3d_core(
     activation_fn: Optional[ActFnType] = None,
     lnc_shard: bool = False,
     filter_shape: str = _FILTER_SHAPE_KDHW_CI_CO,
+    flip_filter_taps_in_kernel: bool = False,
     sbm: Optional[SbufManager] = None,
     use_auto_allocation: bool = False,
 ) -> nl.NkiTensor:
@@ -114,7 +110,7 @@ def _conv3d_core(
             Input dilation factors. Inserts (input_dilation - 1) zeros between input elements.
             Default (1, 1, 1) gives standard convolution behavior.
         activation_fn (Optional[ActFnType]): Optional activation function to apply after conv.
-        lnc_shard (bool): Enable LNC sharding across neuron cores.
+        lnc_shard (bool): Does nothing. Will be deprecated in next release.
         filter_shape (str): Storage layout of the filters tensor.
         sbm (Optional[SbufManager]): Optional caller-provided SBUF manager. When None, the kernel creates its
             own SbufManager.
@@ -178,7 +174,16 @@ def _conv3d_core(
         - All sizes iteratively reduced in _build_tile_config until SBUF budget is met
     """
     cfg = _build_conv3d_config(
-        x_in, filters, bias, stride, padding, dilation, input_dilation, activation_fn, lnc_shard, filter_shape
+        x_in,
+        filters,
+        bias,
+        stride,
+        padding,
+        dilation,
+        input_dilation,
+        activation_fn,
+        filter_shape,
+        flip_filter_taps_in_kernel,
     )
     dtype_size = sizeinbytes(x_in.dtype)
 
@@ -195,7 +200,7 @@ def _conv3d_core(
     else:
         total_sbuf_budget = nl.tile_size.total_available_sbuf_size
 
-    tile_cfg = _build_tile_config(cfg, lnc_shard, dtype_size, total_sbuf_budget)
+    tile_cfg = _build_tile_config(cfg, dtype_size, total_sbuf_budget)
     mem_cfg = _build_memory_config(cfg, tile_cfg, dtype_size, total_sbuf_budget)
     _validate_conv3d_inputs(x_in, filters, bias, cfg)
 
@@ -507,8 +512,8 @@ class Conv3dConfig(nl.NKIObject):
     has_bias: bool
     has_activation: bool
     activation_fn: Optional[ActFnType]
-    lnc_shard: bool
     filter_shape: str
+    flip_filter_taps_in_kernel: bool
     B: int
     C_in: int
     C_out: int
@@ -610,8 +615,8 @@ def _build_conv3d_config(
     dilation: tuple[int, int, int],
     input_dilation: tuple[int, int, int],
     activation_fn: Optional[ActFnType],
-    lnc_shard: bool,
     filter_shape: str,
+    flip_filter_taps_in_kernel: bool = False,
 ) -> Conv3dConfig:
     """
     Build Conv3dConfig from input tensors and convolution parameters.
@@ -647,8 +652,8 @@ def _build_conv3d_config(
         has_bias=bias != None,
         has_activation=activation_fn != None,
         activation_fn=activation_fn,
-        lnc_shard=lnc_shard,
         filter_shape=filter_shape,
+        flip_filter_taps_in_kernel=flip_filter_taps_in_kernel,
         B=B,
         C_in=C_in,
         C_out=C_out,
@@ -690,7 +695,6 @@ def _calculate_union_window_size(cfg: Conv3dConfig, num_dh_stacked: int, w_tile:
 
 def _build_tile_config(
     cfg: Conv3dConfig,
-    lnc_shard: bool,
     dtype_size: int,
     total_sbuf_budget: Optional[int] = None,
 ) -> Conv3dTileConfig:
@@ -698,9 +702,7 @@ def _build_tile_config(
     P_MAX = nl.tile_size.pmax
     F_MAX = nl.tile_size.psum_fmax
     TOTAL_SBUF = total_sbuf_budget if total_sbuf_budget != None else nl.tile_size.total_available_sbuf_size
-    n_prgs, prg_id = 1, 0
-    if lnc_shard:
-        _, n_prgs, prg_id = get_verified_program_sharding_info("conv3d_transpose", (0, 1))
+    _, n_prgs, prg_id = get_verified_program_sharding_info("conv3d_transpose", (0, 1))
 
     full_c_out_tile_count = div_ceil(cfg.C_out, P_MAX)
     total_dh_positions = cfg.D_out * cfg.H_out
@@ -711,12 +713,12 @@ def _build_tile_config(
     cout_waste = 2 * cout_tiles_per_nc - full_c_out_tile_count
     shard_on_dh = (total_dh_positions >= 2) and (dh_waste <= cout_waste)
 
-    if lnc_shard and shard_on_dh:
+    if n_prgs > 1 and shard_on_dh:
         C_out_start, C_out_end, C_out_local = 0, cfg.C_out, cfg.C_out
         dh_per_nc = div_ceil(total_dh_positions, n_prgs)
         dh_start = dh_per_nc * prg_id
         dh_end = min(dh_start + dh_per_nc, total_dh_positions)
-    elif lnc_shard:
+    elif n_prgs > 1:
         C_out_per_nc = div_ceil(cfg.C_out, n_prgs)
         C_out_start = C_out_per_nc * prg_id
         C_out_end = min(C_out_start + C_out_per_nc, cfg.C_out)
@@ -1728,10 +1730,6 @@ def _scatter_input_to_stacked(
                                 continue
                             d_local = d_in - valid_d_start
                             h_local = h_in - valid_h_start
-                            # Native NkiTensor.slice requires `end` to be the true
-                            # exclusive bound (<= dim size); for a strided slice
-                            # selecting num_valid_w elements with stride input_dilation_w
-                            # that bound is dst_base + (num_valid_w - 1) * step + 1.
                             dst_base = dh_idx * w_tile_size + kw_valid_start
                             dst_end = dst_base + (num_valid_w - 1) * cfg.input_dilation_w + 1
                             dst_view = raw_buf.slice(
@@ -1886,9 +1884,6 @@ def _conv3d_matmul(
         for c_out_idx in range(len(psum_tiles)):
             if packed_used:
                 # Packed path
-                # Native NkiTensor.slice requires `end` to be the true exclusive
-                # bound (<= dim size); for strided slices selecting n elements with
-                # a stride, that bound is start + (n-1)*step + 1, not start + n*step.
                 psum_sub = (
                     psum_tiles[c_out_idx]
                     .slice(dim=1, start=0, end=effective_free_dim, step=1)
@@ -2362,7 +2357,7 @@ def _load_filters_into_bufs(
     dimension with the appropriate partition stride. Zero-initializes buffers
     when the partition stride exceeds the C_in tile size to handle padding.
     """
-    K_h, K_w = cfg.K_h, cfg.K_w
+    K_d, K_h, K_w = cfg.K_d, cfg.K_h, cfg.K_w
     K_total_used = len(used_k_positions)
     c_in_size = c_in_end - c_in_start
     c_out_wide = c_out_group_end - c_out_group_start
@@ -2390,6 +2385,10 @@ def _load_filters_into_bufs(
             partition_offset = k_rep_idx * partition_stride
             flat_k_pos = used_k_positions[k_start + k_rep_idx]
             k_d_idx, k_h_idx, k_w_idx = _decompose_k_position(flat_k_pos, K_h, K_w)
+            if cfg.flip_filter_taps_in_kernel:
+                k_d_idx = K_d - 1 - k_d_idx
+                k_h_idx = K_h - 1 - k_h_idx
+                k_w_idx = K_w - 1 - k_w_idx
             if use_dma_transpose:
                 # KDHW_CO_CI
                 src_view = (
@@ -2520,11 +2519,13 @@ def conv3d_transpose(
     filters: nl.NkiTensor,
     bias: Optional[nl.NkiTensor] = None,
     stride: tuple[int, int, int] = (1, 1, 1),
-    padding: tuple[int, int, int] = (0, 0, 0),
+    padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
     dilation: tuple[int, int, int] = (1, 1, 1),
+    output_padding: tuple[int, int, int] = (0, 0, 0),
     activation_fn: Optional[ActFnType] = None,
     lnc_shard: bool = False,
     filter_shape: str = _FILTER_SHAPE_KDHW_CI_CO,
+    flip_filter_taps_in_kernel: bool = False,
     sbm: Optional[SbufManager] = None,
     use_auto_allocation: bool = False,
 ) -> nl.NkiTensor:
@@ -2552,16 +2553,25 @@ def conv3d_transpose(
 
     Args:
         x_in (nl.NkiTensor): [B, C_in, D, H, W], Input tensor on HBM.
-        filters (nl.NkiTensor): Filter weights on HBM with spatial axes flipped. Shape depends on filter_shape:
+        filters (nl.NkiTensor): Filter weights on HBM. Their spatial orientation depends on
+            flip_filter_taps_in_kernel (see below). Shape depends on filter_shape:
             - "KDHW_CI_CO" (default): [K_d, K_h, K_w, C_in, C_out]
             - "KDHW_CO_CI":           [K_d, K_h, K_w, C_out, C_in]
         bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM.
         stride (tuple[int, int, int]): (stride_d, stride_h, stride_w), Convolution strides.
-        padding (tuple[int, int, int]): (pad_d, pad_h, pad_w), Padding for each spatial dimension.
+        padding (tuple[int, int, int, int, int, int]): Asymmetric 6-value padding
+            (pad_d_lo, pad_d_hi, pad_h_lo, pad_h_hi, pad_w_lo, pad_w_hi). For symmetric
+            padding, set the two sides of each dimension equal (e.g. (p, p, p, p, p, p)).
         dilation (tuple[int, int, int]): (dilation_d, dilation_h, dilation_w), Filter dilation factors.
+        output_padding (tuple[int, int, int]): (out_pad_d, out_pad_h, out_pad_w), Additional size added to one
+            side of each output spatial dimension. Must be non-negative.
         activation_fn (Optional[ActFnType]): Optional activation function to apply after convolution.
-        lnc_shard (bool): Enable LNC sharding across neuron cores.
+        lnc_shard (bool): Does nothing. Will be deprecated next release.
         filter_shape (str): Storage layout of the filters tensor. Default is "KDHW_CI_CO".
+        flip_filter_taps_in_kernel (bool): Selects who reverses the filter taps. When True, the kernel
+            reverses taps along each spatial axis internally, so filters is supplied in forward
+            orientation. When False default, the kernel uses taps as stored, so filters must already be
+            spatially flipped by the caller.
         sbm (Optional[SbufManager]): Optional caller-provided SBUF manager. When None, the kernel creates its
             own SbufManager.
         use_auto_allocation (bool): Must equal sbm.is_auto_alloc() when sbm is provided.
@@ -2606,23 +2616,51 @@ def conv3d_transpose(
             use_auto_allocation=use_auto_allocation
         )
     """
+    if lnc_shard:
+        get_logger("conv3d_transpose").warn(
+            "lnc_shard does nothing and will be deprecated in the next release. "
+            "Please stop passing lnc_shard to conv3d_transpose."
+        )
+
     kernel_assert(
         filter_shape in _SUPPORTED_FILTER_SHAPES,
         f"Unsupported filter_shape '{filter_shape}'. Supported: {_SUPPORTED_FILTER_SHAPES}",
     )
     stride_d, stride_h, stride_w = stride
-    pad_d, pad_h, pad_w = padding
     dilation_d, dilation_h, dilation_w = dilation
+    out_pad_d, out_pad_h, out_pad_w = output_padding
     K_d, K_h, K_w, _, _ = _extract_filter_dims(filters, filter_shape)
-    conv_pad_d = dilation_d * (K_d - 1) - pad_d
-    conv_pad_h = dilation_h * (K_h - 1) - pad_h
-    conv_pad_w = dilation_w * (K_w - 1) - pad_w
 
     kernel_assert(
-        conv_pad_d >= 0 and conv_pad_h >= 0 and conv_pad_w >= 0,
-        f"conv3d_transpose: dilation * (K - 1) must be >= padding per dim, got "
-        f"pad=({pad_d},{pad_h},{pad_w}), dilation=({dilation_d},{dilation_h},{dilation_w}), "
-        f"K=({K_d},{K_h},{K_w})",
+        len(padding) == 6,
+        f"conv3d_transpose: padding must be a 6-tuple "
+        f"(pad_d_lo, pad_d_hi, pad_h_lo, pad_h_hi, pad_w_lo, pad_w_hi); "
+        f"use equal values per dimension for symmetric padding. Got {padding}",
+    )
+    pad_d_lo, pad_d_hi, pad_h_lo, pad_h_hi, pad_w_lo, pad_w_hi = padding
+
+    conv_pad_d_lo = dilation_d * (K_d - 1) - pad_d_lo
+    conv_pad_d_hi = dilation_d * (K_d - 1) - pad_d_hi
+    conv_pad_h_lo = dilation_h * (K_h - 1) - pad_h_lo
+    conv_pad_h_hi = dilation_h * (K_h - 1) - pad_h_hi
+    conv_pad_w_lo = dilation_w * (K_w - 1) - pad_w_lo
+    conv_pad_w_hi = dilation_w * (K_w - 1) - pad_w_hi
+    crop_d_lo = max(0, -conv_pad_d_lo)
+    crop_d_hi = max(0, -conv_pad_d_hi)
+    crop_h_lo = max(0, -conv_pad_h_lo)
+    crop_h_hi = max(0, -conv_pad_h_hi)
+    crop_w_lo = max(0, -conv_pad_w_lo)
+    crop_w_hi = max(0, -conv_pad_w_hi)
+    conv_pad_d_lo = max(0, conv_pad_d_lo)
+    conv_pad_d_hi = max(0, conv_pad_d_hi)
+    conv_pad_h_lo = max(0, conv_pad_h_lo)
+    conv_pad_h_hi = max(0, conv_pad_h_hi)
+    conv_pad_w_lo = max(0, conv_pad_w_lo)
+    conv_pad_w_hi = max(0, conv_pad_w_hi)
+
+    kernel_assert(
+        out_pad_d >= 0 and out_pad_h >= 0 and out_pad_w >= 0,
+        f"conv3d_transpose: output_padding must be non-negative, got {output_padding}",
     )
 
     if sbm == None:
@@ -2633,17 +2671,49 @@ def conv3d_transpose(
             use_auto_alloc=use_auto_allocation,
         )
 
-    return _conv3d_core(
+    core_out = _conv3d_core(
         x_in,
         filters,
         bias=bias,
         stride=(1, 1, 1),
-        padding=(conv_pad_d, conv_pad_d, conv_pad_h, conv_pad_h, conv_pad_w, conv_pad_w),
+        padding=(
+            conv_pad_d_lo,
+            conv_pad_d_hi + out_pad_d,
+            conv_pad_h_lo,
+            conv_pad_h_hi + out_pad_h,
+            conv_pad_w_lo,
+            conv_pad_w_hi + out_pad_w,
+        ),
         dilation=(dilation_d, dilation_h, dilation_w),
         input_dilation=(stride_d, stride_h, stride_w),
         activation_fn=activation_fn,
-        lnc_shard=lnc_shard,
         filter_shape=filter_shape,
+        flip_filter_taps_in_kernel=flip_filter_taps_in_kernel,
         sbm=sbm,
         use_auto_allocation=use_auto_allocation,
     )
+
+    # No oversized sides => return as-is. Otherwise crop the spatial output
+    # (layout [B, C_out, D_out, H_out, W_out]) to the true transpose extent
+    if crop_d_lo or crop_d_hi or crop_h_lo or crop_h_hi or crop_w_lo or crop_w_hi:
+        B_out, C_out_out, core_d, core_h, core_w = core_out.shape
+        cropped_view = (
+            core_out.slice(dim=2, start=crop_d_lo, end=core_d - crop_d_hi, step=1)
+            .slice(dim=3, start=crop_h_lo, end=core_h - crop_h_hi, step=1)
+            .slice(dim=4, start=crop_w_lo, end=core_w - crop_w_hi, step=1)
+        )
+        y_out = nl.ndarray(
+            shape=(
+                B_out,
+                C_out_out,
+                core_d - crop_d_lo - crop_d_hi,
+                core_h - crop_h_lo - crop_h_hi,
+                core_w - crop_w_lo - crop_w_hi,
+            ),
+            dtype=core_out.dtype,
+            buffer=nl.shared_hbm,
+        )
+        nisa.dma_copy(dst=y_out, src=cropped_view)
+        return y_out
+
+    return core_out

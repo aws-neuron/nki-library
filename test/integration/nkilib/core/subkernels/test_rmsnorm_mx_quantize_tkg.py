@@ -22,11 +22,11 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-
 from nkilib_src.nkilib.core.subkernels.norm_tkg_utils import _RMSNORM_QMX_SHARDING_THRESHOLD
 from nkilib_src.nkilib.core.subkernels.rmsnorm_mx_quantize_tkg import rmsnorm_mx_quantize_tkg
 from nkilib_src.nkilib.core.subkernels.rmsnorm_mx_quantize_tkg_torch import rmsnorm_mx_quantize_tkg_wrapper_torch_ref
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info, kernel_assert
+
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
     CompilerArgs,
@@ -66,7 +66,7 @@ def rmsnorm_mx_quantize_tkg_wrapper(
     T = B * S
     kernel_assert(H_free % 4 == 0, f"H_free must be divisible by 4 for quantize_mx, got {H_free=}")
 
-    with_residual = residual != None
+    with_residual = residual is not None
 
     output_shape = (H_par, T, H_free)
     quant_shape = (H_par, H_free // 4, T) if output_quant_in_sbuf or not output_quant_packed else (T, H * 5 // 4)
@@ -104,26 +104,29 @@ def rmsnorm_mx_quantize_tkg_wrapper(
         output_quant_hbm = nl.ndarray(
             quant_shape, dtype=_out_quant_dtype, buffer=nl.shared_hbm, name="wrapper_output_quant_hbm"
         )
-        output_scale_hbm = nl.ndarray(
-            quant_shape, dtype=nl.uint8, buffer=nl.shared_hbm, name="wrapper_output_scale_hbm"
-        )
-
         T_slice_quant = nl.ds(T_local * (1 - prg_id), T_local) if do_shard else nl.ds(0, T)
         nisa.dma_copy(src=output_quant[:, :, T_slice_quant], dst=output_quant_hbm[:, :, T_slice_quant])
 
-        # Copy scale values to HBM, skipping garbage portions of strided scale tensor
-        for sb_quadrant in nl.affine_range(4):
-            nisa.dma_copy(
-                src=output_scale[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
-                dst=output_scale_hbm[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
+        # A packed layout carries the scales inside the quantized tensor, so there is no
+        # separate scale tensor to allocate or spill.
+        output_scale_hbm = None
+        if output_scale is not None:
+            output_scale_hbm = nl.ndarray(
+                quant_shape, dtype=nl.uint8, buffer=nl.shared_hbm, name="wrapper_output_scale_hbm"
             )
+            # Copy scale values to HBM, skipping garbage portions of strided scale tensor
+            for sb_quadrant in nl.affine_range(4):
+                nisa.dma_copy(
+                    src=output_scale[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
+                    dst=output_scale_hbm[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
+                )
 
     else:
         output_quant_hbm = output_quant
         output_scale_hbm = output_scale
 
     output = [output_hbm, output_quant_hbm]
-    if not output_quant_packed:
+    if output_scale_hbm is not None:
         output.append(output_scale_hbm)
     if with_residual:
         output.append(output_residual)
@@ -245,7 +248,7 @@ def generate_inputs(
         "inp": rng.normal(size=(batch, seqlen, hidden)).astype(in_dtype),
         "gamma": rng.normal(size=(1, hidden)).astype(in_dtype),
     }
-    if hidden_actual != None:
+    if hidden_actual is not None:
         inputs["hidden_actual"] = hidden_actual
     if with_residual:
         inputs["residual"] = rng.normal(size=(batch, seqlen, hidden)).astype(in_dtype)
@@ -412,7 +415,6 @@ class TestRmsNormQuantizeMxTKGKernel:
             compiler_args=CompilerArgs(
                 logical_nc_config=2,
                 platform_target=platform_target,
-                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             rtol=1e-2,
             atol=1e-3,

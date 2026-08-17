@@ -17,7 +17,6 @@ import nki.language as nl
 import numpy as np
 import pytest
 from nki.collectives import ReplicaGroup
-
 from nkilib_src.nkilib.experimental.collectives.sb2sb_allgather import (
     allgather_sb2sb,
     allgather_sb2sb_tiled,
@@ -26,6 +25,7 @@ from nkilib_src.nkilib.experimental.collectives.sb2sb_allgather_torch import (
     allgather_sb2sb_tiled_torch_ref,
     allgather_sb2sb_torch_ref,
 )
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.test_orchestrator import Orchestrator

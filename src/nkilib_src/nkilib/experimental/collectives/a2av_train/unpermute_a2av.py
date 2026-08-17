@@ -128,9 +128,15 @@ def unpermute_a2av(
             tsize = te - ts
 
             tile_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
+            # Slice src to the actual tile width (tsize). The final tile is shorter
+            # than TILE_SIZE when T is not a multiple of TILE_SIZE (e.g. T=64 when
+            # the per-device token count b_local*s_local < 128), so a fixed
+            # +TILE_SIZE src read has more elements than dst=tile_sb[0:tsize] and
+            # dma_copy asserts "src and dst have the same number of elements"
+            # (src=TILE_SIZE*H, dst=tsize*H). Downstream only consumes tsize rows.
             nisa.dma_copy(
                 dst=tile_sb[0:tsize, :],
-                src=output[src_rank_idx * T + ts : src_rank_idx * T + ts + TILE_SIZE, :],
+                src=output[src_rank_idx * T + ts : src_rank_idx * T + ts + tsize, :],
             )
 
             disp_tile = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
@@ -213,7 +219,14 @@ def unpermute_a2av(
                 )
 
             data_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=data_sb, src=got_hbm[base + ts : base + ts + TILE_SIZE, :])
+            # Slice both dst and src to tsize: on the final partial tile
+            # (T % TILE_SIZE != 0) a fixed +TILE_SIZE read of the last dest_rank's
+            # region runs past got_hbm's end (base+ts+TILE_SIZE > EP*T -> OOB read
+            # / dma_copy size assert). Zero the full buffer first so the tail rows
+            # [tsize:TILE_SIZE] the downstream tensor_tensor still reads are defined
+            # (they are OOB-skipped on the final scatter, so they never reach output).
+            nisa.memset(data_sb, 0)
+            nisa.dma_copy(dst=data_sb[0:tsize, :], src=got_hbm[base + ts : base + ts + tsize, :])
 
             cur_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
             nisa.dma_copy(

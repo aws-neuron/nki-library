@@ -24,9 +24,9 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-
 from nkilib_src.nkilib.core.max.cascaded_max_utils import predicated_folded_load, unfolded_store
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_program_sharding_info
+
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -56,6 +56,8 @@ def folded_load_store_kernel(input_tensor, fold_factor: int, batch_start: int, b
         batch_start=batch_start,
         batch_end=batch_end,
     )
+    # No pre-allocated SBUF buffer was passed, so the load returns the tile it filled.
+    assert data_sb is not None, "predicated_folded_load returns a tile when data_sb is not supplied"
     unfolded_store(
         data_sb,
         output_tensor,
@@ -97,6 +99,8 @@ def folded_load_store_dst_kernel(
         batch_start=src_batch_start,
         batch_end=src_batch_end,
     )
+    # No pre-allocated SBUF buffer was passed, so the load returns the tile it filled.
+    assert data_sb is not None, "predicated_folded_load returns a tile when data_sb is not supplied"
     unfolded_store(
         data_sb,
         output_tensor,
@@ -153,7 +157,6 @@ def folded_load_oversized_sb_kernel(
 
 def folded_load_store_torch_ref(input_tensor: torch.Tensor, fold_factor: int, batch_start: int, batch_end: int) -> dict:
     """Torch reference for folded_load_store_kernel."""
-    b_range = batch_end - batch_start
     return {"output_tensor": input_tensor[batch_start:batch_end].clone()}
 
 

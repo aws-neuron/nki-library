@@ -19,6 +19,7 @@ import nki
 import numpy as np
 import pytest
 
+from test.utils import kernel_tracer
 from test.utils.common_dataclasses import (
     CompilerArgs,
     KernelArgs,
@@ -29,12 +30,28 @@ from test.utils.common_dataclasses import (
     ValidationArgs,
 )
 from test.utils.kernel_tracer import trace_kernel
+from test.utils.metrics_collector import NoopMetricsCollector
+
+
+def test_collect_neuronx_cc_flags_enables_birsim_with_validation_tolerance():
+    compiler_args = CompilerArgs(platform_target=Platforms.TRN2, enable_birsim=True)
+    validation_args = ValidationArgs(golden_output={}, relative_accuracy=1e-2, absolute_accuracy=1e-5)
+
+    compiler_flags = kernel_tracer._collect_neuronx_cc_flags(compiler_args, validation_args)
+
+    assert compiler_flags == [
+        "--internal-backend-options=--enable-birsim=True "
+        "--enable-birsim-at-begin=False "
+        "--enable-birsim-after-all=False "
+        "--enable-birsim-at-end=True "
+        "--birsim-output-tolerance 1.0,1e-05"
+    ]
 
 
 @nki.jit
 def kernel_with_assert_false(dummy_out):
     """Kernel that always fails with assert False."""
-    assert False, "This kernel should fail"
+    assert False, "This kernel should fail"  # noqa: B011 -- NKI kernels can only use `assert`, not `raise`
 
 
 class TestKernelTracerFailsOnAssert:
@@ -59,4 +76,5 @@ class TestKernelTracerFailsOnAssert:
                     mode=TraceMode.CompileOnly,
                     output_directory=tmpdir,
                     frontendMode=NKICompilationMode.parser,
+                    collector=NoopMetricsCollector(),
                 )

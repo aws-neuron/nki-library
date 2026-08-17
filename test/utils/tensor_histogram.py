@@ -50,7 +50,7 @@ class BoxTable:
     def add_row(self, values: list[str]):
         """Add a data row to the table."""
         cells = []
-        for val, width in zip(values, self.col_widths):
+        for val, width in zip(values, self.col_widths, strict=True):
             # Truncate or pad to fit column width
             cell = val[:width].ljust(width)
             cells.append(f" {cell} ")
@@ -490,7 +490,7 @@ class TensorHistogram:
                     end_w = min((j + 1) * block_w, w)
 
                     block_total = (end_h - start_h) * (end_w - start_w)
-                    block_matches = torch.sum(close[start_h:end_h, start_w:end_w]).item()
+                    block_matches = int(torch.sum(close[start_h:end_h, start_w:end_w]).item())
                     block_mismatches = block_total - block_matches
 
                     if block_mismatches == 0:

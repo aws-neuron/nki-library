@@ -37,6 +37,7 @@ def bwmm_shard_on_block_mx_torch_ref(
     down_proj_bias: Optional[torch.Tensor] = None,
     gate_up_proj_scale: Optional[torch.Tensor] = None,
     down_proj_scale: Optional[torch.Tensor] = None,
+    ep_rank: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
     n_static_blocks: int = -1,
     n_dynamic_blocks: int = 55,
@@ -60,6 +61,10 @@ def bwmm_shard_on_block_mx_torch_ref(
     down_in_scale: Optional[torch.Tensor] = None,
 ) -> dict:
     """PyTorch reference for bwmm_shard_on_block_mx. Signature matches kernel exactly."""
+    # ep_rank only affects the packed-affinity ROW layout (the kernel derives its gather offset
+    # ep_rank * E_local from it); the reference receives expert_affinities_masked already sliced to this
+    # rank's local experts, so it is a no-op here. Present to satisfy the kernel<->ref signature contract.
+    _ = ep_rank
     quant_params = None
     if quantization_type == QuantizationType.STATIC_MX:
         # STATIC_MX reuses gate_up_proj_scale / down_proj_scale to carry the per-expert

@@ -18,7 +18,6 @@ from functools import cache
 import nki.language as nl
 import numpy as np
 import torch
-
 from nkilib_src.nkilib.core.attention.attention_tkg import INACTIVE_BLOCK_IDX
 from nkilib_src.nkilib.core.attention.attention_tkg_utils import AttnTKGConfig, is_batch_sharded
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
@@ -91,13 +90,34 @@ def generate_active_blocks_array(batch: int, S_ctx: int, block_len: int, assumed
 
 def gen_deterministic_active_block_table(batch, S_ctx, S_tkg, pos_id, block_len, assumed_num_cache_blocks):
     # The active blocks table needs to be used for position_ids and the table initialization itself.
-    arr = generate_active_blocks_array(batch, S_ctx, block_len, assumed_num_cache_blocks).copy()
-
     assumed_actual_ctx_lens = pos_id.flatten()
+    # Number of blocks covering active cache and active token.
+    active_blocks_per_batch = [div_ceil(assumed_actual_ctx_lens[b] + S_tkg, block_len) for b in range(batch)]
+    table_shape = (batch, S_ctx // block_len)
+
+    if assumed_num_cache_blocks < np.prod(table_shape):
+        # This generator does not model prefix caching: every populated logical table entry gets a
+        # distinct physical block. Immutable prior blocks could be shared across batches, but blocks
+        # receiving active-token updates must remain private or use copy-on-write.
+        num_active_blocks = sum(active_blocks_per_batch)
+        assert num_active_blocks <= assumed_num_cache_blocks, (
+            f"Physical cache has {assumed_num_cache_blocks} blocks, but active table entries require "
+            f"{num_active_blocks} unique blocks"
+        )
+        arr = np.full(table_shape, INACTIVE_BLOCK_IDX, dtype=np.int32)
+        active_block_indices = np.random.choice(assumed_num_cache_blocks, size=num_active_blocks, replace=False).astype(
+            np.int32
+        )
+        offset = 0
+        for b, num_active_blocks_for_batch in enumerate(active_blocks_per_batch):
+            arr[b, :num_active_blocks_for_batch] = active_block_indices[offset : offset + num_active_blocks_for_batch]
+            offset += num_active_blocks_for_batch
+        return arr
+
+    # Preserve the existing generated tables when the physical pool covers the logical table.
+    arr = generate_active_blocks_array(batch, S_ctx, block_len, assumed_num_cache_blocks).copy()
     for b in range(batch):
-        # Number of blocks covering active cache and active token.
-        num_actual_active_blks = div_ceil(assumed_actual_ctx_lens[b] + S_tkg, block_len)
-        arr[b, num_actual_active_blks:] = INACTIVE_BLOCK_IDX
+        arr[b, active_blocks_per_batch[b] :] = INACTIVE_BLOCK_IDX
     return arr
 
 
@@ -176,7 +196,7 @@ def print_test_config(attn_cfg, test_cfg):
         in_str = in_str.replace("d_head=", "", 1)
         in_str = in_str.replace("block_len=", "", 1)
         for field in fields(cfg):
-            if field.type == bool:
+            if field.type is bool:
                 val = getattr(cfg, field.name)
                 if val == field.default:
                     in_str = in_str.replace(f", {field.name}={val}", "", 1)

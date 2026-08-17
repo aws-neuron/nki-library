@@ -14,19 +14,18 @@
 
 """HBM safety proofs for framework-ready kernels."""
 
-# Setup simulator module aliasing before any nki imports
-from test.utils.simulation_setup import setup_simulation_mode
-
-setup_simulation_mode()
-
 import importlib
 
 import numpy as np
 import pytest
+from nki.language.buffers import is_hbm  # ty: ignore[unresolved-import]
 
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+from test.utils.simulation_setup import setup_simulation_mode
 
 from .framework_ready_api_spec import HBM_SAFE_PROOF, HbmProof, ProofTensorSpec
+
+# Cap BLAS threads in xdist workers; no import-order dependency
+setup_simulation_mode()
 
 
 def _assert_outputs_are_hbm(result: object, label: str):
@@ -36,7 +35,7 @@ def _assert_outputs_are_hbm(result: object, label: str):
     items = list(result) if isinstance(result, (list, tuple)) else [result]
     for i, item in enumerate(items):
         if hasattr(item, "buffer"):
-            assert TensorView(item).is_hbm(), f"Output {i} of {label} is a tensor but not in HBM"
+            assert is_hbm(item.buffer), f"Output {i} of {label} is a tensor but not in HBM"
 
 
 def _run_hbm_safe_test(proof: HbmProof):
@@ -64,7 +63,7 @@ def _run_hbm_safe_test(proof: HbmProof):
         _assert_outputs_are_hbm(result, label)
         return result
 
-    from nki.simulator import simulate_kernel
+    from nki.simulator import simulate_kernel  # ty: ignore[unresolved-import]
 
     simulate_kernel(checking_wrapper, args=[], kwargs=kwargs, lnc=lnc)
 

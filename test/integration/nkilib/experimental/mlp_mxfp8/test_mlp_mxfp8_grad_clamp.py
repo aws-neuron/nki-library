@@ -24,9 +24,7 @@ from typing import Any, final
 import numpy as np
 import numpy.typing as npt
 import pytest
-from neuronxcc.nki._private.private_api import float8_e4m3fn_x4
-from typing_extensions import override
-
+from neuronxcc.nki._private.private_api import float8_e4m3fn_x4  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
     _swizzle,
     golden_matmul,
@@ -37,6 +35,8 @@ from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_bwd_mxfp8.config import (
 from nkilib_src.nkilib.experimental.mlp_mxfp8.mlp_bwd_mxfp8.mlp_bwd_mxfp8_kernel import (
     mlp_backward_mxfp8_nki,
 )
+from typing_extensions import override
+
 from test.integration.nkilib.experimental.mlp_mxfp8.mlp_mxfp8_checkpoint_utils import (
     check_correctness,
     generate_inputs,

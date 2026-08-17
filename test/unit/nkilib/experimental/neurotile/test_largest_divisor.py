@@ -15,9 +15,10 @@
 """CPU-only unit tests for nt.largest_divisor() and nt.ceiling_div() trace-time utilities."""
 
 import pytest
-
 from nkilib_src.nkilib.experimental import neurotile as nt
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import p_tile_count
+
+from test.utils.negative_test_helpers import call_with_invalid_argument
 from test.utils.pytest_test_metadata import pytest_marks
 
 
@@ -76,7 +77,7 @@ class TestLargestDivisorMisuseGuards:
 
     def test_n_must_be_int(self):
         with pytest.raises(AssertionError, match="n must be a positive int"):
-            nt.largest_divisor(8.0, 8)
+            call_with_invalid_argument(nt.largest_divisor, 8.0, 8)
 
     def test_max_val_must_be_positive(self):
         with pytest.raises(AssertionError, match="max_val must be a positive int"):
@@ -86,7 +87,7 @@ class TestLargestDivisorMisuseGuards:
 
     def test_max_val_must_be_int(self):
         with pytest.raises(AssertionError, match="max_val must be a positive int"):
-            nt.largest_divisor(8, 4.0)
+            call_with_invalid_argument(nt.largest_divisor, 8, 4.0)
 
 
 @pytest_marks(["neurotile"])
@@ -140,4 +141,4 @@ class TestPTileCount:
 
     def test_b_must_be_int(self):
         with pytest.raises(AssertionError, match="b must be a positive int"):
-            nt.ceiling_div(10, 2.0)
+            call_with_invalid_argument(nt.ceiling_div, 10, 2.0)

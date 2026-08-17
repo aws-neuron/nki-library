@@ -14,14 +14,13 @@
 
 import enum
 import functools
-from typing import Optional
+from typing import Optional, TypedDict
 
 import neuron_dtypes as dt
 import nki
 import nki.language as nl
 import numpy as np
 import pytest
-
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import (
     output_projection_tkg_torch_ref,
 )
@@ -31,6 +30,7 @@ from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib_src.nkilib.experimental.primitives.output_projection.output_projection_tkg import (
     output_projection_tkg,
 )
+
 from test.integration.nkilib.utils.tensor_generators import (
     FP8_E4M3_MAX,
     gaussian_tensor_generator,
@@ -324,7 +324,7 @@ def _filter_sweep_params(B, n_heads=None, S_tkg=None, d_head=None, H=None, trans
     Strategy 2 (tp=F): n_heads*d_head<=4096, n_heads<=64, d_head<=128, B<=4, S_tkg<=8, H mult 128
     Strategy 3 (tp=T): S_tkg*B<=512, B<=128, S_tkg<=8, n_heads<=10, d_head<=128, H mult 128
     """
-    if any(v is None for v in [n_heads, S_tkg, d_head, H, transpose_out]):
+    if n_heads is None or S_tkg is None or d_head is None or H is None or transpose_out is None:
         return FilterResult.VALID
 
     if H % 128 != 0:
@@ -349,6 +349,19 @@ def _filter_sweep_params(B, n_heads=None, S_tkg=None, d_head=None, H=None, trans
             return FilterResult.VALID
 
     return FilterResult.INVALID
+
+
+class OutputProjTkgDtypeModeConfig(TypedDict):
+    """Shapes and fusion settings shared by every dtype_mode canary case."""
+
+    B: int
+    H: int
+    S_tkg: int
+    d_head: int
+    dtype: str
+    n_heads: int
+    test_bias: bool
+    transpose_out: bool
 
 
 class TestOutputProjTkgKernel:
@@ -702,16 +715,16 @@ class TestOutputProjTkgKernel:
     # Torch ref: STATIC input clip is derived from dtype_mode (OCP → 448,
     # NON_OCP → 240) so goldens match.
     # ------------------------------------------------------------------
-    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG = dict(
-        B=4,
-        H=3072,
-        S_tkg=4,
-        d_head=128,
-        dtype=nl.bfloat16,
-        n_heads=8,
-        test_bias=True,
-        transpose_out=False,
-    )
+    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG: OutputProjTkgDtypeModeConfig = {
+        "B": 4,
+        "H": 3072,
+        "S_tkg": 4,
+        "d_head": 128,
+        "dtype": nl.bfloat16,
+        "n_heads": 8,
+        "test_bias": True,
+        "transpose_out": False,
+    }
 
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
     @pytest.mark.parametrize("quantization_type", [QuantizationType.STATIC, QuantizationType.ROW])
