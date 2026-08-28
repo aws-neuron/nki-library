@@ -17,6 +17,8 @@
 import nki.isa as nisa
 import nki.language as nl
 
+from ....core.utils.kernel_assert import kernel_assert
+from ....core.utils.tensor_view import TensorView
 from .. import tile_stream
 from ..iter_order import RowMajor
 from ..tile_stream import TileStream, get_logical_shape
@@ -37,6 +39,13 @@ class Broadcast(nl.NKIObject):
         self._name = f"Broadcast(dst={dst.get_name()}, src={src.get_name()})"
 
     def execute(self) -> None:
+        # Single-tile only: src is one partition row and dst is <= pmax rows. For a
+        # larger dst, broadcast once into a <= pmax buffer and reuse it across tiles.
+        kernel_assert(
+            self._src.get_num_tiles() == 1 and self._dst.get_num_tiles() == 1,
+            f"Broadcast '{self._name}': src and dst must each be a single tile",
+        )
+
         self._dst.reset_cur_tile()
         self._src.reset_cur_tile()
 
@@ -45,9 +54,12 @@ class Broadcast(nl.NKIObject):
             src_tile = self._src.get_tile()
 
             dst_npar = dst_tile.shape[0]
-            shuffle_mask = []
-            for _ in range(32):
-                shuffle_mask.append(self._src_partition)
+            # The src view below is sliced down to the single chosen partition row, so
+            # within that view the source row is at index 0. shuffle_mask[i] selects the
+            # source partition (within the 32-partition quadrant) that output row i copies
+            # from -- it must therefore be 0, not src_partition (the slice already applied
+            # that offset; putting src_partition here too would double-apply it).
+            shuffle_mask = [0] * 32
             for i in range((dst_npar + 31) // 32):
                 cur_npar = min(32, dst_npar - i * 32)
                 nisa.nc_stream_shuffle(
