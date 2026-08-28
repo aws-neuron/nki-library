@@ -98,10 +98,13 @@ def _norm_cross_core_reduce(
     prog_id: int,
 ) -> nl.ndarray:
     """
-    Reduce accumulator across partitions and exchange between SPMD cores.
+    Reduce accumulator across partitions and, on multi-core (LNC2), exchange
+    between SPMD cores.
 
-    Performs partition-level reduction followed by sendrecv communication
-    to aggregate results from both SPMD cores.
+    Performs partition-level reduction; when more than one SPMD program is
+    launched (LNC2) it then does a sendrecv exchange to aggregate the per-core
+    partials. With a single program (LNC1) the partition reduction is the final
+    result and no cross-core exchange is performed.
 
     Args:
         accum (nl.ndarray): [P_MAX, 1], Accumulator buffer in SBUF.
@@ -113,15 +116,20 @@ def _norm_cross_core_reduce(
     """
     local_total = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_partition_reduce(local_total, op=reduce_op, data=accum)
-    remote = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.sendrecv(
-        src=local_total,
-        dst=remote,
-        pipe_id=0,
-        send_to_rank=(1 - prog_id),
-        recv_from_rank=(1 - prog_id),
-    )
-    nisa.tensor_tensor(local_total, local_total, remote, reduce_op)
+    # With a single SPMD program (LNC1) the partition reduce above already holds
+    # the complete result; the cross-core exchange only applies when there is more
+    # than one program (LNC2). num_programs(0) is a trace-time constant, so at LNC1
+    # this branch is statically dropped and no sendrecv (which requires LNC>=2) is emitted.
+    if nl.num_programs(0) > 1:
+        remote = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.sendrecv(
+            src=local_total,
+            dst=remote,
+            pipe_id=0,
+            send_to_rank=(1 - prog_id),
+            recv_from_rank=(1 - prog_id),
+        )
+        nisa.tensor_tensor(local_total, local_total, remote, reduce_op)
     return local_total
 
 
