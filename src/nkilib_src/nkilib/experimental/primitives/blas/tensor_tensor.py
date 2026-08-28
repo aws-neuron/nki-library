@@ -64,7 +64,7 @@ class TensorTensor(nl.NKIObject):
         )
 
     def execute(self):
-        for _ in range(self._dst.get_num_tiles_without_virtual_batches()):
+        for _ in range(self._dst.get_num_tiles()):
             self.execute_tile()
         self._dst.reset_cur_tile()
         self._src1.reset_cur_tile()
