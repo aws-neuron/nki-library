@@ -1555,9 +1555,19 @@ def _process_head_group(
                 nisa.nc_transpose(
                     psum, QKV[:, nl.ds(qkv_offset + head_idx * d + i_d * nl.tile_size.pmax, nl.tile_size.pmax)]
                 )
-                dst_offset = i_d * (B * n_heads * S) + head_idx * (B * S)
-                nisa.tensor_copy(out[:, nl.ds(dst_offset, B * S)], psum)
-        out_2d = out  # already [pmax, n_d_tiles*B*n_heads*S]
+                # Write BATCH-major [n_d_tiles][B][n_heads][S] to match (a) the QK-matmul consumer in
+                # attention_tkg._compute_qk_matmul, which reads q_sb as
+                # q_sb[:, i_d*bs_full*s_active_qh + ...].reshape([bs_full, s_active_qh]).select(1, batch)
+                # (i.e. batch-major, then head), and (b) the d<=128 dst_4d [d, B, n_heads, S] layout.
+                # The transposed psum is [pmax, B*S] in (batch, seq) row order, so scatter each batch's
+                # S columns to its batch-major slot. A single contiguous [pmax, B*S] copy at
+                # head_idx*(B*S) would be HEAD-major, which only coincides with the consumer's
+                # batch-major layout when B == 1; for B >= 2 it permutes heads vs batches and silently
+                # corrupts every batch row's attention output (~8% cos error, d_head>128 only).
+                for i_batch in range(B):
+                    dst_offset = i_d * (B * n_heads * S) + i_batch * (n_heads * S) + head_idx * S
+                    nisa.tensor_copy(out[:, nl.ds(dst_offset, S)], psum[:, nl.ds(i_batch * S, S)])
+        out_2d = out  # [pmax, n_d_tiles*B*n_heads*S], batch-major
     else:
         d, B, n_heads, S = dst_4d.shape
         # Interleaved RoPE internally reshapes its input to (d, B*n_heads*S) for an nc_matmul,

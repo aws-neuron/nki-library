@@ -2633,6 +2633,20 @@ class TestRangeAttnBlk:
         AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
                             block_len=32, skip_output_projection=True, update_cache=False,
                             qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+        # d_head=256 (n_d_tiles=2) with DECODE BATCH > 1. REGRESSION for the d>128 Q/K d-tiled
+        # producer head/batch layout bug: _process_head_group wrote the tiled Q/K free dim
+        # HEAD-major ([n_d_tiles][n_heads][B][S]) while _compute_qk_matmul reads it BATCH-major
+        # ([n_d_tiles][B][q_heads][S]). The two orderings coincide only at batch==1, so every
+        # existing d256 config (all batch=1) passed while batch>=2 silently corrupted every
+        # batch row's attention output (~8% cos error). These batch=2 configs fail on the
+        # unpatched kernel and pass after the fix. (d_head<=128 uses the dst_4d [d,B,n_heads,S]
+        # batch-major path and was always correct, so no d128 batch>1 regression config is needed.)
+        AttnBlkTestConfig(batch=2, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, skip_output_projection=True, update_cache=False),
+        AttnBlkTestConfig(batch=2, q_heads=8, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            kv_heads=4, block_len=32, skip_output_projection=True, update_cache=False),
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            kv_heads=4, block_len=32, skip_output_projection=True, update_cache=False),
         # Transposed in+out layout
         AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                             block_len=32, transposed_in=True, transposed_out=True),
