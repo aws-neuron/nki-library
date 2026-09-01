@@ -126,3 +126,6 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 # sparse_attention_indexer numpy torch references use `assert`. The kernel
 # files use kernel_assert instead.
 "src/nkilib_src/nkilib/experimental/sparse_attention_indexer/*_torch.py" = ["S101"]
+# deepseek_v4_csa torch references transcribe the model's own code, `assert`
+# included. The kernel files use kernel_assert instead.
+"src/nkilib_src/nkilib/experimental/deepseek_v4_csa/*_torch.py" = ["S101"]
