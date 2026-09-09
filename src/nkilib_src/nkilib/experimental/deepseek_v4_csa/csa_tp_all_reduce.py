@@ -45,14 +45,12 @@ and make it 2-LNC-CORRECT:
     channel), so each core's disjoint-slice collective is independently correct.
 """
 
-import torch
-from torch import nn
-
 import nki
 import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 from nki.collectives import ReplicaGroup
+from torch import nn
 
 
 @nki.jit
@@ -80,26 +78,10 @@ def nki_tp_all_reduce_kernel(input: nl.NkiTensor, replica_group: ReplicaGroup) -
     src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="src")
     dst = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="dst")
     out = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm)
-    # Trn3 DMA traffic-shaping (gen4-only), the QoS lever already applied to every
-    # other editable kernel — this file was the last one with no priority coverage.
-    # priority=0 (highest) on the staging-in copy: the collective cannot start until
-    # `src` is materialized, and it is a CROSS-RANK barrier, so every rank's whole
-    # 4-way reduce is gated behind the slowest rank's staging copy. The copy-back is
-    # left at priority=1: it only gates this rank's own return value, with no other
-    # rank waiting on it. Class-of-service only — every byte and every add is
-    # untouched, so the reduced result stays BIT-IDENTICAL.
+
     nisa.dma_copy(dst=src, src=input, priority=0)
-    # The COLLECTIVE ITSELF also takes a gen4 DMA-QoS priority (nki/collectives/_ops.py
-    # `all_reduce(..., priority: Optional[int])` -> validate_dma_qos, "NeuronCore-v4+
-    # only"), NOT just the surrounding dma_copy pair. That matters here: the two staging
-    # copies above/below are SERIALIZED around the collective, so there is no
-    # concurrency for their classes of service to arbitrate — it is the collective's own
-    # cross-rank NeuronLink DMAs that overlap the block's in-flight weight stream and
-    # contend for DMA bandwidth. Tag it priority=0 (highest): the all-reduce is the
-    # block's final op AND a 4-rank barrier, so every rank waits on the slowest rank's
-    # reduce. Class-of-service only -> BIT-IDENTICAL sum.
-    ncc.all_reduce(dsts=[dst], srcs=[src], op=nl.add, replica_group=replica_group,
-                   priority=0)
+
+    ncc.all_reduce(dsts=[dst], srcs=[src], op=nl.add, replica_group=replica_group, priority=0)
     nisa.dma_copy(dst=out, src=dst, priority=1)
     return out
 
@@ -121,7 +103,7 @@ def tp_all_reduce(partial, replica_ranks):
         P -= 2
     flat = partial.reshape(P, total // P).contiguous()
     replica_group = ReplicaGroup([list(replica_ranks)])
-    summed = nki_tp_all_reduce_kernel[2](flat, replica_group)   # [P, total//P]
+    summed = nki_tp_all_reduce_kernel[2](flat, replica_group)  # [P, total//P]
     return summed.reshape(bsz, seqlen, dim)
 
 

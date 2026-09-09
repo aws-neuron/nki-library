@@ -239,11 +239,14 @@ def get_hadamard_matrix(n, device, dtype):
     if key not in _hadamard_cache:
         H = torch.tensor([[1.0]])
         while H.shape[0] < n:
-            H = torch.cat([
-                torch.cat([H, H], dim=1),
-                torch.cat([H, -H], dim=1),
-            ], dim=0)
-        _hadamard_cache[key] = (H * (n ** -0.5)).to(dtype=dtype, device=device)
+            H = torch.cat(
+                [
+                    torch.cat([H, H], dim=1),
+                    torch.cat([H, -H], dim=1),
+                ],
+                dim=0,
+            )
+        _hadamard_cache[key] = (H * (n**-0.5)).to(dtype=dtype, device=device)
     return _hadamard_cache[key]
 
 
@@ -288,4 +291,3 @@ def precompute_win_bias_parts(S, W):
     base = torch.where(valid, torch.zeros(1), torch.tensor(-1e9))
     sink_indicator = is_sink.float()
     return base, sink_indicator
-

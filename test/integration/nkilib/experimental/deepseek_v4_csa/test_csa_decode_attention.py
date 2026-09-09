@@ -70,25 +70,11 @@ from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 # The `priority=` DMA hints these kernels carry are NeuronCore-v4 only.
 pytestmark = pytest.mark.platforms(exclude=list(set(Platforms) - {Platforms.TRN3, Platforms.TRN3_A0}))
 
-# Model constants rather than free test parameters: the indexer's head dimension is
-# fixed at 128 because nki_indexer_qproj_gemv relies on one 128-column N-tile being
-# exactly one head's channel block, and the window is fixed at 128 in the kernels.
 _INDEX_HEAD_DIM = 128
 _WINDOW = 128
-
-# The indexer scores one 128-row query tile: in decode every query row is identical,
-# so this is the smallest tile the kernels' TILE_Q=128 geometry accepts.
 _S_Q = 128
 
 _BF16 = ml_dtypes.bfloat16
-
-# Every device test runs the kernel twice and grades the SECOND execution
-# (`--save-nth-output` tracks `num_runs`), i.e. one warmup then one measured run.
-#
-# This is load-bearing, not boilerplate: the warmup makes the tests measure steady
-# state, which is what they are for. It does mean they do NOT cover
-# first-execution behaviour -- grading run 0 is a separate exercise, and dropping
-# `inference_args` to save a run changes what these tests assert.
 _WARMUP_RUNS = 2
 
 
@@ -292,9 +278,7 @@ class TestCsaDecodeAttention:
 
     @pytest.mark.fast
     @pytest_parametrize(_SCORE_PARAMS, _SCORE_CASES, abbrevs=_SCORE_ABBREVS)
-    def test_indexer_score(
-        self, test_manager: Orchestrator, platform_target: Platforms, t_c: int, n_index_heads: int
-    ):
+    def test_indexer_score(self, test_manager: Orchestrator, platform_target: Platforms, t_c: int, n_index_heads: int):
         """Raw indexer scores plus the causal bias, one core, ``[S_q, T_c]`` out.
 
         The relu is applied per head BEFORE the per-head weight, so a head with a
@@ -401,9 +385,7 @@ class TestCsaDecodeAttention:
             return {
                 "topk_indices_T": idx,
                 # Already scaled by softmax_scale, as the block hands it over.
-                "all_q_T": _f16(
-                    rng.standard_normal((head_dim, n_heads * s_len)) * (head_dim**-0.5)
-                ),
+                "all_q_T": _f16(rng.standard_normal((head_dim, n_heads * s_len)) * (head_dim**-0.5)),
                 "win_K_T": _f16(rng.standard_normal((head_dim, _WINDOW)) * 0.3),
                 "win_V": _f16(rng.standard_normal((_WINDOW, head_dim)) * 0.3),
                 "compress_kv": _bf16(rng.standard_normal((t_c, head_dim)) * 0.3),
@@ -445,6 +427,12 @@ class TestCsaDecodeAttention:
         # also the K-split path, but at 8x the cache: the score stage runs 8 chunks per
         # core and the top-k runs at its full pinned width with no padding tail.
         (32, 512, 64, 64, 8192, 1024, 8192),
+        # 8K context, but the top-k still runs at the pinned n_val=8192 -- so three
+        # QUARTERS of the score row is sentinel padding. This is what the block
+        # actually traces at seq_len=8192, and it is the case where the padding
+        # dominates: a top-k that mishandles a mostly-padded row is wrong here and
+        # right at both of the shapes above (one has no padding, the other half).
+        (32, 512, 64, 64, 2048, 1024, 8192),
     ]
     _FUSED_ABBREVS = {
         "n_heads": "h",
@@ -478,9 +466,7 @@ class TestCsaDecodeAttention:
         which cross-core strategy the kernel compiles to -- K-split or head-split --
         via ``k`` and ``T_c``, both trace-time constants.
         """
-        self._run_fused(
-            test_manager, platform_target, n_heads, head_dim, rope_head_dim, n_index_heads, t_c, k, n_val
-        )
+        self._run_fused(test_manager, platform_target, n_heads, head_dim, rope_head_dim, n_index_heads, t_c, k, n_val)
 
     @pytest_parametrize(_FUSED_PARAMS, _FUSED_CASES[2:], abbrevs=_FUSED_ABBREVS)
     def test_score_topk_gather_fused_large(
@@ -496,13 +482,9 @@ class TestCsaDecodeAttention:
         n_val: int,
     ):
         """The fused kernel at the production 32K-context cache size."""
-        self._run_fused(
-            test_manager, platform_target, n_heads, head_dim, rope_head_dim, n_index_heads, t_c, k, n_val
-        )
+        self._run_fused(test_manager, platform_target, n_heads, head_dim, rope_head_dim, n_index_heads, t_c, k, n_val)
 
-    def _run_fused(
-        self, test_manager, platform_target, n_heads, head_dim, rope_head_dim, n_index_heads, t_c, k, n_val
-    ):
+    def _run_fused(self, test_manager, platform_target, n_heads, head_dim, rope_head_dim, n_index_heads, t_c, k, n_val):
         rng = _rng()
         half_rope = rope_head_dim // 2
         s_len = 1
@@ -513,9 +495,7 @@ class TestCsaDecodeAttention:
                 {
                     "k_val": k,
                     "n_val": n_val,
-                    "all_q_T": _f16(
-                        rng.standard_normal((head_dim, n_heads * s_len)) * (head_dim**-0.5)
-                    ),
+                    "all_q_T": _f16(rng.standard_normal((head_dim, n_heads * s_len)) * (head_dim**-0.5)),
                     "win_K_T": _f16(rng.standard_normal((head_dim, _WINDOW)) * 0.3),
                     "win_V": _f16(rng.standard_normal((_WINDOW, head_dim)) * 0.3),
                     "compress_kv": _bf16(rng.standard_normal((t_c, head_dim)) * 0.3),

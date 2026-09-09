@@ -233,17 +233,16 @@ def _tiled_sparse_attention(
 
     for q_start in range(0, s_len, _TILE_Q):
         rows = slice(q_start, q_start + _TILE_Q)
-        q_tile = q[rows]                                             # [tile, n_heads, head_dim]
+        q_tile = q[rows]  # [tile, n_heads, head_dim]
 
         # Every row of the tile reads the same 256 window columns; win_bias_base
         # decides which of them the row may actually attend to.
-        k_win = win_K_T.float()[:, q_start : q_start + _WIN_SIZE]    # [head_dim, 256]
-        v_win = win_V.float()[q_start : q_start + _WIN_SIZE]         # [256, head_dim]
+        k_win = win_K_T.float()[:, q_start : q_start + _WIN_SIZE]  # [head_dim, 256]
+        v_win = win_V.float()[q_start : q_start + _WIN_SIZE]  # [256, head_dim]
 
-        bias = (
-            win_bias_sink.float()[rows].unsqueeze(1) * attn_sink.float().reshape(1, n_heads, 1)
-            + win_bias_base.float()[rows].unsqueeze(1)
-        )
+        bias = win_bias_sink.float()[rows].unsqueeze(1) * attn_sink.float().reshape(
+            1, n_heads, 1
+        ) + win_bias_base.float()[rows].unsqueeze(1)
         win_scores = torch.einsum("shd,dj->shj", q_tile, k_win) + bias
         comp_scores = comp_scores_all[rows]
 

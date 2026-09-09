@@ -35,13 +35,6 @@ Two conventions worth knowing when reading these:
 import torch
 import torch.nn.functional as F
 
-# Selected positions the sparse attention gathers per chunk. Only used to slice a
-# flat index row back into the per-chunk groups the kernels consume.
-_COMP_CHUNK = 128
-
-# nisa.topk treats the 128 partitions as 8 independent groups of 16.
-_TOPK_GROUP = 16
-
 
 def _rms_rope_rows(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, gain, eps: float) -> torch.Tensor:
     """RMSNorm over the free axis then RoPE on the trailing ``2 * cos.shape[-1]`` channels.
@@ -174,76 +167,6 @@ def nki_indexer_score_2core_torch_ref(
     return {"output_0": scores[0:1].to(torch.bfloat16)}
 
 
-def _topk_indices(scores: torch.Tensor, k_val: int) -> torch.Tensor:
-    """The ``k_val`` highest-scoring positions of a 1-D score row, ascending.
-
-    Sorted only so the comparison is well defined: the kernels emit their winners
-    as an unordered SET (the downstream softmax over gathered positions is
-    permutation-invariant), so order carries no meaning and comparing unsorted
-    would fail on a difference that does not exist.
-    """
-    return torch.topk(scores.float(), k_val).indices.sort().values.to(torch.int32)
-
-
-def nki_indexer_score_topk_torch_ref(
-    q_T_all: torch.Tensor,
-    kv_t: torch.Tensor,
-    weights: torch.Tensor,
-    k_val: int,
-) -> dict[str, torch.Tensor]:
-    """Oracle for ``nki_indexer_score_topk_kernel``: the selected positions, sorted.
-
-    The kernel returns a ``[8, k_val]`` buffer and fills row 0 only (``nisa.topk``
-    computes 8 independent groups and only group 0 is read), so the test compares
-    row 0 against this.
-    """
-    scores = _indexer_scores(q_T_all, kv_t, weights)
-    return {"output_0": _topk_indices(scores[0], k_val)}
-
-
-def nki_indexer_score_topk_2core_torch_ref(
-    q_T_all: torch.Tensor,
-    kv_t: torch.Tensor,
-    weights: torch.Tensor,
-    k_val: int,
-    n_val: int,
-) -> dict[str, torch.Tensor]:
-    """Oracle for ``nki_indexer_score_topk_2core``: 2-core scoring then a single-core top-k.
-
-    ``n_val`` is the width the kernel runs ``nisa.topk`` at, padding the score row
-    up to it with a negative sentinel. Padding cannot change the answer -- every
-    real score is non-negative -- so it is absent here, and its being absent is
-    what makes this a real check on the padding.
-    """
-    del n_val
-    scores = _indexer_scores(q_T_all, kv_t, weights)
-    return {"output_0": _topk_indices(scores[0], k_val)}
-
-
-def nisa_topk_snake_torch_ref(in_tensor: torch.Tensor, k_val: int, n_val: int) -> dict[str, torch.Tensor]:
-    """Oracle for ``nisa_topk_snake_kernel``: per-group top-k VALUES in snake layout.
-
-    ``nisa.topk`` reads a ``[128, n / 16]`` tile as 8 independent groups of 16
-    partitions, and within a group logical element ``j`` lives at partition
-    ``j % 16``, column ``j // 16`` -- the "snake" layout. This reference decodes
-    each group back to a flat row, takes its top-k, and returns the values.
-
-    Only the values are compared, not the indices: with tied scores several index
-    sets are equally correct, so indices would flag a difference that is not an
-    error. The values are unique regardless of how ties break.
-    """
-    total_rows, src_x = in_tensor.shape
-    n_batches = total_rows // 128
-    groups_per_call = 128 // _TOPK_GROUP
-
-    flat = in_tensor.float().reshape(n_batches, groups_per_call, _TOPK_GROUP, src_x)
-    # snake[p, c] holds logical element 16 * c + p, so transposing (p, c) -> (c, p)
-    # and flattening recovers the logical order.
-    logical = flat.permute(0, 1, 3, 2).reshape(n_batches * groups_per_call, _TOPK_GROUP * src_x)
-    values = torch.topk(logical[:, 0:n_val], k_val, dim=-1).values
-    return {"output_0": values.to(torch.bfloat16)}
-
-
 def _gather_attention(
     idx: torch.Tensor,
     all_q_T: torch.Tensor,
@@ -272,11 +195,11 @@ def _gather_attention(
     # identical in decode, and the kernels read only this one.
     q_hb = all_q_T.float()[:, 0 : n_heads * s_len : s_len]
 
-    win_scores = (q_hb.t() @ win_K_T.float())
+    win_scores = q_hb.t() @ win_K_T.float()
     win_scores[:, 0] = win_scores[:, 0] + attn_sink_in.float().reshape(-1)
 
-    gathered = compress_kv.float()[idx.long()]                 # [k, head_dim]
-    comp_scores = q_hb.t() @ gathered.t()                      # [n_heads, k]
+    gathered = compress_kv.float()[idx.long()]  # [k, head_dim]
+    comp_scores = q_hb.t() @ gathered.t()  # [n_heads, k]
 
     both = torch.cat([win_scores, comp_scores], dim=-1)
     shift = both.max(dim=-1, keepdim=True).values
@@ -313,8 +236,16 @@ def nki_decode_gather_ok_torch_ref(
     n_heads = attn_sink_in.shape[1]
     s_len = all_q_T.shape[1] // n_heads
     out = _gather_attention(
-        topk_indices_T[:, 0], all_q_T, win_K_T, win_V, compress_kv,
-        attn_sink_in, derope_cos, derope_sin, n_heads, s_len,
+        topk_indices_T[:, 0],
+        all_q_T,
+        win_K_T,
+        win_V,
+        compress_kv,
+        attn_sink_in,
+        derope_cos,
+        derope_sin,
+        n_heads,
+        s_len,
     )
     return {"output_0": out}
 
@@ -353,7 +284,15 @@ def nki_indexer_score_topk_gather_2core_torch_ref(
     idx = torch.topk(scores[0].float(), k_val).indices
 
     out = _gather_attention(
-        idx, all_q_T, win_K_T, win_V, compress_kv,
-        attn_sink_in, derope_cos, derope_sin, n_heads, s_len,
+        idx,
+        all_q_T,
+        win_K_T,
+        win_V,
+        compress_kv,
+        attn_sink_in,
+        derope_cos,
+        derope_sin,
+        n_heads,
+        s_len,
     )
     return {"output_0": out}

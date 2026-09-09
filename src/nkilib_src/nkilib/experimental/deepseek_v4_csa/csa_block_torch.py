@@ -44,6 +44,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from .csa_common import CSAConfig
+
+
 # --------------------------------------------------------------------------
 # RoPE
 # --------------------------------------------------------------------------
@@ -113,7 +115,7 @@ def hadamard_transform_cpu(x: torch.Tensor) -> torch.Tensor:
     """CPU implementation of Hadamard transform. Works for power-of-2 dims."""
     n = x.shape[-1]
     assert n > 0 and (n & (n - 1)) == 0, f"Dim must be power of 2, got {n}"
-    scale = n ** -0.5
+    scale = n**-0.5
     h = x.float()
     step = 1
     while step < n:
@@ -151,7 +153,7 @@ def sparse_attn_cpu(q, kv, attn_sink, topk_idxs, softmax_scale):
     B, S, n_heads, head_dim = q.shape
     topk_count = topk_idxs.shape[-1]
 
-    mask = (topk_idxs == -1)
+    mask = topk_idxs == -1
     safe_idxs = topk_idxs.clamp(min=0)
 
     batch_idx = torch.arange(B, device=kv.device)[:, None, None].expand(B, S, topk_count)
@@ -178,10 +180,7 @@ def sparse_attn_cpu(q, kv, attn_sink, topk_idxs, softmax_scale):
 def get_window_topk_idxs(window_size, bsz, seqlen, start_pos):
     if start_pos >= window_size - 1:
         start_pos_mod = start_pos % window_size
-        matrix = torch.cat([
-            torch.arange(start_pos_mod + 1, window_size),
-            torch.arange(0, start_pos_mod + 1)
-        ], dim=0)
+        matrix = torch.cat([torch.arange(start_pos_mod + 1, window_size), torch.arange(0, start_pos_mod + 1)], dim=0)
     elif start_pos > 0:
         matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
     else:
@@ -201,7 +200,7 @@ class Compressor(nn.Module):
         self.head_dim = head_dim
         self.rope_head_dim = config.rope_head_dim
         self.compress_ratio = config.compress_ratio
-        self.overlap = (config.compress_ratio == 4)
+        self.overlap = config.compress_ratio == 4
         self.rotate = rotate
         coff = 1 + self.overlap
 
@@ -269,7 +268,7 @@ class Compressor(nn.Module):
             kv = rotate_activation(kv)
 
         if start_pos == 0:
-            self.kv_cache[:bsz, :seqlen // ratio] = kv
+            self.kv_cache[:bsz, : seqlen // ratio] = kv
 
         return kv
 
@@ -288,7 +287,7 @@ class Indexer(nn.Module):
         self.index_topk = config.index_topk
         self.q_lora_rank = config.q_lora_rank
         self.compress_ratio = config.compress_ratio
-        self.softmax_scale = self.head_dim ** -0.5
+        self.softmax_scale = self.head_dim**-0.5
 
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=torch.bfloat16)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False, dtype=torch.bfloat16)
@@ -300,7 +299,7 @@ class Indexer(nn.Module):
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
@@ -316,21 +315,16 @@ class Indexer(nn.Module):
 
         self.compressor(x, start_pos)
 
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
 
-        index_score = torch.einsum(
-            "bshd,btd->bsht",
-            q,
-            self.kv_cache[:bsz, :end_pos // ratio]
-        )
+        index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, : end_pos // ratio])
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
         if start_pos == 0:
-            mask = (
-                torch.arange(seqlen // ratio).repeat(seqlen, 1)
-                >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+            mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+            index_score = index_score + torch.where(
+                mask, float("-inf"), torch.zeros_like(mask, dtype=index_score.dtype)
             )
-            index_score = index_score + torch.where(mask, float("-inf"), torch.zeros_like(mask, dtype=index_score.dtype))
 
         k = min(self.index_topk, end_pos // ratio)
         topk_idxs = index_score.topk(k, dim=-1)[1]
@@ -354,6 +348,7 @@ class CSAAttentionCore(nn.Module):
     Owns: Compressor, Indexer, attn_sink, freqs_cis, kv_cache.
     Does NOT own: wq_a, wq_b, wkv, kv_norm, wo_a, wo_b (projection weights).
     """
+
     def __init__(self, config: CSAConfig):
         super().__init__()
         self.config = config
@@ -362,7 +357,7 @@ class CSAAttentionCore(nn.Module):
         self.rope_head_dim = config.rope_head_dim
         self.window_size = config.window_size
         self.compress_ratio = config.compress_ratio
-        self.softmax_scale = config.head_dim ** -0.5
+        self.softmax_scale = config.head_dim**-0.5
 
         self.attn_sink = nn.Parameter(torch.empty(config.n_heads, dtype=torch.float32))
         self.compressor = Compressor(config, config.head_dim, rotate=False)
@@ -370,16 +365,19 @@ class CSAAttentionCore(nn.Module):
 
         max_seq_len = config.seq_len
         freqs_cis = precompute_freqs_cis(
-            self.rope_head_dim, max_seq_len + 1,
-            config.original_seq_len, config.compress_rope_theta,
-            config.rope_factor, config.beta_fast, config.beta_slow
+            self.rope_head_dim,
+            max_seq_len + 1,
+            config.original_seq_len,
+            config.compress_rope_theta,
+            config.rope_factor,
+            config.beta_fast,
+            config.beta_slow,
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
         kv_cache_size = config.window_size + max_seq_len // self.compress_ratio
         self.register_buffer(
-            "kv_cache",
-            torch.zeros(config.batch_size, kv_cache_size, self.head_dim, dtype=torch.bfloat16)
+            "kv_cache", torch.zeros(config.batch_size, kv_cache_size, self.head_dim, dtype=torch.bfloat16)
         )
 
         indexer_cache_size = max_seq_len // self.compress_ratio
@@ -403,7 +401,6 @@ class CSAAttentionCore(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         win = self.window_size
-        ratio = self.compress_ratio
         start_pos = 0
 
         if self.compressor.kv_cache is None:
@@ -427,8 +424,9 @@ class CSAAttentionCore(nn.Module):
             self.kv_cache[:bsz, :seqlen] = kv
         else:
             cutoff = seqlen % win
-            self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = \
-                kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+            self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split(
+                [win - cutoff, cutoff], dim=1
+            )
 
         kv_compress = self.compressor(x, start_pos)
         if kv_compress is not None:
@@ -483,8 +481,9 @@ class CSAAttentionCore(nn.Module):
         return o
 
 
-def _init_block_weights(model, seed: int = 42, weight_gain: float = 1.0,
-                        norm_init: float = 1.0, sink_scale: float = 1.0):
+def _init_block_weights(
+    model, seed: int = 42, weight_gain: float = 1.0, norm_init: float = 1.0, sink_scale: float = 1.0
+):
     """Deterministic init.
 
     2-D weights: xavier_uniform(gain=weight_gain). 1-D params default to a
@@ -539,13 +538,9 @@ class CSAAttentionBlockPrefill(nn.Module):
         assert self.n_groups % tp_size == 0, "o_groups must be divisible by tp_size"
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        self.n_local_groups = self.n_groups // tp_size          # groups owned by this rank
-        self.group_in = self.n_heads * self.head_dim // self.n_groups   # per-group wo_a input width
+        self.n_local_groups = self.n_groups // tp_size  # groups owned by this rank
+        self.group_in = self.n_heads * self.head_dim // self.n_groups  # per-group wo_a input width
 
-        # All projection weights bf16 -- the core consumes bf16 x/qr, and the NKI
-        # block runs bf16 matmuls under --auto-cast=none (DeepSeek-V4's bf16
-        # default). Keeps the CPU reference and the NKI kernel on the same numeric
-        # footing (diff is hardware matmul accumulation only).
         pdt = torch.bfloat16
 
         # ----- Query projection -----
@@ -597,14 +592,12 @@ class CSAAttentionBlockPrefill(nn.Module):
         """
         o = o.reshape(bsz, seqlen, self.n_groups, self.group_in)
         g0 = self.tp_rank * self.n_local_groups
-        o_local = o[:, :, g0:g0 + self.n_local_groups, :]        # [B, S, n_local_groups, group_in]
+        o_local = o[:, :, g0 : g0 + self.n_local_groups, :]  # [B, S, n_local_groups, group_in]
 
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, self.group_in)
         o_local = torch.einsum("bsgd,grd->bsgr", o_local, wo_a)  # [B, S, n_local_groups, o_lora_rank]
-        out_partial = self.wo_b(o_local.flatten(2))              # [B, S, dim] -- rank partial
+        out_partial = self.wo_b(o_local.flatten(2))  # [B, S, dim] -- rank partial
 
-        # NOTE(tensor-parallel): out_partial is this rank's contribution only.
-        # The final output is sum over ranks: dist.all_reduce(out_partial).
         return out_partial
 
     # ---- prefill forward (whole sequence) ----------------------------------
@@ -612,27 +605,30 @@ class CSAAttentionBlockPrefill(nn.Module):
     def forward(self, x, start_pos: int = 0):
         bsz, seqlen, _ = x.size()
         rd = self.rope_head_dim
-        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         q, qr = self._project_q(x, freqs_cis)
         kv = self._project_kv(x, freqs_cis)
 
-        # Core sparse attention (prefill path when start_pos == 0: window indices,
-        # KV compression, indexer top-k, sparse attention matmul).
-        o = self.core(q, kv, x, qr, start_pos)          # [B, S, n_heads, head_dim]
+        o = self.core.prefill(q, kv, x, qr)  # [B, S, n_heads, head_dim]
 
         # De-rotate RoPE on the output's rope channels.
         apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
 
-        return self._output_projection(o, bsz, seqlen)   # [B, S, dim] rank partial
+        return self._output_projection(o, bsz, seqlen)  # [B, S, dim] rank partial
 
 
 # --------------------------------------------------------------------------
 # Tensor-parallel reference-data generation (head-parallel over `tp_size` ranks)
 # --------------------------------------------------------------------------
-def generate_prefill_block_reference_tp(full_config, tp_size: int = 4,
-                                weight_gain: float = 0.2, norm_init: float = 1.0,
-                                sink_scale: float = 1.0, input_scale: float = 1.0):
+def generate_prefill_block_reference_tp(
+    full_config,
+    tp_size: int = 4,
+    weight_gain: float = 0.2,
+    norm_init: float = 1.0,
+    sink_scale: float = 1.0,
+    input_scale: float = 1.0,
+):
     """Head-parallel TP decomposition of the FULL prefill model over `tp_size` ranks.
 
     The production model has full_config.n_heads (=128) query heads and
@@ -656,16 +652,15 @@ def generate_prefill_block_reference_tp(full_config, tp_size: int = 4,
     and per-rank shard state_dicts.
     """
     full = CSAAttentionBlockPrefill(full_config, tp_size=1, tp_rank=0)
-    _init_block_weights(full, weight_gain=weight_gain, norm_init=norm_init,
-                        sink_scale=sink_scale)
+    _init_block_weights(full, weight_gain=weight_gain, norm_init=norm_init, sink_scale=sink_scale)
     full.eval()
 
     B, S = full_config.batch_size, full_config.seq_len
-    Hl = full_config.n_heads // tp_size          # 32 query heads per rank
-    Gl = full_config.o_groups // tp_size         # 4 output groups per rank
+    Hl = full_config.n_heads // tp_size  # 32 query heads per rank
+    Gl = full_config.o_groups // tp_size  # 4 output groups per rank
     hd = full_config.head_dim
     R = full_config.o_lora_rank
-    group_in = full_config.n_heads * hd // full_config.o_groups   # 4096 (full)
+    group_in = full_config.n_heads * hd // full_config.o_groups  # 4096 (full)
 
     torch.manual_seed(99)
     x = (torch.randn(B, S, full_config.dim) * input_scale).to(torch.bfloat16)
@@ -676,12 +671,13 @@ def generate_prefill_block_reference_tp(full_config, tp_size: int = 4,
         freqs_cis = full.freqs_cis[0:S]
         q, qr = full._project_q(x, freqs_cis)
         kv = full._project_kv(x, freqs_cis)
-        o_full = full.core(q, kv, x, qr, start_pos=0)          # [B,S,128,head_dim]
+        o_full = full.core.prefill(q, kv, x, qr)  # [B,S,128,head_dim]
         apply_rotary_emb(o_full[..., -rd:], freqs_cis, inverse=True)
         ref_output_full = full._output_projection(o_full.clone(), B, S)  # [B,S,dim]
 
     full_sd = {
-        k: v for k, v in full.state_dict().items()
+        k: v
+        for k, v in full.state_dict().items()
         if not k.startswith("core.kv_cache")
         and not k.startswith("core.freqs_cis")
         and not k.startswith("freqs_cis")
@@ -690,39 +686,36 @@ def generate_prefill_block_reference_tp(full_config, tp_size: int = 4,
 
     per_rank_weights, ref_partials = [], []
     for r in range(tp_size):
-        h0, h1 = r * Hl, (r + 1) * Hl                # this rank's query heads
-        g0r, g1r = r * Gl * R, (r + 1) * Gl * R      # this rank's wo_a rows / wo_b cols
+        h0, h1 = r * Hl, (r + 1) * Hl  # this rank's query heads
+        g0r, g1r = r * Gl * R, (r + 1) * Gl * R  # this rank's wo_a rows / wo_b cols
         sd_r = {}
         for k, v in full_sd.items():
-            if k == "wq_b.weight":                   # [n_heads*hd, q_lora] -> this rank's heads
-                sd_r[k] = v[h0 * hd:h1 * hd, :].clone()
-            elif k == "core.attn_sink":              # [n_heads] -> this rank's heads
+            if k == "wq_b.weight":  # [n_heads*hd, q_lora] -> this rank's heads
+                sd_r[k] = v[h0 * hd : h1 * hd, :].clone()
+            elif k == "core.attn_sink":  # [n_heads] -> this rank's heads
                 sd_r[k] = v[h0:h1].clone()
-            elif k == "wo_a.weight":                 # [o_groups*R, group_in] -> this rank's groups
+            elif k == "wo_a.weight":  # [o_groups*R, group_in] -> this rank's groups
                 sd_r[k] = v[g0r:g1r, :].clone()
-            elif k == "wo_b.weight":                 # [dim, o_groups*R] -> this rank's group cols
+            elif k == "wo_b.weight":  # [dim, o_groups*R] -> this rank's group cols
                 sd_r[k] = v[:, g0r:g1r].clone()
-            else:                                    # wq_a/q_norm/wkv/kv_norm/indexer/compressor replicated
+            else:  # wq_a/q_norm/wkv/kv_norm/indexer/compressor replicated
                 sd_r[k] = v.clone()
         per_rank_weights.append(sd_r)
-        # Golden partial: an Hl-head/Gl-group block over this rank's head slice of
-        # o_full (== what the NKI rank block computes independently).
         with torch.no_grad():
-            og = o_full[:, :, h0:h1, :].reshape(B, S, Gl, group_in)        # [B,S,Gl,group_in]
+            og = o_full[:, :, h0:h1, :].reshape(B, S, Gl, group_in)  # [B,S,Gl,group_in]
             wo_a_r = sd_r["wo_a.weight"].view(Gl, R, group_in)
-            lat = torch.einsum("bsgd,grd->bsgr", og, wo_a_r)               # [B,S,Gl,R]
-            partial_r = torch.matmul(lat.reshape(B, S, Gl * R),
-                                     sd_r["wo_b.weight"].t())              # [B,S,dim]
+            lat = torch.einsum("bsgd,grd->bsgr", og, wo_a_r)  # [B,S,Gl,R]
+            partial_r = torch.matmul(lat.reshape(B, S, Gl * R), sd_r["wo_b.weight"].t())  # [B,S,dim]
         ref_partials.append(partial_r)
 
     summed = torch.stack([p.float() for p in ref_partials], 0).sum(0)
     max_sum_err = (summed - ref_output_full.float()).abs().max().item()
 
     return {
-        "x": x,                                # prefill input [B,S,dim] (the trace input)
-        "ref_output_full": ref_output_full,    # all-reduce target [B,S,dim]
-        "ref_partials": ref_partials,          # list of tp_size [B,S,dim] partials
-        "per_rank_weights": per_rank_weights,   # list of tp_size shard state_dicts
+        "x": x,  # prefill input [B,S,dim] (the trace input)
+        "ref_output_full": ref_output_full,  # all-reduce target [B,S,dim]
+        "ref_partials": ref_partials,  # list of tp_size [B,S,dim] partials
+        "per_rank_weights": per_rank_weights,  # list of tp_size shard state_dicts
         "max_sum_err": max_sum_err,
         "tp_size": tp_size,
     }
@@ -759,15 +752,9 @@ class CSAAttentionBlockDecode(nn.Module):
         assert self.n_groups % tp_size == 0, "o_groups must be divisible by tp_size"
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        self.n_local_groups = self.n_groups // tp_size          # groups owned by this rank
-        self.group_in = self.n_heads * self.head_dim // self.n_groups   # per-group wo_a input width
+        self.n_local_groups = self.n_groups // tp_size  # groups owned by this rank
+        self.group_in = self.n_heads * self.head_dim // self.n_groups  # per-group wo_a input width
 
-        # All projection weights are bf16: the core's indexer/compressor consume
-        # bf16 x/qr (their wq_b/weights_proj are bf16), the core's validated
-        # contract is bf16 q/kv/x/qr, and the NKI block runs bf16 matmuls
-        # (--auto-cast=none). This mirrors the original DeepSeek-V4 model's bf16
-        # default dtype and keeps the CPU reference and the NKI kernel on the
-        # same numeric footing (diff is hardware matmul accumulation only).
         pdt = torch.bfloat16
 
         # ----- Query projection -----
@@ -820,15 +807,12 @@ class CSAAttentionBlockDecode(nn.Module):
         # Flatten heads then view as groups; keep only this rank's groups.
         o = o.reshape(bsz, seqlen, self.n_groups, self.group_in)
         g0 = self.tp_rank * self.n_local_groups
-        o_local = o[:, :, g0:g0 + self.n_local_groups, :]        # [B, S, n_local_groups, group_in]
+        o_local = o[:, :, g0 : g0 + self.n_local_groups, :]  # [B, S, n_local_groups, group_in]
 
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, self.group_in)
         o_local = torch.einsum("bsgd,grd->bsgr", o_local, wo_a)  # [B, S, n_local_groups, o_lora_rank]
-        out_partial = self.wo_b(o_local.flatten(2))              # [B, S, dim] -- rank partial
+        out_partial = self.wo_b(o_local.flatten(2))  # [B, S, dim] -- rank partial
 
-        # NOTE(tensor-parallel): out_partial is this rank's contribution only.
-        # The final output is sum over ranks: dist.all_reduce(out_partial). We
-        # return the partial and leave the collective to the caller.
         return out_partial
 
     # ---- prefill (populate caches) -----------------------------------------
@@ -847,95 +831,32 @@ class CSAAttentionBlockDecode(nn.Module):
         bsz, seqlen, _ = x.size()
         assert seqlen == 1, f"Decode expects seqlen=1, got {seqlen}"
         rd = self.rope_head_dim
-        freqs_cis = self.freqs_cis[start_pos:start_pos + 1]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + 1]
 
         q, qr = self._project_q(x, freqs_cis)
         kv = self._project_kv(x, freqs_cis)
 
         # Core sparse attention (inserts the new kv into the window cache and
         # attends over window + top-k compressed positions).
-        o = self.core(q, kv, x, qr, start_pos)          # [B, 1, n_heads, head_dim]
+        o = self.core(q, kv, x, qr, start_pos)  # [B, 1, n_heads, head_dim]
 
         # De-rotate RoPE on the output's rope channels.
         apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
 
-        return self._output_projection(o, bsz, seqlen)   # [B, 1, dim] rank partial
+        return self._output_projection(o, bsz, seqlen)  # [B, 1, dim] rank partial
 
 
 # --------------------------------------------------------------------------
 # Reference data generation (prefill -> extract caches -> decode)
 # --------------------------------------------------------------------------
-def generate_decode_block_reference(config, tp_size: int = 4, tp_rank: int = 0,
-                             weight_gain: float = 0.46, norm_init: float = 1.0,
-                             sink_scale: float = 1.0, input_scale: float = 1.0):
-    """Build the block, run prefill, extract caches, run one decode step.
-
-    Returns a dict with the raw decode input `x_dec`, the post-prefill KV caches
-    (window / compressed / indexer) that the NKI block consumes, the rank-`tp_rank`
-    reference output, and the block weights for loading into the NKI module.
-
-    The magnitude knobs control how large the reference output is (useful for
-    exposing numerical error — a tiny gain=0.1 init decays the output to ~1e-6,
-    where bf16 rounding dominates the relative error):
-      weight_gain: xavier gain for 2-D projection weights. Default 0.46 gives an
-                   O(1e-2) output whose max_abs_diff (~1.1e-3) sits just below
-                   the 2e-3 tolerance; gain=1.0 is standard-xavier (max_abs ~5e-3).
-      norm_init:   RMSNorm weights initialized near this value (1.0 = identity).
-      sink_scale:  attn_sink magnitude.
-      input_scale: std of the random hidden-state inputs (prefill + decode). Note
-                   the block is input-scale-invariant (RMSNorm after wq_a/wkv).
-    """
-    block = CSAAttentionBlockDecode(config, tp_size=tp_size, tp_rank=tp_rank)
-    _init_block_weights(block, weight_gain=weight_gain, norm_init=norm_init,
-                        sink_scale=sink_scale)
-    block.eval()
-
-    B, S = config.batch_size, config.seq_len
-    W = config.window_size
-    T_c = S // config.compress_ratio
-
-    # Prefill from raw hidden states.
-    torch.manual_seed(99)
-    x_prefill = (torch.randn(B, S, config.dim) * input_scale).to(torch.bfloat16)
-    with torch.no_grad():
-        block.prefill(x_prefill)
-
-    # Extract caches after prefill (pre-decode; the NKI block inserts the new
-    # token into the window itself, matching core.forward).
-    kv_window = block.core.kv_cache[:B, :W].clone()
-    kv_compress = block.core.kv_cache[:B, W:W + T_c].clone()
-    indexer_kv_cache = block.core.indexer.kv_cache[:B, :T_c].clone()
-
-    # Decode from a raw hidden state.
-    torch.manual_seed(200)
-    x_dec = (torch.randn(B, 1, config.dim) * input_scale).to(torch.bfloat16)
-    with torch.no_grad():
-        ref_output = block(x_dec, start_pos=S)
-
-    # Weights to load into the NKI block (skip caches + freqs buffers).
-    ref_weights = {
-        k: v for k, v in block.state_dict().items()
-        if not k.startswith("core.kv_cache")
-        and not k.startswith("core.freqs_cis")
-        and not k.startswith("freqs_cis")
-        and not k.startswith("core.indexer.kv_cache")
-    }
-
-    return {
-        "x_dec": x_dec,
-        "kv_window": kv_window,
-        "kv_compress": kv_compress,
-        "indexer_kv_cache": indexer_kv_cache,
-        "ref_output": ref_output,
-        "ref_weights": ref_weights,
-        "tp_size": tp_size,
-        "tp_rank": tp_rank,
-    }
-
-
-def generate_decode_block_reference_tp(full_config, tp_size: int = 4,
-                                weight_gain: float = 0.46, norm_init: float = 1.0,
-                                sink_scale: float = 1.0, input_scale: float = 1.0):
+def generate_decode_block_reference_tp(
+    full_config,
+    tp_size: int = 4,
+    weight_gain: float = 0.46,
+    norm_init: float = 1.0,
+    sink_scale: float = 1.0,
+    input_scale: float = 1.0,
+):
     """Head-parallel tensor-parallel decomposition of the FULL model over `tp_size` ranks.
 
     The production model has full_config.n_heads (=128) query heads and
@@ -958,15 +879,14 @@ def generate_decode_block_reference_tp(full_config, tp_size: int = 4,
     ref_output_full, the per-rank partials, and the per-rank shard state_dicts.
     """
     full = CSAAttentionBlockDecode(full_config, tp_size=1, tp_rank=0)
-    _init_block_weights(full, weight_gain=weight_gain, norm_init=norm_init,
-                        sink_scale=sink_scale)
+    _init_block_weights(full, weight_gain=weight_gain, norm_init=norm_init, sink_scale=sink_scale)
     full.eval()
 
     B, S = full_config.batch_size, full_config.seq_len
     W = full_config.window_size
     T_c = S // full_config.compress_ratio
-    Hl = full_config.n_heads // tp_size          # 32 query heads per rank
-    Gl = full_config.o_groups // tp_size         # 4 output groups per rank
+    Hl = full_config.n_heads // tp_size  # 32 query heads per rank
+    Gl = full_config.o_groups // tp_size  # 4 output groups per rank
     hd = full_config.head_dim
     R = full_config.o_lora_rank
 
@@ -977,7 +897,7 @@ def generate_decode_block_reference_tp(full_config, tp_size: int = 4,
 
     # Head-independent caches, shared by every rank.
     kv_window = full.core.kv_cache[:B, :W].clone()
-    kv_compress = full.core.kv_cache[:B, W:W + T_c].clone()
+    kv_compress = full.core.kv_cache[:B, W : W + T_c].clone()
     indexer_kv_cache = full.core.indexer.kv_cache[:B, :T_c].clone()
 
     torch.manual_seed(200)
@@ -986,15 +906,16 @@ def generate_decode_block_reference_tp(full_config, tp_size: int = 4,
     with torch.no_grad():
         # Full decode up to the per-head attention output o (post de-RoPE), then
         # the full grouped output projection = the golden all-reduce target.
-        freqs_cis = full.freqs_cis[S:S + 1]
+        freqs_cis = full.freqs_cis[S : S + 1]
         q, qr = full._project_q(x_dec, freqs_cis)
         kv = full._project_kv(x_dec, freqs_cis)
-        o_full = full.core(q, kv, x_dec, qr, start_pos=S)      # [B,1,128,head_dim]
+        o_full = full.core(q, kv, x_dec, qr, start_pos=S)  # [B,1,128,head_dim]
         apply_rotary_emb(o_full[..., -rd:], freqs_cis, inverse=True)
         ref_output_full = full._output_projection(o_full.clone(), B, 1)  # [B,1,dim]
 
     full_sd = {
-        k: v for k, v in full.state_dict().items()
+        k: v
+        for k, v in full.state_dict().items()
         if not k.startswith("core.kv_cache")
         and not k.startswith("core.freqs_cis")
         and not k.startswith("freqs_cis")
@@ -1003,29 +924,28 @@ def generate_decode_block_reference_tp(full_config, tp_size: int = 4,
 
     per_rank_weights, ref_partials = [], []
     for r in range(tp_size):
-        h0, h1 = r * Hl, (r + 1) * Hl                # this rank's query heads
-        g0r, g1r = r * Gl * R, (r + 1) * Gl * R      # this rank's wo_a rows / wo_b cols
+        h0, h1 = r * Hl, (r + 1) * Hl  # this rank's query heads
+        g0r, g1r = r * Gl * R, (r + 1) * Gl * R  # this rank's wo_a rows / wo_b cols
         sd_r = {}
         for k, v in full_sd.items():
-            if k == "wq_b.weight":                   # [n_heads*hd, q_lora] -> this rank's heads
-                sd_r[k] = v[h0 * hd:h1 * hd, :].clone()
-            elif k == "core.attn_sink":              # [n_heads] -> this rank's heads
+            if k == "wq_b.weight":  # [n_heads*hd, q_lora] -> this rank's heads
+                sd_r[k] = v[h0 * hd : h1 * hd, :].clone()
+            elif k == "core.attn_sink":  # [n_heads] -> this rank's heads
                 sd_r[k] = v[h0:h1].clone()
-            elif k == "wo_a.weight":                 # [o_groups*R, group_in] -> this rank's groups
+            elif k == "wo_a.weight":  # [o_groups*R, group_in] -> this rank's groups
                 sd_r[k] = v[g0r:g1r, :].clone()
-            elif k == "wo_b.weight":                 # [dim, o_groups*R] -> this rank's group cols
+            elif k == "wo_b.weight":  # [dim, o_groups*R] -> this rank's group cols
                 sd_r[k] = v[:, g0r:g1r].clone()
-            else:                                    # wq_a/q_norm/wkv/kv_norm/indexer/compressor replicated
+            else:  # wq_a/q_norm/wkv/kv_norm/indexer/compressor replicated
                 sd_r[k] = v.clone()
         per_rank_weights.append(sd_r)
         # Golden partial: an Hl-head/Gl-group block over this rank's head slice of
         # o_full (== what the NKI rank block computes independently).
         with torch.no_grad():
-            og = o_full[:, :, h0:h1, :].reshape(B, 1, Gl, Hl * hd // Gl)   # [B,1,Gl,group_in]
+            og = o_full[:, :, h0:h1, :].reshape(B, 1, Gl, Hl * hd // Gl)  # [B,1,Gl,group_in]
             wo_a_r = sd_r["wo_a.weight"].view(Gl, R, Hl * hd // Gl)
-            lat = torch.einsum("bsgd,grd->bsgr", og, wo_a_r)               # [B,1,Gl,R]
-            partial_r = torch.matmul(lat.reshape(B, 1, Gl * R),
-                                     sd_r["wo_b.weight"].t())              # [B,1,dim]
+            lat = torch.einsum("bsgd,grd->bsgr", og, wo_a_r)  # [B,1,Gl,R]
+            partial_r = torch.matmul(lat.reshape(B, 1, Gl * R), sd_r["wo_b.weight"].t())  # [B,1,dim]
         ref_partials.append(partial_r)
 
     summed = torch.stack([p.float() for p in ref_partials], 0).sum(0)
@@ -1036,11 +956,9 @@ def generate_decode_block_reference_tp(full_config, tp_size: int = 4,
         "kv_window": kv_window,
         "kv_compress": kv_compress,
         "indexer_kv_cache": indexer_kv_cache,
-        "ref_output_full": ref_output_full,   # all-reduce target [B,1,dim]
-        "ref_partials": ref_partials,         # list of tp_size [B,1,dim] partials
+        "ref_output_full": ref_output_full,  # all-reduce target [B,1,dim]
+        "ref_partials": ref_partials,  # list of tp_size [B,1,dim] partials
         "per_rank_weights": per_rank_weights,  # list of tp_size shard state_dicts
         "max_sum_err": max_sum_err,
         "tp_size": tp_size,
     }
-
-
