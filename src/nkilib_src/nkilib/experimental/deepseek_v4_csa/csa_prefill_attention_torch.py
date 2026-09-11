@@ -61,24 +61,26 @@ def nki_rms_rope_torch_ref(
     eps_val: float,
     do_rms: int = 1,
     inverse: int = 0,
+    heads: int = 1,
+    in_head_major: int = 1,
+    out_head_major: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Oracle for ``nki_rms_rope_kernel``: RMSNorm(+gain) then RoPE over ``[S_rows, head_dim]``.
-
-    Three call sites share this kernel, and the flags are what pick between them:
-    the q-path (``gain_in=None``), the kv-path (``gain_in=kv_norm.weight``) and the
-    output de-RoPE (``do_rms=0, inverse=1``). ``cos_in``/``sin_in`` are per-ROW, so
-    the caller has already gathered the right angle for each (head, position) row.
-
-    The bf16 round after the norm and before the rotation is deliberate: the model
-    casts at its RMSNorm output boundary, and the kernel reproduces that, so the
-    reference has to as well or it would be systematically more accurate than what
-    it grades.
     """
     half_rope = cos_in.shape[1]
     rope_dim = 2 * half_rope
-    nope_dim = x_in.shape[1] - rope_dim
+    if in_head_major:
+        head_dim, s_len = x_in.shape[1], x_in.shape[0] // heads
+        rows = x_in
+    else:
+        head_dim, s_len = x_in.shape[1] // heads, x_in.shape[0]
+        rows = x_in.reshape(s_len, heads, head_dim).permute(1, 0, 2).reshape(heads * s_len, head_dim)
+    nope_dim = head_dim - rope_dim
+    if heads > 1:
+        cos_in = cos_in.repeat(heads, 1)
+        sin_in = sin_in.repeat(heads, 1)
 
-    x = x_in.float()
+    x = rows.float()
     if do_rms:
         x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps_val)
         if gain_in is not None:
@@ -87,6 +89,8 @@ def nki_rms_rope_torch_ref(
 
     rotated = _rope_pairs(normed[:, nope_dim:], cos_in.float(), sin_in.float(), bool(inverse))
     out = torch.cat([normed[:, :nope_dim], rotated.to(torch.bfloat16)], dim=-1)
+    if not out_head_major:
+        out = out.reshape(heads, s_len, head_dim).permute(1, 0, 2).reshape(s_len, heads * head_dim)
     return {"output_0": out}
 
 

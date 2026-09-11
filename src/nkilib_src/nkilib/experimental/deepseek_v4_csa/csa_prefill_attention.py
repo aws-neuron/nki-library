@@ -62,8 +62,6 @@ from ...core.utils.kernel_assert import kernel_assert
 
 
 # --------------------------------------------------------------------------
-# NKI Kernel: fused RMSNorm + RoPE projection tail (PREFILL).
-#
 # The prefill analogue of csa_nki_model_decode_block.nki_qkv_rms_rope_kernel.
 # That kernel is decode-shaped: it packs the n_heads q rows + the 1 kv row of a
 # SINGLE token onto one [n_heads+1, head_dim] partition tile. Prefill has S rows
@@ -87,170 +85,201 @@ def nki_rms_rope_kernel(
     eps_val: float,
     do_rms: int = 1,
     inverse: int = 0,
+    heads: int = 1,
+    in_head_major: int = 1,
+    out_head_major: int = 1,
 ) -> nl.NkiTensor:
     """Fused RMS(+optional gain) + RoPE over a [S_rows, head_dim] tile.
 
     x_in:   [S_rows, head_dim] bf16 — rows are (head-major) sequence positions.
-    cos_in/sin_in: [S_rows, half_rope] fp32 — per-row rotation, already gathered
-            so row r's angles match x_in row r (the caller repeats per head).
+    cos_in/sin_in: [S, half_rope] fp32 — per-POSITION rotation; with ``heads > 1``
+            the table is indexed by position alone, so the caller does not repeat
+            it per head.
     gain_in:[1, head_dim] fp32 or None — learnable RMSNorm gain, broadcast.
     Returns:[S_rows, head_dim] bf16 — nope channels passthrough, rope rotated.
+
+    ``heads``/``in_head_major``/``out_head_major`` select the LAYOUT of the multi-head
+    q and de-RoPE tensors, independently on each side:
+
+    * head-major is ``[heads * S, head_dim]``, row ``h * S + s``;
+    * query-major (``*_head_major=0``) is ``[S, heads * head_dim]``, row ``s`` and
+      column block ``h``.
+
     """
-    S_rows, head_dim = x_in.shape
+    if in_head_major:
+        head_dim = x_in.shape[1]
+        S = x_in.shape[0] // heads
+    else:
+        head_dim = x_in.shape[1] // heads
+        S = x_in.shape[0]
+    S_rows = S * heads
     half_rope = cos_in.shape[1]
     rope_head_dim = 2 * half_rope
     nope_dim = head_dim - rope_head_dim
     TILE = 128  # partition tile (v4 hard cap)
-    # The caller passes H*S (q/de-RoPE) or S (kv), both multiples of 128 for every
-    # graded seq-len, so tiles are always full -- no ragged tail to handle.
-    kernel_assert(S_rows % TILE == 0, f"S_rows={S_rows} must be a multiple of {TILE}")
-    n_tiles = S_rows // TILE
+    kernel_assert(S % TILE == 0, f"S={S} must be a multiple of {TILE}")
+    n_tiles = S // TILE
     rows = TILE
 
-    out = nl.ndarray((S_rows, head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    if out_head_major:
+        out = nl.ndarray((S_rows, head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    else:
+        out = nl.ndarray((S, heads * head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    # Learnable gain is row-invariant, so load it ONCE outside the tile loop and
-    # broadcast over the partition dim with a stride-0 access pattern.
     if gain_in is not None:
         gain = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=gain[0:TILE, 0:head_dim], src=gain_in.ap(pattern=[[0, TILE], [1, head_dim]]), priority=1)
 
-    for t in nl.affine_range(n_tiles):
-        r0 = t * TILE
+    for h in nl.affine_range(heads):
+        for ts in nl.affine_range(n_tiles):
+            s0 = ts * TILE
+            cos_row = s0
+            src_row = h * S + s0 if in_head_major else s0
+            src_col = 0 if in_head_major else h * head_dim
+            dst_row = h * S + s0 if out_head_major else s0
+            dst_col = 0 if out_head_major else h * head_dim
+            # priority=0: this load gates the whole RMS+RoPE chain below.
+            x_sb = nl.ndarray((TILE, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=x_sb[0:rows, 0:head_dim],
+                src=x_in[src_row : src_row + rows, src_col : src_col + head_dim],
+                priority=0,
+            )
+            x_f32 = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=x_f32[0:rows, 0:head_dim], src=x_sb[0:rows, 0:head_dim])
 
-        # priority=0: this load gates the whole RMS+RoPE chain below.
-        x_sb = nl.ndarray((TILE, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.dma_copy(dst=x_sb[0:rows, 0:head_dim], src=x_in[r0 : r0 + rows, 0:head_dim], priority=0)
-        x_f32 = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=x_f32[0:rows, 0:head_dim], src=x_sb[0:rows, 0:head_dim])
-
-        if do_rms:
-            # mean(x^2) over the free axis -> *1/head_dim + eps (fused) -> rsqrt.
-            x_sq = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(
-                dst=x_sq[0:rows, 0:head_dim],
-                data1=x_f32[0:rows, 0:head_dim],
-                data2=x_f32[0:rows, 0:head_dim],
-                op=nl.multiply,
-            )
-            msq = nl.ndarray((TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_reduce(dst=msq[0:rows, 0:1], data=x_sq[0:rows, 0:head_dim], op=nl.add, axis=1)
-            nisa.tensor_scalar(
-                dst=msq[0:rows, 0:1],
-                data=msq[0:rows, 0:1],
-                op0=nl.multiply,
-                operand0=1.0 / head_dim,
-                op1=nl.add,
-                operand1=eps_val,
-            )
-            rms = nl.ndarray((TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(dst=rms[0:rows, 0:1], op=nl.rsqrt, data=msq[0:rows, 0:1])
-            nisa.tensor_scalar(
-                dst=x_f32[0:rows, 0:head_dim],
-                data=x_f32[0:rows, 0:head_dim],
-                op0=nl.multiply,
-                operand0=rms[0:rows, 0:1],
-            )
-            if gain_in is not None:
+            if do_rms:
+                # mean(x^2) over the free axis -> *1/head_dim + eps (fused) -> rsqrt.
+                x_sq = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(
-                    dst=x_f32[0:rows, 0:head_dim],
+                    dst=x_sq[0:rows, 0:head_dim],
                     data1=x_f32[0:rows, 0:head_dim],
-                    data2=gain[0:rows, 0:head_dim],
+                    data2=x_f32[0:rows, 0:head_dim],
                     op=nl.multiply,
                 )
+                msq = nl.ndarray((TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_reduce(dst=msq[0:rows, 0:1], data=x_sq[0:rows, 0:head_dim], op=nl.add, axis=1)
+                nisa.tensor_scalar(
+                    dst=msq[0:rows, 0:1],
+                    data=msq[0:rows, 0:1],
+                    op0=nl.multiply,
+                    operand0=1.0 / head_dim,
+                    op1=nl.add,
+                    operand1=eps_val,
+                )
+                rms = nl.ndarray((TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=rms[0:rows, 0:1], op=nl.rsqrt, data=msq[0:rows, 0:1])
+                nisa.tensor_scalar(
+                    dst=x_f32[0:rows, 0:head_dim],
+                    data=x_f32[0:rows, 0:head_dim],
+                    op0=nl.multiply,
+                    operand0=rms[0:rows, 0:1],
+                )
+                if gain_in is not None:
+                    nisa.tensor_tensor(
+                        dst=x_f32[0:rows, 0:head_dim],
+                        data1=x_f32[0:rows, 0:head_dim],
+                        data2=gain[0:rows, 0:head_dim],
+                        op=nl.multiply,
+                    )
 
-        # Cast at the RMSNorm output boundary (the reference casts back here).
-        normed = nl.ndarray((TILE, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=normed[0:rows, 0:head_dim], src=x_f32[0:rows, 0:head_dim])
+            # Cast at the RMSNorm output boundary (the reference casts back here).
+            normed = nl.ndarray((TILE, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=normed[0:rows, 0:head_dim], src=x_f32[0:rows, 0:head_dim])
 
-        # nope channels pass straight through.
-        if nope_dim > 0:
-            nisa.dma_copy(dst=out[r0 : r0 + rows, 0:nope_dim], src=normed[0:rows, 0:nope_dim])
+            # nope channels pass straight through.
+            if nope_dim > 0:
+                nisa.dma_copy(
+                    dst=out[dst_row : dst_row + rows, dst_col : dst_col + nope_dim], src=normed[0:rows, 0:nope_dim]
+                )
 
-        # ---- RoPE on the trailing rope_head_dim channels (fp32 math) ----
-        rope_f = nl.ndarray((TILE, rope_head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=rope_f[0:rows, 0:rope_head_dim], src=normed[0:rows, nope_dim:head_dim])
-        # View as [.., half_rope, 2]: [...,0]=even (x1), [...,1]=odd (x2).
-        rope_pairs = rope_f.reshape((TILE, half_rope, 2))
-        x1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=x1[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 0])
-        x2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=x2[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 1])
+            # ---- RoPE on the trailing rope_head_dim channels (fp32 math) ----
+            rope_f = nl.ndarray((TILE, rope_head_dim), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=rope_f[0:rows, 0:rope_head_dim], src=normed[0:rows, nope_dim:head_dim])
+            # View as [.., half_rope, 2]: [...,0]=even (x1), [...,1]=odd (x2).
+            rope_pairs = rope_f.reshape((TILE, half_rope, 2))
+            x1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=x1[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 0])
+            x2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=x2[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 1])
 
-        # priority=2: cos/sin are consumed LAST (only by the rotation), so they
-        # yield DMA bandwidth to the loads the pipeline stalls on first.
-        cos_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=cos_h[0:rows, 0:half_rope], src=cos_in[r0 : r0 + rows, 0:half_rope], priority=2)
-        sin_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=sin_h[0:rows, 0:half_rope], src=sin_in[r0 : r0 + rows, 0:half_rope], priority=2)
+            # priority=2: cos/sin are consumed LAST (only by the rotation), so they
+            # yield DMA bandwidth to the loads the pipeline stalls on first.
+            cos_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=cos_h[0:rows, 0:half_rope], src=cos_in[cos_row : cos_row + rows, 0:half_rope], priority=2)
+            sin_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sin_h[0:rows, 0:half_rope], src=sin_in[cos_row : cos_row + rows, 0:half_rope], priority=2)
 
-        # y1 = x1*cos - x2*sin ; y2 = x1*sin + x2*cos   (inverse negates sin, so
-        # the signs swap: y1 = x1*cos + x2*sin ; y2 = -x1*sin + x2*cos)
-        tmp_a = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        tmp_b = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        y1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        y2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=tmp_a[0:rows, 0:half_rope],
-            data1=x1[0:rows, 0:half_rope],
-            data2=cos_h[0:rows, 0:half_rope],
-            op=nl.multiply,
-        )
-        nisa.tensor_tensor(
-            dst=tmp_b[0:rows, 0:half_rope],
-            data1=x2[0:rows, 0:half_rope],
-            data2=sin_h[0:rows, 0:half_rope],
-            op=nl.multiply,
-        )
-        if inverse:
+            # y1 = x1*cos - x2*sin ; y2 = x1*sin + x2*cos   (inverse negates sin, so
+            # the signs swap: y1 = x1*cos + x2*sin ; y2 = -x1*sin + x2*cos)
+            tmp_a = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            tmp_b = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            y1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+            y2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(
-                dst=y1[0:rows, 0:half_rope],
-                data1=tmp_a[0:rows, 0:half_rope],
-                data2=tmp_b[0:rows, 0:half_rope],
-                op=nl.add,
+                dst=tmp_a[0:rows, 0:half_rope],
+                data1=x1[0:rows, 0:half_rope],
+                data2=cos_h[0:rows, 0:half_rope],
+                op=nl.multiply,
             )
-        else:
             nisa.tensor_tensor(
-                dst=y1[0:rows, 0:half_rope],
-                data1=tmp_a[0:rows, 0:half_rope],
-                data2=tmp_b[0:rows, 0:half_rope],
-                op=nl.subtract,
+                dst=tmp_b[0:rows, 0:half_rope],
+                data1=x2[0:rows, 0:half_rope],
+                data2=sin_h[0:rows, 0:half_rope],
+                op=nl.multiply,
             )
-        nisa.tensor_tensor(
-            dst=tmp_a[0:rows, 0:half_rope],
-            data1=x1[0:rows, 0:half_rope],
-            data2=sin_h[0:rows, 0:half_rope],
-            op=nl.multiply,
-        )
-        nisa.tensor_tensor(
-            dst=tmp_b[0:rows, 0:half_rope],
-            data1=x2[0:rows, 0:half_rope],
-            data2=cos_h[0:rows, 0:half_rope],
-            op=nl.multiply,
-        )
-        if inverse:
+            if inverse:
+                nisa.tensor_tensor(
+                    dst=y1[0:rows, 0:half_rope],
+                    data1=tmp_a[0:rows, 0:half_rope],
+                    data2=tmp_b[0:rows, 0:half_rope],
+                    op=nl.add,
+                )
+            else:
+                nisa.tensor_tensor(
+                    dst=y1[0:rows, 0:half_rope],
+                    data1=tmp_a[0:rows, 0:half_rope],
+                    data2=tmp_b[0:rows, 0:half_rope],
+                    op=nl.subtract,
+                )
             nisa.tensor_tensor(
-                dst=y2[0:rows, 0:half_rope],
-                data1=tmp_b[0:rows, 0:half_rope],
-                data2=tmp_a[0:rows, 0:half_rope],
-                op=nl.subtract,
+                dst=tmp_a[0:rows, 0:half_rope],
+                data1=x1[0:rows, 0:half_rope],
+                data2=sin_h[0:rows, 0:half_rope],
+                op=nl.multiply,
             )
-        else:
             nisa.tensor_tensor(
-                dst=y2[0:rows, 0:half_rope],
-                data1=tmp_a[0:rows, 0:half_rope],
-                data2=tmp_b[0:rows, 0:half_rope],
-                op=nl.add,
+                dst=tmp_b[0:rows, 0:half_rope],
+                data1=x2[0:rows, 0:half_rope],
+                data2=cos_h[0:rows, 0:half_rope],
+                op=nl.multiply,
             )
+            if inverse:
+                nisa.tensor_tensor(
+                    dst=y2[0:rows, 0:half_rope],
+                    data1=tmp_b[0:rows, 0:half_rope],
+                    data2=tmp_a[0:rows, 0:half_rope],
+                    op=nl.subtract,
+                )
+            else:
+                nisa.tensor_tensor(
+                    dst=y2[0:rows, 0:half_rope],
+                    data1=tmp_a[0:rows, 0:half_rope],
+                    data2=tmp_b[0:rows, 0:half_rope],
+                    op=nl.add,
+                )
 
-        # Re-interleave y1 (even) / y2 (odd), cast bf16, write out.
-        rope_out = nl.ndarray((TILE, half_rope, 2), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 0], src=y1[0:rows, 0:half_rope])
-        nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 1], src=y2[0:rows, 0:half_rope])
-        rope_flat = rope_out.reshape((TILE, rope_head_dim))
-        rope_bf16 = nl.ndarray((TILE, rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=rope_bf16[0:rows, 0:rope_head_dim], src=rope_flat[0:rows, 0:rope_head_dim])
-        nisa.dma_copy(dst=out[r0 : r0 + rows, nope_dim:head_dim], src=rope_bf16[0:rows, 0:rope_head_dim])
+            # Re-interleave y1 (even) / y2 (odd), cast bf16, write out.
+            rope_out = nl.ndarray((TILE, half_rope, 2), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 0], src=y1[0:rows, 0:half_rope])
+            nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 1], src=y2[0:rows, 0:half_rope])
+            rope_flat = rope_out.reshape((TILE, rope_head_dim))
+            rope_bf16 = nl.ndarray((TILE, rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=rope_bf16[0:rows, 0:rope_head_dim], src=rope_flat[0:rows, 0:rope_head_dim])
+            nisa.dma_copy(
+                dst=out[dst_row : dst_row + rows, dst_col + nope_dim : dst_col + head_dim],
+                src=rope_bf16[0:rows, 0:rope_head_dim],
+            )
 
     return out
 
@@ -290,12 +319,6 @@ def nki_compressor_core_kernel(
 
     out = nl.ndarray((T_c, head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    # SPMD across compressed-position tiles only: each core owns a disjoint set of
-    # 128-position tiles and runs the FULL per-position softmax-over-slots + RMSNorm
-    # + RoPE for its positions, writing disjoint HBM output rows. Both reductions
-    # (softmax over the 2*ratio slots, RMSNorm over head_dim) are per-position, so
-    # nothing is reduced across cores. The host launches [2] only when num_tiles
-    # splits evenly; otherwise [1].
     core_id = nl.program_id(0)
     n_cores = nl.num_programs()
     tiles_per_core = num_tiles // n_cores
@@ -1082,13 +1105,6 @@ def nki_prefill_sparse_attn_kernel(
     num_chunks = k_val // COMP_CHUNK
 
     kernel_assert(n_heads == 128, "sparse prefill needs all 128 heads on one rank (sequence-parallel sharding)")
-    # The window is read as a full W-column slice with no additive mask, which is only
-    # equivalent to the reference for queries whose whole W-window holds real tokens --
-    # i.e. global position >= W. The reference clamps instead (query p < W attends p + 1
-    # keys). The caller guarantees this: the kernel runs only on the SCORED region, whose
-    # first row is index_topk * compress_ratio = 4096, far above W = 128. A caller that
-    # pointed this kernel at the leading positions would silently attend zero-padding
-    # with score 0 rather than masking it out.
     kernel_assert(k_val % COMP_CHUNK == 0, "k must be a multiple of the gather chunk (128)")
     kernel_assert(head_dim % HD_CHUNK == 0, "head_dim must be a multiple of 128")
 
@@ -1098,21 +1114,12 @@ def nki_prefill_sparse_attn_kernel(
     s_per_core = S // n_cores
     s_start = core_id * s_per_core
 
-    # `name=` is load-bearing on a multi-core grid: an anonymous shared_hbm alloc is
-    # localized PER CORE, so each core's rows would be invisible to the others.
     output = nl.ndarray((n_heads * S, head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="sparse_prefill_out")
 
     for q_local in nl.static_range(s_per_core):
         q = s_start + q_local  # this core's query, a trace-time constant
         p = q  # window slice is pre-positioned by the caller, so p is tile-relative
 
-        # ---- this query's Q, all heads: [HD_CHUNK, n_heads] stationary tiles ----
-        # Q via dma_transpose from a QUERY-MAJOR layout. The head-major
-        # [head_dim, n_heads * S] layout forces an access pattern whose free stride is S,
-        # which neuronx-cc lowers to ONE DESCRIPTOR PER 2-BYTE ELEMENT -- 65536 descriptors
-        # per query, measured at 45.7% of all DMA engine-time and 27.7x more expensive
-        # than an identically-shaped contiguous load in the same kernel. Reading one
-        # query's contiguous [n_heads, head_dim] block instead costs PAR descriptors.
         q_hb = [None] * HD_TILES
         for hd in range(HD_TILES):
             q_hb[hd] = nl.ndarray((HD_CHUNK, n_heads), dtype=nl.float16, buffer=nl.sbuf)
@@ -1129,20 +1136,6 @@ def nki_prefill_sparse_attn_kernel(
             idx = nl.ndarray((COMP_CHUNK, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.dma_copy(dst=idx, src=topk_idx_T.ap(pattern=[[S, COMP_CHUNK], [1, 1]], offset=c * COMP_CHUNK * S + q))
             kv_chunks[c] = nl.ndarray((COMP_CHUNK, head_dim), dtype=nl.float16, buffer=nl.sbuf)
-            # oob_mode.skip makes the gather memory-safe BY CONSTRUCTION: an index outside
-            # [0, T_c) leaves its destination row untouched instead of aborting the device
-            # (status=1006). The default oob_mode.error couples selection correctness to
-            # memory safety, turning any bad top-k index into a hard device fault.
-            #
-            # This is memory safety only, NOT numerical safety. A skipped row keeps the
-            # memset zeros, so its score is q . 0 == 0 -- not -1e9 -- and exp(0 - shift) is
-            # a real weight on a zero-valued row, which inflates the softmax denominator
-            # and dilutes the output rather than dropping the position. Correctness
-            # therefore still rests on the caller's invariant that every index is in
-            # [0, T_c): the indexer causally masks before the top-k and the scored region
-            # always has at least k valid compressed positions, so the k winners are all
-            # real. If that invariant is ever in doubt, mask the score instead of zeroing
-            # the row -- zeroing is not equivalent to exclusion.
             nisa.memset(dst=kv_chunks[c], value=0)
             nisa.dma_copy(
                 dst=kv_chunks[c],
@@ -1153,13 +1146,6 @@ def nki_prefill_sparse_attn_kernel(
             )
 
         # ---- window K^T / V: the causal W-column slice for THIS query ----
-        # Columns [p + 1, p + 1 + W) of a buffer front-padded by W, which is original
-        # positions [g - W + 1, g] for the query at global position g -- the window
-        # INCLUDING the query's own key, exactly what the reference model attends
-        # (csa_block_torch.get_window_topk_idxs: max(g - W + 1, 0) + [0, W)). Starting at
-        # `p` instead shifts the whole window one position earlier and drops the query's
-        # own key; that is what this did before, and it survived the block test because
-        # the check is absolute (max_abs < 2e-3) against a signal whose std is ~2.2e-3.
         win_kt = [None] * HD_TILES
         for hd in range(HD_TILES):
             hd_start = hd * HD_CHUNK
@@ -1171,14 +1157,6 @@ def nki_prefill_sparse_attn_kernel(
         nisa.dma_copy(dst=win_v, src=all_V_win[p + 1 : p + 1 + W, 0:head_dim], priority=2)
 
         # ---- window scores ----
-        # NO attention sink. The sink is a bias on the key at ABSOLUTE position 0 only
-        # (csa_block_torch.sparse_attn_cpu: `sink_mask = (safe_idxs == 0)`), and this
-        # kernel only ever runs on the scored region, whose queries all satisfy
-        # g >= index_topk * compress_ratio = 4096, so position 0 is never inside their
-        # W = 128 window -- the dense kernel likewise adds nothing there because
-        # `precompute_win_bias_parts` leaves its sink indicator all-zero past the first
-        # tile. Adding the sink at the slice's first column, as this did before, applied
-        # it to position g - W on EVERY query.
         win_ps = nl.ndarray((n_heads, W), dtype=nl.float32, buffer=nl.psum)
         for hd in nl.affine_range(HD_TILES):
             nisa.nc_matmul(dst=win_ps, stationary=q_hb[hd], moving=win_kt[hd])
@@ -1186,13 +1164,6 @@ def nki_prefill_sparse_attn_kernel(
         nisa.tensor_copy(dst=win_scores, src=win_ps)
 
         # ---- compressed scores over the k gathered positions ONLY ----
-        # The gathered K^T is built and consumed ONE 128-chunk at a time and never
-        # materialized whole. Holding it as [head_dim, k] alongside the gathered V doubled
-        # the per-query SBUF working set (8 KB/partition each at k=1024, head_dim=512), and
-        # once the scheduler kept several unrolled query bodies in flight the register
-        # allocator spilled -- measured as 79,872 spill DMAs lowering to one 2-byte
-        # descriptor per fp16 element, 1.59 s of a 2.58 s block. Per chunk the transposed
-        # tile is 1 KB/partition and dies immediately.
         comp_scores = nl.ndarray((n_heads, k_val), dtype=nl.float32, buffer=nl.sbuf)
         for c in nl.affine_range(num_chunks):
             c0 = c * COMP_CHUNK
@@ -1281,17 +1252,6 @@ def nki_prefill_sparse_attn_kernel(
 # nc_transpose fold `_snake_fill` uses in the decode indexer. HBM traffic becomes
 # read S_q * T_c bf16 + write S_q * k uint32 -- 117 MB + 29 MB at those shapes.
 #
-# All EIGHT snake groups are used, so one nisa.topk call serves 8 queries. An earlier
-# attempt at that was abandoned on the belief that nisa.topk corrupts group 0 when the
-# other groups carry data; the real fault was an illegal access. A 16-partition SBUF
-# slice must start at partition 0, 32, 64 or 96, so touching group g at partition
-# offset 16g fails BIR verification for odd g ("Invalid access of 16 partitions
-# starting at partition 16"). Keeping the group index in the FREE dimension instead --
-# fill a [128, 128] tile whose free axis is (group, row-within-group) and fold it with
-# ONE nc_transpose; read the winners back with ONE DMA whose HBM pattern re-splits
-# partition p into (row base + p // 16, column (p % 16) * k_cols) -- makes every
-# partition access start at 0. Measured exact: 0 out-of-range indices and 0 wrong rows
-# against torch.topk at (S_q, T_c) = (256, 4096), (256, 8192) and (2048, 8192).
 # --------------------------------------------------------------------------
 _SNAKE_GROUP = 16
 _SNAKE_GROUPS = 8
@@ -1338,10 +1298,6 @@ def nki_prefill_topk_kernel(
     tiles_per_core = S_q // (GROUPS * n_cores)
     tile_base = core_id * tiles_per_core
 
-    # The padding columns beyond live_x never change, so the sentinel is written ONCE and
-    # each tile only rewrites the live columns. That reuse is a loop-carried dependency,
-    # hence sequential_range: every range flavour here unrolls, but sequential is the one
-    # that stops the scheduler hoisting the next tile's fill above this tile's topk.
     snake = nl.ndarray((PAR, snake_x), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.memset(dst=snake, value=_SNAKE_NEG)
 
@@ -1351,11 +1307,6 @@ def nki_prefill_topk_kernel(
     for t_local in nl.sequential_range(tiles_per_core):
         base = (tile_base + t_local) * GROUPS
 
-        # Fill all 8 groups: snake[16g + r, 128b + c] = scores[base + g, 2048b + 16c + r].
-        # Each row is read as its natural [128, 16] view (a contiguous 16-element burst per
-        # partition) into free columns [16g, 16g + 16), then ONE nc_transpose folds the
-        # whole [128, 128] tile free->partition. A DMA that folded it directly would cost
-        # one descriptor per element.
         for b in nl.static_range(live_x // 128):
             blk = nl.ndarray((128, PAR), dtype=nl.bfloat16, buffer=nl.sbuf)
             for g in nl.static_range(GROUPS):
@@ -1369,10 +1320,6 @@ def nki_prefill_topk_kernel(
 
         nisa.topk(val_dst=val, idx_dst=idx, src=snake, n=n_val)
 
-        # One DMA for all 8 rows: SBUF partition p carries row (base + p // 16)'s winner
-        # for column (p % 16) * k_cols + c, which is what the 3-level HBM pattern below
-        # streams. Reading the groups out as 16-partition slices instead would be an
-        # illegal partition offset for odd g.
         nisa.dma_copy(
             dst=out.ap(pattern=[[k_val, GROUPS], [k_cols, GROUP], [1, k_cols]], offset=base * k_val),
             src=idx[0:PAR, 0:k_cols],
