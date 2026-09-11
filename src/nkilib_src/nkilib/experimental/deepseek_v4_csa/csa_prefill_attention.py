@@ -56,6 +56,7 @@ class-of-service hint that changes no byte and no MAC.
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from nki.isa.constants import oob_mode
 
 from ...core.utils.kernel_assert import kernel_assert
 
@@ -1027,3 +1028,354 @@ def nki_gather_csa_attn_kernel(
                 nisa.dma_copy(dst=output[q_global : q_global + TILE_Q, 0:head_dim], src=out_bf16)
 
     return output
+
+
+# --------------------------------------------------------------------------
+# NKI Kernel: TRUE sparse prefill attention (per-query indirect gather)
+#
+# The other two prefill attention kernels are dense-plus-mask: they score every
+# causal compressed column and predicate the unselected ones to -1e9. That is
+# correct but computes `causal_cols / k` more score positions than the model needs
+# (4.3x at seq_len=32768, 128x at 1M).
+#
+# This kernel instead gathers each query's `k` SELECTED compressed rows with an
+# indirect DMA and scores only those, so its compressed cost is O(k) and
+# independent of context length.
+#
+# WHY IT NEEDS n_heads ON THE PARTITION DIM. The dense kernels put QUERIES on the
+# matmul output-partition dim and loop heads, which lets 128 queries share one
+# moving K^T operand -- and that sharing is exactly what per-query selection
+# breaks, because each query wants different columns. So this kernel transposes the
+# roles: heads on the output partitions, one query at a time, the gathered K^T as
+# the moving operand. That makes the stationary tile [head_dim_chunk, n_heads], so
+# it is only efficient when n_heads is large: at n_heads=128 it fills all 128
+# output partitions, at n_heads=32 it wastes three quarters of them. Hence this
+# kernel is for the SEQUENCE-PARALLEL sharding (all heads local, queries split
+# across ranks, compressed KV replicated), not the head-parallel sharding.
+#
+# The window is a per-query causal SLICE rather than a masked 256-column block, so
+# no additive window bias is needed: query p reads window columns [p, p+W) and the
+# window is the causal W-column slice ENDING AT the query's own position.
+# --------------------------------------------------------------------------
+@nki.jit
+def nki_prefill_sparse_attn_kernel(
+    topk_idx_T: nl.NkiTensor,  # [k, S] uint32 — per-query selected compressed positions
+    all_q: nl.NkiTensor,  # [S * n_heads, head_dim] f16 — QUERY-MAJOR: one query's heads contiguous
+    all_K_T_win: nl.NkiTensor,  # [head_dim, S + W] f16 — window K^T (padded)
+    all_V_win: nl.NkiTensor,  # [S + W, head_dim] f16 — window V (padded)
+    compress_kv: nl.NkiTensor,  # [T_c, head_dim] f16 — FULL compressed KV, replicated per rank
+    attn_sink_in: nl.NkiTensor,  # [1, n_heads] f32 — read for n_heads only; see the window note
+) -> nl.NkiTensor:
+    """O(k) sparse prefill attention. Returns [n_heads * S, head_dim] bf16.
+
+    Requires n_heads == 128 (one full matmul output-partition tile) and
+    k % 128 == 0. `S` here is the number of queries THIS launch covers.
+    """
+    head_dim = all_q.shape[1]
+    k_val = topk_idx_T.shape[0]
+    S = topk_idx_T.shape[1]
+    n_heads = attn_sink_in.shape[1]
+    W = 128
+    COMP_CHUNK = 128
+    HD_CHUNK = 128
+    HD_TILES = head_dim // HD_CHUNK
+    num_chunks = k_val // COMP_CHUNK
+
+    kernel_assert(n_heads == 128, "sparse prefill needs all 128 heads on one rank (sequence-parallel sharding)")
+    # The window is read as a full W-column slice with no additive mask, which is only
+    # equivalent to the reference for queries whose whole W-window holds real tokens --
+    # i.e. global position >= W. The reference clamps instead (query p < W attends p + 1
+    # keys). The caller guarantees this: the kernel runs only on the SCORED region, whose
+    # first row is index_topk * compress_ratio = 4096, far above W = 128. A caller that
+    # pointed this kernel at the leading positions would silently attend zero-padding
+    # with score 0 rather than masking it out.
+    kernel_assert(k_val % COMP_CHUNK == 0, "k must be a multiple of the gather chunk (128)")
+    kernel_assert(head_dim % HD_CHUNK == 0, "head_dim must be a multiple of 128")
+
+    core_id = nl.program_id(0)
+    n_cores = nl.num_programs()
+    kernel_assert(S % n_cores == 0, "query count must divide across the launch grid")
+    s_per_core = S // n_cores
+    s_start = core_id * s_per_core
+
+    # `name=` is load-bearing on a multi-core grid: an anonymous shared_hbm alloc is
+    # localized PER CORE, so each core's rows would be invisible to the others.
+    output = nl.ndarray((n_heads * S, head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="sparse_prefill_out")
+
+    for q_local in nl.static_range(s_per_core):
+        q = s_start + q_local  # this core's query, a trace-time constant
+        p = q  # window slice is pre-positioned by the caller, so p is tile-relative
+
+        # ---- this query's Q, all heads: [HD_CHUNK, n_heads] stationary tiles ----
+        # Q via dma_transpose from a QUERY-MAJOR layout. The head-major
+        # [head_dim, n_heads * S] layout forces an access pattern whose free stride is S,
+        # which neuronx-cc lowers to ONE DESCRIPTOR PER 2-BYTE ELEMENT -- 65536 descriptors
+        # per query, measured at 45.7% of all DMA engine-time and 27.7x more expensive
+        # than an identically-shaped contiguous load in the same kernel. Reading one
+        # query's contiguous [n_heads, head_dim] block instead costs PAR descriptors.
+        q_hb = [None] * HD_TILES
+        for hd in range(HD_TILES):
+            q_hb[hd] = nl.ndarray((HD_CHUNK, n_heads), dtype=nl.float16, buffer=nl.sbuf)
+            nisa.dma_transpose(
+                dst=q_hb[hd],
+                src=all_q.ap(
+                    pattern=[[head_dim, n_heads], [1, HD_CHUNK]], offset=q * n_heads * head_dim + hd * HD_CHUNK
+                ),
+            )
+
+        # ---- indirect gather of this query's k selected compressed rows ----
+        kv_chunks = [None] * num_chunks
+        for c in nl.affine_range(num_chunks):
+            idx = nl.ndarray((COMP_CHUNK, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=idx, src=topk_idx_T.ap(pattern=[[S, COMP_CHUNK], [1, 1]], offset=c * COMP_CHUNK * S + q))
+            kv_chunks[c] = nl.ndarray((COMP_CHUNK, head_dim), dtype=nl.float16, buffer=nl.sbuf)
+            # oob_mode.skip makes the gather memory-safe BY CONSTRUCTION: an index outside
+            # [0, T_c) leaves its destination row untouched instead of aborting the device
+            # (status=1006). The default oob_mode.error couples selection correctness to
+            # memory safety, turning any bad top-k index into a hard device fault.
+            #
+            # This is memory safety only, NOT numerical safety. A skipped row keeps the
+            # memset zeros, so its score is q . 0 == 0 -- not -1e9 -- and exp(0 - shift) is
+            # a real weight on a zero-valued row, which inflates the softmax denominator
+            # and dilutes the output rather than dropping the position. Correctness
+            # therefore still rests on the caller's invariant that every index is in
+            # [0, T_c): the indexer causally masks before the top-k and the scored region
+            # always has at least k valid compressed positions, so the k winners are all
+            # real. If that invariant is ever in doubt, mask the score instead of zeroing
+            # the row -- zeroing is not equivalent to exclusion.
+            nisa.memset(dst=kv_chunks[c], value=0)
+            nisa.dma_copy(
+                dst=kv_chunks[c],
+                src=compress_kv.ap(pattern=[[head_dim, COMP_CHUNK], [1, head_dim]], vector_offset=idx, indirect_dim=0),
+                dge_mode=nisa.dge_mode.swdge,
+                oob_mode=oob_mode.skip,
+                priority=0,
+            )
+
+        # ---- window K^T / V: the causal W-column slice for THIS query ----
+        # Columns [p + 1, p + 1 + W) of a buffer front-padded by W, which is original
+        # positions [g - W + 1, g] for the query at global position g -- the window
+        # INCLUDING the query's own key, exactly what the reference model attends
+        # (csa_block_torch.get_window_topk_idxs: max(g - W + 1, 0) + [0, W)). Starting at
+        # `p` instead shifts the whole window one position earlier and drops the query's
+        # own key; that is what this did before, and it survived the block test because
+        # the check is absolute (max_abs < 2e-3) against a signal whose std is ~2.2e-3.
+        win_kt = [None] * HD_TILES
+        for hd in range(HD_TILES):
+            hd_start = hd * HD_CHUNK
+            win_kt[hd] = nl.ndarray((HD_CHUNK, W), dtype=nl.float16, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=win_kt[hd], src=all_K_T_win[hd_start : hd_start + HD_CHUNK, p + 1 : p + 1 + W], priority=2
+            )
+        win_v = nl.ndarray((W, head_dim), dtype=nl.float16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=win_v, src=all_V_win[p + 1 : p + 1 + W, 0:head_dim], priority=2)
+
+        # ---- window scores ----
+        # NO attention sink. The sink is a bias on the key at ABSOLUTE position 0 only
+        # (csa_block_torch.sparse_attn_cpu: `sink_mask = (safe_idxs == 0)`), and this
+        # kernel only ever runs on the scored region, whose queries all satisfy
+        # g >= index_topk * compress_ratio = 4096, so position 0 is never inside their
+        # W = 128 window -- the dense kernel likewise adds nothing there because
+        # `precompute_win_bias_parts` leaves its sink indicator all-zero past the first
+        # tile. Adding the sink at the slice's first column, as this did before, applied
+        # it to position g - W on EVERY query.
+        win_ps = nl.ndarray((n_heads, W), dtype=nl.float32, buffer=nl.psum)
+        for hd in nl.affine_range(HD_TILES):
+            nisa.nc_matmul(dst=win_ps, stationary=q_hb[hd], moving=win_kt[hd])
+        win_scores = nl.ndarray((n_heads, W), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=win_scores, src=win_ps)
+
+        # ---- compressed scores over the k gathered positions ONLY ----
+        # The gathered K^T is built and consumed ONE 128-chunk at a time and never
+        # materialized whole. Holding it as [head_dim, k] alongside the gathered V doubled
+        # the per-query SBUF working set (8 KB/partition each at k=1024, head_dim=512), and
+        # once the scheduler kept several unrolled query bodies in flight the register
+        # allocator spilled -- measured as 79,872 spill DMAs lowering to one 2-byte
+        # descriptor per fp16 element, 1.59 s of a 2.58 s block. Per chunk the transposed
+        # tile is 1 KB/partition and dies immediately.
+        comp_scores = nl.ndarray((n_heads, k_val), dtype=nl.float32, buffer=nl.sbuf)
+        for c in nl.affine_range(num_chunks):
+            c0 = c * COMP_CHUNK
+            ps = nl.ndarray((n_heads, COMP_CHUNK), dtype=nl.float32, buffer=nl.psum)
+            for hd in nl.affine_range(HD_TILES):
+                hd_start = hd * HD_CHUNK
+                tp = nl.ndarray((HD_CHUNK, COMP_CHUNK), dtype=nl.float16, buffer=nl.psum)
+                nisa.nc_transpose(dst=tp, data=kv_chunks[c][0:COMP_CHUNK, hd_start : hd_start + HD_CHUNK])
+                kt_c = nl.ndarray((HD_CHUNK, COMP_CHUNK), dtype=nl.float16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=kt_c, src=tp)
+                nisa.nc_matmul(dst=ps, stationary=q_hb[hd], moving=kt_c)
+            nisa.tensor_copy(dst=comp_scores[0:n_heads, c0 : c0 + COMP_CHUNK], src=ps)
+
+        # ---- one global-max softmax over [window | gathered] ----
+        win_max = nl.ndarray((n_heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=win_max, data=win_scores, op=nl.maximum, axis=1)
+        comp_max = nl.ndarray((n_heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=comp_max, data=comp_scores, op=nl.maximum, axis=1)
+        neg_max = nl.ndarray((n_heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=neg_max, data1=win_max, data2=comp_max, op=nl.maximum)
+        nisa.tensor_scalar(dst=neg_max, data=neg_max, op0=nl.multiply, operand0=-1.0)
+
+        win_sum = nl.ndarray((n_heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+        win_exp = nl.ndarray((n_heads, W), dtype=nl.float16, buffer=nl.sbuf)
+        nisa.activation(
+            dst=win_exp,
+            op=nl.exp,
+            data=win_scores,
+            bias=neg_max,
+            reduce_op=nl.add,
+            reduce_res=win_sum,
+            reduce_cmd=nisa.reduce_cmd.reset_reduce,
+        )
+        comp_sum = nl.ndarray((n_heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+        comp_exp = nl.ndarray((n_heads, k_val), dtype=nl.float16, buffer=nl.sbuf)
+        nisa.activation(
+            dst=comp_exp,
+            op=nl.exp,
+            data=comp_scores,
+            bias=neg_max,
+            reduce_op=nl.add,
+            reduce_res=comp_sum,
+            reduce_cmd=nisa.reduce_cmd.reset_reduce,
+        )
+
+        # ---- V accumulation: window slice first, then the gathered chunks ----
+        out_psum = nl.ndarray((n_heads, head_dim), dtype=nl.float32, buffer=nl.psum)
+        we_T = nl.ndarray((W, n_heads), dtype=nl.float16, buffer=nl.psum)
+        nisa.nc_transpose(dst=we_T, data=win_exp)
+        we_T_sb = nl.ndarray((W, n_heads), dtype=nl.float16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=we_T_sb, src=we_T)
+        nisa.nc_matmul(dst=out_psum, stationary=we_T_sb, moving=win_v)
+        for c in nl.affine_range(num_chunks):
+            c0 = c * COMP_CHUNK
+            ce_T = nl.ndarray((COMP_CHUNK, n_heads), dtype=nl.float16, buffer=nl.psum)
+            nisa.nc_transpose(dst=ce_T, data=comp_exp[0:n_heads, c0 : c0 + COMP_CHUNK])
+            ce_T_sb = nl.ndarray((COMP_CHUNK, n_heads), dtype=nl.float16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=ce_T_sb, src=ce_T)
+            nisa.nc_matmul(dst=out_psum, stationary=ce_T_sb, moving=kv_chunks[c])
+
+        # ---- normalize by the shared denominator and write out head-major ----
+        total = nl.ndarray((n_heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=total, data1=win_sum, data2=comp_sum, op=nl.add)
+        inv = nl.ndarray((n_heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=inv, op=nl.reciprocal, data=total)
+        o_f32 = nl.ndarray((n_heads, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=o_f32, src=out_psum)
+        nisa.tensor_scalar(dst=o_f32, data=o_f32, op0=nl.multiply, operand0=inv)
+        o_bf = nl.ndarray((n_heads, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=o_bf, src=o_f32)
+        nisa.dma_copy(dst=output.ap(pattern=[[S * head_dim, n_heads], [1, head_dim]], offset=q * head_dim), src=o_bf)
+
+    return output
+
+
+# --------------------------------------------------------------------------
+# NKI Kernel: per-query top-k over the indexer scores, entirely on-chip
+#
+# The block used to build nisa.topk's snake layout on the HOST: reshape/transpose
+# [S_q, T_c] into [S_q * 128, T_c/16] and hand it back to a topk kernel that
+# returned [S_q * 128, k] values AND indices. Only 1/128 of that output is ever
+# read (snake group 0 = 16 partitions x k/16 columns), so at S_q = 7168, T_c = 8192
+# the stage moved ~6.5 GB through HBM to deliver 29 MB of indices.
+#
+# Here the snake tile is built in SBUF from the score rows directly, with the same
+# nc_transpose fold `_snake_fill` uses in the decode indexer. HBM traffic becomes
+# read S_q * T_c bf16 + write S_q * k uint32 -- 117 MB + 29 MB at those shapes.
+#
+# All EIGHT snake groups are used, so one nisa.topk call serves 8 queries. An earlier
+# attempt at that was abandoned on the belief that nisa.topk corrupts group 0 when the
+# other groups carry data; the real fault was an illegal access. A 16-partition SBUF
+# slice must start at partition 0, 32, 64 or 96, so touching group g at partition
+# offset 16g fails BIR verification for odd g ("Invalid access of 16 partitions
+# starting at partition 16"). Keeping the group index in the FREE dimension instead --
+# fill a [128, 128] tile whose free axis is (group, row-within-group) and fold it with
+# ONE nc_transpose; read the winners back with ONE DMA whose HBM pattern re-splits
+# partition p into (row base + p // 16, column (p % 16) * k_cols) -- makes every
+# partition access start at 0. Measured exact: 0 out-of-range indices and 0 wrong rows
+# against torch.topk at (S_q, T_c) = (256, 4096), (256, 8192) and (2048, 8192).
+# --------------------------------------------------------------------------
+_SNAKE_GROUP = 16
+_SNAKE_GROUPS = 8
+_SNAKE_PAR = 128
+_SNAKE_NEG = -1.0e30
+"""Sentinel for snake positions that hold no score. Must be strictly below every real
+score, including the indexer's -1e9 causal mask, so padding can never be selected."""
+
+
+@nki.jit
+def nki_prefill_topk_kernel(
+    scores: nl.NkiTensor,  # [S_q, T_c] bf16 — indexer scores, causal bias already folded in
+    k_val: int,  # top-k count; multiple of 16
+    n_val: int,  # nisa.topk width; T_c padded up to a proven-safe width
+) -> nl.NkiTensor:
+    """Per-query top-k positions. Returns [S_q, k_val] uint32 GLOBAL compressed positions.
+
+    The returned index is a global position because the snake fill satisfies
+    ``snake[16 * g + r, c] == scores[base + g, 16 * c + r]``, which is exactly
+    nisa.topk's per-group index encoding.
+
+    The k winners of a row are an UNORDERED SET: nisa.topk emits each snake partition's
+    winners in ascending position order, not by value. The gather that consumes them is
+    order-agnostic.
+    """
+    S_q = scores.shape[0]
+    T_c = scores.shape[1]
+    GROUP = _SNAKE_GROUP
+    GROUPS = _SNAKE_GROUPS
+    PAR = _SNAKE_PAR
+    snake_x = n_val // GROUP
+    live_x = T_c // GROUP
+    k_cols = k_val // GROUP
+
+    kernel_assert(T_c % (GROUP * 128) == 0, "T_c must be a multiple of 16*128 for the snake fold")
+    kernel_assert(k_val % GROUP == 0, "k must be a multiple of the snake group size")
+    kernel_assert(n_val >= T_c, "topk width must cover T_c")
+
+    out = nl.ndarray((S_q, k_val), dtype=nl.uint32, buffer=nl.shared_hbm, name="prefill_topk_idx")
+
+    core_id = nl.program_id(0)
+    n_cores = nl.num_programs()
+    kernel_assert(S_q % (GROUPS * n_cores) == 0, "score rows must divide into 8-row tiles across the grid")
+    tiles_per_core = S_q // (GROUPS * n_cores)
+    tile_base = core_id * tiles_per_core
+
+    # The padding columns beyond live_x never change, so the sentinel is written ONCE and
+    # each tile only rewrites the live columns. That reuse is a loop-carried dependency,
+    # hence sequential_range: every range flavour here unrolls, but sequential is the one
+    # that stops the scheduler hoisting the next tile's fill above this tile's topk.
+    snake = nl.ndarray((PAR, snake_x), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.memset(dst=snake, value=_SNAKE_NEG)
+
+    val = nl.ndarray((PAR, k_val), dtype=nl.bfloat16, buffer=nl.sbuf)
+    idx = nl.ndarray((PAR, k_val), dtype=nl.uint32, buffer=nl.sbuf)
+
+    for t_local in nl.sequential_range(tiles_per_core):
+        base = (tile_base + t_local) * GROUPS
+
+        # Fill all 8 groups: snake[16g + r, 128b + c] = scores[base + g, 2048b + 16c + r].
+        # Each row is read as its natural [128, 16] view (a contiguous 16-element burst per
+        # partition) into free columns [16g, 16g + 16), then ONE nc_transpose folds the
+        # whole [128, 128] tile free->partition. A DMA that folded it directly would cost
+        # one descriptor per element.
+        for b in nl.static_range(live_x // 128):
+            blk = nl.ndarray((128, PAR), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for g in nl.static_range(GROUPS):
+                nisa.dma_copy(
+                    dst=blk[0:128, g * GROUP : (g + 1) * GROUP],
+                    src=scores.ap(pattern=[[GROUP, 128], [1, GROUP]], offset=(base + g) * T_c + b * 128 * GROUP),
+                )
+            tp = nl.ndarray((PAR, 128), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(dst=tp, data=blk)
+            nisa.tensor_copy(dst=snake[0:PAR, b * 128 : (b + 1) * 128], src=tp)
+
+        nisa.topk(val_dst=val, idx_dst=idx, src=snake, n=n_val)
+
+        # One DMA for all 8 rows: SBUF partition p carries row (base + p // 16)'s winner
+        # for column (p % 16) * k_cols + c, which is what the 3-level HBM pattern below
+        # streams. Reading the groups out as 16-partition slices instead would be an
+        # illegal partition offset for odd g.
+        nisa.dma_copy(
+            dst=out.ap(pattern=[[k_val, GROUPS], [k_cols, GROUP], [1, k_cols]], offset=base * k_val),
+            src=idx[0:PAR, 0:k_cols],
+        )
+
+    return out

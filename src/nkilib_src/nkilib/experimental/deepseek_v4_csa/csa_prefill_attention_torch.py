@@ -331,3 +331,67 @@ def nki_gather_csa_attn_torch_ref(
         attn_sink_in,
     )
     return {"output_0": out}
+
+
+def nki_prefill_sparse_attn_torch_ref(
+    topk_idx_T: torch.Tensor,
+    all_q: torch.Tensor,
+    all_K_T_win: torch.Tensor,
+    all_V_win: torch.Tensor,
+    compress_kv: torch.Tensor,
+    attn_sink_in: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Oracle for ``nki_prefill_sparse_attn_kernel``.
+
+    Same global-max softmax over ``[window | compressed]`` as the dense prefill
+    kernels. Two differences follow from the sparse formulation: the window is read as
+    the causal ``W``-column slice ending at the query's own position rather than via an
+    additive bias over a shared ``2W`` tile, and the compressed set is the ``k`` GATHERED
+    positions rather than all ``T_c`` behind a ``-1e9`` predicate. Both are equivalent to
+    the dense form -- an unselected position contributes ``exp(-1e9 - shift) == 0``.
+
+    Written against ``csa_block_torch``, NOT against the kernel: an oracle that copies
+    the kernel's indexing cannot detect an indexing bug, and that is exactly how a
+    one-position window shift and a misplaced attention sink previously passed here.
+    """
+    k_val, s_len = topk_idx_T.shape
+    head_dim = all_q.shape[1]
+    n_heads = all_q.shape[0] // s_len
+    w = _W
+
+    # all_q is [S * n_heads, head_dim] query-major -> [S, H, D]
+    q = all_q.float().reshape(s_len, n_heads, head_dim)
+    del attn_sink_in  # sink applies to absolute position 0 only, which is outside this window
+    out = torch.zeros((n_heads * s_len, head_dim), dtype=torch.bfloat16)
+
+    for s in range(s_len):
+        p = s  # window slice is pre-positioned by the caller
+        qs = q[s]  # [H, D]
+
+        # [p + 1, p + 1 + W) on a buffer front-padded by W == original positions
+        # [g - W + 1, g] for the query at global position g -- the window INCLUDING the
+        # query's own key, which is what csa_block_torch.get_window_topk_idxs attends.
+        # No attention sink: that bias belongs to ABSOLUTE position 0 only, and this
+        # kernel runs solely on the scored region where position 0 is far outside the
+        # W = 128 window.
+        win_k = all_K_T_win.float()[:, p + 1 : p + 1 + w]  # [D, W]
+        win_v = all_V_win.float()[p + 1 : p + 1 + w]  # [W, D]
+        win_scores = qs @ win_k  # [H, W]
+
+        sel = topk_idx_T[:, s].long()  # [k]
+        comp_k = compress_kv.float()[sel]  # [k, D]
+        comp_scores = qs @ comp_k.T  # [H, k]
+
+        shift = torch.maximum(
+            win_scores.max(dim=-1, keepdim=True).values,
+            comp_scores.max(dim=-1, keepdim=True).values,
+        )
+        we = torch.exp(win_scores - shift)
+        ce = torch.exp(comp_scores - shift)
+        total = we.sum(-1, keepdim=True) + ce.sum(-1, keepdim=True)
+        o = (we @ win_v + ce @ comp_k) / total  # [H, D]
+
+        for h in range(n_heads):
+            out[h * s_len + s] = o[h].to(torch.bfloat16)
+
+    return {"output_0": out}

@@ -86,6 +86,55 @@ def nki_tp_all_reduce_kernel(input: nl.NkiTensor, replica_group: ReplicaGroup) -
     return out
 
 
+@nki.jit
+def nki_tp_all_gather_kernel(
+    input: nl.NkiTensor, replica_group: ReplicaGroup, world: int, rows: int, free: int
+) -> nl.NkiTensor:
+    """Concatenate this rank's ``input`` shard with every other rank's, along dim 0.
+
+    ``input`` is a 2D ``[rows, free]`` shard; the result is ``[world * rows, free]`` in
+    RANK ORDER, which is what sequence-parallel prefill needs: rank r computes compressed
+    positions ``[r * T_c / world, (r + 1) * T_c / world)`` and every rank then needs all
+    ``T_c`` of them, because a query's top-k may select any compressed position.
+
+    ``rows``/``free`` are passed as compile-time ints rather than read off
+    ``input.shape``: a traced kernel cannot tuple-unpack the shape of an IO tensor
+    (``error: failed to resolve name 'input.shape'``), and the gathered ``dst`` needs
+    ``world * rows``, so the extent cannot be forwarded whole the way ``all_reduce``
+    forwards ``input.shape`` into a same-shape allocation.
+
+    Same three constraints as the all_reduce above, for the same reasons: the collective
+    src/dst must be freshly-allocated ``nl.shared_hbm`` WITH ``name=`` (else NCC_IBIR440),
+    a collective cannot touch IO tensors directly (hence the stage in/out copies), and the
+    launch must be on the ``[2]`` grid so it runs inside the block's lnc=2 context -- a
+    ``[1]``-grid collective in an lnc=2 graph fails NCC_ILLC059. As with all_reduce, the
+    ONE whole-tensor collective is what gets distributed across the rank's 2 logical
+    cores; do not hand-split it per program_id.
+    """
+    src = nl.ndarray((rows, free), dtype=input.dtype, buffer=nl.shared_hbm, name="ag_src")
+    dst = nl.ndarray((world * rows, free), dtype=input.dtype, buffer=nl.shared_hbm, name="ag_dst")
+    out = nl.ndarray((world * rows, free), dtype=input.dtype, buffer=nl.shared_hbm)
+
+    nisa.dma_copy(dst=src, src=input, priority=0)
+    ncc.all_gather(dsts=[dst], srcs=[src], replica_group=replica_group, collective_dim=0, priority=0)
+    nisa.dma_copy(dst=out, src=dst, priority=1)
+    return out
+
+
+def tp_all_gather_rows(shard, replica_ranks):
+    """All-gather a ``[n, F]`` row-shard into ``[world * n, F]`` in rank order.
+
+    Returns ``shard`` unchanged for a single-rank group, so the same call site works on
+    the sequential (no-peer) harness and on a real multi-worker launch.
+    """
+    ranks = list(replica_ranks)
+    if len(ranks) == 1:
+        return shard
+    rows, free = shard.shape
+    replica_group = ReplicaGroup([ranks])
+    return nki_tp_all_gather_kernel[2](shard.contiguous(), replica_group, len(ranks), rows, free)
+
+
 def tp_all_reduce(partial, replica_ranks):
     """All-reduce (sum) a [B, 1, dim] partial across `replica_ranks` on 2 LNC.
 

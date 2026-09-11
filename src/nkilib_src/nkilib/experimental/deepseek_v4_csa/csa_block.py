@@ -87,14 +87,138 @@ from .csa_prefill_attention import (
     nki_fused_csa_attn_kernel,
     nki_gather_csa_attn_kernel,
     nki_indexer_score_mask_kernel,
+    nki_prefill_sparse_attn_kernel,
+    nki_prefill_topk_kernel,
     nki_rms_rope_kernel,
 )
-from .csa_tp_all_reduce import tp_all_reduce
-
+from .csa_tp_all_reduce import tp_all_gather_rows, tp_all_reduce
 
 # ------------------------------------------------------------------------
 # Host-side glue the kernels consume
 # ------------------------------------------------------------------------
+# Which prefill attention to use for the scored second half. This is a TRACE-TIME
+# choice on a compile-time shape, like every other kernel selection in this file: the
+# O(k) sparse kernel is flat in context length while the dense-plus-mask kernel grows
+# with it, so the right kernel depends on T_c and only on T_c.
+#
+# Measured per query, n_heads=128, head_dim=512, k=1024 (ActiveInferenceTime):
+#     T_c     dense    sparse
+#     2048    11.7 us  22.0 us   -> dense
+#     4096    21.1 us  22.0 us   -> even
+#     8192    56.9 us  22.0 us   -> sparse, 2.6x
+# so the two cross just under T_c = 4096 (seq_len 16384 at compress_ratio 4).
+#
+# End-to-end per rank at tp4, this rank's whole prefill block, sparse vs the dense
+# head-parallel path (min of 6 timed executions of the traced block):
+#     seq_len  rank  dense      sparse     speedup
+#     16384    1      147.1 ms   128.3 ms   1.15x
+#     32768    0     1769.3 ms  1168.1 ms   1.51x
+#     32768    1     1763.4 ms  1231.6 ms   1.43x
+# Dense is head-parallel, so every rank does the same work and its critical path is any
+# rank; sparse is sequence-parallel, so the critical path is the slowest rank.
+#
+# `CSA_SPARSE_PREFILL` forces one side for A/B measurement: "1" always sparse,
+# "0" always dense, "auto" (default) dispatches on T_c.
+_SPARSE_PREFILL_MODE = os.environ.get("CSA_SPARSE_PREFILL", "auto")
+_SPARSE_MIN_T_C = 4096
+# Proven-safe nisa.topk width; see the note at the padding site below.
+_SAFE_TOPK_N = 8192
+# Queries per sparse-attention launch, halved across the [2] grid. Measured neutral for
+# runtime across 16..1024 once the sequence-parallel query path was sliced (128.6 us/rank
+# at 256 vs 128.7 at 512 vs 128.3 at 1024, seq_len 16384), so the value is chosen for
+# COMPILABILITY: at 256 a rank whose whole 8192-row share is scored needs 32 launches and
+# neuronx-cc aborts on it (`Assertion 'false && "Not Implemented"'`). 1024 keeps every rank
+# shape this block dispatches -- 4096- and 8192-row shares -- at 4 to 8 launches.
+_SPARSE_TILE_Q = int(os.environ.get("CSA_SPARSE_TILE_Q", "1024"))
+
+
+def sparse_prefill_q_range(seq_len: int, t_c: int, index_topk: int, ratio: int, tp_rank: int, tp_size: int):
+    """This rank's contiguous output-row range under SEQUENCE-parallel prefill.
+
+    The sparse kernel needs all ``n_heads`` on one core, so the ranks split the
+    SEQUENCE instead of the heads (Aakash's layout: replicated compressed KV, queries
+    divided, softmax therefore entirely local -- the reduction runs over the key axis,
+    which sequence sharding does not split).
+
+    Queries below ``split_pos = index_topk * ratio`` have fewer causal compressed
+    positions than ``index_topk``, so they select ALL of them and there is no sparsity
+    to exploit; that region stays on the dense kernel. Rank 0 owns it, because keeping
+    every rank's rows CONTIGUOUS lets the driver concatenate the partials instead of
+    gathering them.
+
+    The row counts are equalised, though. Handing rank 0 the whole dense region on top
+    of a full share of the scored region gave it 11264 of 32768 rows against 7168 for
+    the others -- 1.57x the work on what is the tp4 critical path, since the ranks run
+    concurrently and the block finishes with the slowest. Rank 0 instead takes exactly
+    ``seq_len / tp_size`` rows (the dense region plus however much of the scored region
+    fills its share) and the remainder divides among the rest.
+
+    Returns ``(lo, hi)`` half-open, in query positions.
+    """
+    del t_c, index_topk, ratio
+    per = seq_len // tp_size
+    if tp_rank == 0:
+        return 0, per
+    share = (seq_len - per) // (tp_size - 1)
+    lo = per + (tp_rank - 1) * share
+    return lo, lo + share
+
+
+def compress_sharded(compressor, x, start_pos, freqs_cos_sin, tp_shard):
+    """Compressed KV, computed on this rank's slice only and all-gathered to full.
+
+    ``tp_shard`` is ``(tp_rank, replica_ranks)`` or None. This is the "each rank does a
+    gather of KV" half of the sequence-parallel design: a query's top-k may select ANY
+    compressed position, so every rank needs all ``T_c`` of them -- but only 1/tp of them
+    need to be COMPUTED locally. The compressor is pointwise up to a one-group halo, so
+    the shards are independent and the concatenation is bit-exact against computing the
+    whole thing (verified: max_abs 0.0 at seq_len 8192/16384/32768, tp=4).
+
+    With ``tp_shard=None`` it computes the full thing locally, so the no-peer harness and
+    single-rank runs take the identical numerical path with no collective.
+    """
+    if tp_shard is None:
+        return compressor(x, start_pos, freqs_cos_sin)
+    tp_rank, replica_ranks = tp_shard
+    world = len(replica_ranks)
+    if world == 1:
+        return compressor(x, start_pos, freqs_cos_sin)
+
+    t_c = x.shape[1] // compressor.compress_ratio
+    if t_c % world != 0:
+        # An uneven split needs all_gather_v; fall back rather than mis-gather.
+        return compressor(x, start_pos, freqs_cos_sin)
+    per = t_c // world
+    shard = compressor(x, start_pos, freqs_cos_sin, t_range=(tp_rank * per, (tp_rank + 1) * per))
+    head_dim = shard.shape[-1]
+    gathered = tp_all_gather_rows(shard.reshape(per, head_dim), replica_ranks)
+    return gathered.reshape(1, t_c, head_dim)
+
+
+def _seq_parallel_prefill(phase: str, full_config: CSAConfig) -> bool:
+    """Does this prefill run shard the SEQUENCE rather than the heads?
+
+    Only when the sparse second half is selected, because that kernel needs all
+    ``n_heads`` on one core. Dense prefill stays head-parallel and byte-identical.
+    """
+    if phase != "prefill":
+        return False
+    if os.environ.get("CSA_SEQ_PARALLEL", "") == "1":
+        # Diagnostic: sequence-parallel sharding INDEPENDENT of the sparse dispatch, so
+        # the sharding and the sparse kernel can be bisected against each other.
+        return True
+    return _use_sparse_prefill(full_config.compressed_len)
+
+
+def _use_sparse_prefill(t_c: int) -> bool:
+    """Trace-time: is the O(k) sparse second half the cheaper kernel at this T_c?"""
+    if _SPARSE_PREFILL_MODE == "1":
+        return True
+    if _SPARSE_PREFILL_MODE == "0":
+        return False
+    return t_c >= _SPARSE_MIN_T_C
+
+
 def encode_snake(scores, n):
     """Encode [rows, n] scores into snake layout [rows//8, 128, n//16] for nisa.topk."""
     rows = scores.shape[0]
@@ -138,6 +262,82 @@ def nisa_topk_batched(scores, k, n_cores=2):
     vals_snake, idxs_snake = nisa_topk_snake_kernel[n_cores](snake_input, k, n)
     vals, idxs = decode_snake(vals_snake, idxs_snake, rows, k)
     return vals, idxs.int()
+
+
+def prefill_second_half_attention(
+    selection: torch.Tensor,  # [S_q, T_c] 0/-1e9 bias (dense) or [S_q, k] positions (sparse)
+    q_second: torch.Tensor,  # [S_q, n_heads, head_dim] fp16, already softmax-scaled
+    win_K_T: torch.Tensor,  # [head_dim, S_q + W] window K^T, front-padded by W
+    win_V: torch.Tensor,  # [S_q + W, head_dim] window V, front-padded by W
+    compress_K_T: torch.Tensor,  # [head_dim, T_c] compressed K^T
+    compress_V: torch.Tensor,  # [T_c, head_dim] compressed V
+    win_bias_base: torch.Tensor,  # [S_q, W] window causal bias
+    win_bias_sink_ind: torch.Tensor,  # [S_q, W] sink-column indicator
+    attn_sink: torch.Tensor,  # [1, n_heads] per-head sink scalar
+    s_lo: int,  # global position of this block's first query row
+    ratio: int,  # compress_ratio
+    sparse: bool,  # which kernel; a trace-time choice on a compile-time shape
+    tile_q: int = _SPARSE_TILE_Q,
+) -> torch.Tensor:
+    """Attention for the SCORED half of prefill. Returns [n_heads, S_q, head_dim].
+
+    One signature for both kernels, because they compute the same thing from the same
+    operands. What differs is internal and stays internal:
+
+    * ``selection`` is a 0/-1e9 additive bias over all ``T_c`` for the dense kernel and a
+      list of ``k`` compressed POSITIONS for the sparse one -- the same operand slot, a
+      different encoding, which is the whole point of the sparse path.
+    * ``q_second`` arrives QUERY-major for both. The sparse kernel wants exactly that (a
+      query's heads are then contiguous, so it can ``dma_transpose`` them instead of
+      paying one DMA descriptor per element); the dense kernel wants head-major and gets
+      it from the permute below, which is the same permute it used to do at the call site.
+    * the sparse kernel is launched per query tile because it unrolls over its query
+      count, so one launch for the whole half would not compile. The dense kernel takes
+      the half in one launch. Either way the caller gets one ``[n_heads, S_q, head_dim]``.
+    """
+    S_q, n_heads, head_dim = q_second.shape
+    win = win_K_T.shape[1] - S_q
+
+    if not sparse:
+        # Head-major Q^T: [head_dim, n_heads * S_q] indexed h * S_q + s.
+        all_q_T = q_second.permute(2, 1, 0).reshape(head_dim, n_heads * S_q)
+        out_flat = nki_gather_csa_attn_kernel[2](
+            selection.to(torch.bfloat16),
+            all_q_T,
+            win_K_T,
+            win_V,
+            compress_K_T,
+            compress_V,
+            win_bias_base,
+            win_bias_sink_ind,
+            attn_sink,
+            s_lo,
+            ratio,
+        )
+        return out_flat.reshape(n_heads, S_q, head_dim)
+
+    topk_idx = selection.to(torch.int32)
+    q_major = q_second.reshape(S_q * n_heads, head_dim)
+    compress_V_f16 = compress_V.to(torch.float16)
+    win_K_T_f16 = win_K_T.to(torch.float16)
+    win_V_f16 = win_V.to(torch.float16)
+    tiles = []
+    for t0 in range(0, S_q, tile_q):
+        tq = min(tile_q, S_q - t0)
+        # The window slices are POSITIONED AT THE TILE rather than passed with a tile
+        # offset. A varying int in the kernel signature makes every tile a separate trace
+        # and so a separate compile; pre-positioned, all tiles share one shape and one
+        # compilation.
+        out_t = nki_prefill_sparse_attn_kernel[2](
+            topk_idx[t0 : t0 + tq].transpose(0, 1).contiguous(),
+            q_major[t0 * n_heads : (t0 + tq) * n_heads],
+            win_K_T_f16[:, t0 : t0 + tq + win],
+            win_V_f16[t0 : t0 + tq + win],
+            compress_V_f16,
+            attn_sink,
+        )
+        tiles.append(out_t.reshape(n_heads, tq, head_dim))
+    return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=1)
 
 
 def nki_fused_csa_attn(
@@ -342,11 +542,34 @@ class CompressorNKI(nn.Module):
         out = nki_compressor_core_kernel[n_cores](kv8, score8, norm_weight, cos_rep, sin_rep, float(self.norm.eps))
         return out.unsqueeze(0)
 
-    def forward(self, x, start_pos, freqs_cos_sin):
+    def forward(self, x, start_pos, freqs_cos_sin, t_range=None):
+        """Compress ``x`` into compressed cache positions.
+
+        ``t_range=(t0, t1)`` computes only compressed positions ``[t0, t1)``, which is
+        what sequence-parallel prefill wants: each rank produces its own slice and the
+        ranks all-gather. It is NOT simply ``x[ratio*t0 : ratio*t1]``, because with
+        ``overlap`` (compress_ratio == 4) compressed position ``t`` pools the second half
+        of raw group ``t`` AND the first half of group ``t - 1`` -- see
+        ``overlap_transform_functional``, which shifts ``first_half`` down by one group.
+        So the slice carries a ONE-GROUP (``ratio`` raw tokens) halo at the front and the
+        halo's own compressed position is dropped afterwards. Its ``first_half`` would have
+        been zero-padded, which is only the right answer at the true sequence start, i.e.
+        for ``t0 == 0`` -- and there no halo is taken, so the padding is genuine.
+        """
         bsz, seqlen, _ = x.size()
 
         if seqlen < self.compress_ratio:
             return None
+
+        if t_range is not None:
+            ratio = self.compress_ratio
+            t0, t1 = t_range
+            halo = 1 if t0 > 0 else 0
+            lo = ratio * (t0 - halo)
+            hi = ratio * t1
+            freqs_cos, freqs_sin = freqs_cos_sin
+            shard = self.forward(x[:, lo:hi], start_pos + lo, (freqs_cos[lo:], freqs_sin[lo:]))
+            return shard if halo == 0 else shard[:, halo:]
 
         # bf16 projection: the eval runs with --auto-cast=none and x is already
         # bf16-valued, so an fp32 F.linear here wastes ~4x PE throughput for a
@@ -366,6 +589,10 @@ class CompressorNKI(nn.Module):
 class IndexerNKI(nn.Module):
     def __init__(self, config, use_nki: bool = True):
         super().__init__()
+        # Sequence-parallel prefill: (lo, hi) rows this rank scores; None = all rows.
+        self.q_range = None
+        # (tp_rank, replica_ranks) when the indexer's compressed KV is sharded + gathered.
+        self.tp_shard = None
         self.dim = config.dim
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -453,33 +680,43 @@ class IndexerNKI(nn.Module):
 
         split_pos = k * ratio
         split_pos = min(split_pos, seqlen)
-        S_q = seqlen - split_pos
+
+        # Sequence-parallel: score only THIS rank's slice of the scored region.
+        lo, hi = self.q_range if self.q_range is not None else (0, seqlen)
+        s_lo, s_hi = max(lo, split_pos), hi
+        S_q = s_hi - s_lo
 
         # --- First half: precomputed causal mask (queries select all valid kv) ---
         first_mask = self.first_mask_buf
 
-        # --- Second half: project + RoPE + Hadamard the queries [split_pos:seqlen] ---
-        seq_cos_second = freqs_cos[start_pos + split_pos : start_pos + seqlen]
-        seq_sin_second = freqs_sin[start_pos + split_pos : start_pos + seqlen]
+        if S_q == 0:
+            # This rank's whole share lies BELOW split_pos, so it has nothing to score.
+            # Reachable, not hypothetical: at seq_len 16384 the equal-row sequence-parallel
+            # split gives rank 0 exactly the [0, 4096) dense region. Falling through would
+            # build zero-row projections and hand a zero-row tile to the scoring kernel,
+            # which aborts the process without a Python traceback. The core already guards
+            # every use of the second mask on S_q > 0, so None is the honest value.
+            return first_mask, None
 
-        qr_second = qr[:, split_pos:, :]
+        # --- Second half: project + RoPE + Hadamard the queries [s_lo:s_hi] ---
+        seq_cos_second = freqs_cos[start_pos + s_lo : start_pos + s_hi]
+        seq_sin_second = freqs_sin[start_pos + s_lo : start_pos + s_hi]
+
+        qr_second = qr[:, s_lo:s_hi, :]
         q_second = self.wq_b(qr_second)
         q_second = q_second.unflatten(-1, (self.n_heads, self.head_dim))
         q_rope = apply_rotary_emb_functional(q_second[..., -rd:], (seq_cos_second, seq_sin_second))
         q_second = torch.cat([q_second[..., :-rd], q_rope], dim=-1)
         q_second = hadamard_transform(q_second)  # [1, S_q, n_heads, head_dim] bf16
 
-        indexer_kv = self.compressor(x, start_pos, freqs_cos_sin)  # [1, T_c_idx, head_dim] bf16
+        indexer_kv = compress_sharded(self.compressor, x, start_pos, freqs_cos_sin, self.tp_shard)
         indexer_kv_t = indexer_kv.transpose(1, 2)  # [1, head_dim, T_c_idx]
 
         # Match the ground-truth dtype: weights_proj (bf16) * scale -> bf16, F.linear in bf16.
-        weights_second = F.linear(
-            x[:, split_pos:, :], (self.weights_proj.weight * self.weight_scale).to(torch.bfloat16)
-        )
+        weights_second = F.linear(x[:, s_lo:s_hi, :], (self.weights_proj.weight * self.weight_scale).to(torch.bfloat16))
         # [1, S_q, n_heads] bf16; widened to fp32 for the kernel's per-head accumulate.
 
         # --- Stack operands for the single fused NKI kernel ---
-        # q_T_all[d, h*S_q + s] = q_second[0, s, h, d]
         # q_T_all[d, h*S_q + s] = q_second[0, s, h, d]: need [head_dim, n_heads, S_q]
         # then flatten the last two axes (h outer, s inner) to match the kernel's
         # q_global = h * S_q + q_start indexing. permute(2, 1, 0) gives head_dim first.
@@ -487,15 +724,34 @@ class IndexerNKI(nn.Module):
         kv_t_2d = indexer_kv_t[0].contiguous()  # [head_dim, T_c_idx] bf16
         weights_2d = weights_second[0].float().contiguous()  # [S_q, n_heads] fp32
 
-        if start_pos == 0:
-            cbias = self.causal_bias_full
-        else:
-            cbias = self.zero_bias_full
+        # The bias buffers cover rows [split_pos, seqlen); take this rank's rows.
+        b0, b1 = s_lo - split_pos, s_hi - split_pos
+        cbias = (self.causal_bias_full if start_pos == 0 else self.zero_bias_full)[b0:b1].contiguous()
 
         # Compute scores and bisection-based selection mask in one kernel
         TILE_Q = 128
         num_q_tiles = S_q // TILE_Q
         n_cores = 2 if (S_q % TILE_Q == 0 and num_q_tiles % 2 == 0) else 1
+        if _use_sparse_prefill(kv_t_2d.shape[1]):
+            # The sparse attention consumes POSITIONS, not a 0/-1e9 mask. Score once
+            # (same matmuls the mask kernel does) and take the top-k directly; the
+            # causal bias is already folded into the scores, so beyond-frontier
+            # positions cannot be selected.
+            # torch.topk lowers to an HLO `sort`, which trn3 does not support
+            # (NCC_EVRF029). `nisa_topk_batched` is the NKI route: snake-encode, run
+            # nisa.topk on GpSimd, decode. Its returned index is already a GLOBAL
+            # compressed position, because the snake fill is scores[16*c + r].
+            scores_2d = nki_indexer_score_kernel[1](q_T_all, kv_t_2d, weights_2d, cbias)
+            # The top-k runs entirely on-chip. Doing it on the host meant materializing
+            # nisa.topk's snake layout as [S_q * 128, T_c/16] bf16 and reading back
+            # [S_q * 128, k] indices AND values, of which 1/128 is ever used -- ~6.5 GB
+            # of HBM traffic at S_q=7168, T_c=8192 to deliver 29 MB of indices.
+            # The width is pinned to _SAFE_TOPK_N and the kernel pads the snake's unused
+            # columns with a sentinel strictly below every real score, so padding can
+            # never be selected.
+            topk_idx = nki_prefill_topk_kernel[2](scores_2d.to(torch.bfloat16), int(k), _SAFE_TOPK_N)
+            return first_mask, topk_idx.to(torch.int32).unsqueeze(0)
+
         second_mask_2d = nki_indexer_score_mask_kernel[n_cores](q_T_all, kv_t_2d, weights_2d, cbias, int(k))
         second_mask = second_mask_2d.unsqueeze(0)  # [1, S_q, T_c_idx]
 
@@ -522,6 +778,12 @@ class CSAAttentionCoreNKI(nn.Module):
         self.attn_sink = nn.Parameter(torch.empty(config.n_heads, dtype=torch.float32))
         self.compressor = CompressorNKI(config, config.head_dim, rotate=False, use_nki=use_nki)
         self.indexer = IndexerNKI(config, use_nki=use_nki)
+        # Sequence-parallel prefill: (lo, hi) output rows this rank owns; None = all rows.
+        self.q_range = None
+        # First global query row present in the `q` tensor handed to forward().
+        self.q_row_base = 0
+        # (tp_rank, replica_ranks) when the compressed KV is sharded + all-gathered.
+        self.tp_shard = None
 
         max_seq_len = config.seq_len
         freqs_cos, freqs_sin = precompute_freqs_cos_sin(
@@ -548,7 +810,7 @@ class CSAAttentionCoreNKI(nn.Module):
 
         first_mask, second_mask = self.indexer(x, qr, start_pos, 0, full_freqs_cs)
 
-        kv_compress = self.compressor(x, start_pos, full_freqs_cs)
+        kv_compress = compress_sharded(self.compressor, x, start_pos, full_freqs_cs, self.tp_shard)
 
         T_c_idx = seqlen // ratio
         k = min(self.config.index_topk, seqlen // ratio)
@@ -556,10 +818,22 @@ class CSAAttentionCoreNKI(nn.Module):
         if first_mask is not None:
             split_pos = min(k * ratio, seqlen)
             T_c_first = split_pos // ratio
-            S_q = seqlen - split_pos
+            # Sequence-parallel: this rank owns output rows [lo, hi). The dense first
+            # half and the scored second half are each intersected with that range;
+            # either intersection may be empty.
+            lo, hi = self.q_range if self.q_range is not None else (0, seqlen)
+            f_lo, f_hi = lo, min(hi, split_pos)
+            s_lo, s_hi = max(lo, split_pos), hi
+            S_q = s_hi - s_lo
 
+            # `q` holds only rows [q_row_base, q_row_base + q.shape[1]) under
+            # sequence-parallel sharding, so every global row index below is translated
+            # into that local frame. Head-parallel leaves the base at 0 and q full-length,
+            # which makes the arithmetic a no-op and the dense path byte-identical.
+            qb = self.q_row_base
+            n_q_local = q.shape[1]
             q_scaled = (q * self.softmax_scale).to(torch.float16)
-            q_T = q_scaled.permute(0, 2, 3, 1).reshape(bsz * self.n_heads, self.head_dim, seqlen)
+            q_T = q_scaled.permute(0, 2, 3, 1).reshape(bsz * self.n_heads, self.head_dim, n_q_local)
 
             kv_f16 = kv.to(torch.float16)
             kv_bf16 = kv.to(torch.bfloat16)
@@ -574,48 +848,56 @@ class CSAAttentionCoreNKI(nn.Module):
             raw_padded_V = F.pad(kv_bf16, (0, 0, win, 0)).reshape(seqlen + win, self.head_dim)
 
             # First half: mask-based kernel (unchanged)
-            first_mask_2d = first_mask.reshape(split_pos, T_c_first)
-            first_kt = torch.cat([raw_padded_K_T[:, : split_pos + win], compress_K_T_2d[:, :T_c_first]], dim=1)
-            first_v = torch.cat([raw_padded_V[: split_pos + win, :], compress_V_2d[:T_c_first, :]], dim=0)
-            all_q_T_first = q_T[:, :, :split_pos].permute(1, 0, 2).reshape(self.head_dim, self.n_heads * split_pos)
-            num_q_tiles_first = split_pos // 128
-            n_cores_first = 2 if (num_q_tiles_first % 2 == 0 and num_q_tiles_first >= 2) else 1
-            out_first_flat = nki_fused_csa_attn_kernel[n_cores_first](
-                first_mask_2d,
-                all_q_T_first,
-                first_kt,
-                first_v,
-                self.win_bias_base[:split_pos],
-                self.win_bias_sink_ind[:split_pos],
-                attn_sink_2d,
-            )
-            out_first_all = out_first_flat.reshape(self.n_heads, split_pos, self.head_dim)
+            parts = []
+            if f_hi > f_lo:
+                n_first = f_hi - f_lo
+                first_mask_2d = first_mask.reshape(split_pos, T_c_first)[f_lo:f_hi].contiguous()
+                first_kt = torch.cat([raw_padded_K_T[:, f_lo : f_hi + win], compress_K_T_2d[:, :T_c_first]], dim=1)
+                first_v = torch.cat([raw_padded_V[f_lo : f_hi + win, :], compress_V_2d[:T_c_first, :]], dim=0)
+                all_q_T_first = (
+                    q_T[:, :, f_lo - qb : f_hi - qb].permute(1, 0, 2).reshape(self.head_dim, self.n_heads * n_first)
+                )
+                num_q_tiles_first = n_first // 128
+                n_cores_first = 2 if (num_q_tiles_first % 2 == 0 and num_q_tiles_first >= 2) else 1
+                out_first_flat = nki_fused_csa_attn_kernel[n_cores_first](
+                    first_mask_2d,
+                    all_q_T_first,
+                    first_kt,
+                    first_v,
+                    self.win_bias_base[f_lo:f_hi],
+                    self.win_bias_sink_ind[f_lo:f_hi],
+                    attn_sink_2d,
+                )
+                parts.append(out_first_flat.reshape(self.n_heads, n_first, self.head_dim))
 
             # Second half: static causal-bound sparse attention (global-max softmax
             # + sel_bias predication, per-tile compile-time causal chunk bound).
-            all_q_T_second = q_T[:, :, split_pos:].permute(1, 0, 2).reshape(self.head_dim, self.n_heads * S_q)
-            second_win_K_T = raw_padded_K_T[:, split_pos : split_pos + S_q + win]
-            second_win_V = raw_padded_V[split_pos : split_pos + S_q + win, :]
+            second_win_K_T = raw_padded_K_T[:, s_lo : s_lo + S_q + win]
+            second_win_V = raw_padded_V[s_lo : s_lo + S_q + win, :]
 
-            # Bisection mask is already 0/-1e9 selection bias with causal masking baked in.
-            sel_bias = second_mask.reshape(S_q, T_c_idx).to(torch.bfloat16)
+            if S_q > 0:
+                # ONE call site, ONE operand list, for both attentions. The sparse and the
+                # dense kernel compute the same thing over the same operands; they differ
+                # only in how the selection is encoded (positions vs a 0/-1e9 bias), in the
+                # Q layout each wants, and in whether the launch is tiled. Those are
+                # internal to `prefill_second_half_attention`, so the caller does not fork.
+                out_second_all = prefill_second_half_attention(
+                    second_mask.reshape(S_q, -1),
+                    q_scaled[0, s_lo - qb : s_hi - qb],
+                    second_win_K_T,
+                    second_win_V,
+                    compress_K_T_2d,
+                    compress_V_2d,
+                    self.win_bias_base[s_lo:s_hi],
+                    self.win_bias_sink_ind[s_lo:s_hi],
+                    attn_sink_2d,
+                    int(s_lo),
+                    int(ratio),
+                    sparse=_use_sparse_prefill(T_c_idx),
+                )
+                parts.append(out_second_all)
 
-            out_second_flat = nki_gather_csa_attn_kernel[2](
-                sel_bias,
-                all_q_T_second,
-                second_win_K_T,
-                second_win_V,
-                compress_K_T_2d,
-                compress_V_2d,
-                self.win_bias_base[split_pos : split_pos + S_q],
-                self.win_bias_sink_ind[split_pos : split_pos + S_q],
-                attn_sink_2d,
-                int(split_pos),
-                int(ratio),
-            )
-            out_second_all = out_second_flat.reshape(self.n_heads, S_q, self.head_dim)
-
-            out_all = torch.cat([out_first_all, out_second_all], dim=1)
+            out_all = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
             o = out_all.permute(1, 0, 2).unsqueeze(0)
         else:
             o = nki_fused_csa_attn(
@@ -642,6 +924,9 @@ class CSAAttentionXLA(nn.Module):
         # final forward op, so the traced block returns the full all-reduced
         # output (RowParallelLinear semantics, the true multi-worker path).
         self.replica_ranks = list(replica_ranks) if replica_ranks is not None else None
+        # Sequence-parallel prefill: (lo, hi) output rows this rank owns, or None for
+        # the head-parallel path where every rank produces all rows.
+        self._q_range = None
         self.dim = config.dim
         self.n_heads = config.n_heads
         self.n_local_heads = config.n_heads
@@ -704,6 +989,31 @@ class CSAAttentionXLA(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
+    def set_q_range(self, q_range) -> None:
+        """Sequence-parallel prefill: restrict this rank to output rows ``[lo, hi)``.
+
+        Pushed to the attention core and the indexer, which is where the query range
+        actually reduces work; ``None`` restores the head-parallel behaviour of every
+        rank producing every row.
+        """
+        self._q_range = q_range
+        self.core.q_range = q_range
+        self.core.q_row_base = 0 if q_range is None else q_range[0]
+        self.core.indexer.q_range = q_range
+
+    def set_tp_shard(self, tp_shard) -> None:
+        """Shard the COMPRESSED KV across ranks and all-gather it.
+
+        ``tp_shard`` is ``(tp_rank, replica_ranks)``, or None to compute the whole
+        compressed cache locally on every rank. Pushed to the attention core and the
+        indexer, which own the two compressor call sites. This is orthogonal to
+        ``set_q_range``: that shards which QUERIES a rank produces, this shards which
+        compressed KV positions it COMPUTES -- the KV itself ends up complete on every
+        rank either way, because the top-k can select any position.
+        """
+        self.core.tp_shard = tp_shard
+        self.core.indexer.tp_shard = tp_shard
+
     def forward(self, x: torch.Tensor, start_pos: int = 0):
         """
         Args:
@@ -723,20 +1033,35 @@ class CSAAttentionXLA(nn.Module):
         # x_in row r. q is head-major [H*S, ...], so repeat the S-length table H
         # times; kv is a single [S, ...] block.
         half = seq_cos.shape[-1]
-        cos_q = seq_cos.float().unsqueeze(0).expand(H, seqlen, half).reshape(H * seqlen, half).contiguous()
-        sin_q = seq_sin.float().unsqueeze(0).expand(H, seqlen, half).reshape(H * seqlen, half).contiguous()
+        # Sequence-parallel: the main query path produces ONLY this rank's output rows.
+        # Under this sharding H is the FULL head count (128, not seqlen/tp_size heads),
+        # because the sparse attention needs every head on one core -- so leaving the q
+        # path on the full sequence makes wq_b emit [seqlen, 128 * head_dim], 1.07e9
+        # elements at seqlen=16384, to use 3072 rows of it. Measured, that redundancy is
+        # the block's dominant cost: it does not merely take 5x longer, it pushes the
+        # register allocator past SBUF and the spills lower to one 2-byte descriptor per
+        # element (43x a normal descriptor), which profiled at 1.59 s of a 2.58 s block.
+        # The KV path stays full-sequence -- KV is replicated on every rank, which is what
+        # makes the softmax local.
+        q_lo, q_hi = self._q_range if self._q_range is not None else (0, seqlen)
+        n_q = q_hi - q_lo
+        cos_qs = seq_cos[q_lo:q_hi].float()
+        sin_qs = seq_sin[q_lo:q_hi].float()
+        cos_q = cos_qs.unsqueeze(0).expand(H, n_q, half).reshape(H * n_q, half).contiguous()
+        sin_q = sin_qs.unsqueeze(0).expand(H, n_q, half).reshape(H * n_q, half).contiguous()
         cos_s = seq_cos.float().contiguous()
         sin_s = seq_sin.float().contiguous()
 
         # ===== Query Path =====
         qr = self.q_norm(self.wq_a(x_bf))  # [B, S, q_lora_rank]
-        q = self.wq_b(qr)  # [B, S, H*D]
+        qr_q = qr if self._q_range is None else qr[:, q_lo:q_hi, :]
+        q = self.wq_b(qr_q)  # [B, n_q, H*D]
         # Per-head RMS (no learnable gain) + RoPE, fused in ONE NKI kernel. Lay q
-        # out head-major [H*S, D] so each row is one head's D-vector: that puts the
+        # out head-major [H*n_q, D] so each row is one head's D-vector: that puts the
         # RMS reduction on the free axis and the sequence on the partition axis.
-        q_rows = q.reshape(bsz * seqlen, H, D)[0:seqlen].permute(1, 0, 2).reshape(H * seqlen, D).contiguous()
+        q_rows = q.reshape(bsz * n_q, H, D)[0:n_q].permute(1, 0, 2).reshape(H * n_q, D).contiguous()
         q_out = nki_rms_rope_kernel(q_rows.to(torch.bfloat16), cos_q, sin_q, None, self.eps, do_rms=1, inverse=0)
-        q = q_out.reshape(H, seqlen, D).permute(1, 0, 2).reshape(bsz, seqlen, H, D)
+        q = q_out.reshape(H, n_q, D).permute(1, 0, 2).reshape(bsz, n_q, H, D)
 
         # ===== KV Path =====
         # Learnable-gain RMSNorm + RoPE, same kernel with gain_in = kv_norm.weight.
@@ -757,30 +1082,60 @@ class CSAAttentionXLA(nn.Module):
         # sparse_attn_xla. Same operands and same [B, S, n_heads, head_dim] out.
         o = self.core(q, kv, x_bf, qr, start_pos=start_pos)
 
+        # Sequence-parallel: the core returned only THIS rank's rows, so everything
+        # downstream (de-RoPE positions, output projection) runs on that row count and
+        # at that position offset, not on the full sequence.
+        o_lo, o_hi = self._q_range if self._q_range is not None else (0, seqlen)
+        n_out = o_hi - o_lo
+        if self._q_range is None:
+            cos_o, sin_o = cos_q, sin_q
+        else:
+            c_o = seq_cos[o_lo:o_hi].float()
+            s_o = seq_sin[o_lo:o_hi].float()
+            cos_o = c_o.unsqueeze(0).expand(H, n_out, half).reshape(H * n_out, half).contiguous()
+            sin_o = s_o.unsqueeze(0).expand(H, n_out, half).reshape(H * n_out, half).contiguous()
+
         # ===== Output de-RoPE =====
         # Rotation only (do_rms=0) with inverse=1, same fused kernel, same
         # head-major layout as the q path.
-        o_rows = o.reshape(bsz * seqlen, H, D)[0:seqlen].permute(1, 0, 2).reshape(H * seqlen, D).contiguous()
-        o_out = nki_rms_rope_kernel(o_rows.to(torch.bfloat16), cos_q, sin_q, None, self.eps, do_rms=0, inverse=1)
-        o = o_out.reshape(H, seqlen, D).permute(1, 0, 2).reshape(bsz, seqlen, H * D)
+        o_rows = o.reshape(bsz * n_out, H, D)[0:n_out].permute(1, 0, 2).reshape(H * n_out, D).contiguous()
+        o_out = nki_rms_rope_kernel(o_rows.to(torch.bfloat16), cos_o, sin_o, None, self.eps, do_rms=0, inverse=1)
+        o = o_out.reshape(H, n_out, D).permute(1, 0, 2).reshape(bsz, n_out, H * D)
 
         # ===== Output Projection (grouped low-rank) =====
-        # Pick whichever of the two orderings streams fewer weight bytes, as
-        # CSADecodeAttentionBlockNKI._output_projection does: composing wo_a into
-        # wo_b widens the projected dim from o_lora_rank back up to group_in, so
-        # fusing only wins when group_in <= o_lora_rank. This config has
-        # group_in == o_lora_rank == 1024, so the fused single matmul is taken.
+        # Two orderings. Fusing composes wo_a into wo_b and then needs ONE matmul;
+        # unfused projects to o_lora_rank first and then out.
+        #
+        # The choice is made on TOTAL work, which has to include building the fused
+        # weight, because that composition is an einsum over weights that runs on every
+        # call. Comparing only the weight footprint (what this did before) always picked
+        # the fused path when group_in <= o_lora_rank, and under sequence-parallel
+        # sharding G is the FULL group count (64, not n_heads/tp_size), which makes the
+        # fused weight [dim, G * group_in] = 4.7e8 elements -- a 1.9 GB fp32 tensor
+        # rebuilt by a 481 GFLOP einsum per call, for a config where the composition
+        # saves nothing (group_in == o_lora_rank, so the second matmul is the same size
+        # either way).
         G, R, Din = self.n_local_groups, self.o_lora_rank, self.group_in
-        o = o.reshape(bsz, seqlen, G, Din)
-        if self.dim * G * Din <= G * R * Din + self.dim * G * R:
+        o = o.reshape(bsz, n_out, G, Din)
+        rows = bsz * n_out
+        fused_macs = self.dim * G * R * Din + rows * G * Din * self.dim
+        unfused_macs = rows * G * Din * R + rows * G * R * self.dim
+        # The MAC counts alone are nearly tied, so the composed weight also has to fit a
+        # size budget: it is a live intermediate, and once it stops fitting the cost is
+        # not proportional -- the register allocator spills, and these spills lower to one
+        # 2-byte descriptor per element, 43x a normal descriptor. The budget admits the
+        # head-parallel shape (1.2e8 elements) unchanged and rejects the sequence-parallel
+        # one (4.7e8), which is exactly the case where fusing buys nothing.
+        _FUSED_WEIGHT_BUDGET = 1 << 27  # 1.34e8 elements
+        if fused_macs <= unfused_macs and self.dim * G * Din <= _FUSED_WEIGHT_BUDGET:
             wo_a = self.wo_a.weight.view(G, R, Din)
             wo_b = self.wo_b.weight.view(self.dim, G, R)
             wfused = torch.einsum("cgr,grd->cgd", wo_b, wo_a).reshape(self.dim, G * Din)
-            output = torch.matmul(o.reshape(bsz, seqlen, G * Din), wfused.t())
+            output = torch.matmul(o.reshape(bsz, n_out, G * Din), wfused.t())
         else:
             wo_a = self.wo_a.weight.view(G, R, Din)
             lat = torch.einsum("bsgd,grd->bsgr", o, wo_a)  # [B, S, G, o_lora]
-            output = self.wo_b(lat.reshape(bsz, seqlen, G * R))
+            output = self.wo_b(lat.reshape(bsz, n_out, G * R))
 
         # ===== Cross-rank all-reduce (merged): RowParallelLinear sum over ranks =====
         # When replica_ranks is set (multi-worker torchrun), append the 2-LNC
@@ -1402,6 +1757,13 @@ def _rank_config(full_config: CSAConfig, tp_size: int) -> CSAConfig:
     return shard_for_tp(full_config, tp_size)
 
 
+def _rank_config_for(phase: str, full_config: CSAConfig, tp_size: int) -> CSAConfig:
+    """Rank config for `phase`: unsharded under sequence parallelism, else head-sharded."""
+    if _seq_parallel_prefill(phase, full_config):
+        return full_config
+    return _rank_config(full_config, tp_size)
+
+
 def _load_rank_weights(model: nn.Module, rank_weights: dict) -> None:
     """Copy one rank's reference shard into ``model``, reporting keys that found no home."""
     sd = model.state_dict()
@@ -1438,7 +1800,11 @@ def _build_reference(phase: str, full_config: CSAConfig, tp_size: int) -> dict:
     )
 
     gen = generate_prefill_block_reference_tp if phase == "prefill" else generate_decode_block_reference_tp
-    return gen(full_config, tp_size=tp_size, weight_gain=_WEIGHT_GAIN[phase])
+    # Sequence-parallel ranks each hold the FULL weights (all heads, all o_groups), so
+    # the reference is generated unsharded and the ranks differ only in which output
+    # rows they produce.
+    ref_tp = 1 if _seq_parallel_prefill(phase, full_config) else tp_size
+    return gen(full_config, tp_size=ref_tp, weight_gain=_WEIGHT_GAIN[phase])
 
 
 def _reference_inputs(phase: str, ref: dict) -> tuple:
@@ -1458,13 +1824,35 @@ def _trace_rank(phase, full_config, tp_size, tp_rank, ref, inputs, workdir, repl
     """
     import torch_neuronx
 
-    cfg = _rank_config(full_config, tp_size)
+    seq_par = _seq_parallel_prefill(phase, full_config)
+    cfg = _rank_config_for(phase, full_config, tp_size)
     if phase == "prefill":
         model = CSAAttentionXLA(cfg, replica_ranks=replica_ranks)
+        if seq_par:
+            model.set_q_range(
+                sparse_prefill_q_range(
+                    full_config.seq_len,
+                    full_config.compressed_len,
+                    full_config.index_topk,
+                    full_config.compress_ratio,
+                    tp_rank,
+                    tp_size,
+                )
+            )
+            # Shard the COMPRESSED KV too, and all-gather it, so each rank computes only
+            # its 1/tp of the compressor instead of all of it redundantly. Only on the
+            # distributed path: a collective needs peer ranks, and the sequential harness
+            # traces the ranks one at a time with none. With tp_shard left None the same
+            # code computes the full cache locally, which is bit-identical -- so the
+            # sequential run still grades the math and the distributed run grades the
+            # collective.
+            if replica_ranks is not None:
+                model.set_tp_shard((tp_rank, list(replica_ranks)))
     else:
         model = CSADecodeAttentionBlockNKI(cfg, tp_size=1, tp_rank=0, replica_ranks=replica_ranks)
     if ref is not None:
-        _load_rank_weights(model, ref["per_rank_weights"][tp_rank])
+        # Sequence-parallel ranks all load the SAME (full) weight set.
+        _load_rank_weights(model, ref["per_rank_weights"][0 if seq_par else tp_rank])
     model.eval()
     return torch_neuronx.trace(model, inputs, compiler_workdir=workdir)
 
@@ -1506,8 +1894,14 @@ def run_sequential(phase: str, full_config: CSAConfig, tp_size: int) -> bool:
         partials.append(traced(*inputs).float())
         print(f"  rank {r} traced and run")
 
-    summed = torch.stack(partials, 0).sum(0)
-    return _check(summed, ref["ref_output_full"], label=f"{phase}_full")
+    if _seq_parallel_prefill(phase, full_config):
+        # Sequence-parallel: each rank produced a DISJOINT, contiguous block of output
+        # rows, in rank order, so the full output is their concatenation -- there is no
+        # cross-rank reduction to undo.
+        combined = torch.cat(partials, dim=1)
+    else:
+        combined = torch.stack(partials, 0).sum(0)
+    return _check(combined, ref["ref_output_full"], label=f"{phase}_full")
 
 
 _LNC = 2
@@ -1522,6 +1916,14 @@ def _pin_this_worker_to_its_cores() -> str | None:
     launch convention) so 4 ranks fill cores 8 to 15. Without this every worker sees
     the same cores and the ranks serialize instead of overlapping.
 
+    If the inherited value ALREADY spans ``world * _LNC`` cores, it is left untouched
+    and this returns it as-is. That matters when the range is chosen to avoid cores
+    another job holds: the runtime allocates one logical core per process index out of
+    the visible set, so re-narrowing each worker to a single pair here would discard
+    the offset and every rank would fall back to logical cores ``0..world-1`` --
+    observed as ``Requested:lnc0..lnc3 Available:0 (cores busy, ret=-16)`` in
+    ``nrt_allocate_neuron_cores`` while an unrelated job held the low cores.
+
     MUST run before ``torch_neuronx`` is imported, which is why the driver imports
     it lazily inside ``_trace_rank`` rather than at module scope. Returns the pinned
     range, or None outside a multi-worker launch.
@@ -1530,7 +1932,11 @@ def _pin_this_worker_to_its_cores() -> str | None:
     if world <= 1:
         return None
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    base = int(os.environ.get("NEURON_RT_VISIBLE_CORES", "8").split("-")[0])
+    visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "8")
+    bounds = visible.split("-")
+    base = int(bounds[0])
+    if len(bounds) == 2 and int(bounds[1]) - base + 1 >= world * _LNC:
+        return visible
     first = base + local_rank * _LNC
     pinned = f"{first}-{first + _LNC - 1}"
     os.environ["NEURON_RT_VISIBLE_CORES"] = pinned
@@ -1554,6 +1960,11 @@ def run_distributed(phase: str, full_config: CSAConfig, tp_size: int) -> bool:
     pinned = _pin_this_worker_to_its_cores()
 
     import torch.distributed as dist
+
+    # Registers the "xla" process-group backend. Without it init_process_group raises
+    # `AssertionError: Unknown backend type xla` -- importing torch_xla alone is not
+    # enough, the backend module itself has to be imported for its side effect.
+    import torch_xla.distributed.xla_backend  # noqa: F401
 
     dist.init_process_group(backend="xla", init_method="env://", rank=rank, world_size=world)
 

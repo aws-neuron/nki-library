@@ -43,6 +43,8 @@ from nkilib_src.nkilib.experimental.deepseek_v4_csa.csa_prefill_attention import
     nki_fused_csa_attn_kernel,
     nki_gather_csa_attn_kernel,
     nki_indexer_score_mask_kernel,
+    nki_prefill_sparse_attn_kernel,
+    nki_prefill_topk_kernel,
     nki_rms_rope_kernel,
 )
 from nkilib_src.nkilib.experimental.deepseek_v4_csa.csa_prefill_attention_torch import (
@@ -50,6 +52,7 @@ from nkilib_src.nkilib.experimental.deepseek_v4_csa.csa_prefill_attention_torch 
     nki_fused_csa_attn_torch_ref,
     nki_gather_csa_attn_torch_ref,
     nki_indexer_score_mask_torch_ref,
+    nki_prefill_sparse_attn_torch_ref,
     nki_rms_rope_torch_ref,
 )
 
@@ -426,6 +429,23 @@ class TestCsaPrefillAttention:
         # split_pos = 0 makes the causal bound at its tightest, so the first query
         # tile reaches only the leading compressed chunk.
         (256, 512, 32, 256, 0, 4, 1),
+        # A/B shape vs the sparse kernel above: matched s_len / t_c / n_heads /
+        # head_dim, split_pos chosen so the causal bound spans ALL of t_c.
+        (128, 2048, 128, 512, 8064, 4, 1),
+        # Establish the dense kernel's slope in t_c by MEASUREMENT rather than assuming
+        # linearity, at both the sequence-parallel head count (128) and the current
+        # head-parallel one (32). split_pos is set so the causal bound spans all of t_c.
+        (128, 4096, 128, 512, 16256, 4, 1),
+        (128, 8192, 128, 512, 32640, 4, 1),
+        (128, 2048, 32, 512, 8064, 4, 1),
+        (128, 4096, 32, 512, 16256, 4, 1),
+        (128, 8192, 32, 512, 32640, 4, 1),
+        # lnc=2 so the dense A/B baseline uses BOTH LNC cores, matching the sparse
+        # kernel's [2] grid. Comparing a 2-core sparse kernel against a 1-core dense
+        # one would overstate the win.
+        (128, 2048, 128, 512, 8064, 4, 2),
+        (128, 4096, 128, 512, 16256, 4, 2),
+        (128, 8192, 128, 512, 32640, 4, 2),
     ]
     _GATHER_ABBREVS = {
         "s_len": "s",
@@ -493,4 +513,129 @@ class TestCsaPrefillAttention:
             inference_args=InferenceArgs(num_runs=_WARMUP_RUNS),
             atol=2e-2,
             rtol=5e-2,
+        )
+
+    # ---------------- TRUE sparse prefill (per-query indirect gather) ----------------
+
+    _SPARSE_PARAMS = "s_len, t_c, k_val, n_heads, head_dim, q_base"
+    _SPARSE_CASES = [
+        (8, 2048, 1024, 128, 512, 4096),
+        (8, 8192, 1024, 128, 512, 16384),
+        (16, 8192, 1024, 128, 512, 16384),
+        # A/B shapes vs the dense kernel below: one query tile, all 128 heads.
+        # t_c is varied at fixed k to show the cost is FLAT in context length.
+        (128, 2048, 1024, 128, 512, 8192),
+        (128, 8192, 1024, 128, 512, 8192),
+        # 256 is the tile size the block actually launches with.
+        (256, 4096, 1024, 128, 512, 8192),
+        (256, 8192, 1024, 128, 512, 8192),
+    ]
+    _SPARSE_ABBREVS = {
+        "s_len": "s",
+        "t_c": "tc",
+        "k_val": "k",
+        "n_heads": "h",
+        "head_dim": "d",
+        "q_base": "qb",
+    }
+
+    @pytest.mark.fast
+    @pytest_parametrize(_SPARSE_PARAMS, _SPARSE_CASES, abbrevs=_SPARSE_ABBREVS)
+    def test_prefill_sparse_attention(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        s_len: int,
+        t_c: int,
+        k_val: int,
+        n_heads: int,
+        head_dim: int,
+        q_base: int,
+    ):
+        """O(k) sparse prefill: gather each query's selected rows instead of masking all T_c.
+
+        Graded against a reference that gathers the same rows, so a wrong index, a
+        wrong window slice or a mis-shared softmax denominator all show up as a
+        numeric failure. ``t_c`` is varied at fixed ``k`` because the kernel's work
+        must be independent of context length -- only the gather addresses change.
+        """
+        rng = _rng()
+
+        def input_generator(test_config):
+            idx = np.stack([rng.permutation(t_c)[:k_val] for _ in range(s_len)], axis=1).astype(np.uint32)
+            return {
+                "topk_idx_T": idx,
+                "all_q": _f16(rng.standard_normal((s_len * n_heads, head_dim)) * (head_dim**-0.5)),
+                "all_K_T_win": _f16(rng.standard_normal((head_dim, s_len + _WINDOW)) * 0.3),
+                "all_V_win": _f16(rng.standard_normal((s_len + _WINDOW, head_dim)) * 0.3),
+                "compress_kv": _f16(rng.standard_normal((t_c, head_dim)) * 0.3),
+                "attn_sink_in": (rng.standard_normal((1, n_heads)) * 0.5).astype(np.float32),
+            }
+
+        def output_tensors(kernel_input: dict[str, Any]) -> dict[str, Any]:
+            return {"output_0": np.zeros((n_heads * s_len, head_dim), dtype=_BF16)}
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=nki_prefill_sparse_attn_kernel,
+            torch_ref=torch_ref_wrapper(nki_prefill_sparse_attn_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            inference_args=InferenceArgs(num_runs=_WARMUP_RUNS),
+            atol=2e-2,
+            rtol=5e-2,
+        )
+
+    # ---------------- fused on-chip per-query top-k ----------------
+
+    _TOPK_PARAMS = "s_q, t_c, k_val, n_val"
+    _TOPK_CASES = [
+        (256, 4096, 1024, 8192),
+        (256, 8192, 1024, 8192),
+        (2048, 8192, 1024, 8192),
+    ]
+    _TOPK_ABBREVS = {"s_q": "sq", "t_c": "tc", "k_val": "k", "n_val": "n"}
+
+    @pytest.mark.fast
+    @pytest_parametrize(_TOPK_PARAMS, _TOPK_CASES, abbrevs=_TOPK_ABBREVS)
+    def test_prefill_topk(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        s_q: int,
+        t_c: int,
+        k_val: int,
+        n_val: int,
+    ):
+        """Per-query top-k positions for the sparse prefill's gather.
+
+        ``trace_only``, because the kernel returns the k winners as an UNORDERED SET
+        (nisa.topk emits each snake partition's winners in ascending POSITION order,
+        not by value), so there is no elementwise oracle: a correct result is a
+        permutation of ``torch.topk``'s indices, and in bf16 -- where the k-th and
+        (k+1)-th scores are frequently exact ties -- not even the same set. What this
+        guards is that every shape the block dispatches still compiles and allocates;
+        the numeric contract on the indices is graded end-to-end by
+        ``test_csa_block``'s prefill cases, which fail if a selected position is wrong.
+        """
+        rng = _rng()
+
+        def input_generator(test_config):
+            # Indexer-shaped scores: non-negative after the relu, with a -1e9 causal tail.
+            sc = np.abs(rng.standard_normal((s_q, t_c))).astype(np.float32) * 0.5
+            frontier = np.minimum((np.arange(s_q) + k_val * 4 + 1) // 4, t_c)
+            sc[np.arange(t_c)[None, :] >= frontier[:, None]] = -1e9
+            return {"scores": sc.astype(_BF16), "k_val": k_val, "n_val": n_val}
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=nki_prefill_topk_kernel,
+            kernel_input_generator=input_generator,
+            trace_only=True,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
         )
