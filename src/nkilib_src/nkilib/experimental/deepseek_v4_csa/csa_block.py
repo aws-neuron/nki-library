@@ -64,6 +64,7 @@ from .csa_common import (
     CSAConfig,
     RMSNorm,
     apply_rotary_emb_functional,
+    get_hadamard_matrix,
     hadamard_transform,
     precompute_freqs_cos_sin,
     precompute_win_bias_parts,
@@ -103,11 +104,6 @@ _SPARSE_TILE_Q = int(os.environ.get("CSA_SPARSE_TILE_Q", "1024"))
 
 def sparse_prefill_q_range(seq_len: int, t_c: int, index_topk: int, ratio: int, tp_rank: int, tp_size: int):
     """This rank's contiguous output-row range under SEQUENCE-parallel prefill.
-
-    The sparse kernel needs all ``n_heads`` on one core, so the ranks split the
-    SEQUENCE instead of the heads: replicated compressed KV, queries divided, softmax
-    therefore entirely local -- the reduction runs over the key axis, which sequence
-    sharding does not split.
 
     Queries below ``split_pos = index_topk * ratio`` have fewer causal compressed
     positions than ``index_topk``, so they select ALL of them and there is no sparsity
@@ -444,18 +440,27 @@ class CompressorNKI(nn.Module):
             score = score[:, :cutoff]
 
         kv = kv.unflatten(1, (-1, ratio))
-        score = score.unflatten(1, (-1, ratio)) + self.ape
-
-        if self.overlap:
-            kv = self.overlap_transform_functional(kv, 0)
-            score = self.overlap_transform_functional(score, -1e9)
+        score_u = score.unflatten(1, (-1, ratio))
 
         freqs_cos, freqs_sin = freqs_cos_sin
         compress_cos = freqs_cos[:cutoff:ratio]
         compress_sin = freqs_sin[:cutoff:ratio]
 
-        if self.use_nki and not self.rotate and self.overlap and kv.shape[0] == 1:
-            return self._compress_core_nki(kv, score, compress_cos, compress_sin)
+        if self.use_nki and self.overlap and kv.shape[0] == 1:
+            # ape is NOT added here: the kernel adds it in fp32, which is what lets the
+            # operands stay bf16 all the way in. Adding an fp32 parameter to the bf16
+            # projection on the host would promote the whole tensor first.
+            return self._compress_core_nki(
+                self.overlap_transform_functional(kv, 0),
+                self.overlap_transform_functional(score_u, -1e9),
+                compress_cos,
+                compress_sin,
+            )
+
+        score = score_u + self.ape
+        if self.overlap:
+            kv = self.overlap_transform_functional(kv, 0)
+            score = self.overlap_transform_functional(score, -1e9)
 
         weights = score.softmax(dim=2)
         kv = (kv * weights).sum(dim=2)
@@ -475,8 +480,8 @@ class CompressorNKI(nn.Module):
         """Run the gated-pooling + RMSNorm + RoPE core in a single NKI kernel.
 
         Args (post overlap_transform):
-            kv:    [1, T_c, ratio2, head_dim] (fp32)
-            score: [1, T_c, ratio2, head_dim] (fp32)
+            kv:    [1, T_c, ratio2, head_dim] (bf16)
+            score: [1, T_c, ratio2, head_dim] (bf16), WITHOUT ape
             compress_cos/sin: [T_c, rope_head_dim // 2] (fp32)
         Returns:
             [1, T_c, head_dim] bf16
@@ -485,8 +490,15 @@ class CompressorNKI(nn.Module):
         hd = self.head_dim
 
         # Drop the batch dim and make slot-major contiguous: [T_c, ratio2, head_dim].
-        kv8 = kv[0].contiguous().float()
-        score8 = score[0].contiguous().float()
+        # BF16 at the handoff: halves what crosses HBM into the kernel, which widens on
+        # load. The fp32 projection accumulator is preserved upstream (see forward), so the
+        # only rounding here is of values the kernel is about to pool and normalize.
+        kv8 = kv[0].contiguous().to(torch.bfloat16)
+        score8 = score[0].contiguous().to(torch.bfloat16)
+
+        # ape in post-overlap SLOT order: slots [0, ratio) took first_half channels, slots
+        # [ratio, 2*ratio) took second_half, so the two channel halves stack into rows.
+        ape_slots = torch.cat([self.ape[:, :hd], self.ape[:, hd:]], dim=0).float().contiguous()
 
         norm_weight = self.norm.weight.detach().view(1, hd).float().contiguous()
 
@@ -501,7 +513,14 @@ class CompressorNKI(nn.Module):
         TILE_P = 128
         num_tiles = (T_c + TILE_P - 1) // TILE_P
         n_cores = 2 if (T_c % TILE_P == 0 and num_tiles % 2 == 0) else 1
-        out = nki_compressor_core_kernel[n_cores](kv8, score8, norm_weight, cos_rep, sin_rep, float(self.norm.eps))
+        # The indexer's compressor (rotate=True) rotates its result by an orthonormal
+        # Hadamard. Handing the matrix to the kernel keeps softmax, RMSNorm, the RoPE
+        # interleave AND that matmul off the host: one transpose plus one matmul per 128
+        # compressed positions, on a head_dim of 128.
+        had = get_hadamard_matrix(hd, kv8.device, torch.bfloat16) if self.rotate else None
+        out = nki_compressor_core_kernel[n_cores](
+            kv8, score8, norm_weight, cos_rep, sin_rep, float(self.norm.eps), ape_slots, had
+        )
         return out.unsqueeze(0)
 
     def forward(self, x, start_pos, freqs_cos_sin, t_range=None):
@@ -534,6 +553,12 @@ class CompressorNKI(nn.Module):
             return shard if halo == 0 else shard[:, halo:]
 
         W = torch.cat([self.wkv.weight, self.wgate.weight], dim=0).to(torch.bfloat16)
+        # The .float() is NOT redundant: on XLA it fuses into the matmul so the fp32
+        # accumulator flows out directly, where a bf16 output rounds the product first.
+        # Measured on a [1024, 7168] x [7168, 2048] bf16 linear against an fp32 reference:
+        # 4.66e-09 max_abs_diff with the cast, 3.05e-05 without. Dropping it moved the
+        # block error from 1.07e-03 to 1.14e-03 at 8192 and 1.29e-03 to 1.36e-03 at 32768
+        # while measuring latency-neutral, so the fp32 temporary earns its cost.
         kv_score = F.linear(x.to(torch.bfloat16), W).float()
         return self._compress_from_kv_score(kv_score, seqlen, freqs_cos_sin)
 
@@ -682,7 +707,12 @@ class IndexerNKI(nn.Module):
         num_q_tiles = S_q // TILE_Q
         n_cores = 2 if (S_q % TILE_Q == 0 and num_q_tiles % 2 == 0) else 1
         if _use_sparse_prefill(kv_t_2d.shape[1]):
-            scores_2d = nki_indexer_score_kernel[1](q_T_all, kv_t_2d, weights_2d, cbias)
+            # `n_cores`, not [1]: the kernel already shards its query tiles by program_id,
+            # so a [1] launch left the second physical core completely idle for the whole
+            # launch while the first ran its engines near saturation. The guard matters: the
+            # kernel divides `num_q_tiles // n_cores`, so an odd tile count on a 2-core
+            # grid would silently drop the last tile.
+            scores_2d = nki_indexer_score_kernel[n_cores](q_T_all, kv_t_2d, weights_2d, cbias)
             topk_idx = nki_prefill_topk_kernel[2](scores_2d.to(torch.bfloat16), int(k), _SAFE_TOPK_N)
             return first_mask, topk_idx.to(torch.int32).unsqueeze(0)
 
@@ -775,6 +805,10 @@ class CSAAttentionCoreNKI(nn.Module):
             compress_K_T_2d = kv_compress_f16.transpose(1, 2).reshape(self.head_dim, T_c_idx)
             attn_sink_2d = self.attn_sink.detach().view(1, self.n_heads).float().contiguous()
 
+            # The pad/cat operand assembly below is NOT serial wall time: in the profile its
+            # transfers stream continuously on the static DMA queue underneath the attention
+            # kernel's region rather than preceding it, so folding the padding into the
+            # kernels would remove overlapped bandwidth, not latency.
             raw_padded_K_T = F.pad(kv_raw_K_T, (win, 0)).reshape(self.head_dim, seqlen + win)
             raw_padded_V = F.pad(kv_bf16, (0, 0, win, 0)).reshape(seqlen + win, self.head_dim)
 
@@ -950,11 +984,23 @@ class CSAAttentionXLA(nn.Module):
         sin_s = seq_sin.float().contiguous()
 
         # ===== Query Path =====
-        qr = self.q_norm(self.wq_a(x_bf))  # [B, S, q_lora_rank]
+        # RMSNorm of the q latent in NKI (do_rope=0). The torch module made ~6 passes over
+        # [S, q_lora_rank] fp32 -- float(), square(), mean(), rsqrt(), two multiplies, cast.
+        qr_lin = self.wq_a(x_bf)  # [B, S, q_lora_rank]
+        qr = nki_rms_rope_kernel[2](
+            qr_lin.reshape(seqlen, self.q_lora_rank).to(torch.bfloat16),
+            None,
+            None,
+            self.q_norm.weight.reshape(1, self.q_lora_rank).float().contiguous(),
+            self.eps,
+            do_rms=1,
+            inverse=0,
+            do_rope=0,
+        ).reshape(bsz, seqlen, self.q_lora_rank)
         qr_q = qr if self._q_range is None else qr[:, q_lo:q_hi, :]
         q = self.wq_b(qr_q)  # [B, n_q, H*D]
 
-        q_out = nki_rms_rope_kernel(
+        q_out = nki_rms_rope_kernel[2](
             q.reshape(bsz * n_q, H * D)[0:n_q].to(torch.bfloat16),
             cos_qs,
             sin_qs,
@@ -971,7 +1017,7 @@ class CSAAttentionXLA(nn.Module):
         # ===== KV Path =====
         # Learnable-gain RMSNorm + RoPE, same kernel with gain_in = kv_norm.weight.
         kv_lin = self.wkv(x_bf)  # [B, S, D]
-        kv_out = nki_rms_rope_kernel(
+        kv_out = nki_rms_rope_kernel[2](
             kv_lin.reshape(seqlen, D).to(torch.bfloat16),
             cos_s,
             sin_s,
@@ -1001,7 +1047,7 @@ class CSAAttentionXLA(nn.Module):
         # [n_out, H*D], so the kernel reads one layout and writes the other: the transpose
         # rides along in the DMA it was already issuing. The call site used to permute to
         # query-major, back to head-major for this kernel, and to query-major again.
-        o_out = nki_rms_rope_kernel(
+        o_out = nki_rms_rope_kernel[2](
             o.reshape(H * n_out, D).to(torch.bfloat16),
             cos_o,
             sin_o,
@@ -1018,6 +1064,11 @@ class CSAAttentionXLA(nn.Module):
         # ===== Output Projection (grouped low-rank) =====
         # Two orderings. Fusing composes wo_a into wo_b and then needs ONE matmul;
         # unfused projects to o_lora_rank first and then out.
+        # Stays in XLA deliberately. Per-region profiling of the 32768 block puts both of
+        # this projection's regions close to the tensor engine's achievable limit, with
+        # TensorE busy nearly the whole time and a small share of the block's wall clock.
+        # A NKI rewrite cannot reduce the FLOPs and has no idle engine to claim, so there
+        # is nothing here to win.
         G, R, Din = self.n_local_groups, self.o_lora_rank, self.group_in
         o = o.reshape(bsz, n_out, G, Din)
         rows = bsz * n_out

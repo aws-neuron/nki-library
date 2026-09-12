@@ -64,10 +64,12 @@ def nki_rms_rope_torch_ref(
     heads: int = 1,
     in_head_major: int = 1,
     out_head_major: int = 1,
+    do_rope: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Oracle for ``nki_rms_rope_kernel``: RMSNorm(+gain) then RoPE over ``[S_rows, head_dim]``.
     """
-    half_rope = cos_in.shape[1]
+    # do_rope=0 is the norm-only variant; cos_in/sin_in are then unused and may be None.
+    half_rope = cos_in.shape[1] if do_rope else 0
     rope_dim = 2 * half_rope
     if in_head_major:
         head_dim, s_len = x_in.shape[1], x_in.shape[0] // heads
@@ -87,8 +89,11 @@ def nki_rms_rope_torch_ref(
             x = x * gain_in.float()
     normed = x.to(torch.bfloat16)
 
-    rotated = _rope_pairs(normed[:, nope_dim:], cos_in.float(), sin_in.float(), bool(inverse))
-    out = torch.cat([normed[:, :nope_dim], rotated.to(torch.bfloat16)], dim=-1)
+    if do_rope:
+        rotated = _rope_pairs(normed[:, nope_dim:], cos_in.float(), sin_in.float(), bool(inverse))
+        out = torch.cat([normed[:, :nope_dim], rotated.to(torch.bfloat16)], dim=-1)
+    else:
+        out = normed
     if not out_head_major:
         out = out.reshape(heads, s_len, head_dim).permute(1, 0, 2).reshape(s_len, heads * head_dim)
     return {"output_0": out}
@@ -101,6 +106,8 @@ def nki_compressor_core_torch_ref(
     cos_rep: torch.Tensor,
     sin_rep: torch.Tensor,
     eps: float,
+    ape=None,
+    hadamard=None,
 ) -> dict[str, torch.Tensor]:
     """Oracle for ``nki_compressor_core_kernel``: gated pooling, then RMSNorm, then RoPE.
 
@@ -118,7 +125,12 @@ def nki_compressor_core_torch_ref(
     head_dim = kv8.shape[2]
     nope_dim = head_dim - rope_dim
 
-    weights = torch.softmax(score8.float(), dim=1)
+    # ape, when given, is the per-slot gate bias the kernel adds in fp32 after widening
+    # the bf16 score; shaped [ratio2, head_dim] and broadcast over positions.
+    scores = score8.float()
+    if ape is not None:
+        scores = scores + ape.float().unsqueeze(0)
+    weights = torch.softmax(scores, dim=1)
     pooled = (kv8.float() * weights).sum(dim=1)
 
     # bf16 at the pooling output, matching the model casting before its RMSNorm.
@@ -131,6 +143,12 @@ def nki_compressor_core_torch_ref(
     sin = sin_rep.float()[:, 0::2]
     rotated = _rope_pairs(normed[:, nope_dim:], cos, sin, inverse=False)
     out = torch.cat([normed[:, :nope_dim], rotated.to(torch.bfloat16)], dim=-1)
+
+    # The indexer's compressor rotates the finished row by an orthonormal Hadamard. The
+    # reference takes the bf16 row into the matmul exactly as the kernel does, so the
+    # single rounding before the rotation is shared rather than being a kernel artifact.
+    if hadamard is not None:
+        out = (out.float() @ hadamard.float()).to(torch.bfloat16)
     return {"output_0": out}
 
 

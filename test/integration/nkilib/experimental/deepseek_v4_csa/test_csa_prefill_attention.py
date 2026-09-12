@@ -92,6 +92,14 @@ def _f16(x: np.ndarray) -> np.ndarray:
     return x.astype(np.float16)
 
 
+def _hadamard(n: int) -> np.ndarray:
+    """Orthonormal ``[n, n]`` Sylvester Hadamard matrix, matching the model's own."""
+    h = np.ones((1, 1), dtype=np.float32)
+    while h.shape[0] < n:
+        h = np.block([[h, h], [h, -h]])
+    return h * n**-0.5
+
+
 def _window_bias(s_len: int) -> tuple[np.ndarray, np.ndarray]:
     """The library's own ``[S, 2W]`` window bias tables, as numpy fp32.
 
@@ -201,11 +209,16 @@ class TestCsaPrefillAttention:
 
     # ---------------- compressor ----------------
 
-    _COMPRESSOR_PARAMS = "t_c, head_dim, rope_head_dim, compress_ratio, lnc"
+    _COMPRESSOR_PARAMS = "t_c, head_dim, rope_head_dim, compress_ratio, lnc, rotate"
     _COMPRESSOR_CASES = [
-        (256, 512, 64, 4, 1),
-        (256, 512, 64, 4, 2),
-        (128, 256, 64, 4, 1),
+        (256, 512, 64, 4, 1, 0),
+        (256, 512, 64, 4, 2, 0),
+        (128, 256, 64, 4, 1, 0),
+        # rotate=1 is the INDEXER's compressor: head_dim 128, result rotated by an
+        # orthonormal Hadamard. Both lnc values, because the rotation is per position
+        # tile and must not depend on which core owns the tile.
+        (256, 128, 64, 4, 1, 1),
+        (256, 128, 64, 4, 2, 1),
     ]
     _COMPRESSOR_ABBREVS = {
         "t_c": "tc",
@@ -213,6 +226,7 @@ class TestCsaPrefillAttention:
         "rope_head_dim": "rd",
         "compress_ratio": "r",
         "lnc": "lnc",
+        "rotate": "rot",
     }
 
     @pytest.mark.fast
@@ -226,6 +240,7 @@ class TestCsaPrefillAttention:
         rope_head_dim: int,
         compress_ratio: int,
         lnc: int,
+        rotate: int,
     ):
         """Gated pooling over the overlapped slots, then RMSNorm, then RoPE.
 
@@ -247,14 +262,21 @@ class TestCsaPrefillAttention:
             # cos/sin arrive with each pair's angle duplicated across its two channels.
             cos_rep = np.repeat(np.cos(angles), 2, axis=1).astype(np.float32)
             sin_rep = np.repeat(np.sin(angles), 2, axis=1).astype(np.float32)
-            return {
-                "kv8": (rng.standard_normal((t_c, ratio2, head_dim)) * 0.5).astype(np.float32),
-                "score8": (rng.standard_normal((t_c, ratio2, head_dim)) * 1.5).astype(np.float32),
+            inputs = {
+                # kv8/score8 are BF16: the block hands the kernel its bf16 projection
+                # output directly and the kernel widens on load, so ape (the fp32 gate
+                # bias) is added inside the kernel rather than by the caller.
+                "kv8": _bf16(rng.standard_normal((t_c, ratio2, head_dim)) * 0.5),
+                "score8": _bf16(rng.standard_normal((t_c, ratio2, head_dim)) * 1.5),
                 "norm_weight": rng.uniform(0.8, 1.2, (1, head_dim)).astype(np.float32),
                 "cos_rep": cos_rep,
                 "sin_rep": sin_rep,
                 "eps": 1e-6,
+                "ape": (rng.standard_normal((ratio2, head_dim)) * 0.3).astype(np.float32),
             }
+            if rotate:
+                inputs["hadamard"] = _bf16(_hadamard(head_dim))
+            return inputs
 
         def output_tensors(kernel_input: dict[str, Any]) -> dict[str, Any]:
             return {"output_0": np.zeros((t_c, head_dim), dtype=_BF16)}

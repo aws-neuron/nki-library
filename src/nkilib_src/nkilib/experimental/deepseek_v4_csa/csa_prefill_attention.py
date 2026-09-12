@@ -88,6 +88,7 @@ def nki_rms_rope_kernel(
     heads: int = 1,
     in_head_major: int = 1,
     out_head_major: int = 1,
+    do_rope: int = 1,
 ) -> nl.NkiTensor:
     """Fused RMS(+optional gain) + RoPE over a [S_rows, head_dim] tile.
 
@@ -113,7 +114,10 @@ def nki_rms_rope_kernel(
         head_dim = x_in.shape[1] // heads
         S = x_in.shape[0]
     S_rows = S * heads
-    half_rope = cos_in.shape[1]
+    # do_rope=0 is the norm-only variant (the q-latent RMSNorm, which has no rotation):
+    # every channel passes through the nope path and cos_in/sin_in are unused, so the
+    # caller passes None rather than a dummy table.
+    half_rope = cos_in.shape[1] if do_rope else 0
     rope_head_dim = 2 * half_rope
     nope_dim = head_dim - rope_head_dim
     TILE = 128  # partition tile (v4 hard cap)
@@ -130,8 +134,31 @@ def nki_rms_rope_kernel(
         gain = nl.ndarray((TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=gain[0:TILE, 0:head_dim], src=gain_in.ap(pattern=[[0, TILE], [1, head_dim]]), priority=1)
 
-    for h in nl.affine_range(heads):
-        for ts in nl.affine_range(n_tiles):
+    # SPMD across the (head, position-tile) space, which has no cross-tile dependency:
+    # every tile reads its own rows and writes its own rows. Left grid-less this kernel ran
+    # on ONE core, leaving the second core idle across this kernel's four launches while the
+    # first carried the work on its Vector engine. Heads split first when they divide the grid
+    # (the q and de-RoPE paths, 32 or 128 heads); otherwise the position tiles do (the kv
+    # path, heads=1). A 1-core grid takes the same path with n_cores=1 and is unchanged.
+    core_id = nl.program_id(0)
+    n_cores = nl.num_programs()
+    if heads % n_cores == 0:
+        heads_per_core = heads // n_cores
+        tiles_lo = 0
+        tiles_hi = n_tiles
+    else:
+        kernel_assert(
+            n_tiles % n_cores == 0,
+            f"neither heads={heads} nor n_tiles={n_tiles} divides the {n_cores}-core grid",
+        )
+        heads_per_core = heads
+        tiles_lo = 0
+        tiles_hi = n_tiles // n_cores
+
+    for h_local in nl.affine_range(heads_per_core):
+        h = core_id * heads_per_core + h_local if heads % n_cores == 0 else h_local
+        for ts_local in nl.affine_range(tiles_hi - tiles_lo):
+            ts = ts_local if heads % n_cores == 0 else core_id * tiles_hi + ts_local
             s0 = ts * TILE
             cos_row = s0
             src_row = h * S + s0 if in_head_major else s0
@@ -193,93 +220,94 @@ def nki_rms_rope_kernel(
                     dst=out[dst_row : dst_row + rows, dst_col : dst_col + nope_dim], src=normed[0:rows, 0:nope_dim]
                 )
 
-            # ---- RoPE on the trailing rope_head_dim channels (fp32 math) ----
-            rope_f = nl.ndarray((TILE, rope_head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=rope_f[0:rows, 0:rope_head_dim], src=normed[0:rows, nope_dim:head_dim])
-            # View as [.., half_rope, 2]: [...,0]=even (x1), [...,1]=odd (x2).
-            rope_pairs = rope_f.reshape((TILE, half_rope, 2))
-            x1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=x1[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 0])
-            x2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=x2[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 1])
+            if do_rope:
+                # ---- RoPE on the trailing rope_head_dim channels (fp32 math) ----
+                rope_f = nl.ndarray((TILE, rope_head_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=rope_f[0:rows, 0:rope_head_dim], src=normed[0:rows, nope_dim:head_dim])
+                # View as [.., half_rope, 2]: [...,0]=even (x1), [...,1]=odd (x2).
+                rope_pairs = rope_f.reshape((TILE, half_rope, 2))
+                x1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=x1[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 0])
+                x2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=x2[0:rows, 0:half_rope], src=rope_pairs[0:rows, 0:half_rope, 1])
 
-            # priority=2: cos/sin are consumed LAST (only by the rotation), so they
-            # yield DMA bandwidth to the loads the pipeline stalls on first.
-            cos_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=cos_h[0:rows, 0:half_rope], src=cos_in[cos_row : cos_row + rows, 0:half_rope], priority=2)
-            sin_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=sin_h[0:rows, 0:half_rope], src=sin_in[cos_row : cos_row + rows, 0:half_rope], priority=2)
+                # priority=2: cos/sin are consumed LAST (only by the rotation), so they
+                # yield DMA bandwidth to the loads the pipeline stalls on first.
+                cos_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=cos_h[0:rows, 0:half_rope], src=cos_in[cos_row : cos_row + rows, 0:half_rope], priority=2)
+                sin_h = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=sin_h[0:rows, 0:half_rope], src=sin_in[cos_row : cos_row + rows, 0:half_rope], priority=2)
 
-            # y1 = x1*cos - x2*sin ; y2 = x1*sin + x2*cos   (inverse negates sin, so
-            # the signs swap: y1 = x1*cos + x2*sin ; y2 = -x1*sin + x2*cos)
-            tmp_a = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            tmp_b = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            y1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            y2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(
-                dst=tmp_a[0:rows, 0:half_rope],
-                data1=x1[0:rows, 0:half_rope],
-                data2=cos_h[0:rows, 0:half_rope],
-                op=nl.multiply,
-            )
-            nisa.tensor_tensor(
-                dst=tmp_b[0:rows, 0:half_rope],
-                data1=x2[0:rows, 0:half_rope],
-                data2=sin_h[0:rows, 0:half_rope],
-                op=nl.multiply,
-            )
-            if inverse:
+                # y1 = x1*cos - x2*sin ; y2 = x1*sin + x2*cos   (inverse negates sin, so
+                # the signs swap: y1 = x1*cos + x2*sin ; y2 = -x1*sin + x2*cos)
+                tmp_a = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                tmp_b = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                y1 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
+                y2 = nl.ndarray((TILE, half_rope), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(
-                    dst=y1[0:rows, 0:half_rope],
-                    data1=tmp_a[0:rows, 0:half_rope],
-                    data2=tmp_b[0:rows, 0:half_rope],
-                    op=nl.add,
+                    dst=tmp_a[0:rows, 0:half_rope],
+                    data1=x1[0:rows, 0:half_rope],
+                    data2=cos_h[0:rows, 0:half_rope],
+                    op=nl.multiply,
                 )
-            else:
                 nisa.tensor_tensor(
-                    dst=y1[0:rows, 0:half_rope],
-                    data1=tmp_a[0:rows, 0:half_rope],
-                    data2=tmp_b[0:rows, 0:half_rope],
-                    op=nl.subtract,
+                    dst=tmp_b[0:rows, 0:half_rope],
+                    data1=x2[0:rows, 0:half_rope],
+                    data2=sin_h[0:rows, 0:half_rope],
+                    op=nl.multiply,
                 )
-            nisa.tensor_tensor(
-                dst=tmp_a[0:rows, 0:half_rope],
-                data1=x1[0:rows, 0:half_rope],
-                data2=sin_h[0:rows, 0:half_rope],
-                op=nl.multiply,
-            )
-            nisa.tensor_tensor(
-                dst=tmp_b[0:rows, 0:half_rope],
-                data1=x2[0:rows, 0:half_rope],
-                data2=cos_h[0:rows, 0:half_rope],
-                op=nl.multiply,
-            )
-            if inverse:
+                if inverse:
+                    nisa.tensor_tensor(
+                        dst=y1[0:rows, 0:half_rope],
+                        data1=tmp_a[0:rows, 0:half_rope],
+                        data2=tmp_b[0:rows, 0:half_rope],
+                        op=nl.add,
+                    )
+                else:
+                    nisa.tensor_tensor(
+                        dst=y1[0:rows, 0:half_rope],
+                        data1=tmp_a[0:rows, 0:half_rope],
+                        data2=tmp_b[0:rows, 0:half_rope],
+                        op=nl.subtract,
+                    )
                 nisa.tensor_tensor(
-                    dst=y2[0:rows, 0:half_rope],
-                    data1=tmp_b[0:rows, 0:half_rope],
-                    data2=tmp_a[0:rows, 0:half_rope],
-                    op=nl.subtract,
+                    dst=tmp_a[0:rows, 0:half_rope],
+                    data1=x1[0:rows, 0:half_rope],
+                    data2=sin_h[0:rows, 0:half_rope],
+                    op=nl.multiply,
                 )
-            else:
                 nisa.tensor_tensor(
-                    dst=y2[0:rows, 0:half_rope],
-                    data1=tmp_a[0:rows, 0:half_rope],
-                    data2=tmp_b[0:rows, 0:half_rope],
-                    op=nl.add,
+                    dst=tmp_b[0:rows, 0:half_rope],
+                    data1=x2[0:rows, 0:half_rope],
+                    data2=cos_h[0:rows, 0:half_rope],
+                    op=nl.multiply,
                 )
+                if inverse:
+                    nisa.tensor_tensor(
+                        dst=y2[0:rows, 0:half_rope],
+                        data1=tmp_b[0:rows, 0:half_rope],
+                        data2=tmp_a[0:rows, 0:half_rope],
+                        op=nl.subtract,
+                    )
+                else:
+                    nisa.tensor_tensor(
+                        dst=y2[0:rows, 0:half_rope],
+                        data1=tmp_a[0:rows, 0:half_rope],
+                        data2=tmp_b[0:rows, 0:half_rope],
+                        op=nl.add,
+                    )
 
-            # Re-interleave y1 (even) / y2 (odd), cast bf16, write out.
-            rope_out = nl.ndarray((TILE, half_rope, 2), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 0], src=y1[0:rows, 0:half_rope])
-            nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 1], src=y2[0:rows, 0:half_rope])
-            rope_flat = rope_out.reshape((TILE, rope_head_dim))
-            rope_bf16 = nl.ndarray((TILE, rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=rope_bf16[0:rows, 0:rope_head_dim], src=rope_flat[0:rows, 0:rope_head_dim])
-            nisa.dma_copy(
-                dst=out[dst_row : dst_row + rows, dst_col + nope_dim : dst_col + head_dim],
-                src=rope_bf16[0:rows, 0:rope_head_dim],
-            )
+                # Re-interleave y1 (even) / y2 (odd), cast bf16, write out.
+                rope_out = nl.ndarray((TILE, half_rope, 2), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 0], src=y1[0:rows, 0:half_rope])
+                nisa.tensor_copy(dst=rope_out[0:rows, 0:half_rope, 1], src=y2[0:rows, 0:half_rope])
+                rope_flat = rope_out.reshape((TILE, rope_head_dim))
+                rope_bf16 = nl.ndarray((TILE, rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=rope_bf16[0:rows, 0:rope_head_dim], src=rope_flat[0:rows, 0:rope_head_dim])
+                nisa.dma_copy(
+                    dst=out[dst_row : dst_row + rows, dst_col + nope_dim : dst_col + head_dim],
+                    src=rope_bf16[0:rows, 0:rope_head_dim],
+                )
 
     return out
 
@@ -289,12 +317,14 @@ def nki_rms_rope_kernel(
 # --------------------------------------------------------------------------
 @nki.jit
 def nki_compressor_core_kernel(
-    kv8: nl.NkiTensor,  # [T_c, ratio2, head_dim] — overlapped kv slots (fp32)
-    score8: nl.NkiTensor,  # [T_c, ratio2, head_dim] — overlapped gate scores + ape (fp32)
+    kv8: nl.NkiTensor,  # [T_c, ratio2, head_dim] — overlapped kv slots (bf16)
+    score8: nl.NkiTensor,  # [T_c, ratio2, head_dim] — overlapped gate scores, NO ape (bf16)
     norm_weight: nl.NkiTensor,  # [1, head_dim] — RMSNorm gain (fp32)
     cos_rep: nl.NkiTensor,  # [T_c, rope_head_dim] — per-pair cos, each value repeated (fp32)
     sin_rep: nl.NkiTensor,  # [T_c, rope_head_dim] — per-pair sin, each value repeated (fp32)
     eps: float,  # RMSNorm epsilon
+    ape: nl.NkiTensor | None = None,  # [ratio2, head_dim] — per-slot gate bias (fp32)
+    hadamard: nl.NkiTensor | None = None,  # [head_dim, head_dim] — orthonormal rotation (bf16)
 ) -> nl.NkiTensor:
     """Gated pooling over the size-(2*ratio) axis, RMSNorm over head_dim, then RoPE.
 
@@ -306,8 +336,13 @@ def nki_compressor_core_kernel(
     Layout: partition = compressed positions (tiled by 128), free = head_dim channels.
     The softmax over the slot axis is computed independently per (position, channel).
 
+    When ``hadamard`` is given the whole row is finally rotated by it (the indexer's
+    compressor does this so the channels it scores are decorrelated). Being orthonormal
+    it needs the nope and roped halves together, so they are assembled in SBUF and the
+    row is written once after the rotation instead of half at a time.
+
     Returns:
-        out: [T_c, head_dim] bf16 — normalized, roped compressed kv.
+        out: [T_c, head_dim] bf16 — normalized, roped, optionally rotated compressed kv.
     """
     T_c, ratio2, head_dim = kv8.shape
     rope_head_dim = cos_rep.shape[1]
@@ -318,6 +353,15 @@ def nki_compressor_core_kernel(
     num_tiles = (T_c + TILE_P - 1) // TILE_P
 
     out = nl.ndarray((T_c, head_dim), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    # The rotation operand is the same for every position tile, so it is loaded once for
+    # the whole kernel rather than per tile. It has to fit on partitions because the row
+    # is transposed to put the contracted channel axis there.
+    h_sb = None
+    if hadamard is not None:
+        kernel_assert(head_dim <= 128, "hadamard rotation requires head_dim <= 128")
+        h_sb = nl.ndarray((head_dim, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=h_sb, src=hadamard[0:head_dim, 0:head_dim])
 
     core_id = nl.program_id(0)
     n_cores = nl.num_programs()
@@ -334,13 +378,31 @@ def nki_compressor_core_kernel(
         nisa.dma_copy(dst=gain, src=norm_weight.ap(pattern=[[0, p_sz], [1, head_dim]]))
 
         # --- Load all slots for this position tile ---
+        # The operands arrive BF16 and are widened here rather than on the host. They come
+        # from a bf16 F.linear, so bf16 -> fp32 is exact and this is bit-identical to
+        # taking them pre-widened -- but it halves what crosses HBM and, more to the point,
+        # stops the host from materializing the fp32 copies at all (537 MB for the
+        # projection plus 2 x 134 MB for the overlapped slots, at seq_len 32768).
         kv_slots = [None] * ratio2
         score_slots = [None] * ratio2
         for j in nl.affine_range(ratio2):
+            kv_bf = nl.ndarray((p_sz, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kv_bf, src=kv8[p_start : p_start + p_sz, j, 0:head_dim])
             kv_slots[j] = nl.ndarray((p_sz, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=kv_slots[j], src=kv8[p_start : p_start + p_sz, j, 0:head_dim])
+            nisa.tensor_copy(dst=kv_slots[j], src=kv_bf)
+            score_bf = nl.ndarray((p_sz, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=score_bf, src=score8[p_start : p_start + p_sz, j, 0:head_dim])
             score_slots[j] = nl.ndarray((p_sz, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=score_slots[j], src=score8[p_start : p_start + p_sz, j, 0:head_dim])
+            nisa.tensor_copy(dst=score_slots[j], src=score_bf)
+            if ape is not None:
+                # The per-slot gate bias is added HERE, in fp32, so the bf16 handoff above
+                # stays exact: the host would otherwise add an fp32 parameter to a bf16
+                # projection output, promoting the whole tensor to fp32 before the kernel
+                # ever sees it. Row-invariant, so one stride-0 partition broadcast.
+                ape_sb = nl.ndarray((p_sz, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+                ape_row = ape[j : j + 1, 0:head_dim]
+                nisa.dma_copy(dst=ape_sb, src=ape_row.ap(pattern=[[0, p_sz], [1, head_dim]]))
+                nisa.tensor_tensor(dst=score_slots[j], data1=score_slots[j], data2=ape_sb, op=nl.add)
 
         # --- Softmax over the slot axis (per position & channel) ---
         # Elementwise max across the ratio2 slots.
@@ -404,8 +466,15 @@ def nki_compressor_core_kernel(
         normed_bf16 = nl.ndarray((p_sz, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=normed_bf16, src=normed)
 
-        # --- Write the nope part (channels 0..nope_dim-1) straight to output ---
-        nisa.dma_copy(dst=out[p_start : p_start + p_sz, 0:nope_dim], src=normed_bf16[0:p_sz, 0:nope_dim])
+        # --- The nope part (channels 0..nope_dim-1) ---
+        # Unrotated it goes straight to HBM. Rotated it must meet the roped half first,
+        # so it is staged in an SBUF row that the matmul below consumes whole.
+        full_bf16 = None
+        if hadamard is None:
+            nisa.dma_copy(dst=out[p_start : p_start + p_sz, 0:nope_dim], src=normed_bf16[0:p_sz, 0:nope_dim])
+        else:
+            full_bf16 = nl.ndarray((p_sz, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=full_bf16[0:p_sz, 0:nope_dim], src=normed_bf16[0:p_sz, 0:nope_dim])
 
         # --- RoPE on the last rope_head_dim channels ---
         # Load cos/sin (already repeated per pair) for these positions.
@@ -450,7 +519,27 @@ def nki_compressor_core_kernel(
         rope_out_flat = rope_out.reshape((p_sz, rope_head_dim))
         rope_out_bf16 = nl.ndarray((p_sz, rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=rope_out_bf16, src=rope_out_flat)
-        nisa.dma_copy(dst=out[p_start : p_start + p_sz, nope_dim:head_dim], src=rope_out_bf16)
+
+        if hadamard is None:
+            nisa.dma_copy(dst=out[p_start : p_start + p_sz, nope_dim:head_dim], src=rope_out_bf16)
+        else:
+            # --- Rotate the assembled row: out[s, d] = sum_c row[s, c] * H[c, d] ---
+            # nc_matmul contracts over the PARTITION axis, so the row tile is transposed
+            # once to put c there; then row^T as the STATIONARY operand with H moving
+            # lands [s, d] directly, with no second transpose to undo. The bf16 operands
+            # accumulate into an fp32 PSUM and round once on the way out, which is what
+            # `bf16 @ bf16` does on XLA -- so this matches the reference bit-for-bit in
+            # intent, not just approximately.
+            nisa.tensor_copy(dst=full_bf16[0:p_sz, nope_dim:head_dim], src=rope_out_bf16)
+            row_t_psum = nl.ndarray((head_dim, p_sz), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(dst=row_t_psum, data=full_bf16[0:p_sz, 0:head_dim])
+            row_t = nl.ndarray((head_dim, p_sz), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=row_t, src=row_t_psum)
+            rot_psum = nl.ndarray((p_sz, head_dim), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=rot_psum, stationary=row_t, moving=h_sb)
+            rot_bf16 = nl.ndarray((p_sz, head_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=rot_bf16, src=rot_psum)
+            nisa.dma_copy(dst=out[p_start : p_start + p_sz, 0:head_dim], src=rot_bf16)
 
     return out
 
