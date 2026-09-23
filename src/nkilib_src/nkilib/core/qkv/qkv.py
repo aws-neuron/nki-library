@@ -102,6 +102,8 @@ def qkv(
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.NkiTensor] = None,
+    # Plain block KV only. See qkv_cte.
+    slot_mapping_oob_skip: bool = False,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -375,6 +377,7 @@ def qkv(
             fp8_packed=fp8_packed,
             block_size=block_size,
             slot_mapping=slot_mapping,
+            slot_mapping_oob_skip=slot_mapping_oob_skip,
             store_output_in_sbuf=store_output_in_sbuf,
             sbm=sbm,
             use_auto_allocation=use_auto_allocation,

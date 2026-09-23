@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import dge_mode
+from nki.isa.constants import dge_mode, oob_mode
 
 from ..utils.allocator import SbufManager, sizeinbytes
 
@@ -291,6 +291,13 @@ def qkv_cte(
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.NkiTensor] = None,
+    # Run the block-KV K/V scatter with oob_mode.skip, so a slot outside
+    # [0, num_blocks * block_size) writes nothing instead of raising. Lets a
+    # caller mark a token as "do not cache" with a negative slot rather than
+    # aiming it at a real slot, which would make the scatter's destination
+    # indices non-unique. Plain block KV only: see _validate_user_inputs.
+    # Default False leaves the emitted DMA byte-for-byte unchanged.
+    slot_mapping_oob_skip: bool = False,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -517,6 +524,7 @@ def qkv_cte(
         fp8_packed=fp8_packed,
         block_size=block_size,
         slot_mapping=slot_mapping,
+        slot_mapping_oob_skip=slot_mapping_oob_skip,
         # Performance
         store_output_in_sbuf=store_output_in_sbuf,
         sbm=sbm,
@@ -937,6 +945,20 @@ def _store_kv_cache(
         )
 
 
+def _kv_scatter_oob_mode(cfg: QKV_CTE_Config):
+    """oob_mode for the indirect block-KV K/V scatter.
+
+    oob_mode.skip drops a descriptor whose address lands outside the cache
+    instead of raising, which is how a caller marks a token as "do not cache"
+    (a negative slot). It changes nothing for an in-range slot: an indirect DMA
+    bound-checks every descriptor either way, and oob_mode only selects what
+    happens to one that fails the check.
+    """
+    if cfg.slot_mapping_oob_skip:
+        return oob_mode.skip
+    return oob_mode.error
+
+
 def _quantize_and_store_kv(
     output_sb: nl.NkiTensor,
     scale_sb: Optional[nl.NkiTensor],
@@ -987,6 +1009,36 @@ def _quantize_and_store_kv(
             operand1=cfg.fp8_max,
         )
         src_sb = clamped_sb[0:s_tile_sz, 0:kv_dim]
+    elif cfg.slot_mapping_oob_skip:
+        # bf16 path under oob_mode.skip: stage into a dedicated full-width tile
+        # first, so the DMA source is not a sub-slice of a wider tile.
+        #
+        # Load-bearing, not tidiness. output_sb is [pmax, q_dim + 2 * kv_dim],
+        # so output_sb[:, kv_offset : kv_offset + kv_dim] is an offset slice of
+        # the free dimension, and nkilib records in this same release that
+        # "oob_mode.skip does not fully suppress writes when the source is a
+        # sub-tensor view" (core/moe/moe_tkg/all_expert_mx_impl.py, above the
+        # memset that works around it). A row of THIS scatter that was meant to
+        # be skipped but is not would land kv_dim elements below the cache base;
+        # for the V cache that is the last live row of the K cache, since K and
+        # V are two slabs of one allocation, i.e. silent corruption of a live
+        # sequence. The MoE workaround (zero the source) is unavailable here,
+        # because the same tile holds the real tokens' K/V.
+        #
+        # The vendor's own -1 plus oob_mode.skip block-KV cache scatter
+        # (neuronxcc/nki/_pre_prod_kernels/kv_cache_update.py,
+        # update_block_cache) passes a whole freshly allocated tile, and the FP8
+        # branch just above already passes a dedicated [pmax, kv_dim] tile.
+        # Match both. Cost: one [pmax, kv_dim] stack tile (128 B per partition
+        # at d_head 64, one KV head, bf16) and one SBUF-to-SBUF tensor_copy per
+        # (S tile, K or V). Only on this path, so every existing caller's DMA
+        # source is untouched.
+        staged_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=output_sb.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=staged_sb[0:s_tile_sz, 0:kv_dim],
+            src=output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim],
+        )
+        src_sb = staged_sb[0:s_tile_sz, 0:kv_dim]
     else:
         # bf16 path: store directly without quantization
         src_sb = output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim]
@@ -1047,6 +1099,13 @@ def _quantize_and_store_kv(
         total_slots = num_blocks * block_size
         cache_2d = cache_hbm.reshape((total_slots, kv_dim))
 
+        # The static AP offset here is 0, so slot s covers exactly the flat
+        # addresses [s * kv_dim, (s + 1) * kv_dim). A negative slot therefore
+        # lands below the tensor base and a slot >= total_slots past its end, so
+        # the bound check the DGE always runs on an indirect DMA rejects the
+        # whole row; oob_mode picks whether that row is dropped or raises. An
+        # in-range row is unaffected: same descriptor, same access pattern, same
+        # DGE mode, same issue order.
         nisa.dma_copy(
             dst=cache_2d.ap(
                 pattern=[[kv_dim, s_tile_sz], [1, kv_dim]],
@@ -1056,6 +1115,7 @@ def _quantize_and_store_kv(
             ),
             src=src_sb,
             dge_mode=dge_mode.swdge,
+            oob_mode=_kv_scatter_oob_mode(cfg),
         )
     else:
         # Cache layout: [B, max_seq_len, kv_dim] - same pattern as BSD output store
