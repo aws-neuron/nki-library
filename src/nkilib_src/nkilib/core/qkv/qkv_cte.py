@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import dge_mode
+from nki.isa.constants import dge_mode, oob_mode
 
 from ..utils.allocator import SbufManager, sizeinbytes
 
@@ -41,6 +41,7 @@ from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ..moe.moe_cte import SkipMode
 
 # QKV CTE
 from .qkv_cte_utils import (
@@ -291,6 +292,12 @@ def qkv_cte(
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.NkiTensor] = None,
+    # skip_token runs the block-KV K/V scatter with oob_mode.skip. A slot outside
+    # [0, num_blocks * block_size) then writes nothing instead of raising. A
+    # caller can mark a token "do not cache" with a negative slot. Plain block KV
+    # only. The default keeps the emitted DMA unchanged. Same convention as
+    # moe_cte, which gates its token gathers on skip_dma.skip_token.
+    skip_dma: SkipMode = SkipMode(),
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -517,6 +524,7 @@ def qkv_cte(
         fp8_packed=fp8_packed,
         block_size=block_size,
         slot_mapping=slot_mapping,
+        skip_dma=skip_dma,
         # Performance
         store_output_in_sbuf=store_output_in_sbuf,
         sbm=sbm,
@@ -937,6 +945,17 @@ def _store_kv_cache(
         )
 
 
+def _kv_scatter_oob_mode(cfg: QKV_CTE_Config):
+    """oob_mode for the indirect block-KV K/V scatter.
+
+    skip drops a descriptor addressed outside the cache; error raises on one.
+    In-range slots are unaffected either way.
+    """
+    if cfg.skip_dma.skip_token:
+        return oob_mode.skip
+    return oob_mode.error
+
+
 def _quantize_and_store_kv(
     output_sb: nl.NkiTensor,
     scale_sb: Optional[nl.NkiTensor],
@@ -987,6 +1006,16 @@ def _quantize_and_store_kv(
             operand1=cfg.fp8_max,
         )
         src_sb = clamped_sb[0:s_tile_sz, 0:kv_dim]
+    elif cfg.skip_dma.skip_token:
+        # Stage into a dedicated tile so the DMA source is not a sub-slice of a
+        # wider one: oob_mode.skip does not reliably suppress a write whose
+        # source is a sub-tensor view. Mirrors the FP8 branch above.
+        staged_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=output_sb.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=staged_sb[0:s_tile_sz, 0:kv_dim],
+            src=output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim],
+        )
+        src_sb = staged_sb[0:s_tile_sz, 0:kv_dim]
     else:
         # bf16 path: store directly without quantization
         src_sb = output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim]
@@ -1047,6 +1076,9 @@ def _quantize_and_store_kv(
         total_slots = num_blocks * block_size
         cache_2d = cache_hbm.reshape((total_slots, kv_dim))
 
+        # AP offset 0, so slot s covers [s * kv_dim, (s + 1) * kv_dim). An
+        # out-of-range slot fails the DGE bound check and oob_mode decides
+        # whether that row is dropped or raises; in-range rows are unaffected.
         nisa.dma_copy(
             dst=cache_2d.ap(
                 pattern=[[kv_dim, s_tile_sz], [1, kv_dim]],
@@ -1056,6 +1088,7 @@ def _quantize_and_store_kv(
             ),
             src=src_sb,
             dge_mode=dge_mode.swdge,
+            oob_mode=_kv_scatter_oob_mode(cfg),
         )
     else:
         # Cache layout: [B, max_seq_len, kv_dim] - same pattern as BSD output store
