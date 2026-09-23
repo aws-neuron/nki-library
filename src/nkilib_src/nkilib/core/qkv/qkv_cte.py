@@ -41,6 +41,7 @@ from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ..moe.moe_cte import SkipMode
 
 # QKV CTE
 from .qkv_cte_utils import (
@@ -291,11 +292,12 @@ def qkv_cte(
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.NkiTensor] = None,
-    # Run the block-KV K/V scatter with oob_mode.skip: a slot outside
-    # [0, num_blocks * block_size) writes nothing instead of raising, so a
-    # caller can mark a token "do not cache" with a negative slot. Plain
-    # block KV only. Default False keeps the emitted DMA unchanged.
-    slot_mapping_oob_skip: bool = False,
+    # skip_token runs the block-KV K/V scatter with oob_mode.skip. A slot outside
+    # [0, num_blocks * block_size) then writes nothing instead of raising. A
+    # caller can mark a token "do not cache" with a negative slot. Plain block KV
+    # only. The default keeps the emitted DMA unchanged. Same convention as
+    # moe_cte, which gates its token gathers on skip_dma.skip_token.
+    skip_dma: SkipMode = SkipMode(),
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -522,7 +524,7 @@ def qkv_cte(
         fp8_packed=fp8_packed,
         block_size=block_size,
         slot_mapping=slot_mapping,
-        slot_mapping_oob_skip=slot_mapping_oob_skip,
+        skip_dma=skip_dma,
         # Performance
         store_output_in_sbuf=store_output_in_sbuf,
         sbm=sbm,
@@ -949,7 +951,7 @@ def _kv_scatter_oob_mode(cfg: QKV_CTE_Config):
     skip drops a descriptor addressed outside the cache; error raises on one.
     In-range slots are unaffected either way.
     """
-    if cfg.slot_mapping_oob_skip:
+    if cfg.skip_dma.skip_token:
         return oob_mode.skip
     return oob_mode.error
 
@@ -1004,7 +1006,7 @@ def _quantize_and_store_kv(
             operand1=cfg.fp8_max,
         )
         src_sb = clamped_sb[0:s_tile_sz, 0:kv_dim]
-    elif cfg.slot_mapping_oob_skip:
+    elif cfg.skip_dma.skip_token:
         # Stage into a dedicated tile so the DMA source is not a sub-slice of a
         # wider one: oob_mode.skip does not reliably suppress a write whose
         # source is a sub-tensor view. Mirrors the FP8 branch above.

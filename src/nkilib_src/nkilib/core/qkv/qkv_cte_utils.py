@@ -43,6 +43,7 @@ from ..utils.kernel_helpers import (
     resolve_fp8_e4m3_dtype,
 )
 from ..utils.logging import get_logger
+from ..moe.moe_cte import SkipMode
 
 _logger = get_logger("qkv_cte")
 
@@ -151,10 +152,11 @@ class QKV_CTE_UserInput(nl.NKIObject):
     dtype_mode: DtypeMode = DtypeMode.NON_OCP
     # --- Run the block-KV K/V scatter with oob_mode.skip, so a slot outside
     # [0, num_blocks * block_size) writes nothing instead of raising. Declared
-    # here rather than next to slot_mapping because the fields above it have no
+    # skip_token runs the block-KV K/V scatter with oob_mode.skip. Declared here
+    # rather than beside slot_mapping because the fields above it have no
     # defaults. Plain block KV only; see the kernel_assert in
     # _validate_user_inputs.
-    slot_mapping_oob_skip: bool = False
+    skip_dma: SkipMode = SkipMode()
 
 
 # Represent quantization config
@@ -214,8 +216,8 @@ class QKV_CTE_Config(nl.NKIObject):
     transpose_k_cache: bool
     fp8_packed: bool
     block_size: Optional[int]
-    # See QKV_CTE_UserInput.slot_mapping_oob_skip.
-    slot_mapping_oob_skip: bool
+    # See QKV_CTE_UserInput.skip_dma.
+    skip_dma: SkipMode
     # Additional Internal Config
     load_input_with_DMA_transpose: bool
     compute_mm_dtype: Any
@@ -709,9 +711,9 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
     )
 
     kernel_assert(
-        not args.slot_mapping_oob_skip
+        not args.skip_dma.skip_token
         or (args.use_block_kv and not args.fp8_packed and not args.transpose_k_cache),
-        "[QKV CTE Kernel] slot_mapping_oob_skip requires use_block_kv=True with "
+        "[QKV CTE Kernel] skip_dma.skip_token requires use_block_kv=True with "
         "fp8_packed=False and transpose_k_cache=False. Only the plain block-KV "
         "scatter addresses the cache with a zero static offset, so only there does "
         "a negative slot resolve to an out-of-bounds address. The packed-FP8 "
@@ -1276,7 +1278,7 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         transpose_k_cache=args.transpose_k_cache,
         fp8_packed=args.fp8_packed,
         block_size=args.block_size,
-        slot_mapping_oob_skip=args.slot_mapping_oob_skip,
+        skip_dma=args.skip_dma,
         # Internal Config
         load_input_with_DMA_transpose=load_input_with_DMA_transpose,
         compute_mm_dtype=compute_mm_dtype,

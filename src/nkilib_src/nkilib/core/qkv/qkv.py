@@ -37,6 +37,7 @@ from ..utils.common_types import (
     StridedInputConfig,
 )
 from ..utils.kernel_assert import kernel_assert
+from ..moe.moe_cte import SkipMode
 
 # QKV
 from .qkv_cte import qkv_cte
@@ -103,7 +104,7 @@ def qkv(
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.NkiTensor] = None,
     # Plain block KV only. See qkv_cte.
-    slot_mapping_oob_skip: bool = False,
+    skip_dma: SkipMode = SkipMode(),
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -377,7 +378,7 @@ def qkv(
             fp8_packed=fp8_packed,
             block_size=block_size,
             slot_mapping=slot_mapping,
-            slot_mapping_oob_skip=slot_mapping_oob_skip,
+            skip_dma=skip_dma,
             store_output_in_sbuf=store_output_in_sbuf,
             sbm=sbm,
             use_auto_allocation=use_auto_allocation,
