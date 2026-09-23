@@ -291,12 +291,10 @@ def qkv_cte(
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.NkiTensor] = None,
-    # Run the block-KV K/V scatter with oob_mode.skip, so a slot outside
-    # [0, num_blocks * block_size) writes nothing instead of raising. Lets a
-    # caller mark a token as "do not cache" with a negative slot rather than
-    # aiming it at a real slot, which would make the scatter's destination
-    # indices non-unique. Plain block KV only: see _validate_user_inputs.
-    # Default False leaves the emitted DMA byte-for-byte unchanged.
+    # Run the block-KV K/V scatter with oob_mode.skip: a slot outside
+    # [0, num_blocks * block_size) writes nothing instead of raising, so a
+    # caller can mark a token "do not cache" with a negative slot. Plain
+    # block KV only. Default False keeps the emitted DMA unchanged.
     slot_mapping_oob_skip: bool = False,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
@@ -948,11 +946,8 @@ def _store_kv_cache(
 def _kv_scatter_oob_mode(cfg: QKV_CTE_Config):
     """oob_mode for the indirect block-KV K/V scatter.
 
-    oob_mode.skip drops a descriptor whose address lands outside the cache
-    instead of raising, which is how a caller marks a token as "do not cache"
-    (a negative slot). It changes nothing for an in-range slot: an indirect DMA
-    bound-checks every descriptor either way, and oob_mode only selects what
-    happens to one that fails the check.
+    skip drops a descriptor addressed outside the cache; error raises on one.
+    In-range slots are unaffected either way.
     """
     if cfg.slot_mapping_oob_skip:
         return oob_mode.skip
@@ -1010,29 +1005,9 @@ def _quantize_and_store_kv(
         )
         src_sb = clamped_sb[0:s_tile_sz, 0:kv_dim]
     elif cfg.slot_mapping_oob_skip:
-        # bf16 path under oob_mode.skip: stage into a dedicated full-width tile
-        # first, so the DMA source is not a sub-slice of a wider tile.
-        #
-        # Load-bearing, not tidiness. output_sb is [pmax, q_dim + 2 * kv_dim],
-        # so output_sb[:, kv_offset : kv_offset + kv_dim] is an offset slice of
-        # the free dimension, and nkilib records in this same release that
-        # "oob_mode.skip does not fully suppress writes when the source is a
-        # sub-tensor view" (core/moe/moe_tkg/all_expert_mx_impl.py, above the
-        # memset that works around it). A row of THIS scatter that was meant to
-        # be skipped but is not would land kv_dim elements below the cache base;
-        # for the V cache that is the last live row of the K cache, since K and
-        # V are two slabs of one allocation, i.e. silent corruption of a live
-        # sequence. The MoE workaround (zero the source) is unavailable here,
-        # because the same tile holds the real tokens' K/V.
-        #
-        # The vendor's own -1 plus oob_mode.skip block-KV cache scatter
-        # (neuronxcc/nki/_pre_prod_kernels/kv_cache_update.py,
-        # update_block_cache) passes a whole freshly allocated tile, and the FP8
-        # branch just above already passes a dedicated [pmax, kv_dim] tile.
-        # Match both. Cost: one [pmax, kv_dim] stack tile (128 B per partition
-        # at d_head 64, one KV head, bf16) and one SBUF-to-SBUF tensor_copy per
-        # (S tile, K or V). Only on this path, so every existing caller's DMA
-        # source is untouched.
+        # Stage into a dedicated tile so the DMA source is not a sub-slice of a
+        # wider one: oob_mode.skip does not reliably suppress a write whose
+        # source is a sub-tensor view. Mirrors the FP8 branch above.
         staged_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=output_sb.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(
             dst=staged_sb[0:s_tile_sz, 0:kv_dim],
@@ -1099,13 +1074,9 @@ def _quantize_and_store_kv(
         total_slots = num_blocks * block_size
         cache_2d = cache_hbm.reshape((total_slots, kv_dim))
 
-        # The static AP offset here is 0, so slot s covers exactly the flat
-        # addresses [s * kv_dim, (s + 1) * kv_dim). A negative slot therefore
-        # lands below the tensor base and a slot >= total_slots past its end, so
-        # the bound check the DGE always runs on an indirect DMA rejects the
-        # whole row; oob_mode picks whether that row is dropped or raises. An
-        # in-range row is unaffected: same descriptor, same access pattern, same
-        # DGE mode, same issue order.
+        # AP offset 0, so slot s covers [s * kv_dim, (s + 1) * kv_dim). An
+        # out-of-range slot fails the DGE bound check and oob_mode decides
+        # whether that row is dropped or raises; in-range rows are unaffected.
         nisa.dma_copy(
             dst=cache_2d.ap(
                 pattern=[[kv_dim, s_tile_sz], [1, kv_dim]],
