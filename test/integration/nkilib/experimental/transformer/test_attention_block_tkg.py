@@ -2629,6 +2629,47 @@ class TestRangeAttnBlk:
                             block_len=32, skip_output_projection=True, update_cache=False),
         AttnBlkTestConfig(batch=1, q_heads=1, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
                             block_len=32, kv_heads=1, skip_output_projection=True, update_cache=False),
+        # d_head=256 WITH in-kernel output projection (d>128 out-proj: the d-tiled attention
+        # output is consumed as n_d_tiles x 128-wide virtual heads). Gemma3-4B TP=4 rank shape:
+        # q_heads=2, kv_heads=1, H=2560.
+        AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, update_cache=False),
+        AttnBlkTestConfig(batch=1, q_heads=1, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, kv_heads=1, update_cache=False),
+        AttnBlkTestConfig(batch=4, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, update_cache=False),
+        AttnBlkTestConfig(batch=4, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, update_cache=False),
+        AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, update_cache=False),
+        AttnBlkTestConfig(batch=4, q_heads=2, d_head=128, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, update_cache=False),
+        # d_head=256 with IN-KERNEL KV cache update (block KV, bf16, non-transposed K), with and
+        # without in-kernel out-proj. Gemma3-4B TP=4 rank shape at B=4.
+        AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32),
+        AttnBlkTestConfig(batch=4, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32),
+        AttnBlkTestConfig(batch=4, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, skip_output_projection=True),
+        AttnBlkTestConfig(batch=3, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32),
+        # In-kernel d256 KV update at the batch sizes the model actually runs (16, 64 -> batch-sharded
+        # attention + batch-sharded scatter), with the cache passed WITH its kv-head dim (4D) as vLLM binds it.
+        AttnBlkTestConfig(batch=16, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, cache_has_kv_head_dim=True),
+        AttnBlkTestConfig(batch=64, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, cache_has_kv_head_dim=True),
+        AttnBlkTestConfig(batch=64, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32),
+        # The model's actual decode shape: B=64, d256, in-kernel update, gemma3-style (QK-norm pre-RoPE),
+        # 4D cache (vLLM binding), KV pool much larger than the batch's blocks, and the model's mask
+        # path (precomputed mask, not pos_ids).
+        AttnBlkTestConfig(batch=64, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=1280, S_max_ctx=1280, S_tkg=1,
+                            block_len=32, cache_has_kv_head_dim=True, physical_cache_blocks_per_head=8192),
+        # B>1 d256 WITHOUT out-proj (isolates attention from the new out-proj path)
+        AttnBlkTestConfig(batch=4, q_heads=2, d_head=256, H=2560, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, skip_output_projection=True, update_cache=False),
         # Gemma d=256 full rotary WITH qk-layernorm pre-rope (hardware/compile lanes only).
         AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
                             block_len=32, skip_output_projection=True, update_cache=False,
