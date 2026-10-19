@@ -88,6 +88,41 @@ def get_n_blocks(T, TOPK, E, B, n_block_per_iter=1):
     return N
 
 
+def routing_blocks_per_expert(T, TOPK, E, B, alpha=None, non_overlapping_shards=False):
+    """Per-expert block counts for the generated routing, as [E] int32.
+
+    Shared by generate_token_position_to_id_and_experts and get_n_blocks_tight so the
+    two cannot disagree on how many blocks the routing occupies.
+    """
+    router = get_router_with_controlled_distribution(
+        T=T, TOPK=TOPK, E=E, alpha=alpha, non_overlapping_shards=non_overlapping_shards
+    )
+    one_hot = np.arange(E)
+    token_experts = np.zeros((T, E))
+    for i in range(min(E, TOPK)):
+        token_experts += np.expand_dims(router[:, i], 1) == np.expand_dims(one_hot, 0)
+    return token_experts, np.ceil(token_experts.sum(0) / B).astype(np.int32)
+
+
+def get_n_blocks_tight(T, TOPK, E, B, alpha=None, non_overlapping_shards=False):
+    """Blocks the routing actually occupies, i.e. an N with zero padding blocks.
+
+    get_n_blocks returns a worst-case bound, so conditions always ends in zeros and the
+    dynamic loop's trailing blocks are inactive. Production sizes N to the real routing,
+    leaving no slack -- which is the only way the ping-pong's last iteration can reach
+    block index N. Restores the RNG state so the caller's seeding is unaffected.
+    """
+    state = np.random.get_state()
+    try:
+        np.random.seed(0)
+        _, blocks_per_expert = routing_blocks_per_expert(
+            T, TOPK, E, B, alpha=alpha, non_overlapping_shards=non_overlapping_shards
+        )
+    finally:
+        np.random.set_state(state)
+    return int(blocks_per_expert.sum())
+
+
 def get_block_size_dropping(seq_len, batch_size, top_k, capacity_factor, num_experts):
     return seq_len * batch_size * top_k * capacity_factor // num_experts
 
@@ -214,16 +249,9 @@ def generate_token_position_to_id_and_experts(
     if n_block_per_iter > 1:
         assert vnc_degree == 1
 
-    router = get_router_with_controlled_distribution(
-        T=T, TOPK=TOPK, E=E, alpha=alpha, non_overlapping_shards=non_overlapping_shards
+    token_experts, blocks_per_expert = routing_blocks_per_expert(
+        T, TOPK, E, B, alpha=alpha, non_overlapping_shards=non_overlapping_shards
     )
-    one_hot = np.arange(E)
-    token_experts = np.zeros((T, E))
-    actual_k = min(E, TOPK)
-    for i in range(actual_k):
-        token_experts += np.expand_dims(router[:, i], 1) == np.expand_dims(one_hot, 0)
-
-    blocks_per_expert = np.ceil(token_experts.sum(0) / B).astype(np.int32)
     n_padding_block = N - np.sum(blocks_per_expert)
 
     if use_split_padding:
@@ -992,8 +1020,9 @@ def _shard_on_block_mx_output_validator(
     lnc_degree,
     rtol=5e-2,
     atol=1e-5,
+    stacked=True,
 ):
-    """Validator for the MX shard-on-block output layout [lnc, T_out, H].
+    """Validator for the MX shard-on-block output layout [lnc, T_out, H] ([T_out, H] if not stacked).
 
     Calls bwmm_shard_on_block_mx_torch_ref directly (matching the standalone
     direct test) — its layout matches the kernel output, unlike the
@@ -1038,11 +1067,8 @@ def _shard_on_block_mx_output_validator(
     class ShardOnBlockMxOutputValidator(CustomValidator):
         @override
         def validate(self, inference_output: npt.NDArray[Any]) -> bool:
-            actual = (
-                np.frombuffer(inference_output, dtype=ml_dtypes.bfloat16)
-                .reshape(lnc_degree, -1, hidden)
-                .astype(np.float32)
-            )
+            actual = np.frombuffer(inference_output, dtype=ml_dtypes.bfloat16).astype(np.float32)
+            actual = actual.reshape(lnc_degree, -1, hidden) if stacked else actual.reshape(1, -1, hidden)
             golden = bwmm_shard_on_block_mx_torch_ref(**ref_kwargs)["output"]
             if hasattr(golden, "numpy"):
                 golden = golden.numpy()
@@ -1189,7 +1215,11 @@ def generate_moe_cte_unified_inputs(
     dma_skip = map_skip_mode(skip)
 
     # Build spec
-    if impl in (MoECTEImplementation.shard_on_block, MoECTEImplementation.shard_on_block_mx):
+    if impl in (
+        MoECTEImplementation.shard_on_block,
+        MoECTEImplementation.shard_on_block_mx,
+        MoECTEImplementation.shard_on_block_mx_v2,
+    ):
         _strategy = BlockShardStrategy.HI_LO if non_overlapping_shards else BlockShardStrategy.PING_PONG
         spec = MoECTESpec(
             implementation=impl,
@@ -1414,11 +1444,13 @@ def moe_cte_unified_output_tensors(
     is_block_parallel = impl in (
         MoECTEImplementation.shard_on_block,
         MoECTEImplementation.shard_on_block_mx,
+        MoECTEImplementation.shard_on_block_mx_v2,
     )
     is_dropping = impl == MoECTEImplementation.shard_on_i_dropping
     is_shard_block = impl == MoECTEImplementation.shard_on_block
     is_mx = impl in (
         MoECTEImplementation.shard_on_block_mx,
+        MoECTEImplementation.shard_on_block_mx_v2,
         MoECTEImplementation.shard_on_i_mx,
         MoECTEImplementation.shard_on_i_mx_hybrid,
     )

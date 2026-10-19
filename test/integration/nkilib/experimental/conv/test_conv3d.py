@@ -19,8 +19,12 @@ from typing import Optional, final
 import nki.language as nl
 import numpy as np
 import pytest
+import torch
+import torch.nn.functional as F
 from nkilib_src.nkilib.core.utils.common_types import ActFnType
 from nkilib_src.nkilib.experimental.conv.conv3d import BatchNormMode, ResidualAddLoc, conv3d
+from nkilib_src.nkilib.experimental.conv.conv3d_helpers import _build_conv3d_config, _validate_conv3d_inputs
+from nkilib_src.nkilib.experimental.conv.conv3d_kernels import _conv3d_low_chan_compute
 from nkilib_src.nkilib.experimental.conv.conv3d_torch import conv3d_torch_ref
 from nkilib_src.nkilib.experimental.conv.conv_fuser_torch import conv_fuser_torch_ref
 
@@ -156,6 +160,130 @@ def generate_conv3d_inputs(
     return inputs
 
 
+def _conv3d_low_chan_transpose_torch_ref(
+    x_in: torch.Tensor,
+    filters: torch.Tensor,
+    padding: tuple[int, int, int, int, int, int],
+    dilation: tuple[int, int, int],
+    transpose_taps: bool,
+) -> dict[str, torch.Tensor]:
+    assert transpose_taps  # noqa: S101
+    pad_d_left, pad_d_right, pad_h_top, pad_h_bottom, pad_w_left, pad_w_right = padding
+    x_in = F.pad(
+        x_in,
+        (pad_w_left, pad_w_right, pad_h_top, pad_h_bottom, pad_d_left, pad_d_right),
+    )
+    weight = filters.flip((0, 1, 2)).permute(3, 4, 0, 1, 2).contiguous()
+    return {
+        "out": F.conv3d(
+            x_in,
+            weight,
+            stride=(1, 1, 1),
+            padding=(0, 0, 0),
+            dilation=dilation,
+        ).detach()
+    }
+
+
+def _conv3d_auto_alloc_kernel(
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
+    stride: tuple[int, int, int] = (1, 1, 1),
+    padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
+    dilation: tuple[int, int, int] = (1, 1, 1),
+    activation_fn: Optional[ActFnType] = None,
+    lnc_shard: bool = False,
+    batch_norm_mode: BatchNormMode = BatchNormMode.NONE,
+    output_pre_norm: Optional[bool] = False,
+    batch_norm_eps: Optional[float] = 1e-5,
+    gamma: Optional[nl.NkiTensor] = None,
+    beta: Optional[nl.NkiTensor] = None,
+    momentum: Optional[float] = 0.1,
+    running_means: Optional[nl.NkiTensor] = None,
+    running_variances: Optional[nl.NkiTensor] = None,
+    residual_add_loc: ResidualAddLoc = ResidualAddLoc.NONE,
+    residuals_in: Optional[nl.NkiTensor] = None,
+    sbm=None,
+    use_auto_allocation: bool = True,
+):
+    return conv3d(
+        x_in=x_in,
+        filters=filters,
+        bias=bias,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        activation_fn=activation_fn,
+        lnc_shard=lnc_shard,
+        batch_norm_mode=batch_norm_mode,
+        output_pre_norm=output_pre_norm,
+        batch_norm_eps=batch_norm_eps,
+        gamma=gamma,
+        beta=beta,
+        momentum=momentum,
+        running_means=running_means,
+        running_variances=running_variances,
+        residual_add_loc=residual_add_loc,
+        residuals_in=residuals_in,
+        sbm=sbm,
+        use_auto_allocation=use_auto_allocation,
+    )
+
+
+def _conv3d_low_chan_compute_kernel(
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
+    dilation: tuple[int, int, int] = (1, 1, 1),
+    transpose_taps: bool = False,
+):
+    cfg = _build_conv3d_config(
+        x_in=x_in,
+        filters=filters,
+        bias=None,
+        stride=(1, 1, 1),
+        padding=padding,
+        dilation=dilation,
+        activation_fn=None,
+        batch_norm_mode=BatchNormMode.NONE,
+        output_pre_norm=False,
+        residual_add_loc=ResidualAddLoc.NONE,
+        transpose_taps=transpose_taps,
+    )
+    _validate_conv3d_inputs(
+        x_in=x_in,
+        filters=filters,
+        bias=None,
+        cfg=cfg,
+        transpose_taps=transpose_taps,
+    )
+    out = nl.ndarray(
+        shape=(cfg.B, cfg.C_out, cfg.D_out, cfg.H_out, cfg.W_out),
+        dtype=x_in.dtype,
+        buffer=nl.shared_hbm,
+    )
+    _conv3d_low_chan_compute(
+        x_in=x_in,
+        filters=filters,
+        bias=None,
+        gamma=None,
+        beta=None,
+        batch_norm_eps=1e-5,
+        running_means=None,
+        running_variances=None,
+        residuals_in=None,
+        cfg=cfg,
+        conv_out=out,
+        means=None,
+        variances=None,
+        sbm=None,
+        use_auto_allocation=False,
+        transpose_taps=transpose_taps,
+    )
+    return out
+
+
 # fmt: off
 # Parameter names for pytest.mark.parametrize
 CONV3D_PARAM_NAMES = (
@@ -237,6 +365,101 @@ CONV3D_BASIC_SLOW_PARAMS = [
 ]
 
 CONV3D_BASIC_ALL_PARAMS = CONV3D_BASIC_PARAMS + CONV3D_BASIC_SLOW_PARAMS
+
+# Large vision workloads
+CONV3D_LARGE_VISION_PARAMS = [
+    pytest.param(6, 32, 32, 1, 432, 768, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.slow, id="large_vision_32ch_432x768"),
+    pytest.param(6, 64, 64, 1, 216, 384, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.slow, id="large_vision_64ch_216x384"),
+    pytest.param(6, 128, 128, 1, 108, 192, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.slow, id="large_vision_128ch_108x192"),
+    pytest.param(6, 256, 256, 1, 54, 96, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.slow, id="large_vision_256ch_54x96"),
+]
+
+# Low-channel replication, tiling, tails, and fallback
+CONV3D_LOW_CHAN_PARAMS = [
+    pytest.param(4, 32, 32, 1, 33, 33, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(3, 33, 64, 2, 9, 67, 1, 3, 3, 1, 2, 2, 0, 0, 2, 1, 2, 1, 1, 2, 1, True, ActFnType.ReLU, False, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(2, 64, 129, 2, 8, 65, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(
+        1, 32, 32, 1, 32, 32, 1, 3, 3, 1, 1, 1, 0, 0, 3, 3, 3, 3, 1, 1, 1,
+        False, None, False, nl.bfloat16,
+        marks=pytest.mark.fast,
+        id="fully_padded_output_positions",
+    ),
+    pytest.param(
+        5, 32, 1, 1, 65, 129, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1,
+        False, None, False, nl.bfloat16,
+        marks=pytest.mark.fast,
+        id="multi_window_rep4_batch_tail",
+    ),
+    pytest.param(
+        3, 64, 1, 1, 65, 257, 1, 1, 3, 1, 1, 2, 0, 0, 0, 0, 2, 2, 1, 1, 2,
+        True, ActFnType.ReLU, False, nl.bfloat16,
+        marks=pytest.mark.fast,
+        id="multi_window_rep2_stride_dilation_padding",
+    ),
+    # Exceeds tap-cache capacity
+    pytest.param(1, 32, 1, 1, 63, 51, 1, 63, 51, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(1, 65, 32, 1, 8, 8, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.fast),
+    # Partition gap with a single-batch tail
+    pytest.param(
+        5, 17, 32, 1, 5, 17, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+        True, ActFnType.ReLU, False, nl.bfloat16,
+        marks=pytest.mark.fast,
+        id="rep4_partition_gap_batch_tail",
+    ),
+    # Partial batch group with a partition gap
+    pytest.param(
+        3, 20, 64, 2, 4, 9, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+        False, ActFnType.SiLU, False, nl.bfloat16,
+        marks=pytest.mark.fast,
+        id="rep4_partition_gap_partial_batch_group",
+    ),
+]
+
+CONV3D_LOW_CHAN_BATCH_NORM_PARAMS = [
+    # Mixed C_out replication with a batch tail
+    pytest.param(3, 33, 129, 1, 4, 17, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, ActFnType.SiLU, False, nl.bfloat16, 1e-3, 0.2, BatchNormMode.TRAINING, True, ResidualAddLoc.POST_ACT, marks=pytest.mark.fast),
+    # Eval fusion with a pre-activation residual
+    pytest.param(2, 32, 32, 1, 5, 33, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16, 1e-5, 0.1, BatchNormMode.EVAL, False, ResidualAddLoc.PRE_ACT, marks=pytest.mark.fast),
+    pytest.param(
+        1, 1, 1, 1, 65, 129, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1,
+        True, ActFnType.ReLU, False, nl.bfloat16, 1e-5, 0.1,
+        BatchNormMode.EVAL, False, ResidualAddLoc.PRE_ACT,
+        marks=pytest.mark.fast,
+        id="multi_window_eval_residual_staging",
+    ),
+    pytest.param(
+        1, 16, 8, 1, 65, 129, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1,
+        False, ActFnType.SiLU, False, nl.bfloat16, 1e-3, 0.2,
+        BatchNormMode.TRAINING, True, ResidualAddLoc.POST_ACT,
+        marks=pytest.mark.fast,
+        id="multi_window_training_residual",
+    ),
+    # fp32 exposes weighted-pooling errors across unequal batch shards and band layouts
+    pytest.param(
+        3, 33, 129, 1, 4, 17, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+        True, ActFnType.SiLU, False, nl.float32, 1e-5, 0.2,
+        BatchNormMode.TRAINING, True, ResidualAddLoc.POST_ACT,
+        marks=pytest.mark.fast,
+        id="uneven_batch_shard_training_fp32",
+    ),
+    # One core contributes an empty shard
+    pytest.param(
+        1, 16, 8, 1, 65, 129, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1,
+        False, ActFnType.SiLU, False, nl.float32, 1e-5, 0.2,
+        BatchNormMode.TRAINING, True, ResidualAddLoc.POST_ACT,
+        marks=pytest.mark.fast,
+        id="multi_window_training_residual_fp32",
+    ),
+    # Isolate mean and variance reduction
+    pytest.param(
+        3, 33, 129, 1, 4, 17, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+        False, None, False, nl.float32, 1e-5, 0.1,
+        BatchNormMode.TRAINING, False, ResidualAddLoc.NONE,
+        marks=pytest.mark.fast,
+        id="training_stats_only_fp32",
+    ),
+]
 
 # Batchnorm-fusion parameters (see CONV3D_BATCH_NORM_PARAM_NAMES for the appended columns). gamma /
 # beta are drawn per C_out, so distinct C_out configs also vary them. Non-obvious coverage axes:
@@ -405,11 +628,26 @@ CONV3D_BATCH_NORM_PARAMS = [
     (1, 32, 64, 1, 16, 16, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, ActFnType.ReLU, False, nl.bfloat16, 1e-2, 0.1, BatchNormMode.TRAINING, False, ResidualAddLoc.PRE_ACT),
 ]
 
-# Residual add under a LARGE-MEAN conv output (x_in shifted off zero, so each channel's mean is several
-# std). Exercises two precision properties: the order of the batchnorm affine in all modes (deferring
-# the mean shift rounds an un-shifted intermediate, losing accuracy in proportion to mean/std — see
-# _rescale_phase), and in TRAINING the bn_stats / bn_aggr count-weighted pool, which stays well
-# conditioned at any mean where an earlier var = E[Y^2] - E[Y]^2 identity did not.
+# Internal auto-allocation on the fallback geometry
+CONV3D_AUTO_ALLOC_PARAMS = [
+    pytest.param(
+        1, 128, 64, 4, 8, 8, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+        True, None, False, nl.bfloat16, 1e-5, 0.1,
+        BatchNormMode.NONE, False, ResidualAddLoc.NONE,
+        marks=pytest.mark.fast,
+        id="fallback_auto_alloc",
+    ),
+    # Training also exercises finalization allocations
+    pytest.param(
+        1, 128, 64, 4, 8, 8, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+        True, None, False, nl.float32, 1e-5, 0.1,
+        BatchNormMode.TRAINING, False, ResidualAddLoc.NONE,
+        marks=pytest.mark.fast,
+        id="fallback_auto_alloc_training",
+    ),
+]
+
+# Large means expose affine-order rounding and unstable variance pooling
 CONV3D_RESIDUAL_LARGE_MEAN_PARAM_NAMES = CONV3D_BATCH_NORM_PARAM_NAMES + ", x_in_mean"
 
 CONV3D_RESIDUAL_LARGE_MEAN_PARAMS = [
@@ -749,6 +987,301 @@ class TestConv3DKernel:
             dtype=dtype,
         )
 
+    @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_LARGE_VISION_PARAMS)
+    def test_conv3d_large_vision(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        height: int,
+        width: int,
+        filter_d: int,
+        filter_h: int,
+        filter_w: int,
+        stride_d: int,
+        stride_h: int,
+        stride_w: int,
+        pad_d_left: int,
+        pad_d_right: int,
+        pad_h_top: int,
+        pad_h_bottom: int,
+        pad_w_left: int,
+        pad_w_right: int,
+        dilation_d: int,
+        dilation_h: int,
+        dilation_w: int,
+        use_bias: bool,
+        activation_fn: Optional[ActFnType],
+        lnc_shard: bool,
+        dtype,
+    ) -> None:
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=batch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            height=height,
+            width=width,
+            filter_d=filter_d,
+            filter_h=filter_h,
+            filter_w=filter_w,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d_left=pad_d_left,
+            pad_d_right=pad_d_right,
+            pad_h_top=pad_h_top,
+            pad_h_bottom=pad_h_bottom,
+            pad_w_left=pad_w_left,
+            pad_w_right=pad_w_right,
+            dilation_d=dilation_d,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+            use_bias=use_bias,
+            activation_fn=activation_fn,
+            lnc_shard=lnc_shard,
+            dtype=dtype,
+        )
+
+    @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_LOW_CHAN_PARAMS)
+    def test_conv3d_low_chan(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        height: int,
+        width: int,
+        filter_d: int,
+        filter_h: int,
+        filter_w: int,
+        stride_d: int,
+        stride_h: int,
+        stride_w: int,
+        pad_d_left: int,
+        pad_d_right: int,
+        pad_h_top: int,
+        pad_h_bottom: int,
+        pad_w_left: int,
+        pad_w_right: int,
+        dilation_d: int,
+        dilation_h: int,
+        dilation_w: int,
+        use_bias: bool,
+        activation_fn: Optional[ActFnType],
+        lnc_shard: bool,
+        dtype,
+    ) -> None:
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=batch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            height=height,
+            width=width,
+            filter_d=filter_d,
+            filter_h=filter_h,
+            filter_w=filter_w,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d_left=pad_d_left,
+            pad_d_right=pad_d_right,
+            pad_h_top=pad_h_top,
+            pad_h_bottom=pad_h_bottom,
+            pad_w_left=pad_w_left,
+            pad_w_right=pad_w_right,
+            dilation_d=dilation_d,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+            use_bias=use_bias,
+            activation_fn=activation_fn,
+            lnc_shard=lnc_shard,
+            dtype=dtype,
+        )
+
+    def test_conv3d_low_chan_rejects_large_c_in(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ) -> None:
+        def input_generator(_):
+            np.random.seed(42)
+            generate_tensor = gaussian_tensor_generator()
+            return {
+                "x_in": generate_tensor(name="x_in", shape=(1, 65, 1, 4, 4), dtype=nl.bfloat16),
+                "filters": generate_tensor(name="filters", shape=(1, 1, 1, 65, 32), dtype=nl.bfloat16),
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_conv3d_low_chan_compute_kernel,
+            kernel_input_generator=input_generator,
+            trace_only=True,
+        )
+        with pytest.raises(Exception, match="conv3d_low_chan requires C_in <= 64"):
+            framework.run_test(
+                test_config=None,
+                compiler_args=CompilerArgs(platform_target=platform_target),
+            )
+
+    @pytest.mark.fast
+    def test_conv3d_low_chan_transpose_taps_rejects_large_c_out(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ) -> None:
+        def input_generator(_):
+            np.random.seed(42)
+            generate_tensor = gaussian_tensor_generator()
+            return {
+                "x_in": generate_tensor(
+                    name="x_in",
+                    shape=(1, 65, 1, 4, 4),
+                    dtype=nl.bfloat16,
+                ),
+                "filters": generate_tensor(
+                    name="filters",
+                    shape=(1, 1, 1, 32, 65),
+                    dtype=nl.bfloat16,
+                ),
+                "transpose_taps": True,
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_conv3d_low_chan_compute_kernel,
+            kernel_input_generator=input_generator,
+            trace_only=True,
+        )
+        with pytest.raises(Exception, match="conv3d_low_chan requires C_out <= 64"):
+            framework.run_test(
+                test_config=None,
+                compiler_args=CompilerArgs(platform_target=platform_target),
+            )
+
+    @pytest.mark.fast
+    def test_conv3d_low_chan_transpose_taps(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ) -> None:
+        batch = 1
+        logical_c_in = 32
+        logical_c_out = 8
+        input_shape = (batch, logical_c_in, 1, 65, 129)
+        filter_shape = (1, 1, 3, logical_c_out, logical_c_in)
+        padding = (0, 0, 0, 0, 1, 1)
+        dilation = (1, 1, 1)
+
+        def input_generator(_):
+            np.random.seed(42)
+            generate_tensor = gaussian_tensor_generator()
+            return {
+                "x_in": generate_tensor(name="x_in", shape=input_shape, dtype=nl.bfloat16),
+                "filters": generate_tensor(name="filters", shape=filter_shape, dtype=nl.bfloat16),
+                "padding": padding,
+                "dilation": dilation,
+                "transpose_taps": True,
+            }
+
+        def output_tensors(_):
+            return {"out": np.zeros((batch, logical_c_out, 1, 65, 129), dtype=nl.bfloat16)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_conv3d_low_chan_compute_kernel,
+            torch_ref=torch_ref_wrapper(_conv3d_low_chan_transpose_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.parametrize(CONV3D_BATCH_NORM_PARAM_NAMES, CONV3D_LOW_CHAN_BATCH_NORM_PARAMS)
+    def test_conv3d_low_chan_batch_norm(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        height: int,
+        width: int,
+        filter_d: int,
+        filter_h: int,
+        filter_w: int,
+        stride_d: int,
+        stride_h: int,
+        stride_w: int,
+        pad_d_left: int,
+        pad_d_right: int,
+        pad_h_top: int,
+        pad_h_bottom: int,
+        pad_w_left: int,
+        pad_w_right: int,
+        dilation_d: int,
+        dilation_h: int,
+        dilation_w: int,
+        use_bias: bool,
+        activation_fn: Optional[ActFnType],
+        lnc_shard: bool,
+        dtype,
+        batch_norm_eps: float,
+        momentum: float,
+        batch_norm_mode: BatchNormMode,
+        output_pre_norm: bool,
+        residual_add_loc: ResidualAddLoc,
+    ) -> None:
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=batch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            height=height,
+            width=width,
+            filter_d=filter_d,
+            filter_h=filter_h,
+            filter_w=filter_w,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d_left=pad_d_left,
+            pad_d_right=pad_d_right,
+            pad_h_top=pad_h_top,
+            pad_h_bottom=pad_h_bottom,
+            pad_w_left=pad_w_left,
+            pad_w_right=pad_w_right,
+            dilation_d=dilation_d,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+            use_bias=use_bias,
+            activation_fn=activation_fn,
+            lnc_shard=lnc_shard,
+            dtype=dtype,
+            batch_norm_mode=batch_norm_mode,
+            output_pre_norm=output_pre_norm,
+            residual_add_loc=residual_add_loc,
+            batch_norm_eps=batch_norm_eps,
+            momentum=momentum,
+        )
+
     @pytest.mark.parametrize(CONV3D_BATCH_NORM_PARAM_NAMES, CONV3D_BATCH_NORM_PARAMS)
     def test_conv3d_fuse_batch_norm(
         self,
@@ -819,6 +1352,78 @@ class TestConv3DKernel:
             residual_add_loc=residual_add_loc,
             batch_norm_eps=batch_norm_eps,
             momentum=momentum,
+        )
+
+    @pytest.mark.parametrize(CONV3D_BATCH_NORM_PARAM_NAMES, CONV3D_AUTO_ALLOC_PARAMS)
+    def test_conv3d_auto_allocation(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        height: int,
+        width: int,
+        filter_d: int,
+        filter_h: int,
+        filter_w: int,
+        stride_d: int,
+        stride_h: int,
+        stride_w: int,
+        pad_d_left: int,
+        pad_d_right: int,
+        pad_h_top: int,
+        pad_h_bottom: int,
+        pad_w_left: int,
+        pad_w_right: int,
+        dilation_d: int,
+        dilation_h: int,
+        dilation_w: int,
+        use_bias: bool,
+        activation_fn: Optional[ActFnType],
+        lnc_shard: bool,
+        dtype,
+        batch_norm_eps: float,
+        momentum: float,
+        batch_norm_mode: BatchNormMode,
+        output_pre_norm: bool,
+        residual_add_loc: ResidualAddLoc,
+    ) -> None:
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=batch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            height=height,
+            width=width,
+            filter_d=filter_d,
+            filter_h=filter_h,
+            filter_w=filter_w,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d_left=pad_d_left,
+            pad_d_right=pad_d_right,
+            pad_h_top=pad_h_top,
+            pad_h_bottom=pad_h_bottom,
+            pad_w_left=pad_w_left,
+            pad_w_right=pad_w_right,
+            dilation_d=dilation_d,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+            use_bias=use_bias,
+            activation_fn=activation_fn,
+            lnc_shard=lnc_shard,
+            dtype=dtype,
+            batch_norm_mode=batch_norm_mode,
+            output_pre_norm=output_pre_norm,
+            residual_add_loc=residual_add_loc,
+            batch_norm_eps=batch_norm_eps,
+            momentum=momentum,
+            kernel_entry=_conv3d_auto_alloc_kernel,
         )
 
     @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_OUTPUT_PRE_NORM_NO_FUSE_PARAMS)
@@ -1470,6 +2075,7 @@ class TestConv3DKernel:
         omit_residuals_in: bool = False,
         x_in_mean: float = 0.0,
         torch_ref=conv3d_torch_ref,
+        kernel_entry=conv3d,
     ) -> None:
         """
         Execute a Conv3D kernel test with specified parameters using UnitTestFramework.
@@ -1567,7 +2173,7 @@ class TestConv3DKernel:
 
         framework = UnitTestFramework(
             test_manager=test_manager,
-            kernel_entry=conv3d,
+            kernel_entry=kernel_entry,
             torch_ref=torch_ref_wrapper(torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,

@@ -18,32 +18,53 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "numpy",
+    "numpy>=1.24",
     "ml-dtypes",
-    "pandas",
+    "pandas[parquet]",
     "torch",
+    "scipy",
+    "typing_extensions",
     "aws-embedded-metrics",
     "boto3",
+    "httpx[http2]~=0.28.1",
     "fabric2",
-    "filelock",
+    "paramiko",
+    "websocket-client",
+    # Preserve compatibility with concurrent fork-based simulator startup.
+    "filelock==3.24.2",
     "plotext",
-    "pytest",
+    "allpairspy",
+    "debugpy",
+    "pytest==8.4.1",
     "pytest-cov",
     "pytest-xdist",
-    "pytest-metadata",
+    "pytest-timeout",
+    "pytest-rerunfailures",
     "pytest-html",
+    "pytest-metadata",
+    "pytest-memray",
+    "coverage",
+    "griffe>=2,<3",
     "ruff==0.14.13",
-    "ty==0.0.51",
+    "ty==0.0.69",
     "pre-commit",
-    "debugpy",
-    "pytest-cov",
-    "allpairspy",
-    "pytest-timeout"
 ]
 
 [tool.setuptools]
 zip-safe = true
 include-package-data = true
+
+# The default index is intentionally not set here so it can be supplied at
+# install time. `explicit` restricts this index to the packages in
+# [tool.uv.sources].
+[[tool.uv.index]]
+name = "neuron"
+url = "https://pip.repos.neuron.amazonaws.com/"
+explicit = true
+
+[tool.uv.sources]
+neuronx-cc = { index = "neuron" }
+nki = { index = "neuron" }
 
 [tool.setuptools.dynamic]
 version = {attr = "nkilib_src.nkilib.version.__version__"}
@@ -52,13 +73,13 @@ version = {attr = "nkilib_src.nkilib.version.__version__"}
 nkilib_src = ["py.typed"]
 
 [tool.ty.environment]
-python-version = "3.12"
+# Infer the language baseline from project.requires-python.
 # ty (unlike the test harness) does not read PYTHONPATH or the runtime sys.path.
 # These paths let it resolve first-party helpers imported by tests via runtime
-# sys.path.insert (scripts/, build-tools/bin/) and the compiler wheels installed
-# into the workspace wheelhouse. The interpreter itself is supplied via --python
-# by build-tools/bin/run_ty.sh.
-extra-paths = ["scripts", "build-tools/bin", "wheelhouse/lib/python3.12/site-packages"]
+# sys.path.insert (scripts/, build-tools/bin/). The interpreter is supplied via
+# --python by the caller, which also passes --extra-search-path for any
+# environment-specific location the compiler wheels are installed into.
+extra-paths = ["scripts", "build-tools/bin", "scripts/weight_store"]
 
 [tool.ty.rules]
 # Only entries that differ from the checker's default severity are listed. Every
@@ -74,28 +95,36 @@ extra-paths = ["scripts", "build-tools/bin", "wheelhouse/lib/python3.12/site-pac
 # Ignored: dominated by third-party stub limitations that are not expected to
 # be fixed, so the few genuine signals they carry are not worth the noise.
 # Re-evaluate only if the upstream stubs change.
-"invalid-type-form" = "ignore"              # nearly all from an array type used as an annotation, a kernel idiom the stub rejects
 "too-many-positional-arguments" = "ignore"  # nearly all from stubs that declare dynamic signatures as taking no arguments
 "invalid-return-type" = "ignore"            # all from stubs
 
-[tool.mypy]
-check_untyped_defs = true
-show_error_codes = true
-pretty = true
-ignore_missing_imports = true
+# src/nkilib_src is not yet type-checked: the rules below report ~7000 diagnostics
+# there, which is a separate effort. Scope them off so the kernel tree is still
+# gated on invalid-type-form -- a function or other non-type used where a type is
+# required, which is what nl.ndarray-as-a-type-hint was. Drop
+# entries from this list as each rule is driven to zero.
+[[tool.ty.overrides]]
+include = ["src/nkilib_src"]
 
-[tool.flake8]
-ignore = [
-    "E203",
-    "W503",
-    "E501",
-]
-max-line-length = 120
+[tool.ty.overrides.rules]
+"unresolved-attribute" = "ignore"
+"invalid-argument-type" = "ignore"
+"not-subscriptable" = "ignore"
+"invalid-assignment" = "ignore"
+"invalid-parameter-default" = "ignore"
+"unsupported-operator" = "ignore"
+"possibly-missing-submodule" = "ignore"
+"unresolved-import" = "ignore"
+"unknown-argument" = "ignore"
+"missing-argument" = "ignore"
+"not-iterable" = "ignore"
+"no-matching-overload" = "ignore"
+"call-non-callable" = "ignore"
 
 [tool.ruff]
 indent-width = 4
 line-length = 120
-extend-exclude = ["*model_config.py", "configuration/", "skills"]
+extend-exclude = ["*model_config.py", "**/mla/config/*.py", "configuration/", "skills"]
 
 [tool.ruff.format]
 quote-style = "preserve"

@@ -18,7 +18,6 @@ import math
 from dataclasses import dataclass
 
 import nki.language as nl
-from nki.language import NKIObject
 
 from ....utils.allocator import sizeinbytes
 from ....utils.tile_info import TiledDimInfo
@@ -62,7 +61,7 @@ def get_gate_up_scales_tensor_info(
             intermediate_dim_tile.tile_count,
             intermediate_dim_tile.subtile_dim_info.tile_size,
         ), nl.float32
-    elif mlp_params.quant_params.is_quant_mx():
+    elif mlp_params.quant_params.is_quant_mx():  # pragma: no branch - exhaustive past preload guard, false arc dead
         NUM_SLOTS = 4
         return (
             src_proj_hidden_dim_tile.subtile_dim_info.tile_count,
@@ -381,7 +380,7 @@ def calc_sbuf_bound_bxs_tile_size(
 
 
 @dataclass
-class MLPCTEMXTileInfo(NKIObject):  # dim_size / tile_size / subtile_size
+class MLPCTEMXTileInfo(nl.NKIObject):  # dim_size / tile_size / subtile_size
     src_proj_bxs_dim_tile: TiledDimInfo  # BxS / s / 256  (tile size s is variable)
     src_proj_hidden_dim_tile: TiledDimInfo  # H / 512 / 4
     intermediate_dim_tile: TiledDimInfo  # I / 512 / 4

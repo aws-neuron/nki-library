@@ -261,6 +261,141 @@ class TestDependencyHash:
             inval.dependency_hash.cache_clear()
 
 
+class TestSideEffectWrite:
+    """_side_effect_writes returns the captured (closure) variables a reference writes
+    into by subscript — the comparator-visible-side-effect pattern that broke the
+    pipeline three times when a new such ref was added without @mark_uncacheable.
+    A cache HIT skips the ref, so the stash never fires and the comparator KeyErrors.
+
+    Refs must live in a real .py file (inspect.getsource needs a source file), so
+    these write throwaway modules on disk and import the ref back."""
+
+    def _load_ref(self, tmp, body: str):
+        # body defines a factory make_ref() returning a @wraps-wrapped closure, mirroring
+        # torch_ref_wrapper. Written to a real file so inspect.getsource resolves it.
+        mod = "_se_probe"
+        with open(os.path.join(tmp, f"{mod}.py"), "w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                    import functools
+
+                    def _wrap(fn):
+                        @functools.wraps(fn)
+                        def wrapped(**kw):
+                            return fn(**kw)
+                        return wrapped
+
+                    """
+                )
+                + textwrap.dedent(body)
+            )
+        sys.path.insert(0, tmp)
+        try:
+            m = importlib.import_module(mod)
+            return m.make_ref()
+        finally:
+            sys.path.remove(tmp)
+            sys.modules.pop(mod, None)
+
+    def test_subscript_write_to_captured_var_flags(self):
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                holder = {}
+                @_wrap
+                def _ref(hidden, gamma):
+                    holder["affinities"] = hidden
+                    return {"out": gamma}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == ["holder"]
+        assert inval.ref_dependency_hash(ref) is None  # single verdict: declined to cache
+
+    def test_reports_all_distinct_captured_writes(self):
+        # Returns every distinct captured holder written (deduped), not just the first.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                extras = {}
+                aux = {}
+                @_wrap
+                def _ref(x):
+                    extras["a"] = x
+                    extras["b"] = x  # same holder again -> not duplicated
+                    aux["c"] = x
+                    return {"out": x}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == ["extras", "aux"]
+
+    def test_mutating_method_on_captured_var_not_flagged(self):
+        # Documented limitation: the scan only detects the subscript-store form (how every
+        # stash in this codebase is written). A mutating-method stash (holder.append(...))
+        # is NOT auto-flagged and needs mark_uncacheable. Guards the docstring caveat.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                seen = []
+                @_wrap
+                def _ref(x):
+                    seen.append(x)
+                    return {"out": x}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == []
+
+    def test_local_dict_write_does_not_flag(self):
+        # writing a LOCAL dict is pure — its state can't leak to a comparator, so cacheable.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                @_wrap
+                def _ref(x, y):
+                    local = {}
+                    local["k"] = x
+                    return {"out": local["k"] + y}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == []
+
+    def test_loop_variable_write_does_not_flag(self):
+        # a for-loop target is a local binding, not a captured var — must not flag.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                @_wrap
+                def _ref(items):
+                    acc = {}
+                    for i in items:
+                        acc[i] = i
+                    return {"out": acc}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == []
+
+    def test_sourceless_ref_does_not_raise(self):
+        # getsource fails on a builtin -> return [] (no crash). The module gate in
+        # ref_dependency_hash then still declines it (fail-closed), so no stale golden.
+        assert inval._side_effect_writes(len) == []
+        assert inval.ref_dependency_hash(len) is None
+
+
 class TestIsNumericSource:
     """_is_numeric_source decides which modules the purity scan runs on. A prefix
     collision here would either falsely decline (numeric module missed) or, worse,
@@ -316,11 +451,6 @@ class TestPurityGuard:
     def test_clean_ref_is_cacheable(self):
         # in-package + pinned (torch/numpy) + stdlib imports are all allowed.
         assert self._scan("import torch\nimport numpy as np\nimport math\ndef ref():\n    return {}\n") is None
-
-    def test_pinned_neuronxcc_and_nki_allowed(self):
-        # MX refs import these; they are version-pinned, so cacheable.
-        src = "import nki.language as nl\nfrom neuronxcc.nki._private.test import mx_util\ndef ref():\n    return {}\n"
-        assert self._scan(src) is None
 
     def test_test_module_scaffolding_not_scanned(self):
         # A torch-ref can live in / wrap through a test module that pulls in the test

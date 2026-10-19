@@ -349,12 +349,27 @@ def _clamp_sort_keys(buf, n_parts: int, width: int) -> None:
     )
 
 
+def snake_padded_n(n: int) -> int:
+    """The ``n`` actually passed to ``nisa.topk`` for a ``n``-wide row: the 16-column snake
+    rounds the row up to a whole column per partition, ``16 * ceil(n / 16)``.
+
+    THE bound every validator must apply (here and in chunked_topk): the instruction's
+    ``n < 65536`` holds for the PADDED size, so raw widths 65,521..65,535 -- legal-looking
+    -- reach exactly 65,536 and die inside the ISA rather than at a named assert.
+    """
+    return PARTS_PER_GROUP * div_ceil(n, PARTS_PER_GROUP)
+
+
 def _validate_gpsimd_topk(config: GpsimdTopkConfig) -> None:
     """Validate that the requested shape satisfies every nisa.topk constraint."""
     n = config.vocab_size
     k = config.k
     kernel_assert(config.inp_dtype == nl.bfloat16, "gpsimd_topk requires bfloat16 input")
-    kernel_assert(8 <= n < 65536, f"gpsimd_topk requires 8 <= vocab ({n}) < 65536")
+    kernel_assert(8 <= n, f"gpsimd_topk requires vocab ({n}) >= 8")
+    kernel_assert(
+        snake_padded_n(n) < 65536,
+        f"gpsimd_topk requires the 16-padded snake width ({snake_padded_n(n)}) of vocab ({n}) to be < 65536",
+    )
     kernel_assert(1 <= k < 32768, f"gpsimd_topk requires 1 <= k ({k}) < 32768")
     kernel_assert(k <= n, f"gpsimd_topk requires k ({k}) <= vocab ({n})")
 
@@ -365,7 +380,7 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
 
     Dimensions:
         BxS: number of rows (flattened batch*sequence)
-        V:   vocab size (reduction dimension), 8 <= V < 65536
+        V:   vocab size (reduction dimension), 8 <= V and 16*ceil(V/16) < 65536
         k:   number of largest elements, 1 <= k <= V
 
     Args:
@@ -511,24 +526,59 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
     #      out_i sync, and the A-half copy method). Any one of those could have been the
     #      actual repair, so the tile count is not established as the causal variable.
     #
-    # The predicate is therefore SPLIT into the two independent concerns it conflated.
+    # The predicate is therefore SPLIT into the two independent concerns it conflated, and the
+    # DGE mode is no longer one of them -- see THE STORE/RELOAD RACE IS REAL below.
     #
     # `fast_dma_safe` keeps its ORIGINAL meaning and its original definition: this
     # shard's phase-1 tiles are all full 128-partition tiles, which is what makes the
-    # dge_mode.none + bf16 de-snake round trip safe against the narrow-dtype strided
-    # store. The empirical n_tiles < 8 cap is REMOVED, because it was not shown to be the
-    # causal variable (see above) and because the thing it actually switched on -- the
-    # cross-engine SBUF syncs below -- is now unconditional, so the repair it delivered is
-    # retained without pinning correctness to a magic tile count.
+    # bf16 de-snake round trip safe against the narrow-dtype strided store. It no longer
+    # selects the DGE mode. The empirical n_tiles < 8 cap stays REMOVED: it was a threshold
+    # standing in for an ordering guarantee, and the ordering is now unconditional.
     fast_dma_safe = (per_lnc_BxS % GROUPS_PER_TILE == 0) and (BxS == n_prgs * per_lnc_BxS)
-    # Fast path: dge_mode.none (descriptors generated off-GpSIMD, max load/compute
-    # overlap). Safe path: dge_mode.unknown -> let the COMPILER pick the DGE mode. The
-    # compiler-selected mode preserves the de-snake-store -> reload ordering on the SAME
-    # private_hbm region (validated correct on hardware for all small/odd shapes); an
-    # explicitly-forced SWDGE was observed to STILL drop values on the par_dim==16 case,
-    # so do not pin it. HWDGE cannot generate the strided de-snake descriptor pattern
-    # ([NCC_IBIR098]), so it is never used for the de-snake.
-    desnake_dge = nisa.dge_mode.none if fast_dma_safe else nisa.dge_mode.unknown
+    # --- THE STORE/RELOAD RACE IS REAL, AND NOT CONFINED TO PARTIAL TILES ---------------
+    # dge_mode.unknown UNCONDITIONALLY (it used to be dge_mode.none whenever fast_dma_safe).
+    # dge_mode.none pre-generates the de-snake descriptors out-of-band and takes the store off
+    # the GpSIMD engine, which is exactly why nothing then orders that store against the
+    # phase-2 reload of the SAME private_hbm region. The compiler-selected mode does preserve
+    # that ordering. HWDGE cannot generate the strided de-snake descriptor pattern
+    # ([NCC_IBIR098]) so it is never chosen here, and an explicitly-forced SWDGE was observed
+    # to STILL drop values on the par_dim==16 case -- so let the compiler pick rather than
+    # pinning a mode.
+    #
+    # MEASURED, at 128 ranks through the GPT-OSS tail (gbs=1024, two hops, 8 rows/rank):
+    # 2 of 128 row blocks returned REPEATED vocab ids with the top-k VALUES exactly right;
+    # with this one line changed, all four gates pass on all 128 ranks at gbs 128, 512 AND
+    # 1024. The asymmetry is the tell: values and indices ride in SEPARATE private_hbm buffers
+    # (asc_val_hbm, asc_idx_hbm) of different widths, so a race can take the index buffer while
+    # the value buffer lands in time -- correct values carrying wrong, typically duplicated,
+    # token ids, which is the failure mode a sampler cannot detect.
+    #
+    # Why it hid for so long, and why a tile-count threshold could never be the fix: exposure
+    # tracks how busy the DMA subsystem is when phase 1 runs, not the tile count. Standalone the
+    # same reduce geometry and tie density is clean over 544 independent blocks; at 32 ranks the
+    # full tail dataflow is clean over 128 blocks (its de-interleave moves 64 KB against
+    # 6.4 MB at 128 ranks); and at 128 ranks gbs 128 and 512 were clean while only gbs=1024
+    # failed. Same code path in every one of those -- red_rows is 8 and fast_dma_safe is True at
+    # BxS 1, 4 and 8 alike -- so nothing about the shape distinguishes them. Only the amount of
+    # collective traffic landing just before the top-k does.
+    #
+    # COST: +2.7% on chunked_topk at the GPT-OSS vocab (A/B in one session, TpbSgCyclesSum:
+    # +2.9% at BxS=1, +1.7% at BxS=4, +3.5% at BxS=8). That is the price of the ordering.
+    #
+    # If someone wants that back, the tempting refinement is to keep dge_mode.none on the STORE
+    # and take the compiler's mode only for the RELOAD. Do NOT land that on the strength of a
+    # green 128-rank run: this defect showed on 2 of 128 row blocks, so a variant that merely
+    # narrows the window passes that test by luck. dge_mode.unknown is worth its 2.7% because it
+    # is a categorical ordering guarantee rather than a statistical one, and the failure it
+    # prevents is a silently wrong token id.
+    desnake_dge = nisa.dge_mode.unknown
+    # KNOWN-WEAKER INVARIANT: the bf16 fast-path de-snake store was originally validated
+    # under the pinned dge_mode.none; with the mode now compiler-chosen, the bf16/mode
+    # pairing's evidence is the 128-rank four-gate pass above plus the two-program
+    # DMA-pressure perms in test_gpsimd_topk (the lnc=2 specdecode/-inf/padded rows exist
+    # as the canary for exactly this). If a compiler update starts dropping the narrow
+    # strided store again, flip this to unconditional float32 first (costs the halved
+    # value-bounce bytes, changes no results) and bisect after.
     asc_val_dtype = nl.bfloat16 if fast_dma_safe else nl.float32
     asc_val_hbm = nl.ndarray((BxS, k_pad), dtype=asc_val_dtype, buffer=nl.private_hbm)
     asc_idx_hbm = nl.ndarray((BxS, k_pad), dtype=nl.float32, buffer=nl.private_hbm)
@@ -806,17 +856,12 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
         # padding slots (k_pad > k) carry garbage here and are masked per-path after the
         # phase-2 reload (see the top-k call comment above).
         # The de-snake stores are STRIDED SBUF->HBM writes (.ap partition-stride k_cols).
-        # HWDGE cannot generate descriptors for that pattern ([NCC_IBIR098]), so instead of
-        # the default SWDGE (descriptors generated by the GpSIMD engine, which serializes
-        # them with the GpSIMD top-k), use dge_mode.none: the Neuron Runtime pre-generates
-        # the descriptors into HBM before execution, taking the store OFF the GpSIMD engine
-        # so it overlaps the next tile's top-k.
+        # HWDGE cannot generate descriptors for that pattern ([NCC_IBIR098]). The mode is
+        # desnake_dge = dge_mode.unknown, UNCONDITIONALLY -- see the desnake_dge comment
+        # above for the measured silent-index-corruption story and why no faster mode may
+        # be restored here (dge_mode.none's out-of-band descriptors drop the ordering
+        # against the phase-2 reload of this same private_hbm region).
         tile_out_off = tile_row_start * k_pad
-        # De-snake store DMA mode is selected by fast_dma_safe (see desnake_dge above):
-        # dge_mode.none for full-tile shards (off-GpSIMD, max overlap), SWDGE for shards
-        # with any partial/single-row tile (keeps the store ordered with its producing
-        # top-k so the phase-2 reload of the same private_hbm region cannot race it --
-        # the low/odd-batch correctness fix).
         nisa.dma_copy(
             dst=asc_val_flat.ap(pattern=[[k_cols, par_dim], [1, k_cols]], offset=tile_out_off),
             src=val_snake[nl.ds(0, par_dim), nl.ds(0, k_cols)],
@@ -892,11 +937,11 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             n_pass_h = div_ceil(HALF, 8)
             two = 2 * n_srows  # partitions used: A on [0:n_srows), B on [n_srows:2n)
             # Split-load: partition r holds row r's LOW half [0:HALF]; partition
-            # r+n_srows holds row r's HIGH half [HALF:k_pad]. Use the DEFAULT DMA mode
-            # (SWDGE), NOT dge_mode.none: the reload reads the SAME private_hbm region the
-            # phase-1 de-snake just wrote, and dge_mode.none's out-of-band descriptors
-            # dropped the store->reload ordering, letting this reload race the de-snake
-            # store on small/partial tiles (corrupting odd-per_lnc shapes on device only).
+            # r+n_srows holds row r's HIGH half [HALF:k_pad]. This reload reads the SAME
+            # private_hbm region the phase-1 de-snake just wrote, so it uses desnake_dge
+            # (= dge_mode.unknown, unconditional -- see its definition comment): any mode
+            # with out-of-band descriptors drops the store->reload ordering and lets this
+            # reload race the de-snake store, reading stale/zeroed HBM on device only.
             sv = nl.ndarray((PMAX, HALF), dtype=nl.float32, buffer=nl.sbuf)
             si = nl.ndarray((PMAX, HALF), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(
@@ -1138,12 +1183,11 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             # k_pad = k_cols*16 >= 8 already satisfies max8's >= 8 elements requirement.
             cv = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
             ci = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
-            # Reload DMA mode follows desnake_dge: SWDGE for partial/odd shards keeps this
-            # reload of the SAME private_hbm region ordered AFTER the phase-1 de-snake
-            # store (dge_mode.none's out-of-band descriptors dropped that ordering and let
-            # the reload race the store on small/partial tiles, reading stale/zeroed HBM
-            # and corrupting values+indices on device only). Full-tile shards keep the
-            # fast dge_mode.none path.
+            # Reload DMA mode is desnake_dge (= dge_mode.unknown, unconditional -- see its
+            # definition comment): this reload reads the SAME private_hbm region the
+            # phase-1 de-snake store wrote, and any mode with out-of-band descriptors
+            # drops that store->reload ordering, reading stale/zeroed HBM and corrupting
+            # values+indices on device only.
             nisa.dma_copy(
                 dst=cv[nl.ds(0, n_srows), :],
                 src=asc_val_hbm[nl.ds(sort_row_start, n_srows), :],

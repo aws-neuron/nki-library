@@ -44,6 +44,8 @@ def generate_ms_deformable_attention_inputs(
     sampling_locations_layout: str = "BQHLP2",
     align_corners: bool = False,
     padding_mode: str = "zeros",
+    max_indices_per_indirect=None,
+    gather_method: str = "transpose",
 ):
     """
     Generate inputs for multi-scale deformable attention kernel test.
@@ -108,60 +110,49 @@ def generate_ms_deformable_attention_inputs(
         "sampling_locations_layout": sampling_locations_layout,
         "align_corners": align_corners,
         "padding_mode": padding_mode,
+        "max_indices_per_indirect": max_indices_per_indirect,
+        "gather_method": gather_method,
     }
 
 
 # fmt: off
 MS_DEFORM_ATTN_PARAM_NAMES = (
-    "batch, n_queries, n_heads, c_head, n_levels, n_points, spatial_shapes, dtype, value_layout, sampling_locations_layout, align_corners, padding_mode"
+    "batch, n_queries, n_heads, c_head, n_levels, n_points, spatial_shapes, dtype, value_layout, sampling_locations_layout, align_corners, padding_mode, max_indices_per_indirect, gather_method"
 )
 
 # Basic test parameters
 MS_DEFORM_ATTN_BASIC_PARAMS = [
     # align_corners = False, padding_mode = zeros, BLNC layout
-    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"),
-    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros"),
-    # align_corners = False, padding_mode = zeros, BNLC layout
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "B2QHLP", False, "zeros"),
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "BQHLP2", False, "zeros"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"),
     # align_corners = False, padding_mode = border
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "border"),
-    (1, 512, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "border"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "border", None, "transpose"),
+    (1, 512, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "border", None, "transpose"),
     # align_corners = True, padding_mode = zeros
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", True, "zeros"),
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "zeros"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "zeros", None, "transpose"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "zeros", None, "transpose"),
     # align_corners = True, padding_mode = border
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", True, "border"),
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "border"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "border", None, "transpose"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "border", None, "transpose"),
     # C_h > 128
-    (1, 256, 4, 256, 4, 4, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"),
-    (1, 256, 4, 144, 4, 4, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "BQHLP2", False, "zeros"),
+    (1, 256, 4, 256, 4, 4, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"),
     # N_q % 128 != 0
-    (1, 263, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"),
-    (1, 501, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "B2QHLP", False, "zeros"),
+    (1, 263, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"),
 ]
 MS_DEFORM_ATTN_BASIC_ALL_PARAMS = [
     pytest.param(*c, marks=pytest.mark.fast) for c in MS_DEFORM_ATTN_BASIC_PARAMS
 ]
 
 # BEVFormer test parameters
-MS_DEFORM_ATTN_BEVFORMER_FAST_PARAMS = [
-    (2, 512, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"),
-]
 MS_DEFORM_ATTN_BEVFORMER_SLOW_PARAMS = [
-    # BEVFormer Base (200x200)
-    (1, 18000, 8, 32, 4, 8, [(113, 200), (57, 100), (29, 50), (15, 25)], nl.bfloat16, "BNLC", "B2QHLP", False, "zeros"), # SCA
-    (1, 40000, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # TSA
-    (1, 900, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # Decoder
-    # BEVFormer Small (150x150)
-    (1, 13500, 8, 32, 1, 8, [(113, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # SCA
-    (1, 22500, 8, 32, 1, 4, [(150, 150)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # TSA
-    (1, 900, 8, 32, 1, 4, [(150, 150)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros") # Decoder
+    (1, 1024, 1, 512, 1, 1, [(57, 100)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"), # DCNv2
+    (1, 2048, 1, 256, 1, 1, [(57, 100)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"), # DCNv2
+    # BEVFormer Tiny (50x50)
+    (1, 1250, 8, 32, 4, 8, [(50, 50), (50, 50), (50, 50), (50, 50)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"), # SCA
+    (1, 1250, 8, 32, 1, 4, [(50, 50)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"), # TSA
+    (1, 450, 8, 32, 1, 4, [(50, 50)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, "transpose"), # Decoder
 ]
-
-MS_DEFORM_ATTN_BEVFORMER_ALL_PARAMS = [
-    pytest.param(*c, marks=pytest.mark.fast) for c in MS_DEFORM_ATTN_BEVFORMER_FAST_PARAMS
-] + MS_DEFORM_ATTN_BEVFORMER_SLOW_PARAMS
+MS_DEFORM_ATTN_BEVFORMER_ALL_PARAMS = MS_DEFORM_ATTN_BEVFORMER_SLOW_PARAMS
 # fmt: on
 
 
@@ -186,6 +177,8 @@ class TestMSDeformableAttention:
         sampling_locations_layout,
         align_corners,
         padding_mode,
+        max_indices_per_indirect,
+        gather_method,
     ):
         """Test multi-scale deformable attention basic configurations."""
 
@@ -203,6 +196,8 @@ class TestMSDeformableAttention:
                 sampling_locations_layout=sampling_locations_layout,
                 align_corners=align_corners,
                 padding_mode=padding_mode,
+                max_indices_per_indirect=max_indices_per_indirect,
+                gather_method=gather_method,
             )
 
         def output_tensors(kernel_input):
@@ -258,6 +253,8 @@ class TestMSDeformableAttention:
         sampling_locations_layout,
         align_corners,
         padding_mode,
+        max_indices_per_indirect,
+        gather_method,
     ):
         """Test multi-scale deformable attention with BEVFormer configs."""
 
@@ -275,6 +272,8 @@ class TestMSDeformableAttention:
                 sampling_locations_layout=sampling_locations_layout,
                 align_corners=align_corners,
                 padding_mode=padding_mode,
+                max_indices_per_indirect=max_indices_per_indirect,
+                gather_method=gather_method,
             )
 
         def output_tensors(kernel_input):

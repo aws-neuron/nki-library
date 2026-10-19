@@ -268,10 +268,10 @@ class QKNormConfig(nl.NKIObject):
     q_norm: Optional[NormType] = NormType.RMS_NORM
     k_norm: Optional[NormType] = NormType.RMS_NORM
     eps: float = 1e-6
-    q_gamma_norm_weights: Optional[nl.ndarray] = None
-    k_gamma_norm_weights: Optional[nl.ndarray] = None
-    q_beta_norm_weights: Optional[nl.ndarray] = None
-    k_beta_norm_weights: Optional[nl.ndarray] = None
+    q_gamma_norm_weights: Optional[nl.NkiTensor] = None
+    k_gamma_norm_weights: Optional[nl.NkiTensor] = None
+    q_beta_norm_weights: Optional[nl.NkiTensor] = None
+    k_beta_norm_weights: Optional[nl.NkiTensor] = None
     gamma_fused_in_rope_caches: bool = False
 
 

@@ -21,6 +21,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ..utils.allocator import SbufManager, sizeinbytes
+from ..utils.dma_names import dma_name
 from ..utils.interleave_copy import interleave_copy
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
@@ -392,6 +393,7 @@ def load_input_to_sbuf(
                     dst=input_sb_view,
                     src=input_hbm_view,
                     dge_mode=_DGE_MODE_NONE,
+                    name=dma_name("norm_hidden_load"),
                 )
             else:
                 # Unbalanced sharding: load each shard separately
@@ -471,6 +473,7 @@ def load_gamma_to_sbuf(
                 dst=gamma_sb_view_reshaped,
                 src=gamma_hbm_view,
                 dge_mode=_DGE_MODE_NONE,
+                name=dma_name("norm_gamma_load"),
             )
         else:
             # Unbalanced sharding: load each shard separately

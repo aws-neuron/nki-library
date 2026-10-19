@@ -40,7 +40,7 @@ def generate_sparse_input(T: int, E: int, top_k: int, dtype: npt.DTypeLike, seed
     np.random.seed(seed)
     K = T * top_k // E
     flattened_input = np.random.permutation(np.concatenate([np.ones(K * E), np.zeros((T - K) * E)]))
-    input_tensor = flattened_input.reshape(E, T).T.astype(dtype)
+    input_tensor = np.ascontiguousarray(flattened_input.reshape(E, T).T, dtype=dtype)
     if dtype == np.float32:
         input_tensor[input_tensor > 0] = 0.1
     return input_tensor

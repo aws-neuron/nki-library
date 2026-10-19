@@ -22,6 +22,12 @@ from test.utils.relevant_test_selection.finder import RelevantTestFinder
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
 
+@pytest.fixture
+def controller_environment(monkeypatch):
+    """Model controller-side operations independently of the test runner's worker identity."""
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+
+
 @pytest.fixture(scope="session")
 def relevant_test_finder_index() -> dict[str, set[str]]:
     """Build the reverse-import index once per session and return the raw dict.

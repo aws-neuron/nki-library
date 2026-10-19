@@ -33,6 +33,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ..utils.allocator import SbufManager
+from ..utils.dma_names import dma_name
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
@@ -435,27 +436,18 @@ def _gen_mask_s_active_bqh_partition_layout(
         f"bs*q_head*s_active*band_factor ({bs}*{q_head}*{s_active}*{band_factor}={bs * s_active_qh * band_factor})",
     )
     # The caller passes mask_out with the PER-BAND free extent already (band_s_prior = tile_s_prior /
-    # band_factor); the full FA-tile s_prior is band_s_prior * band_factor. band b's free slice covers the
-    # SAME free positions as band 0 but at token values shifted by a CONSTANT b*band_s_prior:
-    #   token(band b, free f) = token(band 0, free f) + b*band_s_prior
-    # (block-KV: bands split the fold's p_slot axis exactly, so the fold shuffle preserves the constant
-    # shift; flat KV: bands are contiguous halves, also a constant shift). So we generate band 0's iota
-    # once (shared across partitions) and encode the band in a per-partition offset column subtracted from
-    # cache_len in the causal compare -- no per-band iota, no transpose. band(p) = (p // s_active_qh) % bf.
+    # band_factor); the full FA-tile s_prior is band_s_prior * band_factor. When each band contains whole
+    # folds (or one fold is split on its f_within axis), band b's tokens are band 0's tokens plus one
+    # constant shift. A boundary partway through one fold of a multi-fold tile does not have that property.
+    # Keep the one-iota/shift path for aligned tiles and generate each band's true shuffled token sequence
+    # for the non-aligned case.
     band_s_prior = s_prior_this_tile
-    # Banding requires the band split to align with the fold structure so the per-band shift is constant.
-    # Single fold per tile (the bring-up regime) always aligns; multi-fold needs num_folds % band_factor==0
-    # so each band spans whole folds. Guard the un-aligned case.
+    use_explicit_band_iota = False
     if band_factor > 1 and block_len > 0:
         num_folds_full = (band_s_prior * band_factor) // (P_MAX * block_len)
-        kernel_assert(
-            num_folds_full == 1 or num_folds_full % band_factor == 0,
-            f"gen_mask banding needs the band split to align with folds: num_folds={num_folds_full}, "
-            f"band_factor={band_factor}. Mid-fold band boundaries break the constant per-band token shift.",
-        )
+        use_explicit_band_iota = num_folds_full != 1 and num_folds_full % band_factor != 0
 
-    # Step 1: iota on the FREE axis with the global s_prior token at each free position, identical across
-    # partitions (channel_multiplier=0).
+    # Step 1: iota on the FREE axis with the global s_prior token at each free position.
     iota_base = sprior_prg_id * s_prior_per_shard + s_prior_offset
     iota_free = sbm.alloc_stack(
         (P_MAX, s_prior_this_tile),
@@ -464,25 +456,90 @@ def _gen_mask_s_active_bqh_partition_layout(
         name=f"{sbm.get_name_prefix()}iota_free_{s_prior_offset}",
     )
     if block_len > 0:
-        # One iota per fold (mirrors the default-layout _generate_iota_tensor) so the folds pipeline
-        # instead of a single long op. Within a fold the free order is [f_within, p_slot]: free index
-        # = f_within*P_MAX + p_slot, value = fold_base + f_within*1 + p_slot*block_len.
-        # Banding: iota_free carries only BAND 0's tokens (band_s_prior free positions). A single fold
-        # split across bands (num_folds_full==1) cuts the f_within (i0) axis -- band 0 is
-        # f_within in [0, band_s_prior // P_MAX), p_slot stays [0, P_MAX). So the f_within count shrinks
-        # to band_s_prior // P_MAX (== block_len when band_factor==1). Bands spanning whole folds
-        # (num_folds_full % band_factor==0) keep f_within=block_len and shrink the fold count.
-        f_within_count = band_s_prior // P_MAX if (band_factor > 1 and band_s_prior < P_MAX * block_len) else block_len
-        num_folds = band_s_prior // (f_within_count * P_MAX)
-        iota_folds = iota_free.reshape_dim(1, [num_folds, f_within_count * P_MAX])
-        for fold_idx in range(num_folds):
-            fold_base = iota_base + fold_idx * P_MAX * block_len
+        if use_explicit_band_iota:
+            _generate_block_kv_band_iota(
+                dst=iota_free,
+                iota_base=iota_base,
+                band_start=0,
+                block_len=block_len,
+            )
+            band_id_row = sbm.alloc_stack(
+                (1, s_active_bqh),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+                name=f"{sbm.get_name_prefix()}band_id_row_{s_prior_offset}",
+            )
             nisa.iota(
-                dst=iota_folds[:, fold_idx, :].reshape_dim(1, [f_within_count, P_MAX]),
-                pattern=[[1, f_within_count], [block_len, P_MAX]],
-                offset=fold_base,
+                dst=band_id_row.reshape_dim(1, [bs, band_factor, s_active_qh]),
+                pattern=[[0, bs], [1, band_factor], [0, s_active_qh]],
+                offset=0,
                 channel_multiplier=0,
             )
+            band_id_partition = sbm.alloc_stack(
+                (P_MAX, 1),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+                name=f"{sbm.get_name_prefix()}band_id_partition_{s_prior_offset}",
+            )
+            band_id_psum = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(band_id_psum, band_id_row)
+            nisa.tensor_copy(band_id_partition, band_id_psum)
+
+            band_selector = sbm.alloc_stack(
+                (P_MAX, 1),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+                name=f"{sbm.get_name_prefix()}band_selector_{s_prior_offset}",
+            )
+            band_iota_free = sbm.alloc_stack(
+                (P_MAX, band_s_prior),
+                dtype=pos_ids.dtype,
+                buffer=nl.sbuf,
+                name=f"{sbm.get_name_prefix()}band_iota_free_{s_prior_offset}",
+            )
+            for band_idx in range(1, band_factor):
+                _generate_block_kv_band_iota(
+                    dst=band_iota_free,
+                    iota_base=iota_base,
+                    band_start=band_idx * band_s_prior,
+                    block_len=block_len,
+                )
+                nisa.tensor_scalar(
+                    dst=band_selector,
+                    data=band_id_partition,
+                    op0=nl.equal,
+                    operand0=float(band_idx),
+                )
+                # Rows for this band still contain band 0's iota, so apply only their delta.
+                nisa.tensor_tensor(band_iota_free, band_iota_free, iota_free, op=nl.subtract)
+                nisa.tensor_scalar(
+                    dst=band_iota_free,
+                    data=band_iota_free,
+                    op0=nl.multiply,
+                    operand0=band_selector,
+                )
+                nisa.tensor_tensor(iota_free, iota_free, band_iota_free, op=nl.add)
+        else:
+            # One iota per fold (mirrors the default-layout _generate_iota_tensor) so the folds pipeline
+            # instead of a single long op. Within a fold the free order is [f_within, p_slot]: free index
+            # = f_within*P_MAX + p_slot, value = fold_base + f_within*1 + p_slot*block_len.
+            # Banding: iota_free carries only BAND 0's tokens (band_s_prior free positions). A single fold
+            # split across bands (num_folds_full==1) cuts the f_within (i0) axis -- band 0 is
+            # f_within in [0, band_s_prior // P_MAX), p_slot stays [0, P_MAX). Bands spanning whole folds
+            # keep f_within=block_len and shrink the fold count.
+            f_within_count = (
+                band_s_prior // P_MAX if (band_factor > 1 and band_s_prior < P_MAX * block_len) else block_len
+            )
+            num_folds = band_s_prior // (f_within_count * P_MAX)
+            iota_folds = iota_free.reshape_dim(1, [num_folds, f_within_count * P_MAX])
+            for fold_idx in range(num_folds):
+                fold_base = iota_base + fold_idx * P_MAX * block_len
+                nisa.iota(
+                    dst=iota_folds[:, fold_idx, :].reshape_dim(1, [f_within_count, P_MAX]),
+                    pattern=[[1, f_within_count], [block_len, P_MAX]],
+                    offset=fold_base,
+                    channel_multiplier=0,
+                )
     else:
         # Flat KV: contiguous s_prior on the free axis (band 0 = first band_s_prior positions).
         nisa.iota(dst=iota_free, pattern=[[1, s_prior_this_tile]], offset=iota_base, channel_multiplier=0)
@@ -513,7 +570,7 @@ def _gen_mask_s_active_bqh_partition_layout(
     # free-axis iota (band axis step band_s_prior, sub axis step 0). pos_row and band_off share the same
     # [1, s_active_bqh] free layout and nc_transpose is linear, so fold the shift into pos_row here -- the
     # single transpose loop below then yields the banded pos_partition (no second transpose pass).
-    if band_factor > 1:
+    if band_factor > 1 and not use_explicit_band_iota:
         # Per-band token shift: band b's iota carries band-0 tokens; the real band-b token is band-0-token
         # + band_shift*b. Two block-KV sub-cases (mirroring the f_within_count split above):
         #  - single fold cut across bands (band_s_prior < P_MAX*block_len): bands cut the f_within (i0) axis
@@ -579,7 +636,7 @@ def _gen_mask_s_active_bqh_partition_layout(
         # order (q, band, q_head, sub). band_factor==1 collapses to the un-banded [bs, q_head, s_active].
         start_src = start_pos[:1].reshape_dim(1, [bs, s_active]).expand_dim(2).broadcast(2, band_factor * q_head)
         nisa.tensor_copy(dst=start_row.reshape_dim(1, [bs, band_factor * q_head, s_active]), src=start_src)
-        if band_factor > 1:
+        if band_factor > 1 and not use_explicit_band_iota:
             # Same per-band token shift folded into pos_row: window start of band b compares against band-0
             # iota, so subtract band*band_shift. Row order (q, band, sub) -> band-step band_shift, sub-step 0.
             band_shift = (
@@ -649,7 +706,7 @@ def _gen_mask_s_active_bqh_partition_layout(
                 nisa.tensor_tensor(mask_out[:, grp, c0 : c0 + cw], normal, ge, op=nl.add)
 
     # Step 4: active mask placement (only when this tile reaches the active region).
-    tile_end = s_prior_offset + s_prior_this_tile
+    tile_end = s_prior_offset + s_prior_this_tile * band_factor
     if active_mask is not None and (s_prior_per_shard <= 0 or tile_end > s_prior_per_shard - s_active):
         _load_active_mask_block_kv_swap(
             mask_out=mask_out,
@@ -671,6 +728,45 @@ def _gen_mask_s_active_bqh_partition_layout(
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+
+def _generate_block_kv_band_iota(
+    dst: nl.NkiTensor,
+    iota_base: int,
+    band_start: int,
+    block_len: int,
+) -> None:
+    """Generate one contiguous band from the block-fold-shuffled token stream."""
+    P_MAX = nl.tile_size.pmax
+    band_s_prior = dst.shape[1]
+    fold_size = P_MAX * block_len
+    band_end = band_start + band_s_prior
+
+    kernel_assert(
+        band_start % P_MAX == 0 and band_s_prior % P_MAX == 0,
+        "Block-KV partition bands must start and end on P_MAX boundaries",
+    )
+
+    write_offset = 0
+    first_fold = band_start // fold_size
+    last_fold = div_ceil(band_end, fold_size)
+    for fold_idx in range(first_fold, last_fold):
+        fold_start = fold_idx * fold_size
+        segment_start = max(band_start, fold_start) - fold_start
+        segment_end = min(band_end, fold_start + fold_size) - fold_start
+        f_within_start = segment_start // P_MAX
+        f_within_count = (segment_end - segment_start) // P_MAX
+        segment_size = f_within_count * P_MAX
+
+        nisa.iota(
+            dst=dst[:, write_offset : write_offset + segment_size].reshape_dim(1, [f_within_count, P_MAX]),
+            pattern=[[1, f_within_count], [block_len, P_MAX]],
+            offset=iota_base + fold_start + f_within_start,
+            channel_multiplier=0,
+        )
+        write_offset += segment_size
+
+    kernel_assert(write_offset == band_s_prior, "Block-KV band iota did not cover the full band")
 
 
 def _generate_iota_tensor(
@@ -1186,6 +1282,8 @@ def _load_active_mask_block_kv_swap(
     """
     P_MAX = nl.tile_size.pmax
     s_active_qh = q_head * s_active
+    band_factor = n_bsq_tiles * P_MAX // (bs * s_active_qh)
+    band_s_prior = mask_out.shape[2]
 
     # batch_start = NC sharding offset + batch tiling offset (mirrors _load_active_mask).
     nc_batch_offset = shard_id * (active_mask.shape[1] // 2) if is_batch_sharded else 0
@@ -1193,9 +1291,40 @@ def _load_active_mask_block_kv_swap(
 
     if s_prior_per_shard == 0:
         s_prior_per_shard = s_prior_offset + n_bsq_tiles * P_MAX  # single-tile fallback
-    tile_size = s_prior_this_tile = mask_out.shape[2]
+    tile_size = band_s_prior * band_factor
     tile_end = s_prior_offset + tile_size
     active_start_linear = s_prior_per_shard - s_active
+
+    band_id_partition = None
+    band_selector = None
+    if band_factor > 1:
+        band_id_row = sbm.alloc_stack(
+            (1, bs * band_factor * s_active_qh),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+            name=f"{sbm.get_name_prefix()}active_band_id_row_{s_prior_offset}",
+        )
+        nisa.iota(
+            dst=band_id_row.reshape_dim(1, [bs, band_factor, s_active_qh]),
+            pattern=[[0, bs], [1, band_factor], [0, s_active_qh]],
+            offset=0,
+            channel_multiplier=0,
+        )
+        band_id_partition = sbm.alloc_stack(
+            (P_MAX, 1),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+            name=f"{sbm.get_name_prefix()}active_band_id_partition_{s_prior_offset}",
+        )
+        band_id_psum = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(band_id_psum, band_id_row)
+        nisa.tensor_copy(band_id_partition, band_id_psum)
+        band_selector = sbm.alloc_stack(
+            (P_MAX, 1),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+            name=f"{sbm.get_name_prefix()}active_band_selector_{s_prior_offset}",
+        )
 
     for k in range(s_active):
         linear_pos = active_start_linear + k
@@ -1209,26 +1338,56 @@ def _load_active_mask_block_kv_swap(
         pos_in_tile = linear_pos - s_prior_offset
         fold, rem = divmod(pos_in_tile, P_MAX * block_len)
         p_slot, f_within = divmod(rem, block_len)
-        free_col = fold * (P_MAX * block_len) + f_within * P_MAX + p_slot
+        full_free_col = fold * (P_MAX * block_len) + f_within * P_MAX + p_slot
+        band_idx, free_col = divmod(full_free_col, band_s_prior)
 
-        # active_mask[k, batch_start:batch_start+bs, :, :] -> [1, s_active_bqh] free vector in
-        # (batch, q_head, sa) order, matching the partition-row order.
+        # active_mask[k, batch_start:batch_start+bs, :, :] supplies one value per query. In the
+        # banded layout, place those values only in the partition rows for the token's band and
+        # leave the other bands zero.
         # load as bf16 row for PE transpose then cast back to uint8 mask_out.
         act_row = sbm.alloc_stack(
-            (1, bs * s_active_qh),
+            (1, bs * band_factor * s_active_qh),
             dtype=nl.bfloat16,
             buffer=nl.sbuf,
             name=f"{sbm.get_name_prefix()}act_row_{k}_{s_prior_offset}",
         )
+        nisa.memset(act_row, value=0)
         nisa.dma_copy(
-            act_row.reshape_dim(1, [bs, q_head, s_active]),
+            act_row.reshape_dim(1, [bs, band_factor, q_head, s_active]).select(2, band_idx),
             active_mask.select(0, k).slice(0, batch_start, batch_start + bs).expand_dim(0),
+            name=dma_name(f"{sbm.get_name_prefix()}active_mask_block_kv_swap_{k}_bo{batch_start}_sp{s_prior_offset}"),
         )
         # Transpose each 128-wide bqh tile onto the partition axis at free_col.
         for grp in range(n_bsq_tiles):
             tp_psum = nl.ndarray((P_MAX, 1), dtype=nl.bfloat16, buffer=nl.psum)
             nisa.nc_transpose(tp_psum, act_row[:1, grp * P_MAX : (grp + 1) * P_MAX])
-            nisa.tensor_copy(mask_out[:, grp, free_col : free_col + 1], tp_psum)
+            if band_factor == 1:
+                nisa.tensor_copy(mask_out[:, grp, free_col : free_col + 1], tp_psum)
+            else:
+                # Other bands share this free column with different logical tokens. Preserve their
+                # causal values by blending the active column only into its partition band.
+                act_partition = sbm.alloc_stack(
+                    (P_MAX, 1),
+                    dtype=nl.float32,
+                    buffer=nl.sbuf,
+                    name=f"{sbm.get_name_prefix()}act_partition_{k}_{s_prior_offset}_{grp}",
+                )
+                nisa.tensor_copy(act_partition, tp_psum)
+                nisa.tensor_scalar(
+                    dst=band_selector,
+                    data=band_id_partition,
+                    op0=nl.equal,
+                    operand0=float(band_idx),
+                )
+                mask_col = mask_out[:, grp, free_col : free_col + 1]
+                nisa.tensor_tensor(act_partition, act_partition, mask_col, op=nl.subtract)
+                nisa.tensor_scalar(
+                    dst=act_partition,
+                    data=act_partition,
+                    op0=nl.multiply,
+                    operand0=band_selector,
+                )
+                nisa.tensor_tensor(mask_col, mask_col, act_partition, op=nl.add)
 
 
 # ============================================================================
@@ -1621,7 +1780,7 @@ def _gen_mask_tkg_hbm_sprior_partition_layout(
     pos_ids_sbuf = sbm.alloc_stack(
         (P_MAX, bs * s_active), dtype=compute_dtype, buffer=nl.sbuf, name=f"{name_prefix}pos_ids_sbuf"
     )
-    nisa.dma_copy(dst=pos_ids_sbuf[0:1, :], src=pos_ids_hbm)
+    nisa.dma_copy(dst=pos_ids_sbuf[0:1, :], src=pos_ids_hbm, name=dma_name(f"{name_prefix}pos_ids_load"))
     stream_shuffle_broadcast(src=pos_ids_sbuf[0:1, :], dst=pos_ids_sbuf)
 
     start_pos_sbuf = None
@@ -1629,7 +1788,7 @@ def _gen_mask_tkg_hbm_sprior_partition_layout(
         start_pos_sbuf = sbm.alloc_stack(
             (P_MAX, bs * s_active), dtype=compute_dtype, buffer=nl.sbuf, name=f"{name_prefix}start_pos_sbuf"
         )
-        nisa.dma_copy(dst=start_pos_sbuf[0:1, :], src=start_pos_hbm)
+        nisa.dma_copy(dst=start_pos_sbuf[0:1, :], src=start_pos_hbm, name=dma_name(f"{name_prefix}start_pos_load"))
         stream_shuffle_broadcast(src=start_pos_sbuf[0:1, :], dst=start_pos_sbuf)
 
     # Context-parallel global sequence offset. The inner kernel applies it as a
@@ -1746,6 +1905,7 @@ def _gen_mask_tkg_hbm_sprior_partition_layout(
                 nisa.dma_copy(
                     dst=dst_view,
                     src=mask_out_sbuf[:, :, overlap_local : overlap_local + overlap_bs, :, :],
+                    name=dma_name(f"{name_prefix}mask_out_store_sp{hbm_sp_offset}_bo{overlap_start}"),
                 )
 
             sbm.close_scope()
@@ -1965,7 +2125,7 @@ def _gen_mask_tkg_hbm_s_active_bqh_partition_layout(
         shard_prg_idx = nc_id if batch_sharded else 0
 
         pos_ids_sbuf = sbm.alloc_stack((1, bs * s_active), dtype=compute_dtype, buffer=nl.sbuf, name="pos_ids_sbuf")
-        nisa.dma_copy(dst=pos_ids_sbuf, src=pos_ids_hbm)
+        nisa.dma_copy(dst=pos_ids_sbuf, src=pos_ids_hbm, name=dma_name(f"mask_swap_pos_ids_load_sp{s_prior}"))
         pos_ids_shard = pos_ids_sbuf[:, nc_batch_start * s_active : (nc_batch_start + bs_per_nc) * s_active]
 
         start_pos_shard = None
@@ -2020,7 +2180,11 @@ def _gen_mask_tkg_hbm_s_active_bqh_partition_layout(
             dst_view = mask_out_result[
                 shard_prg_idx : shard_prg_idx + 1, :, hbm_free_offset : hbm_free_offset + band_s_prior
             ].reshape((P_MAX, band_s_prior))
-            nisa.dma_copy(dst=dst_view, src=mask_out_sbuf.reshape((P_MAX, band_s_prior)))
+            nisa.dma_copy(
+                dst=dst_view,
+                src=mask_out_sbuf.reshape((P_MAX, band_s_prior)),
+                name=dma_name(f"mask_swap_banded_store_sp{s_prior}_f{hbm_free_offset}"),
+            )
 
             banded_free_written += band_s_prior
             sbm.close_scope()

@@ -12,28 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MLP Backward MXFP8 kernel implementations."""
+"""MLP Backward MXFP8 kernel implementation."""
 
-from .config import (
-    ClampLimits,
-    MlpBwdMatmulConfig,
-)
-from .mlp_bwd_mxfp8_kernel import (
-    mlp_backward_mxfp8_base_nki,
-    mlp_backward_mxfp8_nki,
-)
-from .recompute import (
-    recompute_gate_act,
-    recompute_gate_up_projection,
-    recompute_intermediate,
-)
+from .mlp_bwd_mxfp8_kernel import mlp_backward_mxfp8_nki
 
-__all__ = [
-    'mlp_backward_mxfp8_nki',
-    'mlp_backward_mxfp8_base_nki',
-    'ClampLimits',
-    'MlpBwdMatmulConfig',
-    'recompute_gate_up_projection',
-    'recompute_gate_act',
-    'recompute_intermediate',
-]
+__all__ = ["mlp_backward_mxfp8_nki"]

@@ -18,7 +18,6 @@ from dataclasses import dataclass
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import oob_mode
 
 from ...utils.allocator import SbufManager
 
@@ -253,7 +252,7 @@ def _build_pack_output_indices(expert_affinities, T, E, pmax, dynamism_cfg, hidd
                 ),
                 indirect_dim=0,
             ),
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
             dge_mode=nisa.dge_mode.swdge,
         )
 
@@ -277,7 +276,7 @@ def _build_pack_output_indices(expert_affinities, T, E, pmax, dynamism_cfg, hidd
                 indirect_dim=0,
             ),
             dst=token_idx_tile_sb[:tile_T_actual, :BF16_PER_INT32],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
             dge_mode=nisa.dge_mode.swdge,
         )
         # Write to packed output positions (sequential since iota ordering)
@@ -579,7 +578,9 @@ def _all_expert_moe_tkg_static(
     expert_affinities = params.expert_params.expert_affinities
     expert_affinities_in_sbuf = expert_affinities.buffer == nl.sbuf
 
-    if params.use_tkg_down_proj_column_tiling:
+    if (
+        params.use_tkg_down_proj_column_tiling
+    ):  # pragma: no cover - validation guard; column tiling is unsupported in all-expert MLP
         kernel_assert(False, "Column tiling for down proj is not supported in all-expert MLP kernel")
 
     hidden_in_sbuf = params.hidden_tensor.buffer == nl.sbuf
@@ -995,7 +996,7 @@ def _gather_input_block(hidden_input, token_indices_T_sb, dims, dynamism_cfg, io
                 indirect_dim=0,
             ),
             dst=input_tile_sb[:tile_T_actual, :H_per_shard],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
             dge_mode=nisa.dge_mode.swdge,
         )
         # Transpose [tile_T_actual, H_per_shard] -> [H0, tile_T_actual, H1_shard]
@@ -1076,7 +1077,7 @@ def _scatter_output_block(
             nisa.dma_copy(
                 src=src_tile,
                 dst=dst_ap,
-                oob_mode=oob_mode.skip,
+                oob_mode=nisa.oob_mode.skip,
                 dge_mode=nisa.dge_mode.swdge,
             )
         else:
@@ -1085,7 +1086,7 @@ def _scatter_output_block(
                 srcs=[dst_ap, src_tile],
                 scales=[1.0, 1.0],
                 reduce_op=nl.add,
-                oob_mode=oob_mode.skip,
+                oob_mode=nisa.oob_mode.skip,
             )
 
 
@@ -1166,7 +1167,7 @@ def _sequential_store_block(
                     indirect_dim=0,
                 ),
                 dst=token_idx_sb[:tile_T_actual, :BF16_PER_INT32],
-                oob_mode=oob_mode.skip,
+                oob_mode=nisa.oob_mode.skip,
                 dge_mode=nisa.dge_mode.swdge,
             )
             nisa.dma_copy(
@@ -1294,7 +1295,7 @@ def _compute_dynamic_block(
                     indirect_dim=0,
                 ),
                 dst=block_aff_sb[:, tile_t, 0],
-                oob_mode=oob_mode.skip,
+                oob_mode=nisa.oob_mode.skip,
             )
         block_aff_flat = block_aff_sb.reshape((block_T, 1))
         identity_sb = nl.shared_identity_matrix(block_T, dtype=io_dtype)
@@ -1393,7 +1394,7 @@ def _compute_dynamic_block(
                         indirect_dim=0,
                     ),
                     dst=scatter_indices[:, tile_t : tile_t + 1],
-                    oob_mode=oob_mode.skip,
+                    oob_mode=nisa.oob_mode.skip,
                     dge_mode=nisa.dge_mode.swdge,
                 )
         _scatter_output_block(

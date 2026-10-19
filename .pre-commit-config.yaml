@@ -8,3 +8,14 @@ repos:
       args: [ --fix ]
     # Run the formatter.
     - id: ruff-format
+- repo: local
+  hooks:
+    # Record backward-compatible public-API changes into the baseline and stage the
+    # refreshed snapshot. Fails the commit on a break (see the script). Convenience /
+    # early feedback only -- the CR dry-run's api-stability test is the real gate.
+    - id: api-baseline-update
+      name: Update public API baseline
+      entry: build-tools/bin/api_baseline_precommit.sh
+      language: script
+      pass_filenames: false
+      always_run: true

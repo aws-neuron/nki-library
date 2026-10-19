@@ -26,11 +26,11 @@ from . import fgcc
 
 @nki.jit
 def fine_grained_allgather(
-    lhs: nl.ndarray,
+    lhs: nl.NkiTensor,
     tp_degree: int,
     num_groups: int,
     force_hbm_cc: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Fine-grained ring-based all-gather kernel for TRN2.
 
@@ -47,7 +47,7 @@ def fine_grained_allgather(
         K: Column dimension (preserved across all-gather).
 
     Args:
-        lhs (nl.ndarray): [m, K], Input tensor, row-sharded across ranks.
+        lhs (nl.NkiTensor): [m, K], Input tensor, row-sharded across ranks.
         tp_degree (int): Tensor parallelism degree (number of ranks). Must be even.
             Supported values: 4, 8, 16, 32, 64, 128.
         num_groups (int): Number of replica groups for collective communication.
@@ -55,7 +55,7 @@ def fine_grained_allgather(
             even when SBUF path is feasible.
 
     Returns:
-        result (nl.ndarray): [RANK_N, ...], Fully gathered tensor in shared HBM.
+        result (nl.NkiTensor): [RANK_N, ...], Fully gathered tensor in shared HBM.
             Shape depends on communication path (SBUF vs HBM).
 
     Notes:
@@ -215,8 +215,8 @@ def fine_grained_allgather(
 
 
 def _copy_gathered_data_hbm(
-    buf: nl.ndarray,
-    result_tensor: nl.ndarray,
+    buf: nl.NkiTensor,
+    result_tensor: nl.NkiTensor,
     numerator: int,
     TILE_M: int,
     TILE_K: int,
@@ -239,8 +239,8 @@ def _copy_gathered_data_hbm(
     dimension determined at runtime by collective_permute_implicit.
 
     Args:
-        buf (nl.ndarray): Source HBM buffer containing gathered data.
-        result_tensor (nl.ndarray): Destination HBM result tensor.
+        buf (nl.NkiTensor): Source HBM buffer containing gathered data.
+        result_tensor (nl.NkiTensor): Destination HBM result tensor.
         numerator (int): Dynamic rank index from collective_permute_implicit.
         TILE_M (int): Tile size along M dimension.
         TILE_K (int): Tile size along K dimension.
@@ -287,7 +287,7 @@ def _copy_gathered_data_hbm(
 
 def _copy_gathered_data_sbuf(
     lhs_buf: list,
-    result_tensor: nl.ndarray,
+    result_tensor: nl.NkiTensor,
     numerator: int,
     channel_idx: int,
     TILE_M: int,
@@ -313,7 +313,7 @@ def _copy_gathered_data_sbuf(
     Args:
         lhs_buf (list): Nested SBUF tile list [channel][k_block][k_tile][m_block],
             each element is (TILE_K, BLOCK_M).
-        result_tensor (nl.ndarray): Destination HBM result tensor.
+        result_tensor (nl.NkiTensor): Destination HBM result tensor.
         numerator (int): Dynamic rank index from collective_permute_implicit.
         channel_idx (int): Current channel index to select from lhs_buf.
         TILE_M (int): Tile size along M dimension.
@@ -372,8 +372,8 @@ def _copy_gathered_data_sbuf(
 
 
 def _run_sbuf_path(
-    lhs: nl.ndarray,
-    result: nl.ndarray,
+    lhs: nl.NkiTensor,
+    result: nl.NkiTensor,
     replica_group: ReplicaGroup,
     lnc_id: int,
     dtype: nki.dtype,
@@ -400,8 +400,8 @@ def _run_sbuf_path(
     communication with data movement across ring iterations.
 
     Args:
-        lhs (nl.ndarray): [LNC_N, CHANNEL_N, local_M, K], Reshaped input tensor.
-        result (nl.ndarray): [RANK_N, LNC_N, CHANNEL_N, local_M, K], Output HBM tensor.
+        lhs (nl.NkiTensor): [LNC_N, CHANNEL_N, local_M, K], Reshaped input tensor.
+        result (nl.NkiTensor): [RANK_N, LNC_N, CHANNEL_N, local_M, K], Output HBM tensor.
         replica_group (ReplicaGroup): Collective communication replica group.
         lnc_id (int): Current LNC program ID.
         dtype (nki.dtype): Data type for buffer allocation.
@@ -672,8 +672,8 @@ def _run_sbuf_path(
 
 
 def _run_hbm_path(
-    lhs: nl.ndarray,
-    result: nl.ndarray,
+    lhs: nl.NkiTensor,
+    result: nl.NkiTensor,
     replica_group: ReplicaGroup,
     lnc_id: int,
     dtype: nki.dtype,
@@ -701,8 +701,8 @@ def _run_hbm_path(
     received data to the correct rank slot in the result tensor.
 
     Args:
-        lhs (nl.ndarray): [CHANNEL_N, LNC_N, local_M, K], Reshaped input tensor.
-        result (nl.ndarray): [RANK_N, CHANNEL_N, LNC_N, local_M, K], Output HBM tensor.
+        lhs (nl.NkiTensor): [CHANNEL_N, LNC_N, local_M, K], Reshaped input tensor.
+        result (nl.NkiTensor): [RANK_N, CHANNEL_N, LNC_N, local_M, K], Output HBM tensor.
         replica_group (ReplicaGroup): Collective communication replica group.
         lnc_id (int): Current LNC program ID.
         dtype (nki.dtype): Data type for buffer allocation.
@@ -872,7 +872,7 @@ def _run_hbm_path(
 
 def _pack_nested_to_flat(
     nested: list,
-    flat: nl.ndarray,
+    flat: nl.NkiTensor,
     CHANNEL_N: int,
     NUM_BLOCK_K: int,
     TILES_IN_BLOCK_K: int,
@@ -889,7 +889,7 @@ def _pack_nested_to_flat(
     Args:
         nested (list): Nested SBUF tile list [channel][k_block][k_tile][m_block],
             each element is (TILE_K, BLOCK_M).
-        flat (nl.ndarray): [TILE_K, flat_size], Destination flat 2D buffer.
+        flat (nl.NkiTensor): [TILE_K, flat_size], Destination flat 2D buffer.
         CHANNEL_N (int): Number of communication channels.
         NUM_BLOCK_K (int): Number of blocks along K.
         TILES_IN_BLOCK_K (int): Number of K tiles per block.
@@ -913,7 +913,7 @@ def _pack_nested_to_flat(
 
 
 def _unpack_flat_to_nested(
-    flat: nl.ndarray,
+    flat: nl.NkiTensor,
     nested: list,
     CHANNEL_N: int,
     NUM_BLOCK_K: int,
@@ -928,7 +928,7 @@ def _unpack_flat_to_nested(
     corresponding nested[channel][k][bk][m] tile.
 
     Args:
-        flat (nl.ndarray): [TILE_K, flat_size], Source flat 2D buffer.
+        flat (nl.NkiTensor): [TILE_K, flat_size], Source flat 2D buffer.
         nested (list): Nested SBUF tile list [channel][k_block][k_tile][m_block],
             each element is (TILE_K, BLOCK_M).
         CHANNEL_N (int): Number of communication channels.

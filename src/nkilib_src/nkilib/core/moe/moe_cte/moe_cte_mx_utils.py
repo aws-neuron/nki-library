@@ -27,7 +27,6 @@ from typing import Any, Optional
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import dge_mode, oob_mode
 
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
@@ -523,6 +522,7 @@ def load_fp8_hidden_states_mx(
     skip_dma: SkipMode,
     token_indices_on_p: nl.NkiTensor,
     block_hidden_concat: nl.NkiTensor,
+    dma_priority=None,
 ):
     """Prefetch (gather only) PRE-QUANTIZED fp8 hidden states for one block.
 
@@ -539,6 +539,10 @@ def load_fp8_hidden_states_mx(
         skip_dma (SkipMode): Padding tokens are skipped via oob_mode.skip.
         token_indices_on_p (nl.NkiTensor): [_pmax, B//_pmax] int32 token ids on partitions for this block.
         block_hidden_concat (nl.NkiTensor): Dest [_pmax, B//_pmax, H_load] gathered concat rows.
+        dma_priority (int): Optional DMA QoS priority (0-3, lower is higher) for the gather DMAs.
+
+    Returns:
+        list: The gather DMA instructions, so callers can order later instructions after them.
     """
     B = dims.B
     H_concat = inps.hidden_states.shape[-1]
@@ -549,8 +553,9 @@ def load_fp8_hidden_states_mx(
     # hidden+scale in one indirect DMA. Affinities region is extracted later.
     row_load = H_concat
 
+    gather_insts = []
     for b_tile_idx in range(n_B_tiles):
-        nisa.dma_copy(
+        _gather = nisa.dma_copy(
             src=inps.hidden_states.ap(
                 pattern=[[H_concat, blk_T], [1, row_load]],
                 offset=0,
@@ -561,9 +566,12 @@ def load_fp8_hidden_states_mx(
                 indirect_dim=0,
             ),
             dst=block_hidden_concat[0:blk_T, b_tile_idx, 0:row_load],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-            dge_mode=dge_mode.swdge,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
+            dge_mode=nisa.dge_mode.swdge,
+            priority=dma_priority,
         )
+        gather_insts.append(_gather)
+    return gather_insts
 
 
 def transpose_fp8_hidden_states(
@@ -781,7 +789,7 @@ def load_hidden_states_mx(
                 ],
             ),
             axes=(3, 1, 2, 0),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             priority=0,
         )
 
@@ -816,7 +824,7 @@ def load_hidden_states_mx(
                     ],
                     offset=b_tile_idx * H_div_512 * _pmax,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             )
 
 
@@ -885,8 +893,8 @@ def compute_hidden_index_vector(
         nisa.dma_copy(
             src=reshaped.ap(pattern=[[dims.B, 1], [1, dims.B]], offset=0, scalar_offset=block_idx, indirect_dim=0),
             dst=token_indices[:, : dims.B],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
+            dge_mode=nisa.dge_mode.hwdge,
         )
     else:
         token_indices = _sbm_alloc(
@@ -897,7 +905,7 @@ def compute_hidden_index_vector(
                 :, block_idx * dims.B : dims.B * (block_idx + 1)
             ],
             dst=token_indices[:, :num_tokens],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
 
     kernel_assert(token_indices.shape == (1, num_tokens), f"token_indices.shape = {token_indices.shape}")

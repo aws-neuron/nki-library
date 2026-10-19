@@ -12,21 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gated DeltaNet (GDN) kernels for Qwen3.5 hybrid linear attention.
+"""Gated DeltaNet (GDN) kernels for hybrid linear attention.
 
-Prefill (chunked gated delta-rule) and decode (single-token recurrence), plus
-the fused decode megakernel (in_proj + conv1d + GQA + recurrence in one @nki.jit).
+Prefill (chunked gated delta-rule) and decode (single-token recurrence), plus the fused
+decode megakernel (in_proj + conv1d + GQA + recurrence in one @nki.jit).
+
+PREFILL FORWARD has ONE entry point, `gdn_cte`, with two candidate intra-chunk inverse
+algorithms: pass `algorithm=ALGORITHM_SCHUR` (the default, and the faster of the two) or
+`ALGORITHM_NEUMANN`. Its BACKWARD is `gdn_cte_bwd`, the reverse-mode VJP of the schur
+forward (schur only -- there is no neumann backward). The implementations are neither
+exported nor `@nki.jit`-decorated --
+they are traced bodies `gdn_cte` inlines. Head dims may be anything up to `MAX_HEAD_DIM`
+(128, the partition bound), with q and k matching. Selecting neumann restricts the call
+(no GQA head sharing, no supplied `recurrent_state`, Dv must equal Dk, `mask_pack`
+unused): it uses a flat [B, S, D] layout with one head dim for q/k/v, and a zero initial
+state. See README.md for the interface table and the comparison.
 """
 
 from .gdn_block_tkg import gdn_block_tkg
 from .gdn_conv1d import gdn_conv1d_decode, gdn_conv1d_prefill
 from .gdn_cte import gdn_cte
+from .gdn_cte_bwd import gdn_cte_bwd
+from .gdn_cte_utils import (
+    ALGORITHM_NEUMANN,
+    ALGORITHM_SCHUR,
+    CHUNK,
+    DEFAULT_ALGORITHM,
+    MAX_HEAD_DIM,
+    N_MASKS,
+    build_mask_pack,
+)
 from .gdn_tkg import gdn_tkg
 
 __all__ = [
+    "ALGORITHM_NEUMANN",
+    "ALGORITHM_SCHUR",
+    "CHUNK",
+    "DEFAULT_ALGORITHM",
+    "MAX_HEAD_DIM",
+    "N_MASKS",
+    "build_mask_pack",
     "gdn_block_tkg",
     "gdn_conv1d_decode",
     "gdn_conv1d_prefill",
     "gdn_cte",
+    "gdn_cte_bwd",
     "gdn_tkg",
 ]

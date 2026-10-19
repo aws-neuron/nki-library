@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
@@ -25,6 +27,12 @@ from nkilib_src.nkilib.core.utils.mx_torch_common import (
 from nkilib_src.nkilib.core.utils.mx_torch_common import (
     nc_matmul_mx_golden as nc_matmul_mx_golden,
 )
+
+# Scale rows a single SBUF quadrant may hold, and equivalently the number of ISA-legal
+# scale_pidx offsets: mxmem1d_valid_scale_pidx requires scale_pidx % 4 == 0 and < 16, so
+# offsets {0, 4, 8, 12}. This is why exactly a factor of 4 may move out of the scale's free
+# dimension and why 64 partitions is the PACK64 ceiling.
+SCALE_ROWS_PER_QUADRANT = 4
 
 # Mapping from nki dtype strings to neuron_dtypes dtype objects
 NL_TO_DT_DTYPE = {
@@ -137,6 +145,111 @@ def quantize_mx_golden(
     mx_data_golden = static_cast(mx_data_golden.astype(np.float32), NL_TO_DT_DTYPE.get(out_x4_dtype, out_x4_dtype))
 
     return mx_data_golden, mx_scale_golden
+
+
+def pack64_gate_up_scale(scale):
+    """Remap a gate/up MX scale tensor to the PACK64 (64-SBUF-partition) HBM layout.
+
+    ``[..., 16, 2, H/512, I]  ->  [..., 2, 64, H/512, I/4]``
+
+    The kernel's packed scale load (``VLLM_NEURON_MEGA_SCALE_PACK64``, on by default)
+    reads 16 contiguous rows per quadrant instead of 4, folding the ``4_I`` factor out
+    of the free dimension and into partitions. The 64 partitions are
+    ``(quadrant q, group k, row r)`` with ``k`` == the matmul's ``q_width_I_idx``, so the
+    consumer selects a group purely by base partition ``4*k`` (the ISA's ``scale_pidx``
+    field, which allows only ``{0, 4, 8, 12}``) and the residual free index collapses to
+    ``tile_i * 128 + j``.
+
+    The remap is EXACT and invertible, not a reinterpretation: for data free index
+    ``i = tile_i*512 + k*128 + j`` the scale lands at partition ``16*q + 4*k + r`` and
+    free ``(h, tile_i*128 + j)``.
+
+    Leading dimensions are passed through, so this accepts both the per-layer
+    ``[E, 16, 2, H/512, I]`` and the stacked ``[L, E, 16, 2, H/512, I]`` forms.
+
+    Args:
+        scale: np.ndarray with trailing dims ``(16, 2, H/512, I)``.
+
+    Returns:
+        np.ndarray, C-contiguous, with those dims replaced by ``(2, 64, H/512, I/4)``.
+    """
+    *lead, p16, g, n_h512, i_dim = scale.shape
+    q_n, r_n = p16 // SCALE_ROWS_PER_QUADRANT, SCALE_ROWS_PER_QUADRANT  # 4 quadrants x 4 rows
+    k_n, j_n = SCALE_ROWS_PER_QUADRANT, 128
+    n_ti = i_dim // (k_n * j_n)
+    assert p16 == 16, f"expected 16 scale partitions, got {p16}"
+    assert i_dim == n_ti * k_n * j_n, f"I={i_dim} is not a multiple of {k_n * j_n}"
+
+    n_lead = len(lead)
+    x = scale.reshape(*lead, q_n, r_n, g, n_h512, n_ti, k_n, j_n)
+    # relative axes after reshape: 0=q 1=r 2=g 3=n_h512 4=n_ti 5=k_n 6=j_n
+    # target order:                g, q, k_n, r, n_h512, n_ti, j_n
+    perm = tuple(range(n_lead)) + tuple(n_lead + a for a in (2, 0, 5, 1, 3, 4, 6))
+    x = np.transpose(x, perm)
+    return np.ascontiguousarray(x.reshape(*lead, g, q_n * k_n * r_n, n_h512, n_ti * j_n))
+
+
+def unpack64_gate_up_scale(scale):
+    """Exact inverse of :func:`pack64_gate_up_scale`.
+
+    ``[..., 2, 64, H/512, I/4]  ->  [..., 16, 2, H/512, I]``
+
+    Leading dimensions are passed through. CPU goldens that are handed the kernel's
+    PACK64 HBM layout use this to recover the natural per-(quadrant, row) scale.
+
+    Args:
+        scale: np.ndarray with trailing dims ``(2, 64, H/512, I/4)``.
+
+    Returns:
+        np.ndarray, C-contiguous, with those dims replaced by ``(16, 2, H/512, I)``.
+    """
+    *lead, g, p64, n_h512, i_q = scale.shape
+    q_n, r_n = 16 // SCALE_ROWS_PER_QUADRANT, SCALE_ROWS_PER_QUADRANT  # 4 quadrants x 4 rows
+    k_n, j_n = SCALE_ROWS_PER_QUADRANT, 128
+    n_ti = i_q // j_n
+    assert p64 == q_n * k_n * r_n, f"expected {q_n * k_n * r_n} packed scale partitions, got {p64}"
+    assert i_q == n_ti * j_n, f"I/4={i_q} is not a multiple of {j_n}"
+
+    n_lead = len(lead)
+    x = scale.reshape(*lead, g, q_n, k_n, r_n, n_h512, n_ti, j_n)
+    # relative axes after reshape: 0=g 1=q 2=k_n 3=r 4=n_h512 5=n_ti 6=j_n
+    # target order:                q, r, g, n_h512, n_ti, k_n, j_n
+    perm = tuple(range(n_lead)) + tuple(n_lead + a for a in (1, 3, 0, 4, 5, 2, 6))
+    x = np.transpose(x, perm)
+    return np.ascontiguousarray(x.reshape(*lead, q_n * r_n, g, n_h512, n_ti * k_n * j_n))
+
+
+def is_pack64_gate_up_scale(scale) -> bool:
+    """True when ``scale`` has the PACK64 trailing dims ``(2, 64, H/512, I/4)`` rather than ``(16, 2, H/512, I)``."""
+    return scale is not None and scale.ndim >= 4 and scale.shape[-4] == 2 and scale.shape[-3] == 64
+
+
+def maybe_unpack64_gate_up_scale(scale):
+    """:func:`unpack64_gate_up_scale` when ``scale`` is in the PACK64 layout, else the scale unchanged.
+
+    For CPU references that are handed the kernel's input tensor as-is: the kernel needs
+    the PACK64 layout when ``VLLM_NEURON_MEGA_SCALE_PACK64`` is on, the torch refs index
+    the natural one, and the remap is exact so both see identical values.
+    """
+    return unpack64_gate_up_scale(scale) if is_pack64_gate_up_scale(scale) else scale
+
+
+def scale_pack64_enabled() -> bool:
+    """True when the GIGA kernel's PACK64 gate/up scale path is active.
+
+    Mirrors ``VLLM_NEURON_MEGA_SCALE_PACK64`` in
+    ``models/gpt_oss/c128_giga_kernel/core/moe/moe_tkg/gate_up_projection_mx.py``,
+    which is ON by default. Tests read it from here so the kernel and the inputs
+    they hand it can never disagree.
+    """
+    return os.environ.get("VLLM_NEURON_MEGA_SCALE_PACK64", "1") not in ("", "0", "false", "False")
+
+
+def maybe_pack64_gate_up_scale(scale):
+    """:func:`pack64_gate_up_scale` when PACK64 is active, else the scale unchanged."""
+    if scale is None or not scale_pack64_enabled():
+        return scale
+    return pack64_gate_up_scale(scale)
 
 
 def dequantize_mx_golden(mx_data_x4, mx_scale):

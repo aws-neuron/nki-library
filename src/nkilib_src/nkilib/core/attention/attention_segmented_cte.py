@@ -37,10 +37,36 @@ from .attention_cte import (
     _attention_cte,
 )
 from .fused_segmented_attention import (
+    _NORM_TP_CHUNK_STAGES,
     _normalize_and_write_head,
     fused_segmented_attention_impl,
     fused_segmented_attention_impl_multihead,
 )
+
+
+def _q_head_ap(q, batch_id, num_tokens, tp_q, seq_start=0):
+    """One head's Q rows as an access pattern over ``q``, honouring ``q``'s real strides.
+
+    ``q``'s declared shape is ``(bs_q, seqlen_q, head_dim)`` when ``tp_q`` and the
+    transpose otherwise, but ``q`` may be a *view* of a larger tensor rather than a dense
+    one -- a caller that projects Q once over the whole sequence and passes a slice of it
+    leaves the stride between heads at the full sequence length. Building the pattern out
+    of ``q.shape`` assumes density and reads the wrong rows for every head past the
+    first; building it out of ``q.strides`` is correct for any view and identical for a
+    dense ``q``.
+
+    ``seq_start`` selects a sub-range of the sequence, for the per-shard remainder copies.
+    """
+    bs_stride, dim1_stride, dim2_stride = q.strides
+    if tp_q:
+        # (bs_q, seqlen_q, head_dim): dim 1 is the sequence.
+        pattern = [[dim1_stride, num_tokens], [dim2_stride, q.shape[2]]]
+        offset = batch_id * bs_stride + seq_start * dim1_stride
+    else:
+        # (bs_q, head_dim, seqlen_q): dim 2 is the sequence.
+        pattern = [[dim1_stride, q.shape[1]], [dim2_stride, num_tokens]]
+        offset = batch_id * bs_stride + seq_start * dim2_stride
+    return q.ap(pattern=pattern, offset=offset)
 
 
 def floor_nisa_kernel(src_t: nl.NkiTensor, dst_t: nl.NkiTensor, p_size: int, f_size: int, allocator: ModularAllocator):
@@ -673,6 +699,7 @@ def _attention_segmented_cte_swa_impl(
     fp8_packed: bool = False,
     k_scale: Optional[nl.NkiTensor] = None,
     v_scale: Optional[nl.NkiTensor] = None,
+    allow_vector_exp: bool = True,
 ):
     """
     Simplified sliding window attention implementation with single-iteration processing.
@@ -890,22 +917,10 @@ def _attention_segmented_cte_swa_impl(
         h_i = (batch_id % num_q_heads) * num_kv_heads // num_q_heads
 
         # Copy this batch's query data (layout matches tp_q)
-        if tp_q:
-            nisa.dma_copy(
-                dst=q_internal[0, :, :],
-                src=q.ap(
-                    pattern=[[head_dim, seqlen_q], [1, head_dim]],
-                    offset=batch_id * seqlen_q * head_dim,
-                ),
-            )
-        else:
-            nisa.dma_copy(
-                dst=q_internal[0, :, :],
-                src=q.ap(
-                    pattern=[[seqlen_q, head_dim], [1, seqlen_q]],
-                    offset=batch_id * head_dim * seqlen_q,
-                ),
-            )
+        nisa.dma_copy(
+            dst=q_internal[0, :, :],
+            src=_q_head_ap(q, batch_id, seqlen_q, tp_q),
+        )
 
         # Load active KV cache
         load_kv_cache(
@@ -965,6 +980,7 @@ def _attention_segmented_cte_swa_impl(
             out_sum_hbm=out_sum_hbm_swa,
             init_sbuf_addr=init_sbuf_addr,
             k_scale_sb=k_scale_sb,
+            allow_vector_exp=allow_vector_exp,
         )
         allocator.set_current_address(init_sbuf_addr)
 
@@ -1077,24 +1093,14 @@ def _attention_segmented_cte_swa_impl(
             q_internal_remainder = nl.ndarray(
                 shape=(1, effective_q_tokens, head_dim), dtype=q.dtype, buffer=nl.private_hbm
             )
-            nisa.dma_copy(
-                dst=q_internal_remainder[0, :, :],
-                src=q.ap(
-                    pattern=[[head_dim, effective_q_tokens], [1, head_dim]],
-                    offset=last_batch * seqlen_q * head_dim + seq_start * head_dim,
-                ),
-            )
         else:
             q_internal_remainder = nl.ndarray(
                 shape=(1, head_dim, effective_q_tokens), dtype=q.dtype, buffer=nl.private_hbm
             )
-            nisa.dma_copy(
-                dst=q_internal_remainder[0, :, :],
-                src=q.ap(
-                    pattern=[[seqlen_q, head_dim], [1, effective_q_tokens]],
-                    offset=last_batch * head_dim * seqlen_q + seq_start,
-                ),
-            )
+        nisa.dma_copy(
+            dst=q_internal_remainder[0, :, :],
+            src=_q_head_ap(q, last_batch, effective_q_tokens, tp_q, seq_start=seq_start),
+        )
 
         # Allocate K/V sbuf for effective segment
         k_cache_sbuf_rem = allocator.alloc_sbuf_tensor(
@@ -1234,6 +1240,7 @@ def _attention_segmented_cte_swa_impl(
             out_sum_hbm=out_sum_hbm_rem,
             init_sbuf_addr=init_sbuf_addr,
             k_scale_sb=k_scale_sb,
+            allow_vector_exp=allow_vector_exp,
         )
         allocator.set_current_address(init_sbuf_addr)
 
@@ -1346,6 +1353,7 @@ def attention_segmented_cte(
     kvp_seg_block_offset_int: int = 0,
     kvp_prior_load_blocks: int = 0,
     kvp_prior_fully_visible: bool = False,
+    allow_vector_exp: bool = True,
 ):
     """
     Segmented attention computation with block-based KV cache and prefix caching.
@@ -1498,6 +1506,7 @@ def attention_segmented_cte(
         kvp_seg_block_offset_int: Compile-time segment block offset for tile visibility checks (default 0).
         kvp_prior_load_blocks: Number of blocks to load for partial prior in boundary-aligned mode (default 0).
         kvp_prior_fully_visible: If True, prior segments are fully visible and skip causal masking (default False).
+        allow_vector_exp: Allow the Vector Engine exp on trn3. False uses the Scalar Engine (default True).
 
     Returns:
         If kvp_q_offset is None: output tensor with attention results. Shape depends on tp_out parameter.
@@ -1575,7 +1584,7 @@ def attention_segmented_cte(
     # incomplete. Done before the SWA dispatch so both paths benefit.
     padded_width = (max_blocks_per_seq // num_blocks_per_seg + 1) * num_blocks_per_seg
 
-    if padded_width > max_blocks_per_seq:
+    if padded_width > max_blocks_per_seq:  # pragma: no branch - padded_width always > max_blocks_per_seq
         block_tables_internal = nl.ndarray(shape=(bs, padded_width), dtype=block_tables.dtype, buffer=nl.private_hbm)
         pad_addr = allocator.get_current_address()
         pad_scratch = allocator.alloc_sbuf_tensor(shape=(bs, padded_width), dtype=block_tables.dtype)
@@ -1614,6 +1623,7 @@ def attention_segmented_cte(
             fp8_packed=fp8_packed,
             k_scale=k_scale,
             v_scale=v_scale,
+            allow_vector_exp=allow_vector_exp,
         )
 
     num_k_tiles_per_seg = math.ceil(prior_seg_size / _K_TILE_SZ)
@@ -1786,22 +1796,10 @@ def attention_segmented_cte(
             batch_h_i = (batch_id % num_q_heads) * num_kv_head // num_q_heads
             b_i_list.append(batch_b_i)
             h_i_list.append(batch_h_i)
-            if tp_q:
-                nisa.dma_copy(
-                    dst=q_internal[b_idx, :, :],
-                    src=q.ap(
-                        pattern=[[head_dim, seqlen_q], [1, head_dim]],
-                        offset=batch_id * seqlen_q * head_dim,
-                    ),
-                )
-            else:
-                nisa.dma_copy(
-                    dst=q_internal[b_idx, :, :],
-                    src=q.ap(
-                        pattern=[[seqlen_q, head_dim], [1, seqlen_q]],
-                        offset=batch_id * head_dim * seqlen_q,
-                    ),
-                )
+            nisa.dma_copy(
+                dst=q_internal[b_idx, :, :],
+                src=_q_head_ap(q, batch_id, seqlen_q, tp_q),
+            )
             pbo = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
             nisa.tensor_scalar(dst=pbo, data=num_full_prior_segments_i32, op0=nl.multiply, operand0=num_blocks_per_seg)
             prior_block_offset_list.append(pbo)
@@ -1870,6 +1868,7 @@ def attention_segmented_cte(
             v_scale_sb=v_scale_sb,
             tp_out=tp_out,
             bs_offset=bs_offset,
+            allow_vector_exp=allow_vector_exp,
         )
 
         # Normalize each head's output by its softmax sum and write to result.
@@ -1904,10 +1903,27 @@ def attention_segmented_cte(
                 nisa.dma_copy(dst=_pp_sum_sb, src=sum_prev_hbm[b_idx : b_idx + 1].ap(pattern=sm_pat, offset=0))
                 _pp_sum_recip_sb = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
                 nisa.reciprocal(_pp_sum_recip_sb, _pp_sum_sb)
-                _pp_o_batch = allocator.alloc_sbuf_tensor(shape=(sb_p, num_free_pp, head_dim), dtype=nl.bfloat16)
+                # Both shapes are dictated by _normalize_and_write_head, which stages
+                # _NORM_TP_CHUNK_STAGES chunks so chunk n+1's o-load DMA does not wait on
+                # chunk n's normalize. The pre-staging 3-D/2-D shapes made the o-load's
+                # destination silently collapse to sb_p * cur_chunk elements -- the trailing
+                # head_dim index has no dimension left to apply to -- which surfaced as
+                # "dma_copy requires src and dst to have the same number of elements,
+                # got src=65536, dst=512" on every KV-parallel param.
+                _pp_o_batch = allocator.alloc_sbuf_tensor(
+                    shape=(sb_p, _NORM_TP_CHUNK_STAGES, num_free_pp, head_dim),
+                    dtype=nl.bfloat16,
+                    # Source of the callee's DMA XBar transpose, which needs a 32B-aligned base.
+                    align_to=32,
+                )
                 _pp_o_tp_sb = None
                 if tp_out:
-                    _pp_o_tp_sb = allocator.alloc_sbuf_tensor(shape=(d_tile_size_par_dim, sb_p), dtype=nl.bfloat16)
+                    _pp_o_tp_sb = allocator.alloc_sbuf_tensor(
+                        shape=(d_tile_size_par_dim, num_d_tiles, _NORM_TP_CHUNK_STAGES, num_free_pp * sb_p),
+                        dtype=nl.bfloat16,
+                        # dma_transpose requires a 32B-aligned destination offset.
+                        align_to=32,
+                    )
                 _normalize_and_write_head(
                     result=result,
                     o_src_hbm=o_prev_hbm[b_idx : b_idx + 1],
@@ -2031,24 +2047,14 @@ def attention_segmented_cte(
             q_internal_remainder = nl.ndarray(
                 shape=(1, effective_q_tokens, head_dim), dtype=q.dtype, buffer=nl.private_hbm
             )
-            nisa.dma_copy(
-                dst=q_internal_remainder[0, :, :],
-                src=q.ap(
-                    pattern=[[head_dim, effective_q_tokens], [1, head_dim]],
-                    offset=last_batch * seqlen_q * head_dim + seq_start * head_dim,
-                ),
-            )
         else:
             q_internal_remainder = nl.ndarray(
                 shape=(1, head_dim, effective_q_tokens), dtype=q.dtype, buffer=nl.private_hbm
             )
-            nisa.dma_copy(
-                dst=q_internal_remainder[0, :, :],
-                src=q.ap(
-                    pattern=[[seqlen_q, head_dim], [1, effective_q_tokens]],
-                    offset=last_batch * head_dim * seqlen_q + seq_start,
-                ),
-            )
+        nisa.dma_copy(
+            dst=q_internal_remainder[0, :, :],
+            src=_q_head_ap(q, last_batch, effective_q_tokens, tp_q, seq_start=seq_start),
+        )
 
         # Allocate HBM buffers for remainder (per-shard Q length).
         # Use effective_grp_length so Core 1's dummy path gets valid
@@ -2213,6 +2219,7 @@ def attention_segmented_cte(
             kvp_seg_block_offset_int=kvp_seg_block_offset_int,
             kvp_prior_load_blocks=kvp_prior_load_blocks,
             kvp_prior_fully_visible=kvp_prior_fully_visible,
+            allow_vector_exp=allow_vector_exp,
         )
 
         # Core 1 does one extra iteration to process Core 0's active segment.
@@ -2284,6 +2291,7 @@ def attention_segmented_cte(
                 out_sum_hbm=sum_rem_curr_hbm,
                 init_sbuf_addr=inner_init_sbuf_addr,
                 k_scale_sb=k_scale_sb,
+                allow_vector_exp=allow_vector_exp,
             )
             allocator.set_current_address(init_sbuf_addr)
 

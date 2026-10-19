@@ -21,6 +21,7 @@ import ml_dtypes
 import nki.language as nl
 import numpy as np
 import pytest
+from nkilib_src.nkilib.experimental.mla.deepseek.mla_common_cte import MlaPrecision
 from nkilib_src.nkilib.experimental.mla.deepseek.mla_vup_oproj_cte import (
     mla_vupmx_oproj_cte_kernel,
 )
@@ -30,10 +31,20 @@ from nkilib_src.nkilib.experimental.mla.deepseek.mla_vup_oproj_cte_torch import 
 
 from test.integration.nkilib.core.qkv.test_qkv_common import _reduce_mx_scale_to_compact_block128
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
-from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.common_dataclasses import CompilerArgs, ModelTestType, Platforms, prepare_model_parametrize
+from test.utils.model_test_configs import no_model_configs
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+
+try:
+    from test.integration.nkilib.experimental.mla.config.test_mla_vup_oproj_cte import (
+        MODEL_PARAM_NAMES,
+        mla_vup_oproj_cte_model_configs,
+    )
+except ImportError:
+    MODEL_PARAM_NAMES = "batch, seqlen, hidden, L, D_V, HID"
+    mla_vup_oproj_cte_model_configs = no_model_configs()
 
 
 def _ds128_to_native32(compact_scale, in_dim, out_dim):
@@ -116,7 +127,92 @@ TEST_PARAMS = [
 # fmt: on
 
 
-@pytest_test_metadata(name="SparseMlaVupMxOprojKernelCte")
+def _generate_inputs_bf16(batch, seqlen, hidden, L, D_V, HID):
+    """BF16 (``MlaPrecision.BF16``) inputs: plain bf16, natural column order, no scales.
+
+    Weights are scaled by ``1 / sqrt(K)`` so each matmul output stays roughly unit variance —
+    bf16 has ~3 decimal digits of mantissa, so letting the two chained projections drift by
+    orders of magnitude would measure dynamic range rather than the kernel.
+    """
+    np.random.seed(42)
+    Hdv = hidden * D_V
+    return {
+        # Natural latent column order (bf16 kernel A writes no 4-pack permutation).
+        "out_attn_hbm": (np.random.randn(batch, seqlen, hidden * L) * 0.3).astype(ml_dtypes.bfloat16),
+        "wuv_qtz_hbm": (np.random.randn(hidden * L, D_V) * L**-0.5).astype(ml_dtypes.bfloat16),
+        "wuv_scale_hbm": None,  # unused in bf16
+        "wo_qtz_hbm": (np.random.randn(Hdv, HID) * Hdv**-0.5).astype(ml_dtypes.bfloat16),
+        "wo_scale_hbm": None,  # unused in bf16
+        "compact_scales": True,  # ignored in bf16
+        "precision": MlaPrecision.BF16,
+        "kv_lora_rank": L,
+    }
+
+
+def _output_tensors_bf16(kernel_input):
+    batch, seqlen, _HL = kernel_input["out_attn_hbm"].shape
+    HID = kernel_input["wo_qtz_hbm"].shape[1]
+    return {"out": np.zeros((batch, seqlen, HID), dtype=ml_dtypes.bfloat16)}
+
+
+# fmt: off
+PARAM_NAMES_BF16 = "batch, seqlen, hidden, L, D_V, HID"
+TEST_PARAMS_BF16 = [
+    # ---- DeepSeek-V3.2 dims in bf16 (D_V=128): parity with the MX cases above ----
+    pytest.param(1, 256, 16,  512, 128, 1024, id="ds_1_256_16_1024"),
+    pytest.param(1, 128, 128, 512, 128, 7168, id="ds_1_128_128_7168_full"),
+    pytest.param(1, 256, 4,   512, 128, 1024, id="ds_H4"),
+    pytest.param(1, 128, 64,  512, 128, 7168, id="ds_H64"),
+
+    # ---- GLM-MoE-DSA (D_V=256, HID=6144) ----
+    pytest.param(1, 256, 8,   512, 256, 6144, id="glm_tp8"),
+    pytest.param(1, 128, 16,  512, 256, 6144, id="glm_tp4"),
+    pytest.param(1, 256, 32,  512, 256, 6144, id="glm_tp2"),
+    pytest.param(1, 128, 64,  512, 256, 6144, id="glm_full_64h"),
+    pytest.param(1, 256, 64,  512, 256, 6144, id="glm_full_64h_s256"),
+    # GLM prefill-length reference config (multi-s-batch: seqlen/2 cores > 128).
+    pytest.param(1, 2048, 8,  512, 256, 6144, id="glm_s2048_tp8"),
+    pytest.param(1, 4096, 4,  512, 256, 6144, id="glm_s4096_tp16"),
+
+    # ---- odd head counts: bf16 drops the MX `hidden % 4 == 0` 4-pack constraint ----
+    pytest.param(1, 256, 2,   512, 256, 6144, id="glm_H2"),
+    pytest.param(1, 256, 1,   512, 256, 6144, id="glm_H1"),
+
+    # ---- S_local sweep at the full GLM config (2..2048), matched across all four kernels in
+    # the stack. seqlen/2 is the per-core count, so 512/1024/2048 exercise the multi-s-batch
+    # streaming loop (s_per_core > _OPROJ_S_TILE=128).
+    pytest.param(1, 2,    64, 512, 256, 6144, id="glm_S2"),
+    pytest.param(1, 16,   64, 512, 256, 6144, id="glm_S16"),
+    pytest.param(1, 32,   64, 512, 256, 6144, id="glm_S32"),
+    pytest.param(1, 64,   64, 512, 256, 6144, id="glm_S64"),
+    pytest.param(1, 512,  64, 512, 256, 6144, id="glm_S512"),
+    pytest.param(1, 1024, 64, 512, 256, 6144, id="glm_S1024"),
+    pytest.param(1, 2048, 64, 512, 256, 6144, id="glm_S2048_64h"),
+    pytest.param(1, 16384, 64, 512, 256, 6144, id="glm_S16384_64h"),
+
+    # ---- vary HID ----
+    pytest.param(1, 256, 8, 512, 256, 512,  id="glm_HID512"),
+    pytest.param(1, 256, 8, 512, 256, 1536, id="glm_HID1536"),
+
+    # ---- long-context per-rank shards (head-sharded long-seq, H=4) ----
+    # NOTE: `seqlen` here is the per-rank shard, not the global context. With the tests'
+    # x64 sharding convention (S_local * 64), seqlen=8192 corresponds to a 512k global
+    # context. With H=4 (Hdv small), out_attn [1, S, H*L] and out [1, S, HID] stay within
+    # HBM at these S. These drive num_s_batches = S/128 up to 128, stressing the
+    # multi-s-batch streaming loop far past the existing 4096/8192 long-seq cases.
+    #   256k global context / x64 -> S_local = 4096
+    pytest.param(1, 4096,  4, 512, 256, 6144, id="glm_256k_ctx_s4096"),
+    #   512k global context / x64 -> S_local = 8192
+    pytest.param(1, 8192,  4, 512, 256, 6144, id="glm_512k_ctx_s8192"),
+    #   deeper s-batch loop (S_local = 16384)
+    pytest.param(1, 16384, 4, 512, 256, 6144, id="glm_long_ctx_s16384"),
+]
+# One DeepSeek-dims case + one GLM case (exercising D_V=256) for the fast lane.
+TEST_PARAMS_BF16_FAST = [TEST_PARAMS_BF16[0], TEST_PARAMS_BF16[4]]
+# fmt: on
+
+
+@pytest_test_metadata(name="SparseMlaVupMxOprojKernelCte", tags=["model"])
 @pytest_marks(["attention", "sparse_mla_vupmx_oproj_cte"])
 class TestSparseMlaVupMxOprojKernelCte:
     """Standalone MX V-up + MX o_proj (kernel batch)."""
@@ -161,3 +257,72 @@ class TestSparseMlaVupMxOprojKernelCte:
         self, test_manager: Orchestrator, platform_target: Platforms, batch, seqlen, hidden, L, D_V, HID, compact_scales
     ):
         self._run(test_manager, platform_target, batch, seqlen, hidden, L, D_V, HID, compact_scales=compact_scales)
+
+    # ---------------------------------------------------------------- BF16 ----
+    def _run_bf16(self, test_manager, platform_target, batch, seqlen, hidden, L, D_V, HID):
+        def input_generator(test_config):
+            return _generate_inputs_bf16(batch, seqlen, hidden, L, D_V, HID)
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=mla_vupmx_oproj_cte_kernel,
+            torch_ref=torch_ref_wrapper(mla_vupmx_oproj_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_tensors_bf16,
+        )
+        """
+        Much tighter than the MX path's rtol=1e-1: bf16 has ~8 mantissa bits against MX fp8's
+        ~3 plus a block scale, and the tensor engine accumulates in fp32, so the only error is
+        bf16 rounding of the two matmuls' operands.
+        """
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            atol=1e-2,
+            rtol=4e-2,
+        )
+
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.fast
+    @pytest.mark.parametrize(PARAM_NAMES_BF16, TEST_PARAMS_BF16_FAST)
+    def test_mla_vup_oproj_cte_bf16_fast(
+        self, test_manager: Orchestrator, platform_target: Platforms, batch, seqlen, hidden, L, D_V, HID
+    ):
+        self._run_bf16(test_manager, platform_target, batch, seqlen, hidden, L, D_V, HID)
+
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.parametrize(PARAM_NAMES_BF16, TEST_PARAMS_BF16)
+    def test_mla_vup_oproj_cte_bf16(
+        self, test_manager: Orchestrator, platform_target: Platforms, batch, seqlen, hidden, L, D_V, HID
+    ):
+        self._run_bf16(test_manager, platform_target, batch, seqlen, hidden, L, D_V, HID)
+
+
+@pytest_marks(["attention", "cte", "model", "mx", "sparse_mla_vupmx_oproj_cte"])
+class TestSparseMlaVupOprojCteModel:
+    """Model-driven tests for the MLA V-up + o_proj CTE kernel, organized by tier.
+
+    Parametrized from the same set as configuration/test_vector_metadata/, which is what feeds
+    the kernel-to-model benchmark dashboard, so a config registered there is a config that runs.
+
+    Carries no @pytest_test_metadata of its own: one annotation per file is enforced, and the
+    kernel is already named by the class above.
+
+    The ``mx`` mark does not describe this kernel's arithmetic: these configs run the bf16 path.
+    The trn3 model lane admits a model test only if it carries one of the MX marks, and per the
+    lane owner we carry ``mx`` rather than widening that group. It is lane selection, not a
+    precision declaration.
+    """
+
+    _OPTIMAL_PARAMS, _OPTIMAL_IDS = prepare_model_parametrize(
+        {
+            ModelTestType.OPTIMAL: mla_vup_oproj_cte_model_configs.get(ModelTestType.OPTIMAL, []),
+        }
+    )
+
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.optimal
+    @pytest.mark.parametrize(MODEL_PARAM_NAMES, _OPTIMAL_PARAMS, ids=_OPTIMAL_IDS)
+    def test_optimal(self, test_manager: Orchestrator, platform_target: Platforms, batch, seqlen, hidden, L, D_V, HID):
+        """OPTIMAL: the GLM-5.3 configs the benchmark dashboard tracks, bf16 V-up + o_proj."""
+        TestSparseMlaVupMxOprojKernelCte()._run_bf16(test_manager, platform_target, batch, seqlen, hidden, L, D_V, HID)

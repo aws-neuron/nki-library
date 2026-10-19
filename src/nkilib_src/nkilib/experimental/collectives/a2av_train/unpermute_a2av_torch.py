@@ -11,66 +11,58 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Torch reference for unpermute_a2av kernel."""
+"""Torch reference for capacity-bounded unpermute_a2av."""
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from nki.collectives import ReplicaGroup
 
-from ..collectives_torch import _to_numpy, _to_torch, get_pg, get_rank
+from ..collectives_torch import _to_numpy, _to_torch, get_pg
+from .permute_a2av_torch import _validate_routed_row_permutation
 
 
 def unpermute_a2av_torch_ref(
     output: np.ndarray,
-    send_indices: np.ndarray,
+    packed_source_indices: np.ndarray,
+    send_counts: np.ndarray,
     recv_counts: np.ndarray,
     replica_group: ReplicaGroup,
+    regroup_indices: np.ndarray = None,
+    num_local_experts: int = 1,
 ) -> dict:
-    """Torch ref: repack output, all-to-all-v, scatter-add to original positions."""
-    T = send_indices.shape[0]
-    EP = send_indices.shape[1]
+    """Emulate packed reverse A2AV and restore unique routed rows."""
+    N = packed_source_indices.shape[0]
+    EP = send_counts.shape[1]
     _, H = output.shape
     dtype = output.dtype
-    rank = get_rank()
     pg = get_pg(replica_group)
+    _validate_routed_row_permutation(packed_source_indices, send_counts)
 
-    # Step 1: Pack output rows into send buffer using recv_counts as send sizes.
-    send_chunks = []
-    send_sizes = []
-    for src in range(EP):
-        count = int(recv_counts[0, src])
-        n_elems = count * H
-        send_sizes.append(n_elems)
-        if count > 0:
-            send_chunks.append(_to_torch(output[src * T : src * T + count, :]).reshape(-1))
-        else:
-            send_chunks.append(torch.zeros(0, dtype=_to_torch(output[:1]).reshape(-1).dtype))
+    if not 1 <= num_local_experts <= 128:
+        raise ValueError("num_local_experts must be in [1, 128]")
+    if num_local_experts > 1:
+        if regroup_indices is None or regroup_indices.shape != (output.shape[0],):
+            raise ValueError("regroup_indices must have shape [C] for multiple local experts")
+        if not np.array_equal(np.sort(regroup_indices), np.arange(output.shape[0])):
+            raise ValueError("regroup_indices must be a full-capacity row permutation")
+        source_major = np.empty_like(output)
+        source_major[regroup_indices.astype(np.intp)] = output
+        output = source_major
 
-    send_flat = torch.cat(send_chunks)
+    send_total = int(recv_counts.sum())
+    send_flat = _to_torch(output[:send_total, :]).reshape(-1)
+    input_sizes = [int(recv_counts[0, peer]) * H for peer in range(EP)]
+    output_sizes = [int(send_counts[0, peer]) * H for peer in range(EP)]
+    recv_flat = torch.zeros(sum(output_sizes), dtype=send_flat.dtype)
+    dist.all_to_all_single(
+        recv_flat,
+        send_flat,
+        output_split_sizes=output_sizes,
+        input_split_sizes=input_sizes,
+        group=pg,
+    )
 
-    # Step 2: Exchange sizes to know recv_sizes.
-    send_sizes_t = torch.tensor(send_sizes, dtype=torch.long)
-    recv_sizes_t = torch.zeros(EP, dtype=torch.long)
-    dist.all_to_all_single(recv_sizes_t, send_sizes_t, group=pg)
-    recv_sizes = [int(recv_sizes_t[d]) for d in range(EP)]
-
-    # Step 3: Variable-length all-to-all exchange.
-    recv_total = sum(recv_sizes)
-    recv_flat = torch.zeros(recv_total, dtype=send_flat.dtype)
-    dist.all_to_all_single(recv_flat, send_flat, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=pg)
-
-    # Step 4: Scatter-add received rows to original token positions.
-    result = np.zeros((T, H), dtype=dtype)
-    offset = 0
-    for d in range(EP):
-        n_rows = recv_sizes[d] // H
-        if n_rows > 0:
-            chunk = _to_numpy(recv_flat[offset : offset + recv_sizes[d]].reshape(n_rows, H), dtype)
-            idx = send_indices[:n_rows, d].astype(np.intp)
-            for r in range(n_rows):
-                if 0 <= idx[r] < T:
-                    result[idx[r], :] += chunk[r, :]
-        offset += recv_sizes[d]
-
+    result = np.zeros((N, H), dtype=dtype)
+    result[packed_source_indices.astype(np.intp), :] = _to_numpy(recv_flat.reshape(N, H), dtype)
     return {"result": result}

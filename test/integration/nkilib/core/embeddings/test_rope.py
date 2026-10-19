@@ -52,7 +52,7 @@ def filter_rope_combinations(d_head, B, n_heads, S, contiguous_layout=None, rela
     return FilterResult.VALID
 
 
-def generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf):
+def generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf, lnc_shard=True):
     """Generate RoPE kernel inputs from parameters."""
     dtype = nl.bfloat16
     half_d = d_head // 2
@@ -61,7 +61,7 @@ def generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in
         "x_in": generate_tensor(name="x_in", shape=(d_head, B, n_heads, S), dtype=dtype),
         "cos": generate_tensor(name="cos", shape=(half_d, B, S), dtype=dtype),
         "sin": generate_tensor(name="sin", shape=(half_d, B, S), dtype=dtype),
-        "lnc_shard": True,
+        "lnc_shard": lnc_shard,
         "contiguous_layout": contiguous_layout,
         "relayout_in_sbuf": relayout_in_sbuf,
     }
@@ -89,9 +89,10 @@ class TestRopeKernel:
         contiguous_layout,
         relayout_in_sbuf,
         is_negative_test=False,
+        lnc_shard=True,
     ):
         def input_generator(test_config):
-            return generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)
+            return generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf, lnc_shard)
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -180,6 +181,21 @@ class TestRopeKernel:
             contiguous_layout,
             relayout_in_sbuf,
             is_negative_test=is_negative_test_case,
+        )
+
+    @pytest.mark.fast
+    def test_rope_unsharded(self, test_manager: Orchestrator, platform_target: Platforms):
+        """RoPE without LNC sharding (lnc_shard=False), the kernel default."""
+        self._run_rope_test(
+            test_manager,
+            platform_target,
+            d_head=64,
+            B=1,
+            n_heads=1,
+            S=16,
+            contiguous_layout=True,
+            relayout_in_sbuf=False,
+            lnc_shard=False,
         )
 
     _ROPE_ABBREVS = {"d_head": "dh", "contiguous_layout": "contig", "relayout_in_sbuf": "relayout"}

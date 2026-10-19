@@ -16,7 +16,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import nki.isa as nisa
 import nki.language as nl
@@ -702,6 +702,112 @@ def create_rotational_topk_config(
     )
 
 
+def pe_unfold_supported(n_stages: int, local_top_k_per_stage: int) -> bool:
+    """
+    Check whether the TensorE un-fold (``unfold_with_pe``) can be compiled for this stage geometry.
+
+    Each per-stage ``nc_matmul`` has moving free size ``local_top_k_per_stage`` (must be <= the PE
+    moving free size limit) and writes fp32 columns ``[b*lk, (b+1)*lk)`` of a PSUM tile; a slice may
+    not straddle a PSUM bank. The two PSUM tiles (values, indices) must also fit one PSUM partition.
+    Callers fall back to ``reshape_with_dma`` when this returns False.
+
+    Args:
+        n_stages: Number of rotational stages.
+        local_top_k_per_stage: Top-k elements produced per stage.
+
+    Returns:
+        bool: True iff the PE un-fold is supported.
+    """
+    lk = local_top_k_per_stage
+    f_max = nl.tile_size.gemm_moving_fmax
+    psum_bank_elems = nl.tile_size.psum_fmax
+    psum_partition_elems = psum_bank_elems * nl.tile_size.psum_num_banks
+    if lk > f_max:
+        return False
+    if 2 * n_stages * lk > psum_partition_elems:
+        return False
+    for b in range(n_stages):
+        if (b * lk) // psum_bank_elems != ((b + 1) * lk - 1) // psum_bank_elems:
+            return False
+    return True
+
+
+def build_unfold_matrix(n_stages: int, bxs_size: int, dtype: Any) -> nl.NkiTensor:
+    """
+    Build the 0/1 selection matrix that un-folds the stage layout with TensorE.
+
+    sel[p, b * bxs_size + r] = 1 iff p == r * n_stages + b, so that
+    ``sel[:, b*bxs_size:(b+1)*bxs_size].T @ value`` yields rows r of stage b, i.e. exactly the
+    element order ``reshape_with_dma`` produces: flat[r, b*k + j] = value[r*n_stages + b, j].
+
+    Args:
+        n_stages: Number of rotational stages.
+        bxs_size: Batch-sequence tile size (partitions per stage).
+        dtype (Any): Data type for the matrix.
+
+    Returns:
+        [N, N] SBUF tensor where N = n_stages * bxs_size.
+    """
+    N = n_stages * bxs_size
+    ident = nl.shared_identity_matrix(N, dtype=dtype)
+    matrix = nl.ndarray((N, N), dtype=dtype, buffer=nl.sbuf)
+    partition_stride = ident.get_pattern()[0][0]
+    nisa.tensor_copy(
+        dst=matrix.reshape((N, n_stages, bxs_size)),
+        src=ident.ap(
+            pattern=[[partition_stride, N], [1, n_stages], [n_stages, bxs_size]],
+            offset=0,
+        ),
+        engine=nisa.scalar_engine,
+    )
+    return matrix
+
+
+def unfold_with_pe(
+    value: nl.NkiTensor,
+    global_index: nl.NkiTensor,
+    sel: nl.NkiTensor,
+    sel_f32: nl.NkiTensor,
+    n_stages: int,
+    flat_value: nl.NkiTensor,
+    flat_index: nl.NkiTensor,
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
+    """
+    Un-fold stage-layout (value, global_index) into flat tensors with 0/1 selection matmuls on TensorE.
+
+    Reshapes [n_stages*rows, k] to [rows, n_stages*k] without the SBUF->HBM->SBUF round trip of
+    ``reshape_with_dma``; the element order is identical.
+
+    Args:
+        value (nl.NkiTensor): [n_stages*rows, k], Stage-layout values in SBUF
+        global_index (nl.NkiTensor): [n_stages*rows, k], Stage-layout fp32 global indices in SBUF
+        sel (nl.NkiTensor): [N, N], Selection matrix in value dtype from ``build_unfold_matrix``
+        sel_f32 (nl.NkiTensor): [N, N], Selection matrix in fp32 from ``build_unfold_matrix``
+        n_stages (int): Number of rotational stages
+        flat_value (nl.NkiTensor): [rows, n_stages*k], SBUF output buffer for the un-folded values
+        flat_index (nl.NkiTensor): [rows, n_stages*k], SBUF output buffer for the un-folded indices
+
+    Returns:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: (flat_value [rows, n_stages*k], flat_index [rows, n_stages*k]) in SBUF
+    """
+    m, n = value.shape
+    rows = m // n_stages
+    bxs_size = sel.shape[1] // n_stages
+    val_ps = nl.ndarray((rows, n * n_stages), dtype=nl.float32, buffer=nl.psum)
+    idx_ps = nl.ndarray((rows, n * n_stages), dtype=nl.float32, buffer=nl.psum)
+    # Values first and copied out of PSUM before the index matmuls are issued: value depends only on
+    # the last max8 while global_index depends on the slower last gather.
+    for b in nl.static_range(n_stages):
+        nisa.nc_matmul(val_ps[:, nl.ds(b * n, n)], sel[0:m, nl.ds(b * bxs_size, rows)], value[:, 0:n])
+    nisa.tensor_copy(dst=flat_value, src=val_ps, engine=nisa.scalar_engine)
+    for b in nl.static_range(n_stages):
+        nisa.nc_matmul(idx_ps[:, nl.ds(b * n, n)], sel_f32[0:m, nl.ds(b * bxs_size, rows)], global_index[:, 0:n])
+    # The index copy stays off the Vector queue so the sort's max8 loop, which only needs flat_value,
+    # is not held behind the slower index chain.
+    nisa.tensor_copy(dst=flat_index, src=idx_ps, engine=nisa.scalar_engine)
+    return flat_value, flat_index
+
+
 def build_stage_offsets(n_stages: int, bxs_size: int, stage_free_size: int):
     """Generate per-partition interleaved stage offsets on-device.
 
@@ -741,17 +847,38 @@ def build_stage_offsets(n_stages: int, bxs_size: int, stage_free_size: int):
     return offsets[0:total_partition_dim, 0:1]
 
 
-def rotate(dst: nl.ndarray, tensor: nl.ndarray, rotation_matrix: nl.ndarray) -> nl.ndarray:
+def chunked_nc_n_gather(dst: nl.NkiTensor, data: nl.NkiTensor, indices: nl.NkiTensor) -> None:
+    """
+    Gather ``data`` by ``indices`` into ``dst`` in chunks no wider than the nc_n_gather ISA group size.
+
+    A single gather wider than the group size splits into multiple internal ISA groups, and that
+    multi-group form corrupts the tail elements of the last BxS tile on hardware while the simulator,
+    which executes the gather atomically, stays correct (NKILIB-1592).
+
+    Args:
+        dst (nl.NkiTensor): [m, width], Gather destination in SBUF
+        data (nl.NkiTensor): [m, n], Table to gather from
+        indices (nl.NkiTensor): [m, width], Per-partition indices into ``data``
+    """
+    group_size = HW_PARAMS.gather_group_size
+    width = indices.shape[1]
+    for gather_tile in nl.static_range(div_ceil(width, group_size)):
+        chunk = min(group_size, width - gather_tile * group_size)
+        chunk_slice = nl.ds(gather_tile * group_size, chunk)
+        nisa.nc_n_gather(dst=dst[:, chunk_slice], data=data, indices=indices[:, chunk_slice])
+
+
+def rotate(dst: nl.NkiTensor, tensor: nl.NkiTensor, rotation_matrix: nl.NkiTensor) -> nl.NkiTensor:
     """
     Apply rotation matrix to tensor.
 
     Args:
-        dst (nl.ndarray): Destination tensor for result
-        tensor (nl.ndarray): Input tensor to rotate
-        rotation_matrix (nl.ndarray): Rotation matrix
+        dst (nl.NkiTensor): Destination tensor for result
+        tensor (nl.NkiTensor): Input tensor to rotate
+        rotation_matrix (nl.NkiTensor): Rotation matrix
 
     Returns:
-        nl.ndarray: Rotated tensor (dst)
+        nl.NkiTensor: Rotated tensor (dst)
     """
     f_max = nl.tile_size.gemm_moving_fmax
     free_size = tensor.shape[1]
@@ -761,25 +888,25 @@ def rotate(dst: nl.ndarray, tensor: nl.ndarray, rotation_matrix: nl.ndarray) -> 
         nisa.nc_matmul(dst[:, tile_slice], rotation_matrix, tensor[:, tile_slice])
 
 
-def insert(tensor: nl.ndarray, values: nl.ndarray, offset: int = 0) -> None:
+def insert(tensor: nl.NkiTensor, values: nl.NkiTensor, offset: int = 0) -> None:
     """
     Insert values into tensor at specified offset (in-place).
 
     Args:
-        tensor (nl.ndarray): [m, n], 2D SBUF array
-        values (nl.ndarray): [m, f], 2D SBUF array where f <= n
+        tensor (nl.NkiTensor): [m, n], 2D SBUF array
+        values (nl.NkiTensor): [m, f], 2D SBUF array where f <= n
         offset (int): Offset position for insertion (default: 0)
     """
     num_values_to_insert = values.shape[1]
     nisa.tensor_copy(dst=tensor[:, nl.ds(offset, num_values_to_insert)], src=values, engine=nisa.scalar_engine)
 
 
-def validate_topk_input(inp: nl.ndarray, n_fold: int = 1, local_top_k_per_stage: int = 0) -> None:
+def validate_topk_input(inp: nl.NkiTensor, n_fold: int = 1, local_top_k_per_stage: int = 0) -> None:
     """
     Validate top-k input tensor shape and constraints.
 
     Args:
-        inp (nl.ndarray): Input tensor to validate
+        inp (nl.NkiTensor): Input tensor to validate
         n_fold (int): Number of folds/stages for processing (default: 1)
         local_top_k_per_stage (int): Local top-k per stage (default: 0)
     """
@@ -804,7 +931,7 @@ def validate_config(topk_config: TopkConfig) -> None:
     )
 
 
-def naive_scanning_topk(inp: nl.ndarray, topk_config: TopkConfig) -> Tuple[nl.ndarray, nl.ndarray]:
+def naive_scanning_topk(inp: nl.NkiTensor, topk_config: TopkConfig) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Top-K kernel using scanning approach with DVE instructions.
 
@@ -813,11 +940,11 @@ def naive_scanning_topk(inp: nl.ndarray, topk_config: TopkConfig) -> Tuple[nl.nd
     per_lnc_BxS exceeds PMAX (128).
 
     Args:
-        inp (nl.ndarray): [BxS, V], Input tensor in HBM
+        inp (nl.NkiTensor): [BxS, V], Input tensor in HBM
         topk_config (TopkConfig): Configuration with algorithm parameters
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - topk_values: [BxS, k], Top-k values
             - topk_indices: [BxS, k], Indices of top-k elements
     """
@@ -858,7 +985,12 @@ def naive_scanning_topk(inp: nl.ndarray, topk_config: TopkConfig) -> Tuple[nl.nd
     return topk_values, topk_indices
 
 
-def topk_core(data: nl.ndarray, k: int) -> Tuple[nl.ndarray, nl.ndarray]:
+def topk_core(
+    data: nl.NkiTensor,
+    k: int,
+    out_vals: Optional[nl.NkiTensor] = None,
+    out_inds: Optional[nl.NkiTensor] = None,
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Core top-k implementation using DVE instructions.
 
@@ -866,19 +998,25 @@ def topk_core(data: nl.ndarray, k: int) -> Tuple[nl.ndarray, nl.ndarray]:
     Expects all inputs in SBUF. Modifies data in-place.
 
     Args:
-        data (nl.ndarray): [BxS, V], Input data in SBUF (modified in-place)
+        data (nl.NkiTensor): [BxS, V], Input data in SBUF (modified in-place)
         k (int): Number of top elements to find
+        out_vals (Optional[nl.NkiTensor]): [BxS, k], Caller-provided SBUF buffer for the values
+            (allocated internally when None)
+        out_inds (Optional[nl.NkiTensor]): [BxS, k], Caller-provided SBUF buffer for the indices
+            (allocated internally when None)
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - out_vals: [BxS, k], Top-k values in SBUF
             - out_inds: [BxS, k], Indices of top-k elements in SBUF
     """
     BxS, vocab_size = data.shape
     n_fold = div_ceil(k, HW_PARAMS.topk_per_stage)
 
-    out_vals = nl.ndarray((BxS, k), dtype=data.dtype, buffer=nl.sbuf)
-    out_inds = nl.ndarray((BxS, k), dtype=HW_PARAMS.index_dtype, buffer=nl.sbuf)
+    if out_vals is None:
+        out_vals = nl.ndarray((BxS, k), dtype=data.dtype, buffer=nl.sbuf)
+    if out_inds is None:
+        out_inds = nl.ndarray((BxS, k), dtype=HW_PARAMS.index_dtype, buffer=nl.sbuf)
 
     for fold_idx in nl.static_range(n_fold):
         if (k % HW_PARAMS.topk_per_stage != 0) and (fold_idx == n_fold - 1):
@@ -912,28 +1050,35 @@ def topk_core(data: nl.ndarray, k: int) -> Tuple[nl.ndarray, nl.ndarray]:
     return out_vals, out_inds
 
 
-def sort(data_sbuf, indices, true_k):
+def sort(
+    data_sbuf: nl.NkiTensor,
+    indices: nl.NkiTensor,
+    true_k: int,
+    topk_val_buf: nl.NkiTensor,
+    topk_idx_buf: nl.NkiTensor,
+    global_topk_idx_buf: nl.NkiTensor,
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Sort data by extracting top true_k elements using repeated max8 passes and masking them..
 
     Only runs ceil(true_k/8) DVE passes rather than sorting the entire buffer,
 
     Args:
-        data_sbuf (nl.ndarray): [m, n], Unsorted data in SBUF
-        indices (Optional[nl.ndarray]): [m, n], Global indices corresponding to elements (default: None)
+        data_sbuf (nl.NkiTensor): [m, n], Unsorted data in SBUF
+        indices (nl.NkiTensor): [m, n], Global indices corresponding to elements
+        true_k (int): Number of sorted elements to extract
+        topk_val_buf (nl.NkiTensor): [m, padded_k], SBUF buffer for the sorted values, padded_k =
+            get_ceil_aligned_size(true_k, HW_PARAMS.dve_max_alus)
+        topk_idx_buf (nl.NkiTensor): [m, padded_k], SBUF buffer for the local indices
+        global_topk_idx_buf (nl.NkiTensor): [m, padded_k], SBUF buffer for the global indices
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
-            - sorted_values: [m, n], Sorted values in SBUF
-            - sorted_indices: [m, n], Global or local indices corresponding to sorted elements
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
+            - sorted_values: [m, true_k], Sorted values in SBUF
+            - sorted_indices: [m, true_k], Global indices corresponding to the sorted elements
     """
     m, pk = data_sbuf.shape
     num_pass = div_ceil(true_k, HW_PARAMS.dve_max_alus)
-    padded_k = num_pass * HW_PARAMS.dve_max_alus
-
-    topk_val_buf = nl.ndarray((m, padded_k), dtype=data_sbuf.dtype, buffer=nl.sbuf)
-    topk_idx_buf = nl.ndarray((m, padded_k), dtype=nl.uint32, buffer=nl.sbuf)
-    global_topk_idx_buf = nl.ndarray((m, padded_k), dtype=nl.uint32, buffer=nl.sbuf)
 
     ix_data, iy_data = nl.ds(0, m), nl.ds(0, pk)
 
@@ -955,11 +1100,9 @@ def sort(data_sbuf, indices, true_k):
                 imm=float("-inf"),
                 dst_idx=topk_idx_buf[:, cur_slice],
             )
-        nisa.nc_n_gather(
-            dst=global_topk_idx_buf[nl.ds(0, m), cur_slice],
-            data=indices[ix_data, iy_data],
-            indices=topk_idx_buf[nl.ds(0, m), cur_slice],
-        )
+
+    # One gather for all passes instead of one small gather per pass.
+    chunked_nc_n_gather(dst=global_topk_idx_buf, data=indices[ix_data, iy_data], indices=topk_idx_buf)
 
     return topk_val_buf[:, :true_k], global_topk_idx_buf[:, :true_k]
 
@@ -971,12 +1114,12 @@ def reshape_with_dma(src, fold_factor, dtype):
     Reshapes from stages layout [s*b, n/s] to original layout [b, n] using HBM as intermediate.
 
     Args:
-        src (nl.ndarray): Source tensor in SBUF
+        src (nl.NkiTensor): Source tensor in SBUF
         fold_factor (int): Folding factor
         dtype: Target data type
 
     Returns:
-        nl.ndarray: Reshaped tensor in SBUF
+        nl.NkiTensor: Reshaped tensor in SBUF
     """
     m, n = src.shape
     data_hbm = nl.ndarray(src.shape, dtype=src.dtype, buffer=nl.private_hbm)

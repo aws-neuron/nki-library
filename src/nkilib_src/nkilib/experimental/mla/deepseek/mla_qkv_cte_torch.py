@@ -31,10 +31,126 @@ import torch
 from ....core.rmsnorm.rmsnorm_mx_prefill_torch import decode_packed_output
 from ....core.subkernels.rmsnorm_torch import rms_norm_torch_ref
 from ....core.utils.mx_torch_common import mx_matmul, quantize_to_mx, unpack_float8_e4m3fn_x4
+from .mla_common_cte import MlaPrecision
 
 _Q_WIDTH = 4
 _PMAX = 128
 _DS_SCALE_BLOCK = 128
+
+
+def _as_bf16_fp32(t) -> torch.Tensor:
+    """Round a tensor/array through bf16 and return it as fp32.
+
+    The bf16 kernel path feeds bf16 operands to a tensor engine that accumulates in fp32, so
+    the reference rounds every matmul input to bf16 and then does the product in fp32.
+    """
+    if not isinstance(t, torch.Tensor):
+        t = torch.from_numpy(np.asarray(t).astype(np.float32))
+    return t.to(torch.bfloat16).to(torch.float32)
+
+
+def _rope_interleaved(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """INTERLEAVED (adjacent-pair / complex) RoPE over the last dim of ``x``.
+
+    Pair j = columns (2j, 2j+1) rotated by the single angle theta_j:
+        out[2j]   = x[2j]*cos_j - x[2j+1]*sin_j
+        out[2j+1] = x[2j]*sin_j + x[2j+1]*cos_j
+
+    ``cos``/``sin`` carry the rope_dim/2 angles and must already be broadcastable to ``x``'s
+    leading dims. Matches HuggingFace ``apply_rotary_pos_emb_interleave`` (DeepSeek-V3.2 main
+    attention and ALL of GLM-MoE-DSA) in arithmetic, and the kernel's
+    ``_apply_rope_*_interleaved`` in output ORDER: the rotated pairs are written back
+    interleaved, whereas HF concatenates the even lane then the odd lane. That is one shared
+    column permutation of q_pe and k_pe, which leaves q_pe . k_pe unchanged.
+    """
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+    return torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+
+
+def _mla_qkv_cte_torch_ref_bf16(
+    x_hbm,
+    wqkv_a_hbm,
+    wq_b_hbm,
+    q_norm_gamma_hbm: torch.Tensor,
+    kv_norm_gamma_hbm: torch.Tensor,
+    wuk_hbm,
+    cos_cache_hbm: torch.Tensor,
+    sin_cache_hbm: torch.Tensor,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    qk_lora_rank: int,
+    norm_eps: float = 1e-6,
+    kv_cache_hbm=None,
+    slot_mapping_hbm=None,
+    kv_cache_fp8_dtype=None,
+) -> Dict[str, torch.Tensor]:
+    """PyTorch reference for the BF16 (``MlaPrecision.BF16``) MLA QKV CTE path.
+
+    Straight-line replay of ``_qkv_stage_bf16``: fused stage-1 projection, q-norm, Q stage-2,
+    interleaved RoPE on q_pe, per-head bf16 absorption, and the latent KV path. No MX
+    quantize, no output-column swizzle, no un-swizzle -- every tensor is in natural order.
+
+    Returns a dict with ``q_lift``, ``q_pe``, ``c_kv``, ``k_pe`` and the q-normed ``qr``
+    (the kernel's plain-bf16 indexer export), all bf16.
+    """
+    x = _as_bf16_fp32(x_hbm)
+    B, S, _ = x.shape
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+
+    wqkv_a = _as_bf16_fp32(wqkv_a_hbm)
+    wq_b = _as_bf16_fp32(wq_b_hbm)
+    wuk = _as_bf16_fp32(wuk_hbm).reshape(qk_nope_head_dim, n_heads, kv_lora_rank)
+    q_norm_gamma = q_norm_gamma_hbm.to(torch.float32)
+    kv_norm_gamma = kv_norm_gamma_hbm.to(torch.float32)
+
+    # Step 1: fused stage-1 projection, natural column order -> [qr | kv | k_pe].
+    fused = x.reshape(B * S, -1) @ wqkv_a
+    fused = fused.reshape(B, S, -1)
+    qr = fused[..., :qk_lora_rank]
+    kv = fused[..., qk_lora_rank : qk_lora_rank + kv_lora_rank]
+    k_pe = fused[..., qk_lora_rank + kv_lora_rank :]
+
+    # Step 2: Q path - RMSNorm(qr) * gamma, then Q stage 2.
+    qr = rms_norm_torch_ref(qr, q_norm_gamma, eps=norm_eps)
+    q = (_as_bf16_fp32(qr).reshape(B * S, qk_lora_rank) @ wq_b).reshape(B, S, n_heads, qk_head_dim)
+    q_nope, q_pe = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
+
+    # Step 3: q_pe interleaved RoPE (cos/sin carry the R/2 angles in their first half).
+    half = qk_rope_head_dim // 2
+    cos = cos_cache_hbm.to(torch.float32)[:, :, :half].unsqueeze(2)  # [B, S, 1, half]
+    sin = sin_cache_hbm.to(torch.float32)[:, :, :half].unsqueeze(2)
+    q_pe_rope = _rope_interleaved(q_pe, cos, sin)
+
+    # Step 4: absorption q_nope[h] @ W_uk[h] per head (bf16 operands, fp32 accumulate).
+    q_nope_bf16 = _as_bf16_fp32(q_nope)
+    q_lift = torch.zeros((B, S, n_heads, kv_lora_rank), dtype=torch.float32)
+    for h in range(n_heads):
+        q_lift[:, :, h, :] = q_nope_bf16[:, :, h, :] @ wuk[:, h, :]
+
+    # Step 5: KV latent path - c_kv = RMSNorm(kv) * gamma, and k_pe interleaved RoPE.
+    c_kv = rms_norm_torch_ref(kv, kv_norm_gamma, eps=norm_eps)
+    k_pe_rope = _rope_interleaved(k_pe.unsqueeze(2), cos, sin).squeeze(2)
+
+    out = {
+        "q_lift": q_lift.to(torch.bfloat16),
+        "q_pe": q_pe_rope.to(torch.bfloat16),
+        "c_kv": c_kv.to(torch.bfloat16),
+        "k_pe": k_pe_rope.to(torch.bfloat16),
+        "qr": qr.to(torch.bfloat16),
+    }
+    if slot_mapping_hbm is not None:
+        # Placeholders: the cache golden is built by the test's comparator, which stashes the
+        # KERNEL's own c_kv / k_pe (validated against this ref separately) and quantizes those.
+        # Comparing the cache to the kernel's own latents keeps the check tight -- reference drift
+        # cannot mask a wrong slot -- and needs no knowledge of the cache dtype here, which the
+        # harness erases by upcasting input arrays to fp32.
+        out["kv_cache"] = np.zeros((1,), dtype=np.uint8)
+    return out
 
 
 def _broadcast_compact_scales(compact_scale, in_dim, out_dim, compact_scales=True):
@@ -86,6 +202,15 @@ def mla_qkv_cte_torch_ref(
     qk_lora_rank: int,
     norm_eps: float = 1e-6,
     compact_scales: bool = True,
+    precision: MlaPrecision = MlaPrecision.MX,
+    # Paged KV cache store. Present for kernel/ref signature parity only: the store scatters
+    # into a MUTATED INPUT, which the harness compares through neither the output descriptor nor
+    # input_output_aliases, so it is validated separately. The VALUES it writes are the same c_kv
+    # / k_pe this ref already returns, modulo the per-token fp8 quantization the store does
+    # itself (no scale input: it is computed on the fly from each token's own latent).
+    kv_cache_hbm=None,
+    slot_mapping_hbm=None,
+    kv_cache_fp8_dtype=None,
 ) -> Dict[str, torch.Tensor]:
     """Returns dict with keys ``q_lift``, ``q_pe``, ``c_kv``, ``k_pe`` (bf16).
 
@@ -101,7 +226,32 @@ def mla_qkv_cte_torch_ref(
         — the order the kernel lands in x_qtz and that wqkv_a contracts against
         (pack_scales=True, folded scales). The framework upcasts the fp8 packed input to
         float32; it is re-viewed as fp8 bytes first.
+
+        With ``precision=MlaPrecision.BF16`` this delegates to
+        :func:`_mla_qkv_cte_torch_ref_bf16`; ``x_hbm_mx`` is then the plain bf16 activation,
+        the weights are bf16 ``[K, N]`` and both scale args are ignored.
     """
+    if precision.is_bf16():
+        return _mla_qkv_cte_torch_ref_bf16(
+            x_hbm=x_hbm_mx,
+            wqkv_a_hbm=wqkv_a_hbm,
+            wq_b_hbm=wq_b_hbm,
+            q_norm_gamma_hbm=q_norm_gamma_hbm,
+            kv_norm_gamma_hbm=kv_norm_gamma_hbm,
+            wuk_hbm=wuk_hbm,
+            cos_cache_hbm=cos_cache_hbm,
+            sin_cache_hbm=sin_cache_hbm,
+            n_heads=n_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_lora_rank=qk_lora_rank,
+            norm_eps=norm_eps,
+            kv_cache_hbm=kv_cache_hbm,
+            slot_mapping_hbm=slot_mapping_hbm,
+            kv_cache_fp8_dtype=kv_cache_fp8_dtype,
+        )
+
     x_mx_np = x_hbm_mx.cpu().numpy() if isinstance(x_hbm_mx, torch.Tensor) else np.asarray(x_hbm_mx)
     Bm, Sm, _row = x_mx_np.shape
     H = wqkv_a_hbm.shape[0] * _Q_WIDTH
@@ -188,11 +338,7 @@ def mla_qkv_cte_torch_ref(
     half = qk_rope_head_dim // 2
     cos = cos_cache[:, :, :half].unsqueeze(2)  # [B, S, 1, half]
     sin = sin_cache[:, :, :half].unsqueeze(2)
-    q_pe_even = q_pe[:, :, :, 0::2]
-    q_pe_odd = q_pe[:, :, :, 1::2]
-    q_out_even = q_pe_even * cos - q_pe_odd * sin
-    q_out_odd = q_pe_even * sin + q_pe_odd * cos
-    q_pe_rope = torch.stack([q_out_even, q_out_odd], dim=-1).flatten(-2)
+    q_pe_rope = _rope_interleaved(q_pe, cos, sin)
 
     """
     Step 4: absorption q_nope @ W_uk per head (bf16).
@@ -216,12 +362,7 @@ def mla_qkv_cte_torch_ref(
     c_kv = rms_norm_torch_ref(kv, kv_norm_gamma, eps=norm_eps)
 
     # k_pe RoPE (shared single head). Same INTERLEAVED layout as q_pe above.
-    k_pe = k_pe.unsqueeze(2)
-    k_pe_even = k_pe[:, :, :, 0::2]
-    k_pe_odd = k_pe[:, :, :, 1::2]
-    k_out_even = k_pe_even * cos - k_pe_odd * sin
-    k_out_odd = k_pe_even * sin + k_pe_odd * cos
-    k_pe_rope = torch.stack([k_out_even, k_out_odd], dim=-1).flatten(-2).squeeze(2)
+    k_pe_rope = _rope_interleaved(k_pe.unsqueeze(2), cos, sin).squeeze(2)
 
     return {
         "q_lift": q_lift.to(torch.bfloat16),

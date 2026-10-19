@@ -38,9 +38,7 @@ from typing import Tuple
 
 import nki.language as nl
 import numpy as np
-from neuronxcc.starfish.support.dtype import (  # ty: ignore[unresolved-import]
-    static_cast,  # noqa: F401  (re-exported for tests)
-)
+from neuron_dtypes import static_cast  # noqa: F401  (re-exported for tests)
 
 from test.utils.mx_utils import quantize_mx_golden
 

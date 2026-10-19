@@ -28,13 +28,13 @@ F_TILE_SIZE = 512  # Free dimension tile size (smaller than linear_scan due to m
 
 @nki.jit
 def selective_scan(
-    x: nl.ndarray,
-    dt: nl.ndarray,
-    A: nl.ndarray,
-    B: nl.ndarray,
-    C: nl.ndarray,
-    D: nl.ndarray = None,
-    initial_state: nl.ndarray = None,
+    x: nl.NkiTensor,
+    dt: nl.NkiTensor,
+    A: nl.NkiTensor,
+    B: nl.NkiTensor,
+    C: nl.NkiTensor,
+    D: nl.NkiTensor = None,
+    initial_state: nl.NkiTensor = None,
 ) -> tuple:
     """
     Selective scan (SSM) as in Mamba models.
@@ -55,19 +55,19 @@ def selective_scan(
         state_size: SSM state dimension
 
     Args:
-        x (nl.ndarray): Input tensor of shape [B_dim, channels, L].
-        dt (nl.ndarray): Time step tensor of shape [B_dim, channels, L]. Should be positive.
-        A (nl.ndarray): State transition matrix of shape [channels, state_size]. Typically negative.
-        B (nl.ndarray): Input projection matrix of shape [B_dim, state_size, L].
-        C (nl.ndarray): Output projection matrix of shape [B_dim, state_size, L].
-        D (nl.ndarray, optional): Skip connection weights of shape [channels]. Default: None.
-        initial_state (nl.ndarray, optional): Initial hidden state of shape
+        x (nl.NkiTensor): Input tensor of shape [B_dim, channels, L].
+        dt (nl.NkiTensor): Time step tensor of shape [B_dim, channels, L]. Should be positive.
+        A (nl.NkiTensor): State transition matrix of shape [channels, state_size]. Typically negative.
+        B (nl.NkiTensor): Input projection matrix of shape [B_dim, state_size, L].
+        C (nl.NkiTensor): Output projection matrix of shape [B_dim, state_size, L].
+        D (nl.NkiTensor, optional): Skip connection weights of shape [channels]. Default: None.
+        initial_state (nl.NkiTensor, optional): Initial hidden state of shape
             [B_dim, channels, state_size]. Default: None (zeros).
 
     Returns:
         tuple: (y, final_state)
-            - y (nl.ndarray): Output tensor of shape [B_dim, channels, L] with same dtype as x.
-            - final_state (nl.ndarray): Final hidden state of shape [B_dim, channels, state_size]
+            - y (nl.NkiTensor): Output tensor of shape [B_dim, channels, L] with same dtype as x.
+            - final_state (nl.NkiTensor): Final hidden state of shape [B_dim, channels, state_size]
               in float32.
 
     Notes:

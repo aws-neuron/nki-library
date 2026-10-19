@@ -39,6 +39,7 @@ from test.utils.unit_test_framework import (
     filter_ref_input,
     torch_ref_wrapper,
     validate_input_keys,
+    validate_input_memory_layout,
     validate_torch_ref_signature,
 )
 
@@ -1118,6 +1119,78 @@ class TestValidateInputKeys:
 
         with pytest.raises(ValueError, match="unknown.must_alias_input.*don't match"):
             validate_input_keys({"a": 1, "unknown.must_alias_input": 2}, kernel)
+
+
+class TestValidateInputMemoryLayout:
+    """Tests for validate_input_memory_layout shared helper."""
+
+    def test_c_ordered_and_non_array_inputs_pass(self):
+        validate_input_memory_layout({"a": np.zeros((4, 8)), "flag": True, "n": 3, "none": None})
+
+    def test_strided_view_passes(self):
+        # Neither C- nor F-contiguous; np.save writes these in C order.
+        strided = np.zeros((2, 3, 4)).transpose(0, 2, 1)
+        assert not strided.flags.c_contiguous and not strided.flags.f_contiguous
+        validate_input_memory_layout({"a": strided})
+
+    def test_single_element_and_1d_arrays_pass(self):
+        # Both flags are set for these, so they are not Fortran-only.
+        validate_input_memory_layout({"a": np.zeros((1, 1)), "b": np.zeros(5)})
+
+    @pytest.mark.parametrize(
+        "make_array",
+        [
+            pytest.param(lambda: np.zeros((8, 4)).T, id="2d_transpose"),
+            pytest.param(
+                lambda: np.broadcast_to(np.ones((1, 16)), (128, 16)).astype(np.float32), id="broadcast_astype"
+            ),
+            pytest.param(lambda: np.zeros((1, 1, 8, 128)).transpose(0, 1, 3, 2), id="permute_unit_leading_dims"),
+            pytest.param(lambda: torch.zeros(1, 1, 8, 128).permute(0, 1, 3, 2).numpy(), id="torch_permute_numpy"),
+        ],
+    )
+    def test_fortran_ordered_input_raises(self, make_array):
+        array = make_array()
+        with pytest.raises(ValueError, match=r"Fortran-ordered.*'bad \(shape=.*np\.ascontiguousarray"):
+            validate_input_memory_layout({"ok": np.zeros(3), "bad": array})
+
+    def test_fix_suggested_in_error_resolves_it(self):
+        validate_input_memory_layout({"a": np.ascontiguousarray(np.zeros((8, 4)).T)})
+
+    def test_run_test_rejects_fortran_ordered_input(self):
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            kernel_input_generator=lambda x: {"a": np.zeros((8, 4)).T},
+            output_tensor_descriptor=lambda x: {"out": np.zeros((4, 8))},
+        )
+
+        with pytest.raises(ValueError, match="Fortran-ordered"):
+            framework.run_test(test_config=None, compiler_args=MagicMock())
+        mock_manager.execute.assert_not_called()
+
+    def test_trace_only_run_test_rejects_fortran_ordered_input(self):
+        def kernel(a):
+            pass
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            kernel_input_generator=lambda x: {"a": np.zeros((8, 4)).T},
+            trace_only=True,
+        )
+
+        with pytest.raises(ValueError, match="Fortran-ordered"):
+            framework.run_test(test_config=None, compiler_args=MagicMock())
+        mock_manager.execute.assert_not_called()
 
 
 class TestFilterKernelInput:

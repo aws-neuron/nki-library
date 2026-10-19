@@ -24,15 +24,15 @@ P_MAX = nl.tile_size.pmax
 
 
 def ssd_head_outer(
-    x: nl.ndarray,
-    dt: nl.ndarray,
-    A: nl.ndarray,
-    B: nl.ndarray,
-    C: nl.ndarray,
+    x: nl.NkiTensor,
+    dt: nl.NkiTensor,
+    A: nl.NkiTensor,
+    B: nl.NkiTensor,
+    C: nl.NkiTensor,
     chunk_size: int = 128,
-    D: nl.ndarray = None,
-    initial_state: nl.ndarray = None,
-    causal_mask: nl.ndarray = None,
+    D: nl.NkiTensor = None,
+    initial_state: nl.NkiTensor = None,
+    causal_mask: nl.NkiTensor = None,
 ) -> tuple:
     """Head-outer SSD scan for Mamba-2 prefill.
 
@@ -50,20 +50,20 @@ def ssd_head_outer(
         Q: Chunk size (= chunk_size, <= 128).
 
     Args:
-        x (nl.ndarray): [batch, nheads, seqlen, headdim], Input activations.
-        dt (nl.ndarray): [batch, nheads, seqlen], Softplus'd timesteps.
-        A (nl.ndarray): [nheads], State transition scalars.
-        B (nl.ndarray): [batch, seqlen, dstate], Input projection.
-        C (nl.ndarray): [batch, seqlen, dstate], Output projection.
+        x (nl.NkiTensor): [batch, nheads, seqlen, headdim], Input activations.
+        dt (nl.NkiTensor): [batch, nheads, seqlen], Softplus'd timesteps.
+        A (nl.NkiTensor): [nheads], State transition scalars.
+        B (nl.NkiTensor): [batch, seqlen, dstate], Input projection.
+        C (nl.NkiTensor): [batch, seqlen, dstate], Output projection.
         chunk_size (int): Chunk size for parallel scan. Must be <= 128.
-        D (nl.ndarray, optional): [nheads], Skip connection weights.
-        initial_state (nl.ndarray, optional): [batch, nheads, dstate, headdim].
-        causal_mask (nl.ndarray): [Q, Q], Lower-triangular mask. Required.
+        D (nl.NkiTensor, optional): [nheads], Skip connection weights.
+        initial_state (nl.NkiTensor, optional): [batch, nheads, dstate, headdim].
+        causal_mask (nl.NkiTensor): [Q, Q], Lower-triangular mask. Required.
 
     Returns:
         tuple: (y, final_state)
-            - y (nl.ndarray): [batch, nheads, seqlen, headdim], Output, same dtype as x.
-            - final_state (nl.ndarray): [batch, nheads, dstate, headdim], float32.
+            - y (nl.NkiTensor): [batch, nheads, seqlen, headdim], Output, same dtype as x.
+            - final_state (nl.NkiTensor): [batch, nheads, dstate, headdim], float32.
 
     Notes:
         - headdim <= 512 (no PSUM tiling in this path)
@@ -228,18 +228,18 @@ def ssd_head_outer(
 
 
 def _compute_chunk_projections_ho(
-    B_sb: nl.ndarray,
-    C_sb: nl.ndarray,
-    triu_sb: nl.ndarray,
+    B_sb: nl.NkiTensor,
+    C_sb: nl.NkiTensor,
+    triu_sb: nl.NkiTensor,
     Q: int,
     dstate: int,
 ) -> tuple:
     """Compute B, C transposes and masked CB^T for one chunk.
 
     Args:
-        B_sb (nl.ndarray): [Q, dstate], B chunk in SBUF.
-        C_sb (nl.ndarray): [Q, dstate], C chunk in SBUF.
-        triu_sb (nl.ndarray): [Q, Q], Upper-triangular mask in SBUF.
+        B_sb (nl.NkiTensor): [Q, dstate], B chunk in SBUF.
+        C_sb (nl.NkiTensor): [Q, dstate], C chunk in SBUF.
+        triu_sb (nl.NkiTensor): [Q, Q], Upper-triangular mask in SBUF.
         Q (int): Chunk size.
         dstate (int): State dimension.
 
@@ -280,41 +280,41 @@ def _compute_chunk_projections_ho(
 
 
 def _compute_ssd_chunk_ho(
-    x_sb: nl.ndarray,
-    dtx: nl.ndarray,
-    cs_row: nl.ndarray,
-    exp_cs_col: nl.ndarray,
-    exp_neg_cs_col: nl.ndarray,
-    state_sb: nl.ndarray,
-    B_f32: nl.ndarray,
-    C_T: nl.ndarray,
-    CB_masked: nl.ndarray,
-    D_Q: nl.ndarray,
+    x_sb: nl.NkiTensor,
+    dtx: nl.NkiTensor,
+    cs_row: nl.NkiTensor,
+    exp_cs_col: nl.NkiTensor,
+    exp_neg_cs_col: nl.NkiTensor,
+    state_sb: nl.NkiTensor,
+    B_f32: nl.NkiTensor,
+    C_T: nl.NkiTensor,
+    CB_masked: nl.NkiTensor,
+    D_Q: nl.NkiTensor,
     Q: int,
     headdim: int,
     dstate: int,
     has_D: bool,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Compute one chunk's SSD output and update state in-place.
 
     Args:
-        x_sb (nl.ndarray): [Q, headdim], Input activations.
-        dtx (nl.ndarray): [Q, headdim], dt * x.
-        cs_row (nl.ndarray): [1, Q], Cumulative sum row.
-        exp_cs_col (nl.ndarray): [Q, 1], exp(cs) column.
-        exp_neg_cs_col (nl.ndarray): [Q, 1], exp(-cs) column.
-        state_sb (nl.ndarray): [dstate, headdim], State (modified in-place).
-        B_f32 (nl.ndarray): [Q, dstate], B in float32.
-        C_T (nl.ndarray): [dstate, Q], Transposed C.
-        CB_masked (nl.ndarray): [Q, Q], Causal-masked CB^T.
-        D_Q (nl.ndarray): [Q, 1], Broadcast D or None.
+        x_sb (nl.NkiTensor): [Q, headdim], Input activations.
+        dtx (nl.NkiTensor): [Q, headdim], dt * x.
+        cs_row (nl.NkiTensor): [1, Q], Cumulative sum row.
+        exp_cs_col (nl.NkiTensor): [Q, 1], exp(cs) column.
+        exp_neg_cs_col (nl.NkiTensor): [Q, 1], exp(-cs) column.
+        state_sb (nl.NkiTensor): [dstate, headdim], State (modified in-place).
+        B_f32 (nl.NkiTensor): [Q, dstate], B in float32.
+        C_T (nl.NkiTensor): [dstate, Q], Transposed C.
+        CB_masked (nl.NkiTensor): [Q, Q], Causal-masked CB^T.
+        D_Q (nl.NkiTensor): [Q, 1], Broadcast D or None.
         Q (int): Chunk size.
         headdim (int): Head dimension.
         dstate (int): State dimension.
         has_D (bool): Whether to apply skip connection.
 
     Returns:
-        nl.ndarray: [Q, headdim], Output chunk.
+        nl.NkiTensor: [Q, headdim], Output chunk.
     """
     # Y_intra = exp(cs) * (CB_causal @ (exp(-cs) * dtx))
     X_scaled = nl.ndarray((Q, headdim), dtype=nl.float32, buffer=nl.sbuf)

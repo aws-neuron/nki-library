@@ -15,17 +15,37 @@
 """Implements MXFP8 matrix multiplication with configurable tiling, supporting both pre-quantized and BF16 inputs.
 The kernel handles physical/logical dimension mapping, block-level accumulation, and non-divisible shape masking."""
 
+from typing import Optional
+
 import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
-from ..mxfp_utils.mxfp8_utils import quantize_mxfp8_utils
-from ..mxfp_utils.mxfp8_utils.common_dataclasses import BlockDescriptor, QuantScheme, TensorDescriptor
-from ..mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
-from ..mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import get_fp8_dtype_x4
-from .matmul_mxfp8_config import MatmulMxfp8KernelConfig, auto_generate_default, resolve_lnc2_sharding, validate_shapes
-from .matmul_mxfp8_constants import PRECISION_BFLOAT16, PRECISION_FP32, PRECISION_MXFP8, PRECISION_MXFP8_X4
-from .matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
+from ..mxfp_utils.mxfp8_utils import _quantize_mxfp8_utils
+from ..mxfp_utils.mxfp8_utils._common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
+from ..mxfp_utils.mxfp8_utils._dense_scales import DATA_ROWS_PER_SCALE
+from ..mxfp_utils.mxfp8_utils._quantize_mxfp8_utils import get_fp8_dtype_x4
+from ..mxfp_utils.mxfp8_utils.common_dataclasses import (
+    BlockDescriptor,
+    LncShardingMode,
+    LoopOrder,
+    QuantScheme,
+    SwizzleMode,
+    TensorDescriptor,
+    TensorOrientation,
+)
+from ._matmul_mxfp8_constants import (
+    PRECISION_BFLOAT16,
+    PRECISION_FP32,
+    operand_precision,
+)
+from ._matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
+from .matmul_mxfp8_config import (
+    MatmulMxfp8KernelConfig,
+    _resolve_lnc2_sharding,
+    _validate_shapes,
+    auto_generate_default,
+)
 
 
 def _auto_generate_config(
@@ -171,7 +191,7 @@ def _validate_and_calculate_shapes(
             TILES_IN_LOAD_N (int): Number of tiles to load at once in N dimension
             lhs_matmul_tile_shape_logical (tuple): LHS tile shape (TILE_K, TILE_M) in logical space
             rhs_matmul_tile_shape_logical (tuple): RHS tile shape (TILE_K, TILE_N) in logical space
-            use_scale_packing (bool): If True and inputs are pre-quantized, assert that scales are packed
+            use_scale_packing (bool): Whether SBUF scale buffers are packed up to 4 tiles per scaling group
 
     Returns:
             Dictionary containing all calculated shapes and dimensions
@@ -184,7 +204,7 @@ def _validate_and_calculate_shapes(
         f"LHS and RHS matmul tile K dimensions must match in logical space, got {LHS_MATMUL_TILE_K_LOGICAL=}, {RHS_MATMUL_TILE_K_LOGICAL=}",
     )
 
-    MATMUL_TILE_K_PHYSICAL = LHS_MATMUL_TILE_K_LOGICAL // quantize_mxfp8_utils.INTERLEAVE_FACTOR
+    MATMUL_TILE_K_PHYSICAL = LHS_MATMUL_TILE_K_LOGICAL // _quantize_mxfp8_utils.INTERLEAVE_FACTOR
     LHS_MATMUL_TILE_M_PHYSICAL = LHS_MATMUL_TILE_M_LOGICAL
     RHS_MATMUL_TILE_N_PHYSICAL = RHS_MATMUL_TILE_N_LOGICAL
     lhs_matmul_tile_shape_physical = (MATMUL_TILE_K_PHYSICAL, LHS_MATMUL_TILE_M_PHYSICAL)
@@ -192,15 +212,6 @@ def _validate_and_calculate_shapes(
 
     if lhs_td.is_quantized:
         lhs_load_tile_shape = lhs_matmul_tile_shape_physical
-        # Detect if LHS scales are packed by comparing data and scales shapes
-        lhs_td.scales_are_packed = quantize_mxfp8_utils.are_scales_packed(lhs_td.data.shape, lhs_td.scales.shape)
-        # If use_scale_packing is True, assert that pre-quantized LHS scales are packed
-        kernel_assert(
-            quantize_mxfp8_utils.scale_packing_not_possible(lhs_td.data.shape, lhs_td.scales.shape)
-            or use_scale_packing == lhs_td.scales_are_packed,
-            f"use_scale_packing={use_scale_packing} but lhs_scales_are_packed={lhs_td.scales_are_packed}. "
-            f"LHS data shape: {lhs_td.data.shape}, LHS scales shape: {lhs_td.scales.shape}. ",
-        )
     else:
         if lhs_td.is_swizzled:
             lhs_load_tile_shape = (
@@ -213,15 +224,6 @@ def _validate_and_calculate_shapes(
 
     if rhs_td.is_quantized:
         rhs_load_tile_shape = rhs_matmul_tile_shape_physical
-        # Detect if RHS scales are packed by comparing data and scales shapes
-        rhs_td.scales_are_packed = quantize_mxfp8_utils.are_scales_packed(rhs_td.data.shape, rhs_td.scales.shape)
-        # If use_scale_packing is True, assert that pre-quantized RHS scales are packed
-        kernel_assert(
-            quantize_mxfp8_utils.scale_packing_not_possible(rhs_td.data.shape, rhs_td.scales.shape)
-            or use_scale_packing == rhs_td.scales_are_packed,
-            f"use_scale_packing={use_scale_packing} but rhs_scales_are_packed={rhs_td.scales_are_packed}. "
-            f"RHS data shape: {rhs_td.data.shape}, RHS scales shape: {rhs_td.scales.shape}. ",
-        )
     else:
         if rhs_td.is_swizzled:
             rhs_load_tile_shape = (
@@ -234,25 +236,6 @@ def _validate_and_calculate_shapes(
 
     lhs_quantize_tile_shape = (lhs_matmul_tile_shape_physical[0], lhs_matmul_tile_shape_physical[1] * 4)
     rhs_quantize_tile_shape = (rhs_matmul_tile_shape_physical[0], rhs_matmul_tile_shape_physical[1] * 4)
-
-    """
-    Pre-quantized packed scales require MATMUL_TILE_K_PHYSICAL == Q_TILE_K because
-    the packed format uses Q_TILE_K-sized tile indexing that doesn't align with
-    smaller physical tile boundaries in the matmul instruction.
-    """
-    if use_scale_packing and MATMUL_TILE_K_PHYSICAL < quantize_mxfp8_utils.Q_TILE_K:
-        kernel_assert(
-            not (lhs_td.is_quantized and lhs_td.scales_are_packed),
-            f"Pre-quantized LHS with packed scales requires tile_k >= {quantize_mxfp8_utils.Q_TILE_K * quantize_mxfp8_utils.INTERLEAVE_FACTOR} "
-            f"(MATMUL_TILE_K_PHYSICAL >= Q_TILE_K={quantize_mxfp8_utils.Q_TILE_K}), "
-            f"got MATMUL_TILE_K_PHYSICAL={MATMUL_TILE_K_PHYSICAL}",
-        )
-        kernel_assert(
-            not (rhs_td.is_quantized and rhs_td.scales_are_packed),
-            f"Pre-quantized RHS with packed scales requires tile_k >= {quantize_mxfp8_utils.Q_TILE_K * quantize_mxfp8_utils.INTERLEAVE_FACTOR} "
-            f"(MATMUL_TILE_K_PHYSICAL >= Q_TILE_K={quantize_mxfp8_utils.Q_TILE_K}), "
-            f"got MATMUL_TILE_K_PHYSICAL={MATMUL_TILE_K_PHYSICAL}",
-        )
 
     # Validate that the load tiles are valid
     kernel_assert(
@@ -311,18 +294,18 @@ def _validate_and_calculate_shapes(
     # Tile dimensions are valid for hardware
     kernel_assert(
         MATMUL_TILE_K_PHYSICAL <= nl.tile_size.pmax
-        and MATMUL_TILE_K_PHYSICAL % quantize_mxfp8_utils.MX_PARTITION_SIZE == 0,
-        f"MATMUL_TILE_K_PHYSICAL ({MATMUL_TILE_K_PHYSICAL}) must be <= pmax ({nl.tile_size.pmax}) and divisible by quantize_mxfp8_utils.MX_PARTITION_SIZE ({quantize_mxfp8_utils.MX_PARTITION_SIZE})",
+        and MATMUL_TILE_K_PHYSICAL % _quantize_mxfp8_utils.MX_PARTITION_SIZE == 0,
+        f"MATMUL_TILE_K_PHYSICAL ({MATMUL_TILE_K_PHYSICAL}) must be <= pmax ({nl.tile_size.pmax}) and divisible by _quantize_mxfp8_utils.MX_PARTITION_SIZE ({_quantize_mxfp8_utils.MX_PARTITION_SIZE})",
     )
     kernel_assert(
         LHS_MATMUL_TILE_M_PHYSICAL <= nl.tile_size.gemm_stationary_fmax
-        and LHS_MATMUL_TILE_M_PHYSICAL % quantize_mxfp8_utils.MX_PARTITION_SIZE == 0,
-        f"LHS_MATMUL_TILE_M_PHYSICAL ({LHS_MATMUL_TILE_M_PHYSICAL}) must be <= gemm_stationary_fmax ({nl.tile_size.gemm_stationary_fmax}) and divisible by quantize_mxfp8_utils.MX_PARTITION_SIZE ({quantize_mxfp8_utils.MX_PARTITION_SIZE})",
+        and LHS_MATMUL_TILE_M_PHYSICAL % _quantize_mxfp8_utils.MX_PARTITION_SIZE == 0,
+        f"LHS_MATMUL_TILE_M_PHYSICAL ({LHS_MATMUL_TILE_M_PHYSICAL}) must be <= gemm_stationary_fmax ({nl.tile_size.gemm_stationary_fmax}) and divisible by _quantize_mxfp8_utils.MX_PARTITION_SIZE ({_quantize_mxfp8_utils.MX_PARTITION_SIZE})",
     )
     kernel_assert(
-        RHS_MATMUL_TILE_N_PHYSICAL <= quantize_mxfp8_utils.TILE_SIZE_GEMM_MOVING_MAX
-        and RHS_MATMUL_TILE_N_PHYSICAL % quantize_mxfp8_utils.MX_PARTITION_SIZE == 0,
-        f"RHS_MATMUL_TILE_N_PHYSICAL ({RHS_MATMUL_TILE_N_PHYSICAL}) must be <= quantize_mxfp8_utils.TILE_SIZE_GEMM_MOVING_MAX ({quantize_mxfp8_utils.TILE_SIZE_GEMM_MOVING_MAX}) and divisible by quantize_mxfp8_utils.MX_PARTITION_SIZE ({quantize_mxfp8_utils.MX_PARTITION_SIZE})",
+        RHS_MATMUL_TILE_N_PHYSICAL <= _quantize_mxfp8_utils.TILE_SIZE_GEMM_MOVING_MAX
+        and RHS_MATMUL_TILE_N_PHYSICAL % _quantize_mxfp8_utils.MX_PARTITION_SIZE == 0,
+        f"RHS_MATMUL_TILE_N_PHYSICAL ({RHS_MATMUL_TILE_N_PHYSICAL}) must be <= _quantize_mxfp8_utils.TILE_SIZE_GEMM_MOVING_MAX ({_quantize_mxfp8_utils.TILE_SIZE_GEMM_MOVING_MAX}) and divisible by _quantize_mxfp8_utils.MX_PARTITION_SIZE ({_quantize_mxfp8_utils.MX_PARTITION_SIZE})",
     )
     # Blocks are divisible by tiles (required for hardware)
     kernel_assert(
@@ -374,7 +357,7 @@ def _validate_and_calculate_shapes(
         unswizzled_fast_dma = (not lhs_td.is_swizzled and lhs_td.fast_dma_transpose) or (
             not rhs_td.is_swizzled and rhs_td.fast_dma_transpose
         )
-        k_alignment = quantize_mxfp8_utils.MX_PARTITION_SIZE if unswizzled_fast_dma else 128
+        k_alignment = _quantize_mxfp8_utils.MX_PARTITION_SIZE if unswizzled_fast_dma else 128
         kernel_assert(K_LOGICAL % k_alignment == 0, f"K must be divisible by {k_alignment} for DGT, got {K_LOGICAL}")
 
     return {
@@ -411,7 +394,7 @@ def matmul_mxfp8(
     rhs_matmul_tile_shape_logical: tuple = None,
     block_loop_order: str = 'mnk',
     tile_loop_order: str = 'mnk',
-    float8_dtype: str = "float8_e5m2",
+    float8_dtype: str = "float8_e4m3fn",
     output_dtype=nl.bfloat16,
     run_with_lnc2: bool = True,
     lnc_2_shard_rhs=None,
@@ -422,12 +405,14 @@ def matmul_mxfp8(
     lhs_is_swizzled: bool = True,
     rhs_is_swizzled: bool = True,
     load_with_PE_swizzle: bool = False,
-    lhs_is_f_by_k: bool = True,
-    rhs_is_f_by_k: bool = True,
+    lhs_orientation: Optional[TensorOrientation] = None,
+    rhs_orientation: Optional[TensorOrientation] = None,
     fast_dma_transpose: bool = False,
-    enable_psum_copy_in=None,
     quant_scheme: str = "wrapX",
-) -> nl.ndarray:
+    disable_dma_transpose: bool = False,
+    psum_copy_in_ratio=None,
+    strided_copy_swizzle_1x32_ratio=None,
+) -> nl.NkiTensor:
     """
     Performs matrix multiplication with MXFP8 quantization.
 
@@ -457,37 +442,50 @@ def matmul_mxfp8(
         run_with_lnc2 (bool): Enable LNC2 parallelization across 2 cores, default True
         lnc_2_shard_rhs (bool): When run_with_lnc2=True, shard on N dimension (RHS) if True,
             or shard on M dimension (LHS) if False. Default True.
-        lhs_scales: Optional pre-computed scales for LHS
-        rhs_scales: Optional pre-computed scales for RHS
-        use_scale_packing (bool): If True and inputs are pre-quantized,
-            assert that scales are packed, default False
+        lhs_scales: Optional pre-computed scales for LHS, dense [K // 32, M] on HBM
+        rhs_scales: Optional pre-computed scales for RHS, dense [K // 32, N] on HBM
+        use_scale_packing (bool): Pack scales in SBUF up to 4 tiles per scaling group, for in-kernel
+            quantized and pre-quantized operands alike. Does not affect the HBM layout. Default False
         spill_reload (bool): If True, each quantized block will be written to HBM
             and on every subsequent load, this spilled block will be reloaded.
         lhs_is_swizzled (bool): Whether LHS BF16 tensor is pre-swizzled [K/4, M*4],
             default True. If False, expects [M, K] layout.
         rhs_is_swizzled (bool): Whether RHS BF16 tensor is pre-swizzled [K/4, N*4],
             default True. If False, expects [N, K] layout.
+        lhs_orientation (Optional[TensorOrientation]): Logical orientation of the LHS
+            operand relative to the contraction dim K. None (default) auto-resolves in
+            TensorDescriptor (F_BY_K for unswizzled BF16, K_BY_F for swizzled/quantized).
+            An explicit K_BY_F on an unswizzled BF16 operand selects PE swizzle.
+        rhs_orientation (Optional[TensorOrientation]): Logical orientation of the RHS
+            operand relative to the contraction dim K. Same semantics as lhs_orientation.
         fast_dma_transpose (bool): When True, use a direct 4D access pattern on the
             source tensor for DMA gather-transpose instead of flattening + vector offsets.
             Avoids allocating vector_offset_pattern buffers in SBUF. Only applies to
             unswizzled inputs. Default False.
+        disable_dma_transpose (bool): When True, the 1x32 loader transposes unswizzled K-by-F
+            operands with dma_copy + nc_transpose instead of a DMA transpose. Default False.
+        strided_copy_swizzle_1x32_ratio: Fraction of unswizzled 1x32 K-by-F
+            BF16/FP16 logical loads using strided tensor-copy swizzling.
+            None or 0 uses PE; 1 uses strided copy. Other formats ignore it.
+        psum_copy_in_ratio: Fraction of eligible FP32 accumulator copies into PSUM.
+            None disables copy-in unless an explicit cached ratio is selected.
 
     Returns:
-        nl.ndarray: Result of matrix multiplication [M, N] in HBM with specified output_dtype
+        nl.NkiTensor: Result of matrix multiplication [M, N] in HBM with specified output_dtype
 
     Notes:
         - Supports non-divisible tensor shapes using dynamic slicing (nl.ds)
         - Auto-generates optimal tiling parameters when not specified
         - LNC2 mode requires at least 2 blocks in N dimension
         - Pre-quantized inputs must be in MXFP8 format (data, scales) tuple
-        - When use_scale_packing=True, pre-quantized inputs must have packed scales
+        - Pre-quantized scales are dense on HBM: one row per 32 K (see dense_scales.py)
         - TODO: Specify intended usage range for optimal performance
 
         Physical vs Logical Dimensions:
             - Logical: Theoretical tensor dimensions [M, K] @ [K, N] for the matmul operation
             - Physical: Hardware storage format (depends on quantization and swizzling)
                 * Pre-swizzled: [K//4, M*4] or [K//4, N*4]
-                * Quantized: [K//4, M] or [K//4, N]
+                * Quantized: [K//4, M] or [K//4, N], with dense scales [K//32, M] or [K//32, N]
 
         Tiles (smallest processing unit):
             - Matmul Tile: Hardware matmul operation shape
@@ -558,12 +556,12 @@ def matmul_mxfp8(
     sbm.open_scope(name="MXFP8 Matmul")
 
     kernel_assert(
-        lhs_is_f_by_k or not lhs_is_swizzled,
-        "K-by-F layout (lhs_is_f_by_k=False) is not supported for pre-swizzled inputs.",
+        lhs_orientation != TensorOrientation.K_BY_F or not lhs_is_swizzled,
+        "K_BY_F orientation is not supported for pre-swizzled inputs.",
     )
     kernel_assert(
-        rhs_is_f_by_k or not rhs_is_swizzled,
-        "K-by-F layout (rhs_is_f_by_k=False) is not supported for pre-swizzled inputs.",
+        rhs_orientation != TensorOrientation.K_BY_F or not rhs_is_swizzled,
+        "K_BY_F orientation is not supported for pre-swizzled inputs.",
     )
 
     # Resolve quant_scheme string to enum
@@ -573,57 +571,80 @@ def matmul_mxfp8(
     )
     resolved_quant_scheme = _quant_scheme_map[quant_scheme]
 
+    # Validate float8_dtype at the boundary rather than letting an unknown string
+    # silently fall back to e5m2 inside get_fp8_dtype_x4.
+    kernel_assert(
+        float8_dtype in ("float8_e4m3fn", "float8_e5m2"),
+        f"Invalid float8_dtype '{float8_dtype}', must be 'float8_e4m3fn' or 'float8_e5m2'.",
+    )
+
+    # Validate loop orders at the boundary and resolve to the LoopOrder vocabulary.
+    # The block loop only implements MNK; the tile loop supports MNK/NMK. LoopOrder
+    # is a str subclass, so the resolved values pass straight through to
+    # matmul_mxfp8_blocks' string comparisons.
+    kernel_assert(
+        block_loop_order == LoopOrder.MNK,
+        f"Invalid block_loop_order '{block_loop_order}', only 'mnk' is supported.",
+    )
+    kernel_assert(
+        tile_loop_order in (LoopOrder.MNK, LoopOrder.NMK),
+        f"Invalid tile_loop_order '{tile_loop_order}', must be 'mnk' or 'nmk'.",
+    )
+    block_loop_order = LoopOrder.MNK
+    tile_loop_order = LoopOrder(tile_loop_order)
+
     # NOTE: the K-by-F F-dimension requirement (F % 512 for non-swizzled BF16) is enforced
-    # centrally in validate_shapes() so every kernel using the generic API gets it.
+    # centrally in _validate_shapes() so every kernel using the generic API gets it.
     lhs_td = TensorDescriptor(
         data=lhs,
         scales=lhs_scales,
         is_swizzled=lhs_is_swizzled,
         is_col_parallel_sharded=False,
-        load_with_PE_swizzle=load_with_PE_swizzle if not lhs_is_swizzled else False,
-        is_f_by_k=None if lhs_is_f_by_k else False,
-        fast_dma_transpose=fast_dma_transpose if not lhs_is_swizzled else False,
+        swizzle_mode=(
+            # 1x32 always uses the PE-swizzle 1x32 loader (dispatch keys on quant_scheme), so
+            # PE for either orientation -- keeps F-by-K off the DGT vector-offset setup path.
+            SwizzleMode.PE
+            if ((load_with_PE_swizzle or resolved_quant_scheme == QuantScheme._1x32) and not lhs_is_swizzled)
+            else (SwizzleMode.DGT_FAST if (fast_dma_transpose and not lhs_is_swizzled) else SwizzleMode.DGT)
+        ),
+        orientation=lhs_orientation,
         quant_scheme=resolved_quant_scheme,
+        disable_dma_transpose=disable_dma_transpose,
     )
     rhs_td = TensorDescriptor(
         data=rhs,
         scales=rhs_scales,
         is_swizzled=rhs_is_swizzled,
         is_col_parallel_sharded=False,
-        load_with_PE_swizzle=load_with_PE_swizzle if not rhs_is_swizzled else False,
-        is_f_by_k=None if rhs_is_f_by_k else False,
-        fast_dma_transpose=fast_dma_transpose if not rhs_is_swizzled else False,
+        swizzle_mode=(
+            SwizzleMode.PE
+            if ((load_with_PE_swizzle or resolved_quant_scheme == QuantScheme._1x32) and not rhs_is_swizzled)
+            else (SwizzleMode.DGT_FAST if (fast_dma_transpose and not rhs_is_swizzled) else SwizzleMode.DGT)
+        ),
+        orientation=rhs_orientation,
         quant_scheme=resolved_quant_scheme,
+        disable_dma_transpose=disable_dma_transpose,
     )
 
-    # TensorDescriptor can promote an operand to PE swizzle, and the cache is keyed on load method.
-    effective_load_with_PE_swizzle = lhs_td.load_with_PE_swizzle or rhs_td.load_with_PE_swizzle
-
-    run_with_lnc2, lnc_2_shard_rhs = resolve_lnc2_sharding(
+    # Encode the raw ABI bools into a mode once, then resolve the shard axis.
+    lnc_mode = _resolve_lnc2_sharding(
         lhs_td.logical_shape[1],
         rhs_td.logical_shape[1],
-        run_with_lnc2,
-        lnc_2_shard_rhs,
+        LncShardingMode.from_bools(run_with_lnc2, lnc_2_shard_rhs),
         lhs_is_prequant=lhs_td.is_quantized,
         rhs_is_prequant=rhs_td.is_quantized,
     )
-    shard_rhs = run_with_lnc2 and lnc_2_shard_rhs
-    shard_lhs = run_with_lnc2 and not lnc_2_shard_rhs
-    if shard_lhs:
-        lhs_td.shard_col_parallel()
-    elif shard_rhs:
-        rhs_td.shard_col_parallel()
+    lnc_mode.shard_operands(lhs_td, rhs_td)
+    # Resolved bools drive the downstream LNC2 asserts and per-core offset logic.
+    run_with_lnc2 = lnc_mode.run_with_lnc2
+    lnc_2_shard_rhs = lnc_mode.lnc_2_shard_rhs
 
     # Build MatmulMxfp8KernelConfig and auto-generate missing fields. auto_generate_default
     # applies the LNC2 shard itself, so pass full dims (matching config.BLOCKS_IN_*).
     K_logical_lhs, M_logical = lhs_td.logical_shape
     _, N_logical = rhs_td.logical_shape
-    lhs_precision = (
-        PRECISION_BFLOAT16 if not lhs_td.is_quantized else (PRECISION_MXFP8_X4 if lhs_td.is_x4 else PRECISION_MXFP8)
-    )
-    rhs_precision = (
-        PRECISION_BFLOAT16 if not rhs_td.is_quantized else (PRECISION_MXFP8_X4 if rhs_td.is_x4 else PRECISION_MXFP8)
-    )
+    lhs_precision = operand_precision(lhs_td.is_quantized, lhs_td.is_x4)
+    rhs_precision = operand_precision(rhs_td.is_quantized, rhs_td.is_x4)
     output_precision = PRECISION_FP32 if output_dtype == nl.float32 else PRECISION_BFLOAT16
 
     config = MatmulMxfp8KernelConfig(
@@ -639,21 +660,35 @@ def matmul_mxfp8(
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
         enable_scale_packing=use_scale_packing,
-        run_with_lnc2=run_with_lnc2,
-        lnc_2_shard_rhs=lnc_2_shard_rhs,
-        lhs_is_swizzled=lhs_is_swizzled,
-        rhs_is_swizzled=rhs_is_swizzled,
-        load_with_PE_swizzle=effective_load_with_PE_swizzle,
-        quant_scheme=quant_scheme,
+        lnc_sharding=lnc_mode,
+        quant_scheme=resolved_quant_scheme,
+        strided_copy_swizzle_1x32_ratio=strided_copy_swizzle_1x32_ratio,
+    )
+    kernel_assert(
+        lhs_td.quant_scheme == rhs_td.quant_scheme,
+        "LHS and RHS quant_scheme must agree.",
     )
     auto_generate_default(
-        config, lhs_precision, rhs_precision, output_precision, enable_psum_copy_in=enable_psum_copy_in
+        config,
+        lhs_precision,
+        rhs_precision,
+        output_precision,
+        psum_copy_in_ratio=psum_copy_in_ratio,
+        fast_dma_transpose=fast_dma_transpose,
+        lhs_is_swizzled=lhs_td.is_swizzled,
+        rhs_is_swizzled=rhs_td.is_swizzled,
+        lhs_load_with_PE_swizzle=lhs_td.uses_pe_swizzle,
+        rhs_load_with_PE_swizzle=rhs_td.uses_pe_swizzle,
+        disable_dma_transpose=disable_dma_transpose,
+        # K-by-F unswizzled BF16 operands key separately from their F-by-K counterparts.
+        lhs_k_by_f=lhs_td.uses_pe_swizzle and lhs_td.orientation == TensorOrientation.K_BY_F,
+        rhs_k_by_f=rhs_td.uses_pe_swizzle and rhs_td.orientation == TensorOrientation.K_BY_F,
     )
     # Fold in a tuned spill_reload so the HBM spill buffers below get allocated.
     spill_reload = spill_reload or config.spill_reload
 
     # Validate and calculate all shapes
-    validate_shapes(config, lhs_td, rhs_td)
+    _validate_shapes(config, lhs_td, rhs_td)
 
     output_tensor_hbm = nl.ndarray(
         (lhs_td.logical_shape[1], rhs_td.logical_shape[1]),
@@ -678,8 +713,16 @@ def matmul_mxfp8(
     K_LOGICAL = lhs_td.logical_shape[0]
     # DGT loading requires K divisible by 128, except the fast DMA transpose path, which
     # gathers any K aligned to MX_PARTITION_SIZE (32) in a single op (see load_tile_dgt).
-    rhs_k_alignment = quantize_mxfp8_utils.MX_PARTITION_SIZE if rhs_td.fast_dma_transpose else 128
-    lhs_k_alignment = quantize_mxfp8_utils.MX_PARTITION_SIZE if lhs_td.fast_dma_transpose else 128
+    rhs_k_alignment = (
+        _quantize_mxfp8_utils.MX_PARTITION_SIZE
+        if rhs_td.fast_dma_transpose or rhs_td.quant_scheme == QuantScheme._1x32
+        else 128
+    )
+    lhs_k_alignment = (
+        _quantize_mxfp8_utils.MX_PARTITION_SIZE
+        if lhs_td.fast_dma_transpose or lhs_td.quant_scheme == QuantScheme._1x32
+        else 128
+    )
     kernel_assert(
         rhs_td.is_quantized or rhs_td.is_swizzled or K_LOGICAL % rhs_k_alignment == 0,
         f"If kernel is not pre-quantized or pre-swizzled it K dim must be divisible by {rhs_k_alignment} for DGT loading",
@@ -735,12 +778,6 @@ def matmul_mxfp8(
 
     BLOCK_K_SIZE = TILE_K * config.TILES_IN_BLOCK_K
 
-    NUM_TILES_K = div_ceil(lhs_td.physical_shape[0], TILE_K)
-
-    NUM_SCALE_GROUPS = (
-        NUM_TILES_K + quantize_mxfp8_utils.MAX_TILES_PER_SCALE_PACKING_GROUP - 1
-    ) // quantize_mxfp8_utils.MAX_TILES_PER_SCALE_PACKING_GROUP
-
     bd = config.bd
 
     if spill_reload and not lhs_td.is_quantized:
@@ -750,26 +787,18 @@ def matmul_mxfp8(
             buffer=data_buffer,
         )
 
-        if use_scale_packing:
-            lhs_scale_hbm = nl.ndarray(
-                (TILE_K * NUM_SCALE_GROUPS, BLOCKS_IN_M_sharded * bd.BLOCK_M_LOGICAL),
-                dtype=nl.float8_e8m0fnu,
-                buffer=data_buffer,
-            )
-
-        else:
-            lhs_scale_hbm = nl.ndarray(
-                (config.BLOCKS_IN_K * BLOCK_K_SIZE, BLOCKS_IN_M_sharded * bd.BLOCK_M_LOGICAL),
-                dtype=nl.float8_e8m0fnu,
-                buffer=data_buffer,
-            )
+        # Dense scales, the same HBM layout as pre-quantized inputs.
+        lhs_scale_hbm = nl.ndarray(
+            (config.BLOCKS_IN_K * BLOCK_K_SIZE // DATA_ROWS_PER_SCALE, BLOCKS_IN_M_sharded * bd.BLOCK_M_LOGICAL),
+            dtype=nl.float8_e8m0fnu,
+            buffer=data_buffer,
+        )
 
         lhsq_td = TensorDescriptor(
             data=lhs_qdata_hbm,
             scales=lhs_scale_hbm,
             is_swizzled=True,
             is_x4=True,
-            scales_are_packed=use_scale_packing,
         )
 
     if spill_reload and not rhs_td.is_quantized:
@@ -779,30 +808,22 @@ def matmul_mxfp8(
             buffer=data_buffer,
         )
 
-        if use_scale_packing:
-            rhs_scale_hbm = nl.ndarray(
-                (TILE_K * NUM_SCALE_GROUPS, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
-                dtype=nl.float8_e8m0fnu,
-                buffer=data_buffer,
-            )
-
-        else:
-            rhs_scale_hbm = nl.ndarray(
-                (config.BLOCKS_IN_K * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
-                dtype=nl.float8_e8m0fnu,
-                buffer=data_buffer,
-            )
+        # Dense scales, the same HBM layout as pre-quantized inputs.
+        rhs_scale_hbm = nl.ndarray(
+            (config.BLOCKS_IN_K * BLOCK_K_SIZE // DATA_ROWS_PER_SCALE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
+            dtype=nl.float8_e8m0fnu,
+            buffer=data_buffer,
+        )
 
         rhsq_td = TensorDescriptor(
             data=rhs_qdata_hbm,
             scales=rhs_scale_hbm,
             is_swizzled=True,
             is_x4=True,
-            scales_are_packed=use_scale_packing,
         )
 
     # This code currently only supports MNK loop order over blocks
-    if block_loop_order == 'mnk':
+    if block_loop_order == LoopOrder.MNK:
         output_td = TensorDescriptor(data=output_tensor_hbm_sharded)
 
         generic_matmul_mxfp8_api(

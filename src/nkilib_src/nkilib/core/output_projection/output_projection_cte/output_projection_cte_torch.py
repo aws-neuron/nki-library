@@ -15,7 +15,7 @@
 """PyTorch reference implementation for output projection CTE kernel."""
 
 import math
-from typing import Optional
+from typing import Any, Optional
 
 import nki.language as nl
 import numpy as np
@@ -162,6 +162,9 @@ def output_projection_cte_torch_ref(
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     compact_weight_scales: bool = False,  # noqa: ARG001 — accepted for kernel signature parity (only used by MX-compact ref)
     attention_layout: Optional[OProjAttentionLayout] = None,
+    # Destination buffer, not an input to the arithmetic; accepted for signature parity.
+    out: Any = None,  # noqa: ARG001
+    out_s_offset: int = 0,
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of output projection for CTE.
@@ -195,6 +198,8 @@ def output_projection_cte_torch_ref(
     Notes:
         - Hardware-specific parameters (LNC sharding) are not included as they
           don't affect the mathematical result.
+        - ``out`` is accepted and ignored; ``out_s_offset`` must be 0, because this ref returns
+          a [B, S, H] chunk rather than writing into a larger caller buffer.
         - This implementation prioritizes clarity over performance.
 
     Pseudocode:
@@ -207,6 +212,9 @@ def output_projection_cte_torch_ref(
         out = out + bias if bias else out
         return out
     """
+    assert out_s_offset == 0, (  # noqa: S101
+        "output_projection_cte_torch_ref does not model out_s_offset != 0"
+    )
     # AUTO must be pre-resolved by the caller (see resolve_dtype_mode_for_torch_ref);
     # the torch ref runs on CPU and can't query hardware.
     assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
@@ -322,6 +330,9 @@ def output_projection_cte_mx_torch_ref(
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for framework signature parity (MX is structurally OCP)
     compact_weight_scales: bool = False,
     attention_layout: Optional[OProjAttentionLayout] = None,  # noqa: ARG001 — accepted for kernel signature parity (MX requires BNdS)
+    # Destination buffer, not an input to the arithmetic; accepted for signature parity.
+    out: Any = None,  # noqa: ARG001
+    out_s_offset: int = 0,
 ) -> dict[str, np.ndarray]:
     """PyTorch reference for MX output projection CTE.
 
@@ -347,6 +358,9 @@ def output_projection_cte_mx_torch_ref(
     Returns:
         dict with "out": numpy float32 [B, S, H].
     """
+    assert out_s_offset == 0, (  # noqa: S101
+        "output_projection_cte_mx_torch_ref does not model out_s_offset != 0"
+    )
     # Convert to numpy if torch tensors (torch_ref_wrapper may pass tensors)
     if isinstance(attention, torch.Tensor):
         attention = attention.numpy()

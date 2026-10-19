@@ -296,6 +296,46 @@ class TestGetRelevantTestDirsEndToEnd:
         with patch.object(self.finder, "_get_changed_files", return_value=changed_files):
             return self.finder.get_relevant_test_dirs("mocked")
 
+    def _narrow_with_files(self, changed_files):
+        """Run get_narrowed_test_dirs with mocked changed files."""
+        with patch.object(self.finder, "_get_changed_files", return_value=changed_files):
+            return self.finder.get_narrowed_test_dirs("mocked")
+
+    # -- get_narrowed_test_dirs ------------------------------------------------
+    # The narrowed call exists for a consumer that cannot run every test, so a change
+    # touching a shared utility must not discard the kernels it also touched. The
+    # run-everything contract of get_relevant_test_dirs is unchanged, which the paired
+    # assertions below pin.
+
+    def test_narrowed_keeps_kernel_dirs_when_a_shared_utility_also_changed(self):
+        changed = [
+            "src/nkilib_src/nkilib/core/mlp/mlp.py",
+            "src/nkilib_src/nkilib/core/utils/pe_broadcast.py",
+        ]
+        # Unchanged: the utility means the selection could not be narrowed.
+        assert self._run_with_files(changed) is None
+        # Narrowed: the kernel the author actually touched is still covered.
+        rel_dirs = _rel_test_dirs(self._narrow_with_files(changed))
+        assert "core/mlp" in rel_dirs
+
+    def test_narrowed_keeps_kernel_dirs_when_an_infra_file_also_changed(self):
+        changed = ["src/nkilib_src/nkilib/core/mlp/mlp.py", "test/conftest.py"]
+        assert self._run_with_files(changed) is None
+        assert "core/mlp" in _rel_test_dirs(self._narrow_with_files(changed))
+
+    def test_narrowed_is_empty_when_only_a_shared_utility_changed(self):
+        # Nothing is attributable, so the caller decides. Matches today's outcome for
+        # such a CR rather than newly analysing an arbitrary subset.
+        changed = ["src/nkilib_src/nkilib/core/utils/pe_broadcast.py"]
+        assert self._run_with_files(changed) is None
+        assert self._narrow_with_files(changed) == set()
+
+    def test_narrowed_matches_relevant_when_nothing_forces_a_full_run(self):
+        # With no utility or infra file involved the two calls must agree, so the
+        # narrowed path is not a second, divergent scoping implementation.
+        changed = ["src/nkilib_src/nkilib/core/mlp/mlp_parameters.py"]
+        assert self._run_with_files(changed) == self._narrow_with_files(changed)
+
     def test_single_attention_cte_change(self):
         """Single file change to attention_cte.py should affect attention tests."""
         result = self._run_with_files(
@@ -338,7 +378,7 @@ class TestGetRelevantTestDirsEndToEnd:
         assert "experimental/transformer" in rel_dirs
 
     def test_experimental_moe_bwd_change(self):
-        """Single file in experimental/moe/bwd/ should only affect experimental/moe."""
+        """MoE backward changes also select the MLP tests that reuse its helpers."""
         result = self._run_with_files(
             [
                 "src/nkilib_src/nkilib/experimental/moe/bwd/bwmm_bwd_dropless.py",
@@ -346,7 +386,7 @@ class TestGetRelevantTestDirsEndToEnd:
         )
         assert result is not None
         rel_dirs = _rel_test_dirs(result)
-        assert rel_dirs == ["experimental/moe", "experimental/moe_mxfp8"]
+        assert rel_dirs == ["experimental/mlp_mxfp8", "experimental/moe", "experimental/moe_mxfp8"]
 
     def test_impl_file_edit_scopes_to_its_test(self, tmp_path):
         """Editing a kernel's implementation file must scope to that kernel's
@@ -413,7 +453,7 @@ class TestGetRelevantTestDirsEndToEnd:
         assert result is None
 
     def test_test_only_change(self):
-        """Only a test file changed in moe_cte should run core/moe tests."""
+        """Only a test file changed in moe_cte should run core/moe and its test-to-test dependents."""
         result = self._run_with_files(
             [
                 "test/integration/nkilib/core/moe/moe_cte/test_moe_bwmm_mx_cte.py",
@@ -421,7 +461,7 @@ class TestGetRelevantTestDirsEndToEnd:
         )
         assert result is not None
         rel_dirs = _rel_test_dirs(result)
-        assert rel_dirs == ["core/moe"]
+        assert rel_dirs == ["core/moe", "experimental/deepseek_v32"]
 
     def test_down_projection_affects_mlp_and_moe(self):
         """Changes to mlp_tkg_down_projection.py should affect mlp and transformer.

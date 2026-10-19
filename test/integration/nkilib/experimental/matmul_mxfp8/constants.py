@@ -15,7 +15,7 @@
 """Constants for MXFP8 matmul tests."""
 
 # Re-export shared constants so existing imports keep working
-from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_constants import (  # noqa: F401
+from nkilib_src.nkilib.experimental.matmul_mxfp8._matmul_mxfp8_constants import (  # noqa: F401
     BYTES_PER_DTYPE,
     INTERLEAVE_FACTOR,
     MAX_BLOCK_M,

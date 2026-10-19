@@ -61,19 +61,19 @@ from .qkv_mla_cte_utils import (
 @nki.jit
 def qkv_mla_mx(
     # Input
-    x_hbm: nl.ndarray,
-    wqkv_a_hbm: nl.ndarray,
-    wqkv_a_scale_hbm: nl.ndarray,
-    wq_b_hbm: nl.ndarray,
-    wq_b_scale_hbm: nl.ndarray,
-    q_norm_gamma_hbm: nl.ndarray,
+    x_hbm: nl.NkiTensor,
+    wqkv_a_hbm: nl.NkiTensor,
+    wqkv_a_scale_hbm: nl.NkiTensor,
+    wq_b_hbm: nl.NkiTensor,
+    wq_b_scale_hbm: nl.NkiTensor,
+    q_norm_gamma_hbm: nl.NkiTensor,
     # KV path weights
-    wkv_b_hbm: nl.ndarray,
-    wkv_b_scale_hbm: nl.ndarray,
-    kv_norm_gamma_hbm: nl.ndarray,
+    wkv_b_hbm: nl.NkiTensor,
+    wkv_b_scale_hbm: nl.NkiTensor,
+    kv_norm_gamma_hbm: nl.NkiTensor,
     # RoPE caches
-    cos_cache_hbm: nl.ndarray,
-    sin_cache_hbm: nl.ndarray,
+    cos_cache_hbm: nl.NkiTensor,
+    sin_cache_hbm: nl.NkiTensor,
     # Dimension parameters
     n_heads: int,
     qk_nope_head_dim: int,
@@ -82,7 +82,7 @@ def qkv_mla_mx(
     kv_lora_rank: int,
     qk_lora_rank: int,
     norm_eps: float = 1e-6,
-) -> Tuple[nl.ndarray, nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     DeepSeek MLA QKV projection with MX quantization for Context Encoding.
 
@@ -107,21 +107,21 @@ def qkv_mla_mx(
         n_heads: Number of attention heads
 
     Args:
-        x_hbm (nl.ndarray): [B, S, H] bf16, Input hidden states
-        wqkv_a_hbm (nl.ndarray): [H//4, qk_lora_rank] fp8x4, First combined Q/KV projection weights
-        wqkv_a_scale_hbm (nl.ndarray): [H//128, ceil((qk_lora_rank + kv_lora_rank + qk_rope_head_dim)/128)] uint8,
+        x_hbm (nl.NkiTensor): [B, S, H] bf16, Input hidden states
+        wqkv_a_hbm (nl.NkiTensor): [H//4, qk_lora_rank] fp8x4, First combined Q/KV projection weights
+        wqkv_a_scale_hbm (nl.NkiTensor): [H//128, ceil((qk_lora_rank + kv_lora_rank + qk_rope_head_dim)/128)] uint8,
             DeepSeek block-128 compact scales for wqkv_a
-        wq_b_hbm (nl.ndarray): [qk_lora_rank//4, n_heads * qk_head_dim] fp8x4, Second Q projection weights
-        wq_b_scale_hbm (nl.ndarray): [qk_lora_rank//128, ceil(n_heads * qk_head_dim / 128)] uint8,
+        wq_b_hbm (nl.NkiTensor): [qk_lora_rank//4, n_heads * qk_head_dim] fp8x4, Second Q projection weights
+        wq_b_scale_hbm (nl.NkiTensor): [qk_lora_rank//128, ceil(n_heads * qk_head_dim / 128)] uint8,
             DeepSeek block-128 compact scales for wq_b
-        q_norm_gamma_hbm (nl.ndarray): [1, qk_lora_rank] bf16, RMSNorm gamma for Q intermediate
-        wkv_b_hbm (nl.ndarray): [kv_lora_rank//4, n_heads * (qk_nope_head_dim + v_head_dim)] fp8x4,
+        q_norm_gamma_hbm (nl.NkiTensor): [1, qk_lora_rank] bf16, RMSNorm gamma for Q intermediate
+        wkv_b_hbm (nl.NkiTensor): [kv_lora_rank//4, n_heads * (qk_nope_head_dim + v_head_dim)] fp8x4,
             Second KV projection weights
-        wkv_b_scale_hbm (nl.ndarray): [kv_lora_rank//128, ceil(n_heads * (qk_nope_head_dim + v_head_dim) / 128)] uint8,
+        wkv_b_scale_hbm (nl.NkiTensor): [kv_lora_rank//128, ceil(n_heads * (qk_nope_head_dim + v_head_dim) / 128)] uint8,
             MX scales for wkv_b
-        kv_norm_gamma_hbm (nl.ndarray): [1, kv_lora_rank] bf16, RMSNorm gamma for KV intermediate
-        cos_cache_hbm (nl.ndarray): [B, S, qk_rope_head_dim] bf16, Cosine RoPE frequencies
-        sin_cache_hbm (nl.ndarray): [B, S, qk_rope_head_dim] bf16, Sine RoPE frequencies
+        kv_norm_gamma_hbm (nl.NkiTensor): [1, kv_lora_rank] bf16, RMSNorm gamma for KV intermediate
+        cos_cache_hbm (nl.NkiTensor): [B, S, qk_rope_head_dim] bf16, Cosine RoPE frequencies
+        sin_cache_hbm (nl.NkiTensor): [B, S, qk_rope_head_dim] bf16, Sine RoPE frequencies
         n_heads (int): Number of attention heads
         qk_nope_head_dim (int): Non-RoPE portion of Q/K head dimension
         qk_rope_head_dim (int): RoPE portion of Q/K head dimension
@@ -131,9 +131,9 @@ def qkv_mla_mx(
         norm_eps (float): RMSNorm epsilon. Defaults to 1e-6
 
     Returns:
-        Q (nl.ndarray): [B, S, n_heads, qk_head_dim] bf16, Query projections with RoPE applied
-        K (nl.ndarray): [B, S, n_heads, qk_head_dim] bf16, Key projections with RoPE applied
-        V (nl.ndarray): [B, S, n_heads, v_head_dim] bf16, Value projections
+        Q (nl.NkiTensor): [B, S, n_heads, qk_head_dim] bf16, Query projections with RoPE applied
+        K (nl.NkiTensor): [B, S, n_heads, qk_head_dim] bf16, Key projections with RoPE applied
+        V (nl.NkiTensor): [B, S, n_heads, v_head_dim] bf16, Value projections
 
     Notes:
         - Matmul shapes:
@@ -757,19 +757,19 @@ def qkv_mla_mx(
 @nki.jit
 def qkv_mla_mx_deepseek_v4(
     # Input
-    x_hbm: nl.ndarray,
+    x_hbm: nl.NkiTensor,
     # Fused first projection
-    wqkv_hbm: nl.ndarray,
-    wqkv_scale_hbm: nl.ndarray,
+    wqkv_hbm: nl.NkiTensor,
+    wqkv_scale_hbm: nl.NkiTensor,
     # Q second projection
-    wq_b_hbm: nl.ndarray,
-    wq_b_scale_hbm: nl.ndarray,
-    q_norm_gamma_hbm: nl.ndarray,
+    wq_b_hbm: nl.NkiTensor,
+    wq_b_scale_hbm: nl.NkiTensor,
+    q_norm_gamma_hbm: nl.NkiTensor,
     # KV norm
-    kv_norm_gamma_hbm: nl.ndarray,
+    kv_norm_gamma_hbm: nl.NkiTensor,
     # RoPE caches
-    cos_cache_hbm: nl.ndarray,
-    sin_cache_hbm: nl.ndarray,
+    cos_cache_hbm: nl.NkiTensor,
+    sin_cache_hbm: nl.NkiTensor,
     # Dimensions
     n_heads: int,
     head_dim: int,
@@ -777,7 +777,7 @@ def qkv_mla_mx_deepseek_v4(
     kv_lora_rank: int,
     qk_lora_rank: int,
     norm_eps: float = 1e-6,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """DeepSeek v4 MLA QKV projection with MX quantization.
 
     Variant of :func:`qkv_mla_mx` that fuses the first projection (single wqkv

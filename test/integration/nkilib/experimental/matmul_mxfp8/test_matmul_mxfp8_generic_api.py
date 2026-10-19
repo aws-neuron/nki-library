@@ -23,41 +23,48 @@ Tested data paths:
   LHS M-sharded: LNC2 shards on M dimension via lhs_m_offset
 """
 
+import copy
 import os
 
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
-from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
-    MatmulMxfp8KernelConfig,
-    auto_generate_default,
-    validate_shapes,
-)
-from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_constants import (
+from nkilib_src.nkilib.experimental.matmul_mxfp8._matmul_mxfp8_constants import (
     PRECISION_BFLOAT16,
     PRECISION_FP32,
     PRECISION_MXFP8,
     PRECISION_MXFP8_X4,
 )
-from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_generic_api import (
+from nkilib_src.nkilib.experimental.matmul_mxfp8._matmul_mxfp8_generic_api import (
     generic_matmul_mxfp8_api,
+)
+from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
+    MatmulMxfp8KernelConfig,
+    _validate_shapes,
+    auto_generate_default,
 )
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils import (
-    load_block,
-    quantize_mxfp8_block,
+    _load_block,
+    _quantize_mxfp8_block,
 )
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import (
-    TensorDescriptor,
-)
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
     with_active_sbm,
 )
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._dense_scales import DATA_ROWS_PER_SCALE
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._quantize_mxfp8_utils import (
+    INTERLEAVE_FACTOR,
+    MX_PARTITION_SIZE,
     get_fp8_dtype_x4,
+)
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import (
+    LncShardingMode,
+    SwizzleMode,
+    TensorDescriptor,
+    TensorOrientation,
 )
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import config_helper, constants
@@ -95,23 +102,25 @@ def _setup(
     spill_reload=False,
     lhs_load_with_PE_swizzle=False,
     rhs_load_with_PE_swizzle=False,
-    lhs_is_f_by_k=None,
-    rhs_is_f_by_k=None,
+    lhs_orientation=None,
+    rhs_orientation=None,
+    rhs_effective_k_dim=None,
 ):
     lhs_td = TensorDescriptor(
         data=lhs,
         scales=lhs_scales,
         is_swizzled=lhs_is_swizzled,
-        load_with_PE_swizzle=lhs_load_with_PE_swizzle if not lhs_is_swizzled else False,
-        is_f_by_k=lhs_is_f_by_k,
+        swizzle_mode=SwizzleMode.PE if (lhs_load_with_PE_swizzle and not lhs_is_swizzled) else SwizzleMode.DGT,
+        orientation=lhs_orientation,
     )
     rhs_td = TensorDescriptor(
         data=rhs,
         scales=rhs_scales,
         is_swizzled=rhs_is_swizzled,
         is_col_parallel_sharded=run_with_lnc2,
-        load_with_PE_swizzle=rhs_load_with_PE_swizzle if not rhs_is_swizzled else False,
-        is_f_by_k=rhs_is_f_by_k,
+        swizzle_mode=SwizzleMode.PE if (rhs_load_with_PE_swizzle and not rhs_is_swizzled) else SwizzleMode.DGT,
+        orientation=rhs_orientation,
+        effective_k_dim=rhs_effective_k_dim,
     )
 
     # Full dims: auto_generate_default applies the LNC2 shard itself.
@@ -140,13 +149,33 @@ def _setup(
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
         enable_scale_packing=use_scale_packing,
-        run_with_lnc2=run_with_lnc2,
-        lnc_2_shard_rhs=True,
-        lhs_is_swizzled=lhs_is_swizzled,
-        rhs_is_swizzled=rhs_is_swizzled,
+        lnc_sharding=LncShardingMode.from_bools(run_with_lnc2, True),
     )
-    auto_generate_default(config, lhs_precision, rhs_precision, PRECISION_FP32)
-    validate_shapes(config, lhs_td, rhs_td)
+    auto_generate_default(
+        config,
+        lhs_precision,
+        rhs_precision,
+        PRECISION_FP32,
+        lhs_is_swizzled=lhs_td.is_swizzled,
+        rhs_is_swizzled=rhs_td.is_swizzled,
+        lhs_load_with_PE_swizzle=lhs_td.uses_pe_swizzle,
+        rhs_load_with_PE_swizzle=rhs_td.uses_pe_swizzle,
+    )
+    if rhs_effective_k_dim is None:
+        _validate_shapes(config, lhs_td, rhs_td)
+    else:
+        # The full-kernel shape check has no K-window; derive the tiling from a window-sized view.
+        window_rows = rhs_effective_k_dim // INTERLEAVE_FACTOR
+        _validate_shapes(
+            config,
+            lhs_td,
+            TensorDescriptor(
+                data=rhs[0:window_rows, :],
+                scales=rhs_scales[0 : rhs_effective_k_dim // MX_PARTITION_SIZE, :],
+                is_swizzled=rhs_is_swizzled,
+                is_col_parallel_sharded=run_with_lnc2,
+            ),
+        )
 
     shapes = {
         'bd': config.bd,
@@ -233,11 +262,13 @@ def _kernel_hbm_k_loop(
     output_to_sbuf=False,
     lhs_load_with_PE_swizzle=False,
     rhs_load_with_PE_swizzle=False,
-    lhs_is_f_by_k=None,
-    rhs_is_f_by_k=None,
-    enable_psum_copy_in=None,
+    lhs_orientation=None,
+    rhs_orientation=None,
+    psum_copy_in_ratio=None,
     quant_scheme="wrapX",
     psum_drain_engine_ratio=None,
+    rhs_effective_k_dim=None,
+    rhs_k_offset=0,
 ):
     create_and_set_active_sbm()
     sbm = get_active_sbm()
@@ -261,8 +292,9 @@ def _kernel_hbm_k_loop(
         rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
         lhs_load_with_PE_swizzle=lhs_load_with_PE_swizzle,
         rhs_load_with_PE_swizzle=rhs_load_with_PE_swizzle,
-        lhs_is_f_by_k=lhs_is_f_by_k,
-        rhs_is_f_by_k=rhs_is_f_by_k,
+        lhs_orientation=lhs_orientation,
+        rhs_orientation=rhs_orientation,
+        rhs_effective_k_dim=rhs_effective_k_dim,
     )
     bd = shapes['bd']
     LHS_MATMUL_TILE_M = shapes['lhs_matmul_tile_shape_physical'][1]
@@ -288,7 +320,10 @@ def _kernel_hbm_k_loop(
                     buffer=data_buffer,
                 ),
                 scales=nl.ndarray(
-                    (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, shapes['BLOCKS_IN_M'] * bd.BLOCK_M_LOGICAL),
+                    (
+                        shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE // DATA_ROWS_PER_SCALE,
+                        shapes['BLOCKS_IN_M'] * bd.BLOCK_M_LOGICAL,
+                    ),
                     dtype=nl.float8_e8m0fnu,
                     buffer=data_buffer,
                 ),
@@ -303,7 +338,10 @@ def _kernel_hbm_k_loop(
                     buffer=data_buffer,
                 ),
                 scales=nl.ndarray(
-                    (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
+                    (
+                        shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE // DATA_ROWS_PER_SCALE,
+                        BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL,
+                    ),
                     dtype=nl.float8_e8m0fnu,
                     buffer=data_buffer,
                 ),
@@ -345,6 +383,7 @@ def _kernel_hbm_k_loop(
         lhsq_td=lhsq_td,
         rhsq_td=rhsq_td,
         rhs_n_offset=rhs_n_offset,
+        rhs_k_offset=rhs_k_offset,
         psum_drain_engine_ratio=psum_drain_engine_ratio,
     )
 
@@ -388,9 +427,9 @@ def _kernel_sbuf_preloaded(
     output_to_sbuf=False,
     lhs_load_with_PE_swizzle=False,
     rhs_load_with_PE_swizzle=False,
-    lhs_is_f_by_k=None,
-    rhs_is_f_by_k=None,
-    enable_psum_copy_in=None,
+    lhs_orientation=None,
+    rhs_orientation=None,
+    psum_copy_in_ratio=None,
     quant_scheme="wrapX",
     psum_drain_engine_ratio=None,
 ):
@@ -433,7 +472,7 @@ def _kernel_sbuf_preloaded(
         lhs_scales_loaded,
         rhs_data_loaded,
         rhs_scales_loaded,
-    ) = load_block.load_lhs_and_rhs(
+    ) = _load_block.load_lhs_and_rhs(
         lhs_td=lhs_td,
         rhs_td=rhs_td,
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
@@ -447,14 +486,14 @@ def _kernel_sbuf_preloaded(
 
     # Quantize if BF16 input
     if lhs_loaded is not None:
-        lhs_data_loaded, lhs_scales_loaded = quantize_mxfp8_block.quantize_mxfp8_block(
+        lhs_data_loaded, lhs_scales_loaded = _quantize_mxfp8_block.quantize_mxfp8_block(
             lhs_loaded,
             shapes['lhs_quantize_tile_shape'],
             True,
             float8_dtype,
         )
     if rhs_loaded is not None:
-        rhs_data_loaded, rhs_scales_loaded = quantize_mxfp8_block.quantize_mxfp8_block(
+        rhs_data_loaded, rhs_scales_loaded = _quantize_mxfp8_block.quantize_mxfp8_block(
             rhs_loaded,
             shapes['rhs_quantize_tile_shape'],
             True,
@@ -548,9 +587,9 @@ def _kernel_sbuf_empty_td_fill(
     output_to_sbuf=False,
     lhs_load_with_PE_swizzle=False,
     rhs_load_with_PE_swizzle=False,
-    lhs_is_f_by_k=None,
-    rhs_is_f_by_k=None,
-    enable_psum_copy_in=None,
+    lhs_orientation=None,
+    rhs_orientation=None,
+    psum_copy_in_ratio=None,
     quant_scheme="wrapX",
     psum_drain_engine_ratio=None,
 ):
@@ -693,9 +732,9 @@ def _kernel_lhs_m_sharded(
     output_to_sbuf=False,
     lhs_load_with_PE_swizzle=False,
     rhs_load_with_PE_swizzle=False,
-    lhs_is_f_by_k=None,
-    rhs_is_f_by_k=None,
-    enable_psum_copy_in=None,
+    lhs_orientation=None,
+    rhs_orientation=None,
+    psum_copy_in_ratio=None,
     quant_scheme="wrapX",
     psum_drain_engine_ratio=None,
 ):
@@ -734,13 +773,19 @@ def _kernel_lhs_m_sharded(
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
         enable_scale_packing=use_scale_packing,
-        run_with_lnc2=True,
-        lnc_2_shard_rhs=False,
-        lhs_is_swizzled=lhs_is_swizzled,
-        rhs_is_swizzled=rhs_is_swizzled,
+        lnc_sharding=LncShardingMode.from_bools(True, False),
     )
-    auto_generate_default(config, lhs_precision, rhs_precision, PRECISION_FP32)
-    validate_shapes(config, lhs_td, rhs_td)
+    auto_generate_default(
+        config,
+        lhs_precision,
+        rhs_precision,
+        PRECISION_FP32,
+        lhs_is_swizzled=lhs_td.is_swizzled,
+        rhs_is_swizzled=rhs_td.is_swizzled,
+        lhs_load_with_PE_swizzle=lhs_td.uses_pe_swizzle,
+        rhs_load_with_PE_swizzle=rhs_td.uses_pe_swizzle,
+    )
+    _validate_shapes(config, lhs_td, rhs_td)
 
     bd = config.bd
     BLOCKS_IN_M = config.BLOCKS_IN_M
@@ -854,6 +899,81 @@ GRID_HBM_K_LOOP = [
     ),
 ]
 
+# A pre-quantized RHS K-window that ends mid-tile (640 = 512 + 128). The test stacks it between
+# NaN-poisoned neighbours and starts the contraction at the window (rhs_k_offset = K).
+GRID_RHS_K_WINDOW = [
+    config_helper.TestConfig(
+        M=128,
+        K=640,
+        N=512,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_M=1,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_LOAD_M=1,
+        TILES_IN_LOAD_N=1,
+        run_with_lnc2=False,
+        output_dtype=constants.MatrixPrecision.FP32,
+        float8_dtype="float8_e4m3fn",
+        rhs_dtype=constants.MatrixPrecision.MXFP8_X4,
+        dists=["normal", "normal"],
+        params=[{"mean": 0, "std": 1}, {"mean": 0, "std": 1}],
+        description="pre-quantized RHS K-window, partial last K tile",
+        seed=53,
+    ),
+]
+
+
+# One K block of 9 tiles with SBUF scale packing: groups of 4, 4 and 1 tiles, so the last
+# packing group is partial.
+GRID_PARTIAL_PACKING_GROUP = [
+    config_helper.TestConfig(
+        M=128,
+        K=9 * 512,
+        N=512,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_M=1,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_BLOCK_K=9,
+        TILES_IN_LOAD_M=1,
+        TILES_IN_LOAD_N=1,
+        run_with_lnc2=False,
+        output_dtype=constants.MatrixPrecision.FP32,
+        float8_dtype="float8_e4m3fn",
+        rhs_dtype=rhs_dtype,
+        enable_scale_packing=True,
+        dists=["normal", "normal"],
+        params=[{"mean": 0, "std": 1}, {"mean": 0, "std": 1}],
+        description=f"9 K tiles packed 4 + 4 + 1, rhs {rhs_dtype}",
+        seed=54,
+    )
+    for rhs_dtype in (constants.MatrixPrecision.BFLOAT16, constants.MatrixPrecision.MXFP8_X4)
+]
+
+
+def _stack_rhs_window_between_poison(kernel_input):
+    """Put the pre-quantized RHS between two same-size NaN neighbours and select it as a K-window.
+
+    0xFF is NaN in both float8_e4m3fn data and float8_e8m0fnu scales, so any read past the window
+    -- by the data or the scale load -- turns the output NaN.
+    """
+    rhs, rhs_scales = kernel_input["rhs"], kernel_input["rhs_scales"]
+    window_k = rhs.shape[0] * INTERLEAVE_FACTOR
+    nan_data = np.full_like(rhs.view(np.uint8), 0xFF).view(rhs.dtype)
+    nan_scales = np.full_like(rhs_scales.view(np.uint8), 0xFF).view(rhs_scales.dtype)
+    return {
+        **kernel_input,
+        "rhs": np.concatenate([nan_data, rhs, nan_data], axis=0),
+        "rhs_scales": np.concatenate([nan_scales, rhs_scales, nan_scales], axis=0),
+        "rhs_effective_k_dim": window_k,
+        "rhs_k_offset": window_k,
+    }
+
+
 # Single block in all dimensions.
 # BLOCK_K = 2*512 = 1024 >= K
 GRID_SBUF_PRELOADED = [
@@ -954,8 +1074,8 @@ GRID_K_BY_F_API = [
         params=[{"mean": 0, "std": 1}, {"mean": 0, "std": 1}],
         description="K-by-F: both sides via API",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     # K-by-F with LNC2 (RHS col-parallel sharded on N). N=1024 -> 2 N-blocks, shardable.
     config_helper.TestConfig(
@@ -979,8 +1099,8 @@ GRID_K_BY_F_API = [
         params=[{"mean": 0, "std": 1}, {"mean": 0, "std": 1}],
         description="K-by-F: both sides via API, LNC2",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
 ]
 
@@ -1013,9 +1133,9 @@ def _api_torch_ref(
     output_to_sbuf=False,
     lhs_load_with_PE_swizzle=False,
     rhs_load_with_PE_swizzle=False,
-    lhs_is_f_by_k=None,
-    rhs_is_f_by_k=None,
-    enable_psum_copy_in=None,
+    lhs_orientation=None,
+    rhs_orientation=None,
+    psum_copy_in_ratio=None,
     quant_scheme="wrapX",
     psum_drain_engine_ratio=None,
 ):
@@ -1041,9 +1161,53 @@ def _api_torch_ref(
         spill_reload=spill_reload,
         lhs_is_swizzled=lhs_is_swizzled,
         rhs_is_swizzled=rhs_is_swizzled,
-        lhs_is_f_by_k=lhs_is_f_by_k,
-        rhs_is_f_by_k=rhs_is_f_by_k,
+        lhs_orientation=lhs_orientation,
+        rhs_orientation=rhs_orientation,
     )
+
+
+def _api_torch_ref_hbm_k_loop(
+    lhs,
+    rhs,
+    output_dtype,
+    run_with_lnc2,
+    float8_dtype,
+    use_scale_packing,
+    tile_loop_order,
+    lhs_scales,
+    rhs_scales,
+    TILES_IN_BLOCK_M=None,
+    TILES_IN_BLOCK_N=None,
+    TILES_IN_BLOCK_K=None,
+    TILES_IN_LOAD_M=None,
+    TILES_IN_LOAD_N=None,
+    lhs_matmul_tile_shape_logical=None,
+    rhs_matmul_tile_shape_logical=None,
+    lhs_is_swizzled=True,
+    rhs_is_swizzled=True,
+    block_loop_order=None,
+    spill_reload=False,
+    output_to_sbuf=False,
+    lhs_load_with_PE_swizzle=False,
+    rhs_load_with_PE_swizzle=False,
+    lhs_orientation=None,
+    rhs_orientation=None,
+    psum_copy_in_ratio=None,
+    quant_scheme="wrapX",
+    psum_drain_engine_ratio=None,
+    rhs_effective_k_dim=None,
+    rhs_k_offset=0,
+):
+    """Torch ref for _kernel_hbm_k_loop: _api_torch_ref over the RHS K-window, if one is set."""
+    if rhs_effective_k_dim is not None:
+        # Pre-quantized RHS window: data rows K // 4, dense scale rows K // 32.
+        k_start, k_stop = rhs_k_offset, rhs_k_offset + rhs_effective_k_dim
+        rhs = rhs[k_start // INTERLEAVE_FACTOR : k_stop // INTERLEAVE_FACTOR]
+        rhs_scales = rhs_scales[k_start // MX_PARTITION_SIZE : k_stop // MX_PARTITION_SIZE]
+    ref_args = dict(locals())
+    for name in ("rhs_effective_k_dim", "rhs_k_offset", "k_start", "k_stop"):
+        ref_args.pop(name, None)
+    return _api_torch_ref(**ref_args)
 
 
 @pytest_test_metadata(name="Generic Matmul MXFP8 API Data Paths")
@@ -1053,7 +1217,7 @@ class TestGenericMatmulMxfp8Api:
     """Tests for matmul_mxfp8_generic_api exercising HBM K-loop, SBUF preloaded,
     empty TD fill, and LHS M-sharded data paths."""
 
-    def _run(self, test_manager, platform_target, conf, kernel_func, extra_kernel_args=None):
+    def _run(self, test_manager, platform_target, conf, kernel_func, extra_kernel_args=None, transform_inputs=None):
         if os.environ.get('TEST_COLLECTION_BENCHMARK') == '1':
             pytest.skip("Benchmark mode - skipping test execution")
         if not platform_target.is_trn3():
@@ -1064,6 +1228,8 @@ class TestGenericMatmulMxfp8Api:
         kernel_input = build_matmul_inputs(conf)
         if extra_kernel_args:
             kernel_input.update(extra_kernel_args)
+        if transform_inputs:
+            kernel_input = transform_inputs(kernel_input)
 
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
@@ -1075,7 +1241,7 @@ class TestGenericMatmulMxfp8Api:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=kernel_func,
-            torch_ref=_api_torch_ref,
+            torch_ref=_api_torch_ref_hbm_k_loop if kernel_func is _kernel_hbm_k_loop else _api_torch_ref,
             kernel_input_generator=lambda _: kernel_input,
             output_tensor_descriptor=lambda _: {"out": np.zeros((conf.M, conf.N), dtype=output_dtype)},
         )
@@ -1086,10 +1252,12 @@ class TestGenericMatmulMxfp8Api:
         )
 
     # --- HBM K-loop: Load from HBM, API handles K loop (single M/N block) -> HBM/SBUF
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", GRID_HBM_K_LOOP)
     @pytest.mark.parametrize("spill_reload", [False, True], ids=["no_spill", "spill"])
-    @pytest.mark.parametrize("output_to_sbuf", [False, True], ids=["to_hbm", "to_sbuf"])
+    @pytest.mark.parametrize(
+        "output_to_sbuf",
+        [pytest.param(False, id="to_hbm"), pytest.param(True, id="to_sbuf", marks=pytest.mark.fast)],
+    )
     def test_hbm_loop_k(self, test_manager, conf, spill_reload, output_to_sbuf, platform_target):
         self._run(
             test_manager,
@@ -1099,8 +1267,30 @@ class TestGenericMatmulMxfp8Api:
             extra_kernel_args={"output_to_sbuf": output_to_sbuf, "spill_reload": spill_reload},
         )
 
-    # --- SBUF preloaded: Caller pre-loads SBUF, API does single-block matmul -> HBM & SBUF
+    # --- Scale packing with a partial last group (9 K tiles -> groups of 4, 4, 1), for an
+    #     in-kernel quantized and a pre-quantized RHS.
     @pytest.mark.fast
+    @pytest.mark.parametrize("conf", GRID_PARTIAL_PACKING_GROUP)
+    def test_partial_scale_packing_group(self, test_manager, conf, platform_target):
+        self._run(test_manager, platform_target, conf, _kernel_hbm_k_loop)
+
+    # --- Pre-quantized RHS K-window in the middle of a wider operand: starts at a nonzero
+    #     rhs_k_offset and must read neither data nor scales past the window end.
+    @pytest.mark.fast
+    @pytest.mark.parametrize("conf", GRID_RHS_K_WINDOW)
+    @pytest.mark.parametrize("use_scale_packing", [True, False], ids=["packed", "unpacked"])
+    def test_rhs_k_window(self, test_manager, conf, use_scale_packing, platform_target):
+        conf = copy.deepcopy(conf)
+        conf.kernel_config.enable_scale_packing = use_scale_packing
+        self._run(
+            test_manager,
+            platform_target,
+            conf,
+            _kernel_hbm_k_loop,
+            transform_inputs=_stack_rhs_window_between_poison,
+        )
+
+    # --- SBUF preloaded: Caller pre-loads SBUF, API does single-block matmul -> HBM & SBUF
     @pytest.mark.parametrize("conf", GRID_SBUF_PRELOADED)
     @pytest.mark.parametrize("output_to_sbuf", [False, True], ids=["to_hbm", "to_sbuf"])
     def test_sbuf_single_block(self, test_manager, conf, output_to_sbuf, platform_target):
@@ -1125,7 +1315,6 @@ class TestGenericMatmulMxfp8Api:
         self._run(test_manager, platform_target, conf, _kernel_lhs_m_sharded)
 
     # --- PE swizzle mixed: LHS PE swizzle, RHS DGT (both unswizzled) ---
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", GRID_PE_SWIZZLE_MIXED)
     def test_pe_swizzle_mixed(self, test_manager, conf, platform_target):
         self._run(
@@ -1137,10 +1326,15 @@ class TestGenericMatmulMxfp8Api:
         )
 
     # --- PE swizzle drain split: PSUM copy-outs spread across Scalar and Vector ---
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", GRID_PE_SWIZZLE_MIXED)
     @pytest.mark.parametrize(
-        "psum_drain_engine_ratio", [(1, 1), (2, 1), (1, 0), (0, 1)], ids=["1s1v", "2s1v", "all_scalar", "all_vector"]
+        "psum_drain_engine_ratio",
+        [
+            pytest.param((1, 1), id="1s1v"),
+            pytest.param((2, 1), id="2s1v"),
+            pytest.param((1, 0), id="all_scalar"),
+            pytest.param((0, 1), id="all_vector", marks=pytest.mark.fast),
+        ],
     )
     def test_pe_swizzle_drain_engine_ratio(self, test_manager, conf, psum_drain_engine_ratio, platform_target):
         self._run(
@@ -1156,13 +1350,18 @@ class TestGenericMatmulMxfp8Api:
         )
 
     # --- K-by-F: Input in [K, F] layout, PE swizzle auto-forced ---
-    @pytest.mark.fast
-    @pytest.mark.parametrize("conf", GRID_K_BY_F_API)
+    @pytest.mark.parametrize(
+        "conf",
+        [GRID_K_BY_F_API[0], pytest.param(GRID_K_BY_F_API[1], marks=pytest.mark.fast)],
+    )
     def test_k_by_f(self, test_manager, conf, platform_target):
         self._run(
             test_manager,
             platform_target,
             conf,
             _kernel_hbm_k_loop,
-            extra_kernel_args={"lhs_is_f_by_k": False, "rhs_is_f_by_k": False},
+            extra_kernel_args={
+                "lhs_orientation": TensorOrientation.K_BY_F,
+                "rhs_orientation": TensorOrientation.K_BY_F,
+            },
         )

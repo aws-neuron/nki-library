@@ -29,15 +29,15 @@ _CHUNK_OUTER_HEAD_THRESHOLD = 8
 
 @nki.jit
 def ssd(
-    x: nl.ndarray,
-    dt: nl.ndarray,
-    A: nl.ndarray,
-    B: nl.ndarray,
-    C: nl.ndarray,
+    x: nl.NkiTensor,
+    dt: nl.NkiTensor,
+    A: nl.NkiTensor,
+    B: nl.NkiTensor,
+    C: nl.NkiTensor,
     chunk_size: int = 128,
-    D: nl.ndarray = None,
-    initial_state: nl.ndarray = None,
-    causal_mask: nl.ndarray = None,
+    D: nl.NkiTensor = None,
+    initial_state: nl.NkiTensor = None,
+    causal_mask: nl.NkiTensor = None,
 ) -> tuple:
     """State Space Duality (SSD) scan for Mamba-2 prefill.
 
@@ -61,22 +61,22 @@ def ssd(
         Q: Chunk size (= chunk_size, <= 128).
 
     Args:
-        x (nl.ndarray): [batch, nheads, seqlen, headdim], Input activations.
-        dt (nl.ndarray): [batch, nheads, seqlen], Softplus'd timesteps. Must be positive.
-        A (nl.ndarray): [nheads], State transition scalars. Typically negative.
-        B (nl.ndarray): [batch, seqlen, dstate], Input projection.
-        C (nl.ndarray): [batch, seqlen, dstate], Output projection.
+        x (nl.NkiTensor): [batch, nheads, seqlen, headdim], Input activations.
+        dt (nl.NkiTensor): [batch, nheads, seqlen], Softplus'd timesteps. Must be positive.
+        A (nl.NkiTensor): [nheads], State transition scalars. Typically negative.
+        B (nl.NkiTensor): [batch, seqlen, dstate], Input projection.
+        C (nl.NkiTensor): [batch, seqlen, dstate], Output projection.
         chunk_size (int): Chunk size for parallel scan. Must be <= 128.
-        D (nl.ndarray, optional): [nheads], Skip connection weights.
-        initial_state (nl.ndarray, optional): [batch, nheads, dstate, headdim], Initial
+        D (nl.NkiTensor, optional): [nheads], Skip connection weights.
+        initial_state (nl.NkiTensor, optional): [batch, nheads, dstate, headdim], Initial
             SSM state. Default: None (zeros).
-        causal_mask (nl.ndarray): [Q, Q], Lower-triangular mask. Required.
+        causal_mask (nl.NkiTensor): [Q, Q], Lower-triangular mask. Required.
             Pass np.tril(np.ones((Q, Q), dtype=np.float32)).
 
     Returns:
         tuple: (y, final_state)
-            - y (nl.ndarray): [batch, nheads, seqlen, headdim], Output, same dtype as x.
-            - final_state (nl.ndarray): [batch, nheads, dstate, headdim], Final SSM state
+            - y (nl.NkiTensor): [batch, nheads, seqlen, headdim], Output, same dtype as x.
+            - final_state (nl.NkiTensor): [batch, nheads, dstate, headdim], Final SSM state
               in float32.
 
     Notes:

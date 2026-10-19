@@ -26,12 +26,12 @@ from .validation import validate_cross_entropy_backward_inputs, validate_cross_e
 
 @nki.jit
 def cross_entropy_forward(
-    logits_hbm: nl.ndarray,
-    targets_hbm: nl.ndarray,
+    logits_hbm: nl.NkiTensor,
+    targets_hbm: nl.NkiTensor,
     positions_per_batch: int = 32,
     chunk_size: int = 32768,
     dtype: nki.dtype = nl.bfloat16,
-) -> tuple[nl.ndarray, nl.ndarray]:
+) -> tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Cross entropy forward pass using online log-sum-exp algorithm with batching.
 
@@ -48,9 +48,9 @@ def cross_entropy_forward(
         chunk_size: Size of vocabulary chunks
 
     Args:
-        logits_hbm (nl.ndarray): [num_positions, V], Input logits tensor in HBM.
+        logits_hbm (nl.NkiTensor): [num_positions, V], Input logits tensor in HBM.
             Supported dtypes: nl.bfloat16, nl.float32. MUST be 2D (already flattened).
-        targets_hbm (nl.ndarray): [num_positions], Target indices tensor in HBM.
+        targets_hbm (nl.NkiTensor): [num_positions], Target indices tensor in HBM.
             dtype: nl.int32. MUST be 1D (already flattened).
         positions_per_batch (int): Number of positions to process together. Default: 32.
             Larger batches improve HBM bandwidth and SBUF utilization.
@@ -77,9 +77,9 @@ def cross_entropy_forward(
             Controls precision of intermediate calculations and memory usage.
 
     Returns:
-        loss_hbm (nl.ndarray): [num_positions], Cross entropy loss per position in HBM.
+        loss_hbm (nl.NkiTensor): [num_positions], Cross entropy loss per position in HBM.
             dtype matches dtype parameter. Buffer: nl.shared_hbm (allocated internally).
-        lse_state_hbm (nl.ndarray): [num_positions], Log-sum-exp values per position in HBM.
+        lse_state_hbm (nl.NkiTensor): [num_positions], Log-sum-exp values per position in HBM.
             dtype matches dtype parameter. Buffer: nl.shared_hbm (allocated internally).
             Saved for backward pass.
 
@@ -306,15 +306,15 @@ def cross_entropy_forward(
 
 @nki.jit
 def cross_entropy_backward(
-    logits_hbm: nl.ndarray,
-    targets_hbm: nl.ndarray,
-    lse_state_hbm: nl.ndarray,
+    logits_hbm: nl.NkiTensor,
+    targets_hbm: nl.NkiTensor,
+    lse_state_hbm: nl.NkiTensor,
     reduction: str = "mean",
     positions_per_batch: int = 32,
     chunk_size: int = 32768,
     dtype: nki.dtype = nl.bfloat16,
     inplace: bool = True,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Cross entropy backward pass computing gradients with respect to logits.
 
@@ -337,13 +337,13 @@ def cross_entropy_backward(
         chunk_size: Size of vocabulary chunks
 
     Args:
-        logits_hbm (nl.ndarray): [num_positions, V], Input logits tensor in HBM.
+        logits_hbm (nl.NkiTensor): [num_positions, V], Input logits tensor in HBM.
             Supported dtypes: nl.bfloat16, nl.float32. MUST be 2D (already flattened).
             Same tensor used in forward pass.
-        targets_hbm (nl.ndarray): [num_positions], Target indices tensor in HBM.
+        targets_hbm (nl.NkiTensor): [num_positions], Target indices tensor in HBM.
             dtype: nl.int32. MUST be 1D (already flattened).
             Same tensor used in forward pass.
-        lse_state_hbm (nl.ndarray): [num_positions], Log-sum-exp values from forward pass in HBM.
+        lse_state_hbm (nl.NkiTensor): [num_positions], Log-sum-exp values from forward pass in HBM.
             dtype matches dtype parameter. Saved state from cross_entropy_forward.
         reduction (str): How to scale gradients. Default: 'mean'.
             - 'mean': Scale by 1/num_positions (most common, matches PyTorch default)
@@ -364,7 +364,7 @@ def cross_entropy_backward(
             Saves num_positions × vocab_size × dtype_bytes of HBM memory.
 
     Returns:
-        grad_logits_hbm (nl.ndarray): [num_positions, V], Gradient with respect to logits in HBM.
+        grad_logits_hbm (nl.NkiTensor): [num_positions, V], Gradient with respect to logits in HBM.
             dtype matches dtype parameter. If inplace=True, this is the same tensor as logits_hbm.
             Buffer: nl.shared_hbm (allocated internally if inplace=False).
 

@@ -40,11 +40,15 @@ so workers never inherit stale prior-session state.
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import time
+from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Callable, Generator
+from enum import Enum
+from typing import Callable, Generator, Iterator, Self
 
 from filelock import FileLock
 
@@ -52,6 +56,40 @@ from .common_dataclasses import PYTEST_XDIST_WORKER_ENV, Platforms, ResolvedHost
 from .exceptions import FleetEmptyError, RequestTooLargeError
 
 logger = logging.getLogger(__name__)
+
+# A request needing more physical cores than this is also offered multi-node deployments, each
+# claimed as one unit; at or below it, every host (multi-node member or not) is claimed alone.
+MULTINODE_CORE_THRESHOLD = 128
+
+
+class PlacementRejection(Enum):
+    """Capacity constraints that prevent placing a request on a host unit."""
+
+    UNSPLITTABLE = "unsplittable"
+    TOO_SMALL = "too_small"
+    MEMBER_TOO_SMALL = "member_too_small"
+
+
+def validate_core_request(num_physical_cores_needed: int, lnc_config: int) -> None:
+    """Raise ``ValueError`` unless the request is a positive whole number of logical ranks."""
+    if num_physical_cores_needed <= 0:
+        raise ValueError(f"Requested physical cores must be positive, got {num_physical_cores_needed}.")
+    if lnc_config <= 0:
+        raise ValueError(f"lnc_config must be positive, got {lnc_config}.")
+    if num_physical_cores_needed % lnc_config:
+        raise ValueError(
+            f"Requested {num_physical_cores_needed} physical cores is not divisible by lnc_config={lnc_config}."
+        )
+
+
+def per_member_physical_cores(num_physical_cores_needed: int, member_count: int, *, lnc_config: int = 1) -> int | None:
+    """Physical cores each of ``member_count`` hosts must provide when the request's logical ranks
+    are split evenly over them, or None if the ranks do not divide by ``member_count``."""
+    validate_core_request(num_physical_cores_needed, lnc_config)
+    ranks = num_physical_cores_needed // lnc_config
+    if ranks % member_count:
+        return None
+    return ranks // member_count * lnc_config
 
 
 @contextlib.contextmanager
@@ -65,8 +103,104 @@ def temporary_random_seed(seed: int) -> Generator[None, None, None]:
         random.setstate(state)
 
 
+class HostUnit(ABC):
+    """One claimable unit of the pool: a single host (``HostRecord``) or every member of a
+    multi-node deployment (``HostGroup``). Iterating a unit yields its ``HostRecord`` members,
+    and the shared behaviour below is defined over that iteration, so the store and its callers
+    handle both kinds the same way."""
+
+    @abstractmethod
+    def __iter__(self) -> Iterator["HostRecord"]: ...
+
+    @property
+    @abstractmethod
+    def primary(self) -> "HostRecord":
+        """The member that identifies the unit (the lowest-ranked pooled member of a multi-node
+        deployment)."""
+
+    @abstractmethod
+    def snapshot(self) -> Self:
+        """A detached copy, safe to hand out after the store lock is released."""
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    @property
+    def host_id(self) -> str:
+        return self.primary.resolved.ssh_host
+
+    @property
+    def member_ids(self) -> tuple[str, ...]:
+        """Aliases of the members in iteration order; pass to ``HostStateStore.release`` so a
+        release touches exactly the hosts this claim reserved."""
+        return tuple(rec.resolved.ssh_host for rec in self)
+
+    @property
+    def host_type(self) -> Platforms:
+        """The members' common platform. Raises ``ValueError`` if members disagree."""
+        host_types = {rec.resolved.host_type for rec in self}
+        if len(host_types) != 1:
+            raise ValueError(
+                f"Host unit {self.host_id} mixes platforms {sorted(p.value for p in host_types)}; "
+                f"a multi-node deployment must be homogeneous."
+            )
+        return host_types.pop()
+
+    @property
+    def total_physical_cores(self) -> int:
+        return sum(rec.resolved.num_physical_cores for rec in self)
+
+    @property
+    def is_claimable(self) -> bool:
+        return all(rec.available for rec in self)
+
+    def can_serve(self, platform: Platforms, num_physical_cores_needed: int, *, lnc_config: int = 1) -> bool:
+        """True if the unit can take the request. A unit with no member on ``platform`` is simply
+        not a candidate; one that has a member there but mixes platforms raises ``ValueError``
+        (see ``host_type``), whatever the members' availability. Every member must be available
+        and report a known (positive) core count, and the placement must be legal (see
+        ``placement_rejection``)."""
+        if not any(rec.resolved.host_type == platform for rec in self):
+            return False
+        return (
+            self.host_type == platform
+            and self.is_claimable
+            and all(rec.resolved.num_physical_cores > 0 for rec in self)
+            and self.placement_rejection(num_physical_cores_needed, lnc_config=lnc_config) is None
+        )
+
+    def placement_rejection(self, num_physical_cores_needed: int, *, lnc_config: int = 1) -> PlacementRejection | None:
+        """Why the request cannot be placed on this unit's capacity, or None if it can. The
+        request's logical ranks (``num_physical_cores_needed // lnc_config``) are split evenly over
+        the members, so each member must host ``num_physical_cores_needed // len(self)`` physical
+        cores. Returns ``UNSPLITTABLE`` if the ranks do not divide by the member count,
+        ``TOO_SMALL`` if the members' total capacity is below the request, and
+        ``MEMBER_TOO_SMALL`` if the total suffices but some member is below its share. Ignores
+        availability and unknown capacity (see ``can_serve``)."""
+        share = per_member_physical_cores(num_physical_cores_needed, len(self), lnc_config=lnc_config)
+        if share is None:
+            return PlacementRejection.UNSPLITTABLE
+        if self.total_physical_cores < num_physical_cores_needed:
+            return PlacementRejection.TOO_SMALL
+        if any(rec.resolved.num_physical_cores < share for rec in self):
+            return PlacementRejection.MEMBER_TOO_SMALL
+        return None
+
+    def post_placement_load(self, num_physical_cores_needed: int) -> float:
+        """Mean over members of ``(work_queue_depth + needed) / num_physical_cores`` — the load
+        each member WOULD carry after this request. A member of unknown (0) capacity counts as
+        infinitely loaded."""
+
+        def _member_load(rec: "HostRecord") -> float:
+            if rec.resolved.num_physical_cores <= 0:
+                return math.inf
+            return (rec.work_queue_depth + num_physical_cores_needed) / rec.resolved.num_physical_cores
+
+        return sum(_member_load(rec) for rec in self) / len(self)
+
+
 @dataclass
-class HostRecord:
+class HostRecord(HostUnit):
     """One host row in host_state.json: a :class:`ResolvedHost` (the host's identity and
     probed capacity) augmented with the store's runtime bookkeeping (``available`` and
     ``work_queue_depth``).
@@ -84,20 +218,29 @@ class HostRecord:
     with fewer cores than a request needs is ineligible for it, and the two together give
     the post-placement load ratio used to route work by headroom. A host whose capacity is
     unknown (never probed / stale row) reads back as 0, which makes it ineligible for any
-    request (needed cores are always >= 1) rather than risking a divide-by-zero in ranking."""
+    request (needed cores are always >= 1) rather than risking a divide-by-zero in ranking.
+
+    ``resolved.logical_host_*`` records the multi-node deployment the host belongs to when its
+    tooling reports one; those keys are absent from the row for a single-node host."""
 
     resolved: ResolvedHost
     work_queue_depth: int = 0
     available: bool = True
 
     def to_json(self) -> dict:
-        return {
+        row = {
             "host_alias": self.resolved.ssh_host,
             "host_type": self.resolved.host_type.value,
             "work_queue_depth": self.work_queue_depth,
             "available": self.available,
             "num_physical_cores": self.resolved.num_physical_cores,
         }
+        # Written only for a multi-node host, so a single-node fleet's rows are unchanged.
+        if self.resolved.logical_host_id is not None:
+            row["logical_host_id"] = self.resolved.logical_host_id
+            row["logical_host_rank"] = self.resolved.logical_host_rank
+            row["logical_host_size"] = self.resolved.logical_host_size
+        return row
 
     @classmethod
     def from_json(cls, raw: dict) -> "HostRecord | None":
@@ -118,10 +261,94 @@ class HostRecord:
                 ssh_host=host_alias,
                 host_type=host_type,
                 num_physical_cores=raw.get("num_physical_cores", 0),
+                logical_host_id=raw.get("logical_host_id"),
+                logical_host_rank=raw.get("logical_host_rank"),
+                logical_host_size=raw.get("logical_host_size"),
             ),
             work_queue_depth=raw.get("work_queue_depth", 0),
             available=raw.get("available", False),
         )
+
+    def __iter__(self) -> Iterator["HostRecord"]:
+        yield self
+
+    @property
+    def primary(self) -> "HostRecord":
+        return self
+
+    def snapshot(self) -> Self:
+        return replace(self)
+
+
+@dataclass
+class HostGroup(HostUnit):
+    """Every pooled member of one multi-node deployment, ordered by ``logical_host_rank``, claimed
+    and released as a single unit. The members are the store's own rows while under the lock
+    (so a reservation updates the state in place) and copies once handed out."""
+
+    members: tuple[HostRecord, ...]
+
+    def __post_init__(self) -> None:
+        if not self.members:
+            raise ValueError("A HostGroup needs at least one member.")
+
+    def __iter__(self) -> Iterator[HostRecord]:
+        return iter(self.members)
+
+    def __len__(self) -> int:
+        return len(self.members)
+
+    @property
+    def primary(self) -> HostRecord:
+        return self.members[0]
+
+    def snapshot(self) -> Self:
+        return replace(self, members=tuple(replace(rec) for rec in self.members))
+
+
+def _reserve(unit: HostUnit, num_physical_cores: int) -> None:
+    """Add ``num_physical_cores`` to every member's ``work_queue_depth``."""
+    for rec in unit:
+        rec.work_queue_depth += num_physical_cores
+
+
+def _unreserve(unit: HostUnit, num_physical_cores: int) -> None:
+    """Subtract ``num_physical_cores`` from every member's ``work_queue_depth``, floored at 0.
+    Going below 0 is an unbalanced release (a claim/release bug), so it is logged."""
+    for rec in unit:
+        if rec.work_queue_depth - num_physical_cores < 0:
+            logger.warning(
+                "Releasing %d cores from host %s whose work_queue_depth is %d "
+                "(unbalanced release - likely a claim/release bug)",
+                num_physical_cores,
+                rec.resolved.ssh_host,
+                rec.work_queue_depth,
+            )
+        rec.work_queue_depth = max(0, rec.work_queue_depth - num_physical_cores)
+
+
+def _host_units(hosts: list[HostRecord], num_physical_cores_needed: int) -> list[HostUnit]:
+    """Partition ``hosts`` into the units a ``num_physical_cores_needed`` request selects from.
+
+    At or below ``MULTINODE_CORE_THRESHOLD`` every host is its own unit. Above it, hosts sharing a
+    ``logical_host_id`` form one ``HostGroup`` (their members are not offered individually) and the
+    rest stay single. A group with fewer pooled members than its reported ``logical_host_size`` is
+    still offered (the store logs it; see ``HostStateStore._units``)."""
+    if num_physical_cores_needed <= MULTINODE_CORE_THRESHOLD:
+        return list(hosts)
+
+    units: list[HostUnit] = []
+    deployments: dict[str, list[HostRecord]] = defaultdict(list)
+    for rec in hosts:
+        if rec.resolved.logical_host_id is None:
+            units.append(rec)
+        else:
+            deployments[rec.resolved.logical_host_id].append(rec)
+
+    for members in deployments.values():
+        members.sort(key=lambda rec: (rec.resolved.logical_host_rank is None, rec.resolved.logical_host_rank or 0))
+        units.append(HostGroup(members=tuple(members)))
+    return units
 
 
 @dataclass
@@ -140,6 +367,11 @@ class HostState:
     ``provisionable_ceiling`` maps a platform to the physical cores of the LARGEST single host
     the fleet could ever provision for it (the biggest per-host size the fleet can bring up).
     A claim needing more cores than this can never be served, so it fails fast.
+
+    Limitation: the ceiling bounds a single host only, so it is not applied to a request above
+    ``MULTINODE_CORE_THRESHOLD`` when the platform has a multi-node deployment in the pool (which
+    may serve it); such a request never fails fast on size and instead waits out the claim
+    deadline if nothing can serve it.
     """
 
     hosts: list[HostRecord]
@@ -197,6 +429,30 @@ class HostStateStore:
         self.state_path = os.path.join(base_dir, self.HOST_STATE_FILENAME)
         self._lock = FileLock(f"{self.state_path}.lock", timeout=lock_timeout_seconds)
         self._initialized = False
+        # (logical_host_id, pooled members, expected size) already reported as incomplete.
+        self._warned_incomplete: set[tuple[str, int, int]] = set()
+
+    def _units(self, hosts: list[HostRecord], num_physical_cores_needed: int) -> list[HostUnit]:
+        """``_host_units``, logging each incomplete deployment once per distinct membership."""
+        units = _host_units(hosts, num_physical_cores_needed)
+        for unit in units:
+            if not isinstance(unit, HostGroup):
+                continue
+            logical_host_id = unit.primary.resolved.logical_host_id
+            expected_size = unit.primary.resolved.logical_host_size
+            if logical_host_id is None or expected_size is None or len(unit) >= expected_size:
+                continue
+            key = (logical_host_id, len(unit), expected_size)
+            if key in self._warned_incomplete:
+                continue
+            self._warned_incomplete.add(key)
+            logger.warning(
+                "Multi-node deployment %s has %d of %d members in the pool",
+                logical_host_id,
+                len(unit),
+                expected_size,
+            )
+        return units
 
     # --- low-level -------------------------------------------------
 
@@ -303,64 +559,85 @@ class HostStateStore:
         platform: Platforms,
         num_physical_cores_needed: int,
         exclude: set[str] | None = None,
-    ) -> HostRecord | None:
-        """Atomically select the best-fit available host for ``platform`` that can serve a
+        *,
+        lnc_config: int = 1,
+    ) -> HostUnit | None:
+        """Atomically select the best-fit available unit for ``platform`` that can serve a
         request needing ``num_physical_cores_needed`` physical cores, reserve those cores on
-        it (``work_queue_depth += num_physical_cores_needed``), and return a copy of the
-        claimed record. Selection + reservation are one locked read-modify-write so
+        every member (``work_queue_depth += num_physical_cores_needed``), and return a copy of
+        the claimed unit. Selection + reservation are one locked read-modify-write so
         concurrent workers can't both claim the same headroom.
 
-        Eligibility: available, matching platform, and ``num_physical_cores`` at least the
-        request (a host too small — including one with unknown capacity 0 — is skipped).
+        Units: at or below ``MULTINODE_CORE_THRESHOLD`` every host is a candidate on its own
+        (``HostRecord``); above it, each multi-node deployment is one candidate (``HostGroup``)
+        alongside the single-node hosts (see ``_host_units``).
+
+        Eligibility: every member available, matching platform, every member's capacity known
+        (positive), the request's logical ranks (``num_physical_cores_needed // lnc_config``)
+        divisible by the member count, and every member's ``num_physical_cores`` at least its
+        even share of the request (see ``HostUnit.placement_rejection``). A deployment with fewer
+        pooled members than its reported size is still a candidate when those rules hold.
+        Every member is charged the full request, not its share.
 
         Ranking: minimum POST-placement load ratio ``(work_queue_depth + needed) /
-        num_physical_cores`` — the ratio the host WOULD have after taking this request. This
-        routes toward the host with the most proportional headroom, so a larger host absorbs
-        proportionally more work than a smaller one instead of an equal per-host share, while
-        a small idle host still wins until a large host's resulting ratio climbs past it.
+        num_physical_cores``, averaged over the unit's members — the ratio the unit WOULD have
+        after taking this request. This routes toward the unit with the most proportional
+        headroom, so a larger host absorbs proportionally more work than a smaller one instead
+        of an equal per-host share, while a small idle host still wins until a large host's
+        resulting ratio climbs past it.
 
-        ``exclude`` holds hosts already tried-and-busy during THIS allocation; they are
-        deprioritized so a deterministic pick rotates across the fleet instead of re-picking
-        the same host. If every eligible host is excluded, the full eligible set is used so a
-        host is still returned.
+        ``exclude`` holds hosts already tried-and-busy during THIS allocation; a unit with any
+        excluded member is deprioritized so a deterministic pick rotates across the fleet
+        instead of re-picking the same unit. If every eligible unit is excluded, the full
+        eligible set is used so a unit is still returned.
 
-        Returns None if no eligible host matches (the caller waits/retries). When nothing is
+        Returns None if no eligible unit matches (the caller waits/retries). When nothing is
         claimable, raises ``RequestTooLargeError`` if the request needs more cores than the
         fleet's largest provisionable host for the platform (an impossible ask no wait can
-        satisfy), else ``FleetEmptyError`` if the platform is poisoned — both unretriable."""
+        satisfy), else ``FleetEmptyError`` if the platform is poisoned — both unretriable. The
+        ceiling check is skipped above ``MULTINODE_CORE_THRESHOLD`` when the platform has a
+        multi-node deployment in the pool (see ``HostState``).
+
+        Raises ``ValueError`` if a candidate multi-node deployment with a member on ``platform``
+        mixes platforms (see ``HostUnit.can_serve``), or if the request is not a positive whole
+        number of ``lnc_config`` logical ranks (see ``validate_core_request``)."""
+        validate_core_request(num_physical_cores_needed, lnc_config)
         excluded: set[str] = exclude or set()
-        claimed: list[HostRecord] = []  # used as Box for return
+        claimed: list[HostUnit] = []  # used as Box for return
 
         def _claim(state: HostState) -> HostState | None:
             if platform in state.under_capacity:
                 return None  # too few of the expected hosts up; withhold as if none available
+
             eligible = [
-                rec
-                for rec in state.hosts
-                if rec.available
-                and rec.resolved.host_type == platform
-                and rec.resolved.num_physical_cores >= num_physical_cores_needed
+                unit
+                for unit in self._units(state.hosts, num_physical_cores_needed)
+                if unit.can_serve(platform, num_physical_cores_needed, lnc_config=lnc_config)
             ]
             if not eligible:
-                return None  # no claimable host; no write
+                return None  # no claimable unit; no write
 
-            # Prefer hosts not busy this allocation; fall back to all eligible if every one
+            # Prefer units not busy this allocation; fall back to all eligible if every one
             # has already been tried (so the deadline loop keeps cycling rather than stalling).
-            selectable = [rec for rec in eligible if rec.resolved.ssh_host not in excluded] or eligible
-            chosen = min(
-                selectable,
-                key=lambda rec: (rec.work_queue_depth + num_physical_cores_needed) / rec.resolved.num_physical_cores,
-            )
-            chosen.work_queue_depth += num_physical_cores_needed
-            claimed.append(replace(chosen))
+            selectable = [
+                unit for unit in eligible if not any(rec.resolved.ssh_host in excluded for rec in unit)
+            ] or eligible
+            chosen = min(selectable, key=lambda unit: unit.post_placement_load(num_physical_cores_needed))
+            _reserve(chosen, num_physical_cores_needed)
+            claimed.append(chosen.snapshot())
             return state
 
         state = self._update(_claim)
         if claimed:
             return claimed[0]
 
+        # TODO: bound requests a multi-node deployment may serve too; the ceiling only describes
+        # the largest single host, so it is skipped when such a deployment exists.
         ceiling = state.provisionable_ceiling.get(platform)
-        if ceiling is not None and num_physical_cores_needed > ceiling:
+        deployment_may_serve = num_physical_cores_needed > MULTINODE_CORE_THRESHOLD and any(
+            rec.resolved.logical_host_id is not None and rec.resolved.host_type == platform for rec in state.hosts
+        )
+        if ceiling is not None and not deployment_may_serve and num_physical_cores_needed > ceiling:
             raise RequestTooLargeError(
                 f"Request needs {num_physical_cores_needed} physical cores, but the largest host "
                 f"the fleet can provision for platform {platform.value} is {ceiling} cores; "
@@ -370,31 +647,66 @@ class HostStateStore:
             raise FleetEmptyError(f"Fleet is perpetually empty for platform {platform.value}.")
         return None
 
-    def release(self, host_id: str, num_physical_cores: int) -> None:
-        """Release ``num_physical_cores`` reserved on a host (decrement its work_queue_depth,
-        floored at 0).
+    def get_all_linked_hosts(self, logical_node_id: str) -> list[HostRecord] | None:
+        all_host_records = self.read()
 
-        Every claim is balanced by exactly one release of the same core count (in the
-        caller's finally). A release that would drive the depth below 0 is an unbalanced
-        release — a double-release or a release of a never-claimed host — so we floor at 0
-        and log it, since it points to a claim/release bug rather than corrupting state."""
-
-        def _mutate(state: HostState) -> HostState | None:
-            for rec in state.hosts:
-                if rec.resolved.ssh_host == host_id:
-                    if rec.work_queue_depth - num_physical_cores < 0:
-                        logger.warning(
-                            "Releasing %d cores from host %s whose work_queue_depth is %d "
-                            "(unbalanced release - likely a claim/release bug)",
-                            num_physical_cores,
-                            host_id,
-                            rec.work_queue_depth,
-                        )
-                    rec.work_queue_depth = max(0, rec.work_queue_depth - num_physical_cores)
-                    return state
+        if not all_host_records:
             return None
 
-        self._update(_mutate)
+        return [
+            host_record
+            for host_record in all_host_records.hosts
+            if host_record.resolved.logical_host_id == logical_node_id
+        ]
+
+    def release(self, host_id: str, num_physical_cores: int, member_ids: tuple[str, ...] | None = None) -> None:
+        """Release ``num_physical_cores`` reserved by a claim of ``num_physical_cores`` on the
+        unit containing ``host_id`` (decrement every member's work_queue_depth, floored at 0).
+
+        Prefer passing ``member_ids`` from the claimed unit (``HostUnit.member_ids``): exactly
+        those rows are released, so a deployment gaining, losing, or renaming members since the
+        claim does not change what is released. A ``host_id`` outside them is logged as an error
+        and exactly ``member_ids`` is still released (never raises, so it is safe in a caller's
+        finally); an alias with no row is skipped and logged. Without ``member_ids`` the unit is
+        re-derived from the current state with the claim's core count, which can mis-attribute
+        the release if deployment membership changed since the claim; a ``host_id`` in no unit
+        is logged and nothing is released.
+
+        Every claim is balanced by exactly one release of the same core count (in the caller's
+        finally). A release that would drive a depth below 0 is an unbalanced release — a
+        double-release or a release of a never-claimed host — so it is floored at 0 and logged,
+        since it points to a claim/release bug rather than corrupting state."""
+        if member_ids is not None and host_id not in member_ids:
+            logger.error(
+                "Released host %s is not among the claimed members %s; releasing the members",
+                host_id,
+                sorted(member_ids),
+            )
+
+        def _release_members(state: HostState, ids: tuple[str, ...]) -> HostState | None:
+            rows = [rec for rec in state.hosts if rec.resolved.ssh_host in ids]
+            missing = set(ids) - {rec.resolved.ssh_host for rec in rows}
+            if missing:
+                logger.warning("Releasing claim on %s: no host row for %s", host_id, sorted(missing))
+            if not rows:
+                return None
+            for rec in rows:
+                _unreserve(rec, num_physical_cores)
+            return state
+
+        def _rederive(state: HostState) -> HostState | None:
+            for unit in self._units(state.hosts, num_physical_cores):
+                if any(rec.resolved.ssh_host == host_id for rec in unit):
+                    _unreserve(unit, num_physical_cores)
+                    return state
+            logger.warning("Releasing claim on %s: no host row matches; nothing released", host_id)
+            return None
+
+        if member_ids is not None:
+            ids = member_ids
+            self._update(lambda state: _release_members(state, ids))
+        else:
+            self._update(_rederive)
 
     def set_physical_cores(self, cores_by_alias: dict[str, int]) -> None:
         """Persist probed physical-core counts onto matching host rows. Only positive
@@ -409,6 +721,28 @@ class HostStateStore:
                 if cores > 0 and rec.resolved.num_physical_cores != cores:
                     rec.resolved = replace(rec.resolved, num_physical_cores=cores)
                     changed = True
+            return state if changed else None
+
+        self._update(_mutate)
+
+    def record_probed_hosts(self, probed: list[ResolvedHost]) -> None:
+        """Persist probed capacity and multi-node deployment onto the EXISTING rows they name,
+        in one locked write. Each field follows ``apply_resolved``'s refresh rule: a positive core
+        count replaces the stored one (0/unknown never clobbers it), and a reported deployment
+        replaces the stored one (an unreported one leaves it intact). The row's platform comes
+        from the store, not the probe.
+
+        Participant-safe: unlike ``apply_resolved`` this never adds or removes hosts, nor touches
+        availability, ``work_queue_depth`` or fleet metadata, so a host that was not probed (or
+        whose probe failed) keeps its row exactly as it was."""
+        probed_by_alias = {host.ssh_host: host for host in probed}
+
+        def _mutate(state: HostState) -> HostState | None:
+            changed = False
+            for rec in state.hosts:
+                match = probed_by_alias.get(rec.resolved.ssh_host)
+                if match is not None:
+                    changed |= _refresh_probed_fields(rec, match)
             return state if changed else None
 
         self._update(_mutate)
@@ -433,45 +767,78 @@ class HostStateStore:
         state = self.read()
         return [rec.resolved.ssh_host for rec in state.hosts if rec.resolved.host_type == platform] if state else []
 
-    def eligible_host_aliases(self, platform: Platforms, num_physical_cores_needed: int) -> set[str]:
-        """Aliases currently eligible to serve a ``num_physical_cores_needed`` request on
-        ``platform`` — the SAME predicate ``claim_least_busy`` selects from (available,
-        matching platform, enough cores, platform not under-capacity). The retry loop uses this
-        to know when every eligible host has been tried-and-busy so it can re-rotate."""
+    def eligible_host_aliases(
+        self, platform: Platforms, num_physical_cores_needed: int, *, lnc_config: int = 1
+    ) -> set[str]:
+        """One identifier per unit currently eligible to serve a ``num_physical_cores_needed``
+        request on ``platform``: the unit's ``host_id`` (its primary's alias). Uses the same
+        partition (``_host_units``) and predicate (``can_serve``, platform not under-capacity)
+        that ``claim_least_busy`` selects from. The retry loop records a busy claim by this id,
+        which excludes the whole unit from the next claim, and compares its busy set against
+        this to know when every eligible unit has been tried-and-busy so it can re-rotate.
+
+        Raises ``ValueError`` like ``claim_least_busy`` for a relevant mixed-platform
+        deployment or an invalid request."""
+        validate_core_request(num_physical_cores_needed, lnc_config)
         state = self.read()
         if state is None or platform in state.under_capacity:
             return set()
         return {
-            rec.resolved.ssh_host
-            for rec in state.hosts
-            if rec.available
-            and rec.resolved.host_type == platform
-            and rec.resolved.num_physical_cores >= num_physical_cores_needed
+            unit.host_id
+            for unit in self._units(state.hosts, num_physical_cores_needed)
+            if unit.can_serve(platform, num_physical_cores_needed, lnc_config=lnc_config)
         }
 
-    def explain_unclaimable(self, platform: Platforms, num_physical_cores_needed: int) -> str:
+    def explain_unclaimable(self, platform: Platforms, num_physical_cores_needed: int, *, lnc_config: int = 1) -> str:
         """Human-readable reason no host of ``platform`` could serve a
         ``num_physical_cores_needed`` request, for the terminal error. Distinguishes a
         genuine fleet-wide failure from a request simply too large for any host:
           * no host of this platform exists in the pool at all; else
-          * a per-reason breakdown over matching hosts (unavailable / too small, with the
-            largest available core count)."""
+          * a per-reason breakdown over matching units (any member on ``platform``) — the same
+            candidates ``claim_least_busy`` selects from: unavailable / with unknown capacity
+            (a member reporting 0 cores) / whose host count cannot evenly split the request's
+            logical ranks / too small in total (with the largest available core count) / with a
+            member below its even per-host share. Each unit is counted under exactly one reason.
+
+        Raises ``ValueError`` for an invalid request (see ``validate_core_request``)."""
+        validate_core_request(num_physical_cores_needed, lnc_config)
         state = self.read()
-        matching = [rec for rec in state.hosts if rec.resolved.host_type == platform] if state else []
+        units = self._units(state.hosts, num_physical_cores_needed) if state else []
+        matching = [unit for unit in units if any(rec.resolved.host_type == platform for rec in unit)]
         if not matching:
             return f"no host of platform {platform.value} exists in the pool"
-        unavailable = [rec for rec in matching if not rec.available]
-        too_small = [
-            rec for rec in matching if rec.available and rec.resolved.num_physical_cores < num_physical_cores_needed
-        ]
+        unavailable = [unit for unit in matching if not unit.is_claimable]
+        claimable = [unit for unit in matching if unit.is_claimable]
+        unknown_capacity = [unit for unit in claimable if any(rec.resolved.num_physical_cores <= 0 for rec in unit)]
+        rejected: dict[PlacementRejection, list[HostUnit]] = defaultdict(list)
+        for unit in claimable:
+            if any(rec.resolved.num_physical_cores <= 0 for rec in unit):
+                continue
+            reason = unit.placement_rejection(num_physical_cores_needed, lnc_config=lnc_config)
+            if reason is not None:
+                rejected[reason].append(unit)
+        num_ranks = num_physical_cores_needed // lnc_config
         reasons: list[str] = []
         if unavailable:
             reasons.append(f"{len(unavailable)} unavailable")
-        if too_small:
-            largest = max(rec.resolved.num_physical_cores for rec in too_small)
-            reasons.append(f"{len(too_small)} too small (largest available {largest} cores)")
+        if unknown_capacity:
+            reasons.append(f"{len(unknown_capacity)} with unknown capacity")
+        for size in sorted({len(unit) for unit in rejected[PlacementRejection.UNSPLITTABLE]}):
+            count = sum(1 for unit in rejected[PlacementRejection.UNSPLITTABLE] if len(unit) == size)
+            reasons.append(f"{count} whose {size} hosts cannot evenly split {num_ranks} logical ranks")
+        if rejected[PlacementRejection.TOO_SMALL]:
+            largest = max(unit.total_physical_cores for unit in rejected[PlacementRejection.TOO_SMALL])
+            reasons.append(
+                f"{len(rejected[PlacementRejection.TOO_SMALL])} too small (largest available {largest} cores)"
+            )
+        for size in sorted({len(unit) for unit in rejected[PlacementRejection.MEMBER_TOO_SMALL]}):
+            count = sum(1 for unit in rejected[PlacementRejection.MEMBER_TOO_SMALL] if len(unit) == size)
+            share = num_physical_cores_needed // size
+            reasons.append(f"{count} with a host below its {share}-core share")
         breakdown = ", ".join(reasons) if reasons else "reason unknown"
-        return f"needing {num_physical_cores_needed} physical cores - of {len(matching)} matching hosts: {breakdown}"
+        return (
+            f"needing {num_physical_cores_needed} physical cores - of {len(matching)} matching candidates: {breakdown}"
+        )
 
 
 class OwnerHostStateStore(HostStateStore):
@@ -508,6 +875,7 @@ class OwnerHostStateStore(HostStateStore):
             except FileNotFoundError:
                 pass
         self._initialized = False
+        self._warned_incomplete.clear()
 
     def apply_resolved(
         self,
@@ -545,15 +913,17 @@ class OwnerHostStateStore(HostStateStore):
 
             A host's ``num_physical_cores`` is refreshed from the resolution when the source
             reports a positive value (a re-probe can fill in a previously-unknown capacity), but a
-            0/unknown report never clobbers an already-known count.
+            0/unknown report never clobbers an already-known count. Its multi-node deployment is
+            refreshed on the same terms: a reported one wins, an unreported one leaves the stored
+            one intact.
             """
             resolved_by_alias = {host.ssh_host: host for host in resolved}
 
             for rec in state.hosts:
                 rec.available = rec.resolved.ssh_host in resolved_by_alias
                 match = resolved_by_alias.get(rec.resolved.ssh_host)
-                if match is not None and match.num_physical_cores > 0:
-                    rec.resolved = replace(rec.resolved, num_physical_cores=match.num_physical_cores)
+                if match is not None:
+                    _refresh_probed_fields(rec, match)
 
             # In resolved but not in state: add fresh (available, depth 0).
             _add_new_hosts(state, resolved)
@@ -583,6 +953,26 @@ class OwnerHostStateStore(HostStateStore):
             return state
 
         self._update(_mutate)
+
+
+def _refresh_probed_fields(rec: HostRecord, probed: ResolvedHost) -> bool:
+    """Refresh ``rec``'s capacity and multi-node deployment from ``probed`` (in place) and return
+    whether anything changed. A positive core count replaces the stored one; a reported deployment
+    replaces the stored one. A 0/unknown count or an unreported deployment leaves the stored value
+    intact. Never touches platform, availability or depth."""
+    current = rec.resolved
+    updated = current
+    if probed.num_physical_cores > 0:
+        updated = replace(updated, num_physical_cores=probed.num_physical_cores)
+    if probed.logical_host_id is not None:
+        updated = replace(
+            updated,
+            logical_host_id=probed.logical_host_id,
+            logical_host_rank=probed.logical_host_rank,
+            logical_host_size=probed.logical_host_size,
+        )
+    rec.resolved = updated
+    return updated != current
 
 
 def _add_new_hosts(state: HostState, resolved: list[ResolvedHost]) -> HostState:

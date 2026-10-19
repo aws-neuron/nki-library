@@ -48,7 +48,9 @@ def perform_intermediate_quantization(
             quantized_output_sbuf_list,
             static_input_quant_scale_sbuf,
         )
-    elif mlp_params.quant_params.is_quant_row_mx() or mlp_params.quant_params.is_quant_mx():
+    elif (
+        mlp_params.quant_params.is_quant_row_mx() or mlp_params.quant_params.is_quant_mx()
+    ):  # pragma: no branch - exhaustive (STATIC_MX else), false arc dead
         _perform_intermediate_mx_quantization(
             mlp_params,
             tile_info,

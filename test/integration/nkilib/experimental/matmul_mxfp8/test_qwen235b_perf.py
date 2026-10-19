@@ -1,0 +1,292 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Qwen3-235B-A22B FORWARD perf for the QKV/O projections the matmul kernel serves.
+
+Unlike test_matmul_mxfp8_model_configs.py (which sweeps every block matmul), this
+restricts to the forward QKV and O projections the generic matmul kernel is the
+production path for. Backward (-> test_qwen235b_backward_perf.py, as fused dX+dW),
+core attention (flash attention kernel), and MoE (MoE kernel) are out of scope.
+
+Each shape runs the five production input-preparation arms: BF16 inputs (fast DGT);
+PE-swizzle 1x32; prequant weight [1x32] (RHS MXFP8 1x32); prequant weight [wrapX]
+(RHS MXFP8 wrapX, LHS fast DGT); and fully prequantized.
+
+TP4 shapes: fused QKV is 4096x4096x2304 (N = (Q*h + 2*KV*h)/TP = 2304); O-proj is
+4096x2048x4096 (K = Q*h/TP = 8192/4 = 2048, the attention output width, not dim/TP).
+"""
+
+import numpy as np
+import pytest
+from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_kernel
+from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
+
+from test.integration.nkilib.experimental.matmul_mxfp8 import (
+    config_helper,
+    constants,
+    model_config_reader,
+)
+from test.integration.nkilib.experimental.matmul_mxfp8.test_input_microbenchmarks import (
+    _make_lhs_1x32_pe_swizzle_rhs_1x32_prequantized,
+    _make_lhs_wrapx_pe_swizzle_rhs_wrapx_prequantized,
+    _make_pe_swizzle_1x32,
+    _make_prequantized,
+)
+from test.integration.nkilib.experimental.matmul_mxfp8.test_matmul_mxfp8_generic_kernel import (
+    _mxfp8_comparator,
+    build_matmul_inputs,
+    get_output_dtype,
+)
+from test.utils import common_dataclasses
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.unit_test_framework import UnitTestFramework
+
+# B1-only: these arms use fast_dma_transpose, which is a B1-only instruction. It has
+# no arch guard, so on A0 it does not fall back -- it faults the device and can take
+# the node down. These suites MUST never be collected on A0. TRN3 / TRN3_PDS are B1.
+_TRN3_B1_PLATFORMS = {common_dataclasses.Platforms.TRN3, common_dataclasses.Platforms.TRN3_PDS}
+
+# ============================================================================
+# Shape selection
+# ============================================================================
+
+# Only the two forward projections; the BWD-* shapes belong to the backward suite
+# (measured there as fused dX+dW, not standalone matmuls) and attention/MoE shapes
+# to their own kernels.
+_FORWARD_PROJECTIONS = ("FWD-FuseQKV", "FWD-OProj")
+
+
+def _projection_shapes(configs):
+    """Extract (M, K, N, description) tuples for the forward QKV/O projections only."""
+    return [
+        (c.M, c.K, c.N, c.description) for c in configs if any(proj in c.description for proj in _FORWARD_PROJECTIONS)
+    ]
+
+
+_QWEN3_235B_TP4_SHAPES = _projection_shapes(model_config_reader.qwen3_235b_tp4)
+
+
+# ============================================================================
+# Config factories for the fast-DGT arms (the other three come from
+# test_input_microbenchmarks). See GRID_* below for the full set.
+# ============================================================================
+
+
+def _make_bf16_inputs_fast_dgt(shapes):
+    """Both operands unswizzled BF16, loaded via DGT with fast_dma_transpose (B1 only).
+
+    Must not set load_with_PE_swizzle or quant_scheme="1x32": load_tile dispatches on
+    those before load_tile_dgt, where fast_dma_transpose is honoured. Tiling is left
+    unset so it comes from the autotune cache (or the heuristic on a miss).
+    """
+    configs = []
+    for M, K, N, desc in shapes:
+        # fast DGT needs K aligned to MX_PARTITION_SIZE (32).
+        if K % 32 != 0:
+            continue
+        conf = config_helper.TestConfig(
+            M=M,
+            K=K,
+            N=N,
+            description=f"{desc} [bf16-inputs-fast-dgt]",
+            run_with_lnc2=None,
+            enable_scale_packing=False,
+            output_dtype=constants.MatrixPrecision.BFLOAT16,
+            lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            lhs_is_swizzled=False,
+            rhs_is_swizzled=False,
+            fast_dma_transpose=True,
+            spill_reload=True,
+        )
+        configs += conf.autoGenerateDefault()
+    return configs
+
+
+def _make_prequant_weight_wrapx_fast_dgt(shapes):
+    """RHS pre-quantized wrapX MXFP8 (dma_copy); LHS BF16 via fast DGT (not PE-swizzle).
+
+    quant_scheme stays wrapX so the on-the-fly-quantized activation's K grouping
+    matches the pre-quantized weight. Tiling comes from the autotune cache.
+    """
+    configs = []
+    for M, K, N, desc in shapes:
+        if K % 32 != 0:
+            continue
+        conf = config_helper.TestConfig(
+            M=M,
+            K=K,
+            N=N,
+            description=f"{desc} [prequant-weight-wrapx-fast-dgt]",
+            run_with_lnc2=None,
+            enable_scale_packing=True,
+            output_dtype=constants.MatrixPrecision.BFLOAT16,
+            lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            rhs_dtype=constants.MatrixPrecision.MXFP8,
+            lhs_is_swizzled=False,
+            rhs_is_swizzled=True,
+            fast_dma_transpose=True,
+            quant_scheme="wrapX",
+            spill_reload=False,
+        )
+        configs += conf.autoGenerateDefault()
+    return configs
+
+
+def _make_bf16_inputs_pe_wrapx(shapes):
+    """BF16 Inputs, PE-swizzle wrapX: both operands unswizzled BF16, transposed via
+    PE-swizzle with the wrapX quant scheme (no fast_dma_transpose). The WrapX PE-Swizzle
+    twin of the BF16-inputs DMA arm; run with NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true.
+    """
+    configs = []
+    for M, K, N, desc in shapes:
+        conf = config_helper.TestConfig(
+            M=M,
+            K=K,
+            N=N,
+            description=f"{desc} [bf16-inputs-pe-wrapx]",
+            run_with_lnc2=None,
+            enable_scale_packing=False,
+            output_dtype=constants.MatrixPrecision.BFLOAT16,
+            lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            lhs_is_swizzled=False,
+            rhs_is_swizzled=False,
+            load_with_PE_swizzle=True,
+            quant_scheme="wrapX",
+            spill_reload=False,
+        )
+        configs += conf.autoGenerateDefault()
+    return configs
+
+
+# ============================================================================
+# Grids: 5 input use cases (TP4)
+# ============================================================================
+
+GRID_TP4_BF16_INPUTS = _make_bf16_inputs_fast_dgt(_QWEN3_235B_TP4_SHAPES)
+GRID_TP4_PREQUANT_WEIGHT_1X32 = _make_lhs_1x32_pe_swizzle_rhs_1x32_prequantized(_QWEN3_235B_TP4_SHAPES)
+GRID_TP4_PREQUANT_WEIGHT_WRAPX = _make_prequant_weight_wrapx_fast_dgt(_QWEN3_235B_TP4_SHAPES)
+GRID_TP4_PREQUANTIZED = _make_prequantized(_QWEN3_235B_TP4_SHAPES)
+GRID_TP4_PE_SWIZZLE_1X32 = _make_pe_swizzle_1x32(_QWEN3_235B_TP4_SHAPES)
+# PE-swizzle wrapX: LHS BF16 transposed via PE-swizzle (wrapX scheme), RHS pre-quantized
+# wrapX. Uses no fast_dma_transpose -- the transpose is a PE (nc_transpose) op -- so with
+# NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true no DMA transpose is used anywhere in the kernel.
+GRID_TP4_PE_WRAPX = _make_lhs_wrapx_pe_swizzle_rhs_wrapx_prequantized(_QWEN3_235B_TP4_SHAPES)
+# BF16 Inputs, WrapX PE Swizzle: both operands BF16 via PE-swizzle (wrapX) -- the E-column
+# twin of pe_wrapx (F). No fast_dma_transpose.
+GRID_TP4_BF16_INPUTS_PE_WRAPX = _make_bf16_inputs_pe_wrapx(_QWEN3_235B_TP4_SHAPES)
+
+
+# ============================================================================
+# Test class
+# ============================================================================
+
+
+def _run_matmul_perf_test(test_manager, conf, platform_target):
+    # B1 only: fast_dma_transpose is a B1-only instruction with no arch guard; on A0 it
+    # faults the device (can take the node down), so never run these on A0. The platform
+    # mark already deselects A0 at collection; this is a defense-in-depth backstop.
+    if platform_target not in _TRN3_B1_PLATFORMS:
+        pytest.skip("MXFP8 matmul perf requires TRN3 B1.")
+
+    compiler_args = common_dataclasses.CompilerArgs(
+        logical_nc_config=2 if conf.run_with_lnc2 else 1,
+        platform_target=platform_target,
+    )
+
+    test_manager.collector.set_kernel_params(conf.to_metrics_dict())
+    output_dtype = get_output_dtype(conf)
+
+    def input_generator(test_config):
+        return build_matmul_inputs(conf)
+
+    def output_tensors(kernel_input):
+        return {"out": np.zeros((conf.M, conf.N), dtype=output_dtype)}
+
+    framework = UnitTestFramework(
+        test_manager=test_manager,
+        kernel_entry=matmul_mxfp8_generic_kernel.matmul_mxfp8,
+        torch_ref=matmul_mxfp8_torch_ref,
+        kernel_input_generator=input_generator,
+        output_tensor_descriptor=output_tensors,
+    )
+    framework.run_test(
+        test_config=None,
+        compiler_args=compiler_args,
+        custom_comparator=_mxfp8_comparator(conf, output_dtype, False),
+    )
+
+
+# Pipeline suite (tagged "model"/"optimal"): all QKV/O-projection forward arms,
+# including the fast_dma_transpose ones. fast_dma_transpose is a B1-only instruction
+# and the TRN3 model-regression stage runs on B1 (the platform mark below deselects A0),
+# so every arm runs in-pipeline on B1.
+@pytest_test_metadata(name="Qwen3-235B Matmul Perf Benchmarks", tags=[])
+@pytest_marks(["generic_matmul_mxfp8_perf", "mx", "mxfp8", "model", "optimal"])
+@pytest.mark.platforms(
+    exclude=[
+        common_dataclasses.Platforms.TRN1,
+        common_dataclasses.Platforms.TRN2,
+        common_dataclasses.Platforms.TRN3_A0,
+        common_dataclasses.Platforms.TRN3_PDS_A0,
+    ]
+)
+class TestQwen235BMatmulPerf:
+    """Qwen3-235B QKV/O projection forward perf; all pipeline arms (B1)."""
+
+    @pytest.mark.parametrize("conf", GRID_TP4_PREQUANT_WEIGHT_1X32)
+    def test_tp4_prequant_weight_1x32(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    @pytest.mark.parametrize("conf", GRID_TP4_PREQUANTIZED)
+    def test_tp4_prequantized(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    @pytest.mark.parametrize("conf", GRID_TP4_PE_SWIZZLE_1X32)
+    def test_tp4_pe_swizzle_1x32(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    # 1x32 NO-DMA-transpose forward arms (perf-table columns I/J). Same 1x32 PE-swizzle
+    # config as the G/H arms above: forward 1x32 already transposes on the PE
+    # (nc_transpose), so there is no DMA transpose and the measured number equals the G/H
+    # twin. Run with NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true (set in the launching shell,
+    # read at import time) to force any residual DMA transpose to PE and make "no DMA
+    # transpose anywhere" explicit. The distinct name maps these runs to I/J.
+    @pytest.mark.parametrize("conf", GRID_TP4_PE_SWIZZLE_1X32)
+    def test_tp4_pe_swizzle_1x32_no_dma_transpose(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    @pytest.mark.parametrize("conf", GRID_TP4_PREQUANT_WEIGHT_1X32)
+    def test_tp4_prequant_weight_1x32_no_dma_transpose(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    @pytest.mark.parametrize("conf", GRID_TP4_PE_WRAPX)
+    def test_tp4_pe_wrapx(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    @pytest.mark.parametrize("conf", GRID_TP4_BF16_INPUTS_PE_WRAPX)
+    def test_tp4_bf16_inputs_pe_wrapx(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    # fast_dma_transpose arms (B1-only): BF16 DGT inputs and prequant-weight wrapX (the
+    # wrapX DMA-transpose column). Both load via fast_dma_transpose, a B1-only
+    # instruction; they run in-pipeline on B1 (A0 deselected by the platform mark above).
+    @pytest.mark.parametrize("conf", GRID_TP4_BF16_INPUTS)
+    def test_tp4_bf16_inputs_fp8_matmul(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)
+
+    @pytest.mark.parametrize("conf", GRID_TP4_PREQUANT_WEIGHT_WRAPX)
+    def test_tp4_prequant_weight_wrapx(self, test_manager, conf, platform_target):
+        _run_matmul_perf_test(test_manager, conf, platform_target)

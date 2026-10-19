@@ -84,6 +84,7 @@ def rmsnorm_mx_prefill_torch_ref(
     unpadded_hidden_size: int = None,
     residual=None,
     emit_norm_bf16: bool = False,
+    hidden_interleaved: bool = False,  # noqa: ARG001 - H-order-only; ref works in natural H (callers de-interleave), signature parity only
 ):
     """Reference for ``rmsnorm_mx_prefill``, with toggles mirroring the kernel's optional outputs.
 
@@ -105,8 +106,8 @@ def rmsnorm_mx_prefill_torch_ref(
         router_bias (np.ndarray): [1, E] optional router bias.
         top_k (int): number of experts selected per token (router path only).
         router_act_fn (RouterActFnType): SOFTMAX (over the top-K logits) or SIGMOID (per-logit).
-        qmx_output_dtype / pack_scales / pack_affinities: dtype/layout-only kernel args, accepted for
-            signature parity; the fp32 reference does not depend on them.
+        qmx_output_dtype / pack_scales / pack_affinities / hidden_interleaved: dtype/layout/H-order-only
+            kernel args, accepted for signature parity; the fp32 reference (natural H) does not depend on them.
 
     The kernel routes from compute_dtype = router_weights.dtype (a 16-bit dtype); the ref rounds norm
     through that dtype before the logits matmul to match the kernel's router precision.

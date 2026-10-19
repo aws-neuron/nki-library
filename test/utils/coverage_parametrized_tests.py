@@ -24,6 +24,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 from allpairspy import AllPairs
 
+from .common_dataclasses import MAX_PATH_COMPONENT_LENGTH
+
 # Re-export assert_negative_test_case for convenience
 from .negative_test_helpers import assert_negative_test_case as assert_negative_test_case
 
@@ -453,11 +455,6 @@ def format_param_value(val: Any, max_len: int = 40) -> str:
         h = hashlib.md5(s.encode()).hexdigest()[:6]
         return s[: max_len - 7] + "_" + h
     return s
-
-
-# Linux NAME_MAX is 255 bytes for a single path component (e.g. directory or file name).
-# Test node IDs may be used as folder names in the format "test_func_name[param_id]".
-MAX_PATH_COMPONENT_LENGTH = 255
 
 
 def extract_parametrize_args(

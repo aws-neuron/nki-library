@@ -29,21 +29,25 @@ import nki.language as nl
 import numpy as np
 import pytest
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import SkipMode
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import (
-    P_MAX,
-    TensorDescriptor,
-    TileLocation,
-)
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
     with_active_sbm,
 )
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.load_apis import (
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._load_apis import (
+    P_MAX,
+    load_tile_PE_Swizzle_1x32,
     load_tile_PE_swizzle_wrapX,
 )
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._quantize_mxfp8_utils import (
     INTERLEAVE_FACTOR,
+)
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import (
+    QuantScheme,
+    SwizzleMode,
+    TensorDescriptor,
+    TensorOrientation,
+    _TileLocation,
 )
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
@@ -114,7 +118,7 @@ def pe_transpose_load_kernel(
     # Create TensorDescriptor for the input
     td = TensorDescriptor(
         data=tensor_fk,
-        load_with_PE_swizzle=True,
+        swizzle_mode=SwizzleMode.PE,
         skip_dma=SkipMode(skip_token=skip_token),
     )
 
@@ -132,11 +136,16 @@ def pe_transpose_load_kernel(
         buffer=nl.sbuf,
     )
 
+    # Zero the destination so the unwritten leading store_f_offset padding is
+    # defined; the store below writes only the tile at store_f_offset.
+    if store_f_offset > 0:
+        nisa.memset(data_sbuf, value=0.0)
+
     for k_idx in nl.affine_range(tiles_in_k):
         current_k_offset = k_offset + k_idx * tile_k
 
         if indices_sbuf is not None:
-            load_loc = TileLocation(
+            load_loc = _TileLocation(
                 tensor=td,
                 tile_k=tile_k,
                 tile_f=tile_f,
@@ -145,7 +154,7 @@ def pe_transpose_load_kernel(
                 vector_offset=indices_sbuf,
             )
         else:
-            load_loc = TileLocation(
+            load_loc = _TileLocation(
                 tensor=td,
                 tile_k=tile_k,
                 tile_f=tile_f,
@@ -153,8 +162,8 @@ def pe_transpose_load_kernel(
                 f_offset=f_offset,
             )
 
-        data_store_loc = TileLocation(
-            tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, is_f_by_k=False),
+        data_store_loc = _TileLocation(
+            tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, orientation=TensorOrientation.K_BY_F),
             tile_k=physical_tile_k,
             tile_f=tile_f,
             k_offset=k_idx,
@@ -513,7 +522,7 @@ class TestBF16PETransposeIndirect:
 
         NUM_SUB_TILES = tile_f // P_MAX
         row_indices_flat = rng.choice(F, size=tile_f, replace=False).astype(np.int32)
-        row_indices = row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F')
+        row_indices = np.ascontiguousarray(row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F'))
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -577,7 +586,7 @@ class TestBF16PETransposeOOBSkip:
         row_indices_flat = np.concatenate([valid_indices, padding_indices])
 
         NUM_SUB_TILES = tile_f // P_MAX
-        row_indices = row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F')
+        row_indices = np.ascontiguousarray(row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F'))
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -626,7 +635,7 @@ class TestBF16PETransposeOOBSkip:
         row_indices_flat[valid_positions] = valid_indices
 
         NUM_SUB_TILES = tile_f // P_MAX
-        row_indices = row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F')
+        row_indices = np.ascontiguousarray(row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F'))
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -725,7 +734,7 @@ class TestBF16PETransposeMultiK:
 
         NUM_SUB_TILES = tile_f // P_MAX
         row_indices_flat = rng.choice(F, size=tile_f, replace=False).astype(np.int32)
-        row_indices = row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F')
+        row_indices = np.ascontiguousarray(row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F'))
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -832,7 +841,7 @@ def pe_transpose_load_kf_kernel(
 
     td = TensorDescriptor(
         data=tensor_kf,
-        is_f_by_k=False,
+        orientation=TensorOrientation.K_BY_F,
     )
 
     data_sbuf = sbm.alloc_stack(
@@ -841,7 +850,7 @@ def pe_transpose_load_kf_kernel(
         buffer=nl.sbuf,
     )
 
-    load_loc = TileLocation(
+    load_loc = _TileLocation(
         tensor=td,
         tile_k=tile_k,
         tile_f=tile_f,
@@ -849,8 +858,8 @@ def pe_transpose_load_kf_kernel(
         f_offset=f_offset,
     )
 
-    data_store_loc = TileLocation(
-        tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, is_f_by_k=False),
+    data_store_loc = _TileLocation(
+        tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, orientation=TensorOrientation.K_BY_F),
         tile_k=physical_tile_k,
         tile_f=tile_f,
         k_offset=0,
@@ -1046,7 +1055,7 @@ def pe_transpose_load_kf_indirect_kernel(
 
     td = TensorDescriptor(
         data=tensor_kf,
-        is_f_by_k=False,
+        orientation=TensorOrientation.K_BY_F,
         skip_dma=SkipMode(skip_token=skip_token),
     )
 
@@ -1061,7 +1070,7 @@ def pe_transpose_load_kf_indirect_kernel(
         buffer=nl.sbuf,
     )
 
-    load_loc = TileLocation(
+    load_loc = _TileLocation(
         tensor=td,
         tile_k=tile_k,
         tile_f=tile_f,
@@ -1070,8 +1079,8 @@ def pe_transpose_load_kf_indirect_kernel(
         vector_offset=indices_sbuf,
     )
 
-    data_store_loc = TileLocation(
-        tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, is_f_by_k=False),
+    data_store_loc = _TileLocation(
+        tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, orientation=TensorOrientation.K_BY_F),
         tile_k=physical_tile_k,
         tile_f=tile_f,
         k_offset=0,
@@ -1213,7 +1222,7 @@ class TestBF16PETransposeKbyFIndirect:
 
         NUM_SUB_TILES = tile_f // P_MAX
         row_indices_flat = rng.choice(K, size=tile_f, replace=False).astype(np.int32)
-        row_indices = row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F')
+        row_indices = np.ascontiguousarray(row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F'))
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -1261,7 +1270,7 @@ class TestBF16PETransposeKbyFIndirect:
         row_indices_flat = np.concatenate([valid_indices, padding_indices])
 
         NUM_SUB_TILES = tile_f // P_MAX
-        row_indices = row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F')
+        row_indices = np.ascontiguousarray(row_indices_flat.reshape(P_MAX, NUM_SUB_TILES, order='F'))
 
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -1276,6 +1285,282 @@ class TestBF16PETransposeKbyFIndirect:
                 "tile_k": tile_k,
                 "k_offset": k_offset,
                 "skip_token": True,
+            },
+            output_tensor_descriptor=lambda _: {
+                "out": np.zeros((physical_tile_k, physical_f), dtype=nl.bfloat16),
+            },
+        )
+        framework.run_test(test_config=None, compiler_args=compiler_args, rtol=0, atol=0)
+
+
+# ============================================================================
+# 1x32 FP32-transpose loader — NKI kernels
+# ============================================================================
+#
+# load_tile_PE_Swizzle_1x32 produces the 1x32 (contiguous-K) interleave layout
+# via fp32-reinterpret PE transpose. It requires tile_k == L_TILE_K (512) and
+# supports both F-by-K ([F, K]) and K-by-F ([K, F]) input layouts.
+
+
+@nki.jit
+@with_active_sbm
+def pe_1x32_load_fk_kernel(
+    tensor_fk,
+    F: int,
+    K: int,
+    tile_f: int,
+    tile_k: int,
+    k_offset: int = 0,
+    f_offset: int = 0,
+):
+    """Load an F-by-K [F, K] tile via the 1x32 FP32-transpose loader to HBM."""
+    create_and_set_active_sbm()
+    sbm = get_active_sbm()
+    sbm.open_scope("PE_1X32_LOAD_FK")
+
+    physical_tile_k = tile_k // INTERLEAVE_FACTOR
+    physical_f = tile_f * INTERLEAVE_FACTOR
+
+    td = TensorDescriptor(
+        data=tensor_fk,
+        swizzle_mode=SwizzleMode.PE,
+        quant_scheme=QuantScheme._1x32,
+    )
+
+    data_sbuf = sbm.alloc_stack(
+        shape=(physical_tile_k, 1, 1, physical_f),
+        dtype=nl.bfloat16,
+        buffer=nl.sbuf,
+    )
+
+    load_loc = _TileLocation(
+        tensor=td,
+        tile_k=tile_k,
+        tile_f=tile_f,
+        k_offset=k_offset,
+        f_offset=f_offset,
+    )
+    data_store_loc = _TileLocation(
+        tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, orientation=TensorOrientation.K_BY_F),
+        tile_k=physical_tile_k,
+        tile_f=tile_f,
+        k_offset=0,
+        f_offset=0,
+    )
+
+    load_tile_PE_Swizzle_1x32(load_loc, data_store_loc=data_store_loc)
+
+    output = nl.ndarray((physical_tile_k, physical_f), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=output, src=data_sbuf[:, 0, 0, :physical_f])
+
+    sbm.close_scope()
+    return output
+
+
+@nki.jit
+@with_active_sbm
+def pe_1x32_load_kf_kernel(
+    tensor_kf,
+    F: int,
+    K: int,
+    tile_f: int,
+    tile_k: int,
+    k_offset: int = 0,
+    f_offset: int = 0,
+    disable_dma_transpose: bool = False,
+):
+    """Load a K-by-F [K, F] tile via the 1x32 FP32-transpose loader to HBM."""
+    create_and_set_active_sbm()
+    sbm = get_active_sbm()
+    sbm.open_scope("PE_1X32_LOAD_KF")
+
+    physical_tile_k = tile_k // INTERLEAVE_FACTOR
+    physical_f = tile_f * INTERLEAVE_FACTOR
+
+    td = TensorDescriptor(
+        data=tensor_kf,
+        orientation=TensorOrientation.K_BY_F,
+        quant_scheme=QuantScheme._1x32,
+        disable_dma_transpose=disable_dma_transpose,
+    )
+
+    data_sbuf = sbm.alloc_stack(
+        shape=(physical_tile_k, 1, 1, physical_f),
+        dtype=nl.bfloat16,
+        buffer=nl.sbuf,
+    )
+
+    load_loc = _TileLocation(
+        tensor=td,
+        tile_k=tile_k,
+        tile_f=tile_f,
+        k_offset=k_offset,
+        f_offset=f_offset,
+    )
+    data_store_loc = _TileLocation(
+        tensor=TensorDescriptor(data=data_sbuf, is_swizzled=True, orientation=TensorOrientation.K_BY_F),
+        tile_k=physical_tile_k,
+        tile_f=tile_f,
+        k_offset=0,
+        f_offset=0,
+    )
+
+    load_tile_PE_Swizzle_1x32(load_loc, data_store_loc=data_store_loc)
+
+    output = nl.ndarray((physical_tile_k, physical_f), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=output, src=data_sbuf[:, 0, 0, :physical_f])
+
+    sbm.close_scope()
+    return output
+
+
+# ============================================================================
+# 1x32 Torch references
+# ============================================================================
+
+
+def pe_1x32_fk_torch_ref(tensor_fk, F, K, tile_f, tile_k, k_offset=0, f_offset=0):
+    """Golden for F-by-K 1x32 load: slice [F, K], transpose to [K, F], 1x32-swizzle."""
+    tile_kf = tensor_fk[f_offset : f_offset + tile_f, k_offset : k_offset + tile_k].T.copy()
+    swizzled = matmul_utils.swizzle_tensor_1x32(tile_kf)
+    return {"out": swizzled.astype(nl.bfloat16)}
+
+
+def pe_1x32_kf_torch_ref(
+    tensor_kf,
+    F,
+    K,
+    tile_f,
+    tile_k,
+    k_offset=0,
+    f_offset=0,
+    disable_dma_transpose=False,
+):
+    """Golden for K-by-F 1x32 load: slice [K, F] tile (already K-major), 1x32-swizzle."""
+    tile_kf = tensor_kf[k_offset : k_offset + tile_k, f_offset : f_offset + tile_f]
+    swizzled = matmul_utils.swizzle_tensor_1x32(tile_kf)
+    return {"out": swizzled.astype(nl.bfloat16)}
+
+
+# ============================================================================
+# 1x32 test shapes — (F, K, tile_f, tile_k, k_offset, f_offset); tile_k fixed at 512
+# ============================================================================
+
+_TEST_SHAPES_1X32 = [
+    # tile_f=128 (single sub-tile)
+    (128, 512, 128, 512, 0, 0),
+    (256, 1024, 128, 512, 512, 128),
+    # tile_f=256 (two sub-tiles)
+    (256, 512, 256, 512, 0, 0),
+    (512, 1024, 256, 512, 512, 256),
+    # tile_f=512 (four sub-tiles)
+    (512, 512, 512, 512, 0, 0),
+    (1024, 1024, 512, 512, 512, 0),
+    # Non-square F, mimics backward kernel shapes
+    (1536, 2048, 512, 512, 512, 0),
+    (2048, 2048, 512, 512, 1536, 512),
+    # Partial (<128) final F sub-tile: F % 128 != 0 (still x4-pack aligned)
+    (520, 512, 128, 512, 0, 0),
+    (520, 512, 512, 512, 0, 0),
+    # Flexible K: loader accepts any tile_k multiple of 128 (incl. K=2304 remainder tiles).
+    # tile_k=256
+    (128, 512, 128, 256, 0, 0),
+    (256, 1024, 256, 256, 512, 0),
+    (128, 2304, 128, 256, 0, 0),
+    (256, 2304, 256, 256, 2048, 0),
+    # tile_k=128
+    (256, 768, 256, 128, 640, 0),
+]
+
+
+# ============================================================================
+# 1x32 test classes
+# ============================================================================
+
+
+@pytest_marks(["bf16_pe_1x32"])
+@pytest.mark.platforms(exclude=[common_dataclasses.Platforms.TRN1, common_dataclasses.Platforms.TRN2])
+class TestBF16PE1x32:
+    """Correctness tests for load_tile_PE_Swizzle_1x32 (fp32-transpose loader)."""
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("F,K,tile_f,tile_k,k_offset,f_offset", _TEST_SHAPES_1X32)
+    def test_pe_1x32_fk_vs_golden(self, test_manager, platform_target, F, K, tile_f, tile_k, k_offset, f_offset):
+        """Verify F-by-K 1x32 load matches the CPU 1x32-swizzle golden."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+
+        compiler_args = common_dataclasses.CompilerArgs(platform_target=platform_target, logical_nc_config=1)
+        physical_tile_k = tile_k // INTERLEAVE_FACTOR
+        physical_f = tile_f * INTERLEAVE_FACTOR
+
+        rng = np.random.RandomState(42)
+        tensor_fk = rng.uniform(-1, 1, (F, K)).astype(nl.bfloat16)
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=pe_1x32_load_fk_kernel,
+            torch_ref=pe_1x32_fk_torch_ref,
+            kernel_input_generator=lambda _: {
+                "tensor_fk": tensor_fk,
+                "F": F,
+                "K": K,
+                "tile_f": tile_f,
+                "tile_k": tile_k,
+                "k_offset": k_offset,
+                "f_offset": f_offset,
+            },
+            output_tensor_descriptor=lambda _: {
+                "out": np.zeros((physical_tile_k, physical_f), dtype=nl.bfloat16),
+            },
+        )
+        framework.run_test(test_config=None, compiler_args=compiler_args, rtol=0, atol=0)
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("F,K,tile_f,tile_k,k_offset,f_offset", _TEST_SHAPES_1X32)
+    @pytest.mark.parametrize(
+        "disable_dma_transpose",
+        [
+            pytest.param(False, id="dma_transpose"),
+            pytest.param(True, id="dma_copy_pe_transpose"),
+        ],
+    )
+    def test_pe_1x32_kf_vs_golden(
+        self,
+        test_manager,
+        platform_target,
+        F,
+        K,
+        tile_f,
+        tile_k,
+        k_offset,
+        f_offset,
+        disable_dma_transpose,
+    ):
+        """Verify both K-by-F ingress paths match the CPU 1x32-swizzle golden."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+
+        compiler_args = common_dataclasses.CompilerArgs(platform_target=platform_target, logical_nc_config=1)
+        physical_tile_k = tile_k // INTERLEAVE_FACTOR
+        physical_f = tile_f * INTERLEAVE_FACTOR
+
+        rng = np.random.RandomState(42)
+        tensor_kf = rng.uniform(-1, 1, (K, F)).astype(nl.bfloat16)
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=pe_1x32_load_kf_kernel,
+            torch_ref=pe_1x32_kf_torch_ref,
+            kernel_input_generator=lambda _: {
+                "tensor_kf": tensor_kf,
+                "F": F,
+                "K": K,
+                "tile_f": tile_f,
+                "tile_k": tile_k,
+                "k_offset": k_offset,
+                "f_offset": f_offset,
+                "disable_dma_transpose": disable_dma_transpose,
             },
             output_tensor_descriptor=lambda _: {
                 "out": np.zeros((physical_tile_k, physical_f), dtype=nl.bfloat16),

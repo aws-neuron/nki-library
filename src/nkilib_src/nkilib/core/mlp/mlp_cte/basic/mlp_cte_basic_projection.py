@@ -27,7 +27,11 @@ from ....utils.tiled_range import TiledRange, TiledRangeIterator
 from ...mlp_parameters import MLPParameters
 from ..mlp_cte_constants import MlpBxsIndices, MLPCTEConstants
 from .mlp_cte_basic_allocation import allocate_intermediate_tensor_tile
-from .mlp_cte_basic_tile_info import MLPCTEBasicTileInfo
+from .mlp_cte_basic_tile_info import (
+    MLPCTEBasicTileInfo,
+    get_down_proj_weights_row_scales_ring_buffer_count,
+    get_down_weights_row_scales_tensor_info,
+)
 
 
 def perform_down_projection(
@@ -108,24 +112,27 @@ def _perform_standard_down_projection(
     """
     Perform non-quantized down projection matmul: intermediate[BxS, I] @ weights[I, H] + bias -> output[BxS, H].
 
-    Iterates over H tiles (outer) and I tiles (inner), accumulating partial products in PSUM.
-    Evicts final result with optional bias addition after all I tiles are processed.
+    Iterates over H DMA tiles (outer) and I tiles (inner), accumulating partial products in PSUM.
+    Evicts final result with optional bias addition after all I tiles are processed. Each weight DMA
+    covers several H tiles, one per PSUM bank the BxS subtiles leave free.
     """
     apply_bias = bias_tensor_sbuf != None
     bxs_dim_tile = tile_info.bxs_dim_tile
-    hidden_dim_tile = tile_info.down_proj_hidden_dim_tile
+    hidden_dma_dim_tile = tile_info.down_proj_weights_hidden_dma_tile
     int_dim_tile = tile_info.down_proj_intermediate_dim_tile
     BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
+    H_TILE_SIZE = hidden_dma_dim_tile.subtile_dim_info.tile_size
+    HIDDEN_TILES_PER_DMA = hidden_dma_dim_tile.subtile_dim_info.tile_count
     I_SHARD_OFFSET = constants.get_intermediate_offset()
 
     tensor_bxs_size = constants.get_bxs_size(mlp_params)
     bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
     current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
 
-    hidden_tiles = TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size)
+    hidden_dma_tiles = TiledRange(mlp_params.hidden_size, hidden_dma_dim_tile.tile_size)
     int_tiles = TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size)
 
-    for hidden_tile in hidden_tiles:
+    for hidden_dma_tile in hidden_dma_tiles:
         proj_results_psum_list = []
         for psum_idx in range(NUM_HW_PSUM_BANKS):
             psum_tensor = nl.ndarray(
@@ -133,69 +140,68 @@ def _perform_standard_down_projection(
                 dtype=nl.float32,
                 buffer=nl.psum,
                 address=(0, psum_idx * PSUM_BANK_SIZE) if sbm else None,
-                name=indices.get_tensor_name("down_psum_tensor", f"hidden{hidden_tile.index}__bank{psum_idx}"),
+                name=indices.get_tensor_name("down_psum_tensor", f"hiddendma{hidden_dma_tile.index}__bank{psum_idx}"),
             )
             proj_results_psum_list.append(psum_tensor)
 
         for int_tile in int_tiles:
-            weights_buffer_idx = (
-                hidden_tile.index * len(int_tiles) + int_tile.index
-            ) % constants.down_proj_weights_buffer_count
+            weights_buffer_idx = (hidden_dma_tile.index * len(int_tiles) + int_tile.index) % len(weights_sbuf_list)
 
             nisa.dma_copy(
                 src=weights_tensor_hbm[
                     nl.ds(I_SHARD_OFFSET + int_tile.start_offset, int_tile.size),
-                    nl.ds(hidden_tile.start_offset, hidden_tile.size),
+                    nl.ds(hidden_dma_tile.start_offset, hidden_dma_tile.size),
                 ],
-                dst=weights_sbuf_list[weights_buffer_idx][: int_tile.size, : hidden_tile.size],
+                dst=weights_sbuf_list[weights_buffer_idx][: int_tile.size, : hidden_dma_tile.size],
                 dge_mode=nisa.dge_mode.hwdge,
             )
 
             for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):
-                psum_bank = bxs_subtile.index
-
                 source_tile_sbuf_view = source_tile_sbuf_list[bxs_subtile.index]
 
-                nisa.nc_matmul(
-                    dst=proj_results_psum_list[psum_bank][0 : bxs_subtile.size, 0 : hidden_tile.size],
-                    stationary=source_tile_sbuf_view.ap(
-                        [
-                            [source_tile_sbuf_view.shape[1], int_tile.size],
-                            [1, bxs_subtile.size],
+                for hidden_tile in TiledRange(hidden_dma_tile, H_TILE_SIZE):
+                    psum_bank = bxs_subtile.index * HIDDEN_TILES_PER_DMA + hidden_tile.index
+
+                    nisa.nc_matmul(
+                        dst=proj_results_psum_list[psum_bank][0 : bxs_subtile.size, 0 : hidden_tile.size],
+                        stationary=source_tile_sbuf_view.ap(
+                            [
+                                [source_tile_sbuf_view.shape[1], int_tile.size],
+                                [1, bxs_subtile.size],
+                            ],
+                            offset=int_tile.start_offset,
+                        ),
+                        moving=weights_sbuf_list[weights_buffer_idx][
+                            0 : int_tile.size,
+                            nl.ds(hidden_tile.index * H_TILE_SIZE, hidden_tile.size),
                         ],
-                        offset=int_tile.start_offset,
-                    ),
-                    moving=weights_sbuf_list[weights_buffer_idx][
-                        0 : int_tile.size,
-                        0 : hidden_tile.size,
-                    ],
-                )
+                    )
 
-                if int_tile.index == (int_dim_tile.tile_count - 1):
-                    if apply_bias:
-                        d2_tile = bias_tensor_sbuf[
-                            : bxs_subtile.size,
-                            nl.ds(hidden_tile.start_offset, hidden_tile.size),
-                        ]
-
-                        nisa.tensor_tensor(
-                            dst=output_tile_sbuf_list[bxs_subtile.index][
+                    if int_tile.index == (int_dim_tile.tile_count - 1):
+                        if apply_bias:
+                            d2_tile = bias_tensor_sbuf[
                                 : bxs_subtile.size,
                                 nl.ds(hidden_tile.start_offset, hidden_tile.size),
-                            ],
-                            data1=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
-                            data2=d2_tile,
-                            op=nl.add,
-                        )
-                    else:
-                        nisa.tensor_copy(
-                            output_tile_sbuf_list[bxs_subtile.index][
-                                : bxs_subtile.size,
-                                nl.ds(hidden_tile.start_offset, hidden_tile.size),
-                            ],
-                            src=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
-                            engine=nisa.vector_engine,
-                        )
+                            ]
+
+                            nisa.tensor_tensor(
+                                dst=output_tile_sbuf_list[bxs_subtile.index][
+                                    : bxs_subtile.size,
+                                    nl.ds(hidden_tile.start_offset, hidden_tile.size),
+                                ],
+                                data1=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
+                                data2=d2_tile,
+                                op=nl.add,
+                            )
+                        else:
+                            nisa.tensor_copy(
+                                output_tile_sbuf_list[bxs_subtile.index][
+                                    : bxs_subtile.size,
+                                    nl.ds(hidden_tile.start_offset, hidden_tile.size),
+                                ],
+                                src=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
+                                engine=nisa.vector_engine,
+                            )
 
 
 def _perform_doublerow_down_projection(
@@ -220,10 +226,12 @@ def _perform_doublerow_down_projection(
     """
     kernel_assert(bias_tensor_sbuf == None, "Down projection bias is not supported with quantization")
     bxs_dim_tile = tile_info.bxs_dim_tile
-    hidden_dim_tile = tile_info.down_proj_hidden_dim_tile
+    hidden_dma_dim_tile = tile_info.down_proj_weights_hidden_dma_tile
     int_dim_tile = tile_info.down_proj_intermediate_dim_tile
     BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
-    H_TILE_SIZE = hidden_dim_tile.tile_size
+    H_DMA_TILE_SIZE = hidden_dma_dim_tile.tile_size
+    H_TILE_SIZE = hidden_dma_dim_tile.subtile_dim_info.tile_size
+    HIDDEN_TILES_PER_DMA = hidden_dma_dim_tile.subtile_dim_info.tile_count
     I_TILE_SIZE = int_dim_tile.tile_size
     I_SHARD_OFFSET = constants.get_intermediate_offset()
     src_proj_int_dim_tile = tile_info.src_proj_intermediate_dim_tile
@@ -233,23 +241,23 @@ def _perform_doublerow_down_projection(
     bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
     current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
 
-    hidden_tiles = TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size)
-    int_doublerow_tile_size = 2 * int_dim_tile.tile_size
-    int_doublerow_tiles = TiledRange(mlp_params.intermediate_size, int_doublerow_tile_size)
+    hidden_dma_tiles = TiledRange(mlp_params.hidden_size, H_DMA_TILE_SIZE)
+
+    int_doublerow_tiles = TiledRange(mlp_params.intermediate_size, 2 * I_TILE_SIZE)
 
     if mlp_params.quant_params.is_quant_row():
+        scales_shape, scales_dtype = get_down_weights_row_scales_tensor_info(hidden_dma_dim_tile)
+        scales_buffer_count = get_down_proj_weights_row_scales_ring_buffer_count(constants, hidden_dma_dim_tile)
         weight_row_scales_sbuf_list = []
-        for scales_buffer_idx in range(
-            min(constants.down_proj_weights_scales_buffer_count, hidden_dim_tile.tile_count)
-        ):
+        for scales_buffer_idx in range(scales_buffer_count):
             weight_row_scales_sbuf = sbm.alloc_stack(
-                (nl.tile_size.pmax, H_TILE_SIZE),
-                dtype=nl.float32,
+                scales_shape,
+                dtype=scales_dtype,
                 name=indices.get_tensor_name('down_weight_scale', f'buffer{scales_buffer_idx}'),
             )
             weight_row_scales_sbuf_list.append(weight_row_scales_sbuf)
 
-    for hidden_tile in hidden_tiles:
+    for hidden_dma_tile in hidden_dma_tiles:
         proj_results_psum_list = []
         for psum_idx in range(NUM_HW_PSUM_BANKS):
             psum_tensor = nl.ndarray(
@@ -257,52 +265,51 @@ def _perform_doublerow_down_projection(
                 dtype=nl.float32,
                 buffer=nl.psum,
                 address=(0, psum_idx * PSUM_BANK_SIZE) if sbm else None,
-                name=indices.get_tensor_name('down_psum_tensor', f'hidden{hidden_tile.index}__bank{psum_idx}'),
+                name=indices.get_tensor_name('down_psum_tensor', f'hiddendma{hidden_dma_tile.index}__bank{psum_idx}'),
             )
             proj_results_psum_list.append(psum_tensor)
 
         if mlp_params.quant_params.is_quant_row():
-            scale_buffer_idx = hidden_tile.index % constants.down_proj_weights_scales_buffer_count
+            scale_buffer_idx = hidden_dma_tile.index % len(weight_row_scales_sbuf_list)
             nisa.dma_copy(
                 src=mlp_params.quant_params.down_w_scale[
-                    nl.ds(0, nl.tile_size.pmax), nl.ds(hidden_tile.start_offset, hidden_tile.size)
+                    nl.ds(0, nl.tile_size.pmax), nl.ds(hidden_dma_tile.start_offset, hidden_dma_tile.size)
                 ],
-                dst=weight_row_scales_sbuf_list[scale_buffer_idx][: nl.tile_size.pmax, : hidden_tile.size],
+                dst=weight_row_scales_sbuf_list[scale_buffer_idx][: nl.tile_size.pmax, : hidden_dma_tile.size],
                 dge_mode=nisa.dge_mode.hwdge,
             )
 
         for int_doublerow_tile in int_doublerow_tiles:
+            # The intermediate transpose lays each tile out as two equally sized column blocks,
+            # except a trailing tile of at most I_TILE_SIZE rows which stays a single block. As
+            # double_row needs two equally sized row groups, it applies exactly when the tile spans
+            # two blocks.
             perform_doublerow_matmul = int_doublerow_tile.size > I_TILE_SIZE
-            single_int_tile_size = int_doublerow_tile.size // 2
+            int_group_count = 2 if perform_doublerow_matmul else 1
+            int_group_size = int_doublerow_tile.size // int_group_count
 
-            weights_buffer_idx = (
-                hidden_tile.index * len(int_doublerow_tiles) + int_doublerow_tile.index
-            ) % constants.down_proj_weights_buffer_count
-
-            weights_sbuf_view = weights_sbuf_list[weights_buffer_idx].reshape((int_dim_tile.tile_size, 2, H_TILE_SIZE))
-
-            in_load_pattern = (
-                [
-                    [mlp_params.hidden_size, single_int_tile_size],
-                    [single_int_tile_size * mlp_params.hidden_size, 2],
-                    [1, hidden_tile.size],
-                ]
-                if perform_doublerow_matmul
-                else [
-                    [mlp_params.hidden_size, int_doublerow_tile.size],
-                    [int_doublerow_tile.size * mlp_params.hidden_size, 1],
-                    [1, hidden_tile.size],
-                ]
+            weights_buffer_idx = (hidden_dma_tile.index * len(int_doublerow_tiles) + int_doublerow_tile.index) % len(
+                weights_sbuf_list
             )
+
+            weights_sbuf_view = weights_sbuf_list[weights_buffer_idx].reshape(
+                (int_dim_tile.tile_size, 2, H_DMA_TILE_SIZE)
+            )
+
+            in_load_pattern = [
+                [mlp_params.hidden_size, int_group_size],
+                [int_group_size * mlp_params.hidden_size, int_group_count],
+                [1, hidden_dma_tile.size],
+            ]
             in_load_offset = (
-                int_doublerow_tile.index * int_doublerow_tile_size + I_SHARD_OFFSET
-            ) * mlp_params.hidden_size + hidden_tile.index * H_TILE_SIZE
+                int_doublerow_tile.start_offset + I_SHARD_OFFSET
+            ) * mlp_params.hidden_size + hidden_dma_tile.start_offset
 
-            out_load_pattern = (
-                [[2 * H_TILE_SIZE, single_int_tile_size], [H_TILE_SIZE, 2], [1, hidden_tile.size]]
-                if perform_doublerow_matmul
-                else [[2 * H_TILE_SIZE, int_doublerow_tile.size], [H_TILE_SIZE, 1], [1, hidden_tile.size]]
-            )
+            out_load_pattern = [
+                [2 * H_DMA_TILE_SIZE, int_group_size],
+                [H_DMA_TILE_SIZE, int_group_count],
+                [1, hidden_dma_tile.size],
+            ]
 
             nisa.dma_copy(
                 src=weights_tensor_hbm.ap(
@@ -312,10 +319,6 @@ def _perform_doublerow_down_projection(
             )
 
             for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):
-                psum_bank = bxs_subtile.index
-
-                dst_tile = proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size]
-
                 source_tile_sbuf_view = source_tile_sbuf_list[bxs_subtile.index].reshape(
                     (
                         BXS_SUBTILE_SIZE,
@@ -324,59 +327,70 @@ def _perform_doublerow_down_projection(
                 )
 
                 st_pattern = (
-                    [[ROUNDED_INT_DIM, single_int_tile_size], [BXS_SUBTILE_SIZE, 2], [1, bxs_subtile.size]]
+                    [[ROUNDED_INT_DIM, int_group_size], [BXS_SUBTILE_SIZE, int_group_count], [1, bxs_subtile.size]]
                     if perform_doublerow_matmul
-                    else [[ROUNDED_INT_DIM, int_doublerow_tile.size], [1, bxs_subtile.size]]
+                    else [[ROUNDED_INT_DIM, int_group_size], [1, bxs_subtile.size]]
                 )
                 st_offset = int_doublerow_tile.index * 2 * BXS_SUBTILE_SIZE
                 intermediate_mm_in = source_tile_sbuf_view.ap(pattern=st_pattern, offset=st_offset)
 
-                mv_pattern = (
-                    [[2 * H_TILE_SIZE, single_int_tile_size], [H_TILE_SIZE, 2], [1, hidden_tile.size]]
-                    if perform_doublerow_matmul
-                    else [[2 * H_TILE_SIZE, int_doublerow_tile.size], [1, hidden_tile.size]]
-                )
-                weights_mm_in = weights_sbuf_view.ap(pattern=mv_pattern, offset=0)
+                for hidden_tile in TiledRange(hidden_dma_tile, H_TILE_SIZE):
+                    psum_bank = bxs_subtile.index * HIDDEN_TILES_PER_DMA + hidden_tile.index
 
-                nisa.nc_matmul(
-                    dst=dst_tile,
-                    stationary=intermediate_mm_in,
-                    moving=weights_mm_in,
-                    perf_mode=('double_row' if perform_doublerow_matmul else 'none'),
-                )
+                    dst_tile = proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size]
 
-                if int_doublerow_tile.index == len(int_doublerow_tiles) - 1:
-                    output_tile = output_tile_sbuf_list[bxs_subtile.index][
-                        : bxs_subtile.size,
-                        nl.ds(hidden_tile.start_offset, hidden_tile.size),
-                    ]
-                    if mlp_params.quant_params.is_quant_row():
-                        nisa.tensor_tensor(
-                            dst=output_tile,
-                            data1=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
-                            data2=weight_row_scales_sbuf_list[scale_buffer_idx][
-                                : bxs_subtile.size,
-                                : hidden_tile.size,
-                            ],
-                            op=nl.multiply,
-                        )
-                        nisa.activation(
-                            dst=output_tile,
-                            op=nl.copy,
-                            data=output_tile,
-                            scale=source_row_scales_sbuf_list[bxs_subtile.index][: bxs_subtile.size, 0:1],
-                            bias=constants.bxs_dim_subtile_zero_bias_vector_sbuf[: bxs_subtile.size, 0:1],
-                        )
-                    elif mlp_params.quant_params.is_quant_static():
-                        nisa.tensor_scalar(
-                            dst=output_tile,
-                            data=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
-                            op0=nl.multiply,
-                            operand0=static_scales_sbuf[: bxs_subtile.size, 0:1],
-                            engine=nisa.vector_engine if bxs_subtile.index % 2 == 0 else nisa.scalar_engine,
-                        )
-                    else:
-                        kernel_assert(False, "Unrecognized quantization type")
+                    mv_pattern = (
+                        [
+                            [2 * H_DMA_TILE_SIZE, int_group_size],
+                            [H_DMA_TILE_SIZE, int_group_count],
+                            [1, hidden_tile.size],
+                        ]
+                        if perform_doublerow_matmul
+                        else [[2 * H_DMA_TILE_SIZE, int_group_size], [1, hidden_tile.size]]
+                    )
+                    weights_mm_in = weights_sbuf_view.ap(pattern=mv_pattern, offset=hidden_tile.index * H_TILE_SIZE)
+
+                    nisa.nc_matmul(
+                        dst=dst_tile,
+                        stationary=intermediate_mm_in,
+                        moving=weights_mm_in,
+                        perf_mode=('double_row' if perform_doublerow_matmul else 'none'),
+                    )
+
+                    if int_doublerow_tile.index == len(int_doublerow_tiles) - 1:
+                        output_tile = output_tile_sbuf_list[bxs_subtile.index][
+                            : bxs_subtile.size,
+                            nl.ds(hidden_tile.start_offset, hidden_tile.size),
+                        ]
+                        if mlp_params.quant_params.is_quant_row():
+                            nisa.tensor_tensor(
+                                dst=output_tile,
+                                data1=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
+                                data2=weight_row_scales_sbuf_list[scale_buffer_idx][
+                                    : bxs_subtile.size,
+                                    nl.ds(hidden_tile.index * H_TILE_SIZE, hidden_tile.size),
+                                ],
+                                op=nl.multiply,
+                            )
+                            nisa.activation(
+                                dst=output_tile,
+                                op=nl.copy,
+                                data=output_tile,
+                                scale=source_row_scales_sbuf_list[bxs_subtile.index][: bxs_subtile.size, 0:1],
+                                bias=constants.bxs_dim_subtile_zero_bias_vector_sbuf[: bxs_subtile.size, 0:1],
+                            )
+                        elif (
+                            mlp_params.quant_params.is_quant_static()
+                        ):  # pragma: no branch - exhaustive down-proj dequant dispatch, else-assert arc dead
+                            nisa.tensor_scalar(
+                                dst=output_tile,
+                                data=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
+                                op0=nl.multiply,
+                                operand0=static_scales_sbuf[: bxs_subtile.size, 0:1],
+                                engine=nisa.vector_engine if bxs_subtile.index % 2 == 0 else nisa.scalar_engine,
+                            )
+                        else:
+                            kernel_assert(False, "Unrecognized quantization type")
 
 
 def sync_down_proj_results_across_int_dim(
@@ -444,6 +458,88 @@ def sync_down_proj_results_across_int_dim(
 
     for bxs_subtile_idx in range(bxs_dim_tile.subtile_dim_info.tile_count):
         sbm.pop_heap()
+
+
+def _get_src_proj_weights_tensor_hbm(mlp_params: MLPParameters, gate_or_up: GateUpDim) -> nl.NkiTensor:
+    return mlp_params.gate_proj_weights_tensor if gate_or_up == GateUpDim.GATE else mlp_params.up_proj_weights_tensor
+
+
+def _get_src_proj_weights_buffer_idx(
+    int_dma_tile: TiledRangeIterator,
+    hidden_tile: TiledRangeIterator,
+    hidden_tile_count: int,
+    weights_buffer_count: int,
+) -> int:
+    return (int_dma_tile.index * hidden_tile_count + hidden_tile.index) % weights_buffer_count
+
+
+def _load_standard_src_proj_weights_tile(
+    constants: MLPCTEConstants,
+    weights_tensor_hbm: nl.NkiTensor,
+    weights_sbuf: nl.NkiTensor,
+    hidden_tile: TiledRangeIterator,
+    int_dma_tile: TiledRangeIterator,
+):
+    """Load one (H tile, I DMA tile) block of a non-quantized source projection weight matrix into SBUF.
+
+    The weights are contiguous along I, so the I DMA tile spans several of the I tiles the matmuls
+    consume to keep the contiguous run each descriptor covers as long as PSUM allows.
+    """
+    nisa.dma_copy(
+        dst=weights_sbuf[: hidden_tile.size, : int_dma_tile.size],
+        src=weights_tensor_hbm[
+            nl.ds(hidden_tile.start_offset, hidden_tile.size),
+            nl.ds(constants.get_intermediate_offset() + int_dma_tile.start_offset, int_dma_tile.size),
+        ],
+        dge_mode=nisa.dge_mode.hwdge,
+    )
+
+
+def _load_doublerow_src_proj_weights_tile(
+    constants: MLPCTEConstants,
+    weights_tensor_hbm: nl.NkiTensor,
+    weights_sbuf: nl.NkiTensor,
+    hidden_doublerow_tile: TiledRangeIterator,
+    int_dma_tile: TiledRangeIterator,
+    hidden_tile_size: int,
+    int_dma_tile_size: int,
+):
+    """Load one (H double-row tile, I DMA tile) block of a quantized source projection weight matrix.
+
+    Loads 2 H tiles x I_DMA_TILE_SIZE into a buffer of shape (H_TILE_SIZE, 2 * I_DMA_TILE_SIZE), laid
+    out as [h_inner, row_idx * I_DMA_TILE_SIZE + i] for row_idx in {0, 1}.
+    """
+    I = weights_tensor_hbm.shape[-1]
+    perform_doublerow_matmul = hidden_doublerow_tile.size == 2 * hidden_tile_size
+
+    in_load_pattern = (
+        [[I, hidden_tile_size], [I * hidden_tile_size, 2], [1, int_dma_tile.size]]
+        if perform_doublerow_matmul
+        else [[I, hidden_tile_size], [1, int_dma_tile.size]]
+    )
+    in_load_offset = (
+        hidden_doublerow_tile.start_offset * I + constants.get_intermediate_offset() + int_dma_tile.start_offset
+    )
+
+    out_load_pattern = (
+        [[2 * int_dma_tile_size, hidden_tile_size], [int_dma_tile_size, 2], [1, int_dma_tile.size]]
+        if perform_doublerow_matmul
+        else [[2 * int_dma_tile_size, hidden_tile_size], [1, int_dma_tile.size]]
+    )
+
+    nisa.dma_copy(
+        src=weights_tensor_hbm.ap(
+            pattern=in_load_pattern,
+            offset=in_load_offset,
+            dtype=constants.src_proj_quant_data_type,
+        ),
+        dst=weights_sbuf.ap(
+            pattern=out_load_pattern,
+            offset=0,
+            dtype=constants.src_proj_quant_data_type,
+        ),
+        dge_mode=nisa.dge_mode.hwdge,
+    )
 
 
 def perform_gate_up_projection(
@@ -514,19 +610,19 @@ def _perform_standard_gate_up_projection(
     """
     Perform non-quantized gate or up projection: hidden[BxS, H] @ weights[H, I] -> result[BxS, I].
 
-    Iterates over I tiles (outer) and H tiles (inner), accumulating partial products in PSUM.
+    Iterates over I DMA tiles (outer) and H tiles (inner), accumulating partial products in PSUM.
     After the last H tile, evicts the result with activation (gate) or elementwise multiply (up).
+    Each weight DMA covers several I tiles, one per PSUM bank the BxS subtiles leave free.
     """
     bxs_dim_tile = tile_info.bxs_dim_tile
     hidden_dim_tile = tile_info.src_proj_hidden_dim_tile
-    int_dim_tile = tile_info.src_proj_intermediate_dim_tile
+    int_dma_dim_tile = tile_info.src_proj_weights_int_dma_tile
     BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
-    I_TILE_SIZE = int_dim_tile.tile_size
-    I_SHARD_OFFSET = constants.get_intermediate_offset()
+    I_DMA_TILE_SIZE = int_dma_dim_tile.tile_size
+    I_TILE_SIZE = int_dma_dim_tile.subtile_dim_info.tile_size
+    INT_TILES_PER_DMA = int_dma_dim_tile.subtile_dim_info.tile_count
 
-    weights_tensor_hbm = (
-        mlp_params.gate_proj_weights_tensor if gate_or_up == GateUpDim.GATE else mlp_params.up_proj_weights_tensor
-    )
+    weights_tensor_hbm = _get_src_proj_weights_tensor_hbm(mlp_params, gate_or_up)
 
     requires_bias_output_buffer = bias_sbuf is not None and gate_or_up == GateUpDim.UP and not mlp_params.skip_gate_proj
     if requires_bias_output_buffer:
@@ -551,7 +647,7 @@ def _perform_standard_gate_up_projection(
     current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
 
     hidden_tiles = TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size)
-    for int_tile in TiledRange(mlp_params.intermediate_size, I_TILE_SIZE):  # 512 in I
+    for int_dma_tile in TiledRange(mlp_params.intermediate_size, I_DMA_TILE_SIZE):  # up to 4 x 512 in I
         psum_list = []
         for psum_idx in range(NUM_HW_PSUM_BANKS):
             psum_name_prefix = f"{'gate' if gate_or_up == GateUpDim.GATE else 'up'}_proj_psum"
@@ -561,62 +657,64 @@ def _perform_standard_gate_up_projection(
                     dtype=constants.psum_accumulation_data_type,
                     buffer=nl.psum,
                     address=(0, psum_idx * PSUM_BANK_SIZE) if sbm else None,
-                    name=indices.get_tensor_name(psum_name_prefix, f"int{int_tile.index}__bank{psum_idx}"),
+                    name=indices.get_tensor_name(psum_name_prefix, f"intdma{int_dma_tile.index}__bank{psum_idx}"),
                 )
             )
 
         for hidden_tile in hidden_tiles:  # 128 in H
-            weights_buffer_idx = (int_tile.index * len(hidden_tiles) + hidden_tile.index) % len(weights_sbuf_list)
-            nisa.dma_copy(
-                dst=weights_sbuf_list[weights_buffer_idx][: hidden_tile.size, : int_tile.size],
-                src=weights_tensor_hbm[
-                    nl.ds(hidden_tile.start_offset, hidden_tile.size),
-                    nl.ds(I_SHARD_OFFSET + int_tile.start_offset, int_tile.size),
-                ],
-                dge_mode=nisa.dge_mode.hwdge,
+            weights_buffer_idx = _get_src_proj_weights_buffer_idx(
+                int_dma_tile, hidden_tile, len(hidden_tiles), len(weights_sbuf_list)
+            )
+            _load_standard_src_proj_weights_tile(
+                constants,
+                weights_tensor_hbm,
+                weights_sbuf_list[weights_buffer_idx],
+                hidden_tile,
+                int_dma_tile,
             )
             for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):  # 128 in BxS
-                psum_bank_idx = bxs_subtile.index
-                nisa.nc_matmul(
-                    dst=psum_list[psum_bank_idx][: bxs_subtile.size, : int_tile.size],
-                    stationary=source_tile_sbuf_list[bxs_subtile.index][
-                        : hidden_tile.size,
-                        nl.ds(hidden_tile.start_offset, bxs_subtile.size),
-                    ],
-                    moving=weights_sbuf_list[weights_buffer_idx][
-                        : hidden_tile.size,
-                        : int_tile.size,
-                    ],
-                )
+                for int_tile in TiledRange(int_dma_tile, I_TILE_SIZE):  # 512 in I
+                    psum_bank_idx = bxs_subtile.index * INT_TILES_PER_DMA + int_tile.index
+                    nisa.nc_matmul(
+                        dst=psum_list[psum_bank_idx][: bxs_subtile.size, : int_tile.size],
+                        stationary=source_tile_sbuf_list[bxs_subtile.index][
+                            : hidden_tile.size,
+                            nl.ds(hidden_tile.start_offset, bxs_subtile.size),
+                        ],
+                        moving=weights_sbuf_list[weights_buffer_idx][
+                            : hidden_tile.size,
+                            nl.ds(int_tile.index * I_TILE_SIZE, int_tile.size),
+                        ],
+                    )
 
-                if hidden_tile.index == len(hidden_tiles) - 1:
-                    if gate_or_up == GateUpDim.GATE or (gate_or_up == GateUpDim.UP and mlp_params.skip_gate_proj):
-                        _evict_gate_res_tile(
-                            mlp_params,
-                            constants,
-                            psum_list[psum_bank_idx],
-                            proj_results_sbuf_list,
-                            bxs_subtile,
-                            int_tile,
-                            bias_sbuf,
-                            None,  # static_scales_sbuf
-                            None,  # weight_row_scales_sbuf
-                            None,  # hidden_scales_sbuf_list
-                        )
-                    else:
-                        _evict_up_res_tile(
-                            mlp_params,
-                            constants,
-                            psum_list[psum_bank_idx],
-                            proj_results_sbuf_list,
-                            bxs_subtile,
-                            int_tile,
-                            bias_sbuf,
-                            bias_output_buffer_sbuf_list,
-                            None,  # static_scales_sbuf
-                            None,  # weight_row_scales_sbuf
-                            None,  # hidden_scales_sbuf_list
-                        )
+                    if hidden_tile.index == len(hidden_tiles) - 1:
+                        if gate_or_up == GateUpDim.GATE or (gate_or_up == GateUpDim.UP and mlp_params.skip_gate_proj):
+                            _evict_gate_res_tile(
+                                mlp_params,
+                                constants,
+                                psum_list[psum_bank_idx],
+                                proj_results_sbuf_list,
+                                bxs_subtile,
+                                int_tile,
+                                bias_sbuf,
+                                None,  # static_scales_sbuf
+                                None,  # weight_row_scales_sbuf
+                                None,  # hidden_scales_sbuf_list
+                            )
+                        else:
+                            _evict_up_res_tile(
+                                mlp_params,
+                                constants,
+                                psum_list[psum_bank_idx],
+                                proj_results_sbuf_list,
+                                bxs_subtile,
+                                int_tile,
+                                bias_sbuf,
+                                bias_output_buffer_sbuf_list,
+                                None,  # static_scales_sbuf
+                                None,  # weight_row_scales_sbuf
+                                None,  # hidden_scales_sbuf_list
+                            )
     if requires_bias_output_buffer:
         sbm.close_scope()  # up_projection
 
@@ -640,21 +738,20 @@ def _perform_doublerow_gate_up_projection(
     Perform quantized (ROW/STATIC) gate or up projection with double-row matmul optimization.
 
     Uses fp8 hidden and weight inputs with double-row perf mode (2 H tiles per matmul).
-    Iterates over I tiles (outer) and H double-row tiles (inner), accumulating in PSUM.
+    Iterates over I DMA tiles (outer) and H double-row tiles (inner), accumulating in PSUM.
     Applies dequantization scales and activation/multiply during eviction.
+    Each weight DMA covers several I tiles, one per PSUM bank the BxS subtiles leave free.
     """
     bxs_dim_tile = tile_info.bxs_dim_tile
     hidden_dim_tile = tile_info.src_proj_hidden_dim_tile
-    int_dim_tile = tile_info.src_proj_intermediate_dim_tile
+    int_dma_dim_tile = tile_info.src_proj_weights_int_dma_tile
     BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
     H_TILE_SIZE = hidden_dim_tile.tile_size
-    I_TILE_SIZE = int_dim_tile.tile_size
-    I_SHARD_OFFSET = constants.get_intermediate_offset()
+    I_DMA_TILE_SIZE = int_dma_dim_tile.tile_size
+    I_TILE_SIZE = int_dma_dim_tile.subtile_dim_info.tile_size
+    INT_TILES_PER_DMA = int_dma_dim_tile.subtile_dim_info.tile_count
 
-    weights_tensor_hbm = (
-        mlp_params.gate_proj_weights_tensor if gate_or_up == GateUpDim.GATE else mlp_params.up_proj_weights_tensor
-    )
-    I = weights_tensor_hbm.shape[-1]
+    weights_tensor_hbm = _get_src_proj_weights_tensor_hbm(mlp_params, gate_or_up)
 
     requires_bias_output_buffer = bias_sbuf is not None and gate_or_up == GateUpDim.UP and not mlp_params.skip_gate_proj
     if requires_bias_output_buffer:
@@ -679,7 +776,7 @@ def _perform_doublerow_gate_up_projection(
 
     hidden_doublerow_tiles = TiledRange(mlp_params.hidden_size, 2 * H_TILE_SIZE)
 
-    for int_tile in TiledRange(mlp_params.intermediate_size, I_TILE_SIZE):  # 512 in I
+    for int_dma_tile in TiledRange(mlp_params.intermediate_size, I_DMA_TILE_SIZE):  # up to 4 x 512 in I
         psum_list = []
         for psum_idx in range(NUM_HW_PSUM_BANKS):
             psum_name_prefix = f"{'gate' if gate_or_up == GateUpDim.GATE else 'up'}_proj_psum"
@@ -689,48 +786,27 @@ def _perform_doublerow_gate_up_projection(
                     dtype=constants.psum_accumulation_data_type,
                     buffer=nl.psum,
                     address=(0, psum_idx * PSUM_BANK_SIZE) if sbm else None,
-                    name=indices.get_tensor_name(psum_name_prefix, f"int{int_tile.index}__bank{psum_idx}"),
+                    name=indices.get_tensor_name(psum_name_prefix, f"intdma{int_dma_tile.index}__bank{psum_idx}"),
                 )
             )
 
         for hidden_doublerow_tile in hidden_doublerow_tiles:  # 256 in H (double-row)
             perform_doublerow_matmul = hidden_doublerow_tile.size == 2 * H_TILE_SIZE
-            weights_buffer_idx = (int_tile.index * len(hidden_doublerow_tiles) + hidden_doublerow_tile.index) % len(
-                weights_sbuf_list
+            weights_buffer_idx = _get_src_proj_weights_buffer_idx(
+                int_dma_tile, hidden_doublerow_tile, len(hidden_doublerow_tiles), len(weights_sbuf_list)
             )
 
-            # Load 2 H tiles × I_TILE_SIZE into buffer (128, 2*I_TILE_SIZE)
-            # Buffer layout: [h_inner, row_idx * I_TILE_SIZE + i] for row_idx in {0,1}
-            in_load_pattern = (
-                [[I, H_TILE_SIZE], [I * H_TILE_SIZE, 2], [1, int_tile.size]]
-                if perform_doublerow_matmul
-                else [[I, H_TILE_SIZE], [1, int_tile.size]]
-            )
-            in_load_offset = hidden_doublerow_tile.start_offset * I + I_SHARD_OFFSET + int_tile.start_offset
-
-            out_load_pattern = (
-                [[2 * I_TILE_SIZE, H_TILE_SIZE], [I_TILE_SIZE, 2], [1, int_tile.size]]
-                if perform_doublerow_matmul
-                else [[2 * I_TILE_SIZE, H_TILE_SIZE], [1, int_tile.size]]
-            )
-
-            nisa.dma_copy(
-                src=weights_tensor_hbm.ap(
-                    pattern=in_load_pattern,
-                    offset=in_load_offset,
-                    dtype=constants.src_proj_quant_data_type,
-                ),
-                dst=weights_sbuf_list[weights_buffer_idx].ap(
-                    pattern=out_load_pattern,
-                    offset=0,
-                    dtype=constants.src_proj_quant_data_type,
-                ),
-                dge_mode=nisa.dge_mode.hwdge,
+            _load_doublerow_src_proj_weights_tile(
+                constants,
+                weights_tensor_hbm,
+                weights_sbuf_list[weights_buffer_idx],
+                hidden_doublerow_tile,
+                int_dma_tile,
+                H_TILE_SIZE,
+                I_DMA_TILE_SIZE,
             )
 
             for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):  # 128 in BxS
-                psum_bank_idx = bxs_subtile.index
-
                 st_pattern = (
                     [[mlp_params.hidden_size, H_TILE_SIZE], [BXS_SUBTILE_SIZE, 2], [1, bxs_subtile.size]]
                     if perform_doublerow_matmul
@@ -739,48 +815,53 @@ def _perform_doublerow_gate_up_projection(
                 st_offset = hidden_doublerow_tile.index * 2 * BXS_SUBTILE_SIZE
                 hidden_mm_in = source_tile_sbuf_list[bxs_subtile.index].ap(pattern=st_pattern, offset=st_offset)
 
-                mv_pattern = (
-                    [[2 * I_TILE_SIZE, H_TILE_SIZE], [I_TILE_SIZE, 2], [1, int_tile.size]]
-                    if perform_doublerow_matmul
-                    else [[2 * I_TILE_SIZE, H_TILE_SIZE], [1, int_tile.size]]
-                )
-                weights_mm_in = weights_sbuf_list[weights_buffer_idx].ap(pattern=mv_pattern, offset=0)
+                for int_tile in TiledRange(int_dma_tile, I_TILE_SIZE):  # 512 in I
+                    psum_bank_idx = bxs_subtile.index * INT_TILES_PER_DMA + int_tile.index
 
-                nisa.nc_matmul(
-                    dst=psum_list[psum_bank_idx][: bxs_subtile.size, : int_tile.size],
-                    stationary=hidden_mm_in,
-                    moving=weights_mm_in,
-                    perf_mode=('double_row' if perform_doublerow_matmul else 'none'),
-                )
+                    mv_pattern = (
+                        [[2 * I_DMA_TILE_SIZE, H_TILE_SIZE], [I_DMA_TILE_SIZE, 2], [1, int_tile.size]]
+                        if perform_doublerow_matmul
+                        else [[2 * I_DMA_TILE_SIZE, H_TILE_SIZE], [1, int_tile.size]]
+                    )
+                    weights_mm_in = weights_sbuf_list[weights_buffer_idx].ap(
+                        pattern=mv_pattern, offset=int_tile.index * I_TILE_SIZE
+                    )
 
-                if hidden_doublerow_tile.index == len(hidden_doublerow_tiles) - 1:
-                    if gate_or_up == GateUpDim.GATE or (gate_or_up == GateUpDim.UP and mlp_params.skip_gate_proj):
-                        _evict_gate_res_tile(
-                            mlp_params,
-                            constants,
-                            psum_list[psum_bank_idx],
-                            proj_results_sbuf_list,
-                            bxs_subtile,
-                            int_tile,
-                            bias_sbuf,
-                            static_scales_sbuf,
-                            weight_row_scales_sbuf,
-                            hidden_scales_sbuf_list,
-                        )
-                    else:
-                        _evict_up_res_tile(
-                            mlp_params,
-                            constants,
-                            psum_list[psum_bank_idx],
-                            proj_results_sbuf_list,
-                            bxs_subtile,
-                            int_tile,
-                            bias_sbuf,
-                            bias_output_buffer_sbuf_list,
-                            static_scales_sbuf,
-                            weight_row_scales_sbuf,
-                            hidden_scales_sbuf_list,
-                        )
+                    nisa.nc_matmul(
+                        dst=psum_list[psum_bank_idx][: bxs_subtile.size, : int_tile.size],
+                        stationary=hidden_mm_in,
+                        moving=weights_mm_in,
+                        perf_mode=('double_row' if perform_doublerow_matmul else 'none'),
+                    )
+
+                    if hidden_doublerow_tile.index == len(hidden_doublerow_tiles) - 1:
+                        if gate_or_up == GateUpDim.GATE or (gate_or_up == GateUpDim.UP and mlp_params.skip_gate_proj):
+                            _evict_gate_res_tile(
+                                mlp_params,
+                                constants,
+                                psum_list[psum_bank_idx],
+                                proj_results_sbuf_list,
+                                bxs_subtile,
+                                int_tile,
+                                bias_sbuf,
+                                static_scales_sbuf,
+                                weight_row_scales_sbuf,
+                                hidden_scales_sbuf_list,
+                            )
+                        else:
+                            _evict_up_res_tile(
+                                mlp_params,
+                                constants,
+                                psum_list[psum_bank_idx],
+                                proj_results_sbuf_list,
+                                bxs_subtile,
+                                int_tile,
+                                bias_sbuf,
+                                bias_output_buffer_sbuf_list,
+                                static_scales_sbuf,
+                                weight_row_scales_sbuf,
+                                hidden_scales_sbuf_list,
+                            )
     if requires_bias_output_buffer:
         sbm.close_scope()  # up_projection
 

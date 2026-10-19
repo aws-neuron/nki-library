@@ -77,18 +77,18 @@ class TkgOutputProjClassification(enum.Enum):
 
 @nki.jit
 def output_proj_tkg_wrapper(
-    attention: nl.ndarray,
-    weight: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    weight_scale: Optional[nl.ndarray] = None,
-    input_scale: Optional[nl.ndarray] = None,
+    weight_scale: Optional[nl.NkiTensor] = None,
+    input_scale: Optional[nl.NkiTensor] = None,
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
     # Placeholder param to match torch-ref/kernel signature
     sbm: Optional[BufferManager] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     sbm = BufferManager(
         0,
         nl.tile_size.total_available_sbuf_size,

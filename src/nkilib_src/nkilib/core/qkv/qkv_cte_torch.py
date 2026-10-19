@@ -105,11 +105,13 @@ def qkv_cte_torch_ref(
     use_block_kv: bool = False,
     transpose_k_cache: bool = False,
     fp8_packed: bool = False,
+    head_split_kv_cache: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[torch.Tensor] = None,
     # --- Hardware-only — accepted for kernel signature parity, no-op on CPU
     store_output_in_sbuf: bool = False,  # noqa: ARG001
     sbm: Any = None,  # noqa: ARG001
+    hbm_name_prefix: str = "",  # noqa: ARG001
     use_auto_allocation: bool = False,  # noqa: ARG001
     load_input_with_DMA_transpose: bool = True,  # noqa: ARG001
     # --- Quantization Related
@@ -169,7 +171,7 @@ def qkv_cte_torch_ref(
         attention_prev (Optional[torch.Tensor]): Previous attention output [B, S, H].
         fused_norm_type (NormType): Normalization type. Default: NO_NORM.
         gamma_norm_weights (Optional[torch.Tensor]): Norm gamma/scale [1, H].
-        layer_norm_bias (Optional[torch.Tensor]): LayerNorm beta [1, H].
+        layer_norm_bias (Optional[torch.Tensor]): Norm beta [1, H]; LAYER_NORM or RMS_NORM.
         norm_eps (float): Normalization epsilon. Default: 1e-6.
         hidden_actual (Optional[int]): Actual hidden dim for padded tensors.
         fused_rope (Optional[bool]): Apply RoPE to Q and K heads. Default: False.
@@ -186,6 +188,9 @@ def qkv_cte_torch_ref(
         fp8_min (Optional[float]): FP8 clamp lower bound.
         kv_dtype (Optional[type]): KV cache dtype.
         use_block_kv (bool): Use block KV cache layout. Default: False.
+        head_split_kv_cache (bool): Accepted for kernel signature parity. This
+            reference does not model the head-major block cache store, so it must
+            be False. Default: False.
         block_size (Optional[int]): Block size for block KV cache.
         slot_mapping (Optional[torch.Tensor]): Slot mapping [B, S] for block KV.
         quantization_type (QuantizationType): Quantization mode. Default: NONE.
@@ -218,6 +223,9 @@ def qkv_cte_torch_ref(
     # the torch ref runs on CPU and can't query hardware.
     assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
         "qkv_cte_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+    )
+    assert not head_split_kv_cache, (  # noqa: S101
+        "qkv_cte_torch_ref does not model the head-major block KV cache store"
     )
     _fp8_e4m3_dtype = nl.float8_e4m3fn if dtype_mode == DtypeMode.OCP else nl.float8_e4m3
     fp8_clip_value = get_max_positive_value_for_dtype(_fp8_e4m3_dtype)
@@ -278,7 +286,7 @@ def qkv_cte_torch_ref(
         # RMS_NORM_SKIP_GAMMA: gamma_norm_weights will be None, and
         # rms_norm_torch_ref skips the multiply when gamma is None
         input = norm_name2func_torch[fused_norm_type](
-            input, gamma_norm_weights, eps=norm_eps, hidden_actual=hidden_actual
+            input, gamma_norm_weights, eps=norm_eps, hidden_actual=hidden_actual, norm_b=layer_norm_bias
         )
 
     # QKV matmul
@@ -669,6 +677,8 @@ def qkv_cte_torch_ref(
     elif output_layout == QKVOutputLayout.NBdS:
         qkv_out = qkv_out.reshape(B, S, num_heads, d_head)
         qkv_out = qkv_out.permute(2, 0, 3, 1)
+    elif output_layout == QKVOutputLayout.BNSd:
+        raise ValueError("BNSd describes the KV-cache Q store, which this reference does not model")
 
     result = {"out": qkv_out}
     result.update(squared_sums)

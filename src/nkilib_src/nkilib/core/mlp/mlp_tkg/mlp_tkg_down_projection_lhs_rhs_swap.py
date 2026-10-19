@@ -146,7 +146,7 @@ def down_projection_lhs_rhs_swap(
                     )
 
     # Reshape output to 2D for PSUM copy (skip flatten if already 2D)
-    if output_tile.ndim > 2:
+    if output_tile.ndim > 2:  # pragma: no branch - output tile always 3D from this call site, 2D arc dead
         output_tile_nd = output_tile.flatten_dims(start_dim=1, end_dim=2)
     else:
         output_tile_nd = output_tile

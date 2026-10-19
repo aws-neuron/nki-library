@@ -80,7 +80,9 @@ def mlp_tkg_mx(
         return mlp_tkg_quad_fp8_mx(params, output_tensor_hbm, output_stored_add_tensor_hbm)
     elif params.quant_params.is_quant_static_mx():
         return mlp_tkg_quad_fp8_static(params, output_tensor_hbm, output_stored_add_tensor_hbm)
-    elif params.quant_params.is_quant_row_mx():
+    elif (
+        params.quant_params.is_quant_row_mx()
+    ):  # pragma: no branch - one-directional: caller guarantees is_dtype_mx() (exhaustive MX dispatch), else arc dead
         return mlp_tkg_quad_fp8_row(params, output_tensor_hbm, output_stored_add_tensor_hbm)
     else:
         kernel_assert(False, "mlp_tkg_mx requires MX, STATIC_MX, or ROW_MX quantization")

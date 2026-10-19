@@ -16,8 +16,6 @@
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import engine
-from nki.isa.constants import dge_mode
 
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
@@ -132,7 +130,7 @@ def _load_slice_affinities_sbuf(expert_affinities, expert_offset_sbuf, E_L, T, i
                 indirect_dim=1,
             ),
             dst=expert_affinities_masked[0:T, 0:E_L],
-            dge_mode=dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else dge_mode.swdge,
+            dge_mode=nisa.dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else nisa.dge_mode.swdge,
         )
     else:
         # 3D tiled output [T_par, n_T128_tiles, E_L] for T > 128
@@ -153,7 +151,7 @@ def _load_slice_affinities_sbuf(expert_affinities, expert_offset_sbuf, E_L, T, i
                     indirect_dim=1,
                 ),
                 dst=expert_affinities_masked[0:T_par, 0:n_full_tiles, 0:E_L],
-                dge_mode=dge_mode.unknown,
+                dge_mode=nisa.dge_mode.unknown,
             )
 
         if has_partial_tile:
@@ -166,7 +164,7 @@ def _load_slice_affinities_sbuf(expert_affinities, expert_offset_sbuf, E_L, T, i
                     indirect_dim=1,
                 ),
                 dst=expert_affinities_masked[0:last_tile_T, n_full_tiles : n_full_tiles + 1, 0:E_L],
-                dge_mode=dge_mode.unknown if last_tile_T % _DGE_ALIGNMENT == 0 else dge_mode.swdge,
+                dge_mode=nisa.dge_mode.unknown if last_tile_T % _DGE_ALIGNMENT == 0 else nisa.dge_mode.swdge,
             )
 
     return expert_affinities_masked
@@ -188,7 +186,7 @@ def _slice_affinities_hbm(expert_affinities, expert_offset_sbuf, E_L, T, io_dtyp
             indirect_dim=1,
         ),
         dst=expert_affinities_masked[nl.ds(T_offset, T_shard), :],
-        dge_mode=dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else dge_mode.swdge,
+        dge_mode=nisa.dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else nisa.dge_mode.swdge,
     )
     if n_prgs > 1:
         nisa.core_barrier(expert_affinities_masked, (0, 1))
@@ -243,13 +241,13 @@ def _apply_expert_index_mask(
             nisa.tensor_copy(
                 src=expert_offset_broadcast[0:T_32s, 0:1],
                 dst=expert_offset_f[0:T_32s, k_idx : k_idx + 1],
-                engine=engine.vector,
+                engine=nisa.engine.vector,
             )
         else:
             nisa.tensor_copy(
                 src=expert_offset_broadcast[0:T_32s, 0:1],
                 dst=expert_offset_f[0:T_32s, k_idx : k_idx + 1],
-                engine=engine.scalar,
+                engine=nisa.engine.scalar,
             )
 
     # For each local expert, mask affinities

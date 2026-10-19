@@ -33,14 +33,19 @@ from .rotational_topk_utils import (
     RotationalTopkConfig,
     TopkConfig,
     build_stage_offsets,
+    build_unfold_matrix,
+    chunked_nc_n_gather,
     create_rotational_topk_config,
     create_topk_config,
+    get_ceil_aligned_size,
     insert,
     naive_scanning_topk,
+    pe_unfold_supported,
     reshape_with_dma,
     rotate,
     sort,
     topk_core,
+    unfold_with_pe,
     validate_config,
     validate_topk_input,
 )
@@ -101,10 +106,9 @@ def rotational_topk(inp: nl.NkiTensor, config: RotationalTopkConfig) -> Tuple[nl
         # Multi-stage rotational algorithm per tile
         value, global_index = _topk_rotated_core(inp, config, n_programs, program_id)
 
-        # Optional sorting (per tile)
+        # Optional sorting (per tile); un-fold on TensorE when legal, else via DMA
         if sorted:
-            flat_value = reshape_with_dma(value, n_stages)
-            flat_index = reshape_with_dma(global_index, n_stages)
+            flat_value, flat_index = unfold_with_pe(value, global_index, ...) or reshape_with_dma(...)
             sorted_val, sorted_idx = sort(flat_value, flat_index)
             dma_copy(sorted_val[:true_k], sorted_idx[:true_k] to HBM)
         else:
@@ -192,6 +196,24 @@ def rotational_topk(inp: nl.NkiTensor, config: RotationalTopkConfig) -> Tuple[nl
     total_partition_dim = n_stages * tile_size
     concatenated_stage_free_dim = stage_free_size + (n_stages * config.local_top_k_per_stage)
 
+    # Un-fold the final stage layout on TensorE where its matmuls are legal; otherwise fall back
+    # to the DMA round-trip reshape.
+    use_pe_reshape = sorted_flag and pe_unfold_supported(n_stages, config.local_top_k_per_stage)
+
+    # Build the constant matrices before the index-table iota so the identity-matrix reads are not
+    # queued behind it and the first max8 only waits on the input load.
+    rotation = build_rotation_matrix(n_stages, tile_size, dtype=inp.dtype)
+    rotation_f32 = nl.ndarray((total_partition_dim, total_partition_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=rotation_f32, src=rotation, engine=nisa.vector_engine)
+    if use_pe_reshape:
+        unfold_sel = build_unfold_matrix(n_stages, tile_size, inp.dtype)
+        if inp.dtype == nl.float32:
+            unfold_sel_f32 = unfold_sel
+        else:
+            # Entries are exactly 0/1, so a plain cast reproduces the fp32 matrix without a second identity read.
+            unfold_sel_f32 = nl.ndarray((total_partition_dim, total_partition_dim), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=unfold_sel_f32, src=unfold_sel, engine=nisa.vector_engine)
+
     indices = nl.ndarray((total_partition_dim, concatenated_stage_free_dim), dtype=nl.float32)
     nisa.iota(
         dst=indices[:, nl.ds(0, stage_free_size)],
@@ -201,17 +223,27 @@ def rotational_topk(inp: nl.NkiTensor, config: RotationalTopkConfig) -> Tuple[nl
 
     stage_offsets = build_stage_offsets(n_stages, tile_size, stage_free_size)
 
-    rotation = build_rotation_matrix(n_stages, tile_size, dtype=inp.dtype)
-    rotation_f32 = nl.ndarray((total_partition_dim, total_partition_dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=rotation_f32, src=rotation, engine=nisa.vector_engine)
-
+    # Stage offsets on the Scalar engine (idle in the preamble) so the in-order Vector queue does
+    # not hold the first max8 behind the index table, which is only needed by the first gather.
     nisa.tensor_scalar(
         dst=indices[:, nl.ds(0, stage_free_size)],
         data=indices[:, nl.ds(0, stage_free_size)],
         op0=nl.add,
         operand0=stage_offsets,
-        engine=nisa.vector_engine,
+        engine=nisa.scalar_engine,
     )
+
+    # Sort buffers are allocated before the stage loop so they cannot land in the dead index table's
+    # address range, where the sort's first max8 would WAR-wait on the last stage's gather.
+    if sorted_flag:
+        sort_padded_k = get_ceil_aligned_size(true_k, HW_PARAMS.dve_max_alus)
+        sort_val_buf = nl.ndarray((tile_size, sort_padded_k), dtype=inp.dtype, buffer=nl.sbuf)
+        sort_idx_buf = nl.ndarray((tile_size, sort_padded_k), dtype=nl.uint32, buffer=nl.sbuf)
+        sort_gidx_buf = nl.ndarray((tile_size, sort_padded_k), dtype=nl.uint32, buffer=nl.sbuf)
+    if use_pe_reshape:
+        flat_width = n_stages * config.local_top_k_per_stage
+        flat_value_buf = nl.ndarray((tile_size, flat_width), dtype=inp.dtype, buffer=nl.sbuf)
+        flat_index_buf = nl.ndarray((tile_size, flat_width), dtype=index_dtype, buffer=nl.sbuf)
 
     for tile_idx in nl.sequential_range(n_bxs_tiles):
         tile_batch_start = lnc_batch_start + tile_idx * tile_size
@@ -232,10 +264,28 @@ def rotational_topk(inp: nl.NkiTensor, config: RotationalTopkConfig) -> Tuple[nl
         sbuf_slice = nl.ds(0, tile_bxs)
 
         if sorted_flag:
-            flat_value = reshape_with_dma(value, config.n_stages, dtype=inp.dtype)
-            flat_index = reshape_with_dma(global_index, config.n_stages, dtype=index_dtype)
+            if use_pe_reshape:
+                flat_value, flat_index = unfold_with_pe(
+                    value,
+                    global_index,
+                    unfold_sel,
+                    unfold_sel_f32,
+                    n_stages,
+                    flat_value_buf[sbuf_slice, :],
+                    flat_index_buf[sbuf_slice, :],
+                )
+            else:
+                flat_value = reshape_with_dma(value, config.n_stages, dtype=inp.dtype)
+                flat_index = reshape_with_dma(global_index, config.n_stages, dtype=index_dtype)
 
-            trimmed_val, trimmed_idx = sort(flat_value, flat_index, true_k)
+            trimmed_val, trimmed_idx = sort(
+                flat_value,
+                flat_index,
+                true_k,
+                sort_val_buf[sbuf_slice, :],
+                sort_idx_buf[sbuf_slice, :],
+                sort_gidx_buf[sbuf_slice, :],
+            )
             nisa.dma_copy(dst=topk_indices[hbm_slice, :true_k], src=trimmed_idx[sbuf_slice, :true_k])
             nisa.dma_copy(dst=topk_values[hbm_slice, :true_k], src=trimmed_val[sbuf_slice, :true_k])
         else:
@@ -265,9 +315,9 @@ def _topk_rotated_core(
     config: RotationalTopkConfig,
     batch_start: int,
     batch_end: int,
-    rotation: nl.ndarray,
-    rotation_f32: nl.ndarray,
-    indices: nl.ndarray,
+    rotation: nl.NkiTensor,
+    rotation_f32: nl.NkiTensor,
+    indices: nl.NkiTensor,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Core rotational top-k algorithm implementation.
@@ -338,37 +388,34 @@ def _topk_rotated_core(
     rotation = rotation[0:valid_pdim, 0:valid_pdim]
     rotation_f32 = rotation_f32[0:valid_pdim, 0:valid_pdim]
 
+    # Per-stage (vals, local inds, global index) tensors alternate by stage parity so stage i's
+    # match_replace8 does not WAR-wait on stage i-1's gather, nor stage i+1's max8 on stage i's rotation.
+    stage_vals = nl.ndarray((valid_pdim, 2 * local_top_k_per_stage), dtype=inp.dtype, buffer=nl.sbuf)
+    stage_inds = nl.ndarray((valid_pdim, 2 * local_top_k_per_stage), dtype=HW_PARAMS.index_dtype, buffer=nl.sbuf)
+    stage_gidx = nl.ndarray((valid_pdim, 2 * local_top_k_per_stage), dtype=indices.dtype, buffer=nl.sbuf)
+
     for stage_idx in nl.static_range(n_stages):
         offset = stage_free_size + (local_top_k_per_stage * stage_idx)
+        parity_slice = nl.ds((stage_idx % 2) * local_top_k_per_stage, local_top_k_per_stage)
 
-        value, local_index = topk_core(data=values[:, :offset], k=local_top_k_per_stage)
-
-        global_index = nl.ndarray(local_index.shape, dtype=indices.dtype, buffer=nl.sbuf)
-        # Tile the gather into chunks no wider than the nc_n_gather ISA group size. A
-        # single gather wider than this splits into multiple internal ISA groups, and
-        # that multi-group form corrupts the tail elements of the last BxS tile on
-        # hardware while the simulator (which executes the gather atomically) stays
-        # correct (NKILIB-1592).
-        gather_group_size = HW_PARAMS.gather_group_size
-        gather_width = local_index.shape[1]
-        n_gather_tiles = (gather_width + gather_group_size - 1) // gather_group_size
-        for gather_tile in nl.static_range(n_gather_tiles):
-            chunk = min(gather_group_size, gather_width - gather_tile * gather_group_size)
-            chunk_slice = nl.ds(gather_tile * gather_group_size, chunk)
-            nisa.nc_n_gather(
-                dst=global_index[:, chunk_slice],
-                data=indices[:, :offset],
-                indices=local_index[:, chunk_slice],
-            )
+        value, local_index = topk_core(
+            data=values[:, :offset],
+            k=local_top_k_per_stage,
+            out_vals=stage_vals[:, parity_slice],
+            out_inds=stage_inds[:, parity_slice],
+        )
+        global_index = stage_gidx[:, parity_slice]
+        chunked_nc_n_gather(dst=global_index, data=indices[:, :offset], indices=local_index)
 
         if stage_idx < n_stages - 1:
             rotated_index = nl.ndarray(global_index.shape, dtype=nl.float32, buffer=nl.psum)
             rotated = nl.ndarray(value.shape, dtype=nl.float32, buffer=nl.psum)
 
-            rotate(dst=rotated_index, tensor=global_index, rotation_matrix=rotation_f32)
+            # Values first: they depend only on max8, while the indices depend on the slower gather,
+            # so the next stage's max8 input is ready early.
             rotate(dst=rotated, tensor=value, rotation_matrix=rotation)
-
             insert(tensor=values, values=rotated, offset=offset)
+            rotate(dst=rotated_index, tensor=global_index, rotation_matrix=rotation_f32)
             insert(tensor=indices, values=rotated_index, offset=offset)
 
     return value, global_index

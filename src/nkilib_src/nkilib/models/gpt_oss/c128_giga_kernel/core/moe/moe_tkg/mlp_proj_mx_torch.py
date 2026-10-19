@@ -26,6 +26,7 @@ to torch immediately. All other inputs are torch tensors.
 """
 
 import math
+from typing import Callable, Optional
 
 import nki.language as nl
 import numpy as np
@@ -58,8 +59,8 @@ def gate_up_proj_mx_torch_ref(
     H: int,
     I: int,
     BxS: int,
-    hidden_unpack_fn: callable = None,
-    weight_unpack_fn: callable = None,
+    hidden_unpack_fn: Optional[Callable] = None,
+    weight_unpack_fn: Optional[Callable] = None,
 ) -> dict[str, torch.Tensor]:
     """PyTorch reference implementation of MXFP4 gate/up projection.
 
@@ -128,7 +129,7 @@ def down_proj_mx_torch_ref(
     I: int,
     BxS: int,
     use_stream_shuffle_broadcast: bool = True,
-    weight_unpack_fn: callable = None,
+    weight_unpack_fn: Optional[Callable] = None,
 ) -> dict[str, torch.Tensor]:
     """PyTorch reference implementation of MXFP4 down projection.
 

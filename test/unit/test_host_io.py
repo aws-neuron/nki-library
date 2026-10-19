@@ -31,6 +31,7 @@ import io
 import os
 import tarfile
 import tempfile
+import threading
 from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
@@ -276,3 +277,54 @@ class TestRemoteS3IODownloadIntegrity:
         """If sha256sum is unavailable/unparseable, skip integrity (best-effort), don't fail."""
         with tempfile.TemporaryDirectory() as tmp:
             self._run_download("sha256sum: command not found\n", b"whatever", os.path.join(tmp, "dl"))
+
+
+class TestRemoteS3IOConcurrentUpload:
+    """Members of a multi-node group upload the same local directory concurrently."""
+
+    def test_concurrent_uploads_of_one_directory_use_separate_archives(self, source_dir) -> None:
+        """Each upload tars to its own local archive, so one upload finishing (and deleting its
+        archive) or another re-tarring cannot change what a concurrent upload sends."""
+        barrier = threading.Barrier(2, timeout=10)
+        uploaded: list[tuple[str, set[str]]] = []
+        lock = threading.Lock()
+
+        def upload_file(local_path, bucket, key):
+            # Both uploads hold their archive at once; a shared path would make them read the same file.
+            barrier.wait()
+            with tarfile.open(local_path) as tf:
+                names = {os.path.normpath(name) for name in tf.getnames()}
+            with lock:
+                uploaded.append((local_path, names))
+
+        s3_client = MagicMock()
+        s3_client.upload_file.side_effect = upload_file
+        client = MagicMock()
+        client.run.return_value = MagicMock(failed=False, stdout="", stderr="")
+        s3_config = MagicMock(bucket="bucket", profile=None, region="us-east-1")
+        collector = MagicMock()
+        collector.timer.return_value.__enter__.return_value = MagicMock(duration=1.0)
+        uploads = [RemoteS3IO(client, f"/tmp/neuronx-cc/tests/out-{index}", s3_config, collector) for index in range(2)]
+        errors: list[BaseException] = []
+
+        def run(io_obj: RemoteS3IO) -> None:
+            try:
+                io_obj.upload(source_dir)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        with (
+            patch("test.utils.host_io.get_s3_client_and_session", return_value=(s3_client, MagicMock())),
+            patch("test.utils.host_io.build_remote_s3_cli_command", return_value="aws s3 cp ..."),
+        ):
+            threads = [threading.Thread(target=run, args=(io_obj,)) for io_obj in uploads]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+
+        assert errors == []
+        assert len({path for path, _ in uploaded}) == 2
+        expected = {"inp-q-000.bin", "inp-k_cache-000.bin", "inp-scale-000", "file.neff"}
+        assert all(expected <= names for _, names in uploaded)
+        assert not any(os.path.exists(path) for path, _ in uploaded)

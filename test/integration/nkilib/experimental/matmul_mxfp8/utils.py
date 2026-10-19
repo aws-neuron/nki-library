@@ -17,7 +17,10 @@
 import hashlib
 import json
 
+import nki.language as nl
 import numpy as np
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._quantize_mxfp8_utils import QUANT_SCHEME_WRAPX
+from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8_torch import interleave_tensor
 
 from test.integration.nkilib.experimental.matmul_mxfp8.constants import (
     BYTES_PER_DTYPE,
@@ -32,78 +35,10 @@ from test.integration.nkilib.experimental.matmul_mxfp8.constants import (
 # ============================================================================
 
 
-def swizzle_tensor(src_tensor, TILE_P=512, fast_dma_transpose=False):
-    """
-    Golden reference for interleave loading.
-
-    A K remainder (P not divisible by TILE_P) is laid out differently by the two
-    DGT loaders, so the golden must follow whichever one the kernel used:
-
-    - Legacy DGT (``fast_dma_transpose=False``) is bounded by the nc_transpose
-      chunk size, so load_block.py decomposes the remainder into 256 and/or 128
-      sub-tiles, each gathered with its own interleave stride.
-    - Fast DMA (``fast_dma_transpose=True``) gathers the whole
-      MX_PARTITION_SIZE-aligned remainder in one dma_transpose, so its sub-tile
-      stride is remainder // INTERLEAVE_FACTOR and the general loop below handles
-      it directly as a single partial tile.
-
-    The two layouts agree for every 32-aligned remainder except 384 — the only
-    value that decomposes into both a 256 and a 128 sub-tile. Using the legacy
-    decomposition for a fast-DMA load (or vice versa) mismatches the quantization
-    groups in matmuls where one operand is pre-swizzled and the other is
-    DGT-loaded, producing a ~100% relative error.
-
-    Args:
-        src_tensor (np.ndarray): Source tensor of shape (P, F).
-        TILE_P (int): Tile size in P dimension.
-        fast_dma_transpose (bool): Match the fast-DMA single-partial-tile
-            remainder layout instead of the legacy 256/128 decomposition.
-
-    Returns:
-        np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
-    """
-    P, F = src_tensor.shape
-
-    # Validate that P is divisible by INTERLEAVE_FACTOR
-    if P % INTERLEAVE_FACTOR != 0:
-        raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({INTERLEAVE_FACTOR})")
-
-    remainder = P % TILE_P
-    if not fast_dma_transpose and remainder != 0 and remainder % 128 == 0:
-        # Decompose into full tiles + DGT-compatible remainder sub-tiles (256 and/or 128)
-        full_p = P - remainder
-        parts = []
-        if full_p > 0:
-            parts.append(swizzle_tensor(src_tensor[:full_p, :], TILE_P))
-        k_off = full_p
-        rem = remainder
-        if rem >= 256:
-            parts.append(swizzle_tensor(src_tensor[k_off : k_off + 256, :], TILE_P=256))
-            k_off += 256
-            rem -= 256
-        if rem >= 128:
-            parts.append(swizzle_tensor(src_tensor[k_off : k_off + 128, :], TILE_P=128))
-        return np.concatenate(parts, axis=0)
-
-    dst_tensor = np.zeros((P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR), dtype=np.float32)
-
-    NUM_TILES_P = (P + TILE_P - 1) // TILE_P  # Ceiling division to include partial tiles
-    SUB_TILE_P = TILE_P // INTERLEAVE_FACTOR
-
-    for tp in range(NUM_TILES_P):
-        # Calculate actual tile size (handles partial last tile)
-        current_tile_size = min(TILE_P, P - tp * TILE_P)
-        current_sub_tile_p = current_tile_size // INTERLEAVE_FACTOR
-
-        for sub_tp in range(INTERLEAVE_FACTOR):
-            for p in range(current_sub_tile_p):
-                src_p = tp * TILE_P + sub_tp * current_sub_tile_p + p
-                if src_p < P:  # Safety check
-                    for f in range(F):
-                        dst_p = tp * SUB_TILE_P + p
-                        dst_tensor[dst_p, f * INTERLEAVE_FACTOR + sub_tp] = src_tensor[src_p, f]
-
-    return dst_tensor.astype(src_tensor.dtype)
+def swizzle_tensor(src_tensor, TILE_P=512):
+    """wrapX-swizzle a [P, F] tensor as the loaders do: a P % TILE_P remainder is split into
+    256 / 128 / sub-128 tiles (decompose_k_remainder)."""
+    return interleave_tensor(src_tensor, QUANT_SCHEME_WRAPX, TILE_P)
 
 
 def swizzle_tensor_1x32(src_tensor):
@@ -197,33 +132,6 @@ def unswizzle_tensor(src_tensor, TILE_P=512):
     return dst_tensor
 
 
-def resize_scales_compact_to_oversized_2d(compact_scales):
-    """
-    Convert scales from compact layout to oversized layout.
-
-    Args:
-        compact_scales (np.ndarray): Compact scales of shape (TILE_K//8, F//4).
-
-    Returns:
-        np.ndarray: Oversized scales of shape (TILE_K, F//4).
-
-    Notes:
-        Pattern: 4 consecutive values starting at indices 0, 32, 64, 96, ...
-    """
-    compact_tile_k, F_div_4 = compact_scales.shape
-    TILE_K = compact_tile_k * 8
-
-    # Create oversized scales array filled with zeros
-    oversized_scales = np.zeros((TILE_K, F_div_4), dtype=compact_scales.dtype)
-
-    # Fill according to the pattern
-    for golden_idx in range(compact_tile_k):
-        hbm_idx = (golden_idx // 4) * 32 + (golden_idx % 4)
-        oversized_scales[hbm_idx, :] = compact_scales[golden_idx, :]
-
-    return oversized_scales
-
-
 def cosine_sim(a, b):
     """
     Computes cosine similarity between two arrays.
@@ -304,3 +212,14 @@ def dict_hash(dictionary) -> str:
     dict_string = json.dumps(dictionary, sort_keys=True)
     # Create hash
     return hashlib.md5(dict_string.encode()).hexdigest()
+
+
+def to_hbm_scales(compact_scales):
+    """
+    Lay out golden MX scales the way a pre-quantized operand carries them on HBM.
+
+    HBM scales are dense -- one row per 8 data rows, [K // 32, F] -- which is the compact
+    layout quantize_mx_golden already returns, so only the dtype changes: the uint8 exponent
+    bytes are viewed as float8_e8m0fnu, the dtype the quantize kernel writes.
+    """
+    return compact_scales.view(nl.float8_e8m0fnu)

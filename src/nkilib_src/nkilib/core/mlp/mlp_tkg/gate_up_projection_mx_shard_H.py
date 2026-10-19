@@ -28,7 +28,6 @@ from typing import Optional
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import oob_mode
 
 from ...quantization.fp8_quantize import pre_combine_dequant_scales
 from ...utils.kernel_assert import kernel_assert
@@ -260,7 +259,7 @@ def gate_up_projection_mx_tp_shard_H(
 
             """
             Copy output while adding bias if needed.
-            
+
             Only NC0 needs to add bias because we shard on contraction dimension (H).
             out_sb shape: [_pmax, cfg.n_total_I512_tile, BxS, _q_width]
             out_psum shape: [_pmax, _q_width, BxS_tile_sz] (for each item in out_psum_lst)
@@ -498,7 +497,7 @@ def process_fused_gate_up_projection_mxfp4(
                 vector_offset=token_indices_on_p,
                 indirect_dim=0,
             ),
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
 
     # Alloc and load bias, which needs zero padding if I < 512
@@ -546,7 +545,7 @@ def process_fused_gate_up_projection_mxfp4(
 
     """
     Reshape workaround for NKI new FE indexing bug.
-    
+
     NKI new FE has bug where indexing does not reduce number of dims.
     Need reshapes as workaround.
     """
@@ -555,7 +554,7 @@ def process_fused_gate_up_projection_mxfp4(
 
     """
     Compute gate and up projections separately.
-    
+
     Both projections' output shape is bf16[_pmax, n_I512_tile, T, _q_width].
     The bottom portion of the final I512 tile contains garbage.
     By providing prg_id even with n_prgs=1, we enforce only one NC to apply the bias

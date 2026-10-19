@@ -24,10 +24,17 @@ These sub-kernels can be used by any algorithm that requires LNC-sharded gate/up
 including all-expert, selective-load, or custom MoE implementations.
 """
 
+import os
 from typing import Optional
 
 import nki.isa as nisa
 import nki.language as nl
+
+from ...utils.dma_names import dma_name
+
+# Imported here rather than with the other first-party imports below because the
+# env-flag block that follows evaluates at module level, above those imports.
+from ...utils.kernel_helpers import mega_flag_default_on
 
 # ── PROTOTYPE: MoE gate/up weight prefetch (retry under the TRACER frontend) ──
 # Overlap optimization for the GPT-OSS decode mega kernel: _decode_layer_body DMAs
@@ -40,6 +47,104 @@ import nki.language as nl
 # under the TRACER frontend (CompilerArgs.nki_compilation_mode=tracer), which
 # executes python more literally. Not thread-safe / prototype only.
 _GATE_UP_PREFETCH_FIFO: dict = {0: [], 1: []}
+
+# Gate/up weight-load DMA-QoS priority override. The load is already STATIC (dge_mode=none).
+#   VLLM_NEURON_MEGA_GU_P0=1 -> priority 0 (highest; prevent compiler downgrade)
+#   VLLM_NEURON_MEGA_GU_P1=1 -> priority 1 (pairs with --p1-max-desc-bytes cap)
+#   VLLM_NEURON_MEGA_GU_P2=1 -> priority 2 (pairs with --p2-max-desc-bytes cap; yields to CC
+#                                like W_qkv)
+# Precedence P2 > P1 > P0 if multiple set. Unset -> None (compiler's DMA-QoS labeling decides).
+_GU_P0 = bool(os.environ.get("VLLM_NEURON_MEGA_GU_P0"))
+_GU_P1 = bool(os.environ.get("VLLM_NEURON_MEGA_GU_P1"))
+_GU_P2 = bool(os.environ.get("VLLM_NEURON_MEGA_GU_P2"))
+_GU_PRIORITY = 2 if _GU_P2 else (1 if _GU_P1 else (0 if _GU_P0 else None))
+
+# VLLM_NEURON_MEGA_GATE_P2_SWA=1: priority 2 on the GATE prefetch of SWA layers ONLY. GU_P2 above
+# tags both halves of every layer; this is the narrowest variant -- gate only, and only in the
+# sliding-window layers. SWA == EVEN layers in this kernel (odd layers are banded/full attention and
+# are the ones carrying the 5 `ksb_noalias` K-gathers), so the parity test below is the SWA test.
+# The layer index is read off the buffer name, which the caller builds as
+# f"gup_prefetch_{gate_or_up_idx}" + layer_tag, with layer_tag == "_L<N>".
+# The load stays STATIC (dge_mode=none) either way, which is what --p2-max-desc-bytes needs in order
+# to clamp it: setting a priority with dge_mode unset routes the DMA to swdge, where the cap only
+# partially applies (10-20 KB packets survive). See the QKV_P2 note in qkv_tkg.py.
+_GATE_P2_SWA = bool(os.environ.get("VLLM_NEURON_MEGA_GATE_P2_SWA"))
+# VLLM_NEURON_MEGA_GATE_P2=1: same, but the gate of EVERY layer (no parity restriction). Takes
+# precedence over GATE_P2_SWA when both are set.
+_GATE_P2 = bool(os.environ.get("VLLM_NEURON_MEGA_GATE_P2"))
+
+
+def _gu_priority(gate_or_up_idx, name=""):
+    """DMA-QoS priority for one half of the fused gate/up prefetch (0 = gate, 1 = up)."""
+    if gate_or_up_idx == 0:  # 0 == GATE_FUSED_IDX
+        if _GATE_P2:
+            return 2
+        if _GATE_P2_SWA:
+            tag = str(name).rsplit("_L", 1)[-1]
+            if tag.isdigit() and int(tag) % 2 == 0:  # even == SWA layer
+                return 2
+    if gate_or_up_idx == 1:  # 1 == UP_FUSED_IDX; P0 when VLLM_NEURON_MEGA_UPDOWN_P0=1
+        p = moe_updown_priority()
+        if p is not None:
+            return p
+    return _GU_PRIORITY
+
+
+# Gate/up weight-load DMA engine. Default STATIC (dge_mode=none) issues on the sync-DMA engine,
+# which runs in PARALLEL with the software-DGE (GPSIMD) engine. So a DMA-order-JSON ordering between
+# the swdge W_out load and this sync gate_up load is NOT enforced (cross-engine race).
+# VLLM_NEURON_MEGA_GU_DMA_ENGINE=swdge moves the gate_up load onto the swdge/GPSIMD queue so it shares
+# ONE FIFO queue with the swdge W_out load -> the JSON's w_out-before-gate_up order is enforced.
+_GU_SWDGE = os.environ.get("VLLM_NEURON_MEGA_GU_DMA_ENGINE") == "swdge"
+
+# Collapse the gate/up MX-scale load from (4 quadrants x n_I_tiles) DMAs into 4 (one per quadrant).
+# The scale's 16 partitions must land 4-per-quadrant at SBUF partitions [0-3,32-35,64-67,96-99]
+# (ISA rule: a scale must sit in the quadrant its scaling group came from), so 4 DMAs are the floor.
+# What IS removable is the I-tiling. Byte-identical destination -> numerically a no-op.
+_SCALE_1TRIG = os.environ.get("VLLM_NEURON_MEGA_SCALE_1TRIG") == "1"
+
+# VLLM_NEURON_MEGA_SCALE_PACK64=1 (PROTOTYPE): pack the gate/up MX scale into 64 SBUF partitions
+# (16 per quadrant at offsets {0,4,8,12}) instead of 16 (4 per quadrant), folding the `4_I` factor
+# out of the free dim. Per-DMA shape goes [4 P, 18432 B] -> [16 P, 4608 B] at identical bytes, which
+# a standalone microbenchmark measured **2.66x faster** (123.5 -> 328.1 GB/s); SBUF per-partition
+# reservation drops 18432 -> 4608 B. DMA count is unchanged at 4/half (the 32-partition destination
+# stride is inexpressible, so 4 is the floor).
+# ISA: mxmem1d_valid_scale_pidx requires scale_pidx % 4 == 0 and < 16 -> exactly 4 slots, so exactly
+# a factor of 4 may leave the free dim; 64P is the ceiling with zero headroom.
+# Consumer: the 4 offsets map 1:1 onto the existing q_width_I_idx loop, so the scale AP becomes
+# ws[nl.ds(4*k, 128 - 4*k), tile_h, tile_i*128 ...].
+# ⚠️ THE PARTITION EXTENT IS LOAD-BEARING AND WAS THE ONE BUG HERE. `nl.ds(4*k, 4)` compiles, emits
+# `%mem[d0 + 4k, d1]` with extent 4, and is NUMERICALLY WRONG: it names only ONE quadrant's 4 scale
+# rows, so the other three quadrants' contraction blocks get the wrong scales. Measured on the
+# 32-rank golden: extent 4 fails all 32 `out` outputs (cosine 0.10-0.12, relative_L2 ~15) while the
+# unpacked control fails only 1 marginal rank; extent 128-4k reproduces the control's cosine
+# distribution VALUE FOR VALUE (64 x exactly 1.000000, same 0.998905/0.0499 pair, same single
+# marginal rank27 at 0.8257). So a compile-only probe cannot validate this change -- see
+# test_mx_matmul_scale_pidx.py, which was compile-only and passed for the wrong variant.
+# Requires the HBM scale in the packed layout [E_L, 2, 64, H/512, I/4]; the test remaps it.
+_SCALE_PACK64 = mega_flag_default_on("VLLM_NEURON_MEGA_SCALE_PACK64")
+# GU_IOUTER (VLLM_NEURON_MEGA_GU_IOUTER=1): run the gate and up projections I-tile by I-tile (matmuls
+# over all H for one I tile, then that tile's PSUM epilogue) instead of all matmuls first and all
+# epilogues after. The stock order leaves the whole up epilogue (6 x eviction+bias, clamp, gate*up,
+# quantize_mx) serialized on Vector after the LAST up matmul: ~2.9 us of Tensor idle before the down
+# projection can start (profile mo197b, full layer). With I outer only the last tile's epilogue is exposed.
+_GU_IOUTER = bool(os.environ.get("VLLM_NEURON_MEGA_GU_IOUTER"))
+# GU_IOUTER=2: I-outer for the UP projection only (the gate projection keeps H-outer so it can start on
+# H tiles that have landed while later tiles are still in flight -- see GU_PREFETCH_HSPLIT).
+_GU_IOUTER_GATE = _GU_IOUTER and os.environ.get("VLLM_NEURON_MEGA_GU_IOUTER") != "2"
+_GU_PREFETCH_HSPLIT = bool(os.environ.get("VLLM_NEURON_MEGA_GU_PREFETCH_HSPLIT"))
+_UP_PREFETCH_ISPLIT = 3
+_GATE_PREFETCH_ISPLIT = 2
+_GATE_PREFETCH_ISPLIT_TILES = frozenset((3, 4, 5))
+# VLLM_NEURON_MEGA_SCALE_PACK64_EXT selects the PARTITION EXTENT of the packed scale AP. Kept as a
+# knob only because it is what identified the bug; **"rest" is the correct value and the default.**
+#   "rest" -> ws[ds(4k, 128-4k)]   ✅ the AP spans every quadrant, so all 16 scale rows are
+#                                    addressable and 4k acts purely as the within-quadrant start
+#                                    offset the ISA's scale_pidx field expects.
+#   "4"    -> ws[ds(4k, 4)]        ❌ names one quadrant's 4 rows only -> 3 of 4 quadrants read the
+#                                    wrong scales. Compiles clean, produces garbage.
+#   "quad" -> ws[ds(4k, 32)]       untested.
+_SCALE_PACK64_EXT = os.environ.get("VLLM_NEURON_MEGA_SCALE_PACK64_EXT", "rest")
 
 
 def prefetch_gate_up_weight_sb(weight, expert_idx, gate_or_up_idx, H, I_local, I_offset, I_local_padded, name):
@@ -56,16 +161,78 @@ def prefetch_gate_up_weight_sb(weight, expert_idx, gate_or_up_idx, H, I_local, I
         .select(dim=1, index=gate_or_up_idx)
         .slice(dim=2, start=I_offset, end=I_offset + I_local)
     )
-    # One monolithic DMA, deliberately. Two alternatives were measured and both lost: splitting it
-    # into 4/8/16 smaller DMAs along I is monotonically worse (5.856 / 6.046 / 6.048 ms vs 5.923),
-    # because per-DMA issue overhead at 128 ranks exceeds the queue occupancy it saves; and DMA QoS
-    # priority is inert for this traffic mix at both extremes (0 and 3). See
-    # scheduling-experiment/FULL128_TUNING.md.
-    if I_buf > I_local:
+    # Few pieces, deliberately: splitting the up DMA into 4/8/16 smaller DMAs along I was measured
+    # monotonically worse (5.856 / 6.046 / 6.048 ms vs 5.923), because per-DMA issue overhead at
+    # 128 ranks exceeds the queue occupancy it saves; and DMA QoS priority is inert for this
+    # traffic mix at both extremes (0 and 3). See scheduling-experiment/FULL128_TUNING.md.
+    _dma_name = dma_name(f"gu_w_prefetch_e{expert_idx}_{gate_or_up_idx}")
+    # GU_PREFETCH_HSPLIT (VLLM_NEURON_MEGA_GU_PREFETCH_HSPLIT=1): issue the GATE weight prefetch as one
+    # DMA per H/512 tile (each 128 rows x I_local bytes, contiguous per partition) so the DMA-order JSON can
+    # put the first tiles ahead of the post-attention qmx stores and the rest after the quant AllGather
+    # (see steering_private/gptoss_dma_json_rev15_nki07/RUNBOOK_gk4386.md). Split along H (not I, which was measured worse): a tile lands as a complete unit the
+    # gate matmuls can consume in H order, and the per-row descriptor stays a single contiguous chunk.
+    if _GU_PREFETCH_HSPLIT and gate_or_up_idx == 0:
+        if I_buf > I_local:
+            nisa.memset(dst=weight_sb[...], value=0, engine=nisa.gpsimd_engine)
+        _n_I_tiles = -(-I_local // MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM)
+        _n_gate_pieces = min(_GATE_PREFETCH_ISPLIT, _n_I_tiles)
+        _gate_bounds = [
+            round(_k * _n_I_tiles / _n_gate_pieces) * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
+            for _k in range(_n_gate_pieces)
+        ] + [I_local]
+        for _h in range(n_H512_tiles):
+            if _n_gate_pieces > 1 and _h in _GATE_PREFETCH_ISPLIT_TILES:
+                for _p in range(_n_gate_pieces):
+                    _lo, _hi = _gate_bounds[_p], min(_gate_bounds[_p + 1], I_local)
+                    nisa.dma_copy(
+                        src=weight_view[:, _h : _h + 1, _lo:_hi],
+                        dst=weight_sb[:, _h : _h + 1, _lo:_hi],
+                        dge_mode=moe_load_dge_mode(_GU_SWDGE),
+                        priority=_gu_priority(gate_or_up_idx, name),
+                        name=dma_name(f"gu_w_prefetch_e{expert_idx}_{gate_or_up_idx}_h{_h}_p{_p}"),
+                    )
+                continue
+            nisa.dma_copy(
+                src=weight_view[:, _h : _h + 1, :],
+                dst=weight_sb[:, _h : _h + 1, :I_local],
+                dge_mode=moe_load_dge_mode(_GU_SWDGE),
+                priority=_gu_priority(gate_or_up_idx, name),
+                name=dma_name(f"gu_w_prefetch_e{expert_idx}_{gate_or_up_idx}_h{_h}"),
+            )
+    elif gate_or_up_idx == 1:
+        if I_buf > I_local:
+            nisa.memset(dst=weight_sb[...], value=0, engine=nisa.gpsimd_engine)
+        _n_I_tiles = -(-I_local // MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM)
+        _n_pieces = min(_UP_PREFETCH_ISPLIT, _n_I_tiles)
+        _bounds = [
+            round(_k * _n_I_tiles / _n_pieces) * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM for _k in range(_n_pieces)
+        ] + [I_local]
+        for _p in range(_n_pieces):
+            _lo, _hi = _bounds[_p], min(_bounds[_p + 1], I_local)
+            nisa.dma_copy(
+                src=weight_view[:, :, _lo:_hi],
+                dst=weight_sb[:, :, _lo:_hi],
+                dge_mode=moe_load_dge_mode(_GU_SWDGE),
+                priority=_gu_priority(gate_or_up_idx, name),
+                name=dma_name(f"gu_w_prefetch_e{expert_idx}_{gate_or_up_idx}_p{_p}"),
+            )
+    elif I_buf > I_local:
         nisa.memset(dst=weight_sb[...], value=0, engine=nisa.gpsimd_engine)
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:, :, :I_local], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(
+            src=weight_view,
+            dst=weight_sb[:, :, :I_local],
+            dge_mode=moe_load_dge_mode(_GU_SWDGE),
+            priority=_gu_priority(gate_or_up_idx, name),
+            name=_dma_name,
+        )
     else:
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(
+            src=weight_view,
+            dst=weight_sb[...],
+            dge_mode=moe_load_dge_mode(_GU_SWDGE),
+            priority=_gu_priority(gate_or_up_idx, name),
+            name=_dma_name,
+        )
     _GATE_UP_PREFETCH_FIFO[gate_or_up_idx].append(weight_sb)
     return weight_sb
 
@@ -74,7 +241,6 @@ def prefetch_gate_up_weight_sb(weight, expert_idx, gate_or_up_idx, H, I_local, I
 from ...utils.common_types import ActFnType
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type
-from ...utils.tensor_view import as_nki_tensor
 
 # Shared MX constants
 from .projection_mx_constants import (
@@ -85,6 +251,8 @@ from .projection_mx_constants import (
     _psum_fmax,
     _q_height,
     _q_width,
+    moe_load_dge_mode,
+    moe_updown_priority,
     pad_to_valid_qmx_partitions,
 )
 
@@ -232,22 +400,38 @@ def gate_up_projection_mx(
         for tile_i in range(n_total_I512_tiles):
             out_psum_lst.append(nl.ndarray((TILE_I, I_4, TILE_T), dtype=nl.bfloat16, buffer=nl.psum))
 
-        _projection_matmul_mx(
-            out_psum_lst=out_psum_lst,
-            weight_sb=gate_weight_sb,
-            weight_scale_sb=gate_weight_scale_sb,
-            input_quant_sb=cur_input_quant,
-            input_scale_sb=cur_input_scale,
-            tile_T_slice=cur_tile_T_slice,
-            tile_T_actual=tile_T_actual,
-            n_H512_tiles=n_H512_tiles,
-            n_total_I512_tiles=n_total_I512_tiles,
-            I_local=I_local,
-            is_software_quant=is_software_quant,
-        )
+        if not _GU_IOUTER_GATE:
+            _projection_matmul_mx(
+                out_psum_lst=out_psum_lst,
+                weight_sb=gate_weight_sb,
+                weight_scale_sb=gate_weight_scale_sb,
+                input_quant_sb=cur_input_quant,
+                input_scale_sb=cur_input_scale,
+                tile_T_slice=cur_tile_T_slice,
+                tile_T_actual=tile_T_actual,
+                n_H512_tiles=n_H512_tiles,
+                n_total_I512_tiles=n_total_I512_tiles,
+                I_local=I_local,
+                is_software_quant=is_software_quant,
+            )
 
         # Step 3.2: PSUM eviction + bias + clamp + activation (after all H tiles complete)
         for tile_i in range(n_total_I512_tiles):
+            if _GU_IOUTER_GATE:
+                _projection_matmul_mx(
+                    out_psum_lst=out_psum_lst,
+                    weight_sb=gate_weight_sb,
+                    weight_scale_sb=gate_weight_scale_sb,
+                    input_quant_sb=cur_input_quant,
+                    input_scale_sb=cur_input_scale,
+                    tile_T_slice=cur_tile_T_slice,
+                    tile_T_actual=tile_T_actual,
+                    n_H512_tiles=n_H512_tiles,
+                    n_total_I512_tiles=n_total_I512_tiles,
+                    I_local=I_local,
+                    is_software_quant=is_software_quant,
+                    tile_i_only=tile_i,
+                )
             cur_tile_I_size = min(
                 MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             )
@@ -372,22 +556,38 @@ def gate_up_projection_mx(
             up_psum_lst.append(nl.ndarray((TILE_I, I_4, TILE_T), dtype=nl.bfloat16, buffer=nl.psum))
 
         # Matmul compute with loop order H → I → 4_I (same input H-slice reused across all I tiles)
-        _projection_matmul_mx(
-            out_psum_lst=up_psum_lst,
-            weight_sb=up_weight_sb,
-            weight_scale_sb=up_weight_scale_sb,
-            input_quant_sb=cur_input_quant,
-            input_scale_sb=cur_input_scale,
-            tile_T_slice=cur_tile_T_slice,
-            tile_T_actual=tile_T_actual,
-            n_H512_tiles=n_H512_tiles,
-            n_total_I512_tiles=n_total_I512_tiles,
-            I_local=I_local,
-            is_software_quant=is_software_quant,
-        )
+        if not _GU_IOUTER:
+            _projection_matmul_mx(
+                out_psum_lst=up_psum_lst,
+                weight_sb=up_weight_sb,
+                weight_scale_sb=up_weight_scale_sb,
+                input_quant_sb=cur_input_quant,
+                input_scale_sb=cur_input_scale,
+                tile_T_slice=cur_tile_T_slice,
+                tile_T_actual=tile_T_actual,
+                n_H512_tiles=n_H512_tiles,
+                n_total_I512_tiles=n_total_I512_tiles,
+                I_local=I_local,
+                is_software_quant=is_software_quant,
+            )
 
         # Step 4.2: PSUM eviction + bias + clamp + gate*up + quantize (after all H tiles complete)
         for tile_i in range(n_total_I512_tiles):
+            if _GU_IOUTER:
+                _projection_matmul_mx(
+                    out_psum_lst=up_psum_lst,
+                    weight_sb=up_weight_sb,
+                    weight_scale_sb=up_weight_scale_sb,
+                    input_quant_sb=cur_input_quant,
+                    input_scale_sb=cur_input_scale,
+                    tile_T_slice=cur_tile_T_slice,
+                    tile_T_actual=tile_T_actual,
+                    n_H512_tiles=n_H512_tiles,
+                    n_total_I512_tiles=n_total_I512_tiles,
+                    I_local=I_local,
+                    is_software_quant=is_software_quant,
+                    tile_i_only=tile_i,
+                )
             cur_tile_I_size = min(
                 MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             )
@@ -582,12 +782,15 @@ def load_gate_up_weight_scale_bias(
         )
         if needs_padding:
             nisa.memset(dst=weight_sb[...], value=0, engine=nisa.gpsimd_engine)
-            nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:, :, :I_local], dge_mode=nisa.dge_mode.none)
+            nisa.dma_copy(src=weight_view, dst=weight_sb[:, :, :I_local], dge_mode=moe_load_dge_mode())
         else:
-            nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+            nisa.dma_copy(src=weight_view, dst=weight_sb[...], dge_mode=moe_load_dge_mode())
         weight_sb = weight_sb.view(weight.dtype)
     scale_dtype = nl.uint8 if skip_scale_load else scale.dtype
-    scale_sb = None if skip_scale_load else nl.ndarray(weight_sb_shape, dtype=scale_dtype, buffer=nl.sbuf)
+    # PACK64: scale lives in 64 partitions with the 4_I factor folded out of the free dim, so the
+    # buffer is (128, n_H512, I/4) instead of weight_sb_shape -- 4x less SBUF per partition.
+    _scale_sb_shape = (TILE_H, n_H512_tiles, I_buf // _q_width) if _SCALE_PACK64 else weight_sb_shape
+    scale_sb = None if skip_scale_load else nl.ndarray(_scale_sb_shape, dtype=scale_dtype, buffer=nl.sbuf)
     bias_sb = nl.ndarray(bias_sb_shape, dtype=bias.dtype, buffer=nl.sbuf) if is_bias else None
 
     """
@@ -603,32 +806,69 @@ def load_gate_up_weight_scale_bias(
         if needs_padding:
             nisa.memset(dst=scale_sb[...], value=0.0, engine=nisa.gpsimd_engine)
 
-        DMA_FREE_DIM_TILE = 1024
+        # The 4 per-quadrant DMAs are STRUCTURALLY REQUIRED: the scale must land 4-per-quadrant at
+        # SBUF partitions [0-3,32-35,64-67,96-99], and a 32-partition destination stride cannot be
+        # expressed either way -- reshape_dim on the partition dim is rejected ("Partition dim cannot
+        # be reshaped") and .ap() asserts "Partition step must equal tensor free dimension size".
+        # What IS removable is the I-tiling: at I=3072 the 1024-element tile splits each quadrant
+        # load into 3, giving 12 DMAs per gate/up (24/layer). One tile per quadrant -> 4 (8/layer).
+        DMA_FREE_DIM_TILE = I_local if _SCALE_1TRIG else 1024
         n_I_tiles = div_ceil(I_local, DMA_FREE_DIM_TILE)
 
-        for quadrant_idx in nl.affine_range(n_quadrants_needed):
-            for i_tile_idx in nl.affine_range(n_I_tiles):
-                i_start = i_tile_idx * DMA_FREE_DIM_TILE
-                i_size = min(DMA_FREE_DIM_TILE, I_local - i_start)
-                scale_view = (
+        if _SCALE_PACK64:
+            # PACK64 is a CO-DESIGN with the caller's HBM layout, so verify the layout at trace
+            # time rather than emitting a DMA that reads out of bounds (or, worse, one that
+            # compiles and computes garbage -- see the extent note at the top of this module).
+            #   unpacked [E_L, 16, 2,  H/512, I  ] -> shape[1:3] == (16, 2)
+            #   packed   [E_L, 2,  64, H/512, I/4] -> shape[1:3] == (2, 64)
+            kernel_assert(
+                scale.shape[1] == 2 and scale.shape[2] == SCALE_P_ELEM_PER_QUADRANT * _q_width * 4,
+                f"VLLM_NEURON_MEGA_SCALE_PACK64 is enabled (it is ON by default) but the gate/up MX "
+                f"scale has the UNPACKED layout {tuple(scale.shape)}. Either remap the HBM scale to "
+                f"[E_L, 2, 64, H/512, I/4] (see pack64_gate_up_scale() in test/utils/mx_utils.py) or "
+                f"set VLLM_NEURON_MEGA_SCALE_PACK64=0.",
+            )
+            # PACK64: HBM is [E_L, 2, 64, H/512, I/4]; per quadrant copy 16 contiguous rows into
+            # SBUF partitions 16q..16q+15 (offsets {0,4,8,12} x 4 rows). 4 DMAs, one per quadrant,
+            # each [16 P, n_H512 * I/4 B] -- same bytes as the 4 x [4 P, n_H512 * I B] it replaces.
+            _n_pack_p = SCALE_P_ELEM_PER_QUADRANT * _q_width  # 16 rows per quadrant
+            for quadrant_idx in nl.affine_range(n_quadrants_needed):
+                pack_view = (
                     scale.select(dim=0, index=expert_idx)
-                    .slice(
-                        dim=0,
-                        start=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx,
-                        end=SCALE_P_ELEM_PER_QUADRANT * (quadrant_idx + 1),
-                    )
-                    .select(dim=1, index=gate_or_up_idx)
-                    .slice(dim=2, start=I_offset + i_start, end=I_offset + i_start + i_size)
+                    .select(dim=0, index=gate_or_up_idx)
+                    .slice(dim=0, start=_n_pack_p * quadrant_idx, end=_n_pack_p * (quadrant_idx + 1))
                 )
                 nisa.dma_copy(
-                    src=scale_view,
-                    dst=scale_sb[
-                        nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, SCALE_P_ELEM_PER_QUADRANT),
-                        :,
-                        i_start : i_start + i_size,
-                    ],
+                    src=pack_view,
+                    dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, _n_pack_p), :, :],
                     dge_mode=nisa.dge_mode.none,
+                    name=dma_name(f"gu_scale_e{expert_idx}_{gate_or_up_idx}_q{quadrant_idx}"),
                 )
+        else:
+            for quadrant_idx in nl.affine_range(n_quadrants_needed):
+                for i_tile_idx in nl.affine_range(n_I_tiles):
+                    i_start = i_tile_idx * DMA_FREE_DIM_TILE
+                    i_size = min(DMA_FREE_DIM_TILE, I_local - i_start)
+                    scale_view = (
+                        scale.select(dim=0, index=expert_idx)
+                        .slice(
+                            dim=0,
+                            start=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx,
+                            end=SCALE_P_ELEM_PER_QUADRANT * (quadrant_idx + 1),
+                        )
+                        .select(dim=1, index=gate_or_up_idx)
+                        .slice(dim=2, start=I_offset + i_start, end=I_offset + i_start + i_size)
+                    )
+                    nisa.dma_copy(
+                        src=scale_view,
+                        dst=scale_sb[
+                            nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, SCALE_P_ELEM_PER_QUADRANT),
+                            :,
+                            i_start : i_start + i_size,
+                        ],
+                        dge_mode=nisa.dge_mode.none,
+                        name=dma_name(f"gu_scale_e{expert_idx}_{gate_or_up_idx}_q{quadrant_idx}_i{i_tile_idx}"),
+                    )
 
     tile_offset = I_offset // MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
 
@@ -646,9 +886,10 @@ def load_gate_up_weight_scale_bias(
             .slice(dim=1, start=tile_offset, end=tile_offset + n_I512_tiles_local)
         )
         nisa.dma_copy(
-            src=as_nki_tensor(bias_view),
+            src=bias_view,
             dst=bias_sb[:I_p_bias_in_hbm, :, :],
             dge_mode=nisa.dge_mode.none,
+            name=dma_name(f"gu_bias_e{expert_idx}_{gate_or_up_idx}"),
         )
 
     return weight_sb, scale_sb, bias_sb
@@ -693,9 +934,13 @@ def _projection_matmul_mx(
     n_total_I512_tiles: int,
     I_local: int,
     is_software_quant: bool = False,
+    tile_i_only=None,
 ) -> None:
     """
     Perform MX matmul accumulation over H tiles and I tiles.
+
+    tile_i_only (GU_IOUTER): when set, only that I tile is accumulated (loop order I -> H -> 4_I), so the
+    caller can interleave each tile's PSUM epilogue with the next tile's matmuls.
     Loop order: H → I → 4_I for better input tensor reuse with larger T.
 
     Args:
@@ -716,8 +961,9 @@ def _projection_matmul_mx(
     Returns:
         None. Results are accumulated in-place into out_psum_lst buffers.
     """
+    _tiles = range(n_total_I512_tiles) if tile_i_only is None else [tile_i_only]
     for tile_h in range(n_H512_tiles):
-        for tile_i in range(n_total_I512_tiles):
+        for tile_i in _tiles:
             cur_tile_I_size = min(
                 MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             )
@@ -725,12 +971,30 @@ def _projection_matmul_mx(
             for q_width_I_idx in range(_q_width):
                 weight_I_offset = tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM + q_width_I_idx * cur_I128_tile_sz
                 weight_I_slice = nl.ds(weight_I_offset, cur_I128_tile_sz)
+                # PACK64: the 4_I factor lives in PARTITIONS (offsets {0,4,8,12}) instead of the
+                # free dim, so this group's scale is 4 rows at base partition 4*q_width_I_idx and the
+                # free index collapses from (tile_i*512 + k*128) to tile_i*cur_I128_tile_sz.
+                # Verified to emit `%mem[d0 + 4k, d1]` with partition extent 4.
+                if _SCALE_PACK64 and not is_software_quant:
+                    _p_base = SCALE_P_ELEM_PER_QUADRANT * q_width_I_idx  # 0, 4, 8, 12
+                    _p_ext = {
+                        "4": SCALE_P_ELEM_PER_QUADRANT,  # one quadrant's rows
+                        "quad": SBUF_QUADRANT_SIZE,  # one quadrant of extent
+                        "rest": nl.tile_size.pmax - _p_base,  # spans all 4 quadrants
+                    }[_SCALE_PACK64_EXT]
+                    _s_ap = weight_scale_sb[
+                        nl.ds(_p_base, _p_ext),
+                        tile_h,
+                        nl.ds(tile_i * cur_I128_tile_sz, cur_I128_tile_sz),
+                    ]
+                elif is_software_quant:
+                    _s_ap = weight_scale_sb[:, :cur_I128_tile_sz]
+                else:
+                    _s_ap = weight_scale_sb[:, tile_h, weight_I_slice]
                 nisa.nc_matmul_mx(
                     dst=out_psum_lst[tile_i][:cur_I128_tile_sz, q_width_I_idx, :tile_T_actual],
                     stationary=weight_sb[:, tile_h, weight_I_slice],
                     moving=input_quant_sb[:, tile_h, tile_T_slice],
-                    stationary_scale=weight_scale_sb[:, :cur_I128_tile_sz]
-                    if is_software_quant
-                    else weight_scale_sb[:, tile_h, weight_I_slice],
+                    stationary_scale=_s_ap,
                     moving_scale=input_scale_sb[:, tile_h, tile_T_slice],
                 )

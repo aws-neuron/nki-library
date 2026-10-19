@@ -14,6 +14,7 @@
 
 """Fused optional residual add + RMSNorm + MX quantization kernel optimized for token generation (decoding) phase."""
 
+import os as _os
 from typing import Optional
 
 import nki
@@ -22,7 +23,9 @@ import nki.language as nl
 
 from ..mlp.mlp_tkg.projection_mx_constants import _q_width
 from ..quantization.fp8_quantize import row_quantization, static_quantization
-from ..utils.kernel_helpers import div_ceil
+from ..utils.dma_names import dma_name
+from ..utils.kernel_helpers import div_ceil, kernel_assert
+from ..utils.sched_hints import begin_qmx_store_copies, record_qmx_store_copy
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from .norm_tkg_utils import _1B_XPOSE_PSUM_STEP, _MX_SCALE_DTYPE, _UINT8_TP_VIEW_DTYPE, validate_rmsnorm_mx_quantize_tkg
 
@@ -45,6 +48,7 @@ def rmsnorm_mx_quantize_tkg(
     is_static_mx: bool = False,
     output_row_dequant_scale: Optional[nl.NkiTensor] = None,
     skip_output_gather: bool = False,
+    hidden_h0_sb: Optional[nl.NkiTensor] = None,
 ):
     """
     Fused residual add (optional) + RMSNorm + optional MX/static/row quantization for token generation.
@@ -61,7 +65,8 @@ def rmsnorm_mx_quantize_tkg(
         H1: H // H0
 
     Args:
-        input (nl.NkiTensor): [B, S, H], Input tensor on HBM.
+        input (nl.NkiTensor): [B, S, H] input on HBM, or [B*S, 1, H] input on SBUF.
+            SBUF input uses B*S as its partition dimension and does not support residual add.
         gamma (nl.NkiTensor): [1, H], RMSNorm scaling weights on HBM.
         output (nl.NkiTensor): [H0, B*S, H1], FP16/BF16 output tensor in SBUF.
         output_quant (Optional[nl.NkiTensor]): [H0, H/512, B*S], FP8x4 quantized output tensor in HBM or SBUF,
@@ -124,6 +129,7 @@ def rmsnorm_mx_quantize_tkg(
     """
 
     # Step 1: Configuration, validation
+    input_in_sbuf = input.buffer == nl.sbuf
     dims, cfg = validate_rmsnorm_mx_quantize_tkg(
         input_shape=input.shape,
         gamma_shape=gamma.shape,
@@ -144,6 +150,33 @@ def rmsnorm_mx_quantize_tkg(
         is_static_mx=is_static_mx,
         has_output_input_dequant_scale=output_input_dequant_scale != None,
     )
+
+    # hidden_h0_sb: the caller already holds the hidden state H0-partitioned, so the conversion
+    # _load_hidden_compute_residual would do is skipped. `input` is then read only for its
+    # shape/dtype, never for data.
+    if hidden_h0_sb is not None:
+        kernel_assert(hidden_h0_sb.buffer == nl.sbuf, "hidden_h0_sb must be in SBUF")
+        kernel_assert(
+            tuple(hidden_h0_sb.shape) == (dims.H0, dims.BxS, dims.H1),
+            f"hidden_h0_sb must be [H0, BxS, H1] = [{dims.H0}, {dims.BxS}, {dims.H1}]; got {tuple(hidden_h0_sb.shape)}",
+        )
+
+    if input_in_sbuf:
+        kernel_assert(
+            dims.S == 1,
+            "SBUF input must have shape [B*S, 1, H] so B*S is the partition dimension",
+        )
+        kernel_assert(not cfg.is_residual_add, "SBUF input does not support fused residual add")
+        kernel_assert(not cfg.do_shard, "SBUF input must already contain the local token shard")
+        kernel_assert(
+            input.dtype in [nl.float16, nl.bfloat16],
+            "SBUF input must use a 16-bit dtype",
+        )
+        transpose_token_stride = div_ceil(cfg.BxS_tile_size * 2, 4) * 2
+        kernel_assert(
+            transpose_token_stride * dims.H1 <= dims.psum_fmax,
+            "SBUF input transpose must fit in one PSUM bank",
+        )
 
     # Step 2: Allocate buffers, load weights/constants
     residual_sb = (
@@ -178,7 +211,7 @@ def rmsnorm_mx_quantize_tkg(
     gamma_hbm = gamma.flatten_dims(start_dim=0, end_dim=1)
     gamma_hbm_view = gamma_hbm.reshape_dim(dim=0, shape=[dims.H1, dims.H0]).expand_dim(dim=1).expand_dim(dim=1)
     gamma_sb_view = gamma_sb.expand_dim(dim=1).expand_dim(dim=1)
-    nisa.dma_transpose(dst=gamma_sb_view, src=gamma_hbm_view)
+    nisa.dma_transpose(dst=gamma_sb_view, src=gamma_hbm_view, name=dma_name("prequant_gamma_load"))
 
     # STATIC_MX pre-quantization for E_L=1 case (currently not used): Load and broadcast input dequant scale once before tile loop.
     # When gate_up_in_scale=None for STATIC_MX, quantization is skipped (handled per-expert downstream in expert MLP loop).
@@ -186,9 +219,13 @@ def rmsnorm_mx_quantize_tkg(
         nisa.dma_copy(dst=output_input_dequant_scale[:1, :], src=gate_up_in_scale[0:1, :])
         stream_shuffle_broadcast(src=output_input_dequant_scale, dst=output_input_dequant_scale)
 
-    # Reshape HBM views for loading with NkiTensor
+    # Reshape input for either on-chip or HBM transpose.
     residual_hbm_view = residual.reshape((dims.B * dims.S * dims.H1, dims.H0)) if cfg.is_residual_add else None
-    input_hbm_view = input.reshape((dims.B * dims.S * dims.H1, dims.H0))
+    input_view = (
+        input.reshape((dims.B * dims.S, dims.H1, dims.H0))
+        if input_in_sbuf
+        else input.reshape((dims.B * dims.S * dims.H1, dims.H0))
+    )
 
     # Step 3: Process tiles - Residual Add + RMSNorm + MX Quantization
     for bxs_tile_idx in range(cfg.num_BxS_tiles):
@@ -208,13 +245,15 @@ def rmsnorm_mx_quantize_tkg(
         hidden_sb = _load_hidden_compute_residual(
             dims=dims,
             cfg=cfg,
-            input_hbm_view=input_hbm_view,
+            input_view=input_view,
+            input_in_sbuf=input_in_sbuf,
             residual_hbm_view=residual_hbm_view,
             input_tile_sb=input_tile_sb,
             residual_sb=residual_sb,
             hbm_tile_offset=hbm_tile_offset,
             tile_BxS_start_idx=tile_BxS_start_idx,
             residual_tile_BxS_slice=tile_BxS_slice_local,
+            hidden_h0_sb=hidden_h0_sb,
         )
 
         # Step 3.3: Compute RMSNorm
@@ -305,37 +344,46 @@ def rmsnorm_mx_quantize_tkg(
 
         # Reinterpret f8x4 -> f32 for transpose, since PE does not allow transpose with f8x4
         output_quant_sb = output_quant_sb.view(nl.float32)
-        output_quant_transposed_sb = nl.ndarray((dims.pmax, n_BxS_tiles, H_packed), dtype=nl.float32, buffer=nl.sbuf)
-        _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_quant_sb, dst_sb=output_quant_transposed_sb)
+        if _os.environ.get("VLLM_NEURON_MEGA_QMX_BATCH_XPOSE") and cfg.shard_size == 1:
+            # Six [H0,1]->[1,H0] transposes + two PSUM->SBUF copies collapse into one of each.
+            _qmx_batched_transpose_store_quant(dims=dims, cfg=cfg, src_sb_f32=output_quant_sb, dst_hbm=output_quant)
+        else:
+            output_quant_transposed_sb = nl.ndarray(
+                (dims.pmax, n_BxS_tiles, H_packed), dtype=nl.float32, buffer=nl.sbuf
+            )
+            _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_quant_sb, dst_sb=output_quant_transposed_sb)
 
-        # Reinterpret f32 -> f8 (unpacks x4 to individual f8 elements), then spill quant data to [B*S, 0:H]
-        output_quant_transposed_view = output_quant_transposed_sb.view(cfg.output_quant_dtype)
-        _spill_tiled_sb_to_hbm(
-            src_sb=output_quant_transposed_view,
-            dst_hbm=output_quant,
-            shard_size=cfg.shard_size,
-            BxS_offset=cfg.BxS_offset,
-            total_free=dims.H,
-            dst_free_offset=0,
-        )
+            # Reinterpret f32 -> f8 (unpacks x4 to individual f8 elements), then spill quant to [B*S, 0:H]
+            output_quant_transposed_view = output_quant_transposed_sb.view(cfg.output_quant_dtype)
+            _spill_tiled_sb_to_hbm(
+                src_sb=output_quant_transposed_view,
+                dst_hbm=output_quant,
+                shard_size=cfg.shard_size,
+                BxS_offset=cfg.BxS_offset,
+                total_free=dims.H,
+                dst_free_offset=0,
+            )
 
         # Reinterpret u8 -> f8 for transpose, since PE does not allow transpose with u8
         output_scale_sb = output_scale_sb.view(_UINT8_TP_VIEW_DTYPE)
-        output_scale_transposed_sb = nl.ndarray(
-            (dims.pmax, n_BxS_tiles, H_packed), dtype=_UINT8_TP_VIEW_DTYPE, buffer=nl.sbuf
-        )
-        _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_scale_sb, dst_sb=output_scale_transposed_sb)
+        if _os.environ.get("VLLM_NEURON_MEGA_QMX_BATCH_XPOSE") and cfg.shard_size == 1:
+            _qmx_batched_transpose_store_scale(dims=dims, cfg=cfg, src_sb_1b=output_scale_sb, dst_hbm=output_quant)
+        else:
+            output_scale_transposed_sb = nl.ndarray(
+                (dims.pmax, n_BxS_tiles, H_packed), dtype=_UINT8_TP_VIEW_DTYPE, buffer=nl.sbuf
+            )
+            _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_scale_sb, dst_sb=output_scale_transposed_sb)
 
-        # Reinterpret f8 -> f8 used by packed output_quant, then spill scales to [B*S, H:H+H/4]
-        output_scale_transposed_sb = output_scale_transposed_sb.view(cfg.output_quant_dtype)
-        _spill_tiled_sb_to_hbm(
-            src_sb=output_scale_transposed_sb,
-            dst_hbm=output_quant,
-            shard_size=cfg.shard_size,
-            BxS_offset=cfg.BxS_offset,
-            total_free=H_packed,
-            dst_free_offset=dims.H,
-        )
+            # Reinterpret f8 -> f8 used by packed output_quant, then spill scales to [B*S, H:H+H/4]
+            output_scale_transposed_sb = output_scale_transposed_sb.view(cfg.output_quant_dtype)
+            _spill_tiled_sb_to_hbm(
+                src_sb=output_scale_transposed_sb,
+                dst_hbm=output_quant,
+                shard_size=cfg.shard_size,
+                BxS_offset=cfg.BxS_offset,
+                total_free=H_packed,
+                dst_free_offset=dims.H,
+            )
 
     # When output is untransposed in HBM, gather output_quant and output_scale separately in HBM
     elif output_quant != None:
@@ -372,17 +420,48 @@ def rmsnorm_mx_quantize_tkg(
 def _load_hidden_compute_residual(
     dims,
     cfg,
-    input_hbm_view,
+    input_view,
+    input_in_sbuf,
     residual_hbm_view,
     input_tile_sb,
     residual_sb,
     hbm_tile_offset,
     tile_BxS_start_idx,
     residual_tile_BxS_slice,
+    hidden_h0_sb=None,
 ):
-    """Load input (+ optional residual) from HBM with DMA transpose and compute residual add."""
+    """Transpose input into the H0-partitioned RMSNorm layout and optionally add a residual."""
+    # Caller already built the H0-partitioned hidden state -> skip the conversion entirely (the
+    # H1 nc_transposes on the SBUF path, or the dma_transpose load on the HBM path).
+    if hidden_h0_sb is not None:
+        return hidden_h0_sb.slice(
+            dim=1,
+            start=tile_BxS_start_idx,
+            end=tile_BxS_start_idx + cfg.BxS_tile_size,
+        )
+    if input_in_sbuf:
+        # nc_transpose destinations must be 4-byte aligned. Pack all H1 transposes
+        # into one PSUM bank and expose the result as logical [H0, BxS, H1].
+        transpose_token_stride = div_ceil(cfg.BxS_tile_size * 2, 4) * 2
+        input_transposed_psum = nl.ndarray(
+            (dims.H0, dims.H1, transpose_token_stride),
+            dtype=input_view.dtype,
+            buffer=nl.psum,
+        )
+        input_tile = input_view.slice(
+            dim=0,
+            start=tile_BxS_start_idx,
+            end=tile_BxS_start_idx + cfg.BxS_tile_size,
+        )
+        for h1_idx in nl.affine_range(dims.H1):
+            nisa.nc_transpose(
+                dst=input_transposed_psum[:, h1_idx, 0 : cfg.BxS_tile_size],
+                data=input_tile[:, h1_idx, :],
+            )
+        return input_transposed_psum[:, :, 0 : cfg.BxS_tile_size].permute([0, 2, 1])
+
     input_src_view = (
-        input_hbm_view.slice(dim=0, start=hbm_tile_offset, end=hbm_tile_offset + cfg.BxS_tile_size * dims.H1)
+        input_view.slice(dim=0, start=hbm_tile_offset, end=hbm_tile_offset + cfg.BxS_tile_size * dims.H1)
         .expand_dim(dim=1)
         .expand_dim(dim=1)
     )
@@ -402,8 +481,12 @@ def _load_hidden_compute_residual(
         )
 
         # Transpose load residual and input
-        nisa.dma_transpose(dst=residual_dst_view, src=residual_src_view)
-        nisa.dma_transpose(dst=input_dst_view, src=input_src_view)
+        nisa.dma_transpose(
+            dst=residual_dst_view, src=residual_src_view, name=dma_name(f"prequant_residual_load_t{tile_BxS_start_idx}")
+        )
+        nisa.dma_transpose(
+            dst=input_dst_view, src=input_src_view, name=dma_name(f"prequant_hidden_load_t{tile_BxS_start_idx}")
+        )
 
         # Residual add: hidden = input + residual
         nisa.tensor_tensor(
@@ -415,7 +498,9 @@ def _load_hidden_compute_residual(
         hidden_sb = residual_sb[:, residual_tile_BxS_slice, :]
     else:
         # Transpose load input
-        nisa.dma_transpose(dst=input_dst_view, src=input_src_view)
+        nisa.dma_transpose(
+            dst=input_dst_view, src=input_src_view, name=dma_name(f"prequant_hidden_load_t{tile_BxS_start_idx}")
+        )
         hidden_sb = input_tile_sb
 
     return hidden_sb
@@ -564,6 +649,59 @@ def _swizzle_quantize_mx(
             )
 
 
+def _qmx_batched_transpose_store_quant(dims, cfg, src_sb_f32, dst_hbm):
+    """One nc_transpose instead of six, for the packed quant store when shard_size == 1.
+
+    `_transpose_qmx_output` tiles over num_H512_tiles, and at shard_size 1 each nc_transpose moves
+    a [H0, 1] -> [1, H0] tile -- 128 elements per instruction, so the cost is issue overhead
+    (measured 2.86 ns/element, 90.1 us exposed over 36 layers). Transposing all tiles at once
+    gives [H0, T] -> [T, H0] in one instruction.
+
+    That puts `tile` on the partition axis, which the HBM store absorbs for free: the packed row
+    wants f8 byte offset 4*(tile*H0 + p) + w, and the [T, H0] f32 tile viewed as f8 is
+    [T, H0*4] = (tile, p*4 + w) -- the same bytes, still a contiguous per-partition burst.
+
+    Quant only. Scales are 1 byte and need the strided-PSUM form, hence the sibling below.
+    """
+    kernel_assert(cfg.shard_size == 1, f"batched qmx transpose assumes shard_size==1; got {cfg.shard_size}")
+    T = dims.num_H512_tiles
+    psum = nl.ndarray((T, dims.H0), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=psum, data=src_sb_f32[0 : dims.H0, 0:T, 0])
+    sb = nl.ndarray((T, dims.H0), dtype=nl.float32, buffer=nl.sbuf)
+    begin_qmx_store_copies()
+    record_qmx_store_copy(nisa.tensor_copy(dst=sb, src=psum))
+    # f32 [T, H0] -> f8 [T, H0*4] == (tile, p*4 + w); HBM row[0:H] as (tile, H0*4). Same bytes.
+    # Named so a DMA-order constraint file can pin it without a positional I-<n> name (which would
+    # renumber whenever an earlier DMA is added or removed). dma_name() is None outside a scope.
+    nisa.dma_copy(
+        dst=dst_hbm[cfg.BxS_offset][0 : dims.H].reshape((T, dims.H0 * 4)),
+        src=sb.view(cfg.output_quant_dtype)[0:T, 0 : dims.H0 * 4],
+        name=dma_name("qmx_quant_store"),
+    )
+
+
+def _qmx_batched_transpose_store_scale(dims, cfg, src_sb_1b, dst_hbm):
+    """The 1-byte twin of _qmx_batched_transpose_store_quant, for the MX scales.
+
+    PE 1-byte transposes need the strided PSUM form `_transpose_qmx_output` uses for `is_1byte`: a
+    trailing _1B_XPOSE_PSUM_STEP dim, with the transpose targeting index 0. The spill it replaces
+    put free index `tile*H0 + p` at HBM offset `H + tile*H0 + p`, so the [T, H0] tile maps straight
+    onto row[H : H + T*H0] viewed as (tile, p).
+    """
+    kernel_assert(cfg.shard_size == 1, f"batched qmx transpose assumes shard_size==1; got {cfg.shard_size}")
+    T = dims.num_H512_tiles
+    psum = nl.ndarray((T, dims.H0, _1B_XPOSE_PSUM_STEP), dtype=_UINT8_TP_VIEW_DTYPE, buffer=nl.psum)
+    nisa.nc_transpose(dst=psum[0:T, 0 : dims.H0, 0], data=src_sb_1b[0 : dims.H0, 0:T, 0])
+    sb = nl.ndarray((T, dims.H0), dtype=_UINT8_TP_VIEW_DTYPE, buffer=nl.sbuf)
+    record_qmx_store_copy(nisa.tensor_copy(dst=sb, src=psum[0:T, 0 : dims.H0, 0]))
+    H_packed = T * dims.H0
+    nisa.dma_copy(
+        dst=dst_hbm[cfg.BxS_offset][dims.H : dims.H + H_packed].reshape((T, dims.H0)),
+        src=sb.view(cfg.output_quant_dtype)[0:T, 0 : dims.H0],
+        name=dma_name("qmx_scale_store"),
+    )
+
+
 def _transpose_qmx_output(dims, cfg, src_sb, dst_sb):
     """Transpose from [H0, num_H512_tiles, shard_size] to [pmax, shard_size/pmax, num_H512_tiles * H0].
 
@@ -694,6 +832,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
         nisa.dma_copy(
             src=src_3d,
             dst=dst_tile,
+            name=dma_name(f"prequant_spill_full_f{dst_free_offset}_b{BxS_offset}"),
         )
     elif remainder == 0:
         # Single full tile
@@ -704,6 +843,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
         nisa.dma_copy(
             src=src_tile,
             dst=dst_tile,
+            name=dma_name(f"prequant_spill_single_f{dst_free_offset}_b{BxS_offset}"),
         )
     else:
         # Has partial last tile
@@ -720,6 +860,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
             nisa.dma_copy(
                 src=src_3d,
                 dst=dst_tile,
+                name=dma_name(f"prequant_spill_full_f{dst_free_offset}_b{BxS_offset}"),
             )
         elif num_full_tiles == 1:
             # Single full tile
@@ -730,6 +871,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
             nisa.dma_copy(
                 src=src_tile,
                 dst=dst_tile,
+                name=dma_name(f"prequant_spill_single_f{dst_free_offset}_b{BxS_offset}"),
             )
         # Single DMA for partial last tile
         partial_offset = num_full_tiles * pmax
@@ -740,4 +882,5 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
         nisa.dma_copy(
             src=src_partial,
             dst=dst_partial,
+            name=dma_name(f"prequant_spill_partial_f{dst_free_offset}_b{BxS_offset}"),
         )

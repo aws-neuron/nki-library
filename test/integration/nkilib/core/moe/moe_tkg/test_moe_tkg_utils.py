@@ -73,6 +73,12 @@ def build_moe_tkg(
         out_dtype = in_dtype
 
     is_mx_quant = is_dtype_mx(quant_dtype)
+    is_static_mx = quant_type == QuantizationType.STATIC_MX
+    is_row_mx = quant_type == QuantizationType.ROW_MX
+    # Only pure MX consumes uint8 block scales and MX-packed hidden input. STATIC_MX and
+    # ROW_MX reuse the MX-packed weights but supply fp32 dequant scales (block scales are
+    # dummy-127 internally in both the kernel and the torch ref) and raw hidden input.
+    is_mx_block_scale = is_mx_quant and not is_static_mx and not is_row_mx
 
     # For all-expert mode, top_k defaults to expert count if not specified
     effective_top_k = top_k if top_k is not None else expert
@@ -117,7 +123,7 @@ def build_moe_tkg(
                 return mx_weights.gate_up_w_scale
             elif inp.name == 'down_w_scale' and is_mx_quant:
                 return mx_weights.down_w_scale
-            elif inp.name == 'hidden_input' and is_mx_quant:
+            elif inp.name == 'hidden_input' and is_mx_block_scale:
                 n_H512_tile = hidden // 512
                 mx_dtype = nl.float8_e4m3fn_x4
                 mx_unpacked_dtype = nl.float8_e4m3fn
@@ -203,7 +209,7 @@ def build_moe_tkg(
 
     gate_up_w_scale_shape = None
     down_w_scale_shape = None
-    if is_mx_quant:
+    if is_mx_block_scale:
         gate_up_w_scale_shape = (expert, _pmax // _q_height, 2, n_H512_tile, intermediate)
         down_w_scale_shape = (expert, math.ceil(intermediate_p / _q_height), n_I512_tile, hidden)
     elif quant_type == QuantizationType.ROW:
@@ -261,6 +267,24 @@ def build_moe_tkg(
             TensorTemplate((expert, 1), dtype=np.float32, name="expert_gate_up_input_scale")
         )
         down_in_scale = tensor_generator(TensorTemplate((expert, 1), dtype=np.float32, name="expert_down_input_scale"))
+    elif is_static_mx:
+        # STATIC_MX reuses the MX-packed weights but supplies fp32 per-tensor weight dequant
+        # scales and fp32 per-tensor input scales; block scales are dummy-127 internally in
+        # both the kernel and the torch ref. The input scale cancels analytically (the kernel
+        # feeds input/in_scale through fp8 and multiplies in_scale back), so it only affects
+        # fp8 quantization stress: keep it at 1.0 so hidden (~N(0,1)) sits in fp8's
+        # well-conditioned range and the kernel/ref fp8 rounding matches. Weight dequant
+        # scales are applied post-matmul, so any positive value is consistent kernel-vs-ref.
+        rng_s = np.random.default_rng(1)
+        gate_up_w_scale = (np.abs(rng_s.standard_normal((expert, 2, 1))) + 0.5).astype(np.float32)
+        down_w_scale = (np.abs(rng_s.standard_normal((expert, 1))) + 0.5).astype(np.float32)
+        gate_up_in_scale = np.ones((expert, 1), dtype=np.float32)
+        down_in_scale = np.ones((expert, 1), dtype=np.float32)
+    elif is_row_mx:
+        # ROW_MX: fp32 per-row weight scales (shape[-1] > 1), no input scales (dynamic in-kernel).
+        rng_s = np.random.default_rng(1)
+        gate_up_w_scale = (np.abs(rng_s.standard_normal((expert, 2, n_I512_tile * _q_width))) + 0.5).astype(np.float32)
+        down_w_scale = (np.abs(rng_s.standard_normal((expert, hidden // _pmax))) + 0.5).astype(np.float32)
 
     kernel_input = {
         "hidden_input": hidden_input,

@@ -132,7 +132,9 @@ def _mlp_tkg_static_mx_impl(
     # Section 1: Normalization (Optional)
     hidden_tensor = params.hidden_tensor
     if not skip_norm and mlpp_has_normalization(params):
-        if mlpp_has_rms_normalization(params):
+        if mlpp_has_rms_normalization(
+            params
+        ):  # pragma: no branch - one-directional: normalization is RMS (assert forbids LayerNorm), else arc dead
             if not use_contiguous_x4:
                 # Software quant path: rmsnorm_tkg produces sharded output [H0, T, H1_shard]
                 H1_shard = dims.H_per_shard // _pmax
@@ -166,9 +168,13 @@ def _mlp_tkg_static_mx_impl(
                 norm_weights = params.norm_params.normalization_weights_tensor
                 eps = params.eps
                 hidden_flat = params.hidden_tensor
-                if len(hidden_flat.shape) == 3 and hidden_flat.buffer != nl.sbuf:
+                if (
+                    len(hidden_flat.shape) == 3 and hidden_flat.buffer != nl.sbuf
+                ):  # pragma: no branch - one-directional: cx4 rmsnorm input always 3D HBM, false arc dead
                     hidden_flat = hidden_flat.flatten_dims(start_dim=0, end_dim=1)
-                elif hidden_flat.buffer == nl.sbuf:
+                elif (
+                    hidden_flat.buffer == nl.sbuf
+                ):  # pragma: no cover - cx4-from-SBUF elif unreachable (input always 3D HBM); not supported
                     kernel_assert(False, "contiguous_x4 rmsnorm from SBUF input not yet supported")
                 rmsnorm_sbm = SbufManager(0, _RMSNORM_SBUF_BUDGET_BYTES, get_logger("rmsnorm_cx4"), use_auto_alloc=True)
                 rmsnorm_sbm.set_name_prefix(name_prefix)
@@ -391,7 +397,9 @@ def _mlp_tkg_static_mx_impl(
     )
 
     # Apply activation function to gate output (skip if fused via activation_op)
-    if activation_op == None:
+    if (
+        activation_op == None
+    ):  # pragma: no branch - one-directional: sole caller passes activation_op=fused_act_op (non-None), None arc dead
         nisa.activation(
             dst=gate_out_sb,
             op=get_nl_act_fn_from_type(params.activation_fn),
@@ -459,11 +467,15 @@ def _mlp_tkg_static_mx_impl(
     )
 
     # Section 7: Output Transpose and Storage
-    if skip_output_store:
+    if (
+        skip_output_store
+    ):  # pragma: no branch - one-directional: sole caller passes skip_output_store=True, returns early
         mx_buf.down_out_sb = down_out_sb
         return [output_tensor_hbm]
 
-    if not params.store_output_in_sbuf:
+    if (
+        not params.store_output_in_sbuf
+    ):  # pragma: no cover - standalone output-store block dead (skip_output_store always True)
         B, S, H = output_tensor_hbm.shape
         output_tensor_hbm = output_tensor_hbm.flatten_dims(start_dim=0, end_dim=1)
 
@@ -585,7 +597,9 @@ def mlp_tkg_quad_fp8_static(
     # Convert 6D scalar fp8 gate/up weights to flat 3D scalar fp8.
     # [128, n_H512, n_I512, 4, 128, 4] → [128, n_H512, I_padded*4] scalar fp8
     # load_gate_up_weight detects scalar fp8 and does reinterpret_cast to x4 after DMA.
-    if len(gate_w_hbm.shape) == 6:
+    if (
+        len(gate_w_hbm.shape) == 6
+    ):  # pragma: no branch - one-directional: STATIC_MX gate/up weights always 6D, already-flat arc dead
         n_H512_w = gate_w_hbm.shape[1]
         I_padded = gate_w_hbm.shape[2] * gate_w_hbm.shape[3] * gate_w_hbm.shape[4]
         gate_w_hbm = gate_w_hbm.reshape((_pmax, n_H512_w, I_padded * _q_width))
@@ -593,7 +607,9 @@ def mlp_tkg_quad_fp8_static(
 
     # Convert 4D scalar fp8 down weights to flat 3D scalar fp8.
     # [128_I, n_I512, H, 4] → [128_I, n_I512, H*4] scalar fp8
-    if len(down_w_hbm.shape) == 4:
+    if (
+        len(down_w_hbm.shape) == 4
+    ):  # pragma: no branch - one-directional: STATIC_MX down weights always 4D, already-flat arc dead
         p_I_d = down_w_hbm.shape[0]
         n_I512_d = down_w_hbm.shape[1]
         down_w_hbm = down_w_hbm.reshape((p_I_d, n_I512_d, H * _q_width))
@@ -645,7 +661,9 @@ def mlp_tkg_quad_fp8_static(
         i_tile_n_I512 = div_ceil(i_tile.size, _pmax * _q_width)
 
         # Slice gate/up weight dequant scales to current I-tile's column range
-        if gate_w_dequant_full.shape[1] > 1:
+        if (
+            gate_w_dequant_full.shape[1] > 1
+        ):  # pragma: no branch - one-directional: STATIC_MX gate scale per-tensor (shape[1]==1), multi-column arc dead
             col_start = (i_tile.start_offset // (_pmax * _q_width)) * _q_width
             col_end = col_start + i_tile_n_I512 * _q_width
             mx_buf.gate_w_dequant_sb = gate_w_dequant_full[:, col_start:col_end]

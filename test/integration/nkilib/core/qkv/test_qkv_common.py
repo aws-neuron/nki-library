@@ -125,7 +125,17 @@ def build_qkv_input(
     qk_norm_pre_rope_config: Optional[dict] = None,
     qk_norm_post_rope_config: Optional[dict] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    pre_broadcast_scales: bool = True,
+    mx_pre_broadcast_scales: bool = False,
+    use_auto_allocation: bool = False,
+    bias_pmax_rows: bool = False,
+    kv_dtype_override=None,
 ):
+    # When pre_broadcast_scales=False, emit quantization scales with partition
+    # dim 1 (shape [1, ...]) instead of pre-broadcast to [128, ...]. This
+    # exercises the kernel's single-row-load + stream_shuffle_broadcast path
+    # (the shape[0] == 1 branch) rather than the full DMA (pre-broadcast) path.
+    _scale_partitions = 128 if pre_broadcast_scales else 1
     qkv_w_scale = None
     qkv_in_scale = None
     if quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX):
@@ -139,11 +149,19 @@ def build_qkv_input(
         )
 
         if quantization_type == QuantizationType.STATIC_MX:
-            # STATIC_MX: per-Q/K/V weight dequant scale, single input scale
+            # STATIC_MX: per-Q/K/V weight dequant scale, single input scale.
+            # Default keeps partition dim 1 ([1, ...]); mx_pre_broadcast_scales=True
+            # broadcasts to [128, ...] to exercise the full-DMA scale-load path
+            # (qkv_tkg_mx_impl.py else-arcs at L450/L632). Kept as a separate knob
+            # from pre_broadcast_scales so existing STATIC_MX tests (which rely on
+            # the [1, ...] shape) are unaffected.
             base_scale = 1.0 / 448.0
             np.random.seed(42)
             qkv_w_scale = base_scale * np.random.uniform(0.995, 1.005, (1, 3)).astype(np.float32)
             qkv_in_scale = base_scale * np.random.uniform(0.995, 1.005, (1, 1)).astype(np.float32)
+            if mx_pre_broadcast_scales:
+                qkv_w_scale = np.broadcast_to(qkv_w_scale, (128, 3)).copy()
+                qkv_in_scale = np.broadcast_to(qkv_in_scale, (128, 1)).copy()
         elif quantization_type == QuantizationType.ROW_MX:
             # ROW_MX: per-column weight dequant scale [1, I], no input scale
             np.random.seed(42)
@@ -175,10 +193,10 @@ def build_qkv_input(
             # Add small per-element deviation (±0.5%), then broadcast to partition dim.
             np.random.seed(42)  # For reproducibility
             qkv_w_scale = np.broadcast_to(
-                base_scale * np.random.uniform(0.995, 1.005, (1, 3)).astype(np.float32), (128, 3)
+                base_scale * np.random.uniform(0.995, 1.005, (1, 3)).astype(np.float32), (_scale_partitions, 3)
             ).copy()
             qkv_in_scale = np.broadcast_to(
-                base_scale * np.random.uniform(0.995, 1.005, (1, 1)).astype(np.float32), (128, 1)
+                base_scale * np.random.uniform(0.995, 1.005, (1, 1)).astype(np.float32), (_scale_partitions, 1)
             ).copy()
         elif quantization_type == QuantizationType.ROW:
             # For row quantization: per-output-channel weight scales, no input quantization
@@ -188,8 +206,10 @@ def build_qkv_input(
             w_scale = (w_max / FP8_E4M3_MAX).astype(np.float32)
             # Quantize weights to FP8
             fused_qkv_weights = (fused_qkv_weights / w_scale).astype(_fp8_weight_dtype)
-            # Broadcast scale to (128, fused_qkv_dim) shape
-            qkv_w_scale = np.broadcast_to(w_scale, (128, fused_qkv_dim)).astype(np.float32)
+            # Broadcast scale to (_scale_partitions, fused_qkv_dim) shape
+            qkv_w_scale = np.ascontiguousarray(
+                np.broadcast_to(w_scale, (_scale_partitions, fused_qkv_dim)), dtype=np.float32
+            )
             qkv_in_scale = None
 
     mlp_prev = tensor_gen(shape=(batch, seqlen, hidden_dim), dtype=dtype, name="mlp_prev") if fused_add else None
@@ -219,7 +239,15 @@ def build_qkv_input(
             if norm_type in [NormType.RMS_NORM, NormType.LAYER_NORM]
             else None
         )
-    bias = tensor_gen(shape=(1, fused_qkv_dim), dtype=dtype, name="bias") if qkv_bias else None
+    # bias_pmax_rows=True emits bias pre-broadcast to [pmax, I] instead of [1, I], to
+    # exercise the "bias already [pmax, I], load directly" branch (qkv_cte.py L4079).
+    if qkv_bias:
+        _bias_rows = p_max if bias_pmax_rows else 1
+        bias = tensor_gen(shape=(1, fused_qkv_dim), dtype=dtype, name="bias")
+        if bias_pmax_rows:
+            bias = np.broadcast_to(bias, (_bias_rows, fused_qkv_dim)).copy()
+    else:
+        bias = None
     layer_norm_bias = tensor_gen(shape=(1, hidden_dim), dtype=dtype, name="layer_norm_bias") if norm_bias else None
 
     cos_cache_t = tensor_gen(shape=(batch, seqlen, d_head), dtype=dtype, name="cos_cache") if fused_rope else None
@@ -291,7 +319,7 @@ def build_qkv_input(
         "num_kv_heads": num_kv_heads,
         "store_output_in_sbuf": False,
         "sbm": None,
-        "use_auto_allocation": False,
+        "use_auto_allocation": use_auto_allocation,
         "load_input_with_DMA_transpose": use_dma_transpose,
         "weight_layout": QKVWeightLayout.MX_CONTIGUOUS
         if quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
@@ -301,7 +329,10 @@ def build_qkv_input(
     if fp8_kv_cache or bf16_kv_cache:
         result["k_cache.must_alias_input"] = k_cache
         result["v_cache.must_alias_input"] = v_cache
-        result["kv_dtype"] = kv_dtype
+        # kv_dtype_override lets a test pass the opaque "float8e4" string sentinel
+        # (resolved by the kernel via dtype_mode) instead of a concrete dtype object,
+        # exercising qkv_cte_utils.py L1204.
+        result["kv_dtype"] = kv_dtype_override if kv_dtype_override is not None else kv_dtype
         result["transpose_k_cache"] = transpose_k_cache
         result["fp8_packed"] = fp8_packed
         if not bf16_kv_cache:
@@ -678,6 +709,20 @@ def run_qkv_test(
     expect_fused_hidden_output: bool = False,
     # --- FP8 E4M3 dtype mode. See DtypeMode enum.
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    # When False, quantization scales are emitted with partition dim 1 ([1, ...])
+    # instead of pre-broadcast to [128, ...], exercising the kernel's
+    # single-row-load + stream_shuffle_broadcast scale path (STATIC/ROW).
+    pre_broadcast_scales: bool = True,
+    # STATIC_MX-only: when True, broadcast MX static-dequant scales to [128, ...]
+    # to exercise the full-DMA scale-load path (default [1, ...]).
+    mx_pre_broadcast_scales: bool = False,
+    # When True, run qkv() with use_auto_allocation=True (auto SBUF allocation),
+    # exercising the auto-alloc PSUM/weight-buffer branches.
+    use_auto_allocation: bool = False,
+    # When True, emit bias pre-broadcast to [pmax, I] instead of [1, I].
+    bias_pmax_rows: bool = False,
+    # Pass the opaque "float8e4" kv_dtype string sentinel (instead of a concrete dtype).
+    kv_dtype_override=None,
 ):
     """Shared test helper for QKV CTE and TKG tests using UnitTestFramework.
 
@@ -741,6 +786,11 @@ def run_qkv_test(
             qk_norm_pre_rope_config=qk_norm_pre_rope_config,
             qk_norm_post_rope_config=qk_norm_post_rope_config,
             dtype_mode=torch_ref_dtype_mode,
+            pre_broadcast_scales=pre_broadcast_scales,
+            mx_pre_broadcast_scales=mx_pre_broadcast_scales,
+            use_auto_allocation=use_auto_allocation,
+            bias_pmax_rows=bias_pmax_rows,
+            kv_dtype_override=kv_dtype_override,
         )
         kernel_input["is_h_dim_4h_transposed"] = is_h_dim_4h_transposed
         # Only pass transposed_in when True to avoid signature mismatch with torch refs
@@ -787,22 +837,23 @@ def run_qkv_test(
                     v_cache = np.zeros((num_blocks, n_kv_heads, block_size, d_head), dtype=cache_dtype)
                 else:
                     v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_dtype)
-                return {
-                    "q_tensor_hbm": np.zeros((B, S, q_dim), dtype=dtype),
-                    "k_cache": k_cache,
-                    "v_cache": v_cache,
-                }
+                cache_outputs = {"k_cache": k_cache, "v_cache": v_cache}
             else:
                 assert max_seq_len is not None, "contiguous KV cache requires max_seq_len"
                 if not transpose_k_cache:
                     k_cache = np.zeros((B, max_seq_len, kv_dim), dtype=cache_dtype)
                 else:
                     k_cache = np.zeros((B, kv_dim, max_seq_len), dtype=cache_dtype)
-                return {
-                    "q_tensor_hbm": np.zeros((B, S, q_dim), dtype=dtype),
+                cache_outputs = {
                     "k_cache": k_cache,
                     "v_cache": np.zeros((B, max_seq_len, kv_dim), dtype=cache_dtype),
                 }
+            # KV-only projection (q_dim==0): the kernel returns q_tensor_hbm=None, so it is
+            # not a validated output. Emit only the K/V cache outputs to match the kernel's
+            # (and torch ref's) output set.
+            if q_dim == 0:
+                return cache_outputs
+            return {"q_tensor_hbm": np.zeros((B, S, q_dim), dtype=dtype), **cache_outputs}
         output_dtype = nl.bfloat16 if dtype in (nl.float8_e4m3, nl.float8_e4m3fn) else dtype
         result = {
             "out": np.zeros((B * S, fused_qkv_dim) if transposed_in else (B, S, fused_qkv_dim), dtype=output_dtype)
@@ -812,6 +863,8 @@ def run_qkv_test(
         return result
 
     _is_fp8_dtype = dtype in (nl.float8_e4m3, nl.float8_e4m3fn)
+
+    _is_kv_only = (fp8_kv_cache or bf16_kv_cache) and n_q_heads == 0
 
     @functools.wraps(qkv_torch_ref)
     def _qkv_torch_ref_with_resolved_dtype_mode(**kwargs):
@@ -823,7 +876,12 @@ def run_qkv_test(
             if in_scale is not None:
                 scale_scalar = float(in_scale.flatten()[0])
                 kwargs["input"] = kwargs["input"] * scale_scalar
-        return qkv_torch_ref(**kwargs)
+        result = qkv_torch_ref(**kwargs)
+        # KV-only projection (q_dim==0): the kernel emits no Q output, so drop the empty
+        # q_tensor_hbm the ref produces so ref/descriptor output keys match.
+        if _is_kv_only and isinstance(result, dict):
+            result = {k: v for k, v in result.items() if k != "q_tensor_hbm"}
+        return result
 
     framework = UnitTestFramework(
         test_manager=test_manager,

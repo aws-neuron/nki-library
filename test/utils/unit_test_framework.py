@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from inspect import signature
 from typing import Callable, Optional
 
+import numpy as np
 from nkilib_src.nkilib.core.utils.torch_ref_wrapper import torch_ref_wrapper  # noqa: F401
 
 from .common_dataclasses import (
@@ -172,6 +173,7 @@ class UnitTestFramework:
 
             # Validate and filter inputs using shared helpers
             validate_input_keys(kernel_input, self.kernel_entry)
+            validate_input_memory_layout(kernel_input)
             filtered_kernel_input = filter_kernel_input(kernel_input, self.kernel_entry)
 
             if self.trace_only:
@@ -293,6 +295,36 @@ def validate_input_keys(kernel_input: dict, kernel_entry: Callable) -> None:
                 missing_required.append(param_name)
     if missing_required:
         raise ValueError(f"kernel_input missing required parameters: {missing_required}")
+
+
+def validate_input_memory_layout(kernel_input: dict) -> None:
+    """Reject Fortran-ordered (column-major) ndarray inputs.
+
+    Inputs serialized with np.save keep their memory layout: a Fortran-ordered
+    array is written with fortran_order=True and column-major data. Readers
+    that ignore that header see transposed data, so the kernel receives
+    different values than the golden was computed from. Requiring C order
+    keeps every inference backend consistent.
+
+    Such arrays are usually produced by accident, so the error names the
+    input and the common causes. Non-contiguous (strided) views are allowed:
+    np.save writes them in C order.
+
+    Raises:
+        ValueError: If any ndarray input is Fortran-ordered.
+    """
+    fortran_ordered = [
+        f"{name} (shape={value.shape}, dtype={value.dtype})"
+        for name, value in kernel_input.items()
+        if isinstance(value, np.ndarray) and value.flags.f_contiguous and not value.flags.c_contiguous
+    ]
+    if fortran_ordered:
+        raise ValueError(
+            f"kernel_input has Fortran-ordered (column-major) arrays: {fortran_ordered}. "
+            "Kernel inputs must be C-ordered; wrap them in np.ascontiguousarray(...). "
+            "Common causes: .T on a 2D array, np.broadcast_to(...).astype(...), and "
+            ".numpy() on a permuted torch tensor."
+        )
 
 
 def filter_kernel_input(kernel_input: dict, kernel_entry: Callable) -> dict:

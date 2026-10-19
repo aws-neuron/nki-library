@@ -42,22 +42,22 @@ _MOE_TKG_ERROR_PREFIX = "[MoE TKG Kernel]"
 
 
 def moe_tkg(
-    hidden_input: nl.ndarray,
-    expert_gate_up_weights: nl.ndarray,
-    expert_down_weights: nl.ndarray,
-    expert_affinities: nl.ndarray,
-    expert_index: nl.ndarray,
+    hidden_input: nl.NkiTensor,
+    expert_gate_up_weights: nl.NkiTensor,
+    expert_down_weights: nl.NkiTensor,
+    expert_affinities: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
     is_all_expert: bool,
-    rank_id: Optional[nl.ndarray] = None,
-    expert_gate_up_bias: Optional[nl.ndarray] = None,
-    expert_down_bias: Optional[nl.ndarray] = None,
-    expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
-    expert_down_weights_scale: Optional[nl.ndarray] = None,
-    hidden_input_scale: Optional[nl.ndarray] = None,
-    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
-    expert_down_input_scale: Optional[nl.ndarray] = None,
+    rank_id: Optional[nl.NkiTensor] = None,
+    expert_gate_up_bias: Optional[nl.NkiTensor] = None,
+    expert_down_bias: Optional[nl.NkiTensor] = None,
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
+    expert_down_weights_scale: Optional[nl.NkiTensor] = None,
+    hidden_input_scale: Optional[nl.NkiTensor] = None,
+    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
+    expert_down_input_scale: Optional[nl.NkiTensor] = None,
     mask_unselected_experts: bool = False,
-    expert_affinities_eager: Optional[nl.ndarray] = None,
+    expert_affinities_eager: Optional[nl.NkiTensor] = None,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
     activation_fn: ActFnType = ActFnType.SiLU,
     output_dtype=None,
@@ -68,9 +68,9 @@ def moe_tkg(
     output_in_sbuf: bool = False,
     is_all_expert_dynamic: bool = False,
     block_size: int = None,
-    input_dequant_scale: Optional[nl.ndarray] = None,
+    input_dequant_scale: Optional[nl.NkiTensor] = None,
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Experimental MoE TKG kernel. Identical to core except selective-expert MX
     dispatches to the nkiprimitives-based implementation.
@@ -197,11 +197,11 @@ def moe_tkg(
 
 
 def _extract_quantization_type(
-    expert_gate_up_weights: nl.ndarray,
-    expert_gate_up_weights_scale: Optional[nl.ndarray],
-    expert_down_weights_scale: Optional[nl.ndarray],
-    expert_gate_up_input_scale: Optional[nl.ndarray],
-    expert_down_input_scale: Optional[nl.ndarray],
+    expert_gate_up_weights: nl.NkiTensor,
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor],
+    expert_down_weights_scale: Optional[nl.NkiTensor],
+    expert_gate_up_input_scale: Optional[nl.NkiTensor],
+    expert_down_input_scale: Optional[nl.NkiTensor],
 ) -> tuple[QuantizationType, bool]:
     quant_type = QuantizationType.NONE
     is_mx_kernel = False
@@ -222,13 +222,13 @@ def _validate_moe_tkg_inputs(
     is_all_expert_dynamic: bool,
     block_size: int,
     is_mx_kernel: bool,
-    expert_gate_up_weights_scale: Optional[nl.ndarray],
-    expert_down_weights_scale: Optional[nl.ndarray],
-    hidden_input_scale: Optional[nl.ndarray],
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor],
+    expert_down_weights_scale: Optional[nl.NkiTensor],
+    hidden_input_scale: Optional[nl.NkiTensor],
     expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-    expert_gate_up_input_scale: Optional[nl.ndarray],
-    expert_down_input_scale: Optional[nl.ndarray],
-    expert_affinities_eager: Optional[nl.ndarray],
+    expert_gate_up_input_scale: Optional[nl.NkiTensor],
+    expert_down_input_scale: Optional[nl.NkiTensor],
+    expert_affinities_eager: Optional[nl.NkiTensor],
 ) -> None:
     if is_mx_kernel:
         kernel_assert(

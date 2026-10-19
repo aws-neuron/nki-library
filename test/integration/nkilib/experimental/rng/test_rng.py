@@ -81,6 +81,13 @@ FAST_RANDOM_VALUES = [
     pytest.param(4096, id="4096"),
 ]
 
+FAST_MULTILANE_RANDOM_VALUES = FAST_RANDOM_VALUES + [
+    pytest.param(127, id="tail-127"),
+    pytest.param(128, id="multilane-128"),
+    pytest.param(129, id="multilane-128-tail-1"),
+    pytest.param(44_928, id="remainder-44928"),
+]
+
 STATISTICAL_RANDOM_PARAMS = "n_elements"
 STATISTICAL_RANDOM_VALUES = [
     pytest.param(1024, id="1024"),
@@ -255,7 +262,7 @@ class TestRngKernels:
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(FAST_RANDOM_PARAMS, FAST_RANDOM_VALUES)
+    @pytest.mark.parametrize(FAST_RANDOM_PARAMS, FAST_MULTILANE_RANDOM_VALUES)
     def test_generate_random_fast_multilane_fast(
         self, test_manager: Orchestrator, platform_target: Platforms, n_elements
     ):

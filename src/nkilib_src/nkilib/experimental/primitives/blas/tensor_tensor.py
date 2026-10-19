@@ -57,14 +57,14 @@ class TensorTensor(nl.NKIObject):
         src2_tile = self._src2.get_tile()
 
         nisa.tensor_tensor(
-            dst=dst_tile.get_view(),
+            dst=dst_tile,
             op=self._op,
-            data1=src1_tile.get_view(),
-            data2=src2_tile.get_view(),
+            data1=src1_tile,
+            data2=src2_tile,
         )
 
     def execute(self):
-        for _ in range(self._dst.get_num_tiles_without_virtual_batches()):
+        for _ in range(self._dst.get_num_tiles()):
             self.execute_tile()
         self._dst.reset_cur_tile()
         self._src1.reset_cur_tile()

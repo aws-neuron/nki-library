@@ -43,22 +43,22 @@ from .moe_block_tkg_utils import (
 
 @nki.jit
 def moe_block_tkg(
-    inp: nl.ndarray,
-    gamma: nl.ndarray,
-    router_weights: nl.ndarray,
-    expert_gate_up_weights: nl.ndarray,
-    expert_down_weights: nl.ndarray,
-    shared_expert_gate_w: Optional[nl.ndarray] = None,
-    shared_expert_up_w: Optional[nl.ndarray] = None,
-    shared_expert_down_w: Optional[nl.ndarray] = None,
-    expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
-    expert_down_weights_scale: Optional[nl.ndarray] = None,
-    router_bias: Optional[nl.ndarray] = None,
-    expert_gate_up_bias: Optional[nl.ndarray] = None,
-    expert_down_bias: Optional[nl.ndarray] = None,
-    shared_expert_gate_bias: Optional[nl.ndarray] = None,
-    shared_expert_up_bias: Optional[nl.ndarray] = None,
-    shared_expert_down_bias: Optional[nl.ndarray] = None,
+    inp: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    router_weights: nl.NkiTensor,
+    expert_gate_up_weights: nl.NkiTensor,
+    expert_down_weights: nl.NkiTensor,
+    shared_expert_gate_w: Optional[nl.NkiTensor] = None,
+    shared_expert_up_w: Optional[nl.NkiTensor] = None,
+    shared_expert_down_w: Optional[nl.NkiTensor] = None,
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
+    expert_down_weights_scale: Optional[nl.NkiTensor] = None,
+    router_bias: Optional[nl.NkiTensor] = None,
+    expert_gate_up_bias: Optional[nl.NkiTensor] = None,
+    expert_down_bias: Optional[nl.NkiTensor] = None,
+    shared_expert_gate_bias: Optional[nl.NkiTensor] = None,
+    shared_expert_up_bias: Optional[nl.NkiTensor] = None,
+    shared_expert_down_bias: Optional[nl.NkiTensor] = None,
     eps: float = 1e-6,
     top_k: int = 1,
     router_act_fn: RouterActFnType = RouterActFnType.SIGMOID,
@@ -76,10 +76,10 @@ def moe_block_tkg(
     hidden_actual: Optional[int] = None,
     skip_router_logits: bool = False,
     is_all_expert: bool = False,
-    rank_id: Optional[nl.ndarray] = None,
-    residual: Optional[nl.ndarray] = None,
-    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
-    expert_down_input_scale: Optional[nl.ndarray] = None,
+    rank_id: Optional[nl.NkiTensor] = None,
+    residual: Optional[nl.NkiTensor] = None,
+    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
+    expert_down_input_scale: Optional[nl.NkiTensor] = None,
     is_all_expert_dynamic: bool = False,
     block_size: Optional[int] = None,
     inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
@@ -102,27 +102,27 @@ def moe_block_tkg(
         K: Top K experts selected for each token
 
     Args:
-        inp (nl.ndarray): [B, S, H] or [128, n_prgs, H//128//n_prgs, B×S] depending on inp_layout.
-        gamma (nl.ndarray): [1, H], Normalization weights on HBM.
-        router_weights (nl.ndarray): [H, E], Router weights on HBM.
-        expert_gate_up_weights (nl.ndarray): [E, H, 2, I] for bf16/fp16 OR [E, 128, 2, ceil(H/512), I] for MX,
+        inp (nl.NkiTensor): [B, S, H] or [128, n_prgs, H//128//n_prgs, B×S] depending on inp_layout.
+        gamma (nl.NkiTensor): [1, H], Normalization weights on HBM.
+        router_weights (nl.NkiTensor): [H, E], Router weights on HBM.
+        expert_gate_up_weights (nl.NkiTensor): [E, H, 2, I] for bf16/fp16 OR [E, 128, 2, ceil(H/512), I] for MX,
             Fused gate and up projection weights on HBM.
-        expert_down_weights (nl.ndarray): [E, I, H] for bf16/fp16 OR [E, I_p, ceil(I/512), H] for MX,
+        expert_down_weights (nl.NkiTensor): [E, I, H] for bf16/fp16 OR [E, I_p, ceil(I/512), H] for MX,
             Down projection weights on HBM. I_p = I//4 if I <= 512 else 128.
-        shared_expert_gate_w (nl.ndarray): [H, I], Optional gate projection weights for shared expert on HBM.
-        shared_expert_up_w (nl.ndarray): [H, I], Optional up projection weights for shared expert on HBM.
-        shared_expert_down_w (nl.ndarray): [I, H], Optional down projection weights for shared expert on HBM.
-        expert_gate_up_weights_scale (nl.ndarray): [E, 16, 2, ceil(H/512), I], Optional MxFP quantization scales
+        shared_expert_gate_w (nl.NkiTensor): [H, I], Optional gate projection weights for shared expert on HBM.
+        shared_expert_up_w (nl.NkiTensor): [H, I], Optional up projection weights for shared expert on HBM.
+        shared_expert_down_w (nl.NkiTensor): [I, H], Optional down projection weights for shared expert on HBM.
+        expert_gate_up_weights_scale (nl.NkiTensor): [E, 16, 2, ceil(H/512), I], Optional MxFP quantization scales
             for gate and up projection weights. Required when expert_gate_up_weights dtype is MX.
-        expert_down_weights_scale (nl.ndarray): [E, I_p/8, ceil(I/512), H], Optional MxFP quantization scales
+        expert_down_weights_scale (nl.NkiTensor): [E, I_p/8, ceil(I/512), H], Optional MxFP quantization scales
             for down projection weights. Required when expert_down_weights dtype is MX.
-        router_bias (nl.ndarray): [1, E], Optional bias for router computation.
-        expert_gate_up_bias (nl.ndarray): [E, 2, I] for non-MX OR [E, I_p, 2, ceil(I/512), 4] for MX,
+        router_bias (nl.NkiTensor): [1, E], Optional bias for router computation.
+        expert_gate_up_bias (nl.NkiTensor): [E, 2, I] for non-MX OR [E, I_p, 2, ceil(I/512), 4] for MX,
             Optional fused gate and up projection bias.
-        expert_down_bias (nl.ndarray): [E, H], Optional down projection bias for expert computation.
-        shared_expert_gate_bias (nl.ndarray): [1, I], Optional gate projection bias for shared expert. Placeholder.
-        shared_expert_up_bias (nl.ndarray): [1, I], Optional up projection bias for shared expert. Placeholder.
-        shared_expert_down_bias (nl.ndarray): [1, H], Optional down projection bias for shared expert. Placeholder.
+        expert_down_bias (nl.NkiTensor): [E, H], Optional down projection bias for expert computation.
+        shared_expert_gate_bias (nl.NkiTensor): [1, I], Optional gate projection bias for shared expert. Placeholder.
+        shared_expert_up_bias (nl.NkiTensor): [1, I], Optional up projection bias for shared expert. Placeholder.
+        shared_expert_down_bias (nl.NkiTensor): [1, H], Optional down projection bias for shared expert. Placeholder.
         eps (float): Epsilon value used in RMSNorm.
         top_k (int): Number of top K experts selected for each token.
         router_act_fn (RouterActFnType): Activation function (softmax/sigmoid) applied on router_logits.
@@ -144,13 +144,13 @@ def moe_block_tkg(
         skip_router_logits (bool): Whether to skip returning router logits tensor.
         is_all_expert (bool): If True, use all-expert mode (iterate over local experts).
             If False, use selective-expert mode (iterate over tokens).
-        rank_id (nl.ndarray): [1, 1], Worker rank for expert sharding. Required when is_all_expert=True.
-        residual (nl.ndarray): [B, S, H] or [T, H], Optional residual tensor for fused residual add.
+        rank_id (nl.NkiTensor): [1, 1], Worker rank for expert sharding. Required when is_all_expert=True.
+        residual (nl.NkiTensor): [B, S, H] or [T, H], Optional residual tensor for fused residual add.
             Only supported for MXFP in all_expert mode.
-        expert_gate_up_input_scale (nl.ndarray, optional): [E_L, 1], Per-tensor FP8 activation dequantization
+        expert_gate_up_input_scale (nl.NkiTensor, optional): [E_L, 1], Per-tensor FP8 activation dequantization
             scale for gate/up projections. Required for STATIC and STATIC_MX quantization modes.
             When provided together with expert_down_input_scale and MX weights, enables STATIC_MX mode.
-        expert_down_input_scale (nl.ndarray, optional): [E_L, 1], Per-tensor FP8 activation dequantization
+        expert_down_input_scale (nl.NkiTensor, optional): [E_L, 1], Per-tensor FP8 activation dequantization
             scale for down projection. Required for STATIC and STATIC_MX quantization modes.
         is_all_expert_dynamic (bool): If True, use dynamic control flow in all-expert mode.
             Only valid when is_all_expert=True. (default: False)
@@ -165,10 +165,10 @@ def moe_block_tkg(
             supported with MX quantization. Default is B_S_H.
 
     Returns:
-        out (nl.ndarray): [T, H] when outp_layout=B_S_H, or [128, n_prgs, H//128//n_prgs, T]
+        out (nl.NkiTensor): [T, H] when outp_layout=B_S_H, or [128, n_prgs, H//128//n_prgs, T]
             when outp_layout=_128_Nprgs_Hfree_T. Output tensor of the kernel.
-        router_logits (nl.ndarray): [T, E], Router logits. Returned when skip_router_logits is False.
-        residual_out (nl.ndarray): [T, H], Residual output. Returned when residual is provided (all_expert mode).
+        router_logits (nl.NkiTensor): [T, E], Router logits. Returned when skip_router_logits is False.
+        residual_out (nl.NkiTensor): [T, H], Residual output. Returned when residual is provided (all_expert mode).
 
     Notes:
         - H must be divisible by 128 (partition size) and by 256 (128 * n_prgs for LNC-2)
@@ -477,11 +477,11 @@ def moe_block_tkg(
 
 
 def _moe_block_tkg_no_t_tiling(
-    inp: nl.ndarray,
-    gamma: nl.ndarray,
-    router_weights: nl.ndarray,
-    expert_gate_up_weights: nl.ndarray,
-    expert_down_weights: nl.ndarray,
+    inp: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    router_weights: nl.NkiTensor,
+    expert_gate_up_weights: nl.NkiTensor,
+    expert_down_weights: nl.NkiTensor,
     dims: "MoEBlockTKGDims",
     quant_config: "QuantizationConfig",
     expert_config: "ExpertConfig",
@@ -495,22 +495,22 @@ def _moe_block_tkg_no_t_tiling(
     hidden_act_fn: ActFnType,
     router_mm_dtype,
     skip_router_logits: bool,
-    expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
-    expert_down_weights_scale: Optional[nl.ndarray] = None,
-    router_bias: Optional[nl.ndarray] = None,
-    expert_gate_up_bias: Optional[nl.ndarray] = None,
-    expert_down_bias: Optional[nl.ndarray] = None,
-    residual: Optional[nl.ndarray] = None,
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
+    expert_down_weights_scale: Optional[nl.NkiTensor] = None,
+    router_bias: Optional[nl.NkiTensor] = None,
+    expert_gate_up_bias: Optional[nl.NkiTensor] = None,
+    expert_down_bias: Optional[nl.NkiTensor] = None,
+    residual: Optional[nl.NkiTensor] = None,
     gate_clamp_upper_limit: Optional[float] = None,
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
-    rank_id: Optional[nl.ndarray] = None,
-    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
-    expert_down_input_scale: Optional[nl.ndarray] = None,
+    rank_id: Optional[nl.NkiTensor] = None,
+    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
+    expert_down_input_scale: Optional[nl.NkiTensor] = None,
     is_all_expert_dynamic: bool = False,
     block_size: Optional[int] = None,
-    moe_output: Optional[nl.ndarray] = None,
+    moe_output: Optional[nl.NkiTensor] = None,
     inp_layout: Optional[MoEBlockIOLayout] = None,
     outp_layout: Optional[MoEBlockIOLayout] = None,
 ):
@@ -684,8 +684,9 @@ def _moe_block_tkg_no_t_tiling(
     if not expert_config.is_all_expert and quant_config.is_moe_weight_mx:
         expert_affinities_eager = router_outputs[3].reshape((dims.T, dims.K))
 
-    # Step 3: [Optional] compute shared expert
-    if expert_config.has_shared_expert:
+    # Step 3: [Optional] compute shared expert. Unreachable today: validate_moe_block_inputs
+    # asserts not has_shared_expert, so has_shared_expert=True raises before reaching here.
+    if expert_config.has_shared_expert:  # pragma: no cover
         # TODO
         pass
 

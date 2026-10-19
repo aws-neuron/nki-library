@@ -23,8 +23,8 @@ import nki
 import nki.language as nl
 import numpy as np
 import pytest
-from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import hbm_dma_transpose
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
+from nkilib_src.nkilib.experimental.mlp_mxfp8._common_utils import hbm_dma_transpose
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
     with_active_sbm,

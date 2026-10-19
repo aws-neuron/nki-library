@@ -30,6 +30,7 @@ from test.utils.common_dataclasses import (
     InferenceArgs,
     Platforms,
 )
+from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
 
@@ -38,6 +39,10 @@ from test.utils.unit_test_collective_framework import CollectiveUnitTestFramewor
 # ============================================================
 
 
+@pytest_test_metadata(
+    name="RingAttentionFwd",
+    pytest_marks=["collectives", "ring_attention"],
+)
 class TestRingAttentionFwd:
     """Integration tests for ring attention forward kernel."""
 
@@ -102,11 +107,21 @@ class TestRingAttentionFwd:
                 [0, 2048, 8192, 12288, 20480, 24576, 30720, 32768],
                 id="causal_striped_s32768_packed_cp4_lnc2",
             ),
+            # ──── Many batches per LNC2 shard, cp>2 causal contiguous ────
+            #      Guards the per-ring-step cp_offset slots: needs contiguous causal,
+            #      cp_degree > 2, and several batches per core so a batch's cp_offset read
+            #      is issued after later ring steps' writes.
+            pytest.param(2, 8, 2, 512, 128, 4, 2, True, False, None, id="causal_contig_gqa_bh16_spr512_cp4_lnc2"),
+            pytest.param(2, 8, 2, 4096, 128, 4, 2, True, False, None, id="causal_contig_gqa_bh16_spr4096_cp4_lnc2"),
             # ──── Ragged seqlen (not a multiple of 128) ────
             pytest.param(1, 1, 1, 4160, 128, 2, 1, False, False, None, id="nocausal_ragged_cp2_lnc1"),
             pytest.param(1, 2, 2, 4160, 128, 2, 2, False, False, None, id="nocausal_ragged_cp2_lnc2_even"),
             pytest.param(1, 1, 1, 4160, 128, 2, 2, False, False, None, id="nocausal_ragged_cp2_lnc2_odd_seqshard"),
             pytest.param(1, 1, 1, 576, 128, 2, 2, False, False, None, id="nocausal_ragged_cp2_lnc2_odd_singlecore"),
+            # ──── bs*nheads == 1 at LNC2 with cp > 2 and long per-rank seqlen ────
+            #      Seqlen-sharded remainder batch where neither NC owns a whole batch. Both NCs must
+            #      write the K/V send buffers, else the collective fails to lower (NCC_ILLC064).
+            pytest.param(1, 1, 1, 8192, 128, 4, 2, False, False, None, id="nocausal_bh1_spr8192_cp4_lnc2_seqshard"),
             pytest.param(1, 1, 1, 4160, 128, 2, 1, True, False, None, id="causal_contig_ragged_cp2_lnc1"),
             pytest.param(1, 2, 2, 4160, 128, 2, 2, True, False, None, id="causal_contig_ragged_cp2_lnc2_even"),
             pytest.param(1, 1, 1, 4160, 128, 2, 2, True, False, None, id="causal_contig_ragged_cp2_lnc2_odd"),
@@ -471,4 +486,67 @@ class TestRingAttentionFwd:
                 additional_cmd_args=additional_cmd_args,
             ),
             output_keys=["out_o", "out_lse"],
+        )
+
+    @pytest.mark.parametrize(
+        "bs, nheads, seqlen_per_rank, d, cp_degree, lnc",
+        [
+            # bs*nheads == 1 at LNC2: remainder batch seqlen-sharded across NCs (seqlen >= 1024)
+            pytest.param(1, 1, 4096, 128, 2, 2, id="tp_layout_bh1_seqshard_cp2_lnc2"),
+            # bs*nheads == 1 at LNC2: remainder batch handled by NC 0 only (seqlen < 1024)
+            pytest.param(1, 1, 512, 128, 2, 2, id="tp_layout_bh1_singlecore_cp2_lnc2"),
+        ],
+    )
+    def test_ring_attention_spmd_fwd_tp_layout_lnc2_odd(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        bs: int,
+        nheads: int,
+        seqlen_per_rank: int,
+        d: int,
+        cp_degree: int,
+        lnc: int,
+    ):
+        """Non-transposed Q/K input (tp_q=tp_k=True) with an LNC2 remainder batch.
+
+        Covers the [bs, seqlen, d] K layout in the remainder-batch send-buffer init,
+        which the main test (pre-transposed K) does not exercise.
+        """
+        np.random.seed(42)
+        scale = 1.0 / math.sqrt(d)
+        q_per_rank = [np.random.randn(bs, nheads, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+        k_per_rank = [np.random.randn(bs, nheads, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+        v_per_rank = [np.random.randn(bs, nheads, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+        replica_groups = (tuple(range(cp_degree)),)
+
+        def create_inputs(rank_id: int):
+            return {
+                "q": q_per_rank[rank_id].astype(ml_dtypes.bfloat16),
+                "k": k_per_rank[rank_id].astype(ml_dtypes.bfloat16),
+                "v": v_per_rank[rank_id].astype(ml_dtypes.bfloat16),
+                "replica_groups": replica_groups,
+                "num_workers": cp_degree,
+                "softmax_scale": scale,
+                "use_causal_mask": False,
+                "striped_input": False,
+                "training": True,
+                "tp_q": True,
+                "tp_k": True,
+            }
+
+        env_vars = {"NEURON_RT_ULTRASERVER_MODE": "4"} if (platform_target.is_trn3() and cp_degree > 1) else None
+        framework = CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=ring_attention_spmd_fwd,
+            torch_ref=ring_attention_spmd_fwd_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=cp_degree,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            inference_args=InferenceArgs(collective_ranks=cp_degree, env_vars=env_vars),
+            output_keys=["out_o", "out_lse"],
+            atol=1e-3,
         )

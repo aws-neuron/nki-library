@@ -178,7 +178,7 @@ def get_floor_aligned_size(size: int, alignment_multiple: int) -> int:
     return get_floor_quotient(size, alignment_multiple) * alignment_multiple
 
 
-def is_hbm_buffer(tensor: nl.ndarray) -> bool:
+def is_hbm_buffer(tensor: nl.NkiTensor) -> bool:
     """Check if tensor buffer is any HBM type (hbm, shared_hbm, private_hbm)."""
     return tensor.buffer in (nl.hbm, nl.shared_hbm, nl.private_hbm)
 
@@ -237,6 +237,8 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
         return nl.gelu_apprx_sigmoid
     elif act_fn == ActFnType.ReLU:
         return nl.relu
+    else:  # pragma: no cover - defensive: unreachable for validated inputs
+        kernel_assert(False, f"Unsupported activation function type: {act_fn}")
 
 
 def apply_activation(dst, data, act_fn: ActFnType, scale=1.0):
@@ -278,7 +280,7 @@ def apply_activation_dx(dst, data, act_fn: ActFnType):
         nisa.activation(dst=dst, data=data, op=nl.silu_dx)
     elif act_fn == ActFnType.Swish:
         nisa.activation(dst=dst, data=data, op=nl.gelu_apprx_sigmoid_dx)
-    else:
+    else:  # pragma: no cover - defensive: unreachable for validated inputs
         kernel_assert(False, f"apply_activation_dx: unsupported activation type {act_fn}")
 
 
@@ -524,6 +526,8 @@ def reduce(op='mul', input: List = None, initial_value=None):
             initial_value = min(initial_value, value)
         elif op == 'max':
             initial_value = max(initial_value, value)
+        else:  # pragma: no cover - defensive: unreachable for validated inputs
+            kernel_assert(False, f"Unsupported op: {op}")
     return initial_value
 
 
@@ -576,7 +580,7 @@ def resolve_dtype_to_nki(dtype):
     """
     dtype_str = str(dtype)
     if dtype_str == 'bool':
-        return nl.bool
+        return nl.bool_
     elif dtype_str == 'int8':
         return nl.int8
     elif dtype_str == 'int16':
@@ -608,11 +612,13 @@ def resolve_dtype_to_nki(dtype):
         return nl.float8_e4m3fn_x4
     elif dtype_str == str(nl.float8_e5m2_x4):
         return nl.float8_e5m2_x4
-    kernel_assert(False, f'Unrecognized dtype {dtype_str}')
+    kernel_assert(
+        False, f'Unrecognized dtype {dtype_str}'
+    )  # pragma: no cover - defensive: unreachable for validated inputs
 
 
 def _sbm_alloc(sbm, shape, dtype, buffer=nl.sbuf, name=None, align=None):
-    """Allocate SBUF tensor via SbufManager if available, else fall back to nl.ndarray."""
+    """Allocate SBUF tensor via SbufManager if available, else fall back to nl.NkiTensor."""
     if sbm is not None:
         return sbm.alloc_stack(shape=shape, dtype=dtype, buffer=buffer, name=name, align=align)
     return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=name)

@@ -357,3 +357,29 @@ class TestSQSEmitter:
         assert payload["Target"] == "trn2"
         assert payload["TraceMode"] == "compile_and_infer"
         assert "Timestamp" in payload
+
+    def test_sqs_client_pinned_to_queue_region(self):
+        """The SQS client must target the queue's own region, not the ambient one.
+
+        The coverage pipeline step runs in us-east-2 while the queue is in us-east-1;
+        boto3 routes SendMessage to the client's region, so without pinning the send
+        hits a non-existent queue in the wrong region (NKILIB-2056).
+        """
+        emitter = SQSEmitter(
+            session=replace(
+                _SESSION,
+                sqs_queue_url="https://sqs.us-east-1.amazonaws.com/123456789/test-queue",
+            ),
+        )
+        with patch("boto3.client") as mock_client:
+            emitter._get_sqs_client()
+        mock_client.assert_called_once_with("sqs", region_name="us-east-1")
+
+    def test_sqs_client_falls_back_when_region_unparseable(self):
+        """A non-standard queue host leaves region resolution to boto3's defaults."""
+        emitter = SQSEmitter(
+            session=replace(_SESSION, sqs_queue_url="https://example.internal/123456789/test-queue"),
+        )
+        with patch("boto3.client") as mock_client:
+            emitter._get_sqs_client()
+        mock_client.assert_called_once_with("sqs")

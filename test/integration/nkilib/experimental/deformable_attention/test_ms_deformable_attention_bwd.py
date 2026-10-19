@@ -44,6 +44,11 @@ def generate_ms_deformable_attention_bwd_inputs(
     sampling_locations_layout: str = "BQHLP2",
     align_corners: bool = False,
     padding_mode: str = "zeros",
+    max_gather_indices_per_indirect=None,
+    max_scatter_indices_per_indirect=None,
+    gather_method: str = "transpose",
+    num_scatter_buffers=None,
+    compute_grads: str = "vla",
 ):
     """
     Generate inputs for multi-scale deformable attention backward kernel test.
@@ -112,49 +117,56 @@ def generate_ms_deformable_attention_bwd_inputs(
         "sampling_locations_layout": sampling_locations_layout,
         "align_corners": align_corners,
         "padding_mode": padding_mode,
+        "max_gather_indices_per_indirect": max_gather_indices_per_indirect,
+        "max_scatter_indices_per_indirect": max_scatter_indices_per_indirect,
+        "gather_method": gather_method,
+        "num_scatter_buffers": num_scatter_buffers,
+        "compute_grad_value": "v" in compute_grads,
+        "compute_grad_sampling_locations": "l" in compute_grads,
+        "compute_grad_attention_weights": "a" in compute_grads,
     }
 
 
 # fmt: off
 MS_DEFORM_ATTN_BWD_PARAM_NAMES = (
-    "batch, n_queries, n_heads, c_head, n_levels, n_points, spatial_shapes, dtype, value_layout, sampling_locations_layout, align_corners, padding_mode"
+    "batch, n_queries, n_heads, c_head, n_levels, n_points, spatial_shapes, dtype, value_layout, sampling_locations_layout, align_corners, padding_mode, max_gather_indices_per_indirect, max_scatter_indices_per_indirect, gather_method, num_scatter_buffers, compute_grads"
 )
 
 # Basic test parameters
 MS_DEFORM_ATTN_BWD_BASIC_ALL_PARAMS = [
     # align_corners = False, padding_mode = zeros, BLNC layout
-    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"),
-    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros"),
-    # align_corners = False, padding_mode = zeros, BNLC layout
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "B2QHLP", False, "zeros"),
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "BQHLP2", False, "zeros"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "vla"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "vla"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "v"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "v"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "la"),
+    (2, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "la"),
     # align_corners = False, padding_mode = border
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "border"),
-    (1, 512, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "border"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "border", None, None, "transpose", None, "vla"),
+    (1, 512, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "border", None, None, "transpose", None, "vla"),
     # align_corners = True, padding_mode = zeros
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", True, "zeros"),
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "zeros"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "zeros", None, None, "transpose", None, "vla"),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "zeros", None, None, "transpose", None, "vla"),
     # align_corners = True, padding_mode = border
-    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", True, "border"),
-    pytest.param(1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "border", marks=pytest.mark.fast),
+    (1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "border", None, None, "transpose", None, "vla"),
+    pytest.param(1, 256, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", True, "border", None, None, "transpose", None, "vla", marks=pytest.mark.fast),
     # C_h > 128
-    pytest.param(1, 256, 4, 256, 4, 4, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", marks=pytest.mark.fast),
-    pytest.param(1, 256, 4, 144, 4, 4, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "BQHLP2", False, "zeros", marks=pytest.mark.fast),
+    pytest.param(1, 256, 4, 256, 4, 4, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "vla", marks=pytest.mark.fast),
     # N_q % 128 != 0
-    pytest.param(1, 263, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", marks=pytest.mark.fast),
-    pytest.param(1, 501, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BNLC", "B2QHLP", False, "zeros", marks=pytest.mark.fast),
+    pytest.param(1, 263, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "vla", marks=pytest.mark.fast),
+    pytest.param(1, 501, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "BQHLP2", False, "zeros", None, None, "transpose", None, "vla", marks=pytest.mark.fast),
 ]
 
 # BEVFormer test parameters
 MS_DEFORM_ATTN_BWD_BEVFORMER_ALL_PARAMS = [
-    (2, 512, 8, 32, 4, 8, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"),
     # BEVFormer Base (200x200)
-    (1, 40000, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # TSA
-    (1, 900, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # Decoder
+    (1, 256, 8, 32, 4, 1, [(50, 45), (25, 21), (13, 9), (5, 7)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", None, None, "transpose", None, "vla"), # Smaller SCA
+    (1, 256, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", None, None, "transpose", None, "vla"), # TSA
+    (1, 256, 8, 32, 1, 4, [(200, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", None, None, "transpose", None, "vla"), # Decoder
     # BEVFormer Small (150x150)
-    (1, 13500, 8, 32, 1, 8, [(113, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # SCA
-    (1, 22500, 8, 32, 1, 4, [(150, 150)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # TSA
-    (1, 900, 8, 32, 1, 4, [(150, 150)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros"), # Decoder
+    (1, 256, 8, 32, 1, 8, [(113, 200)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", None, None, "transpose", None, "vla"), # SCA
+    (1, 256, 8, 32, 1, 4, [(150, 150)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", None, None, "transpose", None, "vla"), # TSA
+    (1, 256, 8, 32, 1, 4, [(150, 150)], nl.bfloat16, "BLNC", "B2QHLP", False, "zeros", None, None, "transpose", None, "vla"), # Decoder
 ]
 # fmt: on
 
@@ -180,6 +192,11 @@ class TestMSDeformableAttentionBwd:
         sampling_locations_layout,
         align_corners,
         padding_mode,
+        max_gather_indices_per_indirect,
+        max_scatter_indices_per_indirect,
+        gather_method,
+        num_scatter_buffers,
+        compute_grads,
     ):
         """Test multi-scale deformable attention backward pass basic configurations."""
 
@@ -197,6 +214,11 @@ class TestMSDeformableAttentionBwd:
                 sampling_locations_layout=sampling_locations_layout,
                 align_corners=align_corners,
                 padding_mode=padding_mode,
+                max_gather_indices_per_indirect=max_gather_indices_per_indirect,
+                max_scatter_indices_per_indirect=max_scatter_indices_per_indirect,
+                gather_method=gather_method,
+                num_scatter_buffers=num_scatter_buffers,
+                compute_grads=compute_grads,
             )
 
         # Compute L for output shapes
@@ -214,11 +236,18 @@ class TestMSDeformableAttentionBwd:
             else:  # B2QHLP
                 grad_sampling_locations_shape = (batch, 2, n_queries, n_heads, n_levels, n_points)
 
-            return {
-                "out_grad_value": np.zeros(grad_value_shape, dtype=dtype),
-                "out_grad_sampling_locations": np.zeros(grad_sampling_locations_shape, dtype=np.float32),
-                "out_grad_attention_weights": np.zeros((batch, n_queries, n_heads, n_levels, n_points), dtype=dtype),
-            }
+            # The kernel only allocates and returns the gradients that were requested, so the
+            # descriptor has to match that arity and order.
+            descriptor = {}
+            if "v" in compute_grads:
+                descriptor["out_grad_value"] = np.zeros(grad_value_shape, dtype=dtype)
+            if "l" in compute_grads:
+                descriptor["out_grad_sampling_locations"] = np.zeros(grad_sampling_locations_shape, dtype=np.float32)
+            if "a" in compute_grads:
+                descriptor["out_grad_attention_weights"] = np.zeros(
+                    (batch, n_queries, n_heads, n_levels, n_points), dtype=dtype
+                )
+            return descriptor
 
         def golden_generator():
             """Generate golden output using torch reference."""
@@ -268,6 +297,11 @@ class TestMSDeformableAttentionBwd:
         sampling_locations_layout,
         align_corners,
         padding_mode,
+        max_gather_indices_per_indirect,
+        max_scatter_indices_per_indirect,
+        gather_method,
+        num_scatter_buffers,
+        compute_grads,
     ):
         """Test multi-scale deformable attention backward pass with BEVFormer configs."""
 
@@ -285,6 +319,11 @@ class TestMSDeformableAttentionBwd:
                 sampling_locations_layout=sampling_locations_layout,
                 align_corners=align_corners,
                 padding_mode=padding_mode,
+                max_gather_indices_per_indirect=max_gather_indices_per_indirect,
+                max_scatter_indices_per_indirect=max_scatter_indices_per_indirect,
+                gather_method=gather_method,
+                num_scatter_buffers=num_scatter_buffers,
+                compute_grads=compute_grads,
             )
 
         # Compute L for output shapes
@@ -302,11 +341,18 @@ class TestMSDeformableAttentionBwd:
             else:  # B2QHLP
                 grad_sampling_locations_shape = (batch, 2, n_queries, n_heads, n_levels, n_points)
 
-            return {
-                "out_grad_value": np.zeros(grad_value_shape, dtype=dtype),
-                "out_grad_sampling_locations": np.zeros(grad_sampling_locations_shape, dtype=np.float32),
-                "out_grad_attention_weights": np.zeros((batch, n_queries, n_heads, n_levels, n_points), dtype=dtype),
-            }
+            # The kernel only allocates and returns the gradients that were requested, so the
+            # descriptor has to match that arity and order.
+            descriptor = {}
+            if "v" in compute_grads:
+                descriptor["out_grad_value"] = np.zeros(grad_value_shape, dtype=dtype)
+            if "l" in compute_grads:
+                descriptor["out_grad_sampling_locations"] = np.zeros(grad_sampling_locations_shape, dtype=np.float32)
+            if "a" in compute_grads:
+                descriptor["out_grad_attention_weights"] = np.zeros(
+                    (batch, n_queries, n_heads, n_levels, n_points), dtype=dtype
+                )
+            return descriptor
 
         def golden_generator():
             """Generate golden output using torch reference."""

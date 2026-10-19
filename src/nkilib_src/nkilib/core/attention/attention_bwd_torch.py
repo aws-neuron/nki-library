@@ -140,7 +140,7 @@ def compute_o_lse(
     logit_bias: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
     dropout_mask: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
     bound_min: Optional[torch.Tensor] = None,
     bound_max: Optional[torch.Tensor] = None,
     cp_offset: int = 0,

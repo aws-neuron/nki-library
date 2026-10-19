@@ -125,6 +125,18 @@ MODELS: dict[str, MoeModelSpec] = {
         "up_clamp_upper": 7.0,
         "up_clamp_lower": -7.0,
     },
+    "glm_5_3": {
+        "hidden": 6144,
+        "full_intermediate": 2048,
+        "total_experts": 256,
+        "global_top_k": 8,
+        "act_fn": ActFnType.SiLU,
+        "bias": False,
+        "gate_clamp_upper": None,
+        "gate_clamp_lower": None,
+        "up_clamp_upper": None,
+        "up_clamp_lower": None,
+    },
     "qwen3_235b": {
         "hidden": 4096,
         "full_intermediate": 1536,
@@ -166,6 +178,24 @@ OPTIMAL_CONFIGS: dict[str, MoeBwmmMxModelConfig] = {
         "SKEWNESS_PCTS": [1.0],
         "SHARD_ON_BLOCK_BLK_SIZES": [128, 256],
         "SHARD_ON_BLOCK_WDTS": [nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4],
+        "SHARD_ON_BLOCK_IS_DYNAMIC": True,
+    },
+    # GLM-5.3 routed MoE, mxfp4, 256 experts top-8, moe_intermediate 2048. EP32/TP2 is the
+    # target sharding: per the GLM MoE microbenchmark it is within 3% of EP64/TP1 when routing
+    # is balanced and about 20% faster when it is not, because only TP splits a single hot
+    # expert across ranks. EP64/TP1 is deliberately absent at this token count, it Stack-OOMs
+    # (down_projection_mx, short by 1.8 KB) with I_TP=2048 at T >= 131072.
+    "glm_5_3": {
+        "BWMM_VARIANTS": ["shard_on_block"],
+        "EP_MOETP_CONFIGS": [
+            (32, 2),  # EP32 MoETP2: E_local=8, I_TP=1024
+        ],
+        # Dispatched token count, not the context length: global_top_k * S / ep, so 8 * 131072 / 32
+        # at a 128k context. Long contexts are chunked, so the dispatch stays this size.
+        "SEQ_LENS": [32768],
+        "SKEWNESS_PCTS": [0.25],
+        "SHARD_ON_BLOCK_BLK_SIZES": [256],
+        "SHARD_ON_BLOCK_WDTS": [nl.float4_e2m1fn_x4],
         "SHARD_ON_BLOCK_IS_DYNAMIC": True,
     },
     "qwen3_235b": {

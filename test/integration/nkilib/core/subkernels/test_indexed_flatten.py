@@ -44,61 +44,86 @@ def _output_tensor_descriptor(kernel_input):
     return {"flattened_array": np.zeros(kernel_input["output_len"], dtype=np.int32)}
 
 
+_LNC_ABBREVS = {"lnc_degree": "lnc"}
+
 # fmt: off
 FAST_PARAM_NAMES = \
-    "T, E, f_len"
+    "lnc_degree, T, E, f_len"
 FAST_TEST_PARAMS = [
-    pytest.param(4096,  1,   128, marks=pytest.mark.fast),
-    (4096,  2,   128),
-    (4096,  2,   256),
-    (4096,  3,   128),
-    (10240, 16,  128),
-    (10240, 17,  128),
-    (65536, 4,   128),
-    (65536, 4,   256),
-    (4096,  64,  128),
-    (4096,  128, 128),
-    (4096,  256, 128),
+    pytest.param(1, 4096,  1,   128, marks=pytest.mark.fast),
+    pytest.param(2, 4096,  1,   128, marks=pytest.mark.fast),
+    (1, 4096,  2,   128),
+    (2, 4096,  2,   128),
+    (1, 4096,  2,   256),
+    (2, 4096,  2,   256),
+    (1, 4096,  3,   128),
+    (2, 4096,  3,   128),
+    (1, 10240, 16,  128),
+    (2, 10240, 16,  128),
+    (1, 10240, 17,  128),
+    (2, 10240, 17,  128),
+    (1, 65536, 4,   128),
+    (2, 65536, 4,   128),
+    (1, 65536, 4,   256),
+    (2, 65536, 4,   256),
+    (1, 4096,  64,  128),
+    (2, 4096,  64,  128),
+    # LNC2 only: NCC_IGCA094 at LNC1 (Pool engine registers).
+    (2, 4096,  128, 128),
+    (2, 4096,  256, 128),
 ]
 
 ROW_OFFSET_PARAM_NAMES = \
-    "T, E, f_len, N, row_offsets_start"
+    "lnc_degree, T, E, f_len, N, row_offsets_start"
 ROW_OFFSET_TEST_PARAMS = [
-    (4096,  2, 128, 4,  2),
-    (4096,  3, 128, 5,  1),
-    (10240, 8, 128, 16, 8),
+    (1, 4096,  2, 128, 4,  2),
+    (2, 4096,  2, 128, 4,  2),
+    (1, 4096,  3, 128, 5,  1),
+    (2, 4096,  3, 128, 5,  1),
+    (1, 10240, 8, 128, 16, 8),
+    (2, 10240, 8, 128, 16, 8),
 ]
 
 SPARSE_ROUTING_PARAM_NAMES = \
-    "T, E, f_len, row_offsets_start, tokens_per_expert"
+    "lnc_degree, T, E, f_len, row_offsets_start, tokens_per_expert"
 SPARSE_ROUTING_TEST_PARAMS = [
     # Empty expert: cross-NC race (expert 1 on NC0, expert 2 on NC1 share offset).
-    pytest.param(256,  4, 16, 0,  [16, 0, 16, 16], marks=pytest.mark.fast),
+    pytest.param(1, 256,  4, 16, 0,  [16, 0, 16, 16], marks=pytest.mark.fast),
+    pytest.param(2, 256,  4, 16, 0,  [16, 0, 16, 16], marks=pytest.mark.fast),
     # Empty expert: with row_offsets_start.
-    (256,  4, 16, 8,  [16, 0, 16, 16]),
+    (1, 256,  4, 16, 8,  [16, 0, 16, 16]),
+    (2, 256,  4, 16, 8,  [16, 0, 16, 16]),
     # Multiple empty experts: cross-NC overlap.
-    (256,  4, 16, 0,  [0, 0, 16, 16]),
+    (1, 256,  4, 16, 0,  [0, 0, 16, 16]),
+    (2, 256,  4, 16, 0,  [0, 0, 16, 16]),
     # Padding spill: T/f_len=32 but only 2-8 blocks allocated per expert.
-    (4096, 4, 128, 0,  [470, 252, 359, 775]),
+    (1, 4096, 4, 128, 0,  [470, 252, 359, 775]),
+    (2, 4096, 4, 128, 0,  [470, 252, 359, 775]),
     # Padding spill: with row_offsets_start.
-    (4096, 4, 128, 8,  [470, 252, 359, 775]),
+    (1, 4096, 4, 128, 8,  [470, 252, 359, 775]),
+    (2, 4096, 4, 128, 8,  [470, 252, 359, 775]),
     # Padding spill: minimal tokens — maximum spill.
-    (4096, 4, 128, 0,  [1, 1, 1, 1]),
+    (1, 4096, 4, 128, 0,  [1, 1, 1, 1]),
+    (2, 4096, 4, 128, 0,  [1, 1, 1, 1]),
     # Mixed: empty expert + padding spill.
-    (4096, 4, 128, 0,  [128, 0, 200, 500]),
+    (1, 4096, 4, 128, 0,  [128, 0, 200, 500]),
+    (2, 4096, 4, 128, 0,  [128, 0, 200, 500]),
 ]
 
 BOUNDARY_STRADDLE_PARAM_NAMES = \
-    "T, E, f_len, tokens_per_expert"
+    "lnc_degree, T, E, f_len, tokens_per_expert"
 BOUNDARY_STRADDLE_TEST_PARAMS = [
     # TIGHT output_len (no padding past the last owned block) so the last populated
     # expert's fused partitions_per_row-block write straddles the buffer end. Pre-fix the
     # LNC2 oob_mode.skip dropped the ENTIRE straddling tile, losing that expert's in-bounds
     # blocks; the kernel now over-allocates internally so the in-bounds blocks survive.
     # partitions_per_row = T//f_len = 16 here; earlier experts fit, only the last straddles.
-    (2048, 3, 128, [2048, 2048, 200]),
-    (2048, 4, 128, [2048, 2048, 2048, 128]),
-    (4096, 2, 128, [4096, 256]),
+    (1, 2048, 3, 128, [2048, 2048, 200]),
+    (2, 2048, 3, 128, [2048, 2048, 200]),
+    (1, 2048, 4, 128, [2048, 2048, 2048, 128]),
+    (2, 2048, 4, 128, [2048, 2048, 2048, 128]),
+    (1, 4096, 2, 128, [4096, 256]),
+    (2, 4096, 2, 128, [4096, 256]),
 ]
 # fmt: on
 
@@ -108,7 +133,13 @@ BOUNDARY_STRADDLE_TEST_PARAMS = [
 class TestIndexedFlattenKernel:
     """Test class for indexed_flatten kernel."""
 
-    def _run_test(self, test_manager: Orchestrator, platform_target: Platforms, input_generator):
+    def _run_test(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        lnc_degree: int,
+        input_generator,
+    ):
         """Run indexed_flatten test with the given input generator."""
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -119,16 +150,17 @@ class TestIndexedFlattenKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target),
             atol=0,
             rtol=0,
         )
 
-    @pytest_parametrize(FAST_PARAM_NAMES, FAST_TEST_PARAMS)
+    @pytest_parametrize(FAST_PARAM_NAMES, FAST_TEST_PARAMS, abbrevs=_LNC_ABBREVS)
     def test_indexed_flatten_fast(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
+        lnc_degree: int,
         T: int,
         E: int,
         f_len: int,
@@ -149,13 +181,14 @@ class TestIndexedFlattenKernel:
                 "padding_val": -1,
             }
 
-        self._run_test(test_manager, platform_target, input_generator)
+        self._run_test(test_manager, platform_target, lnc_degree, input_generator)
 
-    @pytest_parametrize(ROW_OFFSET_PARAM_NAMES, ROW_OFFSET_TEST_PARAMS)
+    @pytest_parametrize(ROW_OFFSET_PARAM_NAMES, ROW_OFFSET_TEST_PARAMS, abbrevs=_LNC_ABBREVS)
     def test_indexed_flatten_row_offsets_start(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
+        lnc_degree: int,
         T: int,
         E: int,
         f_len: int,
@@ -178,13 +211,14 @@ class TestIndexedFlattenKernel:
                 "padding_val": -1,
             }
 
-        self._run_test(test_manager, platform_target, input_generator)
+        self._run_test(test_manager, platform_target, lnc_degree, input_generator)
 
-    @pytest_parametrize(SPARSE_ROUTING_PARAM_NAMES, SPARSE_ROUTING_TEST_PARAMS)
+    @pytest_parametrize(SPARSE_ROUTING_PARAM_NAMES, SPARSE_ROUTING_TEST_PARAMS, abbrevs=_LNC_ABBREVS)
     def test_indexed_flatten_sparse_token_routing(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
+        lnc_degree: int,
         T: int,
         E: int,
         f_len: int,
@@ -237,14 +271,15 @@ class TestIndexedFlattenKernel:
                 "padding_val": -1,
             }
 
-        self._run_test(test_manager, platform_target, input_generator)
+        self._run_test(test_manager, platform_target, lnc_degree, input_generator)
 
     @pytest.mark.fast
-    @pytest_parametrize(BOUNDARY_STRADDLE_PARAM_NAMES, BOUNDARY_STRADDLE_TEST_PARAMS)
+    @pytest_parametrize(BOUNDARY_STRADDLE_PARAM_NAMES, BOUNDARY_STRADDLE_TEST_PARAMS, abbrevs=_LNC_ABBREVS)
     def test_indexed_flatten_boundary_straddle(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
+        lnc_degree: int,
         T: int,
         E: int,
         f_len: int,
@@ -291,4 +326,4 @@ class TestIndexedFlattenKernel:
                 "padding_val": -1,
             }
 
-        self._run_test(test_manager, platform_target, input_generator)
+        self._run_test(test_manager, platform_target, lnc_degree, input_generator)

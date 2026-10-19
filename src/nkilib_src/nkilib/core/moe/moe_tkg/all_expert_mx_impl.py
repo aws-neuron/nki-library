@@ -19,10 +19,9 @@ from typing import Optional, Union
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import dge_mode, oob_mode
 
 from ...moe_block.moe_block_tkg_utils import _SBUF_USABLE_PER_PARTITION, _dtype_size
-from ...quantization.fp8_quantize import pre_combine_dequant_scales, row_quantization, static_quantization
+from ...quantization.fp8_quantize import pre_combine_dequant_scales, row_quantization
 from ...utils.common_types import MoEAllToAllVStrategy, MoELNCShardingStrategy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
@@ -389,12 +388,12 @@ def _all_expert_static_mx(
     kernel_cfg: AllExpertMXKernelConfig,
     dims: AllExpertMXDimensions,
     output_t_offset: int = 0,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Static all-expert MoE computation with per-expert STATIC_MX quantization.
 
     Unlike _all_expert_mx_static which receives pre-quantized fp8_x4 input,
-    this function receives bf16 input and performs swizzle + static_quantization
+    this function receives bf16 input and performs a fused swizzle + static quantization
     per expert inside the loop using that expert's gate_up_in_scale.
 
     Args:
@@ -405,7 +404,7 @@ def _all_expert_static_mx(
         output_t_offset (int): T offset for output writes (used in tiling).
 
     Returns:
-        nl.ndarray: Output tensor with MoE computation results.
+        nl.NkiTensor: Output tensor with MoE computation results.
     """
     # Compute dimensions for swizzle
     pmax = dims.pmax
@@ -488,6 +487,19 @@ def _all_expert_static_mx(
         else:
             expert_affinities_masked_sb = input_tensors.expert_affinities_masked
 
+    # Dummy 127 MX scales
+    input_scale_sb = nl.ndarray((pmax, n_H512_tiles, T_load), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.memset(dst=input_scale_sb, value=127)
+
+    # Per-expert gate_up_in_scales
+    gate_up_in_scales_sb = nl.ndarray((pmax, dims.E_L), dtype=nl.float32, buffer=nl.sbuf)
+    quant_scales_sb = nl.ndarray((pmax, dims.E_L), dtype=nl.float32, buffer=nl.sbuf)
+    # gate_up_in_scale is [E_L, 1] in HBM; replicate it across all pmax partitions in one DMA:
+    # [E_L, 1] -> [1, E_L, 1] -> [pmax, E_L, 1] (stride-0 partition dim) -> [pmax, E_L]
+    gate_up_in_view = input_tensors.gate_up_in_scale.expand_dim(dim=0).broadcast(dim=0, size=pmax).squeeze_dim(dim=2)
+    nisa.dma_copy(dst=gate_up_in_scales_sb, src=gate_up_in_view, dge_mode=nisa.dge_mode.hwdge)
+    nisa.reciprocal(dst=quant_scales_sb, data=gate_up_in_scales_sb)
+
     # Step 2: Allocate output
     output_shape = (dims.tile_T, dims.n_tiles_in_T, dims.H)
     output_sb = nl.ndarray(output_shape, dtype=kernel_cfg.activation_compute_dtype, buffer=nl.sbuf)
@@ -508,42 +520,28 @@ def _all_expert_static_mx(
         weights.down_weight_scale_sb = scale_sb
         weights.dummy_scale_tile_sb = scale_sb
 
-        # Step 3.2: Swizzle bf16 input from [pmax, T_load, H_free] → [pmax, n_H512, T_load, q_width]
-        swizzled_sb = nl.ndarray((pmax, n_H512_tiles, T_load, _q_width), dtype=input_bf16_sb.dtype, buffer=nl.sbuf)
+        # Step 3.2: Select per-expert gate_up_in_scale
+        input_dequant_scale = gate_up_in_scales_sb[:, expert_idx : expert_idx + 1]
+        quant_scale_sb = quant_scales_sb[:, expert_idx : expert_idx + 1]
+
+        # Step 3.3: Fused swizzle + static quantization, tiled over H512 tiles.
+        # [pmax, T_load, H_free] bf16 → [pmax, n_H512, T_load, q_width] fp8: each pass scales one quad lane by
+        # 1/dequant_scale and writes it directly in fp8, so no bf16 swizzle copy of the input is materialized.
+        # trn3 (required by STATIC_MX) saturates on the fp8 downcast, so no explicit clip to FP8_MAXVAL is needed.
+        quantized_sb = nl.ndarray((pmax, n_H512_tiles, T_load, _q_width), dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
         for h512_tile_idx in nl.affine_range(n_H512_tiles):
             for q_idx in nl.affine_range(_q_width):
-                nisa.tensor_copy(
-                    dst=swizzled_sb[:, h512_tile_idx, :, q_idx],
-                    src=input_bf16_sb[:, :, q_idx * n_H512_tiles + h512_tile_idx],
+                # Alternate engines so the quad lanes are not all serialized on one engine
+                nisa.tensor_scalar(
+                    dst=quantized_sb[:, h512_tile_idx, :, q_idx],
+                    data=input_bf16_sb[:, :, q_idx * n_H512_tiles + h512_tile_idx],
+                    op0=nl.multiply,
+                    operand0=quant_scale_sb,
+                    engine=nisa.scalar_engine if q_idx % 2 == 0 else nisa.vector_engine,
                 )
 
-        # Step 3.3: Load per-expert gate_up_in_scale and quantize
-        gate_up_in_scale_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        gate_up_in_view = (
-            input_tensors.gate_up_in_scale.select(dim=0, index=expert_idx)
-            .broadcast(dim=0, size=pmax)
-            .reshape_dim(dim=0, shape=(pmax, 1))
-        )
-        nisa.dma_copy(dst=gate_up_in_scale_sb, src=gate_up_in_view)
-
-        # Flatten swizzled bf16 and apply static_quantization (modifies in-place)
-        total_free = n_H512_tiles * T_load * _q_width
-        swizzled_flat = swizzled_sb.reshape((pmax, total_free))
-        quantized_flat, input_dequant_scale = static_quantization(swizzled_flat, gate_up_in_scale_sb)
-
-        # Cast bf16 → fp8, then reinterpret as fp8_x4
-        quantized_fp8 = nl.ndarray(quantized_flat.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=quantized_fp8, src=quantized_flat)
-        total_x4 = n_H512_tiles * T_load
-        input_quant_sb = nl.ndarray((pmax, total_x4), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-        nisa.tensor_copy(
-            dst=input_quant_sb.view(nl.uint32), src=quantized_fp8.view(nl.uint32), engine=nisa.vector_engine
-        )
-        input_quant_sb = input_quant_sb.reshape((pmax, n_H512_tiles, T_load))
-
-        # Dummy 127 MX scales
-        input_scale_sb = nl.ndarray((pmax, n_H512_tiles, T_load), dtype=nl.uint8, buffer=nl.sbuf)
-        nisa.memset(dst=input_scale_sb, value=127)
+        # Reinterpret each quad's 4 contiguous fp8 lanes as fp8_x4 (no copy)
+        input_quant_sb = quantized_sb.view(nl.float8_e4m3fn_x4).reshape((pmax, n_H512_tiles, T_load))
 
         # Step 3.4: Compute combined dequant scales (input_dequant * weight_dequant)
         gate_w_dequant_sb = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -644,7 +642,7 @@ def _all_expert_mx_dynamic_shard_on_I(
                     offset=t_tile * dims.tile_T * (dims.H // 2),
                     dtype=nl.uint32,
                 ),
-                dge_mode=dge_mode.none,
+                dge_mode=nisa.dge_mode.none,
             )
 
     # Step 1.2: Arange [0, 1, 2, 3] for token indices broadcast, when input is not prequantized
@@ -674,7 +672,7 @@ def _all_expert_mx_dynamic_shard_on_I(
         nisa.dma_copy(
             src=input_int32_view,
             dst=output_int32_view,
-            dge_mode=dge_mode.none,
+            dge_mode=nisa.dge_mode.none,
         )
         output_indices_hbm = None
     else:
@@ -735,7 +733,7 @@ def _all_expert_mx_dynamic_shard_on_I(
             nisa.dma_copy(
                 src=local_routed_token_indices_with_count_sb[0, nl.ds(n_static_tokens, n_dynamic_tokens)],
                 dst=dynamic_block_token_indices_hbm[0, :],
-                dge_mode=dge_mode.none,
+                dge_mode=nisa.dge_mode.none,
             )
             dynamic_block_token_indices_hbm = dynamic_block_token_indices_hbm.reshape(
                 (dynamism_cfg.n_dynamic_blocks, dynamism_cfg.block_size)
@@ -838,7 +836,7 @@ def _all_expert_mx_dynamic_shard_on_E(
                     offset=t_tile * dims.tile_T * (dims.H // 2),
                     dtype=nl.uint32,
                 ),
-                dge_mode=dge_mode.none,
+                dge_mode=nisa.dge_mode.none,
             )
     # LNC=1 (n_prgs==1): a single core zeroed the whole output; no cross-core
     # ordering needed. core_barrier requires LNC degree >= 2.
@@ -872,7 +870,7 @@ def _all_expert_mx_dynamic_shard_on_E(
         nisa.dma_copy(
             src=input_int32_view,
             dst=output_int32_view,
-            dge_mode=dge_mode.none,
+            dge_mode=nisa.dge_mode.none,
         )
         output_indices_hbm = None
     else:
@@ -956,7 +954,7 @@ def _all_expert_mx_dynamic_shard_on_E(
             nisa.dma_copy(
                 src=local_routed_token_indices_with_count_sb[0, nl.ds(n_static_tokens, n_dynamic_tokens)],
                 dst=dynamic_block_token_indices_hbm[0, :],
-                dge_mode=dge_mode.none,
+                dge_mode=nisa.dge_mode.none,
             )
             dynamic_block_token_indices_hbm = dynamic_block_token_indices_hbm.reshape(
                 (dynamism_cfg.n_dynamic_blocks, dynamism_cfg.block_size)
@@ -1024,7 +1022,7 @@ def _build_output_indices(input_tensors, dims, dynamism_cfg):
         .reshape_dim(dim=1, shape=(dims.T, BF16_PER_INT32))
         .slice(dim=0, start=0, end=1)
     )  # shape (1, T, BF16_PER_INT32) bf16
-    nisa.dma_copy(src=src_view, dst=dst_view, dge_mode=dge_mode.none)
+    nisa.dma_copy(src=src_view, dst=dst_view, dge_mode=nisa.dge_mode.none)
 
     # Step 2.2: Find routed token indices using NonzeroWithCount
     nisa.nonzero_with_count(
@@ -1060,8 +1058,8 @@ def _build_output_indices(input_tensors, dims, dynamism_cfg):
                 indirect_dim=0,
             ),
             # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
-            oob_mode=oob_mode.skip,
-            dge_mode=dge_mode.swdge,
+            oob_mode=nisa.oob_mode.skip,
+            dge_mode=nisa.dge_mode.swdge,
         )
 
     # Step 4: Gather token indices from input buffer and pack into output buffer
@@ -1089,8 +1087,8 @@ def _build_output_indices(input_tensors, dims, dynamism_cfg):
                     indirect_dim=0,
                 ),
                 dst=token_idx_tile_sb,
-                oob_mode=oob_mode.skip,
-                dge_mode=dge_mode.swdge,
+                oob_mode=nisa.oob_mode.skip,
+                dge_mode=nisa.dge_mode.swdge,
             )
             # Spill token indices into contiguous rows in output
             nisa.dma_copy(
@@ -1467,7 +1465,7 @@ def _layout_adapter_qmx_hbm(
                 ),
                 dst=input_sb[:, t32_tile_idx, :, :],
                 # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
-                oob_mode=oob_mode.skip,
+                oob_mode=nisa.oob_mode.skip,
                 dge_mode=nisa.dge_mode.swdge,
             )
         else:
@@ -1560,7 +1558,7 @@ def _layout_adapter_a2av_hbm(
             ),
             dst=input_concat_tile_sb,
             # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
             dge_mode=nisa.dge_mode.swdge,
         )
 
@@ -1684,7 +1682,7 @@ def _load_block_expert_affinities(input_tensors, dims, dynamism_cfg, token_posit
             # Always use 0 for innermost dim because we load 1x expert's affinities at a time
             dst=expert_affinities_masked_sb[:, tile_T, 0],
             # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
             dge_mode=nisa.dge_mode.swdge,
         )
 
@@ -1834,8 +1832,8 @@ def _compute_expert_mlp(
     output_t_offset: int = 0,
     is_software_quant: bool = False,
     T_physical: int = None,
-    down_in_scale_sb: nl.ndarray = None,
-) -> nl.ndarray:
+    down_in_scale_sb: nl.NkiTensor = None,
+) -> nl.NkiTensor:
     """
     Compute expert MLP for one block of input.
 
@@ -1954,18 +1952,25 @@ def _compute_expert_mlp(
         T_act = act_quant_sb.shape[2]
         I_4 = act_quant_sb.shape[3]
 
-        # Flatten and apply static_quantization (divides by down_in_scale, clips to FP8 range)
-        total_free = n_I512_tiles * T_act * I_4
-        act_flat = act_quant_sb.reshape((TILE_I, total_free))
-        quantized_flat, _ = static_quantization(act_flat, down_in_scale_sb)
+        # Scale by 1/down_in_scale straight into fp8 in a single pass. trn3 (required by STATIC_MX) saturates
+        # on the fp8 downcast, so no explicit clip to FP8_MAXVAL is needed.
+        quant_scale_sb = nl.ndarray(down_in_scale_sb.shape, dtype=nl.float32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=quant_scale_sb, data=down_in_scale_sb)
+        # Tiled over I512 tiles so the quantization of one tile can overlap with the gate/up work of the next.
+        # Vector engine: on the Scalar engine this lowers to an ActivationCopy, which cannot write a buffer that is
+        # reinterpreted as an MX (microscaled) dtype below.
+        quantized_sb = nl.ndarray((TILE_I, n_I512_tiles, T_act, I_4), dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
+        for i_tile in nl.affine_range(n_I512_tiles):
+            nisa.tensor_scalar(
+                dst=quantized_sb[:, i_tile, :, :],
+                data=act_quant_sb[:, i_tile, :, :],
+                op0=nl.multiply,
+                operand0=quant_scale_sb,
+                engine=nisa.vector_engine,
+            )
 
-        # Cast bf16 to fp8, then reinterpret as fp8_x4
-        quantized_fp8 = nl.ndarray(quantized_flat.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=quantized_fp8, src=quantized_flat)
-        total_x4 = n_I512_tiles * T_act
-        temp_quant = nl.ndarray((TILE_I, total_x4), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=temp_quant.view(nl.uint32), src=quantized_fp8.view(nl.uint32), engine=nisa.vector_engine)
-        act_quant_sb = temp_quant.reshape((TILE_I, n_I512_tiles, T_act))
+        # Reinterpret each quad's 4 contiguous fp8 lanes as fp8_x4 (no copy)
+        act_quant_sb = quantized_sb.view(nl.float8_e4m3fn_x4).reshape((TILE_I, n_I512_tiles, T_act))
 
         # Dummy 127 MX scales
         act_scale_sb = weights.dummy_scale_tile_sb
@@ -2112,8 +2117,8 @@ def _compute_block(
                     ),
                     dst=spill_indices_sb[:, tile_T_idx : tile_T_idx + 1],
                     # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
-                    oob_mode=oob_mode.skip,
-                    dge_mode=dge_mode.swdge,
+                    oob_mode=nisa.oob_mode.skip,
+                    dge_mode=nisa.dge_mode.swdge,
                 )
             token_position_to_id_T_sb = spill_indices_sb
 
@@ -2175,7 +2180,7 @@ def _static_mx_needs_shard_t(
     weight_bytes = _dtype_size(weight_dtype)
     weight_per_part = n_I512_local * H * weight_bytes + n_I512_local * H
 
-    # bf16 input + swizzled copy (both live simultaneously during static_quantization)
+    # bf16 input + the fp8 quantized copy of it (1 byte/elem), rounded up to 2x the bf16 input for headroom
     _NUM_CONCURRENT_INPUT_BUFFERS = 2
     input_per_part = T * H_free * input_bytes * _NUM_CONCURRENT_INPUT_BUFFERS
 

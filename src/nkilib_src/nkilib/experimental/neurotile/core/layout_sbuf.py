@@ -150,11 +150,6 @@ class SBUFLayout(nl.NKIObject):
         return grid, layout
 
     @staticmethod
-    def contiguous_ap(sbuf):
-        """Build contiguous AP for an SBUF ndarray."""
-        return sbuf.ap(pattern=contiguous_ap_pattern(tuple(sbuf.shape)), offset=0)
-
-    @staticmethod
     def f_extent(remaining, tile_p):
         """Total F-columns in SBUF for a loaded region."""
         total_f = product(remaining, start=1)

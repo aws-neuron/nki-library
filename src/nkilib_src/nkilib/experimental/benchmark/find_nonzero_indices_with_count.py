@@ -27,7 +27,7 @@ PADDING_VALUE = -1  # Padding value for unused index slots in output
 
 
 @nki.jit
-def find_nonzero_indices_with_count(input_tensor: nl.ndarray) -> nl.ndarray:
+def find_nonzero_indices_with_count(input_tensor: nl.NkiTensor) -> nl.NkiTensor:
     """
     Find nonzero indices in a 1D tensor and return them with a count.
 
@@ -39,10 +39,10 @@ def find_nonzero_indices_with_count(input_tensor: nl.ndarray) -> nl.ndarray:
         T: Sequence length (number of elements in input)
 
     Args:
-        input_tensor (nl.ndarray): [1, T], Input tensor on HBM. Supported dtypes: float32, int32.
+        input_tensor (nl.NkiTensor): [1, T], Input tensor on HBM. Supported dtypes: float32, int32.
 
     Returns:
-        output (nl.ndarray): [1, T+1], Output tensor on HBM with dtype int32. Format:
+        output (nl.NkiTensor): [1, T+1], Output tensor on HBM with dtype int32. Format:
             [idx1, idx2, ..., -1, -1, ..., count] where nonzero indices come first,
             followed by padding (-1), and count is the last element.
 
@@ -95,12 +95,12 @@ def find_nonzero_indices_with_count(input_tensor: nl.ndarray) -> nl.ndarray:
     return nonzero_indices_with_count_hbm
 
 
-def _validate_inputs(input_tensor: nl.ndarray) -> None:
+def _validate_inputs(input_tensor: nl.NkiTensor) -> None:
     """
     Validate input tensor shape and dtype.
 
     Args:
-        input_tensor (nl.ndarray): Input tensor to validate
+        input_tensor (nl.NkiTensor): Input tensor to validate
 
     Returns:
         None

@@ -21,7 +21,7 @@ need two stand-ins that mirror that contract:
   - :class:`MockTensor` -- any tensor / ndarray source. Covers the identity
     HBM tensor (the common case), a sliced view (``pattern=`` + ``offset=``
     so ``get_pattern`` reports parent strides), an on-chip buffer
-    (``buffer=nl.sbuf`` / ``nl.psum`` so ``tensor_view`` auto-detects the
+    (``buffer=nl.sbuf`` / ``nl.psum`` so the view helpers auto-detect the
     space), and a sub-width view of a wider allocation (``storage_shape=`` so
     ``_partition_row_stride`` reads the physical row width). It is
     subscriptable (``[:, a:b]`` narrows the free dim, preserving

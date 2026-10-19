@@ -63,27 +63,29 @@ def attention_mxfp8_tkg_torch_ref(
     re-quantization, mask application, active-token update).
 
     Args:
-        q: Query tensor [B, H, 1, d] bfloat16/float32.
-        k_active: Active key [B, d] bfloat16/float32.
-        v_active: Active value [B, d] bfloat16/float32.
+        q: Query tensor [B, H, s_active, d] bfloat16/float32.
+        k_active: Active key [B, s_active, d] bfloat16/float32.
+        v_active: Active value [B, s_active, d] bfloat16/float32.
         k_prior: MXFP8 K cache [num_blocks, 32, 160] float32. Each block = 128 tokens.
         v_prior: MXFP8 V cache [num_blocks, 32, 160] float32. Each block = 128 tokens.
-        mask: Per-head token mask [B, H, 1, s_prior] uint8.
+        mask: Unified per-head token mask [B, H, s_active, s_prior + s_active] uint8.
+            The s_prior prefix masks the prior context; the trailing s_active columns
+            mask the active tokens (intra-active causality encoded by the caller).
         identity_hbm: [128, 128] bfloat16 identity matrix (unused by ref).
         active_blocks_table: Block indices [B, num_blocks] int32. None = sequential.
         sbm: Optional SbufManager (unused by ref).
 
     Returns:
-        dict with 'out_hbm': [B, H, d] bfloat16 attention output.
+        dict with 'out_hbm': [B, H, s_active, d] bfloat16 attention output.
     """
     q_np = _to_fp32(q)
     k_active_np = _to_fp32(k_active)
     v_active_np = _to_fp32(v_active)
     k_prior_np = _to_fp32(k_prior).reshape(-1, _P_PER_BLOCK, _PACKED_COLS)
     v_prior_np = _to_fp32(v_prior).reshape(-1, _P_PER_BLOCK, _PACKED_COLS)
-    mask_np = np.asarray(mask)  # [B, H, 1, s_prior]
+    mask_np = np.asarray(mask)  # [B, H, s_active, s_prior + s_active]
 
-    bs, n_heads, _, d_head = q_np.shape
+    bs, n_heads, s_active, d_head = q_np.shape
     scale = 1.0 / math.sqrt(d_head)
     num_blocks = k_prior_np.shape[0]
     num_chunks = num_blocks // _BLOCKS_PER_CHUNK
@@ -95,13 +97,18 @@ def attention_mxfp8_tkg_torch_ref(
         k_unpacked[block_idx] = _unpack_mx_block(k_prior_np[block_idx], d_head, "d_head")
         v_unpacked[block_idx] = _unpack_mx_block(v_prior_np[block_idx], d_head, "block_len")
 
+    # Query rows flatten head-major (row = h*s_active + s) into a band of q_head*s_active,
+    # mirroring the kernel's packed-Q layout.
+    band = n_heads * s_active
+    s_prior = mask_np.shape[3] - s_active
+
     # Q MXFP8 round-trip (kernel quantizes scaled Q for the block matmuls)
-    q_scaled = q_np[:, :, 0, :] * scale
-    q_rt = np.zeros((bs, n_heads, d_head), dtype=np.float32)
+    q_scaled = q_np.reshape(bs, band, d_head) * scale
+    q_rt = np.zeros((bs, band, d_head), dtype=np.float32)
     for batch_idx in range(bs):
         q_rt[batch_idx] = mxfp8_round_trip_2d(q_scaled[batch_idx])
 
-    result = np.zeros((bs, n_heads, d_head), dtype=np.float32)
+    result = np.zeros((bs, n_heads, s_active, d_head), dtype=np.float32)
     for batch_idx in range(bs):
         # Gather this batch's blocks through the indirection table
         if active_blocks_table is not None:
@@ -111,12 +118,14 @@ def attention_mxfp8_tkg_torch_ref(
         k_flat = k_unpacked[table_b].reshape(-1, d_head)
         v_flat = v_unpacked[table_b].reshape(-1, d_head)
 
-        mask_b = mask_np[batch_idx, :, 0, :]  # [H, s_prior]
-        s_prior = mask_b.shape[1]
+        # Prior slice of the unified mask, head-major flattened to [band, s_prior].
+        mask_prior = mask_np[batch_idx, :, :, :s_prior].reshape(band, s_prior)
+        # Active tail: [band, s_active], one active-key mask row per query row.
+        mask_active = mask_np[batch_idx, :, :, s_prior:].reshape(band, s_active)
 
-        running_max = np.full((n_heads, 1), _RUNNING_MAX_INIT, dtype=np.float32)
-        running_sum = np.zeros((n_heads, 1), dtype=np.float32)
-        running_out = np.zeros((n_heads, d_head), dtype=np.float32)
+        running_max = np.full((band, 1), _RUNNING_MAX_INIT, dtype=np.float32)
+        running_sum = np.zeros((band, 1), dtype=np.float32)
+        running_out = np.zeros((band, d_head), dtype=np.float32)
 
         for chunk_idx in range(num_chunks):
             t_start = chunk_idx * _CHUNK_TOKENS
@@ -125,10 +134,10 @@ def attention_mxfp8_tkg_torch_ref(
             v_chunk = v_flat[t_start:t_end]
 
             # Slice mask for this chunk; pad with 0 if chunk extends beyond s_prior
-            valid_chunk = np.zeros((n_heads, _CHUNK_TOKENS), dtype=np.uint8)
+            valid_chunk = np.zeros((band, _CHUNK_TOKENS), dtype=np.uint8)
             copy_end = min(t_end, s_prior)
             if t_start < s_prior:
-                valid_chunk[:, : copy_end - t_start] = mask_b[:, t_start:copy_end]
+                valid_chunk[:, : copy_end - t_start] = mask_prior[:, t_start:copy_end]
 
             scores = np.einsum("hd,td->ht", q_rt[batch_idx], k_chunk)
             # Kernel evicts MM1 scores to BF16 with masked positions at -65504
@@ -151,17 +160,26 @@ def attention_mxfp8_tkg_torch_ref(
             running_out = running_out + np.einsum("ht,td->hd", exp_scores_rt, v_chunk)
             running_max = m_new
 
-        # Active-token update: scalar softmax step with the un-quantized scaled Q
-        score_new = q_scaled[batch_idx] @ k_active_np[batch_idx]  # [n_heads]
-        m_new = np.maximum(running_max[:, 0], score_new)
-        correction = np.exp(running_max[:, 0] - m_new)
-        running_out = running_out * correction[:, np.newaxis]
-        running_sum = running_sum * correction[:, np.newaxis]
-        exp_new = np.exp(score_new - m_new)
-        running_sum = running_sum + exp_new[:, np.newaxis]
-        running_out = running_out + exp_new[:, np.newaxis] * v_active_np[batch_idx][np.newaxis, :]
+        # Active-token update, modeled as one more MXFP8 chunk.
+        k_active_rt = mxfp8_round_trip_2d(k_active_np[batch_idx])  # [s_active, d], contract d_head
+        v_active_rt = mxfp8_round_trip_2d(v_active_np[batch_idx].T).T  # [s_active, d], contract block_len
 
-        result[batch_idx] = running_out / running_sum
+        score_active = np.einsum("hd,td->ht", q_rt[batch_idx], k_active_rt)  # [band, s_active]
+        score_active = np.where(mask_active.astype(bool), score_active, _SCORE_NEG_INF)
+        score_active = score_active.astype(ml_dtypes.bfloat16).astype(np.float32)
+
+        m_local = score_active.max(axis=-1, keepdims=True)  # [band, 1]
+        m_new = np.maximum(running_max, m_local)
+        correction = np.exp(running_max - m_new)
+        running_out = running_out * correction
+        running_sum = running_sum * correction
+        exp_active = np.exp(score_active - m_new)  # [band, s_active]
+        running_sum = running_sum + exp_active.sum(axis=-1, keepdims=True)
+        exp_active_rt = mxfp8_round_trip_2d(exp_active)
+        running_out = running_out + np.einsum("ht,td->hd", exp_active_rt, v_active_rt)  # [band, d]
+        running_max = m_new
+
+        result[batch_idx] = (running_out / running_sum).reshape(n_heads, s_active, d_head)
 
     return {"out_hbm": dt.static_cast(result.astype(np.float32), ml_dtypes.bfloat16)}
 

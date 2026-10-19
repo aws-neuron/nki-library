@@ -38,6 +38,8 @@ from ..subkernels.layernorm_tkg import (
 )
 from ..subkernels.layernorm_tkg import layernorm_tkg as _layernorm_tkg
 from ..subkernels.rmsnorm_tkg import SHARDING_THRESHOLD as rmsnorm_sharding_threshold
+from ..subkernels.rmsnorm_tkg import flashnorm_deferred_enabled as _flashnorm_deferred_enabled
+from ..subkernels.rmsnorm_tkg import flashnorm_weightless_enabled as _flashnorm_weightless_enabled
 from ..subkernels.rmsnorm_tkg import rmsnorm_tkg as _rmsnorm_tkg
 from ..utils.allocator import (
     SbufManager,
@@ -45,12 +47,15 @@ from ..utils.allocator import (
     sizeinbytes,
 )
 from ..utils.common_types import DtypeMode, NormType, QKVOutputLayout, QuantizationType
+from ..utils.dma_names import dma_name, get_dma_name_scope
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_verified_program_sharding_info
 from ..utils.logging import get_logger
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ..utils.tiled_range import TiledRange, TiledRangeIterator
 from .qkv_tkg_mx_impl import _qkv_tkg_mx_impl
+
+_PIN_AFTER = [None]
 
 P_MAX = 128
 F_MAX = 512
@@ -61,6 +66,44 @@ H_BLOCK_SIZE = 2048
 NUM_TILES_PER_H_BLOCK = H_BLOCK_SIZE // P_MAX
 
 _DGE_MODE_NONE = 3
+
+# VLLM_NEURON_MEGA_QKV_P2: tag the W_qkv weight-load DMA as DMA-QoS priority 2 (P2) while
+# forcing it STATIC (dge_mode=none) so the compiler's --p2-max-desc-bytes desc-cap fully
+# applies (the cap acts on P2 STATIC contiguous descriptors; on swdge/GpSimd it only partially
+# splits, leaving 10-20KB packets). NOTE: setting priority alone (dge_mode unset) routes to
+# swdge -> must set dge_mode=none explicitly.
+_QKV_P2 = bool(_os.environ.get("VLLM_NEURON_MEGA_QKV_P2"))
+_QKV_PRIORITY = 2 if _QKV_P2 else None
+_QKV_DGE_MODE = _DGE_MODE_NONE if _QKV_P2 else None
+
+# VLLM_NEURON_MEGA_QKV_DMA_ENGINE=swdge: issue the W_qkv weight load on the software-DGE (GpSimd)
+# queue instead of the sync static engine. Static and swdge are separate engines running in
+# parallel, so a DMA-order-JSON ordering between a static load and a swdge load is a cross-engine
+# race; moving W_qkv onto swdge puts it in the same FIFO as the other swdge traffic, where the
+# JSON order is actually enforced. Ignored when QKV_P2 is set (P2 needs static for the desc-cap).
+# Default: swdge. Use VLLM_NEURON_MEGA_QKV_DMA_ENGINE=auto for the compiler default.
+_QKV_DMA_ENGINE = _os.environ.get("VLLM_NEURON_MEGA_QKV_DMA_ENGINE", "swdge")
+_QKV_SWDGE = _QKV_DMA_ENGINE == "swdge"
+
+# VLLM_NEURON_MEGA_QKV_DMA_ENGINE=static: issue the W_qkv weight load on the STATIC (sync) DMA
+# engine, i.e. dge_mode=none, WITHOUT the P2 priority tag. _QKV_P2 above also forces static but
+# couples it to DMA-QoS priority 2; this value isolates the engine change from QoS.
+# ⚠️ Static and swdge are separate engines running in parallel, so a DMA-order-JSON ordering
+# between a static load and a swdge load is a CROSS-ENGINE RACE (see the swdge note above). The
+# idx78/79 win is exactly "K-cache load before W_qkv" -- if the K gathers are not also static,
+# that ordering stops being enforced under this mode.
+_QKV_STATIC = _QKV_DMA_ENGINE in ("static", "none")
+
+_QKV_W_ISPLIT = 4
+_QKV_W_ISPLIT_BLOCKS = frozenset((1,))
+_QKV_W_ISPLIT_LAYERS = frozenset((2, 6, 10, 14, 18, 22, 26, 30, 34, 35))
+
+
+def _qkv_w_isplit_layer_selected() -> bool:
+    """True when the W_qkv piece split applies to the layer whose DMA-name scope is active ("L<n>_")."""
+    _sc = get_dma_name_scope() or ""
+    return _sc.startswith("L") and _sc[1:].rstrip("_").isdigit() and int(_sc[1:].rstrip("_")) in _QKV_W_ISPLIT_LAYERS
+
 
 logger = get_logger("qkv_tkg")
 
@@ -329,7 +372,7 @@ def qkv_tkg(
         quant_config = None
 
     # Perform optional fused norm and load
-    hidden_sb = _fused_norm_and_load(
+    hidden_sb, rms_recip_sb = _fused_norm_and_load(
         hidden=hidden,
         norm_type=norm_type,
         norm_w=norm_w,
@@ -358,6 +401,7 @@ def qkv_tkg(
             io_dtype=io_dtype,
             quantization_type=quantization_type,
             quant_config=quant_config,
+            rms_recip_sb=rms_recip_sb,
         )
     else:
         output = _qkv_projection_hbm_output(
@@ -370,6 +414,7 @@ def qkv_tkg(
             io_dtype=io_dtype,
             quantization_type=quantization_type,
             quant_config=quant_config,
+            rms_recip_sb=rms_recip_sb,
         )
 
     sbm.close_scope()
@@ -850,8 +895,10 @@ def _fused_norm_and_load(
             the shard directly (H1_shard == H1_sharded).
 
     Returns:
-        nl.NkiTensor wrapping hidden states in SBUF:
-          Shape: (H0, BxS, H1_sharded)
+        Tuple of (hidden states in SBUF with shape (H0, BxS, H1_sharded), 1/RMS or None).
+        The second element is the FlashNorm Opt-2 per-token reciprocal RMS with shape
+        (H0, BxS); it is non-None only on the RMS_NORM path with deferral enabled, in
+        which case the hidden states are NOT yet scaled by it.
     """
 
     BxS, H0, H1 = cfg.BxS, cfg.H0, cfg.H1
@@ -862,6 +909,8 @@ def _fused_norm_and_load(
 
     hidden_sb = None
     hidden_sb_quantized = None
+    # FlashNorm Opt 2 per-token 1/RMS, populated only on the RMS_NORM + deferred path.
+    rms_recip_sb = None
 
     hidden_shape = (H0, BxS, H1)
     hidden_sharded_shape = (H0, BxS, H1_sharded)
@@ -924,6 +973,11 @@ def _fused_norm_and_load(
             hidden_sb = sbm.alloc_stack(hidden_shape, dtype=hidden.dtype, buffer=nl.sbuf)
         # Perform norm with load
         if norm_type == NormType.RMS_NORM:
+            # FlashNorm Opt 2: ask the norm for 1/RMS instead of letting it scale the
+            # [H0, BxS, H1] tile; the caller applies it once per output tile after the
+            # QKV matmul. Only valid because the consumer is linear (exact commutation).
+            if _flashnorm_deferred_enabled():
+                rms_recip_sb = sbm.alloc_heap((BxS, 1), dtype=nl.float32, buffer=nl.sbuf)
             # Perform rmsnorm with load
             # hidden_sb: (H0, BxS, H1)
             hidden_sb = _rmsnorm_tkg(
@@ -933,6 +987,11 @@ def _fused_norm_and_load(
                 eps=eps,
                 hidden_actual=hidden_actual,
                 sbm=sbm,
+                rms_recip_out=rms_recip_sb,
+                # FlashNorm Opt 1. QKV is the ONLY rmsnorm_tkg consumer whose caller folds
+                # gamma into the weight (the test's create_inputs scales W_qkv's rows), so
+                # the gate is applied here rather than inside the shared norm kernel.
+                weightless=_flashnorm_weightless_enabled(),
             )
         elif norm_type == NormType.LAYER_NORM:
             # Perform layernorm with load
@@ -966,7 +1025,7 @@ def _fused_norm_and_load(
         sbm.pop_heap()  # in_scale_tile
         hidden_sb = hidden_sb_quantized
 
-    return hidden_sb
+    return hidden_sb, rms_recip_sb
 
 
 def _input_load(
@@ -1042,7 +1101,9 @@ def _initialize_qkv_out(
         stream_shuffle_broadcast(qkv_bias_sb, qkv_out_sb)
         sbm.close_scope()
     else:
-        nisa.memset(qkv_out_sb, value=0)
+        _ms = nisa.memset(qkv_out_sb, value=0)
+        if _PIN_AFTER[0] is not None and _ms is not None:
+            _ms.depends_on(_PIN_AFTER[0], kind=nisa.dependency.schedule)
 
 
 def _static_dequantize(
@@ -1145,7 +1206,7 @@ def _apply_bias(
         # BxS partitions by setting the partition-dim stride to 0 on the source.
         BxS = output_sb.shape[0]
         qkv_bias_bcast = qkv_bias.broadcast(dim=0, size=BxS)
-        nisa.dma_copy(qkv_bias_sb, qkv_bias_bcast)
+        nisa.dma_copy(qkv_bias_sb, qkv_bias_bcast, dge_mode=_DGE_MODE_NONE, name=dma_name("qkv_bias_bcast_load"))
 
     nisa.tensor_tensor(dst=output_sb, data1=output_sb, data2=qkv_bias_sb, op=nl.add)
     sbm.pop_heap()  # qkv_bias_sb
@@ -1161,6 +1222,7 @@ def _compute_qkv_i_block(
     sbm: SbufManager,
     quantization_type: QuantizationType,
     quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]],
+    rms_recip_sb: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     """
     Compute a single I-block of QKV projection: bias init, matmul, optional dequant, and cross-core reduce.
@@ -1175,6 +1237,7 @@ def _compute_qkv_i_block(
         sbm: SbufManager for SBUF allocation
         quantization_type: Quantization mode
         quant_config: Quantization config (StaticQuantConfig or RowQuantConfig)
+        rms_recip_sb: FlashNorm Opt-2 per-token 1/RMS in SBUF. Shape: (BxS, 1) or None
 
     Returns:
         Computed output in SBUF. Shape: (BxS, i_block.size)
@@ -1186,6 +1249,12 @@ def _compute_qkv_i_block(
     preapply_bias = (
         quantization_type == QuantizationType.NONE and qkv_bias != None and qkv_bias.dtype == qkv_out_sb.dtype
     )
+
+    # FlashNorm Opt 2 defers 1/RMS until AFTER this matmul, and (aW + c)/RMS != aW/RMS + c,
+    # so the bias must not already be sitting in the accumulator when the scale lands.
+    # Force the post-projection bias path instead (Proposition 2's bias caveat).
+    if rms_recip_sb is not None:
+        preapply_bias = False
 
     # Not pre-applying bias is slightly efficient if we use I_column_tiling.
     # In this case no reductoin is needed post-matmult, so we can engine balance tensor_copy and apply bias later.
@@ -1212,6 +1281,7 @@ def _compute_qkv_i_block(
         i_block_idx=i_block.index,
         sbm=sbm,
         has_preapplied_bias=preapply_bias,
+        rms_recip_sb=rms_recip_sb,
     )
 
     if quantization_type == QuantizationType.STATIC:
@@ -1221,6 +1291,12 @@ def _compute_qkv_i_block(
             dim=1, start=i_block.start_offset, end=i_block.end_offset
         )
         _row_dequantize(output_sb, weight_scale_block, cfg, sbm)
+
+    # FlashNorm Opt 2 note: the deferred 1/RMS is applied INSIDE _qkv_projection, folded into
+    # the PSUM->SBUF eviction, so there is no separate scaling pass here. It lands before the
+    # bias add below (required: (aW + c)/RMS != aW/RMS + c) and before the cross-core add.
+    # Under LNC>1 each core holds a partial sum over its own H shard; 1/RMS is a whole-token
+    # scalar, so scaling partials then adding equals scaling the sum (distributive).
 
     if not preapply_bias and qkv_bias != None and cfg.shard_id == 0:
         qkv_bias_block = qkv_bias.slice(dim=1, start=i_block.start_offset, end=i_block.end_offset)
@@ -1253,6 +1329,7 @@ def _qkv_projection_sbuf_output(
     io_dtype,
     quantization_type: QuantizationType = QuantizationType.NONE,
     quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]] = None,
+    rms_recip_sb: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     """
     QKV projection with SBUF output (output_in_sbuf=True path).
@@ -1269,6 +1346,7 @@ def _qkv_projection_sbuf_output(
         io_dtype: Data type for input/output tensors
         quantization_type: Quantization mode
         quant_config: Quantization config (StaticQuantConfig or RowQuantConfig)
+        rms_recip_sb: FlashNorm Opt-2 per-token 1/RMS in SBUF. Shape: (BxS, 1) or None
 
     Returns:
         QKV projection output in SBUF. Shape: (BxS, I)
@@ -1287,7 +1365,16 @@ def _qkv_projection_sbuf_output(
         output_slice = qkv_out_sb[:, i_block.start_offset : i_block.end_offset]
 
         _compute_qkv_i_block(
-            hidden_sb, qkv_w, qkv_bias, output_slice, i_block, cfg, sbm, quantization_type, quant_config
+            hidden_sb,
+            qkv_w,
+            qkv_bias,
+            output_slice,
+            i_block,
+            cfg,
+            sbm,
+            quantization_type,
+            quant_config,
+            rms_recip_sb=rms_recip_sb,
         )
 
         sbm.close_scope()
@@ -1305,6 +1392,7 @@ def _qkv_projection_hbm_output(
     io_dtype,
     quantization_type: QuantizationType = QuantizationType.NONE,
     quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]] = None,
+    rms_recip_sb: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     """
     QKV projection with HBM output (output_in_sbuf=False path).
@@ -1322,6 +1410,7 @@ def _qkv_projection_hbm_output(
         sbm: SbufManager for SBUF allocation
         io_dtype: Dtype of the input hidden, which should also be the output dtype
         quant_config: Quantization config (StaticQuantConfig or RowQuantConfig)
+        rms_recip_sb: FlashNorm Opt-2 per-token 1/RMS in SBUF. Shape: (BxS, 1) or None
 
     Returns:
         QKV projection output tensor. Shape depends on output_layout:
@@ -1350,7 +1439,16 @@ def _qkv_projection_hbm_output(
         qkv_out_sb = sbm.alloc_stack((BxS, i_block.size), dtype=io_dtype, buffer=nl.sbuf)
 
         output_sb = _compute_qkv_i_block(
-            hidden_sb, qkv_w, qkv_bias, qkv_out_sb, i_block, cfg, sbm, quantization_type, quant_config
+            hidden_sb,
+            qkv_w,
+            qkv_bias,
+            qkv_out_sb,
+            i_block,
+            cfg,
+            sbm,
+            quantization_type,
+            quant_config,
+            rms_recip_sb=rms_recip_sb,
         )
 
         # Store to HBM with layout-specific transformation
@@ -1430,15 +1528,16 @@ def _qkv_projection(
     i_block_idx: int,
     sbm: SbufManager,
     has_preapplied_bias: bool = False,
+    rms_recip_sb: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     # Note: "column_tiling" here refers to special perf-mode of nc_matmult, that allows us fill PE-array with multiple tiles.
     if cfg.use_I_column_tiling:
         return _qkv_projection_I_column_tiled(
-            hidden_sb, qkv_w_hbm, qkv_out_sb, cfg, i_block_idx, sbm, has_preapplied_bias
+            hidden_sb, qkv_w_hbm, qkv_out_sb, cfg, i_block_idx, sbm, has_preapplied_bias, rms_recip_sb
         )
     else:
         return _qkv_projection_H_column_tiled(
-            hidden_sb, qkv_w_hbm, qkv_out_sb, cfg, i_block_idx, sbm, has_preapplied_bias
+            hidden_sb, qkv_w_hbm, qkv_out_sb, cfg, i_block_idx, sbm, has_preapplied_bias, rms_recip_sb
         )
 
 
@@ -1450,6 +1549,7 @@ def _qkv_projection_H_column_tiled(
     i_block_idx: int,
     sbm: SbufManager,
     has_preapplied_bias: bool = False,
+    rms_recip_sb: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     """Original array-tiling path: tiles H chunks across partition rows, requires reduction."""
     _, _, I = qkv_w_hbm.shape
@@ -1514,7 +1614,14 @@ def _qkv_projection_H_column_tiled(
 
         w_block_slot = h_block.index % num_w_blocks
         qkv_w_sb_block = qkv_w_sb.select(dim=1, index=w_block_slot).slice(dim=1, start=0, end=h_block.size)
-        nisa.dma_copy(qkv_w_sb_block, qkv_w_block)
+        if _QKV_P2:
+            nisa.dma_copy(qkv_w_sb_block, qkv_w_block, dge_mode=_QKV_DGE_MODE, priority=_QKV_PRIORITY)
+        elif _QKV_SWDGE:
+            nisa.dma_copy(qkv_w_sb_block, qkv_w_block, dge_mode=nisa.dge_mode.swdge)
+        elif _QKV_STATIC:
+            nisa.dma_copy(qkv_w_sb_block, qkv_w_block, dge_mode=_DGE_MODE_NONE)
+        else:
+            nisa.dma_copy(qkv_w_sb_block, qkv_w_block)
 
         for h1_tile in range(array_tiled_H1):
             array_tile_offset = array_tiling_factor * h1_tile
@@ -1554,6 +1661,19 @@ def _qkv_projection_H_column_tiled(
                 op=nl.add,
             )
 
+    # FlashNorm Opt 2 on this path: the loop above ACCUMULATES partial products into
+    # qkv_out_sb, so the scale cannot be folded into any single add (it would be applied
+    # once per accumulation step). Apply it once, after the reduction completes.
+    if rms_recip_sb is not None:
+        for i_tile in TiledRange(I, cfg.i_tile_size):
+            out_slice = qkv_out_sb[0 : cfg.BxS, i_tile.start_offset : i_tile.end_offset]
+            nisa.tensor_scalar(
+                out_slice,
+                out_slice,
+                op0=nl.multiply,
+                operand0=rms_recip_sb,
+            )
+
     sbm.close_scope()
     return qkv_out_sb
 
@@ -1566,6 +1686,7 @@ def _qkv_projection_I_column_tiled(
     i_block_idx: int,
     sbm: SbufManager,
     has_preapplied_bias: bool = False,
+    rms_recip_sb: Optional[nl.NkiTensor] = None,
 ) -> nl.NkiTensor:
     """I-column-tiling path: tiles I across partition rows, no reduction needed."""
     _, _, I = qkv_w_hbm.shape
@@ -1623,8 +1744,32 @@ def _qkv_projection_I_column_tiled(
 
         w_block_slot = h_block.index % num_w_blocks
         qkv_w_sb_block = qkv_w_sb.select(dim=1, index=w_block_slot).slice(dim=1, start=0, end=h_block.size)
-        nisa.dma_copy(qkv_w_sb_block, qkv_w_block)
-
+        _n_w_pieces = (
+            min(_QKV_W_ISPLIT, h_block.size)
+            if h_block.index in _QKV_W_ISPLIT_BLOCKS and _qkv_w_isplit_layer_selected()
+            else 1
+        )
+        if _n_w_pieces > 1:
+            _w_bounds = [round(_k * h_block.size / _n_w_pieces) for _k in range(_n_w_pieces)] + [h_block.size]
+            _w_parts = [
+                (
+                    qkv_w_sb_block.slice(dim=1, start=_w_bounds[_k], end=_w_bounds[_k + 1]),
+                    qkv_w_block.slice(dim=1, start=_w_bounds[_k], end=_w_bounds[_k + 1]),
+                    dma_name(f"qkv_w_i{i_block_idx}_h{h_block.index}_p{_k}"),
+                )
+                for _k in range(_n_w_pieces)
+            ]
+        else:
+            _w_parts = [(qkv_w_sb_block, qkv_w_block, dma_name(f"qkv_w_i{i_block_idx}_h{h_block.index}"))]
+        for _w_dst, _w_src, _w_name in _w_parts:
+            if _QKV_P2:
+                nisa.dma_copy(_w_dst, _w_src, dge_mode=_QKV_DGE_MODE, priority=_QKV_PRIORITY, name=_w_name)
+            elif _QKV_SWDGE:
+                nisa.dma_copy(_w_dst, _w_src, dge_mode=nisa.dge_mode.swdge, name=_w_name)
+            elif _QKV_STATIC:
+                nisa.dma_copy(_w_dst, _w_src, dge_mode=_DGE_MODE_NONE, name=_w_name)
+            else:
+                nisa.dma_copy(_w_dst, _w_src, dge_mode=_DGE_MODE_NONE, name=_w_name)
         for h1_tile_idx in range(h_block.size):
             hidden_tile = hidden_block.select(dim=2, index=h1_tile_idx)
 
@@ -1661,7 +1806,21 @@ def _qkv_projection_I_column_tiled(
                 nisa.tensor_tensor(out_slice, out_slice, psum_slice, op=nl.add)
             # Unlike with H-column-tiling, there is no reduction needed.
             else:
-                if col_idx % 2 == 0:
+                # FlashNorm Opt 2: fold the deferred per-token 1/RMS INTO this existing
+                # PSUM->SBUF eviction (tensor_copy -> tensor_scalar) instead of adding a
+                # separate pass over [BxS, I]. A standalone multiply after the projection
+                # measured +30 us of Scalar ACTIVATE squarely on the QKV->attention
+                # critical path, which more than ate the norm-side saving; folded here the
+                # scale is free -- same instruction count, same engines, same alternation.
+                if rms_recip_sb is not None:
+                    nisa.tensor_scalar(
+                        out_slice,
+                        psum_slice,
+                        op0=nl.multiply,
+                        operand0=rms_recip_sb,
+                        engine=nisa.engine.vector if col_idx % 2 == 0 else nisa.engine.scalar,
+                    )
+                elif col_idx % 2 == 0:
                     nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.vector)
                 else:
                     nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.scalar)

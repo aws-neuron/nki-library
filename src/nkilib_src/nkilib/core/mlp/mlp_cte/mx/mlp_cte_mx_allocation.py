@@ -168,7 +168,9 @@ def allocate_src_projection_scales(
     name: str,
     alloc: Callable,
 ):
-    if not (mlp_params.quant_params.is_quant_row_mx() or mlp_params.quant_params.is_quant_mx()):
+    if not (
+        mlp_params.quant_params.is_quant_row_mx() or mlp_params.quant_params.is_quant_mx()
+    ):  # pragma: no branch - called only under preload (MX/ROW_MX), return-None arc dead
         return None
 
     scales_tensor_shape, scales_tensor_dtype = get_gate_up_scales_tensor_info(
@@ -219,7 +221,9 @@ def allocate_down_projection_scales(
     down_proj_scales_sbuf_list: list,
     alloc: Callable,
 ):
-    if not (mlp_params.quant_params.is_quant_row_mx() or mlp_params.quant_params.is_quant_mx()):
+    if not (
+        mlp_params.quant_params.is_quant_row_mx() or mlp_params.quant_params.is_quant_mx()
+    ):  # pragma: no branch - called only under preload (MX/ROW_MX), return-None arc dead
         return None
 
     hidden_dim_tile = tile_info.down_proj_hidden_dim_tile

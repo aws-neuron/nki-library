@@ -14,8 +14,10 @@
 
 """Unit tests for CollectiveUnitTestFramework and SimDistRunner multi-pass logic."""
 
+import importlib
 from unittest.mock import MagicMock, patch
 
+import nkilib_src.nkilib.experimental.collectives.distributed_adapter as canonical_adapter_mod
 import numpy as np
 import pytest
 import torch
@@ -35,9 +37,18 @@ from test.utils.common_dataclasses import (
 from test.utils.unit_test_collective_framework import (
     CollectiveUnitTestFramework,
     SimDistRunner,
+    _dist_adapter_modules,
     _MPSimProcessGroup,
     _run_torch_refs_parallel,
 )
+
+# The GPT-OSS giga-kernel packages vendor their own distributed_adapter; their torch
+# refs import get_pg/get_rank from these copies, not from the canonical module.
+_VENDORED_DIST_ADAPTER_MODULES = [
+    "nkilib_src.nkilib.models.gpt_oss.c128_giga_kernel.experimental.collectives.distributed_adapter",
+    "nkilib_src.nkilib.models.gpt_oss.c128spec_giga_kernel.experimental.collectives.distributed_adapter",
+    "nkilib_src.nkilib.models.gpt_oss.c512_giga_kernel.experimental.collectives.distributed_adapter",
+]
 
 
 class TestCollectiveUnitTestFramework:
@@ -837,3 +848,45 @@ class TestSimDistRunnerMultiPass:
         expected = torch.tensor([6.0, 6.0, 6.0, 6.0])
         for r in range(4):
             assert torch.allclose(results[r]["out"], expected)
+
+
+class TestVendoredDistributedAdapters:
+    """SimDistRunner installs the sim backend on the vendored GPT-OSS adapter copies too.
+
+    Each vendored copy has its own module-level sim-adapter slot. Setting the adapter on
+    the canonical module alone left the vendored refs raising "No distributed backend".
+    """
+
+    def test_discovery_finds_canonical_and_vendored_copies(self):
+        for module_name in _VENDORED_DIST_ADAPTER_MODULES:
+            importlib.import_module(module_name)
+        found = {m.__name__ for m in _dist_adapter_modules()}
+        assert canonical_adapter_mod.__name__ in found
+        assert set(_VENDORED_DIST_ADAPTER_MODULES) <= found
+
+    @pytest.mark.parametrize("module_name", _VENDORED_DIST_ADAPTER_MODULES)
+    def test_vendored_get_pg_and_get_rank_under_sim_runner(self, module_name):
+        vendored = importlib.import_module(module_name)
+        assert vendored is not canonical_adapter_mod
+        num_ranks = 4
+        rg = ReplicaGroup([list(range(num_ranks))])
+
+        def torch_ref(x, replica_group):
+            pg = vendored.get_pg(replica_group)
+            t = torch.from_numpy(x)
+            out = [torch.zeros_like(t) for _ in range(num_ranks)]
+            dist.all_gather(out, t, group=pg)
+            return {"out": torch.cat(out).numpy(), "rank": np.array([vendored.get_rank()])}
+
+        per_rank_inputs = {
+            r: {"x": np.full((2,), float(r), dtype=np.float32), "replica_group": rg} for r in range(num_ranks)
+        }
+        results = SimDistRunner(num_ranks=num_ranks, replica_groups=[rg]).run(torch_ref, per_rank_inputs)
+
+        expected = np.repeat(np.arange(num_ranks, dtype=np.float32), 2)
+        for r in range(num_ranks):
+            np.testing.assert_array_equal(results[r]["out"], expected)
+            assert results[r]["rank"][0] == r
+        # The adapter is installed only inside the forked rank processes.
+        assert vendored._sim_adapter is None
+        assert canonical_adapter_mod._sim_adapter is None

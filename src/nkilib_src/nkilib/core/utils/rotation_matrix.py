@@ -17,6 +17,8 @@
 import nki.isa as nisa
 import nki.language as nl
 
+from .kernel_assert import kernel_assert
+
 
 def build_rotation_matrix(
     block_size: int,
@@ -25,7 +27,7 @@ def build_rotation_matrix(
     dtype=nl.float16,
     negate: bool = False,
     engine=nisa.vector_engine,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Build a block-diagonal circulant shift matrix in SBUF.
 
     Constructs an NxN matrix (N = block_size x num_blocks) composed of
@@ -88,29 +90,30 @@ def build_rotation_matrix(
     #   "wrapped" segment:  rows [tail:block_size] — elements that wrapped around
     tail = block_size - shifts
 
-    if tail > 0:
-        # Straight segment (rows 0..tail-1)
-        # After the internal shift negation, this corresponds to the user's "wrapped" portion.
-        if negate:
-            nisa.tensor_scalar(
-                dst=matrix.reshape((N, num_blocks, block_size))[:, :, 0:tail],
-                data=ident.ap(
-                    pattern=[[partition_stride, N], [block_size, num_blocks], [1, tail]],
-                    offset=shifts,
-                ),
-                op0=nl.multiply,
-                operand0=-1.0,
-                engine=engine,
-            )
-        else:
-            nisa.tensor_copy(
-                dst=matrix.reshape((N, num_blocks, block_size))[:, :, 0:tail],
-                src=ident.ap(
-                    pattern=[[partition_stride, N], [block_size, num_blocks], [1, tail]],
-                    offset=shifts,
-                ),
-                engine=engine,
-            )
+    # shifts is reduced to [0, block_size-1], so tail = block_size - shifts is in [1, block_size].
+    kernel_assert(tail > 0, "tail must be positive")
+    # Straight segment (rows 0..tail-1)
+    # After the internal shift negation, this corresponds to the user's "wrapped" portion.
+    if negate:
+        nisa.tensor_scalar(
+            dst=matrix.reshape((N, num_blocks, block_size))[:, :, 0:tail],
+            data=ident.ap(
+                pattern=[[partition_stride, N], [block_size, num_blocks], [1, tail]],
+                offset=shifts,
+            ),
+            op0=nl.multiply,
+            operand0=-1.0,
+            engine=engine,
+        )
+    else:
+        nisa.tensor_copy(
+            dst=matrix.reshape((N, num_blocks, block_size))[:, :, 0:tail],
+            src=ident.ap(
+                pattern=[[partition_stride, N], [block_size, num_blocks], [1, tail]],
+                offset=shifts,
+            ),
+            engine=engine,
+        )
 
     if shifts > 0:
         # Wrapped segment (rows tail..block_size-1)

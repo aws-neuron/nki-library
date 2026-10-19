@@ -24,17 +24,17 @@ _F_SIZE_BF16 = 16384
 _F_SIZE_F32 = 8192
 
 
-def _norm_compute(tile: nl.ndarray, act_op, reduce_op, accum: nl.ndarray) -> None:
+def _norm_compute(tile: nl.NkiTensor, act_op, reduce_op, accum: nl.NkiTensor) -> None:
     """
     Per-tile norm computation: apply activation and reduce into accumulator.
 
     Applies activation then reduces along free dimension, accumulating into accum.
 
     Args:
-        tile (nl.ndarray): Input tile in SBUF. Shape varies by caller.
+        tile (nl.NkiTensor): Input tile in SBUF. Shape varies by caller.
         act_op: Activation operation (nl.square, nl.abs).
         reduce_op: Reduction operation (nl.add, nl.maximum).
-        accum (nl.ndarray): [P_MAX, 1], Accumulator buffer in SBUF.
+        accum (nl.NkiTensor): [P_MAX, 1], Accumulator buffer in SBUF.
     """
     nisa.activation(tile, op=act_op, data=tile)
     tile_reduced = nl.ndarray((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -43,11 +43,11 @@ def _norm_compute(tile: nl.ndarray, act_op, reduce_op, accum: nl.ndarray) -> Non
 
 
 def _norm_spmd_body(
-    data: nl.ndarray,
+    data: nl.NkiTensor,
     numel: int,
     act_op,
     reduce_op,
-    accum: nl.ndarray,
+    accum: nl.NkiTensor,
 ) -> int:
     """
     SPMD tiling body for norm kernels: loads tiles and applies norm compute.
@@ -56,11 +56,11 @@ def _norm_spmd_body(
     Delegates per-tile computation to _norm_compute.
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM.
         numel (int): Total number of elements in data.
         act_op: Activation operation (nl.square, nl.abs).
         reduce_op: Reduction operation (nl.add, nl.max).
-        accum (nl.ndarray): [P_MAX, 1], Accumulator buffer in SBUF.
+        accum (nl.NkiTensor): [P_MAX, 1], Accumulator buffer in SBUF.
 
     Returns:
         int: Program ID of the current SPMD core.
@@ -93,10 +93,10 @@ def _norm_spmd_body(
 
 
 def _norm_cross_core_reduce(
-    accum: nl.ndarray,
+    accum: nl.NkiTensor,
     reduce_op,
     prog_id: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Reduce accumulator across partitions and, on multi-core (LNC2), exchange
     between SPMD cores.
@@ -107,12 +107,12 @@ def _norm_cross_core_reduce(
     result and no cross-core exchange is performed.
 
     Args:
-        accum (nl.ndarray): [P_MAX, 1], Accumulator buffer in SBUF.
+        accum (nl.NkiTensor): [P_MAX, 1], Accumulator buffer in SBUF.
         reduce_op: Reduction operation (nl.add, nl.max, etc.).
         prog_id (int): Program ID of the current SPMD core.
 
     Returns:
-        nl.ndarray: [1, 1], Final reduced value in SBUF.
+        nl.NkiTensor: [1, 1], Final reduced value in SBUF.
     """
     local_total = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_partition_reduce(local_total, op=reduce_op, data=accum)
@@ -135,9 +135,9 @@ def _norm_cross_core_reduce(
 
 @nki.jit
 def l2_norm_kernel(
-    data: nl.ndarray,
+    data: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Compute L2 norm (Euclidean norm) of input tensor.
 
@@ -149,11 +149,11 @@ def l2_norm_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [1, 1], L2 norm scalar on HBM.
+        out (nl.NkiTensor): [1, 1], L2 norm scalar on HBM.
 
     Pseudocode:
         # SPMD core 0 and core 1 each process a partition of data
@@ -180,9 +180,9 @@ def l2_norm_kernel(
 
 @nki.jit
 def l1_norm_kernel(
-    data: nl.ndarray,
+    data: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Compute L1 norm (Manhattan norm) of input tensor.
 
@@ -194,11 +194,11 @@ def l1_norm_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [1, 1], L1 norm scalar on HBM.
+        out (nl.NkiTensor): [1, 1], L1 norm scalar on HBM.
 
     Pseudocode:
         # SPMD core 0 and core 1 each process a partition of data
@@ -222,9 +222,9 @@ def l1_norm_kernel(
 
 @nki.jit
 def linf_norm_kernel(
-    data: nl.ndarray,
+    data: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Compute Linf norm (max norm) of input tensor.
 
@@ -236,11 +236,11 @@ def linf_norm_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [1, 1], Linf norm scalar on HBM.
+        out (nl.NkiTensor): [1, 1], Linf norm scalar on HBM.
 
     Pseudocode:
         # SPMD core 0 and core 1 each process a partition of data

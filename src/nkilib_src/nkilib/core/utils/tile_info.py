@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import nki.language as nl
-from nki.language import NKIObject
 
 from .kernel_assert import kernel_assert
 from .kernel_helpers import get_ceil_quotient
@@ -27,7 +26,7 @@ from .kernel_helpers import get_ceil_quotient
 # Basic tiled dimension info
 #
 @dataclass
-class TiledDimInfo(NKIObject):
+class TiledDimInfo(nl.NKIObject):
     """
     Private
     """

@@ -62,7 +62,7 @@ def indexed_flatten(
         flattened_array (nl.NkiTensor): [output_len,], Flattened output array on shared HBM
 
     Notes:
-        - Requires LNC2 (2 NeuronCores)
+        - Runs at LNC1 or LNC2
         - output_len must be divisible by P_MAX (128)
         - output_len must be divisible by f_len
         - T must be divisible by f_len
@@ -209,17 +209,21 @@ def indexed_flatten(
     reshaped_reload_local = nl.ndarray((P_MAX, output_len // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=reshaped_reload_local, src=reshaped_reload)
 
-    reshaped_reload_remote = nl.ndarray((P_MAX, output_len // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
-    nisa.sendrecv(
-        src=reshaped_reload_local,
-        dst=reshaped_reload_remote,
-        send_to_rank=(1 - shard_id),
-        recv_from_rank=(1 - shard_id),
-        pipe_id=0,
-    )
+    if num_shards == 1:
+        # One shard already covers every expert row, and sendrecv needs a peer rank.
+        result_sb = reshaped_reload_local
+    else:
+        reshaped_reload_remote = nl.ndarray((P_MAX, output_len // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
+        nisa.sendrecv(
+            src=reshaped_reload_local,
+            dst=reshaped_reload_remote,
+            send_to_rank=(1 - shard_id),
+            recv_from_rank=(1 - shard_id),
+            pipe_id=0,
+        )
 
-    result_sb = nl.ndarray((P_MAX, output_len // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=result_sb, data1=reshaped_reload_local, data2=reshaped_reload_remote, op=nl.maximum)
+        result_sb = nl.ndarray((P_MAX, output_len // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=result_sb, data1=reshaped_reload_local, data2=reshaped_reload_remote, op=nl.maximum)
 
     flattened_array = nl.ndarray((output_len,), dtype=index_dtype, buffer=nl.shared_hbm)
     if shard_id == 0:

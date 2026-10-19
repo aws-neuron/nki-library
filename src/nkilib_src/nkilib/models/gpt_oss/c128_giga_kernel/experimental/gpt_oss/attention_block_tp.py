@@ -47,26 +47,27 @@ import nki.language as nl
 from nki.collectives import ReplicaGroup
 
 from ...core.utils.common_types import QuantizationType
+from ..trace_caches import reset_trace_state
 from ..transformer.attention_block_tkg import attention_block_tkg
 
 
 @nki.jit
 def attention_block_tp_kernel(
-    X_shard: nl.ndarray,
-    W_qkv: nl.ndarray,
-    bias_qkv: nl.ndarray,
-    W_out: nl.ndarray,
-    bias_out: nl.ndarray,
-    cos: nl.ndarray,
-    sin: nl.ndarray,
-    sink: nl.ndarray,
-    K_cache: nl.ndarray,
-    V_cache: nl.ndarray,
-    active_blocks_table: nl.ndarray,
-    attention_mask: nl.ndarray,
-    kv_cache_update_idx: nl.ndarray,
-    pos_ids: nl.ndarray,
-    swa_start_pos_ids: nl.ndarray,
+    X_shard: nl.NkiTensor,
+    W_qkv: nl.NkiTensor,
+    bias_qkv: nl.NkiTensor,
+    W_out: nl.NkiTensor,
+    bias_out: nl.NkiTensor,
+    cos: nl.NkiTensor,
+    sin: nl.NkiTensor,
+    sink: nl.NkiTensor,
+    K_cache: nl.NkiTensor,
+    V_cache: nl.NkiTensor,
+    active_blocks_table: nl.NkiTensor,
+    attention_mask: nl.NkiTensor,
+    kv_cache_update_idx: nl.NkiTensor,
+    pos_ids: nl.NkiTensor,
+    swa_start_pos_ids: nl.NkiTensor,
     replica_group: ReplicaGroup,
     num_ranks: int,
     B: int,
@@ -98,13 +99,17 @@ def attention_block_tp_kernel(
         ``[B*S_tkg // num_ranks, H]`` this rank's token shard of the summed
         multi-head attention output (SP layout).
     """
+    # Trace-scoped module caches must be dropped on entry to every OUTERMOST @nki.jit kernel:
+    # the prefetch FIFOs' consumers pop unconditionally whenever non-empty, so a leftover entry
+    # from a previous trace in this process is silently consumed. See experimental/trace_caches.py.
+    reset_trace_state()
     T_shard, H = X_shard.shape
     T = T_shard * num_ranks
     dtype = X_shard.dtype
 
     # ── Dispatch: AllGather[TP] the SP token shards -> full [T, H] on every rank.
-    ag_src = nl.ndarray((T_shard, H), dtype=dtype, buffer=nl.shared_hbm, name="ag_src")
-    ag_dst = nl.ndarray((T, H), dtype=dtype, buffer=nl.shared_hbm, name="ag_dst")
+    ag_src = nl.ndarray((T_shard, H), dtype=dtype, buffer=nl.private_hbm, name="ag_src")
+    ag_dst = nl.ndarray((T, H), dtype=dtype, buffer=nl.private_hbm, name="ag_dst")
     nisa.dma_copy(dst=ag_src, src=X_shard)
     ncc.all_gather(dsts=[ag_dst], srcs=[ag_src], replica_group=replica_group, collective_dim=0)
 
@@ -161,8 +166,8 @@ def attention_block_tp_kernel(
 
     # ── Combine: ReduceScatter[TP] sums head-partials across ranks and re-shards
     # over tokens -> [T // num_ranks, H] per rank (SP layout).
-    rs_src = nl.ndarray((T, H), dtype=out.dtype, buffer=nl.shared_hbm, name="rs_src")
-    rs_dst = nl.ndarray((T_shard, H), dtype=out.dtype, buffer=nl.shared_hbm, name="rs_dst")
+    rs_src = nl.ndarray((T, H), dtype=out.dtype, buffer=nl.private_hbm, name="rs_src")
+    rs_dst = nl.ndarray((T_shard, H), dtype=out.dtype, buffer=nl.private_hbm, name="rs_dst")
     result = nl.ndarray((T_shard, H), dtype=out.dtype, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=rs_src, src=out)
     ncc.reduce_scatter(dsts=[rs_dst], srcs=[rs_src], op=nl.add, replica_group=replica_group, collective_dim=0)

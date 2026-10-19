@@ -99,15 +99,28 @@ def _find_kernel_entries() -> List[Tuple[str, str, str]]:
 
 DISPATCH_KNOWN_FAILURES = frozenset(
     {
-        # GDN kernels are validated via explicit torch_ref= in their integration tests
-        # (test_gdn_*.py), not convention-based auto-dispatch. They are not yet wired for
-        # the <name>_torch_ref naming + signature-parity contract:
-        #   gdn_cte:       ref is gdn_cte_torch_nki_ref (name mismatch)
+        # GDN decode kernels are validated via explicit torch_ref= in their integration
+        # tests (test_gdn_*.py), not convention-based auto-dispatch. They are not yet
+        # wired for the <name>_torch_ref naming + signature-parity contract:
         #   gdn_block_tkg: ref is gdn_block_decode_fused_torch_ref (name mismatch)
         #   gdn_tkg:       no gdn_tkg_torch.py module (ref lives inline in the integration test)
         #   qkv_cte:       has qkv_cte_torch_ref but parameter names differ from the kernel
+        # The gdn_cte prefill family IS wired for convention dispatch and must stay that
+        # way. It has ONE @nki.jit entry (gdn_cte) and one ref (gdn_cte_torch_ref); its two
+        # algorithms are plain traced bodies the dispatcher inlines, so they are not
+        # discovered here and need no refs of their own.
         # TODO(qqdong): wire these to convention dispatch and remove from this set.
-        "gdn_cte",
+        # gpt_oss_tail_chunked_megakernel: convention dispatch hands the ref exactly the
+        # arguments ONE RANK receives, and this kernel's answer is not a function of them -- the
+        # top-k spans the whole vocab, which lives across all VTP ranks' weight shards, so a rank
+        # cannot compute it from its own shard alone. Its reference is therefore global by
+        # nature: gpt_oss_tail_chunked_ref in tail_chunked_megakernel_torch.py takes the full
+        # shard list and returns per-rank results, and the integration test passes it explicitly
+        # via torch_ref=. Same situation as gdn_tkg below (ref not expressible as convention
+        # dispatch), not a missing reference.
+        # TODO: revisit if convention dispatch ever gains a way to give the ref the
+        # collective's world (e.g. a rank id plus all shards).
+        "gpt_oss_tail_chunked_megakernel",
         "gdn_block_tkg",
         "gdn_tkg",
         "qkv_cte",

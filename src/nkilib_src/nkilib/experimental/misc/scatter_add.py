@@ -32,7 +32,9 @@ _D_TILE_FACTOR = 4
 
 
 @nki.jit
-def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray) -> nl.ndarray:
+def scatter_add(
+    input: nl.NkiTensor, dim: int, index: nl.NkiTensor, src: nl.NkiTensor, unique_indices: bool = True
+) -> nl.NkiTensor:
     """
     Scatter-add from src into input based on indices using gather-accumulate-scatter pattern.
 
@@ -47,19 +49,25 @@ def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray)
         K: Number of source rows / indices
 
     Args:
-        input (nl.ndarray): [N, D], Destination tensor to accumulate into (modified in-place)
+        input (nl.NkiTensor): [N, D], Destination tensor to accumulate into (modified in-place)
         dim (int): Dimension along which to scatter (must be 0)
-        index (nl.ndarray): [K], 1D tensor of row indices into input
-        src (nl.ndarray): [K, D], Source values to scatter-add
+        index (nl.NkiTensor): [K], 1D tensor of row indices into input
+        src (nl.NkiTensor): [K, D], Source values to scatter-add
+        unique_indices (bool): If True (default), assume destination indices are unique within
+            each 128-row tile and use the plain tile-wide gather/scatter path. If False,
+            duplicate rows within a tile are pre-combined on the Tensor Engine so repeated
+            indices accumulate correctly, which embedding-gradient scatters need. Costs one
+            extra 128x128 matmul per PSUM-wide column chunk.
 
     Returns:
-        input (nl.ndarray): [N, D], The input tensor with scattered values added
+        input (nl.NkiTensor): [N, D], The input tensor with scattered values added
 
     Notes:
         - Input and src tensors must be 2D
         - Index tensor must be 1D
         - dim must be 0
-        - Indices within a tile of 128 rows should be unique for correctness
+        - With unique_indices=True (default) indices within a 128-row tile must be unique;
+          duplicates are silently dropped. Pass unique_indices=False when they may repeat.
 
     Pseudocode:
         for k_tile in tiles(K):
@@ -95,6 +103,9 @@ def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray)
             src=index.ap(pattern=[[1, k_valid], [1, 1]], offset=k_tile_idx * k_tile_size),
         )
 
+        if not unique_indices:
+            dup_matrix = _build_duplicate_matrix(index, idx_tile, k_tile_idx * k_tile_size, k_valid, src.dtype)
+
         for local_d_tile_idx in nl.affine_range(num_d_tiles_per_shard):
             d_tile_offset = d_offset + local_d_tile_idx * d_tile_size
             d_valid = min(d_tile_size, d_per_shard - local_d_tile_idx * d_tile_size)
@@ -123,7 +134,29 @@ def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray)
 
             # Add in SBUF
             result_tile = nl.ndarray((k_valid, d_valid), dtype=input.dtype, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=result_tile, data1=existing_tile, data2=src_tile, op=nl.add)
+            if unique_indices:
+                nisa.tensor_tensor(dst=result_tile, data1=existing_tile, data2=src_tile, op=nl.add)
+            else:
+                # Every row of a duplicate group gathered the same `existing` value, and after
+                # this matmul holds the same group total, so the racing indirect writes below
+                # all store the same correct result. PSUM caps the matmul free dimension, so
+                # walk the column tile in psum_fmax chunks.
+                for chunk_start in range(0, d_valid, nl.tile_size.psum_fmax):
+                    chunk_valid = min(nl.tile_size.psum_fmax, d_valid - chunk_start)
+                    chunk = nl.ds(chunk_start, chunk_valid)
+                    group_sum = nl.ndarray((k_valid, chunk_valid), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(
+                        dst=group_sum,
+                        stationary=dup_matrix,
+                        moving=src_tile[:, chunk],
+                        is_stationary_onezero=True,
+                    )
+                    nisa.tensor_tensor(
+                        dst=result_tile[:, chunk],
+                        data1=existing_tile[:, chunk],
+                        data2=group_sum,
+                        op=nl.add,
+                    )
 
             # Scatter write back
             nisa.dma_copy(
@@ -137,6 +170,38 @@ def scatter_add(input: nl.ndarray, dim: int, index: nl.ndarray, src: nl.ndarray)
             )
 
     return input
+
+
+def _build_duplicate_matrix(index, idx_tile, k_offset, k_valid, dtype):
+    """Build the [k_valid, k_valid] index-equality matrix for one k tile.
+
+    ``E[i, j]`` is 1.0 when ``index[i] == index[j]`` and 0.0 otherwise, over the ``k_valid``
+    indices starting at ``k_offset``. As the stationary operand of an ``nc_matmul`` against the
+    src tile it produces ``sum_j E[i, j] * src[j, :]``, the total of every src row sharing row
+    i's destination. ``E`` is symmetric, so no transpose is needed.
+
+    Args:
+        index (nl.NkiTensor): [K], the full 1D index tensor in HBM.
+        idx_tile (nl.NkiTensor): [k_valid, 1], this tile's indices already in SBUF.
+        k_offset (int): Start of this tile within ``index``.
+        k_valid (int): Number of indices in this tile (<= 128).
+        dtype: Data type of ``E``; must match the src tile's dtype for ``nc_matmul``.
+
+    Returns:
+        nl.NkiTensor: [k_valid, k_valid] equality matrix in SBUF.
+    """
+    # tensor_scalar requires a float32 per-partition operand, so cast this tile's indices.
+    idx_col = nl.ndarray((k_valid, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=idx_col, src=idx_tile)
+
+    # Re-read the indices with a zero partition stride so every partition holds the full index
+    # row, which forms the free-dimension side of the comparison.
+    idx_row = nl.ndarray((k_valid, k_valid), dtype=index.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=idx_row, src=index.ap(pattern=[[0, k_valid], [1, k_valid]], offset=k_offset))
+
+    dup_matrix = nl.ndarray((k_valid, k_valid), dtype=dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=dup_matrix, data=idx_row, op0=nl.equal, operand0=idx_col)
+    return dup_matrix
 
 
 def _validate_scatter_add_inputs(input, dim, index, src, num_shards):

@@ -116,9 +116,9 @@ class QuantizeMX(nl.NKIObject):
             scale_tile = self._dst_scale.get_tile()
 
             nisa.quantize_mx(
-                dst=dst_tile.get_view(),
-                src=src_tile.get_view(),
-                dst_scale=scale_tile.get_view(),
+                dst=dst_tile,
+                src=src_tile,
+                dst_scale=scale_tile,
             )
 
         self._src.reset_cur_tile()

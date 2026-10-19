@@ -23,11 +23,15 @@ from ...mlp_parameters import MLPParameters, mlpp_has_dma_xpose, mlpp_input_has_
 from ..mlp_cte_constants import MlpBxsIndices, MLPCTEConstants
 from .mlp_cte_basic_tile_info import (
     MLPCTEBasicTileInfo,
+    get_down_proj_weights_alloc_ring_buffer_count,
+    get_down_proj_weights_ring_buffer_count,
     get_down_weights_tensor_info,
     get_gate_up_weights_tensor_info,
     get_hidden_tile_tensor_info,
     get_intermediate_tile_tensor_info,
     get_output_tile_tensor_info,
+    get_src_proj_weights_alloc_ring_buffer_count,
+    get_src_proj_weights_ring_buffer_count,
 )
 
 
@@ -127,14 +131,39 @@ def allocate_src_projection_weights(
         mlp_params,
         constants,
         tile_info.src_proj_hidden_dim_tile,
-        tile_info.src_proj_intermediate_dim_tile,
+        tile_info.src_proj_weights_int_dma_tile,
     )
     weights_tensor_size = sizeinbytes(weights_tensor_dtype)
     for dim_size in weights_tensor_shape[1:]:
         weights_tensor_size *= dim_size
+
+    # Gate/up is allocated before (and greedier than) the down-proj ring, so reserve down-proj's
+    # planned footprint here to avoid starving that later allocation on SBUF-tight configs.
+    down_weights_shape, down_weights_dtype = get_down_weights_tensor_info(
+        mlp_params,
+        constants,
+        tile_info.down_proj_weights_hidden_dma_tile,
+        tile_info.down_proj_intermediate_dim_tile,
+    )
+    down_weights_size = sizeinbytes(down_weights_dtype)
+    for dim_size in down_weights_shape[1:]:
+        down_weights_size *= dim_size
+    down_proj_reserve = down_weights_size * get_down_proj_weights_ring_buffer_count(
+        constants, tile_info.down_proj_weights_hidden_dma_tile
+    )
+    available_free_space = max(0, sbm.get_free_space() - down_proj_reserve)
+
+    # Deepen prefetch only for non-quant: quant configs carry extra row/scale SBUF stacks (and often
+    # keep weights resident), leaving no idle SBUF to spend — deepening there OOMs the scale stacks.
+    if mlp_params.quant_params.is_quant():
+        src_proj_ring_count = get_src_proj_weights_ring_buffer_count(constants, tile_info.src_proj_weights_int_dma_tile)
+    else:
+        src_proj_ring_count = get_src_proj_weights_alloc_ring_buffer_count(
+            constants, tile_info.src_proj_weights_int_dma_tile
+        )
     actual_src_proj_weights_buffer_count = min(
-        sbm.get_free_space() // weights_tensor_size,
-        constants.src_proj_weights_max_buffer_count,
+        available_free_space // weights_tensor_size,
+        src_proj_ring_count,
     )
     for weight_buffer_idx in range(actual_src_proj_weights_buffer_count):
         weights_tensor = alloc(
@@ -153,15 +182,33 @@ def allocate_down_projection_weights(
     indices: MlpBxsIndices,
     down_proj_weights_sbuf: list,
     alloc: Callable,
+    sbm: SbufManager,
 ):
     weights_tensor_shape, weights_tensor_dtype = get_down_weights_tensor_info(
         mlp_params,
         constants,
-        tile_info.down_proj_hidden_dim_tile,
+        tile_info.down_proj_weights_hidden_dma_tile,
         tile_info.down_proj_intermediate_dim_tile,
     )
 
-    for weight_buffer_idx in range(constants.down_proj_weights_buffer_count):
+    weights_tensor_size = sizeinbytes(weights_tensor_dtype)
+    for dim_size in weights_tensor_shape[1:]:
+        weights_tensor_size *= dim_size
+    # Deepen prefetch only for non-quant (see allocate_src_projection_weights): quant configs have no
+    # idle SBUF to spend, so deepening the down ring OOMs their scale stacks.
+    if mlp_params.quant_params.is_quant():
+        down_proj_ring_count = get_down_proj_weights_ring_buffer_count(
+            constants, tile_info.down_proj_weights_hidden_dma_tile
+        )
+    else:
+        down_proj_ring_count = get_down_proj_weights_alloc_ring_buffer_count(
+            constants, tile_info.down_proj_weights_hidden_dma_tile
+        )
+    actual_down_proj_weights_buffer_count = min(
+        sbm.get_free_space() // weights_tensor_size,
+        down_proj_ring_count,
+    )
+    for weight_buffer_idx in range(actual_down_proj_weights_buffer_count):
         down_proj_weights_tensor = alloc(
             weights_tensor_shape,
             dtype=weights_tensor_dtype,

@@ -97,7 +97,7 @@ def _output_projection_tkg_mx(
             quantization_type=quantization_type,
             input_scale_hbm=input_scale,
         )
-    else:
+    else:  # pragma: no cover - unreachable: _validate_and_create_config asserts not transpose_out for MX/STATIC_MX
         return _output_projection_tkg_mx_with_transpose_out(
             attention=attention,
             weights_qtz=weights_qtz,

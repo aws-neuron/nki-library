@@ -118,6 +118,31 @@ class AttnTKGConfig(nl.NKIObject):
     by the softmax denominator) and export local softmax stats (max, sum) via cp_softmax_stats_out.
     Used by CP for distributed softmax correction across ranks."""
 
+    enable_pv_moving_free_dim_padding: bool = False
+    """Whether to pad dense PV matmuls toward a moving free dimension of 64.
+    The kernel uses neighboring batches' P columns as filler and discards those result columns.
+    This can help targets that throttle small matmuls, but increases total PV work."""
+
+    enable_pv_swapped_column_tiling: bool = False
+    """Whether to use the experimental column-tiled P@V formulation.
+    This packs four s-prior tiles into each 32-column hardware tile and executes four
+    independent batch tiles together."""
+
+    seq_packed_slot_interleave_degree: int = 0
+    """Packed attention only: override the slot multi-buffering depth.
+
+    0 keeps the default min(num_slots, TileConstants.psum_b_max). Set to 1 to disable the
+    manual SBUF multi-buffering across schedule slots, so the manual allocator reuses one
+    address per slot as the automatic allocator does. No effect under automatic
+    allocation, where the degree is always 1.
+
+    This does not trade against PSUM depth uniformly. The per-slot QK matmul takes
+    floor(psum_b_max / degree) banks, so its depth falls as the degree rises; the PV matmul
+    addresses PSUM as (slot_index % degree), so it rotates over min(num_slots, degree) banks
+    and its depth rises. Any statement about "the" PSUM depth has to say which matmul it
+    means, and both are then subject to the SBUF clamp in _get_safe_batch_interleave_degree,
+    which can lower either independently."""
+
 
 ### Constants
 @dataclass
@@ -413,46 +438,14 @@ def is_qk_swapped(
         if batches_per_psum % bs_per_nc != 0:
             return False
         # Cap the band factor. band_factor=2 is validated end-to-end; up to 4 is allowed. Higher factors
-        # (e.g. 16 for bs_per_nc=1) are rejected -> fall back to the non-swap path: the banded gen_mask's
-        # per-band token shift assumes the band split aligns to the fold structure, which breaks for large
-        # factors on multi-fold tiles, and the banded MM1/PV have only been exercised at small factors.
+        # (e.g. 16 for bs_per_nc=1) are rejected because the banded MM1/PV path has only been exercised at
+        # small factors.
         # TODO(perf): evaluate whether band_factor 3/4 actually beat the non-swap path -- only 2 is proven
         # a win so far; the higher factors may not be worth the extra banded-softmax/PV overhead.
         _MAX_BAND_FACTOR = 4
         band_factor = batches_per_psum // bs_per_nc
         if band_factor > _MAX_BAND_FACTOR:
             return False
-
-        # Fold-alignment: banding generates only band 0's per-fold iota and recovers band b's tokens with a
-        # single constant per-band shift. That shift is only correct when each band spans a whole number of
-        # folds (or a single fold split on its f_within axis). Per FA tile, num_folds = (band_s_prior *
-        # band_factor) / (p_max * resized_block_len); the shift is constant iff num_folds == 1 or
-        # num_folds % band_factor == 0. A mid-fold band boundary (e.g. 5 folds / 2 bands) breaks it, so fall
-        # back to the non-swap path. gen_mask asserts the same condition; gating here keeps the pre-generated
-        # mask path (which has no such assert) consistent. Needs the resized block_len -> requires block_len.
-        if block_len > 0:  # always true here (block KV gated above); resize needs the original block_len
-            num_blocks_per_batch = curr_sprior // block_len
-            reduced_block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
-                num_blocks_per_batch,
-                block_len,
-                lnc,
-                p_max,
-                bs,
-                q_head_per_kv,
-                s_active,
-                full_sprior=curr_sprior,
-            )
-            fold_size = p_max * reduced_block_len
-            _, fa_tile = uses_flash_attention(True, s_prior_per_shard)
-            fa_tile = min(fa_tile, s_prior_per_shard)
-            # Check every FA tile over the shard (full tiles + partial remainder).
-            tile_offset = 0
-            while tile_offset < s_prior_per_shard:
-                tile_s_prior = min(fa_tile, s_prior_per_shard - tile_offset)
-                num_folds = (tile_s_prior) // fold_size  # band_s_prior * band_factor == tile_s_prior
-                if not (num_folds == 1 or num_folds % band_factor == 0):
-                    return False
-                tile_offset += tile_s_prior
 
     # The de-interleaved swap evict reshapes each mm1 group as [.., qk_row_tile_factor, pack_factor * p_max].
     # Every FA tile's s_prior must be a whole multiple of # p_max * qk_row_tile_factor * pack_factor.
@@ -468,6 +461,19 @@ def is_qk_swapped(
         return False
 
     return True
+
+
+def get_qk_row_tile_factor(
+    *,
+    is_auto_alloc: bool,
+    d_head: int,
+    block_len: int,
+    fp8_packed: bool,
+    use_dma_transpose: bool,
+) -> int:
+    """Return the QK row-tiling factor for an already-resized block-KV config."""
+    min_block_len = 4 if fp8_packed else 2
+    return 2 if (is_auto_alloc and d_head == 64 and block_len >= min_block_len and use_dma_transpose) else 1
 
 
 ### Block KV

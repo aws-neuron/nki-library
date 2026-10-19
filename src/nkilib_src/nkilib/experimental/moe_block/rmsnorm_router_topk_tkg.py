@@ -32,10 +32,10 @@ from ...core.utils.kernel_helpers import get_verified_program_sharding_info
 
 @nki.jit
 def rmsnorm_router_topk_tkg(
-    hidden_states: nl.ndarray,
-    gamma: nl.ndarray,
-    router_weights: nl.ndarray,
-    router_bias: Optional[nl.ndarray] = None,
+    hidden_states: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    router_weights: nl.NkiTensor,
+    router_bias: Optional[nl.NkiTensor] = None,
     eps: float = 1e-6,
     top_k: int = 1,
     hidden_actual: Optional[int] = None,
@@ -47,10 +47,10 @@ def rmsnorm_router_topk_tkg(
     """Fused RMSNorm (+ optional MX quantize) + Router TopK.
 
     Args:
-        hidden_states (nl.ndarray): [B, S, H], Input tensor on HBM.
-        gamma (nl.ndarray): [1, H], RMSNorm weights on HBM.
-        router_weights (nl.ndarray): [H, E], Router weights on HBM.
-        router_bias (Optional[nl.ndarray]): [1, E], Optional router bias on HBM.
+        hidden_states (nl.NkiTensor): [B, S, H], Input tensor on HBM.
+        gamma (nl.NkiTensor): [1, H], RMSNorm weights on HBM.
+        router_weights (nl.NkiTensor): [H, E], Router weights on HBM.
+        router_bias (Optional[nl.NkiTensor]): [1, E], Optional router bias on HBM.
         eps (float): Epsilon for RMSNorm. Default 1e-6.
         top_k (int): Number of top experts per token. Default 1.
         hidden_actual (Optional[int]): Actual hidden dim for padded inputs.

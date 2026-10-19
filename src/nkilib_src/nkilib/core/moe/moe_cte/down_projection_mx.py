@@ -326,8 +326,9 @@ def down_projection_mx(
                     moving=bias_sb[:, bias_h_slice],
                     is_stationary_onezero=True,
                 )
-                engine = nisa.vector_engine if i_bias_tile % 2 == 0 else nisa.scalar_engine
-                nisa.tensor_copy(dst=bias_broadcasted[:, bias_h_slice], src=bias_psum, engine=engine)
+                # All tiles on the scalar engine: no performance mode applies to this fp32->bf16
+                # copy, so the vector engine is no faster here, and it is the busier of the two.
+                nisa.tensor_copy(dst=bias_broadcasted[:, bias_h_slice], src=bias_psum, engine=nisa.scalar_engine)
     else:
         # Path 2: Bias already broadcasted to (128, H)
         kernel_assert(

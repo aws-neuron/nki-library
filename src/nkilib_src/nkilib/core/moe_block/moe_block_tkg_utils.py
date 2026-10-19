@@ -107,30 +107,30 @@ class MoEBlockTKGDims(nl.NKIObject):
 
 
 def parse_moe_block_config(
-    inp: nl.ndarray,
-    router_weights: nl.ndarray,
-    expert_gate_up_weights: nl.ndarray,
-    shared_expert_gate_w: Optional[nl.ndarray],
+    inp: nl.NkiTensor,
+    router_weights: nl.NkiTensor,
+    expert_gate_up_weights: nl.NkiTensor,
+    shared_expert_gate_w: Optional[nl.NkiTensor],
     top_k: int,
     hidden_actual: Optional[int],
     is_all_expert: bool,
-    expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
-    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
+    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
+    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
     inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
 ) -> tuple[MoEBlockTKGDims, QuantizationConfig, ExpertConfig]:
     """
     Parse input tensors and compute dimension constants.
 
     Args:
-        inp (nl.ndarray): [B, S, H] or [H0, n_prgs, H1_shard, BxS] depending on inp_layout.
-        router_weights (nl.ndarray): [H, E], Router weights tensor.
-        expert_gate_up_weights (nl.ndarray): Expert gate/up projection weights.
-        shared_expert_gate_w (nl.ndarray): Optional shared expert gate weights.
+        inp (nl.NkiTensor): [B, S, H] or [H0, n_prgs, H1_shard, BxS] depending on inp_layout.
+        router_weights (nl.NkiTensor): [H, E], Router weights tensor.
+        expert_gate_up_weights (nl.NkiTensor): Expert gate/up projection weights.
+        shared_expert_gate_w (nl.NkiTensor): Optional shared expert gate weights.
         top_k (int): Number of top-K experts.
         hidden_actual (int): Optional actual hidden dimension for RMSNorm.
         is_all_expert (bool): Whether using all-expert mode.
-        expert_gate_up_weights_scale (nl.ndarray): Optional quantization scales for gate/up weights.
-        expert_gate_up_input_scale (nl.ndarray): Optional FP8 dequant scale for gate/up input (STATIC_MX).
+        expert_gate_up_weights_scale (nl.NkiTensor): Optional quantization scales for gate/up weights.
+        expert_gate_up_input_scale (nl.NkiTensor): Optional FP8 dequant scale for gate/up input (STATIC_MX).
         inp_layout (MoEBlockIOLayout): Input tensor layout.
 
     Returns:
@@ -189,14 +189,14 @@ def validate_moe_block_inputs(
     dims: MoEBlockTKGDims,
     quant_config: QuantizationConfig,
     expert_config: ExpertConfig,
-    shared_expert_gate_w: Optional[nl.ndarray],
-    shared_expert_up_w: Optional[nl.ndarray],
-    shared_expert_down_w: Optional[nl.ndarray],
+    shared_expert_gate_w: Optional[nl.NkiTensor],
+    shared_expert_up_w: Optional[nl.NkiTensor],
+    shared_expert_down_w: Optional[nl.NkiTensor],
     hidden_act_scale_factor: Optional[float],
-    hidden_act_bias: Optional[nl.ndarray],
+    hidden_act_bias: Optional[nl.NkiTensor],
     router_mm_dtype,
-    rank_id: Optional[nl.ndarray],
-    residual: Optional[nl.ndarray],
+    rank_id: Optional[nl.NkiTensor],
+    residual: Optional[nl.NkiTensor],
 ):
     """
     Validate input parameters for MoE Block TKG kernel.
@@ -205,14 +205,14 @@ def validate_moe_block_inputs(
         dims (MoEBlockTKGDims): Parsed dimension constants.
         quant_config (QuantizationConfig): Quantization configuration.
         expert_config (ExpertConfig): Expert execution configuration.
-        shared_expert_gate_w (nl.ndarray): Optional shared expert gate weights.
-        shared_expert_up_w (nl.ndarray): Optional shared expert up weights.
-        shared_expert_down_w (nl.ndarray): Optional shared expert down weights.
+        shared_expert_gate_w (nl.NkiTensor): Optional shared expert gate weights.
+        shared_expert_up_w (nl.NkiTensor): Optional shared expert up weights.
+        shared_expert_down_w (nl.NkiTensor): Optional shared expert down weights.
         hidden_act_scale_factor (float): Optional activation scale factor.
-        hidden_act_bias (nl.ndarray): Optional activation bias.
+        hidden_act_bias (nl.NkiTensor): Optional activation bias.
         router_mm_dtype: Router matmul dtype.
-        rank_id (nl.ndarray): Optional rank ID for all-expert mode.
-        residual (nl.ndarray): Optional residual tensor.
+        rank_id (nl.NkiTensor): Optional rank ID for all-expert mode.
+        residual (nl.NkiTensor): Optional residual tensor.
 
     Raises:
         AssertionError: If any validation check fails.
@@ -228,8 +228,9 @@ def validate_moe_block_inputs(
         not expert_config.has_shared_expert, "shared_expert has not been supported in moe_block_tkg kernel yet"
     )
 
-    # Shared expert validation (for future support)
-    if expert_config.has_shared_expert:
+    # Shared expert validation (for future support). Unreachable today: the assert above
+    # rejects has_shared_expert=True, so this block's body never executes.
+    if expert_config.has_shared_expert:  # pragma: no cover
         kernel_assert(
             shared_expert_up_w != None,
             "shared expert up weight must be a valid tensor when shared expert is enabled",

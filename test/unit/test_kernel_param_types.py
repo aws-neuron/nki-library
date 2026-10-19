@@ -52,7 +52,8 @@ def _get_framework_ready_kernels():
         # Convert filepath to module path: nkilib_src/nkilib/core/mlp/mlp.py -> nkilib_src.nkilib.core.mlp.mlp
         module_path = rel_path(loc.filepath).replace("/", ".").replace(".py", "")
         result.append((module_path, loc.name))
-    return result
+    # Discovery order may differ across workers; pytest-xdist requires identical collection.
+    return sorted(result)
 
 
 FRAMEWORK_KERNELS = _get_framework_ready_kernels()

@@ -223,6 +223,33 @@ class TestCumsumKernel:
             rtol=rtol,
         )
 
+    @pytest.mark.fast
+    def test_cumsum_explicit_positive_axis(self, test_manager: Orchestrator, platform_target: Platforms):
+        """Pass a non-negative last-dim axis explicitly (axis=rank-1) instead of the
+        default -1. Exercises the axis-already-non-negative path of the axis
+        normalization, which every other test skips by relying on the default.
+        """
+        batch, hidden = 1, 16
+        axis = 1  # 2D input -> last-dim index; equals rank - 1, no negative normalization
+
+        def input_generator(test_config):
+            np.random.seed(42)
+            return {"x": np.random.randn(batch, hidden).astype(np.float32), "axis": axis}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=cumsum,
+            torch_ref=torch_ref_wrapper(cumsum_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
     @pytest.mark.coverage_parametrize(
         batch=[1, 64, 128, 256, 512, 1024, 2048],
         hidden=[256, 512, 1024, 2048, 4096, 6144, 8192],

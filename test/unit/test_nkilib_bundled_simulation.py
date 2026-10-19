@@ -266,8 +266,10 @@ class BundledSimulator:
                     del sys.modules[key]
             importlib.invalidate_caches()
         """)
+        # Fixtures need only the standard library. Ignore inherited Python paths
+        # and skip site initialization, including editable-install import hooks.
         return subprocess.run(
-            [sys.executable, "-c", setup_code + code],
+            [sys.executable, "-I", "-S", "-c", setup_code + code],
             capture_output=True,
             text=True,
             env=env,

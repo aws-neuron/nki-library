@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 import nki.language as nl
-from nki.language import NKIObject
 
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info
@@ -121,14 +120,14 @@ def is_sharded_dim_bxs(sharded_dim: ShardedDim) -> bool:
 
 
 @dataclass
-class DimShard(NKIObject):
+class DimShard(nl.NKIObject):
     dim_offset: int  # Offset into the dimension being sharded on
     dim_size: int  # The size of the shard
     shard_mlp_params: MLPParameters  # Kernel params with an updated sharded dimension based on the shard size
 
 
 @dataclass
-class ShardInfo(NKIObject):
+class ShardInfo(nl.NKIObject):
     sharded_dim: ShardedDim  # The dimension being sharded
     shards: list  # The shards that the worker will process - list[DimShard]
 
@@ -179,6 +178,8 @@ def _calculate_bxs_sharding(
 def is_launch_grid_valid_for_mlp() -> bool:
     """Check if launch grid configuration is valid for MLP operations."""
     grid_ndim = nl.program_ndim()
-    if grid_ndim < 0 or grid_ndim > 1:
+    if (
+        grid_ndim < 0 or grid_ndim > 1
+    ):  # pragma: no branch - grid_ndim validated in [0,1] at kernel entry, out-of-range return-False arc dead
         return False
     return True

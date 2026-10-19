@@ -145,7 +145,8 @@ def swa_fused_cte_torch_ref(
     # the V cache arrives UNPACKED, token-major (num_blocks, num_kv_heads, block_size, d_head) fp8 (same
     # layout as the bf16 cache, only the dtype differs). Dequantize both to float for attention; the
     # returned golden caches are re-quantized (K packed, V unpacked) to match the kernel's FP8 write
-    # bit-for-bit. k_scale/v_scale are per-tensor [.,.] fp32 (a single scalar). Detect FP8 by the K cache
+    # bit-for-bit. k_scale/v_scale are per-tensor [128,1] fp32 (one scalar replicated over partitions;
+    # we read element 0). Detect FP8 by the K cache
     # rank/trailing-axis (the framework may hand the ref a float view of the fp8 tensor, so don't rely on
     # dtype): packed K is 5D with trailing axis 2, vs the bf16 K cache which is 4D. k_scale present is the
     # decisive signal.

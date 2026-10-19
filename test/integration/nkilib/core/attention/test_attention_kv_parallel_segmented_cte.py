@@ -400,6 +400,7 @@ class TestKVParallelSegmentedPrefill:
             fp8_packed=False,
             k_scale=None,
             v_scale=None,
+            allow_vector_exp=True,
         ):
             return create_golden(get_rank())
 
@@ -572,6 +573,7 @@ class TestKVParallelSegmentedPrefill:
             fp8_packed=False,
             k_scale=None,
             v_scale=None,
+            allow_vector_exp=True,
         ):
             return create_golden(get_rank())
 
@@ -733,6 +735,7 @@ class TestKVParallelSegmentedPrefill:
             fp8_packed=False,
             k_scale=None,
             v_scale=None,
+            allow_vector_exp=True,
         ):
             return create_golden(get_rank())
 
@@ -1011,6 +1014,7 @@ class TestKVParallelSegmentedPrefill:
             fp8_packed=False,
             k_scale=None,
             v_scale=None,
+            allow_vector_exp=True,
         ):
             return create_golden(get_rank())
 
@@ -1189,6 +1193,7 @@ class TestKVParallelSegmentedPrefillModelConfigs:
             fp8_packed=False,
             k_scale=None,
             v_scale=None,
+            allow_vector_exp=True,
         ):
             return create_golden(get_rank())
 

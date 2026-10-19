@@ -23,6 +23,8 @@ from ...core.utils.kernel_assert import assert_shape
 NUM_LANES = 128
 NUM_RNG_SEEDS = 6
 DTYPE_SIZE_INT32 = 4
+# Use a large odd stride to separate adjacent lane seeds.
+LANE_SEED_STRIDE = 0x9E3779
 
 
 def _set_per_lane_rng_state(base_state):
@@ -31,8 +33,8 @@ def _set_per_lane_rng_state(base_state):
     nisa.rand_set_state seeds each partition's PRNG from the corresponding partition of
     src_seeds, so unless the 128 lanes hold different seeds they emit identical streams
     (a 128-periodic sequence). Given a [NUM_LANES, NUM_RNG_SEEDS] uint32 ``base_state``
-    tile already in SBUF, this adds a per-partition offset equal to the lane index and
-    writes the result back to the GPSIMD engine, producing 128 independent streams.
+    tile already in SBUF, this adds the lane index times LANE_SEED_STRIDE and writes the
+    result back to the GPSIMD engine, producing 128 independent streams.
     Lane 0 keeps the original base seed.
 
     This is a plain (non-@nki.jit) helper that emits instructions inline into the calling
@@ -40,17 +42,13 @@ def _set_per_lane_rng_state(base_state):
     seeding policy lives in one place.
 
     Args:
-        base_state (nl.ndarray): [NUM_LANES, NUM_RNG_SEEDS] uint32 SBUF tile holding the
+        base_state (nl.NkiTensor): [NUM_LANES, NUM_RNG_SEEDS] uint32 SBUF tile holding the
             base seed in each partition (typically a broadcast of one seed, or the value
             read back from nisa.rand_get_state).
     """
-    # iota(dst, pattern, offset, channel_multiplier): pattern [[0, NUM_RNG_SEEDS]] gives a
-    # zero free-step across the 6 seed words; channel_multiplier=1 makes the value equal
-    # the partition (lane) index. Materialize the full [128, 6] tile so we can combine
-    # with nisa.tensor_tensor, which preserves integer dtypes (nisa.tensor_scalar
-    # arithmetic requires float32).
+    # Build integer lane offsets. nisa.tensor_scalar requires float32.
     lane_offset = nl.ndarray(shape=(NUM_LANES, NUM_RNG_SEEDS), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.iota(dst=lane_offset, pattern=[[0, NUM_RNG_SEEDS]], offset=0, channel_multiplier=1)
+    nisa.iota(dst=lane_offset, pattern=[[0, NUM_RNG_SEEDS]], offset=0, channel_multiplier=LANE_SEED_STRIDE)
 
     per_lane_seeds = nl.ndarray(shape=(NUM_LANES, NUM_RNG_SEEDS), dtype=nl.uint32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=per_lane_seeds, data1=base_state, data2=lane_offset, op=nl.add)
@@ -58,7 +56,7 @@ def _set_per_lane_rng_state(base_state):
 
 
 @nki.jit
-def get_rng_state_gpsimd(tensor_state: nl.ndarray):
+def get_rng_state_gpsimd(tensor_state: nl.NkiTensor):
     """
     Retrieve the current RNG state from the GPSIMD engine.
 
@@ -72,11 +70,11 @@ def get_rng_state_gpsimd(tensor_state: nl.ndarray):
         S: Number of RNG seeds per lane (6)
 
     Args:
-        tensor_state (nl.ndarray): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
+        tensor_state (nl.NkiTensor): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
             used only for shape/dtype reference.
 
     Returns:
-        output (nl.ndarray): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
+        output (nl.NkiTensor): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
             containing the 6 RNG seeds from lane 0.
 
     Pseudocode:
@@ -93,7 +91,7 @@ def get_rng_state_gpsimd(tensor_state: nl.ndarray):
 
 
 @nki.jit
-def set_rng_state_gpsimd(tensor_state: nl.ndarray):
+def set_rng_state_gpsimd(tensor_state: nl.NkiTensor):
     """
     Set the RNG state for the GPSIMD engine with a distinct per-lane seed.
 
@@ -110,11 +108,11 @@ def set_rng_state_gpsimd(tensor_state: nl.ndarray):
         S: Number of RNG seeds per lane (6)
 
     Args:
-        tensor_state (nl.ndarray): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
+        tensor_state (nl.NkiTensor): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
             containing the 6 seeds to broadcast.
 
     Returns:
-        output (nl.ndarray): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
+        output (nl.NkiTensor): [1, NUM_RNG_SEEDS], dtype uint32, HBM tensor
             echoing back the (lane-0) seeds that were set.
 
     Pseudocode:
@@ -134,7 +132,7 @@ def set_rng_state_gpsimd(tensor_state: nl.ndarray):
 
 
 @nki.jit
-def generate_random(output: nl.ndarray, n_elements: int):
+def generate_random(output: nl.NkiTensor, n_elements: int):
     """
     Generate random int32 values, tiling to fit SBUF.
 
@@ -149,12 +147,12 @@ def generate_random(output: nl.ndarray, n_elements: int):
         F: Tile size on free dimension, determined by available SBUF
 
     Args:
-        output (nl.ndarray): [1, n_elements], dtype int32, HBM tensor
+        output (nl.NkiTensor): [1, n_elements], dtype int32, HBM tensor
             to be filled with random values.
         n_elements (int): Number of random int32 values to generate.
 
     Returns:
-        output (nl.ndarray): [1, n_elements], dtype int32, HBM tensor
+        output (nl.NkiTensor): [1, n_elements], dtype int32, HBM tensor
             filled with random values.
 
     Notes:
@@ -192,7 +190,7 @@ def generate_random(output: nl.ndarray, n_elements: int):
 
 
 @nki.jit
-def generate_random_fast(output: nl.ndarray, n_elements: int):
+def generate_random_fast(output: nl.NkiTensor, n_elements: int):
     """
     Generate random int32 values using ALL 128 GPSIMD lanes (fast, layout-dependent stream).
 
@@ -229,16 +227,17 @@ def generate_random_fast(output: nl.ndarray, n_elements: int):
         F: Per-partition tile size on free dimension (lane_free)
 
     Args:
-        output (nl.ndarray): [1, n_elements], dtype int32, HBM tensor to be filled.
+        output (nl.NkiTensor): [1, n_elements], dtype int32, HBM tensor to be filled.
         n_elements (int): Number of random int32 values to generate.
 
     Returns:
-        output (nl.ndarray): [1, n_elements], dtype int32, HBM tensor filled with random values.
+        output (nl.NkiTensor): [1, n_elements], dtype int32, HBM tensor filled with random values.
 
     Notes:
         - Uses sequential_range due to the loop-carried RNG state dependency
         - Each full tile consumes all 128 partitions -> chunk = NUM_LANES * lane_free
-        - Remainder (< one full chunk) is handled separately using lane 0 only
+        - The remainder uses all lanes for complete 128-value groups
+        - A final remainder smaller than 128 values uses lane 0
 
     Pseudocode:
         # Seed each lane distinctly so the 128 lanes are independent streams
@@ -253,8 +252,13 @@ def generate_random_fast(output: nl.ndarray, n_elements: int):
             random_buffer = rng(shape=(128, lane_free))  # all 128 lanes used
             output[0, tile_idx * chunk : (tile_idx + 1) * chunk] = random_buffer.reshape(chunk)
         if remainder > 0:
-            random_buffer = rng(shape=(128, remainder))
-            output[0, n_full_tiles * chunk : ...] = random_buffer[0]  # lane 0 only
+            remainder_free, tail = divmod(remainder, 128)
+            if remainder_free > 0:
+                random_buffer = rng(shape=(128, remainder_free))
+                output[0, n_full_tiles * chunk : ...] = random_buffer.reshape(128 * remainder_free)
+            if tail > 0:
+                random_buffer = rng(shape=(128, tail))
+                output[0, ...] = random_buffer[0]
     """
 
     # Per-lane seeding: re-derive 128 independent streams from the current engine state
@@ -281,9 +285,17 @@ def generate_random_fast(output: nl.ndarray, n_elements: int):
         nisa.dma_copy(dst=out_tile, src=random_buffer)
 
     if remainder > 0:
-        # Remainder is smaller than one full 128-lane chunk; fall back to lane 0.
         offset = n_full_tiles * chunk
-        random_buffer = nl.ndarray([NUM_LANES, remainder], dtype=nl.int32, buffer=nl.sbuf)
-        nisa.rng(dst=random_buffer, engine=nisa.engine.gpsimd)
-        nisa.dma_copy(dst=output[0:1, offset : offset + remainder], src=random_buffer[0:1, 0:remainder])
+        remainder_free, tail = divmod(remainder, NUM_LANES)
+        if remainder_free > 0:
+            multilane_size = NUM_LANES * remainder_free
+            random_buffer = nl.ndarray([NUM_LANES, remainder_free], dtype=nl.int32, buffer=nl.sbuf)
+            nisa.rng(dst=random_buffer, engine=nisa.engine.gpsimd)
+            out_tile = output[0, offset : offset + multilane_size].reshape((NUM_LANES, remainder_free))
+            nisa.dma_copy(dst=out_tile, src=random_buffer)
+            offset += multilane_size
+        if tail > 0:
+            random_buffer = nl.ndarray([NUM_LANES, tail], dtype=nl.int32, buffer=nl.sbuf)
+            nisa.rng(dst=random_buffer, engine=nisa.engine.gpsimd)
+            nisa.dma_copy(dst=output[0:1, offset : offset + tail], src=random_buffer[0:1, 0:tail])
     return output

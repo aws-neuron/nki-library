@@ -28,6 +28,7 @@ import logging
 import os
 import shutil
 import subprocess
+import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterator
 
@@ -118,6 +119,11 @@ def parent(path: str) -> str:
 
 def to_archive_name_in_parent(path: str) -> str:
     return os.path.join(parent(path), os.path.basename(path)) + ".tar"
+
+
+def to_unique_archive_name_in_parent(path: str) -> str:
+    """``<parent>/<basename>_<32 random hex>.tar``: a local archive path no concurrent upload of ``path`` shares."""
+    return os.path.join(parent(path), f"{os.path.basename(path)}_{uuid.uuid4().hex}.tar")
 
 
 def is_archive(path: str) -> bool:
@@ -469,7 +475,9 @@ class RemoteS3IO(HostDirectory):
 
         local_archive_location = None
         if not is_archive(local_path):
-            local_archive_location = to_archive_name_in_parent(local_path)
+            # Unique per upload: the members of a multi-node group upload the same directory
+            # concurrently, and each deletes its archive when its own upload finishes.
+            local_archive_location = to_unique_archive_name_in_parent(local_path)
             with self._collector.timer(MetricName.S3_UPLOAD_LOCAL_ARCHIVE_TIME):
                 command_result = subprocess.run(
                     create_archive_command(local_path, local_archive_location, excluded_paths=excluded_paths).split(" ")

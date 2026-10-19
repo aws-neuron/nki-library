@@ -24,6 +24,7 @@ def rms_norm_torch_ref(
     gamma: Optional[torch.Tensor],
     eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
+    norm_b: Optional[torch.Tensor] = None,
     **_,
 ) -> torch.Tensor:
     """
@@ -34,6 +35,8 @@ def rms_norm_torch_ref(
         gamma: Scale parameter (optional).
         eps: Epsilon for numerical stability.
         hidden_actual: Actual hidden dimension for padded inputs.
+        norm_b: Optional beta added after the gamma scale, giving the affine form
+            ``rms_norm(x) * gamma + beta`` (no mean subtraction, unlike LayerNorm).
 
     Returns:
         Normalized tensor.
@@ -50,6 +53,8 @@ def rms_norm_torch_ref(
     norm = hidden * rms.reciprocal()
     if gamma is not None:
         norm *= gamma
+    if norm_b is not None:
+        norm += norm_b.to(torch.float32)
     return norm
 
 

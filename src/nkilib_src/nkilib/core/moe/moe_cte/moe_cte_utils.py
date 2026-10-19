@@ -47,8 +47,6 @@ from typing import Any, Optional
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import oob_mode
-from nki.language import NKIObject
 
 from ...utils.allocator import SbufManager
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
@@ -63,7 +61,7 @@ TOTAL_PSUM_SIZE = PSUM_SIZE * N_PSUM_BANKS
 SBUF_QUADRANT_SIZE = 32
 
 
-class SkipMode(NKIObject):
+class SkipMode(nl.NKIObject):
     """
     Controls DMA skipping behavior for memory optimization.
 
@@ -137,7 +135,7 @@ class ScaleFormat(Enum):
     PRE_BROADCAST = 1
 
 
-class QuantConfig(NKIObject):
+class QuantConfig(nl.NKIObject):
     """Quantization configuration for MoE shard-on-I kernel.
 
     Attributes:
@@ -167,7 +165,7 @@ class QuantConfig(NKIObject):
         return self.activation_mode != ActivationQuantMode.NONE
 
 
-class InputTensors(NKIObject):
+class InputTensors(nl.NKIObject):
     """
     Container for all input tensor references.
 
@@ -204,7 +202,7 @@ class InputTensors(NKIObject):
     gate_up_proj_scale_E2I: Any = None  # reshaped for per-channel DMA
 
 
-class Configs(NKIObject):
+class Configs(nl.NKIObject):
     """
     Comprehensive kernel execution configuration.
 
@@ -405,7 +403,7 @@ def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES, sbm=None):
     offset = block_idx * B
     """
     Transpose token_position_to_id[offset:offset+B] (NUM_TILES, TILE_SIZE) -> result
-    (TILE_SIZE, NUM_TILES) with a strided dma_copy on HWDGE. 
+    (TILE_SIZE, NUM_TILES) with a strided dma_copy on HWDGE.
         result[p, t] = token_position_to_id[offset + t*TILE_SIZE + p]
         - src dim0 [1, TILE_SIZE]: TILE_SIZE contiguous elements -> partition dim
         - src dim1 [TILE_SIZE, NUM_TILES]: NUM_TILES tiles, stride TILE_SIZE -> free dim
@@ -467,7 +465,7 @@ def load_token_indices_dynamic_block(
     reshaped_token_position_to_id = token_position_to_id.reshape((total_size // B, B))  # (Blocks, Block_Size)
 
     if skip_dma.skip_token:
-        nisa.memset(local_token_indices[0:TILE_SIZE, 0:NUM_TILES], value=0)
+        nisa.memset(local_token_indices[0:TILE_SIZE, 0:NUM_TILES], value=-1)
 
     """
     Transpose all B = TILE_SIZE * NUM_TILES elements of row block_idx in a single DMA.
@@ -484,7 +482,7 @@ def load_token_indices_dynamic_block(
         src=reshaped_token_position_to_id.ap(
             pattern=[[1, TILE_SIZE], [TILE_SIZE, NUM_TILES]], offset=0, scalar_offset=block_idx, indirect_dim=0
         ),
-        oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         dge_mode=nisa.dge_mode.hwdge,
     )
     return local_token_indices
@@ -816,7 +814,7 @@ def calculate_expert_affinities(
                 offset=0,
                 vector_offset=addr_fin_all.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, 1]], offset=tile_idx),
             ),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
         expert_affinity_f32_lst.append(expert_affinity_buf[0:TILE_SIZE, tile_idx : tile_idx + 1])
 
@@ -829,6 +827,7 @@ def reduce_outputs(
     reduce_tile_size: int,
     offset: int,
     dim_hidden: int,
+    output_core1: Optional[nl.NkiTensor] = None,
 ):
     """
     Synchronize across axis=0 in output by performing reduce and store.
@@ -846,6 +845,8 @@ def reduce_outputs(
         reduce_tile_size (int): Size of each tile along the partition dimension.
         offset (int): Starting tile offset for read/write operations.
         dim_hidden (int): Hidden dimension size (H).
+        output_core1 (nl.NkiTensor, optional): [T, H] accumulator of core 1. When set, output is
+            core 0's [T, H] accumulator and output += output_core1 replaces output[0] += output[1].
 
     Returns:
         None: Modifies output tensor in-place.
@@ -862,19 +863,23 @@ def reduce_outputs(
             output[0, start_idx:start_idx+reduce_tile_size, :] = output[0, start_idx:start_idx+reduce_tile_size, :] + output[1, start_idx:start_idx+reduce_tile_size, :]
             output[1, start_idx:start_idx+reduce_tile_size, :] = zeros
     """
-    T = output.shape[1]
+    T = output.shape[1] if output_core1 == None else output.shape[0]
+    # The second operand: shard 1 of [2, T, H] starts T*H elements in; output_core1 starts at 0.
+    src1, src1_base = (output, T * dim_hidden) if output_core1 == None else (output_core1, 0)
 
     for tile_idx in range(num_tiles):
         start_idx = (tile_idx + offset) * reduce_tile_size
+        # Handle non multiple of 128 T
+        rows = min(reduce_tile_size, T - start_idx)
 
-        # Reduce output[0] + output[1] and store directly to output[0]
+        # Reduce output[0] + output[1] (or output + output_core1) and store directly to the first
         nisa.dma_compute(
-            dst=output.ap(pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]], offset=start_idx * dim_hidden),
+            dst=output.ap(pattern=[[dim_hidden, rows], [1, dim_hidden]], offset=start_idx * dim_hidden),
             srcs=[
-                output.ap(pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]], offset=start_idx * dim_hidden),
-                output.ap(
-                    pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]],
-                    offset=T * dim_hidden + start_idx * dim_hidden,
+                output.ap(pattern=[[dim_hidden, rows], [1, dim_hidden]], offset=start_idx * dim_hidden),
+                src1.ap(
+                    pattern=[[dim_hidden, rows], [1, dim_hidden]],
+                    offset=src1_base + start_idx * dim_hidden,
                 ),
             ],
             scales=[1.0, 1.0],

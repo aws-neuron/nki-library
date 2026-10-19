@@ -14,6 +14,8 @@
 
 """Gate and Up projection sub-kernels for MLP TKG with column tiling and LHS/RHS swap modes."""
 
+from typing import Optional
+
 import nki.isa as nisa
 import nki.language as nl
 
@@ -529,12 +531,14 @@ def process_gate_up_projection(
     share_memory_scope: bool = False,
     use_dge: bool = False,
     prealloc_gate_up_buffers=None,
+    gate_up_weights: Optional[nl.NkiTensor] = None,
 ):
     """
     Performs the Gate/Up projection for MLP (T = BxS).
 
     Dispatches to column tiling or LHS/RHS swap path based on
     `params.use_tkg_gate_up_proj_column_tiling`, then runs shared post-processing.
+    gate_up_weights is this expert's optional [H, 2 * I] view for the LHS/RHS swap path.
     """
     if params.use_tkg_gate_up_proj_column_tiling:
         kernel_assert(not share_memory_scope, "share_memory_scope is not supported with column tiling")
@@ -558,6 +562,7 @@ def process_gate_up_projection(
             share_memory_scope=share_memory_scope,
             use_dge=use_dge,
             prealloc_gate_up_buffers=prealloc_gate_up_buffers,
+            gate_up_weights=gate_up_weights,
         )
         use_fused_gate_up_sendrecv = False
         gate_up_sb_fp32 = None

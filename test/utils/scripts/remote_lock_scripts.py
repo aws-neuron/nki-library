@@ -65,7 +65,7 @@ from typing import Any, NamedTuple
 # overwrites the deployed helper when its SCRIPT_VERSION is strictly newer than
 # the version already on the host, so a stale client can never downgrade a
 # newer deployed helper out from under concurrent newer clients.
-SCRIPT_VERSION = 5
+SCRIPT_VERSION = 6
 EVENTS_LOG_PREFIX = "events-"
 
 # When this env var is truthy on the host, reconcile-driven grants emit a
@@ -199,6 +199,10 @@ class LockResult:
     # Serialized only when True; absent/False defaults keep the wire backward
     # compatible (no locking-protocol version change).
     re_enqueued: bool = False
+    # Additive-optional assembly signal: True when THIS caller's entry holds a
+    # region none of whose cores is locked, so a ready=True poll would commit it.
+    # Serialized only when True.
+    assembled: bool = False
     # Core reset can take up to ~7s of active inference time.
     # We want to opportunistically skip it to reduce inference time.
     # Due to NRT limitation we can only do so when the LNC config is the same across runs on all cores.
@@ -223,6 +227,8 @@ class LockResult:
             result["bumped"] = self.bumped
         if self.re_enqueued:
             result["re_enqueued"] = self.re_enqueued
+        if self.assembled:
+            result["assembled"] = self.assembled
         if not self.should_reset_cores:
             result["should_reset_cores"] = self.should_reset_cores
         return json.dumps(result)
@@ -241,6 +247,7 @@ class LockResult:
             worst_case_eta=data.get("worst_case_eta"),
             bumped=data.get("bumped", False),
             re_enqueued=data.get("re_enqueued", False),
+            assembled=data.get("assembled", False),
             should_reset_cores=data.get("should_reset_cores", True),
         )
 
@@ -251,7 +258,13 @@ class QueueEntry:
 
     Persisted as part of LockState.queue. ``commit_deadline_ts`` is only set
     once an entry reaches the head and is granted a commit window; it is
-    omitted from the serialized dict while None.
+    omitted from the serialized dict while None. ``hold`` marks a not-ready
+    entry that is placed like a ready one (gets a region set aside) but never
+    commits, and keeps its FIFO position when its readiness grace lapses; it is
+    omitted from the serialized dict while False. ``hold_cap`` is how long, in
+    seconds, a held entry may keep a fully assembled region before it is
+    reclaimed and the entry bumped to the tail (``COMMIT_WINDOW`` when None);
+    omitted while None.
     """
 
     entry_id: str
@@ -261,6 +274,8 @@ class QueueEntry:
     commit_deadline_ts: int | None = None
     reserved_region: list[int] = field(default_factory=list)
     ready: bool = False
+    hold: bool = False
+    hold_cap: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict (omits commit_deadline_ts when None)."""
@@ -276,6 +291,10 @@ class QueueEntry:
             result["reserved_region"] = self.reserved_region
         if self.ready:
             result["ready"] = self.ready
+        if self.hold:
+            result["hold"] = self.hold
+        if self.hold_cap is not None:
+            result["hold_cap"] = self.hold_cap
         return result
 
     @classmethod
@@ -289,6 +308,8 @@ class QueueEntry:
             commit_deadline_ts=data.get("commit_deadline_ts"),
             reserved_region=data.get("reserved_region") or data.get("reserved_cores", []),
             ready=data.get("ready", False),
+            hold=data.get("hold", False),
+            hold_cap=data.get("hold_cap"),
         )
 
 
@@ -737,6 +758,22 @@ def _solve_placement(
     return best["assign"]
 
 
+def _is_placeable(entry: QueueEntry) -> bool:
+    """A ready or held entry is placed into a region; any other entry reserves nothing."""
+    return entry.ready or entry.hold
+
+
+def _assembled_deadline(entry: QueueEntry, now: int) -> int:
+    """Reclaim deadline for a region that is fully assembled at ``now``.
+
+    A ready entry gets ``COMMIT_WINDOW`` to commit. A held, not-ready entry keeps
+    its region for its hold cap (``COMMIT_WINDOW`` when it gave none).
+    """
+    if entry.ready or entry.hold_cap is None:
+        return now + COMMIT_WINDOW
+    return now + entry.hold_cap
+
+
 def reconcile(
     state: LockState,
     now: int,
@@ -754,13 +791,16 @@ def reconcile(
     ``(state, now, total_cores, draining)`` it always produces the same mutation
     and the same ordered event list.
 
-    Rather than a single head commit window, every ready waiter is placed
-    cooperatively into its OWN disjoint aligned ``reserved_region`` in FIFO
-    order. A region may include cores that are still locked (a *future* region
-    that assembles once those locks expire, bounded by the lock cap); a fully
-    free region opens its commit window immediately. A reserved entry commits
-    its own block on a later poll; an entry that holds a reservation but never
-    commits before its deadline has the tiles reclaimed.
+    Rather than a single head commit window, every placeable waiter (ready, or
+    not ready with ``hold``) is placed cooperatively into its OWN disjoint
+    aligned ``reserved_region`` in FIFO order. A region may include cores that
+    are still locked (a *future* region that assembles once those locks expire,
+    bounded by the lock cap); a fully free region opens its deadline
+    immediately. A ready entry commits its own block on a later poll; a held
+    entry never commits but keeps its region set aside until it turns ready.
+    The deadline is ``COMMIT_WINDOW`` after assembly for a ready entry and the
+    entry's hold cap for a held one; a region still held at its deadline is
+    reclaimed, and a held entry whose cap lapsed also moves to the queue tail.
 
     Steps, in order:
       1. Expire stale core locks (reusing the existing expiry predicate) and
@@ -773,18 +813,27 @@ def reconcile(
          stale timer does not fire on undrain. No reclaim, bump, or packing.
 
       2. Reclaim expired reservations: an entry that holds ``reserved_region``
-         whose ``commit_deadline_ts`` has passed releases its tiles (emit
-         ``RESERVE_EXPIRED``) but keeps its FIFO position; packing may re-reserve
-         it the same pass.
-      3. Bump every not-ready entry whose one-shot readiness grace expired
-         (emit ``BUMP``) so the queue cannot wedge behind stuck uploaders.
-      4. Cooperative aligned-block placement: a joint solver assigns each ready,
-         region-less entry its own disjoint aligned region (free-now or future),
-         minimizing assembly time lexicographically in FIFO order. Held regions
-         stay fixed; a held region opens its commit window the first pass it is
-         fully assembled. A not-ready entry reserves nothing (transparent to
-         backfill); each not-ready entry a hypothetical free-now allocation would
-         place gets a one-shot readiness grace window. A large front entry takes
+         whose ``commit_deadline_ts`` has passed (commit window for a ready
+         entry, hold cap for a held one) releases its tiles (emit
+         ``RESERVE_EXPIRED``). A ready entry keeps its FIFO position and packing
+         may re-reserve it the same pass; a held, not-ready entry is bumped in
+         Step 3 so the cores pass to the entries behind it.
+      3. Bump every not-ready entry whose one-shot readiness grace expired, and
+         every held entry whose hold cap lapsed in Step 2 (emit ``BUMP``), so the
+         queue cannot wedge behind stuck uploaders or idle holders. A ``hold``
+         entry is exempt from the grace bump: its lapsed grace is cleared but it
+         keeps its FIFO position (it is still pruned in Step 1 if it stops
+         polling). A cap-bumped entry stays queued and placeable; its cap
+         restarts the next time it is placed and its region assembles.
+      4. Cooperative aligned-block placement: a joint solver assigns each
+         placeable (ready or held), region-less entry its own disjoint aligned
+         region (free-now or future), minimizing assembly time lexicographically
+         in FIFO order, so a held entry is placed ahead of ready entries behind
+         it. Existing regions stay fixed; a region opens its deadline the first
+         pass it is fully assembled. An entry that is neither ready nor held
+         reserves nothing (transparent to backfill); each such entry a
+         hypothetical free-now allocation would place gets a one-shot readiness
+         grace window. A large front entry takes
          a future region instead of blocking, so smaller entries behind backfill
          disjoint free cores; the only true barrier is capacity exhaustion (no
          eligible aligned block remains for an entry).
@@ -839,9 +888,15 @@ def reconcile(
 
     # Step 2: reclaim expired reservations. An entry granted a reservation that
     # did not commit before its deadline (e.g. its client died) releases the
-    # tiles but keeps its FIFO position; packing below may re-reserve it.
+    # tiles. A ready entry keeps its FIFO position; packing below may re-reserve
+    # it. A held, not-ready entry whose hold cap lapsed is also bumped in Step 3:
+    # it is placeable, so keeping its position would re-place it on the same
+    # cores with a fresh cap and the cap would bound nothing.
+    cap_lapsed_ids: set[str] = set()
     for e in state.queue:
         if e.reserved_region and e.commit_deadline_ts is not None and now > e.commit_deadline_ts:
+            if e.hold and not e.ready:
+                cap_lapsed_ids.add(e.entry_id)
             e.reserved_region = []
             e.commit_deadline_ts = None
             events.append(ReconcileEvent(EventType.RESERVE_EXPIRED, e.entry_id))
@@ -851,10 +906,20 @@ def reconcile(
     # allocation would place; an entry that misses its window loses its anchor
     # and moves to the tail so the queue cannot wedge behind stuck uploaders.
     # Survivors keep FIFO order; bumped entries are appended in their original
-    # relative order.
-    expired = [
-        e for e in state.queue if (not e.ready) and e.commit_deadline_ts is not None and now > e.commit_deadline_ts
-    ]
+    # relative order. A held entry keeps its position on a lapsed grace (clearing
+    # it lets Step 4 re-open a fresh one) but is bumped when its hold cap lapsed
+    # in Step 2.
+    expired: list[QueueEntry] = []
+    for e in state.queue:
+        if e.entry_id in cap_lapsed_ids:
+            expired.append(e)
+            continue
+        if e.ready or e.commit_deadline_ts is None or now <= e.commit_deadline_ts:
+            continue
+        if e.hold:
+            e.commit_deadline_ts = None
+        else:
+            expired.append(e)
     if expired:
         expired_ids = {e.entry_id for e in expired}
         survivors = [e for e in state.queue if e.entry_id not in expired_ids]
@@ -863,22 +928,23 @@ def reconcile(
             events.append(ReconcileEvent(EventType.BUMP, e.entry_id))
         state.queue[:] = survivors + expired
 
-    # Step 4: cooperative aligned-block placement. Held regions are fixed; the
-    # solver only places ready, region-less entries. A placed region may include
-    # still-locked cores (a future region) and assembles when they expire.
+    # Step 4: cooperative aligned-block placement. Existing regions are fixed;
+    # the solver places placeable (ready or held), region-less entries in FIFO
+    # order. A placed region may include still-locked cores (a future region)
+    # and assembles when they expire.
     free_at = _build_free_at(state, now, total_cores)
     locked_now = set(state.get_locked_cores(now))
-    ready_regionless = [e for e in state.queue if e.ready and not e.reserved_region]
+    placeable_regionless = [e for e in state.queue if _is_placeable(e) and not e.reserved_region]
     solver_stats: dict[str, Any] = {}
     blocks = _solve_placement(
-        [e.request_cores for e in ready_regionless],
+        [e.request_cores for e in placeable_regionless],
         free_at,
         total_cores,
         now,
         node_cap=node_cap,
         stats=solver_stats,
     )
-    assignment = {id(e): block for e, block in zip(ready_regionless, blocks, strict=True)}
+    assignment = {id(e): block for e, block in zip(placeable_regionless, blocks, strict=True)}
 
     if debug and solver_stats.get("greedy_fallback"):
         # Pass-level diagnostic: the solver fell back to greedy completion (lost
@@ -892,31 +958,31 @@ def reconcile(
             ),
         )
 
-    # Free-now pool used only to decide which not-ready entries earn a readiness
-    # grace window. It is independent of the solver's reservations; a placed
-    # ready block (free-now or future) is subtracted as the FIFO scan reaches it
-    # so a not-ready entry never counts cores a ready entry ahead already took.
+    # Free-now pool used only to decide which non-placeable entries earn a
+    # readiness grace window. It is independent of the solver's reservations; a
+    # placed block (free-now or future) is subtracted as the FIFO scan reaches it
+    # so such an entry never counts cores a placeable entry ahead already took.
     simulated_free = set(state.get_free_tiles(now, total_cores))
     for e in state.queue:
         if e.reserved_region:
-            # Drop a stale held region so the entry re-solves cleanly: a
-            # readiness downgrade (not-ready entries hold nothing) or a changed
-            # request size (the held block no longer matches the requested core
-            # count) invalidates the region. Falling through leaves the entry
-            # region-less this pass; it is re-placed next pass (if still ready)
-            # or handled by the W-lazy path below (if not ready).
-            if not e.ready or len(e.reserved_region) != e.request_cores:
+            # Drop a stale region so the entry re-solves cleanly: an entry that
+            # is neither ready nor held reserves nothing, and a changed request
+            # size means the block no longer matches the requested core count.
+            # Falling through leaves the entry region-less this pass; it is
+            # re-placed next pass (if still placeable) or handled by the W-lazy
+            # path below (if not).
+            if not _is_placeable(e) or len(e.reserved_region) != e.request_cores:
                 e.reserved_region = []
                 e.commit_deadline_ts = None
             else:
-                # Held region is fixed. Open its commit window the first pass it is
-                # fully assembled (no locked cores remain); a partial region keeps
+                # Region is fixed. Open its deadline the first pass it is fully
+                # assembled (no locked cores remain); a partial region keeps
                 # commit_deadline_ts None so Step 2 never reclaims it.
                 if e.commit_deadline_ts is None and set(e.reserved_region).isdisjoint(locked_now):
-                    e.commit_deadline_ts = now + COMMIT_WINDOW
+                    e.commit_deadline_ts = _assembled_deadline(e, now)
                 continue
-        if not e.ready:
-            # W-lazy: a not-ready entry reserves nothing and is transparent to
+        if not _is_placeable(e):
+            # W-lazy: a non-placeable entry reserves nothing and is transparent to
             # backfill. If a free-now contiguous block would fit it in the
             # simulation, it is imminent: give it a one-shot readiness grace so
             # Step 3 can bump it if it never becomes ready.
@@ -927,10 +993,10 @@ def reconcile(
                 # this not-ready entry consumes simulated cores for entries behind it
                 simulated_free -= set(simulated_block)
             continue
-        # ready + region-less -> take the solver's block, if any. None means no
-        # eligible aligned block this pass (capacity exhausted by earlier picks);
-        # leave it unreserved but do NOT break -- not-ready entries behind it may
-        # still earn a readiness grace.
+        # placeable + region-less -> take the solver's block, if any. None means
+        # no eligible aligned block this pass (capacity exhausted by earlier
+        # picks); leave it unreserved but do NOT break -- non-placeable entries
+        # behind it may still earn a readiness grace.
         block = assignment.get(id(e))
         if block is None:
             continue
@@ -947,8 +1013,8 @@ def reconcile(
                 ),
             )
         if max(free_at[c] for c in block) <= now:
-            # fully free now -> open the commit window immediately.
-            e.commit_deadline_ts = now + COMMIT_WINDOW
+            # fully free now -> open the deadline immediately.
+            e.commit_deadline_ts = _assembled_deadline(e, now)
         else:
             # partial (future) region -> no window until it fully assembles.
             e.commit_deadline_ts = None
@@ -957,6 +1023,17 @@ def reconcile(
 
     _assert_reservation_invariant(state, now)
     return events
+
+
+def _held_cap(entry: QueueEntry) -> int:
+    """Seconds a held, not-ready entry keeps an assembled region before committing.
+
+    Zero for a ready entry (it is committing); otherwise its hold cap, or
+    ``COMMIT_WINDOW`` when it gave none, matching ``_assembled_deadline``.
+    """
+    if entry.ready:
+        return 0
+    return entry.hold_cap if entry.hold_cap is not None else COMMIT_WINDOW
 
 
 def estimate_eta(
@@ -970,24 +1047,28 @@ def estimate_eta(
 
     Seeds a per-core "becomes free" timeline from
     ``state.physical_neuron_cores_lock_timeout`` (live locks) AND from every
-    queue entry's ``reserved_region`` (committed-imminent blocks held for
-    ``hold_window``), then walks the existing FIFO queue placing only the
-    entries the caller actually waits behind, and finally returns the earliest
-    time at which the caller's ``request_cores`` cores are free. Worst case =
-    everyone the caller waits behind holds to their full window.
+    queue entry's ``reserved_region``, then walks the existing FIFO queue
+    placing only the entries the caller actually waits behind, and finally
+    returns the earliest time at which the caller's ``request_cores`` cores are
+    free. Worst case = everyone the caller waits behind holds to their full
+    hold cap and lock window.
 
     Seeding/skip rules (matching how ``reconcile`` actually grants):
       - Live locks seed ``free_at`` from their expiry.
-      - A queued entry's ``reserved_region`` is held until it fully assembles:
-        every core is marked busy until ``max(free_at[c] for c in region) +
-        hold_window`` (the region commits when its latest core frees, then holds
-        for the window). For a free-now region this reduces to ``now +
-        hold_window``; a future region defers the hold to its assembly time.
+      - A queued entry's ``reserved_region`` is busy until it fully assembles
+        (``max(free_at[c] for c in region)``, its latest core frees), plus the
+        entry's hold, plus ``hold_window`` for the commit. A ready entry
+        (including a ready entry that also holds) is committing, so its hold is
+        zero. A held, not-ready entry keeps the assembled region for its hold
+        cap (``COMMIT_WINDOW`` when absent) before committing; if its deadline
+        is already open (``commit_deadline_ts``) the hold ends at that deadline,
+        so the remaining cap is used rather than restarting a full cap.
       - The FIFO walk SKIPS entries that already hold ``reserved_region`` (their
         block is in the seed -- placing them again would double-count) and
-        entries with ``ready is False`` (W-lazy: a ready caller backfills past a
-        not-ready entry, so it does not delay the caller). Only ready,
-        unreserved entries are placed; each such entry is exactly a FIFO/barrier
+        entries that are neither ready nor held (W-lazy: a ready caller
+        backfills past such an entry, so it does not delay the caller). Ready
+        or held, unreserved entries are placed (``_is_placeable``) for their
+        hold (zero when ready) plus ``hold_window``; each is a FIFO/barrier
         predecessor the caller must wait behind.
 
     Purity: ``now`` is injected and the function performs no ``time.time()``
@@ -1033,13 +1114,10 @@ def estimate_eta(
         expiry = state.physical_neuron_cores_lock_timeout.get(str(core_id))
         free_at.append(expiry if expiry is not None and expiry > now else now)
 
-    # Seed reservations as occupied. A queued entry commits only once its whole
-    # region assembles (its latest core frees), then holds for hold_window, so
-    # mark every reserved core busy until max(free_at over the region) +
-    # hold_window. For a free-now region this is just now + hold_window; for a
-    # future region (some cores still locked) it correctly defers the hold to
-    # the assembly time. (A region MAY include still-locked cores it is waiting
-    # on.)
+    # Seed reservations as occupied. A region assembles when its latest core
+    # frees (it MAY include still-locked cores it is waiting on). A held,
+    # not-ready entry then keeps it for its hold cap (or until an already-open
+    # deadline) before committing; every entry finally holds for hold_window.
     for entry in state.queue:
         # ETA-only clamp: tolerate a reserved_region read from older or foreign
         # host state whose core ids may exceed THIS host's total_cores. ETA is
@@ -1049,7 +1127,14 @@ def estimate_eta(
         region = [c for c in entry.reserved_region if 0 <= c < total_cores]
         if not region:
             continue
-        busy_until = max(free_at[c] for c in region) + hold_window
+        assembled_at = max(free_at[c] for c in region)
+        if entry.ready or not entry.hold:
+            commit_at = assembled_at
+        elif entry.commit_deadline_ts is not None:
+            commit_at = max(assembled_at, entry.commit_deadline_ts)
+        else:
+            commit_at = assembled_at + _held_cap(entry)
+        busy_until = commit_at + hold_window
         for c in region:
             free_at[c] = max(free_at[c], busy_until)
 
@@ -1058,26 +1143,27 @@ def estimate_eta(
         # k-th smallest free time (at that instant >= k cores have become free).
         return sorted(free_at)[k - 1]
 
-    def occupy(k: int, start: int) -> None:
-        # Occupy the k earliest-available cores for hold_window from ``start``.
+    def occupy(k: int, until: int) -> None:
+        # Occupy the k earliest-available cores until ``until``.
         order = sorted(range(len(free_at)), key=lambda i: free_at[i])
         for i in order[:k]:
-            free_at[i] = start + hold_window
+            free_at[i] = until
 
     # Walk queued entries in FIFO order, placing only the ones the ready caller
     # actually waits behind. Skip entries already holding reserved_region (in the
-    # seed -- placing again would double-count) and not-ready entries (W-lazy:
-    # the caller backfills past them). Only ready+unreserved entries are placed.
+    # seed -- placing again would double-count) and entries that are neither
+    # ready nor held (W-lazy: the caller backfills past them). A held entry
+    # keeps its cores for its hold cap before committing for hold_window.
     for entry in state.queue:
         if entry.reserved_region:
             continue
-        if not entry.ready:
+        if not _is_placeable(entry):
             continue
         n = entry.request_cores
         if n <= 0 or n > total_cores:
             continue
         start = earliest_free(n)
-        occupy(n, start)
+        occupy(n, start + _held_cap(entry) + hold_window)
 
     if request_cores > total_cores:
         # Cannot ever be satisfied on this host; best-effort optimism returns now.
@@ -1107,6 +1193,8 @@ def poll(
     ready: bool,
     lnc_config: int,
     caller_id: str | None = None,
+    hold: bool = False,
+    hold_cap_seconds: int | None = None,
 ) -> LockResult:
     """Single mutating FIFO-queue verb: enqueue/refresh/commit.
 
@@ -1128,8 +1216,11 @@ def poll(
       3. Already queued: commit its OWN ``reserved_region`` block when NOT
          draining and ``ready`` -- at ANY position, since the reservation is
          disjoint and free by the reconcile invariant. A ``ready=false`` entry
-         holds no reservation and never commits; no entry commits while
-         draining. Otherwise return IN_QUEUE (or DRAINING).
+         never commits: without ``hold`` it holds no reservation; with ``hold``
+         it is placed like a ready entry and keeps its region (up to its hold
+         cap once assembled) until a ``ready=true`` poll commits it. No entry
+         commits while draining. Otherwise return IN_QUEUE (or DRAINING), with
+         ``assembled`` set when the entry's region has no locked core.
 
     While draining the verb withholds all grants (no commit;
     reconcile skips window-opening) but preserves the queue and the caller's
@@ -1148,6 +1239,12 @@ def poll(
         entry_id: Stable per-attempt queue identity for this caller
         ready: Whether the caller is ready to commit (false never grabs cores)
         caller_id: Optional caller identifier for event logging
+        hold: Place a not-ready entry like a ready one (a region is set aside
+            but never committed) and keep its FIFO position when its readiness
+            grace lapses instead of bumping it to the tail
+        hold_cap_seconds: How long a held entry may keep a fully assembled
+            region before it is reclaimed and the entry bumped to the tail
+            (reported as ``bumped``; ``COMMIT_WINDOW`` when None)
 
     Returns:
         LockResult: ALLOCATED (with cores/expiry) on commit, else
@@ -1167,6 +1264,8 @@ def poll(
     existing = next((e for e in state.queue if e.entry_id == entry_id), None)
     if existing is not None:
         existing.ready = ready
+        existing.hold = hold
+        existing.hold_cap = hold_cap_seconds
         # Refresh the requested size so reconcile's packing, ETA, and commit all
         # use the current request rather than the stale enqueue-time value.
         existing.request_cores = num_physical
@@ -1235,6 +1334,8 @@ def poll(
             enqueued_ts=now,
             last_seen_ts=now,
             ready=ready,
+            hold=hold,
+            hold_cap=hold_cap_seconds,
         )
         state.queue.append(entry)
         position = len(state.queue) - 1
@@ -1255,14 +1356,10 @@ def poll(
     # draining, but ONLY once the block is fully free (no core still locked). A
     # partial (future) region is held until its locked cores expire and it
     # assembles; committing it early would double-allocate a core another caller
-    # still holds. A ready=false entry holds no reservation and never commits; no
-    # entry commits while draining (reconcile granted none).
-    if (
-        not draining
-        and existing.reserved_region
-        and ready
-        and set(existing.reserved_region).isdisjoint(state.get_locked_cores(now))
-    ):
+    # still holds. A ready=false entry never commits (a held one keeps its region
+    # set aside); no entry commits while draining (reconcile granted none).
+    assembled = bool(existing.reserved_region) and set(existing.reserved_region).isdisjoint(state.get_locked_cores(now))
+    if not draining and ready and assembled:
         block = list(existing.reserved_region)
         state.queue.remove(existing)
         return _lock_and_save(block, EventType.COMMIT)
@@ -1277,6 +1374,7 @@ def poll(
         position=position,
         worst_case_eta=_relative(eta, now),
         bumped=bumped_this_cycle,
+        assembled=assembled,
     )
 
 
@@ -1532,6 +1630,14 @@ def main(args: list[str]) -> LockResult:
     p_poll.add_argument("--ready", dest="ready", action="store_true", help="Caller is ready to commit")
     p_poll.add_argument("--lnc-config", dest="lnc_config", type=int, default=2, help="LNC configuration (1 or 2)")
     p_poll.add_argument("--caller-id", dest="caller_id", help="Caller identifier for event logging")
+    p_poll.add_argument("--hold", dest="hold", action="store_true", help="Keep FIFO position while not ready")
+    p_poll.add_argument(
+        "--hold-cap-seconds",
+        dest="hold_cap_seconds",
+        type=int,
+        default=None,
+        help="Max seconds a held entry keeps an assembled region before it is bumped",
+    )
 
     # probe subcommand
     p_probe = subparsers.add_parser("probe", help="Read-only worst-case ETA peek (no enqueue/mutation)")
@@ -1601,6 +1707,8 @@ def main(args: list[str]) -> LockResult:
                 parsed.ready,
                 parsed.lnc_config,
                 caller_id=parsed.caller_id,
+                hold=parsed.hold,
+                hold_cap_seconds=parsed.hold_cap_seconds,
             )
         elif parsed.command == "probe":
             result = probe(

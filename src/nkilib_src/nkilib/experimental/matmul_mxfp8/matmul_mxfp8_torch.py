@@ -20,22 +20,20 @@ validation against NKI kernel outputs.
 
 import neuron_dtypes as dtype
 import numpy as np
-from neuronxcc.nki._private.private_api import float8_e4m3fn_x4, float8_e5m2_x4
-from neuronxcc.nki._private.test import mx_util
+
+from ...core.utils.mx_torch_common import nc_matmul_mx_golden, quantize_to_mx
+from ..mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
+from ..quantize_mxfp8.quantize_mxfp8_torch import interleave_tensor as quantize_interleave_tensor
+from .matmul_mxfp8_constants import QuantScheme
 
 # Swizzle interleave factor (must match hardware constant)
 _INTERLEAVE_FACTOR = 4
 
 
-def _get_mx_max_exp(dst_dtype):
-    """Get maximum exponent for MX format, adjusted for TRN3 rounding mode."""
-    return {float8_e5m2_x4: 14, float8_e4m3fn_x4: 7}[dst_dtype]
-
-
 def _raw_exponent_scale(scale):
     """Return the MX scale tensor's raw biased exponent bytes as uint8.
 
-    MX scales encode a biased exponent as one byte. ``mx_util.nc_matmul_mx_golden``
+    MX scales encode a biased exponent as one byte. ``nc_matmul_mx_golden``
     expects the integer byte value (0-255) via ``.astype``. When the pre-quantized
     scale input is float8_e8m0fnu, ``.astype`` would convert the represented value
     (2^(byte-127)) rather than the byte, corrupting the golden scale factors.
@@ -50,78 +48,10 @@ def _raw_exponent_scale(scale):
 
 # NOTE: This duplicates test/integration/.../matmul_mxfp8/utils.py:swizzle_tensor
 # intentionally — src/ modules must not import from test/.
-def _swizzle(src_tensor, TILE_P=512, fast_dma_transpose=False):
-    """
-    Golden reference for interleave loading.
-
-    A K remainder (P not divisible by TILE_P) is laid out differently by the two
-    DGT loaders, so the golden must follow whichever one the kernel used:
-
-    - Legacy DGT (``fast_dma_transpose=False``) is bounded by the nc_transpose
-      chunk size, so load_block.py decomposes the remainder into 256 and/or 128
-      sub-tiles, each gathered with its own interleave stride.
-    - Fast DMA (``fast_dma_transpose=True``) gathers the whole
-      MX_PARTITION_SIZE-aligned remainder in one dma_transpose, so its sub-tile
-      stride is remainder // INTERLEAVE_FACTOR and the general loop below handles
-      it directly as a single partial tile.
-
-    The two layouts agree for every 32-aligned remainder except 384 — the only
-    value that decomposes into both a 256 and a 128 sub-tile. Using the legacy
-    decomposition for a fast-DMA load (or vice versa) mismatches the quantization
-    groups in matmuls where one operand is pre-swizzled and the other is
-    DGT-loaded, producing a ~100% relative error.
-
-    Args:
-        src_tensor (np.ndarray): Source tensor of shape (P, F).
-        TILE_P (int): Tile size in P dimension.
-        fast_dma_transpose (bool): Match the fast-DMA single-partial-tile
-            remainder layout instead of the legacy 256/128 decomposition.
-
-    Returns:
-        np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
-    """
-    P, F = src_tensor.shape
-
-    # Validate that P is divisible by INTERLEAVE_FACTOR
-    if P % _INTERLEAVE_FACTOR != 0:
-        raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({_INTERLEAVE_FACTOR})")
-
-    remainder = P % TILE_P
-    if not fast_dma_transpose and remainder != 0 and remainder % 128 == 0:
-        # Decompose into full tiles + DGT-compatible remainder sub-tiles (256 and/or 128)
-        full_p = P - remainder
-        parts = []
-        if full_p > 0:
-            parts.append(_swizzle(src_tensor[:full_p, :], TILE_P))
-        k_off = full_p
-        rem = remainder
-        if rem >= 256:
-            parts.append(_swizzle(src_tensor[k_off : k_off + 256, :], TILE_P=256))
-            k_off += 256
-            rem -= 256
-        if rem >= 128:
-            parts.append(_swizzle(src_tensor[k_off : k_off + 128, :], TILE_P=128))
-        return np.concatenate(parts, axis=0)
-
-    dst_tensor = np.zeros((P // _INTERLEAVE_FACTOR, F * _INTERLEAVE_FACTOR), dtype=np.float32)
-
-    NUM_TILES_P = (P + TILE_P - 1) // TILE_P  # Ceiling division to include partial tiles
-    SUB_TILE_P = TILE_P // _INTERLEAVE_FACTOR
-
-    for tp in range(NUM_TILES_P):
-        # Calculate actual tile size (handles partial last tile)
-        current_tile_size = min(TILE_P, P - tp * TILE_P)
-        current_sub_tile_p = current_tile_size // _INTERLEAVE_FACTOR
-
-        for sub_tp in range(_INTERLEAVE_FACTOR):
-            for p in range(current_sub_tile_p):
-                src_p = tp * TILE_P + sub_tp * current_sub_tile_p + p
-                if src_p < P:  # Safety check
-                    for f in range(F):
-                        dst_p = tp * SUB_TILE_P + p
-                        dst_tensor[dst_p, f * _INTERLEAVE_FACTOR + sub_tp] = src_tensor[src_p, f]
-
-    return dst_tensor.astype(src_tensor.dtype)
+def _swizzle(src_tensor):
+    """wrapX-swizzle a [P, F] operand as the loaders do: a P % 512 remainder is split into
+    256 / 128 / sub-128 tiles (decompose_k_remainder)."""
+    return quantize_interleave_tensor(src_tensor, QuantScheme.WRAPX.value)
 
 
 # NOTE: This duplicates test/integration/.../matmul_mxfp8/utils.py:swizzle_tensor_1x32
@@ -162,11 +92,11 @@ def _resolve_x4_dtype(float8_dtype_str):
     return getattr(dtype, name)
 
 
-def golden_matmul(lhs_swizzled, rhs_swizzled, compute_dtype_x4):
+def _golden_matmul(lhs_swizzled, rhs_swizzled, compute_dtype_x4):
     """Quantize swizzled BF16 inputs and compute MX matmul golden."""
-    a_data, a_scale = mx_util.quantize_mx_golden(lhs_swizzled, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
-    b_data, b_scale = mx_util.quantize_mx_golden(rhs_swizzled, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
-    return mx_util.nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
+    a_data, a_scale = quantize_to_mx(lhs_swizzled, compute_dtype_x4)
+    b_data, b_scale = quantize_to_mx(rhs_swizzled, compute_dtype_x4)
+    return nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
 
 
 def matmul_mxfp8_torch_ref(
@@ -192,17 +122,21 @@ def matmul_mxfp8_torch_ref(
     lhs_is_swizzled=True,
     rhs_is_swizzled=True,
     load_with_PE_swizzle=False,
-    lhs_is_f_by_k=True,
-    rhs_is_f_by_k=True,
+    lhs_orientation=None,
+    rhs_orientation=None,
     fast_dma_transpose=False,
-    enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    disable_dma_transpose=False,
+    psum_copy_in_ratio=None,
+    strided_copy_swizzle_1x32_ratio=None,
 ):
     """Compute golden matmul output for MXFP8 matrix multiplication.
 
     Handles both BF16 inputs (swizzled or unswizzled) and pre-quantized MXFP8 inputs.
     For BF16 inputs, swizzles if needed, quantizes to MXFP8, and computes matmul.
-    For pre-quantized inputs, uses the quantized data and scales directly.
+    For pre-quantized inputs, uses the quantized data and dense [K // 32, F] scales directly.
+    use_scale_packing only changes the kernel's SBUF layout, so the golden ignores it.
+    Feature ratios only change scheduling and load mechanisms.
 
     Returns:
         dict: {"out": np.ndarray} with the golden matmul result.
@@ -214,29 +148,19 @@ def matmul_mxfp8_torch_ref(
 
     # Both operands' K axis must use the same permutation for the matmul to be
     # valid, so a single quant_scheme selects the swizzle for every BF16 operand.
-    # wrapX must also follow the DGT loader the kernel used: the fast-DMA and legacy
-    # paths interleave a K remainder differently (see _swizzle).
-    if quant_scheme == "1x32":
-        swizzle = _swizzle_1x32
-    else:
-
-        def swizzle(src_tensor):
-            return _swizzle(src_tensor, fast_dma_transpose=fast_dma_transpose)
+    swizzle = _swizzle_1x32 if quant_scheme == "1x32" else _swizzle
 
     lhs_prequantized = lhs_scales is not None
     rhs_prequantized = rhs_scales is not None
 
-    # Normalize the layout flags: None (auto/unset) means F-by-K, matching the kernel default.
-    # Doing this once lets the branches below use the simpler `not lhs_is_f_by_k` form while
-    # still treating an unset (None) flag as F-by-K rather than K-by-F.
-    lhs_is_f_by_k = lhs_is_f_by_k is not False
-    rhs_is_f_by_k = rhs_is_f_by_k is not False
-
+    # None (auto/unset) and F_BY_K both mean F-by-K (the kernel default); only an explicit
+    # K_BY_F selects the K-by-F layout. This matches TensorDescriptor's resolution and the
+    # kernel's `orientation=None if is_f_by_k else K_BY_F` mapping exactly.
     if not lhs_prequantized and not rhs_prequantized:
         # Both BF16: swizzle if needed, then quantize and matmul
         if lhs_is_swizzled:
             lhs_sw = lhs
-        elif not lhs_is_f_by_k:
+        elif lhs_orientation == TensorOrientation.K_BY_F:
             # lhs is [K, M] already (K-by-F); swizzle directly
             lhs_sw = swizzle(lhs.copy())
         else:
@@ -245,121 +169,51 @@ def matmul_mxfp8_torch_ref(
 
         if rhs_is_swizzled:
             rhs_sw = rhs
-        elif not rhs_is_f_by_k:
+        elif rhs_orientation == TensorOrientation.K_BY_F:
             # rhs is [K, N] already (K-by-F); swizzle directly
             rhs_sw = swizzle(rhs.copy())
         else:
             # rhs is [N, K] unswizzled (F-by-K, the default); transpose to [K, N] then swizzle
             rhs_sw = swizzle(rhs.T.copy())
 
-        result = golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
+        result = _golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
     else:
         # At least one operand is pre-quantized.
         # For BF16 operands, swizzle and quantize. For pre-quantized, use directly.
         if not lhs_prequantized:
-            lhs_sw = lhs if lhs_is_swizzled else (swizzle(lhs.copy()) if not lhs_is_f_by_k else swizzle(lhs.T.copy()))
-            a_data, a_scale = mx_util.quantize_mx_golden(lhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
+            if lhs_is_swizzled:
+                lhs_sw = lhs
+            elif lhs_orientation == TensorOrientation.K_BY_F:
+                lhs_sw = swizzle(lhs.copy())
+            else:
+                lhs_sw = swizzle(lhs.T.copy())
+            a_data, a_scale = quantize_to_mx(lhs_sw, compute_dtype_x4)
         else:
             # Pre-quantized: data may be non-x4 dtype, view as x4
             a_data = lhs
             if str(a_data.dtype) != str(compute_dtype_x4):
                 a_data = a_data.view(compute_dtype_x4)
-            K = a_data.shape[0] * _INTERLEAVE_FACTOR
-            F = lhs_scales.shape[1]
-            if use_scale_packing:
-                a_scale = _unpack_packed_scales(lhs_scales, K, F)
-            else:
-                a_scale = _compact_scales(lhs_scales)
-            a_scale = _raw_exponent_scale(a_scale)
+            # HBM scales are dense [K // 32, F], the layout the golden consumes.
+            a_scale = _raw_exponent_scale(lhs_scales)
 
         if not rhs_prequantized:
-            rhs_sw = rhs if rhs_is_swizzled else (swizzle(rhs.copy()) if not rhs_is_f_by_k else swizzle(rhs.T.copy()))
-            b_data, b_scale = mx_util.quantize_mx_golden(rhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
+            if rhs_is_swizzled:
+                rhs_sw = rhs
+            elif rhs_orientation == TensorOrientation.K_BY_F:
+                rhs_sw = swizzle(rhs.copy())
+            else:
+                rhs_sw = swizzle(rhs.T.copy())
+            b_data, b_scale = quantize_to_mx(rhs_sw, compute_dtype_x4)
         else:
             b_data = rhs
             if str(b_data.dtype) != str(compute_dtype_x4):
                 b_data = b_data.view(compute_dtype_x4)
-            K = b_data.shape[0] * _INTERLEAVE_FACTOR
-            F = rhs_scales.shape[1]
-            if use_scale_packing:
-                b_scale = _unpack_packed_scales(rhs_scales, K, F)
-            else:
-                b_scale = _compact_scales(rhs_scales)
-            b_scale = _raw_exponent_scale(b_scale)
+            # HBM scales are dense [K // 32, F], the layout the golden consumes.
+            b_scale = _raw_exponent_scale(rhs_scales)
 
-        result = mx_util.nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
+        result = nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
 
     return {"out": result.astype(out_dt)}
-
-
-def _compact_scales(oversized_scales):
-    """Extract compact scales [P//8, F//4] from oversized layout [P, F//4]."""
-    P, F_div4 = oversized_scales.shape
-    compact_rows = P // 8
-
-    compact = np.zeros((compact_rows, F_div4), dtype=oversized_scales.dtype)
-    for idx in range(compact_rows):
-        hbm_row = (idx // 4) * 32 + (idx % 4)
-        if hbm_row < P:
-            compact[idx, :] = oversized_scales[hbm_row, :]
-    return compact
-
-
-def _unpack_packed_scales(packed_scales, K, F):
-    """Extract compact scales [K//4//8, F] from packed layout.
-
-    Reverses _pack_scales (from quantize_mxfp8_torch.py) by reading scale values
-    from their packed positions back into dense row order.
-    """
-    from ..mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
-        INTERLEAVE_FACTOR,
-        Q_TILE_K,
-        get_remainder_partition_offset,
-        get_scale_packing_info,
-    )
-
-    L_TILE_K = 512
-    NUM_TILES_IN_K = K // L_TILE_K
-    REMAINDER_K = K % L_TILE_K
-    HAS_REMAINDER_256 = REMAINDER_K >= 256
-    HAS_REMAINDER_128 = REMAINDER_K % 256 >= 128
-
-    total_compact_rows = K // INTERLEAVE_FACTOR // 8
-    compact = np.zeros((total_compact_rows, F), dtype=packed_scales.dtype)
-
-    golden_offset = 0
-    tile_idx = 0
-
-    def _unpack_tile(tile_k_size, golden_offset, tile_idx, k_idx_within_tile=0):
-        scaling_group_idx, _, slot_partition_offset = get_scale_packing_info(tile_idx, True)
-        remainder_partition_offset = get_remainder_partition_offset(k_idx_within_tile, Q_TILE_K)
-        scale_p_start = scaling_group_idx * Q_TILE_K
-        num_rows = (tile_k_size // INTERLEAVE_FACTOR) // 8
-        for row_idx in range(num_rows):
-            packed_row = (row_idx // 4) * 32 + (row_idx % 4)
-            compact[golden_offset + row_idx, :] = packed_scales[
-                scale_p_start + slot_partition_offset + packed_row + remainder_partition_offset, :
-            ]
-        return golden_offset + num_rows
-
-    for i in range(NUM_TILES_IN_K):
-        golden_offset = _unpack_tile(L_TILE_K, golden_offset, tile_idx)
-        tile_idx += 1
-
-    if HAS_REMAINDER_256:
-        golden_offset = _unpack_tile(256, golden_offset, tile_idx)
-
-    if HAS_REMAINDER_128:
-        k_idx_within_tile = 256 if HAS_REMAINDER_256 else 0
-        golden_offset = _unpack_tile(128, golden_offset, tile_idx, k_idx_within_tile)
-
-    # Handle small remainders (< 128 logical elements) that still have scale data
-    remaining = REMAINDER_K - (256 if HAS_REMAINDER_256 else 0) - (128 if HAS_REMAINDER_128 else 0)
-    if remaining > 0 and remaining % INTERLEAVE_FACTOR == 0:
-        k_idx_within_tile = REMAINDER_K - remaining
-        golden_offset = _unpack_tile(remaining, golden_offset, tile_idx, k_idx_within_tile)
-
-    return compact
 
 
 def quantize_lhs_matmul_pipeline_torch_ref(
@@ -367,7 +221,6 @@ def quantize_lhs_matmul_pipeline_torch_ref(
     rhs_sw,
     return_fp8_dtype=None,
     run_with_lnc2=None,
-    enable_scale_packing=None,
     TILES_IN_BLOCK_M=None,
     TILES_IN_BLOCK_N=None,
     TILES_IN_BLOCK_K=None,
@@ -381,15 +234,16 @@ def quantize_lhs_matmul_pipeline_torch_ref(
     float8_dtype=None,
     use_scale_packing=None,
     spill_reload=None,
+    quant_scheme=None,
 ):
     """Golden for quantize-LHS + matmul pipeline.
 
     LHS is BF16 [M, K] (unswizzled), RHS is BF16 swizzled.
-    Swizzle LHS, quantize both, and compute matmul.
+    Swizzle LHS in the pipeline's scheme, quantize both, and compute matmul.
     """
     compute_dtype_x4 = _resolve_x4_dtype(float8_dtype or return_fp8_dtype)
-    lhs_sw = _swizzle(lhs_bf16.T.copy())
-    result = golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
+    lhs_sw = _swizzle_1x32(lhs_bf16.T.copy()) if quant_scheme == "1x32" else _swizzle(lhs_bf16.T.copy())
+    result = _golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
     return {"out": result.astype(output_dtype)}
 
 
@@ -398,7 +252,6 @@ def quantize_rhs_matmul_pipeline_torch_ref(
     rhs_bf16,
     return_fp8_dtype=None,
     run_with_lnc2=None,
-    enable_scale_packing=None,
     TILES_IN_BLOCK_M=None,
     TILES_IN_BLOCK_N=None,
     TILES_IN_BLOCK_K=None,
@@ -412,13 +265,14 @@ def quantize_rhs_matmul_pipeline_torch_ref(
     float8_dtype=None,
     use_scale_packing=None,
     spill_reload=None,
+    quant_scheme=None,
 ):
     """Golden for quantize-RHS + matmul pipeline.
 
     LHS is BF16 swizzled, RHS is BF16 [N, K] (unswizzled).
-    Swizzle RHS, quantize both, and compute matmul.
+    Swizzle RHS in the pipeline's scheme, quantize both, and compute matmul.
     """
     compute_dtype_x4 = _resolve_x4_dtype(float8_dtype or return_fp8_dtype)
-    rhs_sw = _swizzle(rhs_bf16.T.copy())
-    result = golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
+    rhs_sw = _swizzle_1x32(rhs_bf16.T.copy()) if quant_scheme == "1x32" else _swizzle(rhs_bf16.T.copy())
+    result = _golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
     return {"out": result.astype(output_dtype)}

@@ -20,16 +20,17 @@ allclose with scaled atol) matching the MLP MXFP8 pattern.
 
 import functools
 import math
+import os
 import random
 from dataclasses import replace
-from typing import final
+from typing import Optional, final
 
 import nki.language as nl
 import numpy as np
 import pytest
 import torch
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import MatmulMxfp8KernelConfig
-from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import get_tile_sizes
+from nkilib_src.nkilib.experimental.mlp_mxfp8._common_utils import get_tile_sizes
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import AffinityOption, ClampLimits, ShardOption
 from nkilib_src.nkilib.experimental.moe_mxfp8.bwd.blockwise_mm_backward_mxfp8 import blockwise_mm_bwd_mxfp8
 from nkilib_src.nkilib.experimental.moe_mxfp8.bwd.blockwise_mm_backward_mxfp8_torch import (
@@ -41,7 +42,13 @@ from nkilib_src.nkilib.experimental.moe_mxfp8.bwd.config import (
     SwizzleMode,
     TransposeMode,
 )
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
 
+from test.integration.nkilib.experimental.mlp_mxfp8.qwen235b_mlp_tuned_configs import build_bwd_candidate
+from test.integration.nkilib.experimental.moe_mxfp8.config_sweep_utils import (
+    emit_cache_candidate,
+    record_cache_candidate,
+)
 from test.integration.nkilib.experimental.moe_mxfp8.mxfp8_moe_bwd_test_utils import (
     build_mxfp8_moe_bwd_inputs,
 )
@@ -90,6 +97,7 @@ def _compute_moe_bwd_config(
     spill_reload: bool = False,
     use_scale_packing: bool = False,
     single_expert_dense: bool = False,
+    quant_scheme: QuantScheme = QuantScheme.WRAPX,
 ) -> MXFP8MOEBwdConfig:
     """Compute a valid MXFP8MOEBwdConfig (per-phase blocking) for the given shape dimensions.
 
@@ -128,7 +136,7 @@ def _compute_moe_bwd_config(
         TILES_IN_BLOCK_K=_clamp_tiles(tiles_k, p1_num_k_tiles),
         TILES_IN_LOAD_M=p1_load_m,
         TILES_IN_LOAD_N=p1_load_n,
-        quant_scheme=QuantScheme.WRAPX,
+        quant_scheme=quant_scheme,
         spill_reload=spill_reload,
         enable_scale_packing=use_scale_packing,
     )
@@ -154,27 +162,27 @@ def _compute_moe_bwd_config(
         TILES_IN_BLOCK_K=_clamp_tiles(tiles_k, p2_num_k_tiles),
         TILES_IN_LOAD_M=p2_load_m,
         TILES_IN_LOAD_N=p2_load_n,
-        quant_scheme=QuantScheme.WRAPX,
+        quant_scheme=quant_scheme,
         spill_reload=spill_reload,
         enable_scale_packing=use_scale_packing,
     )
 
-    # Phase 3: d_gate_up_T[I_TP, B] @ hidden_states_T[B, H/shard]
-    p3_m = 2 * I_TP if single_expert_dense else I_TP
-    p3_tiles = phase_tiles(p3_m, B, H_PER_SHARD)
-    p3_num_i_tiles = math.ceil(p3_m / p3_tiles["tile_m"])
-    p3_num_h_tiles = math.ceil(H_PER_SHARD / p3_tiles["tile_n"])
+    # Phase 3: hidden_states_T[H/shard, B] @ d_gate_up_T[B, I_TP]
+    p3_n = 2 * I_TP if single_expert_dense else I_TP
+    p3_tiles = phase_tiles(H_PER_SHARD, B, p3_n)
+    p3_num_h_tiles = math.ceil(H_PER_SHARD / p3_tiles["tile_m"])
+    p3_num_i_tiles = math.ceil(p3_n / p3_tiles["tile_n"])
     p3_num_k_tiles = math.ceil(B / p3_tiles["l_tile_k"])
-    p3_block_n = _clamp_tiles(tiles_n, p3_num_h_tiles)
+    p3_block_n = _clamp_tiles(tiles_n, p3_num_i_tiles)
     if (H, B, I_TP, tiles_m, tiles_n, tiles_k) == (5120, 4096, 256, 4, 8, 8):
         p3_block_n = min(p3_block_n, 4)
-    p3_block_m = _clamp_tiles(tiles_m, max(1, p3_num_i_tiles // 4))
+    p3_block_m = _clamp_tiles(tiles_m, max(1, p3_num_h_tiles // 4))
     p3_block_m, p3_load_m = tune_block_and_load_tiles(p3_block_m, p3_tiles["tile_m"])
     p3_block_n, p3_load_n = tune_block_and_load_tiles(p3_block_n, p3_tiles["tile_n"])
     phase3 = MatmulMxfp8KernelConfig(
-        M=p3_m,
+        M=H_PER_SHARD,
         K=B,
-        N=H_PER_SHARD,
+        N=p3_n,
         tile_m=p3_tiles["tile_m"],
         tile_k=p3_tiles["l_tile_k"],
         tile_n=p3_tiles["tile_n"],
@@ -183,24 +191,24 @@ def _compute_moe_bwd_config(
         TILES_IN_BLOCK_K=_clamp_tiles(tiles_k, p3_num_k_tiles),
         TILES_IN_LOAD_M=p3_load_m,
         TILES_IN_LOAD_N=p3_load_n,
-        quant_scheme=QuantScheme.WRAPX,
+        quant_scheme=quant_scheme,
         spill_reload=spill_reload,
         enable_scale_packing=use_scale_packing,
     )
 
-    # Phase 4: output_grad_T[H/shard, B] @ scaled_intermediate_T[B, I_TP]
-    p4_tiles = phase_tiles(H_PER_SHARD, B, I_TP)
-    p4_num_h_tiles = math.ceil(H_PER_SHARD / p4_tiles["tile_m"])
-    p4_num_i_tiles = math.ceil(I_TP / p4_tiles["tile_n"])
+    # Phase 4: scaled_intermediate_T[I_TP, B] @ output_grad_T[B, H/shard]
+    p4_tiles = phase_tiles(I_TP, B, H_PER_SHARD)
+    p4_num_i_tiles = math.ceil(I_TP / p4_tiles["tile_m"])
+    p4_num_h_tiles = math.ceil(H_PER_SHARD / p4_tiles["tile_n"])
     p4_num_k_tiles = math.ceil(B / p4_tiles["l_tile_k"])
-    p4_block_m = _clamp_tiles(tiles_m, max(1, p4_num_h_tiles // 4))
-    p4_block_n = _clamp_tiles(tiles_n, p4_num_i_tiles)
+    p4_block_m = _clamp_tiles(tiles_m, max(1, p4_num_i_tiles // 4))
+    p4_block_n = _clamp_tiles(tiles_n, p4_num_h_tiles)
     p4_block_m, p4_load_m = tune_block_and_load_tiles(p4_block_m, p4_tiles["tile_m"])
     p4_block_n, p4_load_n = tune_block_and_load_tiles(p4_block_n, p4_tiles["tile_n"])
     phase4 = MatmulMxfp8KernelConfig(
-        M=H_PER_SHARD,
+        M=I_TP,
         K=B,
-        N=I_TP,
+        N=H_PER_SHARD,
         tile_m=p4_tiles["tile_m"],
         tile_k=p4_tiles["l_tile_k"],
         tile_n=p4_tiles["tile_n"],
@@ -209,7 +217,7 @@ def _compute_moe_bwd_config(
         TILES_IN_BLOCK_K=_clamp_tiles(tiles_k, p4_num_k_tiles),
         TILES_IN_LOAD_M=p4_load_m,
         TILES_IN_LOAD_N=p4_load_n,
-        quant_scheme=QuantScheme.WRAPX,
+        quant_scheme=quant_scheme,
         spill_reload=spill_reload,
         enable_scale_packing=use_scale_packing,
     )
@@ -217,30 +225,46 @@ def _compute_moe_bwd_config(
     return MXFP8MOEBwdConfig(phase1_config=phase1, phase2_config=phase2, phase3_config=phase3, phase4_config=phase4)
 
 
-def _moe_bwd_config_from_tuned(tuned_config, H, B, I_TP, run_with_lnc2=True, single_expert_dense=False):
+def _moe_bwd_config_from_tuned(
+    tuned_config,
+    H,
+    B,
+    I_TP,
+    run_with_lnc2=True,
+    single_expert_dense=False,
+    quant_scheme=QuantScheme.WRAPX,
+):
     """Fill in the per-phase (M,K,N) on a tuned MXFP8MOEBwdConfig (see tuned_blocking.py), using
     the same per-phase mapping as _compute_moe_bwd_config. Lets the test drive the shape-tuned
     blocking as an explicit config."""
     num_shards = 2 if run_with_lnc2 else 1
     I_TP_PER_SHARD = I_TP // num_shards
     H_PER_SHARD = H // num_shards
+    tuned_schemes = {
+        tuned_config.phase1_config.quant_scheme,
+        tuned_config.phase2_config.quant_scheme,
+        tuned_config.phase3_config.quant_scheme,
+        tuned_config.phase4_config.quant_scheme,
+    }
+    if tuned_schemes != {quant_scheme}:
+        raise ValueError(f"Tuned config scheme {tuned_schemes} does not match requested {quant_scheme}")
 
     return MXFP8MOEBwdConfig(
         phase1_config=replace(tuned_config.phase1_config, M=B, K=H, N=I_TP_PER_SHARD),
         phase2_config=replace(tuned_config.phase2_config, M=B, K=2 * I_TP, N=H_PER_SHARD),
         phase3_config=replace(
             tuned_config.phase3_config,
-            M=2 * I_TP if single_expert_dense else I_TP,
+            M=H_PER_SHARD,
             K=B,
-            N=H_PER_SHARD,
+            N=2 * I_TP if single_expert_dense else I_TP,
         ),
-        phase4_config=replace(tuned_config.phase4_config, M=H_PER_SHARD, K=B, N=I_TP),
+        phase4_config=replace(tuned_config.phase4_config, M=I_TP, K=B, N=H_PER_SHARD),
         phase3_transpose_mode=tuned_config.phase3_transpose_mode,
         phase4_transpose_mode=tuned_config.phase4_transpose_mode,
     )
 
 
-def _validate_explicit_test_config(config: MXFP8MOEBwdConfig) -> None:
+def _validate_explicit_test_config(config: MXFP8MOEBwdConfig, pe_transpose_only: bool = False) -> None:
     """Reject partial test configs before they can reach kernel defaults."""
     for phase_name, phase_config in (
         ("phase1", config.phase1_config),
@@ -266,7 +290,8 @@ def _validate_explicit_test_config(config: MXFP8MOEBwdConfig) -> None:
             raise ValueError(f"{phase_name} multi-tile M block must not use a one-tile load")
         if block_n > 1 and load_n == 1:
             raise ValueError(f"{phase_name} multi-tile N block must not use a one-tile load")
-        if load_n * tile_n > MAX_DGT_LOAD_WIDTH:
+        uses_wrapx_dgt = phase_config.quant_scheme == QuantScheme.WRAPX and not pe_transpose_only
+        if uses_wrapx_dgt and load_n * tile_n > MAX_DGT_LOAD_WIDTH:
             raise ValueError(f"{phase_name} N load width must not exceed {MAX_DGT_LOAD_WIDTH}, got {load_n} * {tile_n}")
 
 
@@ -507,6 +532,10 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
         bias: bool = False,
         clamp_limits=None,
         prequantize_weights: bool = False,
+        # These deliberately stay DGT rather than tracking MXFP8MOEBwdConfig's PE default:
+        # the tuned/sweep shapes are routed with E > 1, where a PE weight load would read
+        # the wrong expert (the PE loader ignores scalar_offset). Tests that want PE opt in
+        # per operand; test_moe_mxfp8_bwd_defaults_omit_config covers the kernel default.
         output_grad_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
         down_weight_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
         d_gate_up_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
@@ -519,6 +548,14 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
         phase4_transpose_mode: TransposeMode = TransposeMode.NC,
         single_expert_dense: bool = False,
         fast_dma_transpose: bool = False,
+        pe_transpose_only: bool = False,
+        quant_scheme: QuantScheme = QuantScheme.WRAPX,
+        num_valid_tokens: Optional[int] = None,
+        num_static_block: Optional[int] = None,
+        omit_config: bool = False,
+        omit_block_size: bool = False,
+        gate_up_weight_orientation: TensorOrientation = TensorOrientation.F_BY_K,
+        down_weight_orientation: TensorOrientation = TensorOrientation.F_BY_K,
     ):
         T = tokens
         H = hidden
@@ -540,6 +577,8 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
                 use_scale_packing=use_scale_packing,
                 bias=bias,
                 single_expert_dense=single_expert_dense,
+                quant_scheme=quant_scheme,
+                pe_transpose_only=pe_transpose_only,
             )
             if tuned_config is not None:
                 moe_bwd_config = _moe_bwd_config_from_tuned(
@@ -549,6 +588,7 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
                     I_TP=I_TP,
                     run_with_lnc2=run_with_lnc2,
                     single_expert_dense=single_expert_dense,
+                    quant_scheme=quant_scheme,
                 )
             else:
                 moe_bwd_config = _compute_moe_bwd_config(
@@ -562,31 +602,18 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
                     spill_reload=spill_reload,
                     use_scale_packing=use_scale_packing,
                     single_expert_dense=single_expert_dense,
+                    quant_scheme=quant_scheme,
                 )
 
-        _validate_explicit_test_config(moe_bwd_config)
+        # The P3/P4 transpose engine is a per-run knob: fold it into the config the
+        # builder consumes (the shape-tuned config carries phase blocking; the run
+        # overrides the transpose modes). Swizzle modes are passed to the builder,
+        # which stamps them onto the same config.
+        moe_bwd_config.phase3_transpose_mode = phase3_transpose_mode
+        moe_bwd_config.phase4_transpose_mode = phase4_transpose_mode
 
-        build_kwargs = {
-            "tokens": T,
-            "hidden": H,
-            "intermediate": I_TP,
-            "expert": E,
-            "block_size": block_size,
-            "top_k": top_k,
-            "run_with_lnc2": run_with_lnc2,
-            "moe_bwd_config": moe_bwd_config,
-            "spill_reload": spill_reload,
-            "use_scale_packing": use_scale_packing,
-            "prequantize_weights": prequantize_weights,
-            "bias": bias,
-            "clamp_limits": clamp_limits,
-            "single_expert_dense": single_expert_dense,
-            "fast_dma_transpose": fast_dma_transpose,
-        }
-        transpose_modes = {
-            "phase3_transpose_mode": phase3_transpose_mode,
-            "phase4_transpose_mode": phase4_transpose_mode,
-        }
+        _validate_explicit_test_config(moe_bwd_config, pe_transpose_only=pe_transpose_only)
+
         swizzle_modes = {
             "output_grad_swizzle_mode": output_grad_swizzle_mode,
             "down_weight_swizzle_mode": down_weight_swizzle_mode,
@@ -597,29 +624,59 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
             "output_grad_t_swizzle_mode": output_grad_t_swizzle_mode,
             "scaled_intermediate_t_swizzle_mode": scaled_intermediate_t_swizzle_mode,
         }
+        build_kwargs = {
+            "tokens": T,
+            "hidden": H,
+            "intermediate": I_TP,
+            "expert": E,
+            "block_size": block_size,
+            "top_k": top_k,
+            "moe_bwd_config": moe_bwd_config,
+            "spill_reload": spill_reload,
+            "use_scale_packing": use_scale_packing,
+            "prequantize_weights": prequantize_weights,
+            "bias": bias,
+            "clamp_limits": clamp_limits,
+            "single_expert_dense": single_expert_dense,
+            "fast_dma_transpose": fast_dma_transpose,
+            "swizzle_modes": swizzle_modes,
+            "pe_transpose_only": pe_transpose_only,
+            "quant_scheme": quant_scheme,
+            "num_valid_tokens": num_valid_tokens,
+            "num_static_block": num_static_block,
+            "gate_up_weight_orientation": gate_up_weight_orientation,
+            "down_weight_orientation": down_weight_orientation,
+        }
 
         if prequantize_weights:
             kernel_inputs, orig_gate_up_weight, orig_down_weight = build_mxfp8_moe_bwd_inputs(**build_kwargs)
-            kernel_inputs.update(transpose_modes)
-            kernel_inputs.update(swizzle_modes)
 
             @functools.wraps(blockwise_mm_bwd_mxfp8_torch_ref)
             def _pq_torch_ref(**kwargs):
                 kwargs["gate_up_proj_weight"] = torch.from_numpy(orig_gate_up_weight.astype(np.float32))
                 kwargs["down_proj_weight"] = torch.from_numpy(orig_down_weight.astype(np.float32))
+                # The reference consumes the original BF16 weights, not the
+                # kernel's packed x4 tensors and their companion scales.
+                kwargs.pop("gate_up_weight_scales", None)
+                kwargs.pop("down_weight_scales", None)
                 return blockwise_mm_bwd_mxfp8_torch_ref(**kwargs)
 
             def input_gen(_):
-                return kernel_inputs
+                return record_cache_candidate(test_manager, kernel_inputs, backward=True)
 
             torch_ref = torch_ref_wrapper(_pq_torch_ref)
         else:
 
             def input_gen(_):
-                kernel_inputs = build_mxfp8_moe_bwd_inputs(**build_kwargs)
-                kernel_inputs.update(transpose_modes)
-                kernel_inputs.update(swizzle_modes)
-                return kernel_inputs
+                inputs = build_mxfp8_moe_bwd_inputs(**build_kwargs)
+                # Drop config / block_size so the kernel falls back to its own
+                # defaults (config -> MXFP8MOEBwdConfig(), block_size -> 4096). The
+                # torch ref mirrors the same defaults, so kernel and golden agree.
+                if omit_config:
+                    del inputs["config"]
+                if omit_block_size:
+                    del inputs["block_size"]
+                return record_cache_candidate(test_manager, inputs, backward=True)
 
             torch_ref = torch_ref_wrapper(blockwise_mm_bwd_mxfp8_torch_ref)
 
@@ -636,6 +693,17 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
         def output_tensors(kernel_input):
             return {name: np.zeros(shape, dtype=dtype) for name, (shape, dtype) in output_shapes.items()}
 
+        # Rows past the effective valid-token count are undefined. Weight gradients
+        # compare in full, including the zero-filled checkpoint remainder consumed by
+        # backward's full-size final block.
+        active_prefix = None
+        if num_valid_tokens is not None:
+            effective_valid_tokens = min(num_valid_tokens, T)
+            active_prefix = {
+                "hidden_states_grad": effective_valid_tokens,
+                "expert_affinities_masked_grad": effective_valid_tokens,
+            }
+
         lnc_count = 2 if run_with_lnc2 else 1
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -650,8 +718,9 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
                 logical_nc_config=lnc_count,
                 platform_target=platform_target,
             ),
-            custom_comparator=_moe_bwd_comparator(output_shapes),
+            custom_comparator=_moe_bwd_comparator(output_shapes, active_prefix),
         )
+        emit_cache_candidate(test_manager)
 
     # ------------------------------------------------------------------
     # Test: baseline shape coverage
@@ -705,6 +774,84 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
             block_size=block_size,
             top_k=top_k,
             intermediate=intermediate,
+        )
+
+    # ------------------------------------------------------------------
+    # Test: framework-style call with no config (defaults)
+    # ------------------------------------------------------------------
+
+    def test_moe_mxfp8_bwd_defaults_omit_config(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+    ):
+        """Kernel runs on its own defaults when config is omitted.
+
+        Omitting ``config`` resolves to ``MXFP8MOEBwdConfig()`` inside the kernel:
+        AFFINITY_ON_I, SHARD_ON_FREE, single_expert_dense, one-tile-per-block phase
+        configs, PE swizzle, NC transpose. A fully packed E=1 / top_k=1 shape
+        (T == N * block_size, no OOB padding) makes those defaults valid and
+        consistent with the golden. E=1 also keeps the PE-swizzle weight default
+        correct here: the per-expert scalar_offset the PE loader ignores is always 0
+        when there is one expert. This exercises the kernel's one-tile default
+        blocking, which the tuned tests deliberately bypass.
+
+        ``single_expert_dense`` is passed to the input builder so the routing tensors
+        are built as the dummies the dense path takes; the kernel's own default has it
+        on, and the builder cannot read back the config the kernel builds.
+        """
+        self._run_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            hidden=256,
+            tokens=1024,
+            expert=1,
+            block_size=512,
+            top_k=1,
+            intermediate=256,
+            single_expert_dense=True,
+            omit_config=True,
+        )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize(
+        ("gate_up_orientation", "down_orientation"),
+        [
+            pytest.param(TensorOrientation.F_BY_K, TensorOrientation.F_BY_K, id="backward_natural"),
+            pytest.param(TensorOrientation.K_BY_F, TensorOrientation.F_BY_K, id="gate_up_forward_natural"),
+            pytest.param(TensorOrientation.F_BY_K, TensorOrientation.K_BY_F, id="down_forward_natural"),
+            pytest.param(TensorOrientation.K_BY_F, TensorOrientation.K_BY_F, id="forward_natural"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("expert", "top_k", "single_expert_dense"),
+        [
+            pytest.param(1, 1, True, id="dense"),
+            pytest.param(2, 2, False, id="routed"),
+        ],
+    )
+    def test_moe_mxfp8_bwd_bf16_weight_orientation_matrix(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+        gate_up_orientation: TensorOrientation,
+        down_orientation: TensorOrientation,
+        expert: int,
+        top_k: int,
+        single_expert_dense: bool,
+    ):
+        self._run_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            hidden=256,
+            tokens=512,
+            expert=expert,
+            block_size=256,
+            top_k=top_k,
+            intermediate=128,
+            single_expert_dense=single_expert_dense,
+            gate_up_weight_orientation=gate_up_orientation,
+            down_weight_orientation=down_orientation,
         )
 
     _FEATURE_TEST_PARAMS = [
@@ -1003,6 +1150,19 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
         intermediate: int,
         sweep_kwargs: dict,
     ):
+        # Deterministic timeout on trn3 for this shape (observed with tm2/tn5/tk5
+        # blocking): inference exceeds the 55s profile-capture limit.
+        if platform_target == common_dataclasses.Platforms.TRN3 and (
+            hidden,
+            tokens,
+            expert,
+            block_size,
+            top_k,
+            intermediate,
+        ) == (4096, 4096, 4, 2048, 4, 640):
+            pytest.xfail(
+                "Persistent inference timeout (55s profile-capture limit) on trn3 at hid4096_tok4096_exp4_bs2048_k4_int640"
+            )
         self._run_test(
             test_manager=test_manager,
             platform_target=platform_target,
@@ -1087,6 +1247,85 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
             scaled_intermediate_t_swizzle_mode=SwizzleMode.PE,
         )
 
+    # ------------------------------------------------------------------
+    # Test: hardware dynamic block loop (num_valid_tokens)
+    # ------------------------------------------------------------------
+    # T is a per-expert capacity, so how many blocks hold real tokens is a runtime
+    # property of the router. The backward shards on the free dimension, so every core
+    # runs every block and the trip counts are equal by construction. Its last occupied
+    # block remains full-size and consumes the forward's zero-filled checkpoint tail.
+    @pytest.mark.fast
+    @pytest.mark.parametrize(
+        "tokens, block_size, num_valid_tokens, num_static_block",
+        [
+            # Exact multiples: no shortening beyond the full block size.
+            pytest.param(8192, 2048, 4 * 2048, 2, id="b2048_N4_all"),
+            # num_static_block == N: the dynamic region is empty, so this exercises the
+            # token-count API over the untouched static loop.
+            pytest.param(8192, 2048, 4 * 2048, 4, id="b2048_N4_all_static"),
+            pytest.param(8192, 2048, 3 * 2048, 2, id="b2048_N4_v3"),
+            # Trailing partial block, shortened to each candidate tail size.
+            pytest.param(16384, 4096, 2 * 4096 + 300, 2, id="b4096_N4_tail1024"),
+            pytest.param(16384, 4096, 2 * 4096 + 1500, 2, id="b4096_N4_tail2048"),
+            pytest.param(16384, 4096, 2 * 4096 + 3000, 2, id="b4096_N4_tail4096"),
+            # Simulator-sized partial tail validates consumption of the forward's
+            # zero-filled checkpoint remainder in the backward weight gradients.
+            pytest.param(6144, 2048, 2 * 2048 + 300, 2, id="b2048_N3_tail1024_small"),
+            # A remainder of exactly a tail size must pick that size, not the next one up.
+            pytest.param(16384, 4096, 2 * 4096 + 1024, 2, id="b4096_N4_exact1024"),
+            # Partial block inside the static prefix: nothing dynamic runs.
+            pytest.param(8192, 2048, 2048 + 500, 2, id="b2048_N4_in_static"),
+            # Whole capacity valid: the dynamic region runs every remaining block.
+            pytest.param(16384, 4096, 4 * 4096, 2, id="b4096_N4_full"),
+            # A single-block schedule must clamp the static prefix to N=1.
+            pytest.param(512, 512, 512, 0, id="b512_N1"),
+            # Runtime counts above capacity are clamped to T, so every block runs once.
+            pytest.param(2048, 512, 5 * 512, 2, id="b512_N4_over_capacity_small"),
+        ],
+    )
+    def test_moe_mxfp8_bwd_single_expert_dense_dynamic_blocks(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+        tokens: int,
+        block_size: int,
+        num_valid_tokens: int,
+        num_static_block: int,
+    ):
+        self._run_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            hidden=512,
+            tokens=tokens,
+            expert=1,
+            block_size=block_size,
+            top_k=1,
+            intermediate=256,
+            single_expert_dense=True,
+            num_valid_tokens=num_valid_tokens,
+            num_static_block=num_static_block,
+        )
+
+    # A fully static control for the dynamic cells above: same shape without the token
+    # count, so the two can be compared directly.
+    @pytest.mark.fast
+    def test_moe_mxfp8_bwd_single_expert_dense_static_ref(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+    ):
+        self._run_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            hidden=512,
+            tokens=16384,
+            expert=1,
+            block_size=4096,
+            top_k=1,
+            intermediate=256,
+            single_expert_dense=True,
+        )
+
     @pytest.mark.parametrize(
         "intermediate",
         [
@@ -1122,4 +1361,130 @@ class TestMoeMxfp8BlockwiseMatMulBwdValidated:
             hidden_states_t_swizzle_mode=SwizzleMode.PE,
             output_grad_t_swizzle_mode=SwizzleMode.PE,
             scaled_intermediate_t_swizzle_mode=SwizzleMode.PE,
+        )
+
+    def _run_qwen3_235b_tp1_8k_two_blocks_1x32(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+        prequantize_weights: bool,
+        pe_transpose_only: bool,
+        moe_bwd_config=None,
+    ):
+        test_manager.collector.set_kernel_params(
+            {
+                "model": "qwen3_235b",
+                "tokens": 8192,
+                "block_size": 4096,
+                "num_blocks": 2,
+                "hidden": 4096,
+                "intermediate": 1536,
+                "quant_scheme": QuantScheme._1x32.value,
+                "transpose_path": "pe_only" if pe_transpose_only else "dma_transpose_and_pe_swizzle",
+                "pe_transpose_only": pe_transpose_only,
+                "spill_reload": False,
+                "scale_packing": True,
+                "cache_weights": True,
+                "prequantize_weights": prequantize_weights,
+            }
+        )
+        self._run_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            hidden=4096,
+            tokens=8192,
+            expert=1,
+            block_size=4096,
+            top_k=1,
+            intermediate=1536,
+            moe_bwd_config=moe_bwd_config,
+            single_expert_dense=True,
+            fast_dma_transpose=False,
+            pe_transpose_only=pe_transpose_only,
+            use_scale_packing=True,
+            prequantize_weights=prequantize_weights,
+            quant_scheme=QuantScheme._1x32,
+            output_grad_swizzle_mode=SwizzleMode.PE,
+            down_weight_swizzle_mode=SwizzleMode.PE,
+            d_gate_up_swizzle_mode=SwizzleMode.PE,
+            gate_up_weight_swizzle_mode=SwizzleMode.PE,
+            d_gate_up_t_swizzle_mode=SwizzleMode.PE,
+            hidden_states_t_swizzle_mode=SwizzleMode.PE,
+            output_grad_t_swizzle_mode=SwizzleMode.PE,
+            scaled_intermediate_t_swizzle_mode=SwizzleMode.PE,
+        )
+
+    def test_moe_mxfp8_bwd_qwen3_235b_8k_two_blocks_phase2_1x32_pe_bf16_weights(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+    ):
+        """Validate BF16 weights on the tuned Qwen3 TP1 PE-only path."""
+        self._run_qwen3_235b_tp1_8k_two_blocks_1x32(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            prequantize_weights=False,
+            pe_transpose_only=True,
+        )
+
+    def test_moe_mxfp8_bwd_qwen3_235b_8k_two_blocks_phase2_1x32_pe_prequantized_weights(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+    ):
+        """Validate prequantized weights on the tuned Qwen3 TP1 PE-only path."""
+        self._run_qwen3_235b_tp1_8k_two_blocks_1x32(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            prequantize_weights=True,
+            pe_transpose_only=True,
+        )
+
+    def test_moe_mxfp8_bwd_qwen3_235b_8k_two_blocks_phase2_1x32_mixed_transpose_bf16_weights(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+    ):
+        """Validate DMA transpose followed by PE swizzle for BF16 weights."""
+        self._run_qwen3_235b_tp1_8k_two_blocks_1x32(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            prequantize_weights=False,
+            pe_transpose_only=False,
+        )
+
+    def test_moe_mxfp8_bwd_qwen3_235b_8k_two_blocks_phase2_1x32_mixed_transpose_prequantized_weights(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+    ):
+        """Validate DMA transpose followed by PE swizzle for prequantized weights."""
+        self._run_qwen3_235b_tp1_8k_two_blocks_1x32(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            prequantize_weights=True,
+            pe_transpose_only=False,
+        )
+
+    @pytest.mark.parametrize(
+        "config_id", ["tuned", "baseline", "phase1_alternate", "phase3_alternate", "baseline_no_psum_copy_in"]
+    )
+    @pytest.mark.parametrize("prequantize_weights", [False, True], ids=["bf16", "prequantized"])
+    def test_moe_mxfp8_bwd_qwen3_cache_sweep(
+        self,
+        test_manager: Orchestrator,
+        platform_target: common_dataclasses.Platforms,
+        config_id,
+        prequantize_weights,
+    ):
+        """Sweep whole dense-MoE backward candidates for the cache population."""
+        config = None
+        if config_id != "tuned":
+            config = build_bwd_candidate(config_id, QuantScheme._1x32, pe_loads=True, use_scale_packing=True)
+        self._run_qwen3_235b_tp1_8k_two_blocks_1x32(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            prequantize_weights=prequantize_weights,
+            pe_transpose_only=os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "").lower() == "true",
+            moe_bwd_config=config,
         )

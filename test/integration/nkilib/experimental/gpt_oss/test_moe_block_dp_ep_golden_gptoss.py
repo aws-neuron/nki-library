@@ -49,6 +49,7 @@ from nkilib_src.nkilib.models.gpt_oss.c128_giga_kernel.experimental.gpt_oss.moe_
 
 from test.integration.nkilib.core.moe_block.test_moe_block_tkg import generate_inputs
 from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
+from test.utils.mx_utils import maybe_pack64_gate_up_scale
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -192,6 +193,17 @@ def moe_block_dp_ep_golden_torch_ref(
 class TestMoeBlockDpEpGolden:
     """EP8 MXFP4 MoE + collectives validated directly against the HF golden (LNC=1)."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_moe_sbuf_collective_off(self, monkeypatch):
+        # moe_block_dp_ep is a standalone GPT-OSS MoE-block scaffold: it consumes
+        # moe_block_tkg's normal output and runs its own ReduceScatter -- it is NOT a
+        # consumer of the mega-decode SBUF-collective capture path. The gate
+        # VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE now defaults on (the GK bundle); with it
+        # on, down_projection_mx diverts its output into the mega-only SBUF capture and
+        # skips the HBM write this test reads -> ~100% mismatch. Pin it off, scoped via
+        # monkeypatch so it never leaks to other test modules in a shared process.
+        monkeypatch.setenv("VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE", "0")
+
     @pytest.mark.fast
     @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC, abbrevs=_ABBREVS)
     def test_moe_block_dp_ep_vs_golden(
@@ -216,7 +228,9 @@ class TestMoeBlockDpEpGolden:
                 "router_weights": _GLOBAL["router_weights"],
                 "expert_gate_up_weights": _GLOBAL["expert_gate_up_weights"][rank_id : rank_id + 1],
                 "expert_down_weights": _GLOBAL["expert_down_weights"][rank_id : rank_id + 1],
-                "expert_gate_up_weights_scale": _GLOBAL["expert_gate_up_weights_scale"][rank_id : rank_id + 1],
+                "expert_gate_up_weights_scale": maybe_pack64_gate_up_scale(
+                    _GLOBAL["expert_gate_up_weights_scale"][rank_id : rank_id + 1]
+                ),
                 "expert_down_weights_scale": _GLOBAL["expert_down_weights_scale"][rank_id : rank_id + 1],
                 "router_bias": _GLOBAL["router_bias"],
                 "expert_gate_up_bias": _GLOBAL["expert_gate_up_bias"][rank_id : rank_id + 1],

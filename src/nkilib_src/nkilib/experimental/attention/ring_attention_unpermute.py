@@ -23,7 +23,7 @@ from nki.collectives import ReplicaGroup
 
 @nki.jit
 def ring_attention_unpermute(
-    x: nl.ndarray,
+    x: nl.NkiTensor,
     replica_groups: tuple = None,
     num_workers: int = 1,
 ):

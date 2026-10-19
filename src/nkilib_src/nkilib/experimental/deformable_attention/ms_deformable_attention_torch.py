@@ -27,6 +27,8 @@ def ms_deformable_attention_torch_ref(
     sampling_locations_layout: str = "BQHLP2",
     align_corners: bool = False,
     padding_mode: str = "zeros",
+    max_indices_per_indirect=None,
+    gather_method: str = "transpose",
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of multi-scale deformable attention forward pass.

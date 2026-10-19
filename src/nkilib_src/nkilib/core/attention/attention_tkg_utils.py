@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Shared configuration, tiling constants, and helpers for the token-generation attention (attention_tkg) kernel."""
+
 import math
 import os
 from dataclasses import dataclass
@@ -109,6 +111,15 @@ class AttnTKGConfig(nl.NKIObject):
     """When True, return unnormalized attention output (sum of exp(QK-max)*V without dividing
     by the softmax denominator) and export local softmax stats (max, sum) via cp_softmax_stats_out.
     Used by CP for distributed softmax correction across ranks."""
+
+    seq_packed_slot_interleave_degree: int = 0
+    """Packed attention only: override the slot multi-buffering depth.
+
+    0 keeps the default min(num_slots, TileConstants.psum_b_max). Set to 1 to disable the
+    manual SBUF multi-buffering across schedule slots, so the manual allocator reuses one
+    address per slot as the automatic allocator does. No effect under automatic
+    allocation, where the degree is always 1. The PSUM interleave degree is derived as
+    psum_b_max // this value, so lowering this raises PSUM multi-buffering."""
 
 
 ### Constants

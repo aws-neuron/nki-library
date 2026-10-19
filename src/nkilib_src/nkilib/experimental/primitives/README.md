@@ -45,7 +45,7 @@ mov = TiledTensor.alloc(grid=(K_tiles, 1), tile_size=(128, 512),
 attn_tiled = TiledTensor(attn_shuffled, tile_size=(128, bxs_size))
 
 # Reshape to expose a dimension, then tile
-view = TensorView(buffer).reshape_dim(1, (n_heads, bxs_size))
+view = buffer.reshape_dim(1, (n_heads, bxs_size))
 tiled = TiledTensor(view, tile_size=(128, 1, block_size))
 # tile_size=1 on a dim → iterate over it (becomes K or N axis)
 

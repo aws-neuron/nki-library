@@ -100,14 +100,14 @@ def _verify_protocol_sync(func: Callable, protocol: TorchRefProtocolType):
         if var_name is None:
             raise RuntimeError(f"Could not find assignment target at line {lineno}")
         var_doc = _extract_var_docstring(source, var_name)
-        if var_doc is None:
+        if var_doc is None:  # pragma: no cover - developer-time protocol/docstring consistency check
             raise RuntimeError(f"Could not find docstring for variable '{var_name}'")
     finally:
         del frame
 
     protocol_doc = protocol.__call__.__doc__
     diff_str = _compare_docstrings(var_doc, protocol_doc)
-    if diff_str:
+    if diff_str:  # pragma: no cover - developer-time protocol/docstring consistency check
         kernel_assert(False, f"Docstring mismatch between variable and Protocol:\n{diff_str}")
 
 

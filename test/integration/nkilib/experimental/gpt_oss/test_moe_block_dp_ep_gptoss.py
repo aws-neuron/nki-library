@@ -32,6 +32,8 @@ just the local MoE math. On ``trn3pds-pdx10-1`` all 8 ranks run and the summed,
 re-sharded output is diffed at the MXFP4 low-precision tolerance.
 """
 
+import functools
+
 import nki.language as nl
 import numpy as np
 import pytest
@@ -46,6 +48,7 @@ from nkilib_src.nkilib.models.gpt_oss.c128_giga_kernel.experimental.gpt_oss.moe_
 # Reuse the maintained MoE MXFP4 input builder.
 from test.integration.nkilib.core.moe_block.test_moe_block_tkg import generate_inputs
 from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.mx_utils import maybe_pack64_gate_up_scale, maybe_unpack64_gate_up_scale
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -108,12 +111,36 @@ def _build_global_moe_inputs():
 _GLOBAL = _build_global_moe_inputs()
 
 
+@functools.wraps(moe_block_dp_ep_torch_ref)
+def _moe_block_dp_ep_torch_ref_natural_scale(**kwargs):
+    """``moe_block_dp_ep_torch_ref`` fed the natural gate/up MX scale layout.
+
+    The per-rank input dict feeds both the kernel and the ref. The kernel needs the PACK64
+    scale layout ``[E_L, 2, 64, H/512, I/4]`` (``VLLM_NEURON_MEGA_SCALE_PACK64`` is on by
+    default) while the nkilib MX torch ref underneath indexes the natural
+    ``[E_L, 16, 2, H/512, I]`` one. The remap is exact, so both consumers see the same values.
+    """
+    kwargs["expert_gate_up_weights_scale"] = maybe_unpack64_gate_up_scale(kwargs["expert_gate_up_weights_scale"])
+    return moe_block_dp_ep_torch_ref(**kwargs)
+
+
 @pytest_test_metadata(name="GPT-OSS MXFP4 MoE DP-EP - collectives")
 @pytest_marks(["collectives"])
 @pytest.mark.high_rank
 @pytest.mark.skip_simulation
 class TestMoeBlockDpEpGptOss:
     """EP8 MXFP4 MoE decode block with AllGather/ReduceScatter collectives (LNC=1)."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_moe_sbuf_collective_off(self, monkeypatch):
+        # moe_block_dp_ep is a standalone GPT-OSS MoE-block scaffold: it consumes
+        # moe_block_tkg's normal output and runs its own ReduceScatter -- it is NOT a
+        # consumer of the mega-decode SBUF-collective capture path. The gate
+        # VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE now defaults on (the GK bundle); with it
+        # on, down_projection_mx diverts its output into the mega-only SBUF capture and
+        # skips the HBM write this test reads -> ~100% mismatch. Pin it off, scoped via
+        # monkeypatch so it never leaks to other test modules in a shared process.
+        monkeypatch.setenv("VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE", "0")
 
     @pytest.mark.fast
     @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC, abbrevs=_RANKS_LNC_ABBREVS)
@@ -139,7 +166,7 @@ class TestMoeBlockDpEpGptOss:
             # This rank's single local expert = expert index rank_id.
             gu_w = _GLOBAL["expert_gate_up_weights"][rank_id : rank_id + 1]
             dn_w = _GLOBAL["expert_down_weights"][rank_id : rank_id + 1]
-            gu_s = _GLOBAL["expert_gate_up_weights_scale"][rank_id : rank_id + 1]
+            gu_s = maybe_pack64_gate_up_scale(_GLOBAL["expert_gate_up_weights_scale"][rank_id : rank_id + 1])
             dn_s = _GLOBAL["expert_down_weights_scale"][rank_id : rank_id + 1]
             gu_b = _GLOBAL["expert_gate_up_bias"][rank_id : rank_id + 1]
             dn_b = _GLOBAL["expert_down_bias"][rank_id : rank_id + 1]
@@ -171,7 +198,7 @@ class TestMoeBlockDpEpGptOss:
         CollectiveUnitTestFramework(
             test_manager=test_manager,
             kernel_entry=moe_block_dp_ep_kernel,
-            torch_ref=moe_block_dp_ep_torch_ref,
+            torch_ref=_moe_block_dp_ep_torch_ref_natural_scale,
             per_rank_input_generator=create_inputs,
             collective_ranks=collective_ranks,
         ).run_test(

@@ -24,6 +24,8 @@ from nkilib_src.nkilib.core.utils.common_types import ActFnType
 from nkilib_src.nkilib.experimental.conv.conv3d import (
     BatchNormMode,
     ResidualAddLoc,
+)
+from nkilib_src.nkilib.experimental.conv.conv3d_helpers import (
     _build_conv3d_config,
     _build_memory_config,
     _build_tile_config,
@@ -67,7 +69,6 @@ def _build_configs(batch, in_channels, out_channels, depth, height, width, batch
         (0, 0, 1, 1, 1, 1),
         (1, 1, 1),
         ActFnType.ReLU,
-        False,
         batch_norm_mode,
         False,
         ResidualAddLoc.NONE,

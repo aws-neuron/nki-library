@@ -32,32 +32,43 @@ Tiling Hierarchy
 
 Kernel Flow (per batch)
 =======================
-  Step 0: Load Q, scale by 1/sqrt(d), quantize to MXFP8, build Q_lo/Q_hi variants
+  Step 0: Load Q, scale by 1/sqrt(d), quantize to MXFP8, build packed-Q variants
   Step 1: Initialize online softmax state (running_max, running_sum, acc)
-  Step 2: For each chunk:
-    2a: Load row indices + mask + K/V blocks via indirect DMA (swdge)
+  Step 2: For each chunk (prior chunks, plus one final "active chunk"):
+    2a: Load mask + K/V — prior blocks via indirect DMA (swdge), or quantize the
+        active k_active/v_active into block0/fold0 of the chunk buffers (MXFP8)
     2b: MM1 — Q × K^T with packed-Q eviction (nc_matmul_mx, row-tiled)
     2c: Online softmax — BF16 scores → exp → running max/sum update
     2d: Re-quantize scores to MXFP8 → MM2 — scores × V (nc_matmul_mx)
-  Step 3: k_active/v_active — scalar softmax update (single-token dot product)
-  Step 4: LNC2 gather (if sharded) → normalize (acc / running_sum) → store
+  Step 3: LNC2 gather (if sharded) → normalize (acc / running_sum) → store
 
-Packed-Q Eviction
-=================
-Each Q x K block matmul fills only band_p (= q_head) output partitions, so Q is
-replicated into variants_per_tile = 128 // q_head variants — variant v holds the
-real Q in free band [v*band_p : (v+1)*band_p] and zeros elsewhere, landing its
+Row-Tiling vs Packed-Q Eviction
+===============================
+n_query_rows = q_head * s_active is the total query-row count. It is split into
+n_row_tiles = ceil(n_query_rows / 128) row-tiles of rows_per_tile = min(n_query_rows, 128)
+rows; each tile is an independent 128-row attention problem over the same KV, with its
+own online-softmax state and PSUM accumulator. Row-tiling and variant-packing never
+coexist: variants_per_tile > 1 only when n_query_rows < 128 (n_row_tiles == 1), and
+n_row_tiles > 1 only when n_query_rows >= 128 (variants_per_tile == 1). All the layout
+below is described per row-tile, over its rows_per_tile query rows.
+
+Packed-Q Eviction (per row-tile)
+--------------------------------
+Each Q x K block matmul fills only rows_per_tile output partitions, so Q is replicated
+into variants_per_tile = 128 // rows_per_tile variants — variant v holds the real Q in
+free band [v*rows_per_tile : (v+1)*rows_per_tile] and zeros elsewhere, landing its
 scores in output-partition band v. variants_per_tile blocks — one per fold sharing a
 column group, all at the same block-in-fold position — then accumulate into a single
 [128P, block_len] PSUM tile, using all 128 partitions:
-    q_head=64 → 2 variants (Q_lo, Q_hi), 2 blocks per tile
-    q_head=32 → 4 variants, 4 blocks per tile
+    rows_per_tile=128 → 1 variant, 1 block per tile (row-tiled, no packing)
+    rows_per_tile=64  → 2 variants (Q_lo, Q_hi), 2 blocks per tile
+    rows_per_tile=32  → 4 variants, 4 blocks per tile
 
 Score Layout: [128P, score_free], shared by MM1's PSUM buffer and the evicted SBUF scores
-    score_free = folds_per_chunk * block_len * score_tiles_per_fold (1024 for q_head=64,
-    512 for q_head=32). Logical block b of the chunk is
+    score_free = folds_per_chunk * block_len * score_tiles_per_fold (2048 for
+    rows_per_tile=128, 1024 for 64, 512 for 32). Logical block b of the chunk is
     fold_idx, block_idx = divmod(b, blocks_per_fold), and its scores land at
-        partition rows [band_idx * band_p : (band_idx + 1) * band_p]
+        partition rows [band_idx * rows_per_tile : (band_idx + 1) * rows_per_tile]
         free columns  [group_idx * fold_len + block_idx * block_len : + block_len]
     where group_idx, band_idx = divmod(fold_idx, variants_per_tile). A column group is
     fold_len wide and holds variants_per_tile folds, one per partition band.
@@ -66,9 +77,11 @@ Score Layout: [128P, score_free], shared by MM1's PSUM buffer and the evicted SB
     occupy fold_len contiguous columns of a single band, in token order — which is what
     lets _load_chunk_mask scatter the token-sequential mask one fold per DMA.
 
-Mask Layout: [B, H, 1, s_prior] uint8
-    User-provided per-head mask in token-sequential order.
-    1 = valid token, 0 = masked (score set to -inf).
+Mask Layout: [B, H, s_active, s_prior + s_active] uint8
+    User-provided unified per-head mask in token-sequential order. One row per
+    active query token; the s_prior prefix masks the prior context and the trailing
+    s_active columns mask the active tokens (the caller encodes intra-active
+    causality). 1 = valid token, 0 = masked (score set to -inf).
 """
 
 from dataclasses import dataclass
@@ -80,11 +93,11 @@ import nki.language as nl
 
 from ...core.utils.allocator import SbufManager, create_auto_alloc_manager
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ...core.utils.kernel_helpers import div_ceil
 from .attention_mxfp8_tkg_utils import mm1_packing_geometry, swizzle_quantize_mx
 
-# bf16 lowest representable value; used to fill masked-out score positions with -inf.
-_SCORE_MASK_NEG_INF = -65504.0
+# bf16 largest representable magnitude; negated to fill masked-out score positions with -inf.
+_SCORE_MASK_INF = 65504.0
 # Sentinel for the running-max initialization (effectively -inf before the first chunk).
 _RUNNING_MAX_INIT = -1e38
 
@@ -127,16 +140,25 @@ class AttnMXFP8Config(nl.NKIObject):
     d_head: int
     """Head dimension."""
 
+    s_active: int = 1
+    """Active sequence length (query tokens per head). 1 for single-token decode,
+    > 1 for speculative decoding. Supported s_active in {1, 2, 4, 8}, giving n_query_rows =
+    q_head * s_active in {32, 64, 128, 256, 512}. n_query_rows <= 128 packs Q variants;
+    n_query_rows > 128 row-tiles the query rows into n_query_rows/128 tiles of 128 rows."""
+
     def __post_init__(self):
         kernel_assert(self.bs >= 1, f"bs must be >= 1, got {self.bs=}")
         kernel_assert(self.q_head in (32, 64), f"q_head must be 32 or 64, got {self.q_head=}")
-        kernel_assert(self.d_head == 128, f"d_head must be 128, got {self.d_head=}")
+        kernel_assert(self.s_active in (1, 2, 4, 8), f"s_active must be 1, 2, 4 or 8, got {self.s_active=}")
 
 
 class TileParams(nl.NKIObject):
     """Derived tiling, sharding, and geometry parameters computed once at kernel entry."""
 
     def __init__(self, cfg: AttnMXFP8Config):
+        self.s_active = cfg.s_active
+        """Active sequence length (query tokens per head)."""
+
         # Softmax
         self.softmax_scale = 1.0 / (cfg.d_head**0.5)
         """Softmax scaling factor: 1/sqrt(d_head)."""
@@ -161,14 +183,25 @@ class TileParams(nl.NKIObject):
         self.fold_len = self.blocks_per_fold * self.block_len
         """Tokens per fold."""
 
-        # Packed-Q eviction geometry (native per-head-count variant packing)
-        band_p, variants_per_tile, score_tiles_per_fold = mm1_packing_geometry(
-            cfg.q_head, p_max=TC.p_max, blocks_per_fold=self.blocks_per_fold
+        """
+        Packed-Q eviction geometry (native per-head-count variant packing).
+        n_query_rows = total query rows = q_head * s_active. When n_query_rows > 128 the rows
+        do not fit in one 128-partition tile, so they are split into n_row_tiles tiles of
+        rows_per_tile (= 128) rows each; each tile is an independent 128-row attention
+        problem over the same KV. When n_query_rows <= 128 there is one tile (rows_per_tile ==
+        n_query_rows) and the packed-Q eviction applies as before.
+        """
+        self.n_query_rows = cfg.q_head * cfg.s_active
+        """Total query rows = q_head * s_active."""
+        self.rows_per_tile = min(self.n_query_rows, TC.p_max)
+        """Query rows per row-tile (= n_query_rows when n_query_rows <= 128, else 128)."""
+        self.n_row_tiles = div_ceil(self.n_query_rows, TC.p_max)
+        """Number of row-tiles the query rows are split into (n_query_rows / 128, or 1)."""
+        variants_per_tile, score_tiles_per_fold = mm1_packing_geometry(
+            self.rows_per_tile, p_max=TC.p_max, blocks_per_fold=self.blocks_per_fold
         )
-        self.band_p = band_p
-        """Partition rows one block's scores occupy (= q_head)."""
         self.variants_per_tile = variants_per_tile
-        """Q variants packed into one PSUM tile (2 for q_head=64, 4 for q_head=32)."""
+        """Q variants packed into one PSUM tile (2 for rows_per_tile=64, 4 for 32, 1 for 128)."""
         self.score_tiles_per_fold = score_tiles_per_fold
         """Score tiles per fold."""
 
@@ -217,58 +250,67 @@ class TileParams(nl.NKIObject):
 
 
 class QuantizedQ(nl.NKIObject):
-    """MXFP8-quantized Q with packed variants for MM1 and scaled bf16 for active-token dot product."""
+    """MXFP8-quantized Q with packed variants for MM1."""
 
     def __init__(self, cfg, tp, sbm):
         self.cfg = cfg
         self.tp = tp
         self.sbm = sbm
-        self.q_scaled = None
         self.q_variants = None
-        """List of variants_per_tile (data, scale) MXFP8 buffers. Each buffer is
-        [128P, p_max F]: the partition dim is the 32-partition MXFP8 Q operand
-        replicated across the four fold quadrants, and the free dim is the packed
-        output-partition layout (variants_per_tile * band_p). Variant v writes the
-        real Q into free band [v*band_p : (v+1)*band_p] (zeros elsewhere) so its
-        block matmul lands in output-partition band v."""
+        """List of n_row_tiles lists, each of variants_per_tile (data, scale) MXFP8
+        buffers. Each buffer is [128P, q_free F]: the partition dim is the 32-partition
+        MXFP8 Q operand replicated across the four fold quadrants, and the free dim is
+        the packed output-partition layout (variants_per_tile * rows_per_tile). Row-tile
+        t's variant v writes that tile's rows into free band
+        [v*rows_per_tile : (v+1)*rows_per_tile] (zeros elsewhere) so its block matmul
+        lands in output-partition band v."""
 
     def load_from_hbm(self, q_hbm, batch_idx):
-        """Load Q from HBM, scale, quantize to MXFP8, build packed variants.
+        """Load Q from HBM, scale, quantize to MXFP8, build packed variants per row-tile.
 
-        Q is loaded into a band_p-tall (= real q_head) buffer with no padding: the
-        packed-Q eviction stacks variants_per_tile blocks per PSUM tile, one per
-        band_p-row partition band, so all 128 partitions carry real scores.
+        Q's [q_head, s_active] axes flatten head-major (row = h*s_active + s) into
+        n_query_rows query rows, split into n_row_tiles tiles of rows_per_tile (<= 128) rows. Each tile
+        is loaded, scaled, MXFP8-quantized to a [32, rows_per_tile] base, and expanded to
+        its packed Q variants independently — nothing is ever allocated wider than 128
+        partitions.
         """
         cfg, tp, sbm = self.cfg, self.tp, self.sbm
+        rows_per_tile = tp.rows_per_tile
+        mx_par = cfg.d_head // 4  # MXFP8 Q operand contraction dim (32) on partitions
 
-        q_bf16 = sbm.alloc_stack((tp.band_p, cfg.d_head), dtype=nl.bfloat16)
-        nisa.dma_copy(dst=q_bf16, src=q_hbm[batch_idx, :, nl.ds(0, 1), :])
+        q_band = q_hbm[batch_idx].reshape((tp.n_query_rows, cfg.d_head))
 
-        self.q_scaled = sbm.alloc_stack((tp.band_p, cfg.d_head), dtype=nl.bfloat16)
-        nisa.tensor_scalar(dst=self.q_scaled, data=q_bf16, op0=nl.multiply, operand0=tp.softmax_scale)
+        self.q_variants = []
+        for row_tile in range(tp.n_row_tiles):
+            row_base = row_tile * rows_per_tile
 
-        # MXFP8 Q operand: contraction dim d_head//4 = 32 on partitions, band_p heads on free.
-        mx_par = cfg.d_head // 4  # 32
-        q_mx_data_base = sbm.alloc_stack((mx_par, tp.band_p), dtype=nl.float8_e4m3fn_x4)
-        q_mx_scale_base = sbm.alloc_stack((mx_par, tp.band_p), dtype=nl.uint8)
-        swizzle_quantize_mx(self.q_scaled, q_mx_data_base, q_mx_scale_base, sbm)
+            q_bf16 = sbm.alloc_stack((rows_per_tile, cfg.d_head), dtype=nl.bfloat16)
+            nisa.dma_copy(dst=q_bf16, src=q_band[nl.ds(row_base, rows_per_tile), :])
 
-        self.q_variants = _build_q_variants(q_mx_data_base, q_mx_scale_base, cfg, tp, sbm)
+            q_scaled = sbm.alloc_stack((rows_per_tile, cfg.d_head), dtype=nl.bfloat16)
+            nisa.tensor_scalar(dst=q_scaled, data=q_bf16, op0=nl.multiply, operand0=tp.softmax_scale)
+
+            q_mx_data_base = sbm.alloc_stack((mx_par, rows_per_tile), dtype=nl.float8_e4m3fn_x4)
+            q_mx_scale_base = sbm.alloc_stack((mx_par, rows_per_tile), dtype=nl.uint8)
+            swizzle_quantize_mx(q_scaled, q_mx_data_base, q_mx_scale_base, sbm)
+
+            self.q_variants.append(_build_q_tile_variants(q_mx_data_base, q_mx_scale_base, tp, sbm))
 
 
 class SoftmaxState(nl.NKIObject):
     """Online softmax running state and accumulators.
 
-    Constructed once per batch iteration. Holds running max/sum, the PSUM
-    accumulator, and the identity matrix needed for PE-based sum reduction.
+    Constructed once per row-tile per batch iteration. Holds running max/sum, the PSUM
+    accumulator, and the identity matrix needed for PE-based sum reduction. Operates on
+    the tile's rows_per_tile query rows (= n_query_rows when n_query_rows <= 128).
     """
 
     def __init__(self, cfg, tp, sbm, identity_sb):
         self.cfg = cfg
         self.tp = tp
         self.sbm = sbm
-        self.band_p = tp.band_p  # partition rows per band (= q_head)
-        self.n_bands = tp.variants_per_tile  # bands packed per PSUM tile (2 or 4)
+        self.band_p = tp.rows_per_tile  # query rows this tile occupies (= n_query_rows when <= 128)
+        self.n_bands = tp.variants_per_tile  # bands packed per PSUM tile (1, 2 or 4)
 
         # Identity matrix for PE reduction (shared across batches, passed in)
         self.identity_sb = identity_sb
@@ -283,15 +325,15 @@ class SoftmaxState(nl.NKIObject):
         """[TC.p_max, 1] fp32 in SBUF."""
         nisa.memset(self.running_sum, value=0.0, engine=nisa.gpsimd_engine)
 
-        self.acc = nl.ndarray((tp.band_p, cfg.d_head), dtype=nl.float32, buffer=nl.psum)
-        """[band_p, d_head] fp32 in PSUM."""
+        self.acc = nl.ndarray((tp.rows_per_tile, cfg.d_head), dtype=nl.float32, buffer=nl.psum)
+        """[rows_per_tile, d_head] fp32 in PSUM."""
         nisa.memset(self.acc, value=0.0)
 
-        # Set later in Steps 3/4
+        # Set later in Step 3 (finalize)
         self.acc_sb = None
         """[TC.p_max, d_head] fp32 in SBUF."""
         self.out_bf16 = None
-        """[q_head, d_head] bf16 in SBUF."""
+        """[rows_per_tile, d_head] bf16 in SBUF."""
 
     def update_online_softmax(self, score_sb, score_max_sb, score_sb_fp32_reinterp):
         """Packed online softmax on [128, score_free]. Score path in bf16, accumulators in fp32.
@@ -322,16 +364,23 @@ class SoftmaxState(nl.NKIObject):
         with a copy (reusing one scratch buffer) before it is combined into the running
         result; band 0 is already aligned and feeds the first combine in place. `op` is
         maximum for the score max, add for the sum. Returns a fresh [band_p, 1] tensor.
+
+        When n_bands == 1 (band_p == 128, no packing) there is nothing to reduce, so the
+        single band is copied out unchanged.
         """
 
-        kernel_assert(self.n_bands in (2, 4), f"n_bands assumed to be either 2 or 4, got {self.n_bands}")
+        kernel_assert(self.n_bands in (1, 2, 4), f"n_bands assumed to be 1, 2 or 4, got {self.n_bands}")
 
         sbm = self.sbm
         band_p = self.band_p
 
         reduced = sbm.alloc_stack((band_p, 1), dtype=nl.float32)
-        aligned = sbm.alloc_stack((band_p, 1), dtype=nl.float32)
 
+        if self.n_bands == 1:
+            nisa.tensor_copy(dst=reduced, src=packed[nl.ds(0, band_p), :], engine=nisa.scalar_engine)
+            return reduced
+
+        aligned = sbm.alloc_stack((band_p, 1), dtype=nl.float32)
         nisa.tensor_copy(dst=aligned, src=packed[nl.ds(band_p, band_p), :], engine=nisa.scalar_engine)
         nisa.tensor_tensor(dst=reduced, data1=packed[nl.ds(0, band_p), :], data2=aligned, op=op)
         for band_idx in range(2, self.n_bands):
@@ -475,9 +524,14 @@ class ChunkBuffers(nl.NKIObject):
 
 
 def _load_chunk_mask(
-    chunk_mask_sb: nl.NkiTensor, batch_idx: int, chunk_idx: int, mask: nl.NkiTensor, tp: TileParams
+    chunk_mask_sb: nl.NkiTensor, batch_idx: int, chunk_idx: int, row_tile: int, mask: nl.NkiTensor, tp: TileParams
 ) -> None:
-    """Load mask [B, H, 1, s_prior] and scatter into eviction-layout SBUF buffer.
+    """Scatter one row-tile's prior mask into the eviction-layout SBUF buffer.
+
+    mask is [B, H, s_active, s_prior + s_active]; here we use only the s_prior prefix
+    (the s_active tail drives the active-token step). The per-batch mask reshapes
+    head-major ([H, s_active] -> n_query_rows, row = h*s_active + s) to [n_query_rows, s_prior + s_active].
+    Row-tile `row_tile` owns query rows [row_tile*rows_per_tile : +rows_per_tile].
 
     One DMA per fold: a fold's fold_len tokens occupy fold_len contiguous columns of a
     single partition band, in token order, so the token-sequential mask needs no
@@ -485,9 +539,12 @@ def _load_chunk_mask(
     the whole buffer. Tokens at or past s_prior have no mask entry, so a chunk reaching
     past s_prior copies only the in-range prefix of each fold; the memset zeroes the
     remaining columns, which no DMA writes and which would otherwise hold the previous
-    chunk's mask.
+    chunk's or row-tile's mask.
     """
-    s_prior = mask.shape[3]
+    s_prior = mask.shape[3] - tp.s_active
+    rows_per_tile = tp.rows_per_tile
+    mask_prior = mask[batch_idx].reshape((tp.n_query_rows, mask.shape[3]))
+    row_base = row_tile * rows_per_tile
 
     if (chunk_idx + 1) * tp.chunk_tokens > s_prior:
         nisa.memset(chunk_mask_sb, value=0)
@@ -498,48 +555,95 @@ def _load_chunk_mask(
         if n_copy <= 0:
             continue
         group_idx, band_idx = divmod(fold_idx, tp.variants_per_tile)
-        p_row = band_idx * tp.band_p
+        p_row = band_idx * rows_per_tile
         f_off = group_idx * tp.fold_len
         nisa.dma_copy(
-            dst=chunk_mask_sb[nl.ds(p_row, tp.band_p), nl.ds(f_off, n_copy)],
-            src=mask[batch_idx, nl.ds(0, tp.band_p), 0, nl.ds(tok_start, n_copy)],
+            dst=chunk_mask_sb[nl.ds(p_row, rows_per_tile), nl.ds(f_off, n_copy)],
+            src=mask_prior[nl.ds(row_base, rows_per_tile), nl.ds(tok_start, n_copy)],
         )
 
 
-def _load_chunk_context(cb, batch_idx, chunk_idx, mask, k_prior, v_prior, kv_loader, tp):
-    """Load all chunk data from HBM into pre-allocated ChunkBuffers."""
-    _load_chunk_mask(cb.chunk_mask_sb, batch_idx, chunk_idx, mask, tp)
+def _load_chunk_kv(cb, k_prior, v_prior, kv_loader, chunk_idx):
+    """Load this chunk's K/V blocks from HBM (shared across all row-tiles)."""
     kv_loader.load_blocks(cb.k_buf, k_prior, chunk_idx)
     kv_loader.load_blocks(cb.v_buf, v_prior, chunk_idx)
 
 
+def _build_active_chunk_kv(cb, batch_idx, k_active, v_active, tp, sbm):
+    """Quantize the active tokens into the block0/fold0 slot of the chunk K/V buffers."""
+    s_active = tp.s_active
+    d_head = tp.block_len
+    p_block = tp.p_per_block  # 32
+
+    nisa.memset(cb.k_buf, value=0.0)
+    nisa.memset(cb.v_buf, value=0.0)
+
+    # Active K: [tokens, d] padded to a full block, contraction along d_head.
+    k_pad = sbm.alloc_stack((TC.p_max, d_head), dtype=nl.bfloat16)
+    nisa.memset(k_pad, value=0.0)
+    nisa.dma_copy(dst=k_pad[nl.ds(0, s_active), :], src=k_active[batch_idx])
+    swizzle_quantize_mx(
+        k_pad,
+        cb.k_buf[nl.ds(0, p_block), 0, nl.ds(0, d_head)].view(nl.float8_e4m3fn_x4),
+        cb.k_buf[nl.ds(0, p_block), 0, nl.ds(d_head, d_head // 4)].view(nl.uint8),
+        sbm,
+    )
+
+    # Active V: load transposed [d, tokens] so contraction is along block_len.
+    v_pad_t = sbm.alloc_stack((d_head, TC.p_max), dtype=nl.bfloat16)
+    nisa.memset(v_pad_t, value=0.0)
+    nisa.dma_transpose(dst=v_pad_t[:, nl.ds(0, s_active)], src=v_active[batch_idx])
+    swizzle_quantize_mx(
+        v_pad_t,
+        cb.v_buf[nl.ds(0, p_block), 0, nl.ds(0, d_head)].view(nl.float8_e4m3fn_x4),
+        cb.v_buf[nl.ds(0, p_block), 0, nl.ds(d_head, d_head // 4)].view(nl.uint8),
+        sbm,
+    )
+
+
+def _load_active_chunk_mask(chunk_mask_sb, batch_idx, row_tile, mask, tp):
+    """Scatter one row-tile's active-token mask into the block0/fold0 slot of the
+    eviction-layout buffer.
+    """
+    s_active = tp.s_active
+    s_prior = mask.shape[3] - s_active
+    rows_per_tile = tp.rows_per_tile
+    mask_r = mask[batch_idx].reshape((tp.n_query_rows, mask.shape[3]))
+    row_base = row_tile * rows_per_tile
+
+    nisa.memset(chunk_mask_sb, value=0)
+    nisa.dma_copy(
+        dst=chunk_mask_sb[nl.ds(0, rows_per_tile), nl.ds(0, s_active)],
+        src=mask_r[nl.ds(row_base, rows_per_tile), nl.ds(s_prior, s_active)],
+    )
+
+
 # ── Q Variant Construction ─────────────────────────────────────────────────────
-def _build_q_variants(q_mx_data_base, q_mx_scale_base, cfg, tp, sbm):
-    """Build variants_per_tile packed Q buffers from base MXFP8 Q [32P, band_p F].
+def _build_q_tile_variants(q_mx_data_base, q_mx_scale_base, tp, sbm):
+    """Build one row-tile's packed Q buffers from its base MXFP8 Q [32P, rows_per_tile F].
 
-    Variant v holds the base Q in free band [v*band_p : (v+1)*band_p] and zeros
-    elsewhere, so its Q x K block matmul lands in output-partition band v. Each
-    variant's [32P, q_free] base is then replicated across the four fold quadrants
-    to [128P, q_free].
-
-    For q_head=64 this yields the original two variants (Q_lo, Q_hi); for q_head=32
-    it yields four, packing all 128 output partitions.
+    Within a tile, variants_per_tile variants each place the tile's rows in a different
+    free band [v*rows_per_tile : (v+1)*rows_per_tile] (zeros elsewhere), so variant v's
+    Q x K block matmul lands in output-partition band v.
 
     Returns:
-        List of variants_per_tile (data, scale) tuples, each [128P, q_free].
+        List of variants_per_tile (data, scale) tuples, every buffer [128P, q_free].
     """
+    rows_per_tile = tp.rows_per_tile
     variants = []
     for variant_idx in range(tp.variants_per_tile):
-        band_off = variant_idx * tp.band_p
+        band_off = variant_idx * rows_per_tile
 
-        # Variant base [32P, q_free]: base Q at free band [band_off : band_off + band_p].
+        # Variant base [32P, q_free]: this tile's rows at free band [band_off : +rows_per_tile].
         v_data_base = sbm.alloc_stack((tp.p_per_block, tp.q_free), dtype=nl.float8_e4m3fn_x4)
         v_scale_base = sbm.alloc_stack((tp.p_per_block, tp.q_free), dtype=nl.uint8)
         nisa.memset(v_data_base, value=0, engine=nisa.gpsimd_engine)
         nisa.memset(v_scale_base, value=0, engine=nisa.gpsimd_engine)
-        nisa.tensor_copy(dst=v_data_base[:, nl.ds(band_off, tp.band_p)], src=q_mx_data_base, engine=nisa.vector_engine)
         nisa.tensor_copy(
-            dst=v_scale_base[:, nl.ds(band_off, tp.band_p)], src=q_mx_scale_base, engine=nisa.vector_engine
+            dst=v_data_base[:, nl.ds(band_off, rows_per_tile)], src=q_mx_data_base, engine=nisa.vector_engine
+        )
+        nisa.tensor_copy(
+            dst=v_scale_base[:, nl.ds(band_off, rows_per_tile)], src=q_mx_scale_base, engine=nisa.vector_engine
         )
 
         # Replicate across 4 quadrants → [128P, q_free]
@@ -665,26 +769,21 @@ class BatchBlockKVCacheLoader(nl.NKIObject):
 
 
 # ── MM1/MM2: Block Matmul ─────────────────────────────────────────────────────
-def _emit_block_matmul(q_bufs, kv_buf, psum_full, fold_idx, block_idx, tp):
+def _emit_block_matmul(tile_variants, kv_buf, psum_full, fold_idx, block_idx, tp):
     """One nc_matmul_mx: Q × kv_buf block → one PSUM tile of psum_full.
 
     Addresses logical block `fold_idx * blocks_per_fold + block_idx` of the chunk:
     block_idx selects the quadrant on partitions, and fold_idx splits into the column
-    group and the partition band, which also picks the Q variant that lands scores in
-    that band. See the module docstring's Score Layout.
-
-    Access-pattern decode (kv_buf is [TC.p_max, folds_per_chunk, packed_cols], each block
-    laid out as [block_len data | block_len//4 scale] fp32 columns):
-      - `moving` is the block_len data columns viewed as float8_e4m3fn_x4 (same width).
-      - `moving_scale` is the block_len//4 scale columns viewed as uint8 (4x wider →
-        block_len columns), over p_per_quadrant // mx_group_partitions rows.
+    group and the partition band, which also picks the Q variant (of the current
+    row-tile's variant list) that lands scores in that band. See the module docstring's
+    Score Layout.
     """
     group_idx, band_idx = divmod(fold_idx, tp.variants_per_tile)
     row_offset = block_idx * tp.p_per_block
     tile_offset = group_idx * tp.fold_len + block_idx * tp.block_len
     scale_partition_count = TC.p_per_quadrant // TC.mx_group_partitions
 
-    q_data, q_scale = q_bufs.q_variants[band_idx]
+    q_data, q_scale = tile_variants[band_idx]
     kv_block = kv_buf[nl.ds(row_offset, tp.p_per_block), fold_idx, :]
 
     psum_tile = psum_full[:, nl.ds(tile_offset, tp.block_len)]
@@ -704,18 +803,19 @@ def _emit_block_matmul(q_bufs, kv_buf, psum_full, fold_idx, block_idx, tp):
     )
 
 
-def _mm1_compute_chunk(q_bufs, k_buf, score_sb, score_max_sb, chunk_mask_sb, tp):
-    """Compute MM1 (Q x K^T) with packed-Q eviction (SBUF scope).
+def _mm1_compute_chunk(tile_variants, k_buf, score_sb, score_max_sb, chunk_mask_sb, tp):
+    """Compute MM1 (Q x K^T) with packed-Q eviction for one row-tile (SBUF scope).
 
+    tile_variants: variants_per_tile (data, scale) Q buffers for the current row-tile.
     k_buf: [TC.p_max, folds_per_chunk, packed_cols] — already loaded with K blocks from HBM.
     score_sb: [TC.p_max, tp.score_free] bf16 — output scores buffer.
     score_max_sb: [TC.p_max, 1] fp32 — per-partition score max, fused into eviction.
-    chunk_mask_sb: [TC.p_max, tp.score_free] uint8 — mask for this chunk.
+    chunk_mask_sb: [TC.p_max, tp.score_free] uint8 — mask for this chunk (this row-tile).
 
     Q variants are [128P, q_free] (32P base replicated across 4 quadrants). Each
-    variant's matmul lands in a band_p-row output-partition band via its zero-filled
-    stationary free dim, so variants_per_tile blocks accumulate into one [128P,
-    block_len] PSUM tile (2 blocks/tile for q_head=64, 4 for q_head=32).
+    variant's matmul lands in a rows_per_tile-row output-partition band via its
+    zero-filled stationary free dim, so variants_per_tile blocks accumulate into one
+    [128P, block_len] PSUM tile (1 block/tile for rows_per_tile=128, 2 for 64, 4 for 32).
     """
     psum_full = nl.ndarray((TC.p_max, tp.score_free), dtype=nl.bfloat16, buffer=nl.psum)
 
@@ -725,16 +825,88 @@ def _mm1_compute_chunk(q_bufs, k_buf, score_sb, score_max_sb, chunk_mask_sb, tp)
     """
     for fold_idx in range(tp.folds_per_chunk):
         for block_idx in range(tp.blocks_per_fold):
-            _emit_block_matmul(q_bufs, k_buf, psum_full, fold_idx, block_idx, tp)
+            _emit_block_matmul(tile_variants, k_buf, psum_full, fold_idx, block_idx, tp)
 
     nisa.select_reduce(
         dst=score_sb,
         predicate=chunk_mask_sb,
         on_true=psum_full,
-        on_false=_SCORE_MASK_NEG_INF,
+        on_false=-_SCORE_MASK_INF,
         reduce_res=score_max_sb,
         reduce_op=nl.maximum,
         reduce_cmd=nisa.reduce_cmd.reset_reduce,
+    )
+
+
+def _validate_inputs(q, k_active, v_active, k_prior, v_prior, mask, identity_hbm, active_blocks_table):
+    """Validate shapes and dtypes of every operand. All config is derived from q / k_prior shapes.
+
+    Scalar-range invariants (q_head in {32, 64}, s_active in {1, 2, 4, 8}) are enforced in
+    AttnMXFP8Config.__post_init__; this checks cross-operand shape and dtype consistency.
+    """
+    bs, q_head, s_active, d_head = q.shape
+    num_blocks = k_prior.shape[0]
+    p_per_block = TC.p_per_quadrant
+    packed_cols = d_head + d_head // 4
+    bucket_size = num_blocks * d_head
+
+    kernel_assert(d_head == 128, f"q head dim must be 128, got {d_head=} from {q.shape=}")
+    kernel_assert(q.dtype == nl.bfloat16, f"q must be bf16, got {q.dtype=}")
+
+    # k_active / v_active: active-token K/V [bs, s_active, d_head] bf16. s_active is derived from
+    # q.shape[2], so a mismatched active K/V would silently read wrong data.
+    kernel_assert(
+        tuple(k_active.shape) == (bs, s_active, d_head) and k_active.dtype == nl.bfloat16,
+        f"k_active must be [bs, s_active, d_head]={(bs, s_active, d_head)} bf16, "
+        f"got {k_active.shape=}, {k_active.dtype=}",
+    )
+    kernel_assert(
+        tuple(v_active.shape) == (bs, s_active, d_head) and v_active.dtype == nl.bfloat16,
+        f"v_active must be [bs, s_active, d_head]={(bs, s_active, d_head)} bf16, "
+        f"got {v_active.shape=}, {v_active.dtype=}",
+    )
+
+    # k_prior / v_prior: MXFP8 block cache [num_blocks, p_per_block, packed_cols] fp32.
+    kernel_assert(
+        tuple(k_prior.shape) == (num_blocks, p_per_block, packed_cols) and k_prior.dtype == nl.float32,
+        f"k_prior must be [num_blocks, {p_per_block}, {packed_cols}] fp32, got {k_prior.shape=}, {k_prior.dtype=}",
+    )
+    kernel_assert(
+        tuple(v_prior.shape) == (num_blocks, p_per_block, packed_cols) and v_prior.dtype == nl.float32,
+        f"v_prior must be [num_blocks, {p_per_block}, {packed_cols}] fp32, got {v_prior.shape=}, {v_prior.dtype=}",
+    )
+
+    # mask: unified [bs, q_head, s_active, s_prior + s_active] uint8. s_prior = mask.shape[3] - s_active
+    # is independent of bucket_size (tokens past s_prior are masked); it must fit within the KV cache.
+    kernel_assert(
+        len(mask.shape) == 4
+        and mask.shape[0] == bs
+        and mask.shape[1] == q_head
+        and mask.shape[2] == s_active
+        and s_active <= mask.shape[3] <= bucket_size + s_active
+        and mask.dtype == nl.uint8,
+        f"mask must be [bs, q_head, s_active, s_prior + s_active] uint8 with s_prior <= {bucket_size}, "
+        f"got {mask.shape=}, {mask.dtype=}, {(bs, q_head, s_active)=}",
+    )
+
+    # identity_hbm: [>=128, >=128] bf16 identity for PE reduction (required despite the Optional default).
+    kernel_assert(
+        identity_hbm != None
+        and len(identity_hbm.shape) == 2
+        and identity_hbm.shape[0] >= TC.p_max
+        and identity_hbm.shape[1] >= TC.p_max
+        and identity_hbm.dtype == nl.bfloat16,
+        f"identity_hbm must be a [>={TC.p_max}, >={TC.p_max}] bf16 tensor, "
+        f"got {None if identity_hbm == None else (identity_hbm.shape, identity_hbm.dtype)}",
+    )
+
+    # active_blocks_table: [bs, num_blocks] int32 (required despite the Optional default).
+    kernel_assert(
+        active_blocks_table != None
+        and tuple(active_blocks_table.shape) == (bs, num_blocks)
+        and active_blocks_table.dtype == nl.int32,
+        f"active_blocks_table must be [bs, num_blocks]={(bs, num_blocks)} int32, "
+        f"got {None if active_blocks_table == None else (active_blocks_table.shape, active_blocks_table.dtype)}",
     )
 
 
@@ -758,8 +930,15 @@ def attention_mxfp8_tkg(
     least one full chunk); requires q_head in {32, 64} and d_head == 128.
 
     All configuration is derived from input tensor shapes:
-        bs, q_head, d_head from q.shape = [bs, q_head, 1, d_head]
+        bs, q_head, s_active, d_head from q.shape = [bs, q_head, s_active, d_head]
         bucket_size from k_prior.shape = [num_blocks, 32, 160]
+
+    Speculative decoding: s_active query tokens per head (1 for single-token decode).
+    The [q_head, s_active] axes flatten head-major (query row = h*s_active + s) into
+    n_query_rows = q_head * s_active query rows. When n_query_rows <= 128 the rows share one
+    tile via packed-Q eviction; when n_query_rows > 128 they are split into n_query_rows/128
+    row-tiles of 128 rows, each an independent attention problem over the same KV. Supported
+    n_query_rows in {32, 64, 128, 256, 512}.
 
     Note: Tensor layouts differ from attention_tkg. This kernel uses H in the
     partition dim for packed-Q eviction, while attention_tkg uses d in partitions.
@@ -767,57 +946,55 @@ def attention_mxfp8_tkg(
     Dimensions:
         B: Batch size.
         H: Number of query heads (32 or 64).
+        s_active: Active sequence length (query tokens per head).
         d: Head dimension (must be 128).
         num_blocks: KV cache blocks; each block covers 128 tokens as [32, 160] MXFP8.
         num_chunks: bucket_size / 2048 online-softmax iterations.
         s_prior: Prior-context tokens covered by the mask. Tokens at or past s_prior
             have no mask entry and are treated as masked.
-        score_free: Free-dim width of the per-chunk score buffer (1024 for H=64,
-            512 for H=32).
+        score_free: Free-dim width of the per-chunk score buffer (2048 for band_p=128,
+            1024 for band_p=64, 512 for band_p=32).
 
     Args:
-        q: Query tensor [B, H, 1, d] bfloat16.
-        k_active: Active key [B, d] bfloat16.
-        v_active: Active value [B, d] bfloat16.
+        q: Query tensor [B, H, s_active, d] bfloat16.
+        k_active: Active key [B, s_active, d] bfloat16.
+        v_active: Active value [B, s_active, d] bfloat16.
         k_prior: MXFP8 K cache [num_blocks, 32, 160] float32. Each block = 128 tokens.
         v_prior: MXFP8 V cache [num_blocks, 32, 160] float32. Each block = 128 tokens.
-        mask: Per-head token mask [B, H, 1, s_prior] uint8.
+        mask: Unified per-head token mask [B, H, s_active, s_prior + s_active] uint8.
+            The s_prior prefix masks the prior context; the trailing s_active columns
+            mask the active tokens (the caller encodes intra-active causality here).
         identity_hbm: [128, 128] bfloat16 identity matrix for PE reduction.
         active_blocks_table: Block indices [B, num_blocks] int32.
         sbm: Optional SbufManager for SBUF allocation. None = auto-alloc mode.
 
     Returns:
-        out_hbm: [B, H, d] bfloat16 attention output.
+        out_hbm: [B, H, s_active, d] bfloat16 attention output.
 
     Pseudocode:
         for b in range(B):
-            load Q, scale by 1/sqrt(d), quantize to MXFP8, build Q_lo/Q_hi variants
+            load Q, scale by 1/sqrt(d), quantize to MXFP8, build packed-Q variants
             init online softmax state (running_max, running_sum, acc)
             for chunk in chunks_of_this_NC:
-                load mask + K/V blocks via indirect DMA
+                load mask + K/V — prior blocks via indirect DMA, or quantize k/v_active
                 MM1: scores = Q x K^T (nc_matmul_mx, packed-Q eviction + fused max)
                 online softmax: exp(scores - max), rescale acc, update running state
                 requantize scores to MXFP8; MM2: acc += scores x V (nc_matmul_mx)
-            scalar softmax update with k_active/v_active (single-token dot product)
             LNC2 gather (if sharded); out = acc / running_sum; store to HBM
     """
     # Derive config from input shapes
-    # k_prior: [num_blocks, 32, 160], each block = d_head tokens
+    # q: [bs, q_head, s_active, d_head]; k_prior: [num_blocks, 32, 160], each block = d_head tokens
     d_head = 128
     num_blocks = k_prior.shape[0]
-    cfg = AttnMXFP8Config(q.shape[0], q.shape[1], num_blocks * d_head, d_head=d_head)
+    cfg = AttnMXFP8Config(q.shape[0], q.shape[1], num_blocks * d_head, d_head=d_head, s_active=q.shape[2])
     tp = TileParams(cfg)
 
-    # mask.shape[3] (s_prior) drives the per-chunk copy arithmetic in _load_chunk_mask
-    kernel_assert(
-        len(mask.shape) == 4 and mask.shape[0] == cfg.bs and mask.shape[1] == cfg.q_head and mask.shape[2] == 1,
-        f"mask must be [bs, q_head, 1, s_prior], got {mask.shape=}, {cfg.bs=}, {cfg.q_head=}",
-    )
+    _validate_inputs(q, k_active, v_active, k_prior, v_prior, mask, identity_hbm, active_blocks_table)
 
     sbm = sbm if sbm != None else create_auto_alloc_manager()
     sbm.open_scope(name="mxfp8_attn")
 
-    out_hbm = nl.ndarray((cfg.bs, cfg.q_head, cfg.d_head), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    out_hbm = nl.ndarray((cfg.bs, cfg.q_head, cfg.s_active, cfg.d_head), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     # Load identity matrix [128, 128] bf16 once (shared across batches)
     identity_sb = sbm.alloc_stack((TC.p_max, TC.p_max), dtype=nl.bfloat16)
@@ -826,36 +1003,50 @@ def attention_mxfp8_tkg(
     for batch_idx in range(cfg.bs):
         kv_loader = BatchBlockKVCacheLoader(active_blocks_table[batch_idx], cfg, tp, sbm)
 
-        # Step 0: Load Q, scale, quantize to MXFP8, build packed variants
+        # Step 0: Load Q, scale, quantize to MXFP8, build per-row-tile packed variants
         q_bufs = QuantizedQ(cfg, tp, sbm)
         q_bufs.load_from_hbm(q, batch_idx)
 
-        # Step 1: Initialize online softmax running state
-        sm_state = SoftmaxState(cfg, tp, sbm, identity_sb)
+        # Step 1: Initialize one online softmax state per row-tile (each holds its own
+        # persistent PSUM accumulator across the chunk loop).
+        sm_states = [SoftmaxState(cfg, tp, sbm, identity_sb) for _ in range(tp.n_row_tiles)]
 
-        # Step 2: Chunk loop — load → MM1 → softmax → MM2
-        for chunk_local in range(tp.chunks_per_nc):
+        # Step 2: Chunk loop. K/V are loaded once per chunk and reused across all row-tiles
+        # (inner row-tiling — this is a memory-bound decode kernel, so KV DMA is hoisted).
+        # The active tokens are appended as a final "active chunk".
+        owns_active = tp.sprior_prg_id == tp.sprior_n_prgs - 1
+        chunks_this_nc = tp.chunks_per_nc + (1 if owns_active else 0)
+        for chunk_local in range(chunks_this_nc):
+            is_active = owns_active and chunk_local == tp.chunks_per_nc
             chunk_idx = tp.chunk_start + chunk_local
             # Allocated per iteration by design: buffers carry no cross-chunk state, so the
             # stack allocator hands back the same SBUF region each pass (reuse, not growth).
             cb = ChunkBuffers(tp, sbm)
 
-            # Load all chunk data from HBM
-            _load_chunk_context(cb, batch_idx, chunk_idx, mask, k_prior, v_prior, kv_loader, tp)
+            # Load this chunk's K/V once (shared across row-tiles)
+            if is_active:
+                _build_active_chunk_kv(cb, batch_idx, k_active, v_active, tp, sbm)
+            else:
+                _load_chunk_kv(cb, k_prior, v_prior, kv_loader, chunk_idx)
 
-            # Compute MM1 → softmax → requantize → MM2
-            _mm1_compute_chunk(q_bufs, cb.k_buf, cb.score_sb, cb.score_max_sb, cb.chunk_mask_sb, tp)
-            sm_state.update_online_softmax(cb.score_sb, cb.score_max_sb, cb.score_sb_fp32_reinterp)
-            scores_data, scores_scale = _requantize_scores(cb.score_sb_fp32_reinterp, tp, sbm)
-            _mm2_compute_chunk(scores_data, scores_scale, cb.v_buf, tp, sm_state)
+            for row_tile in range(tp.n_row_tiles):
+                # Per-tile: scatter this tile's mask, then MM1 → softmax → requantize → MM2.
+                # The score scratch buffers carry no cross-tile state, so they are reused.
+                if is_active:
+                    _load_active_chunk_mask(cb.chunk_mask_sb, batch_idx, row_tile, mask, tp)
+                else:
+                    _load_chunk_mask(cb.chunk_mask_sb, batch_idx, chunk_idx, row_tile, mask, tp)
+                _mm1_compute_chunk(
+                    q_bufs.q_variants[row_tile], cb.k_buf, cb.score_sb, cb.score_max_sb, cb.chunk_mask_sb, tp
+                )
+                sm_states[row_tile].update_online_softmax(cb.score_sb, cb.score_max_sb, cb.score_sb_fp32_reinterp)
+                scores_data, scores_scale = _requantize_scores(cb.score_sb_fp32_reinterp, tp, sbm)
+                _mm2_compute_chunk(scores_data, scores_scale, cb.v_buf, tp, sm_states[row_tile])
 
-        # Step 3: Load k_active/v_active (HBM scope), then compute (SBUF scope)
-        k_active_sb, v_active_sb = _load_kv_active(batch_idx, k_active, v_active, cfg, sbm)
-        _compute_active_tokens_sbuf(q_bufs, k_active_sb, v_active_sb, sm_state, cfg, sbm)
-
-        # Step 4: Normalize (SBUF scope), then store output (HBM scope)
-        _finalize_output(cfg, tp, sm_state, sbm)
-        _store_output_hbm(batch_idx, tp, sm_state, out_hbm)
+        # Step 3 per row-tile: normalize (LNC2 gather if sharded) and store.
+        for row_tile in range(tp.n_row_tiles):
+            _finalize_output(cfg, tp, sm_states[row_tile], sbm)
+            _store_output_hbm(batch_idx, row_tile, tp, sm_states[row_tile], out_hbm)
 
     sbm.close_scope()  # mxfp8_attn
 
@@ -906,18 +1097,13 @@ def _mm2_compute_chunk(scores_data, scores_scale, v_buf, tp, sm_state):
     v_buf: [TC.p_max, folds_per_chunk, packed_cols] — already loaded with V blocks from HBM.
 
     Tiling: one nc_matmul_mx per fold position (folds_per_chunk iterations).
-    scores_data's free dim is laid out [tile][band][head], and since
-    variants_per_tile * band_p == 128, the flat slice fold_idx * band_p walks
-    the fold positions in the same order as v_buf's column bands. Each matmul
-    contracts a band's band_p score columns (128 token partitions = folds_per_chunk
-    quadrants) against the matching V fold, accumulating into the shared acc tile.
-
-    Access-pattern decode (same [data | scale] block layout as MM1):
-      - v_fold selects fold fold_idx of v_buf [TC.p_max, folds_per_chunk, packed_cols].
-      - `moving` is the block_len V data columns viewed as float8_e4m3fn_x4.
-      - `moving_scale` is the block_len//4 scale columns viewed as uint8 (4x wider).
+    scores_data's free dim is laid out [tile][band][row], and since
+    variants_per_tile * rows_per_tile == 128, the flat slice fold_idx * rows_per_tile
+    walks the fold positions in the same order as v_buf's column bands. Each matmul
+    contracts a band's rows_per_tile score columns (128 token partitions = folds_per_chunk
+    quadrants) against the matching V fold, accumulating into this row-tile's acc.
     """
-    score_free_per_band = tp.band_p
+    score_free_per_band = tp.rows_per_tile
     scale_partition_count = TC.p_max // TC.mx_group_partitions
 
     for fold_idx in range(tp.folds_per_chunk):
@@ -932,132 +1118,60 @@ def _mm2_compute_chunk(scores_data, scores_scale, v_buf, tp, sm_state):
         )
 
 
-# ── Step 3: Active-token helpers ──────────────────────────────────────────────
+# ── Step 3: Finalize Output (SBUF scope) ─────────────────────────────────────
+def _finalize_output(cfg, tp, sm_state, sbm):
+    """Copy the accumulator PSUM→SBUF, LNC2 gather (if sharded), normalize by softmax sum.
 
-
-def _compute_k_active_score(q_scaled_sb, k_active_sb, cfg, sbm):
-    """Compute score_new = Q_scaled · k_active → [q_heads, 1]."""
-    k_broadcast = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.bfloat16)
-    stream_shuffle_broadcast(src=k_active_sb, dst=k_broadcast)
-    qk = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.float32)
-    nisa.tensor_tensor(dst=qk, data1=q_scaled_sb[nl.ds(0, cfg.q_head), :], data2=k_broadcast, op=nl.multiply)
-    score_new = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
-    nisa.tensor_reduce(dst=score_new, op=nl.add, data=qk, axis=1)
-    return score_new
-
-
-def _softmax_update_scalar(score_new, running_max, running_sum, running_out, cfg, sbm):
-    """Update online softmax with a single score per head. Returns exp_new.
-
-    Operates only on the top half [0:q_head]; downstream finalize reads just that
-    half, so the packed bottom-half replica is never needed here.
+    The active tokens are now part of the chunk loop, so acc is fully accumulated in PSUM
+    on entry; this is the single point where it is copied to SBUF for the scalar
+    normalize/gather ops. Result stored in sm_state.out_bf16.
     """
-    HALF_P = cfg.q_head
-    rmax = running_max[nl.ds(0, HALF_P), :]
-    rsum = running_sum[nl.ds(0, HALF_P), :]
-    m_new = sbm.alloc_stack((HALF_P, 1), dtype=nl.float32)
-    nisa.tensor_tensor(dst=m_new, data1=rmax, data2=score_new, op=nl.maximum)
-    correction = sbm.alloc_stack((HALF_P, 1), dtype=nl.float32)
-    nisa.tensor_tensor(dst=correction, data1=rmax, data2=m_new, op=nl.subtract)
-    nisa.activation(dst=correction, op=nl.exp, data=correction)
-    nisa.tensor_scalar(
-        dst=running_out[nl.ds(0, HALF_P), :],
-        data=running_out[nl.ds(0, HALF_P), :],
-        op0=nl.multiply,
-        operand0=correction,
-    )
-    nisa.tensor_scalar(dst=rsum, data=rsum, op0=nl.multiply, operand0=correction)
-    exp_new = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
-    nisa.tensor_tensor(dst=exp_new, data1=score_new, data2=m_new, op=nl.subtract)
-    nisa.activation(dst=exp_new, op=nl.exp, data=exp_new)
-    nisa.tensor_tensor(dst=rsum, data1=rsum, data2=exp_new, op=nl.add)
-    nisa.tensor_copy(dst=rmax, src=m_new, engine=nisa.vector_engine)
-    return exp_new
-
-
-def _accumulate_v_active(exp_new, v_active_sb, running_out, cfg, sbm):
-    """Accumulate running_out += exp(score_new) * v_active."""
-    v_broadcast = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.bfloat16)
-    stream_shuffle_broadcast(src=v_active_sb, dst=v_broadcast)
-    v_fp32 = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.float32)
-    nisa.tensor_copy(dst=v_fp32, src=v_broadcast, engine=nisa.vector_engine)
-    weighted_v = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.float32)
-    nisa.tensor_scalar(dst=weighted_v, data=v_fp32, op0=nl.multiply, operand0=exp_new)
-    nisa.tensor_tensor(
-        dst=running_out[nl.ds(0, cfg.q_head), :],
-        data1=running_out[nl.ds(0, cfg.q_head), :],
-        data2=weighted_v,
-        op=nl.add,
-    )
-
-
-def _load_kv_active(batch_idx, k_active_hbm, v_active_hbm, cfg, sbm):
-    """Allocate SBUF buffers and load k_active/v_active from HBM."""
-    k_active_sb = sbm.alloc_stack((1, cfg.d_head), dtype=nl.bfloat16)
-    nisa.dma_copy(dst=k_active_sb, src=k_active_hbm[batch_idx : batch_idx + 1, nl.ds(0, cfg.d_head)])
-    v_active_sb = sbm.alloc_stack((1, cfg.d_head), dtype=nl.bfloat16)
-    nisa.dma_copy(dst=v_active_sb, src=v_active_hbm[batch_idx : batch_idx + 1, nl.ds(0, cfg.d_head)])
-    return k_active_sb, v_active_sb
-
-
-def _compute_active_tokens_sbuf(q_bufs, k_active_sb, v_active_sb, sm_state, cfg, sbm):
-    """Scalar softmax update for active tokens (SBUF scope).
-
-    Copies acc from PSUM to SBUF, computes Q·k_active dot product, updates
-    running softmax state, and accumulates exp(score) * v_active.
-
-    Args:
-        k_active_sb: [1, d_head] bfloat16 in SBUF — already loaded from HBM.
-        v_active_sb: [1, d_head] bfloat16 in SBUF — already loaded from HBM.
-    """
-    # Copy PSUM accumulator to SBUF for scalar operations. acc is band_p (= q_head) tall.
+    rows_per_tile = tp.rows_per_tile
     sm_state.acc_sb = sbm.alloc_stack((TC.p_max, cfg.d_head), dtype=nl.float32)
-    nisa.memset(sm_state.acc_sb, value=0.0)
     nisa.tensor_copy(
-        dst=sm_state.acc_sb[nl.ds(0, cfg.q_head), :],
-        src=sm_state.acc[nl.ds(0, cfg.q_head), :],
+        dst=sm_state.acc_sb[nl.ds(0, rows_per_tile), :],
+        src=sm_state.acc[nl.ds(0, rows_per_tile), :],
         engine=nisa.scalar_engine,
     )
 
-    score_new = _compute_k_active_score(q_bufs.q_scaled, k_active_sb, cfg, sbm)
-    exp_new = _softmax_update_scalar(score_new, sm_state.running_max, sm_state.running_sum, sm_state.acc_sb, cfg, sbm)
-    _accumulate_v_active(exp_new, v_active_sb, sm_state.acc_sb, cfg, sbm)
-
-
-# ── Step 4: Finalize Output (SBUF scope) ─────────────────────────────────────
-def _finalize_output(cfg, tp, sm_state, sbm):
-    """LNC2 gather (if sharded), normalize by softmax sum (SBUF scope).
-
-    Result stored in sm_state.out_bf16.
-    """
     if tp.sprior_n_prgs > 1:
         _lnc2_gather_and_normalize(cfg, tp, sm_state, sbm)
     else:
-        _normalize_output(cfg, sm_state, sbm)
+        _normalize_output(cfg, tp, sm_state, sbm)
 
 
-def _store_output_hbm(batch_idx, tp, sm_state, out_hbm):
-    """Store normalized output to HBM (only NC 0 writes in LNC2 mode)."""
+def _store_output_hbm(batch_idx, row_tile, tp, sm_state, out_hbm):
+    """Store one row-tile's normalized output to HBM (only NC 0 writes in LNC2 mode).
+
+    out_hbm[batch_idx] is [q_head, s_active, d]; out_bf16 is [rows_per_tile, d] with row
+    h*s_active + s (head-major). The full band reshapes to [n_query_rows, d]; this row-tile
+    writes its slice [row_tile*rows_per_tile : +rows_per_tile].
+    """
     if tp.sprior_prg_id == 0:
-        nisa.dma_copy(dst=out_hbm[batch_idx], src=sm_state.out_bf16)
+        rows_per_tile = tp.rows_per_tile
+        row_base = row_tile * rows_per_tile
+        out_band = out_hbm[batch_idx].reshape((tp.n_query_rows, out_hbm.shape[-1]))
+        nisa.dma_copy(dst=out_band[nl.ds(row_base, rows_per_tile), :], src=sm_state.out_bf16)
 
 
-def _normalize_output(cfg, sm_state, sbm):
-    """Compute output = acc / running_sum (single NC path), output as bf16."""
-    inv_sum = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
-    nisa.activation(dst=inv_sum, op=nl.reciprocal, data=sm_state.running_sum[nl.ds(0, cfg.q_head), :])
-    sm_state.out_bf16 = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.bfloat16)
+def _normalize_output(cfg, tp, sm_state, sbm):
+    """Compute output = acc / running_sum for this row-tile (single NC path), output as bf16."""
+    rows_per_tile = tp.rows_per_tile
+    inv_sum = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
+    nisa.activation(dst=inv_sum, op=nl.reciprocal, data=sm_state.running_sum[nl.ds(0, rows_per_tile), :])
+    sm_state.out_bf16 = sbm.alloc_stack((rows_per_tile, cfg.d_head), dtype=nl.bfloat16)
     nisa.tensor_scalar(
-        dst=sm_state.out_bf16, data=sm_state.acc_sb[nl.ds(0, cfg.q_head), :], op0=nl.multiply, operand0=inv_sum
+        dst=sm_state.out_bf16, data=sm_state.acc_sb[nl.ds(0, rows_per_tile), :], op0=nl.multiply, operand0=inv_sum
     )
 
 
 def _lnc2_gather_and_normalize(cfg, tp, sm_state, sbm):
-    """Exchange acc and sum across NCs, rescale by correction factor, normalize."""
+    """Exchange acc and sum across NCs, rescale by correction factor, normalize (one row-tile)."""
+    rows_per_tile = tp.rows_per_tile
     # Exchange running max to compute global max
-    m_local = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
-    nisa.tensor_copy(dst=m_local, src=sm_state.running_max[nl.ds(0, cfg.q_head), :], engine=nisa.vector_engine)
-    m_remote = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
+    m_local = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
+    nisa.tensor_copy(dst=m_local, src=sm_state.running_max[nl.ds(0, rows_per_tile), :], engine=nisa.vector_engine)
+    m_remote = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
     nisa.sendrecv(
         src=m_local,
         dst=m_remote,
@@ -1065,28 +1179,28 @@ def _lnc2_gather_and_normalize(cfg, tp, sm_state, sbm):
         recv_from_rank=(1 - tp.sprior_prg_id),
         pipe_id=0,
     )
-    m_global = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
+    m_global = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
     nisa.tensor_tensor(dst=m_global, data1=m_local, data2=m_remote, op=nl.maximum)
 
     # Correction factor: exp(local_max - global_max)
-    local_corr = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
+    local_corr = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
     nisa.tensor_tensor(dst=local_corr, data1=m_local, data2=m_global, op=nl.subtract)
     nisa.activation(dst=local_corr, op=nl.exp, data=local_corr)
 
     # Rescale local acc and sum
-    acc_q = sm_state.acc_sb[nl.ds(0, cfg.q_head), :]
+    acc_q = sm_state.acc_sb[nl.ds(0, rows_per_tile), :]
     nisa.tensor_scalar(dst=acc_q, data=acc_q, op0=nl.multiply, operand0=local_corr)
-    l_local = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
+    l_local = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
     nisa.tensor_scalar(
-        dst=l_local, data=sm_state.running_sum[nl.ds(0, cfg.q_head), :], op0=nl.multiply, operand0=local_corr
+        dst=l_local, data=sm_state.running_sum[nl.ds(0, rows_per_tile), :], op0=nl.multiply, operand0=local_corr
     )
 
     # Exchange rescaled partials
-    acc_recv = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.float32)
+    acc_recv = sbm.alloc_stack((rows_per_tile, cfg.d_head), dtype=nl.float32)
     nisa.sendrecv(
         src=acc_q, dst=acc_recv, send_to_rank=(1 - tp.sprior_prg_id), recv_from_rank=(1 - tp.sprior_prg_id), pipe_id=0
     )
-    l_recv = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
+    l_recv = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
     nisa.sendrecv(
         src=l_local, dst=l_recv, send_to_rank=(1 - tp.sprior_prg_id), recv_from_rank=(1 - tp.sprior_prg_id), pipe_id=0
     )
@@ -1095,7 +1209,7 @@ def _lnc2_gather_and_normalize(cfg, tp, sm_state, sbm):
     nisa.tensor_tensor(dst=acc_q, data1=acc_q, data2=acc_recv, op=nl.add)
     nisa.tensor_tensor(dst=l_local, data1=l_local, data2=l_recv, op=nl.add)
 
-    inv_sum = sbm.alloc_stack((cfg.q_head, 1), dtype=nl.float32)
+    inv_sum = sbm.alloc_stack((rows_per_tile, 1), dtype=nl.float32)
     nisa.activation(dst=inv_sum, op=nl.reciprocal, data=l_local)
-    sm_state.out_bf16 = sbm.alloc_stack((cfg.q_head, cfg.d_head), dtype=nl.bfloat16)
+    sm_state.out_bf16 = sbm.alloc_stack((rows_per_tile, cfg.d_head), dtype=nl.bfloat16)
     nisa.tensor_scalar(dst=sm_state.out_bf16, data=acc_q, op0=nl.multiply, operand0=inv_sum)

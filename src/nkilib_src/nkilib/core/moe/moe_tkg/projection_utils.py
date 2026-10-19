@@ -829,3 +829,11 @@ def adaptive_dge_mode(tensor: nl.NkiTensor) -> int:
         return _DGE_MODE_NONE
     else:
         return _DGE_MODE_UNKNOWN
+
+
+def _down_proj_dge_mode(tensor: nl.NkiTensor, use_dge: bool, auto_alloc: bool):
+    """HWDGE for down-projection loads if use_dge, or if runtime-indexed on Trn2 in auto-alloc mode."""
+    mode = adaptive_dge_mode(tensor)
+    if use_dge or (auto_alloc and nisa.get_nc_version() == nisa.nc_version.gen3 and mode == _DGE_MODE_UNKNOWN):
+        return nisa.dge_mode.hwdge
+    return mode

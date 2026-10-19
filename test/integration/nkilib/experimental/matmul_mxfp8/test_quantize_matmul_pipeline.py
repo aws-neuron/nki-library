@@ -39,10 +39,14 @@ from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
     quantize_lhs_matmul_pipeline_torch_ref,
     quantize_rhs_matmul_pipeline_torch_ref,
 )
-from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
     with_active_sbm,
+)
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils._quantize_mxfp8_utils import (
+    QUANT_SCHEME_1X32,
+    QUANT_SCHEME_WRAPX,
 )
 from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8 import (
     quantize_block_mxfp8_kernel,
@@ -63,7 +67,6 @@ def quantize_lhs_matmul_pipeline_kernel(
     rhs_sw,
     return_fp8_dtype: str,
     run_with_lnc2: bool,
-    enable_scale_packing: bool,
     TILES_IN_BLOCK_M: int,
     TILES_IN_BLOCK_N: int,
     TILES_IN_BLOCK_K: int,
@@ -77,6 +80,7 @@ def quantize_lhs_matmul_pipeline_kernel(
     float8_dtype: str,
     use_scale_packing: bool,
     spill_reload: bool,
+    quant_scheme: str,
 ):
     """Combined kernel: quantize LHS only, RHS is BF16 swizzled (matmul quantizes internally)."""
 
@@ -85,9 +89,7 @@ def quantize_lhs_matmul_pipeline_kernel(
     sbm = get_active_sbm()
     sbm.open_scope("TEST QUANT + MM")
 
-    lhs_scales_hbm, lhs_data_hbm = quantize_block_mxfp8_kernel(
-        lhs_bf16, return_fp8_dtype, run_with_lnc2, enable_scale_packing
-    )
+    lhs_scales_hbm, lhs_data_hbm = quantize_block_mxfp8_kernel(lhs_bf16, return_fp8_dtype, run_with_lnc2, quant_scheme)
 
     output = matmul_mxfp8_generic_kernel.matmul_mxfp8(
         lhs=lhs_data_hbm,
@@ -107,6 +109,7 @@ def quantize_lhs_matmul_pipeline_kernel(
         run_with_lnc2=run_with_lnc2,
         use_scale_packing=use_scale_packing,
         spill_reload=spill_reload,
+        quant_scheme=quant_scheme,
     )
 
     sbm.close_scope()
@@ -120,7 +123,6 @@ def quantize_rhs_matmul_pipeline_kernel(
     rhs_bf16,
     return_fp8_dtype: str,
     run_with_lnc2: bool,
-    enable_scale_packing: bool,
     TILES_IN_BLOCK_M: int,
     TILES_IN_BLOCK_N: int,
     TILES_IN_BLOCK_K: int,
@@ -134,6 +136,7 @@ def quantize_rhs_matmul_pipeline_kernel(
     float8_dtype: str,
     use_scale_packing: bool,
     spill_reload: bool,
+    quant_scheme: str,
 ):
     """Combined kernel: quantize RHS only, LHS is BF16 swizzled (matmul quantizes internally)."""
     if get_active_sbm() is None:
@@ -141,9 +144,7 @@ def quantize_rhs_matmul_pipeline_kernel(
     sbm = get_active_sbm()
     sbm.open_scope("TEST QUANT + MM")
 
-    rhs_scales_hbm, rhs_data_hbm = quantize_block_mxfp8_kernel(
-        rhs_bf16, return_fp8_dtype, run_with_lnc2, enable_scale_packing
-    )
+    rhs_scales_hbm, rhs_data_hbm = quantize_block_mxfp8_kernel(rhs_bf16, return_fp8_dtype, run_with_lnc2, quant_scheme)
 
     output = matmul_mxfp8_generic_kernel.matmul_mxfp8(
         lhs=lhs_sw,
@@ -163,10 +164,107 @@ def quantize_rhs_matmul_pipeline_kernel(
         run_with_lnc2=run_with_lnc2,
         use_scale_packing=use_scale_packing,
         spill_reload=spill_reload,
+        quant_scheme=quant_scheme,
     )
 
     sbm.close_scope()
     return output
+
+
+@nki.jit
+@with_active_sbm
+def quantize_matmul_fast_dgt_bf16_pipeline_kernel(
+    lhs_f_by_k,
+    rhs_f_by_k,
+    quantize_lhs: bool,
+    return_fp8_dtype: str,
+    run_with_lnc2: bool,
+    TILES_IN_BLOCK_M: int,
+    TILES_IN_BLOCK_N: int,
+    TILES_IN_BLOCK_K: int,
+    TILES_IN_LOAD_M: int,
+    TILES_IN_LOAD_N: int,
+    lhs_matmul_tile_shape_logical: tuple,
+    rhs_matmul_tile_shape_logical: tuple,
+    block_loop_order: str,
+    tile_loop_order: str,
+    output_dtype,
+    float8_dtype: str,
+    use_scale_packing: bool,
+    spill_reload: bool,
+    quant_scheme: str,
+):
+    """Quantize one operand; the matmul loads the other as unswizzled BF16 via the fast DMA transpose.
+
+    Both inputs are F-by-K ([M, K] and [N, K]), as the quantize kernel and the DGT loader take them.
+    """
+    if get_active_sbm() is None:
+        create_and_set_active_sbm()
+    sbm = get_active_sbm()
+    sbm.open_scope("TEST QUANT + FAST DGT MM")
+
+    quantized_src = lhs_f_by_k if quantize_lhs else rhs_f_by_k
+    scales_hbm, data_hbm = quantize_block_mxfp8_kernel(quantized_src, return_fp8_dtype, run_with_lnc2, quant_scheme)
+    if quantize_lhs:
+        operands = {"lhs": data_hbm, "lhs_scales": scales_hbm, "rhs": rhs_f_by_k, "rhs_is_swizzled": False}
+    else:
+        operands = {"lhs": lhs_f_by_k, "rhs": data_hbm, "rhs_scales": scales_hbm, "lhs_is_swizzled": False}
+
+    output = matmul_mxfp8_generic_kernel.matmul_mxfp8(
+        **operands,
+        fast_dma_transpose=True,
+        TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
+        TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
+        TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
+        TILES_IN_LOAD_M=TILES_IN_LOAD_M,
+        TILES_IN_LOAD_N=TILES_IN_LOAD_N,
+        lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
+        rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
+        block_loop_order=block_loop_order,
+        tile_loop_order=tile_loop_order,
+        float8_dtype=float8_dtype,
+        output_dtype=output_dtype,
+        run_with_lnc2=run_with_lnc2,
+        use_scale_packing=use_scale_packing,
+        spill_reload=spill_reload,
+        quant_scheme=quant_scheme,
+    )
+
+    sbm.close_scope()
+    return output
+
+
+def quantize_matmul_fast_dgt_bf16_pipeline_torch_ref(
+    lhs_f_by_k,
+    rhs_f_by_k,
+    quantize_lhs,
+    return_fp8_dtype,
+    run_with_lnc2,
+    TILES_IN_BLOCK_M,
+    TILES_IN_BLOCK_N,
+    TILES_IN_BLOCK_K,
+    TILES_IN_LOAD_M,
+    TILES_IN_LOAD_N,
+    lhs_matmul_tile_shape_logical,
+    rhs_matmul_tile_shape_logical,
+    block_loop_order,
+    tile_loop_order,
+    output_dtype,
+    float8_dtype,
+    use_scale_packing,
+    spill_reload,
+    quant_scheme,
+):
+    """Golden: both operands in the shared wrapX layout (decompose_k_remainder), then MX matmul."""
+    kwargs = {
+        "return_fp8_dtype": return_fp8_dtype,
+        "output_dtype": output_dtype,
+        "float8_dtype": float8_dtype,
+        "quant_scheme": quant_scheme,
+    }
+    if quantize_lhs:
+        return quantize_lhs_matmul_pipeline_torch_ref(lhs_f_by_k, matmul_utils.swizzle_tensor(rhs_f_by_k.T), **kwargs)
+    return quantize_rhs_matmul_pipeline_torch_ref(matmul_utils.swizzle_tensor(lhs_f_by_k.T), rhs_f_by_k, **kwargs)
 
 
 # ============================================================================
@@ -181,11 +279,11 @@ def _build_pipeline_inputs(
     fp8_str: str,
     quantize_lhs: bool,
     quantize_rhs: bool,
-    enable_scale_packing: bool,
     lnc_degree: int,
     use_scale_packing: bool,
     seed: int = 42,
     spill_reload: bool = False,
+    quant_scheme: str = QUANT_SCHEME_WRAPX,
 ):
     """Return the combined pipeline kernel function and its inputs.
 
@@ -203,9 +301,12 @@ def _build_pipeline_inputs(
     lhs_bf16 = rng.uniform(-1, 1, (M, K)).astype(nl.bfloat16)
     rhs_bf16 = rng.uniform(-1, 1, (K, N)).astype(nl.bfloat16)
 
-    # Swizzled BF16 (same layout the matmul golden uses)
-    lhs_sw = matmul_utils.swizzle_tensor(lhs_bf16.T.copy())  # (K, M)
-    rhs_sw = matmul_utils.swizzle_tensor(rhs_bf16.copy())  # (K, N)
+    # Swizzled BF16 in the quantize kernel's layout, down to its K-remainder tiling (see
+    # _K_DIV_32_WRAPX_NOTE).
+    swizzle = matmul_utils.swizzle_tensor_1x32 if quant_scheme == QUANT_SCHEME_1X32 else matmul_utils.swizzle_tensor
+
+    lhs_sw = swizzle(lhs_bf16.T.copy())  # (K, M)
+    rhs_sw = swizzle(rhs_bf16.copy())  # (K, N)
 
     output_dtype = nl.float32
 
@@ -219,7 +320,6 @@ def _build_pipeline_inputs(
     matmul_config = {
         "return_fp8_dtype": fp8_str,
         "run_with_lnc2": run_with_lnc2,
-        "enable_scale_packing": enable_scale_packing,
         "TILES_IN_BLOCK_M": conf.TILES_IN_BLOCK_M,
         "TILES_IN_BLOCK_N": conf.TILES_IN_BLOCK_N,
         "TILES_IN_BLOCK_K": conf.TILES_IN_BLOCK_K,
@@ -233,6 +333,7 @@ def _build_pipeline_inputs(
         "float8_dtype": fp8_str,
         "use_scale_packing": use_scale_packing,
         "spill_reload": spill_reload,
+        "quant_scheme": quant_scheme,
     }
 
     if quantize_lhs and not quantize_rhs:
@@ -274,6 +375,32 @@ _MEDIUM_SHAPES = [
 
 _LARGE_SHAPES = [(1024, 3072, 3072)]
 
+# K aligned to MX_PARTITION_SIZE (32) but not to L_TILE_K (512), so the quantize kernel emits a
+# 256 / 128 / sub-128 remainder decomposition. The comment gives that decomposition.
+_K_DIV_32_SHAPES = [
+    pytest.param(512, 544, 512, marks=pytest.mark.fast),  # 512 + 32
+    (512, 640, 512),  # 512 + 128
+    (1024, 1696, 512),  # 3x512 + 128 + 32
+    (512, 2016, 1024),  # 3x512 + 256 + 128 + 96
+]
+
+_K_DIV_32_WRAPX_NOTE = """A wrapX K remainder has more than one valid layout, because wrapX ties a
+(partition, slot) to a logical K through the *producer's* tile size:
+
+    k = k_offset + p * (tile_k / 4) + i
+
+A 160-element remainder can therefore be laid out as one 160-wide tile (sub-tile stride 40) or as
+128 + 32 (strides 32 and 8). Both are self-consistent; they are not interchangeable.
+quantize_block_mxfp8_kernel picks the second via decompose_k_remainder, since quantize_mx caps a
+tile at 128 partitions and needs the count to be a multiple of 32.
+
+nc_matmul_mx contracts its two operands by (partition, slot) position, so every operand paired
+against a quantize-kernel output has to use the same decomposition: swizzle_tensor for a
+pre-swizzled operand, and the matmul's BF16 loaders (legacy and fast DMA transpose) for an
+unswizzled one. Getting it wrong is not a subtle numerical drift: it silently contracts mismatched
+K and the result is ~100% off.
+
+1x32 is immune, since k = 4 * row + p holds regardless of tiling."""
 
 # ============================================================================
 # Test class
@@ -302,14 +429,19 @@ class TestQuantizeMatmulPipeline:
         N: int,
         quantize_lhs: bool,
         quantize_rhs: bool,
-        enable_scale_packing: bool,
         use_scale_packing: bool,
         fp8_str: str = "float8_e4m3fn",
         lnc_degree: int = 1,
         seed: int = 42,
         spill_reload: bool = False,
+        quant_scheme: str = QUANT_SCHEME_WRAPX,
+        bf16_fast_dgt: bool = False,
     ):
-        """Execute the combined quantize->matmul pipeline and validate."""
+        """Execute the combined quantize->matmul pipeline and validate.
+
+        bf16_fast_dgt passes the non-quantized operand unswizzled, loaded by the matmul's fast DMA
+        transpose, instead of pre-swizzled.
+        """
         if not platform_target.is_trn3():
             pytest.skip("MX is only supported on TRN3.")
 
@@ -331,14 +463,28 @@ class TestQuantizeMatmulPipeline:
             fp8_str,
             quantize_lhs,
             quantize_rhs,
-            enable_scale_packing,
             lnc_degree,
             use_scale_packing,
             seed,
             spill_reload,
+            quant_scheme,
         )
 
         torch_ref = quantize_lhs_matmul_pipeline_torch_ref if quantize_lhs else quantize_rhs_matmul_pipeline_torch_ref
+        if bf16_fast_dgt:
+            # Same values as _build_pipeline_inputs, as F-by-K BF16 for the quantize kernel and DGT.
+            rng = np.random.RandomState(seed)
+            lhs_bf16 = rng.uniform(-1, 1, (M, K)).astype(nl.bfloat16)
+            rhs_bf16 = rng.uniform(-1, 1, (K, N)).astype(nl.bfloat16)
+            operand_keys = ("lhs_bf16", "rhs_sw", "lhs_sw", "rhs_bf16")
+            kernel_input = {
+                "lhs_f_by_k": lhs_bf16,
+                "rhs_f_by_k": rhs_bf16.T.copy(),
+                "quantize_lhs": quantize_lhs,
+                **{key: value for key, value in kernel_input.items() if key not in operand_keys},
+            }
+            pipeline_kernel = quantize_matmul_fast_dgt_bf16_pipeline_kernel
+            torch_ref = quantize_matmul_fast_dgt_bf16_pipeline_torch_ref
 
         def _mxfp8_comparator(golden_dict, output_tensors):
             """Wrap torch ref golden with MXFP8 check_correctness validation."""
@@ -382,11 +528,9 @@ class TestQuantizeMatmulPipeline:
     # ------------------------------------------------------------------
     @pytest.mark.fast
     @pytest.mark.parametrize("M,K,N", _SMALL_SHAPES + [_MEDIUM_SHAPES[0]] + _LARGE_SHAPES)
-    @pytest.mark.parametrize("enable_scale_packing", [True, False], ids=["packed", "unpacked"])
+    @pytest.mark.parametrize("use_scale_packing", [True, False], ids=["packed", "unpacked"])
     @pytest.mark.parametrize("spill_reload", [True, False])
-    def test_lhs_prequantized_rhs_bf16(
-        self, test_manager, platform_target, M, K, N, enable_scale_packing, spill_reload
-    ):
+    def test_lhs_prequantized_rhs_bf16(self, test_manager, platform_target, M, K, N, use_scale_packing, spill_reload):
         """LHS is BF16 swizzled (matmul quantizes internally) + RHS(BF16) → quantize RHS → matmul."""
         self._run_pipeline(
             test_manager,
@@ -396,8 +540,7 @@ class TestQuantizeMatmulPipeline:
             N=N,
             quantize_lhs=False,
             quantize_rhs=True,
-            enable_scale_packing=enable_scale_packing,
-            use_scale_packing=enable_scale_packing,
+            use_scale_packing=use_scale_packing,
             spill_reload=spill_reload,
         )
 
@@ -406,11 +549,9 @@ class TestQuantizeMatmulPipeline:
     #         (with and without scale packing)
     # ------------------------------------------------------------------
     @pytest.mark.parametrize("M,K,N", _SMALL_SHAPES + _MEDIUM_SHAPES + _LARGE_SHAPES)
-    @pytest.mark.parametrize("enable_scale_packing", [True, False], ids=["packed", "unpacked"])
+    @pytest.mark.parametrize("use_scale_packing", [True, False], ids=["packed", "unpacked"])
     @pytest.mark.parametrize("spill_reload", [True, False])
-    def test_rhs_prequantized_lhs_bf16(
-        self, test_manager, platform_target, M, K, N, enable_scale_packing, spill_reload
-    ):
+    def test_rhs_prequantized_lhs_bf16(self, test_manager, platform_target, M, K, N, use_scale_packing, spill_reload):
         """RHS is BF16 swizzled (matmul quantizes internally) + LHS(BF16) → quantize LHS → matmul."""
         self._run_pipeline(
             test_manager,
@@ -420,7 +561,105 @@ class TestQuantizeMatmulPipeline:
             N=N,
             quantize_lhs=True,
             quantize_rhs=False,
-            enable_scale_packing=enable_scale_packing,
-            use_scale_packing=enable_scale_packing,
+            use_scale_packing=use_scale_packing,
             spill_reload=spill_reload,
+        )
+
+    # ------------------------------------------------------------------
+    # Case 3: the same two directions under the 1x32 layout
+    # ------------------------------------------------------------------
+    @pytest.mark.fast
+    @pytest.mark.parametrize("M,K,N", _SMALL_SHAPES + [_MEDIUM_SHAPES[0]] + _LARGE_SHAPES)
+    @pytest.mark.parametrize("use_scale_packing", [True, False], ids=["packed", "unpacked"])
+    @pytest.mark.parametrize("quantize_lhs", [True, False], ids=["quant_lhs", "quant_rhs"])
+    def test_1x32_pipeline(self, test_manager, platform_target, M, K, N, use_scale_packing, quantize_lhs):
+        """quantize(1x32) → matmul(1x32). Both operands carry the 1x32 layout."""
+        self._run_pipeline(
+            test_manager,
+            platform_target,
+            M=M,
+            K=K,
+            N=N,
+            quantize_lhs=quantize_lhs,
+            quantize_rhs=not quantize_lhs,
+            use_scale_packing=use_scale_packing,
+            quant_scheme=QUANT_SCHEME_1X32,
+        )
+
+    # ------------------------------------------------------------------
+    # Case 4: K % 32 (but not % 512) end-to-end under 1x32
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize("M,K,N", _K_DIV_32_SHAPES)
+    @pytest.mark.parametrize("use_scale_packing", [True, False], ids=["packed", "unpacked"])
+    @pytest.mark.parametrize("quantize_lhs", [True, False], ids=["quant_lhs", "quant_rhs"])
+    def test_1x32_pipeline_k_div_32(self, test_manager, platform_target, M, K, N, use_scale_packing, quantize_lhs):
+        """quantize(1x32) → matmul(1x32) for K % 32 != 0 mod 512.
+
+        The quantize kernel splits K into 512 + 256/128/sub-128 tiles and quantizes any sub-128
+        tile as a padded 32-partition tile. Because the 1x32 mapping k = 4*row + p is independent
+        of tile_k, the matmul reads every one of those tiles back at the right K.
+        """
+        self._run_pipeline(
+            test_manager,
+            platform_target,
+            M=M,
+            K=K,
+            N=N,
+            quantize_lhs=quantize_lhs,
+            quantize_rhs=not quantize_lhs,
+            use_scale_packing=use_scale_packing,
+            quant_scheme=QUANT_SCHEME_1X32,
+        )
+
+    # ------------------------------------------------------------------
+    # Case 5: K % 32 end-to-end under wrapX
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize("M,K,N", _K_DIV_32_SHAPES)
+    @pytest.mark.parametrize("use_scale_packing", [True, False], ids=["packed", "unpacked"])
+    @pytest.mark.parametrize("quantize_lhs", [True, False], ids=["quant_lhs", "quant_rhs"])
+    def test_wrapx_pipeline_k_div_32(self, test_manager, platform_target, M, K, N, use_scale_packing, quantize_lhs):
+        """quantize(wrapX) → matmul(wrapX) for K % 32 != 0 mod 512.
+
+        See _K_DIV_32_WRAPX_NOTE: wrapX admits more than one valid layout for a K remainder, so
+        the pre-swizzled operand is built with the quantize kernel's own decomposition.
+        """
+        self._run_pipeline(
+            test_manager,
+            platform_target,
+            M=M,
+            K=K,
+            N=N,
+            quantize_lhs=quantize_lhs,
+            quantize_rhs=not quantize_lhs,
+            use_scale_packing=use_scale_packing,
+            quant_scheme=QUANT_SCHEME_WRAPX,
+        )
+
+    # ------------------------------------------------------------------
+    # Case 6: K % 32 under wrapX against an unswizzled BF16 operand on the fast DMA transpose
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "M,K,N",
+        [pytest.param(128, 672, 512, marks=pytest.mark.fast)] + _K_DIV_32_SHAPES,  # 512 + 128 + 32
+    )
+    @pytest.mark.parametrize("quantize_lhs", [True, False], ids=["quant_lhs", "quant_rhs"])
+    @pytest.mark.platforms(exclude=[common_dataclasses.Platforms.TRN3_A0, common_dataclasses.Platforms.TRN3_PDS_A0])
+    def test_wrapx_k_div_32_fast_dgt_bf16(self, test_manager, platform_target, M, K, N, quantize_lhs):
+        """quantize(wrapX) -> matmul with the other operand as unswizzled BF16 on the fast DMA transpose.
+
+        The fast DMA loader must split the K remainder like the quantize kernel (see
+        _K_DIV_32_WRAPX_NOTE); a single remainder tile pairs mismatched K. Fast DMA transpose is
+        B1-only, so A0 is excluded.
+        """
+        self._run_pipeline(
+            test_manager,
+            platform_target,
+            M=M,
+            K=K,
+            N=N,
+            quantize_lhs=quantize_lhs,
+            quantize_rhs=not quantize_lhs,
+            use_scale_packing=False,
+            quant_scheme=QUANT_SCHEME_WRAPX,
+            bf16_fast_dgt=True,
         )

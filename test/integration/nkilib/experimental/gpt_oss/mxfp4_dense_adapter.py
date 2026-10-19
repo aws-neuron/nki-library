@@ -52,6 +52,8 @@ import numpy as np
 import torch
 from nkilib_src.nkilib.core.utils.mx_torch_common import unpack_float4_x4
 
+from test.utils.mx_utils import maybe_unpack64_gate_up_scale
+
 _Q_WIDTH = 4
 _Q_HEIGHT = 8
 _PMAX = 128
@@ -80,6 +82,10 @@ def _dequant_qkr(weight_qtz_flat, weight_scale_2d, F_out):
 def packed_mx_to_dense_gate_up(gate_up_w_qtz, gate_up_w_scale, H, I):
     """[E,128,2,n_H512,I] + [E,16,2,n_H512,I] -> dense [E,H,2,I] fp32.
 
+    The scale is also accepted in the kernel's PACK64 layout ``[E,2,64,n_H512,I/4]``
+    (``VLLM_NEURON_MEGA_SCALE_PACK64``, on by default): the collective golden tests hand
+    the same tensor to the kernel and to this adapter, so it is remapped back here.
+
     For each expert e and slice g in {gate(0), up(1)}: the ref does
     ``w_flat = unpack(weight_qtz.transpose(1,0,2).reshape(H//4, I))`` then
     ``mx_matmul`` contracts the hidden operand whose natural index is
@@ -87,6 +93,7 @@ def packed_mx_to_dense_gate_up(gate_up_w_qtz, gate_up_w_scale, H, I):
     ``W[h_nat, i]`` via ``permute(I, q, row)`` so it matches the golden's natural
     hidden ordering, returning ``W.T = [H, I]``.
     """
+    gate_up_w_scale = maybe_unpack64_gate_up_scale(gate_up_w_scale)
     E = gate_up_w_qtz.shape[0]
     dense = torch.zeros(E, H, 2, I, dtype=torch.float32)
     for e in range(E):

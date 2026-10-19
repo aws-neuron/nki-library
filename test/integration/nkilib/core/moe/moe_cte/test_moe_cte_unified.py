@@ -66,6 +66,8 @@ NON_MX_TEST_CASES = [
 MX_BLOCK_TEST_CASES = [
     # MXFP4 + standard scales
     (MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float4_e2m1fn_x4,    False, False, False, 1, QuantizationType.MX),
+    # MXFP4 + standard scales, [T, H] output
+    (MoECTEImplementation.shard_on_block_mx_v2,         3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float4_e2m1fn_x4,    False, False, False, 1, QuantizationType.MX),
     # MXFP4 + packed scales
     pytest.param(MoECTEImplementation.shard_on_block_mx,            3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,    False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7.0,           None,          7.0,         -7.0,        False,                         nl.float4_e2m1fn_x4,    False, False, True,  1, QuantizationType.MX, marks=pytest.mark.fast),
     # MXFP8 (e4m3) + standard scales
@@ -195,7 +197,7 @@ class TestMoeCTEUnified:
         # Block-sharding kernels emit a 2-shard output where shard 1 is scratch;
         # need a custom validator that compares only shard 0 against the ref.
         validator_cls = None
-        if impl == MoECTEImplementation.shard_on_block_mx and top_k > 1:
+        if impl in (MoECTEImplementation.shard_on_block_mx, MoECTEImplementation.shard_on_block_mx_v2) and top_k > 1:
             validator_cls = _shard_on_block_mx_output_validator(
                 kernel_input=input_generator(None),
                 tokens=tokens,
@@ -203,6 +205,7 @@ class TestMoeCTEUnified:
                 lnc_degree=lnc_degree,
                 rtol=rtol,
                 atol=atol,
+                stacked=impl == MoECTEImplementation.shard_on_block_mx,
             )
         elif impl == MoECTEImplementation.shard_on_block and top_k > 1 and non_overlapping_shards:
             from inspect import signature

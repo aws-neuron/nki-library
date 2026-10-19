@@ -18,6 +18,7 @@ import nki.language as nl
 import nkilib_src.nkilib.experimental.attention.attention_const_max as kernel_module
 import numpy as np
 import pytest
+from nkilib_src.nkilib.core.utils.common_types import AttentionLayout
 from nkilib_src.nkilib.experimental.attention.attention_const_max_torch import attention_const_max_torch_ref
 
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
@@ -49,20 +50,39 @@ class TestAttentionConstMax:
     @staticmethod
     def _output_tensors(kernel_input):
         q = kernel_input["q_hbm"]
-        N, d, Sq = q.shape
+        d = kernel_input["v_hbm"].shape[2]
+        N = q.shape[0]
+        Sq = q.shape[1] if kernel_input.get("q_layout") == AttentionLayout.SEQ_MAJOR else q.shape[2]
         return {"out": np.zeros((N, Sq, d), dtype=q.dtype)}
 
+    # fmt: off
     @pytest_parametrize(
-        "N, Sq, Sk, d, softmax_max, softmax_scale",
+        "N, Sq, Sk, d, softmax_max, softmax_scale, q_layout, k_layout",
         [
-            pytest.param(1, 512, 16384, 128, _SOFTMAX_MAX, 0.0884, id="512_16k", marks=pytest.mark.fast),
-            pytest.param(5, 512, 43008, 128, _SOFTMAX_MAX, 0.0884, id="5h_512_42k"),
-            pytest.param(5, 675, 43264, 128, _SOFTMAX_MAX, 0.0884, id="5h_675_43264", marks=pytest.mark.fast),
-            pytest.param(2, 16384, 16384, 128, _SOFTMAX_MAX, 0.0884, id="2h_16k_16k"),
-            pytest.param(1, 900, 2176, 128, _SOFTMAX_MAX, 0.0884, id="partial_blocks", marks=pytest.mark.fast),
-            pytest.param(5, 1, 43264, 128, _SOFTMAX_MAX, 0.0884, id="5h_tkg_sq1", marks=pytest.mark.fast),
+            # Head-major layouts
+            pytest.param(1, 512, 16384, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="512_16k", marks=pytest.mark.fast),
+            pytest.param(5, 512, 43008, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="5h_512_42k"),
+            pytest.param(5, 675, 43200, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="5h_675_43200", marks=pytest.mark.fast),
+            pytest.param(2, 16384, 16384, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="2h_16k_16k"),
+            pytest.param(1, 900, 2176, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="partial_blocks", marks=pytest.mark.fast),
+            pytest.param(1, 100, 72, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="partial_sk_only", marks=pytest.mark.fast),
+            pytest.param(1, 256, 200, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="full_plus_partial_sk", marks=pytest.mark.fast),
+            pytest.param(1, 128, 1, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="sk_1_boundary", marks=pytest.mark.fast),
+            pytest.param(5, 1, 43200, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.HEAD_MAJOR, id="5h_tkg_sq1", marks=pytest.mark.fast),
+            # Sequence-major layouts — Sq=675 (not 128-aligned): exercises nc_transpose remainder tile path
+            pytest.param(5, 675, 43200, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.SEQ_MAJOR, AttentionLayout.HEAD_MAJOR, id="5h_675_43200_q_seq_major", marks=pytest.mark.fast),
+            pytest.param(5, 675, 43200, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.HEAD_MAJOR, AttentionLayout.SEQ_MAJOR, id="5h_675_43200_k_seq_major", marks=pytest.mark.fast),
+            pytest.param(5, 675, 43200, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.SEQ_MAJOR, AttentionLayout.SEQ_MAJOR, id="5h_675_43200_qk_seq_major", marks=pytest.mark.fast),
+            # Sequence-major — Sq=512 (128-aligned): no remainder tile
+            pytest.param(1, 512, 16384, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.SEQ_MAJOR, AttentionLayout.HEAD_MAJOR, id="512_16k_q_seq_major", marks=pytest.mark.fast),
+            pytest.param(1, 512, 16384, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.SEQ_MAJOR, AttentionLayout.SEQ_MAJOR, id="512_16k_qk_seq_major", marks=pytest.mark.fast),
+            # Sequence-major — Sq=1 (TKG): single sub-128 tile, both axes
+            pytest.param(5, 1, 43200, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.SEQ_MAJOR, AttentionLayout.SEQ_MAJOR, id="5h_tkg_sq1_qk_seq_major", marks=pytest.mark.fast),
+            # Sequence-major — Sq=128 (exact single tile)
+            pytest.param(1, 128, 128, 128, _SOFTMAX_MAX, 0.0884, AttentionLayout.SEQ_MAJOR, AttentionLayout.SEQ_MAJOR, id="square_128_qk_seq_major", marks=pytest.mark.fast),
         ],
     )
+    # fmt: on
     def test_attention_const_max(
         self,
         test_manager: Orchestrator,
@@ -73,11 +93,19 @@ class TestAttentionConstMax:
         d,
         softmax_max,
         softmax_scale,
+        q_layout,
+        k_layout,
     ):
         def input_generator(test_config):
             inputs = generate_inputs(N, Sq, Sk, d)
+            if q_layout == AttentionLayout.SEQ_MAJOR:
+                inputs["q_hbm"] = inputs["q_hbm"].transpose(0, 2, 1).copy()
+            if k_layout == AttentionLayout.SEQ_MAJOR:
+                inputs["k_hbm"] = inputs["k_hbm"].transpose(0, 2, 1).copy()
             inputs["softmax_max"] = softmax_max
             inputs["softmax_scale"] = softmax_scale
+            inputs["q_layout"] = q_layout
+            inputs["k_layout"] = k_layout
             return inputs
 
         framework = UnitTestFramework(
@@ -103,8 +131,8 @@ class TestAttentionConstMax:
             pytest.param(
                 1, 900, 2176, 128, _SOFTMAX_MAX, 0.0884, id="tensor_max_partial_blocks", marks=pytest.mark.fast
             ),
-            pytest.param(5, 1, 43264, 128, _SOFTMAX_MAX, 0.0884, id="tensor_max_tkg_sq1"),
-            pytest.param(5, 675, 43264, 128, _SOFTMAX_MAX, 0.0884, id="tensor_max_5h_675_43264"),
+            pytest.param(5, 1, 43200, 128, _SOFTMAX_MAX, 0.0884, id="tensor_max_tkg_sq1"),
+            pytest.param(5, 675, 43200, 128, _SOFTMAX_MAX, 0.0884, id="tensor_max_5h_675_43200"),
         ],
     )
     def test_attention_const_max_tensor(
@@ -153,6 +181,7 @@ class TestAttentionConstMax:
             pytest.param(6, 512, 32768, 128, _SOFTMAX_MAX, 0.0884, id="lnc2_6h_512_32k", marks=pytest.mark.fast),
             pytest.param(5, 1024, 16384, 128, _SOFTMAX_MAX, 0.0884, id="lnc2_5h_1024_16k"),
             pytest.param(5, 1023, 16384, 128, _SOFTMAX_MAX, 0.0884, id="lnc2_5h_1023_16k_uneven"),
+            pytest.param(5, 1350, 10800, 128, _SOFTMAX_MAX, 0.0884, id="lnc2_5h_1350_10800", marks=pytest.mark.fast),
         ],
     )
     def test_attention_const_max_lnc2(
@@ -200,8 +229,8 @@ class TestAttentionConstMax:
             pytest.param(2, 512, 16384, 128, 12.0, 0.0884, 1.2, 0.5, id="stress_mean0.5_std1.2_max12"),
             pytest.param(2, 512, 16384, 128, 15.0, 0.0884, 1.0, 1.0, id="stress_mean1.0_max15"),
             # Large Sk with higher std
-            pytest.param(1, 675, 43264, 128, 12.0, 0.0884, 1.5, 0.0, id="stress_o2_std1.5_max12"),
-            pytest.param(1, 675, 43264, 128, 20.0, 0.0884, 2.0, 0.0, id="stress_o2_std2.0_max20"),
+            pytest.param(1, 675, 43200, 128, 12.0, 0.0884, 1.5, 0.0, id="stress_o2_std1.5_max12"),
+            pytest.param(1, 675, 43200, 128, 20.0, 0.0884, 2.0, 0.0, id="stress_o2_std2.0_max20"),
             # Overly large max (tests epsilon path — many scores underflow)
             pytest.param(2, 512, 4096, 128, 15.0, 0.0884, 1.0, 0.0, id="stress_large_max15_std1"),
             pytest.param(2, 512, 4096, 128, 25.0, 0.0884, 1.0, 0.0, id="stress_large_max25_std1"),

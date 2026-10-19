@@ -26,9 +26,9 @@ _F_SIZE_F32 = 1024
 
 
 def _scalar_kernel_body(
-    data: nl.ndarray,
-    out_hbm: nl.ndarray,
-    scalar_sb: nl.ndarray,
+    data: nl.NkiTensor,
+    out_hbm: nl.NkiTensor,
+    scalar_sb: nl.NkiTensor,
     numel: int,
     op,
 ) -> None:
@@ -39,9 +39,9 @@ def _scalar_kernel_body(
     results to output tensor.
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM.
-        out_hbm (nl.ndarray): [N], Output tensor on HBM.
-        scalar_sb (nl.ndarray): [P_MAX, 1], Scalar value in SBUF.
+        data (nl.NkiTensor): [N], Input tensor on HBM.
+        out_hbm (nl.NkiTensor): [N], Output tensor on HBM.
+        scalar_sb (nl.NkiTensor): [P_MAX, 1], Scalar value in SBUF.
         numel (int): Total number of elements in data.
         op: Operation to apply (nl.add, nl.subtract, nl.multiply).
     """
@@ -65,9 +65,9 @@ def _scalar_kernel_body(
 
 
 def _tensor_kernel_body(
-    data1: nl.ndarray,
-    data2: nl.ndarray,
-    out_hbm: nl.ndarray,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
+    out_hbm: nl.NkiTensor,
     numel: int,
     op,
 ) -> None:
@@ -78,9 +78,9 @@ def _tensor_kernel_body(
     results to output tensor.
 
     Args:
-        data1 (nl.ndarray): [N], First input tensor on HBM.
-        data2 (nl.ndarray): [N], Second input tensor on HBM.
-        out_hbm (nl.ndarray): [N], Output tensor on HBM.
+        data1 (nl.NkiTensor): [N], First input tensor on HBM.
+        data2 (nl.NkiTensor): [N], Second input tensor on HBM.
+        out_hbm (nl.NkiTensor): [N], Output tensor on HBM.
         numel (int): Total number of elements in data1.
         op: Operation to apply (nl.add, nl.subtract, nl.multiply).
     """
@@ -108,10 +108,10 @@ def _tensor_kernel_body(
 
 
 def _tensor_alpha_kernel_body(
-    data1: nl.ndarray,
-    data2: nl.ndarray,
-    out_hbm: nl.ndarray,
-    alpha_sb: nl.ndarray,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
+    out_hbm: nl.NkiTensor,
+    alpha_sb: nl.NkiTensor,
     numel: int,
     op,
 ) -> None:
@@ -122,10 +122,10 @@ def _tensor_alpha_kernel_body(
     operation with data1, and writes results to output tensor.
 
     Args:
-        data1 (nl.ndarray): [N], First input tensor on HBM.
-        data2 (nl.ndarray): [N], Second input tensor on HBM.
-        out_hbm (nl.ndarray): [N], Output tensor on HBM.
-        alpha_sb (nl.ndarray): [P_MAX, 1], Alpha scalar in SBUF.
+        data1 (nl.NkiTensor): [N], First input tensor on HBM.
+        data2 (nl.NkiTensor): [N], Second input tensor on HBM.
+        out_hbm (nl.NkiTensor): [N], Output tensor on HBM.
+        alpha_sb (nl.NkiTensor): [P_MAX, 1], Alpha scalar in SBUF.
         numel (int): Total number of elements in data1.
         op: Operation to apply (nl.add, nl.subtract).
     """
@@ -157,9 +157,9 @@ def _tensor_alpha_kernel_body(
 
 
 def _tensor_reciprocal_kernel_body(
-    data1: nl.ndarray,
-    data2: nl.ndarray,
-    out_hbm: nl.ndarray,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
+    out_hbm: nl.NkiTensor,
     numel: int,
 ) -> None:
     """
@@ -169,9 +169,9 @@ def _tensor_reciprocal_kernel_body(
     multiplies with data1, and writes results to output tensor.
 
     Args:
-        data1 (nl.ndarray): [N], First input tensor on HBM.
-        data2 (nl.ndarray): [N], Second input tensor on HBM.
-        out_hbm (nl.ndarray): [N], Output tensor on HBM.
+        data1 (nl.NkiTensor): [N], First input tensor on HBM.
+        data2 (nl.NkiTensor): [N], Second input tensor on HBM.
+        out_hbm (nl.NkiTensor): [N], Output tensor on HBM.
         numel (int): Total number of elements in data1.
     """
     P_MAX = nl.tile_size.pmax
@@ -203,10 +203,10 @@ def _tensor_reciprocal_kernel_body(
 
 @nki.jit
 def add_scalar_kernel(
-    data: nl.ndarray,
-    scalar_tensor: nl.ndarray,
+    data: nl.NkiTensor,
+    scalar_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise add scalar to tensor.
 
@@ -217,12 +217,12 @@ def add_scalar_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM. Must have ndim >= 1.
-        scalar_tensor (nl.ndarray): [P_MAX, 1], Scalar broadcast tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM. Must have ndim >= 1.
+        scalar_tensor (nl.NkiTensor): [P_MAX, 1], Scalar broadcast tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element in data:
@@ -238,10 +238,10 @@ def add_scalar_kernel(
 
 @nki.jit
 def sub_scalar_kernel(
-    data: nl.ndarray,
-    scalar_tensor: nl.ndarray,
+    data: nl.NkiTensor,
+    scalar_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise subtract scalar from tensor.
 
@@ -252,12 +252,12 @@ def sub_scalar_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM. Must have ndim >= 1.
-        scalar_tensor (nl.ndarray): [P_MAX, 1], Scalar broadcast tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM. Must have ndim >= 1.
+        scalar_tensor (nl.NkiTensor): [P_MAX, 1], Scalar broadcast tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element in data:
@@ -273,10 +273,10 @@ def sub_scalar_kernel(
 
 @nki.jit
 def mul_scalar_kernel(
-    data: nl.ndarray,
-    scalar_tensor: nl.ndarray,
+    data: nl.NkiTensor,
+    scalar_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise multiply tensor by scalar.
 
@@ -287,12 +287,12 @@ def mul_scalar_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM. Must have ndim >= 1.
-        scalar_tensor (nl.ndarray): [P_MAX, 1], Scalar broadcast tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM. Must have ndim >= 1.
+        scalar_tensor (nl.NkiTensor): [P_MAX, 1], Scalar broadcast tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element in data:
@@ -308,10 +308,10 @@ def mul_scalar_kernel(
 
 @nki.jit
 def div_scalar_kernel(
-    data: nl.ndarray,
-    scalar_tensor: nl.ndarray,
+    data: nl.NkiTensor,
+    scalar_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise divide tensor by scalar.
 
@@ -323,12 +323,12 @@ def div_scalar_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM. Must have ndim >= 1.
-        scalar_tensor (nl.ndarray): [P_MAX, 1], Scalar broadcast tensor on HBM.
+        data (nl.NkiTensor): [N], Input tensor on HBM. Must have ndim >= 1.
+        scalar_tensor (nl.NkiTensor): [P_MAX, 1], Scalar broadcast tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         reciprocal_scalar = 1.0 / scalar
@@ -346,11 +346,11 @@ def div_scalar_kernel(
 
 @nki.jit
 def add_tensor_kernel(
-    data1: nl.ndarray,
-    data2: nl.ndarray,
-    alpha_tensor: nl.ndarray,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
+    alpha_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise add tensors with alpha scaling.
 
@@ -361,13 +361,13 @@ def add_tensor_kernel(
         N: Total number of elements in input tensors
 
     Args:
-        data1 (nl.ndarray): [N], First input tensor on HBM. Must have ndim >= 1.
-        data2 (nl.ndarray): [N], Second input tensor on HBM.
-        alpha_tensor (nl.ndarray): [P_MAX, 1], Alpha scalar broadcast tensor on HBM.
+        data1 (nl.NkiTensor): [N], First input tensor on HBM. Must have ndim >= 1.
+        data2 (nl.NkiTensor): [N], Second input tensor on HBM.
+        alpha_tensor (nl.NkiTensor): [P_MAX, 1], Alpha scalar broadcast tensor on HBM.
         numel (int): Number of elements in data1.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:
@@ -383,11 +383,11 @@ def add_tensor_kernel(
 
 @nki.jit
 def sub_tensor_kernel(
-    data1: nl.ndarray,
-    data2: nl.ndarray,
-    alpha_tensor: nl.ndarray,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
+    alpha_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise subtract tensors with alpha scaling.
 
@@ -398,13 +398,13 @@ def sub_tensor_kernel(
         N: Total number of elements in input tensors
 
     Args:
-        data1 (nl.ndarray): [N], First input tensor on HBM. Must have ndim >= 1.
-        data2 (nl.ndarray): [N], Second input tensor on HBM.
-        alpha_tensor (nl.ndarray): [P_MAX, 1], Alpha scalar broadcast tensor on HBM.
+        data1 (nl.NkiTensor): [N], First input tensor on HBM. Must have ndim >= 1.
+        data2 (nl.NkiTensor): [N], Second input tensor on HBM.
+        alpha_tensor (nl.NkiTensor): [P_MAX, 1], Alpha scalar broadcast tensor on HBM.
         numel (int): Number of elements in data1.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:
@@ -420,10 +420,10 @@ def sub_tensor_kernel(
 
 @nki.jit
 def mul_tensor_kernel(
-    data1: nl.ndarray,
-    data2: nl.ndarray,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise multiply tensors.
 
@@ -434,12 +434,12 @@ def mul_tensor_kernel(
         N: Total number of elements in input tensors
 
     Args:
-        data1 (nl.ndarray): [N], First input tensor on HBM. Must have ndim >= 1.
-        data2 (nl.ndarray): [N], Second input tensor on HBM.
+        data1 (nl.NkiTensor): [N], First input tensor on HBM. Must have ndim >= 1.
+        data2 (nl.NkiTensor): [N], Second input tensor on HBM.
         numel (int): Number of elements in data1.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:
@@ -452,10 +452,10 @@ def mul_tensor_kernel(
 
 @nki.jit
 def div_tensor_kernel(
-    data1: nl.ndarray,
-    data2: nl.ndarray,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise divide tensors.
 
@@ -467,12 +467,12 @@ def div_tensor_kernel(
         N: Total number of elements in input tensors
 
     Args:
-        data1 (nl.ndarray): [N], First input tensor on HBM. Must have ndim >= 1.
-        data2 (nl.ndarray): [N], Second input tensor on HBM.
+        data1 (nl.NkiTensor): [N], First input tensor on HBM. Must have ndim >= 1.
+        data2 (nl.NkiTensor): [N], Second input tensor on HBM.
         numel (int): Number of elements in data1.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:
@@ -486,12 +486,12 @@ def div_tensor_kernel(
 
 @nki.jit
 def addcdiv_kernel(
-    data: nl.ndarray,
-    data1: nl.ndarray,
-    data2: nl.ndarray,
-    value_tensor: nl.ndarray,
+    data: nl.NkiTensor,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
+    value_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise addcdiv: data + value * (data1 / data2).
 
@@ -502,14 +502,14 @@ def addcdiv_kernel(
         N: Total number of elements in input tensors
 
     Args:
-        data (nl.ndarray): [N], Base input tensor on HBM.
-        data1 (nl.ndarray): [N], Numerator tensor on HBM.
-        data2 (nl.ndarray): [N], Denominator tensor on HBM.
-        value_tensor (nl.ndarray): [P_MAX, 1], Scalar value broadcast tensor on HBM.
+        data (nl.NkiTensor): [N], Base input tensor on HBM.
+        data1 (nl.NkiTensor): [N], Numerator tensor on HBM.
+        data2 (nl.NkiTensor): [N], Denominator tensor on HBM.
+        value_tensor (nl.NkiTensor): [P_MAX, 1], Scalar value broadcast tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:
@@ -554,12 +554,12 @@ def addcdiv_kernel(
 
 @nki.jit
 def addcmul_kernel(
-    data: nl.ndarray,
-    data1: nl.ndarray,
-    data2: nl.ndarray,
-    value_tensor: nl.ndarray,
+    data: nl.NkiTensor,
+    data1: nl.NkiTensor,
+    data2: nl.NkiTensor,
+    value_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise addcmul: data + value * (data1 * data2).
 
@@ -570,14 +570,14 @@ def addcmul_kernel(
         N: Total number of elements in input tensors
 
     Args:
-        data (nl.ndarray): [N], Base input tensor on HBM.
-        data1 (nl.ndarray): [N], First multiplicand tensor on HBM.
-        data2 (nl.ndarray): [N], Second multiplicand tensor on HBM.
-        value_tensor (nl.ndarray): [P_MAX, 1], Scalar value broadcast tensor on HBM.
+        data (nl.NkiTensor): [N], Base input tensor on HBM.
+        data1 (nl.NkiTensor): [N], First multiplicand tensor on HBM.
+        data2 (nl.NkiTensor): [N], Second multiplicand tensor on HBM.
+        value_tensor (nl.NkiTensor): [P_MAX, 1], Scalar value broadcast tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:
@@ -620,11 +620,11 @@ def addcmul_kernel(
 
 @nki.jit
 def lerp_kernel(
-    data: nl.ndarray,
-    end: nl.ndarray,
-    weight_tensor: nl.ndarray,
+    data: nl.NkiTensor,
+    end: nl.NkiTensor,
+    weight_tensor: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise linear interpolation: data + weight * (end - data).
 
@@ -635,13 +635,13 @@ def lerp_kernel(
         N: Total number of elements in input tensors
 
     Args:
-        data (nl.ndarray): [N], Start tensor on HBM.
-        end (nl.ndarray): [N], End tensor on HBM.
-        weight_tensor (nl.ndarray): [P_MAX, 1], Interpolation weight broadcast tensor on HBM.
+        data (nl.NkiTensor): [N], Start tensor on HBM.
+        end (nl.NkiTensor): [N], End tensor on HBM.
+        weight_tensor (nl.NkiTensor): [P_MAX, 1], Interpolation weight broadcast tensor on HBM.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:
@@ -683,9 +683,9 @@ def lerp_kernel(
 
 @nki.jit
 def sqrt_kernel(
-    data: nl.ndarray,
+    data: nl.NkiTensor,
     numel: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Elementwise square root.
 
@@ -696,11 +696,11 @@ def sqrt_kernel(
         N: Total number of elements in input tensor
 
     Args:
-        data (nl.ndarray): [N], Input tensor on HBM. Elements must be non-negative.
+        data (nl.NkiTensor): [N], Input tensor on HBM. Elements must be non-negative.
         numel (int): Number of elements in data.
 
     Returns:
-        out (nl.ndarray): [N], Output tensor on HBM.
+        out (nl.NkiTensor): [N], Output tensor on HBM.
 
     Pseudocode:
         for each element:

@@ -14,23 +14,21 @@
 
 """PyTorch/numpy reference implementation for quantize_block_mxfp8_kernel.
 
-Computes the expected quantized FP8 data and float8_e8m0fnu scales in the same
-interleaved/packed layout the kernel produces, using only src-tree
-utilities (no neuronxcc test internals).
+Computes the expected quantized FP8 data and dense float8_e8m0fnu scales in the
+layout the kernel produces, using only src-tree utilities (no neuronxcc test internals).
 """
 
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 
-from ..mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
+from ..mxfp_utils.mxfp8_utils._quantize_mxfp8_utils import (
     INTERLEAVE_FACTOR,
-    get_remainder_partition_offset,
-    get_scale_output_shape,
-    get_scale_packing_info,
+    QUANT_SCHEME_1X32,
+    QUANT_SCHEME_WRAPX,
+    decompose_k_remainder,
 )
-
-Q_TILE_K = 128
+from ..mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
 
 # Alternative emax values used by the kernel (--enable-mx-alternative-emax).
 # Standard MX emax is 15/8; alternative is 14/7.
@@ -56,29 +54,39 @@ def quantize_block_mxfp8_torch_ref(
     src_tensor: np.ndarray,
     return_fp8_dtype: str,
     run_with_lnc2: bool = False,
-    enable_scale_packing: bool = True,
+    quant_scheme: str = None,
+    use_fast_dma_transpose: bool = False,
+    src_orientation=None,
 ) -> dict[str, np.ndarray]:
     """Golden reference for quantize_block_mxfp8_kernel.
 
     Computes the expected quantized data and scales using MX block
-    quantization with alternative emax, then arranges them in the same
-    interleaved/packed layout the kernel produces.
+    quantization with alternative emax, in the layout the kernel produces:
+    interleaved data and dense [K // 32, F] scales.
+
+    use_fast_dma_transpose only selects which loader the kernel uses; every loader produces
+    the same layout, so the golden ignores it. src_orientation K_BY_F means src_tensor is
+    [K, F]; the output is that of its [F, K] transpose.
 
     Returns:
-        dict with "quantized_data_hbm" (FP8 ndarray) and "quantized_scales_hbm" (float8_e8m0fnu ndarray).
+        dict with "quantized_data_hbm" (FP8 ndarray) and "quantized_scales_hbm" ([K // 32, F] float8_e8m0fnu ndarray).
     """
+    assert quant_scheme is not None, "quant_scheme is required"  # noqa: S101
+    if src_orientation == TensorOrientation.K_BY_F:
+        src_tensor = np.ascontiguousarray(src_tensor.T)
     F, K = src_tensor.shape
     non_x4_dtype = _get_non_x4_dtype(return_fp8_dtype)
     x4_dtype = _get_x4_dtype(return_fp8_dtype)
 
     # Interleave input, quantize, reshape to kernel output layout
-    interleaved = _interleave_tensor(src_tensor.T)  # (K, F) -> (K//4, F*4)
+    interleaved = interleave_tensor(src_tensor.T, quant_scheme)  # (K, F) -> (K//4, F*4)
     golden_data_x4, golden_scales = _quantize_mx_alt_emax(interleaved, x4_dtype)
     golden_data = golden_data_x4.view(non_x4_dtype).reshape(K // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR)
 
     return {
         "quantized_data_hbm": golden_data,
-        "quantized_scales_hbm": _pack_scales(golden_scales, K, F, enable_scale_packing),
+        # View the uint8 exponents as float8_e8m0fnu so the binary representation is preserved.
+        "quantized_scales_hbm": golden_scales.view(nl.float8_e8m0fnu),
     }
 
 
@@ -137,10 +145,10 @@ def _interleave_chunk(
 
 
 def _interleave_tensor(src: np.ndarray, TILE_P: int = 512) -> np.ndarray:
-    """Interleave rows within each tile: [P, F] -> [P//4, F*4].
+    """wrapX interleave of full TILE_P tiles plus the P % TILE_P remainder, [P, F] -> [P//4, F*4].
 
-    Processes full TILE_P tiles, then handles remainder as 256-tile + 128-tile,
-    matching the kernel's tiling strategy.
+    The remainder is split by ``decompose_k_remainder``, as every wrapX loader and the quantize
+    kernel split it.
     """
     P, F = src.shape
     dst = np.zeros((P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR), dtype=np.float32)
@@ -154,81 +162,40 @@ def _interleave_tensor(src: np.ndarray, TILE_P: int = 512) -> np.ndarray:
             src, dst, src_p_start=tile_idx * TILE_P, dst_p_start=tile_idx * SUB_TILE_P, chunk_size=TILE_P, F=F
         )
 
-    # Process remainder as 256-tile then 128-tile
-    remainder = P % TILE_P
     src_offset = NUM_FULL_TILES * TILE_P
     dst_offset = NUM_FULL_TILES * SUB_TILE_P
 
-    if remainder >= 256:
-        _interleave_chunk(src, dst, src_p_start=src_offset, dst_p_start=dst_offset, chunk_size=256, F=F)
-        src_offset += 256
-        dst_offset += 256 // INTERLEAVE_FACTOR
-        remainder -= 256
-
-    if remainder >= 128:
-        _interleave_chunk(src, dst, src_p_start=src_offset, dst_p_start=dst_offset, chunk_size=128, F=F)
+    remainder = P % TILE_P
+    for chunk_size in decompose_k_remainder(remainder):
+        _interleave_chunk(src, dst, src_p_start=src_offset, dst_p_start=dst_offset, chunk_size=chunk_size, F=F)
+        src_offset += chunk_size
+        dst_offset += chunk_size // INTERLEAVE_FACTOR
 
     return dst.astype(src.dtype)
 
 
-def _pack_scales(golden_scales: np.ndarray, K: int, F: int, enable_scale_packing: bool) -> np.ndarray:
-    """Arrange dense scales [K//4//8, F] into the kernel's output layout.
+def _interleave_tensor_1x32(src: np.ndarray) -> np.ndarray:
+    """1x32 interleave: [P, F] -> [P//4, F*4].
 
-    Returns scales as float8_e8m0fnu matching the kernel output dtype.
+    Packs INTERLEAVE_FACTOR consecutive P values of a feature into its four adjacent
+    output columns:
+
+        dst[p, f * INTERLEAVE_FACTOR + c] = src[INTERLEAVE_FACTOR * p + c, f]
+
+    Matches the hardware ``load_tile_PE_Swizzle_1x32`` loader. The mapping is local to each
+    group of INTERLEAVE_FACTOR rows, so unlike wrapX it is independent of the kernel's
+    tiling and needs no remainder handling.
     """
-    # View source uint8 scales as float8_e8m0fnu so assignments into the e8m0
-    # output buffer preserve the binary representation.
-    golden_scales_e8m0 = golden_scales.view(nl.float8_e8m0fnu)
+    P, F = src.shape
+    return (
+        src.reshape(P // INTERLEAVE_FACTOR, INTERLEAVE_FACTOR, F)
+        .transpose(0, 2, 1)
+        .reshape(P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR)
+    )
 
-    if not enable_scale_packing:
-        out = np.zeros((K // 4, F), dtype=nl.float8_e8m0fnu)
-        for row_idx in range(golden_scales_e8m0.shape[0]):
-            out[(row_idx // 4) * 32 + (row_idx % 4), :] = golden_scales_e8m0[row_idx, :]
-        return out
 
-    L_TILE_K = 512
-    NUM_TILES_IN_K = K // L_TILE_K
-    REMAINDER_K = K % L_TILE_K
-    HAS_REMAINDER_256 = REMAINDER_K >= 256
-    HAS_REMAINDER_128 = REMAINDER_K % 256 >= 128
-
-    golden_offset = 0
-    tile_idx = 0
-
-    def _pack_tile(tile_k_size, golden_offset, tile_idx, out, k_idx_within_tile=0):
-        """Pack scales for a single tile into the packed output."""
-        scaling_group_idx, _, slot_partition_offset = get_scale_packing_info(tile_idx, True)
-        remainder_partition_offset = get_remainder_partition_offset(k_idx_within_tile, Q_TILE_K)
-        scale_p_start = scaling_group_idx * Q_TILE_K
-        num_rows = (tile_k_size // INTERLEAVE_FACTOR) // 8
-        tile_scales = golden_scales_e8m0[golden_offset : golden_offset + num_rows, :]
-        for row_idx in range(num_rows):
-            packed_row = (row_idx // 4) * 32 + (row_idx % 4)
-            out[scale_p_start + slot_partition_offset + packed_row + remainder_partition_offset, :] = tile_scales[
-                row_idx, :
-            ]
-        return golden_offset + num_rows
-
-    packed_scale_P, _ = get_scale_output_shape(K, F, Q_TILE_K, enable_scale_packing=True)
-    out = np.zeros((packed_scale_P, F), dtype=nl.float8_e8m0fnu)
-
-    # Process full 512-tiles
-    for i in range(NUM_TILES_IN_K):
-        golden_offset = _pack_tile(L_TILE_K, golden_offset, tile_idx, out)
-        tile_idx += 1
-
-    # Process remainder tiles - both 256 and 128 share the same tile_idx
-    if HAS_REMAINDER_256:
-        golden_offset = _pack_tile(256, golden_offset, tile_idx, out)
-
-    if HAS_REMAINDER_128:
-        k_idx_within_tile = 256 if HAS_REMAINDER_256 else 0
-        golden_offset = _pack_tile(128, golden_offset, tile_idx, out, k_idx_within_tile)
-
-    # Handle small remainders (< 128 logical elements) that still have scale data
-    remaining = REMAINDER_K - (256 if HAS_REMAINDER_256 else 0) - (128 if HAS_REMAINDER_128 else 0)
-    if remaining > 0 and remaining % INTERLEAVE_FACTOR == 0:
-        k_idx_within_tile = REMAINDER_K - remaining
-        golden_offset = _pack_tile(remaining, golden_offset, tile_idx, out, k_idx_within_tile)
-
-    return out
+def interleave_tensor(src: np.ndarray, quant_scheme: str = QUANT_SCHEME_WRAPX, TILE_P: int = 512) -> np.ndarray:
+    """Interleave [P, F] -> [P//4, F*4] into the given quantization scheme's layout."""
+    if quant_scheme == QUANT_SCHEME_1X32:
+        return _interleave_tensor_1x32(src)
+    return _interleave_tensor(src, TILE_P)

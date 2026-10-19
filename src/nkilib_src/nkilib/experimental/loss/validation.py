@@ -27,8 +27,8 @@ MAX_ALLOCATION_BYTES = 24 * 1024 * 1024  # 24 MiB SBUF limit
 
 
 def validate_cross_entropy_forward_inputs(
-    logits_hbm: nl.ndarray,
-    targets_hbm: nl.ndarray,
+    logits_hbm: nl.NkiTensor,
+    targets_hbm: nl.NkiTensor,
     positions_per_batch: int,
     chunk_size: int,
     func_name: str = "cross_entropy_forward",
@@ -47,8 +47,8 @@ def validate_cross_entropy_forward_inputs(
         chunk_size: Vocabulary chunk size (must be ≤ F_MAX)
 
     Args:
-        logits_hbm (nl.ndarray): Input logits tensor to validate.
-        targets_hbm (nl.ndarray): Target indices tensor to validate.
+        logits_hbm (nl.NkiTensor): Input logits tensor to validate.
+        targets_hbm (nl.NkiTensor): Target indices tensor to validate.
         positions_per_batch (int): Number of positions to process per batch.
         chunk_size (int): Size of vocabulary chunks for processing.
         func_name (str): Name of calling function for error messages. Default: "cross_entropy_forward_kernel".
@@ -142,9 +142,9 @@ def validate_cross_entropy_forward_inputs(
 
 
 def validate_cross_entropy_backward_inputs(
-    logits_hbm: nl.ndarray,
-    targets_hbm: nl.ndarray,
-    lse_state_hbm: nl.ndarray,
+    logits_hbm: nl.NkiTensor,
+    targets_hbm: nl.NkiTensor,
+    lse_state_hbm: nl.NkiTensor,
     positions_per_batch: int,
     chunk_size: int,
     reduction: str = "mean",
@@ -164,9 +164,9 @@ def validate_cross_entropy_backward_inputs(
         chunk_size: Vocabulary chunk size (must be ≤ F_MAX)
 
     Args:
-        logits_hbm (nl.ndarray): Input logits tensor to validate.
-        targets_hbm (nl.ndarray): Target indices tensor to validate.
-        lse_state_hbm (nl.ndarray): LSE state from forward pass to validate.
+        logits_hbm (nl.NkiTensor): Input logits tensor to validate.
+        targets_hbm (nl.NkiTensor): Target indices tensor to validate.
+        lse_state_hbm (nl.NkiTensor): LSE state from forward pass to validate.
         positions_per_batch (int): Number of positions to process per batch.
         chunk_size (int): Size of vocabulary chunks for processing.
         reduction (str): Reduction type ('mean' or 'sum'). Default: 'mean'.

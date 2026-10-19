@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""MLP kernel entry point: dispatches to the context-encoding (CTE) or token-generation (TKG) implementation, with optional FP8/MXFP quantization and fused normalization."""
 
 from typing import Optional
 

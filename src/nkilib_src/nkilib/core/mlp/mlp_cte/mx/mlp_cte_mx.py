@@ -483,7 +483,9 @@ def _mlp_cte_single_shard(
     if preload_w_scales:
         sbm.pop_heap()  # gate_proj_weight_scales_sbuf
         sbm.pop_heap()  # up_proj_weight_scales_sbuf
-    elif mlp_params.quant_params.is_logical_quant_static():
+    elif (
+        mlp_params.quant_params.is_logical_quant_static()
+    ):  # pragma: no branch - exhaustive (only STATIC_MX reaches it), false arc dead
         sbm.pop_heap()  # gate_up_proj_static_input_scales_sbuf
         sbm.pop_heap()  # down_proj_static_input_scales_sbuf
         sbm.pop_heap()  # gate_proj_static_weight_scales_sbuf

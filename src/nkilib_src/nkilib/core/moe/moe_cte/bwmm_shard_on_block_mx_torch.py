@@ -104,3 +104,83 @@ def bwmm_shard_on_block_mx_torch_ref(
         separate_outputs=is_tensor_update_accumulating,
         quant_params=quant_params,
     )
+
+
+def bwmm_shard_on_block_mx_v2_torch_ref(
+    hidden_states: torch.Tensor,
+    expert_affinities_masked: torch.Tensor,
+    gate_up_proj_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    token_position_to_id: torch.Tensor,
+    block_to_expert: torch.Tensor,
+    conditions: Optional[torch.Tensor] = None,
+    gate_and_up_proj_bias: Optional[torch.Tensor] = None,
+    down_proj_bias: Optional[torch.Tensor] = None,
+    gate_up_proj_scale: Optional[torch.Tensor] = None,
+    down_proj_scale: Optional[torch.Tensor] = None,
+    ep_rank: Optional[torch.Tensor] = None,
+    block_size: Optional[int] = None,
+    n_static_blocks: int = -1,
+    n_dynamic_blocks: int = 55,
+    top_k: int = 1,
+    ep_degree: int = 1,
+    gate_up_activations_T: Optional[torch.Tensor] = None,
+    down_activations: Optional[torch.Tensor] = None,
+    activation_function: ActFnType = ActFnType.SiLU,
+    skip_dma: SkipMode = SkipMode(False, False),
+    compute_dtype: Any = nl.bfloat16,
+    weight_dtype: Any = None,
+    is_tensor_update_accumulating: bool = True,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
+    gate_clamp_upper_limit: Optional[float] = None,
+    gate_clamp_lower_limit: Optional[float] = None,
+    up_clamp_lower_limit: Optional[float] = None,
+    up_clamp_upper_limit: Optional[float] = None,
+    use_packed_scales: bool = False,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    gate_up_in_scale: Optional[torch.Tensor] = None,
+    down_in_scale: Optional[torch.Tensor] = None,
+) -> dict:
+    """PyTorch reference for bwmm_shard_on_block_mx_v2. Signature matches kernel exactly.
+
+    Returns the result as [T, H]: slot 0 of the accumulating bwmm_shard_on_block_mx reference.
+    """
+    result = bwmm_shard_on_block_mx_torch_ref(
+        hidden_states=hidden_states,
+        expert_affinities_masked=expert_affinities_masked,
+        gate_up_proj_weight=gate_up_proj_weight,
+        down_proj_weight=down_proj_weight,
+        token_position_to_id=token_position_to_id,
+        block_to_expert=block_to_expert,
+        conditions=conditions,
+        gate_and_up_proj_bias=gate_and_up_proj_bias,
+        down_proj_bias=down_proj_bias,
+        gate_up_proj_scale=gate_up_proj_scale,
+        down_proj_scale=down_proj_scale,
+        ep_rank=ep_rank,
+        block_size=block_size,
+        n_static_blocks=n_static_blocks,
+        n_dynamic_blocks=n_dynamic_blocks,
+        top_k=top_k,
+        ep_degree=ep_degree,
+        gate_up_activations_T=gate_up_activations_T,
+        down_activations=down_activations,
+        activation_function=activation_function,
+        skip_dma=skip_dma,
+        compute_dtype=compute_dtype,
+        weight_dtype=weight_dtype,
+        is_tensor_update_accumulating=is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        use_packed_scales=use_packed_scales,
+        quantization_type=quantization_type,
+        gate_up_in_scale=gate_up_in_scale,
+        down_in_scale=down_in_scale,
+    )
+    output = result["output"]
+    if output.ndim == 3:
+        result["output"] = output[0].contiguous()
+    return result

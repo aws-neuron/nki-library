@@ -20,7 +20,6 @@ with expert affinity scattering.
 
 import os as _os
 
-import neuronxcc.nki.typing as nt
 import nki
 import nki.isa as nisa
 import nki.language as nl
@@ -33,7 +32,9 @@ from ..utils import (
     tiled_range,
 )
 from ..utils.common_types import RouterActFnType
+from ..utils.dma_names import dma_name
 from ..utils.kernel_assert import kernel_assert
+from ..utils.sched_hints import take_qmx_store_copies
 
 P_MAX = 128
 F_MAX = 512
@@ -59,13 +60,13 @@ def router_topk(
     x: nl.NkiTensor,
     w: nl.NkiTensor,
     w_bias: nl.NkiTensor,
-    router_logits: nt.mutable_tensor,
-    expert_affinities: nt.mutable_tensor,
-    expert_index: nt.mutable_tensor,
+    router_logits: nl.NkiTensor,
+    expert_affinities: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
     act_fn: RouterActFnType,
     k: int,
-    x_hbm_layout: XHBMLayout_H_T__0,
-    x_sb_layout: XSBLayout_tp102__0,
+    x_hbm_layout: int,
+    x_sb_layout: int,
     router_pre_norm: bool = True,
     norm_topk_prob: bool = False,
     use_column_tiling: bool = False,
@@ -99,10 +100,10 @@ def router_topk(
                         If in SBUF: a permutation of [128, T, H/128] depending on x_sb_layout.
         w (nl.NkiTensor): Weight tensor [H, E] in HBM
         w_bias (nl.NkiTensor): Optional bias tensor [1, E] or [E] in HBM
-        router_logits (nt.mutable_tensor): Output router logits [T, E] in HBM
-        expert_affinities (nt.mutable_tensor): Output expert affinities [T, E] in HBM or SBUF.
+        router_logits (nl.NkiTensor): Output router logits [T, E] in HBM
+        expert_affinities (nl.NkiTensor): Output expert affinities [T, E] in HBM or SBUF.
                         Buffer type is auto-detected.
-        expert_index (nt.mutable_tensor): Output expert indices [T, K] in HBM or SBUF.
+        expert_index (nl.NkiTensor): Output expert indices [T, K] in HBM or SBUF.
                         Buffer type is auto-detected.
         act_fn (RouterActFnType): Activation function (SOFTMAX or SIGMOID)
         k (int): Number of top experts to select (must be <= 8)
@@ -185,6 +186,7 @@ def router_topk(
 
     # Detect buffer types from tensor attributes
     x_input_in_sbuf = x.buffer == nl.sbuf
+    _x_sched_deps = take_qmx_store_copies()
     expert_affin_in_sb = expert_affinities.buffer == nl.sbuf
     expert_index_in_sb = expert_index.buffer == nl.sbuf
 
@@ -285,7 +287,7 @@ def router_topk(
 
     """
     TensorEngine/PEArray column tiling setup.
-    
+
     The 'x' tensor's T is on the free-dim in SBUF. If T<128 then some of the PEArray columns
     are unused. Hence we engage the column-tiling feature to split the array in multiple tiles
     (column-wise), each of which can execute an independent matmul in parallel.
@@ -321,7 +323,7 @@ def router_topk(
 
     """
     Internal x_sb_layout defaults to x_sb_layout, which makes sense when the 'x' input is in SBUF.
-    
+
     But when we load 'x' from HBM, we override internal_x_sb_layout to be the SBUF layout we load into.
     To be clear, when loading from HBM, the SB layout is chosen by this kernel, below. It is *not*
     specified by the user via x_sb_layout.
@@ -360,17 +362,21 @@ def router_topk(
         nisa.dma_copy(
             dst=router_logits_bias_vector_sb,
             src=w_bias,
+            name=dma_name("router_bias_load"),
         )
         if use_PE_broadcast_w_bias:  # Use TensorE/matmul to do the broadcast
             ones_mask = nl.ndarray((1, t_tile_size), dtype=router_logits_bias_vector_sb.dtype, buffer=nl.sbuf)
-            nisa.memset(dst=ones_mask, value=1.0, engine=engine.gpsimd)
+            # Keep GpSimd free for DMA index and trigger work during attention.
+            nisa.memset(dst=ones_mask, value=1.0, engine=nisa.vector_engine)
             bias_bc_psum = nl.ndarray((t_tile_size, E), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(
+            _bias_bc_mm = nisa.nc_matmul(
                 dst=bias_bc_psum,
                 stationary=ones_mask[...],
                 moving=router_logits_bias_vector_sb[...],
                 is_stationary_onezero=True,
             )
+            if _x_sched_deps:
+                _bias_bc_mm.depends_on(*_x_sched_deps, kind=nisa.dependency.schedule)
             nisa.tensor_copy(dst=router_logits_bias_broadcasted_sb, src=bias_bc_psum[...], engine=engine.scalar)
         else:
             stream_shuffle_broadcast.stream_shuffle_broadcast(
@@ -384,7 +390,7 @@ def router_topk(
         t_tile_size_actual = t_tile.size
         """
         Initialize PSUM buffer.
-        
+
         We allocate [pmax, E] (i.e. the full pmax) because each column-tile writes into
         a separate p-dim range. If T < pmax we'll use an access pattern to get the correct data.
         """
@@ -396,7 +402,7 @@ def router_topk(
 
             """
             Form 'x' tile that is a multiple of t_tile_size.
-            
+
             This will be oversized on the last tile if T is not a multiple of pmax.
             But the correct remainder amount is selected using the mask in the matmul.
             Compute the start/end indexes for this T-tile slice where T_offset is the LNC shard offset.
@@ -421,7 +427,7 @@ def router_topk(
             tile_position = (0, current_column_tile_column_offset)  # will be (0,0) if use_column_tiling==false
 
             # matmul ([P,F] notation): x_tile_sb [pmax, t_tile_size] @ w_tile_sb [pmax, E] = router_logits_psum [t_tile_size, E]
-            nisa.nc_matmul(
+            _router_mm = nisa.nc_matmul(
                 # dst=router_logits_psum[nl.ds(current_column_tile_column_offset, t_tile_size_actual), :],
                 dst=router_logits_psum[nl.ds(current_column_tile_column_offset, t_tile_size_actual), :],
                 stationary=x_tile_sb,
@@ -429,13 +435,15 @@ def router_topk(
                 tile_position=tile_position,
                 tile_size=tile_size,
             )
+            if _x_sched_deps:
+                _router_mm.depends_on(*_x_sched_deps, kind=nisa.dependency.schedule)
 
         """Apply bias."""
 
         if has_bias:
             """
             Apply the bias to router-logits.
-            
+
             Element-wise add with the broadcasted bias tensor while copying from PSUM->SBUF.
             Tensor shapes:
             - router_logits_sb: [t_p_dim, num_t_tiles, E]
@@ -498,12 +506,12 @@ def router_topk(
     """
     After computing router-logits, the subsequent operations in this kernel are set up in a pipeline
     where individual stages can be enabled/disabled. Only certain combinations are valid.
-    
+
     The pipeline is:
     ACT1 --> topK --> ACT2 --> Norm --> Scatter
-    
+
     ACT* is an activation function. Norm is an L1 norm (normalize by sum of all values).
-    
+
     Valid combinations:
       (topK, ACT2, Scatter)
       (ACT1, topK)
@@ -512,7 +520,7 @@ def router_topk(
 
     """
     The following flags specify which stages to enable. topK is always enabled.
-    
+
     Rather than simply accept these flags as kernel arguments, they are derived from
     the existing arguments to maintain kernel interface backwards compatibility.
     """
@@ -576,7 +584,7 @@ def router_topk(
 
     """
     Top-K operation finds the largest K values in each partition along with their indexes.
-    
+
     Select input for topK operation. If ACT1 is enabled, use its output. Otherwise use router-logits.
     """
     topk_input_sb = router_logits_sb if (not pipeline_enable_act1) else expert_affinities_full_sb
@@ -869,7 +877,17 @@ def router_topk(
 
                 # mask_sbuf = nisa.memset((t_p_dim, E), 0.0, dtype=router_logits_sb.dtype, engine=nisa.engine.gpsimd)
                 mask_sbuf = nl.ndarray(shape=(t_tile_size, E), dtype=router_logits_sb.dtype, buffer=nl.sbuf)
-                nisa.memset(dst=mask_sbuf, value=0.0, engine=nisa.gpsimd_engine)
+                mask_sbuf_u32 = mask_sbuf.view(nl.uint32)
+                # Keep GpSimd and Vector free while zeroing through an integer view so
+                # NaN/Inf bit patterns cannot survive multiplication by zero.
+                nisa.tensor_scalar(
+                    dst=mask_sbuf_u32,
+                    data=mask_sbuf_u32,
+                    op0=nl.multiply,
+                    operand0=0,
+                    op1=None,
+                    engine=nisa.engine.scalar,
+                )
 
                 # [1,E] tensor of incrementing ints
                 expert_num_idx_arr_sbuf = nl.ndarray((t_p_dim, E), dtype=router_indexes_topk_sb.dtype, buffer=nl.sbuf)
@@ -953,10 +971,10 @@ def router_topk(
                 Here we perform the scatter using indirect DMA which allows the destination HBM tensor
                 (expert_affinities_hbm) to be accessed using an index tensor that is dynamically constructed
                 during execution (router_indexes_topk_sb).
-                
+
                 But indirect-DMA does not support a 2D index tensor (ie. we cannot directly use router_indexes_topk_sb).
                 We must transform both expert_affinities_hbm and router_indexes_topk_sb into 1D.
-                
+
                 The procedure is:
                 - Create expert_affinities_hbm = [T,E] in HBM as a tensor of zeroes
                 - Reshape it to a 1D tensor of shape [T*E] = expert_affinities_hbm_1d (just a view change)
@@ -977,7 +995,7 @@ def router_topk(
                 """
                 Indirect-DMA requires us to take the indexes from router_indexes_topk_sb and transform them
                 into equivalent indexes into a flattened 1D HBM tensor of shape [T*E].
-                
+
                 Create a column-vector in SBUF with values (0, E, 2E, 3E, 4E, ...) but offset into the
                 current T-tile. When sharding is enabled, T_offset accounts for the global token offset.
                 """
@@ -998,16 +1016,16 @@ def router_topk(
                 """
                 Recall that router_indexes_topk_sb = [128,T/128,K], meaning each Row (token) contains a list
                 of K indexes (the indexes of the top-K experts).
-                
+
                 index_offset_sb = [T/128,1]
                 tensor_scalar will broadcast index_offset_sb in the free-dim.
-                
+
                 This op will therefore take router_indexes_topk_sb and:
                 - add 0 to all values in Row T=0
                 - add E to all values in Row T=1
                 - add 2E to all values in Row T=2
                 - etc
-                
+
                 The result is that each expert index gets mapped into the corresponding index into the
                 flattened 1D tensor shape [T*E]. Not shown above is the additional offset, contained in
                 index_offset_sb, to shift us into the current T-tile.
@@ -1049,11 +1067,13 @@ def router_topk(
                 nisa.dma_copy(
                     src=expert_affinities_one_hot_scattered_sb[:t_p_dim, :num_t_whole_tiles, :E],
                     dst=_hbm_tiled_store_view(expert_affinities, T_offset, num_t_whole_tiles, t_p_dim),
+                    name=dma_name(f"router_affinity_store_t{T_offset}"),
                 )
             if t_remainder > 0:
                 nisa.dma_copy(
                     src=expert_affinities_one_hot_scattered_sb[:t_remainder, num_t_whole_tiles, :E],
                     dst=_hbm_remainder_store_view(expert_affinities, T_offset, num_t_whole_tiles, t_p_dim, t_remainder),
+                    name=dma_name(f"router_affinity_store_rem_t{T_offset}"),
                 )
 
             if n_prgs > 1:
@@ -1729,12 +1749,21 @@ def router_topk_input_w_load(w: nl.NkiTensor, x_sb_layout):
 
         # Router weight load: parked on GpSimd, which also issues the immovable KV
         # gather-transposes. engine= requires dge_mode=hwdge.
+        # Special value "none": issue as a STATIC DMA (dge_mode=none, the sync static engine,
+        # same queue the gate_up prefetch uses) and DO NOT set engine= — mirrors the W_out
+        # loader's convention in output_projection_tkg.py.
         _eng = _os.environ.get("VLLM_NEURON_MEGA_ROUTERW_DMA_ENGINE", "")
-        _kw = {"engine": getattr(nisa.engine, _eng), "dge_mode": nisa.dge_mode.hwdge} if _eng else {}
+        if _eng == "none":
+            _kw = {"dge_mode": nisa.dge_mode.none}
+        elif _eng:
+            _kw = {"engine": getattr(nisa.engine, _eng), "dge_mode": nisa.dge_mode.hwdge}
+        else:
+            _kw = {}
         nisa.dma_copy(
             src=(w.reshape_dim(dim=0, shape=(num_h_tiles, P_MAX)).permute((1, 0, 2))),
             dst=w_sb,
             **_kw,
+            name=dma_name("router_w_load"),
         )
 
     return w_sb

@@ -82,22 +82,22 @@ _ABBREVS = {
 
 
 def gen_mask_tkg_wrapper(
-    pos_ids_hbm: nl.ndarray,
-    mask_out_hbm: nl.ndarray,
+    pos_ids_hbm: nl.NkiTensor,
+    mask_out_hbm: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
     is_s_prior_sharded: bool,
     s_prior_per_shard: int,
-    start_pos_hbm: nl.ndarray = None,
+    start_pos_hbm: Optional[nl.NkiTensor] = None,
     s_prior_offset: int = 0,
     block_len: int = 0,
     strided_mm1: bool = True,
-    active_mask_hbm: nl.ndarray = None,
+    active_mask_hbm: Optional[nl.NkiTensor] = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
     transposed_out: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Wrapper kernel that handles HBM↔SBUF transfers for testing gen_mask_tkg.
 
     transposed_out=False:
@@ -111,7 +111,7 @@ def gen_mask_tkg_wrapper(
     _, lnc, shard_id = get_verified_program_sharding_info("gen_mask_wrapper", (0, 1))
 
     mask_out_sbuf_shape = mask_out_hbm.shape if lnc == 1 else mask_out_hbm.shape[1:]
-    num_elts = reduce('mul', mask_out_sbuf_shape, 1)
+    num_elts = reduce('mul', list(mask_out_sbuf_shape), 1)
 
     sbm = SbufManager(0, num_elts * 8, Logger("gen_mask_wrapper"), use_auto_alloc=True)
     sbm.open_scope(name="gen_mask_wrapper")
@@ -1118,6 +1118,48 @@ class TestGenMaskTkg:
 
         self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
+    # Transposed (QK-swap) layout WITH active-token placement. block_len>0 routes
+    # active tokens through the block-KV swap loader (_load_active_mask_block_kv_swap).
+    # fmt: off
+    transposed_active_test_params = "batch, q_head, s_ctx, s_active, block_len, sliding_window, lnc"
+    transposed_active_test_perms = [
+        (4, 16, 2048, 8, 32, 0, 1),      # block KV, full causal
+        (4, 16, 2048, 8, 32, 128, 1),    # block KV, SWA
+    ]
+    # fmt: on
+
+    @pytest_parametrize(transposed_active_test_params, transposed_active_test_perms, abbrevs=_ABBREVS)
+    def test_transposed_mask_with_active_tokens(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        q_head: int,
+        s_ctx: int,
+        s_active: int,
+        block_len: int,
+        sliding_window: int,
+        lnc: int,
+    ):
+        """Transposed (QK-swap) mask layout with active-token placement via the block-KV swap loader."""
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                lnc=lnc,
+                strided_mm1=False,
+                sliding_window=sliding_window,
+                transposed_out=True,
+                include_active_mask=True,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
+
 
 # ============================================================================
 # HBM WRAPPER TESTS
@@ -1358,8 +1400,10 @@ class TestGenMaskTkgHbm:
         # Larger batch / s_ctx
         (16, 4, 4096, 5, 0, True, 1),
         (8, 2, 4096, 7, 16, False, 1),
+        (16, 8, 65536, 1, 32, False, 1),  # 64K context, s_prior tiling + active mask
         # LNC=2 s_prior-sharded
         (4, 2, 4096, 5, 0, True, 2),    # BQS=40
+        (4, 2, 2048, 5, 0, True, 2),    # BQS=40, s_prior-sharded small mirror of the 4096 skip (arcs 1147/1160)
         (4, 1, 8192, 5, 16, False, 2),
         (4, 1, 8192, 5, 128, False, 2),
         (4, 1, 32768, 5, 128, False, 2),  # block_len=128, no resize, multi-fold, sprior-sharded
@@ -1430,6 +1474,10 @@ class TestGenMaskTkgHbm:
         # LNC=2 batch-sharded
         (8, 8, 4096, 5, 128, 0, True, 2),
         (8, 8, 4096, 5, 256, 128, False, 2),   # block_len=128 + SWA, batch-sharded
+        # Large s_prior on the default layout, the non-transposed counterpart of the s_ctx=32768
+        # exercise transposed configs: s_prior tiling and the SWA free-axis scratch.
+        (16, 8, 32768, 1, 128, 32, False, 1),
+        (16, 8, 65536, 1, 128, 32, False, 1),
     ]
     # fmt: on
 
@@ -1651,6 +1699,8 @@ class TestGenMaskTkgHbm:
         (4, 1, 4096, 5, 256, 128, False, 1),   # block_len=128 + SWA + active mask
         (4, 2, 4096, 5, 128, 0, True, 2),
         (4, 1, 8192, 5, 256, 128, False, 2),   # block_len=128 + SWA + active mask, sprior-sharded
+        # Large s_prior with SWA and the active-mask load together on the default layout.
+        (16, 8, 32768, 1, 128, 32, False, 1),
     ]
     # fmt: on
 
@@ -1781,6 +1831,18 @@ class TestGenMaskTkgHbm:
         # LNC=2 batch-sharded (bs*s_active_bqh large)
         (16, 8, 2048, 4, 32, 0, 2),      # block KV, batch-sharded
         (16, 8, 2048, 4, 0, 128, 2),     # flat KV, batch-sharded, SWA
+        # Large s_prior at n_bsq_tiles_shard == 1
+        (16, 8, 32768, 1, 32, 0, 1),     # s_active_qh=8, one grp per shard, block KV
+        (16, 8, 32768, 1, 32, 128, 1),   # same, SWA (adds the three free-axis scratch buffers)
+        (32, 8, 32768, 1, 32, 0, 2),     # production Qwen3-32B decode shape, batch-sharded
+        (16, 8, 65536, 1, 32, 0, 1),     # 8 tiles
+        # Batch tiling
+        (8, 16, 8192, 8, 64, 0, 1),
+        # Non-power-of-2 remainder paths in the two tilings.
+        (20, 16, 8192, 8, 64, 0, 1),     # 20 groups -> 4 batch tiles of 5, an odd batch tile
+        (64, 8, 16384, 3, 64, 0, 1),     # s_active=3 -> batch quantum 16, 2 batch x 2 s_prior tiles
+        (32, 8, 20480, 1, 32, 0, 2),     # s_prior 160*P_MAX -> 5 s_prior tiles, even-division backoff
+        (16, 8, 2560, 1, 32, 0, 1),      # s_prior 20*P_MAX -> block_len resized 32 to 4, fold 512
     ]
     # fmt: on
 

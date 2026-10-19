@@ -32,7 +32,6 @@ from ...quantization.fp8_quantize import pre_combine_dequant_scales
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, _psum_alloc, _sbm_alloc, div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import as_nki_tensor
 from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
@@ -92,7 +91,7 @@ def _load_down_weight(
     )
     nisa.dma_copy(
         dst=weight_sb[:p_I, :, :],
-        src=as_nki_tensor(down_weights_view),
+        src=down_weights_view,
         dge_mode=nisa.dge_mode.hwdge,
     )
     return weight_sb.view(down_weights.dtype)

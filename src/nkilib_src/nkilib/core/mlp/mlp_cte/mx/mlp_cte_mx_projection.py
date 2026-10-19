@@ -212,7 +212,9 @@ def perform_down_projection(
                             ],
                             op=nl.multiply,
                         )
-                    elif mlp_params.quant_params.is_quant_mx():
+                    elif (
+                        mlp_params.quant_params.is_quant_mx()
+                    ):  # pragma: no branch - gate/up eviction exhaustive over MX types, last-elif false arc dead
                         nisa.tensor_copy(
                             dst=output_tile,
                             src=proj_results_psum_list[psum_bank][: bxs_subtile.size, : hidden_tile.size],
@@ -508,7 +510,9 @@ def _evict_gate_res_tile(
                 scale=static_scales_sbuf[: len(int_subtiles), 0:1],
                 bias=bias_vector[: len(int_subtiles), 0:1],
             )
-        elif mlp_params.quant_params.is_quant_row_mx():
+        elif (
+            mlp_params.quant_params.is_quant_row_mx()
+        ):  # pragma: no branch - down eviction exhaustive over MX types, last-elif false arc dead
             # apply hidden row scales
             nisa.tensor_tensor(
                 dst=dst_tile,

@@ -38,6 +38,7 @@ def perform_float_projection(
     cfg: TilingConfig,
     prg_id: int,
     attention_layout: OProjAttentionLayout,
+    out_s_offset: int = 0,
 ) -> None:
     """
     Perform float (non-quantized) output projection: out = attention @ weight + bias.
@@ -65,6 +66,9 @@ def perform_float_projection(
         prg_id (int): Program ID for LNC sharding.
         attention_layout (OProjAttentionLayout): Dimension order of ``attention_hbm``. For
             BSNd and BNSd the D-on-partition layout is produced by a DMA transpose on load.
+        out_s_offset (int): Row offset into ``out_hbm``'s S dimension. Lets a caller
+            project one S chunk of a longer sequence into the right slice of a shared
+            result tensor; ``out_hbm``'s S dimension may be larger than ``cfg.s_size``.
 
     Returns:
         None: Writes results to out tensor.
@@ -123,8 +127,12 @@ def perform_float_projection(
             attention_view = attention_hbm.select(dim=0, index=batch_idx).slice(
                 dim=s_dim, start=s_start, end=s_start + curr_s_tile_size
             )
-            output_view = out_hbm.select(dim=0, index=batch_idx).slice(
-                dim=1, start=h_start, end=h_start + curr_h_block_size
+            # Narrow to this call's S chunk first, so every s_start below stays local to
+            # the chunk and the rest of the kernel is unaware of the offset.
+            output_view = (
+                out_hbm.select(dim=0, index=batch_idx)
+                .slice(dim=0, start=out_s_offset, end=out_s_offset + cfg.s_size)
+                .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
             )
 
             attention_sb = load_attention(
@@ -236,7 +244,9 @@ def _compute_matmul_add_bias(
         for h_subtile_idx in range(num_h_subtiles):
             h_subtile_start = cfg.h_tile.get_local_subtile_start(h_subtile_idx)
             curr_h_subtile_size = cfg.h_tile.get_local_subtile_bound(h_block_idx, h_subtile_idx)
-            if curr_h_subtile_size <= 0:
+            if (
+                curr_h_subtile_size <= 0
+            ):  # pragma: no branch - dead arc: loop bound is get_actual_subtile_num (exact ceil), so every subtile has size >= 1
                 break
 
             res_psum = nl.ndarray(

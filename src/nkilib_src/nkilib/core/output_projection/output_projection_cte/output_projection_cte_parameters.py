@@ -513,7 +513,9 @@ def build_quantization_config(
     elif quantization_type == QuantizationType.ROW_MX:
         quant_data_type = nl.float8_e4m3fn_x4
         is_row_mxfp8_quantized = True
-    elif quantization_type == QuantizationType.ROW:
+    elif (
+        quantization_type == QuantizationType.ROW
+    ):  # pragma: no branch - exhaustive: NONE returns early above; STATIC/MX/STATIC_MX/ROW_MX/ROW cover all remaining enum values, so ROW is always true when reached
         quant_data_type = _resolved_e4m3_for_static_row
         is_row_fp8_quantized = True
 

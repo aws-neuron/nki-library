@@ -54,21 +54,22 @@ from ...core.utils.common_types import (
     ExpertAffinityScaleMode,
     RouterActFnType,
 )
+from ..trace_caches import reset_trace_state
 
 
 @nki.jit
 def moe_block_dp_ep_kernel(
-    inp_shard: nl.ndarray,
-    gamma: nl.ndarray,
-    router_weights: nl.ndarray,
-    expert_gate_up_weights: nl.ndarray,
-    expert_down_weights: nl.ndarray,
-    expert_gate_up_weights_scale: nl.ndarray,
-    expert_down_weights_scale: nl.ndarray,
-    router_bias: nl.ndarray,
-    expert_gate_up_bias: nl.ndarray,
-    expert_down_bias: nl.ndarray,
-    rank_id: nl.ndarray,
+    inp_shard: nl.NkiTensor,
+    gamma: nl.NkiTensor,
+    router_weights: nl.NkiTensor,
+    expert_gate_up_weights: nl.NkiTensor,
+    expert_down_weights: nl.NkiTensor,
+    expert_gate_up_weights_scale: nl.NkiTensor,
+    expert_down_weights_scale: nl.NkiTensor,
+    router_bias: nl.NkiTensor,
+    expert_gate_up_bias: nl.NkiTensor,
+    expert_down_bias: nl.NkiTensor,
+    rank_id: nl.NkiTensor,
     replica_group: ReplicaGroup,
     num_ranks: int,
     top_k: int,
@@ -102,14 +103,18 @@ def moe_block_dp_ep_kernel(
     Returns:
         ``[T // num_ranks, H]`` this rank's token shard of the summed MoE output.
     """
+    # Trace-scoped module caches must be dropped on entry to every OUTERMOST @nki.jit kernel:
+    # the prefetch FIFOs' consumers pop unconditionally whenever non-empty, so a leftover entry
+    # from a previous trace in this process is silently consumed. See experimental/trace_caches.py.
+    reset_trace_state()
     T_shard, H = inp_shard.shape
     T = T_shard * num_ranks
     dtype = inp_shard.dtype
 
     # ── Dispatch: AllGather[EP] the SP token shards -> full [T, H] on every rank.
     # (name= required on collective src/dst: NCC_IBIR440 DRAM allocation failure.)
-    ag_src = nl.ndarray((T_shard, H), dtype=dtype, buffer=nl.shared_hbm, name="ag_src")
-    ag_dst = nl.ndarray((T, H), dtype=dtype, buffer=nl.shared_hbm, name="ag_dst")
+    ag_src = nl.ndarray((T_shard, H), dtype=dtype, buffer=nl.private_hbm, name="ag_src")
+    ag_dst = nl.ndarray((T, H), dtype=dtype, buffer=nl.private_hbm, name="ag_dst")
     nisa.dma_copy(dst=ag_src, src=inp_shard)
     ncc.all_gather(dsts=[ag_dst], srcs=[ag_src], replica_group=replica_group, collective_dim=0)
 
@@ -146,8 +151,8 @@ def moe_block_dp_ep_kernel(
 
     # ── Combine: ReduceScatter[EP] sums per-expert partials across ranks and
     # re-shards over tokens -> [T // num_ranks, H] on each rank (SP layout).
-    rs_src = nl.ndarray((T, H), dtype=expert_out.dtype, buffer=nl.shared_hbm, name="rs_src")
-    rs_dst = nl.ndarray((T_shard, H), dtype=expert_out.dtype, buffer=nl.shared_hbm, name="rs_dst")
+    rs_src = nl.ndarray((T, H), dtype=expert_out.dtype, buffer=nl.private_hbm, name="rs_src")
+    rs_dst = nl.ndarray((T_shard, H), dtype=expert_out.dtype, buffer=nl.private_hbm, name="rs_dst")
     out = nl.ndarray((T_shard, H), dtype=expert_out.dtype, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=rs_src, src=expert_out)
     ncc.reduce_scatter(dsts=[rs_dst], srcs=[rs_src], op=nl.add, replica_group=replica_group, collective_dim=0)

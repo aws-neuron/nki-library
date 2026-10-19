@@ -89,6 +89,7 @@ def mlp_output_tensor_descriptor(kernel_input):
     dtype = nl.bfloat16
 
     transposed_out = kernel_input.get("transposed_out", False)
+    output: dict[str, np.ndarray]
     if transposed_out:
         # Transposed output: [H0, n_prgs, H1_shard, BxS]
         transposed_in = kernel_input.get("transposed_in", False)
@@ -850,7 +851,7 @@ def mlp_row_quant_tensor_generator(hidden_std: float = 1.0, weight_std: float = 
             max_pos_val = get_max_positive_value_for_dtype(dtype)
             tensor = rng.normal(size=shape, scale=weight_std).clip(-max_pos_val, max_pos_val).astype(dtype)
         else:
-            tensor = rng.normal(size=shape)
+            tensor = rng.normal(size=shape).astype(dtype)
         return tensor
 
     return tensor_generator

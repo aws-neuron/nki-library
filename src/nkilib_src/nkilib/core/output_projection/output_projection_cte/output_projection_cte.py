@@ -20,6 +20,7 @@ import nki
 import nki.language as nl
 
 from ...utils.common_types import DtypeMode, OProjAttentionLayout, QuantizationType
+from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info
 from .output_projection_cte_float import perform_float_projection
 from .output_projection_cte_parameters import (
@@ -52,6 +53,8 @@ def output_projection_cte(
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     compact_weight_scales: bool = False,
     attention_layout: Optional[OProjAttentionLayout] = None,
+    out: Optional[nl.NkiTensor] = None,
+    out_s_offset: int = 0,
 ) -> nl.NkiTensor:
     """
     Output projection kernel optimized for Context Encoding (CTE/Prefill) scenarios.
@@ -100,6 +103,13 @@ def output_projection_cte(
               CTE output with heads folded into batch and ``tp_out=False``. Supported by
               ``QuantizationType.NONE``.
 
+        out (Optional[nl.NkiTensor]): [B, S_total, H], caller-allocated output. When
+            given, results are written here instead of into a freshly allocated tensor,
+            and the same tensor is returned. Lets a caller project several S chunks into
+            one result without a stitching copy.
+        out_s_offset (int): Row offset into ``out``'s S dimension for this call's chunk.
+            Only meaningful together with ``out``. Float (non-quantized) path only.
+
     Returns:
         out (nl.NkiTensor): [B, S, H], Output tensor in HBM.
 
@@ -135,7 +145,7 @@ def output_projection_cte(
     _, n_prgs, prg_id = get_program_sharding_info()
 
     # Default to 1 program if not in SPMD context (e.g., simulation)
-    if n_prgs == None:
+    if n_prgs == None:  # pragma: no cover - defensive: get_program_sharding_info returns (0,1,0), never None for n_prgs
         n_prgs = 1
         prg_id = 0
 
@@ -184,7 +194,21 @@ def output_projection_cte(
         out_dtype = nl.bfloat16
     else:
         out_dtype = attention.dtype
-    out = nl.ndarray((b_size, s_size, h_size), dtype=out_dtype, buffer=nl.shared_hbm)
+    if out is None:
+        kernel_assert(out_s_offset == 0, "out_s_offset requires a caller-supplied out")
+        out = nl.ndarray((b_size, s_size, h_size), dtype=out_dtype, buffer=nl.shared_hbm)
+    else:
+        kernel_assert(
+            quantization_type == QuantizationType.NONE,
+            "caller-supplied out is only wired up for the float path",
+        )
+        out_b, out_s, out_h = out.shape
+        kernel_assert(out_b == b_size, "out batch must match attention batch")
+        kernel_assert(out_h == h_size, "out hidden must match weight hidden")
+        kernel_assert(
+            out_s_offset >= 0 and out_s_offset + s_size <= out_s,
+            "out_s_offset + S must fit inside out's S dimension",
+        )
 
     if quant_config.is_enabled and quantization_type == QuantizationType.STATIC:
         perform_static_quantized_projection(
@@ -254,6 +278,7 @@ def output_projection_cte(
             cfg=tiling_config,
             prg_id=prg_id,
             attention_layout=attention_layout,
+            out_s_offset=out_s_offset,
         )
 
     return out

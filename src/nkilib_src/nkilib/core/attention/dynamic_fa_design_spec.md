@@ -15,7 +15,7 @@ regardless of actual content. With dynamic FA, only tiles containing valid data 
 ## Interface
 
 ```python
-attention_tkg(..., max_context_len: Optional[nl.ndarray] = None)
+attention_tkg(..., max_context_len: Optional[nl.NkiTensor] = None)
 ```
 
 - `max_context_len`: int32 scalar tensor `[1]`. When provided, enables dynamic FA.

@@ -272,7 +272,7 @@ def kernel_test_construction_negative(
 
 
 @nki.jit
-def kernel_test_from_tensor_view(
+def kernel_test_from_view(
     dummy_out,
     source_shape: tuple,
     tile_size: tuple,
@@ -523,13 +523,13 @@ class TestTiledTensor:
         ],
     )
     @pytest.mark.parametrize("buffer", [nl.hbm])
-    def test_construction_from_tensor_view(
+    def test_construction_from_view(
         self, test_manager, platform_target, source_shape, view_ops, tile_size, expected_grid_shape, buffer
     ):
         _run_trace_only(
             test_manager,
             platform_target,
-            kernel_test_from_tensor_view,
+            kernel_test_from_view,
             {
                 "dummy_out.must_alias_input": _make_dummy(),
                 "source_shape": source_shape,

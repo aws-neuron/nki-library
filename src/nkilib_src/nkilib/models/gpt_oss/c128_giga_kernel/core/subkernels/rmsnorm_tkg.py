@@ -14,6 +14,7 @@
 
 """RMSNorm kernel optimized for token generation (decoding) phase with efficient sharding and memory management."""
 
+import os as _os
 from typing import Optional, Tuple
 
 import nki.isa as nisa
@@ -22,7 +23,7 @@ import nki.language as nl
 from ..utils.allocator import SbufManager, sizeinbytes
 from ..utils.common_types import MoEBlockIOLayout
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
+from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info, mega_flag_default_on
 from ..utils.logging import get_logger
 from ..utils.tiled_range import TiledRange
 from .norm_tkg_utils import (
@@ -37,8 +38,36 @@ from .norm_tkg_utils import (
 # Minimum BxS size to enable sharding (balances computation vs communication overhead)
 SHARDING_THRESHOLD = 18
 
+# ── FlashNorm (arxiv 2407.09577) ──
+# Opt 1 "weightless norm": gamma is folded into the FOLLOWING linear layer's weight rows
+# offline (W*[i,:] = gamma[i] * W[i,:]), so the norm itself drops its gamma multiply.
+# Opt 2 "deferred norm": 1/RMS(a) is a per-token SCALAR, so (a/RMS)W* == (aW*)/RMS -- the
+# norm emits UNSCALED x and hands 1/RMS to the consumer, which applies it after the matmul.
+# Both are exact for a bias-free linear consumer; the caller owns the folding and the
+# deferred multiply (see qkv_tkg._fused_norm_and_load).
+_FLASHNORM_WEIGHTLESS = bool(_os.environ.get("VLLM_NEURON_MEGA_FLASHNORM_WEIGHTLESS"))
+_FLASHNORM_DEFERRED = mega_flag_default_on("VLLM_NEURON_MEGA_FLASHNORM_DEFERRED")
+# Where the Opt-2 gamma product lands: "iodtype" (default) | "inplace" | "fp32".
+# Instructions vs RMS/matmul overlap trade off against each other here; see the branch in
+# _process_rmsnorm_tile. Runtime-selectable so one build can serve every A/B arm.
+_FLASHNORM_TILE = _os.environ.get("VLLM_NEURON_MEGA_FLASHNORM_TILE", "inplace").strip().lower()
+
+
+def flashnorm_weightless_enabled() -> bool:
+    """True when gamma is pre-folded into the consumer weight, so the norm skips it."""
+    return _FLASHNORM_WEIGHTLESS
+
+
+def flashnorm_deferred_enabled() -> bool:
+    """True when the norm returns unscaled x plus 1/RMS for the consumer to apply."""
+    return _FLASHNORM_DEFERRED
+
+
 # Tile size for BxS dimension processing
 BxS_FULL_TILE_SIZE = 512
+
+
+_PIN_AFTER = [None]
 
 
 def rmsnorm_tkg(
@@ -53,6 +82,8 @@ def rmsnorm_tkg(
     use_heap_memory: bool = False,
     sbm: Optional[SbufManager] = None,
     inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
+    rms_recip_out: Optional[nl.NkiTensor] = None,
+    weightless: bool = False,
 ):
     """
     RMSNorm implementation optimized for inference token generation (decoding) phase.
@@ -78,6 +109,15 @@ def rmsnorm_tkg(
         inp_layout (MoEBlockIOLayout): Input tensor layout. When _128_Nprgs_Hfree_T, input is
             [128, n_prgs, H//128//n_prgs, T] in HBM; loads and permutes to [128, T, H//128]
             in SBUF before normalization. Default is B_S_H
+        rms_recip_out (Optional[nl.NkiTensor]): [BxS, 1] fp32 in SBUF. FlashNorm Opt 2: when
+            supplied, ``output`` receives UNSCALED (gamma-applied) x and 1/RMS is written
+            here -- tokens on the partition axis, ready for the consumer to apply to its
+            [BxS, I] matmul result. Default is None
+        weightless (bool): FlashNorm Opt 1. Skip the gamma load + multiply entirely because
+            the caller pre-folded gamma into the FOLLOWING linear layer's weight rows
+            (W*[i,:] = gamma[i] * W[i,:]). ONLY pass True when that fold really happened --
+            this kernel has ~9 consumers and only QKV's caller does it, so the flag is
+            per-call rather than a module-level env read. Default is False
 
     Returns:
         output (nl.NkiTensor): [128, BxS, H//128], Output tensor with RMSNorm applied
@@ -154,6 +194,8 @@ def rmsnorm_tkg(
             single_core_forced=single_core_forced,
             use_heap_memory=use_heap_memory,
             sbm=sbm,
+            rms_recip_out=rms_recip_out,
+            weightless=weightless,
         )
 
     sbm.close_scope()
@@ -171,6 +213,8 @@ def _rmsnorm_tkg_shard_on_bxs(
     single_core_forced: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[SbufManager] = None,
+    rms_recip_out: Optional[nl.NkiTensor] = None,
+    weightless: bool = False,
 ):
     """
     RMSNorm with sharding on the BxS dimension.
@@ -189,6 +233,9 @@ def _rmsnorm_tkg_shard_on_bxs(
         single_core_forced (bool): If True, force single-core execution.
         use_heap_memory (bool): If True, allocate on heap; otherwise on stack.
         sbm (Optional[SbufManager]): SBUF memory manager instance.
+        rms_recip_out (Optional[NkiTensor]): [BxS, 1] FlashNorm Opt-2 1/RMS output.
+        weightless (bool): FlashNorm Opt 1 — skip the gamma load + multiply (caller
+            pre-folded gamma into the consumer weight).
 
     Returns:
         None: Results written to output_view.
@@ -222,6 +269,12 @@ def _rmsnorm_tkg_shard_on_bxs(
         input_view_sharded = input_view.slice(dim=1, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
 
     output_view_sharded = output_sb_view.slice(dim=1, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
+    # [BxS, 1]: the BxS shard is on the partition axis (dim 0).
+    rms_recip_out_sharded = (
+        rms_recip_out.slice(dim=0, start=shard_id * shard_size, end=(shard_id + 1) * shard_size)
+        if rms_recip_out is not None
+        else None
+    )
 
     _rmsnorm_tkg_llama_impl(
         input=input_view_sharded,
@@ -234,6 +287,8 @@ def _rmsnorm_tkg_shard_on_bxs(
         shard_on_h=False,
         use_heap_memory=use_heap_memory,
         sbm=sbm,
+        rms_recip_out=rms_recip_out_sharded,
+        weightless=weightless,
     )
 
     if output_view.buffer == nl.sbuf:
@@ -336,6 +391,10 @@ def _process_rmsnorm_tile(
     shard_on_h: bool,
     use_heap_memory: bool = False,
     sbm: SbufManager = None,
+    rms_recip_out: Optional[nl.NkiTensor] = None,
+    eps_scalar: float = 1e-6,
+    weightless: bool = False,
+    input_aliases_output: bool = False,
 ):
     """
     Process a single tile of RMSNorm computation.
@@ -351,6 +410,23 @@ def _process_rmsnorm_tile(
         shard_on_h (bool): If True, exchange partial sums between cores.
         use_heap_memory (bool): If True, allocate on heap; otherwise on stack
         sbm (SbufManager): SBUF memory manager instance
+        rms_recip_out (Optional[NkiTensor]): [BxS, 1] FlashNorm Opt-2 output. When given,
+            1/RMS is written here and NOT applied to output_sb_view; the consumer applies
+            it after its matmul.
+        eps_scalar (float): Same epsilon as eps_view, as a plain float. Needed on the
+            FlashNorm Opt-2 path where the result is [BxS, 1] and the [H0, 1] eps_view
+            cannot broadcast onto it.
+        weightless (bool): FlashNorm Opt 1 — skip the gamma multiply because gamma is
+            pre-folded into the consumer's weight rows. Correct ONLY when that fold
+            actually happened, so it is a per-CALL flag rather than a module-level env
+            read: rmsnorm_tkg has ~9 consumers (MoE block, MLP, projections, QKV) and
+            only QKV's caller does the fold. Reading the env var here would silently
+            drop gamma for all the others.
+        input_aliases_output (bool): True when input_sb_view and output_sb_view are views
+            over the SAME SBUF buffer (the caller loaded the input into ``output`` via
+            ``load_input_to_sbuf(input_sb=output)``). Lets the Opt-1+2 path skip a
+            tile-sized self-copy; ``is`` cannot detect it because the two are distinct
+            view objects over one buffer.
 
     Returns:
         None: Results written directly to output_sb_view
@@ -358,6 +434,9 @@ def _process_rmsnorm_tile(
     Notes:
         - Computes RMSNorm: output = (input * gamma) / sqrt(mean(input^2) + eps)
         - Uses intermediate float32 precision for numerical stability
+        - FlashNorm: gamma multiply is skipped when it is pre-folded into the consumer
+          weight, and the 1/RMS multiply is skipped when it is deferred past the matmul.
+          With both on, this tile reduces to "square -> reduce -> rsqrt" plus one copy.
     """
     alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
 
@@ -410,46 +489,125 @@ def _process_rmsnorm_tile(
             nl.add,
         )
 
-    # Apply gamma scaling: input * gamma
-    gamma_mult = alloc_tensor(shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf)
-    num_allocated_tensor += 1
-    gamma_mult_view = gamma_mult
-    nisa.tensor_tensor(
-        gamma_mult_view,
-        input_sb_view,
-        gamma_sb_view,
-        nl.multiply,
-    )
+    # Apply gamma scaling: input * gamma.
+    # FlashNorm Opt 1: gamma is already folded into the consumer's weight rows, so this
+    # whole tensor_tensor (and its fp32 [H0, BxS, H1] temp) disappears. Driven by the
+    # caller's flag, NOT the env var directly -- see the weightless= docstring note.
+    if weightless:
+        gamma_mult_view = input_sb_view
+    elif rms_recip_out is not None:
+        # FlashNorm Opt 2 without Opt 1: gamma is the only thing applied to the tile, and
+        # with the scale deferred nothing downstream needs fp32 precision here. Where the
+        # product lands is a measured tradeoff, so it is RUNTIME-selectable (one build can
+        # then serve every A/B arm, which is what keeps arms free of source drift):
+        #
+        #   VLLM_NEURON_MEGA_FLASHNORM_TILE=inplace   (DEFAULT)
+        #     Write straight into output_sb_view. Fewest instructions (no temp, no copy).
+        #     The tradeoff is that this multiply becomes the QKV matmul's direct producer on
+        #     the shared tile, which pins it late and costs RMS/matmul overlap -- on the
+        #     GPT-OSS 36-layer decode shape the instruction saving wins anyway, which is why
+        #     this is the default (it is what the measured-optimal arm runs).
+        #   VLLM_NEURON_MEGA_FLASHNORM_TILE=iodtype
+        #     Distinct temp in the OUTPUT dtype: keeps the matmul's producer cheap (better
+        #     overlap) while still avoiding the dtype-converting CAST an fp32 temp forces.
+        #   VLLM_NEURON_MEGA_FLASHNORM_TILE=fp32
+        #     Original: fp32 temp + converting copy. Best overlap, most instructions.
+        if _FLASHNORM_TILE == "inplace":
+            gamma_mult_view = output_sb_view
+        else:
+            _tile_dtype = inter_dtype if _FLASHNORM_TILE == "fp32" else output_sb_view.dtype
+            gamma_mult = alloc_tensor(shape=(H0, BxS, H1), dtype=_tile_dtype, buffer=nl.sbuf)
+            num_allocated_tensor += 1
+            gamma_mult_view = gamma_mult
+        nisa.tensor_tensor(
+            gamma_mult_view,
+            input_sb_view,
+            gamma_sb_view,
+            nl.multiply,
+        )
+    else:
+        gamma_mult = alloc_tensor(shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf)
+        num_allocated_tensor += 1
+        gamma_mult_view = gamma_mult
+        nisa.tensor_tensor(
+            gamma_mult_view,
+            input_sb_view,
+            gamma_sb_view,
+            nl.multiply,
+        )
 
     # Complete reduction across H0 dimension using matmul
-    if sbm.is_auto_alloc():
-        final_reduced = nl.ndarray((H0, BxS), dtype=nl.float32, buffer=nl.psum)
-    else:
-        final_reduced = nl.ndarray((H0, BxS), dtype=nl.float32, buffer=nl.psum, address=(0, 0))
-    nisa.nc_matmul(
-        stationary=matmul_reduction_const_view,
-        moving=rmsnorm_reduced_square,
-        dst=final_reduced,
-    )
-
-    # Compute normalization factor: 1/sqrt(mean(x^2) + eps)
     hidden_scale = 1.0 / hidden_actual
-    nisa.activation(
-        rmsnorm_reduced_square[...],
-        op=nl.rsqrt,
-        data=final_reduced[...],
-        scale=hidden_scale,
-        bias=eps_view,
-    )
+    if rms_recip_out is not None:
+        # FlashNorm Opt 2: the consumer needs 1/RMS with TOKENS on the partition axis
+        # ([BxS, 1]), not replicated across H0 ([H0, BxS]). nc_matmul computes
+        # stationary^T @ moving, so feeding the [H0, BxS] partials as the stationary
+        # operand against a [H0, 1] ones-column yields [BxS, 1] directly -- the same
+        # single matmul, a smaller result, and no transpose to fix up the layout.
+        if sbm.is_auto_alloc():
+            final_reduced = nl.ndarray((BxS, 1), dtype=nl.float32, buffer=nl.psum)
+        else:
+            final_reduced = nl.ndarray((BxS, 1), dtype=nl.float32, buffer=nl.psum, address=(0, 0))
+        nisa.nc_matmul(
+            stationary=rmsnorm_reduced_square,
+            moving=matmul_reduction_const_view[:, 0:1],
+            dst=final_reduced,
+        )
+        # eps as a plain float: the [H0, 1] eps_view cannot broadcast onto [BxS, 1].
+        _act = nisa.activation(
+            rms_recip_out,
+            op=nl.rsqrt,
+            data=final_reduced[...],
+            scale=hidden_scale,
+            bias=eps_scalar,
+        )
+        if _PIN_AFTER[0] is not None and _act is not None:
+            _act.depends_on(_PIN_AFTER[0], kind=nisa.dependency.schedule)
+    else:
+        if sbm.is_auto_alloc():
+            final_reduced = nl.ndarray((H0, BxS), dtype=nl.float32, buffer=nl.psum)
+        else:
+            final_reduced = nl.ndarray((H0, BxS), dtype=nl.float32, buffer=nl.psum, address=(0, 0))
+        nisa.nc_matmul(
+            stationary=matmul_reduction_const_view,
+            moving=rmsnorm_reduced_square,
+            dst=final_reduced,
+        )
+
+        # Compute normalization factor: 1/sqrt(mean(x^2) + eps)
+        nisa.activation(
+            rmsnorm_reduced_square[...],
+            op=nl.rsqrt,
+            data=final_reduced[...],
+            scale=hidden_scale,
+            bias=eps_view,
+        )
 
     # Final RMSNorm: (input * gamma) * normalization_factor
-    reduced_view = rmsnorm_reduced_square.expand_dim(dim=2).broadcast(dim=2, size=H1)
-    nisa.tensor_tensor(
-        output_sb_view,
-        gamma_mult_view,
-        reduced_view,
-        nl.multiply,
-    )
+    # FlashNorm Opt 2: 1/RMS is a per-token scalar and the consumer is linear, so hand it
+    # out instead of multiplying an [H0, BxS, H1] tile by it here.
+    if rms_recip_out is not None:
+        # 1/RMS was already written straight into rms_recip_out above, so the only thing
+        # left is making sure the consumer's tile holds the (unscaled) values.
+        #
+        # With Opt 1 also on, this kernel applies NOTHING to the tile: gamma is folded into
+        # the consumer weight and the scale is deferred, so gamma_mult_view IS input_sb_view,
+        # which the caller loaded into `output` itself (load_input_to_sbuf(input_sb=output)).
+        # The tile is therefore already in place and in the right dtype -- copying it would
+        # be a tile-sized self-copy (measured 10.1 us / 36 layers of pure waste). `is` alone
+        # does not catch it because these are distinct view objects over the same buffer, so
+        # compare the underlying tensors too.
+        _same_buffer = gamma_mult_view is output_sb_view or (gamma_mult_view is input_sb_view and input_aliases_output)
+        if not _same_buffer:
+            nisa.tensor_copy(dst=output_sb_view, src=gamma_mult_view)
+    else:
+        reduced_view = rmsnorm_reduced_square.expand_dim(dim=2).broadcast(dim=2, size=H1)
+        nisa.tensor_tensor(
+            output_sb_view,
+            gamma_mult_view,
+            reduced_view,
+            nl.multiply,
+        )
 
     if use_heap_memory:
         for _ in range(num_allocated_tensor):
@@ -702,6 +860,8 @@ def _rmsnorm_tkg_llama_impl(
     shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: SbufManager = None,
+    rms_recip_out: Optional[nl.NkiTensor] = None,
+    weightless: bool = False,
 ):
     """
     Perform RMSNorm on input tensor with sharding support.
@@ -717,6 +877,11 @@ def _rmsnorm_tkg_llama_impl(
         shard_on_h (bool): If True, exchange partial sums between cores.
         use_heap_memory (bool): If True, allocate on heap; otherwise on stack
         sbm (SbufManager): SBUF memory manager instance
+        rms_recip_out (Optional[NkiTensor]): [BxS, 1] FlashNorm Opt-2 1/RMS output; when
+            given, the scale is not applied here.
+        weightless (bool): FlashNorm Opt 1 — skip the gamma load + multiply because gamma
+            is pre-folded into the consumer's weight rows. Caller-driven, never read from
+            the environment here; see _process_rmsnorm_tile for why.
 
     Returns:
         None: Results written directly to output tensor view
@@ -748,6 +913,8 @@ def _rmsnorm_tkg_llama_impl(
     # Load input and reuse output_buffer
     if input.buffer == nl.sbuf:
         input_sb_view = input
+        # Caller-supplied SBUF input is a different buffer from output.
+        input_aliases_output = False
     else:
         input_sb_view = load_input_to_sbuf(
             input_hbm=input,
@@ -757,37 +924,56 @@ def _rmsnorm_tkg_llama_impl(
             shard_on_h=shard_on_h,
             sbm=sbm,
         )
+        # The HBM load lands IN `output`, so input_sb_view and output are the same buffer
+        # seen through two views. Recorded here (the only place that knows) so the tile
+        # processor can skip a self-copy on the FlashNorm Opt-1+2 path.
+        input_aliases_output = True
 
-    # Load gamma
-    # if hidden_dim_tp is on, rmsnorm_gamma offset needs to be 32B aligned
-    gamma_align = 32 if hidden_dim_tp else None
-    gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, align=gamma_align)
-    num_allocated_tensor += 1
-    gamma_sb_view = load_gamma_to_sbuf(
-        gamma_hbm=gamma,
-        gamma_sb=gamma_sb,
-        num_H_shards=num_H_shards,
-        hidden_dim_tp=hidden_dim_tp,
-        shard_on_h=shard_on_h,
-    )
+    # Load gamma. FlashNorm Opt 1 folds it into the consumer weight, so skip the DMA too.
+    if weightless:
+        gamma_sb_view = None
+    else:
+        # if hidden_dim_tp is on, rmsnorm_gamma offset needs to be 32B aligned
+        gamma_align = 32 if hidden_dim_tp else None
+        gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, align=gamma_align)
+        num_allocated_tensor += 1
+        gamma_sb_view = load_gamma_to_sbuf(
+            gamma_hbm=gamma,
+            gamma_sb=gamma_sb,
+            num_H_shards=num_H_shards,
+            hidden_dim_tp=hidden_dim_tp,
+            shard_on_h=shard_on_h,
+        )
 
     # Load eps
     eps_sb = alloc_tensor(shape=(H0, 1), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
-    nisa.memset(eps_sb, value=eps)
+    _ms1 = nisa.memset(eps_sb, value=eps)
 
     # Load matmul reduction const
     matmul_reduction_const = alloc_tensor(shape=(H0, H0), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
-    nisa.memset(matmul_reduction_const, value=1.0)
+    _ms2 = nisa.memset(matmul_reduction_const, value=1.0)
+    if _PIN_AFTER[0] is not None:
+        for _h in (_ms1, _ms2):
+            if _h is not None:
+                _h.depends_on(_PIN_AFTER[0], kind=nisa.dependency.schedule)
 
     for bxs_tile in TiledRange(BxS, BxS_FULL_TILE_SIZE):
         input_sb_view_tile = input_sb_view.slice(
             dim=1, start=bxs_tile.start_offset, end=bxs_tile.start_offset + bxs_tile.size
         )
-        gamma_sb_view_tile = gamma_sb_view.expand_dim(dim=1).broadcast(dim=1, size=bxs_tile.size)
+        gamma_sb_view_tile = (
+            gamma_sb_view.expand_dim(dim=1).broadcast(dim=1, size=bxs_tile.size) if gamma_sb_view is not None else None
+        )
         output_sb_view_tile = output.slice(
             dim=1, start=bxs_tile.start_offset, end=bxs_tile.start_offset + bxs_tile.size
+        )
+        # rms_recip_out is [BxS, 1] (tokens on the partition axis), so a BxS tile slices dim 0.
+        rms_recip_out_tile = (
+            rms_recip_out.slice(dim=0, start=bxs_tile.start_offset, end=bxs_tile.start_offset + bxs_tile.size)
+            if rms_recip_out is not None
+            else None
         )
         _process_rmsnorm_tile(
             input_sb_view=input_sb_view_tile,
@@ -800,6 +986,10 @@ def _rmsnorm_tkg_llama_impl(
             shard_on_h=shard_on_h,
             use_heap_memory=use_heap_memory,
             sbm=sbm,
+            rms_recip_out=rms_recip_out_tile,
+            eps_scalar=eps,
+            weightless=weightless,
+            input_aliases_output=input_aliases_output,
         )
 
     if use_heap_memory:

@@ -459,7 +459,9 @@ def input_norm_load(
             dims.hidden_layout = HiddenLayout.H0_T_H1
 
             input_view = input
-            if len(input_view.shape) == 3:
+            if (
+                len(input_view.shape) == 3
+            ):  # pragma: no branch - one-directional: no-norm non-transposed input always 3D, ndim!=3 arc dead
                 input_view = input_view.flatten_dims(start_dim=0, end_dim=1)
 
             # Use contiguous load + on-chip transpose for small H
@@ -484,7 +486,9 @@ def input_norm_load(
                 sbm.set_name_prefix(prev_prefix)
             else:
                 input_view = input
-                if len(input_view.shape) == 3:
+                if (
+                    len(input_view.shape) == 3
+                ):  # pragma: no branch - one-directional: no-norm input always 3D (large-H branch), ndim!=3 arc dead
                     input_view = input_view.flatten_dims(start_dim=0, end_dim=1)
 
                 # Apply T_offset slicing for T-tiling
@@ -537,7 +541,9 @@ def _load_transposed_tile(
         src_view = src_tensor.slice(dim=src_dim, start=0, end=total_size - res_elements).reshape_dim(
             dim=src_dim, shape=(num_full_tiles, tile_size)
         )
-        if not src_view.is_indirect():
+        if (
+            not src_view.is_indirect()
+        ):  # pragma: no branch - one-directional: mlp passes only static tensors, indirect-gather else arc dead
             while src_view.ndim < 4:
                 src_view = src_view.expand_dim(1)
             nisa.dma_transpose(
@@ -617,7 +623,7 @@ def transpose_store(
 
     # Transpose output[H0, H1, T] to [T, H], only required in LHS/RHS swap projection
     H0, H1, T = output_temp.shape
-    for h1_tile_idx in range(H1):
+    for h1_tile_idx in range(H1):  # pragma: no cover - transpose_store has no caller within mlp_tkg module
         psum_idx = h1_tile_idx % dims._psum_bmax
         tp_psum = nl.ndarray(
             (T, H0),
@@ -706,7 +712,9 @@ def adaptive_dge_mode(tensor: nl.NkiTensor) -> int:
     Returns:
         int: _DGE_MODE_UNKNOWN if dynamic access (compiler decides), _DGE_MODE_NONE (static) otherwise.
     """
-    if not tensor.is_indirect():
+    if (
+        not tensor.is_indirect()
+    ):  # pragma: no branch - one-directional: mlp passes only static tensors, indirect adaptive-dge else arc dead
         return _DGE_MODE_NONE
     else:
         return _DGE_MODE_UNKNOWN

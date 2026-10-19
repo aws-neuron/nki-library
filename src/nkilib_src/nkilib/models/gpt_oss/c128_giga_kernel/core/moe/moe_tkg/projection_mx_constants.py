@@ -14,8 +14,10 @@
 
 """Shared constants and configuration for MX projection sub-kernels."""
 
+import os as _os
 from dataclasses import dataclass
 
+import nki.isa as _nisa
 import nki.language as nl
 
 from ...utils.kernel_assert import kernel_assert
@@ -170,3 +172,33 @@ class ProjConfig(nl.NKIObject):
             self.prg_id = 0
 
         self.check_shapes()
+
+
+# Route the MoE gate/up and down WEIGHT loads onto the software-DGE queue instead of the sync
+# static engine (their default `dge_mode=none`). Static DMA and SWDGE run on separate engines in
+# parallel, so ordering between a static load and a swdge load is a cross-engine race; putting the
+# big weight loads on one swdge FIFO makes their relative order enforceable (the property
+# idx12/idx23/idx24 chased one load at a time).
+# SCOPE: weights only. The MX scale and bias loads stay STATIC on purpose -- they are small and
+# numerous (8 scale + 2 bias DMAs per layer for gate/up, 4 + 1 for down), so moving them would
+# crowd the swdge queue that the weight loads are meant to own. Output stores are NOT affected.
+MOE_LOAD_SWDGE = _os.environ.get("VLLM_NEURON_MEGA_MOE_SWDGE") == "1"
+
+
+def moe_load_dge_mode(force_swdge: bool = False):
+    """dge_mode for a MoE weight/scale/bias LOAD: swdge when requested, else the static default."""
+    return _nisa.dge_mode.swdge if (MOE_LOAD_SWDGE or force_swdge) else _nisa.dge_mode.none
+
+
+# VLLM_NEURON_MEGA_UPDOWN_P0=1: DMA-QoS priority 0 (highest) on the UP and DOWN weight prefetches.
+# Designed to pair with GATE_P2_SWA: the SWA layers' gate is tagged P2 so it yields to the
+# collectives and gets clamped by --p2-max-desc-bytes, while up/down sit at P0 where the compiler
+# cannot downgrade them AND no --pN-max-desc-bytes cap applies, so they keep their large contiguous
+# descriptors. The loads stay STATIC (dge_mode=none) -- a priority with dge_mode unset would route
+# the DMA to swdge instead.
+MOE_UPDOWN_P0 = _os.environ.get("VLLM_NEURON_MEGA_UPDOWN_P0") == "1"
+
+
+def moe_updown_priority():
+    """DMA-QoS priority for the UP / DOWN weight prefetch: 0 when requested, else compiler default."""
+    return 0 if MOE_UPDOWN_P0 else None

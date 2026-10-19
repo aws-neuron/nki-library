@@ -88,6 +88,7 @@ def rmsnorm_mx_prefill(
     unpadded_hidden_size: int = None,
     residual: nl.NkiTensor = None,
     emit_norm_bf16: bool = False,
+    hidden_interleaved: bool = False,
 ):
     """Fused RMSNorm [T,H] + MX quantization (+ optional router top-K) for prefill.
 
@@ -97,11 +98,11 @@ def rmsnorm_mx_prefill(
         H0 = 128 partition fold, num_H512 = H/512, q_width = 4
 
     Args:
-        hidden_states (nl.NkiTensor): [B, S, H] bf16 input on HBM. Loaded in NATURAL H order -- the
-            kernel applies the swizzle internally during the FP32-packed transpose (see below), so the
-            caller must NOT pre-permute the hidden states.
-        gamma (nl.NkiTensor): [1, H] or [H] RMSNorm weights on HBM. Natural H order (indexes hidden_states
-            directly); not swizzled.
+        hidden_states (nl.NkiTensor): [B, S, H] bf16 input on HBM. H order is set by hidden_interleaved:
+            False (default) = NATURAL H (not permuted); True = 4-way interleaved. Either way the caller
+            does NOT apply the internal swizzle -- the kernel does that during the FP32-packed transpose.
+        gamma (nl.NkiTensor): [1, H] or [H] RMSNorm weights on HBM. Always NATURAL H order, independent of
+            hidden_interleaved (the kernel de-interleaves hidden_states during the load); not swizzled.
         router_weights (nl.NkiTensor): [H, E] router weights PRE-PERMUTED into the kernel's internal
             swizzle H order on HBM. If None, the router is skipped and only the packed quant tensor is
             returned.
@@ -167,13 +168,21 @@ def rmsnorm_mx_prefill(
         residual (nl.NkiTensor): [B, S, H] optional residual on HBM. When set, the kernel adds it to
             hidden_states before RMSNorm (hidden = hidden_states + residual); the norm/quant/router
             all consume the sum. The pre-norm sum is also written out (output_residual) for the next
-            layer's residual stream. If None, no residual add is performed.
+            layer's residual stream, in the SAME H order as the inputs (interleaved when
+            hidden_interleaved) -- the model's residual stream is itself interleaved, so this hands it
+            back ready to use. If None, no residual add is performed.
         emit_norm_bf16 (bool): when True, additionally return the token-major bf16 RMSNorm output
             norm_bf16 [T, H] = (hidden [+ residual]) * inv_rms * gamma, in NATURAL H order -- the same
             value a standalone RMSNorm produces. This lets one fused launch feed both the MX-quant
             consumers AND bf16 consumers (attention wq_a/wkv_a, the sparse indexer wk/weights_proj) that
             need the normed activation un-quantized. Computed fp32 and cast to bf16 on store (matches a
-            torch RMSNorm reference); orthogonal to the router and to residual.
+            torch RMSNorm reference); orthogonal to the router and to residual. Natural H even under
+            hidden_interleaved (hidden_states is de-interleaved during the load).
+        hidden_interleaved (bool): when True, hidden_states and residual arrive in the model's 4-way
+            interleaved H order (stored[q*(H/4) + p] == natural[4*p + q]) instead of natural H. gamma
+            stays natural H either way. Outputs match what each consumer wants: the packed MX row and
+            norm_bf16 are natural H (they feed kernels), while output_residual comes back in the input's
+            order (it feeds the model's own residual stream, which is interleaved).
 
     Returns:
         list of HBM tensors, always starting with norm_quant_packed (nl.NkiTensor): [T, row_region]
@@ -353,22 +362,48 @@ def rmsnorm_mx_prefill(
 
         """Stage 1: load tile (+ optional residual add, fused on the DMA engine via dma_compute so it
         costs no Vector/Scalar/PE cycles -- the bottleneck engines stay free for quantize_mx). The
-        pre-norm sum hidden = input + residual feeds the norm and is also spilled to output_residual."""
+        pre-norm sum hidden = input + residual feeds the norm and is also spilled to output_residual.
+
+        Under hidden_interleaved the de-interleave happens HERE, once per tile, so every later stage sees
+        natural H and reads contiguously."""
+        num_p = H // _Q_WIDTH
         in_tile = sbm.alloc_stack((_H0, H), dtype=in_dtype, name=f"in_tile_t{tile_idx}")
+        # Interleaved input: load into a staging tile in the input's order so the DMA stays one wide
+        # contiguous transfer, then de-interleave SBUF->SBUF below.
+        raw_tile = (
+            sbm.alloc_stack((_H0, H), dtype=in_dtype, name=f"raw_tile_t{tile_idx}") if hidden_interleaved else in_tile
+        )
         if has_residual:
             nisa.dma_compute(
-                dst=in_tile[0:n_tok, 0:H],
+                dst=raw_tile[0:n_tok, 0:H],
                 srcs=[in_view[tok_off : tok_off + n_tok, 0:H], residual_view[tok_off : tok_off + n_tok, 0:H]],
                 reduce_op=nl.add,
             )
+            # Spilled in the INPUT's H order (interleaved under the flag): output_residual feeds the
+            # model's residual stream, which is itself interleaved, so it needs no re-shuffle.
             nisa.dma_copy(
                 dst=output_residual[tok_off : tok_off + n_tok, 0:H],
-                src=in_tile[0:n_tok, 0:H],
+                src=raw_tile[0:n_tok, 0:H],
                 dge_mode=nisa.dge_mode.hwdge,
             )
         else:
             nisa.dma_copy(
-                dst=in_tile[0:n_tok, 0:H], src=in_view[tok_off : tok_off + n_tok, 0:H], dge_mode=nisa.dge_mode.hwdge
+                dst=raw_tile[0:n_tok, 0:H], src=in_view[tok_off : tok_off + n_tok, 0:H], dge_mode=nisa.dge_mode.hwdge
+            )
+        if hidden_interleaved:
+            # src slot q*(H/4)+p -> dst slot 4p+q, in two halves of the p range across Vector and Scalar.
+            p_half = num_p // 2
+            nat_pat = [[H, _H0], [_Q_WIDTH, num_p], [1, _Q_WIDTH]]
+            int_pat = [[H, _H0], [1, num_p], [num_p, _Q_WIDTH]]
+            nisa.tensor_copy(
+                dst=in_tile.ap(pattern=nat_pat)[0:n_tok, 0:p_half, 0:_Q_WIDTH],
+                src=raw_tile.ap(pattern=int_pat)[0:n_tok, 0:p_half, 0:_Q_WIDTH],
+                engine=nisa.engine.vector,
+            )
+            nisa.tensor_copy(
+                dst=in_tile.ap(pattern=nat_pat, offset=p_half * _Q_WIDTH)[0:n_tok, 0:p_half, 0:_Q_WIDTH],
+                src=raw_tile.ap(pattern=int_pat, offset=p_half)[0:n_tok, 0:p_half, 0:_Q_WIDTH],
+                engine=nisa.engine.scalar,
             )
 
         """Stages 2-4: fused RMSNorm + swizzle-transpose + router, split so the transpose/router path
@@ -611,6 +646,7 @@ def _fused_norm_router_transpose_quantize(
             (_H0, _TRANSPOSED_FREE), dtype=nl.float32, name=f"norm_block_t{tile_idx}_b{block_idx}"
         )
         norm_block_16b = norm_block.view(compute_dtype)
+        # in_tile is natural H on both arcs (de-interleaved in the Stage 1 load), so this read is contiguous.
         nisa.tensor_tensor(
             dst=norm_block_16b[0:n_tok, 0:_QUANT_FREE],
             data1=in_tile[0:n_tok, block_off : block_off + _QUANT_FREE],

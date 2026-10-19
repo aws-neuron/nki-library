@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
 import sys
@@ -48,6 +49,11 @@ import numpy.typing as npt
 
 from .metrics_collector import IMetricsCollector
 
+# Linux NAME_MAX: the longest a single path component (a file or directory name) may
+# be, in bytes. Test node IDs become output directory names, both locally and on the
+# fleet hosts, so every producer of such a name checks against this.
+MAX_PATH_COMPONENT_LENGTH = 255
+
 # Directory name for inference artifacts
 INF_ARTIFACT_DIR_NAME = "infer_result"
 
@@ -59,6 +65,11 @@ PROFILER_DB_DIR_NAME = "profiler_db"
 # paired with the NTFF of the inference that ran against it.
 NEFF_NAME = "file.neff"
 SEPARATED_NEFF_NAME = "file-separated.neff"
+
+# Allocator/scheduler flow an unspecified compile_mode means: the one kernel_tracer
+# hardcoded before it became selectable. Not the same as leaving nki's compile_mode
+# unset, which falls through to the C++ defaults (LSA and scheduling both ON).
+DEFAULT_COMPILE_MODE = "enable-alloc=legacy"
 
 # Test type constants for parametrized test filtering
 # MODEL_TEST_TYPE is used to identify model-derived test configs for weekly regression runs
@@ -263,9 +274,8 @@ class NKICompilationMode(Enum):
 
 class SeparationPassMode(Enum):
     NONE = "none"
-    DIRECT = "direct"
-    INDIRECT = "indirect"
-    INDIRECT_SERIALIZE = "indirect-serialize"  # Indirect separation with ordered edges between all moved loads
+    DEFAULT = "default"
+    SERIALIZE_LOADS = "serialize-loads"  # Separation with ordered edges between all moved loads
 
 
 class UploadProfileMode(Enum):
@@ -416,6 +426,21 @@ GoldenTensorMapping = Mapping[str, npt.NDArray[Any] | CustomValidatorWithOutputT
 GoldenOutputType = LazyGoldenGenerator | PerRankLazyGoldenGenerator | GoldenTensorMapping
 
 
+def normalize_kernel_input(
+    kernel_input: dict[str, Any] | PerRankLazyInputGenerator | None, rank_id: int = 0
+) -> dict[str, Any]:
+    """Normalize kernel_input to a plain dict of arg name -> value.
+
+    Resolves lazily-generated inputs so every consumer (single-core dump, birsim,
+    and simulation) sees a plain mapping:
+    - PerRankLazyInputGenerator: materialise the given rank (default rank 0)
+    - Plain dict / None: returned as-is (None -> empty dict)
+    """
+    if isinstance(kernel_input, PerRankLazyInputGenerator):
+        return kernel_input.for_rank(rank_id)
+    return kernel_input or {}
+
+
 def normalize_golden_output(golden_output: GoldenOutputType, rank_id: int = 0) -> GoldenTensorMapping:
     """Normalize golden_output to a dict of output name -> tensor.
 
@@ -551,11 +576,19 @@ class ResolvedHost:
     source when it resolves the host (0 if unknown / not probed); it drives capacity-based
     routing in the host-state store — a host with fewer cores than a request needs is
     ineligible for it.
+
+    ``logical_host_id``/``logical_host_rank``/``logical_host_size`` identify the multi-node
+    deployment the host belongs to (hosts sharing an id form one deployment), the host's index
+    within it, and the deployment's host count. All are ``None`` for a single-node host or when
+    the host's tooling does not report them.
     """
 
     ssh_host: str
     host_type: Platforms
     num_physical_cores: int = 0
+    logical_host_id: str | None = None
+    logical_host_rank: int | None = None
+    logical_host_size: int | None = None
 
 
 class InstanceSize(StrEnum):
@@ -608,6 +641,10 @@ class CompilerArgs:
     # (--nki-compilation-mode, default parser). Set to NKICompilationMode.tracer to
     # pin the tracer frontend for a test regardless of how the suite is invoked.
     nki_compilation_mode: "NKICompilationMode | None"
+    # Per-test allocator/scheduler flow override, one of
+    # nki.compiler.ncc_driver.COMPILE_MODES. None => use the session/CLI default
+    # (--compile-mode). Pin it for a kernel that only compiles under one flow.
+    compile_mode: "str | None"
 
     def __init__(
         self,
@@ -620,6 +657,7 @@ class CompilerArgs:
         separation_pass_mode: SeparationPassMode = SeparationPassMode.NONE,
         enable_device_dump: bool = False,
         nki_compilation_mode: "NKICompilationMode | None" = None,
+        compile_mode: "str | None" = None,
     ):
         self.platform_target = platform_target
         self.additional_cmd_args = additional_cmd_args if additional_cmd_args is not None else []
@@ -629,12 +667,13 @@ class CompilerArgs:
         self.separation_pass_mode = separation_pass_mode
         self.enable_device_dump = enable_device_dump
         self.nki_compilation_mode = nki_compilation_mode
+        self.compile_mode = compile_mode
         if os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS"):
             sep_mode = os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS")
             if sep_mode == "serialize":
-                self.separation_pass_mode = SeparationPassMode.INDIRECT_SERIALIZE
+                self.separation_pass_mode = SeparationPassMode.SERIALIZE_LOADS
             else:
-                self.separation_pass_mode = SeparationPassMode.INDIRECT
+                self.separation_pass_mode = SeparationPassMode.DEFAULT
         if logical_nc_config is None:
             self.logical_nc_config = self.__get_logical_nc_config_for_platform__()
         else:
@@ -763,3 +802,90 @@ class NeuronDeviceInfo:
         if max_id - min_id + 1 == len(self.neuroncore_ids):
             return f"{min_id}-{max_id}"
         return ",".join(str(id) for id in self.neuroncore_ids)
+
+
+# neuron-ls JSON flags, newest first. ``--output-format json`` adds instance-level info (incl.
+# multi-node topology); older neuron-ls only supports ``--json-output``, which emits the bare
+# device list.
+NEURON_LS_JSON_ARGS: tuple[tuple[str, ...], ...] = (("--output-format", "json"), ("--json-output",))
+
+
+def looks_like_json(stdout: str) -> bool:
+    """Whether stdout opens a JSON object or array.
+
+    An old neuron-ls rejects an unknown flag by printing ``unknown flag `output-format'`` to
+    STDOUT, not stderr, so neither the stream nor the exit code distinguishes a rejected attempt
+    from a good one. The shape of the payload is the reliable signal.
+    """
+    return stdout.lstrip()[:1] in ("{", "[")
+
+
+def neuron_ls_json_command(neuron_ls_bin: str) -> str:
+    """Shell command running neuron-ls with JSON output, falling back to the legacy flag when
+    the installed neuron-ls predates ``--output-format``. LNC is forced so physical-core counting
+    matches what the worker will see. Parse the output with :meth:`NeuronLsReport.from_stdout`.
+
+    The first attempt's stdout is captured instead of streamed: an old neuron-ls writes its
+    ``unknown flag`` complaint there, and streaming it would prepend garbage to the fallback's
+    JSON. Only JSON-shaped output is emitted, so neither a usage message on a zero exit nor one
+    on a non-zero exit can reach the parser.
+    """
+    env = f"NEURON_LOGICAL_NC_CONFIG={NeuronDeviceInfo.logical_neuroncore_config}"
+    new_args, legacy_args = (" ".join(args) for args in NEURON_LS_JSON_ARGS)
+    return (
+        f"out=$({env} {neuron_ls_bin} {new_args} 2>/dev/null); "
+        'case "$out" in [\\[{]*) printf \'%s\\n\' "$out" ;; '
+        f"*) {env} {neuron_ls_bin} {legacy_args} ;; esac"
+    )
+
+
+@dataclass
+class NeuronLsReport:
+    """Parsed neuron-ls JSON output in either format.
+
+    ``--output-format json`` emits ``{"instance_info": {...}, "devices": [...]}``; the multi-node
+    deployment is taken from ``instance_info.ultraserver_info`` (its id alone decides membership).
+    That format omits the per-device ``instance_type`` (it lives once under ``instance_info``), so it
+    is copied onto every device that lacks one, giving callers the same device shape in both formats.
+    Legacy ``--json-output`` emits only the device list, so the ``logical_host_*`` fields stay
+    ``None``, as they do for a single-node host.
+    """
+
+    devices: list[NeuronDeviceInfo]
+    logical_host_id: str | None = None
+    logical_host_rank: int | None = None
+    logical_host_size: int | None = None
+
+    @classmethod
+    def from_stdout(cls, stdout: str) -> "NeuronLsReport":
+        """Parse neuron-ls stdout. Raises ``json.JSONDecodeError``/``ValueError``/``KeyError`` on
+        malformed output; empty JSON (``[]``, ``{}``, ``null``) yields no devices."""
+        data = json.loads(stdout)
+        if not data:
+            return cls(devices=[])
+        if isinstance(data, list):
+            return cls(devices=[NeuronDeviceInfo.from_dict(device) for device in data])
+        if not isinstance(data, dict):
+            raise ValueError(f"unexpected neuron-ls JSON type: {type(data).__name__}")
+
+        instance_info = data.get("instance_info") or {}
+        instance_type = instance_info.get("instance_type") or ""
+        devices = [
+            NeuronDeviceInfo.from_dict({**device, "instance_type": device.get("instance_type") or instance_type})
+            for device in data.get("devices") or []
+        ]
+        ultraserver_info = instance_info.get("ultraserver_info") or {}
+        raw_id = ultraserver_info.get("ultraserver_id")
+        if raw_id is None or str(raw_id) == "":
+            return cls(devices=devices)
+        return cls(
+            devices=devices,
+            logical_host_id=str(raw_id),
+            logical_host_rank=ultraserver_info.get("ultraserver_instance_index"),
+            logical_host_size=ultraserver_info.get("ultraserver_size"),
+        )
+
+    @property
+    def total_physical_cores(self) -> int:
+        """Physical cores across all devices, as ``Host.get_total_physical_cores`` computes them."""
+        return sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in self.devices)

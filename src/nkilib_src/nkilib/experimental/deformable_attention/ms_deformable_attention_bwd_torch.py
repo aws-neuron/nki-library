@@ -14,6 +14,8 @@
 
 """PyTorch reference implementation for Multi-Scale Deformable Attention Backward Pass."""
 
+from typing import Optional
+
 import torch
 
 
@@ -28,6 +30,19 @@ def ms_deformable_attention_bwd_torch_ref(
     sampling_locations_layout: str = "BQHLP2",
     align_corners: bool = False,
     padding_mode: str = "zeros",
+    max_gather_indices_per_indirect: Optional[int] = None,
+    max_scatter_indices_per_indirect: Optional[int] = None,
+    gather_method: str = "transpose",
+    num_scatter_buffers: Optional[int] = None,
+    compute_grad_value: bool = True,
+    compute_grad_sampling_locations: bool = True,
+    compute_grad_attention_weights: bool = True,
+    iota_k_scale_in=None,
+    grad_value_buffers_in=None,
+    prev_reduced_grad_value=None,
+    dump_iota_k_scale: bool = False,
+    dump_grad_value_buffers: bool = False,
+    dump_reduced_grad_value: bool = False,
 ) -> dict:
     """
     PyTorch reference implementation of multi-scale deformable attention backward pass.
@@ -247,8 +262,11 @@ def ms_deformable_attention_bwd_torch_ref(
             0, 5, 1, 2, 3, 4
         )  # (B, N_q, N_h, N_l, N_p, 2) -> (B, 2, N_q, N_h, N_l, N_p)
 
-    return {
-        "out_grad_value": grad_value,
-        "out_grad_sampling_locations": grad_sampling_locations,
-        "out_grad_attention_weights": grad_attention_weights,
-    }
+    out = {}
+    if compute_grad_value:
+        out["out_grad_value"] = grad_value
+    if compute_grad_sampling_locations:
+        out["out_grad_sampling_locations"] = grad_sampling_locations
+    if compute_grad_attention_weights:
+        out["out_grad_attention_weights"] = grad_attention_weights
+    return out

@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import enum
-from typing import Optional, TypedDict, final
+from typing import Any, Optional, TypedDict, final
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
+from nkilib_src.nkilib.core.qkv.qkv import qkv as qkv_dispatch
 from nkilib_src.nkilib.core.qkv.qkv_tkg import qkv_tkg
 from nkilib_src.nkilib.core.qkv.qkv_torch import qkv_torch_ref
 from nkilib_src.nkilib.core.subkernels.layernorm_tkg import (
@@ -77,39 +78,39 @@ class QkvTkgClassification(enum.Enum):
 
 @nki.jit
 def qkv_tkg_sb2sb_wrapper_kernel(
-    input: nl.ndarray,
-    fused_qkv_weights: nl.ndarray,
+    input: nl.NkiTensor,
+    fused_qkv_weights: nl.NkiTensor,
     output_layout: QKVOutputLayout = QKVOutputLayout.BSD,
     # -- Bias
-    bias: Optional[nl.ndarray] = None,
+    bias: Optional[nl.NkiTensor] = None,
     # -- Quantization
     quantization_type: QuantizationType = QuantizationType.NONE,
-    qkv_w_scale: Optional[nl.ndarray] = None,
-    qkv_in_scale: Optional[nl.ndarray] = None,
+    qkv_w_scale: Optional[nl.NkiTensor] = None,
+    qkv_in_scale: Optional[nl.NkiTensor] = None,
     # -- Fused Residual Add
     fused_residual_add: bool = False,
-    mlp_prev: Optional[nl.ndarray] = None,
-    attention_prev: Optional[nl.ndarray] = None,
+    mlp_prev: Optional[nl.NkiTensor] = None,
+    attention_prev: Optional[nl.NkiTensor] = None,
     # --- Fused Norm Related
     fused_norm_type: NormType = NormType.NO_NORM,
-    gamma_norm_weights: Optional[nl.ndarray] = None,
-    layer_norm_bias: Optional[nl.ndarray] = None,
+    gamma_norm_weights: Optional[nl.NkiTensor] = None,
+    layer_norm_bias: Optional[nl.NkiTensor] = None,
     norm_eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     # --- Fused RoPE Related
     fused_rope: Optional[bool] = False,
-    cos_cache: Optional[nl.ndarray] = None,
-    sin_cache: Optional[nl.ndarray] = None,
-    k_cos_cache: Optional[nl.ndarray] = None,
-    k_sin_cache: Optional[nl.ndarray] = None,
+    cos_cache: Optional[nl.NkiTensor] = None,
+    sin_cache: Optional[nl.NkiTensor] = None,
+    k_cos_cache: Optional[nl.NkiTensor] = None,
+    k_sin_cache: Optional[nl.NkiTensor] = None,
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
     # --- FP8 KV Cache Quantization Related (unused, accepted for signature match with qkv)
-    k_cache: Optional[nl.ndarray] = None,
-    v_cache: Optional[nl.ndarray] = None,
-    k_scale: Optional[nl.ndarray] = None,
-    v_scale: Optional[nl.ndarray] = None,
+    k_cache: Optional[nl.NkiTensor] = None,
+    v_cache: Optional[nl.NkiTensor] = None,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
     fp8_max: Optional[float] = None,
     fp8_min: Optional[float] = None,
     kv_dtype: Optional[type] = None,
@@ -118,7 +119,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     use_block_kv: bool = False,
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
-    slot_mapping: Optional[nl.ndarray] = None,
+    slot_mapping: Optional[nl.NkiTensor] = None,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -135,25 +136,25 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     # --- QK-Norm Related (unused, accepted for signature match with qkv_torch_ref)
     qk_norm_pre_rope=None,
     qk_norm_post_rope=None,
-    qk_norm_pre_rope_q_gamma: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_k_gamma: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_q_gamma: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_k_gamma: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_q_beta: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_k_beta: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_q_beta: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_k_beta: Optional[nl.ndarray] = None,
+    qk_norm_pre_rope_q_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_k_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_q_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_k_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_q_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_k_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_q_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_k_beta: Optional[nl.NkiTensor] = None,
     transposed_in: bool = False,
     # --- Strided Input / Output (unused, accepted for signature match with qkv / qkv_torch_ref)
     strided_input_config=None,
-    output_hbm: Optional[nl.ndarray] = None,
+    output_hbm: Optional[nl.NkiTensor] = None,
     # --- Squared-sum outputs (unused here; accepted for signature match with qkv / qkv_torch_ref)
-    q_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
-    k_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
-    v_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
+    q_squared_sum_out: Optional[nl.NkiTensor] = None,  # noqa: ARG001
+    k_squared_sum_out: Optional[nl.NkiTensor] = None,  # noqa: ARG001
+    v_squared_sum_out: Optional[nl.NkiTensor] = None,  # noqa: ARG001
     # Signature parity with qkv_torch_ref; unused in wrapper (qkv_tkg is dtype-passing).
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     hidden = input
     qkv_w = fused_qkv_weights
     qkv_bias = bias
@@ -202,10 +203,10 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     )
     input_view = (
         hidden.flatten_dims(start_dim=0, end_dim=1)  # (BxS, H)
-        .reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])  # (BxS, num_shards, H0, H1_shard)
-        .permute(dims=[2, 0, 1, 3])  # (H0, BxS, num_shards, H1_shard)
+        .reshape_dim(dim=1, shape=(num_shards, H0, H1_shard))  # (BxS, num_shards, H0, H1_shard)
+        .permute(dims=(2, 0, 1, 3))  # (H0, BxS, num_shards, H1_shard)
     )
-    dst_view = hidden_sb.reshape_dim(dim=2, shape=[num_shards, H1_shard])  # (H0, BxS, num_shards, H1_shard)
+    dst_view = hidden_sb.reshape_dim(dim=2, shape=(num_shards, H1_shard))  # (H0, BxS, num_shards, H1_shard)
     nisa.dma_copy(
         dst=dst_view,
         src=input_view,
@@ -261,6 +262,94 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     sbm.close_scope()
 
     return output_hbm
+
+
+@nki.jit
+def qkv_dispatch_sbuf_input_wrapper_kernel(input, fused_qkv_weights):
+    """Build an SBUF input on-chip and call the TOP-LEVEL qkv() dispatcher (not
+    qkv_tkg directly), so the dispatcher's SBUF-input branch runs (qkv.py L316
+    else-arc / L324: input.buffer == nl.sbuf). BxS <= SEQLEN_THRESHOLD (96) so the
+    dispatcher routes SBUF input to qkv_tkg. Output spilled to HBM for validation."""
+    hidden = input
+    B, S, H = hidden.shape
+    BxS = B * S
+    H0 = nl.tile_size.pmax
+    H1 = H // H0
+    _, I = fused_qkv_weights.shape
+
+    sbm = SbufManager(
+        0,
+        nl.tile_size.total_available_sbuf_size - 16 * 1024,
+        logger=Logger("qkv-dispatch-sbuf-input-wrapper"),
+        use_auto_alloc=False,
+    )
+    sbm.open_scope()
+
+    _, num_shards, _ = get_verified_program_sharding_info()
+    H1_shard = H1 // num_shards
+    hidden_sb = sbm.alloc_heap(shape=(H0, BxS, H1), dtype=hidden.dtype, buffer=nl.sbuf, name="hidden_sb")
+    input_view = (
+        hidden.flatten_dims(start_dim=0, end_dim=1)
+        .reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])
+        .permute(dims=[2, 0, 1, 3])
+    )
+    dst_view = hidden_sb.reshape_dim(dim=2, shape=[num_shards, H1_shard])
+    nisa.dma_copy(dst=dst_view, src=input_view)
+
+    # Call the dispatcher with SBUF input + SBUF output.
+    output_sb = qkv_dispatch(
+        input=hidden_sb,
+        fused_qkv_weights=fused_qkv_weights,
+        output_layout=QKVOutputLayout.BSD,
+        fused_norm_type=NormType.NO_NORM,
+        store_output_in_sbuf=True,
+        sbm=sbm,
+    )
+    output_hbm = nl.ndarray((BxS, I), dtype=hidden_sb.dtype, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=output_hbm.ap(pattern=[[I, BxS], [1, I]], offset=0), src=output_sb)
+    sbm.close_scope()
+    return output_hbm
+
+
+def qkv_dispatch_sbuf_input_wrapper_ref(input, fused_qkv_weights):
+    """Torch ref: plain QKV projection (SBUF-vs-HBM input is a device-only detail)."""
+    return qkv_torch_ref(
+        input=input,
+        fused_qkv_weights=fused_qkv_weights,
+        output_layout=QKVOutputLayout.BSD,
+        fused_norm_type=NormType.NO_NORM,
+    )
+
+
+@nki.jit
+def qkv_tkg_nonauto_sbm_wrapper_kernel(input, fused_qkv_weights):
+    """Call qkv_tkg with HBM input/output and an explicit NON-auto SbufManager, so
+    the HBM-output weight loader's is_auto_alloc()==False branch runs (qkv_tkg.py
+    L1580 false-arc). Distinct from the sb2sb wrapper, which uses SBUF output."""
+    sbm = SbufManager(
+        0,
+        nl.tile_size.total_available_sbuf_size - 16 * 1024,
+        logger=Logger("qkv-tkg-nonauto-sbm-wrapper"),
+        use_auto_alloc=False,
+    )
+    return qkv_tkg(
+        hidden=input,
+        qkv_w=fused_qkv_weights,
+        norm_type=NormType.NO_NORM,
+        quantization_type=QuantizationType.NONE,
+        output_layout=QKVOutputLayout.BSD,
+        output_in_sbuf=False,
+        sbm=sbm,
+    )
+
+
+def qkv_tkg_nonauto_sbm_wrapper_ref(input, fused_qkv_weights):
+    return qkv_torch_ref(
+        input=input,
+        fused_qkv_weights=fused_qkv_weights,
+        output_layout=QKVOutputLayout.BSD,
+        fused_norm_type=NormType.NO_NORM,
+    )
 
 
 def filter_qkv_tkg_combinations(
@@ -385,9 +474,108 @@ class TestQkvTkgKernel:
             inference_args=TKG_INFERENCE_ARGS,
         )
 
+    @pytest.mark.fast
+    def test_qkv_dispatch_sbuf_input(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        # SBUF input routed through the top-level qkv() dispatcher (not qkv_tkg
+        # directly) so the dispatcher's SBUF-input branch runs (qkv.py L316/L324).
+        # Small BxS (<= SEQLEN_THRESHOLD 96) so the dispatcher accepts SBUF input.
+        B, S, H, fused_qkv_dim = 1, 4, 512, 512
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+
+        def input_generator(test_config):
+            full_input = build_qkv_input(
+                batch=B,
+                seqlen=S,
+                hidden_dim=H,
+                fused_qkv_dim=fused_qkv_dim,
+                dtype=nl.float16,
+                eps=1e-6,
+                norm_type=NormType.NO_NORM,
+                quantization_type=QuantizationType.NONE,
+                fused_add=False,
+                output_layout=QKVOutputLayout.BSD,
+                lnc_degree=2,
+                num_q_heads=2,
+                num_kv_heads=1,
+                d_head=128,
+            )
+            return {"input": full_input["input"], "fused_qkv_weights": full_input["fused_qkv_weights"]}
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((B, S, fused_qkv_dim), dtype=nl.float16)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=qkv_dispatch_sbuf_input_wrapper_kernel,
+            torch_ref=torch_ref_wrapper(qkv_dispatch_sbuf_input_wrapper_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
+    @pytest.mark.fast
+    def test_qkv_tkg_nonauto_sbm(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        # qkv_tkg with HBM output + explicit non-auto SbufManager, so the HBM-output
+        # weight loader's is_auto_alloc()==False branch runs (qkv_tkg.py L1580 false-arc).
+        # H=3072 (GPT-OSS) so use_I_column_tiling=True -> _qkv_projection_I_column_tiled
+        # (where L1580 lives) is the projection path taken.
+        B, S, H, fused_qkv_dim = 1, 4, 3072, 512
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+
+        def input_generator(test_config):
+            full_input = build_qkv_input(
+                batch=B,
+                seqlen=S,
+                hidden_dim=H,
+                fused_qkv_dim=fused_qkv_dim,
+                dtype=nl.float16,
+                eps=1e-6,
+                norm_type=NormType.NO_NORM,
+                quantization_type=QuantizationType.NONE,
+                fused_add=False,
+                output_layout=QKVOutputLayout.BSD,
+                lnc_degree=2,
+                num_q_heads=2,
+                num_kv_heads=1,
+                d_head=128,
+            )
+            return {"input": full_input["input"], "fused_qkv_weights": full_input["fused_qkv_weights"]}
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((B, S, fused_qkv_dim), dtype=nl.float16)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=qkv_tkg_nonauto_sbm_wrapper_kernel,
+            torch_ref=torch_ref_wrapper(qkv_tkg_nonauto_sbm_wrapper_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
     # fmt: off
     qkv_tkg_sb2sb_kernel_accuracy_test_params = "lnc_degree, batch, seqlen, hidden_dim, hidden_actual, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type, quantization_type, norm_bias, qkv_bias, eps, output_layout"
-    qkv_tkg_sb2sb_kernel_accuracy_test_perms = [
+    qkv_tkg_sb2sb_kernel_accuracy_test_perms: list[Any] = [
         # H support test & I support test
         [1, 1, 4, 16384, None, 384, 1, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, False, False, 1e-6, QKVOutputLayout.BSD],
         [1, 4, 1, 32768, None, 384, 1, 1, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, 1e-6, QKVOutputLayout.BSD],
@@ -425,6 +613,13 @@ class TestQkvTkgKernel:
     qkv_tkg_sb2sb_kernel_accuracy_test_perms += [
         [2, 1, 5, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 1, 1, 8192, None, 1408, 7, 2, 128, NormType.NO_NORM, QuantizationType.ROW, False, True, 1e-6, QKVOutputLayout.NBSd],
+    ]
+    # Small-shape mirrors so the SBUF-input path (hidden_in_sbuf) + explicit
+    # non-auto SbufManager (is_auto_alloc()==False) branches run under simulation.
+    # Every other sb2sb param uses a large hidden_dim (>=4096) and is sim-skipped.
+    qkv_tkg_sb2sb_kernel_accuracy_test_perms += [
+        pytest.param(2, 1, 1, 512, None, 384, 1, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, False, False, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
+        [2, 1, 1, 768, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, 1e-6, QKVOutputLayout.NBSd],
     ]
     # fmt: on
 
@@ -500,6 +695,8 @@ class TestQkvTkgKernel:
         transposed_in: bool = False,
         dtype_mode: DtypeMode = DtypeMode.NON_OCP,
         inference_args=TKG_INFERENCE_ARGS,
+        pre_broadcast_scales: bool = True,
+        mx_pre_broadcast_scales: bool = False,
     ):
         run_qkv_test(
             test_manager=test_manager,
@@ -529,6 +726,8 @@ class TestQkvTkgKernel:
             inference_args=inference_args,
             expect_fused_hidden_output=True,
             dtype_mode=dtype_mode,
+            pre_broadcast_scales=pre_broadcast_scales,
+            mx_pre_broadcast_scales=mx_pre_broadcast_scales,
         )
 
     # fmt: off
@@ -629,6 +828,108 @@ class TestQkvTkgKernel:
         )
 
     # fmt: off
+    # Non-pre-broadcast scale tests: scales passed with partition dim 1 ([1, N])
+    # to exercise the single-row-load + stream_shuffle_broadcast scale path
+    # (qkv_tkg.py shape[0] == 1 branches for STATIC w/in scales and ROW w scale).
+    # Small shapes so they run under simulation (no large-shape skip).
+    qkv_tkg_scale_broadcast_test_params = \
+        "lnc_degree, batch, seqlen, hidden_dim, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type, quantization_type"
+    qkv_tkg_scale_broadcast_test_perms = [
+        pytest.param(2, 1, 1, 512, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC, marks=pytest.mark.fast),
+        pytest.param(2, 1, 1, 512, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.ROW, marks=pytest.mark.fast),
+    ]
+
+    # Small-shape non-MX test with hidden_actual set (!= None) to cover the
+    # qkv_tkg.py L297 else-arc (hidden_actual defaulting). All existing
+    # hidden_actual params use H>=3072 and are large-shape-skipped.
+    qkv_tkg_hidden_actual_test_params = \
+        "lnc_degree, batch, seqlen, hidden_dim, hidden_actual, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type"
+    qkv_tkg_hidden_actual_test_perms = [
+        pytest.param(2, 1, 1, 512, 384, 384, 1, 1, 128, NormType.RMS_NORM, marks=pytest.mark.fast),
+    ]
+    # fmt: on
+
+    @pytest_parametrize(
+        qkv_tkg_hidden_actual_test_params,
+        qkv_tkg_hidden_actual_test_perms,
+    )
+    def test_qkv_tkg_hidden_actual_unit(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        hidden_dim,
+        hidden_actual,
+        fused_qkv_dim,
+        n_q_heads,
+        n_kv_heads,
+        d_head,
+        norm_type,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        self.run_qkv_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            B=batch,
+            H=hidden_dim,
+            S=seqlen,
+            dtype=nl.bfloat16,
+            eps=1e-6,
+            fused_add=False,
+            fused_qkv_dim=fused_qkv_dim,
+            lnc_degree=compiler_args.logical_nc_config,
+            norm_type=norm_type,
+            quantization_type=QuantizationType.NONE,
+            output_layout=QKVOutputLayout.BSD,
+            hidden_actual=hidden_actual,
+            n_kv_heads=n_kv_heads,
+            n_q_heads=n_q_heads,
+            d_head=d_head,
+        )
+
+    @pytest_parametrize(
+        qkv_tkg_scale_broadcast_test_params,
+        qkv_tkg_scale_broadcast_test_perms,
+    )
+    def test_qkv_tkg_scale_broadcast_unit(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        hidden_dim,
+        fused_qkv_dim,
+        n_q_heads,
+        n_kv_heads,
+        d_head,
+        norm_type,
+        quantization_type,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        self.run_qkv_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            B=batch,
+            H=hidden_dim,
+            S=seqlen,
+            dtype=nl.bfloat16,
+            eps=1e-6,
+            fused_add=False,
+            fused_qkv_dim=fused_qkv_dim,
+            lnc_degree=compiler_args.logical_nc_config,
+            norm_type=norm_type,
+            quantization_type=quantization_type,
+            output_layout=QKVOutputLayout.BSD,
+            n_kv_heads=n_kv_heads,
+            n_q_heads=n_q_heads,
+            d_head=d_head,
+            pre_broadcast_scales=False,
+        )
+
+    # fmt: off
     # transposed_in tests: input in [H0, n_prgs, H1_shard, BxS] layout
     qkv_tkg_transposed_in_test_params = \
         "lnc_degree, batch, seqlen, hidden_dim, hidden_actual, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type, quantization_type"
@@ -641,6 +942,15 @@ class TestQkvTkgKernel:
         pytest.param(2, 1, 1, 5120, None, 384, 1, 1, 128, NormType.NO_NORM, QuantizationType.NONE, marks=pytest.mark.fast),
         # STATIC quant with RMSNorm
         pytest.param(2, 8, 1, 8192, None, 768, 4, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC, marks=pytest.mark.fast),
+        # Small-shape mirrors so the transposed_in path runs under simulation
+        # (all above use H>=5120 and are large-shape-skipped). Covers the
+        # transposed_in load + shard-on-H RMSNorm + B/S-None output branches
+        # (qkv_tkg.py L500, L862, L881, L1359).
+        [2, 1, 1, 512, None, 384, 1, 1, 128, NormType.RMS_NORM, QuantizationType.NONE],
+        pytest.param(2, 1, 1, 512, None, 384, 1, 1, 128, NormType.NO_NORM, QuantizationType.NONE, marks=pytest.mark.fast),
+        # STATIC + transposed_in so the STATIC-quant "not transposed_in" guard
+        # takes its transposed_in=True (false) arc (qkv_tkg.py L954 false-arc).
+        pytest.param(2, 1, 1, 512, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC, marks=pytest.mark.fast),
     ]
     # fmt: on
 
@@ -943,6 +1253,76 @@ class TestQkvTkgKernel:
             n_kv_heads=n_kv_heads,
             n_q_heads=n_q_heads,
             d_head=d_head,
+        )
+
+    # fmt: off
+    # MX coverage tests: exercise branches the standard MX params leave uncovered:
+    #  - hidden_actual != None (mx_impl L242 else-arc)
+    #  - STATIC_MX with pre-broadcast [128, ...] scales (mx_impl L450/L632 else-arcs)
+    # Small shapes so they run under simulation. trn3_a0 (gen4) only.
+    qkv_tkg_mx_scales_and_bias_test_params = \
+        "lnc_degree, batch, seqlen, hidden_dim, hidden_actual, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type, quantization_type, qkv_bias, mx_pre_broadcast_scales"
+    qkv_tkg_mx_scales_and_bias_test_perms = [
+        # MX with hidden_actual set (non-None) -> mx_impl L242 else-arc.
+        pytest.param(2, 12, 1, 512, 512, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, False, False, marks=pytest.mark.fast),
+        # STATIC_MX with pre-broadcast [128, ...] scales -> mx_impl L450/L632 else-arcs.
+        pytest.param(2, 12, 1, 512, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.STATIC_MX, False, True, marks=pytest.mark.fast),
+        # STATIC_MX with bias + multi-head I (I=(2+2*5)*128=1536 spans multiple
+        # I-tiles) -> mx_impl per-Q/K/V dequant tile-boundary branches (L955/L967/
+        # L978 false-arcs), static-quant bias branch (L875), and the
+        # BxS != T_padded partial-row branch via BxS=12 (not a mult of tile).
+        pytest.param(2, 12, 1, 512, None, (2 + 2 * 5) * 128, 2, 5, 128, NormType.NO_NORM, QuantizationType.STATIC_MX, True, False, marks=pytest.mark.fast),
+        # ROW_MX with bias + BxS=13 (not a multiple of 4 -> T_padded=16 != BxS) ->
+        # ROW_MX partial-row memset (L649 true-arc) and ROW_MX bias branch (L898).
+        pytest.param(2, 13, 1, 512, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.ROW_MX, True, False, marks=pytest.mark.fast),
+    ]
+    # fmt: on
+
+    @pytest_parametrize(
+        qkv_tkg_mx_scales_and_bias_test_params,
+        qkv_tkg_mx_scales_and_bias_test_perms,
+    )
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    def test_qkv_tkg_mx_scales_and_bias_unit(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        hidden_dim,
+        hidden_actual,
+        fused_qkv_dim,
+        n_q_heads,
+        n_kv_heads,
+        d_head,
+        norm_type,
+        quantization_type,
+        qkv_bias,
+        mx_pre_broadcast_scales,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        self.run_qkv_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            B=batch,
+            H=hidden_dim,
+            S=seqlen,
+            dtype=nl.bfloat16,
+            eps=1e-6,
+            fused_add=False,
+            fused_qkv_dim=fused_qkv_dim,
+            lnc_degree=compiler_args.logical_nc_config,
+            norm_type=norm_type,
+            quantization_type=quantization_type,
+            is_h_dim_4h_transposed=True,
+            output_layout=QKVOutputLayout.BSD,
+            qkv_bias=qkv_bias,
+            hidden_actual=hidden_actual,
+            n_kv_heads=n_kv_heads,
+            n_q_heads=n_q_heads,
+            d_head=d_head,
+            mx_pre_broadcast_scales=mx_pre_broadcast_scales,
         )
 
     # fmt: off

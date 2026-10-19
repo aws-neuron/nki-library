@@ -331,12 +331,14 @@ def cleanup_heap_for_normalization(
     tile_info: MLPCTEBasicTileInfo,
     sbm: Optional[SbufManager],
 ):
-    if sbm != None:
+    if sbm != None:  # pragma: no branch - sbm always non-None from caller, sbm-None arc dead
         if mlpp_has_rms_normalization(mlp_params):
             sbm.pop_heap()  # square_result_sbuf
             for _ in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                 sbm.pop_heap()  # square_accum_result_sbuf_list
-        elif mlpp_has_layer_normalization(mlp_params):
+        elif mlpp_has_layer_normalization(
+            mlp_params
+        ):  # pragma: no branch - normalization is RMS or LAYER under has_normalization, exhaustive elif false arc dead
             sbm.pop_heap()  # bn_stats_result_sbuf
             for _ in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
                 sbm.pop_heap()  # bn_aggr_result_sbuf_list

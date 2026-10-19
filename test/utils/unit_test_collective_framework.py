@@ -24,17 +24,18 @@ import multiprocessing as mp
 import os
 import pickle
 import shutil
+import sys
 import tempfile
 import time
 import tracemalloc
 from typing import Callable, Optional
 
+import nkilib_src.nkilib.experimental.collectives.distributed_adapter as _canonical_dist_adapter
 import torch
 from nki.collectives import ReplicaGroup
 from nkilib_src.nkilib.experimental.collectives.distributed_adapter import (
     SimDistAdapter,
     replica_group_key,
-    set_adapter,
 )
 from torch.distributed import ProcessGroup, Work
 
@@ -214,6 +215,30 @@ def _log_vm_size(rank, label):
         pass
 
 
+# Every loaded copy of the distributed adapter: the canonical module plus the vendored
+# copies under models/gpt_oss/*_giga_kernel/experimental/collectives/. Each copy has its
+# own module-level sim-adapter slot, and the vendored torch refs import get_pg/get_rank
+# from their own copy, so the sim backend has to be installed on all of them.
+_DIST_ADAPTER_MODULE_SUFFIX = ".collectives.distributed_adapter"
+
+
+def _dist_adapter_modules() -> list:
+    """Return the canonical distributed_adapter module and every loaded vendored copy."""
+    mods = [_canonical_dist_adapter]
+    for name, mod in list(sys.modules.items()):
+        if mod is None or mod is _canonical_dist_adapter:
+            continue
+        if name.endswith(_DIST_ADAPTER_MODULE_SUFFIX) and callable(getattr(mod, "set_adapter", None)):
+            mods.append(mod)
+    return mods
+
+
+def _set_adapter_everywhere(adapter: Optional[SimDistAdapter]) -> None:
+    """Install (or clear, with None) the sim adapter on every loaded distributed_adapter module."""
+    for mod in _dist_adapter_modules():
+        mod.set_adapter(adapter)
+
+
 class SimDistRunner:
     """Memory-efficient multi-pass collective torch ref runner.
 
@@ -265,14 +290,14 @@ class SimDistRunner:
         torch.set_num_threads(1)
 
         pg_map = self._make_pg_map(rank, coll_dir, stop_after_call)
-        set_adapter(SimDistAdapter(rank, pg_map))
+        _set_adapter_everywhere(SimDistAdapter(rank, pg_map))
         try:
             result = torch_ref(**per_rank_inputs[rank])
             return result
         except _StopAfterCollective:
             return None  # expected — rank recorded its send and stopped
         finally:
-            set_adapter(None)
+            _set_adapter_everywhere(None)
 
     def run(self, torch_ref: Callable, per_rank_inputs: dict) -> dict:
         """Run torch_ref across all ranks with multi-pass memory optimization."""
