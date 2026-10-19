@@ -20,12 +20,14 @@ Tests cover various configurations including fused operations (normalization, re
 different data types, batch sizes, sequence lengths, and output layouts.
 """
 
+from test.utils.model_test_configs import no_model_configs
+
 try:
     from test.integration.nkilib.core.qkv.test_qkv_cte_model_config import (
         qkv_cte_model_configs,
     )
 except ImportError:
-    qkv_cte_model_configs = []
+    qkv_cte_model_configs = no_model_configs()
 
 import nki.language as nl
 import numpy as np

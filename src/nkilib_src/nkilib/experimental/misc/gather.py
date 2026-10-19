@@ -33,7 +33,7 @@ _D_TILE_FACTOR = 4
 
 
 @nki.jit
-def gather(input: nl.ndarray, dim: int, index: nl.ndarray) -> nl.ndarray:
+def gather(input: nl.NkiTensor, dim: int, index: nl.NkiTensor) -> nl.NkiTensor:
     """
     Gather rows from input based on indices using indirect DMA load.
 
@@ -47,12 +47,12 @@ def gather(input: nl.ndarray, dim: int, index: nl.ndarray) -> nl.ndarray:
         K: Number of indices (output rows)
 
     Args:
-        input (nl.ndarray): [N, D], Source tensor to gather from
+        input (nl.NkiTensor): [N, D], Source tensor to gather from
         dim (int): Dimension along which to gather (must be 0)
-        index (nl.ndarray): [K], 1D tensor of row indices into input
+        index (nl.NkiTensor): [K], 1D tensor of row indices into input
 
     Returns:
-        output (nl.ndarray): [K, D], Gathered result where output[i, :] = input[index[i], :]
+        output (nl.NkiTensor): [K, D], Gathered result where output[i, :] = input[index[i], :]
 
     Notes:
         - Input tensor must be 2D

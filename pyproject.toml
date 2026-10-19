@@ -7,7 +7,7 @@ name = "nki_library"
 dynamic = ["version", "entry-points"]
 description = "NeuronKernelInterfaceLibrary"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 keywords = ["NKI", "Neuron", "Kernels", "High-Performance", "Hardware", "AWS", "Amazon"]
 license = "Apache-2.0"
 dependencies = [
@@ -18,30 +18,51 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "numpy",
-    "pandas",
+    "numpy>=1.24",
+    "ml-dtypes",
+    "pandas[parquet]",
     "torch",
+    "scipy",
+    "typing_extensions",
     "aws-embedded-metrics",
     "boto3",
+    "httpx[http2]~=0.28.1",
     "fabric2",
+    "paramiko",
+    "websocket-client",
     "filelock",
     "plotext",
-    "pytest",
+    "allpairspy",
+    "debugpy",
+    "pytest==8.4.1",
     "pytest-cov",
     "pytest-xdist",
-    "pytest-metadata",
+    "pytest-timeout",
+    "pytest-rerunfailures",
     "pytest-html",
+    "pytest-metadata",
+    "pytest-memray",
+    "coverage",
     "ruff==0.14.13",
+    "ty==0.0.69",
     "pre-commit",
-    "debugpy",
-    "pytest-cov",
-    "allpairspy",
-    "pytest-timeout"
 ]
 
 [tool.setuptools]
 zip-safe = true
 include-package-data = true
+
+# The default index is intentionally not set here so it can be supplied at
+# install time. `explicit` restricts this index to the packages in
+# [tool.uv.sources].
+[[tool.uv.index]]
+name = "neuron"
+url = "https://pip.repos.neuron.amazonaws.com/"
+explicit = true
+
+[tool.uv.sources]
+neuronx-cc = { index = "neuron" }
+nki = { index = "neuron" }
 
 [tool.setuptools.dynamic]
 version = {attr = "nkilib_src.nkilib.version.__version__"}
@@ -49,19 +70,54 @@ version = {attr = "nkilib_src.nkilib.version.__version__"}
 [tool.setuptools.package-data]
 nkilib_src = ["py.typed"]
 
-[tool.mypy]
-check_untyped_defs = true
-show_error_codes = true
-pretty = true
-ignore_missing_imports = true
+[tool.ty.environment]
+python-version = "3.12"
+# ty (unlike the test harness) does not read PYTHONPATH or the runtime sys.path.
+# These paths let it resolve first-party helpers imported by tests via runtime
+# sys.path.insert (scripts/, build-tools/bin/). The interpreter is supplied via
+# --python by the caller, which also passes --extra-search-path for any
+# environment-specific location the compiler wheels are installed into.
+extra-paths = ["scripts", "build-tools/bin"]
 
-[tool.flake8]
-ignore = [
-    "E203",
-    "W503",
-    "E501",
-]
-max-line-length = 120
+[tool.ty.rules]
+# Only entries that differ from the checker's default severity are listed. Every
+# correctness rule already defaults to error, so a regression in one fails the
+# build with no entry here -- including rules added by future releases. Advisory
+# rules default to warning and do not fail the build unless listed.
+
+# Advisory by default: attribute access on a package where a submodule of the
+# same name exists resolves differently depending on import order, so it is
+# worth failing on. This is the only rule whose severity is raised.
+"possibly-missing-submodule" = "error"
+
+# Ignored: dominated by third-party stub limitations that are not expected to
+# be fixed, so the few genuine signals they carry are not worth the noise.
+# Re-evaluate only if the upstream stubs change.
+"too-many-positional-arguments" = "ignore"  # nearly all from stubs that declare dynamic signatures as taking no arguments
+"invalid-return-type" = "ignore"            # all from stubs
+
+# src/nkilib_src is not yet type-checked: the rules below report ~7000 diagnostics
+# there, which is a separate effort. Scope them off so the kernel tree is still
+# gated on invalid-type-form -- a function or other non-type used where a type is
+# required, which is what nl.ndarray-as-a-type-hint was. Drop
+# entries from this list as each rule is driven to zero.
+[[tool.ty.overrides]]
+include = ["src/nkilib_src"]
+
+[tool.ty.overrides.rules]
+"unresolved-attribute" = "ignore"
+"invalid-argument-type" = "ignore"
+"not-subscriptable" = "ignore"
+"invalid-assignment" = "ignore"
+"invalid-parameter-default" = "ignore"
+"unsupported-operator" = "ignore"
+"possibly-missing-submodule" = "ignore"
+"unresolved-import" = "ignore"
+"unknown-argument" = "ignore"
+"missing-argument" = "ignore"
+"not-iterable" = "ignore"
+"no-matching-overload" = "ignore"
+"call-non-callable" = "ignore"
 
 [tool.ruff]
 indent-width = 4

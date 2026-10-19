@@ -63,6 +63,7 @@ from .utils.composite_emitter import CompositeEmitter
 from .utils.coverage_utils import get_coverage_data
 from .utils.csv_monitor import DURATION_MONITOR, MEMORY_MONITOR
 from .utils.feature_flag_helper import (
+    OptionLookup,
     construct_test_output_directory_name,
     get_feature_flag,
     resolve_base_output_directory,
@@ -91,9 +92,8 @@ from .utils.pytest_plugin import (
     resolve_current_user,
     resolve_host_provisioning_mode,
     resolve_session_trace_mode,
-    resolve_testrun_uid,
 )
-from .utils.pytest_test_metadata import derive_labeled_kernel_name
+from .utils.pytest_test_metadata import resolve_file_kernel_name
 from .utils.qor_collector import collect_qor_from_test_dir
 from .utils.relevant_test_selection.filtering import (
     partition_items_by_relevance,
@@ -111,12 +111,6 @@ if is_xdist_worker() and _RNG_SEED_ENV_KEY not in os.environ:
 
 def pytest_addoption(parser):
     group = parser.getgroup("nkilib-internal", "nkilib internal options")
-    group.addoption(
-        "--target-host-file",
-        action="store",
-        default=None,
-        help="Path to JSON file containing MLA accelerator host definitions.  This is used in place of --target-host if the set of hosts are not homogeneous with respect to host type.",
-    )
     group.addoption(
         "--metrics-namespace",
         action="store",
@@ -257,7 +251,7 @@ def setup_logging(request: pytest.FixtureRequest, test_worker_id: str, artifacts
     logging.info(f'Logging format in worker: {log_format=} {log_file=} {log_level=}')
 
 
-def _resolve_target_host_file(config: Config) -> list[TargetHost] | None:
+def _resolve_target_host_file(config: OptionLookup) -> list[TargetHost] | None:
     """Parse the ``--target-host-file`` into a TargetHost list (with the internal
     ``dice`` pseudo-host filtered out), or None when no file is given.
 
@@ -294,34 +288,6 @@ def _resolve_target_host_file(config: Config) -> list[TargetHost] | None:
 
     # Filter out "dice" pseudo-host — DICE inference is handled via DICE_ENDPOINT env var.
     return [th for th in target_hosts if th.ssh_host != "dice"]
-
-
-def _initialize_exclusive_mode(config: Config) -> None:
-    """Reserve one host for the exclusive session, then narrow the env so workers use it.
-
-    Probes fleet candidates, picks the first reachable host, and exports
-    NKILIB_TARGET_HOST so xdist workers (which inherit env before spawning —
-    DSession.pytest_sessionstart is @pytest.hookimpl(trylast=True)) take the
-    --target-host path in make_host_manager. If the user already specified
-    --target-host explicitly, their choice is respected and no probing occurs.
-    """
-    # Respect an explicit --target-host; do not override the user's choice.
-    explicit_targets: list[str] = get_feature_flag(config, "target_host", [])
-    if explicit_targets:
-        return
-
-    target_hosts = _resolve_target_host_file(config)
-    if not target_hosts:
-        raise pytest.UsageError(
-            "--exclusive-host requires a remote fleet host file (--shared-fleet or NKILIB_TARGET_HOST_FILE)."
-        )
-    alias = HostManager.test_session(
-        target_hosts=target_hosts,
-        ssh_config_path=os.path.expanduser(get_feature_flag(config, "ssh_config_path", "~/.ssh/config")),
-        testrun_uid=resolve_testrun_uid(config),
-    )
-    os.environ["NKILIB_TARGET_HOST"] = alias
-    os.environ.pop("NKILIB_TARGET_HOST_FILE", None)
 
 
 @pytest.fixture(scope="session")
@@ -374,10 +340,7 @@ def test_manager(
     perf_analysis_enabled: bool,
     hw_profile_enabled: bool,
 ) -> Orchestrator:
-    metadata_name = None
-    if request.cls and hasattr(request.cls, "__pytest_test_metadata__"):
-        metadata_name = request.cls.__pytest_test_metadata__.get("name")
-    kernel_name = derive_labeled_kernel_name(request.fspath, metadata_name)
+    kernel_name = resolve_file_kernel_name(request.path)
 
     dice_endpoint = os.environ.get("DICE_ENDPOINT")
     if dice_endpoint:
@@ -393,6 +356,7 @@ def test_manager(
             kernel_name=kernel_name,
             dice_endpoint=dice_endpoint,
             nki_compilation_mode=NKICompilationMode[get_feature_flag(request.config, "nki_compilation_mode")],
+            compile_mode=get_feature_flag(request.config, "compile_mode"),
         )
 
     return make_test_manager(
@@ -690,6 +654,7 @@ def pytest_configure(config: Config):
         target=",".join(p.value for p in get_platform_targets(config)),
         trace_mode=resolve_session_trace_mode(config).value,
         nki_compilation_mode=get_feature_flag(config, "nki_compilation_mode"),
+        compile_mode=get_feature_flag(config, "compile_mode"),
         kernel_name=os.environ.get("KERNEL_NAME"),
         run_type=os.environ.get("RUN_TYPE"),
         is_release=os.environ.get("IS_RELEASE", "").lower() == "true",
@@ -752,16 +717,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if hasattr(session.config, "workerinput"):
         return
 
-    # Clean up exclusive-host reset-state files (controller only, after all workers done).
-    from .utils.core_reset_strategy import CoreResetStrategy
-
-    uid = resolve_testrun_uid(session.config)
-    CoreResetStrategy.cleanup_session_locks(uid)
-
     # Emit run_complete via SQS
     session_ctx = session.config.stash.get(SESSION_CONTEXT_KEY, None)
     if session_ctx and session_ctx.sqs_queue_url:
         terminalreporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        assert terminalreporter is not None, "the terminal reporter is required to summarise a run"
         # A skipped test has a "passed" setup phase, so exclude skipped nodeids from passed.
         skipped_ids = {r.nodeid for r in terminalreporter.stats.get("skipped", [])}
         failed_ids = {r.nodeid for r in terminalreporter.stats.get("failed", [])}
@@ -832,8 +792,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
-    """Controller-only session setup: clean stale monitor CSVs and, in
-    exclusive-host mode, reserve one host for the whole session."""
+    """Controller-only session setup: clean stale monitor CSVs."""
     if hasattr(session.config, "workerinput"):
         return  # workers do nothing here
 
@@ -842,6 +801,3 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         MEMORY_MONITOR.cleanup_stale(output_dir)
     if get_feature_flag(session.config, "monitor_durations") is not None:
         DURATION_MONITOR.cleanup_stale(output_dir)
-
-    if get_feature_flag(session.config, "exclusive_host", False):
-        _initialize_exclusive_mode(session.config)

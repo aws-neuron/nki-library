@@ -35,15 +35,19 @@ import logging
 import os
 import random
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import pytest
 from _pytest.config import Config
+from _pytest.mark import Mark
 from _pytest.python import Metafunc
-from _pytest.stash import StashKey
+from _pytest.stash import Stash, StashKey
 
 from .common_dataclasses import (
+    DEFAULT_COMPILE_MODE,
     HostProvisioningMode,
     HostProvisioningResult,
     NKICompilationMode,
@@ -68,7 +72,7 @@ from .host_state import HostStateStore
 from .metrics_collector import IMetricsCollector, MetricsCollector, NoopMetricsCollector
 from .metrics_emitter import IMetricsEmitter, MetricsEmitter, NoopMetricsEmitter, OutputMode, SessionContext
 from .param_extractor import compute_params_hash, derive_test_method_id, extract_pytest_params, normalize_param_names
-from .pytest_test_metadata import derive_labeled_kernel_name, discover_pytest_test_metadata_marks
+from .pytest_test_metadata import discover_pytest_test_metadata_marks, resolve_file_kernel_name
 from .s3_utils import S3ArtifactUploadConfig
 from .simulation_setup import setup_simulation_mode
 from .suite_chunking import get_chunked_tests
@@ -77,6 +81,37 @@ from .test_orchestrator import Orchestrator
 _RNG_SEED_ENV_KEY = "NEURON_PYTHONHASHSEED"
 
 logging.getLogger("paramiko.transport").setLevel(logging.WARNING)
+
+
+@runtime_checkable
+class _CallSpec(Protocol):
+    """The parameter mapping of one parametrized case."""
+
+    params: dict[str, Any]
+
+
+@runtime_checkable
+class _ParametrizedItem(Protocol):
+    """A collected test produced by parametrization, which carries its case's parameters.
+
+    Non-parametrized tests do not have this attribute at all, so presence of the
+    attribute is exactly the "is parametrized" test.
+    """
+
+    callspec: _CallSpec
+
+
+class _StashHolder(Protocol):
+    """The only thing session-state writers need from a pytest config: its stash."""
+
+    @property
+    def stash(self) -> Stash: ...
+
+
+class _MarkerSource(Protocol):
+    """The only thing marker inspection needs from a collected test: its resolved markers."""
+
+    def iter_markers(self, name: str | None = None) -> Iterator[Mark]: ...
 
 
 # ─── Session state on ``config`` ───
@@ -104,13 +139,30 @@ The controller has no per-test emit cycle, so setup-phase metrics are recorded h
 # ─── Helper functions ───
 
 
+def _single_compile_separation_requested() -> bool:
+    """Whether this run requested the single compile DMA-hoisting separation flow.
+
+    The request is an env var rather than a pytest flag. When the implementing module is
+    unavailable, the import fails and the request degrades to False.
+    """
+    try:
+        from .single_compile_separation_private import separation_requested
+    except ImportError:
+        return False
+    return separation_requested()
+
+
 def resolve_session_trace_mode(config: Config) -> TraceMode:
     """Resolve session trace mode from CLI flags. Result is cached on config."""
     if SESSION_TRACE_MODE_KEY in config.stash:
         return config.stash[SESSION_TRACE_MODE_KEY]
 
     test_mode = get_feature_flag(config, "test_mode")
-    if test_mode:
+    if _single_compile_separation_requested():
+        if test_mode:
+            raise pytest.UsageError("The single compile separation pass flow cannot be combined with --test-mode")
+        mode = TraceMode.CompileAndInferAndSeparate
+    elif test_mode:
         mode = TraceMode.create(test_mode)
     elif not is_local_run(config):
         mode = TraceMode.CompileAndInfer
@@ -136,7 +188,7 @@ def is_debugger_mode(config: Config) -> bool:
     return resolve_session_trace_mode(config) == TraceMode.Debugger
 
 
-def apply_host_provisioning_result(config: Config, result: HostProvisioningResult) -> None:
+def apply_host_provisioning_result(config: _StashHolder, result: HostProvisioningResult) -> None:
     """Decompose a plug-in's :class:`HostProvisioningResult` onto ``config`` — the single place
     config learns what a plug-in did. Folds ``plugin_provisioned`` into the provisioning mode
     (so there is one representation of it, not a separate flag) and records recoverability.
@@ -226,7 +278,7 @@ def resolve_git_short_sha(default: str | None = None) -> str | None:
         return default
 
 
-def get_pytest_mark_names(node: pytest.Item) -> list[str]:
+def get_pytest_mark_names(node: _MarkerSource) -> list[str]:
     """Return all resolved pytest marker names in deterministic order."""
     return sorted({marker.name for marker in node.iter_markers()})
 
@@ -265,10 +317,7 @@ def make_collector(
     if tier is not None:
         collector.add_dimension({"TestTier": tier.value})
 
-    metadata_name = None
-    if request.cls and hasattr(request.cls, "__pytest_test_metadata__"):
-        metadata_name = request.cls.__pytest_test_metadata__.get("name")
-    labeled_kernel = derive_labeled_kernel_name(request.fspath, metadata_name)
+    labeled_kernel = resolve_file_kernel_name(request.path)
     if labeled_kernel:
         collector.add_dimension({"KernelName": labeled_kernel})
 
@@ -349,6 +398,7 @@ def make_host_manager(
             bucket=get_feature_flag(config, "artifact_upload_s3_bucket"),
             prefix=get_feature_flag(config, "artifact_upload_s3_prefix"),
             profile=get_feature_flag(config, "aws_profile"),
+            region=get_feature_flag(config, "artifact_upload_s3_region"),
         )
 
     if target_hosts is None:
@@ -366,7 +416,11 @@ def make_host_manager(
         state_store.initialize(bootstrap)
 
     # A local host is needed only for a local run that actually executes on the Neuron device.
-    runs_on_hardware = resolve_session_trace_mode(config) in (TraceMode.CompileAndInfer, TraceMode.Debugger)
+    runs_on_hardware = resolve_session_trace_mode(config) in (
+        TraceMode.CompileAndInfer,
+        TraceMode.CompileAndInferAndSeparate,
+        TraceMode.Debugger,
+    )
 
     hm = HostManager(
         state_store=state_store,
@@ -375,7 +429,7 @@ def make_host_manager(
         testrun_uid=resolve_testrun_uid(config),
         needs_local_host=is_local_run(config) and runs_on_hardware,
         s3_config=s3_config,
-        exclusive=get_feature_flag(config, "exclusive_host", False),
+        transport=get_feature_flag(config, "transport", "paramiko"),
         host_rotation_patience_seconds=get_feature_flag(config, "ssh_host_rotation_patience_seconds"),
         hosts_recoverable=is_recoverable_run(config),
     )
@@ -412,6 +466,7 @@ def make_test_manager(
         hw_profile_enabled=hw_profile_enabled,
         kernel_name=kernel_name,
         nki_compilation_mode=NKICompilationMode[get_feature_flag(config, "nki_compilation_mode")],
+        compile_mode=get_feature_flag(config, "compile_mode"),
     )
 
 
@@ -426,6 +481,12 @@ def pytest_addoption(parser):
         default=[],
         nargs="+",
         help="Hostname(s) of MLA accelerator hosts to execute tests on remotely",
+    )
+    group.addoption(
+        "--target-host-file",
+        action="store",
+        default=None,
+        help="Path to JSON file containing MLA accelerator host definitions.  This is used in place of --target-host if the set of hosts are not homogeneous with respect to host type.",
     )
     group.addoption(
         "--output-directory",
@@ -464,15 +525,36 @@ def pytest_addoption(parser):
     group.addoption(
         "--test-mode",
         action="store",
-        choices=["trace-only", "compile-only", "compile-and-infer", "simulation", "debugger"],
+        choices=[
+            "trace-only",
+            "compile-only",
+            "compile-and-infer",
+            "simulation",
+            "debugger",
+        ],
         help="Override default trace mode (markers take precedence)",
     )
     group.addoption(
         "--nki-compilation-mode",
         action="store",
-        default=NKICompilationMode.parser.value,
+        default=NKICompilationMode.tracer.value,
         choices=[m.value for m in NKICompilationMode],
         help="NKI compiler frontend to use",
+    )
+    group.addoption(
+        "--compile-mode",
+        action="store",
+        # None = unspecified; kernel_tracer resolves it. No choices= on purpose: nki
+        # validates the mode, and importing its list here would make every test
+        # require a newer nki.
+        default=None,
+        help=(
+            "Allocator/scheduler flow: enable-alloc=legacy (neuronx-cc owns "
+            "both), enable-alloc=linear (NKI LinearScanAllocation allocates, "
+            "neuronx-cc schedules), or 'enable-alloc=linear enable-sched=asap' "
+            "(NKI owns both). Validated by nki, which rejects anything else. "
+            f"Unset means {DEFAULT_COMPILE_MODE}, today's flow."
+        ),
     )
     group.addoption(
         "--debugger-interactive",
@@ -538,6 +620,13 @@ def pytest_addoption(parser):
         help="Enable DGE Notifications during profiling",
     )
     group.addoption(
+        "--ucode-lib-path",
+        action="store",
+        default=None,
+        help="Path to a custom uCode library (.so). Uploaded to the remote host "
+        "alongside the NEFF; NEURON_RT_UCODE_LIB_PATH is set for the profile run.",
+    )
+    group.addoption(
         "--artifact-upload-s3-bucket",
         action="store",
         default=None,
@@ -548,6 +637,17 @@ def pytest_addoption(parser):
         action="store",
         default="artifacts_tmp",
         help="S3 prefix for artifact file transfer (default: artifacts_tmp)",
+    )
+    group.addoption(
+        "--artifact-upload-s3-region",
+        action="store",
+        default=None,
+        help=(
+            "Region of the artifact-transfer S3 bucket. Optional; if unset it is "
+            "resolved from the bucket. Passed as --region to the remote 'aws s3 cp' "
+            "so it signs for the bucket's region rather than the host's (required "
+            "for hosts in Local Zones with no S3 endpoint)."
+        ),
     )
     group.addoption(
         "--aws-profile",
@@ -596,11 +696,19 @@ def pytest_addoption(parser):
         "Off by default.",
     )
     group.addoption(
-        "--exclusive-host",
+        "--transport",
+        action="store",
+        default=None,
+        choices=["ssh", "paramiko"],
+        help="Remote-host transport: 'paramiko' (default; persistent fabric2/paramiko connection "
+        "per worker) or 'ssh' (native ssh subprocess per command, multiplexed via ControlMaster).",
+    )
+
+    group.addoption(
+        "--skip-core-reset",
         action="store_true",
         default=False,
-        help="Acquire one remote host exclusively for the entire session. "
-        "All xdist workers share it via local process-level core locking and SSH ControlMaster.",
+        help="Opportunistically skip neuron core reset behavior",
     )
 
     group.addoption(
@@ -730,10 +838,7 @@ def test_manager(
     hw_profile_enabled: bool,
 ) -> Orchestrator:
     """Standard kernel test orchestrator."""
-    metadata_name = None
-    if request.cls and hasattr(request.cls, "__pytest_test_metadata__"):
-        metadata_name = request.cls.__pytest_test_metadata__.get("name")
-    kernel_name = derive_labeled_kernel_name(request.fspath, metadata_name)
+    kernel_name = resolve_file_kernel_name(request.path)
     return make_test_manager(
         request.config,
         trace_mode,
@@ -779,9 +884,9 @@ def pytest_configure(config: Config):
     _set_neuron_tag_defaults(config)
 
     # Discover marks from @pytest_test_metadata decorators
-    # Use config.rootdir so discovery works whether the plugin is loaded from
+    # Use config.rootpath so discovery works whether the plugin is loaded from
     # the source tree or from the installed nkilib_testing wheel.
-    test_root = Path(config.rootdir) / "test"
+    test_root = config.rootpath / "test"
     if test_root.is_dir():
         discovered_marks = discover_pytest_test_metadata_marks(test_root)
         for mark_name, description in discovered_marks.items():
@@ -852,21 +957,21 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
         platforms_marker = item.get_closest_marker("platforms")
         excluded = set(platforms_marker.kwargs.get("exclude") or []) if platforms_marker else set()
 
-        if hasattr(item, "callspec"):
+        if isinstance(item, _ParametrizedItem):
             for param_val in item.callspec.params.values():
                 if isinstance(param_val, PlatformAware) and param_val.supported_platforms is not None:
                     excluded |= set(Platforms) - param_val.supported_platforms
 
         supported = set(Platforms) - excluded
 
-        if hasattr(item, "callspec") and "platform_target" in item.callspec.params:
+        if isinstance(item, _ParametrizedItem) and "platform_target" in item.callspec.params:
             supported &= {item.callspec.params["platform_target"]}
 
         for p in supported:
             item.add_marker(pytest.mark.__getattr__(p.value))
 
     if is_simulation_mode(config):
-        from .simulation_setup import skip_slow_simulation_tests
+        from .simulation_setup import apply_xfail_simulation, skip_slow_simulation_tests
 
         # Skip tests that carry an explicit TraceMode marker override (e.g.
         # trace_only, compile_only, compile_and_infer).  The trace_mode fixture
@@ -888,6 +993,10 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
         for item in items:
             if item.get_closest_marker("skip_simulation"):
                 item.add_marker(skip_incompatible)
+
+        # Translate xfail_simulation -> a non-strict xfail (simulation only). Unlike
+        # skip_simulation the test still runs; it just isn't counted as a failure.
+        apply_xfail_simulation(items)
 
     # Let builtin deselect_by_mark (and -k) run; afterwards `items` is the eligible set.
     yield
@@ -976,7 +1085,7 @@ def pytest_generate_tests(metafunc: Metafunc):
     if _RNG_SEED_ENV_KEY in os.environ:
         random.seed(int(os.environ[_RNG_SEED_ENV_KEY]))
 
-    params = coverage_marker.kwargs.copy()
+    params = dict(coverage_marker.kwargs)
     assert params, "No parameters defined for coverage_parametrize"
     coverage_override = params.pop("coverage", None)
     filter_func = params.pop("filter", None)

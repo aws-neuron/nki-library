@@ -80,8 +80,8 @@ class TestSubmoduleDiscovery:
         """Test that discovered submodules are registered in sys.modules."""
         import nkilib_src.nkilib as nkilib
 
-        # Access core to ensure it's loaded
-        _ = nkilib.core
+        # Access core to ensure it's loaded; discovery creates the attribute at runtime.
+        assert hasattr(nkilib, 'core')
 
         # Verify it's in sys.modules with the correct name
         assert 'nkilib_src.nkilib.core' in sys.modules

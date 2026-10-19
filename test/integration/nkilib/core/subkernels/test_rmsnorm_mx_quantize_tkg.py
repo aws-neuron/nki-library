@@ -104,26 +104,29 @@ def rmsnorm_mx_quantize_tkg_wrapper(
         output_quant_hbm = nl.ndarray(
             quant_shape, dtype=_out_quant_dtype, buffer=nl.shared_hbm, name="wrapper_output_quant_hbm"
         )
-        output_scale_hbm = nl.ndarray(
-            quant_shape, dtype=nl.uint8, buffer=nl.shared_hbm, name="wrapper_output_scale_hbm"
-        )
-
         T_slice_quant = nl.ds(T_local * (1 - prg_id), T_local) if do_shard else nl.ds(0, T)
         nisa.dma_copy(src=output_quant[:, :, T_slice_quant], dst=output_quant_hbm[:, :, T_slice_quant])
 
-        # Copy scale values to HBM, skipping garbage portions of strided scale tensor
-        for sb_quadrant in nl.affine_range(4):
-            nisa.dma_copy(
-                src=output_scale[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
-                dst=output_scale_hbm[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
+        # A packed layout carries the scales inside the quantized tensor, so there is no
+        # separate scale tensor to allocate or spill.
+        output_scale_hbm = None
+        if output_scale is not None:
+            output_scale_hbm = nl.ndarray(
+                quant_shape, dtype=nl.uint8, buffer=nl.shared_hbm, name="wrapper_output_scale_hbm"
             )
+            # Copy scale values to HBM, skipping garbage portions of strided scale tensor
+            for sb_quadrant in nl.affine_range(4):
+                nisa.dma_copy(
+                    src=output_scale[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
+                    dst=output_scale_hbm[nl.ds(sb_quadrant * 32, 4), :, T_slice_quant],
+                )
 
     else:
         output_quant_hbm = output_quant
         output_scale_hbm = output_scale
 
     output = [output_hbm, output_quant_hbm]
-    if not output_quant_packed:
+    if output_scale_hbm is not None:
         output.append(output_scale_hbm)
     if with_residual:
         output.append(output_residual)

@@ -129,14 +129,14 @@ bfloat16 for other operations.
 
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import engine, reduce_cmd
-from nki.language.opcode import maximum as _maximum
+import nki.language.opcode as _nl_opcode
 
 from ..utils.allocator import align_to
 from ..utils.interleave_copy import interleave_copy
@@ -147,6 +147,7 @@ from ..utils.kernel_helpers import (
     div_ceil,
     get_verified_program_sharding_info,
     is_sbuf_tensor,
+    is_trn3_b1,
 )
 from ..utils.logging import get_logger
 from ..utils.modular_allocator import ModularAllocator
@@ -155,6 +156,8 @@ from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 logger = get_logger("attention_cte")
 
 
+# Physical rotation depth of mm1_partial_max; the sink column is initialized once per stage.
+_MM1_PARTIAL_MAX_STAGES = 2
 _FLOAT32_MIN = -3.4028235e38  # used for initialization and masking
 
 """
@@ -183,11 +186,25 @@ _V_TILE_SZ = 128  # V tile size for loading and MM2 operations
 _K_TILE_SZ = 512  # K tile size for loading and MM1+masking operations
 _EXP_TILE_SZ = 512  # Tile size for exp instructions (must equal _K_TILE_SZ)
 _LARGE_TILE_SZ = 2048  # Larger tile size for allocations/pipelining (4 x 512 tiles)
+_NUM_K_TILES_IN_LARGE_TILE = _LARGE_TILE_SZ // _K_TILE_SZ  # 512-key K/exp sub-tiles per large tile
+
+# PSUM banks MM1 rotates through. One [128, 512] fp32 score tile fills one bank exactly, so four
+# banks means only four score tiles in flight; because the Vector row-max evict that frees a bank
+# is slower per tile than MM1 itself, MM1 stalls once per large tile. Banks 5 and 6 are unused
+# when MM2 accumulates in PSUM with a single d-tile, so MM1 can have six.
+_MM1_PSUM_BANKS_WIDE = (0, 1, 2, 3, 5, 6)
+_BF16_ITEMSIZE = 2
+_SBUF_COMPILER_RESERVE = 8 * 1024
 _FLASH_ATTENTION_THRESHOLD = 10 * 1024  # Use flash attention above this K/V length
 _FLASH_ATTENTION_SECTION_LENGTH = 8 * 1024  # Section size when using flash attention
 _SWA_ALLOCATION_STRATEGY_THRESHOLD = (
     128  # for SWA, threshold above which allocate more q tiles and use range_select masking
 )
+
+
+def _sbuf_scratch_budget() -> int:
+    """Per-partition SBUF this kernel may claim, net of what the compiler reserves."""
+    return nl.tile_size.total_available_sbuf_size - _SBUF_COMPILER_RESERVE
 
 
 @nki.jit
@@ -218,6 +235,7 @@ def attention_cte(
     position_bias: Optional[nl.NkiTensor] = None,
     bias_layout: str = "dense",
     bias_band_params: Optional[dict] = None,
+    allow_vector_exp: bool = True,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
 
@@ -318,6 +336,7 @@ def attention_cte(
                      The third axis must also leave ``>= _K_TILE_SZ - 1 = 511`` zero-filled
                      padding columns after the active band to absorb shear overshoot on
                      the last Q tile.
+      allow_vector_exp (bool): Allow the Vector Engine exp on trn3. False uses the Scalar Engine. Default True.
 
     Returns:
       Output tensor with attention results. Shape depends on tp_out parameter.
@@ -435,7 +454,14 @@ def attention_cte(
         position_bias=position_bias,
         bias_layout=bias_layout,
         bias_band_params=bias_band_params,
+        allow_vector_exp=allow_vector_exp,
     )
+
+
+# DMA-to-PE lowering uses shared transpose scratch. Allow the compiler to
+# rotate addresses and legalize buffer reuse in this mode.
+if _psum_num_banks() == 7:
+    attention_cte = attention_cte.enable_address_rotation().enable_non_ssa_legalization()
 
 
 def _attention_cte(
@@ -482,6 +508,7 @@ def _attention_cte(
     kvp_cp_offset_int: int = 0,
     kvp_k_threshold_sb=None,
     kvp_seg_block_offset_int: int = 0,
+    allow_vector_exp: bool = True,
 ):
     """Internal attention implementation with full parameter set including SBUF I/O.
 
@@ -612,7 +639,7 @@ def _attention_cte(
             "When using k_cache_sbuf/v_cache_sbuf with prefix caching, must use k_prior_sbuf/v_prior_sbuf (not HBM k_prior/v_prior)",
         )
 
-    seqlen_q, seqlen_k_active, seqlen_k_prior, d, out_shape, softmax_shape = _check_input_and_return_shape(
+    seqlen_q, seqlen_k_active, seqlen_k_prior, d, d_v, out_shape, softmax_shape = _check_input_and_return_shape(
         q,
         k,
         v,
@@ -814,12 +841,54 @@ def _attention_cte(
                 f"active_offset={_aoff}, active_band_width={_abw})",
             )
 
+    # range_select fuses the row-max reduce but has no scale operand, unlike the
+    # tensor_scalar_reduce the unmasked and affine_select paths use. Rather than reject
+    # scale != 1.0 there, move the scale onto Q -- softmax(scale * (Q @ K^T)) ==
+    # softmax((scale * Q) @ K^T) -- which _load_q_impl absorbs for free as the op1 of the
+    # tensor_scalar it already runs for delayed fp8 K dequant.
+    #
+    # Decided here rather than in _compute_tile_parameters because a single ac is shared by every
+    # _attention_cte_impl call below; mutating it per call would zero the scale on the second.
+    _uses_range_select = is_prefix_caching or sliding_window > 0 or global_cp_deg is not None or has_kv_used_len
+
+    # The static causal diagonal has a range_select form too (``atp.static_causal_range_sel``),
+    # gated on scale == 1.0 for the same reason. Folded only for power-of-two scales so
+    # ``q * scale`` is exact in bf16 and the scores stay bit-identical to scaling the fp32 MM1
+    # output; the range_select paths above fold unconditionally because there the fold decides
+    # whether the call runs at all.
+    _plain_causal = (
+        causal_mask
+        and sliding_window == 0
+        and global_cp_deg is None
+        and not has_kv_used_len
+        and not is_sequence_packed
+        and not is_prefix_caching
+    )
+    # frexp returns (mantissa, exponent) with mantissa in [0.5, 1); exactly 0.5 means a power
+    # of two.
+    _scale_is_pow2 = scale > 0.0 and math.frexp(scale)[0] == 0.5
+    q_prescale = 1.0
+    if scale != 1.0 and (_uses_range_select or (_plain_causal and _scale_is_pow2 and position_bias is None)):
+        # position_bias is preloaded into PSUM, so MM1 accumulates QK + bias and the evict scales
+        # the sum: mask(scale * (QK + bias)). Folding into Q gives scale * QK + bias instead, so
+        # the caller must pre-divide the bias -- which the position_bias docstring already
+        # describes for the ALiBi case.
+        kernel_assert(
+            position_bias is None,
+            "SWA/Prefix Caching/CP/kv_used_len with position_bias only support scale=1.0, "
+            f"because the scale is folded into Q and would not reach the bias, but got {scale=}. "
+            "Pre-divide position_bias by scale and pass scale=1.0.",
+        )
+        q_prescale = scale
+        scale = 1.0
+
     # Create AttnConfig with high-level configuration
     ac = AttnConfig(
         seqlen_q=seqlen_q,
         seqlen_k_active=seqlen_k_active,
         seqlen_k_prior=seqlen_k_prior,
         d=d,
+        d_v=d_v,
         tp_q=tp_q,
         tp_k=tp_k,
         tp_out=tp_out,
@@ -832,6 +901,7 @@ def _attention_cte(
         cp_strided_q_slicing=cp_strided_q_slicing,
         cp_striped_input=cp_striped_input,
         scale=scale,
+        q_prescale=q_prescale,
         cache_softmax=cache_softmax,
         skip_output_normalization=skip_output_normalization,
         dtype=q.dtype,
@@ -860,6 +930,7 @@ def _attention_cte(
         kvp_cp_offset_int=kvp_cp_offset_int,
         kvp_seg_block_offset_int=kvp_seg_block_offset_int,
         kvp_k_threshold_sb=kvp_k_threshold_sb,
+        allow_vector_exp=allow_vector_exp,
     )
 
     # skip_output_normalization requires cache_softmax so the caller gets the raw sum
@@ -1014,6 +1085,7 @@ class AttnConfig(nl.NKIObject):
     seqlen_k_active: int = None
     seqlen_k_prior: int = None
     d: int = None
+    d_v: int = None  # V head dimension, may differ from d (e.g. DeepSeek V3 MLA)
 
     # Transpose flags
     tp_q: bool = None
@@ -1037,6 +1109,10 @@ class AttnConfig(nl.NKIObject):
 
     # Other
     scale: float = None
+    # Softmax scale folded into Q up front instead of applied on the MM1 evict. Normally
+    # 1.0, because the evict applies the scale; the range_select masking paths have no
+    # scale operand, so on those paths the scale moves here instead.
+    q_prescale: float = 1.0
     cache_softmax: bool = None
     skip_output_normalization: bool = None  # Skip 1/S normalization; return unnormalized output + raw sum
     dtype: Any = None
@@ -1072,6 +1148,7 @@ class AttnConfig(nl.NKIObject):
     kvp_seg_block_offset_int: int = 0  # Compile-time seg_block_offset for tile_fully_visible check
     kvp_k_threshold_sb: Any = None  # Pre-generated static k_threshold pattern in SBUF
     kvp_all_tiles_visible: bool = False  # Compile-time: all tiles in this segment are fully visible
+    allow_vector_exp: bool = True
 
 
 def _attention_cte_impl(
@@ -1159,6 +1236,8 @@ def _attention_cte_impl(
     if not is_seqlen_sharded:
         shard_seqlen_q_start = 0
         shard_seqlen_q_length = atp.num_grps
+    atp.shard_grp_start = shard_seqlen_q_start
+    atp.shard_grp_count = shard_seqlen_q_length
 
     # Initialize allocator and buffer container
     allocator = ModularAllocator(initial_address=init_sbuf_addr)
@@ -1274,6 +1353,16 @@ def _attention_cte_impl(
 
     # Allocate running statistics (persistent across sections)
     bufs.mm1_running_max = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
+    # nisa.exponential (Vector, B1 only) subtracts max_value, whereas the nisa.activation fallback
+    # adds a bias, so the Vector exp path needs the max un-negated. It is allocated here, beside the
+    # running max it mirrors, because it must be indexed per Q group and persist across sections: a
+    # local nl.ndarray inside _exp_impl aliases across software-pipeline stages, which corrupts the
+    # multi-section prior>0 path. prior=0 has one section and cannot expose it.
+    bufs.mm1_running_max_pos = (
+        allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
+        if (ac.allow_vector_exp and is_trn3_b1())
+        else None
+    )
     bufs.exp_running_sum = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
     bufs.exp_sum_reciprocal = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
 
@@ -1365,7 +1454,7 @@ def _attention_cte_impl(
 
             for grp_i in range(shard_seqlen_q_start, shard_seqlen_q_end - 2):  # for each block of seq_q
                 if ac.use_swa and atp.is_causal:
-                    for _d_tile in range(atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim):
+                    for _d_tile in range(atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim):
                         nisa.memset(
                             bufs.mm2_sb[grp_i][_d_tile][...], value=0.0
                         )  # when use_swa, mm_i == 0 is not the initial tile
@@ -1438,6 +1527,7 @@ class AttnInternalBuffers(nl.NKIObject):
     mm1_partial_max = None  # tile-wise max after MM1
     mm1_section_max = None  # max for section after MM1
     mm1_running_max = None  # (persistent across sections) Running max across sections for output after MM1
+    mm1_running_max_pos = None  # (persistent across sections) mm1_running_max un-negated, for the Vector-Engine exp
     prev_mm1_running_max = None  # Previous running max across sections for output after MM1 (used to hold value temporarily before section update)
     flash_attn_correction_factor = None  # Correction factor for flash attn (exp(prev_max-curr_max))
 
@@ -1509,6 +1599,8 @@ class AttnTileParams(nl.NKIObject):
 
     # Group parameters
     num_grps: int = None
+    shard_grp_start: int = 0  # first Q group this shard owns (seqlen sharding shifts it off 0)
+    shard_grp_count: int = None  # Q groups this shard owns; set to num_grps unless seqlen sharded
     num_q_grps_per_load: int = None  # load multiple q groups for better DMA efficiency
     can_pack_q_load: bool = None  # whether Q loads can be packed into num_q_grps_per_load
 
@@ -1535,6 +1627,11 @@ class AttnTileParams(nl.NKIObject):
     # Required when we need runtime-determined masking (e.g., CP/prefix caching),
     # or for performance reasons (e.g., SWA to avoid multiple copies with affine select)
     dynamic_sel_mask: bool = None
+    static_causal_range_sel: bool = None  # static causal diagonal mask via range_select, not affine_select
+    mm2_accum_in_psum: bool = None  # accumulate MM2 across large tiles in PSUM, not SBUF
+    # PSUM banks MM1 rotates its score tiles through. (0, 1, 2, 3) is the original
+    # behaviour; six banks let MM1 run further ahead of the Vector evict.
+    mm1_psum_banks: tuple = None
 
     # Section
     section_len: int = None  # Length of section, typically 8k if multiple sections, else same as k seqlen
@@ -1556,14 +1653,6 @@ def _compute_tile_parameters(
       AttnTileParams: Complete tile parameter configuration
     """
     atp = AttnTileParams()
-
-    # Validate scale parameter for special modes
-    if ac.use_swa or ac.is_prefix_caching or ac.use_cp or ac.has_kv_used_len:
-        # Only scale = 1.0 supported in these cases due to use of range select instead of TSCR
-        kernel_assert(
-            ac.scale == 1.0,
-            f"SWA/Prefix Caching/CP/kv_used_len only support scale=1.0, but got {ac.scale=}",
-        )
 
     # When we use CP, tiles are dynamically masked (mask unknown at compile time), so we turn off causal
     # to disable compute-skipping. For strided Q slicing, we do not turn off causal masking since
@@ -1623,6 +1712,15 @@ def _compute_tile_parameters(
                     # data race. So we only use this optimization without prefix caching
                     atp.use_swa_optimized_allocation = True
 
+    # The static causal diagonal mask can be one range_select instead of tensor_copy +
+    # affine_select + a separate row-max evict. affine_select runs on GpSimd and cannot read
+    # PSUM, which is the only reason the PSUM->SBUF tensor_copy exists; range_select reads PSUM
+    # directly and fuses the row-max, so the three-instruction diagonal path collapses to one.
+    # Restricted to non-SWA causal: SWA needs a second (lower) per-row bound, and range_select
+    # has no scale operand, so scale != 1.0 keeps the affine_select path. Set here rather than
+    # beside is_causal because the SWA block above can still flip dynamic_sel_mask.
+    atp.static_causal_range_sel = atp.is_causal and not atp.dynamic_sel_mask and not ac.use_swa and ac.scale == 1.0
+
     # Partition size
     atp.sb_p = nl.tile_size.pmax
     # assert that _Q_GRP_SZ = _V_TILE_SZ = atp.sb_p (= 128) since that is an implict assumption in the code
@@ -1638,6 +1736,9 @@ def _compute_tile_parameters(
 
     # Group configuration
     atp.num_grps = div_ceil(ac.seqlen_q, atp.sb_p)
+    # Whole range by default; the seqlen-sharded path narrows these to the shard it is tracing.
+    atp.shard_grp_start = 0
+    atp.shard_grp_count = atp.num_grps
     atp.can_pack_q_load = not is_seqlen_sharded
 
     num_q_grps_per_load_dtype = 4 if ac.dtype == nl.float32 else 8  # fewer groups for float32 for SBUF memory
@@ -1675,11 +1776,19 @@ def _compute_tile_parameters(
     else:
         total_seqlen_k = atp.seqlen_k_active_updated
 
+    # Resolve d_v: fallback to d when d_v is not explicitly set (d_v == d case)
+    if ac.d_v is None:
+        ac.d_v = ac.d
+    d_v = ac.d_v
+
     # head dim D tile size (must be computed before section_len for SBUF scaling)
     atp.num_d_tiles = div_ceil(ac.d, _D_TILE_SZ)
     atp.d_tile_size_par_dim = min(ac.d, _D_TILE_SZ)
-    atp.d_tile_size_free_dim = min(ac.d, _V_D_TILE_SZ)
-    atp.num_d_tiles_free_dim = div_ceil(ac.d, _V_D_TILE_SZ)
+    atp.d_tile_size_free_dim = min(d_v, _V_D_TILE_SZ)
+    atp.num_d_tiles_free_dim = div_ceil(d_v, _V_D_TILE_SZ)
+    # V/output tile params when tp_out=True (d_v in partition dim)
+    atp.num_d_tiles_v = div_ceil(d_v, _D_TILE_SZ)
+    atp.d_tile_size_par_dim_v = min(d_v, _D_TILE_SZ)
 
     use_flash_attn = total_seqlen_k > (_FLASH_ATTENTION_THRESHOLD // atp.num_d_tiles)
     if use_flash_attn:
@@ -1708,6 +1817,24 @@ def _compute_tile_parameters(
     atp.num_tps_in_mm2_grp = _K_TILE_SZ // atp.sb_p  # 512 // 128 = 4
     atp.mm2_grp_sz = _K_TILE_SZ
 
+    # MM2 owns PSUM banks 4..7. Giving each d-tile its own bank -- instead of each large
+    # tile -- lets every large tile of a Q group accumulate into the same bank, so the sum
+    # over large tiles happens on the PE array and only the final result is evicted to
+    # SBUF. Needs one bank per d-tile; anything wider keeps the per-large-tile banks and
+    # the SBUF accumulation.
+    num_mm2_d_tiles = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
+    atp.mm2_accum_in_psum = num_mm2_d_tiles <= _psum_num_banks() - 4
+
+    # Hand MM1 six PSUM banks instead of four (see _MM1_PSUM_BANKS_WIDE). Only when MM2
+    # confines itself to bank 4 -- it accumulates in PSUM and needs exactly one d-tile bank -- and
+    # all eight banks are usable, since with seven the tp_out transposes land on bank 6 and would
+    # collide. Every other shape keeps the original four banks and stays bit-identical.
+    atp.mm1_psum_banks = (
+        _MM1_PSUM_BANKS_WIDE
+        if (atp.mm2_accum_in_psum and num_mm2_d_tiles == 1 and _psum_num_banks() == 8)
+        else tuple(range(_NUM_K_TILES_IN_LARGE_TILE))
+    )
+
     return atp
 
 
@@ -1733,6 +1860,19 @@ def _setup_range_select_bounds(
     without needing a separate kv_rank_id parameter.
     """
     # Populate range select lower and/or upper bounds. NOTE: both bounds are inclusive
+    if atp.static_causal_range_sel:
+        # Static causal upper bound: keep k <= q_absolute. Same IOTA as the dynamic path's
+        # non-CP, non-sequence-packed branch below, minus the CP offset. The lower bound is a
+        # constant 0, for which zero_bias_tensor is reused, so no lower-bound tensor is needed.
+        # Mutually exclusive with the dynamic branch: static_causal_range_sel requires
+        # not dynamic_sel_mask.
+        bufs.range_sel_ubs = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
+        nisa.iota(
+            bufs.range_sel_ubs[...],
+            pattern=[[atp.sb_p, atp.num_grps]],
+            channel_multiplier=1,
+        )
+
     if atp.dynamic_sel_mask:
         # Populate CP offset if needed
         cp_offset_sb = None
@@ -1966,7 +2106,7 @@ def _allocate_attention_buffers(
     # Define the partition and free dimension for the two matmuls
     mm1_p, mm1_n = atp.sb_p, nl.tile_size.psum_fmax
     if ac.tp_out:
-        mm2_p, mm2_n = atp.sb_p, atp.d_tile_size_par_dim
+        mm2_p, mm2_n = atp.sb_p, atp.d_tile_size_par_dim_v
     else:
         mm2_p, mm2_n = atp.sb_p, atp.d_tile_size_free_dim
 
@@ -1989,12 +2129,12 @@ def _allocate_attention_buffers(
         bufs.v_sb = v_cache_sbuf
     else:
         if ac.tp_out:
-            p_v, n_v = atp.sb_p, atp.d_tile_size_par_dim  # d is free dim for MM2
+            p_v, n_v = atp.sb_p, atp.d_tile_size_par_dim_v  # d_v is free dim for MM2
             bufs.v_sb = allocator.alloc_sbuf_tensor(
                 shape=(p_v, n_v),
                 dtype=nl.bfloat16,
-                block_dim=[atp.num_v_tiles_per_section, atp.num_d_tiles],
-                num_free_tiles=[atp.num_v_tiles_per_section, atp.num_d_tiles],
+                block_dim=[atp.num_v_tiles_per_section, atp.num_d_tiles_v],
+                num_free_tiles=[atp.num_v_tiles_per_section, atp.num_d_tiles_v],
             )
         else:
             p_v, n_v = atp.sb_p, atp.d_tile_size_free_dim  # d is free dim for MM2
@@ -2025,10 +2165,23 @@ def _allocate_attention_buffers(
     bufs.mm1_partial_max = allocator.alloc_sbuf_tensor(
         shape=(atp.sb_p, mm1_partial_max_n_elts),
         dtype=nl.float32,
-        block_dim=[atp.num_grps],
-        num_free_tiles=[2],
+        block_dim=[_MM1_PARTIAL_MAX_STAGES],
+        num_free_tiles=[_MM1_PARTIAL_MAX_STAGES],
         align_to=4,
     )
+
+    # The sink joins the row max like a K tile, so it gets a permanent home in the last column.
+    # The per-section memsets are narrowed to the k-tile columns so it survives. Seeding the shard's
+    # own first stages covers its groups: a write only reaches groups this shard actually reads.
+    if sink is not None:
+        for stage in range(min(_MM1_PARTIAL_MAX_STAGES, atp.shard_grp_count)):
+            nisa.tensor_copy(
+                bufs.mm1_partial_max[(atp.shard_grp_start + stage) % _MM1_PARTIAL_MAX_STAGES][
+                    :, atp.num_k_tiles_per_section
+                ],
+                bufs.sink_sb,
+                engine=nisa.gpsimd_engine,
+            )
 
     bufs.mm1_section_max = allocator.alloc_sbuf_tensor(
         shape=(atp.sb_p, 1),
@@ -2068,10 +2221,10 @@ def _allocate_attention_buffers(
 
     if ac.tp_out:
         bufs.mm2_prev_output = allocator.alloc_sbuf_tensor(
-            shape=(atp.d_tile_size_par_dim, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim_v, atp.sb_p),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps, atp.num_d_tiles],
-            num_free_tiles=[2, atp.num_d_tiles],
+            block_dim=[atp.num_grps, atp.num_d_tiles_v],
+            num_free_tiles=[2, atp.num_d_tiles_v],
         )
     else:
         bufs.mm2_prev_output = allocator.alloc_sbuf_tensor(
@@ -2083,10 +2236,10 @@ def _allocate_attention_buffers(
 
     if ac.tp_out:
         bufs.mm2_accum_flash_attn = allocator.alloc_sbuf_tensor(
-            shape=(atp.d_tile_size_par_dim, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim_v, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps, atp.num_d_tiles],
-            num_free_tiles=[2, atp.num_d_tiles],
+            block_dim=[atp.num_grps, atp.num_d_tiles_v],
+            num_free_tiles=[2, atp.num_d_tiles_v],
         )
     else:
         bufs.mm2_accum_flash_attn = allocator.alloc_sbuf_tensor(
@@ -2098,10 +2251,10 @@ def _allocate_attention_buffers(
 
     if ac.tp_out:
         bufs.mm2_prev_output_scaled = allocator.alloc_sbuf_tensor(
-            shape=(atp.d_tile_size_par_dim, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim_v, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps, atp.num_d_tiles],
-            num_free_tiles=[2, atp.num_d_tiles],
+            block_dim=[atp.num_grps, atp.num_d_tiles_v],
+            num_free_tiles=[2, atp.num_d_tiles_v],
         )
 
         # PSUM allocations for tp_flash_attn_correction_factor_psum and tp_exp_sum_reciprocal_psum
@@ -2110,16 +2263,16 @@ def _allocate_attention_buffers(
         for grp_idx in range(atp.num_grps):
             tmp_flash_attn_correction_factor = []
             tmp_exp_sum_reciprocal = []
-            for d_idx in range(atp.num_d_tiles):
+            for d_idx in range(atp.num_d_tiles_v):
                 tp_flash_attn_correction_factor_psum_tile = nl.ndarray(
-                    (atp.d_tile_size_par_dim, atp.sb_p),
+                    (atp.d_tile_size_par_dim_v, atp.sb_p),
                     dtype=nl.float32,
                     buffer=nl.psum,
                     address=(0, ((grp_idx % 2) * (_psum_num_banks() - 4) + 3) * PSUM_BANK_SIZE),
                 )
                 tmp_flash_attn_correction_factor.append(tp_flash_attn_correction_factor_psum_tile)
                 tp_exp_sum_reciprocal_psum_tile = nl.ndarray(
-                    (atp.d_tile_size_par_dim, atp.sb_p),
+                    (atp.d_tile_size_par_dim_v, atp.sb_p),
                     dtype=nl.float32,
                     buffer=nl.psum,
                     address=(0, ((grp_idx % 2) * (_psum_num_banks() - 4) + 3) * PSUM_BANK_SIZE),
@@ -2130,25 +2283,25 @@ def _allocate_attention_buffers(
             bufs.tp_exp_sum_reciprocal_psum.append(tmp_exp_sum_reciprocal)
 
         bufs.tp_flash_attn_correction_factor_sb = allocator.alloc_sbuf_tensor(
-            shape=(atp.d_tile_size_par_dim, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim_v, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps, atp.num_d_tiles],
-            num_free_tiles=[4, atp.num_d_tiles],
+            block_dim=[atp.num_grps, atp.num_d_tiles_v],
+            num_free_tiles=[4, atp.num_d_tiles_v],
         )
 
         bufs.tp_exp_sum_reciprocal_sb = allocator.alloc_sbuf_tensor(
-            shape=(atp.d_tile_size_par_dim, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim_v, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps, atp.num_d_tiles],
-            num_free_tiles=[4, atp.num_d_tiles],
+            block_dim=[atp.num_grps, atp.num_d_tiles_v],
+            num_free_tiles=[4, atp.num_d_tiles_v],
         )
 
     if ac.tp_out:
         bufs.mm2_final = allocator.alloc_sbuf_tensor(
-            shape=(atp.d_tile_size_par_dim, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim_v, atp.sb_p),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps, atp.num_d_tiles],
-            num_free_tiles=[2, atp.num_d_tiles],
+            block_dim=[atp.num_grps, atp.num_d_tiles_v],
+            num_free_tiles=[2, atp.num_d_tiles_v],
         )
     else:
         bufs.mm2_final = allocator.alloc_sbuf_tensor(
@@ -2160,10 +2313,10 @@ def _allocate_attention_buffers(
 
     if ac.tp_out:
         bufs.mm2_sb = allocator.alloc_sbuf_tensor(
-            shape=(atp.d_tile_size_par_dim, mm2_p),
+            shape=(atp.d_tile_size_par_dim_v, mm2_p),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps, atp.num_d_tiles],
-            num_free_tiles=[2, atp.num_d_tiles],
+            block_dim=[atp.num_grps, atp.num_d_tiles_v],
+            num_free_tiles=[2, atp.num_d_tiles_v],
         )
     else:
         bufs.mm2_sb = allocator.alloc_sbuf_tensor(
@@ -2180,13 +2333,6 @@ def _allocate_attention_buffers(
         num_free_tiles=[2, atp.num_large_tiles_per_section],
     )
 
-    bufs.exp_sb = allocator.alloc_sbuf_tensor(
-        shape=(atp.sb_p, _LARGE_TILE_SZ),
-        dtype=nl.bfloat16,
-        block_dim=[atp.num_grps, atp.num_large_tiles_per_section],
-        num_free_tiles=([4, 2] if atp.use_swa_optimized_allocation else [1, atp.num_large_tiles_per_section]),
-    )
-
     # mm1_psum PSUM allocation
     bufs.mm1_psum = []
     for grp_idx in range(atp.num_grps):
@@ -2198,13 +2344,25 @@ def _allocate_attention_buffers(
                     (mm1_p, mm1_n),
                     dtype=ac.mm_out_dtype,
                     buffer=nl.psum,
-                    address=(0, (k_tile_idx % 4) * PSUM_BANK_SIZE),
+                    # Key the bank off the tile's position in the whole section, not off
+                    # k_tile_idx alone, so consecutive large tiles land on different banks and MM1
+                    # can run ahead of the evict instead of waiting for bank 0 to be freed.
+                    address=(
+                        0,
+                        atp.mm1_psum_banks[
+                            (large_tile_idx * _NUM_K_TILES_IN_LARGE_TILE + k_tile_idx) % len(atp.mm1_psum_banks)
+                        ]
+                        * PSUM_BANK_SIZE,
+                    ),
                 )
                 tile_row.append(mm1_psum_tile)
             grp_row.append(tile_row)
         bufs.mm1_psum.append(grp_row)
 
-    if not atp.dynamic_sel_mask:
+    # Only the affine_select diagonal path needs these: a PSUM->SBUF landing buffer and the
+    # affine_select output. The range_select path writes mm1_masked straight from PSUM, so both
+    # are dead there and skipping them frees SBUF.
+    if not atp.dynamic_sel_mask and not atp.static_causal_range_sel:
         bufs.mm1_copy_sb = allocator.alloc_sbuf_tensor(
             shape=(mm1_p, mm1_n),
             dtype=ac.mm_out_dtype,
@@ -2231,31 +2389,34 @@ def _allocate_attention_buffers(
         align_to=32,  # align for dma transpose
     )
 
-    # mm2_psum allocation
+    # mm2_psum allocation. MM2 uses banks 4.. (MM1 owns 0..3 above).
+    #
+    # When atp.mm2_accum_in_psum, the bank is chosen by d-tile and every large tile of a Q
+    # group is handed the same tiles, so the MM2 matmuls accumulate across large tiles in
+    # place and _pv_large_tile_impl evicts once. Otherwise the bank is chosen by large tile and
+    # each large tile is accumulated into SBUF on the Vector Engine.
     bufs.mm2_psum = []
     for grp_idx in range(atp.num_grps):
         grp_row = []
+        shared_tiles = None
         for large_tile_idx in range(atp.num_large_tiles_per_section):
+            if shared_tiles is not None:
+                grp_row.append(shared_tiles)
+                continue
             tmp = []
-            if ac.tp_out:
-                for d_idx in range(atp.num_d_tiles):
-                    mm2_psum_tile = nl.ndarray(
-                        (mm2_n, mm2_p),
-                        dtype=ac.mm_out_dtype,
-                        buffer=nl.psum,
-                        address=(0, ((4 + (large_tile_idx % (_psum_num_banks() - 4))) * PSUM_BANK_SIZE)),
-                    )
-                    tmp.append(mm2_psum_tile)
-            else:
-                for d_idx in range(atp.num_d_tiles_free_dim):
-                    mm2_psum_tile = nl.ndarray(
-                        (mm2_p, mm2_n),
-                        dtype=ac.mm_out_dtype,
-                        buffer=nl.psum,
-                        address=(0, ((4 + (large_tile_idx % (_psum_num_banks() - 4))) * PSUM_BANK_SIZE)),
-                    )
-                    tmp.append(mm2_psum_tile)
+            num_mm2_d_tiles = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
+            for d_idx in range(num_mm2_d_tiles):
+                bank_idx = d_idx if atp.mm2_accum_in_psum else large_tile_idx
+                mm2_psum_tile = nl.ndarray(
+                    (mm2_n, mm2_p) if ac.tp_out else (mm2_p, mm2_n),
+                    dtype=ac.mm_out_dtype,
+                    buffer=nl.psum,
+                    address=(0, ((4 + (bank_idx % (_psum_num_banks() - 4))) * PSUM_BANK_SIZE)),
+                )
+                tmp.append(mm2_psum_tile)
             grp_row.append(tmp)
+            if atp.mm2_accum_in_psum:
+                shared_tiles = tmp
         bufs.mm2_psum.append(grp_row)
 
     # Position bias SBUF tile — one [sb_p, _K_TILE_SZ] scratch per Q group.
@@ -2268,6 +2429,22 @@ def _allocate_attention_buffers(
             block_dim=[atp.num_grps],
             num_free_tiles=[2],
         )
+
+    # Allocated last so the second stage -- the exp run-ahead over the next Q group -- is taken
+    # only when the partition has room, since it does not fit a whole non-flash section at d=128.
+    exp_sb_stage_bytes = atp.num_large_tiles_per_section * _LARGE_TILE_SZ * _BF16_ITEMSIZE
+    if atp.use_swa_optimized_allocation:
+        exp_sb_num_free_tiles = [4, 2]
+    else:
+        free_bytes = _sbuf_scratch_budget() - allocator.get_current_address()
+        exp_sb_grp_stages = 2 if free_bytes >= 2 * exp_sb_stage_bytes else 1
+        exp_sb_num_free_tiles = [exp_sb_grp_stages, atp.num_large_tiles_per_section]
+    bufs.exp_sb = allocator.alloc_sbuf_tensor(
+        shape=(atp.sb_p, _LARGE_TILE_SZ),
+        dtype=nl.bfloat16,
+        block_dim=[atp.num_grps, atp.num_large_tiles_per_section],
+        num_free_tiles=exp_sb_num_free_tiles,
+    )
 
 
 def _q_to_kv_batch_id(batch_id: int, bs: int, bs_kv: int) -> int:
@@ -2342,6 +2519,13 @@ def _check_input_and_return_shape(
         d_from_k = len(k_cache_sbuf[0]) * k_cache_sbuf[0][0].shape[0]
         kernel_assert(d <= d_from_k, f"Head dimension mismatch: q has d={d}, but k_cache_sbuf covers d={d_from_k}")
 
+        # Extract d_v from v_cache_sbuf tile shape (128, d_v_tile_size)
+        d_v = (
+            v_cache_sbuf[0].shape[1]
+            if not isinstance(v_cache_sbuf[0], list)
+            else len(v_cache_sbuf[0]) * v_cache_sbuf[0][0].shape[1]
+        )
+
         # Compute seqlen_k from number of tiles (each tile is _K_TILE_SZ elements)
         seqlen_k = len(k_cache_sbuf) * _K_TILE_SZ
 
@@ -2361,23 +2545,28 @@ def _check_input_and_return_shape(
             assert_shape(k, (batch_size_kv, seqlen_k, d), "k")
         else:
             assert_shape(k, (batch_size_kv, d, seqlen_k), "k")
-        assert_shape(v, (batch_size_kv, seqlen_k, d), "v")
+        d_v = v.shape[2]  # V head dim may differ from Q/K head dim (e.g. DeepSeek V3 MLA)
+        kernel_assert(
+            d_v <= _MAX_HEAD_DIM,
+            f"we do not support v head_dim > {_MAX_HEAD_DIM}, got v head dim {d_v}",
+        )
+        assert_shape(v, (batch_size_kv, seqlen_k, d_v), "v")
         if is_prefix_caching:
             seqlen_k_prior = k_prior.shape[seqlen_k_dim]
             if tp_k:
                 assert_shape(k_prior, (batch_size_kv, seqlen_k_prior, d), "k_prior")
             else:
                 assert_shape(k_prior, (batch_size_kv, d, seqlen_k_prior), "k_prior")
-            assert_shape(v_prior, (batch_size_kv, seqlen_k_prior, d), "v_prior")
+            assert_shape(v_prior, (batch_size_kv, seqlen_k_prior, d_v), "v_prior")
         else:
             seqlen_k_prior = None
 
     out_seqlen = seqlen_q
 
     if tp_out:
-        out_shape = (batch_size, d, out_seqlen)
+        out_shape = (batch_size, d_v, out_seqlen)
     else:
-        out_shape = (batch_size, out_seqlen, d)
+        out_shape = (batch_size, out_seqlen, d_v)
 
     # compute the shape for cached softmax tensors, negative max and recipriocal sum
     cache_softmax_tile_size = 128
@@ -2394,7 +2583,7 @@ def _check_input_and_return_shape(
     padded_seq_grps = div_ceil(out_seqlen, cache_softmax_tile_size)
     cache_softmax_shape = [batch_size, cache_softmax_tile_size, padded_seq_grps]
 
-    return (seqlen_q, seqlen_k, seqlen_k_prior, d, out_shape, cache_softmax_shape)
+    return (seqlen_q, seqlen_k, seqlen_k_prior, d, d_v, out_shape, cache_softmax_shape)
 
 
 def _load_q_tile(q, out, tp_q, batch_id, grp_i, seqlen_offset, load_dtype, sbuf_addr, grps_per_load=1) -> int:
@@ -2867,19 +3056,31 @@ def _load_q_impl(
                 sbuf_addr,
                 grps_per_load=atp.num_q_grps_per_load,
             )
-            # Delayed fp8 K dequant: scale Q in SBUF instead of scaling all K tiles.
-            # q_sb has shape (d_tile_size, 128*grps_per_load) with partition dim = d_tile_size.
-            # k_scale_sb is (pmax, 1) SBUF tensor applied along partition dim.
-            if bufs.k_scale_sb is not None:
+            # Two scales can ride on the freshly loaded Q, both as multiplies along the
+            # partition dim of q_sb (d_tile_size, 128*grps_per_load):
+            #   k_scale_sb -- delayed fp8 K dequant, a (pmax, 1) per-d factor, applied here
+            #                 instead of to every K tile.
+            #   q_prescale -- the softmax scale, moved off the MM1 evict for the range_select
+            #                 masking paths (see _compute_tile_parameters).
+            # tensor_scalar evaluates (data op0 operand0) op1 operand1, so when both are live
+            # they cost one instruction, not two. Scaling Q is correct exactly once per load
+            # because _load_q_tile always refetches from HBM.
+            if bufs.k_scale_sb is not None or ac.q_prescale != 1.0:
                 num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ * atp.num_q_grps_per_load)
                 for d_tile in range(atp.num_d_tiles):
                     d = min(atp.d_tile_size_par_dim, ac.d - d_tile * atp.d_tile_size_par_dim)
-                    nisa.tensor_scalar(
-                        dst=bufs.q_sb[grp_i // atp.num_q_grps_per_load][d_tile][:d, :num_f],
-                        data=bufs.q_sb[grp_i // atp.num_q_grps_per_load][d_tile][:d, :num_f],
-                        op0=nl.multiply,
-                        operand0=bufs.k_scale_sb[:d, :],
-                    )
+                    q_tile = bufs.q_sb[grp_i // atp.num_q_grps_per_load][d_tile][:d, :num_f]
+                    if bufs.k_scale_sb is None:
+                        nisa.tensor_scalar(dst=q_tile, data=q_tile, op0=nl.multiply, operand0=ac.q_prescale)
+                    else:
+                        nisa.tensor_scalar(
+                            dst=q_tile,
+                            data=q_tile,
+                            op0=nl.multiply,
+                            operand0=bufs.k_scale_sb[:d, :],
+                            op1=nl.multiply,
+                            operand1=ac.q_prescale,
+                        )
 
 
 def _qk_and_max_impl(
@@ -2899,7 +3100,10 @@ def _qk_and_max_impl(
         else True
     )
     if has_any_compute_pred:
-        nisa.memset(bufs.mm1_partial_max[grp_i], value=_FLOAT32_MIN)
+        nisa.memset(
+            bufs.mm1_partial_max[grp_i % _MM1_PARTIAL_MAX_STAGES][:, : atp.num_k_tiles_per_section],
+            value=_FLOAT32_MIN,
+        )
 
         for large_tile_idx in range(atp.num_large_tiles_per_section):
             _qk_and_max_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs, batch_id)
@@ -2922,15 +3126,18 @@ def _update_max_impl(
     if not has_any_compute_pred:
         return
 
-    # Step 1: Compute section max
-    # If we have sink, need to include it in final max compute
-    if (sink is not None) and (sp.section_idx == 0):
-        nisa.tensor_copy(bufs.mm1_partial_max[grp_i][:, atp.num_k_tiles_per_section], bufs.sink_sb)
-
+    # Step 1: Compute section max. The sink lives permanently in the last column of
+    # mm1_partial_max (see _allocate_attention_buffers), so it needs no per-section copy.
+    #
+    # On the first section mm1_section_max and mm1_running_max hold the same value, so reduce
+    # straight into the running max and skip a GpSimd copy between this reduce and the exp that
+    # consumes the max. Only section_idx > 0 needs the two kept apart, because there the section
+    # max is combined with the surviving running max.
+    reduce_into_running = sp.section_idx == 0 or atp.num_sections == 1
     nisa.tensor_reduce(
-        bufs.mm1_section_max[grp_i][:, 0],
+        bufs.mm1_running_max[:, grp_i] if reduce_into_running else bufs.mm1_section_max[grp_i][:, 0],
         nl.maximum,
-        bufs.mm1_partial_max[grp_i],
+        bufs.mm1_partial_max[grp_i % _MM1_PARTIAL_MAX_STAGES],
         1,
         negate=True,
     )
@@ -2938,7 +3145,6 @@ def _update_max_impl(
     # Step 2: compute and store running max, and flash attention correction factor
     if atp.num_sections != 1:
         if sp.section_idx == 0:
-            nisa.tensor_copy(bufs.mm1_running_max[:, grp_i], bufs.mm1_section_max[grp_i])
             nisa.memset(bufs.flash_attn_correction_factor[grp_i][...], value=0.0)
         if sp.section_idx > 0:
             nisa.activation(
@@ -2961,8 +3167,112 @@ def _update_max_impl(
                 bias=bufs.mm1_running_max[:, grp_i],
                 scale=1.0,
             )
+
+
+@dataclass
+class KTileInfo(nl.NKIObject):
+    """Trace-time classification + position for one K tile (shared by the QK and exp passes)."""
+
+    is_prior: bool  # tile lies in the prior-KV region (vs active)
+    seqlen_k: int  # region length (prior or active)
+    k_start_pos: int  # region-local start of the tile
+    unmasked: bool  # tile has unmasked, in-range keys
+    num_valid_k: int = 0  # valid keys from the tile start to the region end
+
+    def __post_init__(self):
+        # Field, not @property: NKI eager/nki_hop lowering does not fold property getters.
+        self.num_valid_k = self.seqlen_k - self.k_start_pos
+
+
+def _classify_and_mask_tile(grp, seqlen_offset, tile_sz, ac: AttnConfig, atp: AttnTileParams):
+    """Classify a K tile as prior / active and decide whether it has unmasked, in-range keys.
+
+    Shared core of ``_k_tile_selection`` and ``_exp_tile_selection``. Resolves the tile against the
+    [prior | active] layout via ``_get_kv_tile_apc``, then applies the causal / SWA masks and the
+    key-range bound. Returns a ``KTileInfo`` (is_prior, seqlen_k, k_start_pos, unmasked, plus a
+    ``num_valid_k`` property): seqlen_k and k_start_pos are the tile's region length and region-local
+    start; unmasked is False when the tile is fully masked (causal / SWA) or starts past the region end.
+
+    Args:
+        grp: Q-group index.
+        seqlen_offset: absolute start position of the tile in the [prior | active] KV layout.
+        tile_sz: tile width in keys (used for the SWA window check).
+        ac (AttnConfig): attention config.
+        atp (AttnTileParams): derived tiling params.
+    """
+    is_prior, seqlen_k, k_start_pos, _ = _get_kv_tile_apc(
+        ac.is_prefix_caching,
+        False,
+        True,
+        atp.seqlen_k_active_updated,
+        ac.seqlen_k_prior,
+        seqlen_offset,
+        None,
+    )
+    # Causal/SWA visibility: prior tiles and non-causal configs see all keys; a causal active tile
+    # must clear the causal diagonal (and the sliding window too when SWA is enabled).
+    if is_prior or not atp.is_causal:
+        unmasked = True
     else:
-        nisa.tensor_copy(bufs.mm1_running_max[:, grp_i], bufs.mm1_section_max[grp_i])
+        unmasked = _has_any_compute_causal(grp, k_start_pos, ac)
+        if ac.use_swa:
+            unmasked = unmasked and _has_any_compute_swa(grp, k_start_pos, tile_sz, ac)
+    # Also require the tile to start within its region (else k_start is past the region end -> no keys).
+    unmasked = unmasked and (k_start_pos < seqlen_k)
+    tile_info = KTileInfo(is_prior, seqlen_k, k_start_pos, unmasked)
+
+    # On the causal diagonal, stop at the last visible key instead of running the whole
+    # tile and masking the tail away. num_valid_k was purely region-based, so the diagonal tile
+    # always ran all _K_TILE_SZ keys; causality only reached the `unmasked` flag above. Every
+    # consumer already sizes itself off num_valid_k -- MM1's nc_matmul free dim, the mask
+    # writes, the row-max evict, the exp, and the dma_transpose's num_f_outer/num_f_inner
+    # split -- so capping it here removes the work outright. MM2 already skipped these
+    # sub-tiles (it sits at the exact causal ideal), which is why the two passes disagreed.
+    # Bit-exact: the dropped keys are fully masked, so they contribute exp() == 0 to the
+    # softmax sum and can never win the running max.
+    #
+    # Plain causal only. Round-robin KV has non-monotonic tile positions; SWA also bounds the
+    # tile from below, so a top bound alone does not describe its valid range; and
+    # cp_strided_q_slicing scales max_q by global_cp_deg, which would stop the cap being a
+    # multiple of _Q_GRP_SZ -- that 128-multiple is what keeps num_f_inner == 0 downstream.
+    if (
+        unmasked
+        and not is_prior
+        and atp.is_causal
+        and ac.kvp_group_size == 0
+        and not ac.use_swa
+        and not ac.cp_strided_q_slicing
+    ):
+        # Mirrors _has_any_compute_causal's max_q_in_grp, as a count rather than an index.
+        causal_valid_k = grp * _Q_GRP_SZ + _Q_GRP_SZ - k_start_pos
+        if causal_valid_k < tile_info.num_valid_k:
+            tile_info.num_valid_k = causal_valid_k
+    return tile_info
+
+
+def _exp_tile_selection(grp_i, large_tile_idx, exp_tile_idx, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
+    """Decide whether one exp tile is processed, and how many valid keys it has.
+
+    Delegates classification + masking to ``_classify_and_mask_tile`` (shared with
+    ``_k_tile_selection``); the exp path needs only should_process_tile and the valid-key count.
+
+    Returns (should_process_tile, num_valid_k_remaining):
+      - should_process_tile: False when the tile is fully masked (causal / SWA) or out of range
+        (tile start past the region end), True otherwise.
+      - num_valid_k_remaining: seqlen_k - k_start_pos, the count of valid keys in the tile's region
+        from the tile start to the region end. The caller caps it to the exp tile width for num_f.
+
+    Args:
+        grp_i: Q-group index (which 128-query group).
+        large_tile_idx: index of the large tile within the section.
+        exp_tile_idx: index of the exp (512-key) tile within the large tile.
+        ac (AttnConfig): attention config (prefix caching, causal, SWA, prior K length).
+        atp (AttnTileParams): derived tiling params (is_causal, active-K length, exp tile size).
+        sp (SectionParams): current section; provides section_offset for absolute positioning.
+    """
+    seqlen_offset = sp.section_offset + large_tile_idx * _LARGE_TILE_SZ + exp_tile_idx * atp.exp_inst_elems
+    tile_info = _classify_and_mask_tile(grp_i, seqlen_offset, atp.exp_inst_elems, ac, atp)
+    return tile_info.unmasked, tile_info.num_valid_k
 
 
 def _exp_impl(
@@ -2973,7 +3283,19 @@ def _exp_impl(
     bufs: AttnInternalBuffers,
     sink,
 ):
-    """Compute exponential of masked QK scores, accumulate sum, and perform transpose (required for MM2)."""
+    """Compute exp(QK - row max) for one Q group for one k-v section, accumulate the softmax row-sum, and
+    transpose the result for MM2 (the PV matmul). Skips fully-masked Q groups; folds in the
+    attention sink when present.
+
+    Args:
+        grp_i: Q-group index (which 128-query block to process).
+        ac (AttnConfig): attention config  (shapes, mask modes, scale ...)
+        atp (AttnTileParams): derived tiling/sizing parameters (number Q groups , num tiles ...).
+        sp (SectionParams): current flash-attention section and its offsets.
+        bufs (AttnInternalBuffers): SBUF and PSUM working buffers; reads mm1_masked and
+            mm1_running_max, writes exp_sb / exp_tp_sb / exp_partial_sum.
+        sink: optional attention-sink logit to include in the softmax, or None.
+    """
     has_any_compute_pred = (
         _has_any_compute_causal(grp_i, sp.section_offset_active, ac)
         if (atp.is_causal and not sp.section_contains_prefix)
@@ -2983,115 +3305,160 @@ def _exp_impl(
         return
 
     q_seqlen_offset = grp_i * atp.sb_p
-    nisa.memset(bufs.exp_partial_sum[grp_i][...], value=0.0)
+    num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
+    nisa.memset(bufs.exp_partial_sum[grp_i][...], value=0.0, engine=nisa.gpsimd_engine)
+
+    # Exp tiles must stay the width of the K tiles the masking wrote; prefix caching assumes this too.
+    kernel_assert(
+        atp.exp_inst_elems == _K_TILE_SZ,
+        f"exp tile size must match the K tile size, got {atp.exp_inst_elems=}, {_K_TILE_SZ=}",
+    )
+
+    # trn3 B1 has the Vector-Engine nisa.exponential, which subtracts max_value directly, whereas
+    # nisa.activation on the Scalar Engine adds a bias. mm1_running_max is stored pre-negated
+    # (mm1_section_max is reduced with negate=True), so the Scalar path uses it as-is and the Vector
+    # path needs it flipped back to a true max. Hoisted out of the tile loop: it is per Q group.
+    # The matching Scalar-Engine row-max evict in _qk_and_max_large_tile_impl is gated off
+    # (use_scalar_row_max is False), so only the Vector exp side is live.
+    use_vector_exp = bufs.mm1_running_max_pos is not None
+    if use_vector_exp:
+        # Per Q group, not per tile: mm1_running_max[:, grp_i] is settled before this group's exp runs.
+        exp_max_tile = bufs.mm1_running_max_pos[:num_p, grp_i : grp_i + 1]
+        nisa.tensor_scalar(
+            exp_max_tile,
+            bufs.mm1_running_max[:num_p, grp_i : grp_i + 1],
+            op0=nl.multiply,
+            operand0=-1.0,
+        )
+
+    # Precompute each exp tile's selection once (shared by the loop below) and chain the fused
+    # sum: reset on the first executed tile, accumulate on the rest, single read-out on the last.
+    exp_selections = []
+    exp_first_tile = None
+    exp_last_tile = None
+    for large_tile_idx in range(atp.num_large_tiles_per_section):
+        for exp_tile_idx in range(atp.num_exp_insts_per_large_tile):
+            should_process_tile, num_valid_k_remaining = _exp_tile_selection(
+                grp_i, large_tile_idx, exp_tile_idx, ac, atp, sp
+            )
+            exp_selections.append((should_process_tile, num_valid_k_remaining))
+            if should_process_tile:
+                current_exp_tile = (large_tile_idx, exp_tile_idx)
+                exp_first_tile = exp_first_tile or current_exp_tile
+                exp_last_tile = current_exp_tile
+
+    # nisa.exponential only reaches the 2x/4x modes its fused accumulator requires on an even
+    # element count, and the Vector and Scalar accumulators are distinct hardware, so the chain
+    # cannot switch engines partway: one odd tile sends this whole group to the Scalar fallback.
+    if use_vector_exp and any(
+        min(num_valid_k, atp.exp_inst_elems) % 2 for selected, num_valid_k in exp_selections if selected
+    ):
+        use_vector_exp = False
 
     for large_tile_idx in range(atp.num_large_tiles_per_section):
-        kernel_assert(
-            atp.exp_inst_elems == 512, "Internal validation failed."
-        )  # prefix caching code assumes this currently, if we increase tile size to 2048, we will need to update logic
-
         for exp_tile_idx in range(atp.num_exp_insts_per_large_tile):
-            is_prior_tile, seqlen_k, k_start_pos, _ = _get_kv_tile_apc(
-                ac.is_prefix_caching,
-                False,
-                True,
-                atp.seqlen_k_active_updated,
-                ac.seqlen_k_prior,
-                sp.section_offset + large_tile_idx * _LARGE_TILE_SZ + exp_tile_idx * atp.exp_inst_elems,
-                None,
+            should_process_tile, num_valid_k_remaining = exp_selections[
+                large_tile_idx * atp.num_exp_insts_per_large_tile + exp_tile_idx
+            ]
+
+            if not should_process_tile:
+                continue
+            num_f = min(num_valid_k_remaining, atp.exp_inst_elems)
+            # Step 1: Compute exponential — chained Scalar-engine sum (reset on the first executed
+            # tile, accumulate on the rest, single read-out on the last).
+            is_first_exp = (large_tile_idx, exp_tile_idx) == exp_first_tile
+            is_last_exp = (large_tile_idx, exp_tile_idx) == exp_last_tile
+            exp_reduce_res = (
+                bufs.exp_partial_sum[grp_i][
+                    :num_p,
+                    large_tile_idx * atp.num_exp_insts_per_large_tile + exp_tile_idx,
+                ]
+                if is_last_exp
+                else None
             )
-            num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-            num_f = min(seqlen_k - k_start_pos, atp.exp_inst_elems)
-
-            q_start_pos = grp_i * _Q_GRP_SZ
-            # Only produce matmul if the tile is in the lower triangle, use tile bot-left corner so adjust q
-            if atp.is_causal and not is_prior_tile:
-                exp_sel_mask = _has_any_compute_causal(grp_i, k_start_pos, ac)
+            exp_reduce_cmd = nisa.reduce_cmd.reset_reduce if is_first_exp else nisa.reduce_cmd.reduce
+            if use_vector_exp:
+                nisa.exponential(
+                    dst=bufs.exp_sb[grp_i][large_tile_idx][:num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)],
+                    src=bufs.mm1_masked[grp_i][large_tile_idx][:num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)],
+                    max_value=exp_max_tile,
+                    reduce_res=exp_reduce_res,
+                    reduce_cmd=exp_reduce_cmd,
+                )
             else:
-                exp_sel_mask = True
-
-            # If using SWA, also skip bot-left lower triangle.
-            if ac.use_swa and atp.is_causal and not is_prior_tile:
-                # Use tile top-right corner so adjust k; also adjust q for sliding window
-                exp_sel_mask = exp_sel_mask and _has_any_compute_swa(grp_i, k_start_pos, atp.exp_inst_elems, ac)
-
-            if exp_sel_mask and seqlen_k > k_start_pos:
-                # Step 1: Compute exponential
-                nisa.activation_reduce(
+                nisa.activation(
                     bufs.exp_sb[grp_i][large_tile_idx][:num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)],
                     op=nl.exp,
                     data=bufs.mm1_masked[grp_i][large_tile_idx][
                         :num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)
                     ],
                     reduce_op=nl.add,
-                    reduce_res=bufs.exp_partial_sum[grp_i][
-                        :num_p,
-                        large_tile_idx * atp.num_exp_insts_per_large_tile + exp_tile_idx,
-                    ],
+                    reduce_cmd=exp_reduce_cmd,
+                    reduce_res=exp_reduce_res,
                     bias=bufs.mm1_running_max[:num_p, grp_i],
                 )
 
-                # Step 2: Perform DMA transpose
-                num_f_outer = num_f // atp.sb_p
-                num_f_inner = num_f % atp.sb_p
-                # split dma_transpose into two parts to satisfy API since we have both Q and K sequence masking
-                # Focusing on exp_tp_sb which is arranged as [128, 4, 128] where each of the 4 [128, 128] blocks
-                # share the same Q seqlen (on free dim) and cover 4 tiles of K seqlen (partition dim)
-                # First region, we have num_f_outer [128, 128] blocks each having full partition dim (K) and each
-                # accessing num_p (<128) on the free dim (Q).
-                # Second region, we handle the remaining K (num_f_inner) - here we have the (num_f_outer+1)th [128,128]
-                # block being utilized with num_f_inner access on partition dim and num_p on the free dim.
+            # Step 2: Perform DMA transpose
+            num_f_outer = num_f // atp.sb_p
+            num_f_inner = num_f % atp.sb_p
+            # split dma_transpose into two parts to satisfy API since we have both Q and K sequence masking
+            # Focusing on exp_tp_sb which is arranged as [128, 4, 128] where each of the 4 [128, 128] blocks
+            # share the same Q seqlen (on free dim) and cover 4 tiles of K seqlen (partition dim)
+            # First region, we have num_f_outer [128, 128] blocks each having full partition dim (K) and each
+            # accessing num_p (<128) on the free dim (Q).
+            # Second region, we handle the remaining K (num_f_inner) - here we have the (num_f_outer+1)th [128,128]
+            # block being utilized with num_f_inner access on partition dim and num_p on the free dim.
 
-                # Example: num_f_outer = 3, num_f_inner = 33, num_p = 100
-                # Region 1: AP: [[512, 128], [128, 3], [1, 100]] => a, b, c = np.mgrid[0:128, 0:3, 0:100]
-                # Region 2: AP: [[512, 33], [128, 1], [1, 100]]  => a, b, c = np.mgrid[0:33, 0:1, 0:100] with offset 128 * 3
+            # Example: num_f_outer = 3, num_f_inner = 33, num_p = 100
+            # Region 1: AP: [[512, 128], [128, 3], [1, 100]] => a, b, c = np.mgrid[0:128, 0:3, 0:100]
+            # Region 2: AP: [[512, 33], [128, 1], [1, 100]]  => a, b, c = np.mgrid[0:33, 0:1, 0:100] with offset 128 * 3
 
-                # NOTE: we add the [1,1] because we need 4 dims for dma_transpose
+            # NOTE: we add the [1,1] because we need 4 dims for dma_transpose
 
-                # Case 1: handle 0:128x
-                if num_f_outer >= 1:
-                    nisa.dma_transpose(
-                        dst=bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx].ap(
-                            [
-                                [atp.mm2_grp_sz, atp.sb_p],
-                                [1, 1],
-                                [atp.sb_p, num_f_outer],
-                                [1, num_p],
-                            ]
-                        ),
-                        src=bufs.exp_sb[grp_i][large_tile_idx].ap(
-                            [
-                                [_LARGE_TILE_SZ, num_p],
-                                [1, 1],
-                                [atp.sb_p, num_f_outer],
-                                [1, atp.sb_p],
-                            ],
-                            offset=exp_tile_idx * atp.mm2_grp_sz,
-                        ),
-                    )
+            # Case 1: handle 0:128x
+            if num_f_outer >= 1:
+                nisa.dma_transpose(
+                    dst=bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx].ap(
+                        [
+                            [atp.mm2_grp_sz, atp.sb_p],
+                            [1, 1],
+                            [atp.sb_p, num_f_outer],
+                            [1, num_p],
+                        ]
+                    ),
+                    src=bufs.exp_sb[grp_i][large_tile_idx].ap(
+                        [
+                            [_LARGE_TILE_SZ, num_p],
+                            [1, 1],
+                            [atp.sb_p, num_f_outer],
+                            [1, atp.sb_p],
+                        ],
+                        offset=exp_tile_idx * atp.mm2_grp_sz,
+                    ),
+                )
 
-                # Case 2: handle num_f - 128x
-                if num_f_inner > 0:
-                    nisa.dma_transpose(
-                        dst=bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx].ap(
-                            [
-                                [atp.mm2_grp_sz, num_f_inner],
-                                [1, 1],
-                                [atp.sb_p, 1],
-                                [1, num_p],
-                            ],
-                            offset=num_f_outer * atp.sb_p,
-                        ),
-                        src=bufs.exp_sb[grp_i][large_tile_idx].ap(
-                            [
-                                [_LARGE_TILE_SZ, num_p],
-                                [1, 1],
-                                [atp.sb_p, 1],
-                                [1, num_f_inner],
-                            ],
-                            offset=exp_tile_idx * atp.mm2_grp_sz + num_f_outer * atp.sb_p,
-                        ),
-                    )
+            # Case 2: handle num_f - 128x
+            if num_f_inner > 0:
+                nisa.dma_transpose(
+                    dst=bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx].ap(
+                        [
+                            [atp.mm2_grp_sz, num_f_inner],
+                            [1, 1],
+                            [atp.sb_p, 1],
+                            [1, num_p],
+                        ],
+                        offset=num_f_outer * atp.sb_p,
+                    ),
+                    src=bufs.exp_sb[grp_i][large_tile_idx].ap(
+                        [
+                            [_LARGE_TILE_SZ, num_p],
+                            [1, 1],
+                            [atp.sb_p, 1],
+                            [1, num_f_inner],
+                        ],
+                        offset=exp_tile_idx * atp.mm2_grp_sz + num_f_outer * atp.sb_p,
+                    ),
+                )
 
     # If there is sink, subtract max from it, then take its exp, then append it to sums
     if (sink is not None) and (sp.section_idx == 0):
@@ -3118,7 +3485,7 @@ def _pv_impl(
         else True
     )
     if has_any_compute_pred:
-        for _d_tile in range(atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim):
+        for _d_tile in range(atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim):
             nisa.memset(bufs.mm2_sb[grp_i][_d_tile][...], value=0.0)
 
         for large_tile_idx in range(atp.num_large_tiles_per_section):
@@ -3146,7 +3513,11 @@ def _fused_qkmax_and_pv_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
-    nisa.memset(bufs.mm1_partial_max[qkmax_grp][...], value=_FLOAT32_MIN)
+    nisa.memset(
+        bufs.mm1_partial_max[qkmax_grp % _MM1_PARTIAL_MAX_STAGES][:, : atp.num_k_tiles_per_section],
+        value=_FLOAT32_MIN,
+        engine=nisa.gpsimd_engine,
+    )
 
     for large_tile_idx in range(atp.num_large_tiles_per_section):
         if has_any_compute_pred_pv:
@@ -3186,10 +3557,18 @@ def _write_back_impl(
 
     # Step 1: Compute/update exp-sum and its reciprocal
     q_seqlen_offset = grp_i * atp.sb_p
-    nisa.tensor_reduce(bufs.exp_section_sum[grp_i][...], nl.add, bufs.exp_partial_sum[grp_i], axis=1)
+    # Same aliasing as the running max above: on the first section exp_section_sum and
+    # exp_running_sum hold the same value, so reduce straight into the running sum and skip the
+    # GpSimd copy. Only section_idx > 0 needs them apart, where the section
+    # sum is folded into the running sum through the flash correction factor.
+    reduce_into_running = sp.section_idx == 0 or atp.num_sections == 1
+    nisa.tensor_reduce(
+        bufs.exp_running_sum[:, grp_i] if reduce_into_running else bufs.exp_section_sum[grp_i][...],
+        nl.add,
+        bufs.exp_partial_sum[grp_i],
+        axis=1,
+    )
     if atp.num_sections != 1:
-        if sp.section_idx == 0:
-            nisa.tensor_copy(bufs.exp_running_sum[:, grp_i], bufs.exp_section_sum[grp_i])
         if sp.section_idx > 0:
             nisa.tensor_copy(
                 bufs.prev_exp_running_sum[grp_i][...],
@@ -3210,11 +3589,9 @@ def _write_back_impl(
                     bufs.exp_running_sum[:, grp_i],
                 )
     else:
-        if ac.skip_output_normalization:
-            # Single section: exp_running_sum was never set, copy from exp_section_sum
-            nisa.tensor_copy(bufs.exp_running_sum[:, grp_i], bufs.exp_section_sum[grp_i])
-        else:
-            nisa.reciprocal(bufs.exp_sum_reciprocal[:, grp_i], bufs.exp_section_sum[grp_i])
+        # Single section: the reduce above already landed in exp_running_sum.
+        if not ac.skip_output_normalization:
+            nisa.reciprocal(bufs.exp_sum_reciprocal[:, grp_i], bufs.exp_running_sum[:, grp_i])
 
     num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
     num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
@@ -3232,8 +3609,8 @@ def _write_back_impl(
         - write to HBM after scaling by reciprocal
       - write to HBM
     """
-    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
-    d_tile_size = atp.d_tile_size_par_dim if ac.tp_out else atp.d_tile_size_free_dim
+    num_d_tiles_iter = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
+    d_tile_size = atp.d_tile_size_par_dim_v if ac.tp_out else atp.d_tile_size_free_dim
     if atp.num_sections != 1:
         if sp.section_idx == 0:
             if is_last_section_with_compute:
@@ -3249,13 +3626,13 @@ def _write_back_impl(
         if sp.section_idx > 0:
             # Load previous output, scale by flash_attn_correction_factor and accumulate
             for d_tile in range(num_d_tiles_iter):
-                d = min(d_tile_size, ac.d - d_tile * d_tile_size)
+                d = min(d_tile_size, ac.d_v - d_tile * d_tile_size)
                 d_offset = d_tile * d_tile_size
                 if ac.tp_out:
                     prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[atp.sb_p, d], [1, num_f]], offset=0)
                     o_src_pat = o.ap(
                         pattern=[[ac.seqlen_q, d], [1, num_f]],
-                        offset=batch_id * ac.d * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
+                        offset=batch_id * ac.d_v * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
                     )
                     nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
 
@@ -3284,8 +3661,8 @@ def _write_back_impl(
                 else:
                     prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[d, num_p], [1, d]], offset=0)
                     o_src_pat = o.ap(
-                        pattern=[[ac.d, num_p], [1, d]],
-                        offset=batch_id * ac.seqlen_q * ac.d + grp_i * atp.sb_p * ac.d + d_offset,
+                        pattern=[[ac.d_v, num_p], [1, d]],
+                        offset=batch_id * ac.seqlen_q * ac.d_v + grp_i * atp.sb_p * ac.d_v + d_offset,
                     )
                     nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
                     nisa.scalar_tensor_tensor(
@@ -3327,10 +3704,10 @@ def _scale_reciprocal_write_back_impl(
     Write back o for the final section after multiplication by reciprocal. Transposes reciprocal if tp_out.
     Iterates over d-tiles internally.
     """
-    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
-    d_tile_size = atp.d_tile_size_par_dim if ac.tp_out else atp.d_tile_size_free_dim
+    num_d_tiles_iter = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
+    d_tile_size = atp.d_tile_size_par_dim_v if ac.tp_out else atp.d_tile_size_free_dim
     for d_tile in range(num_d_tiles_iter):
-        d = min(d_tile_size, ac.d - d_tile * d_tile_size)
+        d = min(d_tile_size, ac.d_v - d_tile * d_tile_size)
         src_buf = src_bufs[d_tile]
 
         if ac.tp_out:
@@ -3354,7 +3731,7 @@ def _scale_reciprocal_write_back_impl(
                 src_buf[:num_p, :d],
                 nl.multiply,
                 bufs.exp_sum_reciprocal[:num_p, grp_i],
-                engine=engine.vector,
+                engine=nisa.engine.vector,
             )
 
     _write_back_o_impl(bufs.mm2_final[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
@@ -3373,23 +3750,23 @@ def _write_back_o_impl(src_bufs, grp_i, ac: AttnConfig, atp: AttnTileParams, o, 
       num_p: Number of partition elements (seqlen_q tile size)
       num_f: Number of free elements (seqlen_q tile size, used for tp_out=True)
     """
-    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
-    d_tile_size = atp.d_tile_size_par_dim if ac.tp_out else atp.d_tile_size_free_dim
+    num_d_tiles_iter = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
+    d_tile_size = atp.d_tile_size_par_dim_v if ac.tp_out else atp.d_tile_size_free_dim
     for d_tile in range(num_d_tiles_iter):
-        d = min(d_tile_size, ac.d - d_tile * d_tile_size)
+        d = min(d_tile_size, ac.d_v - d_tile * d_tile_size)
         d_offset = d_tile * d_tile_size
         src_buf = src_bufs[d_tile]
 
         if ac.tp_out:
             o_dst_pat = o.ap(
                 pattern=[[ac.seqlen_q, d], [1, num_f]],
-                offset=batch_id * ac.d * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
+                offset=batch_id * ac.d_v * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
             )
             src_pat = src_buf.ap(pattern=[[atp.sb_p, d], [1, num_f]], offset=0)
         else:
             o_dst_pat = o.ap(
-                pattern=[[ac.d, num_p], [1, d]],
-                offset=batch_id * ac.seqlen_q * ac.d + grp_i * atp.sb_p * ac.d + d_offset,
+                pattern=[[ac.d_v, num_p], [1, d]],
+                offset=batch_id * ac.seqlen_q * ac.d_v + grp_i * atp.sb_p * ac.d_v + d_offset,
             )
             src_pat = src_buf.ap(pattern=[[d, num_p], [1, d]], offset=0)
         nisa.dma_copy(dst=o_dst_pat, src=src_pat)
@@ -3507,6 +3884,157 @@ def _load_position_bias_tile(
     return True
 
 
+def _k_tile_selection(qkmax_grp, large_tile_idx, k_tile_idx, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
+    """Decide whether one K tile is processed by the QK + row-max pass, and return its position.
+
+    Called once per K tile inside ``_qk_and_max_large_tile_impl`` (the QK+max loop): it gates whether
+    that tile runs the QK^T matmul + masking + row-max reduce, and supplies the position those steps
+    need. Sibling of ``_exp_tile_selection`` (the exp pass); both wrap ``_classify_and_mask_tile`` and
+    add their own pass-specific processing check.
+
+    Returns ``(tile_info, should_process)``:
+      - tile_info (KTileInfo): is_prior, seqlen_k, k_start_pos (region-local) and num_valid_k, from
+        ``_classify_and_mask_tile``.
+      - should_process: True if the tile has work; False when it is beyond the section's K tiles,
+        fully masked (causal / SWA), or out of range (Q group past seqlen_q, or k_start past region end).
+    """
+    q_seqlen_offset = qkmax_grp * atp.sb_p
+    # Resolve the tile's absolute key position: index within the large tile -> within the section ->
+    # global K-tile index (context-parallel uses kv_section_idx) -> key offset.
+    k_tile_idx_in_section = large_tile_idx * _NUM_K_TILES_IN_LARGE_TILE + k_tile_idx
+    kv_section_idx = sp.kv_section_idx if sp.kv_section_idx is not None else sp.section_idx
+    k_tile_idx_global = atp.num_k_tiles_per_section * kv_section_idx + k_tile_idx_in_section
+    tile_info = _classify_and_mask_tile(qkmax_grp, k_tile_idx_global * _K_TILE_SZ, _K_TILE_SZ, ac, atp)
+    # Process only if the tile is in-section, has unmasked keys, and the Q group is in range.
+    in_section = k_tile_idx_in_section < atp.num_k_tiles_per_section
+    should_process_tile = in_section and tile_info.unmasked and q_seqlen_offset < ac.seqlen_q
+    return tile_info, should_process_tile
+
+
+def _k_tile_mask_branch(qkmax_grp, tile, should_process, ac: AttnConfig, atp: AttnTileParams):
+    """Classify Step-3 masking for one k-tile: returns ``(kvp_tile_fully_visible, diagonal_sel_mask)``.
+
+    Trace-time only. Shared by the Step-3 emit loop and by the row-max chain planner so the two always
+    agree on which masking branch -- and therefore which engine's reduce accumulator -- a tile lands on.
+    """
+    num_f = min(tile.num_valid_k, _K_TILE_SZ)
+
+    # For interleaved KV: skip masking entirely if tile is fully visible
+    kvp_tile_fully_visible = False
+    if ac.kvp_group_size > 0 and not tile.is_prior:
+        if ac.kvp_all_tiles_visible:
+            kvp_tile_fully_visible = True
+        elif ac.kvp_cp_offset_int > 0:
+            stride = ac.kvp_group_size * ac.block_size
+            last_block_in_tile = (tile.k_start_pos + num_f - 1) // ac.block_size
+            max_k_threshold_in_tile = last_block_in_tile * stride + ac.block_size - 1
+            # Use adjusted coordinates: min_adjusted_ubs = min_q - seg_block_offset*stride (rank=0 best case)
+            min_adjusted_ubs = qkmax_grp * _Q_GRP_SZ + ac.kvp_cp_offset_int - ac.kvp_seg_block_offset_int * stride
+            kvp_tile_fully_visible = min_adjusted_ubs > max_k_threshold_in_tile
+
+    diagonal_sel_mask = (
+        should_process and ((qkmax_grp * _Q_GRP_SZ) < (tile.k_start_pos + _K_TILE_SZ))
+        if (atp.is_causal and not tile.is_prior and not atp.dynamic_sel_mask and not kvp_tile_fully_visible)
+        else False
+    )
+    if ac.use_swa and atp.is_causal and not tile.is_prior:
+        # When using SWA, above condition for diagonal_sel_mask might miss some
+        # conditions where masking needs to be applied since it only checks for
+        # causal condition. Therefore we either need dynamic mask or affine select mask.
+        diagonal_sel_mask = not atp.dynamic_sel_mask
+
+    return kvp_tile_fully_visible, diagonal_sel_mask
+
+
+def _row_max_on_scalar(kvp_tile_fully_visible, diagonal_sel_mask, tile, atp: AttnTileParams):
+    """Whether this k-tile evicts MM1 with a tensor_scalar-style instruction, which ``activate2`` can run
+    on the Scalar Engine. ``range_select`` (the dynamic/prior mask) and the interleaved-KV
+    three-instruction path are Vector-only. Branch order mirrors the Step-3 emit loop.
+    """
+    if diagonal_sel_mask:
+        # The range_select form of the diagonal mask is Vector-only, like the dynamic one below.
+        return not atp.static_causal_range_sel
+    if (atp.dynamic_sel_mask or tile.is_prior) and not kvp_tile_fully_visible:
+        return False
+    return True  # no masking
+
+
+def _emit_row_max_evict(dst, data, scale, reduce_res, reduce_cmd, on_scalar):
+    """Evict MM1 scores scaled, with a fused row-max onto the chosen engine's accumulator.
+
+    ``activate2`` computes ``op(data * imm0 + imm1)`` before reducing, so ``nl.copy`` with ``imm0=scale``
+    makes one Scalar-Engine instruction do both the scale and the max; ``tensor_scalar_reduce`` is the
+    Vector-Engine equivalent. Mirrors ``_qk`` in
+    ``experimental/attention/flash_attention2_trn3/flash_attention_fwd.py``.
+    """
+    if on_scalar:
+        nisa.activate2(
+            dst=dst,
+            op=nl.copy,
+            data=data,
+            imm0=scale,
+            imm1=0.0,
+            op0=nl.multiply,
+            op1=nl.add,
+            reduce_op=nl.maximum,
+            reduce_cmd=reduce_cmd,
+            reduce_res=reduce_res,
+        )
+    else:
+        nisa.tensor_scalar_reduce(
+            dst,
+            data=data,
+            op0=nl.multiply,
+            operand0=scale,
+            reduce_op=nl.maximum,
+            reduce_res=reduce_res,
+            reduce_cmd=reduce_cmd,
+        )
+
+
+def _row_max_chain_endpoints(k_tile_selections, ac: AttnConfig, atp: AttnTileParams, qkmax_grp, split_by_engine):
+    """Return ``{on_scalar: (first, last)}``: per reduce accumulator, the first and last executed k-tile
+    index in this large tile whose row-max reduces can be chained (reset on first, accumulate on the rest,
+    read out once on last), or None to fall back to per-tile reduces (also None when fewer than two tiles
+    are executed).
+
+    k_tile_selections is the per-k-tile ``(KTileInfo, should_process)`` list for the large tile (computed
+    once by the caller and shared with the emit loop); the executed tiles (should_process) are exactly the
+    ones the emit loop processes, so (first, last) bound them. Masking writes SBUF (not the reduce accumulator), so
+    chaining across masked/skipped tiles is safe. Chaining covers causal, non-causal, prefix, SWA, and
+    context-parallel masking; interleaved-KV (kvp) and sequence packing are excluded (the row-max chain
+    is not exact-max validated for them) and fall back to per-tile reduces.
+
+    ACT and DVE hold separate reduce accumulators, so when the evicts are split across both engines
+    (``split_by_engine``) each engine gets its own chain and the two never interleave: the Scalar chain
+    covers the tensor_scalar-style evicts, the Vector chain the range_select ones. With
+    ``split_by_engine`` False every tile evicts on Vector, giving the single chain keyed ``False``.
+    """
+    # Interleaved-KV (kvp): row-max chain not exact-max validated for it; fall back to per-tile reduces.
+    if ac.kvp_group_size != 0:
+        return None
+    # Sequence packing: not exact-max validated and ~0 chaining gain; fall back to per-tile reduces.
+    if ac.is_sequence_packed:
+        return None
+
+    chains = {}
+    num_executed = 0
+    for k_tile_idx in range(_NUM_K_TILES_IN_LARGE_TILE):
+        tile_info, should_process = k_tile_selections[k_tile_idx]
+        if not should_process:
+            continue
+        num_executed = num_executed + 1
+        on_scalar = False
+        if split_by_engine:
+            kvp_visible, diagonal = _k_tile_mask_branch(qkmax_grp, tile_info, should_process, ac, atp)
+            on_scalar = _row_max_on_scalar(kvp_visible, diagonal, tile_info, atp)
+        first_tile = chains[on_scalar][0] if on_scalar in chains else k_tile_idx
+        chains[on_scalar] = (first_tile, k_tile_idx)
+    if num_executed < 2:
+        return None
+    return chains
+
+
 def _qk_and_max_large_tile_impl(
     qkmax_grp,
     large_tile_idx,
@@ -3526,295 +4054,312 @@ def _qk_and_max_large_tile_impl(
     """
 
     q_seqlen_offset = qkmax_grp * atp.sb_p
+    # Valid query rows in this Q group (partition dim); loop-invariant across k-tiles.
+    num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
 
     # Whether position-bias preload is active for this invocation. The actual
     # bias preload happens per-K-tile in the matmul loop below.
     has_bias = ac.use_position_bias and bufs.position_bias_hbm is not None
 
     # perform matmul and masking in 512 (_K_TILE_SZ) tile increment on the seqlen dimension
-    num_k_tiles_in_large_tile = _LARGE_TILE_SZ // _K_TILE_SZ
-    for k_tile_idx in range(num_k_tiles_in_large_tile):
+    # Compute each k-tile's selection once, shared by _row_max_chain_endpoints and the loop below.
+    k_tile_selections = []
+    for k_tile_idx in range(_NUM_K_TILES_IN_LARGE_TILE):
+        k_tile_selections.append(_k_tile_selection(qkmax_grp, large_tile_idx, k_tile_idx, ac, atp, sp))
+    # Row-max chaining: chain this large tile's executed reduces on the Vector accumulator, reading out
+    # once (on the last chained tile) instead of per tile. None = fall back to per-tile reduces.
+    # The row-max evict stays on Vector on every target. nisa.activate2 is far more expensive per
+    # element than nisa.tensor_scalar_reduce for a PSUM read + scale + fused max, so moving the evict
+    # to Scalar is slower even where Scalar is otherwise free. The placement logic is retained in
+    # _row_max_on_scalar and the chaining below is engine-independent; only the engine choice is off.
+    use_scalar_row_max = False
+    row_max_chains = _row_max_chain_endpoints(k_tile_selections, ac, atp, qkmax_grp, use_scalar_row_max)
+    for k_tile_idx in range(_NUM_K_TILES_IN_LARGE_TILE):
+        tile, should_process = k_tile_selections[k_tile_idx]
+
+        if not should_process:
+            continue
         # Extract relevant tensor tiles for convenience
         mm1_psum_tile = bufs.mm1_psum[qkmax_grp][large_tile_idx][k_tile_idx]
-        if not atp.dynamic_sel_mask:
+        # Keyed off the allocation, not off dynamic_sel_mask: the range_select diagonal path
+        # leaves both buffers unallocated.
+        if bufs.mm1_copy_sb is not None:
             mm1_copy_sb_tile = bufs.mm1_copy_sb[qkmax_grp][large_tile_idx][k_tile_idx]
             mm1_affine_select_output_tile = bufs.mm1_affine_select_output[qkmax_grp][large_tile_idx][k_tile_idx]
         mm1_masked_tile = bufs.mm1_masked[qkmax_grp][large_tile_idx]
-        mm1_partial_max_tile = bufs.mm1_partial_max[qkmax_grp]
+        mm1_partial_max_tile = bufs.mm1_partial_max[qkmax_grp % _MM1_PARTIAL_MAX_STAGES]
 
-        k_tile_idx_in_section = large_tile_idx * num_k_tiles_in_large_tile + k_tile_idx
-        _kv_sec_idx = sp.kv_section_idx if sp.kv_section_idx is not None else sp.section_idx
-        k_tile_idx_global = atp.num_k_tiles_per_section * _kv_sec_idx + k_tile_idx_in_section
-        is_prior_tile, seqlen_k, k_start_pos, _ = _get_kv_tile_apc(
-            ac.is_prefix_caching,
-            False,
-            True,
-            atp.seqlen_k_active_updated,
-            ac.seqlen_k_prior,
-            k_tile_idx_global * _K_TILE_SZ,
-            None,
+        k_tile_idx_in_section = large_tile_idx * _NUM_K_TILES_IN_LARGE_TILE + k_tile_idx
+        num_f = min(tile.num_valid_k, _K_TILE_SZ)
+
+        # Step 1: Load position bias into PSUM before matmul (if present)
+        # This pre-seeds PSUM with bias so that after matmul accumulation,
+        # PSUM contains QK + bias. The DMA for bias can overlap with Q/K loads.
+        use_accumulate = False
+        if has_bias:
+            abs_k_pos = sp.section_offset + k_tile_idx_in_section * _K_TILE_SZ
+            bias_sb_tile = bufs.position_bias_sb[qkmax_grp]
+            preload_ok = _load_position_bias_tile(
+                ac=ac,
+                atp=atp,
+                bufs=bufs,
+                bias_sb_tile=bias_sb_tile,
+                batch_id=batch_id,
+                q_seqlen_offset=q_seqlen_offset,
+                num_p_bias=num_p,
+                abs_k_pos=abs_k_pos,
+                num_f=num_f,
+            )
+            if preload_ok:
+                # Preload bias into PSUM; matmul below will accumulate on top.
+                interleave_copy(mm1_psum_tile[:num_p, :num_f], bias_sb_tile[:num_p, :num_f], index=k_tile_idx)
+                use_accumulate = True
+
+        # Step 2: MM1 matmul (accumulates onto bias if pre-loaded, otherwise overwrites)
+        if tile.is_prior and bufs.k_sb_prior is not None:
+            k_tile_to_use = bufs.k_sb_prior[tile.k_start_pos // _K_TILE_SZ]
+        elif bufs.k_sb_prior is not None:
+            k_tile_to_use = bufs.k_sb[tile.k_start_pos // _K_TILE_SZ]
+        else:
+            k_tile_to_use = bufs.k_sb[k_tile_idx_in_section]
+
+        for d_tile in range(atp.num_d_tiles):
+            d_chunk = min(atp.d_tile_size_par_dim, ac.d - d_tile * atp.d_tile_size_par_dim)
+            nisa.nc_matmul(
+                mm1_psum_tile[:num_p, :num_f],
+                bufs.q_sb[qkmax_grp // atp.num_q_grps_per_load][d_tile][
+                    :d_chunk,
+                    nl.ds((qkmax_grp % atp.num_q_grps_per_load) * _Q_GRP_SZ, num_p),
+                ],
+                k_tile_to_use[d_tile][:d_chunk, :num_f],
+                accumulate=True if use_accumulate else None,
+            )
+
+        # Step 3: Masking + scale + max reduce (unchanged from no-bias path)
+        # PSUM now contains QK + bias (or just QK if no bias)
+
+        kvp_tile_fully_visible, diagonal_sel_mask = _k_tile_mask_branch(qkmax_grp, tile, should_process, ac, atp)
+
+        # Row-max chain: reset on the first chained tile, accumulate (reduce) on the rest, and read out
+        # only on the last; when not chaining, every tile resets and reads out (per-tile reduce). The
+        # chain is per engine because ACT and DVE hold separate reduce accumulators.
+        row_max_on_scalar = use_scalar_row_max and _row_max_on_scalar(
+            kvp_tile_fully_visible, diagonal_sel_mask, tile, atp
+        )
+        row_max_chain = row_max_chains.get(row_max_on_scalar) if row_max_chains is not None else None
+        row_max_reduce_cmd = (
+            nisa.reduce_cmd.reduce
+            if (row_max_chain is not None and k_tile_idx != row_max_chain[0])
+            else nisa.reduce_cmd.reset_reduce
+        )
+        row_max_reduce_res = (
+            None
+            if (row_max_chain is not None and k_tile_idx != row_max_chain[1])
+            else mm1_partial_max_tile[:num_p, k_tile_idx_in_section]
         )
 
-        if atp.is_causal and not is_prior_tile:
-            # Only produce matmul if the tile is in the lower triangle, use tile bot-left corner so adjust q
-            matmul_selection = _has_any_compute_causal(qkmax_grp, k_start_pos, ac)
-            # If using SWA, also skip bot-left lower triangle.
-            if ac.use_swa:
-                # Use tile top-right corner so adjust k; also adjust q for sliding window
-                matmul_selection = matmul_selection and _has_any_compute_swa(qkmax_grp, k_start_pos, _K_TILE_SZ, ac)
-        else:
-            matmul_selection = True
-
-        if q_seqlen_offset >= ac.seqlen_q or k_start_pos >= seqlen_k:  # make sure we don't extend bound
-            matmul_selection = False
-
-        if matmul_selection and k_tile_idx_in_section < atp.num_k_tiles_per_section:
-            num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
-            num_q_free = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-
-            # Step 1: Load position bias into PSUM before matmul (if present)
-            # This pre-seeds PSUM with bias so that after matmul accumulation,
-            # PSUM contains QK + bias. The DMA for bias can overlap with Q/K loads.
-            use_accumulate = False
-            if has_bias:
-                abs_k_pos = sp.section_offset + k_tile_idx_in_section * _K_TILE_SZ
-                num_p_bias = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-                bias_sb_tile = bufs.position_bias_sb[qkmax_grp]
-                preload_ok = _load_position_bias_tile(
-                    ac=ac,
-                    atp=atp,
-                    bufs=bufs,
-                    bias_sb_tile=bias_sb_tile,
-                    batch_id=batch_id,
-                    q_seqlen_offset=q_seqlen_offset,
-                    num_p_bias=num_p_bias,
-                    abs_k_pos=abs_k_pos,
-                    num_f=num_f,
-                )
-                if preload_ok:
-                    # Preload bias into PSUM; matmul below will accumulate on top.
-                    interleave_copy(
-                        mm1_psum_tile[:num_q_free, :num_f], bias_sb_tile[:num_q_free, :num_f], index=k_tile_idx
-                    )
-                    use_accumulate = True
-
-            # Step 2: MM1 matmul (accumulates onto bias if pre-loaded, otherwise overwrites)
-            if is_prior_tile and bufs.k_sb_prior is not None:
-                k_tile_to_use = bufs.k_sb_prior[k_start_pos // _K_TILE_SZ]
-            elif bufs.k_sb_prior is not None:
-                k_tile_to_use = bufs.k_sb[k_start_pos // _K_TILE_SZ]
-            else:
-                k_tile_to_use = bufs.k_sb[k_tile_idx_in_section]
-
-            for d_tile in range(atp.num_d_tiles):
-                d_chunk = min(atp.d_tile_size_par_dim, ac.d - d_tile * atp.d_tile_size_par_dim)
-                nisa.nc_matmul(
-                    mm1_psum_tile[:num_q_free, :num_f],
-                    bufs.q_sb[qkmax_grp // atp.num_q_grps_per_load][d_tile][
-                        :d_chunk,
-                        nl.ds((qkmax_grp % atp.num_q_grps_per_load) * _Q_GRP_SZ, num_q_free),
-                    ],
-                    k_tile_to_use[d_tile][:d_chunk, :num_f],
-                    accumulate=True if use_accumulate else None,
-                )
-
-            # Step 3: Masking + scale + max reduce (unchanged from no-bias path)
-            # PSUM now contains QK + bias (or just QK if no bias)
-            num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-            num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
-
-            # For interleaved KV: skip masking entirely if tile is fully visible
-            kvp_tile_fully_visible = False
-            if ac.kvp_group_size > 0 and not is_prior_tile:
-                if ac.kvp_all_tiles_visible:
-                    kvp_tile_fully_visible = True
-                elif ac.kvp_cp_offset_int > 0:
-                    stride = ac.kvp_group_size * ac.block_size
-                    last_block_in_tile = (k_start_pos + num_f - 1) // ac.block_size
-                    max_k_threshold_in_tile = last_block_in_tile * stride + ac.block_size - 1
-                    # Use adjusted coordinates: min_adjusted_ubs = min_q - seg_block_offset*stride (rank=0 best case)
-                    min_adjusted_ubs = (
-                        qkmax_grp * _Q_GRP_SZ + ac.kvp_cp_offset_int - ac.kvp_seg_block_offset_int * stride
-                    )
-                    kvp_tile_fully_visible = min_adjusted_ubs > max_k_threshold_in_tile
-
-            diagonal_sel_mask = (
-                matmul_selection and ((qkmax_grp * _Q_GRP_SZ) < (k_start_pos + _K_TILE_SZ))
-                if (atp.is_causal and not is_prior_tile and not atp.dynamic_sel_mask and not kvp_tile_fully_visible)
-                else False
+        if diagonal_sel_mask and atp.static_causal_range_sel:
+            # One instruction for what the affine_select path below needs three of: read PSUM,
+            # apply the causal bound 0 <= k <= q_absolute, and fuse the row-max evict. Both
+            # bounds are inclusive. dst (mm1_masked) and reduce_res (mm1_partial_max) are both
+            # fp32, which is the combination range_select's docs require to keep a fully masked
+            # row from turning into NaN in the downstream exp (FP32_MIN - FP32_MIN == 0).
+            nisa.range_select(
+                mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                on_true_tile=mm1_psum_tile[:num_p, :num_f],
+                on_false_value=_FLOAT32_MIN,
+                comp_op0=nl.greater_equal,
+                comp_op1=nl.less_equal,
+                bound0=bufs.zero_bias_tensor[:num_p, :1],
+                bound1=bufs.range_sel_ubs[:num_p, qkmax_grp : qkmax_grp + 1],
+                reduce_op=_nl_opcode.maximum,
+                reduce_res=row_max_reduce_res,
+                reduce_cmd=row_max_reduce_cmd,
+                range_start=tile.k_start_pos,
             )
-            if ac.use_swa and atp.is_causal and not is_prior_tile:
-                # When using SWA, above condition for diagonal_sel_mask might miss some
-                # conditions where masking needs to be applied since it only checks for
-                # causal condition. Therefore we either need dynamic mask or affine select mask.
-                diagonal_sel_mask = not atp.dynamic_sel_mask
 
-            if diagonal_sel_mask:  # static diagonal mask
-                nisa.tensor_copy(
-                    mm1_copy_sb_tile[:num_p, :num_f],
-                    mm1_psum_tile[:num_p, :num_f],
-                )
+        elif diagonal_sel_mask:  # static diagonal mask
+            nisa.tensor_copy(
+                mm1_copy_sb_tile[:num_p, :num_f],
+                mm1_psum_tile[:num_p, :num_f],
+            )
+            nisa.affine_select(
+                mm1_affine_select_output_tile[:num_p, :num_f],
+                pattern=[[-1, num_f]],
+                offset=qkmax_grp * atp.sb_p - tile.k_start_pos,
+                channel_multiplier=1,
+                cmp_op=nl.greater_equal,
+                on_true_tile=mm1_copy_sb_tile[:num_p, :num_f],
+                on_false_value=_FLOAT32_MIN,
+            )
+
+            if ac.use_swa:
                 nisa.affine_select(
                     mm1_affine_select_output_tile[:num_p, :num_f],
-                    pattern=[[-1, num_f]],
-                    offset=qkmax_grp * atp.sb_p - k_start_pos,
-                    channel_multiplier=1,
+                    pattern=[[1, num_f]],
+                    offset=(tile.k_start_pos + ac.sliding_window - 1 - qkmax_grp * atp.sb_p),
+                    channel_multiplier=-1,
                     cmp_op=nl.greater_equal,
-                    on_true_tile=mm1_copy_sb_tile[:num_p, :num_f],
+                    on_true_tile=mm1_affine_select_output_tile[:num_p, :num_f],
                     on_false_value=_FLOAT32_MIN,
                 )
 
-                if ac.use_swa:
-                    nisa.affine_select(
-                        mm1_affine_select_output_tile[:num_p, :num_f],
-                        pattern=[[1, num_f]],
-                        offset=(k_start_pos + ac.sliding_window - 1 - qkmax_grp * atp.sb_p),
-                        channel_multiplier=-1,
-                        cmp_op=nl.greater_equal,
-                        on_true_tile=mm1_affine_select_output_tile[:num_p, :num_f],
-                        on_false_value=_FLOAT32_MIN,
-                    )
+            _emit_row_max_evict(
+                dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                data=mm1_affine_select_output_tile[:num_p, :num_f],
+                scale=ac.scale,
+                reduce_res=row_max_reduce_res,
+                reduce_cmd=row_max_reduce_cmd,
+                on_scalar=row_max_on_scalar,
+            )
 
-                nisa.tensor_scalar_reduce(
-                    mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                    data=mm1_affine_select_output_tile[:num_p, :num_f],
-                    op0=nl.multiply,
-                    operand0=ac.scale,
-                    reduce_op=nl.maximum,
-                    reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+        elif (
+            atp.dynamic_sel_mask or tile.is_prior
+        ) and not kvp_tile_fully_visible:  # dynamic (compile-time unknown) mask
+            if ac.kvp_group_size > 0 and not tile.is_prior and bufs.k_threshold_sb is not None:
+                # Static mask path for interleaved KV (3 instructions)
+                k_threshold_tile = bufs.k_threshold_sb[:num_p, nl.ds(tile.k_start_pos, num_f)]
+                adjusted_ub = bufs.range_sel_ubs[:num_p, qkmax_grp : qkmax_grp + 1]
+
+                # Instruction 1: mask[q,j] = k_threshold[j] > adjusted_ubs[q]
+                nisa.tensor_scalar(
+                    dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                    data=k_threshold_tile,
+                    op0=nl.greater,
+                    operand0=adjusted_ub,
                 )
 
-            elif (
-                atp.dynamic_sel_mask or is_prior_tile
-            ) and not kvp_tile_fully_visible:  # dynamic (compile-time unknown) mask
-                if ac.kvp_group_size > 0 and not is_prior_tile and bufs.k_threshold_sb is not None:
-                    # Static mask path for interleaved KV (3 instructions)
-                    k_threshold_tile = bufs.k_threshold_sb[:num_p, nl.ds(k_start_pos, num_f)]
-                    adjusted_ub = bufs.range_sel_ubs[:num_p, qkmax_grp : qkmax_grp + 1]
-
-                    # Instruction 1: mask[q,j] = k_threshold[j] > adjusted_ubs[q]
-                    nisa.tensor_scalar(
-                        dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        data=k_threshold_tile,
-                        op0=nl.greater,
-                        operand0=adjusted_ub,
-                    )
-
-                    # SWA: also mask positions below lower bound
-                    if ac.use_swa and bufs.range_sel_lbs is not None:
-                        adjusted_lb = bufs.range_sel_lbs[:num_p, qkmax_grp : qkmax_grp + 1]
-                        nisa.scalar_tensor_tensor(
-                            dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                            data=k_threshold_tile,
-                            op0=nl.less,
-                            operand0=adjusted_lb,
-                            op1=nl.maximum,
-                            operand1=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        )
-
-                    # Instruction 2: masked_scores = mask * FLOAT32_MIN + scores
+                # SWA: also mask positions below lower bound
+                if ac.use_swa and bufs.range_sel_lbs is not None:
+                    adjusted_lb = bufs.range_sel_lbs[:num_p, qkmax_grp : qkmax_grp + 1]
                     nisa.scalar_tensor_tensor(
                         dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        data=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        op0=nl.multiply,
-                        operand0=_FLOAT32_MIN,
-                        op1=nl.add,
-                        operand1=mm1_psum_tile[:num_p, :num_f],
+                        data=k_threshold_tile,
+                        op0=nl.less,
+                        operand0=adjusted_lb,
+                        op1=nl.maximum,
+                        operand1=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
                     )
 
-                    # Instruction 3: scale + max reduction
-                    nisa.tensor_scalar_reduce(
-                        dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        data=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        op0=nl.multiply,
-                        operand0=ac.scale,
-                        reduce_op=nl.maximum,
-                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
-                    )
-                elif is_prior_tile:
-                    bound0 = bufs.range_sel_lbs_prior[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
-                    bound1 = bufs.range_sel_ubs_prior[:num_p, qkmax_grp]
-                    comp_op1 = nl.less  # k < prior_used_len
-                    kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
-                    nisa.range_select(
-                        mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        on_true_tile=mm1_psum_tile[:num_p, :num_f],
-                        on_false_value=_FLOAT32_MIN,
-                        comp_op0=nl.greater_equal,
-                        comp_op1=comp_op1,
-                        bound0=bound0[:num_p, :1],
-                        bound1=bound1[:num_p, :1],
-                        reduce_op=_maximum,
-                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
-                        reduce_cmd=reduce_cmd.reset_reduce,
-                        range_start=k_start_pos,
-                    )
-                elif ac.is_sequence_packed:
-                    bound0 = bufs.range_sel_lbs[:num_p, nl.ds(qkmax_grp, 1)]
-                    bound1 = bufs.range_sel_ubs[:num_p, nl.ds(qkmax_grp, 1)]
-                    comp_op1 = nl.less_equal if atp.is_causal else nl.less
-                    kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
-                    nisa.range_select(
-                        mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        on_true_tile=mm1_psum_tile[:num_p, :num_f],
-                        on_false_value=_FLOAT32_MIN,
-                        comp_op0=nl.greater_equal,
-                        comp_op1=comp_op1,
-                        bound0=bound0[:num_p, :1],
-                        bound1=bound1[:num_p, :1],
-                        reduce_op=_maximum,
-                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
-                        reduce_cmd=reduce_cmd.reset_reduce,
-                        range_start=k_start_pos,
-                    )
-                else:
-                    bound0 = bufs.range_sel_lbs[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
-                    bound1 = bufs.range_sel_ubs[:num_p, qkmax_grp]
-                    comp_op1 = nl.less_equal  # k <= q + cp_offset
-                    kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
-                    nisa.range_select(
-                        mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        on_true_tile=mm1_psum_tile[:num_p, :num_f],
-                        on_false_value=_FLOAT32_MIN,
-                        comp_op0=nl.greater_equal,
-                        comp_op1=comp_op1,
-                        bound0=bound0[:num_p, :1],
-                        bound1=bound1[:num_p, :1],
-                        reduce_op=_maximum,
-                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
-                        reduce_cmd=reduce_cmd.reset_reduce,
-                        range_start=k_start_pos,
-                    )
+                # Instruction 2: masked_scores = mask * FLOAT32_MIN + scores
+                nisa.scalar_tensor_tensor(
+                    dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                    data=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                    op0=nl.multiply,
+                    operand0=_FLOAT32_MIN,
+                    op1=nl.add,
+                    operand1=mm1_psum_tile[:num_p, :num_f],
+                )
 
-            else:  # no masking
+                # Instruction 3: scale + max reduction
                 nisa.tensor_scalar_reduce(
-                    mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                    data=mm1_psum_tile[:num_p, :num_f],
+                    dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                    data=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
                     op0=nl.multiply,
                     operand0=ac.scale,
                     reduce_op=nl.maximum,
-                    reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+                    reduce_res=row_max_reduce_res,
+                    reduce_cmd=row_max_reduce_cmd,
+                )
+            elif tile.is_prior:
+                bound0 = bufs.range_sel_lbs_prior[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
+                bound1 = bufs.range_sel_ubs_prior[:num_p, qkmax_grp]
+                comp_op1 = nl.less  # k < prior_used_len
+                kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
+                nisa.range_select(
+                    mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                    on_true_tile=mm1_psum_tile[:num_p, :num_f],
+                    on_false_value=_FLOAT32_MIN,
+                    comp_op0=nl.greater_equal,
+                    comp_op1=comp_op1,
+                    bound0=bound0[:num_p, :1],
+                    bound1=bound1[:num_p, :1],
+                    reduce_op=_nl_opcode.maximum,
+                    reduce_res=row_max_reduce_res,
+                    reduce_cmd=row_max_reduce_cmd,
+                    range_start=tile.k_start_pos,
+                )
+            elif ac.is_sequence_packed:
+                bound0 = bufs.range_sel_lbs[:num_p, nl.ds(qkmax_grp, 1)]
+                bound1 = bufs.range_sel_ubs[:num_p, nl.ds(qkmax_grp, 1)]
+                comp_op1 = nl.less_equal if atp.is_causal else nl.less
+                kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
+                nisa.range_select(
+                    mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                    on_true_tile=mm1_psum_tile[:num_p, :num_f],
+                    on_false_value=_FLOAT32_MIN,
+                    comp_op0=nl.greater_equal,
+                    comp_op1=comp_op1,
+                    bound0=bound0[:num_p, :1],
+                    bound1=bound1[:num_p, :1],
+                    reduce_op=_nl_opcode.maximum,
+                    reduce_res=row_max_reduce_res,
+                    reduce_cmd=row_max_reduce_cmd,
+                    range_start=tile.k_start_pos,
+                )
+            else:
+                bound0 = bufs.range_sel_lbs[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
+                bound1 = bufs.range_sel_ubs[:num_p, qkmax_grp]
+                comp_op1 = nl.less_equal  # k <= q + cp_offset
+                kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
+                nisa.range_select(
+                    mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                    on_true_tile=mm1_psum_tile[:num_p, :num_f],
+                    on_false_value=_FLOAT32_MIN,
+                    comp_op0=nl.greater_equal,
+                    comp_op1=comp_op1,
+                    bound0=bound0[:num_p, :1],
+                    bound1=bound1[:num_p, :1],
+                    reduce_op=_nl_opcode.maximum,
+                    reduce_res=row_max_reduce_res,
+                    reduce_cmd=row_max_reduce_cmd,
+                    range_start=tile.k_start_pos,
                 )
 
+        else:  # no masking
+            _emit_row_max_evict(
+                dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                data=mm1_psum_tile[:num_p, :num_f],
+                scale=ac.scale,
+                reduce_res=row_max_reduce_res,
+                reduce_cmd=row_max_reduce_cmd,
+                on_scalar=row_max_on_scalar,
+            )
 
-def _pv_large_tile_impl(
-    pv_grp,
-    large_tile_idx,
-    ac: AttnConfig,
-    atp: AttnTileParams,
-    sp: SectionParams,
-    bufs: AttnInternalBuffers,
-):
-    """Perform MM2 (P@V) matmul for the Q grp and large (2048) V tile."""
 
+@dataclass
+class Mm2TileInfo(nl.NKIObject):
+    """Trace-time position of one MM2 (P@V) matmul within a large tile."""
+
+    mm2_grp_i: int  # index of the K-seqlen group inside the large tile
+    mm2_i: int  # index of the V tile inside that group
+    v_tile_idx: int  # index of the V tile within the section
+    is_prior: bool  # tile lies in the prior-KV region (vs active)
+    k_start_pos_512_tile: int  # region-local start of the enclosing K-seqlen group
+    num_p: int  # valid keys in this V tile (contraction dim)
+    num_f: int  # valid query rows in this Q group
+
+
+def _pv_mm2_tile_selection(pv_grp, large_tile_idx, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
+    """Decide which MM2 (P@V) matmuls one (Q group, large tile) pair runs, and where they read from.
+
+    Trace-time only: it emits no instructions. ``_pv_large_tile_impl`` calls it for its own large tile
+    to drive the matmul loop, and again for the *later* large tiles so it can tell whether it holds the
+    last contribution to the shared MM2 PSUM accumulator and therefore owns the eviction. Sharing the
+    selection rather than duplicating the gates is what keeps the two answers in agreement -- the same
+    reason ``_k_tile_selection`` is shared by the QK emit loop and the row-max chain planner.
+
+    Returns ``(tiles, psum_valid)``:
+      - tiles (list[Mm2TileInfo]): one entry per matmul that survives the causal / SWA / seqlen gates,
+        in emission order.
+      - psum_valid: True if the accumulator this large tile contributes to is valid to read, i.e. the
+        large tile is in range and at least one matmul was selected.
+    """
     q_seqlen_offset = pv_grp * atp.sb_p
     num_mm2_grps_in_large_tile = _LARGE_TILE_SZ // atp.mm2_grp_sz
     num_mm2_per_grp = atp.mm2_grp_sz // _V_TILE_SZ
     num_mm2_per_large_tile = num_mm2_per_grp * num_mm2_grps_in_large_tile
 
-    mm2_psum_tile = bufs.mm2_psum[pv_grp][large_tile_idx]
-
-    # Pre-compute loop_reduce_sel for Step 2
     is_prior_tile_first, seqlen_k_first, k_start_pos_first, _ = _get_kv_tile_apc(
         ac.is_prefix_caching,
         False,
@@ -3833,87 +4378,118 @@ def _pv_large_tile_impl(
     if ac.use_swa and atp.is_causal and not is_prior_tile_first:
         loop_reduce_sel = loop_reduce_sel and _has_any_compute_swa(pv_grp, k_start_pos_first, _LARGE_TILE_SZ, ac)
 
-    # Loop over d-tiles as outermost to avoid PSUM bank conflicts (all d-tiles share same bank)
-    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
-    for d_tile in range(num_d_tiles_iter):
-        # Tracks whether any MM2 matmul wrote to PSUM in this iteration; gates the
-        # PSUM→SBUF copy to avoid reading uninitialized PSUM when all tiles are masked.
-        mm2_psum_set = False
+    tiles = []
+    for mm2_grp_i in range(num_mm2_grps_in_large_tile):
+        is_prior_tile, seqlen_k, k_start_pos_512_tile, _ = _get_kv_tile_apc(
+            ac.is_prefix_caching,
+            False,
+            True,
+            atp.seqlen_k_active_updated,
+            ac.seqlen_k_prior,
+            sp.section_offset + large_tile_idx * _LARGE_TILE_SZ + mm2_grp_i * atp.mm2_grp_sz,
+            None,
+        )
 
-        # Step 1: Perform matmul and accumulate in PSUM for each K-seqlen group
-        for mm2_grp_i in range(num_mm2_grps_in_large_tile):
-            exp_tp_sb_tile = bufs.exp_tp_sb[pv_grp][large_tile_idx][mm2_grp_i]
+        for mm2_i in range(num_mm2_per_grp):
+            v_tile_idx = large_tile_idx * num_mm2_per_large_tile + mm2_grp_i * num_mm2_per_grp + mm2_i
+            k_start_pos = k_start_pos_512_tile + mm2_i * _V_TILE_SZ
 
-            is_prior_tile, seqlen_k, k_start_pos_512_tile, _ = _get_kv_tile_apc(
-                ac.is_prefix_caching,
-                False,
-                True,
-                atp.seqlen_k_active_updated,
-                ac.seqlen_k_prior,
-                sp.section_offset + large_tile_idx * _LARGE_TILE_SZ + mm2_grp_i * atp.mm2_grp_sz,
-                None,
+            num_p = min(seqlen_k - k_start_pos, _V_TILE_SZ)
+            num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
+
+            mm2_sel_mask = (
+                _has_any_compute_causal(pv_grp, k_start_pos, ac) if (atp.is_causal and not is_prior_tile) else True
             )
+            if ac.use_swa and atp.is_causal and not is_prior_tile:
+                mm2_sel_mask = mm2_sel_mask and _has_any_compute_swa(pv_grp, k_start_pos, _V_TILE_SZ, ac)
 
-            for mm2_i in range(num_mm2_per_grp):
-                v_tile_idx = large_tile_idx * num_mm2_per_large_tile + mm2_grp_i * num_mm2_per_grp + mm2_i
-                k_start_pos = k_start_pos_512_tile + mm2_i * _V_TILE_SZ
-
-                num_p = min(seqlen_k - k_start_pos, _V_TILE_SZ)
-                num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-
-                mm2_sel_mask = (
-                    _has_any_compute_causal(pv_grp, k_start_pos, ac) if (atp.is_causal and not is_prior_tile) else True
+            if mm2_sel_mask and v_tile_idx < atp.num_v_tiles_per_section and num_p > 0 and num_f > 0:
+                tiles.append(
+                    Mm2TileInfo(
+                        mm2_grp_i=mm2_grp_i,
+                        mm2_i=mm2_i,
+                        v_tile_idx=v_tile_idx,
+                        is_prior=is_prior_tile,
+                        k_start_pos_512_tile=k_start_pos_512_tile,
+                        num_p=num_p,
+                        num_f=num_f,
+                    )
                 )
-                if ac.use_swa and atp.is_causal and not is_prior_tile:
-                    mm2_sel_mask = mm2_sel_mask and _has_any_compute_swa(pv_grp, k_start_pos, _V_TILE_SZ, ac)
 
-                if mm2_sel_mask and v_tile_idx < atp.num_v_tiles_per_section and num_p > 0 and num_f > 0:
-                    mm2_psum_set = True
+    return tiles, (loop_reduce_sel and k_seqlen_mask and len(tiles) > 0)
 
-                    if is_prior_tile and bufs.v_sb_prior is not None:
-                        v_tile_to_use = bufs.v_sb_prior[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
-                    elif bufs.v_sb_prior is not None:
-                        v_tile_to_use = bufs.v_sb[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
-                    else:
-                        v_tile_to_use = bufs.v_sb[v_tile_idx]
 
-                    if ac.tp_out:
-                        nisa.nc_matmul(
-                            mm2_psum_tile[d_tile][: atp.d_tile_size_par_dim, :num_f],
-                            v_tile_to_use[d_tile][:num_p, : atp.d_tile_size_par_dim],
-                            exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
-                        )
-                    else:
-                        nisa.nc_matmul(
-                            mm2_psum_tile[d_tile][:num_f, : atp.d_tile_size_free_dim],
-                            exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
-                            v_tile_to_use[d_tile][:num_p, : atp.d_tile_size_free_dim],
-                        )
+def _pv_large_tile_impl(
+    pv_grp,
+    large_tile_idx,
+    ac: AttnConfig,
+    atp: AttnTileParams,
+    sp: SectionParams,
+    bufs: AttnInternalBuffers,
+):
+    """Perform MM2 (P@V) matmul for the Q grp and large (2048) V tile."""
 
-        # Step 2: Copy PSUM to SBUF for this d-tile (frees PSUM bank for next d-tile)
-        if loop_reduce_sel and k_seqlen_mask and mm2_psum_set:
+    q_seqlen_offset = pv_grp * atp.sb_p
+    mm2_psum_tile = bufs.mm2_psum[pv_grp][large_tile_idx]
+    mm2_tiles, psum_valid = _pv_mm2_tile_selection(pv_grp, large_tile_idx, ac, atp, sp)
+
+    if atp.mm2_accum_in_psum:
+        # Every large tile of this Q group was handed the same PSUM tiles, so the matmuls below
+        # accumulate on top of the earlier large tiles' partial sums on the PE array. Only the last
+        # large tile that contributes evicts, and it evicts a complete sum -- so the Vector Engine
+        # runs one copy per (Q group, d-tile) instead of one copy plus one add per large tile.
+        evict = psum_valid and not any(
+            _pv_mm2_tile_selection(pv_grp, later_idx, ac, atp, sp)[1]
+            for later_idx in range(large_tile_idx + 1, atp.num_large_tiles_per_section)
+        )
+        accumulate_into_sb = False
+    else:
+        evict = psum_valid
+        accumulate_into_sb = large_tile_idx > 0
+
+    # Loop over d-tiles as outermost: without mm2_accum_in_psum all d-tiles share one PSUM bank, so
+    # each must be evicted before the next is computed.
+    num_d_tiles_iter = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
+    for d_tile in range(num_d_tiles_iter):
+        # Step 1: Perform matmul and accumulate in PSUM for each K-seqlen group
+        for tile in mm2_tiles:
+            exp_tp_sb_tile = bufs.exp_tp_sb[pv_grp][large_tile_idx][tile.mm2_grp_i]
+
+            if tile.is_prior and bufs.v_sb_prior is not None:
+                v_tile_to_use = bufs.v_sb_prior[tile.k_start_pos_512_tile // _V_TILE_SZ + tile.mm2_i]
+            elif bufs.v_sb_prior is not None:
+                v_tile_to_use = bufs.v_sb[tile.k_start_pos_512_tile // _V_TILE_SZ + tile.mm2_i]
+            else:
+                v_tile_to_use = bufs.v_sb[tile.v_tile_idx]
+
+            if ac.tp_out:
+                nisa.nc_matmul(
+                    mm2_psum_tile[d_tile][: atp.d_tile_size_par_dim_v, : tile.num_f],
+                    v_tile_to_use[d_tile][: tile.num_p, : atp.d_tile_size_par_dim_v],
+                    exp_tp_sb_tile[: tile.num_p, nl.ds(tile.mm2_i * _V_TILE_SZ, tile.num_f)],
+                )
+            else:
+                nisa.nc_matmul(
+                    mm2_psum_tile[d_tile][: tile.num_f, : atp.d_tile_size_free_dim],
+                    exp_tp_sb_tile[: tile.num_p, nl.ds(tile.mm2_i * _V_TILE_SZ, tile.num_f)],
+                    v_tile_to_use[d_tile][: tile.num_p, : atp.d_tile_size_free_dim],
+                )
+
+        # Step 2: Evict PSUM to SBUF for this d-tile
+        if evict:
             if ac.tp_out:
                 num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-                if large_tile_idx == 0:
-                    nisa.tensor_copy(bufs.mm2_sb[pv_grp][d_tile][:, :num_f], mm2_psum_tile[d_tile][:, :num_f])
-                else:
-                    nisa.tensor_tensor(
-                        bufs.mm2_sb[pv_grp][d_tile][:, :num_f],
-                        bufs.mm2_sb[pv_grp][d_tile][:, :num_f],
-                        mm2_psum_tile[d_tile][:, :num_f],
-                        nl.add,
-                    )
+                dst = bufs.mm2_sb[pv_grp][d_tile][:, :num_f]
+                psum = mm2_psum_tile[d_tile][:, :num_f]
             else:
                 num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-                if large_tile_idx == 0:
-                    nisa.tensor_copy(bufs.mm2_sb[pv_grp][d_tile][:num_p, :], mm2_psum_tile[d_tile][:num_p, :])
-                else:
-                    nisa.tensor_tensor(
-                        bufs.mm2_sb[pv_grp][d_tile][:num_p, :],
-                        bufs.mm2_sb[pv_grp][d_tile][:num_p, :],
-                        mm2_psum_tile[d_tile][:num_p, :],
-                        nl.add,
-                    )
+                dst = bufs.mm2_sb[pv_grp][d_tile][:num_p, :]
+                psum = mm2_psum_tile[d_tile][:num_p, :]
+
+            if accumulate_into_sb:
+                nisa.tensor_tensor(dst, dst, psum, nl.add)
+            else:
+                nisa.tensor_copy(dst, psum)
 
 
 def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_grps: int = 1):

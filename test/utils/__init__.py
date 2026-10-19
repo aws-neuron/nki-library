@@ -35,9 +35,10 @@ def _alias_for(fullname: str) -> str:
 #   * Python < 3.12 (3.10/3.11) still honors the legacy API, which we keep to
 #     avoid depending on import-machinery internals on the older runtime.
 if sys.version_info >= (3, 12):
+    from importlib.abc import Loader, MetaPathFinder
     from importlib.util import spec_from_loader
 
-    class _NkilibTestingRedirector:
+    class _NkilibTestingRedirector(MetaPathFinder, Loader):
         """Modern find_spec/exec_module redirector (Python >= 3.12)."""
 
         def find_spec(self, fullname, path=None, target=None):

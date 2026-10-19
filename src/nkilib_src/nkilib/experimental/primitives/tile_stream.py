@@ -20,7 +20,7 @@ import nki.language as nl
 
 from ...core.utils.allocator import BufferManager
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.kernel_helpers import div_ceil
+from ...core.utils.kernel_helpers import div_ceil, is_hbm_buffer
 from .iter_order import IterOrder, RowMajor
 from .view_spec import Broadcast, Permute, ReshapeDim, Select, Slice, ViewSpec
 
@@ -777,7 +777,7 @@ def tile(
     tensor = tensor
 
     # HBM path: no partition dimension
-    if tensor.is_hbm():
+    if is_hbm_buffer(tensor):
         if iter_order is None:
             iter_order = RowMajor()
         return HBMStream(

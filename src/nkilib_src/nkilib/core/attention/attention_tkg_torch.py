@@ -17,7 +17,7 @@ PyTorch reference for attention_tkg kernel
 """
 
 import math
-from typing import Optional, Protocol, Tuple, Union
+from typing import Optional, Protocol, Tuple
 
 import torch
 
@@ -51,7 +51,7 @@ Args:
     mask: Attention mask tensor
     out: Output tensor (modified in-place)
     cfg: Attention TKG configuration
-    sbm: SBUF manager (unused in torch ref)
+    sbm: SBUF manager (unused in torch ref, so may be None)
     inv_freqs: Inverse frequencies for RoPE
     rope_pos_ids: Position IDs for RoPE
     start_pos_ids: Per-query SWA window start positions
@@ -77,7 +77,7 @@ def _attention_tkg_torch_ref_impl(
     mask: torch.Tensor,
     out: torch.Tensor,
     cfg: AttnTKGConfig,
-    sbm: SbufManager,
+    sbm: Optional[SbufManager],
     inv_freqs: Optional[torch.Tensor] = None,
     rope_pos_ids: Optional[torch.Tensor] = None,
     start_pos_ids: Optional[torch.Tensor] = None,
@@ -88,9 +88,7 @@ def _attention_tkg_torch_ref_impl(
     DBG_TENSORS: Optional[tuple] = None,
     max_context_len=None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for kernel signature parity (no FP8 tile allocations on CPU)
-) -> Union[
-    Tuple[torch.Tensor, torch.Tensor | None], Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]
-]:
+) -> Tuple[torch.Tensor, torch.Tensor | None]:
     """Reference implementation for attention_tkg. See attention_tkg_torch_ref for the full contract."""
     LNC = attention_tkg_torch_ref.lnc
     """
@@ -538,7 +536,7 @@ class _AttentionTkgTorchRefFn(Protocol):
         mask: torch.Tensor,
         out: torch.Tensor,
         cfg: AttnTKGConfig,
-        sbm: SbufManager,
+        sbm: Optional[SbufManager],
         inv_freqs: Optional[torch.Tensor] = None,
         rope_pos_ids: Optional[torch.Tensor] = None,
         start_pos_ids: Optional[torch.Tensor] = None,
@@ -549,9 +547,7 @@ class _AttentionTkgTorchRefFn(Protocol):
         DBG_TENSORS: Optional[tuple] = None,
         max_context_len=None,
         dtype_mode: DtypeMode = DtypeMode.NON_OCP,
-    ) -> Union[
-        Tuple[torch.Tensor, torch.Tensor | None], Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
 
@@ -567,7 +563,7 @@ class _AttentionTkgTorchRefFn(Protocol):
             mask: Attention mask tensor
             out: Output tensor (modified in-place)
             cfg: Attention TKG configuration
-            sbm: SBUF manager (unused in torch ref)
+            sbm: SBUF manager (unused in torch ref, so may be None)
             inv_freqs: Inverse frequencies for RoPE
             rope_pos_ids: Position IDs for RoPE
             start_pos_ids: Per-query SWA window start positions

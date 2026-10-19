@@ -14,13 +14,16 @@
 
 import math
 from typing import Any, final
+from unittest.mock import patch
+
+from test.utils.model_test_configs import no_model_configs
 
 try:
     from test.integration.nkilib.core.mlp.test_mlp_tkg_model_config import (
         mlp_tkg_model_configs,
     )
 except ImportError:
-    mlp_tkg_model_configs = []
+    mlp_tkg_model_configs = no_model_configs()
 
 import nki.language as nl
 import pytest
@@ -648,10 +651,10 @@ def _tkg_sweep_filter(
 
 
 def _mlp_tkg_sbuf_wrapper_kernel(
-    hidden_tensor: nl.ndarray,
-    gate_proj_weights_tensor: nl.ndarray,
-    up_proj_weights_tensor: nl.ndarray,
-    down_proj_weights_tensor: nl.ndarray,
+    hidden_tensor: nl.NkiTensor,
+    gate_proj_weights_tensor: nl.NkiTensor,
+    up_proj_weights_tensor: nl.NkiTensor,
+    down_proj_weights_tensor: nl.NkiTensor,
     normalization_weights_tensor=None,
     gate_proj_bias_tensor=None,
     up_proj_bias_tensor=None,
@@ -667,6 +670,7 @@ def _mlp_tkg_sbuf_wrapper_kernel(
     down_w_scale=None,
     gate_up_in_scale=None,
     down_in_scale=None,
+    use_folded_mx_scales: bool = False,
     quant_clipping_bound: float = 0.0,
     output_dtype=None,
     store_output_in_sbuf: bool = False,
@@ -688,7 +692,7 @@ def _mlp_tkg_sbuf_wrapper_kernel(
     transposed_out: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """Wrapper for testing SBUF input or SBUF output paths.
 
     When store_output_in_sbuf=False: loads HBM input into SBUF, calls mlp with SBUF input.
@@ -717,6 +721,7 @@ def _mlp_tkg_sbuf_wrapper_kernel(
         down_w_scale=down_w_scale,
         gate_up_in_scale=gate_up_in_scale,
         down_in_scale=down_in_scale,
+        use_folded_mx_scales=use_folded_mx_scales,
         quant_clipping_bound=quant_clipping_bound,
         output_dtype=output_dtype,
         store_output_in_sbuf=store_output_in_sbuf,
@@ -849,7 +854,11 @@ class TestMlpTkgKernel:
         is_negative_test=False,
     ):
         """Run an MLP TKG unit test: builds kernel_input from vec_dict, then delegates to run_mlp_test."""
-        lnc = vec_dict["vnc_degree"] if isinstance(vec_dict, dict) else compiler_args.logical_nc_config
+        if isinstance(vec_dict, dict):
+            lnc = vec_dict["vnc_degree"]
+        else:
+            assert compiler_args is not None, "compiler_args is required when vec_dict is not a mapping"
+            lnc = compiler_args.logical_nc_config
 
         if compiler_args is None:
             compiler_args = CompilerArgs(
@@ -1128,6 +1137,20 @@ class TestMlpTkgKernel:
         transposed_in,
         transposed_out,
     ):
+        # Deterministic timeouts on trn3: inference exceeds the 55s profile-capture limit.
+        if (
+            platform_target == Platforms.TRN3
+            and seqlen == 1
+            and (
+                (
+                    (batch, hidden, intermediate) == (1, 8192, 448)
+                    and quant_type == QuantizationType.STATIC
+                    and transposed_in
+                )
+                or ((batch, hidden, intermediate) == (4, 8192, 5120) and quant_type == QuantizationType.NONE)
+            )
+        ):
+            pytest.xfail("Persistent inference timeout (55s profile-capture limit) on trn3")
         self._run_validated_mlp_tkg(
             test_manager=test_manager,
             platform_target=platform_target,
@@ -1242,6 +1265,9 @@ class TestMlpTkgKernel:
         transposed_in,
         transposed_out,
     ):
+        # Deterministic timeout on trn3: inference exceeds the 55s profile-capture limit.
+        if platform_target == Platforms.TRN3 and (batch, seqlen, hidden, intermediate) == (1, 1, 2048, 512):
+            pytest.xfail("Persistent inference timeout (55s profile-capture limit) on trn3 at b1_s1_h2048_i512")
         vec_dict = {
             "vnc_degree": vnc_degree,
             "batch": batch,
@@ -1317,6 +1343,16 @@ class TestMlpTkgKernel:
             and config_name == "non_column_tiling_full_features"
         ):
             pytest.xfail("NKILIB-848: non-determinism from SBUF address dependency at b=1,s=1,h=4096,i=128")
+
+        # Deterministic timeout on trn3: inference exceeds the 55s profile-capture limit.
+        if (
+            platform_target == Platforms.TRN3
+            and (batch, seqlen, hidden, intermediate) == (32, 1, 4096, 400)
+            and config_name == "column_tiling_basic"
+        ):
+            pytest.xfail(
+                "Persistent inference timeout (55s profile-capture limit) on trn3 at b32_s1_h4096_i400 column_tiling_basic"
+            )
 
         self._build_and_run_tkg_sweep(
             test_manager,
@@ -1526,6 +1562,16 @@ class TestMlpTkgKernel:
             and config_name == "non_column_tiling_full_features"
         ):
             pytest.xfail("NKILIB-848: non-determinism from SBUF address dependency at b=1,s=1,h=4096,i=128")
+
+        # Deterministic timeout on trn3: inference exceeds the 55s profile-capture limit.
+        if (
+            platform_target == Platforms.TRN3
+            and (batch, seqlen, hidden, intermediate) == (128, 1, 4096, 400)
+            and config_name == "column_tiling_full_features_rmsnorm"
+        ):
+            pytest.xfail(
+                "Persistent inference timeout (55s profile-capture limit) on trn3 at b128_s1_h4096_i400 column_tiling_full_features_rmsnorm"
+            )
 
         self._build_and_run_tkg_sweep(
             test_manager,
@@ -2302,6 +2348,165 @@ class TestMlpTkgModel:
         self._run_model_test(**kwargs)
 
     @pytest.mark.tier0
+    def test_mlp_tkg_llama3_70b_high_batch_gate_up_contraction_order(
+        self,
+        platform_target: Platforms,
+    ):
+        """Regression test for gate/up H-block contraction ORDER in the I-shard
+        high-batch kernel.
+
+        The gate/up weight prefetch ring must never issue the next prefetch into
+        the slot the current matmul still reads.  When the prefetch distance
+        equals the ring depth, ``nxt % WRING == j % WRING``, so iteration j
+        contracts hidden H-pair j against weight H-pair j+WRING -- the two H
+        halves of gate_w/up_w end up swapped relative to the hidden vector.  The
+        result is a wrong but perfectly well-conditioned linear map: finite, same
+        dynamic range, no NaN and no saturation, so nothing downstream complains
+        while generation degenerates into fluent nonsense.
+
+        Why the sibling double_row_regression test cannot catch this: its
+        generator draws hidden AND gate/up/down weights from ``uniform(0, 241)``
+        -- all non-negative.  Permuting which H-block multiplies which weight
+        block barely moves a sum of 8192 strictly positive terms, so the
+        misparing is invisible (modelled NRMSE 4e-4 against a 0.10 threshold).
+        This test therefore uses SIGNED, zero-mean weights, where cancellation
+        makes contraction order load-bearing (modelled NRMSE > 1.0).
+        """
+        import numpy as np
+        from nkilib_src.nkilib.core.mlp.mlp_tkg import mlp_tkg as _mlp_tkg_mod
+        from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_tkg import mlp_tkg_llama3_70b_high_batch
+        from nkilib_src.nkilib.core.mlp.mlp_torch import mlp_torch_ref
+        from nkilib_src.nkilib.core.utils.torch_ref_wrapper import torch_ref_wrapper
+
+        from test.integration.nkilib.core.mlp.test_mlp_common import build_fused_norm_mlp
+        from test.utils.simulation_setup import simulate_kernel
+
+        if platform_target != Platforms.TRN2:
+            pytest.skip("Llama3-70B high-batch dispatch is trn2-only (lnc=2 + BS_TILE_SIZE=128)")
+
+        rng = np.random.default_rng(0)
+
+        def _signed_generator(shape, dtype, name):
+            # Zero-mean weights: cancellation makes the contraction order matter.
+            # Per-row-distinct hidden so a per-row error cannot average away.
+            if name in ("gate_w", "up_w", "down_w"):
+                return rng.normal(0.0, 40.0, size=shape).astype(dtype)
+            if name in ("hidden", "fused_add_tensor"):
+                return rng.normal(0.0, 40.0, size=shape).astype(dtype)
+            if name.endswith("in_scale") or name.endswith("w_scale"):
+                return np.full(shape=shape, fill_value=rng.random() * 0.01, dtype=dtype)
+            return np.full(shape=shape, fill_value=rng.random(), dtype=dtype)
+
+        kernel_input = build_fused_norm_mlp(
+            batch=256,
+            seqlen=1,
+            hidden=8192,
+            intermediate=3584,
+            dtype=nl.bfloat16,
+            quantization_type=QuantizationType.STATIC,
+            quant_dtype=nl.float8_e4m3,
+            fused_add=False,
+            norm_type=NormType.RMS_NORM,
+            store_add=False,
+            lnc_degree=2,
+            skip_gate=False,
+            act_fn_type=ActFnType.SiLU,
+            gate_bias=False,
+            up_bias=False,
+            down_bias=False,
+            norm_bias=False,
+            use_tkg_gate_up_proj_column_tiling=True,
+            use_tkg_down_proj_column_tiling=True,
+            use_tkg_down_proj_optimized_layout=False,
+            tensor_generator=_signed_generator,
+            mode=ComputationMode.DECODE,
+        )
+        kernel_input["quant_clipping_bound"] = 0.0
+        kernel_input["force_cte_mode"] = False
+        kernel_input["mode"] = ComputationMode.DECODE
+        kernel_input["sbm"] = None
+        kernel_input["dtype_mode"] = DtypeMode.NON_OCP
+
+        cleaned_input = {k.removesuffix(".must_alias_input"): v for k, v in kernel_input.items()}
+
+        # Assert the specialized kernel actually fired, so a predicate refactor
+        # that routes around it cannot turn this into a silent no-op pass.
+        dispatch_call_count = [0]
+        original_high_batch = _mlp_tkg_mod.mlp_tkg_llama3_70b_high_batch
+        assert original_high_batch is mlp_tkg_llama3_70b_high_batch, (
+            "high-batch symbol drift: mlp_tkg module no longer holds the imported function"
+        )
+
+        def _counting_high_batch(*args, **kwargs):
+            dispatch_call_count[0] += 1
+            return original_high_batch(*args, **kwargs)
+
+        mlp_tkg_mod: Any = _mlp_tkg_mod
+        mlp_tkg_mod.mlp_tkg_llama3_70b_high_batch = _counting_high_batch
+        try:
+            kernel_outputs = simulate_kernel(mlp_kernel, cleaned_input, lnc_count=2)
+        finally:
+            mlp_tkg_mod.mlp_tkg_llama3_70b_high_batch = original_high_batch
+
+        assert dispatch_call_count[0] > 0, (
+            "mlp_tkg_llama3_70b_high_batch was NEVER called during the kernel trace — "
+            "the test fell through to the generic _mlp_tkg_impl path and cannot "
+            "exercise the gate/up contraction order."
+        )
+
+        actual = (
+            kernel_outputs["out"]
+            if isinstance(kernel_outputs, dict)
+            else (kernel_outputs[0] if isinstance(kernel_outputs, list) else kernel_outputs)
+        )
+        actual_np = np.asarray(actual).astype(np.float32)
+
+        ref_callable = torch_ref_wrapper(mlp_torch_ref[2])
+        ref_outputs = ref_callable(**cleaned_input)
+        expected = (
+            ref_outputs["out"]
+            if isinstance(ref_outputs, dict)
+            else (ref_outputs if not isinstance(ref_outputs, list) else ref_outputs[0])
+        )
+        expected_np = np.asarray(expected).astype(np.float32)
+
+        hidden_dim = expected_np.shape[-1]
+        actual_np = actual_np.reshape(-1, hidden_dim)
+        expected_np = expected_np.reshape(-1, hidden_dim)
+
+        diff = actual_np - expected_np
+        abs_b = np.abs(expected_np)
+        nrmse = (float(np.mean(diff * diff)) / max(float(np.mean(abs_b * abs_b)), 1e-6)) ** 0.5
+
+        # Row cosine similarity is the direction-sensitive signal: a contraction
+        # permutation destroys direction (modelled ~0.26) while FP8 rounding does not.
+        num = (actual_np * expected_np).sum(1)
+        den = np.linalg.norm(actual_np, axis=1) * np.linalg.norm(expected_np, axis=1) + 1e-12
+        mean_cos = float(np.mean(num / den))
+
+        diagnostic = (
+            f"shape={expected_np.shape} nrmse={nrmse:.4f} mean_row_cosine={mean_cos:.4f} "
+            f"mean|b|={float(abs_b.mean()):.4f}"
+        )
+
+        # With signed weights the FP8 round-trip floor stays well under 0.30 NRMSE and
+        # well above 0.95 cosine, while an H-block permutation lands near NRMSE 1.0 /
+        # cosine 0.26. Both directions are asserted: NRMSE alone can be inflated by
+        # scale error, cosine alone can be fooled by a pure gain error.
+        assert nrmse < 0.30, (
+            f"gate/up contraction-order regression: NRMSE {nrmse:.4f} >= 0.30. "
+            f"Diagnostic: {diagnostic}. Check that the gate/up weight-ring prefetch "
+            f"distance is strictly less than the ring depth (nxt = j + WRING - 1), so "
+            f"the prefetch never overwrites the slot the current matmul reads."
+        )
+        assert mean_cos > 0.95, (
+            f"gate/up contraction-order regression: mean row cosine {mean_cos:.4f} <= 0.95. "
+            f"Diagnostic: {diagnostic}. The output direction diverged from the reference, "
+            f"the signature of hidden H-pair j being contracted against weight H-pair "
+            f"j+WRING (prefetch distance == ring depth)."
+        )
+
+    @pytest.mark.tier0
     def test_mlp_tkg_llama3_70b_high_batch_double_row_regression(
         self,
         platform_target: Platforms,
@@ -2410,8 +2615,7 @@ class TestMlpTkgModel:
 
         # Wrap the high-batch dispatch in mlp_tkg's module namespace with a
         # counter so we can verify the specialized kernel actually fired (not
-        # the generic _mlp_tkg_impl fallthrough). Restore the original symbol
-        # in finally so other tests in the same xdist worker are unaffected.
+        # the generic _mlp_tkg_impl fallthrough).
         dispatch_call_count = [0]
         original_high_batch = _mlp_tkg_mod.mlp_tkg_llama3_70b_high_batch
         assert original_high_batch is mlp_tkg_llama3_70b_high_batch, (
@@ -2422,11 +2626,10 @@ class TestMlpTkgModel:
             dispatch_call_count[0] += 1
             return original_high_batch(*args, **kwargs)
 
-        _mlp_tkg_mod.mlp_tkg_llama3_70b_high_batch = _counting_high_batch
-        try:
+        # The context manager restores the original symbol so other tests in the
+        # same worker are unaffected.
+        with patch.object(_mlp_tkg_mod, "mlp_tkg_llama3_70b_high_batch", _counting_high_batch):
             kernel_outputs = simulate_kernel(mlp_kernel, cleaned_input, lnc_count=2)
-        finally:
-            _mlp_tkg_mod.mlp_tkg_llama3_70b_high_batch = original_high_batch
 
         assert dispatch_call_count[0] > 0, (
             "mlp_tkg_llama3_70b_high_batch was NEVER called during the kernel "

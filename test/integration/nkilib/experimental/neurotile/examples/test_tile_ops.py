@@ -29,10 +29,10 @@ from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
     _02_fold_pattern_override_torch as fold_refs,
 )
 from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
-    _03_tensor_view as view_mod,
+    _03_views as view_mod,
 )
 from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
-    _03_tensor_view_torch as view_refs,
+    _03_views_torch as view_refs,
 )
 from nkilib_src.nkilib.experimental.neurotile.examples._03_tile_ops import (
     _04_transpose as transpose_mod,
@@ -226,41 +226,41 @@ class TestNeurotileFoldPattern:
 
 
 @pytest_marks(["neurotile"])
-class TestNeurotileTensorView:
-    """Tutorials in 03_tensor_view.py."""
+class TestNeurotileViews:
+    """Tutorials in _03_views.py."""
 
     @pytest.mark.fast
-    def test_tensor_view_chain(self, test_manager, platform_target):
+    def test_view_chain(self, test_manager, platform_target):
         # src: [B=1, S=4, H=256], out: [H0=128, B*S*H1=8]
         _run(
             test_manager,
             platform_target,
-            view_mod.tensor_view_chain,
-            view_refs.tensor_view_chain_torch_ref,
+            view_mod.view_chain,
+            view_refs.view_chain_torch_ref,
             lambda _: {"src": np.random.RandomState(42).randn(1, 4, 256).astype(ml_dtypes.bfloat16)},
             lambda _: {"out": np.zeros((128, 8), dtype=ml_dtypes.bfloat16)},
         )
 
     @pytest.mark.fast
-    def test_tensor_view_select(self, test_manager, platform_target):
+    def test_view_select(self, test_manager, platform_target):
         # src: [4, 128, 16] bf16 -> out: src[0] * 3
         _run(
             test_manager,
             platform_target,
-            view_mod.tensor_view_select,
-            view_refs.tensor_view_select_torch_ref,
+            view_mod.view_select,
+            view_refs.view_select_torch_ref,
             lambda _: {"src": np.random.RandomState(42).randn(4, 128, 16).astype(ml_dtypes.bfloat16)},
             lambda _: {"out": np.zeros((128, 16), dtype=ml_dtypes.bfloat16)},
         )
 
     @pytest.mark.fast
-    def test_tensor_view_3d_direct(self, test_manager, platform_target):
+    def test_view_3d_direct(self, test_manager, platform_target):
         # src: [128, 4, 32] fp32 -> out: same shape
         _run(
             test_manager,
             platform_target,
-            view_mod.tensor_view_3d_direct,
-            view_refs.tensor_view_3d_direct_torch_ref,
+            view_mod.view_3d_direct,
+            view_refs.view_3d_direct_torch_ref,
             lambda _: {"src": np.random.RandomState(42).randn(128, 4, 32).astype(np.float32)},
             lambda ki: {"out": np.zeros_like(ki["src"])},
             rtol=1e-5,
@@ -343,7 +343,7 @@ class TestNeurotileTranspose:
         )
 
     @pytest.mark.fast
-    def test_transpose_coalesced_single_store(self, test_manager, platform_target):
+    def test_transpose_coalesced_single_store_example(self, test_manager, platform_target):
         # One transpose DMA per tile-row AND one store DMA per row via rearrange scatter.
         _run(
             test_manager,

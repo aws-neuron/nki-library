@@ -18,7 +18,8 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional, Protocol, TextIO, runtime_checkable
+from types import CodeType
+from typing import Any, Callable, Mapping, Optional, Protocol, TextIO, runtime_checkable
 
 from typing_extensions import override
 
@@ -43,16 +44,26 @@ else:
             return hash(self.value)
 
 
-try:
-    import nki.isa as nisa
-except ModuleNotFoundError:
-    nisa = None  # nki not available; get_nc_gen() will raise if called
 import numpy.typing as npt
 
 from .metrics_collector import IMetricsCollector
 
 # Directory name for inference artifacts
 INF_ARTIFACT_DIR_NAME = "infer_result"
+
+# Directory name for profiler parquet output
+PROFILER_DB_DIR_NAME = "profiler_db"
+
+# The compiled NEFF and separated NEFF derived from the single compile version separated pass.
+# Hoisting writes a new file rather than modifying NEFF_NAME in place, so each NEFF stays
+# paired with the NTFF of the inference that ran against it.
+NEFF_NAME = "file.neff"
+SEPARATED_NEFF_NAME = "file-separated.neff"
+
+# Allocator/scheduler flow an unspecified compile_mode means: the one kernel_tracer
+# hardcoded before it became selectable. Not the same as leaving nki's compile_mode
+# unset, which falls through to the C++ defaults (LSA and scheduling both ON).
+DEFAULT_COMPILE_MODE = "enable-alloc=legacy"
 
 # Test type constants for parametrized test filtering
 # MODEL_TEST_TYPE is used to identify model-derived test configs for weekly regression runs
@@ -209,6 +220,7 @@ def unpack_model_config(entry):
 
 class TraceMode(Enum):
     CompileAndInfer = "compile_and_infer"
+    CompileAndInferAndSeparate = "compile_and_infer_and_separate"
     CompileOnly = "compile_only"
     TraceOnly = "trace_only"
     Simulator = "simulation"
@@ -333,11 +345,17 @@ class LazyGoldenGenerator:
         return self.__cached_golden__
 
 
+class PerRankGenerator(Protocol):
+    """A callable that produces a per-rank input mapping, keyed by a named ``rank_id``."""
+
+    def __call__(self, *, rank_id: int) -> dict[str, Any]: ...
+
+
 @dataclass
 class PerRankLazyGenerator:
     """Base class for per-rank lazy generators with caching."""
 
-    generator: Callable[[int], dict[str, Any]]
+    generator: PerRankGenerator
     __cache__: dict[int, dict[str, Any]] = field(init=False, default_factory=dict)
     computation_times: dict[int, float] = field(init=False, default_factory=dict)
 
@@ -349,16 +367,15 @@ class PerRankLazyGenerator:
             except TypeError as e:
                 # Only catch TypeError from wrong parameter name, not from inside the generator
                 if "unexpected keyword argument" in str(e) and "rank_id" in str(e):
-                    location = ""
-                    if hasattr(self.generator, "__code__"):
-                        code = self.generator.__code__
-                        location = f" at {code.co_filename}:{code.co_firstlineno}"
+                    code = getattr(self.generator, "__code__", None)
+                    location = f" at {code.co_filename}:{code.co_firstlineno}" if isinstance(code, CodeType) else ""
                     raise TypeError(f"Generator{location} must use 'rank_id' as parameter name") from e
                 raise
             self.computation_times[rank_id] = time.perf_counter() - start
         return self.__cache__[rank_id]
 
 
+@dataclass
 class PerRankLazyInputGenerator(PerRankLazyGenerator):
     """Generates inputs per rank for collectives tests.
 
@@ -368,6 +385,12 @@ class PerRankLazyInputGenerator(PerRankLazyGenerator):
 
         kernel_input=PerRankLazyInputGenerator(create_inputs)
     """
+
+    # Set by the collective harness to the rank-0 input mapping, for callers that
+    # need a representative shape/dtype without materialising every rank. Defaults
+    # to empty so the harness can construct first and assign it right after.
+    base_input: dict[str, Any] = field(default_factory=dict)
+    input_artifacts_directory: str | None = None
 
 
 @dataclass
@@ -390,13 +413,30 @@ class PerRankLazyGoldenGenerator(PerRankLazyGenerator):
 
 
 # Type aliases for golden output handling:
-# - GoldenTensorDict: The normalized form - a dict mapping output names to tensors or validators
-# - GoldenOutputType: All possible input forms that can be normalized to GoldenTensorDict
-GoldenTensorDict = dict[str, npt.NDArray[Any] | CustomValidatorWithOutputTensorData]
-GoldenOutputType = LazyGoldenGenerator | PerRankLazyGoldenGenerator | GoldenTensorDict
+# - GoldenTensorMapping: The normalized form - output names mapped to tensors or validators.
+#   A read-only Mapping rather than a dict, because Mapping is covariant in its value type
+#   and so also accepts a narrower dict (e.g. one holding only validators).
+# - GoldenOutputType: All possible input forms that can be normalized to GoldenTensorMapping
+GoldenTensorMapping = Mapping[str, npt.NDArray[Any] | CustomValidatorWithOutputTensorData]
+GoldenOutputType = LazyGoldenGenerator | PerRankLazyGoldenGenerator | GoldenTensorMapping
 
 
-def normalize_golden_output(golden_output: GoldenOutputType, rank_id: int = 0) -> GoldenTensorDict:
+def normalize_kernel_input(
+    kernel_input: dict[str, Any] | PerRankLazyInputGenerator | None, rank_id: int = 0
+) -> dict[str, Any]:
+    """Normalize kernel_input to a plain dict of arg name -> value.
+
+    Resolves lazily-generated inputs so every consumer (single-core dump, birsim,
+    and simulation) sees a plain mapping:
+    - PerRankLazyInputGenerator: materialise the given rank (default rank 0)
+    - Plain dict / None: returned as-is (None -> empty dict)
+    """
+    if isinstance(kernel_input, PerRankLazyInputGenerator):
+        return kernel_input.for_rank(rank_id)
+    return kernel_input or {}
+
+
+def normalize_golden_output(golden_output: GoldenOutputType, rank_id: int = 0) -> GoldenTensorMapping:
     """Normalize golden_output to a dict of output name -> tensor.
 
     Handles all golden output types consistently:
@@ -480,8 +520,12 @@ class Platforms(StrEnum):
             return self.value
 
     def get_nc_gen(self) -> str:
-        if nisa is None:
-            raise ImportError("nki.isa is required for get_nc_gen() but is not installed")
+        # Imported lazily: nki is not installed in every environment that imports this module.
+        try:
+            import nki.isa as nisa
+        except ModuleNotFoundError as exc:
+            raise ImportError("nki.isa is required for get_nc_gen() but is not installed") from exc
+
         gen_map = {
             Platforms.TRN1: nisa.nc_version.gen2,
             Platforms.TRN2: nisa.nc_version.gen3,
@@ -580,6 +624,14 @@ class CompilerArgs:
     dump_after_lowering: bool
     separation_pass_mode: SeparationPassMode
     enable_device_dump: bool  # Inserts a device_print after each ISA instruction to dump intermediate tensors. WARNING: Local debug only. High disk/perf impact.
+    # Per-test NKI compiler frontend override. None => use the session/CLI default
+    # (--nki-compilation-mode, default parser). Set to NKICompilationMode.tracer to
+    # pin the tracer frontend for a test regardless of how the suite is invoked.
+    nki_compilation_mode: "NKICompilationMode | None"
+    # Per-test allocator/scheduler flow override, one of
+    # nki.compiler.ncc_driver.COMPILE_MODES. None => use the session/CLI default
+    # (--compile-mode). Pin it for a kernel that only compiles under one flow.
+    compile_mode: "str | None"
 
     def __init__(
         self,
@@ -591,6 +643,8 @@ class CompilerArgs:
         dump_after_lowering: bool = False,
         separation_pass_mode: SeparationPassMode = SeparationPassMode.NONE,
         enable_device_dump: bool = False,
+        nki_compilation_mode: "NKICompilationMode | None" = None,
+        compile_mode: "str | None" = None,
     ):
         self.platform_target = platform_target
         self.additional_cmd_args = additional_cmd_args if additional_cmd_args is not None else []
@@ -599,6 +653,8 @@ class CompilerArgs:
         self.dump_after_lowering = dump_after_lowering
         self.separation_pass_mode = separation_pass_mode
         self.enable_device_dump = enable_device_dump
+        self.nki_compilation_mode = nki_compilation_mode
+        self.compile_mode = compile_mode
         if os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS"):
             sep_mode = os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS")
             if sep_mode == "serialize":
@@ -638,9 +694,7 @@ class InferenceArgs:
 
     def __post_init__(self):
         """Set default num_runs based on enable_determinism_check"""
-        if self.num_runs is None:
-            # Default: 2 for determinism check, 1 otherwise
-            self.num_runs = 2 if self.enable_determinism_check else 1
+        self.num_runs = self.resolved_num_runs
 
         # Validate collective_ranks - NRT only supports 1, 2, 4, 8, 16 or multiples of 32
         valid_ranks = {1, 2, 4, 8, 16}
@@ -650,15 +704,34 @@ class InferenceArgs:
                 f"Supported values are 1, 2, 4, 8, 16 or multiples of 32."
             )
 
+    @property
+    def resolved_num_runs(self) -> int:
+        """Number of executions: 2 when checking determinism, 1 otherwise, unless set explicitly."""
+        if self.num_runs is None:
+            return 2 if self.enable_determinism_check else 1
+        return self.num_runs
+
 
 # Pre-configured InferenceArgs for TKG kernels with determinism checking
 TKG_INFERENCE_ARGS = InferenceArgs(enable_determinism_check=True, num_runs=10)
 
 
+class NamedCallable(Protocol):
+    """A callable that also carries a name, as every plain function does.
+
+    Used where the harness reports which entry point it is working on: a bare
+    callable type promises no name, but a function does.
+    """
+
+    __name__: str
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
 @dataclass
 class KernelArgs:
-    kernel_func: Callable  # pyright: ignore[reportMissingTypeArgument]
-    compiler_input: CompilerArgs = field(default_factory=CompilerArgs)
+    kernel_func: NamedCallable
+    compiler_input: CompilerArgs
     # Kernel inputs: either a dict (same for all ranks) or PerRankLazyInputGenerator (per-rank)
     kernel_input: dict[str, Any] | PerRankLazyInputGenerator | None = None
     validation_args: ValidationArgs | None = None
@@ -677,7 +750,7 @@ class NeuronDeviceInfo:
     memory_size: int
     neuroncore_ids: list[int]
     neuron_processes: list[dict[str, Any]]
-    instance_type: str
+    instance_type: str = ""
     logical_neuroncore_config: int = (
         2  # future version of compiler and runtime simply default to lnc 2 without explicitly specifying it
     )
@@ -696,7 +769,7 @@ class NeuronDeviceInfo:
             memory_size=data["memory_size"],
             neuroncore_ids=data["neuroncore_ids"],
             neuron_processes=data.get("neuron_processes", []),
-            instance_type=data["instance_type"],
+            instance_type=data.get("instance_type", ""),
         )
 
     def get_memory_size_gb(self) -> float:

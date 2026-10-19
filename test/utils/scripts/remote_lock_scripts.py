@@ -65,7 +65,7 @@ from typing import Any, NamedTuple
 # overwrites the deployed helper when its SCRIPT_VERSION is strictly newer than
 # the version already on the host, so a stale client can never downgrade a
 # newer deployed helper out from under concurrent newer clients.
-SCRIPT_VERSION = 4
+SCRIPT_VERSION = 5
 EVENTS_LOG_PREFIX = "events-"
 
 # When this env var is truthy on the host, reconcile-driven grants emit a
@@ -97,7 +97,7 @@ STALE_THRESHOLD = 12 * POLL_PERIOD
 # remaining entries. The contended large-request set is tiny in practice, so
 # the solver terminates well under this cap; it only guards pathological queue
 # depth from making a reconcile pass expensive.
-SOLVER_NODE_CAP = 5000
+SOLVER_NODE_CAP: int = 5000
 # Max ready, region-less entries placed via recursive branch-and-bound in one
 # reconcile pass. Beyond this, fall back to the iterative greedy completion so a
 # very deep ready-queue degrades gracefully instead of exceeding the interpreter
@@ -199,6 +199,10 @@ class LockResult:
     # Serialized only when True; absent/False defaults keep the wire backward
     # compatible (no locking-protocol version change).
     re_enqueued: bool = False
+    # Core reset can take up to ~7s of active inference time.
+    # We want to opportunistically skip it to reduce inference time.
+    # Due to NRT limitation we can only do so when the LNC config is the same across runs on all cores.
+    should_reset_cores: bool = True
 
     def to_json(self) -> str:
         """Convert to JSON string for file output."""
@@ -219,6 +223,8 @@ class LockResult:
             result["bumped"] = self.bumped
         if self.re_enqueued:
             result["re_enqueued"] = self.re_enqueued
+        if not self.should_reset_cores:
+            result["should_reset_cores"] = self.should_reset_cores
         return json.dumps(result)
 
     @classmethod
@@ -235,6 +241,7 @@ class LockResult:
             worst_case_eta=data.get("worst_case_eta"),
             bumped=data.get("bumped", False),
             re_enqueued=data.get("re_enqueued", False),
+            should_reset_cores=data.get("should_reset_cores", True),
         )
 
 
@@ -293,6 +300,7 @@ class LockState:
     draining_enabled_with_timeout: int | None  # Unix timestamp or None
     physical_neuron_cores_lock_timeout: dict[str, int]  # core_id -> expiry timestamp
     queue: list[QueueEntry] = field(default_factory=list)  # FIFO waiters
+    last_lnc_config_per_core: dict[int, int] = field(default_factory=dict)
 
     @classmethod
     def empty(cls, version: int) -> LockState:
@@ -301,6 +309,7 @@ class LockState:
             version=version,
             draining_enabled_with_timeout=None,
             physical_neuron_cores_lock_timeout={},
+            last_lnc_config_per_core={},
             queue=[],
         )
 
@@ -312,6 +321,7 @@ class LockState:
             draining_enabled_with_timeout=data.get("draining_enabled_with_timeout"),
             physical_neuron_cores_lock_timeout=data.get("physical_neuron_cores_lock_timeout", {}),
             queue=[QueueEntry.from_dict(e) for e in data.get("queue", [])],
+            last_lnc_config_per_core={int(k): v for k, v in data.get("last_lnc_config_per_core", {}).items()},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -324,6 +334,8 @@ class LockState:
             result["draining_enabled_with_timeout"] = self.draining_enabled_with_timeout
         if self.queue:
             result["queue"] = [e.to_dict() for e in self.queue]
+        if self.last_lnc_config_per_core:
+            result["last_lnc_config_per_core"] = self.last_lnc_config_per_core
         return result
 
     def is_draining(self, now: int) -> bool:
@@ -732,6 +744,7 @@ def reconcile(
     *,
     draining: bool,
     debug: bool = False,
+    node_cap: int = SOLVER_NODE_CAP,
 ) -> list[ReconcileEvent]:
     """Side-effect-free FIFO-queue reconcile pass with concurrent reservations.
 
@@ -862,6 +875,7 @@ def reconcile(
         free_at,
         total_cores,
         now,
+        node_cap=node_cap,
         stats=solver_stats,
     )
     assignment = {id(e): block for e, block in zip(ready_regionless, blocks, strict=True)}
@@ -1091,6 +1105,7 @@ def poll(
     version: int,
     entry_id: str,
     ready: bool,
+    lnc_config: int,
     caller_id: str | None = None,
 ) -> LockResult:
     """Single mutating FIFO-queue verb: enqueue/refresh/commit.
@@ -1192,6 +1207,7 @@ def poll(
             version=state.version,
             draining_enabled_with_timeout=state.draining_enabled_with_timeout,
             physical_neuron_cores_lock_timeout=state.physical_neuron_cores_lock_timeout,
+            last_lnc_config_per_core=state.last_lnc_config_per_core,
             queue=state.queue[:position],
         )
         return estimate_eta(ahead, num_physical, now, total_cores, hold_window=timeout_seconds)
@@ -1200,10 +1216,14 @@ def poll(
         # Reuse acquire's expiry/lock/append_event mechanics for commit.
         expiry = now + timeout_seconds
         state.lock_cores(block, expiry)
+        # Skip reset only when every allocated core previously ran at this lnc_config.
+        # Any LNC change (up or down) or first use (None) requires reset.
+        should_reset = not all(state.last_lnc_config_per_core.get(core) == lnc_config for core in block)
+        state.last_lnc_config_per_core.update(dict.fromkeys(block, lnc_config))
         save_state(locks_file, state)
         _flush_reconcile_events()
         append_event(locks_file, event, caller_id, cores=block, expiry=expiry)
-        return LockResult(status=LockStatus.ALLOCATED, cores=block, expiry=expiry)
+        return LockResult(status=LockStatus.ALLOCATED, cores=block, expiry=expiry, should_reset_cores=should_reset)
 
     # Step 2: not yet queued -> enqueue a NEW tail entry WITH its readiness. A
     # new entry never commits same-exec (two-phase: ENQUEUE now, COMMIT on a
@@ -1510,6 +1530,7 @@ def main(args: list[str]) -> LockResult:
     p_poll.add_argument("version", type=int, help="Lock protocol version")
     p_poll.add_argument("entry_id", help="Stable per-attempt queue identity")
     p_poll.add_argument("--ready", dest="ready", action="store_true", help="Caller is ready to commit")
+    p_poll.add_argument("--lnc-config", dest="lnc_config", type=int, default=2, help="LNC configuration (1 or 2)")
     p_poll.add_argument("--caller-id", dest="caller_id", help="Caller identifier for event logging")
 
     # probe subcommand
@@ -1578,6 +1599,7 @@ def main(args: list[str]) -> LockResult:
                 parsed.version,
                 parsed.entry_id,
                 parsed.ready,
+                parsed.lnc_config,
                 caller_id=parsed.caller_id,
             )
         elif parsed.command == "probe":

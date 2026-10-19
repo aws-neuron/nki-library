@@ -170,7 +170,7 @@ class TestComputeCacheKey:
 
         @dataclass
         class MockBirResult:
-            descriptor: MockDescriptor = None
+            descriptor: MockDescriptor | None = None
 
             def __post_init__(self):
                 self.descriptor = MockDescriptor()

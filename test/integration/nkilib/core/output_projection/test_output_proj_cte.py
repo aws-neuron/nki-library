@@ -15,7 +15,7 @@
 """Integration tests for the output projection CTE kernel using UnitTestFramework."""
 
 import functools
-from typing import final
+from typing import Optional, TypedDict, final
 
 import nki.language as nl
 import numpy as np
@@ -25,7 +25,7 @@ from nkilib_src.nkilib.core.output_projection.output_projection_cte.output_proje
     output_projection_cte_mx_torch_ref,
     output_projection_cte_torch_ref,
 )
-from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import DtypeMode, OProjAttentionLayout, QuantizationType
 
 try:
     from test.integration.nkilib.core.output_projection.test_output_proj_cte_model_config import (
@@ -76,8 +76,13 @@ def generate_output_proj_cte_inputs(
     test_bias: bool,
     quantization_type: QuantizationType = QuantizationType.NONE,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    attention_layout: Optional[OProjAttentionLayout] = None,
 ) -> dict:
-    """Generate inputs for output projection CTE test."""
+    """Generate inputs for output projection CTE test.
+
+    ``attention_layout=None`` is passed through to the kernel unchanged so tests exercise
+    the pre-tag default; the generated tensor follows the layout that resolves to.
+    """
     dtype = nl.bfloat16
     input_scales = None
     weight_scales = None
@@ -106,8 +111,6 @@ def generate_output_proj_cte_inputs(
             ).copy()
         elif quantization_type == QuantizationType.ROW:
             # Per-row weight dequant scale: [128, H], no input scales
-            # Reshape attention to [B, S, N, D] for ROW quant
-            attention = attention.transpose(0, 3, 1, 2)
             weight_scales = np.broadcast_to(
                 np.random.random_sample((1, hidden)).astype(np.float32) / 256.0, (128, hidden)
             ).copy()
@@ -121,6 +124,20 @@ def generate_output_proj_cte_inputs(
                 w = weight.reshape(nd // 4, 4, hidden)
                 weight = np.ascontiguousarray(np.transpose(w, (0, 2, 1))).reshape(nd, hidden)
 
+    # Mirror the kernel's None resolution so the tensor matches the layout it will read.
+    resolved_layout = attention_layout
+    if resolved_layout is None:
+        resolved_layout = (
+            OProjAttentionLayout.BSNd if quantization_type == QuantizationType.ROW else OProjAttentionLayout.BNdS
+        )
+
+    if resolved_layout == OProjAttentionLayout.BSNd:
+        # [B, N, D, S] -> [B, S, N, D]
+        attention = np.ascontiguousarray(attention.transpose(0, 3, 1, 2))
+    elif resolved_layout == OProjAttentionLayout.BNSd:
+        # [B, N, D, S] -> [B, N, S, D]
+        attention = np.ascontiguousarray(attention.transpose(0, 1, 3, 2))
+
     return {
         "attention": attention,
         "weight": weight,
@@ -129,6 +146,7 @@ def generate_output_proj_cte_inputs(
         "input_scales": input_scales,
         "weight_scales": weight_scales,
         "dtype_mode": dtype_mode,
+        "attention_layout": attention_layout,
     }
 
 
@@ -317,6 +335,47 @@ OUTPUT_PROJ_CTE_UNIT_CASES = [
     (1, 1024 + 64, 7168, 4, 256, False),
     (1, 2048 + 120, 8192, 5, 256, False),
     (1, 4096 + 1000, 16384, 6, 256, False),
+]
+
+# BSNd cases: attention arrives untransposed as [B, S, N, D]
+OUTPUT_PROJ_CTE_UNTRANSPOSED_ATTENTION_CASES = [
+    (1, 8192, 3072, 1, 64, True),
+    (1, 8192, 3072, 2, 64, True),
+    (1, 8192, 3072, 4, 64, True),
+    (1, 8192, 3072, 8, 64, True),
+    (1, 8192, 3072, 16, 64, True),
+    (1, 1024, 3072, 1, 64, True),
+    (1, 1024, 3072, 8, 64, True),
+    (1, 2048, 3072, 8, 64, True),
+    (1, 16384, 3072, 8, 64, True),
+    (1, 32768, 3072, 1, 64, True),
+    (1, 576, 8192, 3, 128, False),
+    (4, 512, 7168, 4, 128, False),
+    (1, 4096, 8192, 2, 128, False),
+    (1, 512, 3072, 16, 10, True),
+    (1, 1024, 3072, 8, 192, True),
+    (1, 1024, 8192, 4, 256, False),
+]
+
+# BNSd cases: attention arrives untransposed heads-outer as [B, N, S, D], i.e. the
+# attention CTE output with heads folded into batch and tp_out=False.
+OUTPUT_PROJ_CTE_HEADS_OUTER_ATTENTION_CASES = [
+    (1, 8192, 3072, 1, 64, True),
+    (1, 8192, 3072, 2, 64, True),
+    (1, 8192, 3072, 8, 64, True),
+    (1, 8192, 3072, 16, 64, True),
+    (1, 1024, 3072, 1, 64, True),
+    (1, 2048, 3072, 8, 64, True),
+    (1, 16384, 3072, 8, 64, True),
+    (1, 576, 8192, 3, 128, False),
+    (4, 512, 7168, 4, 128, False),
+    (1, 4096, 8192, 2, 128, False),
+    # group_size > 1: N folds into D, so a packed tile spans several heads.
+    (1, 512, 3072, 16, 10, True),
+    (1, 128, 3072, 8, 32, True),
+    # D > 128: D folds back into N, so a packed tile is a column band of one head.
+    (1, 1024, 3072, 8, 192, True),
+    (1, 1024, 8192, 4, 256, False),
 ]
 
 # Slow unit cases (>2min compile time), run in full pipeline but not dry-run
@@ -517,6 +576,17 @@ _SWEEP_D_HEAD = BoundedRange(
 )
 
 
+class OutputProjCteDtypeModeConfig(TypedDict):
+    """Shapes and fusion settings shared by every dtype_mode canary case."""
+
+    batch: int
+    seqlen: int
+    hidden: int
+    n_head: int
+    d_head: int
+    test_bias: bool
+
+
 @pytest_test_metadata(name="Output Projection CTE", tags=["model"])
 @pytest_marks(["output_projection", "cte", "mx"])
 @final
@@ -545,6 +615,96 @@ class TestOutputProjCteKernel:
         def input_generator(test_config):
             return generate_output_proj_cte_inputs(
                 batch=batch, seqlen=seqlen, hidden=hidden, n_head=n_head, d_head=d_head, test_bias=test_bias
+            )
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=torch_ref_wrapper(output_projection_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    @pytest.mark.fast
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNTRANSPOSED_ATTENTION_CASES, abbrevs=_ABBREVS)
+    def test_output_proj_cte_bf16_untransposed_attention_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+        platform_target: Platforms,
+    ):
+        """bf16 projection reading attention in the untransposed [B, S, N, D] layout."""
+        dtype = nl.bfloat16
+
+        def input_generator(test_config):
+            return generate_output_proj_cte_inputs(
+                batch=batch,
+                seqlen=seqlen,
+                hidden=hidden,
+                n_head=n_head,
+                d_head=d_head,
+                test_bias=test_bias,
+                attention_layout=OProjAttentionLayout.BSNd,
+            )
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=torch_ref_wrapper(output_projection_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    @pytest.mark.fast
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_HEADS_OUTER_ATTENTION_CASES, abbrevs=_ABBREVS)
+    def test_output_proj_cte_bf16_heads_outer_attention_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+        platform_target: Platforms,
+    ):
+        """bf16 projection reading attention in the untransposed heads-outer [B, N, S, D] layout."""
+        dtype = nl.bfloat16
+
+        def input_generator(test_config):
+            return generate_output_proj_cte_inputs(
+                batch=batch,
+                seqlen=seqlen,
+                hidden=hidden,
+                n_head=n_head,
+                d_head=d_head,
+                test_bias=test_bias,
+                attention_layout=OProjAttentionLayout.BNSd,
             )
 
         def output_tensors(kernel_input):
@@ -1134,6 +1294,16 @@ class TestOutputProjCteKernel:
         test_bias: bool,
     ):
         """Unit test for ROW FP8 output projection (TRN2). Input is [B, S, N, D]."""
+        # Deterministic timeout on this vector: inference exceeds the 55s
+        # profile-capture limit on trn3.
+        if (
+            platform_target == Platforms.TRN3
+            and (batch, seqlen, hidden, n_head, d_head) == (1, 16, 5120, 10, 128)
+            and test_bias
+        ):
+            pytest.xfail(
+                "Persistent inference timeout (55s profile-capture limit) on trn3 at b1_s16_h5120_nh10_dh128_bias1"
+            )
         dtype = nl.bfloat16
 
         def input_generator(test_config):
@@ -1145,6 +1315,7 @@ class TestOutputProjCteKernel:
                 d_head=d_head,
                 test_bias=test_bias,
                 quantization_type=QuantizationType.ROW,
+                attention_layout=OProjAttentionLayout.BSNd,
             )
 
         def output_tensors(kernel_input):
@@ -1173,7 +1344,7 @@ class TestOutputProjCteKernel:
     # SBUF with the resolved FP8 dtype. OCP is TRN3-gated via pytest.skip;
     # NON_OCP and AUTO run on any platform.
     # ============================================================================
-    _OUTPUT_PROJ_CTE_BY_DTYPE_MODE_CONFIG = {
+    _OUTPUT_PROJ_CTE_BY_DTYPE_MODE_CONFIG: OutputProjCteDtypeModeConfig = {
         "batch": 1,
         "seqlen": 512,
         "hidden": 3072,

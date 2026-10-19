@@ -53,7 +53,7 @@ def run_debugger_inference(
     """
     import os
 
-    from nki.debugger import debug_kernel
+    from nki.debugger import debug_kernel  # ty: ignore[unresolved-import]
 
     logging.info(
         f"Running nki.debug: dump_dir={dump_dir}, core_id={core_id}, "

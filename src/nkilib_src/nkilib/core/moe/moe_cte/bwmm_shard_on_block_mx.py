@@ -21,7 +21,6 @@ from typing import Any, Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import dge_mode, oob_mode
 
 from ...mlp.mlp_parameters import MLPQuantizationParameters
 from ...utils.allocator import SbufManager, sizeinbytes
@@ -96,6 +95,57 @@ _DYN_STEP_LOG2 = _DYN_STEP.bit_length() - 1  # log2(_DYN_STEP); used as right-sh
 logger = get_logger("bwmm_shard_on_block_mx")
 
 
+def resolve_block_split(
+    N: int,
+    n_static_blocks_cfg: int,
+    n_dynamic_blocks: int,
+    has_conditions: bool,
+    T: int,
+    top_k: int,
+    ep_degree: int,
+    B: int,
+    num_shards: int,
+):
+    """Resolve the static/dynamic block split; returns (n_static, n_dynamic, auto_computed).
+
+    Both the weight-skip mask precompute and the block dispatch must call this, or the mask
+    is built for a different block range than the loops process.
+    """
+    if n_static_blocks_cfg > 0:
+        n_dyn = N - n_static_blocks_cfg
+        n_static = N - n_dyn
+        auto_computed = False
+    elif has_conditions and (n_dynamic_blocks < 0 or n_dynamic_blocks > N):
+        # Best case: tokens spread top_k ways over ep_degree ranks, packed into B-sized
+        # blocks. Capped at N so an over-provisioned estimate cannot yield a negative n_dyn.
+        n_static = min(max(1, div_ceil(div_ceil(T * top_k, ep_degree), B)), N)
+        n_dyn = N - n_static
+        auto_computed = True
+    else:
+        n_dyn = n_dynamic_blocks
+        n_static = N - n_dyn
+        auto_computed = False
+
+    # Lockstep ping-pong consumes blocks in pairs, so an even n_dyn bounds shard 1's extra
+    # iteration at n_static + n_active <= N - 1 instead of reading past the block arrays.
+    if n_dyn % 2 == 1:
+        if n_static > 0:
+            n_dyn += 1
+            n_static -= 1
+        else:
+            n_dyn -= 1
+            n_static += 1
+
+    # process_dynamic_blocks steps the block index by num_shards, so it cannot process
+    # fewer than num_shards blocks. Push residual into the static path, which has an odd-N
+    # branch that handles N < num_shards via is_dummy.
+    if 0 < n_dyn < num_shards:
+        n_static += n_dyn
+        n_dyn = 0
+
+    return n_static, n_dyn, auto_computed
+
+
 @nki.jit
 def bwmm_shard_on_block_mx(
     hidden_states,
@@ -111,6 +161,8 @@ def bwmm_shard_on_block_mx(
     # quantize scales
     gate_up_proj_scale: nl.NkiTensor = None,
     down_proj_scale: nl.NkiTensor = None,
+    # [1, 1] int32 expert-parallel rank of this instance; required on the packed-affinity path.
+    ep_rank: nl.NkiTensor = None,
     # Non-tensor args
     block_size=None,
     n_static_blocks: int = -1,
@@ -285,30 +337,43 @@ def bwmm_shard_on_block_mx(
     gate_up_proj_weight, target_dtype = convert_to_mxfp_dtype(gate_up_proj_weight, weight_dtype)
     down_proj_weight, _ = convert_to_mxfp_dtype(down_proj_weight, target_dtype)
 
-    # Pre-quantized fp8 hidden states (real MX): hidden_states arrives as a concatenated
-    # [T, H_concat] tensor = [hidden_quant (H fp8) | hidden_scale (H/4 uint8)] from a prior
-    # QMX layer. We skip on-device quantization and gather+transpose both regions. The true
-    # hidden dim H is recovered from the gate/up weight (concat dim hides it on the input).
-    is_fp8_hidden = hidden_states.dtype in (nl.float8_e4m3fn, nl.float8_e5m2)
-
     T = hidden_states.shape[0]
     B = block_size
     E, _Hp, _, _n_H512, I = gate_up_proj_weight.shape
-    # When the producer fused expert affinities into the row, the concat is
-    # [hidden (H fp8) | scale (scale_region uint8) | affinities (E bf16) | pad]. Detect this by the
-    # concat being wider than hidden+scale, and extract the affinity for this block. affinities_col_offset is the fp8 column
-    # where the affinity region starts (= the end of the hidden+scale region).
-    is_affinities_packed = False
+
+    """
+    Pre-quantized hidden states (real MX): hidden_states arrives as a concatenated row from a prior
+    QMX layer, so we skip on-device quantization and gather+transpose the regions instead.
+
+      [hidden_quant (H fp8) | hidden_scale (scale_region uint8)]                        (unpacked)
+      [hidden_quant (H fp8) | hidden_scale (scale_region uint8) | affinities (E) | pad] (packed)
+
+    The packed producer fuses the dense [T, E] expert affinities into the row and returns the tensor
+    VIEWED as the affinity dtype (a >=2-byte float). Detection:
+      - expert_affinities_masked is None  -> affinities are PACKED in the row; the affinity dtype is hidden_states.dtype.
+      - else fp8 dtype                    -> prequant, unpacked (affinities via the standalone tensor).
+      - else                              -> plain online-quant [T, H] input (not prequant).
+    H is recovered from the gate/up weight (the concat/scale/affinity tail hides it on the input).
+    """
+    is_affinities_packed = expert_affinities_masked == None
+    kernel_assert(
+        not is_affinities_packed or ep_rank != None,
+        "ep_rank is required when affinities are packed (dense global tail, local block_expert)",
+    )
+    expert_affinities_dtype = hidden_states.dtype  # affinity tail dtype (only meaningful when packed)
+    is_fp8_hidden = is_affinities_packed or hidden_states.dtype in (nl.float8_e4m3fn, nl.float8_e5m2)
     affinities_col_offset = 0
     if is_fp8_hidden:
-        H = _Hp * _n_H512 * _q_width  # real hidden dimension that's not concatted with scales
+        H = _Hp * _n_H512 * _q_width  # real hidden dimension that's not concatted with scales/affinities
         kernel_assert(
             quantization_type == QuantizationType.MX,
-            f"fp8 pre-quantized hidden states only support QuantizationType.MX, got {quantization_type}",
+            f"pre-quantized hidden states only support QuantizationType.MX, got {quantization_type}",
         )
-        hidden_scale_width = H + div_ceil(_n_H512, SLOTS_PER_PACKED_BUFFER) * _pmax
-        is_affinities_packed = hidden_states.shape[-1] > hidden_scale_width
-        affinities_col_offset = hidden_scale_width
+        # Reinterpret the row as fp8 (a no-op when already fp8) so every hidden+scale byte-column
+        # computation below is dtype-agnostic; shape[-1] becomes the fp8 column count (row_region), and
+        # the affinity region (when packed) starts at the fp8 column just past hidden+scale.
+        hidden_states = hidden_states.view(nl.float8_e4m3fn)
+        affinities_col_offset = H + div_ceil(_n_H512, SLOTS_PER_PACKED_BUFFER) * _pmax
     else:
         _, H = hidden_states.shape
     cond_vec_len = conditions.shape[0] if conditions != None else 0
@@ -510,6 +575,20 @@ def bwmm_shard_on_block_mx(
     arange_4H = sbm.alloc_stack((1, _q_width), dtype=nl.float32, name="arange_4H", align=SBUF_QUADRANT_SIZE)
     nisa.iota(arange_4H, [[1, _q_width]], offset=0)
 
+    # Packed-affinity path: DMA this rank's ep_rank into SBUF once, then derive the block-invariant
+    # global expert base (ep_rank * E_local)
+    local_expert_start_idx_sb = None
+    if is_affinities_packed:
+        local_expert_start_idx_sb = sbm.alloc_stack(
+            (1, 1), dtype=nl.int32, name="local_expert_start_idx_sb", align=SBUF_QUADRANT_SIZE
+        )
+        nisa.dma_copy(dst=local_expert_start_idx_sb[0, 0], src=ep_rank.ap(pattern=[[1, 1], [1, 1]], offset=0))
+        e_local_sb = sbm.alloc_stack((1, 1), dtype=nl.int32, name="e_local_sb", align=SBUF_QUADRANT_SIZE)
+        nisa.memset(dst=e_local_sb, value=E)
+        nisa.tensor_tensor(
+            dst=local_expert_start_idx_sb, data1=local_expert_start_idx_sb, data2=e_local_sb, op=nl.multiply
+        )
+
     # fp8 path keeps the raw concat [T, H_concat] view; the gather helper does its own .ap().
     # bf16 path reshapes to the H-folded layout consumed by load_hidden_states_mx.
     _hidden_states_view = (
@@ -527,6 +606,7 @@ def bwmm_shard_on_block_mx(
         token_position_to_id=token_position_to_id,
         block_to_expert=block_to_expert,
         expert_affinities_masked=expert_affinities_masked,
+        local_expert_start_idx=local_expert_start_idx_sb,
         p_gup_idx_vector=p_gup_idx_vector,
         p_gup_idx_vector_int32=p_gup_idx_vector_int32,
         p_down_idx_vector=p_down_idx_vector,
@@ -609,6 +689,7 @@ def bwmm_shard_on_block_mx(
         is_fp8_hidden=is_fp8_hidden,
         is_affinities_packed=is_affinities_packed,
         affinities_col_offset=affinities_col_offset,
+        expert_affinities_dtype=expert_affinities_dtype,
     )
 
     check_kernel_compatibility(dims, configs)
@@ -628,7 +709,7 @@ def bwmm_shard_on_block_mx(
     )
     """
     Allocate buffers for prefetching and current block processing.
-    
+
     hidden_sbuf_expected_shape defines the expected layout for hidden states:
     (32_B * 4_H, dims.B // 32, mx4_prj_cfg.n_H512_tile, 128_H)
     """
@@ -662,7 +743,7 @@ def bwmm_shard_on_block_mx(
         )
 
     # fp8 pre-quantized path: persistent buffer holding one block's gathered concat rows
-    # ([hidden_quant (H fp8) | hidden_scale (packed: n_packed*128 uint8)] [| affinities (E bf16) | pad]
+    # ([hidden_quant (H fp8) | hidden_scale (packed: n_packed*128 uint8)] [| affinities (E) | pad]
     # when affinities are fused) between the prefetch (DMA) and transpose (PE) stages. H and the packed
     # scale region are both multiples of 4, so the row is fp32-aligned for the transpose's fp8->fp32
     # reinterpret; the affinity tail (when present) is the full remaining concat width.
@@ -801,18 +882,19 @@ def bwmm_shard_on_block_mx(
     if skip_dma.skip_weight:
         # Determine the actual number of static blocks that process_static_blocks will iterate over, so the skip mask matches the block-to-shard assignment.
         if configs.use_dynamic_while:
-            if configs.n_static_blocks > 0:
-                _n_dyn = dims.N - configs.n_static_blocks
-                # make it even number of blocks
-                _n_dyn = _n_dyn + 1 if _n_dyn % 2 == 1 else _n_dyn
-                _num_static_for_mask = dims.N - _n_dyn
-            else:
-                if conditions != None and (n_dynamic_blocks < 0 or n_dynamic_blocks > dims.N):
-                    # Must match the auto-computed n_static_blocks below so the skip
-                    # mask aligns with the block-to-shard assignment.
-                    _num_static_for_mask = max(1, div_ceil(div_ceil(dims.T * top_k, ep_degree), dims.B))
-                else:
-                    _num_static_for_mask = dims.N - n_dynamic_blocks
+            # Must match the split resolved below, or the mask is built for a different
+            # block range than the loops process.
+            _num_static_for_mask, _, _ = resolve_block_split(
+                N=dims.N,
+                n_static_blocks_cfg=configs.n_static_blocks,
+                n_dynamic_blocks=n_dynamic_blocks,
+                has_conditions=conditions != None,
+                T=dims.T,
+                top_k=top_k,
+                ep_degree=ep_degree,
+                B=dims.B,
+                num_shards=dims.num_shards,
+            )
         else:
             _num_static_for_mask = N
 
@@ -946,31 +1028,17 @@ def bwmm_shard_on_block_mx(
                 configs.n_static_blocks < dims.N,
                 f"Cannot have more static blocks than total number of blocks. Got ({configs.n_static_blocks}) > N = {dims.N}",
             )
-            n_dynamic_blocks = dims.N - configs.n_static_blocks
-            n_dynamic_blocks = n_dynamic_blocks + 1 if n_dynamic_blocks % 2 == 1 else n_dynamic_blocks
-            n_static_blocks = dims.N - n_dynamic_blocks
-            n_dynamic_blocks_local = n_dynamic_blocks
-            auto_computed = False
-        else:
-            # If invalid n_dynamic_blocks is passed, auto-calculate best case combination.
-            # Always process at least one static block
-            if conditions != None and (n_dynamic_blocks < 0 or n_dynamic_blocks > dims.N):
-                # Best case: tokens spread top_k ways, sharded across ep_degree EP ranks,
-                # packed into B-sized blocks. ceil(ceil(T*top_k/ep_degree)/B).
-                n_static_blocks = max(1, div_ceil(div_ceil(dims.T * top_k, ep_degree), dims.B))
-                n_dynamic_blocks_local = dims.N - n_static_blocks
-                auto_computed = True
-            else:
-                n_dynamic_blocks_local = n_dynamic_blocks
-                n_static_blocks = dims.N - n_dynamic_blocks_local
-                auto_computed = False
-
-        # process_dynamic_blocks steps the block index by num_shards, so it cannot
-        # process fewer than num_shards blocks. Push residual into the static path,
-        # which has an odd-N branch that handles N < num_shards via is_dummy.
-        if 0 < n_dynamic_blocks_local < dims.num_shards:
-            n_static_blocks += n_dynamic_blocks_local
-            n_dynamic_blocks_local = 0
+        n_static_blocks, n_dynamic_blocks_local, auto_computed = resolve_block_split(
+            N=dims.N,
+            n_static_blocks_cfg=configs.n_static_blocks,
+            n_dynamic_blocks=n_dynamic_blocks,
+            has_conditions=conditions != None,
+            T=dims.T,
+            top_k=top_k,
+            ep_degree=ep_degree,
+            B=dims.B,
+            num_shards=dims.num_shards,
+        )
 
         if configs.n_static_blocks <= 0 and auto_computed:
             logger.info(
@@ -1014,10 +1082,10 @@ def bwmm_shard_on_block_mx(
         if n_dynamic_blocks_local > 0:
             """
             Precompute dynamic-for iteration counts at top level
-            
+
             Chunked scheme:
               n_outer_iters = n_active // _DYN_STEP   (each outer iter = _DYN_STEP blocks = _DYN_INNER/core)
-              n_half        = (n_active + 1) >> 1     (what total ping-pong iters would be)
+              n_half        = (n_active + 1) >> 1     (lockstep ping-pong iters, both shards)
               n_rem_iters   = n_half - n_outer_iters * _DYN_INNER
             Each outer iter consumes _DYN_INNER ping-pong iters per shard; remainder
             loop handles the rest (0 .. _DYN_INNER-1 iters).
@@ -1046,7 +1114,8 @@ def bwmm_shard_on_block_mx(
                 operand0=_DYN_STEP_LOG2,
             )
 
-            # n_half = (n_active + 1) >> 1 (total number of ping pong iterations needed in dynamic blocks path)
+            # n_half = (n_active + 1) >> 1. Must stay shard-independent: the cores run in
+            # lockstep and a differing trip count deadlocks them (NRT_TIMEOUT).
             n_half_sb = sbm.alloc_stack((1, 1), dtype=nl.int32, name="n_half", align=SBUF_QUADRANT_SIZE)
             nisa.tensor_scalar(dst=n_half_sb, data=n_active_sb, op0=nl.add, operand0=1)
             nisa.tensor_scalar(dst=n_half_sb, data=n_half_sb, op0=nl.right_shift, operand0=1)
@@ -1084,9 +1153,10 @@ def bwmm_shard_on_block_mx(
                 # Chunked: (n_dynamic_blocks_local // _DYN_STEP) * _DYN_INNER blocks per shard.
                 n_chunks_max = n_dynamic_blocks_local // _DYN_STEP
                 n_chunked_alloc = n_chunks_max * _DYN_INNER
-                # Remainder: after chunking, at most (_DYN_STEP - 1) active blocks remain.
-                # Per shard: ceil(min(n_dynamic_blocks_local, _DYN_STEP - 1) / num_shards).
-                n_rem_alloc = div_ceil(min(n_dynamic_blocks_local, _DYN_STEP - 1), dims.num_shards)
+                # Remainder: span the whole dynamic region at stride num_shards so the window
+                # start is compile-time. Sizing it to the leftover needs a runtime start, which
+                # can overrun block_to_expert and forces a clamp that shifts the comparisons.
+                n_rem_alloc = div_ceil(n_dynamic_blocks_local, dims.num_shards)
 
                 # --- Chunked mask ---
                 if n_chunked_alloc > 0:
@@ -1141,20 +1211,12 @@ def bwmm_shard_on_block_mx(
 
                 # --- Remainder mask ---
                 """
-                The remainder region starts at a runtime-computed offset
-                (n_static_blocks + n_outer_iters * _DYN_STEP). DMA-load using a
-                scalar_offset derived from n_outer_iters at runtime.
-                Allocate one extra sentinel slot at the tail so the prefetch's
-                next-expert lookup at the last rem iter (rem_shard_iter+1
-                walking past n_rem_alloc - 1) reads E (skip) safely. The
-                prefetch result at the last rem iter is never consumed
-                (next_block_idx is clamped to N-1 with no further compute), so
-                the sentinel value is functionally a don't-care.
+                Window over this shard's stride-num_shards blocks across the whole dynamic
+                region, so its start is compile-time; the runtime remainder offset becomes an
+                index into it (rem_shard_iter) rather than a DMA base.
+                One extra sentinel slot at the tail so the prefetch's next-expert lookup on the
+                last rem iter reads E (skip) safely; that prefetch is never consumed.
                 """
-                # Records how many rem iters the rem_base clamp consumed,
-                # so the rem loop's iter counters start at that shift and
-                # iter 0 indexes the first real rem-region block.
-                rem_iter_shift_sb = None
                 if n_rem_alloc > 0:
                     rem_experts_mask = _sbm_alloc(
                         sbm,
@@ -1164,80 +1226,23 @@ def bwmm_shard_on_block_mx(
                         align=SBUF_QUADRANT_SIZE,
                     )
                     nisa.memset(dst=rem_experts_mask, value=dims.E)
-                    rem_iter_shift_sb = _sbm_alloc(
-                        sbm,
-                        (1, 1),
-                        dtype=nl.uint32,
-                        name="rem_iter_shift",
-                        align=SBUF_QUADRANT_SIZE,
-                    )
 
                     sbm.open_scope(name="rem_weight_skip_mask")
                     prev_prefix = sbm.get_name_prefix()
                     sbm.set_name_prefix(f"{prev_prefix}rem_")
 
-                    # rem_base_sb (uint32) = n_static_blocks + shard_id + n_outer_iters * _DYN_STEP
-                    rem_base_sb = _sbm_alloc(sbm, (1, 1), dtype=nl.uint32, name="rem_base", align=SBUF_QUADRANT_SIZE)
-                    nisa.tensor_scalar(
-                        dst=rem_base_sb,
-                        data=n_outer_iters_sb,
-                        op0=nl.multiply,
-                        operand0=_DYN_STEP,
-                        op1=nl.add,
-                        operand1=n_static_blocks + dims.shard_id,
-                    )
-
-                    """
-                    The mask DMA reads n_rem_alloc entries strided by num_shards starting at rem_base. If any lane goes past N-1, oob_mode.skip
-                    aborts the whole DMA — so clamp rem_base down to a safe start. When clamping, we must land on a block this shard actually
-                    processes (every num_shards-th block starting from n_static_blocks + shard_id), otherwise the mask records experts for the
-                    wrong neighbor blocks and weight-skip decisions go stale.
-                    """
-                    _max_safe_base = dims.N - 1 - (n_rem_alloc - 1) * dims.num_shards
-                    _rem_base_parity = (n_static_blocks + dims.shard_id) % dims.num_shards
-                    _max_safe_base_aligned = _max_safe_base - ((_max_safe_base - _rem_base_parity) % dims.num_shards)
-                    # rem_iter_shift_sb tracks how many iters the clamp consumed,
-                    # so iter 0 of the rem loop still indexes the first real rem block.
-                    rem_clamped_base_sb = _sbm_alloc(
-                        sbm,
-                        (1, 1),
-                        dtype=nl.uint32,
-                        name="rem_clamped_base",
-                        align=SBUF_QUADRANT_SIZE,
-                    )
-                    nisa.tensor_scalar(
-                        dst=rem_clamped_base_sb,
-                        data=rem_base_sb,
-                        op0=nl.minimum,
-                        operand0=_max_safe_base_aligned,
-                    )
-                    # rem_iter_shift_sb = (rem_base - clamped_base) / num_shards
-                    nisa.tensor_tensor(
-                        dst=rem_iter_shift_sb,
-                        data1=rem_base_sb,
-                        data2=rem_clamped_base_sb,
-                        op=nl.subtract,
-                    )
-                    # num_shards == 2; divide by 2 via right shift by 1.
-                    nisa.tensor_scalar(
-                        dst=rem_iter_shift_sb,
-                        data=rem_iter_shift_sb,
-                        op0=nl.right_shift,
-                        operand0=1,
-                    )
-
+                    # Highest block read is n_static + shard_id + num_shards*(n_rem_alloc-1),
+                    # i.e. <= N-1 for even n_dynamic, so no clamp and no oob_mode.skip (whose
+                    # all-or-nothing abort would blank the mask to E and skip every load).
                     nisa.dma_copy(
                         dst=rem_experts_mask[0:1, 0:n_rem_alloc],
-                        src=inps.block_to_expert.ap(
+                        src=inps.block_to_expert.reshape((dims.N, 1)).ap(
                             pattern=[
                                 [1, 1],
                                 [dims.num_shards, n_rem_alloc],
                             ],
-                            offset=0,
-                            scalar_offset=rem_clamped_base_sb,
-                            indirect_dim=0,
+                            offset=n_static_blocks + dims.shard_id,
                         ),
-                        oob_mode=oob_mode.skip,
                     )
 
                     if n_rem_alloc > 1:
@@ -1273,10 +1278,9 @@ def bwmm_shard_on_block_mx(
                     sbm, (1, 1), dtype=nl.uint32, name="rem_shard_iter", align=SBUF_QUADRANT_SIZE
                 )
                 if n_rem_alloc > 0:
-                    # Init iter counter to the rem-base clamp shift so iter 0
-                    # of the rem loop indexes the slot holding the actual
-                    # first rem-region block's expert.
-                    nisa.tensor_copy(dst=rem_shard_iter_sb, src=rem_iter_shift_sb)
+                    # This shard's first remainder block sits at window index
+                    # n_outer_iters * _DYN_INNER; highest index used is n_half - 1.
+                    nisa.tensor_copy(dst=rem_shard_iter_sb, src=n_outer_scaled_sb)
                 else:
                     nisa.memset(dst=rem_shard_iter_sb, value=0)
 
@@ -1417,59 +1421,68 @@ def load_prev_block(output, token_indices, block_old, NUM_TILES, dtype, shard_id
                 vector_offset=block_token_mapping,
                 indirect_dim=0,
             ),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
     return block_old
 
 
-def _extract_block_affinity(block_hidden_concat, block_expert, dims, kernel_cfg, sbm, name_prefix="aff"):
+def _extract_block_affinity(
+    block_hidden_concat, block_expert, local_expert_start_idx, dims, kernel_cfg, sbm, name_prefix="aff"
+):
     """Extract this block's expert-affinity column from the gathered fp8 concat rows (packed path).
 
     When the producer fused the dense [T, E] affinities into the row (is_affinities_packed), each
-    gathered row is [hidden | scale | affinities (E bf16) | pad]. The affinity this block needs is the
-    block_expert column of every token's affinity vector. This is a pure on-chip op (one tensor_copy
-    with scalar_offset=block_expert) -- NOT a DMA -- so it replaces the separate indirect affinity
-    gather (calculate_expert_affinities) and removes a SWDGE pass per B128 tile.
+    gathered row is [hidden | scale | affinities (E_global * kernel_cfg.expert_affinities_dtype) | pad].
+    The affinity region is dense over ALL experts because the producer's router runs BEFORE the EP
+    shard, but this rank holds only local experts and block_expert is a LOCAL id
+    (0..E_local-1). The global column is block_expert + local_expert_start_idx (== ep_rank * E_local).
 
     block_hidden_concat is [_pmax, n_B_tiles, concat_free_size] fp8. The affinity region starts at fp8
-    column kernel_cfg.affinities_col_offset; viewed as bf16 that is column affinities_col_offset // 2,
-    and the per-token row stride in bf16 is concat_free_size // 2.
+    column kernel_cfg.affinities_col_offset. Viewed as the affinity dtype, that is column
+    affinities_col_offset // affin_as_fp8, and the per-token row stride is
+    concat_free_size // affin_as_fp8 -- affin_as_fp8 = sizeinbytes(dtype) fp8 columns per element.
 
-    Returns a list of n_B_tiles tensors, each [_pmax, 1] fp32 -- the same shape contract as
-    calculate_expert_affinities, so the per-block compute consumes expert_affinity[n] identically.
+    Returns a list of n_B_tiles tensors, each [_pmax, 1] fp32.
     """
-    _bf16_as_fp8 = 2  # bf16 occupies 2 fp8 columns
+    affin_dtype = kernel_cfg.expert_affinities_dtype
+    affin_as_fp8 = sizeinbytes(affin_dtype)  # bf16 -> 2, fp32 -> 4 fp8 columns per affinity element
     n_B_tiles = dims.B // _pmax
-    aff_col_bf16 = kernel_cfg.affinities_col_offset // _bf16_as_fp8
+    aff_col = kernel_cfg.affinities_col_offset // affin_as_fp8
 
-    # bf16 view of the fp8 concat: [_pmax, n_B_tiles, concat_free_size // 2]. Indexing through the
-    # nl.NkiTensor makes the dynamic expert select operate in bf16 element units
-    # and avoids the fp8-vs-bf16 scalar_offset unit
+    # Affinity-dtype view of the fp8 concat: [_pmax, n_B_tiles, concat_free_size // affin_as_fp8].
+    # Indexing through the nl.NkiTensor makes the dynamic expert select operate in affinity-element
+    # units and avoids the fp8-vs-affinity scalar_offset unit.
+    concat_view = block_hidden_concat.view(affin_dtype)
+    # Slice the whole affinity tail to end-of-row: [aff_col, free_affin) spans all E_global affinity
+    # columns plus trailing pad. The dynamic global index always lands in the affinity region, so the
+    # pad is never selected
+    free_affin = concat_view.shape[-1]
 
-    concat_bf16 = block_hidden_concat.view(nl.bfloat16)
-
-    # Dynamic select requires a uint32 index (TensorCopyDynamicSrc verifier). block_expert is int32;
-    # experts are 0..E-1 (always positive) so the bit pattern is identical -- reinterpret in place.
-    block_expert_u32 = block_expert.view(nl.uint32)
+    # Global affinity column = local block_expert + this rank's expert base (ep_rank * E_local).
+    global_expert = _sbm_alloc(
+        sbm, (1, 1), dtype=nl.int32, name=f"{name_prefix}_global_expert", align=SBUF_QUADRANT_SIZE
+    )
+    nisa.tensor_tensor(dst=global_expert, data1=block_expert, data2=local_expert_start_idx, op=nl.add)
+    global_expert_u32 = global_expert.view(nl.uint32)
 
     expert_affinity = []
     for n in range(n_B_tiles):
         affinity_f32 = _sbm_alloc(
             sbm, (_pmax, 1), dtype=nl.float32, name=f"{name_prefix}_affinity_t{n}", align=SBUF_QUADRANT_SIZE
         )
-        # [_pmax, n_B_tiles, free_bf16] -> pick B-tile n -> [_pmax, free_bf16]
-        #   -> slice affinity cols [aff_col_bf16, +E] -> [_pmax, E]
-        #   -> dynamic-select this block's expert column -> [_pmax]
+        # [_pmax, n_B_tiles, free_affin] -> pick B-tile n -> [_pmax, free_affin]
+        #   -> slice affinity cols [aff_col, end) -> [_pmax, E_global(+pad)]
+        #   -> dynamic-select this block's GLOBAL expert column -> [_pmax]
         #   -> expand to [_pmax, 1] for the fp32 affinity contract.
         aff_tv = (
-            concat_bf16.slice(1, n, n + 1)
+            concat_view.slice(1, n, n + 1)
             .squeeze_dim(1)
-            .slice(1, aff_col_bf16, aff_col_bf16 + dims.E)
-            .select(dim=1, index=block_expert_u32)
+            .slice(1, aff_col, free_affin)
+            .select(dim=1, index=global_expert_u32)
             .expand_dim(1)
         )
-        # tensor_copy bf16 -> fp32 (compute consumes fp32 affinity).
-        nisa.tensor_copy(dst=affinity_f32, src=aff_tv)
+        # tensor_copy affinity dtype -> fp32 (compute consumes fp32 affinity; fp32 in is a no-op cast).
+        nisa.tensor_copy(dst=affinity_f32, src=aff_tv, engine=nisa.vector_engine)
         expert_affinity.append(affinity_f32)
     return expert_affinity
 
@@ -1559,8 +1572,8 @@ def _prefetch_gup_tile0(
     nisa.dma_copy(
         dst=buffers.gup_tile_buf_a[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, :load_I],
         src=gup_weight_view,
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-        dge_mode=dge_mode.hwdge,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+        dge_mode=nisa.dge_mode.hwdge,
     )
     if skip_scales:
         # STATIC_MX: scale operand is the constant all-127 dummy, nothing to load per block.
@@ -1585,8 +1598,8 @@ def _prefetch_gup_tile0(
                     scalar_offset=_scale_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip,
+                dge_mode=nisa.dge_mode.hwdge,
             )
         else:
             # Gate scales
@@ -1602,8 +1615,8 @@ def _prefetch_gup_tile0(
                     scalar_offset=_scale_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.error,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.error,
+                dge_mode=nisa.dge_mode.hwdge,
             )
             # Up scales
             nisa.dma_copy(
@@ -1618,8 +1631,8 @@ def _prefetch_gup_tile0(
                     scalar_offset=_scale_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.error,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.error,
+                dge_mode=nisa.dge_mode.hwdge,
             )
         return
     # Full scales — one trigger for weight_skipping (simpler OOB-skip), two triggers otherwise (better DMA scheduling)
@@ -1643,7 +1656,7 @@ def _prefetch_gup_tile0(
                 indirect_dim=0,
             ),
             dst=inps.gup_scales_sb[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, : prj_cfg.I],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
     else:
         # Two triggers: split gate and up for better DMA scheduling
@@ -1660,7 +1673,7 @@ def _prefetch_gup_tile0(
                 indirect_dim=0,
             ),
             dst=inps.gup_scales_sb[:_pmax, 0:1, : prj_cfg.n_H512_tile_sharded, : prj_cfg.I],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
         # Up scales
         nisa.dma_copy(
@@ -1675,7 +1688,7 @@ def _prefetch_gup_tile0(
                 indirect_dim=0,
             ),
             dst=inps.gup_scales_sb[:_pmax, 1:2, : prj_cfg.n_H512_tile_sharded, : prj_cfg.I],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
 
 
@@ -1810,8 +1823,8 @@ def load_gup_weights_scales_mx(
     nisa.dma_copy(
         dst=gup_weights_qtz_sb,
         src=gup_weight_view,
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-        dge_mode=dge_mode.hwdge,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+        dge_mode=nisa.dge_mode.hwdge,
     )
 
     """
@@ -1849,8 +1862,8 @@ def load_gup_weights_scales_mx(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+                dge_mode=nisa.dge_mode.hwdge,
             )
         else:
             # fold E * 16 together
@@ -1897,7 +1910,7 @@ def load_gup_weights_scales_mx(
                     indirect_dim=0,
                 ),
                 dst=inps.gup_scales_sb[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, : prj_cfg.I],
-                oob_mode=oob_mode.skip,
+                oob_mode=nisa.oob_mode.skip,
             )
 
     """
@@ -1937,8 +1950,8 @@ def load_gup_weights_scales_mx(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+                dge_mode=nisa.dge_mode.hwdge,
             )
         else:
             # gate_and_up_proj_bias shape: (E, _pmax, 2, n_total_I512_tile, _q_width)
@@ -1958,8 +1971,8 @@ def load_gup_weights_scales_mx(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+                dge_mode=nisa.dge_mode.hwdge,
             )
 
     return gup_weights_qtz_sb, inps.gup_scales_sb, gup_bias_sb, token_indices_on_p, gup_n_quadrants_needed
@@ -1998,8 +2011,8 @@ def _load_gup_weight_tile(
     nisa.dma_copy(
         dst=dst_weight[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, :cur_I_load_sz],
         src=gup_weight_view,
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-        dge_mode=dge_mode.hwdge,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+        dge_mode=nisa.dge_mode.hwdge,
     )
 
     # --- SCALES ---
@@ -2026,7 +2039,7 @@ def _load_gup_weight_tile(
                 indirect_dim=0,
             ),
             dst=dst_scale[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, :cur_I_load_sz],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
 
     # --- BIAS ---
@@ -2054,8 +2067,8 @@ def _load_gup_weight_tile(
                 scalar_offset=block_expert,
                 indirect_dim=0,
             ),
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+            dge_mode=nisa.dge_mode.hwdge,
         )
     else:
         # I >= 512: bias HBM has _pmax on p-dim
@@ -2074,8 +2087,8 @@ def _load_gup_weight_tile(
                 scalar_offset=block_expert,
                 indirect_dim=0,
             ),
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+            dge_mode=nisa.dge_mode.hwdge,
         )
 
 
@@ -2139,10 +2152,10 @@ def load_down_proj_weights_mx(
     """
     """
     Load down projection weights from HBM to SBUF.
-    
+
     down_proj_weight shape: (E, p_I, n_total_I512_tile, H)
     Load directly into dst_weight with scalar AP.
-    scalar_offset=block_expert with indirect_dim=0 means access starts at 
+    scalar_offset=block_expert with indirect_dim=0 means access starts at
     block_expert * (p_I * n_total_I512_tile * H)
     """
 
@@ -2159,8 +2172,8 @@ def load_down_proj_weights_mx(
     nisa.dma_copy(
         src=down_weight_view,
         dst=dst_weight[: dims.p_I, :, :],
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-        dge_mode=dge_mode.hwdge,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+        dge_mode=nisa.dge_mode.hwdge,
     )
 
     """
@@ -2234,8 +2247,8 @@ def load_down_proj_weights_mx(
                 scalar_offset=block_expert,
                 indirect_dim=0,
             ),
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+            dge_mode=nisa.dge_mode.hwdge,
         )
     else:
         """
@@ -2287,7 +2300,7 @@ def load_down_proj_weights_mx(
                 indirect_dim=0,
             ),
             dst=down_scale_sb[: dims.p_I, : prj_cfg.n_total_I512_tile, : prj_cfg.H_sharded],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
 
     # load bias
@@ -2309,8 +2322,8 @@ def load_down_proj_weights_mx(
                 pattern=[[dims.H, 1], [1, dims.H]], offset=0, scalar_offset=block_expert, indirect_dim=0
             ),
             dst=down_bias_sb,
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+            dge_mode=nisa.dge_mode.hwdge,
         )
 
     return down_scale_sb, down_bias_sb
@@ -2344,7 +2357,7 @@ def _write_output_scatter(src_data, token_indices_2D, outs, dims, shard_id):
         nisa.dma_copy(
             dst=output_ap,
             src=src_data[0:_pmax, n, 0 : dims.H],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
 
 
@@ -2656,7 +2669,9 @@ def compute_one_block(
 
     if kernel_cfg.is_affinities_packed:
         # Extract expert affinities for this block expert
-        expert_affinity = _extract_block_affinity(buffers.block_hidden_concat, block_expert, dims, kernel_cfg, sbm=sbm)
+        expert_affinity = _extract_block_affinity(
+            buffers.block_hidden_concat, block_expert, inps.local_expert_start_idx, dims, kernel_cfg, sbm=sbm
+        )
     else:
         expert_affinity = calculate_expert_affinities(
             inps.expert_affinities_masked,
@@ -2709,7 +2724,7 @@ def compute_one_block(
             sbm.set_name_prefix(_prev_pfx)
     """
     GATE/UP PROJECTIONS + ACTIVATION + MULTIPLY
-    
+
     Scoped so that gate/up weights, bias, gate_proj_out_sb, up_proj_out_sb,
     and all internal projection allocations are freed after producing intermediate_state_sb.
     """
@@ -2758,7 +2773,7 @@ def compute_one_block(
         Use persistent tile buffer + one scope-local buffer for double buffering.
         If persistent buffer wasn't pre-allocated (SBUF budget too tight to keep it
         alive through down proj), allocate a scope-local buffer instead — loses
-        cross-block prefetch but still enables double-buffering within the I-tile loop.       
+        cross-block prefetch but still enables double-buffering within the I-tile loop.
         """
 
         gup_wt_a = (
@@ -2818,8 +2833,8 @@ def compute_one_block(
                             scalar_offset=block_expert,
                             indirect_dim=0,
                         ),
-                        oob_mode=oob_mode.skip,
-                        dge_mode=dge_mode.hwdge,
+                        oob_mode=nisa.oob_mode.skip,
+                        dge_mode=nisa.dge_mode.hwdge,
                         name=f"dma_gup_scales_packed_tile0_{tag}",
                     )
                 else:
@@ -2835,8 +2850,8 @@ def compute_one_block(
                             scalar_offset=block_expert,
                             indirect_dim=0,
                         ),
-                        oob_mode=oob_mode.error,
-                        dge_mode=dge_mode.hwdge,
+                        oob_mode=nisa.oob_mode.error,
+                        dge_mode=nisa.dge_mode.hwdge,
                         name=f"dma_gate_scales_packed_tile0_{tag}",
                     )
                     nisa.dma_copy(
@@ -2851,8 +2866,8 @@ def compute_one_block(
                             scalar_offset=block_expert,
                             indirect_dim=0,
                         ),
-                        oob_mode=oob_mode.error,
-                        dge_mode=dge_mode.hwdge,
+                        oob_mode=nisa.oob_mode.error,
+                        dge_mode=nisa.dge_mode.hwdge,
                         name=f"dma_up_scales_packed_tile0_{tag}",
                     )
             else:
@@ -2878,7 +2893,7 @@ def compute_one_block(
                         indirect_dim=0,
                     ),
                     dst=inps.gup_scales_sb[:_pmax, :2, : prj_cfg.n_H512_tile_sharded, : prj_cfg.I],
-                    oob_mode=oob_mode.skip,
+                    oob_mode=nisa.oob_mode.skip,
                 )
 
         # Load full bias once. If hoisted_gup_bias is provided (skip_weight path), reuse
@@ -2917,8 +2932,8 @@ def compute_one_block(
                         scalar_offset=_bias_expert,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.skip if kernel_cfg.skip_dma.skip_weight else oob_mode.error,
-                    dge_mode=dge_mode.hwdge,
+                    oob_mode=nisa.oob_mode.skip if kernel_cfg.skip_dma.skip_weight else nisa.oob_mode.error,
+                    dge_mode=nisa.dge_mode.hwdge,
                 )
             else:
                 bias_stride_dim1 = 2 * prj_cfg.n_total_I512_tile * _q_width
@@ -2936,8 +2951,8 @@ def compute_one_block(
                         scalar_offset=_bias_expert,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.skip if kernel_cfg.skip_dma.skip_weight else oob_mode.error,
-                    dge_mode=dge_mode.hwdge,
+                    oob_mode=nisa.oob_mode.skip if kernel_cfg.skip_dma.skip_weight else nisa.oob_mode.error,
+                    dge_mode=nisa.dge_mode.hwdge,
                 )
 
         # Single scratch buffer for up projection output. Gate writes directly to
@@ -3631,7 +3646,9 @@ def compute_one_block(
             dst=pending_token_indices[0:_pmax, 0 : dims.n_B128_tiles],
             src=token_indices_2D[0:_pmax, 0 : dims.n_B128_tiles],
         )
-    else:
+    elif not is_dummy:
+        # The dummy block only keeps the two shards in lockstep -- the other shard writes
+        # this block's real values, and block_new can hold NaN from unwritten partitions.
         for n in range(dims.B // _pmax):
             T = outs.output.shape[-2]
             shard_offset = shard_id * T * dims.H
@@ -3653,7 +3670,7 @@ def compute_one_block(
             nisa.dma_copy(
                 dst=output_ap,
                 src=block_new[0:_pmax, n, 0 : dims.H],
-                oob_mode=oob_mode.skip,
+                oob_mode=nisa.oob_mode.skip,
             )
 
     if sbm != None:
@@ -4298,7 +4315,7 @@ def process_dynamic_blocks(
                 Shard 0: both formulas equal index + STEP, so no runtime
                 adjustment is needed.
                 Shard 1: on last iter subtract (INNER - 1) from the base.
-                Clamped to N-1 for safety.          
+                Clamped to N-1 for safety.
                 """
                 if inner < INNER - 1:
                     nisa.tensor_scalar(
@@ -4405,6 +4422,19 @@ def process_dynamic_blocks(
                         )
                         _dyn_next_expert_for_weights = boundary_skip_expert_sb
 
+                        if _use_rem_skip:
+                            # The rem mask's own pairwise pass cannot produce this slot: the
+                            # predecessor is the last chunked block, off the stride lattice.
+                            nisa.tensor_copy(
+                                dst=rem_experts_mask.ap(
+                                    pattern=[[n_rem_alloc + 1, 1], [1, 1]],
+                                    offset=0,
+                                    scalar_offset=rem_shard_iter_sb,
+                                    indirect_dim=1,
+                                ),
+                                src=boundary_skip_expert_sb,
+                            )
+
                 compute_one_block(
                     _bi_sb,
                     _nbi_sb,
@@ -4475,8 +4505,8 @@ def process_dynamic_blocks(
         _dyn_expert_for_weights = None
         _dyn_next_expert_for_weights = None
         if _use_rem_skip:
-            # Mask is sized n_rem_alloc + 1 with the +1 sentinel slot at E,
-            # so curr/next lookups use _n_rem_mask_len as the AP pattern bound.
+            # Window index for this shard's current rem block; the +1 slot serves the
+            # prefetch's next-block lookup on the last iteration.
             _n_rem_mask_len = n_rem_alloc + 1
             nisa.tensor_copy(
                 dst=dyn_weight_expert_sb,
@@ -4488,10 +4518,6 @@ def process_dynamic_blocks(
                 ),
             )
             _dyn_expert_for_weights = dyn_weight_expert_sb
-            # Precompute prefetch's skip-aware expert via rem_shard_iter + 1.
-            # On the last rem iter, this walks into the sentinel slot (= E)
-            # which is functionally a don't-care since the prefetch's output
-            # is never consumed (no compute follows the last rem iter).
             _dyn_next_expert_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
             nisa.tensor_copy(
                 dst=_dyn_next_expert_sb,

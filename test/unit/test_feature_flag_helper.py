@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from unittest.mock import MagicMock
+from typing import Any
 
 from test.utils.feature_flag_helper import (
     NEURON_NEV_PREFIX,
@@ -21,6 +21,16 @@ from test.utils.feature_flag_helper import (
     get_feature_flag,
     resolve_ssh_config_path,
 )
+
+
+class _OptionStub:
+    """Stands in for a pytest config: any option lookup returns the same preset value."""
+
+    def __init__(self, option_value: Any = None) -> None:
+        self._option_value = option_value
+
+    def getoption(self, name: str) -> Any:
+        return self._option_value
 
 
 class TestEnvFlagEnabled:
@@ -46,62 +56,55 @@ class TestEnvFlagEnabled:
 
 class TestGetFeatureFlag:
     def test_returns_config_value_when_set(self):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = "config_value"
+        config = _OptionStub("config_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "config_value"
 
     def test_returns_env_value_when_config_is_none(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = None
+        config = _OptionStub(None)
         monkeypatch.setenv(f"{NEURON_NEV_PREFIX}TEST_KEY", "env_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "env_value"
 
     def test_returns_default_when_no_config_or_env(self):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = None
+        config = _OptionStub(None)
 
-        result = get_feature_flag(mock_config, "test-key", default_value="default")
+        result = get_feature_flag(config, "test-key", default_value="default")
 
         assert result == "default"
 
     def test_config_takes_precedence_over_env(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = "config_value"
+        config = _OptionStub("config_value")
         monkeypatch.setenv(f"{NEURON_NEV_PREFIX}TEST_KEY", "env_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "config_value"
 
     def test_resolves_env_reference_in_config_value(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = "$MY_VAR"
+        config = _OptionStub("$MY_VAR")
         monkeypatch.setenv("MY_VAR", "resolved_value")
 
-        result = get_feature_flag(mock_config, "test-key")
+        result = get_feature_flag(config, "test-key")
 
         assert result == "resolved_value"
 
     def test_converts_dashes_to_underscores_in_env_key(self, monkeypatch):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = None
+        config = _OptionStub(None)
         monkeypatch.setenv(f"{NEURON_NEV_PREFIX}MY_TEST_KEY", "env_value")
 
-        result = get_feature_flag(mock_config, "my-test-key")
+        result = get_feature_flag(config, "my-test-key")
 
         assert result == "env_value"
 
     def test_zero_config_value_is_returned_not_treated_as_falsy(self):
-        mock_config = MagicMock()
-        mock_config.getoption.return_value = 0
+        config = _OptionStub(0)
 
-        result = get_feature_flag(mock_config, "test-key", default_value="default")
+        result = get_feature_flag(config, "test-key", default_value="default")
 
         assert result == 0
 
@@ -122,11 +125,9 @@ class TestResolveSshConfigPath:
 
     def test_defaults_to_user_ssh_config(self, monkeypatch):
         monkeypatch.delenv(f"{NEURON_NEV_PREFIX}SSH_CONFIG_PATH", raising=False)
-        config = MagicMock()
-        config.getoption.return_value = None  # no CLI flag
+        config = _OptionStub(None)  # no CLI flag
         assert resolve_ssh_config_path(config) == os.path.expanduser("~/.ssh/config")
 
     def test_uses_and_expands_configured_path(self):
-        config = MagicMock()
-        config.getoption.return_value = "~/custom/ssh_config"
+        config = _OptionStub("~/custom/ssh_config")
         assert resolve_ssh_config_path(config) == os.path.expanduser("~/custom/ssh_config")

@@ -37,7 +37,6 @@ from .common_dataclasses import (
     NeuronDeviceInfo,
     Platforms,
     ResolvedHost,
-    TargetHost,
     resolve_probe_worker_count,
 )
 from .core_lock_client import POLL_JITTER_MAX, POLL_PERIOD, REMOTE_LOCKS_JSON, STALE_THRESHOLD
@@ -50,10 +49,8 @@ from .core_lock_manager import (
     calculate_total_needed_physical_cores,
     check_lock_version,
 )
-from .core_reset_strategy import CoreResetStrategy
 from .exceptions import (
     FleetEmptyError,
-    HostsBusyError,
     InferenceException,
     LocalExecutionException,
     NoNeuronDevicesException,
@@ -64,7 +61,6 @@ from .exceptions import (
 )
 from .host_communication import (
     SSH_INFERENCE_TIMEOUT_SECONDS,
-    LocalCommunication,
     ParamikoCommunication,
     SshCommunication,
 )
@@ -73,11 +69,6 @@ from .metrics_collector import NOOP_METRICS_COLLECTOR, IMetricsCollector, Metric
 from .remote_executor import RemoteExecutor
 from .s3_utils import S3ArtifactUploadConfig
 from .scripts.remote_lock_scripts import LockState, find_contiguous_cores
-
-# Constructed once at module load and reused as the shared default; CoreResetStrategy
-# with exclusive_run=False has no file-backed state (_state_path/_lock are None) and is
-# never mutated in place, so sharing this instance across callers is safe.
-_DEFAULT_CORE_RESET_STRATEGY = CoreResetStrategy(exclusive_run=False)
 
 # Caller-side patience for FIFO core allocation.
 # If a host's worst-case ETA exceeds this, the caller dequeues and rotates to
@@ -103,6 +94,15 @@ FAST_POLL_PERIOD = 1
 # Post-lock commands (e.g. profile post-processing) run without a core lock and
 # may legitimately take much longer than a locked capture; bound them at 15 min.
 POST_LOCK_TIMEOUT_SECONDS = 900
+
+# Directories excluded from the upload archive to reduce transfer size.
+UPLOAD_EXCLUDED_PATHS = ["artifacts", "metrics"]
+
+# Names of environment variables to forward from the local environment to the remote
+# workload when they are set. Test configurations that depend on an optional runtime
+# component add the variable that selects it here, so the workload runs against the same
+# component as the local process.
+ENV_PASSTHROUGH: set[str] = set()
 
 
 def select_poll_base(position: int | None, *, fast: int = FAST_POLL_PERIOD, slow: int = POLL_PERIOD) -> int:
@@ -188,9 +188,6 @@ def detect_local_platform(neuron_installation_path: str) -> Platforms | None:
 
 
 class Host(ABC):
-    def __init__(self, core_reset_strategy: CoreResetStrategy) -> None:
-        self._reset_strategy = core_reset_strategy
-
     def execute_command(
         self,
         command: str,
@@ -201,6 +198,7 @@ class Host(ABC):
         do_copy_artifacts: bool = False,
         get_list_of_files_to_copy: Callable[[str], list[str]] | None = None,
         post_lock_command: str | None = None,
+        skip_core_reset: bool = False,
     ) -> str | None:
         run_exception = None
         stdout = ""
@@ -210,11 +208,13 @@ class Host(ABC):
         ) as core_allocation:
             with collector.timer(MetricName.CORE_LOCK_HOLD_TIME):
                 unique_port = self._get_unique_collectives_port(core_allocation.logical_core_ids[0])
+                reset_cores = (not skip_core_reset) or core_allocation.should_reset_cores
                 neuron_env = self._build_neuron_env(
                     core_allocation,
                     lnc_config,
                     unique_port,
                     self._get_debug_output_dir(target_directory),
+                    reset_cores,
                 )
 
                 neuron_env.update(self._setup_neuron_tags())
@@ -222,9 +222,6 @@ class Host(ABC):
                     stdout = self._run_command(command, target_directory, neuron_env, collector)
                 except Exception as e:
                     run_exception = e
-            # Record the outcome while still holding the core lock: releasing first
-            # would let another worker read stale LNC state in the release-to-teardown gap.
-            self._reset_strategy.mark_test_complete(core_allocation, lnc_config, failed=run_exception is not None)
 
         if not run_exception and post_lock_command:
             if self._should_run_post_lock():
@@ -364,9 +361,10 @@ class Host(ABC):
         lnc_config: int,
         unique_port: int,
         debug_output_dir: str,
+        reset_cores: bool,
     ) -> dict[str, str]:
         """Build the common Neuron runtime environment variables for execution."""
-        return {
+        env = {
             "NEURON_RT_ENABLE_OCP": "1",
             "NEURON_RT_ENABLE_OCP_SATURATION": "1",
             "NEURON_RT_VISIBLE_CORES": core_allocation.get_core_list_str(),
@@ -374,10 +372,13 @@ class Host(ABC):
             "NEURON_RT_ROOT_COMM_ID": f"localhost:{unique_port}",
             "NEURON_RT_DEBUG_OUTPUT_DIR": debug_output_dir,
             # Avoid core reset between tests (overriding per-test default).
-            "NEURON_RT_RESET_CORES": "1"
-            if self._reset_strategy.should_reset_cores(core_allocation, lnc_config)
-            else "0",
+            "NEURON_RT_RESET_CORES": "1" if reset_cores else "0",
         }
+        for name in sorted(ENV_PASSTHROUGH):
+            value = os.environ.get(name)
+            if value:
+                env[name] = value
+        return env
 
     @staticmethod
     def _setup_neuron_tags() -> dict[str, str]:
@@ -400,10 +401,7 @@ class LocalHost(Host):
         local_neuron_installation_path: str,
         host_id: str,
         core_allocation_dir: str,
-        core_reset_strategy: CoreResetStrategy,
     ):
-        super().__init__(core_reset_strategy)
-        self._comm = LocalCommunication(host_id=host_id)
         self.neuron_ls_path: str = os.path.join(local_neuron_installation_path, "neuron-ls")
         self.host_id: str = host_id
         self.core_allocation_dir: str = core_allocation_dir
@@ -666,30 +664,27 @@ class SshHost(Host):
         s3_config: S3ArtifactUploadConfig,
         patience_seconds: int = DEFAULT_PATIENCE_SECONDS,
         remote_base_path: str = "/tmp/neuronx-cc/tests",
-        core_reset_strategy: CoreResetStrategy = _DEFAULT_CORE_RESET_STRATEGY,
-        exclusive: bool = False,
+        transport: str = "paramiko",
     ):
-        super().__init__(core_reset_strategy)
         self.ssh_alias: str = ssh_alias
         self.s3_config = s3_config
         self.patience_seconds = patience_seconds
         self._ssh_config_path = ssh_config_path
 
-        # SshCommunication is an experimental communication format; it is guarded
-        # by the "exclusive host" feature flag until it will be streamlined for
-        # all use cases.
-        if exclusive:
+        if transport == "ssh":
             self._comm = SshCommunication(
                 ssh_config_path=ssh_config_path,
                 alias=ssh_alias,
                 s3_config=s3_config,
             )
-        else:
+        elif transport == "paramiko":
             self._comm = ParamikoCommunication(
                 ssh_config_path,
                 ssh_alias,
                 s3_config=s3_config,
             )
+        else:
+            raise ValueError(f"Unknown transport '{transport}' (expected 'ssh' or 'paramiko')")
         self.remote_base_path: str = remote_base_path
         self.remote_full_path: str | None = None
 
@@ -865,7 +860,11 @@ class SshHost(Host):
         remote_dir = self._comm.directory(remote_full_path, collector)
 
         with collector.timer(MetricName.FILE_TRANSFER_UPLOAD_TIME):
-            remote_dir.upload(target_directory, force_local_cleanup=force_local_cleanup)
+            remote_dir.upload(
+                target_directory,
+                force_local_cleanup=force_local_cleanup,
+                excluded_paths=UPLOAD_EXCLUDED_PATHS,
+            )
 
         self.__install_prerequisites__(remote_path=remote_full_path)
 
@@ -1113,11 +1112,22 @@ class SshHost(Host):
 
             logical_cores = outcome.logical_cores
             physical_cores = outcome.physical_cores
+            if logical_cores is None or physical_cores is None:
+                _abandon_attempt()
+                raise TimeoutException(
+                    f"[{self.ssh_alias}] Allocation reported success without a core assignment "
+                    f"(logical={logical_cores}, physical={physical_cores})"
+                )
             core_lock_manager.record_contention_metrics()
             logging.info(f"[{self.ssh_alias}] Allocated logical cores {logical_cores} (physical: {physical_cores})")
 
         try:
-            yield CoreAllocation(host_id=self.ssh_alias, logical_core_ids=logical_cores, lnc_config=lnc_config)
+            yield CoreAllocation(
+                host_id=self.ssh_alias,
+                logical_core_ids=logical_cores,
+                lnc_config=lnc_config,
+                should_reset_cores=outcome.should_reset_cores if outcome.should_reset_cores is not None else True,
+            )
         finally:
             try:
                 # best effort release attempt. we don't much care about the outcome because core reservation
@@ -1195,14 +1205,14 @@ class HostManager:
         testrun_uid: str,
         needs_local_host: bool,
         s3_config: S3ArtifactUploadConfig | None = None,
-        exclusive: bool = False,
+        transport: str = "paramiko",
         host_rotation_patience_seconds: int | None = DEFAULT_PATIENCE_SECONDS,
         hosts_recoverable: bool = False,
     ) -> None:
         self.testrun_uid = testrun_uid
         self.ssh_config_path = ssh_config_path
         self.s3_config = s3_config or S3ArtifactUploadConfig()
-        self.exclusive = exclusive
+        self.transport = transport
         self.neuron_installation_path = neuron_installation_path
         self.hosts_recoverable = hosts_recoverable
         # A missing/None value (e.g. the unset CLI flag resolving to None) falls
@@ -1231,24 +1241,10 @@ class HostManager:
                 ssh_config_path=self.ssh_config_path,
                 s3_config=self.s3_config,
                 patience_seconds=self.host_rotation_patience_seconds,
-                core_reset_strategy=self.__build_reset_strategy__(alias),
-                exclusive=self.exclusive,
+                transport=self.transport,
             )
             self.target_hosts[alias] = host
         return host
-
-    def __build_reset_strategy__(self, ssh_alias: str) -> CoreResetStrategy:
-        """Per-capture reset policy for a remote host.
-
-        Exclusive sessions skip the per-capture reset except when core state
-        demands one (see CoreResetStrategy); shared runs always reset. State is
-        namespaced by testrun_uid + sanitized alias so xdist workers share it.
-        """
-        return CoreResetStrategy(
-            exclusive_run=self.exclusive,
-            testrun_uid=self.testrun_uid,
-            ssh_alias=ssh_alias,
-        )
 
     def mark_host_unavailable(self, host_id: str):
         """Mark a host unavailable in the store after a host-level failure (connection
@@ -1323,7 +1319,6 @@ class HostManager:
             self.neuron_installation_path,
             self.LOCAL_HOST_ID,
             self.base_host_info_path,
-            core_reset_strategy=CoreResetStrategy(exclusive_run=False),
         )
         resolved_host = ResolvedHost(self.LOCAL_HOST_ID, detected_platform, host.get_total_physical_cores())
 
@@ -1536,35 +1531,3 @@ class HostManager:
                 f"all matching hosts remained busy. "
                 f"Patience rotations: {rotation_count}. Hosts attempted: {', '.join(attempted_hosts)}"
             )
-
-    @staticmethod
-    def test_session(
-        *,
-        target_hosts: list[TargetHost],
-        ssh_config_path: str,
-        testrun_uid: str,
-    ) -> str:
-        """Probe candidate hosts and return the alias of the first reachable one.
-
-        Used by the controller in exclusive-host mode to pick one host for the
-        entire session. Raises ``HostsBusyError`` if no host responds.
-        """
-        errors: list[str] = []
-        for target_host in target_hosts:
-            alias = target_host.ssh_host
-            comm = SshCommunication(ssh_config_path=ssh_config_path, alias=alias)
-            if comm.is_active():
-                try:
-                    result = comm.run("true", timeout=10)
-                    if result.ok:
-                        logging.info(f"[exclusive] Reserved host {alias} for session {testrun_uid}")
-                        return alias
-                except Exception as e:
-                    logging.info(f"[exclusive] Host {alias} unavailable: {e}")
-                    errors.append(f"{alias}: {e}")
-            else:
-                logging.info(f"[exclusive] Host {alias} unavailable: not active")
-                errors.append(f"{alias}: not active")
-        raise HostsBusyError(
-            f"Could not reserve any exclusive host from {len(target_hosts)} candidate(s):\n" + "\n".join(errors)
-        )

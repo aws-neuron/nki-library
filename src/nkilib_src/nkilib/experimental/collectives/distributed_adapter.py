@@ -24,6 +24,8 @@ which backend is active. Backend selection is automatic:
 - Otherwise if torch.distributed is initialized, use TorchDistAdapter.
 """
 
+from typing import Optional
+
 import torch.distributed as dist
 from nki.collectives import ReplicaGroup
 from torch.distributed import ProcessGroup
@@ -94,10 +96,12 @@ def _get_adapter() -> DistributedAdapter:
     raise RuntimeError("No distributed backend: torch.distributed not initialized and no sim adapter set")
 
 
-def set_adapter(adapter: DistributedAdapter):
+def set_adapter(adapter: Optional[DistributedAdapter]):
     """Set the sim adapter for the current process.
 
-    Called by SimDistRunner per-process before running a torch_ref.
+    Called by SimDistRunner per-process before running a torch_ref. Passing None
+    clears it, restoring the initial state in which the backend is selected
+    automatically.
     """
     global _sim_adapter
     _sim_adapter = adapter

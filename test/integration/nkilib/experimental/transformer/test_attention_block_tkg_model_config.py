@@ -60,12 +60,16 @@ attention_block_tkg_model_configs = {
       for b in [2, 4, 8, 16, 32, 64, 128]
       for s in [1, 4]
       for s_ctx in [10240, 12288, 16384]],
+    ## LNC=1 (single core) config
+    AttnBlkTestConfig(batch=64, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1, block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, test_bias=True, test_sink=True, cache_lens_mean=1.0, cache_lens_stddev=0.0, lnc=1),
     ## SWA (S_ctx=256, sliding_window=128)
     *[AttnBlkTestConfig(batch=b, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=256, S_max_ctx=256, S_tkg=s,
                         block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, test_bias=True, test_sink=True,
                         sliding_window=128, cache_lens_mean=1.0, cache_lens_stddev=0.0)
       for b in [2, 4, 8, 16, 32, 64, 128]
       for s in [1, 4]],
+    ## LNC=1 SWA config
+    AttnBlkTestConfig(batch=64, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=256, S_max_ctx=256, S_tkg=1, block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, test_bias=True, test_sink=True, sliding_window=128, cache_lens_mean=1.0, cache_lens_stddev=0.0, lnc=1),
     # Other
     AttnBlkTestConfig(batch=1, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=5, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, supported_platforms=_TRN2_ONLY),
     AttnBlkTestConfig(batch=1, q_heads=2, d_head=128, H=8192, H_actual=None, S_ctx=26624, S_max_ctx=36896, S_tkg=5, block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, CP=4, supported_platforms=_TRN2_ONLY),

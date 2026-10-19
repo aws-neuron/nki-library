@@ -29,6 +29,13 @@ from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
     calc_sbuf_free_dim_size,
     calculate_sbuf_usage,
     fits_in_sbuf,
+    resolve_lnc2_sharding,
+)
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import (
+    LncShardingMode,
+    LoopOrder,
+    QuantScheme,
+    TensorOrientation,
 )
 
 from test.integration.nkilib.experimental.matmul_mxfp8.constants import (
@@ -90,13 +97,15 @@ class TestConfig:
         enable_scale_packing: Optional[bool] = None,
         lnc_2_shard_rhs: Optional[bool] = None,
         load_with_PE_swizzle: bool = False,
+        fast_dma_transpose: bool = False,
         fast_subset: Optional[set] = None,
-        # Both default to F-by-K ([F, K]) to match the kernel default and avoid the K-by-F
-        # F%512 constraint on M/N for the common case. Set either to False per-operand to
-        # exercise the K-by-F ([K, F]) layout.
-        lhs_is_f_by_k: bool = True,
-        rhs_is_f_by_k: bool = True,
+        # Both default to None (F-by-K, the kernel default) to avoid the K-by-F F%512
+        # constraint on M/N for the common case. Set either to TensorOrientation.K_BY_F
+        # per-operand to exercise the K-by-F ([K, F]) layout.
+        lhs_orientation: Optional[TensorOrientation] = None,
+        rhs_orientation: Optional[TensorOrientation] = None,
         quant_scheme: str = "wrapX",
+        disable_dma_transpose: bool = False,
     ) -> None:
         # Create kernel config with kernel-level params
         self.kernel_config = MatmulMxfp8KernelConfig(
@@ -111,16 +120,20 @@ class TestConfig:
             TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
             TILES_IN_LOAD_M=TILES_IN_LOAD_M,
             TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-            block_loop_order=block_loop_order if block_loop_order is not None else 'mnk',
-            tile_loop_order=tile_loop_order if tile_loop_order is not None else 'mnk',
+            block_loop_order=LoopOrder(block_loop_order) if block_loop_order is not None else LoopOrder.MNK,
+            tile_loop_order=LoopOrder(tile_loop_order) if tile_loop_order is not None else LoopOrder.MNK,
             float8_dtype=float8_dtype if float8_dtype is not None else 'float8_e4m3fn',
             enable_scale_packing=enable_scale_packing if enable_scale_packing is not None else False,
-            run_with_lnc2=run_with_lnc2 if run_with_lnc2 is not None else True,
-            lnc_2_shard_rhs=lnc_2_shard_rhs,
+            lnc_sharding=LncShardingMode.from_bools(
+                run_with_lnc2 if run_with_lnc2 is not None else True, lnc_2_shard_rhs
+            ),
             spill_reload=spill_reload if spill_reload is not None else False,
-            lhs_is_swizzled=lhs_is_swizzled,
-            rhs_is_swizzled=rhs_is_swizzled,
         )
+        # Operand-layout facts live on the TestConfig (not the kernel config, which
+        # no longer duplicates them). They are consumed when building the kernel's
+        # TensorDescriptors and when emitting metrics / the autotune cache key.
+        self._lhs_is_swizzled = lhs_is_swizzled
+        self._rhs_is_swizzled = rhs_is_swizzled
         # Store original None-ness for optional params used in generation logic
         self._orig_run_with_lnc2 = run_with_lnc2
         self._orig_tile_loop_order = tile_loop_order
@@ -150,13 +163,20 @@ class TestConfig:
         self.params = params
         self.stride = stride if stride is not None else DEFAULT_STRIDE
         self.load_with_PE_swizzle = load_with_PE_swizzle
+        # Only meaningful for unswizzled BF16 operands that take the DGT path. The load
+        # dispatch in load_apis.load_tile checks quant_scheme==1x32 and load_with_PE_swizzle
+        # BEFORE falling through to DGT, so this has no effect unless both of those are off.
+        self.fast_dma_transpose = fast_dma_transpose
         # Sub-indices (within this entry's autoGenerateRandomSubset output)
         # to mark pytest.mark.fast. Stable to grid reordering and additions;
         # sensitive to seed and TESTS_PER_SETUP changes. Consumed by populate_tests().
         self.fast_subset = frozenset(fast_subset) if fast_subset is not None else frozenset()
-        self.lhs_is_f_by_k = lhs_is_f_by_k
-        self.rhs_is_f_by_k = rhs_is_f_by_k
+        self.lhs_orientation = lhs_orientation
+        self.rhs_orientation = rhs_orientation
         self.quant_scheme = quant_scheme
+        # 1x32 K-by-F loader replaces its DMA transpose with dma_copy + PE transpose.
+        # Only meaningful with quant_scheme=="1x32" on unswizzled K-by-F operands.
+        self.disable_dma_transpose = disable_dma_transpose
         self.enable_psum_copy_in = None
 
     # ------------------------------------------------------------------
@@ -164,15 +184,15 @@ class TestConfig:
     # ------------------------------------------------------------------
 
     @property
-    def M(self) -> Optional[int]:
+    def M(self) -> int:
         return self.kernel_config.M
 
     @property
-    def K(self) -> Optional[int]:
+    def K(self) -> int:
         return self.kernel_config.K
 
     @property
-    def N(self) -> Optional[int]:
+    def N(self) -> int:
         return self.kernel_config.N
 
     @property
@@ -229,11 +249,11 @@ class TestConfig:
 
     @property
     def lhs_is_swizzled(self) -> bool:
-        return self.kernel_config.lhs_is_swizzled
+        return self._lhs_is_swizzled
 
     @property
     def rhs_is_swizzled(self) -> bool:
-        return self.kernel_config.rhs_is_swizzled
+        return self._rhs_is_swizzled
 
     @property
     def enable_scale_packing(self) -> bool:
@@ -283,7 +303,9 @@ class TestConfig:
             "lhs_is_swizzled": self.lhs_is_swizzled,
             "rhs_is_swizzled": self.rhs_is_swizzled,
             "load_with_PE_swizzle": self.load_with_PE_swizzle,
+            "fast_dma_transpose": self.fast_dma_transpose,
             "quant_scheme": self.quant_scheme,
+            "disable_dma_transpose": self.disable_dma_transpose,
             "spill_reload": self.spill_reload,
             "enable_scale_packing": self.enable_scale_packing,
             "lnc_2_shard_rhs": self.lnc_2_shard_rhs,
@@ -305,11 +327,6 @@ class TestConfig:
         """Look up BF16 baseline for this shape from cache."""
         key = f"{self.M}x{self.K}x{self.N}"
         return _BF16_BASELINE_CACHE.get(key)
-
-    @staticmethod
-    def _max_tiles(dim: int, tile: int, cap: int = 0) -> int:
-        """Max number of tiles that fit in dim, optionally capped. Delegates to KernelConfig."""
-        return MatmulMxfp8KernelConfig._max_tiles(dim, tile, cap)
 
     def calculate_sbuf_usage(self) -> int:
         """Calculate the SBUF memory usage for this configuration in bytes."""
@@ -380,7 +397,23 @@ class TestConfig:
         lhs_dist = random.choice(dists["lhs"])
         rhs_dist = random.choice(dists["rhs"])
 
-        # Build a kernel config from current state, preserving already-set values
+        # Resolve the LNC2 flags on the full dims the way the kernel does, so the flags
+        # recorded in metrics match the ones the kernel resolves and the sweep writer's
+        # cache key matches the kernel's lookup. Pass prequant flags so the auto axis
+        # choice matches the kernel for asymmetric (one-side-prequantized) shapes.
+        _run_with_lnc2 = self.kernel_config.run_with_lnc2 if self._orig_run_with_lnc2 is not None else True
+        _lhs_is_prequant = lhs_dtype in (MatrixPrecision.MXFP8, MatrixPrecision.MXFP8_X4)
+        _rhs_is_prequant = rhs_dtype in (MatrixPrecision.MXFP8, MatrixPrecision.MXFP8_X4)
+        _resolved_lnc_sharding = resolve_lnc2_sharding(
+            self.M,
+            self.N,
+            LncShardingMode.from_bools(_run_with_lnc2, self.kernel_config.lnc_2_shard_rhs),
+            lhs_is_prequant=_lhs_is_prequant,
+            rhs_is_prequant=_rhs_is_prequant,
+        )
+
+        # Build a kernel config from current state, preserving already-set values.
+        # auto_generate_default takes full M/N and applies the LNC2 shard itself.
         kc = MatmulMxfp8KernelConfig(
             M=self.M,
             K=self.K,
@@ -393,23 +426,36 @@ class TestConfig:
             TILES_IN_BLOCK_K=self.kernel_config.TILES_IN_BLOCK_K,
             TILES_IN_LOAD_M=self.kernel_config.TILES_IN_LOAD_M,
             TILES_IN_LOAD_N=self.kernel_config.TILES_IN_LOAD_N,
-            block_loop_order=self.kernel_config.block_loop_order if self._orig_block_loop_order is not None else 'mnk',
-            tile_loop_order=self.kernel_config.tile_loop_order if self._orig_tile_loop_order is not None else 'mnk',
+            block_loop_order=self.kernel_config.block_loop_order
+            if self._orig_block_loop_order is not None
+            else LoopOrder.MNK,
+            tile_loop_order=self.kernel_config.tile_loop_order
+            if self._orig_tile_loop_order is not None
+            else LoopOrder.MNK,
             float8_dtype=self.kernel_config.float8_dtype if self._orig_float8_dtype is not None else 'float8_e4m3fn',
             enable_scale_packing=self.kernel_config.enable_scale_packing,
-            run_with_lnc2=self.kernel_config.run_with_lnc2 if self._orig_run_with_lnc2 is not None else True,
-            lnc_2_shard_rhs=self.kernel_config.lnc_2_shard_rhs,
+            lnc_sharding=_resolved_lnc_sharding,
             spill_reload=self.kernel_config.spill_reload,
-            lhs_is_swizzled=self.kernel_config.lhs_is_swizzled,
-            rhs_is_swizzled=self.kernel_config.rhs_is_swizzled,
+            # quant_scheme reaches auto_generate_default (via the config) so it builds the
+            # cache key with the correct per-operand token (pe_1x32 / pe_wrapx). The
+            # operand-layout / PE-swizzle facts are passed to auto_generate_default per
+            # operand below (the config no longer stores them).
+            quant_scheme=QuantScheme(self.quant_scheme),
         )
 
-        # Delegate kernel-level auto-generation
+        # Delegate kernel-level auto-generation. Operand-layout facts are passed in
+        # per operand (the kernel config no longer stores them); PE swizzle only
+        # applies to an unswizzled operand.
         auto_generate_default(
             kc,
             lhs_dtype=lhs_dtype,
             rhs_dtype=rhs_dtype,
             output_dtype_str=output_dtype,
+            fast_dma_transpose=self.fast_dma_transpose,
+            lhs_is_swizzled=self.lhs_is_swizzled,
+            rhs_is_swizzled=self.rhs_is_swizzled,
+            lhs_load_with_PE_swizzle=self.load_with_PE_swizzle and not self.lhs_is_swizzled,
+            rhs_load_with_PE_swizzle=self.load_with_PE_swizzle and not self.rhs_is_swizzled,
         )
 
         # Resolve lnc_2_shard_rhs for the TestConfig wrapper
@@ -445,16 +491,18 @@ class TestConfig:
             params=[lhs_dist[1], rhs_dist[1]],
             stride=self.stride,
             spill_reload=kc.spill_reload if self._orig_spill_reload is not None else None,
-            lhs_is_swizzled=kc.lhs_is_swizzled,
-            rhs_is_swizzled=kc.rhs_is_swizzled,
-            lhs_is_f_by_k=self.lhs_is_f_by_k,
-            rhs_is_f_by_k=self.rhs_is_f_by_k,
+            lhs_is_swizzled=self.lhs_is_swizzled,
+            rhs_is_swizzled=self.rhs_is_swizzled,
+            lhs_orientation=self.lhs_orientation,
+            rhs_orientation=self.rhs_orientation,
             enable_scale_packing=kc.enable_scale_packing if self._orig_enable_scale_packing is not None else None,
             lnc_2_shard_rhs=lnc_2_shard_rhs_val
             if self._orig_lnc_2_shard_rhs is not None or not lnc_2_shard_rhs_val
             else None,
             load_with_PE_swizzle=self.load_with_PE_swizzle,
+            fast_dma_transpose=self.fast_dma_transpose,
             quant_scheme=self.quant_scheme,
+            disable_dma_transpose=self.disable_dma_transpose,
         )
 
         return [config]
@@ -586,9 +634,10 @@ class TestConfig:
                 # Swizzled flags
                 lhs_is_swizzled=self.lhs_is_swizzled,
                 rhs_is_swizzled=self.rhs_is_swizzled,
-                lhs_is_f_by_k=self.lhs_is_f_by_k,
-                rhs_is_f_by_k=self.rhs_is_f_by_k,
+                lhs_orientation=self.lhs_orientation,
+                rhs_orientation=self.rhs_orientation,
                 lnc_2_shard_rhs=lnc_2_shard_rhs,
+                disable_dma_transpose=self.disable_dma_transpose,
             )
 
             # Only add if it fits in SBUF and isn't a duplicate

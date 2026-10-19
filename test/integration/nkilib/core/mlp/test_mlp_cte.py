@@ -14,12 +14,14 @@
 
 import math
 
+from test.utils.model_test_configs import no_model_configs
+
 try:
     from test.integration.nkilib.core.mlp.test_mlp_cte_model_config import (
         mlp_cte_model_configs,
     )
 except ImportError:
-    mlp_cte_model_configs = []
+    mlp_cte_model_configs = no_model_configs()
 
 from typing import Any, final
 
@@ -97,6 +99,9 @@ LAYER_NORM_CONFIG = {
 # Parameters: vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, rtol, norm_type, quantization_type,
 #             fused_add, store_add, skip_gate, act_fn_type, gate_bias, up_bias, down_bias, norm_bias
 MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_FALSE = [
+    [2, 1, 128, 4096, 1792, None, 3e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    # Compute-bound BF16 regression sentinel: Qwen3-VL TP32 S8k (baseline ~80% MFU) — must not slow down
+    [2, 1, 8192, 5120, 800, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
     [2, 1, 128, 8192, 896, 238002211, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
     [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
     [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
@@ -242,14 +247,22 @@ MLP_CTE_UNIT_TEST_CASES_ROW_QUANT = [
     pytest.param(2, 1, 256, 16384, ceilalign(896, 128), 8.05e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
     [2, 4, 1024, 16384, ceilalign(896, 128), 1.96e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
     [2, 2, 1024, 16384, ceilalign(896, 128), 1.01e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    # Intermediate size whose 256-row remainder exceeds 128, i.e. the double-row down projection
+    # has a trailing pair of intermediate blocks that cannot be fed as one double-row matmul.
+    pytest.param(1, 1, 256, 1024, 448, None, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
 ]
 
 MLP_CTE_UNIT_TEST_CASES_STATIC_QUANT = [
     # Llama 3.3 70B
     [2, 1, 10240, 8192, ceilalign(1792, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    # Compute-bound STATIC regression sentinel: Llama-3.3-70B TP16 S8k (baseline ~84% MFU) — must not slow down
+    [2, 1, 8192, 8192, ceilalign(1792, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
     # Qwen 3 32B
     [2, 1, 10240, 5120, ceilalign(3200, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
     [2, 1, 10240, 5120, ceilalign(1600, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    # Intermediate size whose 256-row remainder exceeds 128, i.e. the double-row down projection
+    # has a trailing pair of intermediate blocks that cannot be fed as one double-row matmul.
+    [1, 1, 384, 1024, 448, None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
 ]
 
 # Slow-compile
@@ -446,6 +459,7 @@ class TestMlpCteKernel:
             mode=ComputationMode.PREFILL,
             gate_up_w_layout=d["gate_up_w_layout"],
             tensor_generator=tensor_generator,
+            use_folded_mx_scales=d.get("use_folded_mx_scales", False),
         )
         # Add missing params that mlp() kernel accepts but build_fused_norm_mlp doesn't produce
         kernel_input["quant_clipping_bound"] = 0.0
@@ -499,6 +513,64 @@ class TestMlpCteKernel:
             "up_bias": up_bias,
             "down_bias": down_bias,
             "norm_bias": norm_bias,
+        }
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
+
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=self._kernel_input_generator(vec_dict),
+            compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            rtol=rtol,
+        )
+
+    @pytest_parametrize(CTE_UNIT_PARAM_NAMES, MLP_CTE_UNIT_TEST_CASES_MX_QUANT, abbrevs=_CTE_ABBREVS)
+    def test_mlp_cte_unit_folded_mx_scales(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree,
+        batch,
+        seqlen,
+        hidden,
+        intermediate,
+        tpbSgCyclesSum,
+        rtol,
+        norm_type,
+        quant_type,
+        gate_up_w_layout,
+        fused_add,
+        store_add,
+        skip_gate,
+        act_fn_type,
+        gate_bias,
+        up_bias,
+        down_bias,
+        norm_bias,
+    ):
+        # Pre-folded MX weight scales are an MX-only, TRN3-only feature.
+        if not platform_target.is_trn3():
+            pytest.skip("MX quantization is only supported on TRN3")
+
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "rtol": rtol,
+            "norm_type": norm_type,
+            "quant_type": quant_type,
+            "gate_up_w_layout": gate_up_w_layout,
+            "fused_add": fused_add,
+            "store_add": store_add,
+            "skip_gate": skip_gate,
+            "act_fn_type": act_fn_type,
+            "gate_bias": gate_bias,
+            "up_bias": up_bias,
+            "down_bias": down_bias,
+            "norm_bias": norm_bias,
+            "use_folded_mx_scales": True,
         }
         compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
 

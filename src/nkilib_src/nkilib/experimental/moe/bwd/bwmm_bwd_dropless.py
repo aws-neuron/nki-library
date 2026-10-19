@@ -21,7 +21,6 @@ from nki.isa.constants import dge_mode, oob_mode
 
 from ....core.utils.allocator import SbufManager, align_to, sizeinbytes
 from ....core.utils.kernel_helpers import (
-    NUM_HW_PSUM_BANKS,
     PSUM_BANK_SIZE,
     apply_activation,
     apply_activation_dx,
@@ -1584,7 +1583,7 @@ def _compute_gate_up_projection_output_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             transpose_psum_idx += 1
-                            transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+                            transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
 
                             down_proj_weight_transposed_psum = nl.ndarray(
                                 (H_TILE_SIZE, TILE_SIZE),
@@ -1639,7 +1638,7 @@ def _compute_gate_up_projection_output_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             transpose_psum_idx += 1
-                            transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+                            transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
                             grad_transpose_psum = nl.ndarray(
                                 (H_TILE_SIZE, B_TILE_SIZE),
                                 dtype=compute_dtype,
@@ -1686,7 +1685,7 @@ def _compute_gate_up_projection_output_grad(
 
                         # Psum address after transpose buffers (use separate bank range)
                         matmul_psum_idx += 1
-                        matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                        matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
                         result_psum = nl.ndarray(
                             (B_TILE_SIZE, I_TP_TILE_SIZE),
                             dtype=nl.float32,
@@ -2173,7 +2172,7 @@ def _compute_down_projection_weight_grad(
                             break
 
                         matmul_psum_idx += 1
-                        matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                        matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
 
                         valid_i_tile = min(I_TP_TILE_SIZE, valid_i_block - i_tile_start)
                         result_psum = nl.ndarray(
@@ -2522,7 +2521,7 @@ def _compute_hidden_states_grad(
                                     break
                                 valid_i_tile = min(I_TP_TILE_SIZE, valid_i_block - i_tile_start)
                                 transpose_psum_idx += 1
-                                transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+                                transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
                                 rhs_transposed_psum = nl.ndarray(
                                     (I_TP_TILE_SIZE, TILE_SIZE),
                                     dtype=compute_dtype,
@@ -2552,7 +2551,7 @@ def _compute_hidden_states_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             matmul_psum_idx += 1
-                            matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                            matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
                             result_psum = nl.ndarray(
                                 (B_TILE_SIZE, H_TILE_SIZE),
                                 buffer=nl.psum,
@@ -2808,7 +2807,7 @@ def _compute_gate_up_projection_weight_grad(
                                 break
                             valid_h_tile = min(H_TILE_SIZE, valid_h_block - h_tile_start)
                             matmul_psum_idx += 1
-                            matmul_psum_idx = matmul_psum_idx % NUM_HW_PSUM_BANKS
+                            matmul_psum_idx = matmul_psum_idx % nl.tile_size.psum_num_banks
 
                             result_psum = nl.ndarray(
                                 (H_TILE_SIZE, I_TP_TILE_SIZE),
@@ -2982,7 +2981,7 @@ def _load_token_indices(token_position_to_id, block_idx, B, NUM_TILES, sbm, dst=
         )
         transpose_psum_idx += 1
 
-        transpose_psum_idx = transpose_psum_idx % NUM_HW_PSUM_BANKS
+        transpose_psum_idx = transpose_psum_idx % nl.tile_size.psum_num_banks
         transposed_token_pos_to_id_fp32 = nl.ndarray(
             (TILE_SIZE, 1),
             dtype=nl.float32,

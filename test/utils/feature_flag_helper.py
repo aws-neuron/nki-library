@@ -14,7 +14,7 @@
 import hashlib
 import os
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import pytest
 from _pytest.config import Config
@@ -22,6 +22,14 @@ from _pytest.config import Config
 from .common_dataclasses import Platforms
 
 NEURON_NEV_PREFIX = "NKILIB_"
+
+
+class OptionLookup(Protocol):
+    """The only thing the feature-flag helpers need from a pytest config: reading an
+    option by name. Stated as a protocol so a purpose-built stand-in is usable in tests
+    without fabricating a full config object."""
+
+    def getoption(self, name: str) -> Any: ...
 
 
 # Strings that count as "true" for a boolean env var. Matches the idiom used elsewhere
@@ -54,7 +62,7 @@ def split_tokens(raw: Optional[str]) -> list[str]:
 
 
 def get_feature_flag(
-    pytest_config: Config,
+    pytest_config: OptionLookup,
     config_key: str,
     default_value: Optional[Any] = None,
 ) -> Any:
@@ -84,13 +92,13 @@ def resolve_base_output_directory(config: Config) -> str:
     return absolute_directory_path
 
 
-def resolve_ssh_config_path(config: Config) -> str:
+def resolve_ssh_config_path(config: OptionLookup) -> str:
     """The ssh-config path for this run (``--ssh-config-path``, default ``~/.ssh/config``),
     user-expanded."""
     return os.path.expanduser(get_feature_flag(config, "ssh_config_path", "~/.ssh/config"))
 
 
-def get_platform_targets(config: Config) -> list[Platforms]:
+def get_platform_targets(config: OptionLookup) -> list[Platforms]:
     """Return the list of target platforms from CLI (or default to [TRN2])."""
     valid_names = [p.value for p in Platforms]
     raw = get_feature_flag(config, "platform_target", None)

@@ -15,6 +15,7 @@
 """Global Level variables for using SbufManager"""
 
 import functools
+import threading
 
 from ....core.utils.allocator import SbufManager
 from ....core.utils.kernel_assert import kernel_assert
@@ -23,11 +24,11 @@ from ....core.utils.logging import get_logger
 # Maximum available SBUF size for TRN3 (256 KiB minus reserved regions)
 MAX_AVAILABLE_SBUF_SIZE_TRN3 = 256 * 1024 - 16384 - 8 - 256
 
-# NOTE: These global variables are intended to be set and unset at a top-level kernel level only.
-# Access them through getter and setter functions only.
-
-# Using global variables as context-manager, singleton classes are not supported yet in NKI.
-_state = {"sbm": None}
+# Active SbufManager, accessed only through the getters/setters below. Thread-local,
+# not a module global: the NKI simulator runs one thread per LNC core, so a shared global
+# lets one core's clear_active_sbm() null the manager while another is mid-kernel -- a
+# simulation-only, non-deterministic failure. Per-thread state isolates each core.
+_state = threading.local()
 
 
 def create_and_set_active_sbm(
@@ -37,21 +38,24 @@ def create_and_set_active_sbm(
     use_auto_alloc=True,
     default_stack_alloc=True,
 ):
-    kernel_assert(_state["sbm"] is None, "SbufManager is already set. Only one kernel should be active at a time.")
+    kernel_assert(
+        get_active_sbm() is None,
+        "SbufManager is already set. Only one kernel should be active at a time (per thread).",
+    )
     sbm = SbufManager(sb_lower_bound, sb_upper_bound, logger, use_auto_alloc, default_stack_alloc)
-    _state["sbm"] = sbm
+    _state.sbm = sbm
 
 
 def get_active_sbm():
-    return _state["sbm"]
+    return getattr(_state, "sbm", None)
 
 
 def clear_active_sbm():
-    _state["sbm"] = None
+    _state.sbm = None
 
 
 def with_active_sbm(func):
-    """Cleanup-only RAII for the module-global active SbufManager.
+    """Cleanup-only RAII for the thread-local active SbufManager.
 
     The parser frontend ignores decorators, so this wrapper executes only on the
     real-execution (tracer) path. SBM setup stays in the kernel body so the parser

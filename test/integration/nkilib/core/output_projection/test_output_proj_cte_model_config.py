@@ -27,6 +27,8 @@ since output projection operates on the attention output which has n_q_heads.
 
 import math
 
+from typing import TypedDict
+
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 
 MODELS = {
@@ -39,7 +41,7 @@ MODELS = {
 }
 
 # (world_size, tp, cp)
-DEFAULT_TP_CP = [
+DEFAULT_TP_CP: list[tuple[int, int, int]] = [
     (64, 64, 1),
     (16, 16, 1),
     (8, 8, 1),
@@ -51,15 +53,22 @@ DEFAULT_TP_CP = [
     (64, 4, 16),
 ]
 
-DEFAULT_SEQLENS = [1024, 10240, 32768]
+DEFAULT_SEQLENS: list[int] = [1024, 10240, 32768]
 
-DEFAULT_QUANT_TYPES = [
+DEFAULT_QUANT_TYPES: list[QuantizationType] = [
     QuantizationType.NONE,
     QuantizationType.STATIC,
     QuantizationType.ROW,
     QuantizationType.STATIC_MX,
     QuantizationType.ROW_MX,
 ]
+
+
+class OutputProjModelConfig(TypedDict, total=False):
+    TP_CP_CONFIGS: list[tuple[int, int, int]]
+    SEQLENS: list[int]
+    QUANT_TYPES: list[QuantizationType]
+    MX_WEIGHT_DTYPE: str
 
 
 def _get_sharded_head_counts(tp, n_q_heads, n_kv_heads):
@@ -91,7 +100,7 @@ def get_output_proj_config(model_name, tp, cp, seqlen, quant_type):
     }
 
 
-OPTIMAL_CONFIGS = {
+OPTIMAL_CONFIGS: dict[str, OutputProjModelConfig] = {
     "llama3_70b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS, "QUANT_TYPES": DEFAULT_QUANT_TYPES},
     "qwen3_32b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS, "QUANT_TYPES": DEFAULT_QUANT_TYPES},
     "qwen3_vl_32b": {

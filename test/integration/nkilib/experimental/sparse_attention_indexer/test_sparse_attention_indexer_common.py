@@ -22,7 +22,9 @@ fp32 so the torch math reproduces the same MX-weight rounding noise).
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
+from nkilib_src.nkilib.experimental.mla.deepseek.mla_common_cte import MlaPrecision
 
+from test.integration.nkilib.core.qkv.test_qkv_common import _reduce_mx_scale_to_compact_block128
 from test.utils.mx_utils import dequantize_mx_golden, quantize_mx_golden
 
 
@@ -66,7 +68,9 @@ def _swizzle_and_quantize_x_for_mx(x_f32, num_S_tiles, S_tile, num_K_tiles, P_MA
     K_TILE_FREE = P_MAX * H_PACK  # 512
     assert x_f32.shape[1] == num_K_tiles * K_TILE_FREE
     BxS, dim = x_f32.shape
-    assert BxS == num_S_tiles * S_tile
+    # num_S_tiles is the CEIL tile count; the last tile may be partial (BxS not a
+    # multiple of S_tile, e.g. a CP shard with S_local < P_MAX). Zero-pad the tail.
+    assert BxS <= num_S_tiles * S_tile
 
     x_mx_data = np.zeros(
         (num_S_tiles, P_MAX, num_K_tiles * P_MAX),
@@ -79,15 +83,16 @@ def _swizzle_and_quantize_x_for_mx(x_f32, num_S_tiles, S_tile, num_K_tiles, P_MA
 
     for s_tile in range(num_S_tiles):
         s_start = s_tile * S_tile
-        s_end = s_start + S_tile
+        s_end = min(s_start + S_tile, BxS)  # clamp partial last tile (no OOB read)
+        rows = s_end - s_start
 
         # Step 1: replicate the kernel's swizzle on x[s_start:s_end] (bf16).
         # Result: transposed [P_MAX, num_K_tiles, K_TILE_FREE] bf16 where
         #   transposed[j, k_tile, 4*s + h_sub] = x[s_start+s, k_tile*K_TILE_FREE + 4*j + h_sub]
         x_tile_bf16 = x_f32[s_start:s_end, :].astype(nl.bfloat16).astype(np.float32)
-        # Pad partition to P_MAX (S_tile == P_MAX so this is a no-op).
+        # Pad partition to P_MAX (partial last tile -> only `rows` valid, rest zero).
         x_pad = np.zeros((P_MAX, dim), dtype=np.float32)
-        x_pad[:S_tile, :] = x_tile_bf16
+        x_pad[:rows, :] = x_tile_bf16
 
         transposed = np.zeros((P_MAX, num_K_tiles, K_TILE_FREE), dtype=np.float32)
         for k_tile in range(num_K_tiles):
@@ -172,11 +177,19 @@ def generate_inputs(
     max_seq_len=None,
     phase_d_kv_layout=False,
     bf16_score_kv_layout=False,
+    compact_scales=False,
 ):
     """Generate kernel inputs including scalar parameters.
 
     The indexer always runs MX (block-32 fp8) projections, so the MX weight/qr
     quantization below is unconditional.
+
+    compact_scales=True emits the WEIGHT scales (wq_b_scale / wk_scale) in the DeepSeek
+    compact block-128 layout instead of native block-32, and sets inputs["compact_scales"]
+    so the kernel expands them in-kernel. The weights are built so both layouts describe the
+    SAME scales exactly (see _uniformize_mx_scale_blocks), which makes the compact and native
+    runs directly comparable. qr / x scales stay native block-32 either way -- they model an
+    upstream quantizer's output, not a checkpoint.
     """
     np.random.seed(42)
     M = batch_size * S
@@ -249,13 +262,23 @@ def generate_inputs(
     wq_b_packed, wq_b_scale, _ = _quantize_weight_for_mx(wq_b_f32)
     wk_dim_first = wk_f32.T  # [dim, head_dim]
     wk_packed, wk_scale, _ = _quantize_weight_for_mx(wk_dim_first)
+    if compact_scales:
+        # Reduce the native block-32 scale to one byte per 128x128 block (top-left pick, the
+        # shared QKV primitive). The reduction is LOSSY by design and needs no uniformity
+        # precondition: the torch reference re-broadcasts this same compact scale via
+        # expand_compact_mx_scale_to_native, so kernel and golden dequantize against identical
+        # scales and the comparison isolates the in-kernel broadcast.
+        wq_b_scale = _reduce_mx_scale_to_compact_block128(wq_b_scale, q_lora_rank, n_heads * head_dim)
+        wk_scale = _reduce_mx_scale_to_compact_block128(wk_scale, dim, head_dim)
     # Pre-quantized x for K-projection (skip in-kernel swizzle + quantize_mx).
     # K-side reads partition slabs of these per S-tile.
     P_MAX_CONST = 128
     H_PACK_CONST = 4
     num_K_tiles_const = dim // (P_MAX_CONST * H_PACK_CONST)
     S_tile_const = P_MAX_CONST
-    num_S_tiles_const = M // S_tile_const
+    # CEIL: a CP shard with S < P_MAX (e.g. T_local=64 at ws64) still needs one padded
+    # S-tile. The quantizer zero-pads the partial tail (matches the QKV kernel's ceil export).
+    num_S_tiles_const = (M + S_tile_const - 1) // S_tile_const
     x_mx_data, x_mx_scale = _swizzle_and_quantize_x_for_mx(
         x,
         num_S_tiles_const,
@@ -291,6 +314,8 @@ def generate_inputs(
     inputs["x_mx_scale"] = x_mx_scale
     inputs["qr_qtz_hbm"] = qr_qtz
     inputs["qr_scale_hbm"] = qr_scale
+    if compact_scales:
+        inputs["compact_scales"] = True
 
     return inputs
 
@@ -340,6 +365,19 @@ def _dequant_swizzled_qr_for_torch_ref(qr_qtz, qr_scale, M, q_lora_rank, P_MAX=1
     return out
 
 
+def expand_compact_mx_scale_to_native(compact_scale, k_block=128, n_block=128, mx_block=32):
+    """Broadcast a DeepSeek compact block-128 scale to the NATIVE block-32 MX layout.
+
+    ``[K // 128, ceil(N / 128)] -> [K // 32, N]``: one compact byte covers 4 native 32-K
+    sub-blocks and 128 N columns. This is the numpy mirror of what the kernel does on device
+    with ``compact_scales=True`` (partition-broadcast DMA + free-axis Vector fan-out), so the
+    torch reference dequantizes against exactly the scales the kernel used.
+
+    Same primitive as ``_ds128_to_native32`` in the MLA QKV test.
+    """
+    return np.repeat(np.repeat(compact_scale.astype(np.uint8), k_block // mx_block, axis=0), n_block, axis=1)
+
+
 def _dequantize_weight_for_torch_ref(packed_x4, scale, K, F):
     """Inverse of _quantize_weight_for_mx for the torch reference.
 
@@ -349,3 +387,93 @@ def _dequantize_weight_for_torch_ref(packed_x4, scale, K, F):
     """
     deq_expanded = dequantize_mx_golden(packed_x4, scale)  # [K // 4, F * 4] float32
     return deq_expanded.reshape(K // 4, F, 4).transpose(0, 2, 1).reshape(K, F)
+
+
+def _committed_k_cache(batch_size, head_dim, max_seq_len, start_pos):
+    """K cache with real values in the COMMITTED range and zeros where the kernel writes.
+
+    ``[0, start_pos)`` is prior context the kernel only reads, so it must be non-zero for the
+    score over those positions to mean anything. ``[start_pos, max_seq_len)`` stays zero: the
+    kernel projects and writes the current tile there itself, and pre-filling it would hide a
+    failure to do so.
+
+    BF16 path only -- the MX generator keeps its fp8 cache zero-filled because the reference does
+    not dequantize it (see the score_ranges note in the torch ref).
+    """
+    kc = np.zeros((batch_size, head_dim, max_seq_len), dtype=np.float32)
+    if start_pos > 0:
+        kc[:, :, :start_pos] = np.random.randn(batch_size, head_dim, start_pos) * 0.5
+    return kc.astype(nl.bfloat16)
+
+
+def generate_inputs_bf16(
+    n_heads,
+    head_dim,
+    dim,
+    q_lora_rank,
+    rope_head_dim,
+    S,
+    batch_size,
+    start_pos,
+    index_topk,
+    rope_layout,
+    max_seq_len=None,
+):
+    """Generate BF16 (``MlaPrecision.BF16``) inputs for the SAI entry kernel.
+
+    Plain bf16 weights with the contraction on rows and no scale tensors, so this is a handful
+    of ``randn`` calls next to :func:`generate_inputs`'s MX quantize + swizzle machinery. Two
+    contract differences from the MX path:
+
+      * ``qr`` is handed over as plain bf16 ``[M, q_lora_rank]`` (``qr_bf16_hbm``) rather than
+        the pre-transposed + MX-quantized ``qr_qtz_hbm``/``qr_scale_hbm`` pair — that is what
+        the bf16 MLA QKV kernel exports, since it has no MX-quantized qr to give.
+      * ``rope_layout`` is explicit. DeepSeek-V3.2's indexer is HALF_SPLIT, GLM-MoE-DSA's is
+        INTERLEAVED; it must match between Q and K (the kernel applies one value to both).
+    """
+    np.random.seed(42)
+    M = batch_size * S
+    end_pos = start_pos + S
+    if max_seq_len is None:
+        max_seq_len = max(256, end_pos + 128)
+
+    x = np.random.randn(M, dim).astype(np.float32) * 0.1
+    cos, sin = precompute_freqs(rope_head_dim, S)
+    return {
+        "x": x,
+        # bf16 view of x: consumed by BOTH the W projection (as before) and the bf16 K projection.
+        "x_non_mx": x.astype(nl.bfloat16),
+        "qr_bf16_hbm": (np.random.randn(M, q_lora_rank) * 0.1).astype(nl.bfloat16),
+        # 1/sqrt(K) keeps each projection's output near unit variance; bf16 has ~3 decimal
+        # digits of mantissa, so unscaled chained projections would measure dynamic range.
+        "wq_b": (np.random.randn(q_lora_rank, n_heads * head_dim) * q_lora_rank**-0.5).astype(nl.bfloat16),
+        "wk": (np.random.randn(dim, head_dim) * dim**-0.5).astype(nl.bfloat16),
+        "wq_b_scale": None,
+        "wk_scale": None,
+        "k_scale_cache": None,
+        "x_mx_data": None,
+        "x_mx_scale": None,
+        "qr_qtz_hbm": None,
+        "qr_scale_hbm": None,
+        "k_norm_gamma": np.ones(head_dim, dtype=np.float32),
+        "k_norm_beta": np.zeros(head_dim, dtype=np.float32),
+        "weights_proj": (np.random.randn(n_heads, dim) * dim**-0.5).astype(nl.bfloat16),
+        "cos": cos,
+        "sin": sin,
+        # Committed positions [0, start_pos) carry REAL data; the kernel fills [start_pos, end_pos)
+        # itself. A zero cache made every prior column score q . 0 = 0 in BOTH kernel and
+        # reference, so those columns compared zero against zero and validated nothing -- a wrong
+        # per-block K offset, a skipped block or a duplicated range all still passed, and the
+        # top-k was ranking a row of dead ties. The reference scores this range for real now.
+        "k_cache": _committed_k_cache(batch_size, head_dim, max_seq_len, start_pos),
+        "mask": create_causal_mask(S, end_pos, start_pos, batch_size),
+        "n_heads": n_heads,
+        "head_dim": head_dim,
+        "rope_head_dim": rope_head_dim,
+        "index_topk": index_topk,
+        "start_pos": start_pos,
+        "use_hadamard": False,
+        "batch_size": batch_size,
+        "precision": MlaPrecision.BF16,
+        "rope_layout": rope_layout,
+    }

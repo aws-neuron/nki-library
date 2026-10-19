@@ -45,6 +45,12 @@ from test.utils.unit_test_collective_framework import CollectiveUnitTestFramewor
 # ======================================================================
 
 
+def _grad(t: torch.Tensor) -> np.ndarray:
+    """Gradient of a leaf tensor after a backward pass."""
+    assert t.grad is not None, "backward() must have populated the gradient"
+    return t.grad.numpy()
+
+
 def _full_attention_fwd_bwd_with_packing(q_full, k_full, v_full, dy_full, cu_seqlens, scale):
     """Full-sequence causal + same-document fwd+bwd via torch autograd.
 
@@ -86,9 +92,9 @@ def _full_attention_fwd_bwd_with_packing(q_full, k_full, v_full, dy_full, cu_seq
     return (
         out_t.detach().numpy(),
         lse_full,
-        q_t.grad.numpy(),
-        k_t.grad.numpy(),
-        v_t.grad.numpy(),
+        _grad(q_t),
+        _grad(k_t),
+        _grad(v_t),
     )
 
 

@@ -57,11 +57,7 @@ def _attach_qk_norm_weights(cfg, q_gamma, k_gamma, q_beta, k_beta):
     cfg.k_beta_norm_weights = k_beta
 
 
-@nki.jit(
-    debug_kernel=True,
-    show_compiler_tb=True,
-    experimental_flags="skip-non-top-level-shared-hbm-check",
-)
+@nki.jit
 def qkv(
     input: nl.NkiTensor,
     fused_qkv_weights: nl.NkiTensor,
@@ -306,7 +302,7 @@ def qkv(
 
     # Extend this variable if future configs become available only in one of the sub-kernels.
     is_input_config_only_available_in_qkv_cte_kernel = (
-        fused_rope or (strided_input_config != None) or in_kernel_cache_update
+        fused_rope or (strided_input_config != None) or in_kernel_cache_update or output_layout == QKVOutputLayout.BNSd
     )
 
     input_in_sbuf = input.buffer == nl.sbuf

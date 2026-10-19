@@ -67,8 +67,12 @@ def _cache_key_for(data):
     config_helper.TestConfig.to_metrics_dict(); raises KeyError if any are
     missing (e.g. a record from an older sweep).
     """
-    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_constants import autotune_cache_key
+    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_constants import QuantScheme, autotune_cache_key
 
+    fast_dma = data.get("fast_dma_transpose", False)
+    pe = data.get("load_with_PE_swizzle", False)
+    # Metrics store quant_scheme as a string; map it to the enum the key logic compares.
+    quant_scheme = QuantScheme._1x32 if data.get("quant_scheme", "wrapX") == "1x32" else QuantScheme.WRAPX
     return autotune_cache_key(
         data["M"],
         data["K"],
@@ -77,10 +81,23 @@ def _cache_key_for(data):
         data["rhs_dtype"],
         data["lhs_is_swizzled"],
         data["rhs_is_swizzled"],
-        data.get("load_with_PE_swizzle", False),
-        data.get("quant_scheme", "wrapX"),
+        # PE swizzle and fast_dma_transpose only take effect on an unswizzled
+        # operand, matching how matmul_mxfp8 builds the per-operand
+        # TensorDescriptors. A swizzled operand's token short-circuits before the
+        # PE check, so masking here keeps mixed pairs (e.g. PE-LHS / DGT-RHS) keyed
+        # per operand instead of OR-reduced.
+        pe and not data["lhs_is_swizzled"],
+        pe and not data["rhs_is_swizzled"],
+        quant_scheme,
         data["run_with_lnc2"],
         data["lnc_2_shard_rhs"],
+        lhs_fast_dma_transpose=fast_dma and not data["lhs_is_swizzled"],
+        rhs_fast_dma_transpose=fast_dma and not data["rhs_is_swizzled"],
+        # No-DMA-transpose 1x32 loads get a distinct "_nodma" key. Records emit the
+        # flag directly; sweeps predating that field are recovered from the method
+        # label in shape_name (e.g. "dw_pe_1x32_no_dma_..."). Default False reproduces
+        # the legacy (DMA) key.
+        disable_dma_transpose=data.get("disable_dma_transpose", "no_dma" in data.get("shape_name", "")),
     )
 
 

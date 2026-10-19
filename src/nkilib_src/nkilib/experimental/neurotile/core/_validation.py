@@ -13,7 +13,7 @@
 # limitations under the License.
 import nki.language as nl
 
-from ._helpers import buffer_space
+from ._helpers import buffer_space, p_tile_count, product
 from .ndslice import NDSlice
 
 # Valid string values for remainder=. Exposed so callers / tests / docstrings
@@ -408,6 +408,43 @@ def _validate_tiles_args(
             + str(tuple(view_shape))
             + ". TODO: support multi-tile iteration over higher-rank-AP views."
         )
+
+
+def _validate_view_like_args(src, storage, caller="nt.view_like"):
+    """src must be a tiled NDSlice, and storage flat 2-D SBUF large enough for its extent.
+
+    Returns the flat SBUF tensor to view. An ``NDSlice`` storage contributes only its
+    buffer: its own extent is deliberately ignored, which is what lets a full-size slot
+    back a shorter region.
+    """
+    assert isinstance(src, NDSlice), caller + ": src must be an NDSlice, got " + str(type(src)) + "."
+    assert src.tile_size is not None, caller + ": src must be tiled (its tile_size is None)."
+    assert len(src.element_shape) == len(src.tile_size), (
+        caller
+        + ": src element_shape "
+        + str(src.element_shape)
+        + " and tile_size "
+        + str(src.tile_size)
+        + " must have equal rank."
+    )
+
+    # ``data`` is the flat SBUF tensor; ``_layout.source`` is the logical view for some
+    # NDSlices (a stream slot) and the flat buffer for others (alloc_tiles).
+    buffer_source = storage.data if isinstance(storage, NDSlice) else storage
+    assert hasattr(buffer_source, "shape") and len(buffer_source.shape) == 2, (
+        caller + ": storage must be flat 2-D SBUF (partition rows, folded free width)."
+    )
+
+    tile_p = src.tile_size[0]
+    # P-tiles fold into F, so each contributes a full element_shape[1:] walk.
+    required_f = product(src.element_shape, start=1) * p_tile_count(src.element_shape[0], tile_p)
+    assert buffer_source.shape[0] >= tile_p, (
+        caller + ": storage has " + str(buffer_source.shape[0]) + " partition rows, src needs " + str(tile_p) + "."
+    )
+    assert buffer_source.shape[1] >= required_f, (
+        caller + ": storage is " + str(buffer_source.shape[1]) + " elements wide, src needs " + str(required_f) + "."
+    )
+    return buffer_source
 
 
 # ============================================================================

@@ -39,6 +39,21 @@ def rel_path(filepath: str):
     return str(Path(filepath).relative_to(_SRC_DIR))
 
 
+def statement_source_end(body: list[ast.stmt], index: int, num_lines: int):
+    """Return the exclusive 0-based end line of the statement at ``index`` in ``body``.
+
+    The statement's source runs up to the start of the following statement, or up to that
+    statement's first decorator when it has one, so decorators are attributed to the
+    definition they belong to. ``num_lines`` is used for the last statement in the module.
+    """
+    if index + 1 >= len(body):
+        return num_lines
+    next_node = body[index + 1]
+    if isinstance(next_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and next_node.decorator_list:
+        return next_node.decorator_list[0].lineno - 1
+    return next_node.lineno - 1
+
+
 def _uses_external_lib(node: ast.AST):
     """Check if AST node calls torch.X or np.X() (np constants like np.float32 are allowed)."""
     called_attrs: set[int] = set()
@@ -114,7 +129,8 @@ def _topological_sort(func_info: _FuncInfo, dependencies: dict[_FuncKey, set[_Fu
                 cycle.append(start)
                 break
             curr = next_node
-        raise ValueError(f"Cycle detected: {' -> '.join(cycle)}")
+        cycle_desc = " -> ".join(f"{fpath}:{name}" for fpath, name in cycle)
+        raise ValueError(f"Cycle detected: {cycle_desc}")
 
     return result
 

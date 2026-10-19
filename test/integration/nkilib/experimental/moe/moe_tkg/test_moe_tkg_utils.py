@@ -50,12 +50,12 @@ def build_moe_tkg(
     expert_affinities_dtype=nl.bfloat16,
     bias=False,
     clamp=False,
-    tensor_generator: Callable = None,
+    tensor_generator: Callable | None = None,
     rank_id: int = 0,
     mask_unselected_experts: bool = False,
     is_all_expert_dynamic: bool = False,
     routed_token_ratio: float = 1.0,
-    block_size: int = None,
+    block_size: int | None = None,
 ):
     """Build input tensors for MoE TKG kernel testing.
 

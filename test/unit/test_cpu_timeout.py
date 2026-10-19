@@ -19,7 +19,8 @@ import resource
 import signal
 import threading
 import time
-from typing import Any, Optional
+from types import FrameType
+from typing import Any, Callable, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,6 +62,13 @@ def _make_mock_item(
         item.get_closest_marker = MagicMock(return_value=None)
     item.config.getoption = MagicMock(return_value=cli_value)
     return item
+
+
+def _installed_sigalrm_handler() -> Callable[[int, FrameType | None], Any]:
+    """Return the installed SIGALRM handler, rejecting the SIG_DFL/SIG_IGN sentinels."""
+    handler = signal.getsignal(signal.SIGALRM)
+    assert handler is not None and not isinstance(handler, int), "no SIGALRM handler is installed"
+    return handler
 
 
 # ===================================================================
@@ -223,7 +231,8 @@ class TestGetCpuTimeout:
 
     def test_integer_marker_coerced_to_float(self) -> None:
         item: MagicMock = _make_mock_item(marker_value=120, cli_value=None)
-        result: float = _get_cpu_timeout(item)
+        result: Optional[float] = _get_cpu_timeout(item)
+        assert result is not None, "integer marker value must resolve to a timeout"
         assert isinstance(result, float)
         assert result == 120.0
 
@@ -302,7 +311,7 @@ class TestSetTimerHook:
             ),
         ):
             prepare_timeout_watchdog(item, settings)
-            handler = signal.getsignal(signal.SIGALRM)
+            handler = _installed_sigalrm_handler()
             handler(signal.SIGALRM, None)
             handler(signal.SIGALRM, None)
 
@@ -326,7 +335,7 @@ class TestSetTimerHook:
             patch("test.utils.cpu_timeout._get_total_cpu", side_effect=[0.0, 999.0]),
         ):
             prepare_timeout_watchdog(item, settings)
-            handler = signal.getsignal(signal.SIGALRM)
+            handler = _installed_sigalrm_handler()
             handler(signal.SIGALRM, None)
 
         assert len(captured) == 1
@@ -350,7 +359,7 @@ class TestSetTimerHook:
             patch("test.utils.cpu_timeout._get_total_cpu", side_effect=[100.0, 100.0]),
         ):
             prepare_timeout_watchdog(item, settings)
-            handler = signal.getsignal(signal.SIGALRM)
+            handler = _installed_sigalrm_handler()
             handler(signal.SIGALRM, None)
 
         assert len(captured) == 1

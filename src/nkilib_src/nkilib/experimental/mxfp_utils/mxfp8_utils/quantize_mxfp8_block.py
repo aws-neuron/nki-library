@@ -14,6 +14,7 @@
 
 """Block-level MXFP8 quantization operations for tensor tiles."""
 
+import nki
 import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
@@ -23,9 +24,9 @@ from .quantize_mxfp8_utils import INTERLEAVE_FACTOR, get_fp8_dtype_x4, get_scale
 
 
 def _quantize_tile(
-    src_tensor: nl.ndarray,
-    quantized_data: nl.ndarray,
-    quantized_scales: nl.ndarray,
+    src_tensor: nl.NkiTensor,
+    quantized_data: nl.NkiTensor,
+    quantized_scales: nl.NkiTensor,
     k_index: int,
     f_start: int,
     f_size: int,
@@ -38,9 +39,9 @@ def _quantize_tile(
     Quantize a single tile by slicing into input tensors and calling quantize_mx_x4_wrapper.
 
     Args:
-        src_tensor (nl.ndarray): Source tensor in SBUF, shape [TILE_K, NUM_TILES_K, F]
-        quantized_data (nl.ndarray): Output quantized data buffer
-        quantized_scales (nl.ndarray): Output quantization scales buffer
+        src_tensor (nl.NkiTensor): Source tensor in SBUF, shape [TILE_K, NUM_TILES_K, F]
+        quantized_data (nl.NkiTensor): Output quantized data buffer
+        quantized_scales (nl.NkiTensor): Output quantization scales buffer
         k_index (int): Tile index in K dimension
         f_start (int): Starting offset in F dimension
         f_size (int): Size of tile in F dimension
@@ -78,15 +79,15 @@ def _quantize_tile(
 
 
 def quantize_mxfp8_block(
-    src_tensor: nl.ndarray,
+    src_tensor: nl.NkiTensor,
     tile_shape: tuple[int, int],
     k_first: bool,
-    return_fp8_dtype: str,
-    quantized_scales: nl.ndarray = None,
+    return_fp8_dtype: nki.dtype,
+    quantized_scales: nl.NkiTensor = None,
     slot_partition_offset: int = 0,
     enable_scale_packing: bool = False,
     remainder_partition_offset: int = 0,
-) -> tuple[nl.ndarray, nl.ndarray]:
+) -> tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Quantize BF16 tensor to MXFP8 format.
 
@@ -96,16 +97,16 @@ def quantize_mxfp8_block(
     by doing memset, which will have worse performance.
 
     Args:
-        src_tensor (nl.ndarray): BF16 tensor in SBUF, shape [TILE_K, NUM_TILES_K, F]
+        src_tensor (nl.NkiTensor): BF16 tensor in SBUF, shape [TILE_K, NUM_TILES_K, F]
         tile_shape (tuple[int, int]): Tile shape [TILE_K, TILE_F] for quantization
         k_first (bool): If True, process K dimension first; else process F dimension first
         return_fp8_dtype (str): FP8 dtype string ("float8_e5m2", "float8_e4m3fn", "float4_e2m1fn")
-        quantized_scales (nl.ndarray): Optional pre-allocated scales buffer (default: None)
+        quantized_scales (nl.NkiTensor): Optional pre-allocated scales buffer (default: None)
         slot_partition_offset (int): Partition offset for scale packing (default: 0)
         enable_scale_packing (bool): Whether scale packing is enabled (default: False)
 
     Returns:
-        tuple[nl.ndarray, nl.ndarray]: (quantized_data, quantized_scales)
+        tuple[nl.NkiTensor, nl.NkiTensor]: (quantized_data, quantized_scales)
     """
 
     sbm = get_active_sbm()

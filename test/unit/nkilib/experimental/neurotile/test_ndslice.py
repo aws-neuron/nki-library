@@ -92,7 +92,7 @@ def make_view(element_shape, tile_size, block_size=None, offset=0):
 
 
 def make_untiled_view(element_shape, offset=0):
-    """Create an untiled NDSlice (tensor_view semantics)."""
+    """Create an untiled NDSlice (whole-tensor view semantics)."""
     strides = _contiguous_strides(element_shape)
 
     grid = Grid.from_shape(element_shape, None)
@@ -1357,6 +1357,7 @@ class TestDmaEngineValidation:
             priority=None,
             pattern_override=None,
             engine=None,
+            name=None,
         ):
             recorded.append({"engine": engine, "dge_mode": dge_mode})
             return (None, None)
@@ -2021,6 +2022,7 @@ class TestLoadDstRouting:
             priority=None,
             pattern_override=None,
             engine=None,
+            name=None,
         ):
             recorded.append(
                 {
@@ -2801,7 +2803,7 @@ class TestValidateTransposeLoad:
 
 
 # ============================================================================
-# High-rank (5-D) tensor_view transform chains
+# High-rank (5-D) view transform chains
 #
 # Regression for the squeeze/reshape stride-threading concern: chaining 3+
 # slice+squeeze ops (filter load) or flatten+reshape+slice (output store) on a
@@ -2824,8 +2826,8 @@ def _nki_view(shape):
     """A contiguous HBM NkiTensor of ``shape`` -- the source a kernel transforms
     in place before tiling. Its native .slice/.squeeze_dim/.flatten_dims/
     .reshape_dim chain is what nt.tiles() / nisa ops consume directly now that
-    nt.tensor_view is gone."""
-    from nki.language.tensor import NkiTensor
+    the old view helper is gone."""
+    from nki.language.tensor import NkiTensor  # ty: ignore[unresolved-import]
 
     return NkiTensor(shape=tuple(shape), dtype="float32", storage=None, buffer=nl.shared_hbm)
 

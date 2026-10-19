@@ -22,6 +22,7 @@ def scatter_add_torch_ref(
     dim: int,
     index: torch.Tensor,
     src: torch.Tensor,
+    unique_indices: bool = True,
 ) -> dict[str, torch.Tensor]:
     """
     PyTorch reference implementation of the scatter_add kernel.
@@ -37,6 +38,8 @@ def scatter_add_torch_ref(
         dim (int): Dimension along which to scatter. Must be 0 to match the kernel contract.
         index (torch.Tensor): [K], 1D integer tensor of row indices into ``input``.
         src (torch.Tensor): [K, D], Source values to scatter-add.
+        unique_indices (bool): Accepted for signature parity with the kernel and ignored;
+            ``torch.scatter_add`` always accumulates duplicate indices.
 
     Returns:
         dict[str, torch.Tensor]: ``{"output": input_after}`` where ``input_after`` is

@@ -20,7 +20,7 @@ from enum import Enum
 # Only includes clear aliases of the same concept. Kernel-specific params
 # (S_tkg, S_ctx, BxS) are intentionally excluded — they carry distinct semantics.
 # Head count names normalize to n_* prefix (shorter, more common).
-# Note: this only normalizes pytest param names that flow into OpenSearch,
+# Note: this only normalizes pytest param names emitted as metrics,
 # not kernel API keys like "num_q_heads" in kernel_input dicts.
 CANONICAL_PARAM_NAMES: dict[str, str] = {
     # Batch dimension
@@ -64,21 +64,24 @@ def _unwrap_kernel_func(kernel_func: typing.Callable) -> typing.Callable:
     function to access type hints.
     """
     # Handle NKI GenericKernel objects - they have a 'func' attribute
-    if hasattr(kernel_func, "func"):
-        return _unwrap_kernel_func(kernel_func.func)
+    inner = getattr(kernel_func, "func", None)
+    if callable(inner):
+        return _unwrap_kernel_func(inner)
 
     # Handle decorated functions with __wrapped__
-    if hasattr(kernel_func, "__wrapped__"):
-        return _unwrap_kernel_func(kernel_func.__wrapped__)
+    wrapped = getattr(kernel_func, "__wrapped__", None)
+    if callable(wrapped):
+        return _unwrap_kernel_func(wrapped)
 
     return kernel_func
 
 
 def normalize_param_value(value):
-    """Normalize a parameter value for JSON serialization.
+    """Normalize a parameter value to a JSON-serializable form.
 
-    Converts Enums to their name, complex objects to strings.
-    Returns None for None/empty/whitespace-only values.
+    Enums and type objects become their name; containers are normalized
+    recursively; any other object becomes its str(). Returns None for None and
+    empty/whitespace-only strings.
     """
     if value is None:
         return None
@@ -88,20 +91,21 @@ def normalize_param_value(value):
     # Convert type objects to their name (e.g., nl.bfloat16 -> "bfloat16")
     if isinstance(value, type):
         return value.__name__
-    # For lists/tuples: keep homogeneous arrays as native arrays so OpenSearch
-    # maps them correctly. Only stringify mixed-type arrays to avoid mapping conflicts.
-    if isinstance(value, (list, tuple)):
-        types = {type(v) for v in value if v is not None}
+    if isinstance(value, bool | int | float):
+        return value
+    # Normalize elements; keep homogeneous arrays native, stringify mixed-type ones.
+    if isinstance(value, list | tuple):
+        normalized = [normalize_param_value(v) for v in value]
+        types = {type(v) for v in normalized if v is not None}
         if len(types) <= 1:
-            return list(value)
-        return json.dumps(value)
-    # Handle other non-serializable types (objects with __dict__)
-    if hasattr(value, "__dict__") and not isinstance(value, type):
-        return str(value)
-    # Handle empty strings or whitespace-only strings
-    if isinstance(value, str) and not value.strip():
-        return None
-    return value
+            return normalized
+        return json.dumps(normalized)
+    # Flatten a dict to a JSON string (metric properties are flat).
+    if isinstance(value, dict):
+        return json.dumps({k: normalize_param_value(v) for k, v in value.items()})
+    if isinstance(value, str):
+        return value if value.strip() else None
+    return str(value)
 
 
 def extract_pytest_params(params: dict) -> dict:
@@ -120,7 +124,7 @@ def normalize_param_names(params: dict) -> dict:
     """Normalize parameter names to canonical forms for consistent metrics.
 
     Maps variant names (e.g., "batch_size", "seq_len") to their canonical
-    equivalents ("batch", "seqlen") so OpenSearch always receives consistent
+    equivalents ("batch", "seqlen") so emitted metrics always use consistent
     field names regardless of which test file emitted the metric.
 
     Only renames keys that have a mapping in CANONICAL_PARAM_NAMES.

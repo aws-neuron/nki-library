@@ -53,6 +53,7 @@ _GRANDFATHERED_FILES = {
     "experimental/benchmark/test_find_nonzero_indices_with_count.py",
     "experimental/collectives/test_collectives.py",
     "experimental/conv/test_conv1d.py",
+    "experimental/gpt_oss/test_moe_golden_direct_gptoss.py",
     "experimental/loss/test_cross_entropy_backward.py",
     "experimental/loss/test_cross_entropy_forward.py",
     "experimental/moe/moe_tkg/test_moe_tkg_mx_selective_primitives.py",
@@ -62,6 +63,7 @@ _GRANDFATHERED_FILES = {
     "experimental/subkernels/test_permute_routed_tokens.py",
     "experimental/subkernels/test_topk_reduce.py",
     "experimental/transformer/test_transformer_tkg.py",
+    "experimental/gdn/test_gdn_tkg.py",
 }
 
 

@@ -19,19 +19,16 @@ failed attempt records a (truncated) FailureReason. Flaky-pass detection and
 original-failure-cause preservation live in the KaenaKernelsTools processor.
 """
 
-from ..utils.metrics_collector import MAX_FAILURE_REASON_LEN, add_rerun_dimensions, sanitize_dimension_value
-
-
-class _FakeCollector:
-    def __init__(self):
-        self.dimensions: dict[str, str] = {}
-
-    def add_dimension(self, dims: dict[str, str]) -> None:
-        self.dimensions.update(dims)
+from ..utils.metrics_collector import (
+    MAX_FAILURE_REASON_LEN,
+    MetricsCollector,
+    add_rerun_dimensions,
+    sanitize_dimension_value,
+)
 
 
 def test_first_attempt_number():
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(collector, attempt_number=1, failed=False)
 
     assert collector.dimensions["AttemptNumber"] == "1"
@@ -39,35 +36,35 @@ def test_first_attempt_number():
 
 
 def test_rerun_attempt_number():
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(collector, attempt_number=2, failed=False)
 
     assert collector.dimensions["AttemptNumber"] == "2"
 
 
 def test_failed_attempt_records_failure_reason():
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(collector, attempt_number=1, failed=True, failure_reason="allclose mismatch: max diff 0.5")
 
     assert collector.dimensions["FailureReason"] == "allclose mismatch: max diff 0.5"
 
 
 def test_failure_reason_newlines_collapsed():
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(collector, attempt_number=1, failed=True, failure_reason="line1\nline2")
 
     assert collector.dimensions["FailureReason"] == "line1 line2"
 
 
 def test_failure_reason_is_truncated():
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(collector, attempt_number=1, failed=True, failure_reason="x" * 1000)
 
     assert len(collector.dimensions["FailureReason"]) <= MAX_FAILURE_REASON_LEN
 
 
 def test_failed_attempt_without_reason_omits_field():
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(collector, attempt_number=1, failed=True, failure_reason=None)
 
     assert collector.dimensions["AttemptNumber"] == "1"
@@ -78,7 +75,7 @@ def test_failure_reason_non_ascii_is_stripped():
     # Regression: a FailureReason with non-ASCII (e.g. the em-dash in a FleetEmptyError
     # message) must be coerced to ASCII. The EMF library rejects a non-ASCII dimension value
     # (isascii()), and that InvalidDimensionError aborts the whole metrics emit.
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(
         collector,
         attempt_number=1,
@@ -94,7 +91,7 @@ def test_failure_reason_non_ascii_is_stripped():
 def test_failure_reason_all_non_ascii_omits_field():
     # If nothing usable survives ASCII-coercion, the dimension is skipped (an empty value
     # would ALSO fail EMF validation, so we must not emit it).
-    collector = _FakeCollector()
+    collector = MetricsCollector()
     add_rerun_dimensions(collector, attempt_number=1, failed=True, failure_reason="——— 日本語 ———")
 
     assert collector.dimensions["AttemptNumber"] == "1"

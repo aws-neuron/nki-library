@@ -36,12 +36,12 @@ class QKV_TKG_MXFP_UserInput(nl.NKIObject):
     and configuration building.
     """
 
-    hidden: nl.ndarray
-    weights_qtz_hbm: nl.ndarray
-    norm_w: Optional[nl.ndarray] = None
+    hidden: nl.NkiTensor
+    weights_qtz_hbm: nl.NkiTensor
+    norm_w: Optional[nl.NkiTensor] = None
     fused_add: bool = False
-    mlp_prev: Optional[nl.ndarray] = None
-    attn_prev: Optional[nl.ndarray] = None
+    mlp_prev: Optional[nl.NkiTensor] = None
+    attn_prev: Optional[nl.NkiTensor] = None
     d_head: Optional[int] = None
     num_kv_heads: Optional[int] = None
     num_q_heads: Optional[int] = None
@@ -50,11 +50,11 @@ class QKV_TKG_MXFP_UserInput(nl.NKIObject):
     norm_type: NormType = NormType.NO_NORM
     quantization_type: QuantizationType = QuantizationType.MX
     is_h_dim_4h_transposed: bool = False
-    weight_scales_hbm: Optional[nl.ndarray] = None
-    input_scale_hbm: Optional[nl.ndarray] = None
+    weight_scales_hbm: Optional[nl.NkiTensor] = None
+    input_scale_hbm: Optional[nl.NkiTensor] = None
     output_in_sbuf: bool = False
-    qkv_bias: Optional[nl.ndarray] = None
-    norm_bias: Optional[nl.ndarray] = None
+    qkv_bias: Optional[nl.NkiTensor] = None
+    norm_bias: Optional[nl.NkiTensor] = None
     hidden_actual: Optional[int] = None
     sbm: Optional[SbufManager] = None
 

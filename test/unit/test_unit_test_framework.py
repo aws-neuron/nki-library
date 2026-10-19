@@ -682,8 +682,7 @@ class TestUnitTestFramework:
             trace_only=True,
         )
         assert framework.trace_only is True
-        assert framework.torch_ref is None
-        assert framework.output_tensor_descriptor is None
+        assert framework.reference is None
 
     def test_trace_only_false_without_torch_ref_raises(self):
         """trace_only=False (default) with torch_ref=None should raise."""

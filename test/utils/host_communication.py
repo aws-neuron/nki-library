@@ -17,17 +17,16 @@ A ``HostCommunication`` is just the wire to a machine: ``run`` a command,
 ``directory`` for file I/O, ``open_channel`` for streaming, and enter/exit. All
 workload logic (core locking, env setup, venv, neuron-ls, artifacts) lives on
 ``Host`` and is expressed in terms of ``run``/``directory`` so it is written once
-regardless of backend. Three backends:
+regardless of backend. Two backends:
 
-- ``LocalCommunication``    — runs locally via subprocess (no SSH, no transfer).
 - ``ParamikoCommunication`` — fabric2/paramiko, one connection per worker. The
   default shared-fleet transport; behaviour identical to the pre-refactor code.
 - ``SshCommunication``      — native ``ssh`` subprocess per command, stateless,
   for exclusive sessions.
 
-The three are interchangeable behind the ``HostCommunication`` surface; the only
-backend-specific knob ``Host`` needs is ``wrap_command`` (the remote venv-activate
-prefix vs. local identity) and whether transfer is local (``is_local``).
+The two are interchangeable behind the ``HostCommunication`` surface; the only
+backend-specific knob ``Host`` needs is ``wrap_command`` (the venv-activate
+prefix).
 """
 
 from __future__ import annotations
@@ -156,9 +155,6 @@ class HostCommunication(ABC):
       venv, neuron-ls, ...); defaults to half the workload budget.
     """
 
-    #: Whether file I/O is on the same machine (no upload/download needed).
-    is_local: bool = False
-
     #: Default timeout for short control commands (mkdir, rm, venv, neuron-ls).
     CONTROL_COMMAND_TIMEOUT: float = SSH_INFERENCE_TIMEOUT_SECONDS / 2
 
@@ -241,68 +237,6 @@ class HostCommunication(ABC):
     @abstractmethod
     def __exit__(self, *exc) -> None:
         raise NotImplementedError
-
-
-class LocalCommunication(HostCommunication):
-    """Runs commands locally via subprocess. No SSH, no remote transfer."""
-
-    is_local = True
-
-    def __init__(
-        self,
-        host_id: str = "localhost",
-        *,
-        max_timeout_seconds: float = SSH_INFERENCE_TIMEOUT_SECONDS,
-        control_timeout_seconds: float | None = None,
-    ) -> None:
-        super().__init__(max_timeout_seconds=max_timeout_seconds, control_timeout_seconds=control_timeout_seconds)
-        self._host_id = host_id
-
-    def run(
-        self,
-        command: str,
-        *,
-        hide: bool = False,
-        warn: bool = True,
-        timeout: float | None = None,
-    ) -> CommandResult:
-        eff = self._effective_timeout(timeout)
-        # bash (not the shell=True /bin/sh default) — the workload commands use
-        # bash-isms (`set -o pipefail`, `source`).
-        try:
-            proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=eff)
-        except subprocess.TimeoutExpired as e:
-            raise TimeoutException(f"[{self._host_id}] command exceeded {eff}s and was aborted: {command[:120]}") from e
-        result = CommandResult(command=command, return_code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
-        if not warn and result.failed:
-            raise LocalExecutionException(f"[local] command failed ({proc.returncode}): {command}\n{proc.stderr}", proc)
-        return result
-
-    def directory(self, path: str, collector: "IMetricsCollector") -> HostDirectory:
-        from .host_io import LocalHostIO  # noqa: PLC0415
-
-        return LocalHostIO(path, collector)
-
-    def open(self) -> None:
-        return None
-
-    def open_channel(self, command: str) -> SshChannel:
-        raise SshChannelOpenError("LocalCommunication does not support channels")
-
-    def is_active(self) -> bool:
-        return True
-
-    def reconnect(self) -> None:
-        return None
-
-    def get_host_id(self) -> str:
-        return self._host_id
-
-    def __enter__(self) -> LocalCommunication:
-        return self
-
-    def __exit__(self, *exc) -> None:
-        return None
 
 
 _SSH_CONNECT_TIMEOUT_SECONDS = 10
@@ -394,6 +328,7 @@ class ParamikoCommunication(HostCommunication):
         if not self.is_active():
             conn.open()
         transport = conn.transport
+        assert transport is not None, "an opened connection exposes a transport"
         try:
             channel = transport.open_session()
             channel.exec_command(command)
@@ -427,8 +362,8 @@ class ParamikoCommunication(HostCommunication):
 
 
 class SshCommunication(HostCommunication):
-    """Native ``ssh`` transport — stateless subprocess per command for exclusive
-    sessions. Retries transient SSH transport failures with exponential backoff."""
+    """Native ``ssh`` transport — stateless subprocess per command, multiplexed
+    via ControlMaster. Retries transient SSH transport failures with exponential backoff."""
 
     _SSH_TRANSPORT_FAILURE = 255
     _MAX_TRANSIENT_RETRIES = 4
@@ -473,6 +408,10 @@ class SshCommunication(HostCommunication):
             *self._KEEPALIVE_OPTS,
             "-o",
             f"ControlPath={self._control_path}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=30",
             "-T",
             self._alias,
             command,

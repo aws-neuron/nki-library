@@ -36,6 +36,7 @@ Usage:
 """
 
 import inspect
+from dataclasses import dataclass
 from inspect import signature
 from typing import Callable, Optional
 
@@ -46,13 +47,27 @@ from .common_dataclasses import (
     InferenceArgs,
     KernelArgs,
     LazyGoldenGenerator,
+    NamedCallable,
     ValidationArgs,
 )
 from .coverage_parametrized_tests import assert_negative_test_case
-from .golden_provider import CustomComparatorProducer, GoldenProducer, TorchRefProducer
+from .golden_provider import (  # noqa: F401
+    CustomComparatorProducer,
+    GoldenProducer,
+    TorchRefProducer,
+    mark_uncacheable,
+)
 from .metadata_loader import load_model_configs
 from .metrics_collector import IMetricsCollector, MetricName
 from .test_orchestrator import Orchestrator
+
+
+@dataclass(frozen=True)
+class ReferenceFuncs:
+    """The pair of callables needed to validate outputs. Either both are supplied or neither is."""
+
+    torch_ref: Callable
+    output_tensor_descriptor: Callable
 
 
 class UnitTestFramework:
@@ -67,7 +82,7 @@ class UnitTestFramework:
     def __init__(
         self,
         test_manager: Orchestrator,
-        kernel_entry: Callable,
+        kernel_entry: NamedCallable,
         kernel_input_generator: Callable,
         torch_ref: Optional[Callable] = None,
         output_tensor_descriptor: Optional[Callable] = None,
@@ -92,6 +107,7 @@ class UnitTestFramework:
                 kernel_assert inside the kernel itself.
         """
         self.trace_only = trace_only
+        self.reference: ReferenceFuncs | None = None
 
         if not trace_only:
             if torch_ref is None:
@@ -99,15 +115,14 @@ class UnitTestFramework:
             if output_tensor_descriptor is None:
                 raise ValueError("output_tensor_descriptor is required when trace_only=False")
             validate_torch_ref_signature(kernel_entry, torch_ref)
+            self.reference = ReferenceFuncs(torch_ref, output_tensor_descriptor)
 
         if check_unused_params:
             check_unused_parameters(kernel_entry)
 
         self.test_manager = test_manager
         self.kernel_entry = kernel_entry
-        self.torch_ref = torch_ref
         self.kernel_input_generator = kernel_input_generator
-        self.output_tensor_descriptor = output_tensor_descriptor
         self.collector = collector
 
     def run_test(
@@ -182,10 +197,13 @@ class UnitTestFramework:
                 self.test_manager.execute(kernel_args)
                 return
 
-            ref_input = filter_ref_input(kernel_input, self.torch_ref)
+            reference = self.reference
+            assert reference is not None, "reference callables are required when trace_only=False"
+
+            ref_input = filter_ref_input(kernel_input, reference.torch_ref)
 
             # Generate output tensors
-            output_tensors = self.output_tensor_descriptor(kernel_input)
+            output_tensors = reference.output_tensor_descriptor(kernel_input)
 
             # Defer torch_ref computation to validation time via lazy golden generator.
             # This avoids running torch_ref in compile-only/trace-only modes (orchestrator
@@ -196,7 +214,7 @@ class UnitTestFramework:
                 # producer may serve the golden without invoking this, so the metric is
                 # present only when a compute actually happens.
                 with self.test_manager.collector.timer(MetricName.GOLDEN_COMPUTATION_TIME):
-                    ref_result = self.torch_ref(**ref_input)
+                    ref_result = reference.torch_ref(**ref_input)
                 _validate_key_sets(
                     expected=set(ref_result.keys()),
                     actual=set(output_tensors.keys()),
@@ -212,7 +230,7 @@ class UnitTestFramework:
             # obtains the golden is its own concern.
             producer: GoldenProducer = TorchRefProducer(
                 compute_ref,
-                self.torch_ref,
+                reference.torch_ref,
                 ref_input,
                 output_tensors,
                 self.test_manager.collector,
@@ -340,7 +358,7 @@ def validate_torch_ref_signature(kernel_entry: Callable, torch_ref: Callable) ->
     )
 
 
-def check_unused_parameters(func: Callable) -> None:
+def check_unused_parameters(func: NamedCallable) -> None:
     """Raise error if any parameter in func's signature appears unused in the function body.
 
     This helps catch bugs where a wrapper accepts a parameter but forgets to pass it through.

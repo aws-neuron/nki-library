@@ -94,7 +94,7 @@ def _get_bir_ap_params(
 
 
 def _k_inner_loop_helper(
-    output_tensor: nl.ndarray,
+    output_tensor: nl.NkiTensor,
     lhs_td: TensorDescriptor,
     rhs_td: TensorDescriptor,
     lhs_f_idx: int,
@@ -118,7 +118,7 @@ def _k_inner_loop_helper(
     Process a single output tile by accumulating across K dimension using BIR AP.
 
     Args:
-        output_tensor (nl.ndarray): Output tensor in SBUF
+        output_tensor (nl.NkiTensor): Output tensor in SBUF
         lhs_td (TensorDescriptor): LHS tensor descriptor with .data, .scales, .scales_are_packed
         rhs_td (TensorDescriptor): RHS tensor descriptor with .data, .scales, .scales_are_packed
         lhs_f_idx (int): LHS tile index in F dimension
@@ -273,7 +273,7 @@ def _k_inner_loop_helper(
 
 
 def matmul_mxfp8_blocks(
-    output_tensor: nl.ndarray,
+    output_tensor: nl.NkiTensor,
     lhs_td: TensorDescriptor,
     LHS_tile_shape: tuple,
     rhs_td: TensorDescriptor,
@@ -294,7 +294,7 @@ def matmul_mxfp8_blocks(
     # TODO: Consider wrapping output_tensor in a TensorDescriptor
 
     Args:
-        output_tensor (nl.ndarray): Pre-allocated SBUF tensor of shape [NUM_LHS_F_TILES, 128, N]
+        output_tensor (nl.NkiTensor): Pre-allocated SBUF tensor of shape [NUM_LHS_F_TILES, 128, N]
         lhs_td (TensorDescriptor): LHS tensor descriptor with .data, .scales
             (each 3D [TILE_K, NUM_K_TILES, F]), .scales_are_packed
         LHS_tile_shape (Tuple[int, int]): LHS tile shape [LHS_TILE_K, LHS_TILE_F]

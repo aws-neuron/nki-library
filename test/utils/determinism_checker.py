@@ -171,8 +171,8 @@ class DeterminismChecker:
 
                 # Find first differing byte using torch
                 diff_mask = ref_tensor != run_tensor
-                diff_idx = torch.argmax(diff_mask.to(torch.int8)).item()
-                num_mismatches = diff_mask.sum().item()
+                diff_idx = int(torch.argmax(diff_mask.to(torch.int8)).item())
+                num_mismatches = int(diff_mask.sum().item())
 
                 error_msg = (
                     f"✗ Determinism check FAILED!\n"

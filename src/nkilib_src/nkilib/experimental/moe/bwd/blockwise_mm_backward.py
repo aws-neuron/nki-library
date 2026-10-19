@@ -34,15 +34,15 @@ from .moe_bwd_parameters import (
 
 @nki.jit
 def blockwise_mm_bwd(
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
-    gate_up_proj_act_checkpoint_T: nl.ndarray,
-    down_proj_act_checkpoint: nl.ndarray,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    output_hidden_states_grad: nl.ndarray,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
+    gate_up_proj_act_checkpoint_T: nl.NkiTensor,
+    down_proj_act_checkpoint: nl.NkiTensor,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    output_hidden_states_grad: nl.NkiTensor,
     block_size: int,
     skip_dma: SkipMode = None,
     compute_dtype: nki.dtype = nl.bfloat16,
@@ -56,10 +56,10 @@ def blockwise_mm_bwd(
     activation_type: ActFnType = ActFnType.SiLU,
     block_tile_size: int = None,
     blocking_params: MOEBwdDroplessBlockingParams = None,
-    hidden_states_grad_out: nl.ndarray = None,
-    expert_affinities_masked_grad_out: nl.ndarray = None,
-    gate_up_proj_weight_grad_out: nl.ndarray = None,
-    down_proj_weight_grad_out: nl.ndarray = None,
+    hidden_states_grad_out: nl.NkiTensor = None,
+    expert_affinities_masked_grad_out: nl.NkiTensor = None,
+    gate_up_proj_weight_grad_out: nl.NkiTensor = None,
+    down_proj_weight_grad_out: nl.NkiTensor = None,
     accumulation_dtype: nki.dtype = None,
     skip_gate_proj: bool = False,
 ) -> tuple:
@@ -81,15 +81,15 @@ def blockwise_mm_bwd(
         N: Number of blocks
 
     Args:
-        hidden_states (nl.ndarray): [T, H], Input hidden states on HBM.
-        expert_affinities_masked (nl.ndarray): [T * E, 1], Expert affinities on HBM.
-        gate_up_proj_weight (nl.ndarray): [E, H, 2, I_TP], Gate/up projection weights on HBM.
-        down_proj_weight (nl.ndarray): [E, I_TP, H], Down projection weights on HBM.
-        gate_up_proj_act_checkpoint_T (nl.ndarray): [N, 2, I_TP, B], Checkpointed gate/up activations.
-        down_proj_act_checkpoint (nl.ndarray): [N, B, H], Checkpointed down projection activations.
-        token_position_to_id (nl.ndarray): [N * B], Token position to block mapping.
-        block_to_expert (nl.ndarray): [N, 1], Expert index per block.
-        output_hidden_states_grad (nl.ndarray): [T, H], Upstream gradient from output.
+        hidden_states (nl.NkiTensor): [T, H], Input hidden states on HBM.
+        expert_affinities_masked (nl.NkiTensor): [T * E, 1], Expert affinities on HBM.
+        gate_up_proj_weight (nl.NkiTensor): [E, H, 2, I_TP], Gate/up projection weights on HBM.
+        down_proj_weight (nl.NkiTensor): [E, I_TP, H], Down projection weights on HBM.
+        gate_up_proj_act_checkpoint_T (nl.NkiTensor): [N, 2, I_TP, B], Checkpointed gate/up activations.
+        down_proj_act_checkpoint (nl.NkiTensor): [N, B, H], Checkpointed down projection activations.
+        token_position_to_id (nl.NkiTensor): [N * B], Token position to block mapping.
+        block_to_expert (nl.NkiTensor): [N, 1], Expert index per block.
+        output_hidden_states_grad (nl.NkiTensor): [T, H], Upstream gradient from output.
         block_size (int): Number of tokens per block (128, 256, 512, or 1024).
         skip_dma (SkipMode): OOB handling mode for DMA operations.
         compute_dtype (nki.dtype): Computation dtype (default: nl.bfloat16).
@@ -107,13 +107,13 @@ def blockwise_mm_bwd(
             for any dimension increases the amount of data loaded into SBUF before the matmul begins execution. This allows
             more compute per load but also increases SBUF memory consumption. If None, uses defaults. It is highly recommended
             to tune this parameter to maximize kernel performance.
-        hidden_states_grad_out (nl.ndarray, optional): Pre-allocated [T, H] output tensor for hidden states
+        hidden_states_grad_out (nl.NkiTensor, optional): Pre-allocated [T, H] output tensor for hidden states
             gradient. If None, allocated internally.
-        expert_affinities_masked_grad_out (nl.ndarray, optional): Pre-allocated [T*E, 1] output tensor for
+        expert_affinities_masked_grad_out (nl.NkiTensor, optional): Pre-allocated [T*E, 1] output tensor for
             expert affinity gradient. If None, allocated internally.
-        gate_up_proj_weight_grad_out (nl.ndarray, optional): Pre-allocated [E, H, 2, I_TP] output tensor for
+        gate_up_proj_weight_grad_out (nl.NkiTensor, optional): Pre-allocated [E, H, 2, I_TP] output tensor for
             gate/up projection weight gradient. If None, allocated internally.
-        down_proj_weight_grad_out (nl.ndarray, optional): Pre-allocated [E, I_TP, H] output tensor for down
+        down_proj_weight_grad_out (nl.NkiTensor, optional): Pre-allocated [E, I_TP, H] output tensor for down
             projection weight gradient. If None, allocated internally.
         accumulation_dtype (nki.dtype, optional): Opt-in high-precision dtype for the gradient
             accumulators (hidden/affinity/weight/bias grads). Default None = compute_dtype (baseline,
@@ -125,12 +125,12 @@ def blockwise_mm_bwd(
 
     Returns:
         tuple: Gradient tensors:
-            - hidden_states_grad (nl.ndarray): [T, H], Gradient for hidden states.
-            - expert_affinities_masked_grad (nl.ndarray): [T * E, 1], Gradient for affinities.
-            - gate_up_proj_weight_grad (nl.ndarray): [E, H, 2, I_TP], Gradient for gate/up weights.
-            - down_proj_weight_grad (nl.ndarray): [E, I_TP, H], Gradient for down weights.
-            - gate_and_up_proj_bias_grad (nl.ndarray, optional): [E, 2, I_TP], Bias gradients if bias=True.
-            - down_proj_bias_grad (nl.ndarray, optional): [E, H], Down bias gradients if bias=True.
+            - hidden_states_grad (nl.NkiTensor): [T, H], Gradient for hidden states.
+            - expert_affinities_masked_grad (nl.NkiTensor): [T * E, 1], Gradient for affinities.
+            - gate_up_proj_weight_grad (nl.NkiTensor): [E, H, 2, I_TP], Gradient for gate/up weights.
+            - down_proj_weight_grad (nl.NkiTensor): [E, I_TP, H], Gradient for down weights.
+            - gate_and_up_proj_bias_grad (nl.NkiTensor, optional): [E, 2, I_TP], Bias gradients if bias=True.
+            - down_proj_bias_grad (nl.NkiTensor, optional): [E, H], Down bias gradients if bias=True.
 
     Notes:
         - block_size must be one of: 128, 256, 512, 1024.

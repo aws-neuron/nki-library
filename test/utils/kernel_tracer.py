@@ -14,18 +14,18 @@
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Optional, Tuple
 
 import numpy as np
-from nki.compiler.driver import compile_to_bir
-from nki.compiler.frontend import ParserFrontend, TracerFrontend
-from nki.compiler.ncc_driver import CompileOptions, compile_bir_to_neff
+from nki.compiler.driver import compile_to_bir  # ty: ignore[unresolved-import]
+from nki.compiler.frontend import ParserFrontend, TracerFrontend  # ty: ignore[unresolved-import]
+from nki.compiler.ncc_driver import CompileOptions, compile_bir_to_neff  # ty: ignore[unresolved-import]
 
-from .bir_neff_cache import compute_cache_key, lookup_cache, store_cache
+from .bir_neff_cache import CompiledKernel, compute_cache_key, lookup_cache, store_cache
 from .common_dataclasses import (
     CompilerArgs,
     CustomValidatorWithOutputTensorData,
-    GoldenTensorDict,
+    GoldenTensorMapping,
     KernelArgs,
     NKICompilationMode,
     PerRankLazyInputGenerator,
@@ -44,6 +44,14 @@ DEFAULT_COMPILER_DEBUG_FLAGS = [
 DUMP_AFTER_LOWERING_FLAGS = [
     "--internal-backend-options=--print-format=condensed --print-after=translate_nki_ast_to_bir,lower_klir_kernel",
 ]
+
+
+def _kernel_non_ssa_legalization_opts(kernel_func) -> dict:
+    """Forward an @nki.jit kernel's public non-SSA legalization opt-in."""
+    if not getattr(kernel_func, "non_ssa_legalization", False):
+        return {}
+
+    return {"non_ssa_legalization": True}
 
 
 def _collect_neuronx_cc_flags(compiler_args: CompilerArgs, validation_args: ValidationArgs | None = None) -> list[str]:
@@ -83,7 +91,7 @@ class TensorStub:
     Duck type for constructing kernels inside the compiler
     """
 
-    shape: List[int]
+    shape: Tuple[int, ...]
     dtype: 'np.dtype'
     name: str
 
@@ -99,7 +107,7 @@ def construct_kernel_IO_from_kernel_args(kernel_under_test: KernelArgs):
 
     kernel_outputs: list = []
     if kernel_under_test.validation_args is not None:
-        golden_output: GoldenTensorDict = normalize_golden_output(kernel_under_test.validation_args.golden_output)
+        golden_output: GoldenTensorMapping = normalize_golden_output(kernel_under_test.validation_args.golden_output)
 
         for (
             output_key,
@@ -126,15 +134,21 @@ def trace_kernel(
     output_directory,
     *,
     frontendMode,
+    compile_mode: str | None = None,
     output_names: list[str] | None = None,
     neuronx_cc_cache_path: str | None = None,
     collector: IMetricsCollector,
-) -> Optional[object]:
+) -> Optional[CompiledKernel]:
     """Compile NKI kernel to MLIR, and optionally to NEFF.
 
     Uses the given frontend (ParserFrontend or TracerFrontend) for
     Python → MLIR compilation. The frontend handles _unwrap_kernel
     internally, so @nki.jit-decorated kernels work transparently.
+
+    compile_mode selects the allocator/scheduler flow, one of
+    nki.compiler.ncc_driver.COMPILE_MODES; None means DEFAULT_COMPILE_MODE. The
+    baremetal flow is not among them: it runs a different MLIR pipeline through
+    nki.compiler._baremetal_driver.
 
     Returns a CompiledKernel for CompileAndInfer mode, None otherwise.
     """
@@ -171,8 +185,16 @@ def trace_kernel(
         artifacts_dir=os.path.join(output_directory, "artifacts"),
         neuronx_cc_args=tuple(neuronx_cc_args),
         enable_device_dump=enable_device_dump,
+        **_kernel_non_ssa_legalization_opts(kernel_under_test.kernel_func),
     )
-    compile_opts = compile_opts.disable_backend_optimizations()
+    if compile_mode is None:
+        # Equivalent to set_compile_mode(DEFAULT_COMPILE_MODE), but keeps the default
+        # path off an nki API that older versions lack.
+        compile_opts = compile_opts.disable_backend_optimizations()
+    else:
+        # Applies the pipeline options, backend options and BIR-emission flag the flow
+        # implies, together, and rejects an unknown mode.
+        compile_opts = compile_opts.set_compile_mode(compile_mode)
 
     with collector.timer(MetricName.FRONTEND_TRACE_TIME):
         result = compile_to_bir(
@@ -183,7 +205,12 @@ def trace_kernel(
             output_names=output_names,
         )
 
-    if mode not in (TraceMode.CompileOnly, TraceMode.CompileAndInfer, TraceMode.Debugger):
+    if mode not in (
+        TraceMode.CompileOnly,
+        TraceMode.CompileAndInfer,
+        TraceMode.CompileAndInferAndSeparate,
+        TraceMode.Debugger,
+    ):
         return None
 
     argument_names = [s.name for s in result.descriptor.input_specs]

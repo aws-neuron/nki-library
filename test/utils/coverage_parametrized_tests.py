@@ -19,7 +19,7 @@ import random
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 from allpairspy import AllPairs
@@ -45,6 +45,9 @@ class FilterResult(Enum):
 class BoundedRange:
     """Wrapper for parameter values with optional boundary values for negative testing.
 
+    ``values`` may be a list or a numpy array; arrays are converted to lists when
+    the parameter space is expanded.
+
     If boundary_values is None, automatic boundary detection is applied:
     - For integers: generates min-1 and max+1
     - For enums: generates enum values not in the values list
@@ -53,7 +56,7 @@ class BoundedRange:
     Set boundary_values=[] to explicitly disable boundary testing for a parameter.
     """
 
-    values: List[Any]
+    values: Union[List[Any], np.ndarray]
     boundary_values: Optional[List[Any]] = None
 
     def get_boundary_values(self) -> List[Any]:
@@ -63,7 +66,7 @@ class BoundedRange:
         return _compute_automatic_boundaries(self.values)
 
 
-def _compute_automatic_boundaries(values: List[Any]) -> List[Any]:
+def _compute_automatic_boundaries(values: Union[List[Any], np.ndarray]) -> List[Any]:
     """Compute automatic boundary values based on value types."""
     if len(values) == 0:
         return []
@@ -161,14 +164,14 @@ def _generate_cases(
 def _generate_valid_cases(
     params: Dict[str, Any],
     coverage: str,
-    filter_func: Callable,
+    filter_func: Optional[Callable],
 ) -> List[tuple]:
     """Generate valid test cases for the given coverage strategy.
 
     Args:
         params: Parameter name to values mapping.
         coverage: Coverage strategy ("singles", "pairs", "full").
-        filter_func: Function to filter valid combinations.
+        filter_func: Function to filter valid combinations, or None for no filtering.
 
     Returns:
         List of test case tuples (only VALID results, not INVALID or REDUNDANT).
@@ -179,7 +182,7 @@ def _generate_valid_cases(
 
 def _generate_invalid_combination_tests(
     params: Dict[str, Any],
-    filter_func: Callable,
+    filter_func: Optional[Callable],
     max_invalid_tests: int,
     max_sampling_attempts: int = 1000,
 ) -> List[CoverageTestCase]:
@@ -365,7 +368,7 @@ def _make_invalid_filter(filter_func, params: Dict[str, Any]):
 def generate_parametrized_test_case(
     params: Dict[str, Any],
     coverage: str,
-    filter_func: Callable,
+    filter_func: Optional[Callable],
     enable_automatic_boundary_tests: bool = True,
     enable_invalid_combination_tests: bool = True,
     n_tests_per_boundary_value: int = 3,
@@ -376,7 +379,7 @@ def generate_parametrized_test_case(
     Args:
         params: Parameter name to values mapping. Values can be lists or BoundedRange.
         coverage: Coverage strategy ("singles", "pairs", "full").
-        filter_func: Function to filter valid combinations.
+        filter_func: Function to filter valid combinations, or None for no filtering.
         enable_automatic_boundary_tests: If True, auto-wrap plain lists with BoundedRange.
         enable_invalid_combination_tests: If True, generate tests using negated filter.
         n_tests_per_boundary_value: Number of valid cases to modify per boundary value.

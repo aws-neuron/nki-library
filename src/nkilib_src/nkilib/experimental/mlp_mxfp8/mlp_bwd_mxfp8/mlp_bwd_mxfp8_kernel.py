@@ -22,7 +22,7 @@ from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
 from ...matmul_mxfp8.matmul_mxfp8_config import MatmulMxfp8KernelConfig
 from ...matmul_mxfp8.matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
-from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
+from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor, TensorOrientation
 from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
 from ...mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import INTERLEAVE_FACTOR
 from ..common_utils import (
@@ -937,28 +937,28 @@ def mlp_backward_mxfp8_base_nki(
 @with_active_sbm
 def mlp_backward_mxfp8_nki(
     # Output gradient (always BF16)
-    output_grad: nl.ndarray,
+    output_grad: nl.NkiTensor,
     # Hidden states (always BF16, needed for recompute and/or transpose)
-    hidden_states: nl.ndarray,
+    hidden_states: nl.NkiTensor,
     # Weights — BF16 (required when corresponding scales not provided)
-    down_proj_weight: nl.ndarray = None,
-    gate_up_weights: nl.ndarray = None,
+    down_proj_weight: nl.NkiTensor = None,
+    gate_up_weights: nl.NkiTensor = None,
     # Weights — pre-quantized (used when scales provided)
-    gate_up_weight_T: nl.ndarray = None,
-    gate_up_weight_T_scales: nl.ndarray = None,
-    gate_up_weights_scales: nl.ndarray = None,
-    down_weight_T: nl.ndarray = None,
-    down_weight_T_scales: nl.ndarray = None,
+    gate_up_weight_T: nl.NkiTensor = None,
+    gate_up_weight_T_scales: nl.NkiTensor = None,
+    gate_up_weights_scales: nl.NkiTensor = None,
+    down_weight_T: nl.NkiTensor = None,
+    down_weight_T_scales: nl.NkiTensor = None,
     # Activations — pre-quantized (optional, used when scales provided)
-    output_grad_T: nl.ndarray = None,
-    output_grad_T_scales: nl.ndarray = None,
-    hidden_states_T: nl.ndarray = None,
-    hidden_states_T_scales: nl.ndarray = None,
+    output_grad_T: nl.NkiTensor = None,
+    output_grad_T_scales: nl.NkiTensor = None,
+    hidden_states_T: nl.NkiTensor = None,
+    hidden_states_T_scales: nl.NkiTensor = None,
     # Optional checkpoints (always BF16)
-    gate_pre: nl.ndarray = None,
-    gate_act: nl.ndarray = None,
-    up: nl.ndarray = None,
-    intermediate: nl.ndarray = None,
+    gate_pre: nl.NkiTensor = None,
+    gate_act: nl.NkiTensor = None,
+    up: nl.NkiTensor = None,
+    intermediate: nl.NkiTensor = None,
     # Configuration
     run_with_lnc2: bool = True,
     matmul_config: MlpBwdMatmulConfig = None,
@@ -1234,8 +1234,12 @@ def mlp_backward_mxfp8_nki(
     intermediate_T_td = TensorDescriptor(data=intermediate_T_buf)
 
     # --- Build remaining TDs and delegate to base kernel ---
-    d_gate_up_td = TensorDescriptor(data=d_gate_up_buf, is_f_by_k=True, is_col_parallel_sharded=run_with_lnc2)
-    scratch_td = TensorDescriptor(data=scratch_buf, is_f_by_k=True, is_col_parallel_sharded=run_with_lnc2)
+    d_gate_up_td = TensorDescriptor(
+        data=d_gate_up_buf, orientation=TensorOrientation.F_BY_K, is_col_parallel_sharded=run_with_lnc2
+    )
+    scratch_td = TensorDescriptor(
+        data=scratch_buf, orientation=TensorOrientation.F_BY_K, is_col_parallel_sharded=run_with_lnc2
+    )
     hidden_states_grad_td = TensorDescriptor(data=hidden_states_grad)
     weight_grad_td = TensorDescriptor(data=gate_up_weight_grad)
     down_weight_grad_td = TensorDescriptor(data=down_proj_weight_grad)

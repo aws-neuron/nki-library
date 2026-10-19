@@ -25,7 +25,7 @@ def build_rotation_matrix(
     dtype=nl.float16,
     negate: bool = False,
     engine=nisa.vector_engine,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Build a block-diagonal circulant shift matrix in SBUF.
 
     Constructs an NxN matrix (N = block_size x num_blocks) composed of

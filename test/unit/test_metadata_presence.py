@@ -22,13 +22,12 @@ tracking.
 import ast
 from pathlib import Path
 
-import pytest
-
 from test.utils.pytest_test_metadata import extract_pytest_test_metadata_from_file
 from test.utils.test_validation_utils import (
     IntegrationFileCollector,
     ValidationErrorReporter,
     ValidationViolation,
+    fail_with_report,
     get_decorator_name,
 )
 
@@ -124,7 +123,7 @@ def test_all_integration_test_classes_have_metadata():
 
     # If there are violations, fail with detailed message
     if reporter.has_violations():
-        pytest.fail(reporter.build())
+        fail_with_report(reporter.build())
 
     # Report success
     total_classes = sum(len(extract_pytest_test_metadata_from_file(f.file_path)) for f in test_files)
@@ -203,6 +202,6 @@ def test_one_metadata_per_file():
             )
 
     if reporter.has_violations():
-        pytest.fail(reporter.build())
+        fail_with_report(reporter.build())
 
     print(f"\n✓ All {len(test_files)} test files have at most one @pytest_test_metadata annotation")

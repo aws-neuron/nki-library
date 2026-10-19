@@ -30,6 +30,7 @@ import logging
 import subprocess
 from collections import deque
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,20 @@ _RUN_ALL_PATTERNS = [
 ]
 
 
+class TestScope(NamedTuple):
+    """The outcome of scoping a change.
+
+    ``run_all`` says the selection could not be narrowed, which a caller able to run
+    everything should honour. ``test_dirs`` is what could still be attributed to
+    specific kernels, which is what a caller unable to run everything should use. The
+    two are returned together because reducing them to one value is what made a
+    shared-utility change mean "analyze nothing".
+    """
+
+    test_dirs: set[str]
+    run_all: bool
+
+
 class RelevantTestFinder:
     """Finds integration test directories relevant to a commit's changes."""
 
@@ -83,6 +98,35 @@ class RelevantTestFinder:
             ValueError: If the commit ID format is invalid.
             RuntimeError: If no changed files or no relevant test paths are found.
         """
+        scope = self._scope(commit_ids, stop_at_run_all=True)
+        return None if scope.run_all else scope.test_dirs
+
+    def get_narrowed_test_dirs(self, commit_ids: str = "HEAD") -> set[str]:
+        """Best-effort scoping for a caller that cannot afford to run everything.
+
+        ``get_relevant_test_dirs`` answers "which tests are relevant", and returns
+        None when it cannot narrow the selection, meaning run them all. A caller that
+        cannot do that reads None as "run nothing", which inverts the intent: a change
+        touching a shared utility alongside specific kernels ends up with less scrutiny
+        than one touching a single kernel.
+
+        This returns whatever could be attributed to specific kernels, so those kernels
+        are still covered. A shared-utility or infrastructure file contributes nothing
+        of its own rather than discarding the rest of the change. An empty set means
+        nothing could be attributed, which is the caller's cue to decide for itself.
+
+        Callers wanting the run-everything signal should keep using
+        ``get_relevant_test_dirs``.
+        """
+        return self._scope(commit_ids, stop_at_run_all=False).test_dirs
+
+    def _scope(self, commit_ids: str, *, stop_at_run_all: bool) -> TestScope:
+        """Resolve changed files to test dirs, and whether the selection was narrowable.
+
+        ``stop_at_run_all`` returns as soon as a file forces a full run, which is what
+        ``get_relevant_test_dirs`` wants: it discards the dirs anyway, and stopping
+        avoids building the import index for a change whose answer is already known.
+        """
         changed_files: list[str] = []
         for commit_id in self._parse_commit_ids(commit_ids):
             changed_files.extend(self._get_changed_files(commit_id))
@@ -96,6 +140,7 @@ class RelevantTestFinder:
         logger.info("Changed files in %s: %s", commit_ids, changed_files)
 
         test_dirs: set[str] = set()
+        run_all = False
         changed_src_files: list[str] = []
         changed_test_files: list[str] = []
 
@@ -105,7 +150,10 @@ class RelevantTestFinder:
             # Check if this is an infrastructure file that should trigger full run
             if self._is_run_all_file(f):
                 logger.info("Infrastructure file changed (%s), running all tests", f)
-                return None
+                run_all = True
+                if stop_at_run_all:
+                    return TestScope(set(), run_all=True)
+                continue
 
             # Check if this is a source file under nkilib
             if self._is_source_file(fpath):
@@ -115,7 +163,12 @@ class RelevantTestFinder:
                 # parts[0] is module (core/experimental/private), parts[1] is kernel group
                 if len(parts) >= 2 and parts[1] in _RUN_ALL_SRC_DIRS:
                     logger.info("Shared utility changed (%s), running all tests", f)
-                    return None
+                    run_all = True
+                    if stop_at_run_all:
+                        return TestScope(set(), run_all=True)
+                    # Contributes no test dirs of its own, but must not discard the
+                    # dirs the rest of the change resolves to.
+                    continue
                 changed_src_files.append(f)
 
             # Check if this is a test file
@@ -148,10 +201,10 @@ class RelevantTestFinder:
                 commit_ids,
                 changed_files,
             )
-            return None
+            return TestScope(set(), run_all=True)
 
         logger.info("Relevant test paths: %s", test_dirs)
-        return test_dirs
+        return TestScope(test_dirs, run_all=run_all)
 
     @staticmethod
     def _parse_commit_ids(commit_ids: str) -> list[str]:
@@ -224,7 +277,7 @@ class RelevantTestFinder:
             return str(abs_path)
         return None
 
-    def _build_reverse_import_index(self):
+    def _build_reverse_import_index(self) -> dict[str, set[str]]:
         """Scan all source and test files and build a reverse dependency map.
 
         For each file F that is imported by file G, we record:
@@ -236,11 +289,14 @@ class RelevantTestFinder:
         - ``from nkilib_src.nkilib.core.x import y`` (absolute ImportFrom, level == 0)
         - ``import nkilib_src.nkilib.core.x`` (absolute Import)
         - ``from test.integration.nkilib.core.x import y`` (cross-test ImportFrom)
+
+        Returns:
+            The reverse dependency map, built on the first call and cached after.
         """
         if self._reverse_deps is not None:
-            return
+            return self._reverse_deps
 
-        self._reverse_deps = {}
+        reverse_deps: dict[str, set[str]] = {}
 
         # Scan source files for source-to-source imports. We include
         # __init__.py: kernel packages commonly re-export their implementation
@@ -250,16 +306,20 @@ class RelevantTestFinder:
         # to the implementation file resolves to no tests and falls back to a
         # full run. Scanning __init__.py restores that edge.
         for py_file in self.src_root.rglob("*.py"):
-            self._scan_file_imports(py_file)
+            self._scan_file_imports(py_file, reverse_deps)
 
         # Scan test files for test-to-test imports
         for py_file in self.test_root.rglob("*.py"):
             if py_file.name == "__init__.py" or py_file.name == "conftest.py":
                 continue
-            self._scan_file_imports(py_file)
+            self._scan_file_imports(py_file, reverse_deps)
 
-    def _scan_file_imports(self, py_file: Path):
-        """Parse a single file and record its imports in the reverse dependency map."""
+        # Published only once fully built, so a failed scan leaves no partial map.
+        self._reverse_deps = reverse_deps
+        return reverse_deps
+
+    def _scan_file_imports(self, py_file: Path, reverse_deps: dict[str, set[str]]) -> None:
+        """Parse a single file and record its imports in the given reverse dependency map."""
         rel_path = str(py_file.relative_to(self.repo_root))
         try:
             source = py_file.read_text(encoding="utf-8")
@@ -289,16 +349,12 @@ class RelevantTestFinder:
                         resolved = self._resolve_test_import(alias.name)
                     if resolved:
                         imp_rel = str(resolved.relative_to(self.repo_root))
-                        if imp_rel not in self._reverse_deps:
-                            self._reverse_deps[imp_rel] = set()
-                        self._reverse_deps[imp_rel].add(rel_path)
+                        reverse_deps.setdefault(imp_rel, set()).add(rel_path)
                 continue
 
             if imported_file:
                 imported_rel = str(imported_file.relative_to(self.repo_root))
-                if imported_rel not in self._reverse_deps:
-                    self._reverse_deps[imported_rel] = set()
-                self._reverse_deps[imported_rel].add(rel_path)
+                reverse_deps.setdefault(imported_rel, set()).add(rel_path)
 
     def _resolve_relative_import(self, importing_file: Path, module: str, level: int) -> Path | None:
         """Resolve a relative import to an absolute file path.

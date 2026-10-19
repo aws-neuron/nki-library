@@ -47,9 +47,29 @@ from ....core.qkv.qkv_cte import _get_psum_bank_size
 from ....core.utils.allocator import SbufManager, get_logger
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil, get_program_sharding_info
+from .mla_bf16_cte import (
+    _BF16_K_TILE,
+    _NUM_TRANSPOSE_BANKS,
+    _absorb_q_nope_bf16,
+    _alloc_matmul_psum,
+    _bf16_compute_k_slab_tiles,
+    _bf16_k_tile_sizes,
+    _bf16_matmul,
+    _bf16_matmul_k_range,
+    _bf16_matmul_split,
+    _bf16_sbuf_footprint,
+    _copy_psum_splits,
+    _load_bf16_gamma,
+    _load_bf16_weights,
+    _load_bf16_weights_k_slab,
+    _load_wuk_bf16_group_tiled,
+    _load_x_bf16_tile,
+    _transpose_bf16_to_k_major,
+)
 from .mla_common_cte import (
     _H_PACK,
     _NUM_HW_PSUM_BANKS,
+    MlaPrecision,
     _apply_rms_norm_inplace,
     _apply_rope_inplace_interleaved_grouped,
     _apply_rope_to_tensor_interleaved,
@@ -99,11 +119,10 @@ def mla_qkv_cte_kernel(
     kv_lora_rank: int,
     qk_lora_rank: int,
     norm_eps: float = 1e-6,
-    # Optional pre-allocated qr export buffers (SAI indexer fast path); see Args docstring.
-    qr_qtz_hbm: nl.NkiTensor = None,
-    qr_scale_hbm: nl.NkiTensor = None,
-) -> Tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
-    """DeepSeek MLA QKV projection (MX), emitting absorbed latents.
+    compact_scales: bool = True,
+    precision: MlaPrecision = MlaPrecision.MX,
+) -> Tuple[nl.NkiTensor, ...]:
+    """DeepSeek MLA QKV projection (MX or BF16), emitting absorbed latents.
 
     Consumes the packed MX activation from rmsnorm_mx_prefill (pack_scales=True)
     directly — no in-kernel quantize. Intended for Context Encoding (prefill) with
@@ -122,12 +141,20 @@ def mla_qkv_cte_kernel(
         kv_lora_rank: Latent KV LoRA rank (L)
         qk_lora_rank: Q LoRA rank
 
+    ``precision`` selects the arithmetic format; every arg below is described for the
+    default MX path. Under ``MlaPrecision.BF16`` the numeric inputs change shape/dtype
+    (see the ``precision`` entry) but the four latent OUTPUTS are identical, so downstream
+    kernels are unaffected. BF16 is what GLM-MoE-DSA (GLM 5.2 / 5.3) needs.
+
     Args:
         x_hbm_mx (nl.NkiTensor): ``[B, S, H + scale_region]`` fp8 packed MX activation (see the param comment).
+            BF16: ``[B, S, H]`` bfloat16, unquantized.
         wqkv_a_hbm (nl.NkiTensor): ``[H // 4, qk_lora_rank + kv_lora_rank + qk_rope_head_dim]`` fp8x4.
-        wqkv_a_scale_hbm (nl.NkiTensor): compact block-128 scales for ``wqkv_a``.
+            BF16: ``[H, qk_lora_rank + kv_lora_rank + qk_rope_head_dim]`` bfloat16, NATURAL column order.
+        wqkv_a_scale_hbm (nl.NkiTensor): compact block-128 scales for ``wqkv_a``. BF16: ignored, pass ``None``.
         wq_b_hbm (nl.NkiTensor): ``[qk_lora_rank // 4, n_heads * (qk_nope_head_dim + qk_rope_head_dim)]`` fp8x4.
-        wq_b_scale_hbm (nl.NkiTensor): compact block-128 scales for ``wq_b``.
+            BF16: ``[qk_lora_rank, n_heads * qk_head_dim]`` bfloat16.
+        wq_b_scale_hbm (nl.NkiTensor): compact block-128 scales for ``wq_b``. BF16: ignored, pass ``None``.
         q_norm_gamma_hbm (nl.NkiTensor): ``[1, qk_lora_rank]`` bf16 RMSNorm gamma for the Q intermediate.
         kv_norm_gamma_hbm (nl.NkiTensor): ``[1, kv_lora_rank]`` bf16 RMSNorm gamma for the KV latent.
         wuk_hbm (nl.NkiTensor): ``[qk_nope_head_dim, n_heads * kv_lora_rank]`` bf16 absorption weight
@@ -141,9 +168,14 @@ def mla_qkv_cte_kernel(
         kv_lora_rank (int): Latent KV LoRA rank.
         qk_lora_rank (int): Q LoRA rank.
         norm_eps (float): RMSNorm epsilon (default 1e-6).
-        qr_qtz_hbm (nl.NkiTensor): Optional pre-allocated buffer for the exported MX-quantized qr
-            latent (SAI indexer fast path). None (default) means no qr export.
-        qr_scale_hbm (nl.NkiTensor): Optional pre-allocated scale buffer paired with ``qr_qtz_hbm``.
+        compact_scales (bool): MX only -- see ``wqkv_a_scale_hbm``.
+        precision (MlaPrecision): ``MX`` (default) or ``BF16``. BF16 takes unquantized bf16
+            activations and weights in natural column order and issues plain
+            ``nisa.nc_matmul``: no 4-packing, no MLA output-column swizzle, no scale
+            broadcast, no ``quantize_mx``, no un-swizzle. It also lifts the MX path's
+            ``qk_nope_head_dim == 128`` restriction (the absorption contraction is tiled at
+            128 rows, so GLM's 192 runs as 128 + 64) and relaxes the LoRA-rank multiple from
+            512 to 128. Pass ``None`` for both scale tensors.
 
     Returns:
         q_lift (nl.NkiTensor): ``[B, S, n_heads, kv_lora_rank]`` bf16, per-head absorbed Q latent.
@@ -151,9 +183,19 @@ def mla_qkv_cte_kernel(
         c_kv (nl.NkiTensor): ``[B, S, kv_lora_rank]`` bf16, shared latent KV (RMSNorm(kv) * gamma).
         k_pe (nl.NkiTensor): ``[B, S, qk_rope_head_dim]`` bf16, shared RoPE key.
 
+        Then, for the SAI indexer's wq_b projection, the q-normed qr latent -- MX emits it
+        pre-transposed and pre-quantized so the indexer skips that work, BF16 emits it plain:
+
+        MX (6 returns): ``qr_qtz`` ``[num_s_tiles, P_MAX, qk_lora_rank // 512, P_MAX]`` uint32
+            (fp8x4) plus ``qr_scale``, the paired block-32 MX scales, same shape uint8.
+        BF16 (5 returns): ``qr`` ``[B, S, qk_lora_rank]`` bf16.
+
     Notes:
-        - Absorption requires ``qk_nope_head_dim == 128`` (full-partition bf16 contraction).
-        - The absorption matmul (q_nope @ W_uk) runs in bf16, not MX.
+        - MX absorption requires ``qk_nope_head_dim == 128`` (full-partition bf16
+          contraction); BF16 accepts any ``qk_nope_head_dim``.
+        - The absorption matmul (q_nope @ W_uk) runs in bf16 in BOTH modes: its contraction
+          is only ``qk_nope_head_dim`` wide, so MX packing (4 elems/word -> 32 partitions)
+          buys no throughput while forcing tiny strided transposes and a slabbed W_uk.
 
     Pseudocode:
         # Stage 1 (MX): fused Q/KV first projection.
@@ -187,6 +229,8 @@ def mla_qkv_cte_kernel(
         qk_rope_head_dim=qk_rope_head_dim,
         kv_lora_rank=kv_lora_rank,
         qk_lora_rank=qk_lora_rank,
+        compact_scales=compact_scales,
+        precision=precision,
     )
 
     B, S, _ = x_hbm_mx.shape
@@ -201,6 +245,45 @@ def mla_qkv_cte_kernel(
         use_auto_alloc=False,
         logger=get_logger("mla_absorbed"),
     )
+
+    if precision.is_bf16():
+        # BF16 qr export for the SAI indexer: plain [B, S, qk_lora] bf16. The MX export is
+        # pre-transposed + MX-quantized only because the indexer's wq_b matmul is an MX
+        # matmul that would otherwise redo that work; a bf16 indexer just needs the values.
+        qr_hbm = nl.ndarray((B, S, qk_lora_rank), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+        _qkv_stage_bf16(
+            x_hbm_mx,
+            wqkv_a_hbm,
+            wq_b_hbm,
+            q_norm_gamma_hbm,
+            kv_norm_gamma_hbm,
+            wuk_hbm,
+            cos_cache_hbm,
+            sin_cache_hbm,
+            q_lift_hbm,
+            q_pe_hbm,
+            c_kv_hbm,
+            k_pe_hbm,
+            qr_hbm,
+            n_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            qk_lora_rank,
+            sbm,
+            norm_eps,
+        )
+        return q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm, qr_hbm
+
+    # qr latent export for the SAI indexer, allocated in-kernel and returned (see _qkv_stage).
+    # Layout matches the indexer's q_projection_mx input: one [P_MAX, lora512, P_MAX] block per
+    # global s-tile (P_MAX-sized), fp8x4 packed as uint32 with paired uint8 block-32 scales.
+    P_MAX = nl.tile_size.pmax
+    num_s_tiles = div_ceil(S, P_MAX)
+    qr_lora_512_tiles = qk_lora_rank // (P_MAX * _H_PACK)
+    qr_qtz_hbm = nl.ndarray((num_s_tiles, P_MAX, qr_lora_512_tiles, P_MAX), dtype=nl.uint32, buffer=nl.shared_hbm)
+    qr_scale_hbm = nl.ndarray((num_s_tiles, P_MAX, qr_lora_512_tiles, P_MAX), dtype=nl.uint8, buffer=nl.shared_hbm)
+
     _qkv_stage(
         x_hbm_mx,
         wqkv_a_hbm,
@@ -225,8 +308,9 @@ def mla_qkv_cte_kernel(
         norm_eps,
         qr_qtz_hbm=qr_qtz_hbm,
         qr_scale_hbm=qr_scale_hbm,
+        compact_scales=compact_scales,
     )
-    return q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm
+    return q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm, qr_qtz_hbm, qr_scale_hbm
 
 
 def _qkv_stage(
@@ -254,21 +338,14 @@ def _qkv_stage(
     qk_lora_rank: int,
     sbm: SbufManager,
     norm_eps: float = 1e-6,
-    # Optional qr latent export for the SAI indexer fast path; see the stage docstring Notes.
+    # qr latent export for the SAI indexer fast path (caller-allocated shared_hbm; see Notes).
     qr_qtz_hbm: nl.NkiTensor = None,
     qr_scale_hbm: nl.NkiTensor = None,
+    compact_scales: bool = True,
 ) -> None:
     """Absorbed-latent MLA QKV stage (packed-MX input). Writes the four latent outputs to
     the caller-provided shared_hbm tensors using the caller's ``sbm``.
     See :func:`mla_qkv_cte_kernel` for arg semantics.
-
-    Notes:
-        - Optional qr export: when ``qr_qtz_hbm`` / ``qr_scale_hbm`` are provided, the
-          transposed + q-normed(gamma) + MX-quantized qr latent is written in place so a
-          downstream stage (the SAI indexer) can skip its own transpose+norm+quantize.
-          Layout matches the indexer's q_projection_mx input:
-          ``qr_qtz_hbm`` [num_s_tiles, P_MAX, QK_LORA_128_TILE_COUNT, P_MAX] fp8x4,
-          ``qr_scale_hbm`` same shape uint8. None (default) -> no export.
     """
     P_MAX = nl.tile_size.pmax
 
@@ -296,9 +373,30 @@ def _qkv_stage(
 
     S_shard_offset = shard_id * S_shard_base
 
+    # The qr export writes one whole 128-query global tile per core (indexed by
+    # s_tile_global_offset // P_MAX, at within-tile column s_tile_global_offset % P_MAX). That is
+    # correct only when a shard's tiles never straddle a 128 boundary: either the whole sequence
+    # fits in one tile (S <= P_MAX, cores share tile 0 at disjoint columns) or every core owns
+    # whole 128-tiles (S_shard_base % P_MAX == 0). Also require an even split so s_tile_sz (the
+    # nl.ds write width) is static. Production T/core is always a large multiple of P_MAX.
+    kernel_assert(
+        S % num_shards == 0 and (S <= P_MAX or S_shard_base % P_MAX == 0),
+        f"[QKV MLA] qr export requires each LNC shard to own whole {P_MAX}-query tiles: "
+        f"S % num_shards == 0 and (S <= {P_MAX} or (S // num_shards) % {P_MAX} == 0). "
+        f"Got S={S}, num_shards={num_shards} (S_shard_base={S_shard_base}).",
+    )
+
     q_out_dim = n_heads * qk_head_dim
     kv_a_out_dim = kv_lora_rank + qk_rope_head_dim
     qkv_out_dim = qk_lora_rank + kv_a_out_dim
+
+    """
+    wqkv_a output columns are [qr | kv | k_pe]; the offline loader pre-swizzles the qr and
+    kv blocks with the MLA column permutation (k_pe untouched). The compact block-128 scale
+    is therefore ALWAYS shipped for the NATURAL (un-swizzled) weight -- (a block-128 scale 
+    cannot follow the interleave).
+    """
+    wqkv_a_scale_groups = [(0, qk_lora_rank), (qk_lora_rank, kv_lora_rank)] if compact_scales else None
 
     # Hardware constants
     H_PACK = _H_PACK
@@ -344,6 +442,13 @@ def _qkv_stage(
     _CALIBRATED_SBUF_BUDGET_BYTES = 240 * 1024
     _sbuf_budget = min(int(nl.tile_size.total_available_sbuf_size), _CALIBRATED_SBUF_BUDGET_BYTES)
 
+    """
+    Single-buffered slabs. Double-buffering (2) would let slab N+1's load overlap slab N's
+    matmuls, but the slab sizer divides the SBUF budget by this count and at H=7168 the only
+    legal slab sizes are {14,7,2,1} 512-tiles -- so 2 buffers halve the slab (14 -> 7),
+    doubling the slab count and shrinking every matmul. Measured at S=128/H=7168/128-head
+    that net-regressed (258 -> 282us), so keep 1.
+    """
     _NUM_WQKV_A_SLAB_BUFFERS = 1
     kv_b_out_dim = n_heads * (qk_nope_head_dim + kv_lora_rank)
     """
@@ -375,7 +480,16 @@ def _qkv_stage(
     USE_K_SLAB = NUM_K_SLABS > 1
 
     if not USE_K_SLAB:
-        wqkv_a_sb, wqkv_a_scale_sb = _load_mx_weights(wqkv_a_hbm, wqkv_a_scale_hbm, H, qkv_out_dim, sbm, name="wqkv_a")
+        wqkv_a_sb, wqkv_a_scale_sb = _load_mx_weights(
+            wqkv_a_hbm,
+            wqkv_a_scale_hbm,
+            H,
+            qkv_out_dim,
+            sbm,
+            name="wqkv_a",
+            compact_scales=compact_scales,
+            scale_swizzle_groups=wqkv_a_scale_groups,
+        )
 
     SCALE_BLOCK = 128
 
@@ -525,6 +639,7 @@ def _qkv_stage(
             full_out_dim=q_out_dim,
             out_col_offset=0,
             weights_dge_mode=dge_mode.hwdge,
+            compact_scales=compact_scales,
         )
     else:
         # Group-sized wq_b scratch (reloaded per head-group); W_uk loaded per s-tile below.
@@ -749,6 +864,8 @@ def _qkv_stage(
                         name=f"slab{slab_id}",
                         # Plain rectangular weight read -> HW descriptor engine.
                         weights_dge_mode=dge_mode.hwdge,
+                        compact_scales=compact_scales,
+                        scale_swizzle_groups=wqkv_a_scale_groups,
                     )
                     _mx_matmul_split_k_range(
                         input_qtz_sb=x_qtz_sb,
@@ -812,6 +929,7 @@ def _qkv_stage(
                     name="wq_b_pg0",
                     full_out_dim=q_out_dim,
                     out_col_offset=0,
+                    compact_scales=compact_scales,
                     weights_dge_mode=dge_mode.hwdge,
                 )
                 _load_wuk_bf16_group(wuk_hbm, wuk_grp_bufs[0], n_heads, qk_nope_head_dim, kv_lora_rank, 0, _g0_count)
@@ -844,22 +962,27 @@ def _qkv_stage(
             )
 
             """
-            Optional export of the quantized qr latent for the SAI indexer (skips its
-            own transpose+norm+quantize). One s-tile block [P_MAX, QK_LORA_128_TILE_COUNT,
+            Export the quantized qr latent for the SAI indexer (skips its own
+            transpose+norm+quantize). One s-tile block [P_MAX, QK_LORA_128_TILE_COUNT,
             P_MAX] per global s-tile index (s_tile_global_offset // P_MAX).
+            qr_qtz_hbm is uint32; view the fp8x4 SBUF src as uint32 so the SBUF->HBM
+            DMA is uint32->uint32 (same 4B width, no MX cast).
             """
-            if qr_qtz_hbm != None:
-                _qr_tile = s_tile_global_offset // S_TILE_SIZE
-                """
-                qr_qtz_hbm is uint32; view the fp8x4 SBUF src as uint32 so the
-                SBUF->HBM DMA is uint32->uint32 (same 4B width, no MX cast).
-                DMACopy can't data-type-cast MX types (NCC_IBIR285).
-                """
-                _qr_sb_u32 = qr_qtz_sb.reinterpret_cast(nl.uint32)
-                nisa.dma_copy(dst=qr_qtz_hbm[_qr_tile], src=_qr_sb_u32[0:P_MAX, 0:QK_LORA_128_TILE_COUNT, 0:s_tile_pad])
-                nisa.dma_copy(
-                    dst=qr_scale_hbm[_qr_tile], src=qr_scale_sb[0:P_MAX, 0:QK_LORA_128_TILE_COUNT, 0:s_tile_pad]
-                )
+            # Write this tile's valid s-columns at their WITHIN-TILE offset so LNC shards whose
+            # first query is not 128-aligned (S_shard < P_MAX -> multiple cores share one global
+            # tile) land in disjoint columns instead of both overwriting column 0. The guard at
+            # the top of the stage rejects shards that would straddle a tile boundary.
+            _qr_tile = s_tile_global_offset // S_TILE_SIZE
+            _qr_col = s_tile_global_offset % S_TILE_SIZE
+            _qr_sb_u32 = qr_qtz_sb.view(nl.uint32)
+            nisa.dma_copy(
+                dst=qr_qtz_hbm[_qr_tile][0:P_MAX, 0:QK_LORA_128_TILE_COUNT, nl.ds(_qr_col, s_tile_sz)],
+                src=_qr_sb_u32[0:P_MAX, 0:QK_LORA_128_TILE_COUNT, 0:s_tile_sz],
+            )
+            nisa.dma_copy(
+                dst=qr_scale_hbm[_qr_tile][0:P_MAX, 0:QK_LORA_128_TILE_COUNT, nl.ds(_qr_col, s_tile_sz)],
+                src=qr_scale_sb[0:P_MAX, 0:QK_LORA_128_TILE_COUNT, 0:s_tile_sz],
+            )
 
             """
             ============================================================
@@ -966,6 +1089,7 @@ def _qkv_stage(
                             full_out_dim=q_out_dim,
                             out_col_offset=n_start * qk_head_dim,
                             weights_dge_mode=dge_mode.hwdge,
+                            compact_scales=compact_scales,
                         )
                         _load_wuk_bf16_group(
                             wuk_hbm, wuk_grp_bufs[nxt], n_heads, qk_nope_head_dim, kv_lora_rank, n_start, n_count
@@ -1019,6 +1143,7 @@ def _qkv_stage(
                         out_col_offset=group_start * qk_head_dim,
                         # Plain rectangular strided weight read -> HW descriptor engine (scales still swdge inside).
                         weights_dge_mode=dge_mode.hwdge,
+                        compact_scales=compact_scales,
                     )
                     q_group_sb = _mx_matmul(
                         qr_qtz_sb,
@@ -1165,6 +1290,494 @@ def _qkv_stage(
             per-head inside the head loop above).
             ============================================================
             """
+            nisa.dma_copy(
+                dst=c_kv_hbm.ap(
+                    pattern=[[kv_lora_rank, s_tile_sz], [1, kv_lora_rank]],
+                    offset=s_tile_global_offset * kv_lora_rank,
+                ),
+                src=c_kv_sb[0:s_tile_sz, 0:kv_lora_rank],
+                dge_mode=dge_mode.hwdge,
+            )
+            nisa.dma_copy(
+                dst=k_pe_hbm.ap(
+                    pattern=[[qk_rope_head_dim, s_tile_sz], [1, qk_rope_head_dim]],
+                    offset=s_tile_global_offset * qk_rope_head_dim,
+                ),
+                src=k_pe_rope_sb[0:s_tile_sz, 0:qk_rope_head_dim],
+                dge_mode=dge_mode.hwdge,
+            )
+
+            sbm.close_scope()
+
+        sbm.close_scope()
+
+    sbm.close_scope()
+
+
+def _qkv_stage_bf16(
+    x_hbm: nl.NkiTensor,
+    wqkv_a_hbm: nl.NkiTensor,
+    wq_b_hbm: nl.NkiTensor,
+    q_norm_gamma_hbm: nl.NkiTensor,
+    kv_norm_gamma_hbm: nl.NkiTensor,
+    wuk_hbm: nl.NkiTensor,
+    cos_cache_hbm: nl.NkiTensor,
+    sin_cache_hbm: nl.NkiTensor,
+    # Outputs (shared_hbm, allocated by the caller)
+    q_lift_hbm: nl.NkiTensor,
+    q_pe_hbm: nl.NkiTensor,
+    c_kv_hbm: nl.NkiTensor,
+    k_pe_hbm: nl.NkiTensor,
+    qr_hbm: nl.NkiTensor,
+    # Dimension parameters
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    qk_lora_rank: int,
+    sbm: SbufManager,
+    norm_eps: float = 1e-6,
+) -> None:
+    """Absorbed-latent MLA QKV stage, BF16 (``MlaPrecision.BF16``).
+
+    Same six-step pipeline as :func:`_qkv_stage` -- fused stage-1 projection, q-norm, Q
+    stage-2 per head group, interleaved RoPE on q_pe, per-head absorption into q_lift, and
+    the latent KV path -- with every MX-format step removed rather than reimplemented:
+
+      * activations arrive as plain bf16 ``[B, S, H]``, so there is no packed-scale region
+        to unfold and no ``quantize_mx`` before stage 2;
+      * weights are bf16 ``[K, N]`` in NATURAL column order, so the MLA output-column
+        swizzle and its ``_unswizzle_lora_cols`` inverse both disappear -- ``kv`` and ``qr``
+        come out of stage 1 already in natural order;
+      * norm gammas are applied as one ``tensor_tensor`` multiply instead of being fused
+        into a swizzling transpose;
+      * ``qk_nope_head_dim`` is no longer pinned to 128: the absorption contraction is K
+        tiled at 128 rows, so GLM-MoE-DSA's 192 runs as an accumulating 128 + 64.
+
+    Weight residency is deliberately simpler than the MX stage, which carries three modes
+    (fully resident / double-buffered per group / per-tile streaming) tuned against measured
+    DeepSeek profiles. Here wq_b and W_uk are always streamed one head group at a time. bf16
+    weights cost 2 bytes/element against MX's ~1.25, so the resident mode would rarely fit
+    anyway; the streaming path is the one that always applies. Revisit with a profile before
+    adding modes back.
+
+    See :func:`mla_qkv_cte_kernel` for arg semantics.
+    """
+    P_MAX = nl.tile_size.pmax
+
+    # bf16 weights are [K, N] with K on rows, so H and the LoRA ranks come straight from the
+    # weight shapes (no 4-pack division as in the MX path).
+    H = wqkv_a_hbm.shape[0]
+    B, S, _ = x_hbm.shape
+    # Every HBM offset below is flat in the sequence axis (matching the MX stage), so the batch
+    # axis must be degenerate. Prefill folds batch into S upstream.
+    kernel_assert(B == 1, f"[QKV MLA bf16] batch must be 1 (fold batch into S upstream), got {B}.")
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    q_out_dim = n_heads * qk_head_dim
+    kv_a_out_dim = kv_lora_rank + qk_rope_head_dim
+    qkv_out_dim = qk_lora_rank + kv_a_out_dim
+
+    # ==================== LNC Sharding Setup ====================
+    _, num_shards, shard_id = get_program_sharding_info()
+    kernel_assert(
+        S % num_shards == 0,
+        f"[QKV MLA bf16] S must divide evenly across LNC shards so the per-tile token count is "
+        f"static. Got S={S}, num_shards={num_shards}.",
+    )
+    S_shard = S // num_shards
+    S_shard_offset = shard_id * S_shard
+
+    sbm.open_scope()
+
+    # ==================== Prologue: norm gammas + norm constants ====================
+    # Both gammas are plain [P_MAX, dim] bf16 broadcasts: natural column order, applied with a
+    # single tensor_tensor after the rsqrt.
+    q_norm_gamma_sb = _load_bf16_gamma(q_norm_gamma_hbm, qk_lora_rank, sbm, name="q_norm_gamma")
+    kv_norm_gamma_sb = _load_bf16_gamma(kv_norm_gamma_hbm, kv_lora_rank, sbm, name="kv_norm_gamma")
+
+    norm_eps_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.bfloat16, buffer=nl.sbuf, name="norm_eps")
+    nisa.memset(dst=norm_eps_sb, value=norm_eps)
+    zero_bias_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.bfloat16, buffer=nl.sbuf, name="zero_bias")
+    nisa.memset(dst=zero_bias_sb, value=0.0)
+
+    # ==================== Tiling setup ====================
+    S_TILE_SIZE = s_tile_pad = P_MAX
+    NUM_INPUT_BUFFERS = 2
+    S_BLOCK_SIZE = NUM_INPUT_BUFFERS * S_TILE_SIZE
+    num_S_blocks = div_ceil(S_shard, S_BLOCK_SIZE)
+
+    H_K_TILES = div_ceil(H, _BF16_K_TILE)
+    QK_LORA_K_TILES = div_ceil(qk_lora_rank, _BF16_K_TILE)
+    h_k_tile_sizes = _bf16_k_tile_sizes(H)
+
+    _CALIBRATED_SBUF_BUDGET_BYTES = 240 * 1024
+    _sbuf_budget = min(int(nl.tile_size.total_available_sbuf_size), _CALIBRATED_SBUF_BUDGET_BYTES)
+
+    """
+    ---- Stage-1 weight K-slab sizing ----
+    Reserve everything that is live while a wqkv_a slab is resident. Chicken-and-egg with the
+    head-group size below (which depends on what the slab leaves free), so reserve the
+    SMALLEST legal head group (2 heads) here; the group chosen afterwards is >= 2 and is
+    itself budgeted against the free space the slab actually leaves.
+    """
+    _x_t_bytes = NUM_INPUT_BUFFERS * H_K_TILES * s_tile_pad * 2
+    _x_stage_bytes = H * 2  # inner-scope staging buffer, coexists with x_t while transposing
+    _stage1_out_bytes = qkv_out_dim * 2  # qr + kv_raw
+    _qr_t_bytes = QK_LORA_K_TILES * s_tile_pad * 2
+    _min_group_wq_b_bytes, _ = _bf16_sbuf_footprint(qk_lora_rank, min(2, n_heads) * qk_head_dim)
+    _min_group_wuk_bytes, _ = _bf16_sbuf_footprint(qk_nope_head_dim, min(2, n_heads) * kv_lora_rank)
+    _WORKING_RESERVE = 48 * 1024  # per-tile rope/kv/c_kv/group scratch + allocator slack
+    _slab_reserve = (
+        _x_t_bytes
+        + _x_stage_bytes
+        + _stage1_out_bytes
+        + _qr_t_bytes
+        + _min_group_wq_b_bytes
+        + _min_group_wuk_bytes
+        + _WORKING_RESERVE
+    )
+    K_SLAB_TILES = _bf16_compute_k_slab_tiles(H, qkv_out_dim, _sbuf_budget, _slab_reserve)
+    NUM_K_SLABS = H_K_TILES // K_SLAB_TILES
+    USE_K_SLAB = NUM_K_SLABS > 1
+
+    if not USE_K_SLAB:
+        wqkv_a_sb = _load_bf16_weights(wqkv_a_hbm, H, qkv_out_dim, sbm, name="wqkv_a")
+
+    """
+    ---- Head-group size for the Q stage-2 (wq_b) + absorption (W_uk) slabs ----
+    Largest EVEN divisor of n_heads whose (wq_b slab + W_uk slab + q_group output + the three
+    per-group buffers) fits the space left after the stage-1 slab, and whose Q stage-2 output
+    still fits PSUM. Even is required so the wq_b column offset stays 128-aligned, matching
+    the MX path and keeping the DMA rectangular.
+    """
+    _F_MAX_LOCAL = 512
+    _MAX_Q_PSUM_BANKS = _NUM_HW_PSUM_BANKS - 1
+    # Stage-1 weights held while the head loop runs: the whole weight when unslabbed, one slab
+    # otherwise (the slab buffer lives in a child scope that closes before the head loop, but
+    # budgeting for it keeps the group choice safe across both branches).
+    _slab_resident_bytes = (H_K_TILES if not USE_K_SLAB else K_SLAB_TILES) * qkv_out_dim * 2
+    _budget_for_group = (
+        _sbuf_budget - _slab_resident_bytes - _x_t_bytes - _stage1_out_bytes - _qr_t_bytes - _WORKING_RESERVE
+    )
+
+    WUK_HEAD_GROUP = 2
+    for group_size in range(n_heads, 1, -1):
+        if n_heads % group_size != 0 or group_size % 2 != 0:
+            continue
+        group_n = group_size * qk_head_dim
+        if div_ceil(group_n, _F_MAX_LOCAL) > _MAX_Q_PSUM_BANKS:
+            continue
+        wq_b_bytes, _ = _bf16_sbuf_footprint(qk_lora_rank, group_n)
+        wuk_bytes, _ = _bf16_sbuf_footprint(qk_nope_head_dim, group_size * kv_lora_rank)
+        # q_group output + q_pe slots + q_lift slots + the grouped-RoPE scratch.
+        out_bytes = (group_n + 2 * group_size * qk_rope_head_dim + group_size * kv_lora_rank) * 2
+        if wq_b_bytes + wuk_bytes + out_bytes <= _budget_for_group:
+            WUK_HEAD_GROUP = group_size
+            break
+
+    num_head_groups = div_ceil(n_heads, WUK_HEAD_GROUP)
+    NUM_LIFT_N_TILES = div_ceil(kv_lora_rank, _F_MAX_LOCAL)
+    kernel_assert(
+        _NUM_TRANSPOSE_BANKS + NUM_LIFT_N_TILES <= _NUM_HW_PSUM_BANKS,
+        f"[QKV MLA bf16] absorption needs {_NUM_TRANSPOSE_BANKS} transpose PSUM banks plus "
+        f"{NUM_LIFT_N_TILES} q_lift banks, exceeding {_NUM_HW_PSUM_BANKS}. Reduce kv_lora_rank.",
+    )
+
+    # Per-head-group weight slabs, reused across groups and s-tiles (streamed, see docstring).
+    wq_b_sb = sbm.alloc_stack(
+        (P_MAX, QK_LORA_K_TILES, WUK_HEAD_GROUP * qk_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf, name="wq_b_grp"
+    )
+    wuk_sb = sbm.alloc_stack(
+        (P_MAX, div_ceil(qk_nope_head_dim, _BF16_K_TILE), WUK_HEAD_GROUP * kv_lora_rank),
+        dtype=nl.bfloat16,
+        buffer=nl.sbuf,
+        name="wuk_grp",
+    )
+
+    x_2d = x_hbm.reshape((B * S, H))
+
+    for s_block_idx in nl.affine_range(num_S_blocks):
+        sbm.open_scope()
+        sbm.set_name_prefix(f"sb{s_block_idx}_")
+
+        s_block_offset = s_block_idx * S_BLOCK_SIZE
+        s_block_sz = min(S_BLOCK_SIZE, S_shard - s_block_offset)
+        num_tiles_in_block = div_ceil(s_block_sz, S_TILE_SIZE)
+
+        """
+        ============================================================
+        STEP 1: load + transpose every tile's activation for this block.
+        ============================================================
+        nc_matmul contracts on the partition axis, so the [s, H] activation must become
+        [H, s] before it can be the stationary operand. Done up front for the whole block so
+        the DMA + PE transposes of tile 1 overlap tile 0's matmuls.
+        """
+        x_t_bufs = []
+        for buf_idx in range(num_tiles_in_block):
+            x_t_bufs.append(
+                sbm.alloc_stack(
+                    (P_MAX, H_K_TILES, s_tile_pad), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"x_t_buf_{buf_idx}"
+                )
+            )
+
+        for i_tile in range(num_tiles_in_block):
+            s_tile_local_offset = s_block_offset + i_tile * S_TILE_SIZE
+            s_tile_sz = min(S_TILE_SIZE, S_shard - s_tile_local_offset)
+            _load_x_bf16_tile(
+                x_2d,
+                x_t_bufs[i_tile],
+                S_shard_offset + s_tile_local_offset,
+                s_tile_sz,
+                s_tile_pad,
+                H,
+                sbm,
+            )
+
+        """
+        ============================================================
+        STEP 2: process each tile in the block.
+        ============================================================
+        """
+        for i_tile in nl.affine_range(num_tiles_in_block):
+            sbm.open_scope()
+            sbm.set_name_prefix(f"sb{s_block_idx}_t{i_tile}_")
+
+            s_tile_local_offset = s_block_offset + i_tile * S_TILE_SIZE
+            s_tile_sz = min(S_TILE_SIZE, S_shard - s_tile_local_offset)
+            s_tile_global_offset = S_shard_offset + s_tile_local_offset
+            x_t_sb = x_t_bufs[i_tile]
+
+            # Prefetch RoPE caches early (their DMA overlaps the stage-1 matmul).
+            cos_sb = sbm.alloc_stack((P_MAX, qk_rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf, name="cos_cache")
+            sin_sb = sbm.alloc_stack(
+                (P_MAX, qk_rope_head_dim // 2), dtype=nl.bfloat16, buffer=nl.sbuf, name="sin_cache"
+            )
+            rope_offset = s_tile_global_offset * qk_rope_head_dim
+            nisa.dma_copy(
+                dst=cos_sb[0:s_tile_sz, 0:qk_rope_head_dim],
+                src=cos_cache_hbm.ap(
+                    pattern=[[qk_rope_head_dim, s_tile_sz], [1, qk_rope_head_dim]], offset=rope_offset
+                ),
+                dge_mode=dge_mode.hwdge,
+            )
+            nisa.dma_copy(
+                dst=sin_sb[0:s_tile_sz, 0 : qk_rope_head_dim // 2],
+                src=sin_cache_hbm.ap(
+                    pattern=[[qk_rope_head_dim, s_tile_sz], [1, qk_rope_head_dim // 2]], offset=rope_offset
+                ),
+                dge_mode=dge_mode.hwdge,
+            )
+
+            """
+            ============================================================
+            Stage 1 - x @ wqkv_a -> [qr | kv | k_pe], natural column order.
+            ============================================================
+            """
+            if not USE_K_SLAB:
+                qr_sb, kv_raw_sb = _bf16_matmul_split(
+                    x_t_sb, wqkv_a_sb, H, s_tile_pad, qkv_out_dim, [qk_lora_rank], sbm, name="stage1"
+                )
+            else:
+                # The slab weight buffer is dead once stage 1 finishes, so confine it to a child
+                # scope. PSUM is a separate space from the SBUF stack, so the accumulators
+                # survive that close and are read out (and split) after it.
+                sbm.open_scope()
+                wqkv_a_slab_sb = sbm.alloc_stack(
+                    (P_MAX, K_SLAB_TILES, qkv_out_dim), dtype=nl.bfloat16, buffer=nl.sbuf, name="wqkv_a_slab"
+                )
+                output_psum = _alloc_matmul_psum(div_ceil(qkv_out_dim, _F_MAX_LOCAL))
+                for slab_id in range(NUM_K_SLABS):
+                    k_tile_start = slab_id * K_SLAB_TILES
+                    _load_bf16_weights_k_slab(
+                        wqkv_a_hbm,
+                        wqkv_a_slab_sb,
+                        out_dim=qkv_out_dim,
+                        k_tile_start=k_tile_start,
+                        k_tile_count=K_SLAB_TILES,
+                        k_tile_sizes=h_k_tile_sizes,
+                        full_out_dim=qkv_out_dim,
+                    )
+                    _bf16_matmul_k_range(
+                        x_t_sb,
+                        wqkv_a_slab_sb,
+                        k_tile_start=k_tile_start,
+                        k_tile_count=K_SLAB_TILES,
+                        k_tile_sizes=h_k_tile_sizes,
+                        m_dim=s_tile_pad,
+                        n_dim=qkv_out_dim,
+                        output_psum=output_psum,
+                    )
+                sbm.close_scope()
+
+                qr_sb, kv_raw_sb = _copy_psum_splits(
+                    output_psum, s_tile_pad, [0, qk_lora_rank, qkv_out_dim], sbm, "stage1"
+                )
+
+            """
+            ============================================================
+            Q path - RMSNorm(qr) * q_gamma, then transpose for stage 2.
+            ============================================================
+            No swizzle to invert and no MX quantize: gamma is one tensor_tensor and the only
+            layout work is the M-major -> K-major flip that nc_matmul needs.
+            """
+            _apply_rms_norm_inplace(qr_sb, zero_bias_sb, norm_eps_sb, s_tile_pad, qk_lora_rank, sbm, name="q_rms")
+            nisa.tensor_tensor(
+                dst=qr_sb[0:s_tile_sz, 0:qk_lora_rank],
+                data1=qr_sb[0:s_tile_sz, 0:qk_lora_rank],
+                data2=q_norm_gamma_sb[0:s_tile_sz, 0:qk_lora_rank],
+                op=nl.multiply,
+            )
+
+            # qr export for the SAI indexer (plain bf16; the indexer does its own transpose).
+            nisa.dma_copy(
+                dst=qr_hbm.ap(
+                    pattern=[[qk_lora_rank, s_tile_sz], [1, qk_lora_rank]],
+                    offset=s_tile_global_offset * qk_lora_rank,
+                ),
+                src=qr_sb[0:s_tile_sz, 0:qk_lora_rank],
+                dge_mode=dge_mode.hwdge,
+            )
+
+            qr_t_sb = sbm.alloc_stack(
+                (P_MAX, QK_LORA_K_TILES, s_tile_pad), dtype=nl.bfloat16, buffer=nl.sbuf, name="qr_t"
+            )
+            _transpose_bf16_to_k_major(
+                qr_sb,
+                qr_t_sb,
+                m_sz=s_tile_sz,
+                m_pad=s_tile_pad,
+                k_tile_sizes=_bf16_k_tile_sizes(qk_lora_rank),
+                src_row_stride=qk_lora_rank,
+            )
+
+            """
+            ============================================================
+            KV path - c_kv = RMSNorm(kv) * kv_gamma, and k_pe RoPE.
+            ============================================================
+            kv_raw columns are already natural order, so c_kv is written in place (the MX path
+            needs an _unswizzle_lora_cols pass here).
+            """
+            c_kv_sb = sbm.alloc_stack((P_MAX, kv_lora_rank), dtype=nl.bfloat16, buffer=nl.sbuf, name="c_kv")
+            nisa.tensor_copy(
+                dst=c_kv_sb[0:s_tile_sz, 0:kv_lora_rank],
+                src=kv_raw_sb[0:s_tile_sz, 0:kv_lora_rank],
+                engine=nisa.scalar_engine,
+            )
+            _apply_rms_norm_inplace(c_kv_sb, zero_bias_sb, norm_eps_sb, s_tile_sz, kv_lora_rank, sbm, name="kv_rms")
+            nisa.tensor_tensor(
+                dst=c_kv_sb[0:s_tile_sz, 0:kv_lora_rank],
+                data1=c_kv_sb[0:s_tile_sz, 0:kv_lora_rank],
+                data2=kv_norm_gamma_sb[0:s_tile_sz, 0:kv_lora_rank],
+                op=nl.multiply,
+            )
+
+            k_pe_sb = sbm.alloc_stack((P_MAX, qk_rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf, name="k_pe_split")
+            nisa.tensor_copy(
+                dst=k_pe_sb[0:s_tile_sz, 0:qk_rope_head_dim],
+                src=kv_raw_sb[0:s_tile_sz, kv_lora_rank : kv_lora_rank + qk_rope_head_dim],
+                engine=nisa.scalar_engine,
+            )
+            k_pe_rope_sb = _apply_rope_to_tensor_interleaved(
+                k_pe_sb, cos_sb, sin_sb, s_tile_sz, qk_rope_head_dim, sbm, name="k_pe_rope"
+            )
+
+            """
+            ============================================================
+            Per head group: Q stage 2, q_pe RoPE, absorption -> q_lift.
+            ============================================================
+            """
+            for group_idx in range(num_head_groups):
+                group_start = group_idx * WUK_HEAD_GROUP
+                group_count = min(WUK_HEAD_GROUP, n_heads - group_start)
+                group_n = group_count * qk_head_dim
+
+                sbm.open_scope()
+                sbm.set_name_prefix(f"sb{s_block_idx}_t{i_tile}_g{group_idx}_")
+
+                _load_bf16_weights_k_slab(
+                    wq_b_hbm,
+                    wq_b_sb,
+                    out_dim=group_n,
+                    k_tile_start=0,
+                    k_tile_count=QK_LORA_K_TILES,
+                    k_tile_sizes=_bf16_k_tile_sizes(qk_lora_rank),
+                    full_out_dim=q_out_dim,
+                    out_col_offset=group_start * qk_head_dim,
+                )
+                _load_wuk_bf16_group_tiled(
+                    wuk_hbm, wuk_sb, n_heads, qk_nope_head_dim, kv_lora_rank, group_start, group_count
+                )
+                q_group_sb = _bf16_matmul(
+                    qr_t_sb, wq_b_sb, qk_lora_rank, s_tile_pad, group_n, sbm, name=f"q_matmul_g{group_idx}"
+                )
+
+                """
+                One DMA per buffer for the whole group instead of two tiny strided DMAs per
+                head: each head writes its slot, then the contiguous head range is stored once.
+                """
+                q_pe_grp_sb = sbm.alloc_stack(
+                    (P_MAX, group_count * qk_rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf, name="q_pe_grp"
+                )
+                q_lift_grp_sb = sbm.alloc_stack(
+                    (P_MAX, group_count * kv_lora_rank), dtype=nl.bfloat16, buffer=nl.sbuf, name="q_lift_grp"
+                )
+
+                for local_head_idx in range(group_count):
+                    q_head_offset = local_head_idx * qk_head_dim
+                    q_pe_offset = q_head_offset + qk_nope_head_dim
+                    sbm.set_name_prefix(f"sb{s_block_idx}_t{i_tile}_g{group_idx}_h{local_head_idx}_")
+
+                    # q_pe: copy raw into the group slot; the whole group is RoPE'd once below.
+                    nisa.tensor_copy(
+                        dst=q_pe_grp_sb[0:s_tile_sz, nl.ds(local_head_idx * qk_rope_head_dim, qk_rope_head_dim)],
+                        src=q_group_sb[0:s_tile_sz, q_pe_offset : q_pe_offset + qk_rope_head_dim],
+                        engine=nisa.scalar_engine,
+                    )
+                    _absorb_q_nope_bf16(
+                        q_group_sb,
+                        wuk_sb,
+                        q_lift_grp_sb,
+                        group_n=group_n,
+                        q_head_offset=q_head_offset,
+                        wuk_head_slot=local_head_idx,
+                        lift_slot=local_head_idx * kv_lora_rank,
+                        s_tile_sz=s_tile_sz,
+                        s_tile_pad=s_tile_pad,
+                        qk_nope_head_dim=qk_nope_head_dim,
+                        kv_lora_rank=kv_lora_rank,
+                        sbm=sbm,
+                    )
+
+                sbm.set_name_prefix(f"sb{s_block_idx}_t{i_tile}_g{group_idx}_")
+
+                # Batched interleaved RoPE over the group's q_pe: 6 wide ops, not 6 per head.
+                rope_grp_scratch = sbm.alloc_stack(
+                    (P_MAX, group_count * qk_rope_head_dim), dtype=nl.bfloat16, buffer=nl.sbuf, name="rope_grp_scratch"
+                )
+                _apply_rope_inplace_interleaved_grouped(
+                    q_pe_grp_sb, cos_sb, sin_sb, rope_grp_scratch, s_tile_sz, qk_rope_head_dim, group_count
+                )
+
+                nisa.dma_copy(
+                    dst=q_pe_hbm.ap(
+                        pattern=[[n_heads * qk_rope_head_dim, s_tile_sz], [1, group_count * qk_rope_head_dim]],
+                        offset=s_tile_global_offset * n_heads * qk_rope_head_dim + group_start * qk_rope_head_dim,
+                    ),
+                    src=q_pe_grp_sb[0:s_tile_sz, 0 : group_count * qk_rope_head_dim],
+                    dge_mode=dge_mode.hwdge,
+                )
+                nisa.dma_copy(
+                    dst=q_lift_hbm.ap(
+                        pattern=[[n_heads * kv_lora_rank, s_tile_sz], [1, group_count * kv_lora_rank]],
+                        offset=s_tile_global_offset * n_heads * kv_lora_rank + group_start * kv_lora_rank,
+                    ),
+                    src=q_lift_grp_sb[0:s_tile_sz, 0 : group_count * kv_lora_rank],
+                    dge_mode=dge_mode.hwdge,
+                )
+
+                sbm.close_scope()
+
+            # ==================== Store the shared latents ====================
             nisa.dma_copy(
                 dst=c_kv_hbm.ap(
                     pattern=[[kv_lora_rank, s_tile_sz], [1, kv_lora_rank]],

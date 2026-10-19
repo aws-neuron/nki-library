@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import enum
-from typing import Optional, final
+from typing import Optional, TypedDict, final
 
 import nki
 import nki.isa as nisa
@@ -77,39 +77,39 @@ class QkvTkgClassification(enum.Enum):
 
 @nki.jit
 def qkv_tkg_sb2sb_wrapper_kernel(
-    input: nl.ndarray,
-    fused_qkv_weights: nl.ndarray,
+    input: nl.NkiTensor,
+    fused_qkv_weights: nl.NkiTensor,
     output_layout: QKVOutputLayout = QKVOutputLayout.BSD,
     # -- Bias
-    bias: Optional[nl.ndarray] = None,
+    bias: Optional[nl.NkiTensor] = None,
     # -- Quantization
     quantization_type: QuantizationType = QuantizationType.NONE,
-    qkv_w_scale: Optional[nl.ndarray] = None,
-    qkv_in_scale: Optional[nl.ndarray] = None,
+    qkv_w_scale: Optional[nl.NkiTensor] = None,
+    qkv_in_scale: Optional[nl.NkiTensor] = None,
     # -- Fused Residual Add
-    fused_residual_add: Optional[bool] = False,
-    mlp_prev: Optional[nl.ndarray] = None,
-    attention_prev: Optional[nl.ndarray] = None,
+    fused_residual_add: bool = False,
+    mlp_prev: Optional[nl.NkiTensor] = None,
+    attention_prev: Optional[nl.NkiTensor] = None,
     # --- Fused Norm Related
     fused_norm_type: NormType = NormType.NO_NORM,
-    gamma_norm_weights: Optional[nl.ndarray] = None,
-    layer_norm_bias: Optional[nl.ndarray] = None,
+    gamma_norm_weights: Optional[nl.NkiTensor] = None,
+    layer_norm_bias: Optional[nl.NkiTensor] = None,
     norm_eps: float = 1e-6,
     hidden_actual: Optional[int] = None,
     # --- Fused RoPE Related
     fused_rope: Optional[bool] = False,
-    cos_cache: Optional[nl.ndarray] = None,
-    sin_cache: Optional[nl.ndarray] = None,
-    k_cos_cache: Optional[nl.ndarray] = None,
-    k_sin_cache: Optional[nl.ndarray] = None,
+    cos_cache: Optional[nl.NkiTensor] = None,
+    sin_cache: Optional[nl.NkiTensor] = None,
+    k_cos_cache: Optional[nl.NkiTensor] = None,
+    k_sin_cache: Optional[nl.NkiTensor] = None,
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
     # --- FP8 KV Cache Quantization Related (unused, accepted for signature match with qkv)
-    k_cache: Optional[nl.ndarray] = None,
-    v_cache: Optional[nl.ndarray] = None,
-    k_scale: Optional[nl.ndarray] = None,
-    v_scale: Optional[nl.ndarray] = None,
+    k_cache: Optional[nl.NkiTensor] = None,
+    v_cache: Optional[nl.NkiTensor] = None,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
     fp8_max: Optional[float] = None,
     fp8_min: Optional[float] = None,
     kv_dtype: Optional[type] = None,
@@ -118,7 +118,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     use_block_kv: bool = False,
     fp8_packed: bool = False,
     block_size: Optional[int] = None,
-    slot_mapping: Optional[nl.ndarray] = None,
+    slot_mapping: Optional[nl.NkiTensor] = None,
     # -----------------------------------------
     store_output_in_sbuf: bool = False,
     # -----------------------------------------
@@ -135,25 +135,25 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     # --- QK-Norm Related (unused, accepted for signature match with qkv_torch_ref)
     qk_norm_pre_rope=None,
     qk_norm_post_rope=None,
-    qk_norm_pre_rope_q_gamma: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_k_gamma: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_q_gamma: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_k_gamma: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_q_beta: Optional[nl.ndarray] = None,
-    qk_norm_pre_rope_k_beta: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_q_beta: Optional[nl.ndarray] = None,
-    qk_norm_post_rope_k_beta: Optional[nl.ndarray] = None,
+    qk_norm_pre_rope_q_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_k_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_q_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_k_gamma: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_q_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_pre_rope_k_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_q_beta: Optional[nl.NkiTensor] = None,
+    qk_norm_post_rope_k_beta: Optional[nl.NkiTensor] = None,
     transposed_in: bool = False,
     # --- Strided Input / Output (unused, accepted for signature match with qkv / qkv_torch_ref)
     strided_input_config=None,
-    output_hbm: Optional[nl.ndarray] = None,
+    output_hbm: Optional[nl.NkiTensor] = None,
     # --- Squared-sum outputs (unused here; accepted for signature match with qkv / qkv_torch_ref)
-    q_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
-    k_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
-    v_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
+    q_squared_sum_out: Optional[nl.NkiTensor] = None,  # noqa: ARG001
+    k_squared_sum_out: Optional[nl.NkiTensor] = None,  # noqa: ARG001
+    v_squared_sum_out: Optional[nl.NkiTensor] = None,  # noqa: ARG001
     # Signature parity with qkv_torch_ref; unused in wrapper (qkv_tkg is dtype-passing).
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     hidden = input
     qkv_w = fused_qkv_weights
     qkv_bias = bias
@@ -202,10 +202,10 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     )
     input_view = (
         hidden.flatten_dims(start_dim=0, end_dim=1)  # (BxS, H)
-        .reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])  # (BxS, num_shards, H0, H1_shard)
-        .permute(dims=[2, 0, 1, 3])  # (H0, BxS, num_shards, H1_shard)
+        .reshape_dim(dim=1, shape=(num_shards, H0, H1_shard))  # (BxS, num_shards, H0, H1_shard)
+        .permute(dims=(2, 0, 1, 3))  # (H0, BxS, num_shards, H1_shard)
     )
-    dst_view = hidden_sb.reshape_dim(dim=2, shape=[num_shards, H1_shard])  # (H0, BxS, num_shards, H1_shard)
+    dst_view = hidden_sb.reshape_dim(dim=2, shape=(num_shards, H1_shard))  # (H0, BxS, num_shards, H1_shard)
     nisa.dma_copy(
         dst=dst_view,
         src=input_view,
@@ -234,6 +234,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
         sbm=sbm,
     )
 
+    assert not isinstance(output_sb, tuple), "fused_residual_add is not supported by this wrapper"
     assert output_sb.shape == (BxS, I)
 
     # Allocate output tensor with layout-specific shape
@@ -242,6 +243,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
         output_pattern = [[I, BxS], [1, I]]
         nisa.dma_copy(dst=output_hbm.ap(pattern=output_pattern, offset=0), src=output_sb)
     elif output_layout == QKVOutputLayout.NBSd:
+        assert d_head is not None, "output_layout NBSd requires d_head"
         nh = I // d_head
         output_hbm = nl.ndarray((nh, BxS, d_head), dtype=hidden_sb.dtype, buffer=nl.shared_hbm)
         # output_sb_pattern = [[d_head, nh], [I, BxS], [1, d_head]]
@@ -296,6 +298,23 @@ def filter_qkv_tkg_combinations(
                 return FilterResult.INVALID
 
     return FilterResult.VALID
+
+
+class QkvTkgDtypeModeConfig(TypedDict):
+    """Shapes and fusion settings shared by every dtype_mode canary case."""
+
+    B: int
+    H: int
+    S: int
+    dtype: str
+    eps: float
+    fused_add: bool
+    lnc_degree: int
+    norm_type: NormType
+    output_layout: QKVOutputLayout
+    n_q_heads: int
+    n_kv_heads: int
+    d_head: int
 
 
 @pytest_test_metadata(name="QKV TKG")
@@ -1073,7 +1092,10 @@ class TestQkvTkgKernel:
     # FP8 quant mode canary for QKV TKG.
     # Tests NON_OCP, OCP, AUTO across STATIC and ROW.
     ####################################################################################################################
-    _QKV_TKG_BY_DTYPE_MODE_CONFIG = {
+    _DTYPE_MODE_D_HEAD = 128
+    _DTYPE_MODE_N_Q_HEADS = 8
+    _DTYPE_MODE_N_KV_HEADS = 1
+    _QKV_TKG_BY_DTYPE_MODE_CONFIG: QkvTkgDtypeModeConfig = {
         "B": 1,
         "H": 8192,
         "S": 1,
@@ -1083,9 +1105,9 @@ class TestQkvTkgKernel:
         "lnc_degree": 2,
         "norm_type": NormType.RMS_NORM,
         "output_layout": QKVOutputLayout.BSD,
-        "n_q_heads": 8,
-        "n_kv_heads": 1,
-        "d_head": 128,
+        "n_q_heads": _DTYPE_MODE_N_Q_HEADS,
+        "n_kv_heads": _DTYPE_MODE_N_KV_HEADS,
+        "d_head": _DTYPE_MODE_D_HEAD,
     }
 
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
@@ -1110,8 +1132,7 @@ class TestQkvTkgKernel:
             pytest.skip("OCP dtype_mode requires TRN3")
         compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
         cfg = self._QKV_TKG_BY_DTYPE_MODE_CONFIG
-        n_q_heads, n_kv_heads, d_head = cfg["n_q_heads"], cfg["n_kv_heads"], cfg["d_head"]
-        fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
+        fused_qkv_dim = (self._DTYPE_MODE_N_Q_HEADS + 2 * self._DTYPE_MODE_N_KV_HEADS) * self._DTYPE_MODE_D_HEAD
         self.run_qkv_tkg_test(
             test_manager=test_manager,
             compiler_args=compiler_args,

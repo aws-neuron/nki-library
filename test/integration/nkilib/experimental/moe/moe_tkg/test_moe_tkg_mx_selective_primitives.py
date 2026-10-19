@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import NotRequired, TypedDict
+
 import nki.language as nl
 import numpy as np
 import pytest
@@ -50,6 +52,33 @@ def _resolve_dtype(d):
     return d
 
 
+class MoeTkgBuildKwargs(TypedDict):
+    """Keyword arguments forwarded to the MoE TKG input builder.
+
+    Keys marked as not required are only supplied by the test variants that
+    exercise the corresponding feature.
+    """
+
+    tokens: int
+    hidden: int
+    intermediate: int
+    expert: int
+    top_k: int | None
+    act_fn: ActFnType
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode
+    is_all_expert: bool
+    expert_affinities_dtype: str
+    in_dtype: str | np.dtype
+    out_dtype: str | np.dtype
+    bias: bool
+    clamp: bool
+    quant_dtype: NotRequired[str | np.dtype]
+    quant_type: NotRequired[QuantizationType]
+    is_all_expert_dynamic: NotRequired[bool]
+    routed_token_ratio: NotRequired[float]
+    block_size: NotRequired[int | None]
+
+
 def _run_moe_tkg_test(
     test_manager: Orchestrator,
     vnc: int,
@@ -73,7 +102,7 @@ def _run_moe_tkg_test(
     in_dtype=None,
     out_dtype=None,
     is_all_expert_dynamic: bool = False,
-    routed_token_ratio: float | None = None,
+    routed_token_ratio: float = 1.0,
     block_size: int | None = None,
     use_primitives: bool = True,
     **_ignored,
@@ -81,7 +110,7 @@ def _run_moe_tkg_test(
     """Common test runner for moe_tkg kernel tests."""
     resolved_in = _resolve_dtype(in_dtype if in_dtype is not None else dtype)
     resolved_out = _resolve_dtype(out_dtype if out_dtype is not None else dtype)
-    build_kw = {
+    build_kw: MoeTkgBuildKwargs = {
         "tokens": tokens,
         "hidden": hidden,
         "intermediate": intermediate,

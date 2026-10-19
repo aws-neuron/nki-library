@@ -161,7 +161,14 @@ class MetricName:
     PROFILER_MFU = "ProfilerMFU"
 
     # ==========================================================================
-    # Cycle count metrics (parsed from show_session_*.json)
+    # Device-time metrics (parsed from show_session_*.json)
+    #
+    # UNITS: show_session's `CycleCount` — and therefore TpbSgCyclesSum — is a
+    # DURATION IN PICOSECONDS, not a cycle count and not a sum. InferenceTime,
+    # which comes from an independent source (the ntff's total_time, in seconds),
+    # equals it * 1e-12 exactly. Never divide these by a clock frequency; ps/1e6
+    # is microseconds. The metric NAME is kept for wire compatibility with the
+    # OpenSearch/SQS consumers and dashboards that already key off it.
     # ==========================================================================
     TPB_SG_CYCLES_SUM = "TpbSgCyclesSum"
     CYCLE_OUTLIERS_PREFIX = "CycleOutliers_CIdx_"
@@ -397,6 +404,17 @@ class IMetricsCollector(ABC):
         """Get the output directory of the test."""
         raise UnimplementedException()
 
+    def get_metric(self, name: str) -> float | None:
+        """Return the most recently recorded value for `name`, or None.
+
+        Read-back exists so tests can assert on a device metric they just
+        recorded (e.g. a latency budget gate). Implementations that do not
+        retain values return None, and callers must treat None as
+        "unavailable" rather than as a failure. Deliberately concrete, not
+        abstract, so existing IMetricsCollector implementations keep working.
+        """
+        return None
+
 
 @dataclass
 class MetricsCollector(IMetricsCollector):
@@ -499,6 +517,16 @@ class MetricsCollector(IMetricsCollector):
         """
         assert self._metrics_context
         self._metrics_context.put_metric(name, value, unit)
+
+    @override
+    def get_metric(self, name: str) -> float | None:
+        """Return the last value recorded for `name` from the metrics context."""
+        if not self._metrics_context:
+            return None
+        metric = self._metrics_context.metrics.get(name)
+        if metric is None or not metric.values:
+            return None
+        return float(metric.values[-1])
 
     @override
     def add_dimension(self, dimensions: dict[str, str]) -> None:
@@ -786,11 +814,8 @@ class MetricsCollector(IMetricsCollector):
                 self.record_metric(MetricName.INFERENCE_TIME, -1.0, "Seconds")
 
             # Getting the MBU from profiler directly
-            mbu = (
-                profiler_summary.get("mbu_estimated_percent")
-                if profiler_summary.get("mbu_estimated_percent") >= 0
-                else -1
-            )
+            mbu_estimated = profiler_summary.get("mbu_estimated_percent")
+            mbu = mbu_estimated if mbu_estimated is not None and mbu_estimated >= 0 else -1
             self.record_metric(MetricName.MBU_ESTIMATED_PERCENT, float(mbu * 100), "Percent")
 
             # MFU Calculation
@@ -986,6 +1011,11 @@ class NoopMetricsCollector(IMetricsCollector):
             unit: CloudWatch unit
         """
         pass
+
+    @override
+    def get_metric(self, name: str) -> float | None:
+        """No-op collector retains nothing, so no value is ever available."""
+        return None
 
     @override
     def add_dimension(self, dimensions: dict[str, str]) -> None:

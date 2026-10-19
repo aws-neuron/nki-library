@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for MXFP8 attention TKG — separate KV blocks with pre-computed masking."""
+"""Tests for MXFP8 attention TKG — separate KV blocks with a token-sequential mask."""
 
 from dataclasses import dataclass
 
@@ -44,15 +44,18 @@ _rng = NKITestsRNG()
 # ── Constants matching kernel ─────────────────────────────────────────────────
 D_HEAD = 128
 BLOCK_LEN = 128  # tokens per block (the atomic KV input unit)
-P_PER_BLOCK = 32
-PACKED_COLS = 160
 P_MAX = 128
-HALF_P = 64
 BLOCKS_PER_FOLD = 4
 FOLDS_PER_CHUNK = 4
 BLOCKS_PER_CHUNK = BLOCKS_PER_FOLD * FOLDS_PER_CHUNK  # 16
 CHUNK_TOKENS = BLOCKS_PER_CHUNK * BLOCK_LEN  # 2048
-SCORE_FREE = FOLDS_PER_CHUNK * BLOCK_LEN * 2  # 1024
+
+# Interior-zero pattern for the token mask. The stride is coprime with the 128/512/2048
+# block/fold/chunk sizes, so masked tokens land in every block, fold, and partition band.
+MASK_ZERO_STRIDE = 7  # 1 in 7 in-range tokens is masked
+# Per-head phase shift. Patterns repeat every MASK_ZERO_STRIDE heads, but a band-offset
+# error shifts heads by 32 or 64 (neither a multiple of 7), so it still changes the pattern.
+MASK_HEAD_SHIFT = 1
 
 
 # ── Test configurations ───────────────────────────────────────────────────────
@@ -64,14 +67,17 @@ class Mxfp8AttnTkgTestConfig:
     bs: int = 1
     q_head: int = 64
     lnc: int = 2
+    s_active: int = 1
 
     def __repr__(self):
-        return f"bs{self.bs}_qh{self.q_head}_pos{self.pos_id}_lnc{self.lnc}"
+        return f"bs{self.bs}_qh{self.q_head}_pos{self.pos_id}_lnc{self.lnc}_sa{self.s_active}"
 
 
 TEST_CONFIGS = [
     # Full pos_id sweep on the sharded path (bs=1, lnc=2)
     pytest.param(Mxfp8AttnTkgTestConfig(pos_id=2048), marks=pytest.mark.fast),
+    # Not chunk-aligned: exercises the partial-chunk mask copy (clamped length + memset)
+    pytest.param(Mxfp8AttnTkgTestConfig(pos_id=3000), marks=pytest.mark.fast),
     Mxfp8AttnTkgTestConfig(pos_id=8192),
     Mxfp8AttnTkgTestConfig(pos_id=65536),
     Mxfp8AttnTkgTestConfig(pos_id=131072),
@@ -82,6 +88,20 @@ TEST_CONFIGS = [
     # bs=8 at 128k with both lnc values
     Mxfp8AttnTkgTestConfig(pos_id=131072, bs=8, lnc=1),
     Mxfp8AttnTkgTestConfig(pos_id=131072, bs=8),
+    # q_head=32
+    pytest.param(Mxfp8AttnTkgTestConfig(pos_id=2048, q_head=32), marks=pytest.mark.fast),
+    Mxfp8AttnTkgTestConfig(pos_id=524288, q_head=32, lnc=1),
+    # Speculative decoding: q_head=32, s_active=2 (band_p=64, reuses the q_head=64 geometry)
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=32, s_active=2),
+    # Speculative decoding: band_p=128 (single Q variant, no cross-band packing)
+    pytest.param(Mxfp8AttnTkgTestConfig(pos_id=2048, q_head=32, s_active=4), marks=pytest.mark.fast),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=32, s_active=4),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=64, s_active=2),
+    # Speculative decoding: band_p>128 (row-tiled query rows)
+    pytest.param(Mxfp8AttnTkgTestConfig(pos_id=2048, q_head=64, s_active=4), marks=pytest.mark.fast),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=64, s_active=4),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=64, s_active=8),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=32, s_active=8),
 ]
 
 
@@ -116,41 +136,48 @@ def _make_mxfp8_comparator(label):
     return comparator
 
 
+def _build_token_mask(bs, q_head, pos_id_val, s_active):
+    """Build a unified mask [bs, q_head, s_active, pos_id + s_active] with per-row interior zeros.
+
+    The pos_id prefix masks the prior context; the trailing s_active columns mask the
+    active tokens (here a causal triangle: query token s attends to active tokens 0..s).
+
+    An all-ones prior mask would validate nothing: the kernel scatters this mask into its
+    eviction layout, so masked positions must exist inside the valid range (where V is
+    non-zero) and must differ per (head, active-token) row, otherwise a wrong partition
+    band or a transposed axis still produces the correct output. The per-row phase folds
+    the active-token index so those rows differ too.
+    """
+    tokens = np.arange(pos_id_val)
+    # One phase per query row (h * s_active + s), head-major.
+    row_phase = np.arange(q_head * s_active) * MASK_HEAD_SHIFT
+    # prior[r, t] == 0 where (t + r * shift) % stride == 0
+    masked = ((tokens[np.newaxis, :] + row_phase[:, np.newaxis]) % MASK_ZERO_STRIDE) == 0
+    prior = np.where(masked, 0, 1).astype(np.uint8)  # [q_head*s_active, pos_id]
+
+    # Active tail: causal triangle over s_active, broadcast to every head. Row (h, s)
+    # attends to active tokens 0..s.
+    causal = np.tril(np.ones((s_active, s_active), dtype=np.uint8))  # [s, s']
+    active = np.tile(causal, (q_head, 1))  # [q_head*s_active, s_active]
+
+    unified = np.concatenate([prior, active], axis=1)  # [q_head*s_active, pos_id + s_active]
+    unified = unified.reshape(q_head, s_active, pos_id_val + s_active)
+    return np.broadcast_to(unified[np.newaxis], (bs, q_head, s_active, pos_id_val + s_active)).copy()
+
+
 def _build_active_blocks_table(batch, num_blocks):
     """Build active_blocks_table [B, num_blocks] with sequential block mapping."""
     table = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
     return np.tile(table, (batch, 1))
 
 
-def _build_chunk_masks(bs, num_blocks, pos_id_val):
-    """Build chunk masks [B * num_chunks, P_MAX, SCORE_FREE] uint8 in the eviction layout.
-
-    Block g of a chunk lands at partition half g%2 and free offset
-    (pair * BLOCKS_PER_FOLD + fold) * BLOCK_LEN, where fold = (g % 16) // 4
-    and pair = (g % 4) // 2. Tokens at positions >= pos_id_val are masked out.
-    """
-    num_chunks = num_blocks // BLOCKS_PER_CHUNK
-    chunk_masks = np.zeros((bs * num_chunks, P_MAX, SCORE_FREE), dtype=np.uint8)
-    for c in range(num_chunks):
-        for blk_in_chunk in range(BLOCKS_PER_CHUNK):
-            fold_idx, blk_in_fold = divmod(blk_in_chunk, BLOCKS_PER_FOLD)
-            pair_idx, half = divmod(blk_in_fold, 2)
-            f_off = (pair_idx * BLOCKS_PER_FOLD + fold_idx) * BLOCK_LEN
-            tok_start = (c * BLOCKS_PER_CHUNK + blk_in_chunk) * BLOCK_LEN
-            n_valid = int(np.clip(pos_id_val - tok_start, 0, BLOCK_LEN))
-            if n_valid > 0:
-                p_slice = slice(0, HALF_P) if half == 0 else slice(HALF_P, P_MAX)
-                chunk_masks[c::num_chunks, p_slice, f_off : f_off + n_valid] = 1
-    return chunk_masks
-
-
-def _generate_inputs(bs, q_head, bucket_size, pos_id_val, seed=42):
+def _generate_inputs(bs, q_head, bucket_size, pos_id_val, s_active, seed=42):
     """Generate all kernel inputs for the given config."""
     _rng.reset(seed)
 
     num_blocks = bucket_size // BLOCK_LEN
 
-    q_bf16 = static_cast(_rng.randn(bs, q_head, 1, D_HEAD).numpy(), nl.bfloat16)
+    q_bf16 = static_cast(_rng.randn(bs, q_head, s_active, D_HEAD).numpy(), nl.bfloat16)
     k_blocks_bf16 = static_cast(_rng.randn(num_blocks, BLOCK_LEN, D_HEAD).numpy(), nl.bfloat16)
     v_blocks_bf16 = static_cast(_rng.randn(num_blocks, BLOCK_LEN, D_HEAD).numpy(), nl.bfloat16)
 
@@ -170,11 +197,11 @@ def _generate_inputs(bs, q_head, bucket_size, pos_id_val, seed=42):
 
     return {
         "q": q_bf16,
-        "k_active": static_cast(_rng.randn(bs, D_HEAD).numpy(), nl.bfloat16),
-        "v_active": static_cast(_rng.randn(bs, D_HEAD).numpy(), nl.bfloat16),
+        "k_active": static_cast(_rng.randn(bs, s_active, D_HEAD).numpy(), nl.bfloat16),
+        "v_active": static_cast(_rng.randn(bs, s_active, D_HEAD).numpy(), nl.bfloat16),
         "k_prior": k_cache_3d,
         "v_prior": v_cache_3d,
-        "mask": _build_chunk_masks(bs, num_blocks, pos_id_val),
+        "mask": _build_token_mask(bs, q_head, pos_id_val, s_active),
         "identity_hbm": np.eye(P_MAX, dtype=ml_dtypes.bfloat16),
         "active_blocks_table": _build_active_blocks_table(bs, num_blocks),
     }
@@ -191,7 +218,7 @@ def _run_attention_mxfp8_tkg_test(
     bucket_size = max(cfg.pos_id, min_chunks * CHUNK_TOKENS)
     bucket_size = (bucket_size + CHUNK_TOKENS - 1) // CHUNK_TOKENS * CHUNK_TOKENS
 
-    kernel_input = _generate_inputs(cfg.bs, cfg.q_head, bucket_size, cfg.pos_id)
+    kernel_input = _generate_inputs(cfg.bs, cfg.q_head, bucket_size, cfg.pos_id, cfg.s_active)
 
     framework = UnitTestFramework(
         test_manager=test_manager,
@@ -199,7 +226,7 @@ def _run_attention_mxfp8_tkg_test(
         kernel_input_generator=lambda _: kernel_input,
         torch_ref=attention_mxfp8_tkg_torch_ref,
         output_tensor_descriptor=lambda _: {
-            "out_hbm": np.zeros((cfg.bs, cfg.q_head, D_HEAD), dtype=ml_dtypes.bfloat16)
+            "out_hbm": np.zeros((cfg.bs, cfg.q_head, cfg.s_active, D_HEAD), dtype=ml_dtypes.bfloat16)
         },
     )
     framework.run_test(
@@ -226,9 +253,10 @@ class TestAttentionMxfp8Tkg:
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     @pytest.mark.coverage_parametrize(
         bs=[1, 2, 4, 8],
-        q_head=[64],  # kernel requires q_head == 64
+        q_head=[32, 64],
         pos_id=[2048, 3000, 8192, 65536, 131072, 524288],
         lnc=[1, 2],
+        s_active=[1, 2, 4, 8],
         coverage="pairs",
         enable_automatic_boundary_tests=False,
     )
@@ -240,12 +268,13 @@ class TestAttentionMxfp8Tkg:
         q_head: int,
         pos_id: int,
         lnc: int,
+        s_active: int,
         is_negative_test_case: bool,
     ):
         """Pairwise sweep over bs/pos_id/lnc plus boundary negative tests for kernel asserts."""
         _run_attention_mxfp8_tkg_test(
             test_manager=test_manager,
             platform_target=platform_target,
-            cfg=Mxfp8AttnTkgTestConfig(pos_id=pos_id, bs=bs, q_head=q_head, lnc=lnc),
+            cfg=Mxfp8AttnTkgTestConfig(pos_id=pos_id, bs=bs, q_head=q_head, lnc=lnc, s_active=s_active),
             is_negative_test_case=is_negative_test_case,
         )

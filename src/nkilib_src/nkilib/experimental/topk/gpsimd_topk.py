@@ -32,10 +32,36 @@ import numpy as np
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 
+# SENTINELS. The kernel is MIXED PRECISION, and which sentinel is legal depends on the
+# dtype of the buffer being written:
+#     phase 1   src_snake ....... bfloat16   padding -inf; NaN folded to BFLOAT16_MIN
+#     phase 2   sort buffers .... float32    padding FLOAT32_MIN; real -inf to NEG_INF_FLOOR
+#     output    topk_values ..... bfloat16   (== inp.dtype)
+# So NEG_INF_FLOOR is a FLOAT32-ONLY value despite the kernel's input and output being
+# bfloat16: _clamp_sort_keys writes it from a float32 floor_tile into the float32 phase-2
+# sort buffers, and it is never stored to a bfloat16 buffer. Phase 2 reloads through
+# float32 (a bfloat16 -inf widens to float32 -inf exactly), clamps, then narrows once on
+# the output store.
+
 # Smallest finite bfloat16 value, used to pad snake slots that hold no real data.
 BFLOAT16_MIN = -3.3895314e38  # most-negative bf16; padded slots never enter the top-k.
+# Also the phase-1 NaN fold target. The asymmetry with NEG_INF_FLOOR below is forced by
+# the dtype: bfloat16 has NO unrepresentable band to hide a sentinel in, so the most
+# negative value phase 1 can write is this FINITE one, and it is therefore caller-visible
+# (a NaN input slot comes back as BFLOAT16_MIN). That is accepted -- NaN has no ordering,
+# so no correct value was available to return -- and the pairing check exempts exactly
+# this substitution. Phase 2 needs no such compromise because float32 has the band.
 # Most-negative float32, used to pad the sort buffer so padding never wins.
 FLOAT32_MIN = float(np.finfo(np.float32).min)
+# Sort-key floor for REAL -inf data, one float32 ULP above the FLOAT32_MIN padding
+# sentinel. See _clamp_sort_keys for why the phase-2 sort needs a three-level ordering
+#     FLOAT32_MIN (padding)  <  NEG_INF_FLOOR (real -inf)  <  every finite bf16
+# and why raising real -inf to this particular value is NOT caller-visible: it lands in the
+# band bfloat16 cannot represent finitely (bf16 saturates to -inf below about -3.3962e38,
+# and this is -3.4028233e38, ~6.6e35 past it), so the float32 -> bfloat16 cast on the
+# output store maps it back to EXACTLY -inf. A floor just above BFLOAT16_MIN instead stays
+# finite in bfloat16 and leaks into the returned values.
+NEG_INF_FLOOR = float(np.nextafter(np.float32(FLOAT32_MIN), np.float32(0)))
 
 # nisa.topk runs one independent top-k per group of 16 partitions.
 PARTS_PER_GROUP = 16
@@ -199,12 +225,151 @@ def _valid_desnake_col_runs(k: int, k_cols: int, k_pad: int) -> Tuple[Tuple[int,
     return tuple(runs)
 
 
+def _clamp_sort_keys(buf, n_parts: int, width: int) -> None:
+    """Raise real -inf sort keys to NEG_INF_FLOOR so they cannot alias the sort marker.
+
+    THE DEFECT. The phase-2 descending sort marks a slot it has already consumed by
+    OVERWRITING it: ``nc_match_replace8(..., imm=float("-inf"))`` replaces the matched
+    value with -inf. A real -inf in the DATA is then bit-identical to a consumed slot.
+    match_replace8 reports the FIRST occurrence of each value max8 selected, so once any
+    pass has stamped a marker at a lower buffer position, a later pass that legitimately
+    selects a real -inf matches the STALE MARKER instead of the real element and reports
+    its position. That position gathers the paired snake index, so the returned index
+    points at a different element than the returned value: values[i, j] is -inf while
+    input[i, indices[i, j]] is some unrelated element. The index stays IN RANGE, so no
+    range check and no value-set comparison can see it -- only an elementwise
+    value<->index pairing check. -inf is a legitimate logit (constrained and speculative
+    decoding mask disallowed tokens to -inf), so this is not garbage-in-garbage-out: the
+    input is orderable and the correct answer is well defined. A sampler consuming
+    (probability, token_id) at slot j emits the WRONG TOKEN, silently.
+
+    THE FIX. Move the real data OFF the marker value, into a sort key that is ordered
+    correctly against everything else it must be compared with. The phase-2 sort needs a
+    strict three-level ordering, and exactly one float32 value satisfies it:
+
+        FLOAT32_MIN  <  NEG_INF_FLOOR  <  every finite bfloat16 value
+        (padding)       (real -inf)        (real data)
+
+      - ABOVE FLOAT32_MIN, the sentinel the de-snake padding columns are memset to, so
+        an unwritten padding slot still loses to real -inf. This is why the clamp must
+        run BEFORE the padding memset at each call site: clamping afterwards would raise
+        the padding too and collapse the two levels.
+      - BELOW BFLOAT16_MIN (-3.3895e38), the most negative FINITE bfloat16, so real -inf
+        still loses to every real finite value and the k-largest SET is unchanged.
+      - ABOVE -inf, so it is distinguishable from the match_replace8 marker. This is the
+        whole point: the marker value no longer occurs in the data, so a stale marker can
+        never be mistaken for a real element.
+
+    WHY A FLOAT32 VALUE IN A BFLOAT16 KERNEL. ``buf`` is always one of the phase-2 FLOAT32
+    sort buffers (sv / masked_v / cv), never the bfloat16 phase-1 snake, so NEG_INF_FLOOR is
+    representable exactly where it is written. The bfloat16 legs are the phase-1 snake and
+    the output store; the reload into phase 2 widens bfloat16 -> float32 (a bfloat16 -inf
+    widens to float32 -inf exactly), and the narrowing happens once, on the store. That
+    single narrowing cast is not a hazard to work around -- it is the mechanism the fix
+    relies on, per the next paragraph.
+
+    WHY THIS IS NOT CALLER-VISIBLE. Raising the sort key would normally corrupt the
+    returned VALUE -- trading a wrong index for a wrong value, which is no fix at all.
+    It does not here, because of where NEG_INF_FLOOR sits relative to bfloat16's dynamic
+    range. The kernel's returned values are bfloat16, and bfloat16 saturates to -inf for
+    anything below about -3.3962e38. NEG_INF_FLOOR is -3.4028233e38, comfortably past
+    that threshold, so the float32 -> bfloat16 cast on the output store maps it back to
+    EXACTLY -inf -- bit-identical to the true value. The raise is visible only inside the
+    float32 sort buffers and is undone by the output cast.
+
+    This is the specific reason a floor chosen just above BFLOAT16_MIN does NOT work:
+    that lands in bfloat16's FINITE range, so it survives the output cast as
+    -3.3895e38 and leaks into the returned values as a value the input never contained.
+    The usable window is the part of (FLOAT32_MIN, BFLOAT16_MIN) that overflows bfloat16,
+    and NEG_INF_FLOOR takes the most-negative end of it -- one ULP above the padding
+    sentinel -- which maximises the margin to the bfloat16 saturation threshold.
+
+    WHY THIS IS PREDICATED AND NOT A max(). The obvious spelling, a single
+    ``tensor_scalar(op0=nl.maximum, operand0=NEG_INF_FLOOR)``, is WRONG: the hardware
+    maximum returns the non-NaN operand when one side is NaN, so it silently rewrites
+    every NaN in the buffer to NEG_INF_FLOOR. That destroys NaN input -- measured on
+    trn3, it turned 32/512 and 256/4096 NaN slots into -inf values paired with NaN
+    elements, i.e. it converted a clean case into a desync. Instead build an
+    ``== -inf`` predicate and write the floor only there: NaN compares equal to nothing,
+    so NaN slots are left exactly as they are, and finite slots are untouched.
+
+    The predicate also makes the clamp ORDER-INDEPENDENT with respect to the padding
+    memsets, since FLOAT32_MIN is finite and never matches ``== -inf``. The call sites
+    still clamp before their memset, which keeps the ordering argument above local and
+    obvious rather than relying on this.
+
+    Cost: TWO Vector ops over the [n_parts, width] sort buffer per sort tile, hoisted OUT
+    of the n_pass = ceil(k/8) max8 -> match_replace8 -> gather chain (32 passes at k=256,
+    each scanning the full width). The sort loop is the measured bottleneck; this adds no
+    per-pass work, so it is a fixed ~2/(3*32) of the sort's op count at k=256.
+    """
+    is_ninf = nl.ndarray((PMAX, width), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=is_ninf[nl.ds(0, n_parts), :],
+        data=buf[nl.ds(0, n_parts), nl.ds(0, width)],
+        op0=nl.equal,
+        operand0=float("-inf"),
+    )
+    # ALSO fold NaN into the same floor. NaN is not merely an aliasing problem like
+    # -inf: it is UNMATCHABLE. nc_match_replace8 finds a consumed slot by value
+    # equality, and NaN never compares equal to itself, so a NaN that max8 selects can
+    # never be matched and its reported dst_idx is UNDEFINED BY ISA CONTRACT -- for any
+    # choice of imm. That undefined position is then gathered, which pairs the returned
+    # value with an unrelated index (a value<->index desync) and, downstream, hands a
+    # consumer an in-range-but-arbitrary index to dereference.
+    #
+    # Detected as (x != x), which is true only for NaN, and folded to NEG_INF_FLOOR so
+    # every sort key is orderable and every max8 pick is matchable. NaN carries no
+    # ordering information, so mapping it to the bottom of the range loses nothing that
+    # was ever well defined -- there is no "k largest" when the input is not orderable.
+    # It buys the property that DOES matter: the kernel returns an index that faithfully
+    # pairs with the value it reports, for every input.
+    is_nan = nl.ndarray((PMAX, width), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_tensor(
+        dst=is_nan[nl.ds(0, n_parts), :],
+        data1=buf[nl.ds(0, n_parts), nl.ds(0, width)],
+        data2=buf[nl.ds(0, n_parts), nl.ds(0, width)],
+        op=nl.not_equal,
+    )
+    nisa.tensor_tensor(
+        dst=is_ninf[nl.ds(0, n_parts), :],
+        data1=is_ninf[nl.ds(0, n_parts), :],
+        data2=is_nan[nl.ds(0, n_parts), :],
+        op=nl.logical_or,
+    )
+    # tensor_copy_predicated's scalar-src form is documented but rejected by this
+    # backend's validator ('float' object has no attribute 'shape'), so materialise the
+    # floor as a full-width tile and copy from that.
+    floor_tile = nl.ndarray((PMAX, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=floor_tile[nl.ds(0, n_parts), :], value=NEG_INF_FLOOR)
+    nisa.tensor_copy_predicated(
+        dst=buf[nl.ds(0, n_parts), nl.ds(0, width)],
+        src=floor_tile[nl.ds(0, n_parts), :],
+        predicate=is_ninf[nl.ds(0, n_parts), :],
+    )
+
+
+def snake_padded_n(n: int) -> int:
+    """The ``n`` actually passed to ``nisa.topk`` for a ``n``-wide row: the 16-column snake
+    rounds the row up to a whole column per partition, ``16 * ceil(n / 16)``.
+
+    THE bound every validator must apply (here and in chunked_topk): the instruction's
+    ``n < 65536`` holds for the PADDED size, so raw widths 65,521..65,535 -- legal-looking
+    -- reach exactly 65,536 and die inside the ISA rather than at a named assert.
+    """
+    return PARTS_PER_GROUP * div_ceil(n, PARTS_PER_GROUP)
+
+
 def _validate_gpsimd_topk(config: GpsimdTopkConfig) -> None:
     """Validate that the requested shape satisfies every nisa.topk constraint."""
     n = config.vocab_size
     k = config.k
     kernel_assert(config.inp_dtype == nl.bfloat16, "gpsimd_topk requires bfloat16 input")
-    kernel_assert(8 <= n < 65536, f"gpsimd_topk requires 8 <= vocab ({n}) < 65536")
+    kernel_assert(8 <= n, f"gpsimd_topk requires vocab ({n}) >= 8")
+    kernel_assert(
+        snake_padded_n(n) < 65536,
+        f"gpsimd_topk requires the 16-padded snake width ({snake_padded_n(n)}) of vocab ({n}) to be < 65536",
+    )
     kernel_assert(1 <= k < 32768, f"gpsimd_topk requires 1 <= k ({k}) < 32768")
     kernel_assert(k <= n, f"gpsimd_topk requires k ({k}) <= vocab ({n})")
 
@@ -215,7 +380,7 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
 
     Dimensions:
         BxS: number of rows (flattened batch*sequence)
-        V:   vocab size (reduction dimension), 8 <= V < 65536
+        V:   vocab size (reduction dimension), 8 <= V and 16*ceil(V/16) < 65536
         k:   number of largest elements, 1 <= k <= V
 
     Args:
@@ -343,15 +508,77 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
     # use the proven-safe path -- default DMA mode (SWDGE keeps the store ordered with
     # its top-k producer and the reload) and a float32 value buffer (4-byte elements
     # round-trip correctly under the strided store; the reload casts bf16->f32 anyway).
+    # Many-tile end of the SAME store/reload hazard the small/partial-tile case above
+    # describes: under dge_mode.none the de-snake stores are unordered against their
+    # consumer, and the number in flight grows as n_tiles = ceil(per_lnc_BxS / 8). An
+    # end-to-end gpt-oss-120b decode run (bs4: 0/640 -> 640/640 requests) was fixed by
+    # capping the unordered path at n_tiles < 8, but that cap is NOT the fix it was
+    # believed to be, for two reasons found by the ordering audit:
+    #
+    #   1. Its stated mechanism is impossible as written. The claim was that the reload
+    #      overtakes the store, so `pos` holds garbage and "the gather faults". `pos` is
+    #      CLAMPED to [0, HALF-1] / [0, k_pad-1] at both nc_n_gather sites before it is
+    #      ever used as a gather index, so a garbage `pos` cannot produce an
+    #      out-of-bounds gather. Whatever the cap fixed, it was not that.
+    #   2. It moves FIVE things at once. Because the single `fast_dma_safe` predicate was
+    #      overloaded, lowering it flipped the de-snake DGE mode AND the value-buffer
+    #      dtype AND three unrelated cross-engine SBUF sync gates (the valley sync, the
+    #      out_i sync, and the A-half copy method). Any one of those could have been the
+    #      actual repair, so the tile count is not established as the causal variable.
+    #
+    # The predicate is therefore SPLIT into the two independent concerns it conflated, and the
+    # DGE mode is no longer one of them -- see THE STORE/RELOAD RACE IS REAL below.
+    #
+    # `fast_dma_safe` keeps its ORIGINAL meaning and its original definition: this
+    # shard's phase-1 tiles are all full 128-partition tiles, which is what makes the
+    # bf16 de-snake round trip safe against the narrow-dtype strided store. It no longer
+    # selects the DGE mode. The empirical n_tiles < 8 cap stays REMOVED: it was a threshold
+    # standing in for an ordering guarantee, and the ordering is now unconditional.
     fast_dma_safe = (per_lnc_BxS % GROUPS_PER_TILE == 0) and (BxS == n_prgs * per_lnc_BxS)
-    # Fast path: dge_mode.none (descriptors generated off-GpSIMD, max load/compute
-    # overlap). Safe path: dge_mode.unknown -> let the COMPILER pick the DGE mode. The
-    # compiler-selected mode preserves the de-snake-store -> reload ordering on the SAME
-    # private_hbm region (validated correct on hardware for all small/odd shapes); an
-    # explicitly-forced SWDGE was observed to STILL drop values on the par_dim==16 case,
-    # so do not pin it. HWDGE cannot generate the strided de-snake descriptor pattern
-    # ([NCC_IBIR098]), so it is never used for the de-snake.
-    desnake_dge = nisa.dge_mode.none if fast_dma_safe else nisa.dge_mode.unknown
+    # --- THE STORE/RELOAD RACE IS REAL, AND NOT CONFINED TO PARTIAL TILES ---------------
+    # dge_mode.unknown UNCONDITIONALLY (it used to be dge_mode.none whenever fast_dma_safe).
+    # dge_mode.none pre-generates the de-snake descriptors out-of-band and takes the store off
+    # the GpSIMD engine, which is exactly why nothing then orders that store against the
+    # phase-2 reload of the SAME private_hbm region. The compiler-selected mode does preserve
+    # that ordering. HWDGE cannot generate the strided de-snake descriptor pattern
+    # ([NCC_IBIR098]) so it is never chosen here, and an explicitly-forced SWDGE was observed
+    # to STILL drop values on the par_dim==16 case -- so let the compiler pick rather than
+    # pinning a mode.
+    #
+    # MEASURED, at 128 ranks through the GPT-OSS tail (gbs=1024, two hops, 8 rows/rank):
+    # 2 of 128 row blocks returned REPEATED vocab ids with the top-k VALUES exactly right;
+    # with this one line changed, all four gates pass on all 128 ranks at gbs 128, 512 AND
+    # 1024. The asymmetry is the tell: values and indices ride in SEPARATE private_hbm buffers
+    # (asc_val_hbm, asc_idx_hbm) of different widths, so a race can take the index buffer while
+    # the value buffer lands in time -- correct values carrying wrong, typically duplicated,
+    # token ids, which is the failure mode a sampler cannot detect.
+    #
+    # Why it hid for so long, and why a tile-count threshold could never be the fix: exposure
+    # tracks how busy the DMA subsystem is when phase 1 runs, not the tile count. Standalone the
+    # same reduce geometry and tie density is clean over 544 independent blocks; at 32 ranks the
+    # full tail dataflow is clean over 128 blocks (its de-interleave moves 64 KB against
+    # 6.4 MB at 128 ranks); and at 128 ranks gbs 128 and 512 were clean while only gbs=1024
+    # failed. Same code path in every one of those -- red_rows is 8 and fast_dma_safe is True at
+    # BxS 1, 4 and 8 alike -- so nothing about the shape distinguishes them. Only the amount of
+    # collective traffic landing just before the top-k does.
+    #
+    # COST: +2.7% on chunked_topk at the GPT-OSS vocab (A/B in one session, TpbSgCyclesSum:
+    # +2.9% at BxS=1, +1.7% at BxS=4, +3.5% at BxS=8). That is the price of the ordering.
+    #
+    # If someone wants that back, the tempting refinement is to keep dge_mode.none on the STORE
+    # and take the compiler's mode only for the RELOAD. Do NOT land that on the strength of a
+    # green 128-rank run: this defect showed on 2 of 128 row blocks, so a variant that merely
+    # narrows the window passes that test by luck. dge_mode.unknown is worth its 2.7% because it
+    # is a categorical ordering guarantee rather than a statistical one, and the failure it
+    # prevents is a silently wrong token id.
+    desnake_dge = nisa.dge_mode.unknown
+    # KNOWN-WEAKER INVARIANT: the bf16 fast-path de-snake store was originally validated
+    # under the pinned dge_mode.none; with the mode now compiler-chosen, the bf16/mode
+    # pairing's evidence is the 128-rank four-gate pass above plus the two-program
+    # DMA-pressure perms in test_gpsimd_topk (the lnc=2 specdecode/-inf/padded rows exist
+    # as the canary for exactly this). If a compiler update starts dropping the narrow
+    # strided store again, flip this to unconditional float32 first (costs the halved
+    # value-bounce bytes, changes no results) and bisect after.
     asc_val_dtype = nl.bfloat16 if fast_dma_safe else nl.float32
     asc_val_hbm = nl.ndarray((BxS, k_pad), dtype=asc_val_dtype, buffer=nl.private_hbm)
     asc_idx_hbm = nl.ndarray((BxS, k_pad), dtype=nl.float32, buffer=nl.private_hbm)
@@ -513,9 +740,26 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             src_snake = nl.ndarray((par_dim, n_cols), dtype=nl.bfloat16, buffer=nl.sbuf)
             # vocab % 16 != 0: snake positions whose vocab index >= vocab are padding
             # (partition q_full's tail, plus any fully-padded higher partitions).
-            # memset the whole tile to BFLOAT16_MIN so every padded slot is guaranteed
-            # to lose the top-k; the valid contiguous prefix is then DMA'd over the top.
-            nisa.memset(dst=src_snake, value=BFLOAT16_MIN)
+            # memset the whole tile so every padded slot loses the top-k; the valid
+            # contiguous prefix is then DMA'd over the top.
+            #
+            # The sentinel is -inf, NOT the most-negative FINITE bf16 (BFLOAT16_MIN).
+            # BFLOAT16_MIN is a SECOND value<->index defect, independent of the phase-2
+            # marker collision: being finite, it is strictly GREATER than a real -inf
+            # logit, so on a row where masking pushed real tokens to -inf every padding
+            # slot outranks the real data and nisa.topk pulls padding into the top-k. The
+            # kernel then returns BFLOAT16_MIN -- a value the input never contained -- and
+            # an index that the final [0, vocab) clamp pins to vocab-1, so the pair is
+            # (value not in input, index of an unrelated element). Measured on trn3 at
+            # vocab 3142 and 1022: values=[-3.3895e38] vs input[indices]=[-inf].
+            #
+            # -inf as the sentinel restores the invariant that padding can never outrank
+            # real data: it is <= every real value including -inf itself. When it ties
+            # real -inf and a padding slot is still selected, the returned value is -inf
+            # and the clamped index addresses a real element that is ALSO -inf, so the
+            # value is right and the pairing holds. For all finite input nothing changes,
+            # since both sentinels already lost to every finite value.
+            nisa.memset(dst=src_snake, value=float("-inf"))
 
             for g in nl.affine_range(n_rows):
                 row = tile_row_start + g
@@ -545,6 +789,43 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
         # n = full_n (NOT vocab): with the blocked layout the valid vocab elements are
         # not a contiguous prefix of snake positions, so all full_n snake slots are
         # active. Padded slots hold BFLOAT16_MIN and never win the top-k.
+        # Fold NaN out of the snake BEFORE nisa.topk selects from it. This is the
+        # earliest point NaN can do damage and the phase-2 sort-key clamps are far too
+        # late: nisa.topk already picked its k winners and emitted their paired snake
+        # positions, so a NaN that confused the selection has ALREADY produced a
+        # (value, position) pair that does not correspond. Folding here means every
+        # value nisa.topk ranks is orderable, so the pairing it emits is meaningful and
+        # every downstream match_replace8 lookup is matchable.
+        #
+        # (x != x) is true only for NaN. Fold to BFLOAT16_MIN -- the same value the
+        # padding memset uses -- so a NaN slot simply loses the top-k like padding does.
+        #
+        # NOT NEG_INF_FLOOR: src_snake is BFLOAT16, and the floor's whole property is that
+        # bfloat16 cannot hold it finitely, so storing it here would saturate straight back
+        # to -inf. BFLOAT16_MIN is the most negative value this dtype can express. That is
+        # sufficient for phase 1, where the requirement is only that every key nisa.topk
+        # ranks be ORDERABLE -- there is no match_replace8 marker yet to collide with, which
+        # is the separate problem NEG_INF_FLOOR exists to solve in phase 2.
+        # NaN carries no ordering information, so there is nothing well defined to lose:
+        # with NaN present there is no "k largest". What this buys is the property that
+        # matters to every consumer: the returned index faithfully pairs with the
+        # returned value, so an index handed to a downstream table gather is the one the
+        # kernel actually selected rather than an arbitrary in-range value.
+        _nan_mask = nl.ndarray((par_dim, n_cols), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=_nan_mask[nl.ds(0, par_dim), :],
+            data1=src_snake[nl.ds(0, par_dim), nl.ds(0, n_cols)],
+            data2=src_snake[nl.ds(0, par_dim), nl.ds(0, n_cols)],
+            op=nl.not_equal,
+        )
+        _nan_floor = nl.ndarray((par_dim, n_cols), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(dst=_nan_floor[nl.ds(0, par_dim), :], value=BFLOAT16_MIN)
+        nisa.tensor_copy_predicated(
+            dst=src_snake[nl.ds(0, par_dim), nl.ds(0, n_cols)],
+            src=_nan_floor[nl.ds(0, par_dim), :],
+            predicate=_nan_mask[nl.ds(0, par_dim), :],
+        )
+
         val_snake = nl.ndarray((par_dim, k_pad), dtype=nl.bfloat16, buffer=nl.sbuf)
         idx_snake = nl.ndarray((par_dim, k_pad), dtype=nl.uint32, buffer=nl.sbuf)
         nisa.topk(val_dst=val_snake[:, nl.ds(0, k)], idx_dst=idx_snake[:, nl.ds(0, k)], src=src_snake, n=full_n)
@@ -575,17 +856,12 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
         # padding slots (k_pad > k) carry garbage here and are masked per-path after the
         # phase-2 reload (see the top-k call comment above).
         # The de-snake stores are STRIDED SBUF->HBM writes (.ap partition-stride k_cols).
-        # HWDGE cannot generate descriptors for that pattern ([NCC_IBIR098]), so instead of
-        # the default SWDGE (descriptors generated by the GpSIMD engine, which serializes
-        # them with the GpSIMD top-k), use dge_mode.none: the Neuron Runtime pre-generates
-        # the descriptors into HBM before execution, taking the store OFF the GpSIMD engine
-        # so it overlaps the next tile's top-k.
+        # HWDGE cannot generate descriptors for that pattern ([NCC_IBIR098]). The mode is
+        # desnake_dge = dge_mode.unknown, UNCONDITIONALLY -- see the desnake_dge comment
+        # above for the measured silent-index-corruption story and why no faster mode may
+        # be restored here (dge_mode.none's out-of-band descriptors drop the ordering
+        # against the phase-2 reload of this same private_hbm region).
         tile_out_off = tile_row_start * k_pad
-        # De-snake store DMA mode is selected by fast_dma_safe (see desnake_dge above):
-        # dge_mode.none for full-tile shards (off-GpSIMD, max overlap), SWDGE for shards
-        # with any partial/single-row tile (keeps the store ordered with its producing
-        # top-k so the phase-2 reload of the same private_hbm region cannot race it --
-        # the low/odd-batch correctness fix).
         nisa.dma_copy(
             dst=asc_val_flat.ap(pattern=[[k_cols, par_dim], [1, k_cols]], offset=tile_out_off),
             src=val_snake[nl.ds(0, par_dim), nl.ds(0, k_cols)],
@@ -661,11 +937,11 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             n_pass_h = div_ceil(HALF, 8)
             two = 2 * n_srows  # partitions used: A on [0:n_srows), B on [n_srows:2n)
             # Split-load: partition r holds row r's LOW half [0:HALF]; partition
-            # r+n_srows holds row r's HIGH half [HALF:k_pad]. Use the DEFAULT DMA mode
-            # (SWDGE), NOT dge_mode.none: the reload reads the SAME private_hbm region the
-            # phase-1 de-snake just wrote, and dge_mode.none's out-of-band descriptors
-            # dropped the store->reload ordering, letting this reload race the de-snake
-            # store on small/partial tiles (corrupting odd-per_lnc shapes on device only).
+            # r+n_srows holds row r's HIGH half [HALF:k_pad]. This reload reads the SAME
+            # private_hbm region the phase-1 de-snake just wrote, so it uses desnake_dge
+            # (= dge_mode.unknown, unconditional -- see its definition comment): any mode
+            # with out-of-band descriptors drops the store->reload ordering and lets this
+            # reload race the de-snake store, reading stale/zeroed HBM on device only.
             sv = nl.ndarray((PMAX, HALF), dtype=nl.float32, buffer=nl.sbuf)
             si = nl.ndarray((PMAX, HALF), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(
@@ -688,6 +964,11 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
                 src=asc_idx_hbm[nl.ds(sort_row_start, n_srows), nl.ds(HALF, HALF)],
                 dge_mode=desnake_dge,
             )
+            # Lift real -inf sort keys off the match_replace8 marker value (see
+            # _clamp_sort_keys). Covers the k_pad == k case, where sv is the buffer the
+            # half-sort actually reads; when k_pad > k the re-split below overwrites sv
+            # from masked_v, which is clamped separately at its own reload.
+            _clamp_sort_keys(sv, two, HALF)
             # Mask the de-snaked padding (unwritten snake positions [k, k_pad)) before the
             # half-sort. The phase-1 val_snake[:, k:k_pad] memset does NOT cover it: that
             # writes snake COLUMNS [k, k_pad), but the de-snake reads columns [0, k_cols) and
@@ -710,6 +991,10 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
                     src=asc_val_hbm[nl.ds(sort_row_start, n_srows), :],
                     dge_mode=desnake_dge,
                 )
+                # Clamp BEFORE the padding memset: the clamp must not raise the padding
+                # sentinel, or FLOAT32_MIN (padding) and NEG_INF_FLOOR (real -inf) would
+                # collapse to one level and a padding slot could tie real -inf again.
+                _clamp_sort_keys(masked_v, n_srows, k_pad)
                 _pad_runs = _invalid_desnake_col_runs(k, k_cols, k_pad)
                 for _run_idx in range(len(_pad_runs)):
                     _col_start = _pad_runs[_run_idx][0]
@@ -741,6 +1026,21 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
                     vals=hv[nl.ds(0, two), cur],
                     imm=float("-inf"),
                 )
+                # Bound the gather index. nc_match_replace8 reports the position of the
+                # FIRST OCCURRENCE of each value from max8; when a value cannot be
+                # matched -- NaN never compares equal to itself, and duplicate extremes
+                # let one pass consume a slot a later pass still searches for -- the
+                # corresponding dst_idx is undefined. nc_n_gather requires
+                # indices < data.size / data.shape[0] and does not check, so an
+                # undefined position becomes an out-of-bounds indirect DGE access that
+                # faults the device. Garbage logits (NaN/Inf mixed with huge finite
+                # values) reach here in practice, so clamp rather than assume.
+                nisa.tensor_scalar(
+                    dst=pos[nl.ds(0, two), :],
+                    data=pos[nl.ds(0, two), :],
+                    op0=nl.minimum,
+                    operand0=HALF - 1,
+                )
                 nisa.nc_n_gather(
                     dst=hsnake[nl.ds(0, two), cur], data=si[nl.ds(0, two), :], indices=pos[nl.ds(0, two), :]
                 )
@@ -753,24 +1053,35 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             # then reverse on the free dim with one nc_n_gather (reversed indices).
             mv = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
             mi = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
-            # A half (already on partitions [0:n_srows)). The A-half COPY METHOD depends
-            # on fast_dma_safe. hsnake is written column-by-column by the per-pass
-            # nc_n_gather (GpSIMD engine) above. On a SINGLE-row sort (n_srows == 1, from
-            # an odd per_lnc_BxS shard) a Vector/Scalar tensor_copy of the full [0:HALF]
-            # width was observed on hardware to race the LAST gather pass (columns
-            # [HALF-8:HALF]) and read stale/zero for that tail -> mv stayed correct but mi
-            # LOST its last 8 indices (dropped-index bug, proven via device dump). The
-            # B-half already uses dma_copy and never showed the tail zeroing, so the safe
-            # path routes the A-half through the same fully-synchronized DMA. For
-            # fast_dma_safe shards (GPT-OSS; n_srows >= 8) the tensor_copy is correct (no
-            # tail zeroing was ever observed at n_srows >= 8) and is the cheaper original
-            # path, so keep it there to avoid any perf change on the high-batch win.
-            if fast_dma_safe:
-                nisa.tensor_copy(dst=mv[nl.ds(0, n_srows), nl.ds(0, HALF)], src=hv[nl.ds(0, n_srows), :])
-                nisa.tensor_copy(dst=mi[nl.ds(0, n_srows), nl.ds(0, HALF)], src=hsnake[nl.ds(0, n_srows), :])
-            else:
-                nisa.dma_copy(dst=mv[nl.ds(0, n_srows), nl.ds(0, HALF)], src=hv[nl.ds(0, n_srows), :])
-                nisa.dma_copy(dst=mi[nl.ds(0, n_srows), nl.ds(0, HALF)], src=hsnake[nl.ds(0, n_srows), :])
+            # A half (already on partitions [0:n_srows)). Both halves go through a
+            # synchronizing SBUF->SBUF DMA, UNCONDITIONALLY -- formerly this was gated on
+            # fast_dma_safe, with a tensor_copy for the value half on full-tile shards.
+            #
+            # hsnake is written column-by-column by the per-pass nc_n_gather (GpSIMD); a
+            # tensor_copy reading the full [0:HALF] width races the LAST gather pass and
+            # reads its tail columns as stale zeros -> snake position 0 -> vocab index 0 at
+            # the row tail, values left correct. First attributed to n_srows == 1 only, then
+            # measured on trn3 at n_srows == 8 (BxS=16, lnc=2, v=3142, k=256: 63 mis-paired
+            # slots, and only when run alongside other shapes -- the signature of a timing
+            # race, not a data-dependent bug). So the shape gate was already known-wrong for
+            # the index half.
+            #
+            # The VALUE half is now routed the same way, because its old justification does
+            # not hold either. It read: "hv is written by max8 (Vector), the same engine that
+            # reads it here, so there is no cross-engine hazard." The premise is false --
+            # nisa.tensor_copy takes engine=unknown by default, i.e. the COMPILER selects
+            # among Vector/Scalar/GpSimd based on engine workload (see nki/isa/_copy.py).
+            # Nothing pins this copy to Vector, so "the same engine" is an assumption the
+            # code never enforces, and if the compiler places it on Scalar or GpSimd the
+            # value half has exactly the cross-engine hazard the index half has.
+            #
+            # Using DMA rather than pinning engine=vector is deliberate: max8 /
+            # nc_match_replace8 are Vector and the sort is the measured bottleneck, so
+            # forcing these copies onto Vector would add work to the critical engine. The
+            # DMA keeps them off all three compute engines. This is also what the
+            # not-fast_dma_safe path always did, so it is the already-proven spelling.
+            nisa.dma_copy(dst=mv[nl.ds(0, n_srows), nl.ds(0, HALF)], src=hv[nl.ds(0, n_srows), :])
+            nisa.dma_copy(dst=mi[nl.ds(0, n_srows), nl.ds(0, HALF)], src=hsnake[nl.ds(0, n_srows), :])
             # B half: shift partitions [n_srows:2n) -> a contiguous [0:n_srows) scratch.
             bv = nl.ndarray((PMAX, HALF), dtype=nl.float32, buffer=nl.sbuf)
             bi = nl.ndarray((PMAX, HALF), dtype=nl.float32, buffer=nl.sbuf)
@@ -804,24 +1115,32 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             # ops, down from 11 (the 4 write-backs are eliminated).
             mv2 = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
             mi2 = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
-            # Order the valley writes before the merge reads them. mv[:, HALF:] / mi[:, HALF:]
-            # are written by the reverse-gather (nc_n_gather, GpSIMD engine) just above; the
-            # merge's first stage reads the full valley via a reshape view on a DIFFERENT
-            # engine (Vector). On a small/partial tile (n_srows < GROUPS_PER_TILE, i.e. the
-            # not-fast_dma_safe shards -- BxS <= 4, the decode regime) that cross-engine read
-            # was observed on hardware to RACE the reverse-gather and read the high half as
-            # stale zeros, so the whole B (high) half -- including the global max -- was
-            # dropped by the first max/min (device-only; the simulator serializes and never
-            # reproduced it). Route the valley through a synchronizing SBUF->SBUF DMA into the
-            # merge's source buffers so stage 0 reads the settled valley. Full-tile shards
-            # (fast_dma_safe; n_srows >= 8, GPT-OSS) never showed the race and keep the cheaper
-            # in-place read.
-            if not fast_dma_safe:
-                mv_sync = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
-                mi_sync = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_copy(dst=mv_sync[nl.ds(0, n_srows), :], src=mv[nl.ds(0, n_srows), :])
-                nisa.dma_copy(dst=mi_sync[nl.ds(0, n_srows), :], src=mi[nl.ds(0, n_srows), :])
-                mv, mi = mv_sync, mi_sync
+            # Order the valley writes before the merge reads them. mv[:, HALF:] /
+            # mi[:, HALF:] are written by the reverse-gather (nc_n_gather, GpSIMD engine)
+            # just above; the merge's first stage reads the full valley via a reshape view
+            # on a DIFFERENT engine (tensor_tensor, Vector). That cross-engine read was
+            # observed on hardware to RACE the reverse-gather and read the high half as
+            # stale zeros, dropping the whole B (high) half -- including the global max --
+            # in the first max/min (device-only; the simulator serializes and never
+            # reproduced it). Route the valley through a synchronizing SBUF->SBUF DMA into
+            # the merge's source buffers so stage 0 reads the settled valley.
+            #
+            # UNCONDITIONAL, formerly `if not fast_dma_safe`. The gate was unsound. It
+            # encoded a belief that the race needs a small/partial tile (n_srows < 8), but
+            # the producer/consumer pair here does not depend on n_srows at all: the
+            # gather writes mv/mi[:, HALF:] on GpSIMD and the merge reads them on Vector at
+            # EVERY n_srows, and widening n_srows makes the gather take LONGER, which
+            # widens the window rather than closing it. The identical belief about the
+            # sibling `hsnake` pair -- documented as racing "only at n_srows == 1" -- was
+            # measured racing at n_srows == 8, which is direct evidence that
+            # "n_srows >= 8 never showed the race" means only that no test had looked.
+            # "Never observed" on shapes whose sync was never removed for a controlled A/B
+            # is not evidence of safety. Cost is two SBUF->SBUF DMAs per sort tile.
+            mv_sync = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
+            mi_sync = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=mv_sync[nl.ds(0, n_srows), :], src=mv[nl.ds(0, n_srows), :])
+            nisa.dma_copy(dst=mi_sync[nl.ds(0, n_srows), :], src=mi[nl.ds(0, n_srows), :])
+            mv, mi = mv_sync, mi_sync
             src_v, src_i, dst_v, dst_i = mv, mi, mv2, mi2
             s = HALF
             while s >= 1:
@@ -864,12 +1183,11 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             # k_pad = k_cols*16 >= 8 already satisfies max8's >= 8 elements requirement.
             cv = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
             ci = nl.ndarray((PMAX, k_pad), dtype=nl.float32, buffer=nl.sbuf)
-            # Reload DMA mode follows desnake_dge: SWDGE for partial/odd shards keeps this
-            # reload of the SAME private_hbm region ordered AFTER the phase-1 de-snake
-            # store (dge_mode.none's out-of-band descriptors dropped that ordering and let
-            # the reload race the store on small/partial tiles, reading stale/zeroed HBM
-            # and corrupting values+indices on device only). Full-tile shards keep the
-            # fast dge_mode.none path.
+            # Reload DMA mode is desnake_dge (= dge_mode.unknown, unconditional -- see its
+            # definition comment): this reload reads the SAME private_hbm region the
+            # phase-1 de-snake store wrote, and any mode with out-of-band descriptors
+            # drops that store->reload ordering, reading stale/zeroed HBM and corrupting
+            # values+indices on device only.
             nisa.dma_copy(
                 dst=cv[nl.ds(0, n_srows), :],
                 src=asc_val_hbm[nl.ds(sort_row_start, n_srows), :],
@@ -902,6 +1220,10 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             # _pad_runs is a compile-time tuple of (col_start, col_len); the parser
             # frontend rejects tuple-unpacking in a for-target ("expecting simple
             # variable"), so iterate by index and read the two fields explicitly.
+            # Lift real -inf sort keys off the match_replace8 marker value (see
+            # _clamp_sort_keys). Runs BEFORE the padding memset below so the padding
+            # sentinel stays strictly below the real--inf floor.
+            _clamp_sort_keys(cv, n_srows, k_pad)
             _pad_runs = _invalid_desnake_col_runs(k, k_cols, k_pad)
             if k_pad > k:
                 for _run_idx in range(len(_pad_runs)):
@@ -921,6 +1243,16 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
                     vals=out_v[nl.ds(0, n_srows), cur],
                     imm=float("-inf"),
                 )
+                # Bound the gather index for the same reason as the split path above: an
+                # unmatchable value (NaN, or a duplicate extreme already consumed by an
+                # earlier pass) leaves dst_idx undefined, and nc_n_gather does not range
+                # check its indices.
+                nisa.tensor_scalar(
+                    dst=pos[nl.ds(0, n_srows), :],
+                    data=pos[nl.ds(0, n_srows), :],
+                    op0=nl.minimum,
+                    operand0=k_pad - 1,
+                )
                 # Gather the paired snake-position indices at those buffer positions
                 # (remapped to vocab indices in the block below).
                 nisa.nc_n_gather(
@@ -928,20 +1260,27 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
                 )
             # Order the gather writes before the shared index-remap reads them. out_i is
             # written ONLY by nc_n_gather (GpSIMD engine) above, one 8-wide slice per pass;
-            # the remap's first op reads the whole out_i on a DIFFERENT engine (the
-            # snake->vocab bit-ops force Vector). On a small/partial tile (n_srows <
-            # GROUPS_PER_TILE, i.e. the not-fast_dma_safe shards -- BxS <= 4, the decode
-            # regime) that cross-engine read RACES the last gather pass and reads the tail
-            # columns as stale zeros -> snake position 0 -> vocab index 0 at the row tail
-            # (values stay correct; only indices corrupt). Route out_i through a
-            # synchronizing SBUF->SBUF DMA, matching the split-path valley fix above. The
-            # split and unsorted paths write out_i with tensor_copy (same engine as the
-            # remap read) so they need no sync; large-batch fast_dma_safe shards
-            # (n_srows >= 8) never showed the race and keep the cheaper in-place read.
-            if not fast_dma_safe:
-                out_i_sync = nl.ndarray((PMAX, n_pass * 8), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_copy(dst=out_i_sync[nl.ds(0, n_srows), :], src=out_i[nl.ds(0, n_srows), :])
-                out_i = out_i_sync
+            # the remap's first op reads the whole out_i on a DIFFERENT engine (a
+            # tensor_copy feeding the snake->vocab bit-ops, which force Vector). That
+            # cross-engine read RACES the last gather pass and reads the tail columns as
+            # stale zeros -> snake position 0 -> vocab index 0 at the row tail (values stay
+            # correct; only indices corrupt). Route out_i through a synchronizing
+            # SBUF->SBUF DMA, matching the split-path valley fix above.
+            #
+            # UNCONDITIONAL, formerly `if not fast_dma_safe`. Same unsound gate as the
+            # valley sync: the GpSIMD-write / Vector-read pair exists at every n_srows, and
+            # a larger n_srows lengthens the gather chain rather than shortening it. This
+            # is the sync with the largest blast radius of the three, because out_i feeds
+            # the snake->vocab remap that produces the RETURNED INDICES: a stale read here
+            # corrupts an index that a caller will use to address memory. The final
+            # [0, vocab) clamp keeps such an index in range, so this cannot itself cause an
+            # out-of-bounds access -- but it silently mis-pairs values with token ids,
+            # which is the failure mode a sampler cannot detect. The split and unsorted
+            # paths write out_i with tensor_copy (Vector, same engine as the remap read) so
+            # they are program-ordered and correctly need no sync.
+            out_i_sync = nl.ndarray((PMAX, n_pass * 8), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=out_i_sync[nl.ds(0, n_srows), :], src=out_i[nl.ds(0, n_srows), :])
+            out_i = out_i_sync
         else:
             # ===== Unsorted fast path (config.sorted == False) ================
             # Skip the descending sort entirely: the K results may be returned in any
@@ -1034,6 +1373,25 @@ def gpsimd_topk(inp: nl.NkiTensor, config: GpsimdTopkConfig) -> Tuple[nl.NkiTens
             data1=remapped_i[nl.ds(0, n_srows), :],
             data2=c_f32[nl.ds(0, n_srows), :],
             op=nl.add,
+        )
+        # Final guarantee on the public contract: every returned index is in [0, vocab).
+        # Two independent ways it could otherwise escape that range:
+        #   - 16 does not divide vocab, so the snake carries full_n - vocab padding
+        #     slots. A padded slot that ties the real data (a row of -inf logits) wins
+        #     the top-k and remaps to as much as full_n - 1.
+        #   - a gathered snake position was itself garbage, which happens when the
+        #     values are not orderable (NaN, duplicate extremes) -- see the pos clamps
+        #     at the two nc_n_gather sites above.
+        # An index outside [0, vocab) breaks the contract callers rely on, and one that
+        # indexes a per-shard table (a gather of the form table[v // shard_size]) turns
+        # into an out-of-bounds indirect DGE access that faults the device. This clamp
+        # is unconditional: it is one Vector op on the k-wide output, and restricting it
+        # to has_pad would leave the garbage-position case unguarded when 16 | vocab.
+        nisa.tensor_scalar(
+            dst=remapped_i[nl.ds(0, n_srows), :],
+            data=remapped_i[nl.ds(0, n_srows), :],
+            op0=nl.minimum,
+            operand0=float(vocab - 1),
         )
 
         nisa.dma_copy(dst=topk_values[nl.ds(sort_row_start, n_srows), :], src=out_v[nl.ds(0, n_srows), nl.ds(0, k)])

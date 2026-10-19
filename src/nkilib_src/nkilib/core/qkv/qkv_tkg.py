@@ -1452,8 +1452,8 @@ def _qkv_projection_H_column_tiled(
     # allocated at the same scope level after the projection scope closes.
     # get_free_space() already accounts for all prior allocations (stack and heap),
     # but not for these future sibling-scope allocations.
-    extra_space_needed = sizeinbytes(output_dtype)
-    for i in range(len(qkv_out_sb.shape)):
+    extra_space_needed = sizeinbytes(nl.float32)
+    for i in range(1, len(qkv_out_sb.shape)):
         extra_space_needed *= qkv_out_sb.shape[i]
 
     remaining_space = sbm.get_free_space() - extra_space_needed
@@ -1568,8 +1568,8 @@ def _qkv_projection_I_column_tiled(
     col_tiling_factor = cfg.array_tiling_factor
 
     # Reserve space for post-projection buffers
-    extra_space_needed = sizeinbytes(output_dtype)
-    for i in range(len(qkv_out_sb.shape)):
+    extra_space_needed = sizeinbytes(nl.float32)
+    for i in range(1, len(qkv_out_sb.shape)):
         extra_space_needed *= qkv_out_sb.shape[i]
 
     remaining_space = sbm.get_free_space() - extra_space_needed

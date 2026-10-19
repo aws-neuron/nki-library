@@ -68,6 +68,7 @@ class AllocationOutcome:
     physical_cores: list[int] | None = None
     position: int | None = None
     worst_case_eta: int | None = None
+    should_reset_cores: bool | None = None
 
 
 @dataclass
@@ -87,6 +88,7 @@ class CoreAllocation:
     host_id: str
     logical_core_ids: list[int]
     lnc_config: int
+    should_reset_cores: bool = True
 
     def get_core_list_str(self) -> str:
         """Get comma-separated logical core IDs for NEURON_RT_VISIBLE_CORES."""
@@ -323,6 +325,7 @@ class CoreLockManager:
                     self.host_locking_version,
                     self._entry_id,
                     ready,
+                    lnc_config,
                     caller_id=self._caller_id,
                 )
         except Exception as e:
@@ -343,6 +346,7 @@ class CoreLockManager:
                 status=AllocationStatus.ALLOCATED,
                 logical_cores=logical_cores,
                 physical_cores=allocated_physical_cores,
+                should_reset_cores=lock_result.should_reset_cores,
             )
 
         if lock_result.status in (LockStatus.DRAINING, LockStatus.IN_QUEUE):

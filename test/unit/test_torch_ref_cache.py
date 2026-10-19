@@ -17,9 +17,12 @@ S3 is mocked (no network); invalidation uses throwaway on-disk packages so the
 real AST-walk / file-read code paths are exercised without touching real source.
 """
 
+import ast
 import enum
+import glob
 import importlib
 import os
+import re
 import sys
 import tempfile
 import textwrap
@@ -32,6 +35,7 @@ import torch
 
 from ..utils import torch_ref_cache as trc
 from ..utils import torch_ref_invalidation as inval
+from ..utils.golden_provider import CachedTorchRef
 
 
 # ===========================================================================
@@ -127,9 +131,14 @@ class TestInputHash:
         def _ref(input_a):
             return input_a
 
-        opts_default = torch_ref_wrapper(_ref)._torch_ref_cache_options
-        opts_preserve = torch_ref_wrapper(_ref, preserve_lower_precision=True)._torch_ref_cache_options
-        opts_converter = torch_ref_wrapper(_ref, output_dtype_converter=lambda t: t.numpy())._torch_ref_cache_options
+        def _options(*args, **kwargs) -> dict:
+            wrapped = torch_ref_wrapper(*args, **kwargs)
+            assert isinstance(wrapped, CachedTorchRef), "torch_ref_wrapper must publish its cache options"
+            return wrapped._torch_ref_cache_options
+
+        opts_default = _options(_ref)
+        opts_preserve = _options(_ref, preserve_lower_precision=True)
+        opts_converter = _options(_ref, output_dtype_converter=lambda t: t.numpy())
 
         h_default = trc._input_hash({"__torch_ref_cache_options__": opts_default})
         h_preserve = trc._input_hash({"__torch_ref_cache_options__": opts_preserve})
@@ -199,6 +208,7 @@ class TestDependencyHash:
             h2 = inval.ref_dependency_hash(mod.ref)
 
             assert h1 != h2, "helper edit must change dep hash (else stale golden)"
+            assert h1 is not None, "a resolvable in-package module must hash"
             assert len(h1) == 16
         finally:
             sys.path.remove(tmp)
@@ -251,58 +261,267 @@ class TestDependencyHash:
             inval.dependency_hash.cache_clear()
 
 
+class TestSideEffectWrite:
+    """_side_effect_writes returns the captured (closure) variables a reference writes
+    into by subscript — the comparator-visible-side-effect pattern that broke the
+    pipeline three times when a new such ref was added without @mark_uncacheable.
+    A cache HIT skips the ref, so the stash never fires and the comparator KeyErrors.
+
+    Refs must live in a real .py file (inspect.getsource needs a source file), so
+    these write throwaway modules on disk and import the ref back."""
+
+    def _load_ref(self, tmp, body: str):
+        # body defines a factory make_ref() returning a @wraps-wrapped closure, mirroring
+        # torch_ref_wrapper. Written to a real file so inspect.getsource resolves it.
+        mod = "_se_probe"
+        with open(os.path.join(tmp, f"{mod}.py"), "w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                    import functools
+
+                    def _wrap(fn):
+                        @functools.wraps(fn)
+                        def wrapped(**kw):
+                            return fn(**kw)
+                        return wrapped
+
+                    """
+                )
+                + textwrap.dedent(body)
+            )
+        sys.path.insert(0, tmp)
+        try:
+            m = importlib.import_module(mod)
+            return m.make_ref()
+        finally:
+            sys.path.remove(tmp)
+            sys.modules.pop(mod, None)
+
+    def test_subscript_write_to_captured_var_flags(self):
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                holder = {}
+                @_wrap
+                def _ref(hidden, gamma):
+                    holder["affinities"] = hidden
+                    return {"out": gamma}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == ["holder"]
+        assert inval.ref_dependency_hash(ref) is None  # single verdict: declined to cache
+
+    def test_reports_all_distinct_captured_writes(self):
+        # Returns every distinct captured holder written (deduped), not just the first.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                extras = {}
+                aux = {}
+                @_wrap
+                def _ref(x):
+                    extras["a"] = x
+                    extras["b"] = x  # same holder again -> not duplicated
+                    aux["c"] = x
+                    return {"out": x}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == ["extras", "aux"]
+
+    def test_mutating_method_on_captured_var_not_flagged(self):
+        # Documented limitation: the scan only detects the subscript-store form (how every
+        # stash in this codebase is written). A mutating-method stash (holder.append(...))
+        # is NOT auto-flagged and needs mark_uncacheable. Guards the docstring caveat.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                seen = []
+                @_wrap
+                def _ref(x):
+                    seen.append(x)
+                    return {"out": x}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == []
+
+    def test_local_dict_write_does_not_flag(self):
+        # writing a LOCAL dict is pure — its state can't leak to a comparator, so cacheable.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                @_wrap
+                def _ref(x, y):
+                    local = {}
+                    local["k"] = x
+                    return {"out": local["k"] + y}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == []
+
+    def test_loop_variable_write_does_not_flag(self):
+        # a for-loop target is a local binding, not a captured var — must not flag.
+        tmp = tempfile.mkdtemp(prefix="trc_se_")
+        ref = self._load_ref(
+            tmp,
+            """
+            def make_ref():
+                @_wrap
+                def _ref(items):
+                    acc = {}
+                    for i in items:
+                        acc[i] = i
+                    return {"out": acc}
+                return _ref
+            """,
+        )
+        assert inval._side_effect_writes(ref) == []
+
+    def test_sourceless_ref_does_not_raise(self):
+        # getsource fails on a builtin -> return [] (no crash). The module gate in
+        # ref_dependency_hash then still declines it (fail-closed), so no stale golden.
+        assert inval._side_effect_writes(len) == []
+        assert inval.ref_dependency_hash(len) is None
+
+
+class TestIsNumericSource:
+    """_is_numeric_source decides which modules the purity scan runs on. A prefix
+    collision here would either falsely decline (numeric module missed) or, worse,
+    falsely skip the scan for a numeric module — so the exact/dotted-boundary match
+    matters."""
+
+    def test_exact_package_names(self):
+        assert inval._is_numeric_source("nkilib_src")
+        assert inval._is_numeric_source("nkilib")
+
+    def test_submodules(self):
+        assert inval._is_numeric_source("nkilib_src.nkilib.core.moe.moe_cte.moe_cte_torch")
+        assert inval._is_numeric_source("nkilib.core.attention.attention_torch")
+
+    def test_test_modules_are_not_numeric_source(self):
+        assert not inval._is_numeric_source("test.integration.nkilib.core.moe.test_moe_cte_common")
+        assert not inval._is_numeric_source("test.utils.common_dataclasses")
+
+    def test_prefix_collisions_rejected(self):
+        # Must match only on the dotted boundary, not a bare string prefix. The
+        # nkilib_testing runtime package is the real-world trap the "." guards against.
+        assert not inval._is_numeric_source("nkilibtesting")
+        assert not inval._is_numeric_source("nkilib_testing.foo")
+        assert not inval._is_numeric_source("nkilib_src_extra")
+        assert not inval._is_numeric_source("nkilibextra")
+        assert not inval._is_numeric_source("")
+        assert not inval._is_numeric_source("torch")
+
+
 class TestPurityGuard:
     """Static purity scan (_purity_violation): decline to cache a reference whose
     transitive source imports an unpinned package, imports dynamically, or reads a
     file — cases the cache key can't capture (contract points 1-3). Point 4 (RNG /
     env / clock / global state) is out of scope here."""
 
-    def _scan(self, src: str) -> str | None:
+    def _scan(self, src: str, module: str = "nkilib_src.probe") -> str | None:
+        # module defaults to a numeric-source name so the unpinned-import rule (which
+        # applies only to numeric source) is exercised. Pass a test.* name to check
+        # the test-scaffolding relaxation.
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
             f.write(src)
             path = f.name
         try:
-            return inval._purity_violation({"m": path})
+            return inval._purity_violation({module: path})
         finally:
             os.unlink(path)
+
+    def _assert_declined(self, src: str, expected_reason: str) -> None:
+        violation = self._scan(src)
+        assert violation is not None, "expected the purity scan to decline this source, but it was accepted"
+        assert expected_reason in violation, f"expected reason {expected_reason!r} in {violation!r}"
 
     def test_clean_ref_is_cacheable(self):
         # in-package + pinned (torch/numpy) + stdlib imports are all allowed.
         assert self._scan("import torch\nimport numpy as np\nimport math\ndef ref():\n    return {}\n") is None
 
-    def test_pinned_neuronxcc_and_nki_allowed(self):
-        # MX refs import these; they are version-pinned, so cacheable.
-        src = "import nki.language as nl\nfrom neuronxcc.nki._private.test import mx_util\ndef ref():\n    return {}\n"
-        assert self._scan(src) is None
+    def test_test_module_scaffolding_not_scanned(self):
+        # A torch-ref can live in / wrap through a test module that pulls in the test
+        # framework: unpinned imports (pytest, fabric2, ...) and file reads (model-config
+        # loaders). None of that computes the golden, so a test module is not purity-
+        # scanned and must not decline caching. The numeric golden code lives in
+        # nkilib_src, which IS scanned.
+        src = (
+            "import pytest\n"
+            "from test.utils.common_dataclasses import CustomValidator\n"
+            "def ref():\n"
+            "    open('model_config.json')\n"
+            "    return {}\n"
+        )
+        assert self._scan(src, module="test.integration.foo.test_bar_common") is None
 
     def test_unpinned_import_declines(self):
-        assert "unpinned" in self._scan("import pandas\ndef ref():\n    return {}\n")
+        self._assert_declined("import pandas\ndef ref():\n    return {}\n", "unpinned")
 
     def test_unpinned_from_import_declines(self):
-        assert "unpinned" in self._scan("from sklearn import metrics\ndef ref():\n    return {}\n")
+        self._assert_declined("from sklearn import metrics\ndef ref():\n    return {}\n", "unpinned")
 
     def test_dynamic_import_declines(self):
         src = "import importlib\ndef ref():\n    importlib.import_module('x')\n    return {}\n"
-        assert "dynamic import" in self._scan(src)
+        self._assert_declined(src, "dynamic import")
 
     def test_open_declines(self):
-        assert "reads a file" in self._scan("def ref():\n    open('t.bin')\n    return {}\n")
+        self._assert_declined("def ref():\n    open('t.bin')\n    return {}\n", "reads a file")
 
     def test_np_load_and_fromfile_decline(self):
-        assert "reads a file" in self._scan("import numpy as np\ndef ref():\n    return np.load('x.npy')\n")
-        assert "reads a file" in self._scan("import numpy as np\ndef ref():\n    return np.fromfile('x')\n")
+        self._assert_declined("import numpy as np\ndef ref():\n    return np.load('x.npy')\n", "reads a file")
+        self._assert_declined("import numpy as np\ndef ref():\n    return np.fromfile('x')\n", "reads a file")
 
     def test_all_real_refs_remain_cacheable(self):
         # Guard against a too-strict allowlist: every shipped torch-ref module must
         # still pass the single-file purity scan (no false decline of the population).
-        import glob
-
         declined = []
         for path in glob.glob("src/nkilib_src/nkilib/**/*_torch.py", recursive=True):
             modname = path.replace("src/", "").replace("/", ".")[:-3]
             if inval._purity_violation({modname: path}) is not None:
                 declined.append(path)
         assert not declined, f"purity guard falsely declined real refs: {declined}"
+
+    def test_torch_ref_test_modules_import_only_known_safe_top_level(self):
+        # The scan skips test.* modules, so allowlist what a ref-defining test file may
+        # import: in-package, version-pinned, stdlib, or known test-infra. Any other
+        # top-level import fails closed, forcing a decision (pin it, or move the numeric
+        # code to nkilib_src) — a new numeric lib can't silently slip past the skip.
+        test_infra_ok = {"pytest", "typing_extensions"}
+        allowed = inval._PINNED_TOP_LEVEL | test_infra_ok | set(sys.stdlib_module_names)
+        defines_ref = re.compile(r"def\s+\w*(torch_ref|torch_wrapper)\w*\s*\(")
+        offenders = {}
+        for path in glob.glob("test/**/*.py", recursive=True):
+            src = open(path, encoding="utf-8").read()
+            if not defines_ref.search(src):
+                continue
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    tops = [a.name.split(".")[0] for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    tops = [node.module.split(".")[0]]
+                else:
+                    continue
+                for top in tops:
+                    if not (inval._in_pkg(top) or top in allowed):
+                        offenders.setdefault(path, set()).add(top)
+        assert not offenders, f"ref-defining test files import non-allowlisted top-level packages: {offenders}"
 
 
 # ===========================================================================

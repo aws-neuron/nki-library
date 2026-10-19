@@ -27,6 +27,7 @@ from ...moe.bwd.moe_bwd_parameters import (
     AffinityOption,
     SkipMode,
 )
+from .config import MXFP8MOEBwdConfig
 
 
 def blockwise_mm_bwd_mxfp8_torch_ref(
@@ -37,40 +38,35 @@ def blockwise_mm_bwd_mxfp8_torch_ref(
     token_position_to_id: torch.Tensor,
     block_to_expert: torch.Tensor,
     output_hidden_states_grad: torch.Tensor,
-    block_size: int,
+    block_size: int = 4096,
     gate_up_proj_act_checkpoint_T: torch.Tensor = None,
     gate_act_checkpoint_T: torch.Tensor = None,
     intermediate_checkpoint_T: torch.Tensor = None,
     scaled_intermediate_checkpoint_T: torch.Tensor = None,
     down_proj_act_checkpoint=None,
+    config: MXFP8MOEBwdConfig = None,
     gate_up_weight_scales=None,
-    gate_up_weight_is_swizzled: bool = False,
     down_weight_scales=None,
-    down_weight_is_swizzled: bool = False,
-    phase1_config=None,
-    phase2_config=None,
-    phase3_config=None,
-    phase4_config=None,
-    fp8_x4_dtype=None,
-    spill_reload: bool = False,
-    use_scale_packing: bool = True,
-    run_with_lnc2: bool = True,
-    shard_option=None,
-    affinity_option=None,
-    compute_dtype=None,
-    skip_dma=None,
-    skip_grad_initialization: bool = False,
-    is_tensor_update_accumulating: bool = True,
-    clamp_limits=None,
-    activation_type=None,
-    bias: bool = False,
+    num_valid_tokens=None,
 ) -> dict:
     """PyTorch reference for ``blockwise_mm_bwd_mxfp8``.
 
-    Thin wrapper around the BF16 MoE backward golden. Hardware/quantization
-    arguments are accepted for signature compatibility but do not affect the result.
+    Thin wrapper around the BF16 MoE backward golden. The parameter set matches the
+    kernel entry exactly; only ``config``'s ``clamp_limits`` / ``bias`` /
+    ``accumulate_hidden_states_grad`` fields and the tensor inputs affect the result.
+    The remaining hardware/quantization knobs do not change the reference math.
     """
+    if config is None:
+        config = MXFP8MOEBwdConfig()
     block_to_expert_1d = block_to_expert.reshape(-1)
+    # Accept-and-ignore: the dynamic block loop only changes WHICH blocks the kernel
+    # computes, not the math. Padding tokens carry zero affinity, so the blocks the
+    # kernel skips contribute nothing to the weight gradients, and the reference
+    # matches there. Their hidden-states-grad rows are undefined on device, so the
+    # comparator comes in masked to num_valid_tokens.
+    _ignored = num_valid_tokens
+    del _ignored
+
     return blockwise_mm_bwd_torch_ref(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
@@ -85,7 +81,7 @@ def blockwise_mm_bwd_mxfp8_torch_ref(
         skip_dma=SkipMode(True, False),
         affinity_option=AffinityOption.AFFINITY_ON_I,
         activation_type=ActFnType.SiLU,
-        clamp_limits=clamp_limits,
-        bias=bias,
-        is_tensor_update_accumulating=is_tensor_update_accumulating,
+        clamp_limits=config.clamp_limits,
+        bias=config.bias,
+        is_tensor_update_accumulating=config.accumulate_hidden_states_grad,
     )

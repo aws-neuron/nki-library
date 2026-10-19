@@ -28,7 +28,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# QoR metrics to collect
+# QoR metrics to collect.
+# NB: TpbSgCyclesSum is a duration in PICOSECONDS despite its name (see
+# MetricName.TPB_SG_CYCLES_SUM in metrics_collector.py) — InferenceTime in seconds
+# is exactly TpbSgCyclesSum * 1e-12.
 QOR_METRICS = [
     "TpbSgCyclesSum",
     "MbuEstimatedPercent",

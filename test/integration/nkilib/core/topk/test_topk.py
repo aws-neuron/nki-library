@@ -212,10 +212,10 @@ class TestTopKKernel:
 
             class ValuesValidator(CustomValidator):
                 @override
-                def validate(self, actual_raw_output: npt.NDArray[Any]):
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
                     BxS, _ = input_tensor.shape
                     k = inputs["config"].topk_config.k
-                    output = np.frombuffer(actual_raw_output, dtype=input_tensor.dtype).reshape(BxS, k)
+                    output = np.frombuffer(inference_output, dtype=input_tensor.dtype).reshape(BxS, k)
                     self._print_with_log("Results for topk_values:")
                     values_correct = maxAllClose(
                         np.sort(output, axis=-1),

@@ -20,7 +20,7 @@ Pure Python -- no NKI, no tracer, no device required.
 
 import nki.language as nl
 import pytest
-from nki.language.tensor import NkiTensor
+from nki.language.tensor import NkiTensor  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import contiguous_ap_pattern as _contiguous_ap_pattern
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import contiguous_strides as _contiguous_strides
 from nkilib_src.nkilib.experimental.neurotile.core._helpers import reachable_dim_extent
@@ -1070,3 +1070,38 @@ class TestAPEmitterNoLevelCap:
         from nkilib_src.nkilib.experimental.neurotile.core import _helpers
 
         assert not hasattr(_helpers, "MAX_AP_LEVELS")
+
+
+# ============================================================================
+# Partition-fold load naming: one user name -> K uniquely suffixed DMAs.
+# NKI rejects a repeated instruction name, so the `_k<k>` suffix is what makes
+# a named fold load compile. Captures the names by stubbing _dma_copy.
+# ============================================================================
+
+
+@pytest_marks(["neurotile"])
+class TestPartitionFoldLoadName:
+    """`_partition_fold_load_dma` names its K DMAs `<name>_k<k>`."""
+
+    def _capture(self, monkeypatch):
+        names = []
+        monkeypatch.setattr(nl, "ndarray", lambda shape, dtype=None, buffer=None: MockTensor(shape))
+        monkeypatch.setattr(HBMLayout, "_dma_copy", staticmethod(lambda **kw: names.append(kw["name"])))
+        return names
+
+    @pytest.mark.fast
+    def test_name_suffixed_per_slice(self, monkeypatch):
+        names = self._capture(monkeypatch)
+        # recipe = (K, P_per_slice, fold_stride, base_pattern)
+        HBMLayout._partition_fold_load_dma(
+            MockTensor((128, 512)), 0, (3, 32, 4096, [[512, 32], [1, 512]]), (96, 512), "float32", None, name="w"
+        )
+        assert names == ["w_k0", "w_k1", "w_k2"]
+
+    @pytest.mark.fast
+    def test_no_name_stays_none(self, monkeypatch):
+        names = self._capture(monkeypatch)
+        HBMLayout._partition_fold_load_dma(
+            MockTensor((128, 512)), 0, (2, 32, 4096, [[512, 32], [1, 512]]), (64, 512), "float32", None
+        )
+        assert names == [None, None]

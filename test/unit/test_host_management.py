@@ -16,6 +16,7 @@
 import contextlib
 import json
 import os
+import random
 import subprocess
 import tempfile
 from contextlib import closing
@@ -26,11 +27,17 @@ import pytest
 from paramiko import SSHException
 
 from test.utils.common_dataclasses import Platforms, ResolvedHost, TargetHost
-from test.utils.core_reset_strategy import CoreResetStrategy
-from test.utils.exceptions import FleetEmptyError, InferenceException, LocalExecutionException, TimeoutException
+from test.utils.exceptions import (
+    FleetEmptyError,
+    InferenceException,
+    RequestTooLargeError,
+    TimeoutException,
+)
 from test.utils.host_management import Host, HostManager, LocalHost, detect_local_neuron_devices
-from test.utils.host_state import HostRecord, HostState, HostStateStore, OwnerHostStateStore
+from test.utils.host_state import HostRecord, HostState, HostStateStore, OwnerHostStateStore, temporary_random_seed
 from test.utils.metrics_collector import MetricName
+
+pytestmark = pytest.mark.usefixtures("controller_environment")
 
 
 def _initialized_store(base_dir, target_hosts, cores_by_alias=None):
@@ -58,6 +65,19 @@ def _poison_platform(base_dir, platform, poisoned=True):
     A worker's claim then observes the poison via the shared file, exactly as in a real run.
     """
     OwnerHostStateStore(base_dir).set_poisoned(platform, poisoned)
+
+
+def _set_ceiling(base_dir, ceiling):
+    """Set the per-platform provisionable ceiling in the state file at ``base_dir``.
+
+    Writing the ceiling is a controller action (via apply_resolved), so it goes through an
+    OwnerHostStateStore — matching how a real run publishes it — while preserving the existing
+    host rows. A worker's claim then observes the ceiling via the shared file.
+    """
+    owner = OwnerHostStateStore(base_dir)
+    current = owner.read()
+    hosts = [rec.resolved for rec in current.hosts] if current else []
+    owner.apply_resolved(hosts, provisionable_ceiling=ceiling)
 
 
 class TestHostManagerRetryErrorReporting:
@@ -443,7 +463,6 @@ class _PatienceRotatingHost(Host):
     """
 
     def __init__(self, host_id: str):
-        super().__init__(CoreResetStrategy(exclusive_run=False))
         self._host_id = host_id
 
     def get_host_id(self) -> str:
@@ -1372,6 +1391,46 @@ class TestDetectLocalNeuronDevices:
             assert detect_local_neuron_devices("/nonexistent/path") is False
 
 
+class TestTemporaryRandomSeed:
+    """Tests for the temporary_random_seed context manager."""
+
+    def setup_method(self) -> None:
+        """Set a deterministic seed before each test."""
+        random.seed(42)
+
+    def teardown_method(self) -> None:
+        """Reseed from system entropy so tests don't leak deterministic state."""
+        random.seed()
+
+    def test_restores_original_state(self) -> None:
+        """RNG state before and after the context manager should be identical."""
+        state_before = random.getstate()
+        with temporary_random_seed(999):
+            random.random()
+        assert random.getstate() == state_before
+
+    def test_choice_deterministic_with_same_seed(self) -> None:
+        """Same temporary seed produces the same random.choice result."""
+        items = ["host_a", "host_b", "host_c"]
+
+        with temporary_random_seed(123):
+            first = random.choice(items)
+
+        with temporary_random_seed(123):
+            second = random.choice(items)
+
+        assert first == second
+
+    def test_outer_sequence_unchanged_with_choice(self) -> None:
+        """random.choice inside the context manager should not alter the outer RNG sequence."""
+        expected_next = random.choice(["a", "b", "c"])
+
+        random.seed(42)
+        with temporary_random_seed(999):
+            random.choice(["a", "b", "c"])
+        assert random.choice(["a", "b", "c"]) == expected_next
+
+
 def _make_mock_device(core_ids: list[int], lnc_config: int = 2) -> MagicMock:
     """Create a mock NeuronDeviceInfo with the given logical core IDs."""
     device = MagicMock()
@@ -1379,178 +1438,6 @@ def _make_mock_device(core_ids: list[int], lnc_config: int = 2) -> MagicMock:
     device.nc_count = len(core_ids)
     device.logical_neuroncore_config = lnc_config
     return device
-
-
-class TestLocalHostCoreAllocation:
-    """Tests for LocalHost.get_core_allocation() with file-based locking."""
-
-    @pytest.fixture(autouse=True)
-    def _patch_neuron_ls(self):
-        # get_total_physical_cores() reads neuron-ls directly via _run_neuron_ls;
-        # 4 logical cores * lnc2 = 8 physical cores total.
-        with patch(
-            "test.utils.host_management._run_neuron_ls",
-            return_value=[_make_mock_device([0, 1, 2, 3])],
-        ):
-            yield
-
-    @pytest.fixture
-    def temp_dir(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield tmpdir
-
-    @pytest.fixture
-    def local_host(self, temp_dir):
-        return LocalHost(
-            "/opt/aws/neuron/bin", "localhost", temp_dir, core_reset_strategy=CoreResetStrategy(exclusive_run=False)
-        )
-
-    def test_allocates_correct_cores(self, local_host):
-        """Core allocation returns the requested number of logical cores."""
-        mock_collector = MagicMock()
-        mock_collector.timer = MagicMock(
-            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
-        )
-
-        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1, 2, 3])]):
-            with local_host.get_core_allocation(collector=mock_collector, collective_ranks=2, lnc_config=2) as alloc:
-                assert len(alloc.logical_core_ids) == 2
-                assert alloc.lnc_config == 2
-                assert alloc.host_id == "localhost"
-
-    def test_releases_cores_after_use(self, local_host):
-        """Cores are released back to the pool after the context manager exits."""
-        mock_collector = MagicMock()
-        mock_collector.timer = MagicMock(
-            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
-        )
-
-        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1, 2, 3])]):
-            with local_host.get_core_allocation(collector=mock_collector, collective_ranks=2, lnc_config=2):
-                pass
-
-            # After exiting, all physical cores should be free — allocate all 4 logical (8 physical)
-            with local_host.get_core_allocation(collector=mock_collector, collective_ranks=4, lnc_config=2) as alloc:
-                assert len(alloc.logical_core_ids) == 4
-
-    def test_lnc1_and_lnc2_dont_overlap(self, local_host):
-        """LNC1 and LNC2 allocations must not share physical cores."""
-        mock_collector = MagicMock()
-        mock_collector.timer = MagicMock(
-            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
-        )
-
-        # 4 logical cores at LNC2 = 8 physical cores total
-        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1, 2, 3])]):
-            # Allocate 1 logical core at LNC2 = 2 physical cores
-            with local_host.get_core_allocation(
-                collector=mock_collector, collective_ranks=1, lnc_config=2
-            ) as alloc_lnc2:
-                lnc2_physical = set(range(alloc_lnc2.logical_core_ids[0] * 2, alloc_lnc2.logical_core_ids[0] * 2 + 2))
-
-                # Allocate 1 logical core at LNC1 = 1 physical core, must not overlap
-                with local_host.get_core_allocation(
-                    collector=mock_collector, collective_ranks=1, lnc_config=1
-                ) as alloc_lnc1:
-                    lnc1_physical = {alloc_lnc1.logical_core_ids[0]}
-                    assert lnc2_physical.isdisjoint(lnc1_physical), (
-                        f"Physical cores overlap: LNC2={lnc2_physical}, LNC1={lnc1_physical}"
-                    )
-
-
-class TestLocalHostExecuteCommand:
-    """Tests for LocalHost.execute_command()."""
-
-    @pytest.fixture(autouse=True)
-    def _patch_neuron_ls(self):
-        # get_total_physical_cores() reads neuron-ls directly via _run_neuron_ls;
-        # 2 logical cores * lnc2 = 4 physical cores total.
-        with patch(
-            "test.utils.host_management._run_neuron_ls",
-            return_value=[_make_mock_device([0, 1])],
-        ):
-            yield
-
-    @pytest.fixture
-    def temp_dir(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield tmpdir
-
-    @pytest.fixture
-    def local_host(self, temp_dir):
-        return LocalHost(
-            "/opt/aws/neuron/bin", "localhost", temp_dir, core_reset_strategy=CoreResetStrategy(exclusive_run=False)
-        )
-
-    def _mock_collector(self):
-        collector = MagicMock()
-        collector.timer = MagicMock(
-            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
-        )
-        return collector
-
-    @patch("test.utils.host_management.subprocess.run")
-    def test_successful_execution_sets_env_vars(self, mock_run, local_host, temp_dir):
-        """Verify env vars are set correctly on local execution."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
-        collector = self._mock_collector()
-
-        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1])]):
-            local_host.execute_command(
-                command="echo hello",
-                target_directory=temp_dir,
-                collector=collector,
-                collective_ranks=1,
-                lnc_config=2,
-            )
-
-        # Check subprocess was called with correct env vars
-        call_kwargs = mock_run.call_args
-        env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
-        assert "NEURON_RT_VISIBLE_CORES" in env
-        assert env["NEURON_LOGICAL_NC_CONFIG"] == "2"
-        assert env["NEURON_RT_ENABLE_OCP"] == "1"
-
-    @patch("test.utils.host_management.subprocess.run")
-    def test_raises_on_nonzero_exit(self, mock_run, local_host, temp_dir):
-        """Non-zero exit code raises LocalExecutionException."""
-        mock_run.return_value = MagicMock(returncode=1, stdout="error output", stderr="some error")
-        collector = self._mock_collector()
-
-        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1])]):
-            with pytest.raises(LocalExecutionException):
-                local_host.execute_command(
-                    command="false",
-                    target_directory=temp_dir,
-                    collector=collector,
-                    collective_ranks=1,
-                    lnc_config=2,
-                )
-
-    @patch("test.utils.host_management.subprocess.run")
-    def test_artifact_collection(self, mock_run, local_host, temp_dir):
-        """do_copy_artifacts moves files into infer_result/ subdirectory."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="output.npy\n")
-        collector = self._mock_collector()
-
-        # Create a file in target_directory that should be moved
-        test_file = os.path.join(temp_dir, "output.npy")
-        with open(test_file, "w") as f:
-            f.write("data")
-
-        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1])]):
-            result_path = local_host.execute_command(
-                command="echo output.npy",
-                target_directory=temp_dir,
-                collector=collector,
-                collective_ranks=1,
-                lnc_config=2,
-                do_copy_artifacts=True,
-                get_list_of_files_to_copy=lambda stdout: ["output.npy"],
-            )
-
-        assert result_path == os.path.join(temp_dir, "infer_result")
-        assert os.path.exists(os.path.join(result_path, "output.npy"))
 
 
 # =============================================================================
@@ -1801,24 +1688,10 @@ class TestPatienceConfiguration:
         host = _make_ssh_host(tmp_path, patience_seconds=99)
         assert host.patience_seconds == 99
 
-    def test_exclusive_run_threads_reset_strategy_into_ssh_host(self, tmp_path) -> None:
-        # _get_host builds the per-host CoreResetStrategy from the manager's exclusive +
-        # testrun_uid (see __build_reset_strategy__). An exclusive strategy is state-backed
-        # and namespaced by testrun_uid + alias; assert it reaches the SshHost so exclusive
-        # per-capture reset isn't silently inert.
-        kwargs = self._capture_ssh_host_kwargs(tmp_path, exclusive=True)
-        strategy = kwargs["core_reset_strategy"]
-        assert strategy._exclusive_run is True
-        # Exclusive path requires (and uses) testrun_uid + ssh_alias; a state path proves both were threaded.
-        assert strategy._state_path is not None
-        assert "test-run" in strategy._state_path and "host1" in strategy._state_path
-
-    def test_shared_run_reset_strategy_is_non_exclusive(self, tmp_path) -> None:
-        # Default (shared) run: the strategy always resets, with no state file.
-        kwargs = self._capture_ssh_host_kwargs(tmp_path)
-        strategy = kwargs["core_reset_strategy"]
-        assert strategy._exclusive_run is False
-        assert strategy._state_path is None
+    def test_transport_threads_into_ssh_host(self, tmp_path) -> None:
+        # _get_host threads the manager's transport choice into each SshHost.
+        kwargs = self._capture_ssh_host_kwargs(tmp_path, transport="ssh")
+        assert kwargs["transport"] == "ssh"
 
 
 class TestSelectPollBase:
@@ -2726,7 +2599,9 @@ class TestSoftJoinQueue:
             patch("time.time", clock.time),
         ):
             host.soft_join_queue(collector=collector, collective_ranks=1, lnc_config=2)
-            entry_after_soft_join = host._core_lock_manager.entry_id
+            soft_join_mgr = host._core_lock_manager
+            assert soft_join_mgr is not None, "soft join caches a core lock manager"
+            entry_after_soft_join = soft_join_mgr.entry_id
             # Now the real allocation commits ready=True on the SAME manager.
             rec._seq = [AllocationOutcome(status=AllocationStatus.ALLOCATED, logical_cores=[0], physical_cores=[0, 1])]
             with host.get_core_allocation(collector=collector, collective_ranks=1, lnc_config=2) as alloc:
@@ -2925,7 +2800,6 @@ class TestSoftJoinQueue:
             "/opt/aws/neuron/bin",
             "localhost",
             str(tmp_path),
-            core_reset_strategy=CoreResetStrategy(exclusive_run=False),
         )
         assert local.soft_join_queue(collector=MagicMock(), collective_ranks=2, lnc_config=2) is None
 
@@ -2978,6 +2852,7 @@ class TestSoftJoinIntegration(TestSshHostPollLoopIntegration):
             # A finishes uploading and commits on the SAME entry_id -> ALLOCATED.
             out_a2 = mgr_a.acquire(num_logical_cores=4, lnc_config=2, ready=True)
             assert out_a2.status == AllocationStatus.ALLOCATED
+            assert out_a2.logical_cores is not None, "an ALLOCATED outcome carries its logical cores"
             assert len(out_a2.logical_cores) == 4
 
 
@@ -3055,16 +2930,20 @@ class TestManagerLifetimePerAttempt(TestSshHostPollLoopIntegration):
             patch("time.time", clock.time),
         ):
             with host.get_core_allocation(collector=col1, collective_ranks=4, lnc_config=2, timeout_seconds=300) as a1:
-                entry1 = host._core_lock_manager.entry_id
-                assert host._core_lock_manager.collector is col1
+                mgr1 = host._core_lock_manager
+                assert mgr1 is not None, "an active allocation caches its core lock manager"
+                entry1 = mgr1.entry_id
+                assert mgr1.collector is col1
                 assert len(a1.logical_core_ids) == 4
             # Teardown drops the cache so the next attempt cannot reuse it.
             assert host._core_lock_manager is None
 
             # Attempt #2: freed cores -> commits THROUGH the queue on a later poll.
             with host.get_core_allocation(collector=col2, collective_ranks=4, lnc_config=2, timeout_seconds=300) as a2:
-                entry2 = host._core_lock_manager.entry_id
-                assert host._core_lock_manager.collector is col2
+                mgr2 = host._core_lock_manager
+                assert mgr2 is not None, "an active allocation caches its core lock manager"
+                entry2 = mgr2.entry_id
+                assert mgr2.collector is col2
                 assert len(a2.logical_core_ids) == 4
             assert host._core_lock_manager is None
 
@@ -3094,11 +2973,13 @@ class TestManagerLifetimePerAttempt(TestSshHostPollLoopIntegration):
         ):
             with host.get_core_allocation(collector=col1, collective_ranks=4, lnc_config=2) as a1:
                 mgr1 = host._core_lock_manager
+                assert mgr1 is not None, "an active allocation caches its core lock manager"
                 entry1 = mgr1.entry_id
                 assert mgr1.collector is col1
                 assert len(a1.logical_core_ids) == 4
             with host.get_core_allocation(collector=col2, collective_ranks=4, lnc_config=2) as a2:
                 mgr2 = host._core_lock_manager
+                assert mgr2 is not None, "an active allocation caches its core lock manager"
                 entry2 = mgr2.entry_id
                 assert mgr2.collector is col2
                 assert len(a2.logical_core_ids) == 4
@@ -3700,6 +3581,64 @@ class TestHostStateAssignment:
                 self._assign(manager, collector=collector)
         assert MetricName.RECOVERABLE_HOST_WAIT_TIME in collector.timed
 
+    def test_recoverable_request_over_ceiling_fails_fast_without_waiting(self, temp_dir):
+        # The bug this fixes: on a recoverable pool whose largest host can never fit the request
+        # (8-core hosts, 32-core request), the claim must fail fast with RequestTooLargeError
+        # instead of polling until the 1800s deadline and then misreporting a dead re-resolver.
+        # No sleep should happen — waiting is futile.
+        manager = self._make_manager(
+            temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)], hosts_recoverable=True
+        )
+        # The 8-core host IS present and available, just too small. Shrink it from the default 64
+        # to match the fleet's 8-core ceiling.
+        manager.state_store.set_physical_cores({"h1": 8})
+        _set_ceiling(temp_dir, {Platforms.TRN2: 8})
+        with patch("test.utils.host_management.time.sleep") as sleep:
+            with pytest.raises(RequestTooLargeError, match="largest host the fleet can provision"):
+                self._assign(manager, num_of_physical_cores_needed=32)
+        sleep.assert_not_called()  # impossible request -> no wait at all
+
+    def test_non_recoverable_request_over_ceiling_fails_fast(self, temp_dir):
+        # Same guard on the non-recoverable path: a too-large request is a RequestTooLargeError
+        # (a FleetEmptyError subtype) naming the sizing cause, not a generic "no available hosts".
+        manager = self._make_manager(temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)])
+        manager.state_store.set_physical_cores({"h1": 8})  # present but too small
+        _set_ceiling(temp_dir, {Platforms.TRN2: 8})
+        with pytest.raises(RequestTooLargeError, match="Request needs 32 physical cores"):
+            self._assign(manager, num_of_physical_cores_needed=32)
+
+    def test_recoverable_request_within_ceiling_still_waits(self, temp_dir):
+        # Regression guard: the ceiling check must not disturb the normal recoverable wait. A
+        # request that FITS the ceiling (8 <= 8) but has no host up yet still waits and succeeds
+        # when the background re-resolver adds a host.
+        manager = self._make_manager(temp_dir, [], needs_local_host=False, hosts_recoverable=True)
+        _set_ceiling(temp_dir, {Platforms.TRN2: 8})
+
+        def add_host_during_wait(_seconds):
+            _add_host(manager.state_store, "newhost", Platforms.TRN2, num_physical_cores=8)
+
+        with patch("test.utils.host_management.time.sleep", side_effect=add_host_during_wait) as sleep:
+            host = self._assign(manager, num_of_physical_cores_needed=8)
+        assert host.get_host_id() == "newhost"
+        sleep.assert_called_once()
+
+    def test_over_ceiling_reported_with_history_in_retry_loop(self, temp_dir):
+        # Through the full retry entrypoint (get_host_assignment_with_retry), a too-large request
+        # surfaces as the RequestTooLargeError (caught by the loop's `except FleetEmptyError` and
+        # re-raised) — cleanly terminal, not retried across hosts until the deadline.
+        manager = self._make_manager(
+            temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)], hosts_recoverable=True
+        )
+        manager.state_store.set_physical_cores({"h1": 8})  # present but too small for 32 cores
+        _set_ceiling(temp_dir, {Platforms.TRN2: 8})
+        with patch("test.utils.host_management.time.sleep"):
+            with pytest.raises(RequestTooLargeError):
+                # 16 ranks x lnc2 = 32 cores, more than any 8-core host can serve.
+                for _host_ctx in manager.get_host_assignment_with_retry(
+                    Platforms.TRN2, NoopMetricsCollector(), collective_ranks=16, lnc_config=2
+                ):
+                    pass
+
     def test_lazily_builds_host_added_by_re_resolver(self, temp_dir):
         # Manager initialized with only h1; a background re-resolution later adds h2 to the file.
         manager = self._make_manager(temp_dir, [TargetHost(ssh_host="h1", host_type=Platforms.TRN2)])
@@ -3736,7 +3675,10 @@ class TestHostStateAssignment:
 
 def _add_host(store, alias, host_type, num_physical_cores=64):
     """Test seam: inject a host (as a background re-resolution would) via the store's private
-    primitive. Defaults to 64 cores so the host is eligible for typical (small) requests."""
+    primitive. Defaults to 64 cores so the host is eligible for typical (small) requests.
+
+    Preserves the existing fleet metadata (poisoned / under_capacity / provisionable_ceiling)
+    so injecting a host mid-wait doesn't silently clear a verdict a test set up."""
     store._update(
         lambda state: HostState(
             hosts=[
@@ -3746,5 +3688,46 @@ def _add_host(store, alias, host_type, num_physical_cores=64):
                 ),
             ],
             poisoned=state.poisoned,
+            under_capacity=state.under_capacity,
+            provisionable_ceiling=state.provisionable_ceiling,
         )
     )
+
+
+class TestNeuronEnvPassthrough:
+    """Environment variables registered for passthrough reach the remote workload."""
+
+    @pytest.fixture
+    def local_host(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield LocalHost("/opt/aws/neuron/bin", "localhost", tmpdir)
+
+    @staticmethod
+    def _build_env(local_host):
+        return local_host._build_neuron_env(
+            core_allocation=CoreAllocation(host_id="localhost", logical_core_ids=[0], lnc_config=2),
+            lnc_config=2,
+            unique_port=61234,
+            debug_output_dir="/tmp/debug",
+            reset_cores=False,
+        )
+
+    def test_registered_variable_is_forwarded_when_set(self, local_host):
+        with patch.dict(host_management.os.environ, {"NEURON_RT_TEST_PASSTHROUGH": "/some/path"}):
+            with patch.object(host_management, "ENV_PASSTHROUGH", {"NEURON_RT_TEST_PASSTHROUGH"}):
+                env = self._build_env(local_host)
+        assert env["NEURON_RT_TEST_PASSTHROUGH"] == "/some/path"
+
+    def test_registered_variable_is_omitted_when_unset(self, local_host):
+        environ = {k: v for k, v in os.environ.items() if k != "NEURON_RT_TEST_PASSTHROUGH"}
+        with patch.dict(host_management.os.environ, environ, clear=True):
+            with patch.object(host_management, "ENV_PASSTHROUGH", {"NEURON_RT_TEST_PASSTHROUGH"}):
+                env = self._build_env(local_host)
+        assert "NEURON_RT_TEST_PASSTHROUGH" not in env
+
+    def test_unregistered_variable_is_not_forwarded(self, local_host):
+        with patch.dict(host_management.os.environ, {"NEURON_RT_TEST_PASSTHROUGH": "/some/path"}):
+            with patch.object(host_management, "ENV_PASSTHROUGH", set()):
+                env = self._build_env(local_host)
+        assert "NEURON_RT_TEST_PASSTHROUGH" not in env
+        assert env["NEURON_RT_VISIBLE_CORES"] == "0"

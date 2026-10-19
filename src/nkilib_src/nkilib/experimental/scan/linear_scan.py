@@ -28,9 +28,9 @@ F_TILE_SIZE = 2048
 
 @nki.jit
 def linear_scan(
-    decay: nl.ndarray,
-    data: nl.ndarray,
-    initial: nl.ndarray = None,
+    decay: nl.NkiTensor,
+    data: nl.NkiTensor,
+    initial: nl.NkiTensor = None,
 ) -> tuple:
     """
     Compute first-order linear recurrence along the last dimension.
@@ -45,11 +45,11 @@ def linear_scan(
         outer_dim: Product of all dimensions except the last two
 
     Args:
-        decay (nl.ndarray): Input HBM tensor of shape (..., P, L) containing
+        decay (nl.NkiTensor): Input HBM tensor of shape (..., P, L) containing
             multiplicative decay coefficients. dtype can be any NKI-supported type.
-        data (nl.ndarray): Input HBM tensor of shape (..., P, L) containing
+        data (nl.NkiTensor): Input HBM tensor of shape (..., P, L) containing
             additive input values. Must have same shape as decay.
-        initial (nl.ndarray, optional): Initial state tensor of shape (..., P, 1).
+        initial (nl.NkiTensor, optional): Initial state tensor of shape (..., P, 1).
             If None, initial state is zero. Default: None.
 
     Returns:

@@ -31,10 +31,10 @@ from .matmul_mxfp8_config import MatmulMxfp8KernelConfig
 
 
 def spill_block(
-    quantized_data_hbm: nl.ndarray,
-    quantized_scales_hbm: nl.ndarray,
-    quantized_data_sbuf: nl.ndarray,
-    quantized_scales_sbuf: nl.ndarray,
+    quantized_data_hbm: nl.NkiTensor,
+    quantized_scales_hbm: nl.NkiTensor,
+    quantized_data_sbuf: nl.NkiTensor,
+    quantized_scales_sbuf: nl.NkiTensor,
     block_idx_k: int,
     block_idx_f: int,
     BLOCK_K_PHYSICAL: int,
@@ -54,11 +54,11 @@ def spill_block(
         F_x4: F dimension in x4 packed elements.
 
     Args:
-        quantized_data_hbm (nl.ndarray): Quantized data in HBM (x4 format).
-        quantized_scales_hbm (nl.ndarray): Quantized scales in HBM.
-        quantized_data_sbuf (nl.ndarray): Quantized data in SBUF (x4 format),
+        quantized_data_hbm (nl.NkiTensor): Quantized data in HBM (x4 format).
+        quantized_scales_hbm (nl.NkiTensor): Quantized scales in HBM.
+        quantized_data_sbuf (nl.NkiTensor): Quantized data in SBUF (x4 format),
             shape (TILE_K, NUM_TILES_K, F_x4).
-        quantized_scales_sbuf (nl.ndarray): Scales in SBUF,
+        quantized_scales_sbuf (nl.NkiTensor): Scales in SBUF,
             shape (TILE_K, NUM_TILES_K, F_x4).
         block_idx_k (int): K block index (determines row position in spill buffer).
         block_idx_f (int): M or N block index (determines column position).
@@ -190,8 +190,8 @@ def _compute_spill_reload_tile_shapes(
 
 
 def _store_output_block_to_hbm(
-    output_sbuf: nl.ndarray,
-    output_tensor_hbm: nl.ndarray,
+    output_sbuf: nl.NkiTensor,
+    output_tensor_hbm: nl.NkiTensor,
     block_idx_m: int,
     block_idx_n: int,
     bd: BlockDescriptor,
@@ -228,7 +228,7 @@ def extract_from_sbuf_td(sbuf_td: TensorDescriptor) -> tuple:
 
 
 def _quantize_and_spill_operand(
-    loaded: nl.ndarray,
+    loaded: nl.NkiTensor,
     quantize_tile_shape: tuple,
     float8_dtype: str,
     use_scale_packing: bool,
@@ -310,6 +310,7 @@ def generic_matmul_mxfp8_api(
     # --- Tile Loading Config --- #
     TILES_IN_LOAD_M: int = None,
     TILES_IN_LOAD_N: int = None,
+    TILES_IN_LOAD_K: int = None,
     # --- Block Location --- #
     block_idx_m: Optional[Tuple[int, int]] = None,
     block_idx_n: Optional[Tuple[int, int]] = None,
@@ -325,6 +326,7 @@ def generic_matmul_mxfp8_api(
     tile_loop_order: str = 'mnk',
     float8_dtype: str = "float8_e4m3fn",
     use_scale_packing: bool = False,
+    psum_drain_engine_ratio: Optional[Tuple[int, int]] = None,
     # --- Spill Reload --- #
     spill_reload: bool = False,
     lhsq_td: Optional[TensorDescriptor] = None,
@@ -335,6 +337,11 @@ def generic_matmul_mxfp8_api(
     # --- LNC2 offset --- #
     rhs_n_offset: int = 0,
     lhs_m_offset: int = 0,
+    # --- Runtime (data-dependent) LHS M offset --- #
+    lhs_m_scalar_offset: Optional[nl.NkiTensor] = None,
+    # --- K-dimension slice offset --- #
+    rhs_k_offset: int = 0,
+    lhs_k_offset: int = 0,
     # --- Accumulation control --- #
     initialize_accumulator: bool = True,
 ) -> None:
@@ -374,15 +381,34 @@ def generic_matmul_mxfp8_api(
         tile_loop_order: Tile loop order within matmul_mxfp8_blocks ('mnk', 'nmk', 'mkn').
         float8_dtype: FP8 dtype for quantization.
         use_scale_packing: Enable scale packing.
+        psum_drain_engine_ratio: (num_scalar, num_vector) split of the PE swizzle PSUM
+            copy-outs across the Scalar and Vector engines, applied to both operands.
+            Only affects operands loaded with PE swizzle. None (default) keeps whatever
+            each TensorDescriptor already specifies — set it per-operand on the
+            TensorDescriptor when LHS and RHS need different ratios.
         spill_reload: Spill quantized blocks to HBM for reuse.
-        lhsq_td: Pre-allocated spill/reload buffer for LHS. Required if spill_reload=True.
-        rhsq_td: Pre-allocated spill/reload buffer for RHS. Required if spill_reload=True.
+        lhsq_td: Pre-allocated quantized spill/reload buffer for LHS. Its
+            presence enables LHS spill/reload independently of RHS.
+        rhsq_td: Pre-allocated quantized spill/reload buffer for RHS. Its
+            presence enables RHS spill/reload independently of LHS.
         lhs_sbuf_td: If provided, skip LHS loading — use this pre-loaded SBUF data
             (already swizzled and quantized).
         rhs_sbuf_td: If provided, skip RHS loading — use this pre-loaded SBUF data
             (already swizzled and quantized).
         rhs_n_offset: Additional N offset for RHS (used for LNC2 N-sharding).
         lhs_m_offset: Additional M offset for LHS (used for LNC2 M-sharding).
+        lhs_m_scalar_offset: RUNTIME additional M offset for the LHS, as a (1, 1) SBUF
+            int32 tensor holding a row count (added on top of the compile-time
+            lhs_m_offset). Lets a caller select an M-window that is only known at
+            runtime -- e.g. a hardware dynamic loop picking block i of a [N*B, H]
+            activation -- without staging the rows into a scratch buffer first. Set the
+            LHS TD's effective_f_dim to the window length so partial M tiles clamp to the
+            window. Supported for unswizzled F-by-K operands on the DGT, DGT_FAST and
+            1x32 PE load paths; the wrapX PE loader and the pre-swizzled/quantized
+            K-by-F path assert against it.
+        rhs_k_offset: Additive K-start offset (logical-K units, K-axis analog of rhs_n_offset)
+            picking a K-window of a wider RHS operand; window length is the TD's effective_k_dim.
+        lhs_k_offset: Symmetric K-window offset for the LHS. Default 0.
         initialize_accumulator: If True (default), the first K-block zeroes the SBUF
             accumulator before writing. If False, all K-blocks accumulate (+=) into
             the existing SBUF contents. Set to False when multiple API calls must
@@ -411,6 +437,7 @@ def generic_matmul_mxfp8_api(
         output_dtype = output_dtype if output_dtype != nl.float32 else (config.output_dtype or nl.float32)
         TILES_IN_LOAD_M = TILES_IN_LOAD_M or config.TILES_IN_LOAD_M
         TILES_IN_LOAD_N = TILES_IN_LOAD_N or config.TILES_IN_LOAD_N
+        TILES_IN_LOAD_K = TILES_IN_LOAD_K or config.TILES_IN_LOAD_K
         lhs_matmul_tile_shape_physical = lhs_matmul_tile_shape_physical or config.lhs_matmul_tile_shape_physical
         rhs_matmul_tile_shape_physical = rhs_matmul_tile_shape_physical or config.rhs_matmul_tile_shape_physical
         lhs_load_tile_shape = lhs_load_tile_shape or config.lhs_load_tile_shape
@@ -422,7 +449,22 @@ def generic_matmul_mxfp8_api(
         use_scale_packing = use_scale_packing or config.enable_scale_packing
         spill_reload = spill_reload or config.spill_reload
 
+    # Spill storage is an explicit alternate representation. Presence of a
+    # spill TD enables that operand independently, which also supports
+    # materializing one operand for reuse without spilling the other.
+    spill_lhs = lhsq_td != None
+    spill_rhs = rhsq_td != None
+
     kernel_assert(lhs_matmul_tile_shape_physical != None, "lhs_matmul_tile_shape_physical is required")
+
+    if psum_drain_engine_ratio is not None:
+        num_scalar, num_vector = psum_drain_engine_ratio
+        kernel_assert(
+            num_scalar >= 0 and num_vector >= 0 and (num_scalar + num_vector) > 0,
+            f"psum_drain_engine_ratio must be non-negative and not both zero, got {psum_drain_engine_ratio}",
+        )
+        lhs_hbm_td.psum_drain_engine_ratio = psum_drain_engine_ratio
+        rhs_hbm_td.psum_drain_engine_ratio = psum_drain_engine_ratio
 
     MATMUL_TILE_K, LHS_MATMUL_TILE_M = lhs_matmul_tile_shape_physical
 
@@ -435,6 +477,30 @@ def generic_matmul_mxfp8_api(
     _, M_LOGICAL = lhs_hbm_td.sharded_logical_shape
     _, N_LOGICAL = rhs_hbm_td.sharded_logical_shape
     K_LOGICAL = lhs_hbm_td.logical_shape[0]
+
+    # A K-slice reads a contraction window (length effective_k_dim, start rhs/lhs_k_offset)
+    # of a wider operand; guard it matches the matmul K and stays in bounds.
+    kernel_assert(rhs_k_offset >= 0 and lhs_k_offset >= 0, "k_offset must be non-negative")
+    if rhs_hbm_td.effective_k_dim is not None:
+        kernel_assert(
+            rhs_hbm_td.effective_k_dim == K_LOGICAL,
+            f"rhs effective_k_dim ({rhs_hbm_td.effective_k_dim}) must equal contraction K ({K_LOGICAL})",
+        )
+        kernel_assert(
+            rhs_k_offset + rhs_hbm_td.effective_k_dim <= rhs_hbm_td.logical_shape[0],
+            f"rhs K-slice [{rhs_k_offset}, {rhs_k_offset + rhs_hbm_td.effective_k_dim}) exceeds "
+            f"RHS K ({rhs_hbm_td.logical_shape[0]})",
+        )
+    if lhs_hbm_td.effective_k_dim is not None:
+        kernel_assert(
+            lhs_hbm_td.effective_k_dim == K_LOGICAL,
+            f"lhs effective_k_dim ({lhs_hbm_td.effective_k_dim}) must equal contraction K ({K_LOGICAL})",
+        )
+        kernel_assert(
+            lhs_k_offset + lhs_hbm_td.effective_k_dim <= lhs_hbm_td.logical_shape[0],
+            f"lhs K-slice [{lhs_k_offset}, {lhs_k_offset + lhs_hbm_td.effective_k_dim}) exceeds "
+            f"LHS K ({lhs_hbm_td.logical_shape[0]})",
+        )
 
     # Default load tile counts
     if TILES_IN_LOAD_M == None:
@@ -486,11 +552,18 @@ def generic_matmul_mxfp8_api(
 
             for idx_k in range(k_start, k_end):
                 # --- Determine effective TDs (original vs spill-reload) ---
-                lhs_load_from_hbm = idx_n == 0 or (not spill_reload) or lhs_hbm_td.is_quantized
-                rhs_load_from_hbm = idx_m == 0 or (not spill_reload) or rhs_hbm_td.is_quantized
+                lhs_load_from_hbm = lhs_hbm_td.is_quantized or not spill_lhs or idx_n == 0
+                rhs_load_from_hbm = rhs_hbm_td.is_quantized or not spill_rhs or idx_m == 0
 
                 eff_lhs_td = lhs_hbm_td if lhs_load_from_hbm else lhsq_td
                 eff_rhs_td = rhs_hbm_td if rhs_load_from_hbm else rhsq_td
+
+                # Runtime M offset rides on the LHS TD, so the loaders pick up the
+                # window without any extra plumbing. Only on the HBM read: once the
+                # operand has been spilled, the spill buffer already holds the
+                # offset rows, so re-applying it would double-count.
+                if lhs_m_scalar_offset is not None and lhs_load_from_hbm:
+                    eff_lhs_td.f_scalar_offset = lhs_m_scalar_offset
 
                 spill_reload_bd = bd.get_spill_reload_bd(
                     lhs_hbm_td.is_swizzled,
@@ -528,12 +601,15 @@ def generic_matmul_mxfp8_api(
                         rhs_td=load_rhs_td,
                         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
                         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
+                        TILES_IN_LOAD_K=TILES_IN_LOAD_K,
                         lhs_load_tile_shape=lhs_load_tile_shape if lhs_load_from_hbm else lhsq_load_tile_shape,
                         rhs_load_tile_shape=rhs_load_tile_shape if rhs_load_from_hbm else rhsq_load_tile_shape,
                         block_idx=(idx_m, idx_k, idx_n),
                         bd=spill_reload_bd,
                         rhs_n_offset=rhs_n_offset if rhs_load_from_hbm else 0,
                         lhs_m_offset=lhs_m_offset if lhs_load_from_hbm else 0,
+                        rhs_k_offset=rhs_k_offset if rhs_load_from_hbm else 0,
+                        lhs_k_offset=lhs_k_offset if lhs_load_from_hbm else 0,
                     )
 
                 if lhs_sbuf_has_data:
@@ -549,7 +625,7 @@ def generic_matmul_mxfp8_api(
                         float8_dtype=float8_dtype,
                         use_scale_packing=use_scale_packing,
                         TILES_IN_BLOCK_K=bd.TILES_IN_BLOCK_K,
-                        spill_reload=spill_reload,
+                        spill_reload=spill_lhs,
                         spill_td=lhsq_td,
                         idx_k=idx_k,
                         idx_f=idx_m,
@@ -568,7 +644,7 @@ def generic_matmul_mxfp8_api(
                         float8_dtype=float8_dtype,
                         use_scale_packing=use_scale_packing,
                         TILES_IN_BLOCK_K=bd.TILES_IN_BLOCK_K,
-                        spill_reload=spill_reload,
+                        spill_reload=spill_rhs,
                         spill_td=rhsq_td,
                         idx_k=idx_k,
                         idx_f=idx_n,

@@ -185,9 +185,11 @@ class TestReverseImportIndex:
         finder = RelevantTestFinder(repo_root=tmp_path)
         finder._build_reverse_import_index()
 
-        deps = finder._reverse_deps.get(files["impl"], set())
-        init_files = [d for d in deps if d == files["init"]]
-        assert init_files, f"__init__.py should import the impl module, got: {deps}"
+        deps = finder._reverse_deps
+        assert deps is not None, "_build_reverse_import_index must have populated the index"
+        impl_deps = deps.get(files["impl"], set())
+        init_files = [d for d in impl_deps if d == files["init"]]
+        assert init_files, f"__init__.py should import the impl module, got: {impl_deps}"
 
 
 class TestResolveAbsoluteImport:
@@ -293,6 +295,46 @@ class TestGetRelevantTestDirsEndToEnd:
         """Run get_relevant_test_dirs with mocked changed files."""
         with patch.object(self.finder, "_get_changed_files", return_value=changed_files):
             return self.finder.get_relevant_test_dirs("mocked")
+
+    def _narrow_with_files(self, changed_files):
+        """Run get_narrowed_test_dirs with mocked changed files."""
+        with patch.object(self.finder, "_get_changed_files", return_value=changed_files):
+            return self.finder.get_narrowed_test_dirs("mocked")
+
+    # -- get_narrowed_test_dirs ------------------------------------------------
+    # The narrowed call exists for a consumer that cannot run every test, so a change
+    # touching a shared utility must not discard the kernels it also touched. The
+    # run-everything contract of get_relevant_test_dirs is unchanged, which the paired
+    # assertions below pin.
+
+    def test_narrowed_keeps_kernel_dirs_when_a_shared_utility_also_changed(self):
+        changed = [
+            "src/nkilib_src/nkilib/core/mlp/mlp.py",
+            "src/nkilib_src/nkilib/core/utils/pe_broadcast.py",
+        ]
+        # Unchanged: the utility means the selection could not be narrowed.
+        assert self._run_with_files(changed) is None
+        # Narrowed: the kernel the author actually touched is still covered.
+        rel_dirs = _rel_test_dirs(self._narrow_with_files(changed))
+        assert "core/mlp" in rel_dirs
+
+    def test_narrowed_keeps_kernel_dirs_when_an_infra_file_also_changed(self):
+        changed = ["src/nkilib_src/nkilib/core/mlp/mlp.py", "test/conftest.py"]
+        assert self._run_with_files(changed) is None
+        assert "core/mlp" in _rel_test_dirs(self._narrow_with_files(changed))
+
+    def test_narrowed_is_empty_when_only_a_shared_utility_changed(self):
+        # Nothing is attributable, so the caller decides. Matches today's outcome for
+        # such a CR rather than newly analysing an arbitrary subset.
+        changed = ["src/nkilib_src/nkilib/core/utils/pe_broadcast.py"]
+        assert self._run_with_files(changed) is None
+        assert self._narrow_with_files(changed) == set()
+
+    def test_narrowed_matches_relevant_when_nothing_forces_a_full_run(self):
+        # With no utility or infra file involved the two calls must agree, so the
+        # narrowed path is not a second, divergent scoping implementation.
+        changed = ["src/nkilib_src/nkilib/core/mlp/mlp_parameters.py"]
+        assert self._run_with_files(changed) == self._narrow_with_files(changed)
 
     def test_single_attention_cte_change(self):
         """Single file change to attention_cte.py should affect attention tests."""
@@ -411,7 +453,7 @@ class TestGetRelevantTestDirsEndToEnd:
         assert result is None
 
     def test_test_only_change(self):
-        """Only a test file changed in moe_cte should run core/moe tests."""
+        """Only a test file changed in moe_cte should run core/moe and its test-to-test dependents."""
         result = self._run_with_files(
             [
                 "test/integration/nkilib/core/moe/moe_cte/test_moe_bwmm_mx_cte.py",
@@ -419,7 +461,7 @@ class TestGetRelevantTestDirsEndToEnd:
         )
         assert result is not None
         rel_dirs = _rel_test_dirs(result)
-        assert rel_dirs == ["core/moe"]
+        assert rel_dirs == ["core/moe", "experimental/deepseek_v32"]
 
     def test_down_projection_affects_mlp_and_moe(self):
         """Changes to mlp_tkg_down_projection.py should affect mlp and transformer.
@@ -519,18 +561,18 @@ class TestTestToTestReverseIndex:
 
     def setup_method(self):
         self.finder = RelevantTestFinder(repo_root=REPO_ROOT)
-        self.finder._build_reverse_import_index()
+        self.reverse_deps = self.finder._build_reverse_import_index()
 
     def test_experimental_moe_block_imports_core_moe_block(self):
         """test_mx_moe_block_tkg_wrapper.py imports generate_inputs from test_moe_block_tkg.py."""
         core_test = "test/integration/nkilib/core/moe_block/test_moe_block_tkg.py"
-        deps = self.finder._reverse_deps.get(core_test, set())
+        deps = self.reverse_deps.get(core_test, set())
         exp_files = [d for d in deps if "experimental/moe_block" in d]
         assert len(exp_files) > 0, f"experimental/moe_block should import from core test, got: {deps}"
 
     def test_test_index_includes_test_files(self):
         """The reverse index should contain test file paths as keys or values."""
-        test_paths = [k for k in self.finder._reverse_deps if k.startswith("test/integration/")]
+        test_paths = [k for k in self.reverse_deps if k.startswith("test/integration/")]
         assert len(test_paths) > 0, "Reverse index should include test file entries"
 
 

@@ -15,11 +15,12 @@
 """Shared utilities for MoE CTE blockwise matrix multiplication tests."""
 
 import math
-from typing import Optional
+from typing import Any, Optional
 
 import ml_dtypes
 import nki.language as nl
 import numpy as np
+import numpy.typing as npt
 
 # BWMMFunc and _mx_internal_data live in src/ so torch_refs can import them
 # without depending on test/. Re-exported here for existing test callers.
@@ -78,13 +79,48 @@ UP_CLAMP_UPPER_DIM_NAME = "ucu"
 UP_CLAMP_LOWER_DIM_NAME = "ucl"
 EXPERT_AFFINITY_MULTIPLY_ON_I_DIM_NAME = "eamoi"
 
-dtype2dtype_range = {nl.int8: (-127, 127), nl.float8_e4m3: (-240.0, 240.0)}
+dtype2dtype_range = {nl.int8: (-127, 127), nl.float8_e4m3: (-240, 240)}
 
 
 def get_n_blocks(T, TOPK, E, B, n_block_per_iter=1):
     N = math.ceil((T * TOPK - (E - 1)) / B) + E - 1
     N = n_block_per_iter * math.ceil(N / n_block_per_iter)
     return N
+
+
+def routing_blocks_per_expert(T, TOPK, E, B, alpha=None, non_overlapping_shards=False):
+    """Per-expert block counts for the generated routing, as [E] int32.
+
+    Shared by generate_token_position_to_id_and_experts and get_n_blocks_tight so the
+    two cannot disagree on how many blocks the routing occupies.
+    """
+    router = get_router_with_controlled_distribution(
+        T=T, TOPK=TOPK, E=E, alpha=alpha, non_overlapping_shards=non_overlapping_shards
+    )
+    one_hot = np.arange(E)
+    token_experts = np.zeros((T, E))
+    for i in range(min(E, TOPK)):
+        token_experts += np.expand_dims(router[:, i], 1) == np.expand_dims(one_hot, 0)
+    return token_experts, np.ceil(token_experts.sum(0) / B).astype(np.int32)
+
+
+def get_n_blocks_tight(T, TOPK, E, B, alpha=None, non_overlapping_shards=False):
+    """Blocks the routing actually occupies, i.e. an N with zero padding blocks.
+
+    get_n_blocks returns a worst-case bound, so conditions always ends in zeros and the
+    dynamic loop's trailing blocks are inactive. Production sizes N to the real routing,
+    leaving no slack -- which is the only way the ping-pong's last iteration can reach
+    block index N. Restores the RNG state so the caller's seeding is unaffected.
+    """
+    state = np.random.get_state()
+    try:
+        np.random.seed(0)
+        _, blocks_per_expert = routing_blocks_per_expert(
+            T, TOPK, E, B, alpha=alpha, non_overlapping_shards=non_overlapping_shards
+        )
+    finally:
+        np.random.set_state(state)
+    return int(blocks_per_expert.sum())
 
 
 def get_block_size_dropping(seq_len, batch_size, top_k, capacity_factor, num_experts):
@@ -160,7 +196,7 @@ def quantize_strategy2scale_shapes(quantize_strategy, E, I_TP, H):
 
 
 def get_router_with_controlled_distribution(
-    T: int, TOPK: int, E: int, alpha: np.float32 = None, non_overlapping_shards: bool = False
+    T: int, TOPK: int, E: int, alpha: float | None = None, non_overlapping_shards: bool = False
 ):
     """Generate a uniform or controlled probability distribution over E experts for tokens."""
     actual_k = min(E, TOPK)
@@ -205,7 +241,7 @@ def generate_token_position_to_id_and_experts(
     use_split_padding: bool = False,
     n_block_per_iter: int = 1,
     vnc_degree: int = 1,
-    alpha: np.float32 = None,
+    alpha: float | None = None,
     is_block_parallel: bool = False,
     quantize=None,
     non_overlapping_shards: bool = False,
@@ -213,16 +249,9 @@ def generate_token_position_to_id_and_experts(
     if n_block_per_iter > 1:
         assert vnc_degree == 1
 
-    router = get_router_with_controlled_distribution(
-        T=T, TOPK=TOPK, E=E, alpha=alpha, non_overlapping_shards=non_overlapping_shards
+    token_experts, blocks_per_expert = routing_blocks_per_expert(
+        T, TOPK, E, B, alpha=alpha, non_overlapping_shards=non_overlapping_shards
     )
-    one_hot = np.arange(E)
-    token_experts = np.zeros((T, E))
-    actual_k = min(E, TOPK)
-    for i in range(actual_k):
-        token_experts += np.expand_dims(router[:, i], 1) == np.expand_dims(one_hot, 0)
-
-    blocks_per_expert = np.ceil(token_experts.sum(0) / B).astype(np.int32)
     n_padding_block = N - np.sum(blocks_per_expert)
 
     if use_split_padding:
@@ -299,7 +328,7 @@ def build_bwmm_inputs(
     gate_clamp_upper_limit=None,
     up_clamp_lower_limit=None,
     up_clamp_upper_limit=None,
-    alpha: np.float32 = None,
+    alpha: float | None = None,
     expert_affinity_multiply_on_I: bool = False,
     is_dropping: bool = False,
     rtype: int = 1,
@@ -946,9 +975,9 @@ def _shard_on_block_output_validator(
 
     class ShardOnBlockOutputValidator(CustomValidator):
         @override
-        def validate(self, actual_raw_output):
+        def validate(self, inference_output: npt.NDArray[Any]) -> bool:
             actual = (
-                np.frombuffer(actual_raw_output, dtype=ml_dtypes.bfloat16)
+                np.frombuffer(inference_output, dtype=ml_dtypes.bfloat16)
                 .reshape(T_out, 2, hidden + expert)
                 .astype(np.float32)
             )
@@ -1036,9 +1065,9 @@ def _shard_on_block_mx_output_validator(
 
     class ShardOnBlockMxOutputValidator(CustomValidator):
         @override
-        def validate(self, actual_raw_output):
+        def validate(self, inference_output: npt.NDArray[Any]) -> bool:
             actual = (
-                np.frombuffer(actual_raw_output, dtype=ml_dtypes.bfloat16)
+                np.frombuffer(inference_output, dtype=ml_dtypes.bfloat16)
                 .reshape(lnc_degree, -1, hidden)
                 .astype(np.float32)
             )

@@ -16,7 +16,6 @@
 A ``HostDirectory`` uploads/downloads a directory between the local box and a
 host, abstracting over the transfer mechanism:
 
-- ``LocalHostIO``      — same-machine moves (no transfer).
 - ``RemoteParamikoIO`` — tar-pipe over a paramiko channel.
 - ``ScpIO``            — tar-pipe over native ssh (direct subprocess pipes).
 - ``RemoteS3IO``       — via an S3 intermediary (boto3 + remote ``aws s3 cp``).
@@ -24,6 +23,7 @@ host, abstracting over the transfer mechanism:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -42,6 +42,7 @@ from .s3_utils import (
     S3TransferDirection,
     build_remote_s3_cli_command,
     generate_s3_key,
+    get_bucket_region,
     get_s3_client_and_session,
 )
 
@@ -54,6 +55,10 @@ _STREAM_BUFFER_SIZE = 65536
 # archives), which can far exceed the transport's default workload budget.
 # Bounded (unlike the pre-refactor code) so a wedged transfer still aborts.
 _S3_TRANSFER_TIMEOUT_SECONDS = 900
+
+# Re-attempts for the S3->local download within a single download() call, so a
+# transient truncation re-transfers the archive rather than failing the test.
+_S3_DOWNLOAD_MAX_ATTEMPTS = 3
 
 
 def cleanup_input_bins(local_path: str) -> None:
@@ -70,7 +75,27 @@ def cleanup_input_bins(local_path: str) -> None:
         bin_file.unlink(missing_ok=True)
 
 
-def create_archive_command(source_path: str, destination_path: str, files_to_include: list[str] | None = None) -> str:
+def _sha256_of_file(path: str) -> str:
+    """Hex SHA-256 of a local file, read in bounded chunks (~1.2 GiB/s, CPU-bound)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(_STREAM_BUFFER_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_sha256sum_output(stdout: str) -> str | None:
+    """Extract the 64-char hex digest from ``sha256sum`` stdout (``<hex>  <path>``), else None."""
+    token = stdout.split(maxsplit=1)[0] if stdout.strip() else ""
+    return token if len(token) == 64 and all(c in "0123456789abcdef" for c in token) else None
+
+
+def create_archive_command(
+    source_path: str,
+    destination_path: str,
+    files_to_include: list[str] | None = None,
+    excluded_paths: list[str] | None = None,
+) -> str:
     if files_to_include is None:
         files_to_include = ["."]
 
@@ -78,8 +103,9 @@ def create_archive_command(source_path: str, destination_path: str, files_to_inc
         destination_path += ".tar"
 
     files_inside_archive = " ".join(file_name for file_name in files_to_include)
+    exclude_args = "".join(f"--exclude={pattern} " for pattern in (excluded_paths or []))
 
-    return f"tar --ignore-failed-read -cf {destination_path} -C {source_path} {files_inside_archive}"
+    return f"tar --ignore-failed-read {exclude_args}-cf {destination_path} -C {source_path} {files_inside_archive}"
 
 
 def defalate_archive_command(source_path: str, destination_path: str) -> str:
@@ -146,7 +172,9 @@ class HostDirectory(ABC):
         self,
         local_path: str,
         force_local_cleanup: bool = False,
+        excluded_paths: list[str] | None = None,
     ) -> None:
+        """``excluded_paths`` are tar glob patterns; matching artifacts are not uploaded."""
         raise NotImplementedError
 
     @abstractmethod
@@ -161,44 +189,6 @@ class HostDirectory(ABC):
     @abstractmethod
     def cleanup(self) -> None:
         raise NotImplementedError
-
-
-class LocalHostIO(HostDirectory):
-    """Same-machine I/O. Upload copies the tree into ``target_path``; download
-    moves files from ``target_path`` into the destination."""
-
-    def upload(
-        self,
-        local_path: str,
-        force_local_cleanup: bool = False,
-    ) -> None:
-        if os.path.abspath(local_path) == os.path.abspath(self.target_path):
-            return
-        if force_local_cleanup and os.path.exists(self.target_path):
-            shutil.rmtree(self.target_path)
-        os.makedirs(self.target_path, exist_ok=True)
-        shutil.copytree(local_path, self.target_path, dirs_exist_ok=True)
-
-    def download(
-        self,
-        destination_dir_path: str,
-        list_of_files: list[str] | None = None,
-        force_clean_destination: bool = False,
-    ) -> str:
-        if force_clean_destination and os.path.exists(destination_dir_path):
-            shutil.rmtree(destination_dir_path)
-        os.makedirs(destination_dir_path, exist_ok=True)
-        names = list_of_files if list_of_files is not None else os.listdir(self.target_path)
-        for name in names:
-            src = os.path.join(self.target_path, name)
-            dst = os.path.join(destination_dir_path, name)
-            if os.path.exists(src) and os.path.abspath(src) != os.path.abspath(dst):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.move(src, dst)
-        return destination_dir_path
-
-    def cleanup(self) -> None:
-        shutil.rmtree(self.target_path, ignore_errors=True)
 
 
 class RemoteParamikoIO(HostDirectory):
@@ -253,6 +243,7 @@ class RemoteParamikoIO(HostDirectory):
         self,
         local_path: str,
         force_local_cleanup: bool = False,
+        excluded_paths: list[str] | None = None,
     ) -> None:
         # Record uncompressed upload bytes
         uncompressed_bytes = sum(
@@ -261,12 +252,17 @@ class RemoteParamikoIO(HostDirectory):
         self._collector.record_metric(MetricName.FILE_TRANSFER_BYTES_UNCOMPRESSED, uncompressed_bytes, "Bytes")
         assert os.path.exists(local_path)
 
+        exclude_args = [f"--exclude={pattern}" for pattern in (excluded_paths or [])]
         with self._collector.timer(MetricName.SFTP_UPLOAD_TIME):
-            local_tar = subprocess.Popen(["tar", "-czf", "-", "-C", local_path, "."], stdout=subprocess.PIPE)
+            local_tar = subprocess.Popen(
+                ["tar", *exclude_args, "-czf", "-", "-C", local_path, "."], stdout=subprocess.PIPE
+            )
+            tar_stdout = local_tar.stdout
+            assert tar_stdout is not None, "stdout=PIPE was requested"
             try:
-                self.write(iter(lambda: local_tar.stdout.read(_STREAM_BUFFER_SIZE), b""), self.target_path)
+                self.write(iter(lambda: tar_stdout.read(_STREAM_BUFFER_SIZE), b""), self.target_path)
             finally:
-                local_tar.stdout.close()
+                tar_stdout.close()
                 local_tar.wait()
 
         # NOTE: input .bin files are intentionally NOT deleted here. A host
@@ -292,14 +288,19 @@ class RemoteParamikoIO(HostDirectory):
 
         with self._collector.timer(MetricName.SFTP_DOWNLOAD_TIME):
             local_tar = subprocess.Popen(["tar", "-xzf", "-", "-C", destination_dir_path], stdin=subprocess.PIPE)
+            tar_stdin = local_tar.stdin
+            assert tar_stdin is not None, "stdin=PIPE was requested"
             try:
                 for chunk in self.read(self.target_path, list_of_files):
-                    local_tar.stdin.write(chunk)
+                    tar_stdin.write(chunk)
             finally:
-                local_tar.stdin.close()
+                tar_stdin.close()
                 local_tar.wait()
             if local_tar.returncode != 0:
-                raise LocalExecutionException("Local tar extract failed", local_tar)
+                raise LocalExecutionException(
+                    "Local tar extract failed",
+                    subprocess.CompletedProcess(local_tar.args, local_tar.returncode),
+                )
 
         uncompressed_bytes = sum(
             os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(destination_dir_path) for f in files
@@ -334,6 +335,10 @@ class ScpIO(HostDirectory):
             *self._KEEPALIVE_OPTS,
             "-o",
             f"ControlPath={self._control_path}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=30",
             "-T",
             self._alias,
             remote_command,
@@ -343,6 +348,7 @@ class ScpIO(HostDirectory):
         self,
         local_path: str,
         force_local_cleanup: bool = False,
+        excluded_paths: list[str] | None = None,
     ) -> None:
         uncompressed_bytes = sum(
             os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(local_path) for f in files
@@ -350,13 +356,21 @@ class ScpIO(HostDirectory):
         self._collector.record_metric(MetricName.FILE_TRANSFER_BYTES_UNCOMPRESSED, uncompressed_bytes, "Bytes")
         assert os.path.exists(local_path)
 
+        # Uncompressed tar: the payload is dominated by float tensors (~1.1x
+        # gzip ratio) and the wire outpaces gzip, so compression only adds CPU
+        # to the critical path.
+        exclude_args = [f"--exclude={pattern}" for pattern in (excluded_paths or [])]
         with self._collector.timer(MetricName.SFTP_UPLOAD_TIME):
-            tar_proc = subprocess.Popen(["tar", "-czf", "-", "-C", local_path, "."], stdout=subprocess.PIPE)
-            ssh_proc = subprocess.Popen(
-                self._ssh_cmd(f"mkdir -p -m 777 {self.target_path} && tar -xzf - -C {self.target_path}"),
-                stdin=tar_proc.stdout,
+            tar_proc = subprocess.Popen(
+                ["tar", *exclude_args, "-cf", "-", "-C", local_path, "."], stdout=subprocess.PIPE
             )
-            tar_proc.stdout.close()
+            tar_stdout = tar_proc.stdout
+            assert tar_stdout is not None, "stdout=PIPE was requested"
+            ssh_proc = subprocess.Popen(
+                self._ssh_cmd(f"mkdir -p -m 777 {self.target_path} && tar -xf - -C {self.target_path}"),
+                stdin=tar_stdout,
+            )
+            tar_stdout.close()
             ssh_proc.wait()
             tar_proc.wait()
         if ssh_proc.returncode != 0:
@@ -382,11 +396,13 @@ class ScpIO(HostDirectory):
         files_arg = " ".join(list_of_files) if list_of_files else "."
         with self._collector.timer(MetricName.SFTP_DOWNLOAD_TIME):
             ssh_proc = subprocess.Popen(
-                self._ssh_cmd(f"tar --ignore-failed-read -czf - -C {self.target_path} {files_arg}"),
+                self._ssh_cmd(f"tar --ignore-failed-read -cf - -C {self.target_path} {files_arg}"),
                 stdout=subprocess.PIPE,
             )
-            tar_proc = subprocess.Popen(["tar", "-xzf", "-", "-C", destination_dir_path], stdin=ssh_proc.stdout)
-            ssh_proc.stdout.close()
+            ssh_stdout = ssh_proc.stdout
+            assert ssh_stdout is not None, "stdout=PIPE was requested"
+            tar_proc = subprocess.Popen(["tar", "-xf", "-", "-C", destination_dir_path], stdin=ssh_stdout)
+            ssh_stdout.close()
             tar_proc.wait()
             ssh_proc.wait()
         if tar_proc.returncode != 0:
@@ -424,11 +440,25 @@ class RemoteS3IO(HostDirectory):
         super().__init__(path, collector)
         self._client = client
         self._s3_config = s3_config
+        if s3_config.bucket is None:
+            raise ValueError("S3-based artifact transfer requires a bucket in the S3 configuration")
+        self._bucket = s3_config.bucket
+        self._resolved_region: str | None = None
+
+    def _bucket_region(self) -> str:
+        """Region to sign remote ``aws s3 cp`` for: the bucket's region, never the
+        host's. Uses the explicit config value if set, else resolves once from the
+        bucket. Memoized per instance (and process-wide via ``get_bucket_region``).
+        """
+        if self._resolved_region is None:
+            self._resolved_region = self._s3_config.region or get_bucket_region(self._bucket, self._s3_config.profile)
+        return self._resolved_region
 
     def upload(
         self,
         local_path: str,
         force_local_cleanup: bool = False,
+        excluded_paths: list[str] | None = None,
     ) -> None:
         s3_config = self._s3_config
         s3_client, session = get_s3_client_and_session(s3_config.profile)
@@ -441,7 +471,9 @@ class RemoteS3IO(HostDirectory):
         if not is_archive(local_path):
             local_archive_location = to_archive_name_in_parent(local_path)
             with self._collector.timer(MetricName.S3_UPLOAD_LOCAL_ARCHIVE_TIME):
-                command_result = subprocess.run(create_archive_command(local_path, local_archive_location).split(" "))
+                command_result = subprocess.run(
+                    create_archive_command(local_path, local_archive_location, excluded_paths=excluded_paths).split(" ")
+                )
             if command_result.returncode != 0:
                 raise LocalExecutionException(f"Unable to create tarball of {local_path}", command_result)
             local_path = local_archive_location
@@ -473,7 +505,7 @@ class RemoteS3IO(HostDirectory):
             creds = session.get_credentials().get_frozen_credentials()
             self.logger.info(f"Downloading s3://{s3_config.bucket}/{s3_key} on remote device...")
             download_cmd = build_remote_s3_cli_command(
-                s3_config.bucket, s3_key, remote_archive_location, creds, S3TransferDirection.INPUTS
+                self._bucket, s3_key, remote_archive_location, creds, S3TransferDirection.INPUTS, self._bucket_region()
             )
             with self._collector.timer(MetricName.S3_UPLOAD_S3_TO_REMOTE_TIME) as t:
                 result = self._client.run(download_cmd, hide=True, timeout=_S3_TRANSFER_TIMEOUT_SECONDS)
@@ -527,9 +559,22 @@ class RemoteS3IO(HostDirectory):
                     f"Unable to create tarball in {remote_archive_location} on remote", result
                 )
 
+            # Fingerprint the archive on the host before it leaves. boto3 does not
+            # validate the object checksum on a ranged (multipart) download, so we
+            # compare the digest ourselves. Best-effort: skip if sha256sum is unavailable.
+            checksum_result = self._client.run(
+                f"sha256sum '{remote_archive_location}'",
+                hide=True,
+                warn=True,
+                timeout=_S3_TRANSFER_TIMEOUT_SECONDS,
+            )
+            remote_sha256 = None if checksum_result.failed else _parse_sha256sum_output(checksum_result.stdout)
+            if remote_sha256 is None:
+                self.logger.warning("Could not compute remote archive sha256; skipping transfer-integrity check")
+
             self.logger.info(f"Uploading from remote to s3://{s3_config.bucket}/{s3_key}...")
             upload_cmd = build_remote_s3_cli_command(
-                s3_config.bucket, s3_key, remote_archive_location, creds, S3TransferDirection.OUTPUTS
+                self._bucket, s3_key, remote_archive_location, creds, S3TransferDirection.OUTPUTS, self._bucket_region()
             )
             with self._collector.timer(MetricName.S3_DOWNLOAD_REMOTE_TO_S3_TIME) as t_remote_to_s3:
                 result = self._client.run(upload_cmd, hide=True, timeout=_S3_TRANSFER_TIMEOUT_SECONDS)
@@ -540,12 +585,41 @@ class RemoteS3IO(HostDirectory):
             archive_name = os.path.basename(s3_key)
             local_archive_location = os.path.join(destination_dir_path, archive_name)
             os.makedirs(destination_dir_path, exist_ok=True)
-            self.logger.info(f"Downloading s3://{s3_config.bucket}/{s3_key} to local...")
-            with self._collector.timer(MetricName.S3_DOWNLOAD_S3_TO_LOCAL_TIME) as t_s3_to_local:
-                s3_client.download_file(s3_config.bucket, s3_key, local_archive_location)
-            self.logger.info(f"Successfully downloaded to: {local_archive_location}")
-            download_bytes = os.path.getsize(local_archive_location)
+
+            # Retry the S3->local download in place. The uploaded object is whole
+            # (multipart completion is atomic), so re-downloading the same key fixes a
+            # truncated GET without rebuilding the tarball, re-uploading, or re-running
+            # the test.
+            download_bytes = 0
+            for attempt in range(_S3_DOWNLOAD_MAX_ATTEMPTS):
+                self.logger.info(f"Downloading s3://{s3_config.bucket}/{s3_key} to local...")
+                with self._collector.timer(MetricName.S3_DOWNLOAD_S3_TO_LOCAL_TIME) as t_s3_to_local:
+                    s3_client.download_file(s3_config.bucket, s3_key, local_archive_location)
+                download_bytes = os.path.getsize(local_archive_location)
+
+                # Transfer integrity only, blind to whether the kernel produced the right
+                # shape. A wrong-size kernel still ships a whole, matching archive.
+                if remote_sha256 is None or _sha256_of_file(local_archive_location) == remote_sha256:
+                    self.logger.info(f"Successfully downloaded to: {local_archive_location}")
+                    break
+
+                # A mismatch that persists across all attempts raises a retryable error, not
+                # a ValidationException (which --rerun-except excludes from the auto-reruns).
+                __cleanup_local_paths__(local_archive_location, ignore_exceptions=True)
+                if attempt + 1 >= _S3_DOWNLOAD_MAX_ATTEMPTS:
+                    raise RemoteFileTransferException(
+                        f"Archive checksum mismatch after {_S3_DOWNLOAD_MAX_ATTEMPTS} download attempts for "
+                        f"s3://{s3_config.bucket}/{s3_key} (remote={remote_sha256}, local_size={download_bytes}) "
+                        f"— archive was truncated or corrupted in transit",
+                        Exception("sha256 mismatch"),
+                    )
+                self.logger.warning(
+                    f"Archive checksum mismatch on download attempt {attempt + 1}/{_S3_DOWNLOAD_MAX_ATTEMPTS} "
+                    f"for s3://{s3_config.bucket}/{s3_key}; re-downloading"
+                )
+
             self._collector.record_metric(MetricName.S3_DOWNLOAD_BYTES, download_bytes, "Bytes")
+
             rate_remote_to_s3 = (
                 (download_bytes / 1024) / t_remote_to_s3.duration if t_remote_to_s3.duration > 0 else 1e9
             )

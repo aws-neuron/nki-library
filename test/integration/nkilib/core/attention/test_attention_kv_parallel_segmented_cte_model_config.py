@@ -31,7 +31,16 @@ Config format: (model_name, group_size, q_heads_per_rank, seqlen, head_dim,
 
 import math
 
+from typing import TypedDict
+
 from test.utils.common_dataclasses import ModelTestType
+
+
+class KvpSegmentedAttnModelConfig(TypedDict, total=False):
+    TP_DCP_CONFIGS: list[tuple[int, int]]
+    SEGMENT_SIZE_PER_RANK: int
+    MAX_SEQS: list[int]
+    BLK_SIZE: list[int]
 
 MODELS = {
     "llama3_1b": {"n_q_heads": 32, "n_kv_heads": 8, "d_head": 64},
@@ -48,7 +57,7 @@ MODELS = {
 #   SEGMENT_SIZE_PER_RANK: local KV tokens per rank per chunk
 #   seqlen = SEGMENT_SIZE_PER_RANK * dcp
 #   num_chunks = max_seq // seqlen
-OPTIMAL_CONFIGS = {
+OPTIMAL_CONFIGS: dict[str, KvpSegmentedAttnModelConfig] = {
     "llama3_1b": {
         "TP_DCP_CONFIGS": [
             # (tp, dcp)

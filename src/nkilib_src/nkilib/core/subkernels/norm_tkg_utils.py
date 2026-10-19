@@ -665,8 +665,8 @@ def validate_rmsnorm_mx_quantize_tkg(
 
     # LNC sharding strategy
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_mx_quantize_tkg", (0, 1))
-    kernel_assert(lnc == 2, "rmsnorm_mx_quantize_tkg kernel only supports LNC=2")
-    do_shard = BxS % lnc == 0 and BxS >= _RMSNORM_QMX_SHARDING_THRESHOLD
+    kernel_assert(lnc in (1, 2), f"rmsnorm_mx_quantize_tkg kernel only supports LNC=1 or LNC=2; got {lnc}")
+    do_shard = lnc > 1 and BxS % lnc == 0 and BxS >= _RMSNORM_QMX_SHARDING_THRESHOLD
     shard_size = BxS // lnc if do_shard else BxS
     BxS_offset = shard_id * shard_size if do_shard else 0
 

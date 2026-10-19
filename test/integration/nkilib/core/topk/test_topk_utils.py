@@ -30,6 +30,7 @@ the full branch accounting.
 from typing import final
 
 import nki.language as nl
+import numpy as np
 import pytest
 from nkilib_src.nkilib.core.topk.rotational_topk_utils import (
     BFLOAT16_MIN,
@@ -80,7 +81,7 @@ class TestTopKUtils:
     @pytest.mark.fast
     def test_rotational_config_eq_and_cache(self):
         """__eq__ handles wrong types and equality; cache defaults to {} when None."""
-        tc = create_topk_config(inp_shape=(4, 3168), inp_dtype=nl.float32, k=256, sorted=True, num_programs=2)
+        tc = create_topk_config(inp_shape=(4, 3168), inp_dtype=np.dtype(nl.float32), k=256, sorted=True, num_programs=2)
         # shared_const_cache=None -> internal {} default (create_rotational_topk_config L672 True arc)
         cfg_none = create_rotational_topk_config(inp_shape=(4, 3168), topk_config=tc)
         # shared_const_cache provided -> used directly (L672 False arc)

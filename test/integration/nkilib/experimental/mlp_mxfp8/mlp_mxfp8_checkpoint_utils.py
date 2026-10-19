@@ -17,11 +17,9 @@
 import itertools
 from dataclasses import dataclass
 
-import neuron_dtypes as ndtype
+import nki.language as nl
 import numpy as np
 import numpy.typing as npt
-from neuronxcc.nki._private.test import mx_util
-from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
 from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import DGT_MIN_K
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
@@ -32,6 +30,7 @@ from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_uti
     Q_TILE_K,
     generate_golden_packed_scales,
 )
+from test.utils.mx_utils import quantize_mx_golden
 from test.utils.rng import NKITestsRNG
 
 _rng = NKITestsRNG()
@@ -216,7 +215,7 @@ def golden_mlp_fwd(hidden_np: npt.NDArray, gate_up_np: npt.NDArray, down_np: npt
 def swizzle_for_mlp(tensor_np: npt.NDArray) -> npt.NDArray:
     """Swizzle a [F, K] BF16 tensor to [K/4, F*4] layout for pre-swizzled input.
 
-    The MLP kernel expects inputs in [F, K] layout (is_f_by_k=True).
+    The MLP kernel expects inputs in [F, K] layout (F-by-K orientation).
     Swizzling converts [K, F] -> [K/4, F*4], so we first transpose to [K, F].
     """
     return matmul_utils.swizzle_tensor(tensor_np.T)
@@ -235,8 +234,8 @@ def prequantize_for_mlp(tensor_np: npt.NDArray, use_scale_packing: bool = False)
     """
     F, K = tensor_np.shape
     swizzled = matmul_utils.swizzle_tensor(tensor_np.T)
-    fp8_x4_dtype = ndtype.float8_e4m3fn_x4
-    data, compact_scales = mx_util.quantize_mx_golden(swizzled, fp8_x4_dtype, custom_mx_max_exp=_get_mx_max_exp)
+    fp8_x4_dtype = nl.float8_e4m3fn_x4
+    data, compact_scales = quantize_mx_golden(swizzled, fp8_x4_dtype)
     if use_scale_packing:
         scales = generate_golden_packed_scales(compact_scales, K, F, Q_TILE_K)
     else:

@@ -32,7 +32,7 @@ _SUPPORTED_INPUT_DTYPES = [nl.bfloat16, nl.float16]
 
 @nki.jit
 def topk_reduce(
-    input: nl.ndarray,
+    input: nl.NkiTensor,
     T: int,
     K: int,
     token_base_index: int = 1,
@@ -56,7 +56,7 @@ def topk_reduce(
         K: Number of routed experts per token (up to 8)
 
     Args:
-        input (nl.ndarray): [TK_padded, H + 2]@HBM, bf16/fp16. Sparse input buffer containing T*K
+        input (nl.NkiTensor): [TK_padded, H + 2]@HBM, bf16/fp16. Sparse input buffer containing T*K
             scattered outputs. Global token index is packed as int32 in the final 2x
             columns of each row (1-indexed, -1 for padding).
         T (int): Total number of input tokens.
@@ -66,7 +66,7 @@ def topk_reduce(
             searches for global indices [rank_id*T+1 .. rank_id*T+T].
 
     Returns:
-        output_hbm (nl.ndarray): [T, H]@HBM, bf16/fp16. Ordered and reduced output.
+        output_hbm (nl.NkiTensor): [T, H]@HBM, bf16/fp16. Ordered and reduced output.
             out[t] = sum of all rows with index (token_base_index + t).
     """
 

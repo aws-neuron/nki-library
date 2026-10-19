@@ -11,70 +11,95 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Torch reference for permute_a2av kernel."""
+"""Torch reference for capacity-bounded permute_a2av."""
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from nki.collectives import ReplicaGroup
 
-from ..collectives_torch import _to_numpy, _to_torch, get_pg, get_rank
+from ..collectives_torch import _to_numpy, _to_torch, get_pg
+
+
+def _validate_routed_row_permutation(
+    packed_source_indices: np.ndarray,
+    send_counts: np.ndarray,
+) -> None:
+    """Validate that peer segments partition a permutation of routed rows."""
+    if packed_source_indices.ndim != 1 or packed_source_indices.dtype != np.int32:
+        raise ValueError("packed_source_indices must be int32 [N]")
+    num_rows = packed_source_indices.shape[0]
+    if send_counts.ndim != 2 or send_counts.shape[0] != 1:
+        raise ValueError("send_counts must have shape [1, EP]")
+    if send_counts.dtype not in (np.int32, np.uint32):
+        raise ValueError("send_counts must be int32/uint32")
+    if np.any(send_counts < 0) or int(send_counts.sum()) != num_rows:
+        raise ValueError("send_counts must partition the packed vector")
+    if not np.array_equal(np.sort(packed_source_indices), np.arange(num_rows)):
+        raise ValueError("packed_source_indices must be a permutation of routed rows")
 
 
 def permute_a2av_torch_ref(
     hidden_states: np.ndarray,
-    send_indices: np.ndarray,
+    packed_source_indices: np.ndarray,
     send_counts: np.ndarray,
+    recv_capacity: int,
     replica_group: ReplicaGroup,
 ) -> dict:
-    """Torch ref: gather by send_indices, pack, all-to-all-v, return recv_data + metadata."""
-    T, H = hidden_states.shape
-    EP = send_indices.shape[1]
+    """Gather routed rows and emulate packed explicit-displacement A2AV."""
+    N, H = hidden_states.shape
+    EP = send_counts.shape[1]
     dtype = hidden_states.dtype
-    rank = get_rank()
     pg = get_pg(replica_group)
+    _validate_routed_row_permutation(packed_source_indices, send_counts)
+    if packed_source_indices.shape != (N,):
+        raise ValueError("packed_source_indices must match the input row count")
 
-    # Step 1: Gather tokens into packed send buffer per destination.
+    send_count_chunks = [torch.tensor([int(send_counts[0, peer])], dtype=torch.int64) for peer in range(EP)]
+    recv_count_chunks = [torch.zeros(1, dtype=torch.int64) for _ in range(EP)]
+    dist.all_to_all(recv_count_chunks, send_count_chunks, group=pg)
+    recv_counts = np.array([[int(chunk[0]) for chunk in recv_count_chunks]], dtype=np.uint32)
+    recv_total = int(recv_counts.sum())
+    if recv_total > recv_capacity:
+        raise ValueError(f"receive total {recv_total} exceeds capacity {recv_capacity}")
+
+    torch_dtype = _to_torch(hidden_states[:1]).dtype
     send_chunks = []
     send_sizes = []
-    for ep_dst in range(EP):
-        count = int(send_counts[0, ep_dst])
+    offset = 0
+    for peer in range(EP):
+        count = int(send_counts[0, peer])
         send_sizes.append(count * H)
-        if count > 0:
-            idx = send_indices[:count, ep_dst].astype(np.intp)
-            send_chunks.append(_to_torch(hidden_states[idx, :]).reshape(-1))
+        if count:
+            indices = packed_source_indices[offset : offset + count].astype(np.intp)
+            send_chunks.append(_to_torch(hidden_states[indices, :]).reshape(-1))
         else:
-            send_chunks.append(torch.zeros(0, dtype=_to_torch(hidden_states[:1]).reshape(-1).dtype))
-
+            send_chunks.append(torch.zeros(0, dtype=torch_dtype))
+        offset += count
     send_flat = torch.cat(send_chunks)
 
-    # Step 2: Exchange sizes to know recv_sizes.
-    send_sizes_t = torch.tensor(send_sizes, dtype=torch.long)
-    recv_sizes_t = torch.zeros(EP, dtype=torch.long)
-    dist.all_to_all_single(recv_sizes_t, send_sizes_t, group=pg)
-    recv_sizes = [int(recv_sizes_t[s]) for s in range(EP)]
+    recv_sizes = [int(recv_counts[0, peer]) * H for peer in range(EP)]
+    recv_flat = torch.zeros(sum(recv_sizes), dtype=send_flat.dtype)
+    dist.all_to_all_single(
+        recv_flat,
+        send_flat,
+        output_split_sizes=recv_sizes,
+        input_split_sizes=send_sizes,
+        group=pg,
+    )
 
-    # Step 3: Variable-length all-to-all exchange.
-    recv_total = sum(recv_sizes)
-    recv_flat = torch.zeros(recv_total, dtype=send_flat.dtype)
-    dist.all_to_all_single(recv_flat, send_flat, output_split_sizes=recv_sizes, input_split_sizes=send_sizes, group=pg)
+    recv_data = np.zeros((recv_capacity, H), dtype=dtype)
+    if recv_total:
+        recv_data[:recv_total, :] = _to_numpy(recv_flat.reshape(recv_total, H), dtype)
 
-    # Step 4: Place received data into [EP*T, H] layout.
-    recv_data = np.zeros((EP * T, H), dtype=dtype)
-    offset = 0
-    for src in range(EP):
-        n_rows = recv_sizes[src] // H
-        if n_rows > 0:
-            recv_data[src * T : src * T + n_rows, :] = _to_numpy(
-                recv_flat[offset : offset + recv_sizes[src]].reshape(n_rows, H), dtype
-            )
-        offset += recv_sizes[src]
-
-    # Step 5: Build metadata [4, EP] uint32.
-    metadata = np.zeros((4, EP), dtype=np.uint32)
-    metadata[0, :] = send_counts[0, :].astype(np.uint32) * H
-    sdispls = np.concatenate([[0], np.cumsum(send_counts[0, :-1])]).astype(np.uint32)
-    metadata[1, :] = sdispls * H
-    metadata[2, :] = np.array([recv_sizes[s] for s in range(EP)], dtype=np.uint32)
-
+    send_displs = np.concatenate([[0], np.cumsum(send_counts[0, :-1])]).astype(np.uint32)
+    recv_displs = np.concatenate([[0], np.cumsum(recv_counts[0, :-1])]).astype(np.uint32)
+    metadata = np.stack(
+        [
+            send_counts[0].astype(np.uint32) * H,
+            send_displs * H,
+            recv_counts[0] * H,
+            recv_displs * H,
+        ]
+    )
     return {"recv_data": recv_data, "metadata": metadata}

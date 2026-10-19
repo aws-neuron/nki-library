@@ -321,7 +321,7 @@ def shapes_to_test_configs(shapes: List, model_name: str = "") -> List[TestConfi
     return configs
 
 
-def load_model_configs(config_dir: str = None) -> dict:
+def load_model_configs(config_dir: str | None = None) -> dict:
     """
     Load all model configurations from the config directory.
 

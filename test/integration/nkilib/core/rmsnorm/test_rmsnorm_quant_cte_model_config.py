@@ -38,6 +38,14 @@ from test.utils.common_dataclasses import ModelTestType
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 
+from typing import TypedDict
+
+
+class RmsnormModelConfig(TypedDict, total=False):
+    TP_CP_CONFIGS: list[tuple[int, int, int]]
+    SEQLENS: list[int]
+    QUANT_TYPES: list[QuantizationType]
+
 MODELS = {
     "llama3_70b": {"hidden": 8192, "fused_residual": False},
     "qwen3_32b": {"hidden": 5120, "fused_residual": False},
@@ -47,7 +55,7 @@ MODELS = {
 }
 
 # (world_size, tp, cp)
-DEFAULT_TP_CP = [
+DEFAULT_TP_CP: list[tuple[int, int, int]] = [
     (64, 64, 1),
     (16, 16, 1),
     (8, 8, 1),
@@ -59,11 +67,11 @@ DEFAULT_TP_CP = [
     (64, 4, 16),
 ]
 
-DEFAULT_SEQLENS = [1024, 10240, 32768]
+DEFAULT_SEQLENS: list[int] = [1024, 10240, 32768]
 
-DEFAULT_QUANT_TYPES = [QuantizationType.STATIC, QuantizationType.ROW]
+DEFAULT_QUANT_TYPES: list[QuantizationType] = [QuantizationType.STATIC, QuantizationType.ROW]
 
-OPTIMAL_CONFIGS = {name: {'TP_CP_CONFIGS': DEFAULT_TP_CP, 'SEQLENS': DEFAULT_SEQLENS} for name in MODELS}
+OPTIMAL_CONFIGS: dict[str, RmsnormModelConfig] = {name: {'TP_CP_CONFIGS': DEFAULT_TP_CP, 'SEQLENS': DEFAULT_SEQLENS} for name in MODELS}
 
 
 def _static_scale_wrapper(default_tensor_generator):

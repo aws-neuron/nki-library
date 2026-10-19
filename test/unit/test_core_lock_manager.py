@@ -469,6 +469,7 @@ def test_manager_acquire_enqueue_then_commit(tmp_path):
     assert first.position == 0
 
     # Release the blocker's cores; the head's next polls open a window and commit.
+    assert blocked.physical_cores is not None, "an ALLOCATED outcome carries its physical cores"
     blocker.release(blocked.physical_cores)
 
     final = None

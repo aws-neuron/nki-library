@@ -31,7 +31,8 @@ import json
 import logging
 import secrets
 import shlex
-from typing import TYPE_CHECKING, Any, Callable
+from types import FunctionType
+from typing import TYPE_CHECKING, Any
 
 from .host_communication import SshChannelOpenError
 
@@ -166,11 +167,13 @@ class RemoteExecutor:
             if self._explicitly_closed:
                 raise RemoteExecutorError("Executor is closed")
             self._start()
+        channel = self._channel
+        assert channel is not None, "a started executor holds an open channel"
         req_id = self._next_id
         self._next_id += 1
         request = {"id": req_id, "token": self._token, "method": method, "params": params}
         try:
-            self._channel.sendall((json.dumps(request) + "\n").encode())
+            channel.sendall((json.dumps(request) + "\n").encode())
             response_line = self._recv_line()
         except RemoteExecutorError:
             self._channel = None
@@ -183,7 +186,7 @@ class RemoteExecutor:
             raise RemoteExecutorError(f"Remote error: {resp['error']}")
         return resp.get("result")
 
-    def call_function(self, func: Callable, **kwargs) -> Any:
+    def call_function(self, func: FunctionType, **kwargs) -> Any:
         """Send a Python function to execute remotely and return its result.
 
         The function's source is shipped via ``inspect.getsource`` and exec'd on

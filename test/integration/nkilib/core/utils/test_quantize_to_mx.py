@@ -21,7 +21,6 @@ via UnitTestFramework (end-to-end on Trainium).
 from typing import final
 
 import neuron_dtypes as dt
-import neuronxcc.nki.typing as nt
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
@@ -38,10 +37,10 @@ from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def quantize_mx_kernel(
-    src_hbm: nl.ndarray,
-    out_data_hbm: nt.mutable_tensor,
-    out_scale_hbm: nt.mutable_tensor,
-) -> None:
+    src_hbm: nl.NkiTensor,
+    out_data_hbm: nl.NkiTensor,
+    out_scale_hbm: nl.NkiTensor,
+) -> tuple[nl.NkiTensor, nl.NkiTensor]:
     """Quantize input to MX x4 format via nisa.quantize_mx.
 
     Output dtype is inferred from out_data_hbm.dtype.
@@ -51,12 +50,13 @@ def quantize_mx_kernel(
         F: Free dimension (must be divisible by 4)
 
     Args:
-        src_hbm (nl.ndarray): [P, F], fp16/bf16 input in HBM.
-        out_data_hbm (nt.mutable_tensor): [P, F//4], packed x4 output in HBM.
-        out_scale_hbm (nt.mutable_tensor): [P, F//4], uint8 scale output in HBM.
+        src_hbm (nl.NkiTensor): [P, F], fp16/bf16 input in HBM.
+        out_data_hbm (nl.NkiTensor): [P, F//4], packed x4 output in HBM.
+        out_scale_hbm (nl.NkiTensor): [P, F//4], uint8 scale output in HBM.
 
     Returns:
-        None (outputs written in-place via nisa.dma_copy).
+        (out_data_hbm, out_scale_hbm): the same output tensors passed in, written
+        in-place via nisa.dma_copy and returned so the compiler IR gets output names.
 
     Notes:
         - P must be divisible by 32 for nisa.quantize_mx, max 128.

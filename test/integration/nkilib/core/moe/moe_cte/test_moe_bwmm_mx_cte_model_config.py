@@ -79,11 +79,40 @@ from test.utils.common_dataclasses import ModelTestType
 import nki.language as nl
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 
+from typing import Any, TypedDict
+
+
+class MoeBwmmMxModelConfig(TypedDict, total=False):
+    BWMM_VARIANTS: list[str]
+    EP_MOETP_CONFIGS: list[tuple[int, int]]
+    SEQ_LENS: list[int]
+    SKEWNESS_PCTS: list[float]
+    SHARD_ON_BLOCK_BLK_SIZES: list[int]
+    SHARD_ON_BLOCK_WDTS: list[Any]
+    SHARD_ON_BLOCK_IS_DYNAMIC: bool
+    SHARD_ON_I_BLK_SIZES: list[int]
+    SHARD_ON_I_WDTS: list[Any]
+    SHARD_ON_I_IS_DYNAMIC: bool
+
 # ============================================================================
 # Model definitions
 # ============================================================================
 
-MODELS = {
+
+class MoeModelSpec(TypedDict):
+    hidden: int
+    full_intermediate: int
+    total_experts: int
+    global_top_k: int
+    act_fn: ActFnType
+    bias: bool
+    gate_clamp_upper: float | None
+    gate_clamp_lower: float | None
+    up_clamp_upper: float | None
+    up_clamp_lower: float | None
+
+
+MODELS: dict[str, MoeModelSpec] = {
     "gptoss_120b": {
         "hidden": 3072,
         "full_intermediate": 3072,
@@ -119,10 +148,10 @@ MODELS = {
 #     shard-on-I:     pad to multiple of 1024
 # ============================================================================
 
-_DEFAULT_BWMM_VARIANTS = ["shard_on_block", "shard_on_I"]
-_DEFAULT_WDTS = [nl.float8_e4m3fn_x4]
+_DEFAULT_BWMM_VARIANTS: list[str] = ["shard_on_block", "shard_on_I"]
+_DEFAULT_WDTS: list[Any] = [nl.float8_e4m3fn_x4]
 
-OPTIMAL_CONFIGS = {
+OPTIMAL_CONFIGS: dict[str, MoeBwmmMxModelConfig] = {
     # NOTE: Now each test takes more than 10 mins to run, to not timeout pipeline, we comment out all the optimal configs.
     # Once an optimization to the test golden gen algo is merged, we can re-enable them. But make sure they pass the tests before uncomment and merge.
     "gptoss_120b": {
@@ -152,7 +181,7 @@ OPTIMAL_CONFIGS = {
     },
 }
 
-GENERALITY_CONFIGS = {
+GENERALITY_CONFIGS: dict[str, MoeBwmmMxModelConfig] = {
     "qwen3_235b": {
         # NOTE: these are generality configs for manual benchmark purpose as the optimal ones are not identified yet and we need to ease the burden of pipeline.
         # NOTE: Some configs would fail accuracy validation marginally, so validate it before moving anything to OPTIMAL_CONFIGS which would be run by pipeline.
@@ -243,14 +272,23 @@ def generate_moe_bwmm_mx_configs(configs=None):
         m = MODELS[model_name]
         c = configs[model_name]
         for variant in c.get("BWMM_VARIANTS", _DEFAULT_BWMM_VARIANTS):
-            variant_key = "SHARD_ON_BLOCK" if variant == "shard_on_block" else "SHARD_ON_I"
-            assert f"{variant_key}_BLK_SIZES" in c, f"{model_name}: {variant} variant requires {variant_key}_BLK_SIZES"
-            is_dynamic = c.get(f"{variant_key}_IS_DYNAMIC", True)
+            if variant == "shard_on_block":
+                variant_key = "SHARD_ON_BLOCK"
+                assert "SHARD_ON_BLOCK_BLK_SIZES" in c, f"{model_name}: {variant} variant requires {variant_key}_BLK_SIZES"
+                blk_sizes = c["SHARD_ON_BLOCK_BLK_SIZES"]
+                is_dynamic = c.get("SHARD_ON_BLOCK_IS_DYNAMIC", True)
+                wdts = c.get("SHARD_ON_BLOCK_WDTS", _DEFAULT_WDTS)
+            else:
+                variant_key = "SHARD_ON_I"
+                assert "SHARD_ON_I_BLK_SIZES" in c, f"{model_name}: {variant} variant requires {variant_key}_BLK_SIZES"
+                blk_sizes = c["SHARD_ON_I_BLK_SIZES"]
+                is_dynamic = c.get("SHARD_ON_I_IS_DYNAMIC", True)
+                wdts = c.get("SHARD_ON_I_WDTS", _DEFAULT_WDTS)
             for ep, mtp in c["EP_MOETP_CONFIGS"]:
                 assert m["total_experts"] % ep == 0, f"total_experts has to be divisible by EP"
                 for seqlen in c["SEQ_LENS"]:
-                    for blk in c[f"{variant_key}_BLK_SIZES"]:
-                        for wdt in c.get(f"{variant_key}_WDTS", _DEFAULT_WDTS):
+                    for blk in blk_sizes:
+                        for wdt in wdts:
                             for skew in c["SKEWNESS_PCTS"]:
                                 d = get_moe_bwmm_mx_config(
                                     model_name, seqlen, variant, blk, skew, mtp, ep,

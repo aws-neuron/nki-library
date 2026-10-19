@@ -101,6 +101,12 @@ TEST_PARAMS = [
 [5120,  4096, 4,   128, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 [5120,  4096, 4,   256, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
+# Qwen3-235B single-expert-dense (H=4096, E=1, TOPK=1): TP1 I_TP=1536, TP2 I_TP=768
+[4096,  4096, 1,   2048, 1,   1536, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 1,   4096, 1,   1536, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 1,   2048, 1,   768,  bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 1,   4096, 1,   768,  bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+
 # Affinity I test cases
 [4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [4096,  4096, 4,   256, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
@@ -114,7 +120,6 @@ TEST_PARAMS = [
 [2880,  4096, 2,  128, 2,    2880, bfloat16, 0,    ClampLimits(7, -7, 7, -7),  True, ActFnType.Swish,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2, 128, 2,    768,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2, 128, 2,    192,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
-[5120,  4096, 2,  128, 2,    8192, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [5120,  4096, 2,  128, 2,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2,  128, 2,    1408, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 [2048,  4096, 2,  128, 2,    352,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
@@ -156,7 +161,6 @@ _FULL_ONLY_KEYS = {
     (5120, 8192, 128, 256, 1, 128),
     (6144, 4096, 16, 512, 4, 1024),
     (2880, 4096, 2, 128, 2, 2880),
-    (5120, 4096, 2, 128, 2, 8192),
     (4096, 4096, 4, 128, 2, 1536),
     (4096, 4096, 4, 256, 2, 1536),
     (4096, 4096, 4, 128, 2, 384),

@@ -21,10 +21,10 @@ decisions are consistent between kernel and golden.
 
 from typing import Any, final
 
+import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from neuronxcc.nki._private.private_api import float8_e4m3fn_x4
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
     _swizzle,
     golden_matmul,
@@ -57,7 +57,7 @@ from test.utils.unit_test_framework import UnitTestFramework
 
 # Constants
 LNC = 2
-COMPUTE_DTYPE_X4 = float8_e4m3fn_x4
+COMPUTE_DTYPE_X4 = nl.float8_e4m3fn_x4
 BWD_GOLDEN_SEED = 123
 
 _bwd_rng = NKITestsRNG(seed=BWD_GOLDEN_SEED)

@@ -26,12 +26,12 @@ from ...core.utils.kernel_assert import kernel_assert
 
 @nki.jit
 def allgather_compute_matmul(
-    lhs: nl.ndarray,
-    rhs: nl.ndarray,
+    lhs: nl.NkiTensor,
+    rhs: nl.NkiTensor,
     tp_degree: int,
     num_groups: int,
     force_hbm_cc: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Fine grained all-gather and matrix multiplication (FGCC) kernel for TRN2.
 
@@ -49,15 +49,15 @@ def allgather_compute_matmul(
         N: Output column dimension (column-sharded per rank).
 
     Args:
-        lhs (nl.ndarray): [m, K], Left-hand side tensor, row-sharded across ranks.
-        rhs (nl.ndarray): [K, N], Right-hand side tensor, column-sharded per rank.
+        lhs (nl.NkiTensor): [m, K], Left-hand side tensor, row-sharded across ranks.
+        rhs (nl.NkiTensor): [K, N], Right-hand side tensor, column-sharded per rank.
         tp_degree (int): Tensor parallelism degree (number of ranks). Must be even.
         num_groups (int): Number of replica groups for collective communication.
         force_hbm_cc (bool): If True, force HBM collective communication path
             even when SBUF path is feasible.
 
     Returns:
-        result (nl.ndarray): [RANK_N, ...], Column-sharded result tensor in shared HBM.
+        result (nl.NkiTensor): [RANK_N, ...], Column-sharded result tensor in shared HBM.
             Shape depends on communication path (SBUF vs HBM).
 
     Notes:
@@ -670,11 +670,11 @@ def _generate_replica_groups(tp_degree: int, num_groups: int) -> List[List[int]]
 
 
 def _matmul(
-    lhs: nl.ndarray,
+    lhs: nl.NkiTensor,
     lhs_in_sbuf: bool,
-    rhs: nl.ndarray,
+    rhs: nl.NkiTensor,
     rhs_in_sbuf: bool,
-    res: nl.ndarray,
+    res: nl.NkiTensor,
     res_in_sbuf: bool,
     TILES_IN_BLOCKS: Tuple[int, int, int] = (16, 2, 8),
     M: Optional[int] = None,
@@ -689,11 +689,11 @@ def _matmul(
     support for operands in either SBUF or HBM.
 
     Args:
-        lhs (nl.ndarray): Left-hand side matrix, shape [M, K].
+        lhs (nl.NkiTensor): Left-hand side matrix, shape [M, K].
         lhs_in_sbuf (bool): Whether lhs is pre-loaded in SBUF.
-        rhs (nl.ndarray): Right-hand side matrix, shape [K, N].
+        rhs (nl.NkiTensor): Right-hand side matrix, shape [K, N].
         rhs_in_sbuf (bool): Whether rhs is pre-loaded in SBUF.
-        res (nl.ndarray): Result accumulation buffer, shape [M, N].
+        res (nl.NkiTensor): Result accumulation buffer, shape [M, N].
         res_in_sbuf (bool): Whether res is in SBUF.
         TILES_IN_BLOCKS (Tuple[int, int, int]): Tile counts per block for (M, N, K).
         M (Optional[int]): Total rows of lhs.
@@ -838,9 +838,9 @@ def _matmul(
 
 
 def _compute_matmul_hbm(
-    lhs_buf: nl.ndarray,
-    rhs: nl.ndarray,
-    result_tensor: nl.ndarray,
+    lhs_buf: nl.NkiTensor,
+    rhs: nl.NkiTensor,
+    result_tensor: nl.NkiTensor,
     numerator: int,
     rhs_in_sbuf: bool,
     TILE_M: int,
@@ -869,9 +869,9 @@ def _compute_matmul_hbm(
     writes result tiles back to the result tensor in HBM using indirect DMA.
 
     Args:
-        lhs_buf (nl.ndarray): Left-hand side buffer in HBM.
-        rhs (nl.ndarray): Right-hand side tensor (HBM or SBUF).
-        result_tensor (nl.ndarray): Output tensor in shared HBM.
+        lhs_buf (nl.NkiTensor): Left-hand side buffer in HBM.
+        rhs (nl.NkiTensor): Right-hand side tensor (HBM or SBUF).
+        result_tensor (nl.NkiTensor): Output tensor in shared HBM.
         numerator (int): Rank ID for indirect DMA offset.
         rhs_in_sbuf (bool): Whether rhs is pre-loaded in SBUF.
         TILE_M (int): Tile size along M dimension.
@@ -947,8 +947,8 @@ def _compute_matmul_hbm(
 
 
 def _launch_collective_permutes_hbm(
-    buf_src: nl.ndarray,
-    buf_dst: nl.ndarray,
+    buf_src: nl.NkiTensor,
+    buf_dst: nl.NkiTensor,
     replica_group: ReplicaGroup,
     CHANNEL_N: int,
     M: int,
@@ -963,8 +963,8 @@ def _launch_collective_permutes_hbm(
     implicit collective permute across all channels.
 
     Args:
-        buf_src (nl.ndarray): Source buffer in shared HBM.
-        buf_dst (nl.ndarray): Destination buffer in shared HBM.
+        buf_src (nl.NkiTensor): Source buffer in shared HBM.
+        buf_dst (nl.NkiTensor): Destination buffer in shared HBM.
         replica_group (ReplicaGroup): Replica group for collective communication.
         CHANNEL_N (int): Number of communication channels.
         M (int): Total M dimension across all ranks.
@@ -993,8 +993,8 @@ def _launch_collective_permutes_hbm(
 
 
 def _launch_collective_permutes_sbuf(
-    buf_src: nl.ndarray,
-    buf_dst: nl.ndarray,
+    buf_src: nl.NkiTensor,
+    buf_dst: nl.NkiTensor,
     replica_group: ReplicaGroup,
     CHANNEL_N: int,
     NUM_BLOCK_K: int,
@@ -1009,8 +1009,8 @@ def _launch_collective_permutes_sbuf(
     permute across all channels.
 
     Args:
-        buf_src (nl.ndarray): Source buffer in SBUF (flattened).
-        buf_dst (nl.ndarray): Destination buffer in SBUF (flattened).
+        buf_src (nl.NkiTensor): Source buffer in SBUF (flattened).
+        buf_dst (nl.NkiTensor): Destination buffer in SBUF (flattened).
         replica_group (ReplicaGroup): Replica group for collective communication.
         CHANNEL_N (int): Number of communication channels.
         NUM_BLOCK_K (int): Number of K blocks.
@@ -1041,8 +1041,8 @@ def _launch_collective_permutes_sbuf(
 
 def _compute_matmul_sbuf(
     lhs_buf: list,
-    rhs: nl.ndarray,
-    result_tensor: nl.ndarray,
+    rhs: nl.NkiTensor,
+    result_tensor: nl.NkiTensor,
     numerator: int,
     rhs_in_sbuf: bool,
     TILE_M: int,
@@ -1073,8 +1073,8 @@ def _compute_matmul_sbuf(
 
     Args:
         lhs_buf (list): Nested list of lhs tiles in SBUF, indexed by [channel][k][bk][m].
-        rhs (nl.ndarray): Right-hand side tensor (HBM or SBUF).
-        result_tensor (nl.ndarray): Output tensor in shared HBM.
+        rhs (nl.NkiTensor): Right-hand side tensor (HBM or SBUF).
+        result_tensor (nl.NkiTensor): Output tensor in shared HBM.
         numerator (int): Rank ID for indirect DMA offset.
         rhs_in_sbuf (bool): Whether rhs is pre-loaded in SBUF.
         TILE_M (int): Tile size along M dimension.

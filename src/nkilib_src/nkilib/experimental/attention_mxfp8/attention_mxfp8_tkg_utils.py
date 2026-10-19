@@ -20,6 +20,38 @@ import nki.language as nl
 from ...core.utils.allocator import SbufManager
 from ...core.utils.kernel_assert import assert_shape, kernel_assert
 
+"""
+Hardware/tiling constants used as defaults by mm1_packing_geometry. These mirror
+MXTileConstants / TileParams in attention_mxfp8_tkg.py, which passes its own values
+explicitly; the defaults exist so the geometry can be derived standalone.
+"""
+_P_MAX = 128
+_BLOCKS_PER_FOLD = 4
+
+
+# ── Packed-Q Eviction Layout ─────────────────────────────────────────────────
+def mm1_packing_geometry(rows_per_tile, p_max=_P_MAX, blocks_per_fold=_BLOCKS_PER_FOLD):
+    """Derive the packed-Q eviction geometry for a given query-row tile height.
+
+    A single MM1 PSUM tile is 128 partitions tall but each Q x K block matmul only
+    fills rows_per_tile output rows, so several Q variants (each placing the real Q in
+    a different free-column band) let multiple KV blocks share one PSUM tile.
+
+    rows_per_tile is the number of query rows one row-tile occupies = min(band_p, 128),
+    where band_p = q_head * s_active (band_p for band_p <= 128, else 128 with the rows
+    split across band_p/128 tiles).
+
+    Returns:
+        variants_per_tile: Q variants packed into one PSUM tile (128 // rows_per_tile):
+            2 for rows_per_tile=64, 4 for 32, 1 for 128.
+        score_tiles_per_fold: Score tiles per fold (blocks_per_fold //
+            variants_per_tile): 2 for rows_per_tile=64, 1 for 32, 4 for 128.
+    """
+    kernel_assert(p_max % rows_per_tile == 0, f"rows_per_tile must divide p_max, got {rows_per_tile=}, {p_max=}")
+    variants_per_tile = p_max // rows_per_tile
+    score_tiles_per_fold = blocks_per_fold // variants_per_tile
+    return variants_per_tile, score_tiles_per_fold
+
 
 # ── MXFP8 Swizzle + Quantize ─────────────────────────────────────────────────
 def swizzle_quantize_mx(src: nl.NkiTensor, dst_data: nl.NkiTensor, dst_scale: nl.NkiTensor, sbm: SbufManager) -> None:

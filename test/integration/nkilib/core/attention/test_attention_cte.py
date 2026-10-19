@@ -13,10 +13,12 @@
 # limitations under the License.
 import math
 
+from test.utils.model_test_configs import no_model_configs
+
 try:
     from test.integration.nkilib.core.attention.test_attention_cte_model_config import attention_cte_model_configs
 except ImportError:
-    attention_cte_model_configs = []
+    attention_cte_model_configs = no_model_configs()
 
 from functools import lru_cache
 from typing import Any, Optional, final
@@ -24,6 +26,7 @@ from typing import Any, Optional, final
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
+import numpy.typing as npt
 import pytest
 from nkilib_src.nkilib.core.attention.attention_cte import (
     _MAX_BS,
@@ -119,6 +122,7 @@ def build_attention_cte_input(
     position_bias=None,
     bias_layout="dense",
     bias_band_params=None,
+    d_v=None,
 ):
     """Generate kernel inputs as a dict matching the attention_cte kernel signature."""
     softmax_dtype = dtype_mapping[softmax_dtype]
@@ -133,12 +137,13 @@ def build_attention_cte_input(
     random_gen = np_random_sample()
     q = random_gen(shape=(bs, seqlen_q, d) if tp_q else (bs, d, seqlen_q), dtype=dtype)
     k = random_gen(shape=(bs_kv, seqlen_kv, d) if tp_k else (bs_kv, d, seqlen_kv), dtype=dtype)
-    v = random_gen(shape=(bs_kv, seqlen_kv, d), dtype=dtype)
+    d_v_actual = d_v if d_v is not None else d
+    v = random_gen(shape=(bs_kv, seqlen_kv, d_v_actual), dtype=dtype)
 
     k_prior, v_prior, prior_used_len_t = None, None, None
     if is_prefix_caching:
         k_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d) if tp_k else (bs_kv, d, seqlen_kv_prior), dtype=dtype)
-        v_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d), dtype=dtype)
+        v_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d_v_actual), dtype=dtype)
         prior_used_len_t = dt.static_cast(np.full(shape=(1,), fill_value=prior_used_len, dtype=nl.int32), nl.int32)
 
     # Make sink a big value to be sensitive
@@ -408,9 +413,9 @@ class TestRangedAttentionCTEKernels:
         bs: int,
         bs_kv: int,
         cache_softmax: bool,
-        cp_degree: int,
+        cp_degree: Optional[int],
         d: int,
-        dtype: str,
+        dtype: npt.DTypeLike,
         seqlen_kv: int,
         seqlen_kv_prior,
         seqlen_q: int,
@@ -423,6 +428,7 @@ class TestRangedAttentionCTEKernels:
         softmax_dtype=np.float32,
         mm_out_dtype=np.float32,
         n_packed_sequences=None,
+        d_v=None,
     ):
         skip_validation = False
         seqlen_kv_total = (seqlen_kv + seqlen_kv_prior) if seqlen_kv_prior else seqlen_kv
@@ -455,6 +461,7 @@ class TestRangedAttentionCTEKernels:
                 softmax_dtype=softmax_dtype,
                 mm_out_dtype=mm_out_dtype,
                 n_packed_sequences=n_packed_sequences,
+                d_v=d_v,
             )
 
         # Build custom validation args when skipping validation for large configs
@@ -563,6 +570,10 @@ class TestRangedAttentionCTEKernels:
         tp_out,
         tpbSgCyclesSum,  # FIXME: use qor once framework supports
     ):
+        # Deterministic timeout at skv=sq=16400, d=128: inference exceeds the 55s
+        # profile-capture limit on trn3.
+        if platform_target == Platforms.TRN3 and seqlen_kv == 16 * 1024 + 16 and d == 128:
+            pytest.xfail("Persistent inference timeout (55s profile-capture limit) on trn3 at skv=sq=16400, d=128")
         compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
@@ -588,6 +599,72 @@ class TestRangedAttentionCTEKernels:
             softmax_scale=softmax_scale,
             cp_rank_id=None,
             use_cp=False,
+        )
+
+    # fmt: off
+    # DeepSeek V3 MLA: d_v != d (V head dim differs from Q/K head dim)
+    attention_cte_mla_dv_unit_params = "bs, seqlen_kv, seqlen_q, d, d_v, softmax_scale, dtype, causal_mask, tp_q, tp_out, tpbSgCyclesSum"
+    attention_cte_mla_dv_unit_perms = [
+        # DeepSeek V3 MLA: d=192 (Q/K latent), d_v=128 (V head dim)
+        [1, 4096, 4096, 192, 128, 1.000, nl.bfloat16, True, True, False, None],
+        [1, 4096, 4096, 192, 128, 1.000, nl.bfloat16, True, False, True, None],
+        [1, 4096, 4096, 192, 128, 1.000, nl.bfloat16, False, True, False, None],
+        # Larger seqlen
+        [1, 8192, 8192, 192, 128, 1.000, nl.bfloat16, True, True, False, None],
+        # GQA: bs > 1
+        [4, 4096, 4096, 192, 128, 1.000, nl.bfloat16, True, True, False, None],
+        # d=256, d_v=128 (hypothetical MLA variant)
+        [1, 4096, 4096, 256, 128, 1.000, nl.bfloat16, True, False, False, None],
+        # d=128, d_v=64 (smaller MLA variant)
+        [1, 4096, 4096, 128, 64, 1.000, nl.bfloat16, True, True, False, None],
+    ]
+    # fmt: on
+
+    @pytest_parametrize(attention_cte_mla_dv_unit_params, attention_cte_mla_dv_unit_perms, abbrevs=_ATTN_CTE_ABBREVS)
+    def test_attention_cte_mla_dv_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        seqlen_kv,
+        seqlen_q,
+        d,
+        d_v,
+        softmax_scale,
+        dtype,
+        causal_mask,
+        tp_q,
+        tp_out,
+        tpbSgCyclesSum,
+    ):
+        """Test attention_cte with d_v != d (MLA: Multi-Latent Attention)."""
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        self.run_attention_cte_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            collector=collector,
+            bool_dims={
+                CAUSAL_MASK_DIM_NAME: causal_mask,
+                TP_Q_DIM_NAME: tp_q,
+                TP_OUT_DIM_NAME: tp_out,
+                TP_K_DIM_NAME: False,
+                SINK_DIM_NAME: False,
+            },
+            bs=bs,
+            bs_kv=bs,
+            cache_softmax=False,
+            cp_degree=None,
+            d=d,
+            dtype=dtype,
+            seqlen_kv=seqlen_kv,
+            seqlen_kv_prior=None,
+            seqlen_q=seqlen_q,
+            sliding_window=0,
+            softmax_scale=softmax_scale,
+            cp_rank_id=None,
+            use_cp=False,
+            d_v=d_v,
         )
 
     # fmt: off
@@ -1473,7 +1550,9 @@ class TestRangedAttentionCTEKernels:
         return config
 
     # Global state for reproducible random sampling
-    _filter_state = {"max_tests": None, "seed": 42, "sample_rate": 1.0}
+    _max_tests: int | None = None
+    _sample_seed: int = 42
+    _sample_rate: float = 1.0
 
     @classmethod
     def set_test_limit(cls, max_tests=None, seed=42):
@@ -1487,11 +1566,11 @@ class TestRangedAttentionCTEKernels:
             # Limit to 100 tests with reproducible sampling
             TestRangedAttentionCTEKernels.set_test_limit(max_tests=100, seed=42)
         """
-        cls._filter_state["max_tests"] = max_tests
-        cls._filter_state["seed"] = seed
+        cls._max_tests = max_tests
+        cls._sample_seed = seed
         # Estimate sample rate (rough heuristic: ~10k valid combinations with pairs coverage)
         if max_tests:
-            cls._filter_state["sample_rate"] = min(1.0, max_tests / 10000.0)
+            cls._sample_rate = min(1.0, max_tests / 10000.0)
 
     def filter_attention_cte_combinations(
         bs,
@@ -1532,13 +1611,13 @@ class TestRangedAttentionCTEKernels:
             return FilterResult.INVALID
 
         # Reproducible random sampling
-        sample_rate = TestRangedAttentionCTEKernels._filter_state.get("sample_rate", 1.0)
+        sample_rate = TestRangedAttentionCTEKernels._sample_rate
         if sample_rate < 1.0:
             import hashlib
 
             # Create deterministic hash from all parameters
             param_str = f"{bs}_{gqa}_{d}_{s_kv}_{tp_q}_{tp_k}_{tp_out}_{sink}_{dtype}_{causal}_{s_q}_{cp_deg}_{cp_strided}_{sw}_{s_kv_prior}"
-            seed = TestRangedAttentionCTEKernels._filter_state.get("seed", 42)
+            seed = TestRangedAttentionCTEKernels._sample_seed
             hash_val = int(hashlib.md5(f"{seed}_{param_str}".encode()).hexdigest(), 16)
 
             # Use hash to decide if we keep this combination
@@ -2843,6 +2922,7 @@ class TestRangedAttentionCTEKernels:
             bias_band_params,
             cp_striped_input=False,
             skip_output_normalization=False,
+            allow_vector_exp=True,
         ):
             return attention_cte_torch_ref(
                 q=q,

@@ -26,11 +26,8 @@ backward kernel under test.
 import hashlib
 import math
 
-import neuron_dtypes as ndtype
 import nki.language as nl
 import numpy as np
-from neuronxcc.nki._private.test import mx_util
-from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ActFnType,
     AffinityOption,
@@ -38,6 +35,11 @@ from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ShardOption,
     SkipMode,
 )
+from nkilib_src.nkilib.experimental.moe_mxfp8.bwd.config import MXFP8MOEBwdConfig
+from nkilib_src.nkilib.experimental.moe_mxfp8.fwd.blockwise_mm_forward_mxfp8_torch import (
+    _dynamic_checkpoint_extent,
+)
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import QuantScheme
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
 from test.integration.nkilib.experimental.matmul_mxfp8.utils import (
@@ -51,6 +53,7 @@ from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_uti
     Q_TILE_K,
     generate_golden_packed_scales,
 )
+from test.utils.mx_utils import quantize_mx_golden
 
 # ============================================================================
 # Routing table generation
@@ -67,7 +70,7 @@ def _get_n_blocks(T, top_k, E, B):
 # ============================================================================
 
 
-def _prequantize_2d(tensor_2d, use_scale_packing):
+def _prequantize_2d(tensor_2d, use_scale_packing, quant_scheme=QuantScheme.WRAPX):
     """Pre-quantize a single 2D [K, F] tensor to MXFP8 x4 format.
 
     Steps:
@@ -78,9 +81,10 @@ def _prequantize_2d(tensor_2d, use_scale_packing):
     Returns (data, scales).
     """
     K, F = tensor_2d.shape
-    swizzled = matmul_utils.swizzle_tensor(tensor_2d)
-    fp8_x4_dtype = ndtype.float8_e4m3fn_x4
-    data, compact_scales = mx_util.quantize_mx_golden(swizzled, fp8_x4_dtype, custom_mx_max_exp=_get_mx_max_exp)
+    swizzle = matmul_utils.swizzle_tensor_1x32 if quant_scheme == QuantScheme._1x32 else matmul_utils.swizzle_tensor
+    swizzled = swizzle(tensor_2d)
+    fp8_x4_dtype = nl.float8_e4m3fn_x4
+    data, compact_scales = quantize_mx_golden(swizzled, fp8_x4_dtype)
     if use_scale_packing:
         scales = generate_golden_packed_scales(compact_scales, K, F, Q_TILE_K)
     else:
@@ -88,7 +92,12 @@ def _prequantize_2d(tensor_2d, use_scale_packing):
     return data, scales
 
 
-def prequantize_moe_weights(gate_up_proj_weight, down_proj_weight, use_scale_packing):
+def prequantize_moe_weights(
+    gate_up_proj_weight,
+    down_proj_weight,
+    use_scale_packing,
+    quant_scheme=QuantScheme.WRAPX,
+):
     """Pre-quantize MoE weights per-expert for the backward kernel.
 
     gate_up_proj_weight: [E, H, 2, I_TP] → per-expert [2*I_TP, H] → x4 [2*I_TP/4, H]
@@ -111,13 +120,13 @@ def prequantize_moe_weights(gate_up_proj_weight, down_proj_weight, use_scale_pac
     for e in range(E):
         # gate_up: [H, 2, I_TP] → reshape to [H, 2*I_TP] → transpose to [2*I_TP, H]
         gate_up_2d = gate_up_proj_weight[e].reshape(H, 2 * I_TP).T.astype(np.float32)
-        gu_data, gu_scales = _prequantize_2d(gate_up_2d, use_scale_packing)
+        gu_data, gu_scales = _prequantize_2d(gate_up_2d, use_scale_packing, quant_scheme)
         gate_up_data_list.append(gu_data)
         gate_up_scales_list.append(gu_scales)
 
         # down: [I_TP, H] → transpose to [H, I_TP]
         down_2d = down_proj_weight[e].T.astype(np.float32)
-        d_data, d_scales = _prequantize_2d(down_2d, use_scale_packing)
+        d_data, d_scales = _prequantize_2d(down_2d, use_scale_packing, quant_scheme)
         down_data_list.append(d_data)
         down_scales_list.append(d_scales)
 
@@ -142,20 +151,30 @@ def build_mxfp8_moe_bwd_inputs(
     block_size,
     top_k,
     dtype=nl.bfloat16,
-    run_with_lnc2=True,
-    blocking_params=None,
+    moe_bwd_config=None,
     spill_reload=False,
     use_scale_packing=False,
     bias=False,
     clamp_limits=None,
     prequantize_weights=False,
+    single_expert_dense=False,
+    fast_dma_transpose=False,
+    swizzle_modes=None,
+    pe_transpose_only=False,
+    quant_scheme=QuantScheme.WRAPX,
+    num_valid_tokens=None,
+    num_static_block=None,
 ):
     T, H, I_TP, E, B = tokens, hidden, intermediate, expert, block_size
+    if single_expert_dense:
+        assert E == 1, f"single_expert_dense requires expert=1, got {E}"
+        assert top_k == 1, f"single_expert_dense requires top_k=1, got {top_k}"
+        assert T % B == 0, f"single_expert_dense requires tokens divisible by block_size, got {T} and {B}"
     N = _get_n_blocks(T, top_k, E, B)
 
-    dma_skip = SkipMode(True, False)
+    skip_dma = SkipMode(True, False)
     token_experts, token_position_to_id, block_to_expert = generate_token_position_to_id_and_experts(
-        T, top_k, E, B, dma_skip, N
+        T, top_k, E, B, skip_dma, N
     )
 
     param_string = f"{T}_{top_k}_{B}_{E}_{I_TP}_{H}_mxfp8"
@@ -166,6 +185,15 @@ def build_mxfp8_moe_bwd_inputs(
     gate_and_up_proj_weights = np.random.uniform(-0.1, 0.1, size=[E, H, 2, I_TP]).astype(dtype)
 
     expert_affinities_masked = (np.random.random_sample([T, E]) * token_experts).astype(dtype)
+    valid_tokens = None
+    if num_valid_tokens is not None:
+        assert single_expert_dense, "num_valid_tokens is only supported on the single_expert_dense path"
+        assert num_valid_tokens > 0, f"num_valid_tokens must be positive, got {num_valid_tokens}"
+        valid_tokens = np.array([num_valid_tokens], dtype=np.int32)
+        # With zero affinity a padding token contributes nothing to the weight gradients
+        # or to d_hidden, so the reference matches the kernel on the blocks it skips.
+        # d_affinity carries no such factor, which is why it is compared masked.
+        expert_affinities_masked[min(num_valid_tokens, T) :] = 0
     hidden_states = np.random.random_sample([T, H]).astype(dtype)
     grad_output = np.random.uniform(-1.0, 1.0, size=[T, H]).astype(dtype)
 
@@ -190,22 +218,62 @@ def build_mxfp8_moe_bwd_inputs(
         E=E,
         I_TP=I_TP,
         dtype=dtype,
-        dma_skip=dma_skip,
+        dma_skip=skip_dma,
         activation_function=ActFnType.SiLU,
         gate_up_proj_bias=gate_up_proj_bias,
         down_proj_bias=down_proj_bias,
         clamp_limits=fwd_clamp_limits,
     )
+    if num_valid_tokens is not None:
+        produced_blocks, shortened_rows = _dynamic_checkpoint_extent(
+            T,
+            B,
+            valid_tokens,
+            num_static_block,
+        )
+        if shortened_rows is not None:
+            gate_up_proj_act_checkpoint_T[produced_blocks - 1, :, :, shortened_rows:] = 0
 
     if prequantize_weights:
         gate_up_data, gate_up_scales, down_data, down_scales = prequantize_moe_weights(
-            gate_and_up_proj_weights, down_proj_weights, use_scale_packing
+            gate_and_up_proj_weights,
+            down_proj_weights,
+            use_scale_packing,
+            quant_scheme,
         )
     else:
         gate_up_data = gate_and_up_proj_weights
         gate_up_scales = None
         down_data = down_proj_weights
         down_scales = None
+
+    # Collapse every non-tensor knob into the fused backward config. Phase configs and
+    # transpose modes come from ``base``; swizzle modes come from ``swizzle_modes``.
+    base = moe_bwd_config if moe_bwd_config is not None else MXFP8MOEBwdConfig()
+    # spill/reload and scale packing are per-phase settings, not config-level ones.
+    for phase_config in (base.phase1_config, base.phase2_config, base.phase3_config, base.phase4_config):
+        phase_config.spill_reload = spill_reload
+        phase_config.enable_scale_packing = use_scale_packing
+    config = MXFP8MOEBwdConfig(
+        affinity_option=AffinityOption.AFFINITY_ON_I,
+        shard_option=ShardOption.SHARD_ON_FREE,
+        activation_type=ActFnType.SiLU,
+        accumulate_hidden_states_grad=top_k != 1,
+        single_expert_dense=single_expert_dense,
+        num_static_block=base.num_static_block if num_static_block is None else num_static_block,
+        fast_dma_transpose=fast_dma_transpose,
+        pe_transpose_only=pe_transpose_only,
+        skip_dma=skip_dma,
+        bias=bias,
+        clamp_limits=clamp_limits if clamp_limits is not None else ClampLimits(),
+        phase1_config=base.phase1_config,
+        phase2_config=base.phase2_config,
+        phase3_config=base.phase3_config,
+        phase4_config=base.phase4_config,
+        phase3_transpose_mode=base.phase3_transpose_mode,
+        phase4_transpose_mode=base.phase4_transpose_mode,
+        **(swizzle_modes or {}),
+    )
 
     inputs = {
         "hidden_states": hidden_states,
@@ -217,28 +285,15 @@ def build_mxfp8_moe_bwd_inputs(
         "block_to_expert": block_to_expert.reshape(-1, 1),
         "output_hidden_states_grad": grad_output,
         "block_size": block_size,
-        "run_with_lnc2": run_with_lnc2,
-        "affinity_option": AffinityOption.AFFINITY_ON_I,
-        "shard_option": ShardOption.SHARD_ON_FREE,
-        "activation_type": ActFnType.SiLU,
-        "is_tensor_update_accumulating": top_k != 1,
-        "spill_reload": spill_reload,
-        "use_scale_packing": use_scale_packing,
-        "skip_dma": SkipMode(True, False),
-        "bias": bias,
-        "clamp_limits": clamp_limits,
+        "config": config,
     }
 
     if gate_up_scales is not None:
         inputs["gate_up_weight_scales"] = gate_up_scales
     if down_scales is not None:
         inputs["down_weight_scales"] = down_scales
-
-    if blocking_params is not None:
-        inputs["phase1_config"] = blocking_params.phase1
-        inputs["phase2_config"] = blocking_params.phase2
-        inputs["phase3_config"] = blocking_params.phase3
-        inputs["phase4_config"] = blocking_params.phase4
+    if valid_tokens is not None:
+        inputs["num_valid_tokens"] = valid_tokens
 
     if prequantize_weights:
         return inputs, gate_and_up_proj_weights, down_proj_weights

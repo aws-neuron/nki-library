@@ -21,11 +21,14 @@ validate the relayout buffer directly against a numpy golden built by a
 reshape of the reference score row.
 """
 
-from typing import final
+import inspect
+from typing import Any, final
 
 import nki.language as nl
 import numpy as np
+import numpy.typing as npt
 import pytest
+from nkilib_src.nkilib.experimental.mla.deepseek.mla_common_cte import MlaPrecision, RopeLayout
 from nkilib_src.nkilib.experimental.sparse_attention_indexer import (
     sparse_attention_indexer_mx_bf16score,
 )
@@ -43,7 +46,9 @@ from typing_extensions import override
 
 from test.integration.nkilib.experimental.sparse_attention_indexer.test_sparse_attention_indexer_common import (
     _dequantize_weight_for_torch_ref,
+    expand_compact_mx_scale_to_native,
     generate_inputs,
+    generate_inputs_bf16,
 )
 from test.utils.common_dataclasses import (
     CompilerArgs,
@@ -138,6 +143,10 @@ def _torch_ref_bf16score(
     end_pos_arg=None,
     emit_flat_topk=False,
     emit_tiled_topk=False,
+    compact_scales=False,
+    precision=MlaPrecision.MX,
+    rope_layout=RopeLayout.HALF_SPLIT,
+    qr_bf16_hbm=None,
 ):
     """Reference for the bf16-score variant. Computes index_score with no
     Hadamard and bf16 score matmul (cast Q/K to bf16 then matmul); MX
@@ -150,10 +159,14 @@ def _torch_ref_bf16score(
     kernel matmuls (dropping the raw-qr golden it used before).
     """
     # Same MX weight dequant as the MX path (Q/K/W projections are still MX).
+    assert wq_b_scale is not None and wk_scale is not None, "the MX reference requires MX weight scales"
     wq_b_scale_np = wq_b_scale.numpy() if hasattr(wq_b_scale, "numpy") else wq_b_scale
     wk_scale_np = wk_scale.numpy() if hasattr(wk_scale, "numpy") else wk_scale
     wq_b_scale_np = wq_b_scale_np.astype(np.uint8)
     wk_scale_np = wk_scale_np.astype(np.uint8)
+    if compact_scales:
+        wq_b_scale_np = expand_compact_mx_scale_to_native(wq_b_scale_np)
+        wk_scale_np = expand_compact_mx_scale_to_native(wk_scale_np)
     q_lora_rank = wq_b.shape[0] * 4
     wq_b_arg = _dequantize_weight_for_torch_ref(wq_b, wq_b_scale_np, q_lora_rank, n_heads * head_dim)
     dim = wk.shape[0] * 4
@@ -182,7 +195,19 @@ def _torch_ref_bf16score(
         batch_size=batch_size,
         qr_qtz_hbm=qr_qtz_hbm,
         qr_scale_hbm=qr_scale_hbm,
+        phase=phase,
+        precision=precision,
+        rope_layout=rope_layout,
+        qr_bf16_hbm=qr_bf16_hbm,
     )
+    if phase == "kproj":
+        M_k = x.shape[0]
+        S_k = M_k // batch_size
+        num_s_tiles_total = batch_size * ((S_k + P_MAX - 1) // P_MAX)
+        return {
+            "k_seq_out_hbm": ref["output_0"],
+            "output_1": np.zeros((num_s_tiles_total, NUM_TOPK_BATCHES, P_MAX, index_topk), dtype=np.uint32),
+        }
     index_score = ref["output_0"]
     if hasattr(index_score, "numpy"):
         index_score_np = index_score.numpy().astype(np.float32)
@@ -212,6 +237,94 @@ def _torch_ref_bf16score(
     return {"output_0": index_score, "output_1": topk_idx_out}
 
 
+def _torch_ref_bf16_proj(
+    x,
+    wq_b,
+    wk,
+    k_norm_gamma,
+    k_norm_beta,
+    weights_proj,
+    cos,
+    sin,
+    k_cache,
+    mask,
+    n_heads,
+    head_dim,
+    rope_head_dim,
+    index_topk,
+    start_pos,
+    use_hadamard=False,
+    batch_size=1,
+    wq_b_scale=None,
+    wk_scale=None,
+    k_scale_cache=None,
+    x_non_mx=None,
+    x_mx_data=None,
+    x_mx_scale=None,
+    qr_qtz_hbm=None,
+    qr_scale_hbm=None,
+    phase="all",
+    k_seq_out_hbm=None,
+    end_pos_arg=None,
+    emit_flat_topk=False,
+    emit_tiled_topk=False,
+    compact_scales=False,
+    precision=MlaPrecision.BF16,
+    rope_layout=RopeLayout.HALF_SPLIT,
+    qr_bf16_hbm=None,
+):
+    """Reference wrapper for the BF16-projection path.
+
+    Signature matches the kernel entry. Unlike :func:`_torch_ref_bf16score` there is no MX
+    weight dequant to undo — the weights arrive as bf16 already. The one fixup is ``wk``: the
+    kernel takes it ``[dim, head_dim]`` (contraction on rows, as ``nc_matmul`` needs) while the
+    shared ref computes ``x @ wk.T`` and so wants ``[head_dim, dim]``.
+    """
+    wk_arg = wk.T if wk is not None else None
+    ref = sparse_attention_indexer_mx_bf16score_torch_ref(
+        x,
+        wq_b,
+        wk_arg,
+        k_norm_gamma,
+        k_norm_beta,
+        weights_proj,
+        cos,
+        sin,
+        k_cache,
+        mask,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        index_topk=index_topk,
+        start_pos=start_pos,
+        use_hadamard=False,
+        batch_size=batch_size,
+        phase=phase,
+        precision=precision,
+        rope_layout=rope_layout,
+        qr_bf16_hbm=qr_bf16_hbm,
+    )
+    index_score = ref["output_0"]
+    index_score_np = (
+        index_score.numpy().astype(np.float32) if hasattr(index_score, "numpy") else np.asarray(index_score, np.float32)
+    )
+
+    M = x.shape[0]
+    S = M // batch_size
+    end_pos = start_pos + S
+    num_s_tiles_per_batch = (S + P_MAX - 1) // P_MAX
+    topk_idx_out = np.zeros((batch_size * num_s_tiles_per_batch, NUM_TOPK_BATCHES, P_MAX, index_topk), dtype=np.uint32)
+    for b in range(batch_size):
+        for s_idx in range(num_s_tiles_per_batch):
+            s_start = s_idx * P_MAX
+            tile_size = min(s_start + P_MAX, S) - s_start
+            row_start = b * S + s_start
+            score_tile = np.zeros((P_MAX, end_pos), dtype=np.float32)
+            score_tile[:tile_size, :end_pos] = index_score_np[row_start : row_start + tile_size, :end_pos]
+            topk_idx_out[b * num_s_tiles_per_batch + s_idx] = _topk_idx_golden(score_tile, end_pos, index_topk)
+    return {"output_0": index_score, "output_1": topk_idx_out}
+
+
 # fmt: off
 FAST_PARAM_NAMES = "n_heads, head_dim, dim, q_lora_rank, rope_head_dim, seqlen, batch, start_pos, use_hadamard, index_topk"
 
@@ -223,27 +336,40 @@ BF16SCORE_TEST_PARAMS = [
                  id="bf16score_v3_long"),
     pytest.param(64, 128, 7168, 1536, 64, 1024, 1, 0, False, 64,
                  id="bf16score_v3_h64"),
-    # DeepSeek cp64-style shard: this rank scores S_local=128 queries against a
-    # gathered context, real indexer dims (128 heads, index_topk=128).
-    # start_pos=1920 -> end_pos=2048. This profiles the fused snake->flat indexer
-    # at a single-tile context with the real 128-head / topk=128 dims.
     pytest.param(128, 128, 7168, 1536, 64, 128, 1, 1920, False, 128,
                  id="bf16score_ds_slocal128_skv2k"),
-    # REAL DeepSeek-V3.2 indexer dims (config_671B_v3.2.json): index_n_heads=64,
-    # index_head_dim=128, index_topk=2048. Same S_local=128 / end_pos=2048 CP-shard
-    # profiling point as above but with the true 64-head / topk=2048 op mix.
     pytest.param(64, 128, 7168, 1536, 64, 128, 1, 1920, False, 2048,
                  id="bf16score_ds_real_h64_topk2k"),
-    # 8k gathered-K repro (real cp64 score phase: S_local=128 vs full S_kv=8192).
-    # end_pos=8192 stresses the PSUM/SBUF tiling that the full-model indexer hit
-    # (NCC_IGCA088). start_pos=8064 -> end_pos=8192.
     pytest.param(64, 128, 7168, 1536, 64, 128, 1, 8064, False, 2048,
                  id="bf16score_ds_real_h64_skv8k"),
-    # 16k repro: end_pos=16384 forces the score PSUM to 16 banks WITHOUT the
-    # PSUM_MAX_W tiling cap (must-fail NCC_IGCA088), confirming the cap keeps it
-    # within the 8 hardware banks. start_pos=16256 -> end_pos=16384.
     pytest.param(64, 128, 7168, 1536, 64, 128, 1, 16256, False, 2048,
                  id="bf16score_ds_real_h64_skv16k"),
+    pytest.param(64, 128, 7168, 1536, 64, 64, 1, 4032, False, 2048,
+                 id="bf16score_ws64_s64_wproj_repro"),
+]
+
+# BF16 Q/K projections (precision=BF16).
+BF16_PROJ_PARAM_NAMES = FAST_PARAM_NAMES + ", rope_layout"
+BF16_PROJ_TEST_PARAMS = [
+    # ---- DeepSeek-V3.2 indexer dims in bf16 (HALF_SPLIT). Different target model, so these
+    # carry DS values (64 heads, dim 7168, q_lora 1536), not GLM's. ----
+    pytest.param(64, 128, 7168, 1536, 64, 128, 1, 0, False, 128, RopeLayout.HALF_SPLIT,
+                 id="bf16proj_ds_h64_S128"),
+    pytest.param(128, 128, 7168, 1536, 64, 256, 1, 0, False, 128, RopeLayout.HALF_SPLIT,
+                 id="bf16proj_ds_h128_S256"),
+    pytest.param(64, 128, 7168, 1536, 64, 128, 1, 1920, False, 2048, RopeLayout.HALF_SPLIT,
+                 id="bf16proj_ds_h64_skv2k_topk2k"),
+
+    pytest.param(32, 128, 6144, 2048, 64, 64, 1, 4032, False, 2048, RopeLayout.INTERLEAVED,
+                 id="glm_S64_Sglob4k"),
+    pytest.param(32, 128, 6144, 2048, 64, 128, 1, 8064, False, 2048, RopeLayout.INTERLEAVED,
+                 id="glm_S128_Sglob8k"),
+    pytest.param(32, 128, 6144, 2048, 64, 256, 1, 16128, False, 2048, RopeLayout.INTERLEAVED,
+                 id="glm_S256_Sglob16k"),
+    pytest.param(32, 128, 6144, 2048, 64, 512, 1, 32256, False, 2048, RopeLayout.INTERLEAVED,
+                 id="glm_S512_Sglob32k"),
+    pytest.param(32, 128, 6144, 2048, 64, 128, 1, 8064, False, 2048, RopeLayout.HALF_SPLIT,
+                 id="glm_S128_halfsplit_guard"),
 ]
 # fmt: on
 
@@ -286,12 +412,190 @@ class TestSparseAttentionIndexer:
         Parametrized over the base kernel and the seq-sharded score/topk variant
         (``sai_entry``); both must produce identical topk (the seq-shard only
         changes which LNC core computes each query, not the math)."""
+        self._run_bf16score_case(
+            test_manager,
+            platform_target,
+            n_heads,
+            head_dim,
+            dim,
+            q_lora_rank,
+            rope_head_dim,
+            seqlen,
+            batch,
+            start_pos,
+            use_hadamard,
+            index_topk,
+            sai_entry,
+        )
+
+    # Compact block-128 weight scales (compact_scales=True): the DeepSeek checkpoint layout,
+    # broadcast to native MX granularity in-kernel.
+    @pytest.mark.parametrize(
+        "sai_entry",
+        [pytest.param(sparse_attention_indexer_mx_bf16score, id="seqshard")],
+    )
+    @pytest.mark.parametrize(
+        FAST_PARAM_NAMES,
+        [
+            pytest.param(128, 128, 7168, 1536, 64, 1024, 1, 0, False, 64, id="compact_v3_long"),
+            pytest.param(64, 128, 7168, 1536, 64, 128, 1, 1920, False, 2048, id="compact_ds_real_h64_topk2k"),
+            pytest.param(64, 128, 7168, 1536, 64, 128, 1, 8064, False, 2048, id="compact_ds_real_h64_skv8k"),
+            pytest.param(128, 128, 7168, 1536, 64, 128, 1, 1920, False, 128, id="compact_h128_slocal128_skv2k"),
+            pytest.param(64, 128, 7168, 1536, 64, 64, 1, 4032, False, 2048, id="compact_ws64_s64"),
+            pytest.param(64, 128, 7168, 1536, 64, 1024, 1, 0, False, 64, id="compact_v3_h64"),
+        ],
+    )
+    def test_indexer_bf16score_compact_scales(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        n_heads,
+        head_dim,
+        dim,
+        q_lora_rank,
+        rope_head_dim,
+        seqlen,
+        batch,
+        start_pos,
+        use_hadamard,
+        index_topk,
+        sai_entry,
+    ):
+        """Weight scales supplied in the compact block-128 layout instead of native block-32."""
+        self._run_bf16score_case(
+            test_manager,
+            platform_target,
+            n_heads,
+            head_dim,
+            dim,
+            q_lora_rank,
+            rope_head_dim,
+            seqlen,
+            batch,
+            start_pos,
+            use_hadamard,
+            index_topk,
+            sai_entry,
+            compact_scales=True,
+        )
+
+    @pytest.mark.parametrize(BF16_PROJ_PARAM_NAMES, BF16_PROJ_TEST_PARAMS)
+    def test_indexer_bf16_proj(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        n_heads,
+        head_dim,
+        dim,
+        q_lora_rank,
+        rope_head_dim,
+        seqlen,
+        batch,
+        start_pos,
+        use_hadamard,
+        index_topk,
+        rope_layout,
+    ):
+        """BF16 Q/K projections (precision=BF16) with a selectable RoPE pairing.
+
+        Covers the GLM-MoE-DSA indexer config (index_n_heads=32, dim=6144, q_lora_rank=2048,
+        INTERLEAVED RoPE) alongside the DeepSeek-V3.2 dims in bf16.
+        """
+        self._run_bf16score_case(
+            test_manager,
+            platform_target,
+            n_heads,
+            head_dim,
+            dim,
+            q_lora_rank,
+            rope_head_dim,
+            seqlen,
+            batch,
+            start_pos,
+            use_hadamard,
+            index_topk,
+            sparse_attention_indexer_mx_bf16score,
+            bf16_proj=True,
+            rope_layout=rope_layout,
+        )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize(BF16_PROJ_PARAM_NAMES, [BF16_PROJ_TEST_PARAMS[0], BF16_PROJ_TEST_PARAMS[3]])
+    def test_indexer_bf16_proj_fast(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        n_heads,
+        head_dim,
+        dim,
+        q_lora_rank,
+        rope_head_dim,
+        seqlen,
+        batch,
+        start_pos,
+        use_hadamard,
+        index_topk,
+        rope_layout,
+    ):
+        """Fast lane: one DeepSeek-dims half-split case + one GLM interleaved case."""
+        self._run_bf16score_case(
+            test_manager,
+            platform_target,
+            n_heads,
+            head_dim,
+            dim,
+            q_lora_rank,
+            rope_head_dim,
+            seqlen,
+            batch,
+            start_pos,
+            use_hadamard,
+            index_topk,
+            sparse_attention_indexer_mx_bf16score,
+            bf16_proj=True,
+            rope_layout=rope_layout,
+        )
+
+    def _run_bf16score_case(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        n_heads,
+        head_dim,
+        dim,
+        q_lora_rank,
+        rope_head_dim,
+        seqlen,
+        batch,
+        start_pos,
+        use_hadamard,
+        index_topk,
+        sai_entry,
+        compact_scales=False,
+        bf16_proj=False,
+        rope_layout=RopeLayout.HALF_SPLIT,
+    ):
+        """Shared body for the bf16-score cases (MX or BF16 projections, native or compact scales)."""
         # Local aliases: kernel/generate_inputs use S / batch_size naming.
         S = seqlen
         batch_size = batch
 
-        def input_generator(test_config):
-            return generate_inputs(
+        if bf16_proj:
+            inputs = generate_inputs_bf16(
+                n_heads,
+                head_dim,
+                dim,
+                q_lora_rank,
+                rope_head_dim,
+                S,
+                batch_size,
+                start_pos,
+                index_topk,
+                rope_layout,
+            )
+            torch_ref = _torch_ref_bf16_proj
+        else:
+            inputs = generate_inputs(
                 n_heads,
                 head_dim,
                 dim,
@@ -303,24 +607,12 @@ class TestSparseAttentionIndexer:
                 use_hadamard,
                 index_topk,
                 bf16_score_kv_layout=True,
+                compact_scales=compact_scales,
             )
-
-        inputs = input_generator(None)
-        # Drop the ref-only raw `qr`: the MX kernel consumes the pre-quantized
-        # qr_qtz_hbm/qr_scale_hbm generate_inputs produces (`qr` is not a kernel
-        # param), and the ref reconstructs the MX-rounded qr from those. Leaving
-        # `qr` in would trip validate_input_keys (extra key vs kernel signature).
-        inputs = {k: v for k, v in inputs.items() if k != "qr"}
+            inputs = {k: v for k, v in inputs.items() if k != "qr"}
+            torch_ref = _torch_ref_bf16score
 
         def topk_comparator(golden_dict, output_tensors):
-            # output_0: index_score [M, end_pos] f32 — strict compare via the
-            # framework's default (we still hand it the golden array).
-            # output_1: topk_idx [num_S, NUM_TOPK_BATCHES, P_MAX, index_topk]
-            #   uint32 — validate by gathering index_score at the selected
-            #   positions and comparing sorted top-k score VALUES per query.
-            #   This is tie-robust: equal scores at different positions (e.g.
-            #   the -inf causal-mask padding) compare equal regardless of which
-            #   index the hardware vs numpy picked.
             golden_score = golden_dict["output_0"]
             if hasattr(golden_score, "numpy"):
                 golden_score = golden_score.numpy()
@@ -333,22 +625,19 @@ class TestSparseAttentionIndexer:
 
             class IndexScoreValidator(CustomValidator):
                 @override
-                def validate(self, actual_raw_output):
-                    actual = np.frombuffer(actual_raw_output, dtype=np.float32).reshape(M, end_pos)
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    actual = np.frombuffer(inference_output, dtype=np.float32).reshape(M, end_pos)
                     return maxAllClose(
                         actual, golden_score, rtol=5e-2, atol=1e-5, equal_nan_inf=True, verbose=1, logfile=self.logfile
                     )
 
             class TopkIdxValidator(CustomValidator):
                 @override
-                def validate(self, actual_raw_output):
-                    hw = np.frombuffer(actual_raw_output, dtype=np.uint32).reshape(
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    hw = np.frombuffer(inference_output, dtype=np.uint32).reshape(
                         batch_size * num_s_tiles_per_batch, NUM_TOPK_BATCHES, P_MAX, k
                     )
-                    # Gather the score each selected index points to, per query,
-                    # then compare sorted values vs the golden's top-k scores.
-                    # The kernel loads a CONTIGUOUS-chunk snake, so topk's snake
-                    # index i maps to actual position: (i%16)*src_x + (i//16).
+
                     T_pad = round_up_to_chunks(end_pos)
                     src_x = T_pad // TOPK_QUERY_CHUNKS
                     hw_vals = np.full((M, k), -np.inf, dtype=np.float32)
@@ -400,14 +689,274 @@ class TestSparseAttentionIndexer:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=sai_entry,
-            torch_ref=torch_ref_wrapper(_torch_ref_bf16score),
+            torch_ref=torch_ref_wrapper(torch_ref),
             kernel_input_generator=lambda _cfg: inputs,
             output_tensor_descriptor=_topk_output_tensors,
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(platform_target=Platforms.TRN3_A0),
+            compiler_args=CompilerArgs(platform_target=platform_target),
             atol=1e-5,
             rtol=5e-2,
             custom_comparator=topk_comparator,
+        )
+
+    # CP phased split: this rank's K-projection half. phase="kproj" runs only
+    # wk + LayerNorm + RoPE and writes the SEQ-MAJOR [M, head_dim] K the CP parent
+    # all-gathers before feeding phase="score". Validates the K hand-off buffer
+    # (the score-over-gathered-K half shares code with the phase="all" path the
+    # start_pos cases above already cover). Real DeepSeek-V3.2 indexer dims.
+    @pytest.mark.parametrize(
+        FAST_PARAM_NAMES,
+        [
+            pytest.param(64, 128, 7168, 1536, 64, 128, 1, 0, False, 2048, id="kproj_ds_real_h64_S128"),
+            pytest.param(64, 128, 7168, 1536, 64, 256, 1, 0, False, 2048, id="kproj_ds_real_h64_S256"),
+        ],
+    )
+    def test_indexer_bf16score_kproj(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        n_heads,
+        head_dim,
+        dim,
+        q_lora_rank,
+        rope_head_dim,
+        seqlen,
+        batch,
+        start_pos,
+        use_hadamard,
+        index_topk,
+    ):
+        """CP phase="kproj": validate the seq-major projected-K output (wk + LayerNorm + RoPE)."""
+        S = seqlen
+        batch_size = batch
+        M = batch_size * S
+
+        inputs = generate_inputs(
+            n_heads,
+            head_dim,
+            dim,
+            q_lora_rank,
+            rope_head_dim,
+            S,
+            batch_size,
+            start_pos,
+            use_hadamard,
+            index_topk,
+            bf16_score_kv_layout=True,
+        )
+        inputs = {k: v for k, v in inputs.items() if k != "qr"}
+        inputs["phase"] = "kproj"
+        inputs["k_seq_out_hbm.must_alias_input"] = np.zeros((M, head_dim), dtype=nl.bfloat16)
+
+        num_s_tiles_total = batch_size * ((S + P_MAX - 1) // P_MAX)
+
+        def _kproj_output_tensors(kernel_input):
+            # phase="kproj" returns (k_seq_out_hbm, topk_out).
+            return {
+                "k_seq_out_hbm": np.zeros((M, head_dim), dtype=nl.bfloat16),
+                "output_1": np.zeros((num_s_tiles_total, NUM_TOPK_BATCHES, P_MAX, index_topk), dtype=np.uint32),
+            }
+
+        def _kproj_comparator(golden_dict, output_tensors):
+            golden_k = np.asarray(
+                golden_dict["k_seq_out_hbm"].numpy()
+                if hasattr(golden_dict["k_seq_out_hbm"], "numpy")
+                else golden_dict["k_seq_out_hbm"],
+                dtype=np.float32,
+            ).reshape(M, head_dim)
+
+            class KSeqValidator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    actual = np.frombuffer(inference_output, dtype=nl.bfloat16).astype(np.float32).reshape(M, head_dim)
+                    return maxAllClose(actual, golden_k, rtol=5e-2, atol=1e-2, verbose=1, logfile=self.logfile)
+
+            class AlwaysPass(CustomValidator):
+                # output_1 is the kernel's uncomputed topk buffer in the kproj phase -- not validated.
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    return True
+
+            return {
+                "k_seq_out_hbm": CustomValidatorWithOutputTensorData(
+                    validator=KSeqValidator, output_ndarray=output_tensors["k_seq_out_hbm"]
+                ),
+                "output_1": CustomValidatorWithOutputTensorData(
+                    validator=AlwaysPass, output_ndarray=output_tensors["output_1"]
+                ),
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=sparse_attention_indexer_mx_bf16score,
+            torch_ref=torch_ref_wrapper(_torch_ref_bf16score),
+            kernel_input_generator=lambda _cfg: inputs,
+            output_tensor_descriptor=_kproj_output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            atol=1e-2,
+            rtol=5e-2,
+            custom_comparator=_kproj_comparator,
+        )
+
+
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+class TestIndexerChunkedTopk:
+    """Numerical validation of the TWO-STAGE (chunked) top-k path.
+
+    Reached whenever ``T >= 65536``, where ``nisa.topk`` cannot rank the context in one call.
+    S is kept at 128 (a single s-tile) purely so the numpy golden stays cheap: the reference
+    still argsorts the full 65536-wide score row per query, which is the expensive part.
+
+    Validation compares GATHERED VALUES, not indices: a two-stage top-k may legitimately pick a
+    different member of a tied group than a single-pass reference, so the invariant that holds
+    is "the selected positions carry the top-k values", which is what this checks.
+    """
+
+    @pytest.mark.parametrize(
+        BF16_PROJ_PARAM_NAMES,
+        [
+            # Target config, the two S_local values whose S_global crosses nisa.topk's ceiling:
+            # S_local 1024 -> S_global 65536, S_local 2048 -> S_global 131072. index_topk 2048.
+            pytest.param(
+                32,
+                128,
+                6144,
+                2048,
+                64,
+                1024,
+                1,
+                64512,
+                False,
+                2048,
+                RopeLayout.INTERLEAVED,
+                id="glm_S1024_Sglob64k",
+            ),
+            pytest.param(
+                32,
+                128,
+                6144,
+                2048,
+                64,
+                2048,
+                1,
+                129024,
+                False,
+                2048,
+                RopeLayout.INTERLEAVED,
+                id="glm_S2048_Sglob128k",
+            ),
+        ],
+    )
+    def test_chunked_topk_values(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        n_heads,
+        head_dim,
+        dim,
+        q_lora_rank,
+        rope_head_dim,
+        seqlen,
+        batch,
+        start_pos,
+        use_hadamard,
+        index_topk,
+        rope_layout,
+    ):
+        S, batch_size = seqlen, batch
+        M = batch_size * S
+        end_pos = start_pos + S
+        inputs = generate_inputs_bf16(
+            n_heads,
+            head_dim,
+            dim,
+            q_lora_rank,
+            rope_head_dim,
+            S,
+            batch_size,
+            start_pos,
+            index_topk,
+            rope_layout,
+        )
+        inputs["emit_flat_topk"] = True  # chunked path emits decoded positions
+
+        def _ref(*args, **kwargs):
+            r = _torch_ref_bf16_proj(*args, **kwargs)
+            return {"output_0": r["output_0"], "output_1": np.zeros((M, index_topk), dtype=np.int32)}
+
+        # The framework validates the ref's signature against the kernel's, so _ref has to carry
+        # the real ref's signature rather than (*args, **kwargs).
+        _ref.__signature__ = inspect.signature(  # ty: ignore[unresolved-attribute]
+            sparse_attention_indexer_mx_bf16score_torch_ref
+        )
+
+        def _out(kernel_input):
+            return {
+                "output_0": np.zeros((M, end_pos), dtype=np.float32),
+                "output_1": np.zeros((M, index_topk), dtype=np.int32),
+            }
+
+        def _comparator(golden_dict, output_tensors):
+            gs = golden_dict["output_0"]
+            gs = gs.numpy() if hasattr(gs, "numpy") else gs
+            gs = np.asarray(gs, dtype=np.float32)
+            # bf16 is the ranking precision the kernel uses.
+            gs_bf16 = gs.astype(nl.bfloat16).astype(np.float32)
+
+            class ScorePass(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    actual = np.frombuffer(inference_output, dtype=np.float32).reshape(M, end_pos)
+                    return maxAllClose(
+                        actual, gs, rtol=5e-2, atol=1e-5, equal_nan_inf=True, verbose=1, logfile=self.logfile
+                    )
+
+            class FlatTopkValidator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    pos = np.frombuffer(inference_output, dtype=np.int32).reshape(M, index_topk)
+                    if pos.min() < 0 or pos.max() >= end_pos:
+                        self._print_with_log(
+                            f"positions out of range: min={pos.min()} max={pos.max()} end_pos={end_pos}"
+                        )
+                        return False
+                    got = np.take_along_axis(gs_bf16, pos.astype(np.int64), axis=1)
+                    want = np.sort(gs_bf16, axis=1)[:, ::-1][:, :index_topk]
+                    self._print_with_log("Results for chunked topk (gathered values):")
+                    return maxAllClose(
+                        np.sort(got, axis=1),
+                        np.sort(want, axis=1),
+                        rtol=5e-2,
+                        atol=1e-5,
+                        verbose=1,
+                        logfile=self.logfile,
+                    )
+
+            return {
+                "output_0": CustomValidatorWithOutputTensorData(
+                    validator=ScorePass, output_ndarray=output_tensors["output_0"]
+                ),
+                "output_1": CustomValidatorWithOutputTensorData(
+                    validator=FlatTopkValidator, output_ndarray=output_tensors["output_1"]
+                ),
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=sparse_attention_indexer_mx_bf16score,
+            torch_ref=torch_ref_wrapper(_ref),
+            kernel_input_generator=lambda _cfg: inputs,
+            output_tensor_descriptor=_out,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            atol=1e-5,
+            rtol=5e-2,
+            custom_comparator=_comparator,
         )

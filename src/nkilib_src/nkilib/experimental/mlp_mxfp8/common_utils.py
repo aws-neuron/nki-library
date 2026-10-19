@@ -19,7 +19,7 @@ import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
-from ..mxfp_utils.mxfp8_utils.common_dataclasses import BlockDescriptor, TensorDescriptor
+from ..mxfp_utils.mxfp8_utils.common_dataclasses import BlockDescriptor, QuantScheme, TensorDescriptor
 from ..mxfp_utils.mxfp8_utils.common_utils import get_active_sbm
 from ..mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
     INTERLEAVE_FACTOR,
@@ -162,6 +162,7 @@ def _allocate_spill_buffer(
     tiles_in_block_k: int,
     use_scale_packing: bool,
     data_buffer,
+    quant_scheme: QuantScheme = QuantScheme.WRAPX,
 ) -> TensorDescriptor:
     """Allocate and zero-initialize an HBM spill/reload buffer for one operand.
 
@@ -172,6 +173,7 @@ def _allocate_spill_buffer(
         tiles_in_block_k: Number of K-tiles per block.
         use_scale_packing: Whether to use packed scale layout.
         data_buffer: HBM buffer type (nl.hbm or nl.private_hbm).
+        quant_scheme: Layout used to produce the quantized spill contents.
 
     Returns:
         TensorDescriptor wrapping the allocated data and scale buffers.
@@ -188,12 +190,13 @@ def _allocate_spill_buffer(
         is_swizzled=True,
         is_x4=True,
         scales_are_packed=use_scale_packing,
+        quant_scheme=quant_scheme,
     )
 
 
 def _store_unswizzled_sbuf_block_to_hbm(
-    output_sbuf: nl.ndarray,
-    dst_hbm: nl.ndarray,
+    output_sbuf: nl.NkiTensor,
+    dst_hbm: nl.NkiTensor,
     row_base: int,
     col_base: int,
     tiles_in_block_m: int,
@@ -211,8 +214,8 @@ def _store_unswizzled_sbuf_block_to_hbm(
     or pre-quantized tensors, which have different physical layouts.
 
     Args:
-        output_sbuf (nl.ndarray): SBUF accumulator with tiled layout.
-        dst_hbm (nl.ndarray): Destination HBM tensor.
+        output_sbuf (nl.NkiTensor): SBUF accumulator with tiled layout.
+        dst_hbm (nl.NkiTensor): Destination HBM tensor.
         row_base (int): Row offset into dst_hbm (e.g. s_base or h_base for LNC sharding).
         col_base (int): Column offset into dst_hbm.
         tiles_in_block_m (int): Number of M-tiles in the block.

@@ -23,6 +23,16 @@ from ..utils.golden_provider import CustomComparatorProducer, GoldenProvider, To
 from ..utils.torch_ref_cache import GoldenCache
 
 
+class _RefWithCacheOptions:
+    """Stand-in for a wrapped reference: callable, and publishing cache options."""
+
+    def __init__(self, options):
+        self._torch_ref_cache_options = options
+
+    def __call__(self, **kwargs):
+        return {"out": np.ones((2,))}
+
+
 def _ref(**kwargs):
     return {"out": np.ones((2,))}
 
@@ -85,10 +95,7 @@ class TestGoldenProvider:
     def test_wrapper_options_folded_into_cache_key(self, _mock_dep):
         # A wrapper exposes its construction options; the provider folds them into the
         # hashed inputs so the key accounts for golden-affecting closure state.
-        def ref(**kwargs):
-            return {"out": np.ones((2,))}
-
-        ref._torch_ref_cache_options = {"preserve_lower_precision": True}
+        ref = _RefWithCacheOptions({"preserve_lower_precision": True})
         captured = []
         with (
             patch.object(GoldenCache, "load", return_value=None),
@@ -104,11 +111,7 @@ class TestGoldenProvider:
         # Two wrappers over the same reference + inputs but different golden-affecting
         # options (e.g. preserve_lower_precision) must key differently.
         def make_ref(preserve):
-            def ref(**kwargs):
-                return {"out": np.ones((2,))}
-
-            ref._torch_ref_cache_options = {"preserve_lower_precision": preserve}
-            return ref
+            return _RefWithCacheOptions({"preserve_lower_precision": preserve})
 
         captured = []
         with (

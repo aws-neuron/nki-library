@@ -45,9 +45,10 @@ class TestGetChunkedTests:
 
         chunks = _collect_all_chunks(total_chunk_count, tests)
 
-        # Concatenating chunks in order reproduces the original list: no dropped,
-        # duplicated, or reordered tests.
-        assert [test for chunk in chunks for test in chunk] == tests
+        # Every test lands in exactly one chunk: none dropped, none duplicated.
+        # Compared as a sorted multiset because chunks stride the input, so
+        # concatenating them interleaves rather than reproducing the original.
+        assert sorted(test for chunk in chunks for test in chunk) == tests
 
     @pytest.mark.parametrize(
         "num_tests, total_chunk_count",
@@ -78,13 +79,23 @@ class TestGetChunkedTests:
 
         assert all(len(chunk) >= 1 for chunk in chunks)
 
-    def test_slice_preserves_collection_order(self):
-        # Determinism prerequisite for pytest-xdist: chunking never reorders.
+    def test_each_chunk_preserves_collection_order(self):
+        # Determinism prerequisite for pytest-xdist: a chunk never reorders the
+        # tests it keeps, so every process runs them in collection order.
         tests = ["c", "a", "b", "z", "y", "x"]
 
         chunks = _collect_all_chunks(3, tests)
 
-        assert [test for chunk in chunks for test in chunk] == tests
+        for chunk in chunks:
+            assert chunk == [test for test in tests if test in chunk]
+
+    def test_adjacent_tests_are_spread_across_chunks(self):
+        # The reason for striding: a contiguous run of expensive tests must not
+        # all land in one chunk. The first `total_chunk_count` tests therefore go
+        # to distinct chunks.
+        chunks = _collect_all_chunks(3, list(range(9)))
+
+        assert chunks == [[0, 3, 6], [1, 4, 7], [2, 5, 8]]
 
     @pytest.mark.parametrize("current_chunk_number", [0, -1, 4])
     def test_chunk_number_out_of_range_raises(self, current_chunk_number):

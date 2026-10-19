@@ -11,92 +11,74 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for permute_a2av kernel."""
+"""Integration tests for the capacity-bounded permute_a2av kernel."""
 
 import ml_dtypes
 import numpy as np
 import pytest
 from nki.collectives import ReplicaGroup
 from nkilib_src.nkilib.experimental.collectives.a2av_train import permute_a2av
-from nkilib_src.nkilib.experimental.collectives.a2av_train.permute_a2av_torch import permute_a2av_torch_ref
+from nkilib_src.nkilib.experimental.collectives.a2av_train.permute_a2av_torch import (
+    permute_a2av_torch_ref,
+)
 
 from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
-from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.coverage_parametrized_tests import FilterResult
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
 
 
-def _generate_symmetric(tokens, expert, ep_size, multiples_of=32, seed=42):
-    """send_indices [tokens, EP] with sentinel tokens; send_counts [1, EP] (symmetric)."""
-    np.random.seed(seed)
-    expert_mask = np.zeros((tokens, expert), dtype=np.float32)
-    for t_idx in range(tokens):
-        selected = np.random.choice(expert, size=2, replace=False)
-        expert_mask[t_idx, selected] = 1.0
-    experts_per_rank = expert // ep_size
-    ep_mask = expert_mask.reshape(tokens, ep_size, experts_per_rank)
-    ep_mask = (ep_mask != 0).any(axis=2)
-
-    send_indices = np.full((tokens, ep_size), tokens, dtype=np.int32)
-    send_counts = np.zeros((1, ep_size), dtype=np.int32)
-    for ep_dst in range(ep_size):
-        idx = np.where(ep_mask[:, ep_dst])[0]
-        n = (len(idx) // multiples_of) * multiples_of
-        send_counts[0, ep_dst] = n
-        send_indices[:n, ep_dst] = idx[:n]
-    return send_indices, send_counts
-
-
-def _generate_variable_per_rank(tokens, ep_size, multiples_of=32, seed=42):
-    """Per-rank send_counts, valid under DGE rule."""
-    rng = np.random.RandomState(seed)
-    choices = np.arange(0, tokens + 1, multiples_of)
-    all_sc, all_si = [], []
-    for _rank in range(ep_size):
-        sc = rng.choice(choices, size=(1, ep_size)).astype(np.int32)
-        while int(sc[0].sum()) > tokens:
-            idx = int(sc[0].argmax())
-            sc[0, idx] = max(0, sc[0, idx] - multiples_of)
-        si = np.full((tokens, ep_size), tokens, dtype=np.int32)
-        for d in range(ep_size):
-            n = int(sc[0, d])
-            si[:n, d] = np.arange(n)
-        all_sc.append(sc)
-        all_si.append(si)
-    return all_si, all_sc
+def _generate_routing(
+    rows: int,
+    ep_size: int,
+    *,
+    seed: int,
+    same_on_every_rank: bool = False,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Generate exact-sum routing permutations with skewed per-peer counts."""
+    all_indices = []
+    all_counts = []
+    for rank in range(ep_size):
+        rng = np.random.RandomState(seed if same_on_every_rank else seed + rank)
+        probabilities = rng.dirichlet(np.linspace(1.0, 2.0, ep_size))
+        counts = rng.multinomial(rows, probabilities).astype(np.int32).reshape(1, ep_size)
+        indices = rng.permutation(rows).astype(np.int32)
+        all_indices.append(indices)
+        all_counts.append(counts)
+    return all_indices, all_counts
 
 
-PARAM_NAMES_SYM = "tokens, hidden, expert, ep_size, dtype"
-TEST_PARAMS_SYM = [
-    (256, 128, 64, 8, ml_dtypes.bfloat16),
-]
-PARAM_NAMES_VAR = "tokens, hidden, ep_size, dtype"
-TEST_PARAMS_VAR = [
-    (256, 128, 8, np.float32),
-    (256, 128, 8, ml_dtypes.bfloat16),
-    (256, 128, 32, ml_dtypes.bfloat16),
-    (256, 128, 64, ml_dtypes.bfloat16),
-]
+def _prior_variable_matrix(tokens: int, hidden: int, ep_size: int, dtype) -> FilterResult:
+    """Retain every variable-count configuration covered before this CR."""
+    if tokens != 256 or hidden != 128:
+        return FilterResult.REDUNDANT
+    if ep_size == 8 and dtype in (np.float32, ml_dtypes.bfloat16):
+        return FilterResult.VALID
+    if ep_size in (32, 64) and dtype == ml_dtypes.bfloat16:
+        return FilterResult.VALID
+    return FilterResult.REDUNDANT
 
 
 @pytest_test_metadata(name="PermuteA2av")
 @pytest_marks(["collectives", "PermuteA2av"])
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 @pytest.mark.high_rank
-@pytest.mark.skip(
-    reason=(
-        "Blocked on NKI fix for recv_counts_known=False write-back "
-        "of metadata row 2 (recv_counts*H). Tested locally with framework "
-        "E2E. TODO: remove this skip once "
-        "https://github.com/aws-neuron/private-nki-staging/pull/3472 lands "
-        "in the version-set NKI wheel."
-    )
-)
+@pytest.mark.skip_simulation
 class TestPermuteA2av:
-    """Test permute_a2av kernel."""
+    """Validate packed dispatch across the prior and new coverage matrices."""
 
     @pytest.mark.fast
-    @pytest_parametrize(PARAM_NAMES_SYM, TEST_PARAMS_SYM)
+    @pytest.mark.coverage_parametrize(
+        tokens=[256],
+        hidden=[128],
+        expert=[64],
+        ep_size=[8],
+        dtype=[ml_dtypes.bfloat16],
+        coverage="full",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+    )
     def test_permute_a2av(
         self,
         test_manager: Orchestrator,
@@ -106,64 +88,26 @@ class TestPermuteA2av:
         expert: int,
         ep_size: int,
         dtype,
+        is_negative_test_case: bool,
     ):
-        """Symmetric counts across ranks."""
+        """Preserve the prior symmetric-routing configuration."""
+        assert expert % ep_size == 0
         np.random.seed(42)
         replica_group = ReplicaGroup([list(range(ep_size))])
-        elem_bytes = np.dtype(dtype).itemsize
-        mo = max(1, 8192 // (elem_bytes * hidden))
-        send_indices, send_counts = _generate_symmetric(tokens, expert, ep_size, multiples_of=mo)
-
-        rank_hs = [np.random.randn(tokens, hidden).astype(dtype) for _ in range(ep_size)]
-
-        def create_inputs(rank_id: int):
-            return {
-                "hidden_states": rank_hs[rank_id],
-                "send_indices": send_indices,
-                "send_counts": send_counts,
-                "replica_group": replica_group,
-            }
-
-        CollectiveUnitTestFramework(
-            test_manager=test_manager,
-            kernel_entry=permute_a2av,
-            torch_ref=permute_a2av_torch_ref,
-            per_rank_input_generator=create_inputs,
-            collective_ranks=ep_size,
-        ).run_test(
-            test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
-            output_keys=["recv_data", "metadata"],
-            inference_args=InferenceArgs(collective_ranks=ep_size),
-            rtol=1e-3,
-            atol=1e-3,
+        all_indices, all_counts = _generate_routing(
+            tokens,
+            ep_size,
+            seed=42,
+            same_on_every_rank=True,
         )
-
-    @pytest.mark.fast
-    @pytest_parametrize(PARAM_NAMES_VAR, TEST_PARAMS_VAR)
-    def test_permute_a2av_variable(
-        self,
-        test_manager: Orchestrator,
-        platform_target: Platforms,
-        tokens: int,
-        hidden: int,
-        ep_size: int,
-        dtype,
-    ):
-        """Per-rank variable send_counts (DGE-aligned per dtype)."""
-        np.random.seed(42)
-        replica_group = ReplicaGroup([list(range(ep_size))])
-        elem_bytes = np.dtype(dtype).itemsize
-        mo = max(1, 8192 // (elem_bytes * hidden))
-        all_si, all_sc = _generate_variable_per_rank(tokens, ep_size, multiples_of=mo, seed=42)
-
-        rank_hs = [np.random.randn(tokens, hidden).astype(dtype) for _ in range(ep_size)]
+        rank_inputs = [np.random.randn(tokens, hidden).astype(dtype) for _ in range(ep_size)]
 
         def create_inputs(rank_id: int):
             return {
-                "hidden_states": rank_hs[rank_id],
-                "send_indices": all_si[rank_id],
-                "send_counts": all_sc[rank_id],
+                "hidden_states": rank_inputs[rank_id],
+                "packed_source_indices": all_indices[rank_id],
+                "send_counts": all_counts[rank_id],
+                "recv_capacity": ep_size * tokens,
                 "replica_group": replica_group,
             }
 
@@ -181,3 +125,306 @@ class TestPermuteA2av:
             rtol=1e-2,
             atol=1e-2,
         )
+
+    @pytest.mark.fast
+    @pytest.mark.coverage_parametrize(
+        tokens=[256],
+        hidden=[128],
+        ep_size=[8, 32, 64],
+        dtype=[np.float32, ml_dtypes.bfloat16],
+        filter=_prior_variable_matrix,
+        coverage="full",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+    )
+    def test_permute_a2av_variable(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        tokens: int,
+        hidden: int,
+        ep_size: int,
+        dtype,
+        is_negative_test_case: bool,
+    ):
+        """Preserve prior EP8/EP32/EP64 variable-count coverage."""
+        np.random.seed(42)
+        replica_group = ReplicaGroup([list(range(ep_size))])
+        all_indices, all_counts = _generate_routing(tokens, ep_size, seed=42)
+        rank_inputs = [np.random.randn(tokens, hidden).astype(dtype) for _ in range(ep_size)]
+
+        def create_inputs(rank_id: int):
+            return {
+                "hidden_states": rank_inputs[rank_id],
+                "packed_source_indices": all_indices[rank_id],
+                "send_counts": all_counts[rank_id],
+                "recv_capacity": ep_size * tokens,
+                "replica_group": replica_group,
+            }
+
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=permute_a2av,
+            torch_ref=permute_a2av_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=ep_size,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            output_keys=["recv_data", "metadata"],
+            inference_args=InferenceArgs(collective_ranks=ep_size),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    @pytest.mark.coverage_parametrize(
+        rows=[128, 131],
+        hidden=[128, 256],
+        ep_size=[8],
+        dtype=[np.float32, ml_dtypes.bfloat16],
+        coverage="pairs",
+        enable_automatic_boundary_tests=False,
+        enable_invalid_combination_tests=False,
+    )
+    def test_permute_a2av_skewed_counts(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        rows: int,
+        hidden: int,
+        ep_size: int,
+        dtype,
+        is_negative_test_case: bool,
+    ):
+        """Exercise packed placement with non-tile-aligned skewed counts."""
+        np.random.seed(42)
+        replica_group = ReplicaGroup([list(range(ep_size))])
+        all_indices, all_counts = _generate_routing(rows, ep_size, seed=100)
+        rank_inputs = [np.random.randn(rows, hidden).astype(dtype) for _ in range(ep_size)]
+
+        def create_inputs(rank_id: int):
+            return {
+                "hidden_states": rank_inputs[rank_id],
+                "packed_source_indices": all_indices[rank_id],
+                "send_counts": all_counts[rank_id],
+                "recv_capacity": ep_size * rows,
+                "replica_group": replica_group,
+            }
+
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=permute_a2av,
+            torch_ref=permute_a2av_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=ep_size,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            output_keys=["recv_data", "metadata"],
+            inference_args=InferenceArgs(collective_ranks=ep_size),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_permute_handles_worst_case_unique_token_routing(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """One rank receives exactly the EP64/H4096 routed-token capacity."""
+        tokens = 65
+        top_k = 2
+        rows = tokens * top_k
+        hidden = 4096
+        ep_size = 64
+        recv_capacity = ep_size * tokens
+        replica_group = ReplicaGroup([list(range(ep_size))])
+        rank_inputs = [
+            np.random.RandomState(200 + rank).randn(rows, hidden).astype(ml_dtypes.bfloat16) for rank in range(ep_size)
+        ]
+
+        def create_inputs(rank_id: int):
+            counts = np.zeros((1, ep_size), dtype=np.int32)
+            counts[0, 0] = tokens
+            counts[0, 1 + rank_id % (ep_size - 1)] = tokens
+            indices = np.arange(rows, dtype=np.int32)
+            return {
+                "hidden_states": rank_inputs[rank_id],
+                "packed_source_indices": indices,
+                "send_counts": counts,
+                "recv_capacity": recv_capacity,
+                "replica_group": replica_group,
+            }
+
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=permute_a2av,
+            torch_ref=permute_a2av_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=ep_size,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            output_keys=["recv_data", "metadata"],
+            inference_args=InferenceArgs(collective_ranks=ep_size),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_permute_handles_zero_count_peers(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Each rank communicates with one peer and leaves all other counts zero."""
+        rows = 129
+        hidden = 256
+        ep_size = 8
+        replica_group = ReplicaGroup([list(range(ep_size))])
+        all_indices = []
+        all_counts = []
+        rank_inputs = []
+        for rank in range(ep_size):
+            destination = (rank + 1) % ep_size
+            counts = np.zeros((1, ep_size), dtype=np.int32)
+            counts[0, destination] = rows
+            indices = np.arange(rows, dtype=np.int32)
+            all_counts.append(counts)
+            all_indices.append(indices)
+            rank_inputs.append(np.random.RandomState(300 + rank).randn(rows, hidden).astype(ml_dtypes.bfloat16))
+
+        def create_inputs(rank_id: int):
+            return {
+                "hidden_states": rank_inputs[rank_id],
+                "packed_source_indices": all_indices[rank_id],
+                "send_counts": all_counts[rank_id],
+                "recv_capacity": rows,
+                "replica_group": replica_group,
+            }
+
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=permute_a2av,
+            torch_ref=permute_a2av_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=ep_size,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            output_keys=["recv_data", "metadata"],
+            inference_args=InferenceArgs(collective_ranks=ep_size),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_permute_preserves_final_capacity_fragment(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Copy 129 received rows into capacity 131 and preserve two exact zero rows."""
+        rows = 129
+        recv_capacity = 131
+        hidden = 128
+        ep_size = 8
+        replica_group = ReplicaGroup([list(range(ep_size))])
+        all_indices = []
+        all_counts = []
+        rank_inputs = []
+        for rank in range(ep_size):
+            destination = (rank + 1) % ep_size
+            counts = np.zeros((1, ep_size), dtype=np.int32)
+            counts[0, destination] = rows
+            indices = np.arange(rows, dtype=np.int32)
+            rank_values = np.arange(rows * hidden, dtype=np.float32).reshape(rows, hidden)
+            rank_inputs.append(rank_values + np.float32(rank * rows * hidden))
+            all_counts.append(counts)
+            all_indices.append(indices)
+
+        def create_inputs(rank_id: int):
+            return {
+                "hidden_states": rank_inputs[rank_id],
+                "packed_source_indices": all_indices[rank_id],
+                "send_counts": all_counts[rank_id],
+                "recv_capacity": recv_capacity,
+                "replica_group": replica_group,
+            }
+
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=permute_a2av,
+            torch_ref=permute_a2av_torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=ep_size,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            output_keys=["recv_data", "metadata"],
+            inference_args=InferenceArgs(collective_ranks=ep_size),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.collectives
+@pytest.mark.PermuteA2av
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+@pytest.mark.high_rank
+@pytest.mark.skip_simulation
+@pytest.mark.parametrize(
+    "rows,ep_size,hidden,concentrated",
+    [
+        pytest.param(1, 8, 128, True, marks=pytest.mark.fast),
+        pytest.param(129, 8, 128, False, marks=pytest.mark.fast),
+        pytest.param(257, 8, 128, True, marks=pytest.mark.fast),
+        # All-rank reference inputs exceed the fast suite's host-memory budget.
+        (8192, 64, 4096, False),
+    ],
+)
+def test_packed_source_index_exact(test_manager, platform_target, rows, ep_size, hidden, concentrated):
+    """Check packed routing against the reference, including zero peers."""
+    all_indices, all_counts = _generate_routing(rows, ep_size, seed=42)
+    if concentrated:
+        for indices, counts in zip(all_indices, all_counts, strict=True):
+            counts[:] = 0
+            counts[0, 0] = rows
+            indices[:] = np.arange(rows, dtype=np.int32)[::-1]
+    capacity = (
+        rows * ep_size
+        if concentrated
+        else max(sum(int(counts[0, dst]) for counts in all_counts) for dst in range(ep_size))
+    )
+    capacity = max(128, capacity)
+    if rows == 8192:
+        capacity = 65536
+    replica_group = ReplicaGroup([list(range(ep_size))])
+
+    def create_inputs(rank_id):
+        indices, counts = all_indices[rank_id], all_counts[rank_id]
+        inputs = {
+            "hidden_states": np.random.RandomState(42 + rank_id).randn(rows, hidden).astype(ml_dtypes.bfloat16),
+            "packed_source_indices": indices,
+            "send_counts": counts,
+            "recv_capacity": capacity,
+            "replica_group": replica_group,
+        }
+        return inputs
+
+    CollectiveUnitTestFramework(
+        test_manager=test_manager,
+        kernel_entry=permute_a2av,
+        torch_ref=permute_a2av_torch_ref,
+        per_rank_input_generator=create_inputs,
+        collective_ranks=ep_size,
+    ).run_test(
+        test_config=None,
+        compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+        output_keys=["recv_data", "metadata"],
+        inference_args=InferenceArgs(collective_ranks=ep_size),
+        rtol=0,
+        atol=0,
+    )

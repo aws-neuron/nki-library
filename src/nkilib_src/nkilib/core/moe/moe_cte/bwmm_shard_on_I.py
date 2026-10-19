@@ -19,14 +19,12 @@ from typing import Any, Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import sendrecv
-from nki.isa.constants import oob_mode
-from nki.language import NKIObject
 
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
 from .moe_cte_utils import (
     DVE_CHANNELS_PER_BANK,
+    N_PSUM_BANKS,
     PSUM_SIZE,
     TILE_SIZE,
     ActivationQuantMode,
@@ -50,7 +48,7 @@ F_MAX = nl.tile_size.psum_fmax
 BLOCK_QUANT_SIZE = 256
 
 
-class OutputTensors(NKIObject):
+class OutputTensors(nl.NKIObject):
     """Container for kernel output tensors."""
 
     output: Any
@@ -58,13 +56,13 @@ class OutputTensors(NKIObject):
     down_activations: Any
 
 
-class DebugTensors(NKIObject):
+class DebugTensors(nl.NKIObject):
     """Container for debug tensors."""
 
     hidden_states: Any
 
 
-class DimensionSizes(NKIObject):
+class DimensionSizes(nl.NKIObject):
     """Container for tensor dimension sizes and derived tiling parameters."""
 
     B: int
@@ -734,7 +732,7 @@ def load_token_indices(token_position_to_id, block_idx, dims: DimensionSizes):
     for b_tile_idx in range(dims.NUM_B_TILES):
         offset = block_idx * dims.B + TILE_SIZE * b_tile_idx
         """
-        This instruction is causing an xbar transpose and having offset as b_tile_idx is throwing compilation errors 
+        This instruction is causing an xbar transpose and having offset as b_tile_idx is throwing compilation errors
         since it expects 32B offsets.
         """
         nisa.dma_copy(
@@ -820,7 +818,7 @@ def load_hidden_states(
         nisa.dma_copy(
             src=hidden_states.ap([[H, TILE_SIZE], [1, H]], offset=0, vector_offset=tmp_vector_index, indirect_dim=0),
             dst=block_hidden_states[tile_idx][0:TILE_SIZE, 0:H],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
 
 
@@ -925,7 +923,7 @@ def load_block_hidden_scale(hidden_scale_hbm, token_indices, NUM_B_TILES, skip_d
         nisa.dma_copy(
             src=hidden_scale_hbm.ap([[1, TILE_SIZE], [1, 1]], offset=0, vector_offset=tmp_vector_index, indirect_dim=0),
             dst=scale_tile[0:TILE_SIZE, 0:1],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
         block_hidden_scale.append(scale_tile)
     return block_hidden_scale
@@ -988,7 +986,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.error,
+                    oob_mode=nisa.oob_mode.error,
                 )
                 stream_shuffle_broadcast(s[0:1, 0:1], s)
                 gup_scale_per_tensor.append(s)
@@ -1023,7 +1021,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
                             scalar_offset=block_expert,
                             indirect_dim=0,
                         ),
-                        oob_mode=oob_mode.error,
+                        oob_mode=nisa.oob_mode.error,
                     )
             gup_block_scale = None
 
@@ -1068,7 +1066,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.error,
+                oob_mode=nisa.oob_mode.error,
             )
             act_s_broadcast = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
             stream_shuffle_broadcast(act_s[0:1, 0:1], act_s_broadcast)
@@ -1137,7 +1135,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.error,
+                    oob_mode=nisa.oob_mode.error,
                 )
         gup_block_scale = gup_block_scale_buf
 
@@ -1257,6 +1255,13 @@ def compute_gate_and_up_projections_shard_on_intermediate(
     h_inner_tripcount = PSUM_SIZE // TILE_SIZE
     block_psum_tiles = N_PSUM_TILE
 
+    # Only cap PSUM to per-column draining when the full N_PSUM_TILE x GUP_N_TILES
+    # accumulator grid would exceed the physical PSUM banks (which baremetal cannot
+    # spill). When the grid fits, keep all columns live so the matmuls and the
+    # PSUM->SBUF drains overlap; capping otherwise serializes them and costs MFU.
+    # Block-quant already accumulates in SBUF, so it never needs the cap.
+    cap_psum = (N_PSUM_TILE * GUP_N_TILES) > N_PSUM_BANKS
+
     # block_hidden_states_T is a list of 4D tiles (block-quant only, for double_row .ap()
     # views) or a list-of-list of 3D tiles (non-quant and per-channel quant; mainline-style).
     if cfg.is_block_quant:
@@ -1299,7 +1304,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.error,
+                oob_mode=nisa.oob_mode.error,
             )
 
         tmp_psum = nl.ndarray((TILE_SIZE, 2 * GUP_N_TILES), dtype=gate_up_bias.dtype, buffer=nl.psum)
@@ -1327,16 +1332,38 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                 gate_or_up, inps.gate_up_proj_weight, block_expert, cfg, dims.NUM_SHARDS, shard_id, None
             )
 
-        gate_or_up_psum_lst = []
-        for psum_tile_idx in range(N_PSUM_TILE):
-            i_lst = []
-            for i_tile_idx in range(GUP_N_TILES):
-                i_lst.append(nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum))
-            gate_or_up_psum_lst.append(i_lst)
+        # When capping (grid > physical banks), allocate one i_tile_idx column of
+        # PSUM accumulators at a time and drain it to SBUF before the next column
+        # reuses the banks, so peak live PSUM is N_PSUM_TILE (<=8). When it fits,
+        # allocate the full N_PSUM_TILE x GUP_N_TILES grid up front and keep every
+        # column live, draining in the trailing loop (better overlap). Non-block
+        # path only; block quant accumulates in SBUF.
+        grid_psum = None
+        if gup_block_scale is None and not cap_psum:
+            # Explicit loops, not comprehensions: the parser frontend rejects an
+            # nl.ndarray allocation inside a comprehension.
+            grid_psum = []
+            for _ in range(N_PSUM_TILE):
+                grid_row = []
+                for _ in range(GUP_N_TILES):
+                    grid_row.append(nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum))
+                grid_psum.append(grid_row)
 
         for i_tile_idx in range(GUP_N_TILES):
             i_start = TILE_SIZE * i_tile_idx
             num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
+
+            col_psum = None
+            if gup_block_scale is None:
+                if cap_psum:
+                    col_psum = []
+                    for _ in range(N_PSUM_TILE):
+                        col_psum.append(nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum))
+                else:
+                    # Reference this column's slice of the live grid (no allocation).
+                    col_psum = []
+                    for b_psum_idx in range(N_PSUM_TILE):
+                        col_psum.append(grid_psum[b_psum_idx][i_tile_idx])
 
             for h_outer_idx in range(h_outer_tripcount):
                 if gup_block_scale != None:
@@ -1439,7 +1466,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                                         ],
                                     )
                                 nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
+                                    dst=col_psum[b_psum_idx][0:num_i_tile, 0:free_size],
                                     stationary=gup_w_upcasted,
                                     moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
                                         0:TILE_SIZE, b_psum_idx, 0:free_size
@@ -1448,7 +1475,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                             else:
                                 if cfg.fuse_gate_and_up_load:
                                     nisa.nc_matmul(
-                                        dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
+                                        dst=col_psum[b_psum_idx][0:num_i_tile, 0:free_size],
                                         stationary=gup_weights[h_outer_idx][
                                             0:TILE_SIZE,
                                             h_inner_idx,
@@ -1461,7 +1488,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                                     )
                                 else:
                                     nisa.nc_matmul(
-                                        dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
+                                        dst=col_psum[b_psum_idx][0:num_i_tile, 0:free_size],
                                         stationary=gup_weights[h_outer_idx][
                                             0:TILE_SIZE,
                                             h_inner_idx,
@@ -1473,29 +1500,52 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                                         ],
                                     )
 
+            # Step 1: when capping, drain this column to SBUF before the next reuses
+            # the banks. When not capping, the whole grid stays live and is drained
+            # in the trailing loop below.
+            if gup_block_scale is None and cap_psum:
+                for b_psum_idx in range(N_PSUM_TILE):
+                    if gup_scale != None:
+                        nisa.tensor_scalar(
+                            data=col_psum[b_psum_idx][0:TILE_SIZE, 0:free_size],
+                            op0=nl.multiply,
+                            operand0=gup_scale[i_tile_idx][gate_or_up],
+                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][b_psum_idx][i_tile_idx][
+                                0:TILE_SIZE, 0:free_size
+                            ],
+                        )
+                    else:
+                        nisa.tensor_copy(
+                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][b_psum_idx][i_tile_idx][
+                                0:num_i_tile, 0:free_size
+                            ],
+                            src=col_psum[b_psum_idx][0:num_i_tile, 0:free_size],
+                        )
+
         for psum_tile_idx in range(N_PSUM_TILE):
             for i_tile_idx in range(GUP_N_TILES):
-                # Step 1: Apply weight scale (move from psum to sbuf)
-                # For block quant, result is already scaled and in sbuf — skip
-                if gup_block_scale != None:
-                    pass  # already in sbuf with block scale applied
-                elif gup_scale != None:
-                    nisa.tensor_scalar(
-                        data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
-                        op0=nl.multiply,
-                        operand0=gup_scale[i_tile_idx][gate_or_up],
-                        dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                            0:TILE_SIZE, 0:free_size
-                        ],
-                    )
-                else:
+                # Step 1: when capping, the drain was fused into the write loop above.
+                # When not capping, the full grid is still live here — drain it now
+                # (weight-scale via tensor_scalar, or tensor_copy). Steps 2/3 are
+                # SBUF-only either way.
+                if gup_block_scale is None and not cap_psum:
                     num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
-                    nisa.tensor_copy(
-                        dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                            0:num_i_tile, 0:free_size
-                        ],
-                        src=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                    )
+                    if gup_scale != None:
+                        nisa.tensor_scalar(
+                            data=grid_psum[psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            op0=nl.multiply,
+                            operand0=gup_scale[i_tile_idx][gate_or_up],
+                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                                0:TILE_SIZE, 0:free_size
+                            ],
+                        )
+                    else:
+                        nisa.tensor_copy(
+                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                                0:num_i_tile, 0:free_size
+                            ],
+                            src=grid_psum[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
+                        )
 
                 # Step 2: Apply per-token hidden scale (post-dequant, before bias)
                 if gate_up_hidden_scale != None:
@@ -1643,7 +1693,7 @@ def load_token_indices_dynamic_block(
             src=reshaped_token_position_to_id.ap(
                 pattern=[[1, TILE_SIZE], [1, 1]], offset=TILE_SIZE * b_tile_idx, scalar_offset=block_idx, indirect_dim=0
             ),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
 
     return local_token_indices
@@ -1699,7 +1749,7 @@ def load_gate_up_proj_weights_shard_intermediate(
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.skip if cfg.skip_dma.skip_weight else oob_mode.error,
+                    oob_mode=nisa.oob_mode.skip if cfg.skip_dma.skip_weight else nisa.oob_mode.error,
                 )
             else:
                 offset = load_p_offset * (2 * _I_TP) + gate_or_up * _I_TP + I_TP_offset
@@ -1711,7 +1761,7 @@ def load_gate_up_proj_weights_shard_intermediate(
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.skip if cfg.skip_dma.skip_weight else oob_mode.error,
+                    oob_mode=nisa.oob_mode.skip if cfg.skip_dma.skip_weight else nisa.oob_mode.error,
                 )
 
     return load_dst
@@ -1793,7 +1843,7 @@ def calculate_expert_affinity_T(
             src=inps.expert_affinities_masked.ap(
                 pattern=[[num_cols, TILE_SIZE], [1, 1]], offset=0, vector_offset=addr_fin_reshaped, indirect_dim=0
             ),
-            oob_mode=oob_mode.skip if cfg.skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if cfg.skip_dma.skip_token else nisa.oob_mode.error,
         )
 
         num_f = min(TILE_SIZE, dims.B - (b_tile_idx * TILE_SIZE))
@@ -1869,7 +1919,7 @@ def load_old_block(
                     vector_offset=block_token_mapping,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             )
         else:
             """
@@ -1885,7 +1935,7 @@ def load_old_block(
                 src=output.ap(
                     pattern=[[H, TILE_SIZE], [1, H]], offset=0, vector_offset=block_token_mapping, indirect_dim=0
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             )
 
     return block_old_lst
@@ -1954,7 +2004,7 @@ def compute_down_proj_shard_on_intermediate(
                 scalar_offset=block_expert,
                 indirect_dim=0,
             ),
-            oob_mode=oob_mode.error,
+            oob_mode=nisa.oob_mode.error,
         )
         down_bias_broadcasted = nl.ndarray((TILE_SIZE, dims.H), dtype=_bias_dtype, buffer=nl.sbuf)
         stream_shuffle_broadcast(down_bias, down_bias_broadcasted)
@@ -2009,7 +2059,7 @@ def compute_down_proj_shard_on_intermediate(
                                 scalar_offset=block_expert,
                                 indirect_dim=0,
                             ),
-                            oob_mode=oob_mode.error,
+                            oob_mode=nisa.oob_mode.error,
                         )
                 down_scale = None
                 down_scale_pt = None
@@ -2025,7 +2075,7 @@ def compute_down_proj_shard_on_intermediate(
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.error,
+                    oob_mode=nisa.oob_mode.error,
                 )
                 down_scale_pt = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
                 stream_shuffle_broadcast(pt_w, down_scale_pt)
@@ -2044,7 +2094,7 @@ def compute_down_proj_shard_on_intermediate(
                             scalar_offset=block_expert,
                             indirect_dim=0,
                         ),
-                        oob_mode=oob_mode.error,
+                        oob_mode=nisa.oob_mode.error,
                     )
                     pt_act_p = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
                     stream_shuffle_broadcast(pt_act, pt_act_p)
@@ -2274,7 +2324,7 @@ def compute_down_proj_shard_on_intermediate(
             # Send the peer partial directly in the accumulator dtype and reduce in
             # accumulator precision (avoids a separate io-dtype downcast before the exchange).
             block_new_acc_recv = nl.ndarray((TILE_SIZE, dims.H), dtype=_acc_dtype, buffer=nl.sbuf)
-            sendrecv(
+            nisa.sendrecv(
                 src=block_new_lst[b_shard_tile_idx + dims.NUM_B_TILES_SHARDED * (1 - shard_id)][
                     0:TILE_SIZE, 0 : dims.H
                 ],
@@ -2293,7 +2343,7 @@ def compute_down_proj_shard_on_intermediate(
             )
         else:
             # Default path: exchange and reduce in io dtype.
-            sendrecv(
+            nisa.sendrecv(
                 src=block_new_lst[b_shard_tile_idx + dims.NUM_B_TILES_SHARDED * (1 - shard_id)][
                     0:TILE_SIZE, 0 : dims.H
                 ],
@@ -2330,7 +2380,7 @@ def compute_down_proj_shard_on_intermediate(
             nisa.dma_copy(
                 dst=outs.down_activations.ap(pattern=[[dims.H, TILE_SIZE], [1, dims.H]], offset=offset),
                 src=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
-                oob_mode=oob_mode.skip if cfg.skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if cfg.skip_dma.skip_token else nisa.oob_mode.error,
             )
 
     if cfg.expert_affinity_multiply_on_I:
@@ -2444,7 +2494,7 @@ def load_down_proj_weight_shard_intermediate_H_tile(
         nisa.dma_copy(
             dst=dp_load_dst[i_tile_idx][0:num_p, 0:num_f],
             src=down_proj_weight.ap(pattern=[[_H, num_p], [1, num_f]], offset=offset, scalar_offset=block_expert),
-            oob_mode=oob_mode.skip if cfg.skip_dma.skip_weight else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if cfg.skip_dma.skip_weight else nisa.oob_mode.error,
         )
 
     return dp_load_dst
@@ -2510,7 +2560,7 @@ def store_block_output_shard_over_block_size(
                 indirect_dim=0,
             ),
             src=block_new[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
 
 

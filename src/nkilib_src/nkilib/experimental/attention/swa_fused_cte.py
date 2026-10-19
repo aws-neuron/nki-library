@@ -103,7 +103,7 @@ def _qkv_head_split(num_q_heads, num_kv_heads, num_shard, shard_id):
     return q_start, q_count, kv_start, kv_count
 
 
-@nki.jit(experimental_flags="skip-non-top-level-shared-hbm-check")
+@nki.jit
 def swa_fused_cte(
     hidden_states: nl.NkiTensor,  # [B, S, H] bf16
     qkv_weight: nl.NkiTensor,  # [H, I]  I=(num_q_heads + 2*num_kv_heads)*d_head
@@ -125,8 +125,8 @@ def swa_fused_cte(
     num_q_heads: int = 16,
     num_kv_heads: int = 2,
     d_head: int = 64,
-    k_scale: nl.NkiTensor = None,  # [1,1] fp32 per-tensor K dequant scale; required iff k_cache is FP8
-    v_scale: nl.NkiTensor = None,  # [1,1] fp32 per-tensor V dequant scale; required iff v_cache is FP8
+    k_scale: nl.NkiTensor = None,  # [128,1] fp32 per-tensor K dequant scale; required iff k_cache is FP8
+    v_scale: nl.NkiTensor = None,  # [128,1] fp32 per-tensor V dequant scale; required iff v_cache is FP8
 ):
     """Fused GPT-OSS SWA block. Returns (out [B,S,H], k_cache, v_cache) with caches updated in place.
 
@@ -328,6 +328,12 @@ def _swa_fused_one_batch(
     vb_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, kv_count * d_head), dtype=fp32, align_to=32)
     qb_dmaj = alloc.alloc_sbuf_tensor(shape=(d_head, q_count), dtype=fp32, align_to=32)
     nisa.dma_copy(dst=qb_dmaj[:, :], src=qkv_bias.ap(pattern=[[1, d_head], [d_head, q_count]], offset=q_col0))
+    # Resident [2*d_head, 1] Q-scale vector, built ONCE and shared by both projection sites
+    # (_project_rope_pairs_fused and _project_one_qpair). The fold multiplies PSUM by this and
+    # adds the SBUF qb bias; on ACT a tensor_scalar reading PSUM rejects a mixed inline-immediate/
+    # pointer operand pair, so the scale is an SBUF pointer sharing qb_sb's [0:2d] partition span.
+    q_scale_sb = alloc.alloc_sbuf_tensor(shape=(2 * d_head, 1), dtype=fp32)
+    nisa.memset(q_scale_sb[:, :], float(scale))
     # Pre-scale the Q-bias by `scale` during the pair-stacked remap (folded into the copy at zero extra
     # op cost). This lets the projection PSUM->SBUF fold use the ACT-legal (multiply, add) op order:
     # (psum + qb) * scale == psum * scale + qb * scale (fp32-identical). qb_sb is built once and read
@@ -362,18 +368,17 @@ def _swa_fused_one_batch(
     stream_shuffle_broadcast(src=opb_sb[0:1, :], dst=opb_bc[:, :])
 
     # ---- FP8 KV-cache scales (resident): dequant scale on the prior load, inverse for write-back
-    # quantize. k_scale/v_scale are per-tensor [1,1] fp32. A per-partition tensor_scalar needs the
-    # scalar operand broadcast over the destination's partitions, so build [_PMAX, 1] columns (slice
-    # [:P] per op). ----
+    # quantize. k_scale/v_scale arrive as [128,1] fp32 -- the per-tensor scale replicated across all
+    # partitions, matching qkv_proj's layout so the framework can hoist a single scale tensor into both
+    # kernels. A per-partition tensor_scalar reads the [:P] slice per op, so load all _PMAX partitions
+    # directly (no broadcast needed). ----
     k_scale_sb = v_scale_sb = inv_k_scale_sb = inv_v_scale_sb = None
     k_fp8_max = _fp8_max(k_cache.dtype) if fp8_packed else 0.0
     if fp8_packed:
         k_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
         v_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
-        nisa.dma_copy(dst=k_scale_sb[0:1, 0:1], src=k_scale[0:1, 0:1])
-        nisa.dma_copy(dst=v_scale_sb[0:1, 0:1], src=v_scale[0:1, 0:1])
-        stream_shuffle_broadcast(src=k_scale_sb[0:1, :], dst=k_scale_sb[:, :])
-        stream_shuffle_broadcast(src=v_scale_sb[0:1, :], dst=v_scale_sb[:, :])
+        nisa.dma_copy(dst=k_scale_sb[0:_PMAX, 0:1], src=k_scale[0:_PMAX, 0:1])
+        nisa.dma_copy(dst=v_scale_sb[0:_PMAX, 0:1], src=v_scale[0:_PMAX, 0:1])
         inv_k_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
         inv_v_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
         nisa.reciprocal(inv_k_scale_sb[:, 0:1], k_scale_sb[:, 0:1])
@@ -558,6 +563,7 @@ def _swa_fused_one_batch(
         qw_sb,
         kw_sb,
         qb_sb,
+        q_scale_sb,
         kb_sb,
         swap_mat,
         tw,
@@ -599,6 +605,7 @@ def _swa_fused_one_batch(
                 nhidden_t,
                 qw_sb,
                 qb_sb,
+                q_scale_sb,
                 ncos_f,
                 nsin_s,
                 swap_mat,
@@ -896,6 +903,7 @@ def _swa_fused_one_batch(
                         nhidden_t,
                         qw_sb,
                         qb_sb,
+                        q_scale_sb,
                         ncos_f,
                         nsin_s,
                         swap_mat,
@@ -986,7 +994,7 @@ def _build_signed_swap_mat(d_head, dt, alloc):
 
 
 def _project_rope_pairs_fused(
-    dst_sb, hidden_t, w_sb, qb_sb, cos_f, sin_s, swap_mat, n_pairs, d_head, num_h_tiles, H, S, scale, alloc
+    dst_sb, hidden_t, w_sb, qb_sb, q_scale_sb, cos_f, sin_s, swap_mat, n_pairs, d_head, num_h_tiles, H, S, scale, alloc
 ):
     """Fused per-pair Q projection + sign-folded RoPE. dst_sb is [2*d_head, n_pairs, S] (head 2p in
     partition rows [0:d], 2p+1 in [d:2d]). For each pair p: project the two heads in one [hsz, 2d=128]
@@ -1012,7 +1020,7 @@ def _project_rope_pairs_fused(
             dst=dst_sb[:, p, :],
             data=psum[:, :],
             op0=nl.multiply,
-            operand0=float(scale),
+            operand0=q_scale_sb[:, 0:1],
             op1=nl.add,
             operand1=qb_sb[:, p : p + 1],
             engine=nisa.scalar_engine,
@@ -1117,6 +1125,7 @@ def _project_rope_from_inputs(
     qw_sb,
     kw_sb,
     qb_sb,
+    q_scale_sb,
     kb_sb,
     swap_mat,
     tw,
@@ -1134,7 +1143,21 @@ def _project_rope_from_inputs(
     """
     save = alloc.get_current_address()
     _project_rope_pairs_fused(
-        q_packed, hidden_t, qw_sb, qb_sb, cos_f, sin_s, swap_mat, n_pairs, d_head, num_h_tiles, H, tw, scale, alloc
+        q_packed,
+        hidden_t,
+        qw_sb,
+        qb_sb,
+        q_scale_sb,
+        cos_f,
+        sin_s,
+        swap_mat,
+        n_pairs,
+        d_head,
+        num_h_tiles,
+        H,
+        tw,
+        scale,
+        alloc,
     )
     _project_tile_dmajor(k_tile, hidden_t, kw_sb, kv_count, d_head, num_h_tiles, H, bias_sb=kb_sb)
     _rope_k_packed(
@@ -1144,7 +1167,7 @@ def _project_rope_from_inputs(
 
 
 def _project_one_qpair(
-    q_packed, hidden_t, qw_sb, qb_sb, cos_f, sin_s, swap_mat, p, d_head, num_h_tiles, H, S, scale, alloc
+    q_packed, hidden_t, qw_sb, qb_sb, q_scale_sb, cos_f, sin_s, swap_mat, p, d_head, num_h_tiles, H, S, scale, alloc
 ):
     """ONE Q head-pair's projection + sign-folded RoPE -> q_packed[:, p, :]. Extracted from
     _project_rope_pairs_fused so the caller can EXPLICITLY interleave these per-pair projection
@@ -1164,7 +1187,7 @@ def _project_one_qpair(
         dst=q_packed[:, p, :],
         data=psum[:, :],
         op0=nl.multiply,
-        operand0=float(scale),
+        operand0=q_scale_sb[:, 0:1],
         op1=nl.add,
         operand1=qb_sb[:, p : p + 1],
         engine=nisa.scalar_engine,
@@ -1187,7 +1210,7 @@ def _emit_next_proj_step(proj_ctx):
     scheduler runs Tensor near program order and won't hoist projection into that intra-pair gap on
     its own. proj_ctx is None on paths with no next tile (tile-0 / TP8 / last wide tile) -> no-op.
 
-    proj_ctx = (step[mutable [int]], n_pairs, nq_packed, nhidden_t, qw_sb, qb_sb, ncos_f, nsin_s,
+    proj_ctx = (step[mutable [int]], n_pairs, nq_packed, nhidden_t, qw_sb, qb_sb, q_scale_sb, ncos_f, nsin_s,
                 swap_mat, nk_tile, kw_sb, kb_sb, d_head, num_h_tiles, H, tw, kv_count, scale, alloc)
     """
     if proj_ctx is None:
@@ -1199,6 +1222,7 @@ def _emit_next_proj_step(proj_ctx):
         nhidden_t,
         qw_sb,
         qb_sb,
+        q_scale_sb,
         ncos_f,
         nsin_s,
         swap_mat,
@@ -1218,7 +1242,21 @@ def _emit_next_proj_step(proj_ctx):
         return  # all steps for this tile already emitted
     if ps < n_pairs:
         _project_one_qpair(
-            nq_packed, nhidden_t, qw_sb, qb_sb, ncos_f, nsin_s, swap_mat, ps, d_head, num_h_tiles, H, tw, scale, alloc
+            nq_packed,
+            nhidden_t,
+            qw_sb,
+            qb_sb,
+            q_scale_sb,
+            ncos_f,
+            nsin_s,
+            swap_mat,
+            ps,
+            d_head,
+            num_h_tiles,
+            H,
+            tw,
+            scale,
+            alloc,
         )
     else:
         _project_tile_dmajor(nk_tile, nhidden_t, kw_sb, kv_count, d_head, num_h_tiles, H, bias_sb=kb_sb)

@@ -14,6 +14,36 @@
 
 """PyTorch reference for conv3d_temporal_unroll (delegates to conv3d_torch_ref)."""
 
+from typing import Optional
+
+import torch
+
+from ...core.utils.common_types import ActFnType
 from .conv3d_torch import conv3d_torch_ref
 
-conv3d_temporal_unroll_torch_ref = conv3d_torch_ref
+
+def conv3d_temporal_unroll_torch_ref(
+    x_in: torch.Tensor,
+    filters: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride: tuple[int, int, int] = (1, 1, 1),
+    padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
+    dilation: tuple[int, int, int] = (1, 1, 1),
+    activation_fn: Optional[ActFnType] = None,
+    lnc_shard: bool = False,
+) -> dict[str, torch.Tensor]:
+    """PyTorch reference for conv3d_temporal_unroll.
+
+    Signature mirrors conv3d_temporal_unroll (which does not support batchnorm
+    fusion) and delegates to the shared conv3d reference.
+    """
+    return conv3d_torch_ref(
+        x_in=x_in,
+        filters=filters,
+        bias=bias,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        activation_fn=activation_fn,
+        lnc_shard=lnc_shard,
+    )

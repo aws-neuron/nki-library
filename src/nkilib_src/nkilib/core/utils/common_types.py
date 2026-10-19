@@ -25,6 +25,7 @@ class QKVOutputLayout(Enum):
     BSD = 0  # (b, s, (n_q_heads + 2 * n_kv_heads) * d_head)
     NBSd = 1  # (num_heads, b, s, d_head)
     NBdS = 2  # (num_heads, b, d_head, s)
+    BNSd = 3  # (b, num_heads, s, d_head)
 
 
 class NormType(Enum):
@@ -185,6 +186,26 @@ class MLPGateUpWeightLayout(Enum):
     H_X4_MIDDLE = 2
 
 
+class OProjAttentionLayout(Enum):
+    """Layout of the attention tensor passed to the output projection CTE kernel.
+
+    BNdS:
+        [B, N, D, S]. Attention is in transposed layout.
+
+    BSNd:
+        [B, S, N, D], Attention is in native untransposed layout.
+
+    BNSd:
+        [B, N, S, D], Attention is untransposed with heads outer. This is the
+        attention CTE output when heads are folded into the batch dimension and
+        ``tp_out=False``, i.e. [B * N, S, D] viewed as 4D.
+    """
+
+    BNdS = 0
+    BSNd = 1
+    BNSd = 2
+
+
 class HiddenLayout(Enum):
     """Layout of hidden activations in SBUF for TKG kernels."""
 
@@ -268,10 +289,10 @@ class QKNormConfig(nl.NKIObject):
     q_norm: Optional[NormType] = NormType.RMS_NORM
     k_norm: Optional[NormType] = NormType.RMS_NORM
     eps: float = 1e-6
-    q_gamma_norm_weights: Optional[nl.ndarray] = None
-    k_gamma_norm_weights: Optional[nl.ndarray] = None
-    q_beta_norm_weights: Optional[nl.ndarray] = None
-    k_beta_norm_weights: Optional[nl.ndarray] = None
+    q_gamma_norm_weights: Optional[nl.NkiTensor] = None
+    k_gamma_norm_weights: Optional[nl.NkiTensor] = None
+    q_beta_norm_weights: Optional[nl.NkiTensor] = None
+    k_beta_norm_weights: Optional[nl.NkiTensor] = None
     gamma_fused_in_rope_caches: bool = False
 
 
@@ -307,3 +328,19 @@ class StridedInputConfig(nl.NKIObject):
     block_stride: int  # Tokens between start of consecutive owned blocks
     block_offset: int  # Token offset of first owned block
     num_local_tokens: int  # Total tokens to process (= output S dimension)
+
+
+class AttentionLayout(Enum):
+    """Ordering of the sequence (S) and head (d) dimensions in attention tensors.
+
+    Controls whether the head dimension or the sequence dimension comes last,
+    on the innermost two axes. Outer dimensions (batch, num_heads, or a
+    flattened batch*heads) are not constrained by this enum.
+
+    Examples:
+        HEAD_MAJOR: [B, N, d, S] or [B*N, d, S]
+        SEQ_MAJOR:  [B, N, S, d] or [B*N, S, d]
+    """
+
+    HEAD_MAJOR = 0  # [..., d, S]
+    SEQ_MAJOR = 1  # [..., S, d]

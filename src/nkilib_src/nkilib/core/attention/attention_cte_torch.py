@@ -17,15 +17,17 @@ Pytorch reference for attention_cte kernel
 
 """
 
+from typing import Optional
+
 import torch
 
 from ..utils.kernel_assert import assert_shape, kernel_assert
 
 
 def attention_cte_torch_ref(
-    q: torch.tensor,
-    k: torch.tensor,
-    v: torch.tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     scale: float = 1.0,
     causal_mask: bool = True,
     k_prior=None,
@@ -39,7 +41,7 @@ def attention_cte_torch_ref(
     cache_softmax=False,
     softmax_dtype=torch.float32,
     mm_out_dtype=torch.float32,
-    cp_offset: torch.tensor = None,
+    cp_offset: Optional[torch.Tensor] = None,
     global_cp_deg: int = None,
     cp_strided_q_slicing: bool = False,
     cp_striped_input: bool = False,
@@ -49,6 +51,7 @@ def attention_cte_torch_ref(
     position_bias=None,
     bias_layout=None,
     bias_band_params=None,
+    allow_vector_exp: bool = True,
 ):
     """PyTorch reference implementation for attention_cte NKI kernel.
 

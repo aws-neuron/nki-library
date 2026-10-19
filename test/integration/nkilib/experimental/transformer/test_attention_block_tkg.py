@@ -44,6 +44,12 @@ from nkilib_src.nkilib.experimental.transformer.attention_block_tkg_torch import
 )
 from typing_extensions import override
 
+from test.integration.nkilib.core.attention.test_attention_tkg_seq_packed import (
+    FP8_PACKED_AUTO_ALLOC_UNPACKED_CASES,
+    GENERATED_FP8_PACKED_AUTO_ALLOC_SEQ_PACKED_CASES,
+    _pack_local_sweep_schedule,
+)
+
 try:
     from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_model_config import (
         attention_block_tkg_model_configs,
@@ -611,6 +617,63 @@ def _generate_kv_quant_inputs(
     return k_scale, v_scale, K_cache, V_cache
 
 
+def _generate_explicit_attention_mask(
+    cfg: AttnBlkTestConfig,
+    cache_lens,
+    *,
+    batch: int,
+    num_heads: int,
+    kv_cache_dtype,
+    is_block_kv: bool,
+):
+    """Generate the ordinary HBM mask matching the kernel's selected QK layout.
+
+    ``cache_lens`` excludes the active tokens. The helper reconstructs their
+    logical positions and chooses the transposed or default mask layout with the
+    same predicate used by the kernel.
+    """
+    import torch
+
+    from test.integration.nkilib.core.attention.test_attention_tkg_utils import build_active_attention_mask
+
+    pos_ids_hbm = torch.from_numpy(
+        np.broadcast_to(cache_lens, (batch, cfg.S_tkg)).astype(np.float32)
+        + (np.arange(cfg.S_tkg, dtype=np.float32)[np.newaxis, :] if cfg.S_tkg > 1 else 0.0)
+    ).reshape(1, batch * cfg.S_tkg)
+    active_mask = build_active_attention_mask(
+        batch=batch,
+        num_heads=num_heads,
+        s_active=cfg.S_tkg,
+        transposed=True,
+    )
+    transposed_out = is_qk_swapped(
+        bs=batch,
+        q_head=num_heads,
+        d_head=cfg.d_head,
+        s_active=cfg.S_tkg,
+        curr_sprior=cfg.S_ctx,
+        lnc=cfg.lnc,
+        p_max=_P_MAX,
+        is_block_kv=is_block_kv,
+        is_2byte_kv=sizeinbytes(kv_cache_dtype) == 2,
+        fp8_packed=cfg.fp8_packed,
+        fuse_rope=False,
+        kv_heads=cfg.kv_heads,
+    )
+    attention_mask = gen_mask_tkg_hbm_torch_ref[cfg.lnc](
+        pos_ids_hbm=pos_ids_hbm,
+        bs=batch,
+        q_head=num_heads,
+        s_active=cfg.S_tkg,
+        s_prior=cfg.S_ctx,
+        block_len=cfg.block_len,
+        active_mask=active_mask,
+        enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+        transposed_out=transposed_out,
+    ).numpy()
+    return dt.static_cast(np.ascontiguousarray(attention_mask), dtype=np.uint8)
+
+
 def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     """Generate kernel inputs for a single rank.
 
@@ -891,8 +954,6 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
             max_cache = cfg.max_context_len - S_tkg
             cache_len = np.clip(cache_len, 0, max_cache)
             cache_len[0] = max_cache
-    import torch
-
     if cfg.use_pos_id:
         # In-kernel mask generation: pass pos_ids instead of attention_mask
         if cfg.sliding_window > 0:
@@ -923,42 +984,14 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     else:
         pos_ids = None
         swa_start_pos_ids = None
-        pos_ids_hbm = torch.from_numpy(
-            np.broadcast_to(cache_len, (B_attn, S_tkg)).astype(np.float32)
-            + (np.arange(S_tkg, dtype=np.float32)[np.newaxis, :] if S_tkg > 1 else 0.0)
-        ).reshape(1, B_attn * S_tkg)
-        active_mask_hbm = build_active_attention_mask(
+        attention_mask = _generate_explicit_attention_mask(
+            cfg,
+            cache_len,
             batch=B_attn,
             num_heads=num_mask_heads,
-            s_active=S_tkg,
-            transposed=True,
-        )  # [S_tkg, B, N, S]
-        transposed_out = is_qk_swapped(
-            bs=B_attn,
-            q_head=num_mask_heads,
-            d_head=d_head,
-            s_active=S_tkg,
-            curr_sprior=S_ctx,
-            lnc=cfg.lnc,
-            p_max=_P_MAX,
+            kv_cache_dtype=kv_cache_dtype,
             is_block_kv=is_block_kv,
-            is_2byte_kv=sizeinbytes(kv_cache_dtype) == 2,
-            fp8_packed=cfg.fp8_packed,
-            fuse_rope=False,
-            kv_heads=num_kv_heads,
         )
-        attention_mask = gen_mask_tkg_hbm_torch_ref[cfg.lnc](
-            pos_ids_hbm=pos_ids_hbm,
-            bs=B_attn,
-            q_head=num_mask_heads,
-            s_active=S_tkg,
-            s_prior=S_ctx,
-            block_len=cfg.block_len,
-            active_mask=active_mask_hbm,
-            enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
-            transposed_out=transposed_out,
-        ).numpy()  # default: (S_ctx, B, N, S); QK-swap: (B, N, S, S_ctx)
-        attention_mask = dt.static_cast(np.ascontiguousarray(attention_mask), dtype=np.uint8)
 
     # Attention sink: one scalar per (KVDP-expanded) query head, [q_heads_attn, 1] @ HBM.
     sink = _rng.uniform(0.0, 1.0, (num_mask_heads, 1)).astype(np.float32) if cfg.test_sink else None
@@ -982,11 +1015,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     # kv_cache_update_idx: (B, S_tkg) for block KV (kv_heads==1) with per-token physical positions,
     #                      (B, kv_heads, S_tkg) for block KV with kv_heads>1 (per-head physical positions),
     #                      (B, 1) for flat KV with start position (consecutive tokens assumed).
-    def generate_kv_cache_update_idx():
-        if cfg.block_len == 0:
-            # Flat KV: only start position needed, consecutive tokens assumed
-            return cache_len.astype(np.uint32)
-
+    def generate_block_kv_cache_update_idx(abt: npt.NDArray[np.int32]):
         # Block KV: translate each token's logical position to physical slot_mapping.
         # Generated per-(batch, kv_head, token); squeeze kv axis at end to match kernel contract:
         # (B, S_tkg) for kv_heads==1, (B, kv_heads, S_tkg) otherwise.
@@ -994,7 +1023,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
         logical_blks = logical_positions // cfg.block_len
         offset_in_blk = logical_positions % cfg.block_len
         # Wrap a 2D active_blocks_table to 3D for a uniform per-head gather.
-        abt_3d = active_blocks_table if num_kv_heads > 1 else active_blocks_table[:, np.newaxis, :]
+        abt_3d = abt if num_kv_heads > 1 else abt[:, np.newaxis, :]
         # physical_blks[b, h, t] = abt_3d[b, h, logical_blks[b, t]]
         physical_blks = abt_3d[
             np.arange(B_attn)[:, None, None],
@@ -1009,7 +1038,11 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
             physical_kv_cache_update_idx = physical_kv_cache_update_idx.squeeze(1)  # (B, S_tkg)
         return physical_kv_cache_update_idx.astype(np.uint32)
 
-    kv_cache_update_idx = generate_kv_cache_update_idx()
+    if active_blocks_table is None:
+        # Flat KV: only start position needed, consecutive tokens assumed
+        kv_cache_update_idx = cache_len.astype(np.uint32)
+    else:
+        kv_cache_update_idx = generate_block_kv_cache_update_idx(active_blocks_table)
 
     # Output projection
     weight_dequant_scale_out = None
@@ -1072,6 +1105,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
     # The caller must always fuse v_scale into W_out.
     softmax_scale_adjusted = cfg.softmax_scale
     if cfg.kv_quant:
+        assert k_scale is not None and v_scale is not None, "the quantized KV path generates cache scales"
         _k_scale_scalar = float(k_scale.flat[0])
         _v_scale_scalar = float(v_scale.flat[0])
 
@@ -1086,6 +1120,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
                 W_out = dt.static_cast(W_out.astype(np.float32) / _v_scale_scalar, dtype)
             elif cfg.quantization_type in (QuantizationType.ROW, QuantizationType.STATIC):
                 # FP8 weights with dequant scale: absorb v_scale into the scale
+                assert weight_dequant_scale_out is not None, "FP8 output weights carry a dequant scale"
                 weight_dequant_scale_out = (weight_dequant_scale_out.astype(np.float32) / _v_scale_scalar).astype(
                     np.float32
                 )
@@ -1164,56 +1199,56 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
 # wrapper to test SBUF IO
 def attention_block_tkg_kernel_test_wrapper(
     # -- input
-    X: nl.ndarray,
+    X: nl.NkiTensor,
     X_in_sb: bool,
     X_hidden_dim_actual: Optional[int],
     # -- rmsnorm X
     rmsnorm_X_enabled: bool,
     rmsnorm_X_eps: Optional[float],
-    rmsnorm_X_gamma: Optional[nl.ndarray],
+    rmsnorm_X_gamma: Optional[nl.NkiTensor],
     # -- qkv projections
-    W_qkv: nl.ndarray,
-    bias_qkv: Optional[nl.ndarray],
+    W_qkv: nl.NkiTensor,
+    bias_qkv: Optional[nl.NkiTensor],
     quantization_type_qkv: QuantizationType,
-    weight_dequant_scale_qkv: Optional[nl.ndarray],
-    input_dequant_scale_qkv: Optional[nl.ndarray],
+    weight_dequant_scale_qkv: Optional[nl.NkiTensor],
+    input_dequant_scale_qkv: Optional[nl.NkiTensor],
     # -- Q/K processing: pre-RoPE RMSNorm
     rmsnorm_QK_pre_rope_enabled: bool,
     rmsnorm_QK_pre_rope_eps: float,
-    rmsnorm_QK_pre_rope_W_Q: Optional[nl.ndarray],
-    rmsnorm_QK_pre_rope_W_K: Optional[nl.ndarray],
+    rmsnorm_QK_pre_rope_W_Q: Optional[nl.NkiTensor],
+    rmsnorm_QK_pre_rope_W_K: Optional[nl.NkiTensor],
     # -- RoPE embeddings
-    cos: Optional[nl.ndarray],
-    sin: Optional[nl.ndarray],
+    cos: Optional[nl.NkiTensor],
+    sin: Optional[nl.NkiTensor],
     rope_contiguous_layout: bool,
     # -- Q/K processing: post-RoPE RMSNorm
     rmsnorm_QK_post_rope_enabled: bool,
     rmsnorm_QK_post_rope_eps: float,
-    rmsnorm_QK_post_rope_W_Q: Optional[nl.ndarray],
-    rmsnorm_QK_post_rope_W_K: Optional[nl.ndarray],
+    rmsnorm_QK_post_rope_W_Q: Optional[nl.NkiTensor],
+    rmsnorm_QK_post_rope_W_K: Optional[nl.NkiTensor],
     # -- attention
     skip_attention: bool,
     K_cache_transposed: bool,
-    active_blocks_table: Optional[nl.ndarray],
-    K_cache: nl.ndarray,
-    V_cache: nl.ndarray,
-    attention_mask: nl.ndarray,
-    sink: Optional[nl.ndarray],
+    active_blocks_table: Optional[nl.NkiTensor],
+    K_cache: nl.NkiTensor,
+    V_cache: nl.NkiTensor,
+    attention_mask: nl.NkiTensor,
+    sink: Optional[nl.NkiTensor],
     softmax_scale: Optional[float],
     enable_fa_s_prior_tiling: bool,
     fp8_packed: bool,
     # -- FP8 KV cache quantization
-    k_scale: Optional[nl.ndarray],
-    v_scale: Optional[nl.ndarray],
+    k_scale: Optional[nl.NkiTensor],
+    v_scale: Optional[nl.NkiTensor],
     # -- KV cache update
     update_cache: bool,
-    kv_cache_update_idx: nl.ndarray,
+    kv_cache_update_idx: nl.NkiTensor,
     # -- output projection
-    W_out: Optional[nl.ndarray],
-    bias_out: Optional[nl.ndarray],
+    W_out: Optional[nl.NkiTensor],
+    bias_out: Optional[nl.NkiTensor],
     quantization_type_out: QuantizationType,
-    weight_dequant_scale_out: Optional[nl.ndarray],
-    input_dequant_scale_out: Optional[nl.ndarray],
+    weight_dequant_scale_out: Optional[nl.NkiTensor],
+    input_dequant_scale_out: Optional[nl.NkiTensor],
     # -- output
     transposed_out: bool,
     transposed_in: bool,
@@ -1223,10 +1258,10 @@ def attention_block_tkg_kernel_test_wrapper(
     KVDP: int = 1,
     KVDP_replica_group=None,
     KVDP_collective_mode=None,
-    KVDP_rank: Optional[nl.ndarray] = None,
+    KVDP_rank: Optional[nl.NkiTensor] = None,
     # -- in-kernel mask generation
-    pos_ids: Optional[nl.ndarray] = None,
-    swa_start_pos_ids: Optional[nl.ndarray] = None,
+    pos_ids: Optional[nl.NkiTensor] = None,
+    swa_start_pos_ids: Optional[nl.NkiTensor] = None,
     S_ctx: Optional[int] = None,
     is_h_transposed_by_4: bool = False,
     max_context_len=None,
@@ -1607,8 +1642,11 @@ def _run_single_rank_test(
         kernel_entry=nki.jit(attention_block_tkg_kernel_test_wrapper),
         torch_ref=torch_ref_wrapper(AttentionBlockTkgTorchRef(cfg.lnc, kv_quant_dtype=cfg.kv_quant_dtype)),
         kernel_input_generator=input_generator,
+        # Output shapes come from the torch ref, which needs the LOGICAL mask — use the un-banded
+        # kernel_input, not the banded ki handed to the kernel (banding only changes the mask layout,
+        # not output shapes).
         output_tensor_descriptor=lambda ki: _infer_output_shapes_and_dtypes(
-            {k.removesuffix(".must_alias_input"): v for k, v in ki.items()}, cfg.lnc
+            {k.removesuffix(".must_alias_input"): v for k, v in kernel_input.items()}, cfg.lnc
         ),
     )
     framework.run_test(
@@ -1846,6 +1884,449 @@ def _run_multi_rank_test(
         custom_comparator=comparator,
         golden_only=golden_only,
         output_keys=output_keys,
+    )
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize(
+    "use_seq_packed_attention,skip_output_projection,test_sink",
+    [
+        (True, False, True),
+        (True, True, False),
+        (False, False, True),
+        (False, True, False),
+    ],
+    ids=[
+        "packed_output_projection_with_sink",
+        "packed_raw_attention_without_sink",
+        "unpacked_output_projection_with_sink",
+        "unpacked_raw_attention_without_sink",
+    ],
+)
+@pytest.mark.mx
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+def test_attn_blk_packed_integration(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    use_seq_packed_attention: bool,
+    skip_output_projection: bool,
+    test_sink: bool,
+):
+    """Compare packed and unpacked attention with identical fused-block inputs."""
+    from test.integration.nkilib.core.attention.test_attention_tkg_seq_packed import (
+        GPT_B8_LENGTHS,
+        GPT_B8_PADDED_SCHEDULE,
+    )
+
+    _run_attn_blk_packed_integration(
+        test_manager=test_manager,
+        platform_target=platform_target,
+        use_seq_packed_attention=use_seq_packed_attention,
+        skip_output_projection=skip_output_projection,
+        test_sink=test_sink,
+        batch=8,
+        lengths=GPT_B8_LENGTHS,
+        schedule=GPT_B8_PADDED_SCHEDULE,
+        block_len=64,
+    )
+
+
+@pytest.mark.parametrize(
+    "sweep_case_name",
+    ["util50_bimodal_b16_c32k_s4", "util100_uniform_b16_c32k_s4"],
+    ids=["util50", "util100"],
+)
+@pytest.mark.parametrize(
+    "use_seq_packed_attention",
+    [True, False],
+    ids=["packed", "unpacked"],
+)
+@pytest.mark.mx
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+def test_attn_blk_packed_sweep_integration(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    use_seq_packed_attention: bool,
+    sweep_case_name: str,
+):
+    """Compare packed and unpacked fused blocks on the 50%- and 100%-utilization sweep schedules.
+
+    These reuse the standalone sweep packings so fused-block numbers are directly
+    comparable to attention-only ones. a50 has length variance that packing can
+    exploit; a100 is uniform full context, so its packed rows are fully occupied
+    and packing removes no tile work, isolating routing overhead.
+    """
+    from test.integration.nkilib.core.attention.test_attention_tkg_seq_packed import (
+        GENERATED_PACKED_SWEEP_CASES,
+    )
+
+    case = next(c for c in GENERATED_PACKED_SWEEP_CASES if c["name"] == sweep_case_name)
+
+    _run_attn_blk_packed_integration(
+        test_manager=test_manager,
+        platform_target=platform_target,
+        use_seq_packed_attention=use_seq_packed_attention,
+        skip_output_projection=True,
+        test_sink=False,
+        batch=len(case["lengths"]),
+        lengths=case["lengths"],
+        schedule=case["schedule"],
+        # The fused block requires 64-token cache blocks; the standalone sweep
+        # uses the smaller default. Lengths and packing schedule are identical.
+        block_len=64,
+    )
+
+
+def _make_attn_blk_fp8_packed_auto_alloc_cfg(lengths, s_ctx=None, *, lnc=2) -> AttnBlkTestConfig:
+    """Build the common fused GPT-OSS geometry used by both sweep arms."""
+    assert len(lengths) % lnc == 0
+    s_ctx = s_ctx or max(lengths)
+    return AttnBlkTestConfig(
+        batch=len(lengths),
+        q_heads=8,
+        kv_heads=1,
+        d_head=64,
+        H=3072,
+        H_actual=2880,
+        S_ctx=s_ctx,
+        S_max_ctx=s_ctx,
+        S_tkg=1,
+        block_len=64,
+        lnc=lnc,
+        update_cache=True,
+        rmsnorm_X=True,
+        test_bias=True,
+        test_sink=True,
+        kv_quant=True,
+        fp8_packed=True,
+    )
+
+
+_ATTN_BLK_LNC1_SWEEP_CASE_NAMES = (
+    # Utilization sweep at the most common comparison context.
+    "util50_bimodal_b16_c32k_s4",
+    "util75_bimodal_b16_c32k_s4",
+    "util100_uniform_b16_c32k_s4",
+    # Context sweep at fixed 75% utilization.
+    "util75_bimodal_b16_c16k_s4",
+    "util75_bimodal_b16_c64k_s4",
+    "util75_bimodal_b16_c128k_s4",
+)
+_ATTN_BLK_FP8_PACKED_AUTO_ALLOC_LNC1_CASES = tuple(
+    next(case for case in GENERATED_FP8_PACKED_AUTO_ALLOC_SEQ_PACKED_CASES if case["name"] == name)
+    for name in _ATTN_BLK_LNC1_SWEEP_CASE_NAMES
+)
+
+
+def _build_attn_blk_lnc1_schedule(case):
+    """Repack an LNC2 sweep workload so one NC owns the complete batch."""
+    cache_lengths = [length - 1 for length in case["lengths"]]
+    num_slots = len(case["schedule"][0])
+    return _pack_local_sweep_schedule(cache_lengths, sequence_offset=0, num_slots=num_slots)
+
+
+@pytest.mark.parametrize(
+    "case",
+    GENERATED_FP8_PACKED_AUTO_ALLOC_SEQ_PACKED_CASES,
+    ids=[case["name"] for case in GENERATED_FP8_PACKED_AUTO_ALLOC_SEQ_PACKED_CASES],
+)
+@pytest.mark.mx
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+def test_attn_blk_seq_packed_fp8_packed_auto_alloc_sweep(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    case,
+):
+    """Run the sequence-packed arm of the FP8-packed auto-allocation sweep."""
+    cfg = _make_attn_blk_fp8_packed_auto_alloc_cfg(case["lengths"], case.get("curr_sprior"))
+    _run_attn_blk_packed_integration(
+        test_manager=test_manager,
+        platform_target=platform_target,
+        use_seq_packed_attention=True,
+        skip_output_projection=False,
+        test_sink=True,
+        batch=cfg.batch,
+        lengths=case["lengths"],
+        schedule=case["schedule"],
+        block_len=cfg.block_len,
+        cfg=cfg,
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    _ATTN_BLK_FP8_PACKED_AUTO_ALLOC_LNC1_CASES,
+    ids=[case["name"] for case in _ATTN_BLK_FP8_PACKED_AUTO_ALLOC_LNC1_CASES],
+)
+@pytest.mark.mx
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+def test_attn_blk_seq_packed_fp8_packed_auto_alloc_lnc1_sweep(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    case,
+):
+    """Cover representative utilization and context sweeps with one logical NC."""
+    cfg = _make_attn_blk_fp8_packed_auto_alloc_cfg(
+        case["lengths"],
+        case.get("curr_sprior"),
+        lnc=1,
+    )
+    _run_attn_blk_packed_integration(
+        test_manager=test_manager,
+        platform_target=platform_target,
+        use_seq_packed_attention=True,
+        skip_output_projection=False,
+        test_sink=True,
+        batch=cfg.batch,
+        lengths=case["lengths"],
+        schedule=_build_attn_blk_lnc1_schedule(case),
+        block_len=cfg.block_len,
+        cfg=cfg,
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    FP8_PACKED_AUTO_ALLOC_UNPACKED_CASES,
+    ids=[case["id"] for case in FP8_PACKED_AUTO_ALLOC_UNPACKED_CASES],
+)
+@pytest.mark.mx
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+def test_attn_blk_unpacked_fp8_packed_auto_alloc_sweep(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    case,
+):
+    """Run deduplicated unpacked baselines for the FP8-packed auto-allocation sweep."""
+    cfg = _make_attn_blk_fp8_packed_auto_alloc_cfg(case["lengths"], case.get("s_prior"))
+    _run_attn_blk_packed_integration(
+        test_manager=test_manager,
+        platform_target=platform_target,
+        use_seq_packed_attention=False,
+        skip_output_projection=False,
+        test_sink=True,
+        batch=cfg.batch,
+        lengths=case["lengths"],
+        schedule=None,
+        block_len=cfg.block_len,
+        cfg=cfg,
+    )
+
+
+def _run_attn_blk_packed_integration(
+    test_manager: Orchestrator,
+    platform_target: Platforms,
+    use_seq_packed_attention: bool,
+    skip_output_projection: bool,
+    test_sink: bool,
+    batch: int,
+    lengths,
+    schedule,
+    block_len: int,
+    cfg: Optional[AttnBlkTestConfig] = None,
+):
+    """Run one fused-block workload with ordinary or sequence-packed attention.
+
+    Legacy focused tests use the small default configuration created here. The
+    FP8-packed sweep supplies its full projection, RMSNorm, cache-update, and
+    output-projection configuration through ``cfg``. Both arms build golden
+    outputs from the same ordinary per-sequence inputs.
+    """
+    if "trn3" not in str(platform_target).lower():
+        pytest.skip("Tensor-indirection packed attention requires NeuronCore-v4 (Trn3).")
+
+    from test.integration.nkilib.core.attention.test_attention_tkg_seq_packed import (
+        _build_packed_accumulator_ti_tables,
+        _build_packed_blocks,
+        _build_packed_mask,
+        _build_seq_id_table,
+        _build_ti_table,
+    )
+    from test.integration.nkilib.core.attention.test_attention_tkg_utils import (
+        gen_deterministic_active_block_table,
+    )
+
+    if cfg is None:
+        cfg = AttnBlkTestConfig(
+            batch=batch,
+            q_heads=8,
+            kv_heads=1,
+            d_head=64,
+            H=1024,
+            H_actual=None,
+            S_ctx=32768,
+            S_max_ctx=32768,
+            S_tkg=1,
+            block_len=block_len,
+            lnc=2,
+            use_pos_id=True,
+            update_cache=False,
+            test_sink=test_sink,
+            skip_output_projection=skip_output_projection,
+        )
+    assert cfg.batch == batch
+    assert cfg.block_len == block_len
+    assert cfg.test_sink == test_sink
+    assert cfg.skip_output_projection == skip_output_projection
+    kernel_input = generate_kernel_inputs(cfg, seed=42)
+
+    assert len(lengths) == batch
+    assert max(lengths) <= cfg.S_ctx
+    cache_lens = np.asarray(lengths, dtype=np.int32)[:, None] - cfg.S_tkg
+    if cfg.use_pos_id:
+        kernel_input["pos_ids"] = cache_lens.astype(np.float32)
+    else:
+        kernel_input["pos_ids"] = None
+        kernel_input["attention_mask"] = _generate_explicit_attention_mask(
+            cfg,
+            cache_lens,
+            batch=cfg.batch,
+            num_heads=cfg.q_heads,
+            kv_cache_dtype=kernel_input["K_cache"].dtype,
+            is_block_kv=True,
+        )
+    if test_sink:
+        kernel_input["sink"] = np.asarray([20.0, -20.0, 2.0, 8.0, 4.0, -4.0, 1.0, 0.0], dtype=np.float32).reshape(
+            cfg.q_heads, 1
+        )
+
+    num_cache_blocks = cfg.batch * cfg.S_ctx // cfg.block_len
+    per_sequence_table = gen_deterministic_active_block_table(
+        cfg.batch,
+        cfg.S_ctx,
+        cfg.S_tkg,
+        cache_lens,
+        cfg.block_len,
+        num_cache_blocks,
+    ).astype(np.int32)
+    kernel_input["active_blocks_table"] = per_sequence_table
+    if cfg.update_cache:
+        # Convert each active token's logical cache position through the same
+        # per-sequence block table used by attention.
+        logical_positions = cache_lens + np.arange(cfg.S_tkg, dtype=np.int32)[None, :]
+        logical_blocks = logical_positions // cfg.block_len
+        offsets_in_block = logical_positions % cfg.block_len
+        physical_blocks = per_sequence_table[
+            np.arange(cfg.batch, dtype=np.int32)[:, None],
+            logical_blocks,
+        ]
+        kernel_input["kv_cache_update_idx"] = (physical_blocks * cfg.block_len + offsets_in_block).astype(np.uint32)
+
+    # The standard torch reference represents the same attention semantics and
+    # intentionally receives only the ordinary per-sequence inputs.
+    golden_outputs = _golden_ref_via_torch(kernel_input, cfg.lnc)
+    ordinary_attention_mask = kernel_input["attention_mask"]
+
+    if use_seq_packed_attention:
+        assert schedule is not None
+        num_slots = len(schedule[0])
+        s_active_qh = cfg.q_heads * cfg.S_tkg
+        seq_packed_active_blocks_table = _build_packed_blocks(
+            per_sequence_table,
+            schedule,
+            num_slots,
+            cfg.block_len,
+        )
+        kernel_input.update(
+            {
+                "seq_packed_attention_mask": _build_packed_mask(
+                    lengths,
+                    schedule,
+                    cfg.q_heads,
+                    cfg.S_tkg,
+                    num_slots,
+                    cfg.block_len,
+                ),
+                "seq_packed_active_blocks_table": seq_packed_active_blocks_table,
+                "seq_packed_q_index_table": _build_ti_table(schedule, cfg.d_head, s_active_qh),
+                "seq_packed_seq_id_table": _build_seq_id_table(schedule),
+            }
+        )
+        # The routes are a hardware lowering of the canonical sequence-ID
+        # schedule; the Torch reference does not need them.
+        (
+            accumulator_partial_route_table,
+            accumulator_group_state_route_table,
+        ) = _build_packed_accumulator_ti_tables(
+            schedule,
+            cfg.d_head,
+            s_active_qh,
+            rows_per_nc=len(schedule) // cfg.lnc,
+            bs_per_nc=cfg.batch // cfg.lnc,
+        )
+        kernel_input.update(
+            {
+                "seq_packed_accumulator_partial_route_table": accumulator_partial_route_table,
+                "seq_packed_accumulator_group_state_route_table": accumulator_group_state_route_table,
+            }
+        )
+        kernel_input["attention_mask"] = None
+    kv_cache_dtype = kernel_input["K_cache"].dtype
+    kernel_input.pop("X_in_sb")
+    if cfg.update_cache:
+        # Cache updates are in-place kernel outputs, so the framework must bind
+        # each output to its corresponding input allocation.
+        kernel_input["K_cache.must_alias_input"] = kernel_input.pop("K_cache")
+        kernel_input["V_cache.must_alias_input"] = kernel_input.pop("V_cache")
+        golden_outputs["K_cache"] = golden_outputs.pop("K_cache_updated")
+        golden_outputs["V_cache"] = golden_outputs.pop("V_cache_updated")
+
+    # UnitTestFramework compares signature(kernel_entry) against signature(torch_ref).
+    # AttentionBlockTkgTorchRef.forward carries X_in_sb (a test-wrapper concept the
+    # kernel lacks) and not the packed metadata (kernel-only), so neither direction
+    # matches here: this adapter drops the packed kwargs, restores the ordinary mask
+    # held only for the golden reference, and takes the kernel's own signature.
+    seq_packed_keys = {
+        "seq_packed_attention_mask",
+        "seq_packed_active_blocks_table",
+        "seq_packed_q_index_table",
+        "seq_packed_seq_id_table",
+        "seq_packed_accumulator_partial_route_table",
+        "seq_packed_accumulator_group_state_route_table",
+    }
+    ordinary_torch_ref = torch_ref_wrapper(AttentionBlockTkgTorchRef(cfg.lnc, kv_quant_dtype=str(kv_cache_dtype)))
+
+    def seq_packed_torch_ref(**kwargs):
+        ref_kwargs = {key: value for key, value in kwargs.items() if key not in seq_packed_keys}
+        ref_kwargs["attention_mask"] = ordinary_attention_mask
+        return ordinary_torch_ref(**ref_kwargs)
+
+    # __signature__ is honoured by inspect.signature but is not a declared attribute of
+    # FunctionType, so the type checker cannot see it on a plain function.
+    seq_packed_torch_ref.__signature__ = signature(attention_block_tkg)  # ty: ignore[unresolved-attribute]
+
+    tolerances = _get_tolerances(cfg.kv_quant, cfg.quantization_type)
+    custom_validation = ValidationArgs(
+        golden_output=_make_cosine_validation(
+            golden_outputs,
+            tolerances,
+            cfg.kv_quant,
+            cfg.quantization_type,
+        )
+    )
+    framework = UnitTestFramework(
+        test_manager=test_manager,
+        kernel_entry=attention_block_tkg,
+        torch_ref=seq_packed_torch_ref,
+        kernel_input_generator=lambda _: kernel_input,
+        output_tensor_descriptor=lambda _: {
+            name: np.zeros(output.shape, dtype=output.dtype) for name, output in golden_outputs.items()
+        },
+    )
+    framework.run_test(
+        test_config=None,
+        compiler_args=CompilerArgs(
+            logical_nc_config=cfg.lnc,
+            enable_birsim=False,
+            platform_target=platform_target,
+            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+        ),
+        inference_args=replace(
+            TKG_INFERENCE_ARGS,
+            collective_ranks=1,
+            enable_determinism_check=False,
+        ),
+        custom_validation_args=custom_validation,
     )
 
 
@@ -2254,6 +2735,35 @@ RANGE_ATTN_BLK_CFGS = [
                         block_len=32, transposed_in=True),
 
     # ===== In-kernel mask generation (use_pos_id=True) =====
+    # QK-swap partition banding + in-kernel gen_mask: b16 batch-sharded -> bs_per_nc=8 < batches_per_psum=16,
+    # s_active_qh=8, band_factor=2. Exercises the banded gen_mask_tkg swap layout (per-band token offset).
+    # block_len=64 single-fold tile (S_ctx=8192) so the band split aligns to the fold's p_slot axis.
+    AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True),
+    # QK-swap banding + S_PRIOR sharding (b8: bs_per_nc=8 -> band_factor=2, s_prior sharded across NCs).
+    # Exercises a query whose cache_len is shorter than one NC's s_prior shard, so that shard is fully
+    # masked -> per-position max stays -inf; the swap path must clamp it to finite (else exp -> NaN).
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True),
+    # Same, with an attention sink (sink fold on the s_prior-sharded banded swap path).
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True, test_sink=True),
+    # QK-swap banding fold-MISALIGNMENT fallback (b8, S_ctx=10240 -> block_len resizes to 8 -> 5 folds per
+    # band-pair, 5 % band_factor(2) != 0). is_qk_swapped must reject banding here so it runs on the
+    # non-swap path; a mid-fold band boundary would otherwise break the constant per-band token shift.
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True),
+    # QK-swap where an FA tile's FIRST contribution to a running max is fully masked. batch=1 is not
+    # divisible by lnc so s_prior is sharded (16384 per NC), and s_active_qh = 32*4 = 128 keeps the swap
+    # gate satisfied at bs_per_nc=1. Each NC gets two 8K FA tiles; NC1's tiles start at s_prior offset
+    # 8192, and cache_lens_mean=0.1 (cache_len ~3276) leaves that first tile with no unmasked position.
+    # Its per-position max is -inf while running_max is still at its -inf init, so the online-softmax
+    # rescale exp(prev_max - curr_max) is NaN unless the swap max is clamped to a finite bound. The
+    # active tokens live in NC1's *second* tile, so they cannot rescue the first one. No sink on purpose:
+    # folding a sink into the max already makes it finite, which would hide the missing clamp.
+    AttnBlkTestConfig(batch=1, q_heads=32, d_head=64, H=3072, H_actual=2880, S_ctx=32768, S_max_ctx=32768, S_tkg=4,
+                        block_len=64, kv_quant=True, fp8_packed=True, rmsnorm_X=False, use_pos_id=True,
+                        cache_lens_mean=0.1, cache_lens_stddev=0.0),
     # Block KV, basic causal mask
     AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                         block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, use_pos_id=True),
@@ -2532,6 +3042,28 @@ def _low_rank_cfgs(cfgs: list[AttnBlkTestConfig]) -> list[AttnBlkTestConfig]:
     return [c for c in cfgs if not c.is_high_rank()]
 
 
+def _attn_blk_fast_marks(cfg: AttnBlkTestConfig) -> list:
+    """Per-config marks for the fast attn-block parametrization.
+
+    - Collective (KVDP>1 / CP>1) configs use multi-rank inputs / collective ops the
+      simulator backend does not support, so they skip the simulation lane.
+    - The q_heads=8, S_ctx=1024 block-KV configs trigger the token-gen block-length
+      reduction (block_len 32 -> 4, 256 blocks/batch). The torch golden that
+      _infer_output_shapes_and_dtypes runs for shape inference then costs >240s CPU,
+      exceeding the compile-only fast lane's --cpu-timeout. Mark them `slow` (not
+      `fast`) so they are excluded from the -m fast lane but still run in the full
+      suite.
+    """
+    marks = []
+    if cfg.KVDP > 1 or cfg.CP > 1:
+        marks.append(pytest.mark.skip_simulation)
+    if cfg.q_heads == 8 and cfg.S_ctx == 1024 and cfg.block_len > 0:
+        marks.append(pytest.mark.slow)
+    else:
+        marks.append(pytest.mark.fast)
+    return marks
+
+
 @pytest_test_metadata(name="Attention Block TKG", tags=["model"])
 @pytest_marks(["attention", "tkg", "experimental", "mx"])
 @final
@@ -2588,6 +3120,15 @@ class TestRangeAttnBlk:
         AttnBlkTestConfig(batch=1, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
                             block_len=32, skip_output_projection=True, update_cache=False,
                             qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True),
+        # d_head=256 with batch>1        
+        AttnBlkTestConfig(batch=2, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, skip_output_projection=True, update_cache=False),
+        AttnBlkTestConfig(batch=2, q_heads=8, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            kv_heads=4, block_len=32, skip_output_projection=True, update_cache=False),
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            kv_heads=4, block_len=32, skip_output_projection=True, update_cache=False),
+        AttnBlkTestConfig(batch=2, q_heads=2, d_head=256, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, rotary_dim=64, skip_output_projection=True, update_cache=False),
         # Transposed in+out layout
         AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                             block_len=32, transposed_in=True, transposed_out=True),
@@ -2688,16 +3229,9 @@ class TestRangeAttnBlk:
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(
         "attn_blk_cfg",
-        [
-            # Collective (KVDP>1 / CP>1) configs use multi-rank inputs and collective
-            # ops that the simulator backend does not support, so skip them in the
-            # simulation lane while keeping them in the fast hardware lane.
-            pytest.param(cfg, marks=pytest.mark.skip_simulation) if cfg.KVDP > 1 or cfg.CP > 1 else cfg
-            for cfg in FAST_ATTN_BLK_CFGS
-        ],
+        [pytest.param(cfg, marks=_attn_blk_fast_marks(cfg)) for cfg in FAST_ATTN_BLK_CFGS],
         ids=lambda p: p.test_id(),
     )
     def test_attn_blk_fast(

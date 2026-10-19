@@ -22,9 +22,11 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
-from .common_dataclasses import GoldenTensorDict, is_xdist_worker, normalize_golden_output
+from .common_dataclasses import GoldenTensorMapping, is_xdist_worker, normalize_golden_output, normalize_kernel_input
 from .simulation_constants import SIMULATION_RUN_ALL_ENV_VAR
+from .simulation_xfails import SIMULATION_XFAIL_NODEIDS, SIMULATION_XFAIL_REASON
 
 # Patterns to identify tests with large shapes that are slow on CPU simulation
 _LARGE_SHAPE_PATTERNS = ("4096", "5120", "7168", "8192", "10240", "16384", "32768", "36864")
@@ -49,6 +51,33 @@ def skip_slow_simulation_tests(items, skip_marker):
             item.add_marker(skip_marker)
 
 
+def apply_xfail_simulation(items):
+    """Mark simulation-only failures as a non-strict ``xfail`` (simulation only).
+
+    Two sources, both applied here so they only take effect in simulation mode (the
+    caller runs only then) and are inert everywhere else, leaving hardware runs
+    unaffected:
+
+    * the ``xfail_simulation`` marker -- ``@pytest.mark.xfail_simulation(reason=...)``
+      or per-param ``pytest.param(..., marks=pytest.mark.xfail_simulation(reason=...))``
+      -- for a case an author tags inline; and
+    * ``SIMULATION_XFAIL_NODEIDS`` (in ``simulation_xfails``) -- a central list of
+      nodeids for generated / coverage-parametrized cases that cannot carry an inline
+      marker on a single failing parametrization.
+
+    A marked test still runs in the simulator but is not counted as a failure; an XPASS
+    surfaces if the simulator/kernel later starts matching (``strict=False``), signalling
+    the marker/entry can be removed. Unlike ``skip_simulation`` the test still executes.
+    """
+    for item in items:
+        marker = item.get_closest_marker("xfail_simulation")
+        if marker is not None:
+            reason = marker.kwargs.get("reason") or "known simulation-only failure"
+            item.add_marker(pytest.mark.xfail(reason=reason, strict=False))
+        elif item.nodeid in SIMULATION_XFAIL_NODEIDS:
+            item.add_marker(pytest.mark.xfail(reason=SIMULATION_XFAIL_REASON, strict=False))
+
+
 def _reset_kernel_global_state():
     """Reset module-level globals that kernels use as singletons.
 
@@ -71,12 +100,6 @@ def simulate_kernel(kernel_func, kernel_input: dict, lnc_count: int) -> list:
     cleaned_input = {k.removesuffix(".must_alias_input"): v for k, v in kernel_input.items()}
     try:
         result = nki.simulate(kernel_func)[lnc_count](**cleaned_input)
-    except AttributeError as e:
-        if "uint16" in str(e):
-            import pytest
-
-            pytest.skip(f"Simulator incompatible with current PyTorch version: {e} (NKI-2034)")
-        raise
     finally:
         # Reset module-level kernel state that persists across simulator invocations.
         # On hardware each kernel runs in a fresh context, but in the simulator
@@ -101,7 +124,7 @@ def run_simulator_inference(kernel_under_test) -> dict[str, np.ndarray]:
     os.environ["NKI_NC_VERSION"] = kernel_under_test.compiler_input.platform_target.get_nc_gen()
     kernel_outputs = simulate_kernel(
         kernel_under_test.kernel_func,
-        kernel_under_test.kernel_input or {},
+        normalize_kernel_input(kernel_under_test.kernel_input),
         kernel_under_test.compiler_input.logical_nc_config,
     )
 
@@ -109,7 +132,7 @@ def run_simulator_inference(kernel_under_test) -> dict[str, np.ndarray]:
         raise ValueError("Simulation mode requires validation_args to verify outputs")
 
     golden_output = kernel_under_test.validation_args.golden_output
-    golden_tensors: GoldenTensorDict = normalize_golden_output(golden_output)
+    golden_tensors: GoldenTensorMapping = normalize_golden_output(golden_output)
     output_names: list[str] = list(golden_tensors.keys())
 
     if len(kernel_outputs) != len(output_names):

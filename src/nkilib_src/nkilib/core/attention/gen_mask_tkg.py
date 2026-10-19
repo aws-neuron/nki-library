@@ -52,6 +52,10 @@ from .attention_tkg_utils import (
 # full-s_prior free axis (up to the FA tile size) can't overrun SBUF.
 _SWA_FREE_TILE = 512
 
+# Number of per-batch scratch slots rotated across batches in the SWA mask path; enough to decouple
+# consecutive batches without the footprint growing with the batch size.
+_SWA_SCRATCH_RING = 4
+
 
 def gen_mask_tkg(
     pos_ids: nl.NkiTensor,
@@ -145,11 +149,13 @@ def gen_mask_tkg(
         - Supports LNC sharding (lnc=1 and lnc=2 configurations)
         - When batch-sharded with LNC=2, both shards load the active mask
           (each shard places it at the last s_active positions of its own tile space)
-        - The mask is initialized to zeros before generation
+        - mask_out is zero-filled only in the transposed (QK-swap) layout; in the default layout every
+          element is written by the per-batch copies before the active-mask load
 
     Pseudocode:
-        # Initialize mask to zeros
-        mask_out = zeros()
+        # Zero-fill (QK-swap layout only; the default layout writes every element)
+        if transposed_out:
+            mask_out = zeros()
 
         # Step 1: Generate index tensor based on cache layout
         if block_len > 0:
@@ -194,12 +200,10 @@ def gen_mask_tkg(
 
     sbm.open_scope(name="gen_mask_tkg")
 
-    # Initialize mask to zeros
-    nisa.memset(mask_out, value=0)
-
     if transposed_out:
-        # QK-swap layout: mask_out is [P_MAX (=s_active_bqh row), n_bsq_tiles, s_prior]. s_prior on the
-        # free axis, s_active_bqh (bqh row) on partitions.
+        # QK-swap layout: mask_out is [P_MAX (=s_active_bqh row), n_bsq_tiles, s_prior], s_prior on the free
+        # axis. Only this layout zero-fills; the default layout's per-batch copies write every element.
+        nisa.memset(mask_out, value=0)
         _gen_mask_s_active_bqh_partition_layout(
             pos_ids=pos_ids,
             mask_out=mask_out,
@@ -338,7 +342,6 @@ def _gen_mask_sprior_partition_layout(
             q_head=q_head,
             s_active=s_active,
             n_sprior_tile=n_sprior_tile,
-            s_prior_offset=s_prior_offset,
             sbm=sbm,
         )
     else:
@@ -657,13 +660,17 @@ def _create_batch_masks(
         sbm: SBUF memory manager.
         batch_offset (int): Batch offset for tensor naming uniqueness. Default: 0.
     """
+    # One pooled scratch with a slice per batch: under auto allocation the compiler reuses one address for
+    # the per-batch buffers, so the compare of batch b+1 would otherwise WAR-serialize on the copy of batch b.
+    cur_mask_pool = sbm.alloc_stack(
+        (iota.shape[0], bs, iota.shape[1]),
+        dtype=mask_out.dtype,
+        buffer=nl.sbuf,
+        name=f"cur_mask_pool_{s_prior_offset}_{batch_offset}",
+    )
+
     for batch_idx in range(bs):
-        cur_mask = sbm.alloc_stack(
-            iota.shape,
-            dtype=mask_out.dtype,
-            buffer=nl.sbuf,
-            name=f"cur_mask_{batch_idx}_{s_prior_offset}_{batch_offset}",
-        )
+        cur_mask = cur_mask_pool[:, batch_idx, :]
         nisa.tensor_scalar(
             dst=cur_mask[...],
             data=iota[...],
@@ -676,7 +683,8 @@ def _create_batch_masks(
         mask_out_pat = mask_out.select(2, batch_idx)
         cur_mask_bcast = cur_mask.expand_dim(2).broadcast(2, q_head).expand_dim(3).broadcast(3, s_active)
 
-        # Alternate between scalar and vector engines for better performance
+        # Alternate the copy engine by batch: the copies are q_head * s_active times the compare volume, so
+        # keeping both engines on them measures faster than ScalarE alone once the scratch is pooled.
         if batch_idx % 2 == 0:
             nisa.tensor_copy(mask_out_pat, cur_mask_bcast, engine=nisa.scalar_engine)
         else:
@@ -692,7 +700,6 @@ def _create_batch_masks_swa(
     q_head: int,
     s_active: int,
     n_sprior_tile: int,
-    s_prior_offset: int,
     sbm: SbufManager,
 ) -> None:
     """
@@ -726,34 +733,27 @@ def _create_batch_masks_swa(
         q_head: Number of query heads.
         s_active: Active sequence length.
         n_sprior_tile: Number of s_prior tiles.
-        s_prior_offset: Offset within current shard (for tensor naming).
         sbm: SBUF memory manager.
+
+    The scratch buffers are float32 (required by nisa.tensor_scalar arithmetic); the final
+    nisa.tensor_copy into mask_out performs the cast. They are auto-named: an explicit name is not
+    unique across the outer FA s_prior-tiling / batch-tiling iterations at LNC=1.
     """
     P_MAX = nl.tile_size.pmax
-    tile_shape = (P_MAX, n_sprior_tile)
+
+    # Per-query scratch, rotated over a small ring of slots so consecutive batches do not WAR-serialize
+    # on one auto-allocated address (queries within a batch still reuse their slot).
+    n_slots = min(bs, _SWA_SCRATCH_RING)
+    pool_shape = (P_MAX, n_slots, n_sprior_tile)
+    pool_ge = sbm.alloc_stack(pool_shape, dtype=nl.float32, buffer=nl.sbuf)
+    pool_lt = sbm.alloc_stack(pool_shape, dtype=nl.float32, buffer=nl.sbuf)
+    pool_scratch = sbm.alloc_stack(pool_shape, dtype=nl.float32, buffer=nl.sbuf)
 
     for batch_idx in range(bs):
-        # Per-query scratch buffers (n_sprior_tile wide)
-        # Must be float32 for nisa.tensor_scalar arithmetic (hardware requirement).
-        # The final nisa.tensor_copy to mask_out handles the implicit dtype cast.
-        buf_ge = sbm.alloc_stack(
-            tile_shape,
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-            name=f"swa_ge_{batch_idx}_{s_prior_offset}",
-        )
-        buf_lt = sbm.alloc_stack(
-            tile_shape,
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-            name=f"swa_lt_{batch_idx}_{s_prior_offset}",
-        )
-        buf_scratch = sbm.alloc_stack(
-            tile_shape,
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-            name=f"swa_scratch_{batch_idx}_{s_prior_offset}",
-        )
+        slot = batch_idx % n_slots
+        buf_ge = pool_ge[:, slot, :]
+        buf_lt = pool_lt[:, slot, :]
+        buf_scratch = pool_scratch[:, slot, :]
 
         # Prior mask end = pos_ids[b, 0] = cache_lens[b] for all queries in this batch.
         # Positions >= cache_lens[b] are active tokens (not in the prior cache).
@@ -768,6 +768,7 @@ def _create_batch_masks_swa(
                 data=iota[...],
                 op0=nl.greater_equal,
                 operand0=start_pos[:, nl.ds(col_idx, 1)],
+                engine=nisa.vector_engine,
             )
 
             # Step 2: lt = (iota < end), end = pos_ids[b, 0] (base position)
@@ -776,6 +777,7 @@ def _create_batch_masks_swa(
                 data=iota[...],
                 op0=nl.less,
                 operand0=pos_ids[:, nl.ds(base_col_idx, 1)],
+                engine=nisa.vector_engine,
             )
 
             # Step 3: normal = ge AND lt (multiply for binary)
@@ -801,6 +803,8 @@ def _create_batch_masks_swa(
                 data=buf_ge[...],
                 op0=nl.multiply,
                 operand0=buf_lt[:, nl.ds(0, 1)],
+                # Multiply is the one tensor_scalar op ScalarE accepts; offloading it unloads VectorE.
+                engine=nisa.scalar_engine,
             )
 
             # Step 8: final = normal + scaled_diff
@@ -813,6 +817,7 @@ def _create_batch_masks_swa(
                     .select(2, qh_idx)  # [P_MAX, n_sprior_tile, s_active]
                     .select(2, sa_idx)  # [P_MAX, n_sprior_tile]
                 )
+                # ScalarE already carries the diff * is_wrap multiply on this path, so alternate the copies.
                 if (batch_idx + qh_idx + sa_idx) % 2 == 0:
                     nisa.tensor_copy(out_view, buf_ge[...], engine=nisa.scalar_engine)
                 else:

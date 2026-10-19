@@ -31,6 +31,13 @@ tp_k: True for CP=1, False for CP>1 (strided CP)
 
 from test.integration.nkilib.core.attention.model_config_utils import get_sharded_head_counts
 from test.utils.common_dataclasses import ModelTestType
+from typing import TypedDict
+
+
+class AttnModelConfig(TypedDict, total=False):
+    TP_CP_CONFIGS: list[tuple[int, int, int]]
+    SEQLENS: list[int]
+
 
 MODELS = {
     "llama3_70b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "sliding_window": 0, "sink": None},
@@ -56,7 +63,7 @@ MODELS = {
 }
 
 # (world_size, tp, cp)
-DEFAULT_TP_CP = [
+DEFAULT_TP_CP: list[tuple[int, int, int]] = [
     (64, 64, 1),
     (16, 16, 1),
     (8, 8, 1),
@@ -68,9 +75,9 @@ DEFAULT_TP_CP = [
     (64, 4, 16),
 ]
 
-DEFAULT_SEQLENS = [1024, 10240, 32768]
+DEFAULT_SEQLENS: list[int] = [1024, 10240, 32768]
 
-OPTIMAL_CONFIGS = {
+OPTIMAL_CONFIGS: dict[str, AttnModelConfig] = {
     "llama3_70b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS},
     "qwen3_32b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS},
     "gemma3_27b": {"TP_CP_CONFIGS": DEFAULT_TP_CP, "SEQLENS": DEFAULT_SEQLENS},

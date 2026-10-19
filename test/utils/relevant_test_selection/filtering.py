@@ -30,6 +30,8 @@ import logging
 from pathlib import Path
 from typing import Any, Iterable
 
+import pytest
+
 logger = logging.getLogger(__name__)
 
 # Attribute name under which the resolved selection is stored on pytest's config.
@@ -95,7 +97,7 @@ def ship_relevant_test_dirs_to_worker(node) -> None:
         node.workerinput[WORKERINPUT_KEY] = list(value) if value is not None else None
 
 
-def partition_items_by_relevance(config: Any, items: list) -> tuple[list, list] | None:
+def partition_items_by_relevance(config: Any, items: list[pytest.Item]) -> tuple[list, list] | None:
     """Split collected ``items`` into (kept, deselected) per the resolved selection.
 
     Returns ``None`` when no filtering should happen (flag off, or run-all None),
@@ -108,12 +110,12 @@ def partition_items_by_relevance(config: Any, items: list) -> tuple[list, list] 
 
     kept, deselected = [], []
     for item in items:
-        if _item_is_relevant(str(item.fspath), relevant_dirs):
+        if _item_is_relevant(str(item.path), relevant_dirs):
             kept.append(item)
         else:
             deselected.append(item)
     return kept, deselected
 
 
-def _item_is_relevant(fspath: str, relevant_dirs: Iterable[str]) -> bool:
-    return any(fspath.startswith(d) for d in relevant_dirs)
+def _item_is_relevant(path: str, relevant_dirs: Iterable[str]) -> bool:
+    return any(path.startswith(d) for d in relevant_dirs)

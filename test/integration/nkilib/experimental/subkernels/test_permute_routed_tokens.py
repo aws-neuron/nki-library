@@ -16,7 +16,6 @@
 
 from typing import final
 
-import nki
 import nki.language as nl
 import numpy as np
 import pytest
@@ -71,7 +70,7 @@ def _run_test(
     H: int,
     K: int,
     E: int,
-    hidden_dtype: nki.dtype,
+    hidden_dtype: str,
 ):
     np.random.seed(42)
 
@@ -132,6 +131,7 @@ def _run_test(
 
 # fmt: off
 PERMUTE_ROUTED_TOKENS_PARAM_NAMES = "lnc_degree, T, H, K, E, hidden_dtype"
+# hidden_dtype is a dtype name such as nl.bfloat16, which the framework defines as a string.
 
 PERMUTE_ROUTED_TOKENS_BF16_E5M2_PARAMS = [
     # bf16 hidden states
@@ -182,7 +182,7 @@ class TestPermuteRoutedTokensKernel:
         H: int,
         K: int,
         E: int,
-        hidden_dtype: nki.dtype,
+        hidden_dtype: str,
     ) -> None:
         _run_test(test_manager, platform_target, lnc_degree, T, H, K, E, hidden_dtype)
 
@@ -204,6 +204,6 @@ class TestPermuteRoutedTokensFP8E4M3Kernel:
         H: int,
         K: int,
         E: int,
-        hidden_dtype: nki.dtype,
+        hidden_dtype: str,
     ) -> None:
         _run_test(test_manager, platform_target, lnc_degree, T, H, K, E, hidden_dtype)

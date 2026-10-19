@@ -21,6 +21,7 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_backward_kernel
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
 from typing_extensions import override
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
@@ -84,16 +85,75 @@ def matmul_mxfp8_backward_torch_ref(
     output_grad_is_swizzled=False,
     weights_is_swizzled=False,
     input_is_swizzled=False,
+    fast_dma_transpose=False,
+    quant_scheme="wrapX",
+    disable_dma_transpose=False,
+    weights_is_f_by_k=False,
+    input_is_f_by_k=False,
 ):
-    """Compute golden backward pass: dX = dY @ W, dW = dY^T @ X."""
-    dy = output_grad.astype(np.float32)
-    w = weights.astype(np.float32)
-    x = input_activation.astype(np.float32)
+    """Compute golden backward pass: dX = dY @ W, dW = dY^T @ X.
 
-    return {
-        "input_grad": (dy @ w).astype(np.float32),
-        "weight_grad": (dy.T @ x).astype(np.float32),
-    }
+    disable_dma_transpose is a load-mechanism choice with identical numerics, so this
+    reference accepts it for signature parity and ignores it.
+
+    Delegates each phase to the forward matmul golden so the MXFP8 quantization
+    error is modelled the same way the kernel produces it. Computing the two
+    matmuls in FP32 here instead would make every quantized arm fail on
+    quantization error rather than on a real defect.
+    """
+    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
+
+    def _phase(lhs, rhs, lhs_scales, rhs_scales, lhs_swizzled, rhs_swizzled, lhs_f_by_k, rhs_f_by_k, config):
+        return matmul_mxfp8_torch_ref(
+            lhs=lhs,
+            rhs=rhs,
+            lhs_scales=lhs_scales,
+            rhs_scales=rhs_scales,
+            lhs_is_swizzled=lhs_swizzled,
+            rhs_is_swizzled=rhs_swizzled,
+            lhs_orientation=None if lhs_f_by_k else TensorOrientation.K_BY_F,
+            rhs_orientation=None if rhs_f_by_k else TensorOrientation.K_BY_F,
+            TILES_IN_BLOCK_M=config.TILES_IN_BLOCK_M if config else None,
+            TILES_IN_BLOCK_N=config.TILES_IN_BLOCK_N if config else None,
+            TILES_IN_BLOCK_K=config.TILES_IN_BLOCK_K if config else None,
+            TILES_IN_LOAD_M=config.TILES_IN_LOAD_M if config else None,
+            TILES_IN_LOAD_N=config.TILES_IN_LOAD_N if config else None,
+            tile_loop_order=tile_loop_order,
+            float8_dtype=float8_dtype,
+            output_dtype=output_dtype,
+            run_with_lnc2=run_with_lnc2,
+            lnc_2_shard_rhs=lnc_2_shard_rhs,
+            use_scale_packing=use_scale_packing,
+            spill_reload=spill_reload,
+            fast_dma_transpose=fast_dma_transpose,
+            quant_scheme=quant_scheme,
+        )["out"]
+
+    # Layout flags mirror matmul_mxfp8_backward exactly: a swizzled operand is
+    # already stored K-by-F and must not also claim an explicit K_BY_F orientation.
+    input_grad = _phase(
+        output_grad,
+        weights,
+        output_grad_scales,
+        weight_scales,
+        output_grad_is_swizzled,
+        weights_is_swizzled,
+        True,
+        weights_is_swizzled or weights_is_f_by_k,
+        input_grad_config,
+    )
+    weight_grad = _phase(
+        output_grad,
+        input_activation,
+        output_grad_scales,
+        input_scales,
+        output_grad_is_swizzled,
+        input_is_swizzled,
+        output_grad_is_swizzled,
+        input_is_swizzled or input_is_f_by_k,
+        weight_grad_config,
+    )
+    return {"input_grad": input_grad, "weight_grad": weight_grad}
 
 
 # ============================================================================
@@ -105,6 +165,15 @@ BACKWARD_CONFIGS = [
     (1024, 1024, 1024, "Square_medium"),
     (2048, 1024, 512, "Nonsquare_M_gt_N"),
     (512, 1024, 2048, "Nonsquare_N_gt_M"),
+    # Partial-F regression for the K-by-F loader. N_2560 (%512 but partial vs LOAD_TILE_F) caught
+    # the original OOB; N_768/N_2304 were rejected by the old %512 guard.
+    (512, 512, 768, "N_768_ctrl"),
+    (512, 768, 512, "K_768_ctrl"),
+    (512, 512, 2304, "N_2304_partial"),
+    (512, 512, 2560, "N_2560_partial"),
+    # Sub-128 partial-F via K (a free/output dim of dW/dX). N is not used here: in backward N is
+    # the dX contraction dim and independently needs %128; sub-128 free dims are covered forward.
+    (512, 520, 512, "K_520_subtile"),
 ]
 
 

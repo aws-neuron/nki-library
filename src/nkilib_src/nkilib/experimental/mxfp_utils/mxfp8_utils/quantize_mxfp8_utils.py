@@ -14,6 +14,7 @@
 
 """Utility functions and constants for MXFP8 quantization operations."""
 
+import nki
 import nki.language as nl
 
 INTERLEAVE_FACTOR = 4
@@ -31,7 +32,7 @@ MIN_F_FOR_QUANTIZATION = 8
 MIN_F_FOR_LNC2 = 512
 
 
-def get_fp8_dtype_x4(dtype_str: str):
+def get_fp8_dtype_x4(dtype_str: nki.dtype):
     """
     Map dtype string to NKI x4 dtype
 

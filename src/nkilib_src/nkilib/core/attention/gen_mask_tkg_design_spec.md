@@ -185,7 +185,7 @@ gen_mask_tkg()
 │   └── _create_batch_masks_swa()
 │       └── for batch, sa_idx:
 │             8 NKI ops per query (3 comparisons + 5 arithmetic)
-│             TensorView triple-select → nisa.tensor_copy to mask_out
+│             triple-select view chain → nisa.tensor_copy to mask_out
 │
 ├── else:                               ← Standard path (.ap() iota replication)
 │   ├── Replicate tmp_iota → mask_iota via nisa.tensor_copy + .ap()

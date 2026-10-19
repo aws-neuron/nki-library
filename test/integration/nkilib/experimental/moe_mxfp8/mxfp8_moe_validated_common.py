@@ -146,7 +146,7 @@ def check_correctness(kernel_result: npt.NDArray, golden_result: npt.NDArray, rt
 # ============================================================================
 
 
-def make_moe_validated_comparator(output_shapes):
+def make_moe_validated_comparator(output_shapes, active_prefix=None):
     """Create a custom_comparator closure for the MXFP8 MoE validated tests.
 
     Each named output is validated against the golden with the three-metric
@@ -157,6 +157,12 @@ def make_moe_validated_comparator(output_shapes):
         output_shapes: dict mapping output names to (shape, kernel_dtype) tuples.
             kernel_dtype is the actual dtype the kernel writes (bfloat16), which
             may differ from the golden's dtype (float32 from torch_ref_wrapper).
+        active_prefix: optional dict mapping an output name to the number of leading
+            dim-0 entries the kernel actually wrote. Both sides are sliced to that
+            prefix before comparison. Needed by the dynamic block loop, which skips
+            padded blocks and leaves their region untouched — the output buffer is a
+            shape/dtype placeholder, so those bytes are not guaranteed zero and must
+            not enter the metric.
     """
 
     def comparator(golden_dict, output_tensors):
@@ -171,6 +177,7 @@ def make_moe_validated_comparator(output_shapes):
                 # validator closes over the value from its own loop iteration, rather
                 # than the loop variable `kernel_dtype` from the last iteration.
                 _kernel_dtype = kernel_dtype
+                _active = None if active_prefix is None else active_prefix.get(name)
 
                 @override
                 def validate(self, inference_output: npt.NDArray[Any]) -> bool:
@@ -179,6 +186,9 @@ def make_moe_validated_comparator(output_shapes):
                         inference_output.view(dtype=self._kernel_dtype).astype(np.float32).reshape(self._golden.shape)
                     )
                     golden_f32 = self._golden.astype(np.float32)
+                    if self._active is not None:
+                        reshaped = reshaped[: self._active]
+                        golden_f32 = golden_f32[: self._active]
                     if np.linalg.norm(reshaped) == 0 and np.linalg.norm(golden_f32) == 0:
                         return True
                     passed, metrics = check_correctness(reshaped, golden_f32)

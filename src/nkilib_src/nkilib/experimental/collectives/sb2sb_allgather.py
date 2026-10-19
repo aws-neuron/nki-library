@@ -24,10 +24,10 @@ from ...core.utils.kernel_assert import kernel_assert
 
 @nki.jit
 def allgather_sb2sb(
-    inp: nl.ndarray,
+    inp: nl.NkiTensor,
     replica_groups: ReplicaGroup,
     tp_degree: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """SBUF-to-SBUF all-gather kernel for gathering tensors across ranks.
 
     Gathers input tensors from all ranks along the last dimension (K dimension).
@@ -40,12 +40,12 @@ def allgather_sb2sb(
         K: Total width after gather (K = W * tp_degree)
 
     Args:
-        inp (nl.ndarray): [H, W], Input tensor on HBM, where W is the local width per rank.
+        inp (nl.NkiTensor): [H, W], Input tensor on HBM, where W is the local width per rank.
         replica_groups (ReplicaGroup): ReplicaGroup defining which ranks participate in the collective.
         tp_degree (int): Tensor parallelism degree (number of ranks in the group).
 
     Returns:
-        out (nl.ndarray): [H, K], Output tensor on shared HBM containing gathered data from all ranks.
+        out (nl.NkiTensor): [H, K], Output tensor on shared HBM containing gathered data from all ranks.
 
     Notes:
         - Input tensor must fit in SBUF (H * W * dtype_size <= SBUF capacity)
@@ -93,10 +93,10 @@ def allgather_sb2sb(
 
 @nki.jit
 def allgather_sb2sb_tiled(
-    inp: nl.ndarray,
+    inp: nl.NkiTensor,
     replica_groups: ReplicaGroup,
     tp_degree: int,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """SBUF-to-SBUF all-gather with tiling and LNC support for larger tensors.
 
     Extends allgather_sb2sb with tiling on the M dimension to handle larger tensors
@@ -110,12 +110,12 @@ def allgather_sb2sb_tiled(
         NUM_M_TILES: Number of tiles along M dimension
 
     Args:
-        inp (nl.ndarray): [M, K], Input tensor on HBM, where K is the local width per rank.
+        inp (nl.NkiTensor): [M, K], Input tensor on HBM, where K is the local width per rank.
         replica_groups (ReplicaGroup): ReplicaGroup defining which ranks participate in the collective.
         tp_degree (int): Tensor parallelism degree (number of ranks in the group).
 
     Returns:
-        result (nl.ndarray): [M, K * tp_degree], Output tensor on shared HBM containing gathered data.
+        result (nl.NkiTensor): [M, K * tp_degree], Output tensor on shared HBM containing gathered data.
 
     Notes:
         - TILE_M is capped at 128 (SBUF partition size limit)

@@ -25,6 +25,7 @@ from typing_extensions import override
 
 from .metrics_collector import IMetricsCollector
 from .metrics_emitter import CoverageData, IMetricsEmitter, OutputMode, SessionContext
+from .s3_utils import region_from_queue_url
 
 
 @final
@@ -51,9 +52,10 @@ class SQSEmitter(IMetricsEmitter):
         self._logger = logging.getLogger(__name__)
 
     def _get_sqs_client(self):
-        """Lazy-initialize SQS client on first use."""
+        """Lazy-initialize SQS client on first use, pinned to the queue's region."""
         if self._sqs is None:
-            self._sqs = boto3.client("sqs")
+            region = region_from_queue_url(self._session.sqs_queue_url or "")
+            self._sqs = boto3.client("sqs", region_name=region) if region else boto3.client("sqs")
         return self._sqs
 
     @override

@@ -47,16 +47,20 @@ class ClampLimits(nl.NKIObject):
     Gradient clamping limits for numerical stability.
 
     Args:
-        linear_clamp_upper_limit (float): Upper clamp limit for linear operations.
-        linear_clamp_lower_limit (float): Lower clamp limit for linear operations.
-        non_linear_clamp_upper_limit (float): Upper clamp limit for non-linear operations.
-        non_linear_clamp_lower_limit (float): Lower clamp limit for non-linear operations.
+        linear_clamp_upper_limit (float | None): Upper clamp limit for linear operations.
+            ``None`` means no upper clamping is applied to linear operations.
+        linear_clamp_lower_limit (float | None): Lower clamp limit for linear operations.
+            ``None`` means no lower clamping is applied to linear operations.
+        non_linear_clamp_upper_limit (float | None): Upper clamp limit for non-linear operations.
+            ``None`` means no upper clamping is applied to non-linear operations.
+        non_linear_clamp_lower_limit (float | None): Lower clamp limit for non-linear operations.
+            ``None`` means no lower clamping is applied to non-linear operations.
     """
 
-    linear_clamp_upper_limit: float = None
-    linear_clamp_lower_limit: float = None
-    non_linear_clamp_upper_limit: float = None
-    non_linear_clamp_lower_limit: float = None
+    linear_clamp_upper_limit: float | None = None
+    linear_clamp_lower_limit: float | None = None
+    non_linear_clamp_upper_limit: float | None = None
+    non_linear_clamp_lower_limit: float | None = None
 
     def __repr__(self):
         return (
@@ -627,57 +631,57 @@ class MOEBwdParameters(nl.NKIObject):
         N: Number of blocks
 
     Args:
-        hidden_states (nl.ndarray): [T, H], Input hidden states.
-        hidden_states_grad (nl.ndarray): [T, H], Output gradient for hidden states.
-        expert_affinities_masked (nl.ndarray): [T * E, 1], Expert affinities.
-        expert_affinities_masked_grad (nl.ndarray): [T * E, 1], Output gradient for affinities.
-        gate_up_proj_weight (nl.ndarray): [E, H, 2, I_TP], Gate/up projection weights.
-        gate_up_proj_weight_grad (nl.ndarray): [E, H, 2, I_TP], Output gradient for gate/up weights.
-        gate_up_proj_act_checkpoint_T (nl.ndarray): [N, 2, I_TP, B], Checkpointed activations.
-        down_proj_weight (nl.ndarray): [E, I_TP, H], Down projection weights.
-        down_proj_weight_grad (nl.ndarray): [E, I_TP, H], Output gradient for down weights.
-        down_proj_act_checkpoint (nl.ndarray): [N, B, H], Checkpointed down activations.
-        token_position_to_id (nl.ndarray): [N * B], Token position mapping.
-        block_to_expert (nl.ndarray): [N, 1], Expert index per block.
-        output_hidden_states_grad (nl.ndarray): [T, H], Upstream gradient.
-        block_size (int): Tokens per block (128, 256, 512, or 1024).
+        hidden_states (nl.NkiTensor): [T, H], Input hidden states.
+        hidden_states_grad (nl.NkiTensor): [T, H], Output gradient for hidden states.
+        expert_affinities_masked (nl.NkiTensor): [T * E, 1], Expert affinities.
+        expert_affinities_masked_grad (nl.NkiTensor): [T * E, 1], Output gradient for affinities.
+        gate_up_proj_weight (nl.NkiTensor): [E, H, 2, I_TP], Gate/up projection weights.
+        gate_up_proj_weight_grad (nl.NkiTensor): [E, H, 2, I_TP], Output gradient for gate/up weights.
+        gate_up_proj_act_checkpoint_T (nl.NkiTensor): [N, 2, I_TP, B], Checkpointed activations.
+        down_proj_weight (nl.NkiTensor): [E, I_TP, H], Down projection weights.
+        down_proj_weight_grad (nl.NkiTensor): [E, I_TP, H], Output gradient for down weights.
+        down_proj_act_checkpoint (nl.NkiTensor): [N, B, H], Checkpointed down activations.
+        token_position_to_id (nl.NkiTensor): [N * B], Token position mapping.
+        block_to_expert (nl.NkiTensor): [N, 1], Expert index per block.
+        output_hidden_states_grad (nl.NkiTensor): [T, H], Upstream gradient.
+        block_size (int): Tokens per block (128, 256, 512, 1024, 2048, or 4096).
         skip_dma (SkipMode): OOB handling mode.
         compute_dtype (nki.dtype): Computation dtype (default: nl.bfloat16).
         is_tensor_update_accumulating (bool): Accumulate into existing gradients.
         clamp_limits (ClampLimits): Gradient clamping limits.
-        gate_and_up_proj_bias_grad (nl.ndarray, optional): [E, 2, I_TP], Bias gradients.
-        down_proj_bias_grad (nl.ndarray, optional): [E, H], Down bias gradients.
+        gate_and_up_proj_bias_grad (nl.NkiTensor, optional): [E, 2, I_TP], Bias gradients.
+        down_proj_bias_grad (nl.NkiTensor, optional): [E, H], Down bias gradients.
         activation_type (ActFnType): Activation function type.
         blocking_params (MOEBwdDroplessBlockingParams): Blocking hyperparameters.
 
     Notes:
-        - block_size must be one of: 128, 256, 512, 1024.
+        - block_size must be one of: 128, 256, 512, 1024, 2048, 4096.
         - H must be divisible by num_shards for LNC sharding.
         - Derived dimensions (T, H, I_TP, E, N) are computed in __post_init__.
     """
 
     # Input tensors
-    hidden_states: nl.ndarray
-    expert_affinities_masked: nl.ndarray
-    gate_up_proj_weight: nl.ndarray
-    gate_up_proj_act_checkpoint_T: nl.ndarray
-    down_proj_weight: nl.ndarray
-    token_position_to_id: nl.ndarray
-    block_to_expert: nl.ndarray
-    output_hidden_states_grad: nl.ndarray
+    hidden_states: nl.NkiTensor
+    expert_affinities_masked: nl.NkiTensor
+    gate_up_proj_weight: nl.NkiTensor
+    gate_up_proj_act_checkpoint_T: nl.NkiTensor
+    down_proj_weight: nl.NkiTensor
+    token_position_to_id: nl.NkiTensor
+    block_to_expert: nl.NkiTensor
+    output_hidden_states_grad: nl.NkiTensor
 
     # Output gradient tensors
-    hidden_states_grad: nl.ndarray
-    expert_affinities_masked_grad: nl.ndarray
-    gate_up_proj_weight_grad: nl.ndarray
-    down_proj_weight_grad: nl.ndarray
+    hidden_states_grad: nl.NkiTensor
+    expert_affinities_masked_grad: nl.NkiTensor
+    gate_up_proj_weight_grad: nl.NkiTensor
+    down_proj_weight_grad: nl.NkiTensor
 
     # Optional bias gradients
-    gate_and_up_proj_bias_grad: Optional[nl.ndarray] = None
-    down_proj_bias_grad: Optional[nl.ndarray] = None
+    gate_and_up_proj_bias_grad: Optional[nl.NkiTensor] = None
+    down_proj_bias_grad: Optional[nl.NkiTensor] = None
 
     # Optional Down Projection Activation Checkpoint
-    down_proj_act_checkpoint: Optional[nl.ndarray] = None
+    down_proj_act_checkpoint: Optional[nl.NkiTensor] = None
 
     # Configuration
     block_size: int = 512
@@ -726,8 +730,8 @@ class MOEBwdParameters(nl.NKIObject):
             AssertionError: If any validation check fails.
         """
         kernel_assert(
-            self.block_size in (128, 256, 512, 1024),
-            f"block_size must be 128, 256, 512, or 1024, got {self.block_size}",
+            self.block_size in (128, 256, 512, 1024, 2048, 4096),
+            f"block_size must be 128, 256, 512, 1024, 2048, or 4096, got {self.block_size}",
         )
         kernel_assert(self.I_TP % 2 == 0, f"I_TP must be divisible by 2, got {self.I_TP}")
         kernel_assert(self.H % 2 == 0, f"H must be divisible by 2, got {self.H}")

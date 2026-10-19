@@ -328,13 +328,11 @@ for f in $(find . -path '*/metrics/*.json'); do
 done
 ```
 
-The CSV contains: `TestName`, `TpbSgCyclesSum` (cycles), `MbuEstimatedPercent` (memory bandwidth utilization), `ProfilerMFU`, `InferenceTime`.
+The CSV contains: `TestName`, `TpbSgCyclesSum` (a duration in **picoseconds**, despite the name — `InferenceTime` in seconds is exactly `TpbSgCyclesSum * 1e-12`), `MbuEstimatedPercent` (memory bandwidth utilization), `ProfilerMFU`, `InferenceTime`.
 
 **Note:** If you just need the resulting metrics file and none of the other test artifacts, you can conserve disk space by using `--force-local-cleanup` along with `--force-local-cleanup-keep metrics`.
 
 ### Tips
 
 - **Always rebuild before testing** - Tests run against built artifacts
-- **Redirect output for analysis:** `brazil-build integration-test ... > /tmp/test.txt 2>&1`
 - **Use parallelism** (`-n auto --maxprocesses 64 --dist worksteal`) - Always use unless <20 test configs
-- **Use timeouts** for long runs: `timeout 300 brazil-build integration-test ...`

@@ -38,9 +38,9 @@ class RMSNormQuantConstants(nl.NKIObject):
         quant_data_type_range (float): Maximum representable value in quant dtype (240.0 for ``nl.float8_e4m3``, 448.0 for ``nl.float8_e4m3fn``)
         dequant_scale_size (int): Number of output elements for dequant scale
         min_dequant_scale_value (float): Minimum dequant scale for numerical stability
-        outer_dim_tile_zero_bias_vector_sbuf (nl.ndarray): Zero bias vector in SBUF
-        rmsn_eps_bias_sbuf (nl.ndarray): Epsilon bias vector for RMS norm
-        pe_broadcast_ones_vector_sbuf (nl.ndarray): Ones vector for PE broadcasting
+        outer_dim_tile_zero_bias_vector_sbuf (nl.NkiTensor): Zero bias vector in SBUF
+        rmsn_eps_bias_sbuf (nl.NkiTensor): Epsilon bias vector for RMS norm
+        pe_broadcast_ones_vector_sbuf (nl.NkiTensor): Ones vector for PE broadcasting
         outer_dim_size (int): Size of outer dimension
         proc_dim_size (int): Size of processing dimension
         MAX_S (int): Maximum supported sequence length
@@ -54,9 +54,9 @@ class RMSNormQuantConstants(nl.NKIObject):
     quant_data_type_range: float
     dequant_scale_size: int
     min_dequant_scale_value: float
-    outer_dim_tile_zero_bias_vector_sbuf: nl.ndarray
-    rmsn_eps_bias_sbuf: nl.ndarray
-    pe_broadcast_ones_vector_sbuf: nl.ndarray
+    outer_dim_tile_zero_bias_vector_sbuf: nl.NkiTensor
+    rmsn_eps_bias_sbuf: nl.NkiTensor
+    pe_broadcast_ones_vector_sbuf: nl.NkiTensor
     outer_dim_size: int
     proc_dim_size: int
     MAX_S: int = 32768

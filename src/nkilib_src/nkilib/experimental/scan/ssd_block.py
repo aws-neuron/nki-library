@@ -25,15 +25,15 @@ F_MAX = nl.tile_size.psum_fmax
 
 
 def ssd_block(
-    x: nl.ndarray,
-    dt: nl.ndarray,
-    A: nl.ndarray,
-    B: nl.ndarray,
-    C: nl.ndarray,
+    x: nl.NkiTensor,
+    dt: nl.NkiTensor,
+    A: nl.NkiTensor,
+    B: nl.NkiTensor,
+    C: nl.NkiTensor,
     chunk_size: int = 128,
-    D: nl.ndarray = None,
-    initial_state: nl.ndarray = None,
-    causal_mask: nl.ndarray = None,
+    D: nl.NkiTensor = None,
+    initial_state: nl.NkiTensor = None,
+    causal_mask: nl.NkiTensor = None,
 ) -> tuple:
     """Chunk-outer SSD (State Space Duality) scan for Mamba-2 prefill.
 
@@ -55,22 +55,22 @@ def ssd_block(
         Q: Chunk size (= chunk_size, <= 128).
 
     Args:
-        x (nl.ndarray): [batch, nheads, seqlen, headdim], Input activations.
-        dt (nl.ndarray): [batch, nheads, seqlen], Softplus'd timesteps. Must be positive.
-        A (nl.ndarray): [nheads], State transition scalars. Typically negative.
-        B (nl.ndarray): [batch, seqlen, dstate], Input projection.
-        C (nl.ndarray): [batch, seqlen, dstate], Output projection.
+        x (nl.NkiTensor): [batch, nheads, seqlen, headdim], Input activations.
+        dt (nl.NkiTensor): [batch, nheads, seqlen], Softplus'd timesteps. Must be positive.
+        A (nl.NkiTensor): [nheads], State transition scalars. Typically negative.
+        B (nl.NkiTensor): [batch, seqlen, dstate], Input projection.
+        C (nl.NkiTensor): [batch, seqlen, dstate], Output projection.
         chunk_size (int): Chunk size for parallel scan. Must be <= 128.
-        D (nl.ndarray, optional): [nheads], Skip connection weights.
-        initial_state (nl.ndarray, optional): [batch, nheads, dstate, headdim], Initial
+        D (nl.NkiTensor, optional): [nheads], Skip connection weights.
+        initial_state (nl.NkiTensor, optional): [batch, nheads, dstate, headdim], Initial
             SSM state. Default: None (zeros).
-        causal_mask (nl.ndarray): [Q, Q], Lower-triangular mask. Required.
+        causal_mask (nl.NkiTensor): [Q, Q], Lower-triangular mask. Required.
             Pass np.tril(np.ones((Q, Q), dtype=np.float32)).
 
     Returns:
         tuple: (y, final_state)
-            - y (nl.ndarray): [batch, nheads, seqlen, headdim], Output, same dtype as x.
-            - final_state (nl.ndarray): [batch, nheads, dstate, headdim], Final SSM state
+            - y (nl.NkiTensor): [batch, nheads, seqlen, headdim], Output, same dtype as x.
+            - final_state (nl.NkiTensor): [batch, nheads, dstate, headdim], Final SSM state
               in float32.
 
     Notes:
@@ -294,28 +294,28 @@ def ssd_block(
 
 
 def _compute_chunk_shared_projections_tiled(
-    B_hbm: nl.ndarray,
-    C_hbm: nl.ndarray,
+    B_hbm: nl.NkiTensor,
+    C_hbm: nl.NkiTensor,
     batch_idx: int,
     chunk_start: int,
     chunk_size: int,
     dstate: int,
     dstate_tile: int,
     num_dstate_tiles: int,
-    triu_sb: nl.ndarray,
+    triu_sb: nl.NkiTensor,
 ) -> tuple:
     """Compute B, C transposes and masked CB^T, tiled over dstate.
 
     Args:
-        B_hbm (nl.ndarray): [batch, seqlen, dstate], Input projection B in HBM.
-        C_hbm (nl.ndarray): [batch, seqlen, dstate], Output projection C in HBM.
+        B_hbm (nl.NkiTensor): [batch, seqlen, dstate], Input projection B in HBM.
+        C_hbm (nl.NkiTensor): [batch, seqlen, dstate], Output projection C in HBM.
         batch_idx (int): Current batch index.
         chunk_start (int): Starting sequence position for this chunk.
         chunk_size (int): Size of each chunk (Q).
         dstate (int): Full state dimension size.
         dstate_tile (int): Tile size for dstate (min(dstate, P_MAX)).
         num_dstate_tiles (int): Number of dstate tiles.
-        triu_sb (nl.ndarray): [Q, Q], Upper-triangular mask in SBUF.
+        triu_sb (nl.NkiTensor): [Q, Q], Upper-triangular mask in SBUF.
 
     Returns:
         tuple: (B_T_tiles, C_T_tiles, B_f32_tiles, CB_masked)
@@ -388,24 +388,24 @@ def _compute_chunk_shared_projections_tiled(
 
 
 def _compute_ssd_head_tile(
-    x_hbm: nl.ndarray,
-    y_hbm: nl.ndarray,
-    state_sb: nl.ndarray,
+    x_hbm: nl.NkiTensor,
+    y_hbm: nl.NkiTensor,
+    state_sb: nl.NkiTensor,
     batch_idx: int,
     global_head_idx: int,
     chunk_start: int,
     d_start: int,
     d_size: int,
-    dt_col: nl.ndarray,
-    exp_cs_col: nl.ndarray,
-    exp_neg_cs_col: nl.ndarray,
-    exp_cs_last: nl.ndarray,
-    decay_factor: nl.ndarray,
-    CB_masked: nl.ndarray,
+    dt_col: nl.NkiTensor,
+    exp_cs_col: nl.NkiTensor,
+    exp_neg_cs_col: nl.NkiTensor,
+    exp_cs_last: nl.NkiTensor,
+    decay_factor: nl.NkiTensor,
+    CB_masked: nl.NkiTensor,
     B_T_tiles: list,
     C_T_tiles: list,
     B_f32_tiles: list,
-    D_scalar: nl.ndarray,
+    D_scalar: nl.NkiTensor,
     Q: int,
     dstate: int,
     dstate_tile: int,
@@ -418,24 +418,24 @@ def _compute_ssd_head_tile(
     Only matmul results use PSUM (which has the F_MAX constraint).
 
     Args:
-        x_hbm (nl.ndarray): [batch, nheads, seqlen, headdim], Input in HBM.
-        y_hbm (nl.ndarray): [batch, nheads, seqlen, headdim], Output in HBM.
-        state_sb (nl.ndarray): [dstate, headdim], SSM state in SBUF (modified in-place).
+        x_hbm (nl.NkiTensor): [batch, nheads, seqlen, headdim], Input in HBM.
+        y_hbm (nl.NkiTensor): [batch, nheads, seqlen, headdim], Output in HBM.
+        state_sb (nl.NkiTensor): [dstate, headdim], SSM state in SBUF (modified in-place).
         batch_idx (int): Current batch index.
         global_head_idx (int): Global head index.
         chunk_start (int): Starting sequence position.
         d_start (int): Starting headdim offset for this tile.
         d_size (int): Size of this headdim tile.
-        dt_col (nl.ndarray): [Q, 1], Timestep column in SBUF.
-        exp_cs_col (nl.ndarray): [Q, 1], exp(cs) column in SBUF.
-        exp_neg_cs_col (nl.ndarray): [Q, 1], exp(-cs) column in SBUF.
-        exp_cs_last (nl.ndarray): [1, 1], exp(cs[-1]) scalar in SBUF.
-        decay_factor (nl.ndarray): [Q, 1], exp(cs[-1] - cs) column in SBUF.
-        CB_masked (nl.ndarray): [Q, Q], Causal-masked CB^T in SBUF.
+        dt_col (nl.NkiTensor): [Q, 1], Timestep column in SBUF.
+        exp_cs_col (nl.NkiTensor): [Q, 1], exp(cs) column in SBUF.
+        exp_neg_cs_col (nl.NkiTensor): [Q, 1], exp(-cs) column in SBUF.
+        exp_cs_last (nl.NkiTensor): [1, 1], exp(cs[-1]) scalar in SBUF.
+        decay_factor (nl.NkiTensor): [Q, 1], exp(cs[-1] - cs) column in SBUF.
+        CB_masked (nl.NkiTensor): [Q, Q], Causal-masked CB^T in SBUF.
         B_T_tiles (list): List of [tile_n, Q] transposed B tiles.
         C_T_tiles (list): List of [tile_n, Q] transposed C tiles.
         B_f32_tiles (list): List of [Q, tile_n] B tiles.
-        D_scalar (nl.ndarray): [1, 1], Skip connection weight, or None.
+        D_scalar (nl.NkiTensor): [1, 1], Skip connection weight, or None.
         Q (int): Chunk size.
         dstate (int): Full state dimension.
         dstate_tile (int): Tile size for dstate.

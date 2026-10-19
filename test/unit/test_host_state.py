@@ -20,7 +20,7 @@ import tempfile
 import pytest
 
 from test.utils.common_dataclasses import PYTEST_XDIST_WORKER_ENV, Platforms, ResolvedHost
-from test.utils.exceptions import FleetEmptyError
+from test.utils.exceptions import FleetEmptyError, RequestTooLargeError
 from test.utils.host_state import (
     HostRecord,
     HostState,
@@ -28,6 +28,8 @@ from test.utils.host_state import (
     OwnerHostStateStore,
     temporary_random_seed,
 )
+
+pytestmark = pytest.mark.usefixtures("controller_environment")
 
 
 def _resolved(*aliases: str, num_physical_cores: int = 64) -> list[ResolvedHost]:
@@ -55,7 +57,7 @@ def _record(
 def store():
     # OwnerHostStateStore so these tests can exercise the controller-only mutations
     # (reset/apply_resolved/set_poisoned) alongside the base participant ops it inherits.
-    # Unit tests run serially (no PYTEST_XDIST_WORKER), so the owner guard permits it.
+    # The controller_environment fixture permits owner construction even under xdist.
     with tempfile.TemporaryDirectory() as d:
         yield OwnerHostStateStore(d)
 
@@ -152,7 +154,9 @@ class TestInitialize:
             for i in range(15):
                 store = HostStateStore(os.path.join(base, f"run{i}"))
                 store.initialize(_resolved(*aliases))
-                orders.add(tuple(h.resolved.ssh_host for h in store.read().hosts))
+                persisted = store.read()
+                assert persisted is not None, "initialize must persist a state file"
+                orders.add(tuple(h.resolved.ssh_host for h in persisted.hosts))
         assert len(orders) > 1, "initialize should randomize host append order across runs"
 
 
@@ -412,6 +416,71 @@ class TestUnderCapacity:
         store.apply_resolved(_resolved("h1"), under_capacity={Platforms.TRN2})
         store.mark_unavailable("h1")
         assert store.is_under_capacity(Platforms.TRN2) is True
+
+
+class TestProvisionableCeiling:
+    """The per-platform capacity ceiling (largest single host the fleet could ever provision),
+    written by ``apply_resolved`` and enforced by ``claim_least_busy``: a request that exceeds
+    it fails fast with RequestTooLargeError instead of returning None (waiting) for a host that
+    can never appear. A platform absent from the map is unbounded — the guard is off."""
+
+    def test_absent_file_and_default_is_unbounded(self, store):
+        assert store.provisionable_ceiling_for(Platforms.TRN2) is None  # no file yet
+        store.initialize(_resolved("h1"))
+        assert store.provisionable_ceiling_for(Platforms.TRN2) is None  # default: no ceiling set
+
+    def test_apply_resolved_sets_and_round_trips_through_disk(self, store):
+        store.apply_resolved(_resolved("h1"), provisionable_ceiling={Platforms.TRN2: 8})
+        assert store.provisionable_ceiling_for(Platforms.TRN2) == 8
+        reopened = HostStateStore(os.path.dirname(store.state_path))
+        assert reopened.provisionable_ceiling_for(Platforms.TRN2) == 8
+
+    def test_membership_only_apply_preserves_the_ceiling(self, store):
+        # apply_resolved without a ceiling arg reconciles membership only, leaving the existing
+        # ceiling untouched (symmetric with the under_capacity contract).
+        store.apply_resolved(_resolved("h1"), provisionable_ceiling={Platforms.TRN2: 8})
+        store.apply_resolved(_resolved("h1"))  # membership-only
+        assert store.provisionable_ceiling_for(Platforms.TRN2) == 8
+
+    def test_ceiling_is_rewritten_whole_each_verdict(self, store):
+        # Passing a ceiling replaces the whole map (a reshape is reflected), like under_capacity.
+        store.apply_resolved(_resolved("h1"), provisionable_ceiling={Platforms.TRN2: 8})
+        store.apply_resolved(_resolved("h1"), provisionable_ceiling={Platforms.TRN2: 128})
+        assert store.provisionable_ceiling_for(Platforms.TRN2) == 128
+
+    def test_claim_over_ceiling_fails_fast(self, store):
+        # A request larger than the ceiling can never be served -> RequestTooLargeError, even
+        # though a host IS available (it's just too small). This is the fail-fast the bug needed.
+        store.apply_resolved(_resolved("h1", num_physical_cores=8), provisionable_ceiling={Platforms.TRN2: 8})
+        with pytest.raises(RequestTooLargeError, match="Request needs 32 physical cores"):
+            store.claim_least_busy(Platforms.TRN2, 32)
+
+    def test_claim_at_or_under_ceiling_is_unaffected(self, store):
+        # A request that fits the ceiling behaves normally: exactly-at-ceiling claims the host.
+        store.apply_resolved(_resolved("h1", num_physical_cores=8), provisionable_ceiling={Platforms.TRN2: 8})
+        assert store.claim_least_busy(Platforms.TRN2, 8).resolved.ssh_host == "h1"
+
+    def test_no_ceiling_means_no_fast_fail(self, store):
+        # Unbounded platform (no ceiling recorded): a too-big request falls through to the normal
+        # wait (returns None), never RequestTooLargeError — the guard fires only on positive
+        # knowledge. This is the backward-compatible default for stores that never set a ceiling.
+        store.initialize(_resolved("h1", num_physical_cores=8))
+        assert store.claim_least_busy(Platforms.TRN2, 32) is None
+
+    def test_over_ceiling_wins_over_poison(self, store):
+        # An impossible-size request should report the SIZING cause, not a generic poison error,
+        # even when the platform is also poisoned — the ceiling check precedes the poison check.
+        store.apply_resolved(_resolved("h1", num_physical_cores=8), provisionable_ceiling={Platforms.TRN2: 8})
+        store.mark_unavailable("h1")
+        store.set_poisoned(Platforms.TRN2, True)
+        with pytest.raises(RequestTooLargeError, match="largest host the fleet can provision"):
+            store.claim_least_busy(Platforms.TRN2, 32)
+
+    def test_ceiling_preserved_across_host_mutations(self, store):
+        # The ceiling is fleet metadata: a per-host mutation (mark_unavailable) must not clear it.
+        store.apply_resolved(_resolved("h1"), provisionable_ceiling={Platforms.TRN2: 8})
+        store.mark_unavailable("h1")
+        assert store.provisionable_ceiling_for(Platforms.TRN2) == 8
 
 
 class TestTemporaryRandomSeed:

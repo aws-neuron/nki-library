@@ -20,6 +20,7 @@ hardware to collect performance data for offline cache updates.
 """
 
 import os
+from typing import Any, NotRequired, TypedDict
 
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
     generate_autotune_candidates,
 )
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import config_helper, constants
 from test.integration.nkilib.experimental.matmul_mxfp8.test_matmul_mxfp8_generic_kernel import (
@@ -131,18 +133,56 @@ def _selected_methods():
 # ── Candidate generation ─────────────────────────────────────────────
 
 
-# Per-method operand dtypes + layout. Tiling comes from the swept candidate (kc);
-# the cache key is derived by the updater from these emitted fields, so the method
-# name here is only a human-readable label in the test id.
-_UNIFORM = {"dists": ["uniform", "uniform"], "params": [{"a": -1.0, "b": 1.0}, {"a": -1.0, "b": 1.0}]}
+class _InputDistribution(TypedDict):
+    """Per-operand random input distribution names and their parameters."""
+
+    dists: list[str]
+    params: list[dict[str, Any]]
+
+
+_UNIFORM: _InputDistribution = {
+    "dists": ["uniform", "uniform"],
+    "params": [{"a": -1.0, "b": 1.0}, {"a": -1.0, "b": 1.0}],
+}
 _BF16 = constants.MatrixPrecision.BFLOAT16
 _MXFP8 = constants.MatrixPrecision.MXFP8
 _MXFP8_X4 = constants.MatrixPrecision.MXFP8_X4
 
-_METHOD_SPECS = {
+
+# Per-method operand dtypes + layout. Tiling comes from the swept candidate (kc);
+# the cache key is derived by the updater from these emitted fields, so the method
+# name here is only a human-readable label in the test id.
+class _MethodSpec(TypedDict):
+    """Operand dtypes and layout flags describing one input-preparation method.
+
+    Keys marked as not required are only supplied by the methods that exercise
+    the corresponding feature; the test config default applies otherwise.
+    """
+
+    lhs_dtype: str
+    rhs_dtype: str
+    lhs_is_swizzled: bool
+    rhs_is_swizzled: bool
+    load_with_PE_swizzle: NotRequired[bool]
+    fast_dma_transpose: NotRequired[bool]
+    quant_scheme: NotRequired[str]
+    enable_scale_packing: NotRequired[bool]
+    lhs_orientation: NotRequired[Any]
+    rhs_orientation: NotRequired[Any]
+    disable_dma_transpose: NotRequired[bool]
+
+
+_METHOD_SPECS: dict[str, _MethodSpec] = {
     "prequant": {"lhs_dtype": _MXFP8_X4, "rhs_dtype": _MXFP8_X4, "lhs_is_swizzled": True, "rhs_is_swizzled": True},
     "preswizzled": {"lhs_dtype": _BF16, "rhs_dtype": _BF16, "lhs_is_swizzled": True, "rhs_is_swizzled": True},
     "dgt": {"lhs_dtype": _BF16, "rhs_dtype": _BF16, "lhs_is_swizzled": False, "rhs_is_swizzled": False},
+    "dgt_fast": {
+        "lhs_dtype": _BF16,
+        "rhs_dtype": _BF16,
+        "lhs_is_swizzled": False,
+        "rhs_is_swizzled": False,
+        "fast_dma_transpose": True,
+    },
     "pe_1x32": {
         "lhs_dtype": _BF16,
         "rhs_dtype": _BF16,
@@ -150,6 +190,45 @@ _METHOD_SPECS = {
         "rhs_is_swizzled": False,
         "load_with_PE_swizzle": True,
         "quant_scheme": "1x32",
+    },
+    "pe_wrapx": {
+        "lhs_dtype": _BF16,
+        "rhs_dtype": _BF16,
+        "lhs_is_swizzled": False,
+        "rhs_is_swizzled": False,
+        "load_with_PE_swizzle": True,
+        "quant_scheme": "wrapX",
+    },
+    # Backward dW config: lhs (dY) is K-by-F (the sole transpose), rhs (X) is F-by-K.
+    # dw_pe_1x32 = DMA route (dY via dma_transpose); dw_pe_1x32_no_dma = no-DMA (dma_copy +
+    # nc_transpose). dX is both-F-by-K -> use pe_1x32 (DMA == no-DMA there, no K-by-F operand).
+    "dw_pe_1x32": {
+        "lhs_dtype": _BF16,
+        "rhs_dtype": _BF16,
+        "lhs_is_swizzled": False,
+        "rhs_is_swizzled": False,
+        "load_with_PE_swizzle": True,
+        "quant_scheme": "1x32",
+        "lhs_orientation": TensorOrientation.K_BY_F,
+    },
+    "dw_pe_1x32_no_dma": {
+        "lhs_dtype": _BF16,
+        "rhs_dtype": _BF16,
+        "lhs_is_swizzled": False,
+        "rhs_is_swizzled": False,
+        "load_with_PE_swizzle": True,
+        "quant_scheme": "1x32",
+        "lhs_orientation": TensorOrientation.K_BY_F,
+        "disable_dma_transpose": True,
+    },
+    "dgt_fast_rhs_prequant": {
+        "lhs_dtype": _BF16,
+        "rhs_dtype": _MXFP8,
+        "lhs_is_swizzled": False,
+        "rhs_is_swizzled": True,
+        "fast_dma_transpose": True,
+        "quant_scheme": "wrapX",
+        "enable_scale_packing": True,
     },
     "lhs_pe_1x32_rhs_prequant": {
         "lhs_dtype": _BF16,
@@ -162,10 +241,22 @@ _METHOD_SPECS = {
     },
 }
 
-# Methods with a pre-quantized operand: MXFP8 is quantized offline, never spilled.
-_PREQUANT_METHODS = ("prequant", "lhs_pe_1x32_rhs_prequant")
+# Methods where BOTH operands are pre-quantized MXFP8: nothing is loaded on-chip as
+# bf16, so there is nothing to swizzle+spill -> spill_reload is a no-op and is skipped.
+# Mixed methods (lhs_pe_1x32_rhs_prequant, dgt_fast_rhs_prequant) still load a bf16
+# operand on-chip, which spill_reload can amortize, so they DO sweep spill_reload.
+_BOTH_PREQUANT_METHODS = ("prequant",)
 # Methods that load an unswizzled operand on-chip; require K divisible by 128.
-_UNSWIZZLED_METHODS = ("dgt", "pe_1x32", "lhs_pe_1x32_rhs_prequant")
+_UNSWIZZLED_METHODS = (
+    "dgt",
+    "dgt_fast",
+    "pe_1x32",
+    "pe_wrapx",
+    "dw_pe_1x32",
+    "dw_pe_1x32_no_dma",
+    "lhs_pe_1x32_rhs_prequant",
+    "dgt_fast_rhs_prequant",
+)
 # Excluded from AUTOTUNE_METHODS="all" (still selectable explicitly by name):
 # the pre-quantized RHS is wrapX-layout while the LHS loads via the 1x32 path, so
 # the K-contraction scale groupings don't match and the product is wrong (see the
@@ -200,21 +291,41 @@ def _make_test_config(kc, method, idx, shape_label):
 
 
 def _generate_all_configs():
-    """Generate TestConfig list from AUTOTUNE_SHAPES env var across selected methods."""
+    """Generate TestConfig list from AUTOTUNE_SHAPES env var across selected methods.
+
+    AUTOTUNE_MAX_CANDIDATES (optional): cap the number of candidate tilings swept
+    per (shape, method). Candidates are evenly subsampled across the full list
+    rather than truncated, so the cap keeps a spread of tile sizes instead of one
+    family. Default: unlimited.
+    """
     shapes = _parse_shapes()
     methods = _selected_methods()
+    max_cand = int(os.environ.get("AUTOTUNE_MAX_CANDIDATES", "0"))
     configs = []
     for label, M, K, N in shapes:
         base = MatmulMxfp8KernelConfig(M=M, K=K, N=N)
-        candidates = generate_autotune_candidates(base)
         for method in methods:
-            for idx, kc in enumerate(candidates):
-                # Pre-quantized MXFP8 never uses spill_reload; skip those candidates.
-                if method in _PREQUANT_METHODS and kc.spill_reload:
-                    continue
+            spec = _METHOD_SPECS[method]
+            # Prequant-ness of each operand drives the auto LNC2 axis choice (shard the
+            # non-pre-quantized operand), which sets the per-core shape the candidates
+            # must be tiled for -- so generate per method, not once per shape.
+            lhs_is_prequant = spec["lhs_dtype"] in (_MXFP8, _MXFP8_X4)
+            rhs_is_prequant = spec["rhs_dtype"] in (_MXFP8, _MXFP8_X4)
+            candidates = generate_autotune_candidates(
+                base, lhs_is_prequant=lhs_is_prequant, rhs_is_prequant=rhs_is_prequant
+            )
+            eligible = [
+                (idx, kc)
+                for idx, kc in enumerate(candidates)
+                # Both-operands-prequant MXFP8 has nothing to spill; skip those candidates.
+                if not (method in _BOTH_PREQUANT_METHODS and kc.spill_reload)
                 # Unswizzled on-chip loads require K divisible by 128.
-                if method in _UNSWIZZLED_METHODS and kc.K % 128 != 0:
-                    continue
+                and not (method in _UNSWIZZLED_METHODS and kc.K % 128 != 0)
+            ]
+            if max_cand > 0 and len(eligible) > max_cand:
+                step = len(eligible) / max_cand
+                eligible = [eligible[int(i * step)] for i in range(max_cand)]
+            for idx, kc in eligible:
                 configs.append(_make_test_config(kc, method, idx, label))
     return configs
 

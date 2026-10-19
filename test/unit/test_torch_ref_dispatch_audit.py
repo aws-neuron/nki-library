@@ -32,15 +32,26 @@ import inspect
 import re
 from inspect import signature
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Callable, List, Protocol, Tuple, runtime_checkable
 
 import pytest
 from nkilib_src.nkilib.core.utils import kernel_torch_dispatch
 from nkilib_src.nkilib.core.utils.kernel_torch_dispatch import dispatch
 
+from test.utils.test_validation_utils import fail_with_report
+
 REPO_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = REPO_ROOT / "src" / "nkilib_src" / "nkilib"
 KERNEL_DIRS = [SRC_DIR / "core", SRC_DIR / "experimental"]
+
+
+@runtime_checkable
+class _WrappedRef(Protocol):
+    """A callable that keeps a reference to the function it wraps."""
+
+    __wrapped__: Callable[..., Any]
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 def _find_kernel_entries() -> List[Tuple[str, str, str]]:
@@ -86,7 +97,41 @@ def _find_kernel_entries() -> List[Tuple[str, str, str]]:
 # When a kernel is fixed, remove it. Adding new entries requires justification.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DISPATCH_KNOWN_FAILURES = frozenset()
+DISPATCH_KNOWN_FAILURES = frozenset(
+    {
+        # GDN decode kernels are validated via explicit torch_ref= in their integration
+        # tests (test_gdn_*.py), not convention-based auto-dispatch. They are not yet
+        # wired for the <name>_torch_ref naming + signature-parity contract:
+        #   gdn_block_tkg: ref is gdn_block_decode_fused_torch_ref (name mismatch)
+        #   gdn_tkg:       no gdn_tkg_torch.py module (ref lives inline in the integration test)
+        #   qkv_cte:       has qkv_cte_torch_ref but parameter names differ from the kernel
+        # The gdn_cte prefill family IS wired for convention dispatch and must stay that
+        # way. It has ONE @nki.jit entry (gdn_cte) and one ref (gdn_cte_torch_ref); its two
+        # algorithms are plain traced bodies the dispatcher inlines, so they are not
+        # discovered here and need no refs of their own.
+        # TODO(qqdong): wire these to convention dispatch and remove from this set.
+        # gpt_oss_tail_chunked_megakernel: convention dispatch hands the ref exactly the
+        # arguments ONE RANK receives, and this kernel's answer is not a function of them -- the
+        # top-k spans the whole vocab, which lives across all VTP ranks' weight shards, so a rank
+        # cannot compute it from its own shard alone. Its reference is therefore global by
+        # nature: gpt_oss_tail_chunked_ref in tail_chunked_megakernel_torch.py takes the full
+        # shard list and returns per-rank results, and the integration test passes it explicitly
+        # via torch_ref=. Same situation as gdn_tkg below (ref not expressible as convention
+        # dispatch), not a missing reference.
+        # TODO: revisit if convention dispatch ever gains a way to give the ref the
+        # collective's world (e.g. a rank id plus all shards).
+        "gpt_oss_tail_chunked_megakernel",
+        "gdn_block_tkg",
+        "gdn_tkg",
+        "qkv_cte",
+    }
+)
+
+
+def _get_dispatchable_kernels() -> List[str]:
+    """All kernel names excluding known failures."""
+    return [name for name, _, _ in _find_kernel_entries() if name not in DISPATCH_KNOWN_FAILURES]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tests
@@ -96,12 +141,7 @@ DISPATCH_KNOWN_FAILURES = frozenset()
 class TestTorchRefDispatch:
     """Discover all @nki.jit kernels and verify dispatch works end-to-end."""
 
-    @staticmethod
-    def _get_dispatchable_kernels() -> List[str]:
-        """All kernel names excluding known failures."""
-        return [name for name, _, _ in _find_kernel_entries() if name not in DISPATCH_KNOWN_FAILURES]
-
-    @pytest.mark.parametrize("kernel_name", _get_dispatchable_kernels.__func__())
+    @pytest.mark.parametrize("kernel_name", _get_dispatchable_kernels())
     def test_dispatch_works(self, kernel_name, monkeypatch):
         """dispatch() must resolve a callable torch_ref with matching signature."""
         # _USE_TORCH_REF is captured at module import; patch the attribute directly.
@@ -117,6 +157,7 @@ class TestTorchRefDispatch:
                 break
 
         assert kernel_mod_path is not None, f"Could not find kernel entry for '{kernel_name}'"
+        assert kernel_fn_name is not None, f"Kernel entry for '{kernel_name}' has no function name"
 
         # Stub with correct __module__ and __name__ for convention-based dispatch
         def stub():
@@ -135,6 +176,7 @@ class TestTorchRefDispatch:
         assert callable(result), f"dispatch({kernel_name}) returned non-callable: {type(result)}"
 
         # Validate signature parity via __wrapped__
+        assert isinstance(result, _WrappedRef), f"dispatch({kernel_name}) result does not expose the wrapped torch_ref"
         torch_ref_func = result.__wrapped__
         kernel_func = getattr(importlib.import_module(kernel_mod_path), kernel_fn_name)
         kernel_params = set(signature(kernel_func).parameters.keys())
@@ -177,6 +219,8 @@ class TestTorchRefDispatch:
                 if result is stub:
                     continue
                 # Check signature
+                if not isinstance(result, _WrappedRef):
+                    continue
                 torch_ref_func = result.__wrapped__
                 kernel_func = getattr(importlib.import_module(mod_path), fn_name)
                 if set(signature(kernel_func).parameters.keys()) == set(signature(torch_ref_func).parameters.keys()):
@@ -189,7 +233,7 @@ class TestTorchRefDispatch:
                 pass
 
         if stale:
-            pytest.fail(
+            fail_with_report(
                 "\n\nStale DISPATCH_KNOWN_FAILURES — these kernels are now dispatch-ready:\n"
                 + "\n".join(stale)
                 + "\n\nFix: remove them from DISPATCH_KNOWN_FAILURES.\n"

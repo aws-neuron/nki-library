@@ -372,6 +372,9 @@ def moe_cte(
     # gate_up_proj_scale / down_proj_scale tensors (gate/up packed [E, 2, 1], down [E, 1]).
     gate_up_in_scale: Optional[nl.NkiTensor] = None,
     down_in_scale: Optional[nl.NkiTensor] = None,
+    # shard_on_block_mx only: [1, 1] int32 expert-parallel rank of this instance; required on the
+    # packed-affinity path (the kernel derives its global expert base as ep_rank * E_local on-device).
+    ep_rank: Optional[nl.NkiTensor] = None,
     accumulation_dtype=None,
     skip_gate_proj: bool = False,
 ):
@@ -621,6 +624,7 @@ def moe_cte(
             down_proj_bias=down_proj_bias,
             gate_up_proj_scale=gate_up_proj_scale,
             down_proj_scale=down_proj_scale,
+            ep_rank=ep_rank,
             block_size=block_size,
             n_static_blocks=cfg.n_static_blocks,
             n_dynamic_blocks=cfg.n_dynamic_blocks,

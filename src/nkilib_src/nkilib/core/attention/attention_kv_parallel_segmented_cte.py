@@ -26,7 +26,6 @@ import nki
 import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
-from nki.collectives import ReplicaGroup
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil
@@ -43,7 +42,7 @@ def attention_kv_parallel_segmented_cte(
     v_cache: nl.NkiTensor,
     block_tables: nl.NkiTensor,
     kvp_q_offset: nl.NkiTensor,
-    replica_groups: ReplicaGroup,
+    replica_groups: ncc.ReplicaGroup,
     group_size: int,
     block_size: int,
     seg_size: int,
@@ -55,6 +54,10 @@ def attention_kv_parallel_segmented_cte(
     kvp_group_size: int = 0,
     apc_mode: bool = False,
     valid_num_prior_tokens: nl.NkiTensor = None,
+    fp8_packed: bool = False,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
+    allow_vector_exp: bool = True,
 ) -> nl.NkiTensor:
     """
     KV-parallel segmented prefill attention.
@@ -71,7 +74,9 @@ def attention_kv_parallel_segmented_cte(
 
     Args:
         q (nl.NkiTensor): [q_heads_per_rank, S, D], This rank's Q heads.
-        k_cache (nl.NkiTensor): [num_blocks, num_kv_heads, block_size, D], Local KV cache (K).
+        k_cache (nl.NkiTensor): Local KV cache (K). Shape depends on fp8_packed:
+            - False: [num_blocks, num_kv_heads, block_size, D]
+            - True: [num_blocks, num_kv_heads, block_size // 2, D, 2]
         v_cache (nl.NkiTensor): [num_blocks, num_kv_heads, block_size, D], Local KV cache (V).
         block_tables (nl.NkiTensor): [1, max_blocks] int32, Block indices for paged KV.
         kvp_q_offset (nl.NkiTensor): [1, 1] int32, Causal mask offset.
@@ -103,6 +108,12 @@ def attention_kv_parallel_segmented_cte(
             The number of fully-visible local prior tokens for Q chunk 0 on this rank.
             Must be a multiple of block_size. The kernel increments this per chunk by
             seg_size // kvp_group_size as later chunks see more local KV.
+        fp8_packed (bool): If True, K uses the packed FP8 layout described above.
+        k_scale (nl.NkiTensor): Optional K-cache dequantization scale, shape [128, 1].
+        v_scale (nl.NkiTensor): Optional V-cache dequantization scale, shape [128, 1].
+            All entries must repeat one scalar; the kernel applies this tensor
+            along the query partition, not as per-head-dimension values.
+        allow_vector_exp (bool): Allow the Vector Engine exp on trn3. False uses the Scalar Engine. Default True.
 
     Returns:
         out (nl.NkiTensor): [q_heads_per_rank, S, D], Merged attention output for this rank's Q heads.
@@ -147,15 +158,34 @@ def attention_kv_parallel_segmented_cte(
         q.shape[2] == k_cache.shape[3],
         f"head_dim mismatch: q has {q.shape[2]}, k_cache has {k_cache.shape[3]}",
     )
-    kernel_assert(
-        k_cache.shape[2] == block_size,
-        f"k_cache block_size dim ({k_cache.shape[2]}) must match block_size ({block_size})",
-    )
+    if fp8_packed:
+        kernel_assert(len(k_cache.shape) == 5, "fp8_packed K cache must be 5-dimensional")
+        kernel_assert(k_cache.shape[4] == 2, "fp8_packed K cache trailing dimension must be 2")
+        kernel_assert(
+            k_cache.shape[2] * 2 == block_size,
+            f"packed k_cache block_size dim ({k_cache.shape[2]} * 2) must match block_size ({block_size})",
+        )
+    else:
+        kernel_assert(len(k_cache.shape) == 4, "non-packed K cache must be 4-dimensional")
+        kernel_assert(
+            k_cache.shape[2] == block_size,
+            f"k_cache block_size dim ({k_cache.shape[2]}) must match block_size ({block_size})",
+        )
+
+    # Collective source/paired-destination buffer type, selected by LNC degree.
+    # On a multi-core rank (lnc_degree > 1) each NeuronCore writes only its own slice of these
+    # staging buffers, so they must live in shared_hbm for every core of a logical rank to
+    # contribute to (and read back) the single buffer the collective operates on; using
+    # private_hbm gives each core a half-populated copy and corrupts the collective result.
+    # On LNC1 there is a single core (its slice is the whole buffer) and the compiler rejects
+    # shared_hbm collective sources, so fall back to private_hbm.
+    collective_hbm = nl.private_hbm if lnc_degree == 1 else nl.shared_hbm
 
     # All-gather Q across ranks.
-    # Collectives cannot read/write I/O tensors directly, so each NC DMAs its slice into shared_hbm first.
+    # Collectives cannot read/write I/O tensors directly, so each NC DMAs its slice into an HBM
+    # staging buffer first.
     # Parallelize the copy: each NC copies its chunk, with remainder distributed round-robin.
-    q_src = nl.ndarray((q_heads_per_rank, seq_len, head_dim), dtype=q.dtype, buffer=nl.shared_hbm, name="q_src")
+    q_src = nl.ndarray((q_heads_per_rank, seq_len, head_dim), dtype=q.dtype, buffer=collective_hbm, name="q_src")
     heads_per_nc_copy = q_heads_per_rank // lnc_degree
     leftover_heads = q_heads_per_rank % lnc_degree
     for nc_idx in range(lnc_degree):
@@ -167,16 +197,16 @@ def attention_kv_parallel_segmented_cte(
     q_full = nl.ndarray(
         (total_heads, seq_len, head_dim),
         dtype=q.dtype,
-        buffer=nl.shared_hbm,
+        buffer=collective_hbm,
         name="q_full",
     )
     ncc.all_gather(dsts=[q_full], srcs=[q_src], replica_group=replica_groups, collective_dim=0)
 
     partial_out = nl.ndarray(
-        (total_heads, seq_len, head_dim), dtype=nl.float32, buffer=nl.shared_hbm, name="partial_out"
+        (total_heads, seq_len, head_dim), dtype=nl.float32, buffer=collective_hbm, name="partial_out"
     )
-    neg_max = nl.ndarray((total_heads, seq_len), dtype=nl.float32, buffer=nl.shared_hbm, name="neg_max")
-    sum_recip = nl.ndarray((total_heads, seq_len), dtype=nl.float32, buffer=nl.shared_hbm, name="sum_recip")
+    neg_max = nl.ndarray((total_heads, seq_len), dtype=nl.float32, buffer=collective_hbm, name="neg_max")
+    sum_recip = nl.ndarray((total_heads, seq_len), dtype=nl.float32, buffer=collective_hbm, name="sum_recip")
 
     chunk_allocator = ModularAllocator()
     kvp_offset_chunk_sbuf = chunk_allocator.alloc_sbuf_tensor((1, 1), nl.int32)
@@ -289,6 +319,10 @@ def attention_kv_parallel_segmented_cte(
             kvp_seg_block_offset_int=chunk_kvp_seg_block_offset_int,
             kvp_prior_load_blocks=kvp_prior_load_blocks,
             kvp_prior_fully_visible=prior_fully_visible,
+            fp8_packed=fp8_packed,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            allow_vector_exp=allow_vector_exp,
         )
 
         nisa.dma_copy(
@@ -307,19 +341,19 @@ def attention_kv_parallel_segmented_cte(
     recv_out = nl.ndarray(
         (group_size, q_heads_per_rank, seq_len, head_dim),
         dtype=nl.float32,
-        buffer=nl.shared_hbm,
+        buffer=collective_hbm,
         name="recv_out",
     )
     recv_neg_max = nl.ndarray(
         (group_size, q_heads_per_rank, seq_len),
         dtype=nl.float32,
-        buffer=nl.shared_hbm,
+        buffer=collective_hbm,
         name="recv_neg_max",
     )
     recv_sum_recip = nl.ndarray(
         (group_size, q_heads_per_rank, seq_len),
         dtype=nl.float32,
-        buffer=nl.shared_hbm,
+        buffer=collective_hbm,
         name="recv_sum_recip",
     )
     ncc.all_to_all(

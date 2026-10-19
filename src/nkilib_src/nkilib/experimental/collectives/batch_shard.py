@@ -34,14 +34,14 @@ class AttnQBatchShardLayout(Enum):
 
 @nki.jit
 def attn_q_batch_shard(
-    input: nl.ndarray,
-    iota_workers: nl.ndarray,
-    gathered_buf: nl.ndarray,
+    input: nl.NkiTensor,
+    iota_workers: nl.NkiTensor,
+    gathered_buf: nl.NkiTensor,
     gqa_group_size: int,
     replica_group: ReplicaGroup,
     layout: AttnQBatchShardLayout = AttnQBatchShardLayout.NBSd,
-    rank_id_in: Optional[nl.ndarray] = None,
-) -> nl.ndarray:
+    rank_id_in: Optional[nl.NkiTensor] = None,
+) -> nl.NkiTensor:
     """QKV batch shard kernel: all_gather on dim 0 + reshape to separate gqa_group_size heads + slice batch.
 
     Implements the Q projection transition from TP64 to TP8DP8 for batch sharding attention.

@@ -27,17 +27,13 @@ Common params: (model_name, quant_type, batch, seqlen, hidden_dim,
 
 import math
 
+from typing import TypedDict
+
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
+from test.integration.nkilib.core.attention.model_config_utils import get_sharded_head_counts
+from test.integration.nkilib.core.qkv.qkv_model_metadata import MODELS
 
-MODELS = {
-    "llama3_70b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "hidden": 8192, "bias": False},
-    "qwen3_32b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "hidden": 5120, "bias": False},
-    "qwen3_235b": {"n_q_heads": 64, "n_kv_heads": 4, "d_head": 128, "hidden": 4096, "bias": False, "use_gamma": True},
-    "gemma3_27b": {"n_q_heads": 32, "n_kv_heads": 16, "d_head": 128, "hidden": 5376, "bias": False},
-    "gptoss_120b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 64, "hidden": 3072, "bias": True},
-}
-
-_DEFAULT_TP_CP = [
+_DEFAULT_TP_CP: list[tuple[int, int, int]] = [
     (64, 64, 1),
     (16, 16, 1),
     (8, 8, 1),
@@ -48,9 +44,16 @@ _DEFAULT_TP_CP = [
     (64, 8, 8),
     (64, 4, 16),
 ]
-_DEFAULT_SEQLENS = [1024, 10240, 32768]
+_DEFAULT_SEQLENS: list[int] = [1024, 10240, 32768]
 
-OPTIMAL_CONFIGS = {
+
+class QkvModelConfig(TypedDict, total=False):
+    TP_CP_CONFIGS: list[tuple[int, int, int]]
+    SEQLENS: list[int]
+    QUANT_TYPES: list[QuantizationType]
+
+
+OPTIMAL_CONFIGS: dict[str, QkvModelConfig] = {
     "llama3_70b": {"TP_CP_CONFIGS": _DEFAULT_TP_CP, "SEQLENS": _DEFAULT_SEQLENS},
     "qwen3_32b": {"TP_CP_CONFIGS": _DEFAULT_TP_CP, "SEQLENS": _DEFAULT_SEQLENS},
     "gemma3_27b": {"TP_CP_CONFIGS": _DEFAULT_TP_CP, "SEQLENS": _DEFAULT_SEQLENS},
@@ -73,23 +76,12 @@ STATIC_DEQUANT_MODELS = {"llama3_70b", "gptoss_120b"}
 FUSED_GAMMA_ROPE_MODELS = {"qwen3_32b"}
 
 
-def _get_sharded_head_counts(tp, n_q_heads, n_kv_heads):
-    padded_q = math.ceil(n_q_heads / tp) * tp
-    if n_q_heads == n_kv_heads:
-        padded_kv = padded_q
-    elif n_kv_heads < tp or n_kv_heads % tp != 0:
-        padded_kv = tp if tp % n_kv_heads == 0 else padded_q
-    else:
-        padded_kv = n_kv_heads
-    return padded_q // tp, padded_kv // tp
-
-
 def get_qkv_config(model_name, tp, cp, seqlen, quant_type):
     """Return QKV config dict for a given model × sharding × seqlen × quant."""
     m = MODELS.get(model_name)
     if m is None:
         return None
-    n_q, n_kv = _get_sharded_head_counts(tp, m["n_q_heads"], m["n_kv_heads"])
+    n_q, n_kv = get_sharded_head_counts(tp, m["n_q_heads"], m["n_kv_heads"])
     seqlen_cp = seqlen // cp
     hidden_padded = math.ceil(m["hidden"] / 512) * 512
     qt = quant_type.name if hasattr(quant_type, 'name') else quant_type

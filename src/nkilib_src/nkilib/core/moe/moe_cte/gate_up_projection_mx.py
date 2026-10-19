@@ -21,7 +21,6 @@ from typing import Optional
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import dge_mode, oob_mode
 
 from ...quantization.fp8_quantize import pre_combine_dequant_scales
 from ...utils.kernel_assert import kernel_assert
@@ -566,8 +565,8 @@ def gate_up_projection_mx_tp(
                 nisa.dma_copy(
                     dst=dst_weight_sb.slice(1, h_start, h_start + cur_chunk_n_H512).slice(2, 0, I),
                     src=weight_qtz.slice(1, h_start, h_start + cur_chunk_n_H512).slice(2, 0, I),
-                    oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-                    dge_mode=dge_mode.hwdge,
+                    oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+                    dge_mode=nisa.dge_mode.hwdge,
                 )
 
                 for i_h_in_chunk in range(cur_chunk_n_H512):

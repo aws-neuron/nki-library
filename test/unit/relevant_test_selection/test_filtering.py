@@ -50,8 +50,8 @@ class _FakeNode:
 
 
 class _FakeItem:
-    def __init__(self, fspath):
-        self.fspath = fspath
+    def __init__(self, path):
+        self.path = path
 
 
 def _never_called(config, name):  # get_option that must not run on the worker path
@@ -116,9 +116,11 @@ def _items():
 def test_partition_keeps_only_relevant():
     config = _FakeConfig()
     setattr(config, RELEVANT_TEST_DIRS_KEY, {_REL})
-    kept, deselected = partition_items_by_relevance(config, _items())
-    assert [str(i.fspath) for i in kept] == [f"{_REL}/test_mxfp_load.py"]
-    assert [str(i.fspath) for i in deselected] == [f"{_OTHER}/test_attention_cte.py"]
+    partition = partition_items_by_relevance(config, _items())
+    assert partition is not None, "a relevant-dirs set was just installed, so filtering must apply"
+    kept, deselected = partition
+    assert [str(i.path) for i in kept] == [f"{_REL}/test_mxfp_load.py"]
+    assert [str(i.path) for i in deselected] == [f"{_OTHER}/test_attention_cte.py"]
 
 
 def test_partition_noop_when_unset():

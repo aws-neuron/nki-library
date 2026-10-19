@@ -51,6 +51,18 @@ from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityS
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import BWMMFunc
 from test.utils.common_dataclasses import ModelTestType
 
+from typing import TypedDict
+
+
+class MoeCteModelConfig(TypedDict, total=False):
+    EP_MOETP_CONFIGS: list[tuple[int, int]]
+    SEQ_LENS: list[int]
+    SKEWNESS_PCTS: list[float]
+    BWMM_FUNC: BWMMFunc
+    BLOCK_SIZE: int
+    SKIP: int
+    EXPERT_AFFINITY_MULTIPLY_ON_I: bool
+
 # ============================================================================
 # Model definitions
 # ============================================================================
@@ -96,7 +108,7 @@ MODELS = {
 
 _DEFAULT_BWMM_FUNC = BWMMFunc.SHARD_ON_INTERMEDIATE_HW
 
-GENERALITY_CONFIGS = {
+GENERALITY_CONFIGS: dict[str, MoeCteModelConfig] = {
     "llama4": {
         "EP_MOETP_CONFIGS": [
             (1, 1),  # EP1 MoETP1

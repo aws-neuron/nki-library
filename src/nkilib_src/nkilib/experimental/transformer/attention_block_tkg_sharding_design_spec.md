@@ -227,7 +227,7 @@ The attention_block_tkg kernel with KV data parallelism wraps the standard atten
 | `KVDP`                 | int                 | KV data parallelism degree (1 = disabled)                         |
 | `KVDP_replica_group`   | ReplicaGroup        | Rank group for collectives                                        |
 | `KVDP_collective_mode` | KVDPCollectiveMode  | Collective mode: `ALL_TO_ALL` (default) or `ALL_GATHER_SLICE`     |
-| `KVDP_rank`            | nl.ndarray          | Shape (1,), uint32 @ HBM. This rank's position in its KVDP group  |
+| `KVDP_rank`            | nl.NkiTensor          | Shape (1,), uint32 @ HBM. This rank's position in its KVDP group  |
 
 ### Collective Modes
 

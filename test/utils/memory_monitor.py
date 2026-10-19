@@ -43,7 +43,14 @@ import gc
 import os
 import signal
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
+from types import FrameType
+from typing import Any
+
+# The handler kinds signal.signal() accepts and returns: a callable, one of the
+# SIG_* constants (int or signal.Handlers), or None when no handler is installed.
+_SignalHandler = Callable[[int, FrameType | None], Any] | int | signal.Handlers
 
 
 @dataclass
@@ -199,7 +206,7 @@ class ProcessTreeMemoryMonitor:
         self._limit_already_exceeded = False
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._old_handler: signal.Handlers | None = None
+        self._old_handler: _SignalHandler | None = None
 
     def start(self) -> None:
         """Start monitoring in a daemon thread. Installs SIGUSR1 handler if limit is set.

@@ -829,17 +829,26 @@ def _rmsnorm_tkg_dloc(
       1. HBM store: normalized [T, H] written to output_hbm
       2. On-chip transpose: written to output_sb at each core's shard
 
-    Each LNC core processes T//2 tokens independently.
+    LNC sharding is by lnc (the logical-NC config):
+      - LNC=2: each core processes T//2 tokens independently, then (if
+        sync_output) exchanges shards via sendrecv, and an HBM core_barrier
+        orders the two cores' writes.
+      - LNC=1: the single core processes all T tokens; T_shard == T,
+        shard_id == 0, and the cross-core sendrecv / core_barrier are skipped.
 
     Args:
         input_hbm: [T, H] in HBM
         gamma: [1, H] in HBM
-        output_hbm: [T, H] in shared_hbm, both cores write their halves
-        output_sb: [H0, T//2, H1] if sync_output=False, [H0, T, H1] if sync_output=True, in SBUF
+        output_hbm: [T, H] in shared_hbm; each core writes its T//lnc rows.
+        output_sb: SBUF transpose output. Shape [H0, T//lnc, H1] when
+            sync_output=False (each core holds only its own shard; at LNC=1 this
+            is the full [H0, T, H1]), or [H0, T, H1] when sync_output=True (full,
+            via the LNC=2 exchange; at LNC=1 it is already full without exchange).
         eps: epsilon for numerical stability
         hidden_actual: actual H for mean calculation (if input is padded)
-        sync_output: if True, sendrecv to exchange shards so each core has full [H0, T, H1];
-                     if False, each core only has its own [H0, T//2, H1] shard (other half undefined)
+        sync_output: if True at LNC=2, sendrecv to exchange shards so each core
+            has the full [H0, T, H1]; if False, each core only has its own
+            [H0, T//2, H1] shard (other half undefined). No-op at LNC=1 (already full).
         sbm: SBUF memory manager
     """
     # Flatten [B, S, H] -> [T, H] if needed
@@ -859,11 +868,13 @@ def _rmsnorm_tkg_dloc(
         hidden_actual = H
 
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg_dloc", (0, 1))
-    kernel_assert(lnc == 2, "rmsnorm_tkg_dloc requires LNC=2")
-    kernel_assert(T % 2 == 0, "T must be even for LNC=2 sharding")
+    kernel_assert(lnc in (1, 2), f"rmsnorm_tkg_dloc only supports LNC=1 or LNC=2; got {lnc}")
+    # LNC=1: single core owns all T tokens (no T-sharding, no cross-core exchange).
+    # LNC=2: each core processes T//2 tokens independently, then optionally syncs.
+    kernel_assert(T % lnc == 0, f"T must be divisible by lnc={lnc}")
 
-    T_shard = T // 2
-    kernel_assert(T_shard % tile_size == 0, f"T//2 must be divisible by {tile_size}")
+    T_shard = T // lnc
+    kernel_assert(T_shard % tile_size == 0, f"T//{lnc} must be divisible by {tile_size}")
 
     if not sbm:
         sbm = SbufManager(
@@ -942,10 +953,14 @@ def _rmsnorm_tkg_dloc(
     sbm.pop_heap()  # tile_buf
 
     # --- HBM barrier: both cores must finish writing before downstream reads ---
-    nisa.core_barrier(output_hbm, (0, 1))
+    # LNC=1: single core wrote the whole [T, H], nothing to synchronize.
+    if lnc > 1:
+        nisa.core_barrier(output_hbm, (0, 1))
 
     # --- Optional: sync SBUF output across cores ---
-    if sync_output:
+    # LNC=1: the single core already holds the full [H0, T, H1] in output_sb
+    # (T_shard == T, sb_shard_offset == 0), so no cross-core exchange is needed.
+    if sync_output and lnc > 1:
         other_offset = (1 - shard_id) * T_shard
         local_src = output_sb_view.slice(dim=1, start=sb_shard_offset, end=sb_shard_offset + T_shard)
         remote_dst = output_sb_view.slice(dim=1, start=other_offset, end=other_offset + T_shard)

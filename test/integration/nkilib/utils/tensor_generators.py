@@ -297,7 +297,7 @@ def np_random_sample_static_quantize_inp(seed=0):
             else:
                 # w_scale has shape (1, shape[-1]) with random values in [0, 1)
                 # Rescale so mean(w_scale) = target_w_scale, preserving per-row ratios
-                w_scale = dt.static_cast(w_scale * (target_w_scale / w_scale.mean()), np.float32)
+                w_scale = dt.static_cast(w_scale * (target_w_scale / np.mean(w_scale)), np.float32)
         else:
             w_scale = dt.static_cast(w_scale * scale_map[dtype], np.float32)
         in_scale = dt.static_cast(in_scale * scale_map[dtype], np.float32)

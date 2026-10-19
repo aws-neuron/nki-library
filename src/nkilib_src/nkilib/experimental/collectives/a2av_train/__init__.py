@@ -14,14 +14,15 @@
 """All-to-all-v training kernels for MoE.
 
 Public kernels:
-    permute_a2av     – gather + all-to-all-v (sender side)
-    unpermute_a2av   – all-to-all-v + scatter-add (receiver side)
+    permute_a2av            - capacity-bounded gather + all-to-all-v
+    unpermute_a2av          - capacity-bounded all-to-all-v + scatter
 
 Internal helpers (module-private, not part of the public API; see
 ``a2av_train_utils``):
     _exclusive_cumsum_u32(counts_hbm, EP)
-    _write_a2av_v_metadata(metadata_hbm, counts_sb, sdispls_sb, H, EP)
-    _validate_a2av_indices_counts(send_indices, counts, T, EP)
+    _write_packed_a2av_v_metadata(metadata_hbm, send_counts_sb, send_displs_sb,
+                                 recv_counts_sb, recv_displs_sb, H, EP)
+    _validate_packed_indices_counts(packed_source_indices, counts, N, EP)
 """
 
 from .permute_a2av import permute_a2av

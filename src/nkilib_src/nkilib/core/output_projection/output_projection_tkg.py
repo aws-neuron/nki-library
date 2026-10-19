@@ -43,8 +43,6 @@ from typing import Any, List, Optional, Union
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import matmul_perf_mode
-from nki.language import affine_range, static_range
 
 from ..utils.allocator import BufferManager, align_to, create_auto_alloc_manager, sizeinbytes
 from ..utils.common_types import DtypeMode, QuantizationType
@@ -224,7 +222,7 @@ def output_projection_tkg(
     """
     SBUF memory layout for non-transpose path with bias (manual allocation):
 
-    The goal is to separate the address ranges of all three 
+    The goal is to separate the address ranges of all three
     DMA streams (bias, attention, weights), eliminating
     anti-dependencies so they can all proceed in parallel.
 
@@ -328,11 +326,11 @@ def output_projection_tkg(
     else:  # TRANSPOSE_OUT == True
         """
         Notes on iteration order:
-        
+
         cfg.h_0_size corresponds to the outermost logical iterator h_0 = prg_id from 0 to cfg.num_prgs - 1. This corresponds to LNC sharding.
         cfg.h_1_size corresponds to the mid logical iterator h_1 from 0 to P_MAX - 1. This is placed in partition dim.
         cfg.h_2_size corresponds to the innermost logical iterator h_2. This is placed in free dim.
-        
+
         Check for h_size % (P_MAX * n_prgs) == 0 above should cover this
         """
         kernel_assert(
@@ -915,7 +913,7 @@ def _prepare_weight_scales(
         )
         w_scale_dtype = weight_scale_hbm.dtype
         weight_scale_blocks = []
-        for h_block_idx in affine_range(num_h_blocks_per_prg):
+        for h_block_idx in nl.affine_range(num_h_blocks_per_prg):
             cur_size = h_block_sizes[h_block_idx]
             cur_offset = h_block_offsets[h_block_idx]
             scale_tensor = sbm.alloc_stack((P_MAX, cur_size), dtype=w_scale_dtype, align=cfg.align, buffer=nl.sbuf)
@@ -1092,7 +1090,7 @@ def _shuffle_attn(
     """
     bxs_size = cfg.b_size * cfg.s_size
 
-    for n_orig in static_range(cfg.n_original_size):
+    for n_orig in nl.static_range(cfg.n_original_size):
         n_group, n_offset = divmod(n_orig, cfg.group_size)
         dst_p_start = n_offset * cfg.d_original_size
 
@@ -1258,13 +1256,13 @@ def _load_weight_h_block(
     """
     w_h_sliced = w_shard_hbm.slice(dim=2, start=h_block_offset, end=h_block_offset + h_block_size)
     if not cfg.use_double_row:
-        for head_idx in affine_range(cfg.n_size):
+        for head_idx in nl.affine_range(cfg.n_size):
             nisa.dma_copy(
                 src=w_h_sliced.select(dim=0, index=head_idx),
                 dst=w_sbuf_slot[head_idx][:, :h_block_size],
             )
     else:
-        for head_idx in affine_range(0, cfg.n_size, 2):
+        for head_idx in nl.affine_range(0, cfg.n_size, 2):
             pair_idx = head_idx // 2
             nisa.dma_copy(
                 src=w_h_sliced.select(dim=0, index=head_idx),
@@ -1340,16 +1338,16 @@ def _output_projection_tkg_impl(
 
     # Allocate circular buffer slots at max_h_block_size (remainder block fits in same slot)
     w_sbuf_blocks = []
-    for _h_block_idx in affine_range(num_w_h_blocks):
+    for _h_block_idx in nl.affine_range(num_w_h_blocks):
         w_heads = []
         if not cfg.use_double_row:
-            for head_idx in affine_range(cfg.n_size):
+            for head_idx in nl.affine_range(cfg.n_size):
                 w_tensor = sbm.alloc_stack(
                     (cfg.d_size, max_h_block_size), dtype=w_shard_hbm.dtype, buffer=nl.sbuf, align=cfg.align
                 )
                 w_heads.append(w_tensor)
         else:
-            for head_idx in affine_range(0, cfg.n_size, 2):
+            for head_idx in nl.affine_range(0, cfg.n_size, 2):
                 w_tensor = sbm.alloc_stack(
                     (cfg.d_size, 2, max_h_block_size), dtype=w_shard_hbm.dtype, buffer=nl.sbuf, align=cfg.align
                 )
@@ -1357,7 +1355,7 @@ def _output_projection_tkg_impl(
         w_sbuf_blocks.append(w_heads)
 
     if all_weights_preloaded:
-        for h_block_idx in affine_range(num_h_blocks_per_prg):
+        for h_block_idx in nl.affine_range(num_h_blocks_per_prg):
             _load_weight_h_block(
                 w_sbuf_blocks[h_block_idx],
                 w_shard_hbm,
@@ -1375,7 +1373,7 @@ def _output_projection_tkg_impl(
                 (bxs_block.size, cfg.h_sharded), dtype=cfg.io_dtype, buffer=nl.sbuf, align=cfg.align
             )
 
-        for h_block_idx in affine_range(num_h_blocks_per_prg):
+        for h_block_idx in nl.affine_range(num_h_blocks_per_prg):
             cur_h_block_size = h_block_sizes[h_block_idx]
             cur_h_block_offset = h_block_offsets[h_block_idx]
             w_slot = h_block_idx % num_w_h_blocks
@@ -1422,7 +1420,7 @@ def _output_projection_tkg_impl(
                 global_psum_idx = 0 if global_psum_idx + 1 >= NUM_PSUM_BANKS else global_psum_idx + 1
 
                 if not cfg.use_double_row:
-                    for head_idx in affine_range(cfg.n_size):
+                    for head_idx in nl.affine_range(cfg.n_size):
                         stationary = attn_shuffled[
                             :, nl.ds(head_idx * bxs_size + bxs_block.start_offset, bxs_block.size)
                         ]
@@ -1438,7 +1436,7 @@ def _output_projection_tkg_impl(
                                 tile_size=(cfg.d_size, col_tiling_dim),
                             )
                 else:
-                    for head_idx in affine_range(cfg.n_size // 2):
+                    for head_idx in nl.affine_range(cfg.n_size // 2):
                         stationary = attn_shuffled[
                             :, :, nl.ds(head_idx * bxs_size + bxs_block.start_offset, bxs_block.size)
                         ]
@@ -1447,7 +1445,10 @@ def _output_projection_tkg_impl(
                             f_size = min(F_MAX, h_block_f_tile_group.size - col_idx * F_MAX)
                             moving = w_sbuf_blocks[w_slot][head_idx][:, :, nl.ds(f_offset, f_size)]
                             nisa.nc_matmul(
-                                res_psum[:, 0:f_size], stationary, moving, perf_mode=matmul_perf_mode.double_row
+                                res_psum[:, 0:f_size],
+                                stationary,
+                                moving,
+                                perf_mode=nisa.matmul_perf_mode.double_row,
                             )
 
                 # Evict each column tile independently — no reduction needed
@@ -1691,7 +1692,7 @@ def _output_projection_tkg_transpose_out_impl(
 
     # Preload all weight blocks if they fit
     if all_weights_preloaded:
-        for h2_block_idx in affine_range(num_h2_blocks):
+        for h2_block_idx in nl.affine_range(num_h2_blocks):
             _load_weight_h2_block(
                 w_sbuf_slots[h2_block_idx],
                 w_shard_hbm,
@@ -1709,7 +1710,7 @@ def _output_projection_tkg_transpose_out_impl(
         full_out_sb = None
 
     sbm.open_scope(interleave_degree=out_sb_interleave_degree, name="h2_block_loop")
-    for h2_block_idx in affine_range(num_h2_blocks):
+    for h2_block_idx in nl.affine_range(num_h2_blocks):
         cur_h_2_block_size = h_2_block_sizes[h2_block_idx]
         cur_h_2_block_offset = h_2_block_offsets[h2_block_idx]
         w_slot = h2_block_idx % num_w_h2_slots
@@ -1757,7 +1758,7 @@ def _output_projection_tkg_transpose_out_impl(
             NUM_BS_PER_PSUM_BANK = 1
             NUM_PSUM_TILES = cur_h_2_block_size * NUM_PSUM_BANKS_PER_BS
 
-        for psum_tile_idx in affine_range(NUM_PSUM_TILES):
+        for psum_tile_idx in nl.affine_range(NUM_PSUM_TILES):
             # Compute h_2_local (within this block) and bs_tile_idx from psum_tile_idx
             if bxs_size <= F_MAX:
                 h_2_local_base = psum_tile_idx * NUM_BS_PER_PSUM_BANK
@@ -1778,14 +1779,14 @@ def _output_projection_tkg_transpose_out_impl(
             )
 
             # Accumulate attn @ weight blocks for all heads
-            for bs_group_idx in affine_range(NUM_BS_PER_PSUM_BANK):
+            for bs_group_idx in nl.affine_range(NUM_BS_PER_PSUM_BANK):
                 h_2_local_idx = h_2_local_base + bs_group_idx
 
                 psum_f_offset = bs_group_idx * bxs_size if bxs_size <= F_MAX else 0
                 curr_bxs_size = bxs_size if bxs_size <= F_MAX else bxs_tile_size
 
                 if not cfg.use_double_row:
-                    for head_idx in affine_range(cfg.n_size):
+                    for head_idx in nl.affine_range(cfg.n_size):
                         moving = attn_shuffled[:, nl.ds(head_idx * bxs_size + bxs_tile_offset, curr_bxs_size)]
                         # w_sbuf[d, n, h_1*max_h_2_block] -> select head -> reshape to [d, h_1, max_h_2_block] -> select h_2_local_idx
                         # Clamp index to valid range; the if-guard below skips the matmul for out-of-range indices
@@ -1802,7 +1803,7 @@ def _output_projection_tkg_transpose_out_impl(
                                 moving=moving,
                             )
                 else:
-                    for head_idx in affine_range(cfg.n_size // 2):
+                    for head_idx in nl.affine_range(cfg.n_size // 2):
                         moving = attn_shuffled[:, :, nl.ds(head_idx * bxs_size + bxs_tile_offset, curr_bxs_size)]
                         # w_sbuf[d, n, h_1*max_h_2_block] -> slice 2 heads -> reshape to [d, 2, h_1, max_h_2_block] -> select h_2_local_idx
                         clamped_h_2_idx = min(h_2_local_idx, max_h_2_block_size - 1)
@@ -1816,7 +1817,7 @@ def _output_projection_tkg_transpose_out_impl(
                                 dst=res_psum[:, nl.ds(psum_f_offset, curr_bxs_size)],
                                 stationary=stationary,
                                 moving=moving,
-                                perf_mode=matmul_perf_mode.double_row,
+                                perf_mode=nisa.matmul_perf_mode.double_row,
                             )
 
             # The number of h_2 matmul result groups (each of size B×S) packed per PSUM bank

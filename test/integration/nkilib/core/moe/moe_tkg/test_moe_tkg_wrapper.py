@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import nki.isa as nisa
 import nki.language as nl
 from nkilib_src.nkilib.core.moe import moe_tkg
@@ -22,23 +24,23 @@ from nkilib_src.nkilib.core.utils.common_types import (
 
 
 def moe_tkg_sbuf_io_wrapper(
-    hidden_input: nl.ndarray,
-    gate_up_weights: nl.ndarray,
-    down_weights: nl.ndarray,
-    expert_affinities: nl.ndarray,
-    expert_index: nl.ndarray,
+    hidden_input: nl.NkiTensor,
+    gate_up_weights: nl.NkiTensor,
+    down_weights: nl.NkiTensor,
+    expert_affinities: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
     is_all_expert: bool,
-    rank_id: nl.ndarray = None,
-    gate_up_weights_bias: nl.ndarray = None,
-    down_weights_bias: nl.ndarray = None,
+    rank_id: Optional[nl.NkiTensor] = None,
+    gate_up_weights_bias: Optional[nl.NkiTensor] = None,
+    down_weights_bias: Optional[nl.NkiTensor] = None,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
     activation_fn: ActFnType = ActFnType.SiLU,
-    gate_clamp_upper_limit: float = None,
-    gate_clamp_lower_limit: float = None,
-    up_clamp_upper_limit: float = None,
-    up_clamp_lower_limit: float = None,
+    gate_clamp_upper_limit: float | None = None,
+    gate_clamp_lower_limit: float | None = None,
+    up_clamp_upper_limit: float | None = None,
+    up_clamp_lower_limit: float | None = None,
     mask_unselected_experts: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Wrapper to test all-expert MoE with SBUF input."""
     T, H = hidden_input.shape
     E = gate_up_weights.shape[0]
@@ -58,8 +60,8 @@ def moe_tkg_sbuf_io_wrapper(
 
     # Load this shard's portion: (T, H) -> (T, h_num_shards, H0, H1_shard) -> select shard -> (H0, T, H1_shard)
     input_view = (
-        hidden_input.reshape_dim(dim=1, shape=[h_num_shards, H0, H1_shard])
-        .permute(dims=[2, 0, 1, 3])
+        hidden_input.reshape_dim(dim=1, shape=(h_num_shards, H0, H1_shard))
+        .permute(dims=(2, 0, 1, 3))
         .select(dim=2, index=h_shard_id)
     )
 
@@ -108,8 +110,8 @@ def moe_tkg_sbuf_io_wrapper(
     # (T, H) -> (T, h_num_shards, H0, H1_shard) -> (H0, T, h_num_shards, H1_shard) -> (H0, T, H1_shard)
     output = nl.ndarray((T, H), dtype=hidden_input.dtype, buffer=nl.shared_hbm)
     output_view = (
-        output.reshape_dim(dim=1, shape=[h_num_shards, H0, H1_shard])  # (T, h_num_shards, H0, H1_shard)
-        .permute(dims=[2, 0, 1, 3])  # (H0, T, h_num_shards, H1_shard)
+        output.reshape_dim(dim=1, shape=(h_num_shards, H0, H1_shard))  # (T, h_num_shards, H0, H1_shard)
+        .permute(dims=(2, 0, 1, 3))  # (H0, T, h_num_shards, H1_shard)
         .select(dim=2, index=h_shard_id)  # (H0, T, H1_shard)
         .slice(dim=1, start=T_offset, end=T_offset + T_shard)  # (H0, T_shard, H1_shard)
     )

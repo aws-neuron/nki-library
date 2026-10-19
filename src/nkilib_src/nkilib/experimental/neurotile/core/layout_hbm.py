@@ -273,10 +273,60 @@ class HBMLayout(nl.NKIObject):
         """HBM views have no tile-local data; returns None."""
         return None
 
+    def _ap_levels(self, grid):
+        """Emitted ``[stride, count]`` levels, so validation and issue share one pattern."""
+        return APEmitter.emit(grid.axes, self.strides, self.addressable_extents(grid))
+
     def ap(self, grid):
         """Build the N-D HBM access pattern from grid.axes + self.strides."""
-        levels = APEmitter.emit(grid.axes, self.strides, self.addressable_extents(grid))
-        return HBMLayout._apply_ap(self.source, self.offset, levels, self.indirect)
+        return HBMLayout._apply_ap(self.source, self.offset, self._ap_levels(grid), self.indirect)
+
+    def _assert_region_is_transferable(self, grid):
+        """Reject a region no single access pattern can express -- a DMA of it
+        would read past the end of the tensor.
+
+        A precondition of *transferring*, not of describing, which is why the
+        DMA paths ask rather than :meth:`ap`: ``NDSlice.__init__`` builds an
+        ``ap`` for every view, and describing a partially tiled region (then
+        descending into it, where each tile is exact) is legal.
+
+        One pattern is a rectangle, so "N full tiles then a short one" is not
+        expressible. A free axis escapes this -- merge-contiguous collapses the
+        tile and element walks into one clamped level -- but the partition axis
+        cannot merge the two, so the tail tile stays rounded up to full size.
+
+        Sharded and gather views legitimately do not cover a dense region, so
+        only plain remainder grids are checked.
+        """
+        if not grid.is_remainder or self.indirect is not None or grid.has_any_gapped_axis():
+            return
+        levels = self._ap_levels(grid)
+        walked = 1
+        for level in levels:
+            walked = walked * level[1]
+        region = 1
+        for extent in self.sbuf_load_extents(grid):
+            region = region * extent
+        if not isinstance(walked, int) or not isinstance(region, int) or walked == region:
+            return
+        assert walked <= region, (
+            "NeuroTile: this partial region cannot be transferred as one DMA. Its access "
+            "pattern would cover " + str(walked) + " elements but the region holds only " + str(region) + " ("
+            "extent="
+            + str(self.sbuf_load_extents(grid))
+            + ", tile_size="
+            + str(grid.tile_size)
+            + ", pattern="
+            + str(levels)
+            + "), so the transfer would run past the end of the tensor.\n"
+            "Cause: the region spans more than one tile AND its last tile is partial, on a "
+            "dimension whose tile walk cannot be merged into the element walk (the partition "
+            "axis). A single access pattern cannot describe 'N full tiles then a short one'.\n"
+            "Fixes, cheapest first: (1) load/store the tiles of this region individually "
+            "instead of coalescing them -- each tile is a valid region on its own; (2) pick a "
+            "block_size that divides the tile count, so the trailing block holds only whole "
+            "tiles; (3) pick a tile_size that divides the extent, so no tile is partial."
+        )
 
     # ================================================================
     # Load / store
@@ -296,6 +346,7 @@ class HBMLayout(nl.NKIObject):
         priority=None,
         pattern_override=None,
         engine=None,
+        name=None,
     ):
         """Load from HBM to SBUF. Returns (Grid, SBUFLayout)."""
         load_dtype = dtype if dtype is not None else self.dtype
@@ -317,6 +368,7 @@ class HBMLayout(nl.NKIObject):
                 oob_mode=oob_mode,
                 oob_value=oob_value,
                 priority=priority,
+                name=name,
             )
 
         remaining = grid.remaining
@@ -358,6 +410,7 @@ class HBMLayout(nl.NKIObject):
             dge_mode,
             priority,
             engine=engine,
+            name=name,
         )
 
         return HBMLayout._wrap_sbuf_load(
@@ -370,14 +423,17 @@ class HBMLayout(nl.NKIObject):
             out_shape=out_shape,
         )
 
-    def store(self, data, grid, oob_mode=None, dge_mode=None, priority=None, pattern_override=None, engine=None):
+    def store(
+        self, data, grid, oob_mode=None, dge_mode=None, priority=None, pattern_override=None, engine=None, name=None
+    ):
         """Build HBM AP, issue DMA from SBUF to HBM."""
         if pattern_override is not None:
             hbm_ap = HBMLayout._apply_ap(self.source, self.offset, pattern_override, self.indirect)
         else:
+            self._assert_region_is_transferable(grid)
             hbm_ap = self.ap(grid)
         HBMLayout._dma_copy(
-            dst=hbm_ap, src=data, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine
+            dst=hbm_ap, src=data, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine, name=name
         )
 
     def sbuf_shape_for(self, grid):
@@ -479,6 +535,43 @@ class HBMLayout(nl.NKIObject):
             result.append(min(owned[d], self.dim_addressable(d, grid)))
         return tuple(result)
 
+    def matched_sbuf_ap(self, sbuf, grid):
+        """SBUF pattern over ``sbuf`` matching this region's HBM AP element-for-element.
+
+        Counts come from the addressable region (:meth:`sbuf_load_extents`),
+        strides from ``sbuf`` -- so the buffer may be larger than the region,
+        which is how a whole-block slot serves a partial trailing block.
+        """
+        owned = grid.owned_extents()
+        effective_tile_size, _ = HBMLayout.compute_effective_tiles(
+            grid.remaining,
+            grid.tile_size,
+            owned_extents=owned,
+        )
+        _, p_tiles = HBMLayout.compute_sbuf_alloc(
+            grid.remaining,
+            grid.tile_size,
+            owned_extents=owned,
+        )
+        return SBUFLayout._build_ap(sbuf, self.sbuf_load_extents(grid), effective_tile_size[0], p_tiles)
+
+    def slot_ap(self, sbuf, grid, out_shape=None):
+        """SBUF operand for a buffer whose size the *library* chose, not the region.
+
+        Used in both directions -- ``load()`` for its destination,
+        ``BlockStream.store()`` for its source -- so a slot's write-back is the
+        exact reverse of the load that filled it. Two independently derived
+        patterns could agree on element *count* while disagreeing on element
+        *order*, which no size assert would catch.
+
+        Kernels need no equivalent: an ordinary ``load()`` returns a buffer
+        already sized to its region.
+        """
+        if out_shape is not None:
+            # Buffer is exactly out_shape; walk it as one contiguous tile.
+            return SBUFLayout._build_ap(sbuf, tuple(out_shape), out_shape[0], 1, None, None)
+        return self.matched_sbuf_ap(sbuf, grid)
+
     def is_remainder(self, grid):
         """True when this view sits on a partial trailing tile.
 
@@ -545,7 +638,9 @@ class HBMLayout(nl.NKIObject):
         return tuple(remaining), p_tiles
 
     @staticmethod
-    def load_partition_fold(layout, grid, recipe, dtype, dge_mode, oob_mode=None, priority=None, engine=None):
+    def load_partition_fold(
+        layout, grid, recipe, dtype, dge_mode, oob_mode=None, priority=None, engine=None, name=None
+    ):
         """Load with K separate DMAs for partition fold. Returns (Grid, SBUFLayout)."""
         sbuf_buffer = HBMLayout._partition_fold_load_dma(
             layout.source,
@@ -557,6 +652,7 @@ class HBMLayout(nl.NKIObject):
             oob_mode=oob_mode,
             priority=priority,
             engine=engine,
+            name=name,
         )
         return SBUFLayout.build_view(
             sbuf_buffer,
@@ -568,7 +664,7 @@ class HBMLayout(nl.NKIObject):
 
     @staticmethod
     def store_partition_fold(
-        source, offset, fold_recipe, element_shape, data, dge_mode, priority=None, oob_mode=None, engine=None
+        source, offset, fold_recipe, element_shape, data, dge_mode, priority=None, oob_mode=None, engine=None, name=None
     ):
         """Store with K separate DMAs for partition fold."""
         K, P_per_slice, fold_stride, base_pattern = fold_recipe
@@ -586,7 +682,13 @@ class HBMLayout(nl.NKIObject):
                 offset=sbuf_offset,
             )
             HBMLayout._dma_copy(
-                dst=hbm_ap, src=sbuf_ap, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine
+                dst=hbm_ap,
+                src=sbuf_ap,
+                oob_mode=oob_mode,
+                dge_mode=dge_mode,
+                priority=priority,
+                engine=engine,
+                name=None if name is None else name + "_k" + str(k),
             )
 
     # ================================================================
@@ -605,7 +707,16 @@ class HBMLayout(nl.NKIObject):
     # ================================================================
 
     def _load_transpose(
-        self, grid, dtype, dst=None, transpose_axes=None, dge_mode=None, oob_mode=None, oob_value=None, priority=None
+        self,
+        grid,
+        dtype,
+        dst=None,
+        transpose_axes=None,
+        dge_mode=None,
+        oob_mode=None,
+        oob_value=None,
+        priority=None,
+        name=None,
     ):
         """DMA transpose path. Returns (Grid, SBUFLayout).
 
@@ -624,6 +735,7 @@ class HBMLayout(nl.NKIObject):
                 oob_mode=oob_mode,
                 oob_value=oob_value,
                 priority=priority,
+                name=name,
             )
             return SBUFLayout.build_view(sbuf, packed_shape, packed_shape, dtype, sbuf_buffer_type())
 
@@ -645,6 +757,7 @@ class HBMLayout(nl.NKIObject):
             oob_mode=oob_mode,
             oob_value=oob_value,
             priority=priority,
+            name=name,
         )
         # Preserve the tile grid across the transpose (axis-swap): the packed SBUF
         # buffer holds one transposed tile per source tile, laid out along the free
@@ -665,7 +778,16 @@ class HBMLayout(nl.NKIObject):
         )
 
     def _gather_transpose(
-        self, grid, dtype, transpose_axes=None, dst=None, dge_mode=None, oob_mode=None, oob_value=None, priority=None
+        self,
+        grid,
+        dtype,
+        transpose_axes=None,
+        dst=None,
+        dge_mode=None,
+        oob_mode=None,
+        oob_value=None,
+        priority=None,
+        name=None,
     ):
         """Indirect (gather) transpose via nisa.dma_transpose with a vector_offset
         AP. ``transpose_axes`` selects the rank (validated at the NDSlice.load
@@ -704,6 +826,7 @@ class HBMLayout(nl.NKIObject):
             oob_mode=oob_mode,
             priority=priority,
             axes=transpose_axes,
+            name=name,
         )
         ones = []
         for _ in range(len(transposed_shape)):
@@ -762,6 +885,7 @@ class HBMLayout(nl.NKIObject):
         dge_mode,
         priority,
         engine=None,
+        name=None,
     ):
         """Build HBM + SBUF APs and issue DMA copy.
 
@@ -775,27 +899,20 @@ class HBMLayout(nl.NKIObject):
         if pattern_override is not None:
             hbm_ap = HBMLayout._apply_ap(self.source, self.offset, pattern_override, self.indirect)
         else:
+            self._assert_region_is_transferable(grid)
             hbm_ap = self.ap(grid)
 
-        if out_shape is not None:
-            # Custom load: SBUF buffer is exactly out_shape; walk it as a
-            # single contiguous tile rather than re-using the HBM grid's
-            # tile structure.
-            sbuf_remaining = tuple(out_shape)
-            sbuf_tile_p = out_shape[0]
-            sbuf_p_tiles = 1
-            ets = None
-            ts = None
+        if pattern_override is None and dst is None and out_shape is None:
+            # Library-allocated destination: matched tile structure.
+            sbuf_ap = SBUFLayout._build_ap(
+                sbuf, self.sbuf_load_extents(grid), tile_p, p_tiles, effective_tile_size, tile_shape
+            )
         else:
-            sbuf_remaining = self.sbuf_load_extents(grid)
-            sbuf_tile_p = tile_p
-            sbuf_p_tiles = p_tiles
-            use_matched = pattern_override is None and dst is None
-            ets = effective_tile_size if use_matched else None
-            ts = tile_shape if use_matched else None
-        sbuf_ap = SBUFLayout._build_ap(sbuf, sbuf_remaining, sbuf_tile_p, sbuf_p_tiles, ets, ts)
+            # Buffer sized by the library, not the region (rotating slot, caller
+            # dst, or an explicit out_shape). Shared with BlockStream.store.
+            sbuf_ap = self.slot_ap(sbuf, grid, out_shape)
         HBMLayout._dma_copy(
-            dst=sbuf_ap, src=hbm_ap, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine
+            dst=sbuf_ap, src=hbm_ap, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine, name=name
         )
 
     def _resolve_sbuf(self, dst, out_shape, default_shape, dtype):
@@ -830,7 +947,7 @@ class HBMLayout(nl.NKIObject):
         )
 
     @staticmethod
-    def _dma_copy(dst, src, oob_mode=None, dge_mode=None, priority=None, engine=None):
+    def _dma_copy(dst, src, oob_mode=None, dge_mode=None, priority=None, engine=None, name=None):
         """Issue nisa.dma_copy; None args map to each op's native default.
 
         ``engine`` selects the HWDGE descriptor-generation engine
@@ -843,7 +960,9 @@ class HBMLayout(nl.NKIObject):
             dge_mode = nisa.dge_mode.unknown
         if engine is None:
             engine = nisa.engine.unknown
-        nisa.dma_copy(dst=dst, src=src, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine)
+        nisa.dma_copy(
+            dst=dst, src=src, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine, name=name
+        )
 
     @staticmethod
     def _f_chunks(f_dim):
@@ -871,6 +990,7 @@ class HBMLayout(nl.NKIObject):
         oob_mode=None,
         oob_value=None,
         priority=None,
+        name=None,
     ):
         """Transpose-load an HBM (p_dim, f_dim) tile into SBUF via nisa.dma_transpose.
 
@@ -906,8 +1026,17 @@ class HBMLayout(nl.NKIObject):
         rows = f_dim if num_chunks == 1 else MAX_SBUF_PARTITION_ROWS
         transposed_shape = (rows, p_dim * num_chunks)
         if dst is not None:
-            assert tuple(dst.shape) == transposed_shape, (
-                "transpose load dst shape " + str(tuple(dst.shape)) + " != expected " + str(transposed_shape)
+            dst_shape = tuple(dst.shape)
+            assert (
+                len(dst_shape) == len(transposed_shape)
+                and dst_shape[0] >= transposed_shape[0]
+                and dst_shape[-1] >= transposed_shape[-1]
+            ), (
+                "transpose load dst shape "
+                + str(dst_shape)
+                + " cannot hold the transposed region "
+                + str(transposed_shape)
+                + " (each dim must be >= the region's)."
             )
             sbuf = dst
         else:
@@ -939,6 +1068,7 @@ class HBMLayout(nl.NKIObject):
                 dge_mode=dge_mode,
                 oob_mode=oob_mode,
                 priority=priority,
+                name=name,
             )
         # (b) Single sub-128 chunk (F < 128) -> its own column block.
         if num_chunks > num_full:
@@ -956,6 +1086,7 @@ class HBMLayout(nl.NKIObject):
                 dge_mode=dge_mode,
                 oob_mode=oob_mode,
                 priority=priority,
+                name=name,
             )
         return sbuf
 
@@ -972,6 +1103,7 @@ class HBMLayout(nl.NKIObject):
         oob_mode=None,
         priority=None,
         axes=None,
+        name=None,
     ):
         """Build APs and issue nisa.dma_transpose; None args map to nisa defaults.
         axes=(1, 0) is required for the indirect (gather) transpose.
@@ -985,11 +1117,22 @@ class HBMLayout(nl.NKIObject):
             dge_mode = nisa.dge_mode.unknown
         if oob_mode is None:
             oob_mode = nisa.oob_mode.error
-        nisa.dma_transpose(dst=sbuf_ap, src=hbm_ap, axes=axes, dge_mode=dge_mode, oob_mode=oob_mode, priority=priority)
+        nisa.dma_transpose(
+            dst=sbuf_ap, src=hbm_ap, axes=axes, dge_mode=dge_mode, oob_mode=oob_mode, priority=priority, name=name
+        )
 
     @staticmethod
     def _partition_fold_load_dma(
-        source, offset, fold_recipe, element_shape, dtype, dge_mode, oob_mode=None, priority=None, engine=None
+        source,
+        offset,
+        fold_recipe,
+        element_shape,
+        dtype,
+        dge_mode,
+        oob_mode=None,
+        priority=None,
+        engine=None,
+        name=None,
     ):
         """Load with K separate DMAs for partition fold. Returns SBUF ndarray."""
         K, P_per_slice, fold_stride, base_pattern = fold_recipe
@@ -1009,7 +1152,13 @@ class HBMLayout(nl.NKIObject):
                 offset=sbuf_offset,
             )
             HBMLayout._dma_copy(
-                dst=sbuf_ap, src=hbm_ap, oob_mode=oob_mode, dge_mode=dge_mode, priority=priority, engine=engine
+                dst=sbuf_ap,
+                src=hbm_ap,
+                oob_mode=oob_mode,
+                dge_mode=dge_mode,
+                priority=priority,
+                engine=engine,
+                name=None if name is None else name + "_k" + str(k),
             )
         return sbuf
 

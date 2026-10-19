@@ -178,7 +178,7 @@ def get_floor_aligned_size(size: int, alignment_multiple: int) -> int:
     return get_floor_quotient(size, alignment_multiple) * alignment_multiple
 
 
-def is_hbm_buffer(tensor: nl.ndarray) -> bool:
+def is_hbm_buffer(tensor: nl.NkiTensor) -> bool:
     """Check if tensor buffer is any HBM type (hbm, shared_hbm, private_hbm)."""
     return tensor.buffer in (nl.hbm, nl.shared_hbm, nl.private_hbm)
 
@@ -612,7 +612,7 @@ def resolve_dtype_to_nki(dtype):
 
 
 def _sbm_alloc(sbm, shape, dtype, buffer=nl.sbuf, name=None, align=None):
-    """Allocate SBUF tensor via SbufManager if available, else fall back to nl.ndarray."""
+    """Allocate SBUF tensor via SbufManager if available, else fall back to nl.NkiTensor."""
     if sbm is not None:
         return sbm.alloc_stack(shape=shape, dtype=dtype, buffer=buffer, name=name, align=align)
     return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=name)

@@ -106,7 +106,7 @@ def _build_kernel_input(
     batch: int,
     seqlen: int,
     hidden_dim: int,
-    dtype: type,
+    dtype: str,
     lower_bound: float,
     tensor_gen: Callable,
     quant_type: QuantizationType,
@@ -184,6 +184,8 @@ _LNC_TEST_PARAMS = [
     (160, False, QuantizationType.STATIC, gaussian_tensor_generator(), 0.0, 2, 1, 16384),
     (160, False, QuantizationType.STATIC, gaussian_tensor_generator(), 0.0, 2, 1, 16384),
     (160, True, QuantizationType.STATIC, gaussian_tensor_generator(), 0.0, 2, 1, 16384),
+    # 10 tiles per core with a small hidden size: exercises the shared squared-scratch path in simulation
+    (2560, False, QuantizationType.STATIC, gaussian_tensor_generator(), 0.0, 2, 1, 1024),
 ]
 
 
@@ -204,6 +206,7 @@ def _lnc_with_fast_keys(fast_keys):
 _LNC_TEST_PARAMS_LNC_UNIT_FAST = _lnc_with_fast_keys(
     {
         (128 // 64, True, QuantizationType.ROW),
+        (2560, False, QuantizationType.STATIC),
     }
 )
 _LNC_TEST_PARAMS_FUSED_RESIDUAL_FAST = _lnc_with_fast_keys(
@@ -255,7 +258,7 @@ class TestRmsNormQuantKernel:
         batch: int,
         seqlen: int,
         hidden: int,
-        dtype: type,
+        dtype: str,
         lnc_degree: int,
         lower_bound: float,
         tensor_gen: Callable,
@@ -310,10 +313,18 @@ class TestRmsNormQuantKernel:
                 hidden=hidden,
                 ln_w=ln_w,
                 kargs=kargs,
-                input_dequant_scale=input_dequant_scale,
-                pre_norm_gamma=pre_norm_gamma,
-                residual=residual,
                 dtype_mode=resolved_dtype_mode,
+                # The optional tensors are only present for the flags this case enables;
+                # forward just the ones the input generator produced.
+                **{
+                    name: tensor
+                    for name, tensor in (
+                        ("input_dequant_scale", input_dequant_scale),
+                        ("pre_norm_gamma", pre_norm_gamma),
+                        ("residual", residual),
+                    )
+                    if tensor is not None
+                },
             )
             ref_extras["dequant_scale"] = result["dequant_scale"]
             out = {"out": result["norm_quant"]}
@@ -326,17 +337,17 @@ class TestRmsNormQuantKernel:
 
             class _Validator(CustomValidator):
                 @override
-                def validate(self, actual_raw_output: npt.NDArray[Any]) -> bool:
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
                     if quant_type == QuantizationType.ROW:
                         full_fp8 = np.frombuffer(
-                            actual_raw_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
+                            inference_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
                         ).reshape(batch, seqlen, hidden + 4)
                         norm_out_hw_fp8 = full_fp8[:, :, :hidden]
                         last_4_contiguous = np.ascontiguousarray(full_fp8[:, :, hidden : hidden + 4])
                         norm_deq_scale_hw = last_4_contiguous.view(dtype=np.float32).reshape(batch, seqlen, 1)
                     else:
                         norm_out_hw_fp8 = np.frombuffer(
-                            actual_raw_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
+                            inference_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype
                         ).reshape(batch, seqlen, hidden)
 
                     passed = maxAllClose(
@@ -366,8 +377,8 @@ class TestRmsNormQuantKernel:
 
                 class _ResidualValidator(CustomValidator):
                     @override
-                    def validate(self, actual_raw_output: npt.NDArray[Any]) -> bool:
-                        hw_residual = np.frombuffer(actual_raw_output.view(dtype=nl.bfloat16), dtype=dtype).reshape(
+                    def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                        hw_residual = np.frombuffer(inference_output.view(dtype=nl.bfloat16), dtype=dtype).reshape(
                             batch, seqlen, hidden
                         )
                         return maxAllClose(
@@ -438,6 +449,129 @@ class TestRmsNormQuantKernel:
             tensor_gen=effective_gen,
             quant_type=quant_type,
             quant_only=quant_only,
+        )
+
+    @pytest.mark.fast
+    def test_rmsnorm_quant_only_no_norm_single_core(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        collector: IMetricsCollector,
+    ):
+        """NO_NORM (quant-only) path on the single-core (lnc=1) route at a sim-runnable small shape.
+
+        The larger quant-only cases in ``_LNC_TEST_PARAMS`` all use hidden=16384, whose id substring
+        makes the simulator skip them. This small-hidden case runs in simulation and exercises the
+        ``needs_rms_normalization() == False`` arcs (skip normalization in validation and in the
+        single-core tile loop).
+        """
+        self._run_test(
+            test_manager,
+            platform_target,
+            collector,
+            batch=1,
+            seqlen=128,
+            hidden=512,
+            dtype=nl.bfloat16,
+            lnc_degree=1,
+            lower_bound=0.0,
+            tensor_gen=gaussian_tensor_generator(),
+            quant_type=QuantizationType.ROW,
+            quant_only=True,
+        )
+
+    @pytest.mark.fast
+    def test_rmsnorm_quant_2d_input(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        collector: IMetricsCollector,
+    ):
+        """2D ``[outer_dim, hidden]`` input at a sim-runnable small shape.
+
+        Every other case feeds a 3D ``[B, S, H]`` tensor, so the 2D-input validation path
+        (``len(hidden.shape) == 2``) is never taken. The kernel explicitly supports rank >= 2 by
+        collapsing all leading dimensions, so this exercises that path end-to-end.
+        """
+        outer_dim = 128
+        hidden = 512
+        dtype = nl.bfloat16
+        quant_np_dtype = dt.float8_e4m3  # NON_OCP path
+
+        def input_generator(_):
+            gen = gaussian_tensor_generator()
+            return {
+                "hidden": gen(shape=(outer_dim, hidden), dtype=dtype, name="hidden"),
+                "ln_w": gen(shape=[hidden], dtype=dtype, name="gamma"),
+                "kargs": RmsNormQuantKernelArgs(
+                    quantization_type=QuantizationType.ROW,
+                    lower_bound=0.0,
+                    norm_type=NormType.RMS_NORM,
+                    eps=1e-6,
+                ),
+            }
+
+        ref_extras: dict[str, Any] = {}
+
+        @torch_ref_wrapper
+        def _torch_ref(
+            hidden,
+            ln_w,
+            kargs,
+            input_dequant_scale=None,  # noqa: ARG001 - present to match kernel signature; unused on the ROW 2D path
+            pre_norm_gamma=None,  # noqa: ARG001 - present to match kernel signature
+            residual=None,  # noqa: ARG001 - present to match kernel signature
+            dtype_mode=DtypeMode.NON_OCP,  # noqa: ARG001 - present to match kernel signature; dtype fixed NON_OCP above
+        ):
+            result = rmsnorm_quant_torch_ref(hidden=hidden, ln_w=ln_w, kargs=kargs, dtype_mode=DtypeMode.NON_OCP)
+            ref_extras["dequant_scale"] = result["dequant_scale"]
+            return {"out": result["norm_quant"]}
+
+        def _comparator(golden_dict, output_tensors):
+            norm_out_golden = golden_dict["out"]
+
+            class _Validator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]) -> bool:
+                    full_fp8 = np.frombuffer(inference_output.view(dtype=nl.bfloat16), dtype=quant_np_dtype).reshape(
+                        outer_dim, hidden + 4
+                    )
+                    norm_out_hw_fp8 = full_fp8[:, :hidden]
+                    last_4_contiguous = np.ascontiguousarray(full_fp8[:, hidden : hidden + 4])
+                    norm_deq_scale_hw = last_4_contiguous.view(dtype=np.float32).reshape(outer_dim, 1)
+                    passed = maxAllClose(
+                        dt.static_cast(norm_out_hw_fp8, np.float32),
+                        dt.static_cast(norm_out_golden, np.float32),
+                        rtol=0.072,
+                        verbose=1,
+                    )
+                    passed &= maxAllClose(
+                        norm_deq_scale_hw,
+                        ref_extras["dequant_scale"],
+                        rtol=0.007,
+                        verbose=1,
+                    )
+                    return passed
+
+            return {
+                "out": CustomValidatorWithOutputTensorData(
+                    validator=_Validator,
+                    output_ndarray=output_tensors["out"],
+                )
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=rmsnorm_quant_kernel,
+            torch_ref=_torch_ref,
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=lambda _: {"out": np.ndarray(shape=[outer_dim, hidden + 4], dtype=quant_np_dtype)},
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=1, platform_target=platform_target),
+            custom_comparator=_comparator,
         )
 
     @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])

@@ -23,7 +23,7 @@ from ...core.utils.kernel_assert import kernel_assert
 
 @nki.jit
 def build_all_to_all_v_metadata(
-    expert_index: nl.ndarray,
+    expert_index: nl.NkiTensor,
     replica_group_size: int,
     E: int,
     recv_counts_known: bool = False,
@@ -40,14 +40,14 @@ def build_all_to_all_v_metadata(
         E: Total number of global experts.
 
     Args:
-        expert_index (nl.ndarray): [T, K] int32 HBM tensor indicating the K experts each token is routed to.
+        expert_index (nl.NkiTensor): [T, K] int32 HBM tensor indicating the K experts each token is routed to.
         replica_group_size (int): Size of replica group for all_to_all_v collective.
         E (int): Number of global experts.
         recv_counts_known (bool): Not currently supported; when True, metadata includes recv counts.
         has_rdispls (bool): Not currently supported; when True, metadata includes recv displacements.
 
     Returns:
-        metadata_hbm (nl.ndarray): [n_rows, replica_group_size] uint32 HBM tensor.
+        metadata_hbm (nl.NkiTensor): [n_rows, replica_group_size] uint32 HBM tensor.
             n_rows is 4 when has_rdispls=True, 3 otherwise.
             Row 0: send counts, Row 1: send displacements, Row 2: recv counts (zeros), Row 3 (optional): recv displacements (zeros).
     """

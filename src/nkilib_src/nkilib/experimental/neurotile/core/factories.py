@@ -19,6 +19,7 @@ from ._helpers import (
     buffer_space,
     contiguous_strides,
     hbm_buffer_type,
+    p_tile_count,
     physical_strides,
     product,
 )
@@ -29,6 +30,7 @@ from ._validation import (
     _validate_block_size_rank,
     _validate_source,
     _validate_tiles_args,
+    _validate_view_like_args,
 )
 from .axis import Axis, AxisLabel
 from .grid import Grid
@@ -881,8 +883,8 @@ def alloc_tiles(
     else:
         # SBUF / PSUM allocation -- flat 2D (P-tiles fold into F-columns)
         if element_shape is not None:
-            p_tiles = (element_shape[0] + tile_p - 1) // tile_p
-            actual_f = product(element_shape, start=1) * p_tiles
+            # P-tiles fold into F, so each contributes a full element_shape[1:] walk.
+            actual_f = product(element_shape, start=1) * p_tile_count(element_shape[0], tile_p)
             sbuf = nl.ndarray((tile_p, actual_f), dtype=dtype, buffer=buffer_type)
             view_element_shape = element_shape
         else:
@@ -1036,6 +1038,61 @@ def alloc_blocks(
     return _prepend_block_level(flat, tuple(block_size))
 
 
+def view_like(src: NDSlice, storage: Any, dtype=None) -> NDSlice:
+    """view_like(src, storage, dtype=None) -> NDSlice
+
+    View caller-owned SBUF ``storage`` with ``src``'s logical tile structure. No data is
+    moved and no memory is allocated.
+
+    This is how one buffer serves regions of differing extent. ``alloc_tiles`` fixes the
+    extent at allocation, so a buffer sized for the largest region reports that size for
+    every region it later holds -- including a shorter one, whose trailing partial tile
+    would then claim to be full. ``view_like`` states the extent per use instead, so a
+    rotating buffer can back a short trailing block without a second allocation and
+    without padding a compute operand.
+
+    .. warning::
+
+       This API is experimental and may change in future releases.
+
+    Args:
+        src (NDSlice): The tiled view whose ``element_shape`` and ``tile_size`` to mirror.
+            Required.
+        storage (nl.NkiTensor | NDSlice): Flat 2-D SBUF storage to view, at least as large
+            as ``src``'s extent needs (the sizing ``alloc_tiles`` performs). An ``NDSlice``
+            is accepted for convenience -- its underlying buffer is used, not its extent.
+            Required.
+        dtype: Element dtype. Defaults to ``storage``'s.
+
+    Returns:
+        NDSlice: An SBUF view over ``storage``, addressed by tile coordinate exactly as
+        ``src`` is. A partial trailing tile reports its own extent.
+
+    Raises:
+        AssertionError: If ``src`` is not a tiled ``NDSlice``, if ``storage`` is not flat
+            2-D SBUF, or if ``storage`` is too small for ``src``'s extent.
+
+    Example:
+        2880 rows in blocks of 16 tiles of ``(128, 128)``: block 0 covers 2048 rows, the
+        trailing block only 832. One slot serves both::
+
+            blks = nt.blocks(v, tile_size=(128, 128), block_size=(16, 1))
+            slot = nt.alloc_tiles(tile_size=(128, 128), grid=(16, 1), buffer_type=nl.sbuf, dtype=v.dtype)
+
+            nt.view_like(blks[0, 0], slot).element_shape  # (2048, 128)
+            tail = nt.view_like(blks[1, 0], slot)
+            tail.element_shape        # (832, 128), not the slot's 2048
+            tail[6, 0].element_shape  # (64, 128) -- the short tile stays short
+    """
+    buffer_source = _validate_view_like_args(src, storage)
+    return _make_sbuf_ndslice(
+        buffer_source,
+        src.element_shape,
+        src.tile_size,
+        buffer_source.dtype if dtype is None else dtype,
+    )
+
+
 # ============================================================================
 # Public API
 # ============================================================================
@@ -1045,6 +1102,7 @@ __all__ = [
     "blocks",
     "alloc_tiles",
     "alloc_blocks",
+    "view_like",
     "NDSlice",
     "Grid",
     "HBMLayout",

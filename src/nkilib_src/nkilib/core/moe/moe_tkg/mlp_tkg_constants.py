@@ -149,7 +149,7 @@ class MLPTKGConstants(nl.NKIObject):
         elif weight_rank == 5:
             # MX MoE (E, 128, 2, ceil(H/512), I)
             local_E, _, _, _, I = params.gate_proj_weights_tensor.shape
-        else:
+        else:  # pragma: no cover - defensive guard; gate weights are always rank 2/3/4/5
             kernel_assert(False, f"Weight tensor expected to have rank of 2, 3, 4, or 5 but got {weight_rank}")
 
         # --- Derived dimensions ---
@@ -204,7 +204,9 @@ class MLPTKGConstants(nl.NKIObject):
             column_tiling_dim = 128
 
         # Adjust hardware-specific logic for column tiling on NeuronCore-v2
-        if nisa.get_nc_version() == nisa.nc_version.gen2:
+        if (
+            nisa.get_nc_version() == nisa.nc_version.gen2
+        ):  # pragma: no cover - pre-trn2 (gen2) only; no pre-trn2 HW in fleet
             # Both the row and column sizes in tile_size cannot be 32
             column_tiling_dim = 64
 

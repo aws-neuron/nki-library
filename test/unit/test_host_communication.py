@@ -27,9 +27,7 @@ from invoke.exceptions import CommandTimedOut
 from test.utils.exceptions import TimeoutException
 from test.utils.host_communication import (
     SSH_INFERENCE_TIMEOUT_SECONDS,
-    CommandResult,
     HostCommunication,
-    LocalCommunication,
     ParamikoCommunication,
     SshCommunication,
 )
@@ -98,17 +96,6 @@ class TestTimeoutTranslation:
         with pytest.raises(TimeoutException):
             comm.run("sleep 999")
 
-    def test_local_maps_command_timeout_to_timeout_exception(self) -> None:
-        comm = LocalCommunication()
-        with pytest.raises(TimeoutException):
-            comm.run("sleep 5", timeout=0.2)
-
-    def test_local_run_within_budget_succeeds(self) -> None:
-        result = LocalCommunication().run("echo hi")
-        assert isinstance(result, CommandResult)
-        assert result.ok
-        assert result.stdout.strip() == "hi"
-
 
 class TestKeepalive:
     """Keepalive self-contained in the transports: paramiko set_keepalive(15)."""
@@ -122,9 +109,9 @@ class TestKeepalive:
 
     def test_run_applies_keepalive(self) -> None:
         comm, conn = _make_paramiko_comm()
-        comm._apply_keepalive = MagicMock()
-        comm.run("echo hi")
-        comm._apply_keepalive.assert_called_once()
+        with patch.object(comm, "_apply_keepalive") as apply_keepalive:
+            comm.run("echo hi")
+        apply_keepalive.assert_called_once()
 
     def test_apply_keepalive_opens_closed_connection(self) -> None:
         comm, conn = _make_paramiko_comm()
@@ -149,6 +136,8 @@ class TestSshCommunication:
         control_paths = [a for a in argv if a.startswith("ControlPath=")]
         assert control_paths == [f"ControlPath={comm._control_path}"]
         assert comm._control_path.endswith("-%C")
+        assert "ControlMaster=auto" in argv
+        assert "ControlPersist=30" in argv
 
     def test_run_maps_command_timeout_to_timeout_exception(self) -> None:
         comm = SshCommunication(ssh_config_path="/tmp/fake_ssh_config", alias="fake-host")

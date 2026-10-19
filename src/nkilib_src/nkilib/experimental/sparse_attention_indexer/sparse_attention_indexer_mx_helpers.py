@@ -27,7 +27,7 @@ import nki.language as nl
 
 from ...core.utils.allocator import SbufManager
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.tensor_view import TensorView
+from ...core.utils.kernel_helpers import div_ceil
 from .sparse_attention_indexer_utils import P_MAX
 
 # MX block constants (per OCP spec: 32 elements/scale, 4-packed FP8 along free dim)
@@ -37,6 +37,9 @@ H_PACK = 4
 MX_BLOCK = 32
 """Microscaling block size — 1 uint8 e8m0 scale per 32 elements of the contraction dim."""
 
+DS_SCALE_BLOCK = 128
+"""DeepSeek compact scale block — 1 uint8 e8m0 scale per 128-K x 128-N weight block."""
+
 PSUM_FMAX = 512
 """Max free dim of one PSUM bank for nc_matmul_mx with fp32 dst."""
 
@@ -44,15 +47,28 @@ PSUM_FMAX = 512
 SCALE_QUADRANT_SIZE = 32
 SCALES_PER_QUADRANT = 4
 
+_UNIQ = [0]
+
+
+def _u():
+    """Monotonic suffix for ``alloc_stack`` / ``open_scope`` names.
+
+    Names must be unique across the WHOLE trace -- ``close_scope`` frees a scope's addresses but
+    not its tensor names -- so a bare literal collides as soon as the helper is called twice. The
+    seq-sharded entries call the compact-scale loader once per shard, which is exactly that case.
+    """
+    _UNIQ[0] += 1
+    return f"_{_UNIQ[0]}"
+
 
 def _quantize_activation_for_mx(
     sbm: SbufManager,
-    src_hbm: nl.ndarray,
+    src_hbm: nl.NkiTensor,
     batch_start: int,
     S: int,
     K: int,
-    hidden_qtz_sb: nl.ndarray,
-    hidden_scale_sb: nl.ndarray,
+    hidden_qtz_sb: nl.NkiTensor,
+    hidden_scale_sb: nl.NkiTensor,
     num_K_tiles: int,
 ) -> None:
     """Quantize a [S, K] activation tile from HBM to MX-FP8.
@@ -118,92 +134,176 @@ def _quantize_activation_for_mx(
 
 
 def _load_mx_weight_scale(
-    scale_hbm: nl.ndarray,
-    scale_sb: nl.ndarray,
+    scale_hbm: nl.NkiTensor,
+    scale_sb: nl.NkiTensor,
     num_K_tiles: int,
     free_dim: int,
     free_offset: int,
     free_extent: int,
+    compact_scales: bool = False,
+    sbm: SbufManager = None,
 ) -> None:
-    """Load a [q_lora_rank // 32, total_out] uint8 e8m0 scale into hardware quadrant layout.
+    """Load a uint8 e8m0 weight scale into the MX hardware quadrant layout.
 
     Each K-tile spans K_TILE=512 elements / MX_BLOCK=32 = 16 contiguous HBM scale rows.
     Hardware layout splits those 16 rows into 4 quadrants of 4 rows each: rows 0-3 of
     HBM map to partitions 0-3, rows 4-7 to partitions 32-35, rows 8-11 to 64-67, rows
     12-15 to 96-99. Other partitions are zero-padded.
 
-    Coalesce all K-tiles per quadrant into a single 3-D AP DMA. Previous
-    code issued ``num_K_tiles * NUM_QUADRANTS`` (e.g. 56 for K-proj at
-    v3_long) tiny DMAs of ~512 bytes each. Now one DMA per quadrant
-    (4 total) covers all K-tiles, amortizing descriptor overhead.
+    Two accepted HBM layouts (see ``compact_scales``):
+
+    * NATIVE block-32 ``[K // 32, free_dim]`` -- one e8m0 byte per (32-K x 1-N) MX group,
+      already at hardware granularity. Loaded directly: one 3-D AP DMA per quadrant
+      (4 total) covers all K-tiles, amortizing descriptor overhead over what used to be
+      ``num_K_tiles * NUM_QUADRANTS`` tiny ~512 B DMAs.
+    * COMPACT block-128 ``[K // 128, ceil(free_dim / 128)]`` -- the DeepSeek
+      ``scale_fmt=ue8m0`` checkpoint layout, ONE byte per (128-K x 128-N) weight block,
+      expanded to the native granularity in-kernel. A 128-K block covers 4 MX groups and
+      a 128-N block covers 128 columns, so every compact byte fans out 4 partitions x
+      128 columns.
+
+    The compact expansion mirrors ``_load_mx_weights`` in mla_common_cte.py and is a
+    two-stage load for the same reason: the DMA engine natively supports stride-0 on the
+    PARTITION axis (so the 4-row fan-out rides along with the DMA) but not on the free
+    axis, where it degrades into per-element copies. Stage 1 DMAs the compact bytes into
+    a small scratch; stage 2 does the 128-wide free-axis fan-out as one wide Vector
+    ``tensor_copy``, which does permit stride-0 source addressing. The scratch lives in
+    an inner SBUF scope and is released before returning, so callers see no extra SBUF
+    pressure.
+
+    Args:
+        scale_hbm (nl.NkiTensor): uint8 e8m0 scales, native or compact (see above).
+        scale_sb (nl.NkiTensor): ``[P_MAX, num_K_tiles, >= free_extent]`` uint8 destination.
+        num_K_tiles (int): Number of 512-element contraction tiles.
+        free_dim (int): Full N width of the NATIVE scale tensor (compact N width is
+            ``ceil(free_dim / 128)``).
+        free_offset (int): N column offset of the slice to load.
+        free_extent (int): N width of the slice to load.
+        compact_scales (bool): Select the ``scale_hbm`` layout. False (default) = native
+            block-32; True = compact block-128, expanded in-kernel.
+        sbm (SbufManager): Required when ``compact_scales`` is True (stage-1 scratch).
     """
     SCALE_ROWS_PER_K_TILE = (P_MAX * H_PACK) // MX_BLOCK  # = 16
     NUM_QUADRANTS = P_MAX // SCALE_QUADRANT_SIZE  # = 4
     nisa.memset(dst=scale_sb, value=0, engine=nisa.engine.gpsimd)
+
+    if not compact_scales:
+        for quad_idx in range(NUM_QUADRANTS):
+            # 3-D AP: partition (SCALES_PER_QUADRANT rows) × k_tile × free.
+            nisa.dma_copy(
+                dst=scale_sb[
+                    nl.ds(quad_idx * SCALE_QUADRANT_SIZE, SCALES_PER_QUADRANT),
+                    0:num_K_tiles,
+                    0:free_extent,
+                ],
+                src=scale_hbm.ap(
+                    pattern=[
+                        [free_dim, SCALES_PER_QUADRANT],
+                        [SCALE_ROWS_PER_K_TILE * free_dim, num_K_tiles],
+                        [1, free_extent],
+                    ],
+                    offset=quad_idx * SCALES_PER_QUADRANT * free_dim + free_offset,
+                    dtype=nl.uint8,
+                ),
+                dge_mode=nisa_constants.dge_mode.hwdge,
+            )
+        return
+
+    # ---- Compact block-128 path ----
+    kernel_assert(sbm is not None, "compact_scales=True requires an SbufManager for the stage-1 scratch.")
+    kernel_assert(
+        free_offset % DS_SCALE_BLOCK == 0 and free_extent % DS_SCALE_BLOCK == 0,
+        f"compact block-{DS_SCALE_BLOCK} scales need free_offset ({free_offset}) and free_extent "
+        f"({free_extent}) to be multiples of {DS_SCALE_BLOCK}; a compact byte covers "
+        f"{DS_SCALE_BLOCK} N columns so a partial block has no single scale.",
+    )
+    # A 512-K tile spans 512/128 = 4 compact rows, one per quadrant: quadrant q of K-tile t
+    # reads compact row t*4 + q, and that one byte feeds all SCALES_PER_QUADRANT partitions.
+    full_n_blocks = div_ceil(free_dim, DS_SCALE_BLOCK)
+    n_blocks = free_extent // DS_SCALE_BLOCK
+    n_block_offset = free_offset // DS_SCALE_BLOCK
+
+    _tag = _u()
+    sbm.open_scope(name=f"compact_mx_scale{_tag}")
+    compact_sb = sbm.alloc_stack(
+        (P_MAX, num_K_tiles, n_blocks), nl.uint8, buffer=nl.sbuf, name=f"mx_scale_compact{_tag}"
+    )
+    # Stage 1 only writes the 4 active rows per quadrant; stage 2 broadcasts ALL P_MAX
+    # partitions, so zero the scratch first to keep the non-quadrant rows 0 (matching the
+    # native path's memset) instead of broadcasting uninitialized SBUF into scale_sb.
+    nisa.memset(dst=compact_sb, value=0, engine=nisa.engine.gpsimd)
     for quad_idx in range(NUM_QUADRANTS):
-        # 3-D AP: partition (SCALES_PER_QUADRANT rows) × k_tile × free.
         nisa.dma_copy(
-            dst=scale_sb[
-                nl.ds(quad_idx * SCALE_QUADRANT_SIZE, SCALES_PER_QUADRANT),
-                0:num_K_tiles,
-                0:free_extent,
-            ],
+            dst=compact_sb[nl.ds(quad_idx * SCALE_QUADRANT_SIZE, SCALES_PER_QUADRANT), 0:num_K_tiles, 0:n_blocks],
             src=scale_hbm.ap(
                 pattern=[
-                    [free_dim, SCALES_PER_QUADRANT],
-                    [SCALE_ROWS_PER_K_TILE * free_dim, num_K_tiles],
-                    [1, free_extent],
+                    [0, SCALES_PER_QUADRANT],  # stride 0: one byte -> 4 partitions
+                    [NUM_QUADRANTS * full_n_blocks, num_K_tiles],
+                    [1, n_blocks],
                 ],
-                offset=quad_idx * SCALES_PER_QUADRANT * free_dim + free_offset,
+                offset=quad_idx * full_n_blocks + n_block_offset,
                 dtype=nl.uint8,
             ),
             dge_mode=nisa_constants.dge_mode.hwdge,
         )
 
+    # Stage 2: one wide Vector fan-out of each compact byte across its 128 N columns.
+    nisa.tensor_copy(
+        dst=scale_sb[0:P_MAX, 0:num_K_tiles, 0:free_extent].reshape_dim(dim=2, shape=(n_blocks, DS_SCALE_BLOCK)),
+        src=compact_sb.expand_dim(dim=3).broadcast(dim=3, size=DS_SCALE_BLOCK),
+    )
+    sbm.close_scope()
+
 
 # Q projection (MX): qr [B*S, q_lora_rank] @ wq_b_fp8 [q_lora_rank // 4, total_out].
 def q_projection_mx(
     sbm: SbufManager,
-    qr: nl.ndarray,
+    qr: nl.NkiTensor,
     batch_start: int,
     S: int,
-    wq_b_fp8: nl.ndarray,
-    wq_b_scale: nl.ndarray,
+    wq_b_fp8: nl.NkiTensor,
+    wq_b_scale: nl.NkiTensor,
     q_lora_rank: int,
     n_heads: int,
     head_dim: int,
     num_shards: int = 1,
     shard_id: int = 0,
-    q_out_hbm: nl.ndarray = None,
-    qr_qtz_hbm: nl.ndarray = None,
-    qr_scale_hbm: nl.ndarray = None,
-) -> nl.ndarray:
+    q_out_hbm: nl.NkiTensor = None,
+    qr_qtz_hbm: nl.NkiTensor = None,
+    qr_scale_hbm: nl.NkiTensor = None,
+    compact_scales: bool = False,
+) -> nl.NkiTensor:
     """MX Q projection: nc_matmul_mx(quantize_mx(qr), wq_b_fp8) -> [S, total_out].
 
     Args:
         sbm (SbufManager): SBUF stack allocator used for scratch buffers.
-        qr (nl.ndarray): [B*S, q_lora_rank] bf16/f32 HBM — activation, quantized at runtime.
+        qr (nl.NkiTensor): [B*S, q_lora_rank] bf16/f32 HBM — activation, quantized at runtime.
         batch_start (int): Row offset into qr for this batch.
         S (int): Number of activation rows (sequence positions) for this batch.
-        wq_b_fp8 (nl.ndarray): [q_lora_rank // 4, n_heads*head_dim] fp8_e4m3fn_x4 HBM — pre-quantized weights.
-        wq_b_scale (nl.ndarray): [q_lora_rank // 32, n_heads*head_dim] uint8 HBM — block-32 e8m0 scales.
+        wq_b_fp8 (nl.NkiTensor): [q_lora_rank // 4, n_heads*head_dim] fp8_e4m3fn_x4 HBM — pre-quantized weights.
+        wq_b_scale (nl.NkiTensor): [q_lora_rank // 32, n_heads*head_dim] uint8 HBM — block-32 e8m0 scales.
         q_lora_rank (int): Contraction dimension of the Q projection.
         n_heads (int): Number of attention heads.
         head_dim (int): Per-head dimension; total_out = n_heads * head_dim.
         num_shards (int): Number of LNC shards splitting the output-tile range.
         shard_id (int): This shard's index within num_shards.
-        q_out_hbm (nl.ndarray): [S, total_out] HBM output buffer; sliced per output shard.
-        qr_qtz_hbm (nl.ndarray): optional PRE-quantized qr from an upstream stage (the
+        q_out_hbm (nl.NkiTensor): [S, total_out] HBM output buffer; sliced per output shard.
+        qr_qtz_hbm (nl.NkiTensor): optional PRE-quantized qr from an upstream stage (the
             fused qkv stage already produces the transposed+q_normed(gamma)+MX-quantized qr
             in the exact [num_s_tiles, P_MAX, num_K_tiles, P_MAX] fp8x4 (viewed uint32)
             layout this function would otherwise recompute). When given, skip
             _quantize_activation_for_mx and DMA-load the per-s-tile block directly — saves a
             redundant transpose+norm+quantize and reuses qkv's already-gamma-normed qr
             (avoids the gamma-less pitfall of exporting qr raw).
-        qr_scale_hbm (nl.ndarray): uint8 block-32 e8m0 scales paired with qr_qtz_hbm.
+        qr_scale_hbm (nl.NkiTensor): uint8 block-32 e8m0 scales paired with qr_qtz_hbm.
+        compact_scales (bool): Select the wq_b_scale layout. False (default) = native
+            block-32 [q_lora_rank // 32, total_out]; True = compact block-128
+            [q_lora_rank // 128, ceil(total_out / 128)], expanded in-kernel. Applies to the
+            WEIGHT scale only -- qr_scale_hbm is always native block-32 (it comes from the
+            upstream kernel's quantizer, not from a checkpoint).
 
     Returns:
-        nl.ndarray: q_out_hbm, with this shard's output-tile columns written.
+        nl.NkiTensor: q_out_hbm, with this shard's output-tile columns written.
     """
     total_out = n_heads * head_dim
     K_TILE = P_MAX * H_PACK  # 512: contraction dim consumed per nc_matmul_mx instr
@@ -249,7 +349,14 @@ def q_projection_mx(
     # Pre-load wq_b_scale into hardware quadrant layout [P_MAX P, num_K_tiles F, out_extent F].
     wq_b_scale_sb = sbm.alloc_stack((P_MAX, num_K_tiles, out_extent), nl.uint8, buffer=nl.sbuf)
     _load_mx_weight_scale(
-        wq_b_scale, wq_b_scale_sb, num_K_tiles, free_dim=total_out, free_offset=out_col_start, free_extent=out_extent
+        wq_b_scale,
+        wq_b_scale_sb,
+        num_K_tiles,
+        free_dim=total_out,
+        free_offset=out_col_start,
+        free_extent=out_extent,
+        compact_scales=compact_scales,
+        sbm=sbm,
     )
 
     for s_tile_idx in nl.sequential_range(num_s_tiles):
@@ -262,7 +369,7 @@ def q_projection_mx(
         hidden_scale_sb = sbm.alloc_stack((P_MAX, num_K_tiles, P_MAX), nl.uint8, buffer=nl.sbuf)
         if qr_qtz_hbm is not None:
             _qr_tile = (batch_start + s_start) // P_MAX
-            _hidden_u32 = TensorView(hidden_qtz_sb).reinterpret_cast(nl.uint32).get_view()
+            _hidden_u32 = hidden_qtz_sb.view(nl.uint32)
             nisa.dma_copy(dst=_hidden_u32[0:P_MAX, 0:num_K_tiles, 0:P_MAX], src=qr_qtz_hbm[_qr_tile])
             nisa.dma_copy(dst=hidden_scale_sb[0:P_MAX, 0:num_K_tiles, 0:P_MAX], src=qr_scale_hbm[_qr_tile])
         else:
@@ -327,11 +434,12 @@ def q_projection_mx(
 # K + W projection: wk_fp8 used for K (MX); weights_proj stays bf16.
 def load_wk_mx_weights(
     sbm: SbufManager,
-    wk_fp8: nl.ndarray,
-    wk_scale: nl.ndarray,
+    wk_fp8: nl.NkiTensor,
+    wk_scale: nl.NkiTensor,
     dim: int,
     head_dim: int,
-) -> tuple[nl.ndarray, nl.ndarray]:
+    compact_scales: bool = False,
+) -> tuple[nl.NkiTensor, nl.NkiTensor]:
     """Pre-load wk's fp8_x4 weights and uint8 scale into SBUF.
 
     The MX-K path is invoked once per S-tile but the weights are S-tile
@@ -341,13 +449,16 @@ def load_wk_mx_weights(
 
     Args:
         sbm (SbufManager): SBUF stack allocator used for the hoisted buffers.
-        wk_fp8 (nl.ndarray): [dim // 4, head_dim] fp8_e4m3fn_x4 HBM — pre-quantized K weights.
-        wk_scale (nl.ndarray): [dim // 32, head_dim] uint8 HBM — block-32 e8m0 scales.
+        wk_fp8 (nl.NkiTensor): [dim // 4, head_dim] fp8_e4m3fn_x4 HBM — pre-quantized K weights.
+        wk_scale (nl.NkiTensor): uint8 HBM e8m0 scales — [dim // 32, head_dim] block-32 when
+            compact_scales is False, [dim // 128, ceil(head_dim / 128)] block-128 when True.
         dim (int): Contraction dimension of the K projection.
         head_dim (int): Per-head dimension (output width of the K projection).
+        compact_scales (bool): Select the wk_scale layout (see above); compact is expanded
+            to native MX granularity in-kernel.
 
     Returns:
-        tuple[nl.ndarray, nl.ndarray]: (wk_fp8_sb [P_MAX, num_K_tiles, head_dim] fp8_e4m3fn_x4,
+        tuple[nl.NkiTensor, nl.NkiTensor]: (wk_fp8_sb [P_MAX, num_K_tiles, head_dim] fp8_e4m3fn_x4,
             wk_scale_sb [P_MAX, num_K_tiles, head_dim] uint8 hardware-quadrant).
     """
     K_TILE = P_MAX * H_PACK  # 512
@@ -375,21 +486,30 @@ def load_wk_mx_weights(
     )
 
     wk_scale_sb = sbm.alloc_stack((P_MAX, num_K_tiles, head_dim), nl.uint8, buffer=nl.sbuf)
-    _load_mx_weight_scale(wk_scale, wk_scale_sb, num_K_tiles, free_dim=head_dim, free_offset=0, free_extent=head_dim)
+    _load_mx_weight_scale(
+        wk_scale,
+        wk_scale_sb,
+        num_K_tiles,
+        free_dim=head_dim,
+        free_offset=0,
+        free_extent=head_dim,
+        compact_scales=compact_scales,
+        sbm=sbm,
+    )
     return wk_fp8_sb, wk_scale_sb
 
 
 def w_projection_mx_batch(
     sbm: SbufManager,
-    x: nl.ndarray,
+    x: nl.NkiTensor,
     batch_start: int,
     S_total: int,
     dim: int,
     n_heads: int,
     scale: float,
-    wp_tile_T_hoist: nl.ndarray,
-    x_non_mx: nl.ndarray,
-    weights_full_sb: nl.ndarray,
+    wp_tile_T_hoist: nl.NkiTensor,
+    x_non_mx: nl.NkiTensor,
+    weights_full_sb: nl.NkiTensor,
 ) -> None:
     """Batch-level W-projection (mirrors q_projection_mx pattern).
 
@@ -403,17 +523,17 @@ def w_projection_mx_batch(
 
     Args:
         sbm (SbufManager): SBUF stack allocator used for scratch buffers.
-        x (nl.ndarray): ``[B*S, dim]`` HBM activation (used for fallback path).
+        x (nl.NkiTensor): ``[B*S, dim]`` HBM activation (used for fallback path).
         batch_start (int): Row offset into x for this batch.
-        S_total (int): Total S rows for this batch (== num_S_tiles * P_MAX for
-            v3_long shapes).
+        S_total (int): Total S rows for this batch. Need NOT be a multiple of P_MAX --
+            the last S-tile is row-clamped (handles CP shards with S_total < P_MAX).
         dim (int): Contraction dimension of the W projection.
         n_heads (int): Number of attention heads (output width).
         scale (float): Post-matmul multiply applied to the result.
-        wp_tile_T_hoist (nl.ndarray): ``[P_MAX, num_dim_tiles, n_heads]`` bf16 — caller-
+        wp_tile_T_hoist (nl.NkiTensor): ``[P_MAX, num_dim_tiles, n_heads]`` bf16 — caller-
             hoisted, dim on partition, matmul-ready.
-        x_non_mx (nl.ndarray): ``[B*S, dim]`` bf16 HBM, used to skip f32->bf16 cast.
-        weights_full_sb (nl.ndarray): ``[P_MAX, num_S_tiles, n_heads]`` f32 — caller-
+        x_non_mx (nl.NkiTensor): ``[B*S, dim]`` bf16 HBM, used to skip f32->bf16 cast.
+        weights_full_sb (nl.NkiTensor): ``[P_MAX, num_S_tiles, n_heads]`` f32 — caller-
             allocated; result lands here, per-S-tile sliced by caller.
 
     Returns:
@@ -422,7 +542,12 @@ def w_projection_mx_batch(
     DIM_TILE = P_MAX
     P_TILE = P_MAX
     num_dim_tiles = (dim + DIM_TILE - 1) // DIM_TILE
-    num_S_tiles = S_total // P_TILE
+    # CEIL (matches the caller's weights_full_sb allocation and the K/score path). FLOOR here
+    # dropped the last partial S-tile: under CP with S_total < P_TILE (e.g. T_local=64 at ws64)
+    # it gave 0 tiles, so the loop never ran and weights_full_sb was left uninitialized SBUF
+    # (garbage per-head weights -> corrupted index_score / top-k). The partial last tile is
+    # row-clamped below (s_tile_sz).
+    num_S_tiles = (S_total + P_TILE - 1) // P_TILE
     compute_dtype = nl.bfloat16
 
     sbm.open_scope(name="w_proj_batch_mx")
@@ -447,6 +572,8 @@ def w_projection_mx_batch(
     # wp slabs, write to weights_full_sb at the per-S-tile slot.
     for s_tile_idx in nl.sequential_range(num_S_tiles):
         s_start = s_tile_idx * P_TILE
+        # Valid rows in this S-tile (< P_TILE for the last tile when S_total % P_TILE != 0).
+        s_tile_sz = min(P_TILE, S_total - s_start)
         """
         8 PSUM banks for parallel accumulate; reduced after the loop.
         Allocate explicitly (parser frontend rejects list-comp NDArray
@@ -478,9 +605,9 @@ def w_projection_mx_batch(
                 compute_dtype,
             )
             nisa.dma_transpose(
-                dst=x_T_S_sb[:DIM_TILE, :num_dim_tiles, :P_TILE],
-                src=x_non_mx[batch_start + s_start : batch_start + s_start + P_TILE, 0:dim].reshape(
-                    (P_TILE, num_dim_tiles, DIM_TILE)
+                dst=x_T_S_sb[:DIM_TILE, :num_dim_tiles, :s_tile_sz],
+                src=x_non_mx[batch_start + s_start : batch_start + s_start + s_tile_sz, 0:dim].reshape(
+                    (s_tile_sz, num_dim_tiles, DIM_TILE)
                 ),
                 axes=(2, 1, 0),
             )
@@ -495,15 +622,15 @@ def w_projection_mx_batch(
                 compute_dtype,
             )
             nisa.dma_transpose(
-                dst=x_T_S_f32[:DIM_TILE, :num_dim_tiles, :P_TILE],
-                src=x[batch_start + s_start : batch_start + s_start + P_TILE, 0:dim].reshape(
-                    (P_TILE, num_dim_tiles, DIM_TILE)
+                dst=x_T_S_f32[:DIM_TILE, :num_dim_tiles, :s_tile_sz],
+                src=x[batch_start + s_start : batch_start + s_start + s_tile_sz, 0:dim].reshape(
+                    (s_tile_sz, num_dim_tiles, DIM_TILE)
                 ),
                 axes=(2, 1, 0),
             )
             nisa.tensor_copy(
-                dst=x_T_S_sb[:DIM_TILE, :num_dim_tiles, :P_TILE],
-                src=x_T_S_f32[:DIM_TILE, :num_dim_tiles, :P_TILE],
+                dst=x_T_S_sb[:DIM_TILE, :num_dim_tiles, :s_tile_sz],
+                src=x_T_S_f32[:DIM_TILE, :num_dim_tiles, :s_tile_sz],
                 engine=nisa.engine.scalar,
             )
 
@@ -512,8 +639,8 @@ def w_projection_mx_batch(
             dim_tile_size = min(DIM_TILE, dim - dim_start)
             bank_idx = dim_tile_idx % NUM_W_BANKS
             nisa.nc_matmul(
-                dst=w_psum_banks[bank_idx][:P_TILE, :n_heads],
-                stationary=x_T_S_sb[:dim_tile_size, dim_tile_idx, :P_TILE],
+                dst=w_psum_banks[bank_idx][:s_tile_sz, :n_heads],
+                stationary=x_T_S_sb[:dim_tile_size, dim_tile_idx, :s_tile_sz],
                 moving=wp_tile_T_hoist[:dim_tile_size, dim_tile_idx, :n_heads],
                 accumulate=(dim_tile_idx >= NUM_W_BANKS),
             )
@@ -526,21 +653,22 @@ def w_projection_mx_batch(
         """
         w_acc_sb = sbm.alloc_stack((P_TILE, n_heads), nl.float32)
         nisa.tensor_copy(
-            dst=w_acc_sb[:P_TILE, :n_heads],
-            src=w_psum_banks[0][:P_TILE, :n_heads],
+            dst=w_acc_sb[:s_tile_sz, :n_heads],
+            src=w_psum_banks[0][:s_tile_sz, :n_heads],
             engine=nisa.engine.scalar,
         )
         for reduce_bank_idx in range(1, NUM_W_BANKS):
             nisa.tensor_tensor(
-                dst=w_acc_sb[:P_TILE, :n_heads],
-                data1=w_acc_sb[:P_TILE, :n_heads],
-                data2=w_psum_banks[reduce_bank_idx][:P_TILE, :n_heads],
+                dst=w_acc_sb[:s_tile_sz, :n_heads],
+                data1=w_acc_sb[:s_tile_sz, :n_heads],
+                data2=w_psum_banks[reduce_bank_idx][:s_tile_sz, :n_heads],
                 op=nl.add,
             )
-        # Apply post-scale and store into weights_full_sb at this S-tile slot.
+        # Apply post-scale and store into weights_full_sb at this S-tile slot (valid rows only;
+        # the last tile's [s_tile_sz:P_TILE] rows are padding queries the score loop discards).
         nisa.tensor_scalar(
-            dst=weights_full_sb[:P_TILE, s_tile_idx, :n_heads],
-            data=w_acc_sb[:P_TILE, :n_heads],
+            dst=weights_full_sb[:s_tile_sz, s_tile_idx, :n_heads],
+            data=w_acc_sb[:s_tile_sz, :n_heads],
             operand0=scale,
             op0=nl.multiply,
         )
@@ -550,23 +678,23 @@ def w_projection_mx_batch(
 
 def k_and_weights_projection_mx(
     sbm: SbufManager,
-    x: nl.ndarray,
+    x: nl.NkiTensor,
     batch_start: int,
     S: int,
-    wk_fp8_sb: nl.ndarray,
-    wk_scale_sb: nl.ndarray,
-    weights_proj: nl.ndarray,
+    wk_fp8_sb: nl.NkiTensor,
+    wk_scale_sb: nl.NkiTensor,
+    weights_proj: nl.NkiTensor,
     dim: int,
     head_dim: int,
     n_heads: int,
     scale: float,
-    k_sb: nl.ndarray,
-    weights_sb: nl.ndarray,
-    x_non_mx: nl.ndarray = None,
-    x_mx_data: nl.ndarray = None,
-    x_mx_scale: nl.ndarray = None,
+    k_sb: nl.NkiTensor,
+    weights_sb: nl.NkiTensor,
+    x_non_mx: nl.NkiTensor = None,
+    x_mx_data: nl.NkiTensor = None,
+    x_mx_scale: nl.NkiTensor = None,
     s_tile_idx: int = 0,
-    wp_tile_T_hoist: nl.ndarray = None,
+    wp_tile_T_hoist: nl.NkiTensor = None,
     skip_w: bool = False,
 ) -> None:
     """K via MX matmul; weights_proj stays bf16.
@@ -579,33 +707,33 @@ def k_and_weights_projection_mx(
 
     Args:
         sbm (SbufManager): SBUF stack allocator used for scratch buffers.
-        x (nl.ndarray): ``[B*S, dim]`` HBM activation (used for fallback path).
+        x (nl.NkiTensor): ``[B*S, dim]`` HBM activation (used for fallback path).
         batch_start (int): Row offset into x for this S-tile.
         S (int): Number of activation rows for this S-tile.
-        wk_fp8_sb (nl.ndarray): ``[P_MAX, num_K_tiles, head_dim]`` fp8_e4m3fn_x4 SBUF — hoisted K weights.
-        wk_scale_sb (nl.ndarray): ``[P_MAX, num_K_tiles, head_dim]`` uint8 SBUF — hoisted K scales.
-        weights_proj (nl.ndarray): ``[n_heads, dim]`` bf16 HBM — W-projection weights (fallback path).
+        wk_fp8_sb (nl.NkiTensor): ``[P_MAX, num_K_tiles, head_dim]`` fp8_e4m3fn_x4 SBUF — hoisted K weights.
+        wk_scale_sb (nl.NkiTensor): ``[P_MAX, num_K_tiles, head_dim]`` uint8 SBUF — hoisted K scales.
+        weights_proj (nl.NkiTensor): ``[n_heads, dim]`` bf16 HBM — W-projection weights (fallback path).
         dim (int): Contraction dimension of the K/W projections.
         head_dim (int): Per-head dimension (K output width).
         n_heads (int): Number of attention heads (W output width).
         scale (float): Post-matmul multiply applied to the W result.
-        k_sb (nl.ndarray): ``[P_MAX, head_dim]`` f32 SBUF — K output buffer (written in-place).
-        weights_sb (nl.ndarray): ``[P_MAX, n_heads]`` f32 SBUF — W output buffer (written in-place).
-        x_non_mx (nl.ndarray): Optional ``[B*S, dim]`` bf16 HBM tensor — same data as
+        k_sb (nl.NkiTensor): ``[P_MAX, head_dim]`` f32 SBUF — K output buffer (written in-place).
+        weights_sb (nl.NkiTensor): ``[P_MAX, n_heads]`` f32 SBUF — W output buffer (written in-place).
+        x_non_mx (nl.NkiTensor): Optional ``[B*S, dim]`` bf16 HBM tensor — same data as
             ``x`` but pre-cast to bf16 on the host. When provided, the
             W-projection's per-dim-tile dma_transpose loads bf16 directly,
             skipping the f32->bf16 ``tensor_copy`` cast that runs on Scalar.
-        x_mx_data (nl.ndarray): Optional ``[num_S_tiles, P_MAX, num_K_tiles*P_MAX]`` fp8x4
+        x_mx_data (nl.NkiTensor): Optional ``[num_S_tiles, P_MAX, num_K_tiles*P_MAX]`` fp8x4
             HBM tensor — host pre-quantized x in the kernel's K-side SBUF
             layout. When provided alongside ``x_mx_scale``, K-projection
             skips the in-kernel HBM load + 4-pass nc_transpose swizzle +
             quantize_mx.
-        x_mx_scale (nl.ndarray): Optional ``[num_S_tiles, P_MAX, num_K_tiles*P_MAX]``
+        x_mx_scale (nl.NkiTensor): Optional ``[num_S_tiles, P_MAX, num_K_tiles*P_MAX]``
             uint8 HBM tensor — host pre-computed MX scales in HW-quadrant
             layout (rows [0..3, 32..35, 64..67, 96..99] valid per K-tile).
         s_tile_idx (int): Index of the current S-tile (used to slice
             ``x_mx_data`` / ``x_mx_scale`` along their first axis).
-        wp_tile_T_hoist (nl.ndarray): Optional ``[P_MAX, num_dim_tiles, n_heads]`` bf16 SBUF —
+        wp_tile_T_hoist (nl.NkiTensor): Optional ``[P_MAX, num_dim_tiles, n_heads]`` bf16 SBUF —
             caller-hoisted W-projection weights; skips per-dim-tile re-DMA.
         skip_w (bool): When True, W-projection is skipped (caller ran it at batch level).
 

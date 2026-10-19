@@ -49,7 +49,7 @@ from typing import Callable, Generator
 from filelock import FileLock
 
 from .common_dataclasses import PYTEST_XDIST_WORKER_ENV, Platforms, ResolvedHost, is_xdist_worker
-from .exceptions import FleetEmptyError
+from .exceptions import FleetEmptyError, RequestTooLargeError
 
 logger = logging.getLogger(__name__)
 
@@ -136,17 +136,23 @@ class HostState:
     available (below the healthy-ratio floor the refresher enforces). A claim for an
     under-capacity platform is withheld — the same as no host being available — so work isn't
     piled onto the handful that came up while the rest of the fleet is still scaling.
+
+    ``provisionable_ceiling`` maps a platform to the physical cores of the LARGEST single host
+    the fleet could ever provision for it (the biggest per-host size the fleet can bring up).
+    A claim needing more cores than this can never be served, so it fails fast.
     """
 
     hosts: list[HostRecord]
     poisoned: set[Platforms] = field(default_factory=set)
     under_capacity: set[Platforms] = field(default_factory=set)
+    provisionable_ceiling: dict[Platforms, int] = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {
             "hosts": [h.to_json() for h in self.hosts],
             "poisoned": sorted(p.value for p in self.poisoned),
             "under_capacity": sorted(p.value for p in self.under_capacity),
+            "provisionable_ceiling": {p.value: cores for p, cores in self.provisionable_ceiling.items()},
         }
 
     @classmethod
@@ -156,7 +162,17 @@ class HostState:
         under_capacity = {
             p for raw_p in raw.get("under_capacity", []) if (p := Platforms.from_str_safe(raw_p)) is not None
         }
-        return cls(hosts=[rec for rec in parsed if rec is not None], poisoned=poisoned, under_capacity=under_capacity)
+        provisionable_ceiling = {
+            p: cores
+            for raw_p, cores in raw.get("provisionable_ceiling", {}).items()
+            if (p := Platforms.from_str_safe(raw_p)) is not None
+        }
+        return cls(
+            hosts=[rec for rec in parsed if rec is not None],
+            poisoned=poisoned,
+            under_capacity=under_capacity,
+            provisionable_ceiling=provisionable_ceiling,
+        )
 
 
 class HostStateStore:
@@ -245,6 +261,13 @@ class HostStateStore:
         state = self.read()
         return platform in state.under_capacity if state else False
 
+    def provisionable_ceiling_for(self, platform: Platforms) -> int | None:
+        """The cores of the largest host the fleet could ever provision for ``platform``, or
+        ``None`` if unbounded (no known ceiling — the fast-fail guard is off for it). Lock-free;
+        None when the state file is absent."""
+        state = self.read()
+        return state.provisionable_ceiling.get(platform) if state else None
+
     def is_initialized(self) -> bool:
         """True once THIS store has persisted state this run, letting a caller skip
         a redundant bootstrap. Deliberately tracks our own writes, not file
@@ -301,9 +324,11 @@ class HostStateStore:
         the same host. If every eligible host is excluded, the full eligible set is used so a
         host is still returned.
 
-        Returns None if no eligible host matches. Raises ``FleetEmptyError`` if no host is
-        claimable AND the fleet is poisoned."""
-        exclude = exclude or set()
+        Returns None if no eligible host matches (the caller waits/retries). When nothing is
+        claimable, raises ``RequestTooLargeError`` if the request needs more cores than the
+        fleet's largest provisionable host for the platform (an impossible ask no wait can
+        satisfy), else ``FleetEmptyError`` if the platform is poisoned — both unretriable."""
+        excluded: set[str] = exclude or set()
         claimed: list[HostRecord] = []  # used as Box for return
 
         def _claim(state: HostState) -> HostState | None:
@@ -321,7 +346,7 @@ class HostStateStore:
 
             # Prefer hosts not busy this allocation; fall back to all eligible if every one
             # has already been tried (so the deadline loop keeps cycling rather than stalling).
-            selectable = [rec for rec in eligible if rec.resolved.ssh_host not in exclude] or eligible
+            selectable = [rec for rec in eligible if rec.resolved.ssh_host not in excluded] or eligible
             chosen = min(
                 selectable,
                 key=lambda rec: (rec.work_queue_depth + num_physical_cores_needed) / rec.resolved.num_physical_cores,
@@ -333,6 +358,14 @@ class HostStateStore:
         state = self._update(_claim)
         if claimed:
             return claimed[0]
+
+        ceiling = state.provisionable_ceiling.get(platform)
+        if ceiling is not None and num_physical_cores_needed > ceiling:
+            raise RequestTooLargeError(
+                f"Request needs {num_physical_cores_needed} physical cores, but the largest host "
+                f"the fleet can provision for platform {platform.value} is {ceiling} cores; "
+                f"no host will ever be large enough."
+            )
         if platform in state.poisoned:
             raise FleetEmptyError(f"Fleet is perpetually empty for platform {platform.value}.")
         return None
@@ -476,7 +509,12 @@ class OwnerHostStateStore(HostStateStore):
                 pass
         self._initialized = False
 
-    def apply_resolved(self, resolved: list[ResolvedHost], under_capacity: set[Platforms] | None = None) -> None:
+    def apply_resolved(
+        self,
+        resolved: list[ResolvedHost],
+        under_capacity: set[Platforms] | None = None,
+        provisionable_ceiling: dict[Platforms, int] | None = None,
+    ) -> None:
         """Reconcile the current state against the freshly-resolved host set by pure
         membership: a host in ``resolved`` is available; a host absent from it is
         unavailable; a host not yet known is added (available, depth 0). Rows kept for
@@ -490,6 +528,11 @@ class OwnerHostStateStore(HostStateStore):
 
         ``under_capacity`` is a set of platforms that should not yield despite having
         hosts to prevent the small amount of hosts available from being flooded.
+
+        ``provisionable_ceiling`` maps a platform to the cores of the largest host the fleet
+        could ever provision for it; a claim exceeding it fails fast (see ``claim_least_busy``).
+        Like ``under_capacity`` it is fleet metadata refreshed whole each cycle — passed
+        ``None`` (a membership-only apply) leaves the existing map untouched.
 
         Controller-only: it reconciles against the WHOLE resolved set, so a worker (which
         sees only its own claims) running it would mark every host it didn't resolve
@@ -516,6 +559,8 @@ class OwnerHostStateStore(HostStateStore):
             _add_new_hosts(state, resolved)
             if under_capacity is not None:
                 state.under_capacity = set(under_capacity)
+            if provisionable_ceiling is not None:
+                state.provisionable_ceiling = dict(provisionable_ceiling)
             return state
 
         self._update(lambda state: _apply_resolved_hosts(state, resolved))

@@ -20,22 +20,18 @@ validation against NKI kernel outputs.
 
 import neuron_dtypes as dtype
 import numpy as np
-from neuronxcc.nki._private.private_api import float8_e4m3fn_x4, float8_e5m2_x4
-from neuronxcc.nki._private.test import mx_util
+
+from ...core.utils.mx_torch_common import nc_matmul_mx_golden, quantize_to_mx
+from ..mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
 
 # Swizzle interleave factor (must match hardware constant)
 _INTERLEAVE_FACTOR = 4
 
 
-def _get_mx_max_exp(dst_dtype):
-    """Get maximum exponent for MX format, adjusted for TRN3 rounding mode."""
-    return {float8_e5m2_x4: 14, float8_e4m3fn_x4: 7}[dst_dtype]
-
-
 def _raw_exponent_scale(scale):
     """Return the MX scale tensor's raw biased exponent bytes as uint8.
 
-    MX scales encode a biased exponent as one byte. ``mx_util.nc_matmul_mx_golden``
+    MX scales encode a biased exponent as one byte. ``nc_matmul_mx_golden``
     expects the integer byte value (0-255) via ``.astype``. When the pre-quantized
     scale input is float8_e8m0fnu, ``.astype`` would convert the represented value
     (2^(byte-127)) rather than the byte, corrupting the golden scale factors.
@@ -50,19 +46,32 @@ def _raw_exponent_scale(scale):
 
 # NOTE: This duplicates test/integration/.../matmul_mxfp8/utils.py:swizzle_tensor
 # intentionally — src/ modules must not import from test/.
-def _swizzle(src_tensor, TILE_P=512):
+def _swizzle(src_tensor, TILE_P=512, fast_dma_transpose=False):
     """
     Golden reference for interleave loading.
 
-    When P is not divisible by TILE_P, the remainder is decomposed into 256
-    and/or 128 sub-tiles to match the DGT hardware's remainder handling in
-    load_block.py. Without this, the interleaving pattern would differ from
-    what DGT produces, causing mismatched quantization groups in matmuls
-    where one operand is pre-swizzled and the other is DGT-loaded.
+    A K remainder (P not divisible by TILE_P) is laid out differently by the two
+    DGT loaders, so the golden must follow whichever one the kernel used:
+
+    - Legacy DGT (``fast_dma_transpose=False``) is bounded by the nc_transpose
+      chunk size, so load_block.py decomposes the remainder into 256 and/or 128
+      sub-tiles, each gathered with its own interleave stride.
+    - Fast DMA (``fast_dma_transpose=True``) gathers the whole
+      MX_PARTITION_SIZE-aligned remainder in one dma_transpose, so its sub-tile
+      stride is remainder // INTERLEAVE_FACTOR and the general loop below handles
+      it directly as a single partial tile.
+
+    The two layouts agree for every 32-aligned remainder except 384 — the only
+    value that decomposes into both a 256 and a 128 sub-tile. Using the legacy
+    decomposition for a fast-DMA load (or vice versa) mismatches the quantization
+    groups in matmuls where one operand is pre-swizzled and the other is
+    DGT-loaded, producing a ~100% relative error.
 
     Args:
         src_tensor (np.ndarray): Source tensor of shape (P, F).
         TILE_P (int): Tile size in P dimension.
+        fast_dma_transpose (bool): Match the fast-DMA single-partial-tile
+            remainder layout instead of the legacy 256/128 decomposition.
 
     Returns:
         np.ndarray: Swizzled tensor of shape (P // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR).
@@ -74,7 +83,7 @@ def _swizzle(src_tensor, TILE_P=512):
         raise ValueError(f"P ({P}) must be divisible by INTERLEAVE_FACTOR ({_INTERLEAVE_FACTOR})")
 
     remainder = P % TILE_P
-    if remainder != 0 and remainder % 128 == 0:
+    if not fast_dma_transpose and remainder != 0 and remainder % 128 == 0:
         # Decompose into full tiles + DGT-compatible remainder sub-tiles (256 and/or 128)
         full_p = P - remainder
         parts = []
@@ -151,9 +160,9 @@ def _resolve_x4_dtype(float8_dtype_str):
 
 def golden_matmul(lhs_swizzled, rhs_swizzled, compute_dtype_x4):
     """Quantize swizzled BF16 inputs and compute MX matmul golden."""
-    a_data, a_scale = mx_util.quantize_mx_golden(lhs_swizzled, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
-    b_data, b_scale = mx_util.quantize_mx_golden(rhs_swizzled, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
-    return mx_util.nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
+    a_data, a_scale = quantize_to_mx(lhs_swizzled, compute_dtype_x4)
+    b_data, b_scale = quantize_to_mx(rhs_swizzled, compute_dtype_x4)
+    return nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
 
 
 def matmul_mxfp8_torch_ref(
@@ -179,11 +188,12 @@ def matmul_mxfp8_torch_ref(
     lhs_is_swizzled=True,
     rhs_is_swizzled=True,
     load_with_PE_swizzle=False,
-    lhs_is_f_by_k=True,
-    rhs_is_f_by_k=True,
+    lhs_orientation=None,
+    rhs_orientation=None,
     fast_dma_transpose=False,
     enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    disable_dma_transpose=False,
 ):
     """Compute golden matmul output for MXFP8 matrix multiplication.
 
@@ -201,22 +211,26 @@ def matmul_mxfp8_torch_ref(
 
     # Both operands' K axis must use the same permutation for the matmul to be
     # valid, so a single quant_scheme selects the swizzle for every BF16 operand.
-    swizzle = _swizzle_1x32 if quant_scheme == "1x32" else _swizzle
+    # wrapX must also follow the DGT loader the kernel used: the fast-DMA and legacy
+    # paths interleave a K remainder differently (see _swizzle).
+    if quant_scheme == "1x32":
+        swizzle = _swizzle_1x32
+    else:
+
+        def swizzle(src_tensor):
+            return _swizzle(src_tensor, fast_dma_transpose=fast_dma_transpose)
 
     lhs_prequantized = lhs_scales is not None
     rhs_prequantized = rhs_scales is not None
 
-    # Normalize the layout flags: None (auto/unset) means F-by-K, matching the kernel default.
-    # Doing this once lets the branches below use the simpler `not lhs_is_f_by_k` form while
-    # still treating an unset (None) flag as F-by-K rather than K-by-F.
-    lhs_is_f_by_k = lhs_is_f_by_k is not False
-    rhs_is_f_by_k = rhs_is_f_by_k is not False
-
+    # None (auto/unset) and F_BY_K both mean F-by-K (the kernel default); only an explicit
+    # K_BY_F selects the K-by-F layout. This matches TensorDescriptor's resolution and the
+    # kernel's `orientation=None if is_f_by_k else K_BY_F` mapping exactly.
     if not lhs_prequantized and not rhs_prequantized:
         # Both BF16: swizzle if needed, then quantize and matmul
         if lhs_is_swizzled:
             lhs_sw = lhs
-        elif not lhs_is_f_by_k:
+        elif lhs_orientation == TensorOrientation.K_BY_F:
             # lhs is [K, M] already (K-by-F); swizzle directly
             lhs_sw = swizzle(lhs.copy())
         else:
@@ -225,7 +239,7 @@ def matmul_mxfp8_torch_ref(
 
         if rhs_is_swizzled:
             rhs_sw = rhs
-        elif not rhs_is_f_by_k:
+        elif rhs_orientation == TensorOrientation.K_BY_F:
             # rhs is [K, N] already (K-by-F); swizzle directly
             rhs_sw = swizzle(rhs.copy())
         else:
@@ -237,8 +251,13 @@ def matmul_mxfp8_torch_ref(
         # At least one operand is pre-quantized.
         # For BF16 operands, swizzle and quantize. For pre-quantized, use directly.
         if not lhs_prequantized:
-            lhs_sw = lhs if lhs_is_swizzled else (swizzle(lhs.copy()) if not lhs_is_f_by_k else swizzle(lhs.T.copy()))
-            a_data, a_scale = mx_util.quantize_mx_golden(lhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
+            if lhs_is_swizzled:
+                lhs_sw = lhs
+            elif lhs_orientation == TensorOrientation.K_BY_F:
+                lhs_sw = swizzle(lhs.copy())
+            else:
+                lhs_sw = swizzle(lhs.T.copy())
+            a_data, a_scale = quantize_to_mx(lhs_sw, compute_dtype_x4)
         else:
             # Pre-quantized: data may be non-x4 dtype, view as x4
             a_data = lhs
@@ -253,8 +272,13 @@ def matmul_mxfp8_torch_ref(
             a_scale = _raw_exponent_scale(a_scale)
 
         if not rhs_prequantized:
-            rhs_sw = rhs if rhs_is_swizzled else (swizzle(rhs.copy()) if not rhs_is_f_by_k else swizzle(rhs.T.copy()))
-            b_data, b_scale = mx_util.quantize_mx_golden(rhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
+            if rhs_is_swizzled:
+                rhs_sw = rhs
+            elif rhs_orientation == TensorOrientation.K_BY_F:
+                rhs_sw = swizzle(rhs.copy())
+            else:
+                rhs_sw = swizzle(rhs.T.copy())
+            b_data, b_scale = quantize_to_mx(rhs_sw, compute_dtype_x4)
         else:
             b_data = rhs
             if str(b_data.dtype) != str(compute_dtype_x4):
@@ -267,7 +291,7 @@ def matmul_mxfp8_torch_ref(
                 b_scale = _compact_scales(rhs_scales)
             b_scale = _raw_exponent_scale(b_scale)
 
-        result = mx_util.nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
+        result = nc_matmul_mx_golden(a_data, b_data, a_scale, b_scale)
 
     return {"out": result.astype(out_dt)}
 

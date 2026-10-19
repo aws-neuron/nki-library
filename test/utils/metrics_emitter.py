@@ -37,6 +37,7 @@ from typing import Any, final
 from aws_embedded_metrics.serializers.log_serializer import LogSerializer
 from typing_extensions import override
 
+from .common_dataclasses import DEFAULT_COMPILE_MODE
 from .exceptions import UnimplementedException
 from .feature_flag_helper import truncate_name_for_filesystem
 from .metrics_collector import IMetricsCollector
@@ -60,6 +61,10 @@ class SessionContext:
     target: str
     trace_mode: str
     nki_compilation_mode: str
+    # Allocator/scheduler flow the run compiled with, one of
+    # nki.compiler.ncc_driver.COMPILE_MODES. None means the caller did not say, which
+    # is the same flow kernel_tracer resolves an unspecified mode to.
+    compile_mode: str | None = None
     kernel_name: str | None = None
     run_type: str | None = None
     is_release: bool = False
@@ -73,6 +78,9 @@ class SessionContext:
             "Target": self.target,
             "TraceMode": self.trace_mode,
             "NkiCompilationMode": self.nki_compilation_mode,
+            # Resolve rather than emitting None, so the dimension always names a real
+            # flow and a legacy run groups with an explicit --compile-mode legacy one.
+            "CompileMode": self.compile_mode or DEFAULT_COMPILE_MODE,
             "IsRelease": self.is_release,
         }
         if self.kernel_name is not None:
@@ -204,7 +212,7 @@ class MetricsEmitter(IMetricsEmitter):
             else:
                 self._write_to_file(emf_data, output_dir)
 
-    def _write_to_file(self, emf_data: dict[str, Any], output_dir: str) -> None:
+    def _write_to_file(self, emf_data: dict[str, Any], output_dir: str | None) -> None:
         """
         Write EMF JSON to metrics subdirectory under the test artifact directory.
         Filename format: <test_name>_<timestamp>.json

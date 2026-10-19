@@ -18,7 +18,7 @@ import importlib
 
 import numpy as np
 import pytest
-from nki.language.buffers import is_hbm
+from nki.language.buffers import is_hbm  # ty: ignore[unresolved-import]
 
 from test.utils.simulation_setup import setup_simulation_mode
 
@@ -63,7 +63,7 @@ def _run_hbm_safe_test(proof: HbmProof):
         _assert_outputs_are_hbm(result, label)
         return result
 
-    from nki.simulator import simulate_kernel
+    from nki.simulator import simulate_kernel  # ty: ignore[unresolved-import]
 
     simulate_kernel(checking_wrapper, args=[], kwargs=kwargs, lnc=lnc)
 

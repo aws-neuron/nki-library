@@ -21,7 +21,7 @@ from nki.dtype import float8_e4m3fn_x4
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
 from ...matmul_mxfp8.matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
-from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
+from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor, TensorOrientation
 from ...mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm, with_active_sbm
 from ...mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import INTERLEAVE_FACTOR
 from ..common_utils import (
@@ -384,10 +384,10 @@ def compute_fused_gate_up_down_mxfp8(
 
 @with_active_sbm
 def mlp_forward_mxfp8_nki(
-    hidden: nl.ndarray,
-    gate_up_weights: nl.ndarray,
-    down_weights: nl.ndarray,
-    intermediate_hbm: nl.ndarray,
+    hidden: nl.NkiTensor,
+    gate_up_weights: nl.NkiTensor,
+    down_weights: nl.NkiTensor,
+    intermediate_hbm: nl.NkiTensor,
     run_with_lnc2: bool = True,
     gate_up_tiles_m: int = 8,
     gate_up_tiles_n: int = 1,
@@ -396,20 +396,20 @@ def mlp_forward_mxfp8_nki(
     down_tiles_n: int = 1,
     down_tiles_k: int = 8,
     fp8_x4_dtype=float8_e4m3fn_x4,
-    save_gate_pre: nl.ndarray = None,
-    save_gate_act: nl.ndarray = None,
-    save_up: nl.ndarray = None,
-    save_hidden: nl.ndarray = None,
+    save_gate_pre: nl.NkiTensor = None,
+    save_gate_act: nl.NkiTensor = None,
+    save_up: nl.NkiTensor = None,
+    save_hidden: nl.NkiTensor = None,
     dtype=nl.bfloat16,
     spill_reload: bool = True,
     use_scale_packing: bool = True,
-    hidden_scales: nl.ndarray = None,
-    gate_up_scales: nl.ndarray = None,
-    down_scales: nl.ndarray = None,
+    hidden_scales: nl.NkiTensor = None,
+    gate_up_scales: nl.NkiTensor = None,
+    down_scales: nl.NkiTensor = None,
     hidden_is_swizzled: bool = False,
     gate_up_is_swizzled: bool = False,
     down_is_swizzled: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """MXFP8 SwiGLU MLP forward pass with optional activation checkpointing.
 
     Computes the SwiGLU MLP forward pass using MXFP8 quantized matmuls.
@@ -428,10 +428,10 @@ def mlp_forward_mxfp8_nki(
         I: Intermediate dimension size (per gate/up projection).
 
     Args:
-        hidden (nl.ndarray): [S, H], input hidden states.
-        gate_up_weights (nl.ndarray): [2I, H], fused weight matrix — rows [0:I] = W_gate, rows [I:2I] = W_up.
-        down_weights (nl.ndarray): [H, I], down projection weights (W_down).
-        intermediate_hbm (nl.ndarray): [S, I], scratch buffer for gated intermediate activations.
+        hidden (nl.NkiTensor): [S, H], input hidden states.
+        gate_up_weights (nl.NkiTensor): [2I, H], fused weight matrix — rows [0:I] = W_gate, rows [I:2I] = W_up.
+        down_weights (nl.NkiTensor): [H, I], down projection weights (W_down).
+        intermediate_hbm (nl.NkiTensor): [S, I], scratch buffer for gated intermediate activations.
         run_with_lnc2 (bool): Whether to shard across 2 LNC cores.
         gate_up_tiles_m (int): Number of M tiles per block for gate/up phase.
         gate_up_tiles_n (int): Number of N tiles per block for gate/up phase.
@@ -440,24 +440,24 @@ def mlp_forward_mxfp8_nki(
         down_tiles_n (int): Number of N tiles per block for down phase.
         down_tiles_k (int): Number of K tiles per block for down phase.
         fp8_x4_dtype: MXFP8 quantized data type for nc_matmul_mx.
-        save_gate_pre (nl.ndarray): [S, I], HBM buffer to checkpoint gate pre-activation, or None.
-        save_gate_act (nl.ndarray): [S, I], HBM buffer to checkpoint SiLU(gate_pre), or None.
-        save_up (nl.ndarray): [S, I], HBM buffer to checkpoint up projection, or None.
-        save_hidden (nl.ndarray): [S, I], HBM buffer to checkpoint gate_act * up, or None
+        save_gate_pre (nl.NkiTensor): [S, I], HBM buffer to checkpoint gate pre-activation, or None.
+        save_gate_act (nl.NkiTensor): [S, I], HBM buffer to checkpoint SiLU(gate_pre), or None.
+        save_up (nl.NkiTensor): [S, I], HBM buffer to checkpoint up projection, or None.
+        save_hidden (nl.NkiTensor): [S, I], HBM buffer to checkpoint gate_act * up, or None
             (same data as intermediate_hbm but kept as a separate named output
             for clarity in the fwd/bwd contract).
         dtype: Output data type (e.g. nl.bfloat16).
         spill_reload (bool): Whether to spill quantized operands to HBM for reload across K-blocks.
         use_scale_packing (bool): Whether to pack MXFP8 scales into compact format.
-        hidden_scales (nl.ndarray): MXFP8 scales for pre-quantized hidden, or None (raw BF16).
-        gate_up_scales (nl.ndarray): MXFP8 scales for pre-quantized gate_up_weights, or None.
-        down_scales (nl.ndarray): MXFP8 scales for pre-quantized down_weights, or None.
+        hidden_scales (nl.NkiTensor): MXFP8 scales for pre-quantized hidden, or None (raw BF16).
+        gate_up_scales (nl.NkiTensor): MXFP8 scales for pre-quantized gate_up_weights, or None.
+        down_scales (nl.NkiTensor): MXFP8 scales for pre-quantized down_weights, or None.
         hidden_is_swizzled (bool): True if hidden is pre-swizzled [K/4, F*4] BF16.
         gate_up_is_swizzled (bool): True if gate_up_weights is pre-swizzled.
         down_is_swizzled (bool): True if down_weights is pre-swizzled.
 
     Returns:
-        output (nl.ndarray): [S, H], MLP output hidden states.
+        output (nl.NkiTensor): [S, H], MLP output hidden states.
 
     Pseudocode:
         gate_pre     = hidden @ W_gate.T
@@ -484,7 +484,9 @@ def mlp_forward_mxfp8_nki(
         data=gate_up_weights, scales=gate_up_scales, is_swizzled=gate_up_is_swizzled, is_col_parallel_sharded=True
     )
     down_w_td = TensorDescriptor(data=down_weights, scales=down_scales, is_swizzled=down_is_swizzled)
-    int_td = TensorDescriptor(data=effective_intermediate, is_f_by_k=True, is_col_parallel_sharded=run_with_lnc2)
+    int_td = TensorDescriptor(
+        data=effective_intermediate, orientation=TensorOrientation.F_BY_K, is_col_parallel_sharded=run_with_lnc2
+    )
 
     # Derive dimensions from logical shapes (works for all input modes)
     H = hidden_td.logical_shape[0]  # K dimension of hidden = hidden size

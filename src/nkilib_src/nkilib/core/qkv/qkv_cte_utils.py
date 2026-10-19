@@ -61,21 +61,21 @@ class QKV_CTE_UserInput(nl.NKIObject):
     Used for initial input validation and to construct QKV_CTE_Config and QKV_CTE_Dims objects.
 
     Attributes:
-        input (nl.ndarray): [B, S, H], Input hidden states tensor
-        fused_qkv_weights (nl.ndarray): [H, I], Fused QKV weight matrix
+        input (nl.NkiTensor): [B, S, H], Input hidden states tensor
+        fused_qkv_weights (nl.NkiTensor): [H, I], Fused QKV weight matrix
         output_layout (QKVOutputLayout): Desired output tensor layout
-        bias (Optional[nl.ndarray]): [1, I], Optional bias tensor
+        bias (Optional[nl.NkiTensor]): [1, I], Optional bias tensor
         fused_residual_add (Optional[bool]): Whether to perform residual addition
-        mlp_prev (Optional[nl.ndarray]): [B, S, H], Previous MLP output for residual
-        attention_prev (Optional[nl.ndarray]): [B, S, H], Previous attention output for residual
+        mlp_prev (Optional[nl.NkiTensor]): [B, S, H], Previous MLP output for residual
+        attention_prev (Optional[nl.NkiTensor]): [B, S, H], Previous attention output for residual
         fused_norm_type (NormType): Type of normalization to apply
-        gamma_norm_weights (Optional[nl.ndarray]): [1, H], Normalization gamma weights
-        layer_norm_bias (Optional[nl.ndarray]): [1, H], Layer norm beta weights
+        gamma_norm_weights (Optional[nl.NkiTensor]): [1, H], Normalization gamma weights
+        layer_norm_bias (Optional[nl.NkiTensor]): [1, H], Layer norm beta weights
         norm_eps (Optional[float]): Epsilon for normalization stability
         hidden_actual (Optional[int]): Actual hidden dimension if H is padded
         fused_rope (Optional[bool]): Whether to apply RoPE
-        cos_cache (Optional[nl.ndarray]): [B, S, d_head], RoPE cosine cache
-        sin_cache (Optional[nl.ndarray]): [B, S, d_head], RoPE sine cache
+        cos_cache (Optional[nl.NkiTensor]): [B, S, d_head], RoPE cosine cache
+        sin_cache (Optional[nl.NkiTensor]): [B, S, d_head], RoPE sine cache
         d_head (Optional[int]): Dimension per attention head
         num_q_heads (Optional[int]): Number of query heads
         num_kv_heads (Optional[int]): Number of key/value heads
@@ -84,39 +84,39 @@ class QKV_CTE_UserInput(nl.NKIObject):
         use_auto_allocation (bool): Whether to use automatic SBUF allocation
         load_input_with_DMA_transpose (bool): Whether to use DMA transpose
         quantization_type (QuantizationType): Quantization type for QKV projection
-        qkv_w_scale (Optional[nl.ndarray]): Quantization scale for QKV weights
-        qkv_in_scale (Optional[nl.ndarray]): Quantization scale for QKV input
+        qkv_w_scale (Optional[nl.NkiTensor]): Quantization scale for QKV weights
+        qkv_in_scale (Optional[nl.NkiTensor]): Quantization scale for QKV input
         is_input_swizzled (bool): If input tensor is swizzled for MX
         weight_layout (QKVWeightLayout): Layout of fused_qkv_weights
     """
 
-    input: nl.ndarray
-    fused_qkv_weights: nl.ndarray
+    input: nl.NkiTensor
+    fused_qkv_weights: nl.NkiTensor
     output_layout: QKVOutputLayout
     # -- Bias
-    bias: Optional[nl.ndarray]
+    bias: Optional[nl.NkiTensor]
     # -- Fused Residual Add
     fused_residual_add: Optional[bool]
-    mlp_prev: Optional[nl.ndarray]
-    attention_prev: Optional[nl.ndarray]
+    mlp_prev: Optional[nl.NkiTensor]
+    attention_prev: Optional[nl.NkiTensor]
     # --- Fused Norm Related
     fused_norm_type: NormType
-    gamma_norm_weights: Optional[nl.ndarray]
-    layer_norm_bias: Optional[nl.ndarray]
+    gamma_norm_weights: Optional[nl.NkiTensor]
+    layer_norm_bias: Optional[nl.NkiTensor]
     norm_eps: Optional[float]
     hidden_actual: Optional[int]
     # --- Fused RoPE Related
     fused_rope: Optional[bool]
-    cos_cache: Optional[nl.ndarray]
-    sin_cache: Optional[nl.ndarray]
+    cos_cache: Optional[nl.NkiTensor]
+    sin_cache: Optional[nl.NkiTensor]
     d_head: Optional[int]
     num_q_heads: Optional[int]
     num_kv_heads: Optional[int]
     # --- KV Cache Related
-    k_cache: Optional[nl.ndarray]
-    v_cache: Optional[nl.ndarray]
-    k_scale: Optional[nl.ndarray]
-    v_scale: Optional[nl.ndarray]
+    k_cache: Optional[nl.NkiTensor]
+    v_cache: Optional[nl.NkiTensor]
+    k_scale: Optional[nl.NkiTensor]
+    v_scale: Optional[nl.NkiTensor]
     fp8_max: Optional[float]
     fp8_min: Optional[float]
     kv_dtype: Optional[Any]
@@ -124,8 +124,9 @@ class QKV_CTE_UserInput(nl.NKIObject):
     use_block_kv: bool
     transpose_k_cache: bool
     fp8_packed: bool
+    head_split_kv_cache: bool
     block_size: Optional[int]
-    slot_mapping: Optional[nl.ndarray]
+    slot_mapping: Optional[nl.NkiTensor]
     # --- Performance Related
     store_output_in_sbuf: bool
     sbm: Optional[SbufManager]
@@ -133,8 +134,8 @@ class QKV_CTE_UserInput(nl.NKIObject):
     load_input_with_DMA_transpose: bool
     # --- Quantization Related
     quantization_type: QuantizationType
-    qkv_w_scale: Optional[nl.ndarray]
-    qkv_in_scale: Optional[nl.ndarray]
+    qkv_w_scale: Optional[nl.NkiTensor]
+    qkv_in_scale: Optional[nl.NkiTensor]
     is_input_swizzled: bool
     weight_layout: QKVWeightLayout
     # --- QK-Norm Related
@@ -142,11 +143,11 @@ class QKV_CTE_UserInput(nl.NKIObject):
     qk_norm_post_rope: Optional[QKNormConfig]
     # --- Strided Input
     strided_input_config: Optional[StridedInputConfig]
-    output_hbm: Optional[nl.ndarray]
+    output_hbm: Optional[nl.NkiTensor]
     # --- Optional per-segment sum-of-squares outputs (each [B, S, 1])
-    q_squared_sum_out: Optional[nl.ndarray] = None
-    k_squared_sum_out: Optional[nl.ndarray] = None
-    v_squared_sum_out: Optional[nl.ndarray] = None
+    q_squared_sum_out: Optional[nl.NkiTensor] = None
+    k_squared_sum_out: Optional[nl.NkiTensor] = None
+    v_squared_sum_out: Optional[nl.NkiTensor] = None
     # --- FP8 E4M3 dtype mode. See DtypeMode enum.
     dtype_mode: DtypeMode = DtypeMode.NON_OCP
 
@@ -155,8 +156,8 @@ class QKV_CTE_UserInput(nl.NKIObject):
 @dataclass
 class QKV_Quant_Config(nl.NKIObject):
     quantization_type: QuantizationType
-    qkv_w_scale: Optional[nl.ndarray] = None  # weight quant scale for qkv projection
-    qkv_in_scale: Optional[nl.ndarray] = None  # in_scale are same for q, k, v
+    qkv_w_scale: Optional[nl.NkiTensor] = None  # weight quant scale for qkv projection
+    qkv_in_scale: Optional[nl.NkiTensor] = None  # in_scale are same for q, k, v
     quant_dtype: Optional[Any] = None  # Follow _fp8_e4m3_dtype for fp8 and fused_qkv_weights.dtype for other cases
     has_mx_static_dequant_scales: bool = False
     has_row_mx_dequant: bool = False
@@ -207,6 +208,7 @@ class QKV_CTE_Config(nl.NKIObject):
     use_block_kv: bool
     transpose_k_cache: bool
     fp8_packed: bool
+    head_split_kv_cache: bool
     block_size: Optional[int]
     # Additional Internal Config
     load_input_with_DMA_transpose: bool
@@ -549,9 +551,9 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
 
     # Validate Output Layout.
     kernel_assert(
-        args.output_layout == QKVOutputLayout.BSD or args.output_layout == QKVOutputLayout.NBSd,
-        f"[QKV CTE Kernel] Unsupported output layout, output_layout must be 'QKVOutputLayout.BSD' or 'QKVOutputLayout.NBSd',"
-        f" but got output_layout = {args.output_layout}.",
+        args.output_layout in (QKVOutputLayout.BSD, QKVOutputLayout.NBSd, QKVOutputLayout.BNSd),
+        f"[QKV CTE Kernel] Unsupported output layout, output_layout must be 'QKVOutputLayout.BSD',"
+        f" 'QKVOutputLayout.NBSd' or 'QKVOutputLayout.BNSd', but got output_layout = {args.output_layout}.",
     )
 
     if args.output_layout == QKVOutputLayout.NBSd:
@@ -612,9 +614,11 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         )
 
     if args.layer_norm_bias != None:
+        # Beta rides the gamma-apply `tensor_scalar`, which runs for both norm types, so RMS_NORM
+        # needs no separate path. With RMS_NORM this is the affine form `rms_norm(x) * gamma + beta`.
         kernel_assert(
-            args.fused_norm_type == NormType.LAYER_NORM,
-            f"[QKV CTE Kernel] Beta normalization bias is only supported for fused LAYER_NORM.",
+            args.fused_norm_type == NormType.LAYER_NORM or args.fused_norm_type == NormType.RMS_NORM,
+            f"[QKV CTE Kernel] Beta normalization bias requires fused LAYER_NORM or RMS_NORM.",
         )
         kernel_assert(
             args.layer_norm_bias.shape == (1, H),
@@ -675,14 +679,22 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
 
     use_kv_cache = args.k_cache is not None or args.v_cache is not None
     use_kv_quantization = args.k_scale is not None and args.v_scale is not None
+
+    # BNSd names the layout of the returned Q tensor, which only exists on the KV cache path;
+    # every other path writes output_hbm and is governed by the BSD/NBSd arms instead.
+    kernel_assert(
+        args.output_layout != QKVOutputLayout.BNSd or use_kv_cache,
+        "[QKV CTE Kernel] BNSd output layout requires a KV cache (k_cache/v_cache).",
+    )
     if use_kv_cache:
         kernel_assert(
             args.k_cache is not None and args.v_cache is not None,
             "[QKV CTE Kernel] Both k_cache and v_cache must be provided together.",
         )
         kernel_assert(
-            args.output_layout == QKVOutputLayout.BSD,
-            f"[QKV CTE Kernel] KV cache is only supported for BSD output layout, got {args.output_layout}",
+            args.output_layout in (QKVOutputLayout.BSD, QKVOutputLayout.BNSd),
+            f"[QKV CTE Kernel] KV cache supports BSD (Q as [B, S, N*d]) or BNSd (Q as"
+            f" [B, N, S, d]) output layout, got {args.output_layout}",
         )
         kernel_assert(
             args.num_q_heads is not None and args.num_kv_heads is not None and args.d_head is not None,
@@ -698,6 +710,19 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
     kernel_assert(
         not args.fp8_packed or args.use_block_kv,
         "[QKV CTE Kernel] fp8_packed requires use_block_kv=True.",
+    )
+
+    kernel_assert(
+        not args.head_split_kv_cache or args.use_block_kv,
+        "[QKV CTE Kernel] head_split_kv_cache requires use_block_kv=True.",
+    )
+
+    # fp8_packed already head-splits V and packs K; transpose_k_cache stores K as
+    # [num_blocks * num_kv_heads, d_head, block_size]. Either one already decides the
+    # K layout, so combining them with head_split_kv_cache would be ambiguous.
+    kernel_assert(
+        not args.head_split_kv_cache or not (args.fp8_packed or args.transpose_k_cache),
+        "[QKV CTE Kernel] head_split_kv_cache is mutually exclusive with fp8_packed and transpose_k_cache.",
     )
 
     if args.use_block_kv:
@@ -1178,7 +1203,7 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     _, num_shards, _ = get_program_sharding_info()
     S_THRESHOLD_FOR_RESHAPE_DEFAULT = (5 * 128) * num_shards
     use_BxS_input_reshape = (S < S_THRESHOLD_FOR_RESHAPE_DEFAULT) and (
-        args.output_layout == QKVOutputLayout.BSD or args.output_layout == QKVOutputLayout.NBSd
+        args.output_layout in (QKVOutputLayout.BSD, QKVOutputLayout.NBSd, QKVOutputLayout.BNSd)
     )  # In case "NBdS" gets added.
     # Strided input requires output S != input S; BxS reshape is invalid.
     if args.strided_input_config != None:
@@ -1254,6 +1279,7 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         use_block_kv=args.use_block_kv,
         transpose_k_cache=args.transpose_k_cache,
         fp8_packed=args.fp8_packed,
+        head_split_kv_cache=args.head_split_kv_cache,
         block_size=args.block_size,
         # Internal Config
         load_input_with_DMA_transpose=load_input_with_DMA_transpose,

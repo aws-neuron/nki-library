@@ -16,6 +16,7 @@
 MX V-up + MX o_proj), the single source of truth so those kernel files stay independent
 of each other and of the qkv_cte MLA utilities."""
 
+from enum import Enum
 from typing import List, Tuple
 
 import nki.isa as nisa
@@ -26,6 +27,71 @@ from ....core.qkv.qkv_cte import _get_psum_bank_size
 from ....core.utils.allocator import SbufManager, get_logger, sizeinbytes
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
+
+
+class MlaPrecision(Enum):
+    """Arithmetic precision for the split sparse-MLA CTE kernels (qkv, V-up + o_proj,
+    sparse-attention indexer).
+
+    MX (default): the DeepSeek-V3.2 path. Activations arrive pre-quantized and PACKED
+        (``rmsnorm_mx_prefill(pack_scales=True)``), weights are fp8x4 4-packed with
+        block-128 (or native block-32) e8m0 scales, and the LoRA output columns of the
+        first projection are pre-swizzled offline with the MLA column permutation
+        (``[w//512, 128, 4] -> [4, w//512, 128]``) so the in-kernel MX transpose can read
+        contiguous slices. Matmuls issue ``nisa.nc_matmul_mx``.
+
+    BF16: plain back-to-back ``nisa.nc_matmul``. Activations are bf16 ``[B, S, H]``,
+        weights are bf16 ``[K, N]`` in NATURAL column order, and no scale tensors are
+        used (pass ``None``). There is no packing, no swizzle and no un-swizzle, so the
+        column permutation helpers and the MX quantize/dequantize steps drop out; the
+        cost is 2 bytes per weight element on the K-slab budget instead of ~1.25.
+        Required for GLM-MoE-DSA (GLM 5.2 / 5.3), whose checkpoints are bf16.
+
+    Only the numeric format changes: layouts of the kernel OUTPUTS (q_lift, q_pe, c_kv,
+    k_pe) are identical in both modes, so downstream kernels are unaffected.
+    """
+
+    MX = 0
+    BF16 = 1
+
+    def is_mx(self) -> bool:
+        return self is MlaPrecision.MX
+
+    def is_bf16(self) -> bool:
+        return self is MlaPrecision.BF16
+
+
+class RopeLayout(Enum):
+    """Element PAIRING used by Rotary Position Embedding.
+
+    Both layouts rotate ``rope_dim / 2`` pairs by the same ``rope_dim / 2`` angles theta_j and
+    read those angles from the first half of the cos/sin caches (HF ships
+    ``cos = cat(freqs, freqs)``). Only WHICH two elements form a pair differs, so the two are
+    NOT interchangeable — picking the wrong one silently produces plausible-looking but wrong
+    scores rather than failing.
+
+    HALF_SPLIT: pair j = (j, j + rope_dim/2).
+        out[j]              = x[j]*cos_j - x[j + rope_dim/2]*sin_j
+        out[j + rope_dim/2] = x[j]*sin_j + x[j + rope_dim/2]*cos_j
+        HuggingFace ``apply_rotary_pos_emb`` / ``rotate_half``. Used by the DeepSeek-V3.2
+        INDEXER.
+
+    INTERLEAVED: pair j = (2j, 2j+1) — adjacent elements, i.e. the complex-number view.
+        out[2j]   = x[2j]*cos_j - x[2j+1]*sin_j
+        out[2j+1] = x[2j]*sin_j + x[2j+1]*cos_j
+        HuggingFace ``apply_rotary_pos_emb_interleave``. Used by DeepSeek-V3.2's MAIN MLA
+        attention, and by ALL of GLM-MoE-DSA (GLM 5.2 / 5.3) — main attention AND indexer.
+
+    So the main-attention Q/K path is INTERLEAVED for both models (which is why the MLA QKV
+    kernel hardcodes it), and the indexer is the one place the two models disagree.
+    """
+
+    HALF_SPLIT = 0
+    INTERLEAVED = 1
+
+    def is_interleaved(self) -> bool:
+        return self is RopeLayout.INTERLEAVED
+
 
 # Tensor-engine partition cap.
 _P_MAX = 128
@@ -47,6 +113,9 @@ _TI_REPLICATE_MASK = [lane_idx % 16 for lane_idx in range(32)]
 
 _NUM_HW_PSUM_BANKS = 8
 _DS_SCALE_BLOCK = 128
+
+# OCP-MX native scale block
+_MX_SCALE_BLOCK = 32
 
 
 def _new_sbm(name):
@@ -124,12 +193,23 @@ def _transpose_preswizzled_for_mx(input_sb, s_tile_sz, full_num_512, num_512_til
             )
 
 
-def _dma_transpose_latent_for_mx(src_hbm, row_stride, s_tile_sz, num_512_tiles, out_planes, out_perm, base_offset):
+def _dma_transpose_latent_for_mx(
+    src_hbm,
+    row_stride,
+    s_tile_sz,
+    num_512_tiles,
+    out_planes,
+    out_perm,
+    base_offset,
+    sbm_scratch=None,
+    tpsum_scratch=None,
+    s_valid=None,
+):
     """Transpose the 4-pack-ordered latent activation from HBM into the MX-quantize
     input layout ``out_perm[p, k512, s, sub]`` WITHOUT a Tensor-Engine nc_transpose.
 
     Requires ``src_hbm`` to carry the cross-kernel 4-pack column order written by
-    _attention_stage's MM2: within each 512-wide latent block, physical column
+    the attention stage's MM2: within each 512-wide latent block, physical column
     ``sub * 128 + group`` holds natural latent ``l = 4*group + sub``. So for a fixed
     (k512, sub) the 128 ``group`` columns are CONTIGUOUS in HBM (stride 1).
 
@@ -141,22 +221,65 @@ def _dma_transpose_latent_for_mx(src_hbm, row_stride, s_tile_sz, num_512_tiles, 
     2. Vector engine (tensor_copy): free-axis permute ``[p, k512, sub, s]`` ->
        ``out_perm[p, k512, s, sub]``, making the MX 4-pack (sub) innermost & contiguous,
        exactly what quantize_mx consumes. partition p == group == l//4.
+
+    ``s_valid`` (default ``s_tile_sz``) is how many rows this shard actually owns in HBM when
+    ``s_tile_sz`` is a PADDED width -- the HBM read/transpose must not exceed the real rows.
+
+    ``sbm_scratch`` / ``tpsum_scratch`` are only needed when ``s_tile_sz`` is not a multiple
+    of 16 (the tiny-tile prefill case), where step 1 falls back to dma_copy + nc_transpose;
+    ``tpsum_scratch`` must supply at least ``_H_PACK`` PSUM ``[128, 128]`` banks.
     """
     P_MAX = nl.tile_size.pmax
     GROUPS = P_MAX  # latent groups per 512-block (L//4 == 128)
-    for k512 in nl.affine_range(num_512_tiles):
-        for sub in nl.affine_range(_H_PACK):
-            # sub-outer contiguous plane: out_planes[p, k512, sub, s], free stride 1 on s.
-            nisa.dma_transpose(
-                dst=out_planes.ap(
-                    pattern=[[num_512_tiles * _H_PACK * s_tile_sz, P_MAX], [1, s_tile_sz]],
-                    offset=(k512 * _H_PACK + sub) * s_tile_sz,
-                ),
-                src=src_hbm.ap(
-                    pattern=[[row_stride, s_tile_sz], [1, GROUPS]],
-                    offset=base_offset + k512 * P_MAX * _H_PACK + sub * GROUPS,
-                ),
-            )
+    _XBAR_ALIGN_ELEMS = 32 // 2  # 32B / bf16
+    if s_valid == None:
+        s_valid = s_tile_sz
+
+    kernel_assert(
+        s_tile_sz % _XBAR_ALIGN_ELEMS == 0 or (sbm_scratch != None and tpsum_scratch != None),
+        f"_dma_transpose_latent_for_mx: s_tile_sz={s_tile_sz} is not a multiple of "
+        f"{_XBAR_ALIGN_ELEMS} (XBar transpose needs 32B-aligned output), so the "
+        f"dma_copy + nc_transpose fallback is required -- pass sbm_scratch and tpsum_scratch.",
+    )
+
+    if s_tile_sz % _XBAR_ALIGN_ELEMS == 0:
+        for k512 in nl.affine_range(num_512_tiles):
+            for sub in nl.affine_range(_H_PACK):
+                # sub-outer contiguous plane: out_planes[p, k512, sub, s], free stride 1 on s.
+                nisa.dma_transpose(
+                    dst=out_planes.ap(
+                        pattern=[[num_512_tiles * _H_PACK * s_tile_sz, P_MAX], [1, s_valid]],
+                        offset=(k512 * _H_PACK + sub) * s_tile_sz,
+                    ),
+                    src=src_hbm.ap(
+                        pattern=[[row_stride, s_valid], [1, GROUPS]],
+                        offset=base_offset + k512 * P_MAX * _H_PACK + sub * GROUPS,
+                    ),
+                )
+    else:
+        sbm_scratch.open_scope()
+        lat_rows = sbm_scratch.alloc_stack(
+            (s_valid, GROUPS), dtype=nl.bfloat16, buffer=nl.sbuf, align=32, name="lat_untp"
+        )
+        for k512 in nl.affine_range(num_512_tiles):
+            for sub in nl.affine_range(_H_PACK):
+                # [s_tile_sz, 128] contiguous rows -> SBUF, then TE-transpose to [128, s_tile_sz].
+                nisa.dma_copy(
+                    dst=lat_rows,
+                    src=src_hbm.ap(
+                        pattern=[[row_stride, s_valid], [1, GROUPS]],
+                        offset=base_offset + k512 * P_MAX * _H_PACK + sub * GROUPS,
+                    ),
+                )
+                nisa.nc_transpose(data=lat_rows, dst=tpsum_scratch[sub][0:GROUPS, 0:s_valid])
+                nisa.tensor_copy(
+                    dst=out_planes.ap(
+                        pattern=[[num_512_tiles * _H_PACK * s_tile_sz, P_MAX], [1, s_valid]],
+                        offset=(k512 * _H_PACK + sub) * s_tile_sz,
+                    ),
+                    src=tpsum_scratch[sub][0:GROUPS, 0:s_valid],
+                )
+        sbm_scratch.close_scope()
     """
     Free-axis permute [p, k512, sub, s] -> [p, k512, s, sub] (sub innermost). Vector
     engine handles within-partition strided gathers; one wide op. Iteration order
@@ -326,6 +449,8 @@ def _load_mx_weights_k_slab(
     full_out_dim: int = None,
     out_col_offset: int = 0,
     weights_dge_mode=dge_mode.swdge,
+    compact_scales: bool = True,
+    scale_swizzle_groups: List[Tuple[int, int]] = None,
 ) -> None:
     """Load a K-slab ``[k_tile_start : k_tile_start + k_tile_count]`` of MX weights.
 
@@ -359,6 +484,9 @@ def _load_mx_weights_k_slab(
         weights_dge_mode: DGE mode for the weight DMA. Defaults to ``swdge``; pass
             ``hwdge`` when the weight read is a plain rectangular strided pattern
             (no free-dim broadcast) to use the faster hardware descriptor engine.
+        compact_scales: If True (default), ``scales_hbm`` is compact block-128 and is
+            expanded in-kernel (2-stage). If False, ``scales_hbm`` is the native
+            block-32 MX layout ``[in_dim_full//32, full_out_dim]``.
     """
     if full_out_dim == None:
         full_out_dim = out_dim
@@ -390,6 +518,26 @@ def _load_mx_weights_k_slab(
             dge_mode=weights_dge_mode,
         )
 
+    if not compact_scales:
+        # ---- Native block-32 path: one DMA per quadrant. ----
+        full_k32_per_tile = QUADS_PER_TILE * SCALE_P_PER_QUAD  # 16 native rows per 512-tile
+        for quad_idx in nl.affine_range(QUADS_PER_TILE):
+            slab_start_native_row = k_tile_start * full_k32_per_tile + quad_idx * SCALE_P_PER_QUAD
+            nisa.dma_copy(
+                dst=scales_sb[nl.ds(quad_idx * 32, SCALE_P_PER_QUAD), 0:k_tile_count, 0:out_dim],
+                src=scales_hbm.ap(
+                    pattern=[
+                        [full_out_dim, SCALE_P_PER_QUAD],
+                        [full_k32_per_tile * full_out_dim, k_tile_count],
+                        [1, out_dim],
+                    ],
+                    offset=slab_start_native_row * full_out_dim + out_col_offset,
+                    dtype=nl.uint8,
+                ),
+                dge_mode=dge_mode.swdge,
+            )
+        return
+
     # ---- Stage 1: DMA compact scales (no free-dim broadcast at DMA time). ----
     sbm.open_scope()
     compact_scales_sb = sbm.alloc_stack(
@@ -415,11 +563,64 @@ def _load_mx_weights_k_slab(
         )
 
     # ---- Stage 2: Vector-engine broadcast into the materialized scales_sb. ----
-    src_view = compact_scales_sb.expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK)
-    dst_view = scales_sb.reshape_dim(dim=2, shape=(out_n_blocks, SCALE_BLOCK))
-    nisa.tensor_copy(dst=dst_view, src=src_view)
+    _broadcast_compact_scales_to_mx(compact_scales_sb, scales_sb, out_dim, out_n_blocks, scale_swizzle_groups)
 
     sbm.close_scope()  # Frees compact_scales_sb.
+
+
+def _broadcast_compact_scales_to_mx(
+    compact_scales_sb: nl.NkiTensor,
+    scales_sb: nl.NkiTensor,
+    out_dim: int,
+    out_n_blocks: int,
+    scale_swizzle_groups: List[Tuple[int, int]] = None,
+) -> None:
+    """Broadcast compact block-128 scales into the materialized MX ``scales_sb`` layout.
+
+    Plain columns get the natural 128-contiguous fan-out. Columns covered by
+    ``scale_swizzle_groups`` (output blocks the offline loader pre-swizzled with the MLA
+    column permutation ``[w//512,128,4] -> [4,w//512,128]``) instead get the SWIZZLED
+    pattern: ``repeat(natural_blocks, 32)`` tiled 4x across the group.
+
+
+    Groups are NOT coalesced: the swizzle permutes within each group independently (its width
+    sets the ``[w//512,128,4]`` grouping), so merging two adjacent groups would produce a
+    different -- wrong -- permutation.
+    """
+    SCALE_BLOCK = _DS_SCALE_BLOCK
+    RUN = SCALE_BLOCK // _H_PACK  # 32-column run
+
+    groups = []
+    _in_groups = scale_swizzle_groups or []
+    for i in range(len(_in_groups)):
+        grp_start, grp_width = _in_groups[i][0], _in_groups[i][1]
+        kernel_assert(
+            grp_start % SCALE_BLOCK == 0 and grp_width % (SCALE_BLOCK * _H_PACK) == 0,
+            f"scale swizzle group (start={grp_start}, width={grp_width}) needs start % {SCALE_BLOCK} == 0 "
+            f"and width % {SCALE_BLOCK * _H_PACK} == 0.",
+        )
+        if grp_start + grp_width <= out_dim:  # skip groups outside this N-slice
+            groups.append((grp_start, grp_width))
+
+    # Plain 128-contiguous broadcast: ONE wide op over all columns (see docstring).
+    src = compact_scales_sb.expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK)
+    dst = scales_sb.reshape_dim(dim=2, shape=(out_n_blocks, SCALE_BLOCK))
+    nisa.tensor_copy(dst=dst, src=src)
+
+    # Swizzled pattern per group: [.., nb, 1]->32 inner, [.., 1, nb, 32]->4 outer.
+    for i in range(len(groups)):
+        grp_start, grp_width = groups[i][0], groups[i][1]
+        nb_g = grp_width // SCALE_BLOCK
+        blk_start = grp_start // SCALE_BLOCK
+        src = (
+            compact_scales_sb[:, :, blk_start : blk_start + nb_g]
+            .expand_dim(dim=2)
+            .broadcast(dim=2, size=_H_PACK)
+            .expand_dim(dim=4)
+            .broadcast(dim=4, size=RUN)
+        )
+        dst = scales_sb[:, :, grp_start : grp_start + grp_width].reshape_dim(dim=2, shape=(_H_PACK, nb_g, RUN))
+        nisa.tensor_copy(dst=dst, src=src)
 
 
 def _mx_matmul_split_k_range(
@@ -487,6 +688,8 @@ def _load_mx_weights(
     name: str = "mx",
     full_out_dim: int = None,
     out_col_offset: int = 0,
+    compact_scales: bool = True,
+    scale_swizzle_groups: List[Tuple[int, int]] = None,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """Load MX weights and DeepSeek-style block-128 scales from HBM to SBUF.
 
@@ -521,6 +724,15 @@ def _load_mx_weights(
         name: Name prefix for allocated buffers.
         full_out_dim: Full N dimension of the HBM tensor; defaults to ``out_dim``.
         out_col_offset: Column index of the slice start (multiple of 128).
+        compact_scales: If True (default), ``scales_hbm`` is the DeepSeek compact
+            block-128 layout ``[in_dim//128, ceil(full_out_dim/128)]`` and is expanded
+            to the MX layout in-kernel (2-stage: partition-broadcast DMA + free-dim
+            vector broadcast). If False, ``scales_hbm`` is the pre-broadcast NATIVE
+            block-32 MX layout ``[in_dim//32, full_out_dim]`` (one e8m0 byte per 32-K x
+            1-N), loaded directly in one DMA with no stage-2 broadcast.
+        scale_swizzle_groups: Optional list of ``(start_col, width)`` output-column groups
+            that the OFFLINE loader pre-swizzled with the MLA column permutation
+            (``[w//512,128,4] -> [4,w//512,128]``)..
 
     Returns:
         ``(weights_sb, scales_sb)``. ``weights_sb`` is
@@ -573,6 +785,29 @@ def _load_mx_weights(
             dge_mode=dge_mode.swdge,
         )
 
+    if not compact_scales:
+        # ---- Native block-32 path: one DMA ----
+        # Native HBM scales are [in_dim//32, full_out_dim] uint8 e8m0. Within a 512-tile,
+        # quadrant q's 32-K sub-blocks r in [0,4) land at partition rows q*32 + r (the MX
+        # "16 active rows at [0,32,64,96]" layout); the free axis is per-column N (no 128
+        # broadcast), so scales_sb is filled column-exact over [0:out_dim].
+        full_k32_per_tile = QUADS_PER_TILE * SCALE_P_PER_QUAD  # 16 native rows per 512-tile
+        for quad_idx in nl.affine_range(QUADS_PER_TILE):
+            nisa.dma_copy(
+                dst=scales_sb[nl.ds(quad_idx * 32, SCALE_P_PER_QUAD), 0:num_512_tiles, 0:out_dim],
+                src=scales_hbm.ap(
+                    pattern=[
+                        [full_out_dim, SCALE_P_PER_QUAD],
+                        [full_k32_per_tile * full_out_dim, num_512_tiles],
+                        [1, out_dim],
+                    ],
+                    offset=quad_idx * SCALE_P_PER_QUAD * full_out_dim + out_col_offset,
+                    dtype=nl.uint8,
+                ),
+                dge_mode=dge_mode.swdge,
+            )
+        return weights_sb, scales_sb
+
     """
     ---- Stage 1: DMA compact scales (no free-dim broadcast at DMA time). ----
     Inner scope: compact_scales_sb is released after stage 2 so it doesn't
@@ -605,14 +840,8 @@ def _load_mx_weights(
             dge_mode=dge_mode.swdge,
         )
 
-    """
-    ---- Stage 2: Vector-engine broadcast into the final scales_sb. ----
-    Source view: [P_MAX, num_512_tiles, n_blocks, 1] -> broadcast(dim=3, size=128).
-    Destination view: [P_MAX, num_512_tiles, n_blocks, 128] (reshape of the 3D scales_sb).
-    """
-    src_view = compact_scales_sb.expand_dim(dim=3).broadcast(dim=3, size=SCALE_BLOCK)
-    dst_view = scales_sb.reshape_dim(dim=2, shape=(out_n_blocks, SCALE_BLOCK))
-    nisa.tensor_copy(dst=dst_view, src=src_view)
+    # ---- Stage 2: Vector-engine broadcast into the final scales_sb (swizzle-aware). ----
+    _broadcast_compact_scales_to_mx(compact_scales_sb, scales_sb, out_dim, out_n_blocks, scale_swizzle_groups)
 
     sbm.close_scope()  # Frees compact_scales_sb.
 

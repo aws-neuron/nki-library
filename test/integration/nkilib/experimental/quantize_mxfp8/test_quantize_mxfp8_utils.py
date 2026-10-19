@@ -209,16 +209,24 @@ def build_custom_validation_args(kernel_input: dict) -> ValidationArgs:
     golden_scales = _pack_scales(golden_scales_raw, K, F, enable_scale_packing)
     non_padded_rows = _get_non_padded_rows(K, F, enable_scale_packing)
 
+    # The validation contract takes a validator class constructed with just the logfile,
+    # so bind this test case's expectations into subclasses.
+    class _BoundScalesValidator(_ScalesValidator):
+        def __init__(self, logfile: TextIO | None = None):
+            super().__init__(logfile, golden_scales, K, F, enable_scale_packing, non_padded_rows)
+
+    class _BoundDataValidator(_DataValidator):
+        def __init__(self, logfile: TextIO | None = None):
+            super().__init__(logfile, golden_data, return_fp8_dtype)
+
     return ValidationArgs(
         golden_output={
             "quantized_scales_hbm": CustomValidatorWithOutputTensorData(
-                validator=lambda logfile: _ScalesValidator(
-                    logfile, golden_scales, K, F, enable_scale_packing, non_padded_rows
-                ),
+                validator=_BoundScalesValidator,
                 output_ndarray=np.ndarray(shape=(scale_P, scale_F), dtype=nl.float8_e8m0fnu),
             ),
             "quantized_data_hbm": CustomValidatorWithOutputTensorData(
-                validator=lambda logfile: _DataValidator(logfile, golden_data, return_fp8_dtype),
+                validator=_BoundDataValidator,
                 output_ndarray=np.ndarray(shape=(K // INTERLEAVE_FACTOR, F * INTERLEAVE_FACTOR), dtype=non_x4_dtype),
             ),
         },

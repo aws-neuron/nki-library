@@ -27,7 +27,7 @@ them onto this provider is future work.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 import numpy.typing as npt
 
@@ -37,6 +37,38 @@ from .torch_ref_cache import GoldenCache
 from .torch_ref_invalidation import ref_dependency_hash
 
 GoldenDict = dict[str, npt.NDArray[Any]]
+
+
+def mark_uncacheable(reference: Callable) -> Callable:
+    """Opt a torch reference out of the golden cache.
+
+    Use for a reference whose comparator depends on a SIDE EFFECT of running the
+    reference — typically the ref stashes an extra value in a closure holder dict
+    that the comparator later reads (e.g. rmsnorm-quant's dequant_scale,
+    rmsnorm-mx-prefill's expert_affinities). The cache serves the golden dict on a
+    HIT without invoking the reference, so that holder stays empty and the
+    comparator raises KeyError. Marking the ref uncacheable forces a recompute
+    every run, so the side effect always fires. Returns the reference for use as a
+    decorator (applied outside @torch_ref_wrapper).
+    """
+    ref: Any = reference
+    ref._torch_ref_uncacheable = True
+    return reference
+
+
+@runtime_checkable
+class CachedTorchRef(Protocol):
+    """A torch reference that carries its own golden-affecting construction options.
+
+    A reference wrapped for numpy<->torch conversion closes over options (e.g.
+    output precision) that change the golden but are absent from its kwargs, so it
+    publishes them as an attribute for the cache key to fold in. A plain callable
+    makes no such promise, which is why this is a separate, narrower contract.
+    """
+
+    _torch_ref_cache_options: dict[str, Any]
+
+    def __call__(self, **kwargs: Any) -> Any: ...
 
 
 class GoldenProvider:
@@ -77,6 +109,12 @@ class GoldenProvider:
         """
         if not self._cache_path:
             return compute
+        if getattr(reference, "_torch_ref_uncacheable", False):
+            # The reference has a comparator-visible side effect (it stashes a value
+            # in a closure holder that the comparator later reads). A cache HIT would
+            # skip compute() and leave that holder empty, so the comparator raises
+            # KeyError. Refs marked this way always recompute — see mark_uncacheable.
+            return compute
         dep_hash = ref_dependency_hash(reference)
         if dep_hash is None:
             # Uncacheable reference (source unobtainable): run uncached.
@@ -87,7 +125,7 @@ class GoldenProvider:
         # Fold a wrapper's golden-affecting options into the key so variants over the
         # same ref don't collide. An unfingerprintable option makes the input hash
         # None -> load/store no-op (recompute): fail closed, never a wrong hit.
-        options = getattr(reference, "_torch_ref_cache_options", None)
+        options = reference._torch_ref_cache_options if isinstance(reference, CachedTorchRef) else None
         key_inputs = {**inputs, "__torch_ref_cache_options__": options} if options else inputs
 
         def cached() -> GoldenDict:

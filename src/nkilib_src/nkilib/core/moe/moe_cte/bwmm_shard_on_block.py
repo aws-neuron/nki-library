@@ -20,9 +20,6 @@ from typing import Any, Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import core_barrier
-from nki.isa.constants import oob_mode
-from nki.language import NKIObject
 
 from ...utils import common_types
 from ...utils.kernel_assert import kernel_assert
@@ -52,7 +49,7 @@ _I_TP_CHUNK_SIZE = 512  # Maximum chunk size for I_TP tiling in the chunked path
 
 
 @dataclass
-class DimensionSizes(NKIObject):
+class DimensionSizes(nl.NKIObject):
     B: int  # Block size (tokens per block)
     H: int  # Hidden dimension size
     T: int  # Total number of input tokens
@@ -394,7 +391,7 @@ def bwmm_shard_on_block(
                                 vector_offset=addr_fin_reshaped,
                                 indirect_dim=0,
                             ),
-                            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
                         )
 
                         # Cast to float32
@@ -416,7 +413,7 @@ def bwmm_shard_on_block(
                             vector_offset=block_token_mapping,
                             indirect_dim=0,
                         ),
-                        oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                        oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
                     )
 
                     if expert_affinities_scaling_mode == common_types.ExpertAffinityScaleMode.PRE_SCALE:
@@ -787,7 +784,9 @@ def bwmm_shard_on_block(
                                                 offset=offset,
                                                 scalar_offset=block_expert,
                                             ),
-                                            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+                                            oob_mode=nisa.oob_mode.skip
+                                            if skip_dma.skip_weight
+                                            else nisa.oob_mode.error,
                                         )
 
                             # Allocate psum for this chunk's i_tiles
@@ -937,7 +936,7 @@ def bwmm_shard_on_block(
                                     offset=offset_dp,
                                     scalar_offset=block_expert,
                                 ),
-                                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+                                oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
                             )
 
                         # Down projection for this chunk — plain accumulation (no affinity/bias yet)
@@ -1019,7 +1018,7 @@ def bwmm_shard_on_block(
                                 indirect_dim=0,
                             ),
                             src=block_new_lst[token_tile_idx].ap(pattern=[[H, TILE_SIZE], [1, H]], offset=0),
-                            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
                         )
                 else:
                     for token_tile_idx in range(NUM_TILES):
@@ -1034,7 +1033,7 @@ def bwmm_shard_on_block(
                                 pattern=[[H, TILE_SIZE], [1, H]], offset=0, vector_offset=token_idx, indirect_dim=0
                             ),
                             src=block_new_lst[token_tile_idx].ap(pattern=[[H, TILE_SIZE], [1, H]], offset=0),
-                            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
                         )
     # END OF STATIC LOOP
 
@@ -1052,9 +1051,9 @@ def bwmm_shard_on_block(
         zeros_dummy = nl.ndarray((reduce_tile_size, 1, H), dtype=output.dtype, buffer=nl.sbuf)
         nisa.memset(dst=zeros_dummy, value=0.0)
         if num_shards == 1:
-            core_barrier(output, (0))
+            nisa.core_barrier(output, (0))
         elif num_shards == 2:
-            core_barrier(output, (0, 1))
+            nisa.core_barrier(output, (0, 1))
 
         if shard_id == 0:
             reduce_outputs(output, zeros_dummy, nc0_tiles, reduce_tile_size, 0, H)
@@ -1345,7 +1344,7 @@ def load_down_proj_weight(
         nisa.dma_copy(
             dst=load_dst[i_tile_idx][0:num_i, 0:H],
             src=down_proj_weight.ap(pattern=[[H, num_i], [1, H]], offset=offset, scalar_offset=block_expert),
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
         )
 
         # Type conversion if needed
@@ -1451,7 +1450,7 @@ def load_gate_up_proj_weights(
                     offset=offset,
                     scalar_offset=block_expert,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
             )
 
             # Type conversion if needed
@@ -1741,7 +1740,7 @@ def load_and_transpose_gup_bias(inps: InputTensors, dims: DimensionSizes, cfg: C
         src=inps.gate_and_up_proj_bias.ap(
             pattern=[[dims.I_TP, 2], [1, dims.I_TP]], offset=0, scalar_offset=block_expert, indirect_dim=0
         ),
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
     )
 
     # transpose
@@ -1829,7 +1828,7 @@ def load_and_broadcast_down_bias(inps: InputTensors, dims: DimensionSizes, cfg: 
         src=inps.down_proj_bias.ap(
             pattern=[[dims.H, 1], [1, dims.H]], offset=0, scalar_offset=block_expert, indirect_dim=0
         ),
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
     )
 
     down_bias_broadcasted = nl.ndarray((TILE_SIZE, dims.H), dtype=cfg.compute_dtype, buffer=nl.sbuf)
@@ -1904,7 +1903,7 @@ def bwmm_load_old_block(
                     vector_offset=block_token_mapping,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             )
         else:
             # output shape: (num_tokens, H)
@@ -1918,7 +1917,7 @@ def bwmm_load_old_block(
                 src=output.ap(
                     pattern=[[H, TILE_SIZE], [1, H]], offset=0, vector_offset=block_token_mapping, indirect_dim=0
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             )
 
     return block_old_lst

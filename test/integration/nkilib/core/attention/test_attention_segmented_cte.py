@@ -38,7 +38,7 @@ from test.utils.common_dataclasses import (
     Platforms,
     prepare_model_parametrize,
 )
-from test.utils.metrics_collector import IMetricsCollector
+from test.utils.metrics_collector import IMetricsCollector, MetricName
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -55,15 +55,15 @@ def generate_inputs(
     tp_q: bool,
     tp_out: bool,
     dtype,
-    sliding_window: int = None,
-    seqlen_q: int = None,
+    sliding_window: int | None = None,
+    seqlen_q: int | None = None,
     use_sink: bool = False,
-    sink_value: float = None,
-    active_seqlen: int = None,
+    sink_value: float | None = None,
+    active_seqlen: int | None = None,
     k_pre_transposed: bool = False,
     fp8_packed: bool = False,
-    k_scale_val: float = None,
-    v_scale_val: float = None,
+    k_scale_val: float | None = None,
+    v_scale_val: float | None = None,
     kv_dtype=None,
 ):
     """Generate input tensors for segmented attention test.
@@ -1191,6 +1191,93 @@ class TestSegmentedAttentionCTE:
             sink_value=2.0,
         )
 
+    # head_dim=64 device latency budgets. Configs A/B/C run at 8Q:1KV, a fixed shape kept as a
+    # cheap relative gate; config A-TP4 is the production gpt-oss TP4/LNC2 shape (16Q:2KV) and is
+    # the one to quote. budget_ps is compared against TpbSgCyclesSum, which is a duration in
+    # PICOSECONDS despite its name, so 4.40e9 = 4.4 ms.
+    _DHEAD64_BUDGET_PARAMS = _MATRIX_PARAMS_BASE + ", budget_ps"
+    _dhead64_budget_perms = [
+        # config A: active 8192, prior 0.
+        pytest.param(1, 8, 1, 128, 2048, 64, 0, True, True, nl.bfloat16, 8192, 2.20e9),
+        # config B: active 8192, prior 128k.
+        pytest.param(1, 8, 1, 128, 2048, 64, 122880, True, True, nl.bfloat16, 8192, 55.0e9),
+        # config C: active 8192, prior 8192. Short-prior point: prior>0 puts the kernel on the
+        # segmented multi-chunk path without paying config B's ~55 ms sweep cost.
+        pytest.param(1, 8, 1, 128, 2048, 64, 8192, True, True, nl.bfloat16, 8192, 5.20e9),
+        # config A-TP4: production gpt-oss TP4/LNC2 shape -- 16Q:2KV, active 8192, prior 0.
+        # Same 8:1 q-per-kv grouping as config A but twice the heads, so twice the per-core work.
+        pytest.param(1, 16, 2, 128, 2048, 64, 0, True, True, nl.bfloat16, 8192, 4.40e9),
+    ]
+
+    @pytest.mark.parametrize(_DHEAD64_BUDGET_PARAMS, _dhead64_budget_perms)
+    def test_attention_segmented_cte_dhead64_latency_budget(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+        budget_ps,
+    ):
+        """head_dim=64 device latency must come in under budget.
+
+        Correctness is still checked by _run_matrix_test, so a regression shows up as a
+        comparison failure rather than a slow pass.
+        """
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            use_sink=True,
+            sink_value=2.0,
+        )
+        # Read back the latency the orchestrator recorded during _run_matrix_test.
+        # Prefer the collector's get_metric() accessor. Fall back to the metrics
+        # context when running against a prebuilt nkilib_testing wheel that predates
+        # it: setup.py republishes test/utils as nkilib_testing, so a source-only
+        # edit stays invisible until the wheel is regenerated.
+        # get_finalized_metrics_context() is not usable here because it appends an
+        # extra ElapsedAllSec sample on every call, and teardown calls it again.
+        metric_name = MetricName.TPB_SG_CYCLES_SUM
+        read_metric = getattr(collector, "get_metric", None)
+        if read_metric is not None:
+            measured_ps = read_metric(metric_name)
+        else:
+            # getattr rather than attribute access: _metrics_context is declared on the
+            # concrete MetricsCollector, not on the IMetricsCollector interface this is
+            # annotated as, so naming it directly fails static type checking.
+            context = getattr(collector, "_metrics_context", None)
+            recorded = context.metrics.get(metric_name) if context is not None else None
+            measured_ps = float(recorded.values[-1]) if recorded and recorded.values else None
+        if measured_ps is None:
+            pytest.skip("device latency metric unavailable (metrics disabled or simulation-only run)")
+        if platform_target in (Platforms.TRN3, Platforms.TRN3_PDS):
+            assert measured_ps <= budget_ps, (
+                f"head_dim=64 latency {measured_ps / 1e9:.3f} ms exceeds budget {budget_ps / 1e9:.3f} ms "
+                f"(prior_tokens={prior_tokens}, q_active={q_active}); "
+                f"ratio {measured_ps / budget_ps:.2f}x"
+            )
+
     # --- #5c. Multi-batch sink (bs>1) — exercises per-batch sink slicing ---
 
     @pytest.mark.parametrize(
@@ -1200,6 +1287,16 @@ class TestSegmentedAttentionCTE:
             pytest.param(2, 8, 1, 128, 2048, 128, 2048, True, True, nl.bfloat16, 512, None),
             # Non-SWA, bs=2, GQA 8:1, no prior
             pytest.param(2, 8, 1, 128, 2048, 128, 0, True, True, nl.bfloat16, 512, None),
+            # Non-SWA, bs=2, GQA 8:1, num_full=2 prior (prior_tokens=1024, prior_seg_size=512
+            # -> floor(1024/512)=2, partial=0). Exercises the opt5 peeled Region C on the
+            # multihead path: 1 accumulate-only segment + 1 final accumulate+normalize
+            # segment. Kept non-SWA on purpose: SWA returns early and never reaches Region C.
+            pytest.param(2, 8, 1, 128, 512, 64, 1024, True, True, nl.bfloat16, 512, None),
+            # Non-SWA, bs=2, GQA 8:1, num_full=4 prior (prior_tokens=2048, prior_seg_size=512
+            # -> floor(2048/512)=4, partial=0). Deeper guard for the opt5 peel: 3
+            # accumulate-only segments + 1 final accumulate+normalize segment; the
+            # interleaved normalize must fire exactly once (on the last prior segment).
+            pytest.param(2, 8, 1, 128, 512, 64, 2048, True, True, nl.bfloat16, 512, None),
             # SWA, bs=2, GQA 8:1, with prior
             pytest.param(2, 8, 1, 128, 512, 64, 512, True, True, nl.bfloat16, 512, 128),
             # SWA, bs=2, GQA 8:1, no prior

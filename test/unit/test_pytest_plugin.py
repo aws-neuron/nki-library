@@ -27,13 +27,17 @@ resolve_session_trace_mode projects remote-vs-local off resolve_host_provisionin
 reads that result from config, so these tests set it there (see _config).
 """
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from _pytest.stash import Stash
 
 from test.utils.common_dataclasses import HostProvisioningResult, TraceMode
 from test.utils.pytest_plugin import apply_host_provisioning_result, get_pytest_mark_names, resolve_session_trace_mode
+from test.utils.simulation_setup import apply_xfail_simulation
+from test.utils.simulation_xfails import SIMULATION_XFAIL_NODEIDS, SIMULATION_XFAIL_REASON
 
 
 def _flags(**overrides):
@@ -56,16 +60,84 @@ def _config(*, plugin_provisioned=False):
     return config
 
 
+class _MarkerNode:
+    """Stands in for a collected test: reports a preset list of resolved markers."""
+
+    def __init__(self, markers: list[pytest.Mark]) -> None:
+        self._markers = markers
+
+    def iter_markers(self, name: str | None = None) -> Iterator[pytest.Mark]:
+        return (marker for marker in self._markers if name is None or marker.name == name)
+
+
+class _CollectedItem:
+    """Stands in for a collected test: resolves and records markers like a pytest Item."""
+
+    def __init__(self, markers: list[pytest.Mark], nodeid: str = "") -> None:
+        self._markers = list(markers)
+        self.nodeid = nodeid
+        self.added: list[pytest.Mark] = []
+
+    def get_closest_marker(self, name: str) -> pytest.Mark | None:
+        for marker in reversed(self._markers):
+            if marker.name == name:
+                return marker
+        return None
+
+    def add_marker(self, marker) -> None:
+        mark = getattr(marker, "mark", marker)
+        self._markers.append(mark)
+        self.added.append(mark)
+
+
+class TestApplyXfailSimulation:
+    """apply_xfail_simulation translates the xfail_simulation marker into a
+    non-strict xfail, and only for tagged tests (it is called in simulation mode only)."""
+
+    def test_marks_tagged_item_with_its_reason(self):
+        item = _CollectedItem([pytest.mark.xfail_simulation(reason="sim numerical gap").mark])
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1
+        assert xfails[0].kwargs["reason"] == "sim numerical gap"
+        assert xfails[0].kwargs["strict"] is False
+
+    def test_defaults_reason_when_marker_has_none(self):
+        item = _CollectedItem([pytest.mark.xfail_simulation.mark])
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1 and xfails[0].kwargs["reason"]
+
+    def test_ignores_untagged_item(self):
+        item = _CollectedItem([pytest.mark.fast.mark], nodeid="test/x.py::test_ok")
+        apply_xfail_simulation([item])
+        assert item.added == []
+
+    def test_marks_item_listed_in_nodeid_registry(self):
+        listed = next(iter(SIMULATION_XFAIL_NODEIDS))
+        item = _CollectedItem([], nodeid=listed)
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1
+        assert xfails[0].kwargs["reason"] == SIMULATION_XFAIL_REASON
+        assert xfails[0].kwargs["strict"] is False
+
+    def test_inline_marker_takes_precedence_over_registry(self):
+        listed = next(iter(SIMULATION_XFAIL_NODEIDS))
+        item = _CollectedItem([pytest.mark.xfail_simulation(reason="inline reason").mark], nodeid=listed)
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1 and xfails[0].kwargs["reason"] == "inline reason"
+
+
 def test_get_pytest_mark_names_returns_sorted_unique_names():
-    node = SimpleNamespace(
-        iter_markers=lambda: iter(
-            [
-                SimpleNamespace(name="slow", args=(), kwargs={}),
-                SimpleNamespace(name="platforms", args=(), kwargs={"exclude": ["trn1"]}),
-                SimpleNamespace(name="fast", args=(), kwargs={}),
-                SimpleNamespace(name="slow", args=("duplicate",), kwargs={}),
-            ]
-        )
+    node = _MarkerNode(
+        [
+            pytest.mark.slow.mark,
+            pytest.mark.platforms(exclude=["trn1"]).mark,
+            pytest.mark.fast.mark,
+            pytest.mark.slow("duplicate").mark,
+        ]
     )
 
     assert get_pytest_mark_names(node) == ["fast", "platforms", "slow"]
@@ -121,6 +193,15 @@ class TestResolveSessionTraceMode:
         """No host flags, no plugin signal, and no local Neuron devices -> CompileOnly."""
         with (
             patch("test.utils.pytest_plugin.get_feature_flag", side_effect=_flags()),
+            patch("test.utils.pytest_plugin.detect_local_neuron_devices", return_value=False),
+        ):
+            assert resolve_session_trace_mode(_config()) == TraceMode.CompileOnly
+
+    def test_single_compile_separation_not_requested_by_default(self):
+        """With no single compile separation request, trace mode resolution is unaffected."""
+        with (
+            patch("test.utils.pytest_plugin.get_feature_flag", side_effect=_flags()),
+            patch("test.utils.pytest_plugin._single_compile_separation_requested", return_value=False),
             patch("test.utils.pytest_plugin.detect_local_neuron_devices", return_value=False),
         ):
             assert resolve_session_trace_mode(_config()) == TraceMode.CompileOnly

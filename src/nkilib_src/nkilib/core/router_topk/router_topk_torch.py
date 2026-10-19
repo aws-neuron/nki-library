@@ -40,6 +40,8 @@ def router_topk_torch_ref(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
+    skip_store_expert_affinities: bool = False,
+    expert_affinities_eager_out=None,
 ):
     """
     PyTorch reference implementation for router top-K kernel.

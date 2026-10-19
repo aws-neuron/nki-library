@@ -23,9 +23,13 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import fabric2
+# fabric2 is imported lazily (see _is_fabric_connection)
+if TYPE_CHECKING:
+    import fabric2
 
 # Redundant aliases on the timing constants mark them as intentional re-exports
 # so the client reads identical values without redefining them. The deployed
@@ -49,6 +53,21 @@ from .scripts.remote_lock_scripts import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+
+def _is_fabric_connection(executor: object) -> bool:
+    """True if `executor` is a ``fabric2.Connection``.
+
+    Imports fabric2 lazily so this module stays importable where fabric2 is
+    absent.
+    """
+    # TODO: remove Connection support once host patcher uses RemoteExecutor
+    try:
+        import fabric2
+    except ImportError:
+        return False
+    return isinstance(executor, fabric2.Connection)
+
+
 # Remote paths for lock files
 REMOTE_LOCK_DIR = "/tmp/neuronx-cc/core_locks"
 REMOTE_VERSION_JSON = f"{REMOTE_LOCK_DIR}/infra_version.json"
@@ -57,12 +76,12 @@ REMOTE_FLOCK_FILE = f"{REMOTE_LOCK_DIR}/atomic_lock"
 REMOTE_LOCK_HELPERS = f"{REMOTE_LOCK_DIR}/lock_helpers.py"
 
 # Default locking protocol version for hosts without version file
-DEFAULT_LOCKING_PROTOCOL_VERSION = 4
+DEFAULT_LOCKING_PROTOCOL_VERSION = 5
 
-# Build-time guard: this constant and the deployed v4 queue verbs must move
+# Build-time guard: this constant and the deployed v5 queue verbs must move
 # together. Fail fast at import if the constant drifts from the protocol the
 # verbs implement, rather than silently regressing hosts.
-assert DEFAULT_LOCKING_PROTOCOL_VERSION == 4, "locking protocol constant must stay pinned to v4"
+assert DEFAULT_LOCKING_PROTOCOL_VERSION == 5, "locking protocol constant must stay pinned to v5"
 
 # JSON key in version file
 MIN_CLIENT_VERSION_KEY = "minClientLockingVersion"
@@ -72,7 +91,12 @@ MIN_CLIENT_VERSION_KEY = "minClientLockingVersion"
 # doubles as the truthful worst-case release time. The on-core capture is wrapped
 # in a shorter shell ``timeout`` so the cap never truncates a real in-progress
 # capture.
-DEFAULT_LOCK_TIMEOUT_SECONDS = 60
+# MEGA_LOCK_TIMEOUT raises the cap for long-running single-tenant captures. The GPT-OSS
+# 36-layer fp8-packed KV-update NEFF executes for ~56 s on device, which overruns the derived
+# capture timeout (DEFAULT_LOCK_TIMEOUT_SECONDS - 5 = 55 s in profiler_utils) and truncates the
+# capture. The default stays 60 so shared-fleet behaviour is unchanged; the GPT-OSS runners
+# under steering_private/gptoss_dma_json_rev15_nki07/run_scripts/ export MEGA_LOCK_TIMEOUT=900.
+DEFAULT_LOCK_TIMEOUT_SECONDS = int(os.environ.get("MEGA_LOCK_TIMEOUT", "60"))
 
 # Path to the local helper script that gets deployed to remote hosts
 _LOCAL_LOCK_HELPERS_PATH = Path(__file__).parent / "scripts" / "remote_lock_scripts.py"
@@ -198,6 +222,7 @@ def _remote_lock_operation(lock_file, helpers_file, command, args, kwargs=None, 
         "worst_case_eta": lr.worst_case_eta,
         "bumped": lr.bumped,
         "re_enqueued": lr.re_enqueued,
+        "should_reset_cores": lr.should_reset_cores,
     }
     return result
 
@@ -299,6 +324,7 @@ def _run_lock_helper(executor, command: str, *args, **kwargs) -> LockResult:
         worst_case_eta=resp.get("worst_case_eta"),
         bumped=resp.get("bumped", False),
         re_enqueued=resp.get("re_enqueued", False),
+        should_reset_cores=resp.get("should_reset_cores", True),
     )
 
 
@@ -325,6 +351,7 @@ def poll(
     version: int,
     entry_id: str,
     ready: bool,
+    lnc_config: int,
     caller_id: str | None = None,
 ) -> LockResult:
     """Poll the FIFO core-allocation queue (fast-path / enqueue / commit)."""
@@ -338,6 +365,7 @@ def poll(
         version,
         entry_id,
         ready,
+        lnc_config,
         caller_id=caller_id,
     )
 
@@ -413,24 +441,21 @@ def is_draining(executor, version: int) -> bool:
 
 def drain(executor, timeout_seconds: int, version: int) -> LockResult:
     """Enable drain mode. Accepts executor or fabric2.Connection (for host patcher compat)."""
-    # TODO: remove Connection support once host patcher uses RemoteExecutor
-    if isinstance(executor, fabric2.Connection):
+    if _is_fabric_connection(executor):
         return _conn_run_lock_helper(executor, "drain", REMOTE_LOCKS_JSON, timeout_seconds, version)
     return _run_lock_helper(executor, "drain", REMOTE_LOCKS_JSON, timeout_seconds, version)
 
 
 def undrain(executor, version: int) -> LockResult:
     """Disable drain mode. Accepts executor or fabric2.Connection (for host patcher compat)."""
-    # TODO: remove Connection support once host patcher uses RemoteExecutor
-    if isinstance(executor, fabric2.Connection):
+    if _is_fabric_connection(executor):
         return _conn_run_lock_helper(executor, "undrain", REMOTE_LOCKS_JSON, version)
     return _run_lock_helper(executor, "undrain", REMOTE_LOCKS_JSON, version)
 
 
 def initialize(executor) -> None:
     """Create lock dir, deploy helpers, read version. Accepts executor or Connection (host patcher compat)."""
-    # TODO: remove Connection support once host patcher uses RemoteExecutor
-    if isinstance(executor, fabric2.Connection):
+    if _is_fabric_connection(executor):
         conn = executor
         conn.run(
             f"mkdir -p -m 777 {REMOTE_LOCK_DIR} && touch {REMOTE_FLOCK_FILE} && chmod 666 {REMOTE_FLOCK_FILE} 2>/dev/null || true",

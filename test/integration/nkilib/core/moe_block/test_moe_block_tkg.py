@@ -207,6 +207,95 @@ def mx_moe_block_tkg_wrapper(
     )
 
 
+# Minimum top-k boundary margin (see _ensure_robust_local_routing) in units of the token's logit std.
+_LOCAL_ROUTING_MIN_MARGIN = 1e-2
+
+
+def _ensure_robust_local_routing(
+    inputs: dict,
+    rng: np.random.Generator,
+    hidden_dtype,
+    top_k: int,
+    num_local_experts: int,
+    hidden_actual: int | None,
+    router_mm_dtype,
+    eps: float = 1e-6,
+    min_margin: float = _LOCAL_ROUTING_MIN_MARGIN,
+    max_attempts: int = 16,
+) -> None:
+    """Redraw input rows of tokens whose top-k routing is a near-tie involving a local expert.
+
+    The torch reference feeds the router an fp32 RMSNorm output (rounded to router_mm_dtype only
+    when that is bf16/fp16), while the kernel rounds x*gamma to the input dtype and rounds again
+    after the rsqrt multiply. For bf16 inputs and an fp32 router this puts a per-element noise of
+    ~2.4e-3 (std, in units of the token's logit std; ~3.4e-3 on a logit gap, up to ~1.2e-2 per
+    element) between the two sides' router logits, and any change to the kernel's arithmetic (e.g.
+    new activation-function tables) moves a few hundred of those roundings. A token whose
+    k-th/(k+1)-th gap sits inside that band can be routed differently by the two sides, and in
+    all-expert mode such a flip zeroes (or fills) the token's whole output row. The default margin
+    of 1e-2 is ~3 sigma of the gap-level noise, so the routing stays stable even if the kernel's
+    rounding is re-realized wholesale, not just nudged.
+
+    Top-k membership depends only on the router logits (softmax and sigmoid are monotonic, and the
+    optional bias is included), so the views are computed on the logits. A token is ambiguous if,
+    in either the reference view or the kernel-rounding view, its top-k boundary involves a local
+    expert and the gap is below ``min_margin``, or if the two views disagree on whether a local
+    expert is in its top-k at all. Only ambiguous tokens are redrawn (from ``rng``, so the result is
+    deterministic); every other tensor and token is left untouched.
+    """
+    if inputs.get("residual") is not None:
+        raise NotImplementedError("robust_local_routing does not model the fused residual add")
+    B, S, H = inputs["inp"].shape
+    T = B * S
+    rank_id = int(inputs["rank_id"][0, 0])
+    local_experts = np.arange(rank_id * num_local_experts, (rank_id + 1) * num_local_experts)
+    kernel_rounds = hidden_dtype in (nl.bfloat16, nl.float16)
+    router_rounds = router_mm_dtype in (nl.bfloat16, nl.float16)
+
+    gamma = inputs["gamma"].astype(np.float32)
+    w = inputs["router_weights"].astype(np.float32)
+    w_bias = inputs["router_bias"].astype(np.float32) if inputs["router_bias"] is not None else 0.0
+
+    def round_to(x: np.ndarray, dtype) -> np.ndarray:
+        return dt.static_cast(x, dtype).astype(np.float32)
+
+    def routing_view(x: np.ndarray):
+        """(gap margin, local expert in top-k, boundary involves local expert) per token."""
+        if router_rounds:
+            x = round_to(x, router_mm_dtype)
+        logits = x @ w + w_bias
+        order = np.argsort(-logits, axis=-1, kind="stable")
+        sorted_logits = np.take_along_axis(logits, order, axis=-1)
+        margin = (sorted_logits[:, top_k - 1] - sorted_logits[:, top_k]) / logits.std(axis=-1)
+        local_in_topk = np.isin(order[:, :top_k], local_experts).any(axis=-1)
+        boundary_is_local = np.isin(order[:, top_k - 1], local_experts) | np.isin(order[:, top_k], local_experts)
+        return margin, local_in_topk, boundary_is_local
+
+    def ambiguous_tokens(inp_np: np.ndarray) -> np.ndarray:
+        x = inp_np.astype(np.float32)
+        rsqrt = 1.0 / np.sqrt(np.square(x).sum(axis=-1, keepdims=True) / (hidden_actual or H) + eps)
+        # Reference view: fp32 RMSNorm output, as the golden computes it.
+        margin, local_in_topk, boundary_is_local = routing_view(x * rsqrt * gamma)
+        ambiguous = boundary_is_local & (margin < min_margin)
+        if kernel_rounds:
+            # Kernel view: x*gamma rounded to the input dtype, times rsqrt, rounded again.
+            x_kernel = round_to(round_to(x * gamma, hidden_dtype) * rsqrt, hidden_dtype)
+            margin_k, local_in_topk_k, boundary_is_local_k = routing_view(x_kernel)
+            ambiguous |= (boundary_is_local_k & (margin_k < min_margin)) | (local_in_topk != local_in_topk_k)
+        return np.flatnonzero(ambiguous)
+
+    inp = inputs["inp"].reshape(T, H)
+    for _ in range(max_attempts):
+        ambiguous = ambiguous_tokens(inp)
+        if len(ambiguous) == 0:
+            inputs["inp"] = inp.reshape(B, S, H)
+            return
+        inp[ambiguous] = dt.static_cast(rng.uniform(low=-0.1, high=0.1, size=(len(ambiguous), H)), hidden_dtype)
+    raise RuntimeError(
+        f"Could not find unambiguous local routing for tokens {ambiguous.tolist()} in {max_attempts} redraws"
+    )
+
+
 def generate_inputs(
     batch: int,
     seqlen: int,
@@ -231,17 +320,28 @@ def generate_inputs(
     is_static_mx: bool = False,
     is_static: bool = False,
     is_row_quant: bool = False,
+    has_residual: bool = False,
     inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
     outp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
+    robust_local_routing: bool = False,
 ) -> dict:
-    """Build input tensors for moe_block_tkg kernel tests. Returns dict of numpy arrays."""
+    """Build input tensors for moe_block_tkg kernel tests. Returns dict of numpy arrays.
+
+    robust_local_routing (all-expert only): redraw the input rows of tokens whose top-k boundary is
+    a near-tie involving one of this rank's local experts, so kernel/reference rounding differences
+    cannot flip whole output rows. See _ensure_robust_local_routing.
+    """
     is_mx_weight = is_dtype_mx(moe_weight_dtype)
+
+    # Seed before generating any inputs. gen_moe_mx_weights() draws from numpy's
+    # global RNG (np.random.*), so np.random.seed() must precede it; otherwise the
+    # MX expert weights are unseeded and vary run-to-run, causing flaky fp8
+    # numerical-accuracy failures on the all-expert MX path.
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
 
     if is_mx_weight:
         mx_weights = gen_moe_mx_weights(hidden, intermediate, num_local_experts, moe_weight_dtype)
-
-    np.random.seed(42)
-    rng = np.random.default_rng(42)
 
     hidden_dtype = input_dtype
     weight_dtype = moe_weight_dtype
@@ -368,6 +468,22 @@ def generate_inputs(
     else:
         inputs["rank_id"] = None
 
+    # Optional fused residual add (all-expert MX only): residual is [B, S, H].
+    if has_residual:
+        inputs["residual"] = dt.static_cast(rng.uniform(low=-0.1, high=0.1, size=(batch, seqlen, hidden)), hidden_dtype)
+
+    # Last RNG consumer: redrawing ambiguous tokens must not perturb any other tensor.
+    if robust_local_routing and is_all_expert:
+        _ensure_robust_local_routing(
+            inputs,
+            rng,
+            hidden_dtype,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            hidden_actual=hidden_actual,
+            router_mm_dtype=router_mm_dtype,
+        )
+
     if inp_layout != MoEBlockIOLayout.B_S_H:
         inputs["inp_layout"] = inp_layout
     if outp_layout != MoEBlockIOLayout.B_S_H:
@@ -433,6 +549,9 @@ MANUAL_PARAMS = [
     [2,     True,           16,     1,          4096,       None,           384,            128,                128,                8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,            nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16, QuantizationType.NONE],
     [2,     True,           16,     1,          4096,       None,           384,            128,                8,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3,         nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16, QuantizationType.NONE],
     # All-expert MXFP4 tests
+    # LNC=1 (single core) configs — verified for all-expert MX and selective-load MX paths
+    [1,     True,           512,    1,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [1,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
     # GPT-OSS 120B
     [2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
     pytest.param(2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX, marks=pytest.mark.fast),
@@ -473,6 +592,10 @@ _MOE_MX_ALL_EXPERT_XFAIL = pytest.mark.xfail(
 
 STATIC_MX_PARAM_NAMES = "lnc, is_all_expert, batch, seqlen, hidden, hidden_actual, intermediate, num_global_experts, num_local_experts, top_k, router_fn, hidden_act_fn, expert_affinities_scaling_mode, input_dtype, has_bias, has_clamp, router_act_first, norm_topk_prob, skip_router_logits, router_mm_dtype"
 STATIC_MX_PARAMS = [
+    # LNC=1 (single core) tiled STATIC_MX, T=128: exercises the shard_on_tokens
+    # gate at the tiled _router_topk call (must be n_prgs>1, else LNC=1 bakes an
+    # invalid single-core SendRecv -> NCC_IBTN243). is_all_expert=False path.
+    [1,     False,          128,    1,          4096,       None,           192,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.bfloat16],
     # Qwen3 235B selective-load (is_all_expert=False)
     [2,     False,          1,      1,          4096,       None,           192,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.bfloat16],
     [2,     False,          8,      1,          4096,       None,           192,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.bfloat16],
@@ -493,7 +616,8 @@ STATIC_MX_PARAMS = [
     [2,     True,           63,      1,         4096,       None,           384,            128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
     # Large T all-expert: T=2048 triggers moe_block T-tiling (HBM [T,H] fed into kernel) and kernel SHARD_T.
     # skip_router_logits=True because the tiled path does not return router logits.
-    [2,     True,           2048,    1,         4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               True,                   nl.float32],
+    # robust_local_routing: at T=2048 some token's top-k boundary is a sub-noise tie on a local expert.
+    pytest.param(2,     True,           2048,    1,         4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               True,                   nl.float32, marks=pytest.mark.robust_local_routing),
     # Large T all-expert with E_L=8 (has_bias=True needed as router tie-breaker)
     pytest.param(2,     True,           2048,    1,         4096,       None,           1536,           128,                8,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    True,       False,      True,               True,               True,                   nl.float32, marks=_MOE_MX_ALL_EXPERT_XFAIL),
 ]
@@ -631,8 +755,10 @@ class TestMoEBlockTkgKernel:
         is_static_mx: bool = False,
         is_static: bool = False,
         is_row_quant: bool = False,
+        has_residual: bool = False,
         inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
         outp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
+        robust_local_routing: bool = False,
     ):
         if is_dtype_mx(moe_weight_dtype) and not platform_target.is_trn3():
             pytest.skip("MX is only supported on TRN3.")
@@ -661,8 +787,10 @@ class TestMoEBlockTkgKernel:
             is_static_mx=is_static_mx,
             is_static=is_static,
             is_row_quant=is_row_quant,
+            has_residual=has_residual,
             inp_layout=inp_layout,
             outp_layout=outp_layout,
+            robust_local_routing=robust_local_routing,
         )
         tokens = batch * seqlen
 
@@ -706,6 +834,8 @@ class TestMoEBlockTkgKernel:
                 out = {"out": np.zeros((tokens, hidden), dtype=input_dtype)}
             if not skip_router_logits:
                 out["router_logits"] = np.zeros((tokens, num_global_experts), dtype=input_dtype)
+            if has_residual:
+                out["residual_out"] = np.zeros((tokens, hidden), dtype=input_dtype)
             return out
 
         # Wrap torch ref to use original MX-typed weights for golden computation
@@ -782,6 +912,7 @@ class TestMoEBlockTkgKernel:
     @pytest.mark.parametrize(STATIC_MX_PARAM_NAMES, STATIC_MX_PARAMS, ids=STATIC_MX_PARAM_IDS)
     def test_moe_block_static_mx(
         self,
+        request: pytest.FixtureRequest,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
         lnc,
@@ -836,6 +967,7 @@ class TestMoEBlockTkgKernel:
             router_mm_dtype=router_mm_dtype,
             platform_target=platform_target,
             is_static_mx=True,
+            robust_local_routing=request.node.get_closest_marker("robust_local_routing") is not None,
         )
 
     @pytest.mark.parametrize(STATIC_PARAM_NAMES, STATIC_PARAMS, ids=STATIC_PARAM_IDS)
@@ -930,6 +1062,52 @@ class TestMoEBlockTkgKernel:
             router_mm_dtype=router_mm_dtype,
             platform_target=platform_target,
             is_row_quant=True,
+        )
+
+    @pytest.mark.fast
+    def test_moe_block_residual(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+    ):
+        """Fused residual add in all-expert MX mode.
+
+        Exercises the residual path (residual != None): the kernel computes
+        hidden = input + residual, RMSNorms it, and returns residual_out as a
+        third output. Uses an all-expert MX E_L=1, T=256 config; residual add
+        requires BxS >= 256 and is unsupported in dynamic mode (T > 512, E_L=1).
+        """
+        if not platform_target.is_trn3():
+            pytest.skip("Residual add is only supported for all-expert MXFP, which requires TRN3.")
+
+        self._run_moe_block_test(
+            test_manager=test_manager,
+            collector=collector,
+            lnc=2,
+            is_all_expert=True,
+            batch=256,
+            seqlen=1,
+            hidden=4096,
+            hidden_actual=None,
+            intermediate=1536,
+            num_global_experts=128,
+            num_local_experts=1,
+            top_k=8,
+            router_fn=RouterActFnType.SOFTMAX,
+            hidden_act_fn=ActFnType.SiLU,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            moe_weight_dtype=nl.float8_e4m3fn_x4,
+            input_dtype=nl.bfloat16,
+            has_shared_expert=False,
+            has_bias=False,
+            has_clamp=False,
+            router_act_first=True,
+            norm_topk_prob=True,
+            skip_router_logits=False,
+            router_mm_dtype=nl.float32,
+            platform_target=platform_target,
+            has_residual=True,
         )
 
     # fmt: off

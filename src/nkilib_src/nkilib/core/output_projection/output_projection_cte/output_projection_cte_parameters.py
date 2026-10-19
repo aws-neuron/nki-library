@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 
 import nki.language as nl
 
-from ...utils.common_types import DtypeMode, QuantizationType
+from ...utils.common_types import DtypeMode, OProjAttentionLayout, QuantizationType
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
 from ...utils.tile_info import TiledDimInfo
@@ -533,6 +533,84 @@ def build_quantization_config(
         is_row_fp8_quantized=is_row_fp8_quantized,
         compact_weight_scales=compact_weight_scales,
     )
+
+
+def resolve_attention_layout(
+    attention_layout: Optional[OProjAttentionLayout],
+    quantization_type: QuantizationType,
+) -> OProjAttentionLayout:
+    """
+    Resolve the attention layout, asserting that this quantization path supports it.
+
+    Support by path:
+        - ``QuantizationType.NONE``: every layout. BNdS loads D straight onto
+          partitions; BSNd and BNSd absorb the transpose via ``nisa.dma_transpose`` on
+          load, so the attention kernel need not emit a PE-transposed output.
+        - ``QuantizationType.ROW``: BSNd only. It quantizes per token, so it loads S
+          onto partitions and transposes on the PE after quantizing.
+        - Every other quantized path: BNdS only.
+
+    Args:
+        attention_layout (Optional[OProjAttentionLayout]): Declared layout of
+            ``attention``, or None to take the layout implied by ``quantization_type``.
+        quantization_type (QuantizationType): Quantization type of this projection.
+
+    Returns:
+        OProjAttentionLayout: The layout the kernel will read ``attention`` as.
+
+    Raises:
+        AssertionError: If ``quantization_type`` does not support ``attention_layout``.
+    """
+    if quantization_type == QuantizationType.ROW:
+        implied_layout = OProjAttentionLayout.BSNd
+    else:
+        implied_layout = OProjAttentionLayout.BNdS
+
+    if attention_layout == None:
+        return implied_layout
+
+    if quantization_type == QuantizationType.NONE:
+        # The float path is the only one that implements every layout.
+        return attention_layout
+
+    kernel_assert(
+        attention_layout == implied_layout,
+        f"quantization_type={quantization_type} only supports attention_layout={implied_layout}, "
+        f"got {attention_layout}. Pass attention_layout=None to take the supported layout.",
+    )
+    return attention_layout
+
+
+def unpack_attention_shape(
+    attention: nl.NkiTensor,
+    attention_layout: OProjAttentionLayout,
+) -> Tuple[int, int, int, int]:
+    """
+    Unpack attention's dimensions in the order the declared layout says they appear.
+
+    Args:
+        attention (nl.NkiTensor): Attention tensor in HBM.
+        attention_layout (OProjAttentionLayout): Declared layout of ``attention``.
+
+    Returns:
+        Tuple[int, int, int, int]: (b_size, n_size, d_size, s_size), in that
+        order regardless of layout.
+
+    Raises:
+        AssertionError: If ``attention`` is not 4-D.
+    """
+    kernel_assert(
+        len(attention.shape) == 4,
+        f"attention_layout={attention_layout} requires a 4D attention tensor, "
+        f"got {len(attention.shape)}D with shape {attention.shape}.",
+    )
+    if attention_layout == OProjAttentionLayout.BSNd:
+        b_size, s_size, n_size, d_size = attention.shape
+    elif attention_layout == OProjAttentionLayout.BNSd:
+        b_size, n_size, s_size, d_size = attention.shape
+    else:
+        b_size, n_size, d_size, s_size = attention.shape
+    return b_size, n_size, d_size, s_size
 
 
 def validate_output_projection_inputs(

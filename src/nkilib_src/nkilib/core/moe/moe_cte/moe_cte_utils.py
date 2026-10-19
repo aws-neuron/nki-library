@@ -47,8 +47,6 @@ from typing import Any, Optional
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import oob_mode
-from nki.language import NKIObject
 
 from ...utils.allocator import SbufManager
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
@@ -63,7 +61,7 @@ TOTAL_PSUM_SIZE = PSUM_SIZE * N_PSUM_BANKS
 SBUF_QUADRANT_SIZE = 32
 
 
-class SkipMode(NKIObject):
+class SkipMode(nl.NKIObject):
     """
     Controls DMA skipping behavior for memory optimization.
 
@@ -137,7 +135,7 @@ class ScaleFormat(Enum):
     PRE_BROADCAST = 1
 
 
-class QuantConfig(NKIObject):
+class QuantConfig(nl.NKIObject):
     """Quantization configuration for MoE shard-on-I kernel.
 
     Attributes:
@@ -167,7 +165,7 @@ class QuantConfig(NKIObject):
         return self.activation_mode != ActivationQuantMode.NONE
 
 
-class InputTensors(NKIObject):
+class InputTensors(nl.NKIObject):
     """
     Container for all input tensor references.
 
@@ -204,7 +202,7 @@ class InputTensors(NKIObject):
     gate_up_proj_scale_E2I: Any = None  # reshaped for per-channel DMA
 
 
-class Configs(NKIObject):
+class Configs(nl.NKIObject):
     """
     Comprehensive kernel execution configuration.
 
@@ -384,15 +382,15 @@ def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES, sbm=None):
         result (nl.NkiTensor): Transposed token indices of shape [TILE_SIZE, NUM_TILES] in SBUF.
 
     Notes:
-        - Uses dma_transpose for efficient layout transformation
-        - Requires 4D tensor with [1,1] padding in middle dimensions
+        - Runs on HWDGE: static offset, matching src/dst dtype, no runtime index compute
         - Result has tokens distributed across partition dimension
         - Enables efficient vector DGE for token gathering
 
     Pseudocode:
         result = allocate [TILE_SIZE, NUM_TILES] in SBUF
         offset = block_idx * B
-        dma_transpose token_position_to_id[offset:offset+B] to result
+        dma_copy transpose of token_position_to_id[offset:offset+B] (NUM_TILES, TILE_SIZE)
+            into result (TILE_SIZE, NUM_TILES) on HWDGE
         return result
     """
     result = _sbm_alloc(
@@ -403,9 +401,17 @@ def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES, sbm=None):
         align=SBUF_QUADRANT_SIZE,
     )
     offset = block_idx * B
-    nisa.dma_transpose(
-        dst=result.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, 1], [1, 1], [1, NUM_TILES]]),
-        src=token_position_to_id.ap(pattern=[[TILE_SIZE, NUM_TILES], [1, 1], [1, 1], [1, TILE_SIZE]], offset=offset),
+    """
+    Transpose token_position_to_id[offset:offset+B] (NUM_TILES, TILE_SIZE) -> result
+    (TILE_SIZE, NUM_TILES) with a strided dma_copy on HWDGE.
+        result[p, t] = token_position_to_id[offset + t*TILE_SIZE + p]
+        - src dim0 [1, TILE_SIZE]: TILE_SIZE contiguous elements -> partition dim
+        - src dim1 [TILE_SIZE, NUM_TILES]: NUM_TILES tiles, stride TILE_SIZE -> free dim
+    """
+    nisa.dma_copy(
+        dst=result.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, NUM_TILES]]),
+        src=token_position_to_id.ap(pattern=[[1, TILE_SIZE], [TILE_SIZE, NUM_TILES]], offset=offset),
+        dge_mode=nisa.dge_mode.hwdge,
     )
     return result
 
@@ -441,11 +447,10 @@ def load_token_indices_dynamic_block(
         total_size = product of token_position_to_id.shape
         validate total_size % B == 0
         reshaped = reshape token_position_to_id to [total_size//B, B]
-        block_idx_copy = copy block_idx to SBUF
-        for idx in range(NUM_TILES):
-            if skip_dma.skip_token:
-                memset local_token_indices[:, idx] to 0
-            dma_copy reshaped[block_idx_copy, idx*TILE_SIZE:(idx+1)*TILE_SIZE] to local_token_indices[:, idx]
+        if skip_dma.skip_token:
+            memset local_token_indices to 0
+        dma_copy transpose of reshaped[block_idx] (NUM_TILES, TILE_SIZE) into
+            local_token_indices (TILE_SIZE, NUM_TILES) in a single DMA
         return local_token_indices
     """
     local_token_indices = _sbm_alloc(
@@ -459,27 +464,27 @@ def load_token_indices_dynamic_block(
     kernel_assert(total_size % B == 0, "token_position_to_id shape must be divisible by B")
     reshaped_token_position_to_id = token_position_to_id.reshape((total_size // B, B))  # (Blocks, Block_Size)
 
-    for idx in range(0, NUM_TILES):
-        if skip_dma.skip_token:
-            nisa.memset(local_token_indices[0:TILE_SIZE, idx], value=0)
+    if skip_dma.skip_token:
+        nisa.memset(local_token_indices[0:TILE_SIZE, 0:NUM_TILES], value=-1)
 
-        """
-        Load contiguous TILE_SIZE elements from row block_idx.
-        
-        src AP: reshaped_token_position_to_id[block_idx, TILE_SIZE*idx : TILE_SIZE*(idx+1)]
-            - pattern [[1, TILE_SIZE], [1, 1]]: read TILE_SIZE contiguous elements (stride=1)
-            - offset = TILE_SIZE * idx: start at column TILE_SIZE*idx within the row
-            - scalar_offset with indirect_dim=0: adds block_idx * B (accumulated shape right of dim 0)
-            - effective start = TILE_SIZE*idx + block_idx*B = row block_idx, column TILE_SIZE*idx
-        dst AP: local_token_indices[:, idx] - write TLE_SIZE to column idx
-        """
-        nisa.dma_copy(
-            dst=local_token_indices.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, 1]], offset=idx),
-            src=reshaped_token_position_to_id.ap(
-                pattern=[[1, TILE_SIZE], [1, 1]], offset=TILE_SIZE * idx, scalar_offset=block_idx, indirect_dim=0
-            ),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-        )
+    """
+    Transpose all B = TILE_SIZE * NUM_TILES elements of row block_idx in a single DMA.
+
+    This is the transpose reshaped_token_position_to_id[block_idx] (NUM_TILES, TILE_SIZE)
+    -> local_token_indices (TILE_SIZE, NUM_TILES)
+       Mapping is identical: dst[p, t] = reshaped[block_idx, t*TILE_SIZE + p].
+        - src dim0 [1, TILE_SIZE]: TILE_SIZE contiguous elements -> partition dim
+        - src dim1 [TILE_SIZE, NUM_TILES]: NUM_TILES tiles, stride TILE_SIZE
+        - scalar_offset with indirect_dim=0: adds block_idx * B
+    """
+    nisa.dma_copy(
+        dst=local_token_indices.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, NUM_TILES]]),
+        src=reshaped_token_position_to_id.ap(
+            pattern=[[1, TILE_SIZE], [TILE_SIZE, NUM_TILES]], offset=0, scalar_offset=block_idx, indirect_dim=0
+        ),
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
+        dge_mode=nisa.dge_mode.hwdge,
+    )
     return local_token_indices
 
 
@@ -809,7 +814,7 @@ def calculate_expert_affinities(
                 offset=0,
                 vector_offset=addr_fin_all.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, 1]], offset=tile_idx),
             ),
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
         expert_affinity_f32_lst.append(expert_affinity_buf[0:TILE_SIZE, tile_idx : tile_idx + 1])
 
@@ -859,14 +864,16 @@ def reduce_outputs(
 
     for tile_idx in range(num_tiles):
         start_idx = (tile_idx + offset) * reduce_tile_size
+        # Handle non multiple of 128 T
+        rows = min(reduce_tile_size, T - start_idx)
 
         # Reduce output[0] + output[1] and store directly to output[0]
         nisa.dma_compute(
-            dst=output.ap(pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]], offset=start_idx * dim_hidden),
+            dst=output.ap(pattern=[[dim_hidden, rows], [1, dim_hidden]], offset=start_idx * dim_hidden),
             srcs=[
-                output.ap(pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]], offset=start_idx * dim_hidden),
+                output.ap(pattern=[[dim_hidden, rows], [1, dim_hidden]], offset=start_idx * dim_hidden),
                 output.ap(
-                    pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]],
+                    pattern=[[dim_hidden, rows], [1, dim_hidden]],
                     offset=T * dim_hidden + start_idx * dim_hidden,
                 ),
             ],

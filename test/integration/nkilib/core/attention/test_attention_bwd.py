@@ -69,7 +69,7 @@ def generate_inputs(
     dtype: Any,
     causal: bool,
     mixed_precision: bool = True,
-    sliding_window: int = -1,
+    sliding_window: Optional[int] = -1,
     num_sinks: int = 0,
     softmax_scale: Optional[float] = None,
     seqlens_list: Optional[list] = None,

@@ -18,6 +18,7 @@ import pytest
 from test.utils.negative_test_helpers import (
     assert_kernel_validation_exception,
     assert_negative_test_case,
+    call_with_invalid_argument,
     is_in_negative_test_context,
 )
 
@@ -94,7 +95,7 @@ class TestAssertKernelValidationException:
 
     def test_fails_on_none_exception(self):
         with pytest.raises(AssertionError, match="Expected to receive"):
-            assert_kernel_validation_exception(None, None)
+            call_with_invalid_argument(assert_kernel_validation_exception, None, None)
 
     def test_fails_on_missing_marker(self):
         exc = Exception("some other error")

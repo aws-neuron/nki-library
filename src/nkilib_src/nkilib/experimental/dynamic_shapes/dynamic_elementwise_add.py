@@ -26,10 +26,10 @@ H_TILE_SIZE = 512  # Hidden dimension tile size (columns per H-tile)
 
 @nki.jit
 def dynamic_elementwise_add(
-    input_a: nl.ndarray,
-    input_b: nl.ndarray,
-    num_m_tiles: nl.ndarray,
-) -> nl.ndarray:
+    input_a: nl.NkiTensor,
+    input_b: nl.NkiTensor,
+    num_m_tiles: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     Elementwise addition with dynamic partition dimension tiling.
 
@@ -43,13 +43,13 @@ def dynamic_elementwise_add(
         num_m_tiles: Runtime trip count for the M-tile loop (int32 scalar).
 
     Args:
-        input_a (nl.ndarray): [M, H], First input tensor, bf16, on HBM.
-        input_b (nl.ndarray): [M, H], Second input tensor, bf16, on HBM. Must match input_a shape.
-        num_m_tiles (nl.ndarray): [1, 1], int32 scalar tensor on HBM. Value = number of M-tiles
+        input_a (nl.NkiTensor): [M, H], First input tensor, bf16, on HBM.
+        input_b (nl.NkiTensor): [M, H], Second input tensor, bf16, on HBM. Must match input_a shape.
+        num_m_tiles (nl.NkiTensor): [1, 1], int32 scalar tensor on HBM. Value = number of M-tiles
             to process (0 <= num_m_tiles <= M // P_MAX).
 
     Returns:
-        result (nl.ndarray): [M, H], bf16 output tensor on HBM. Elements in the first
+        result (nl.NkiTensor): [M, H], bf16 output tensor on HBM. Elements in the first
             (num_m_tiles * P_MAX) rows contain input_a + input_b; remaining rows are unmodified.
 
     Notes:

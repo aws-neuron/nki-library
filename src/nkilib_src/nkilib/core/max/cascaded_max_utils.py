@@ -50,7 +50,7 @@ def reduce(op: str = 'mul', input_list: Optional[List] = None, initial_value=Non
             initial_value = initial_value + element
         elif op == 'min':
             initial_value = min(initial_value, element)
-        elif op == 'max':
+        elif op == 'max':  # pragma: no branch - op validated in supported_ops; only 'max' can reach here
             initial_value = max(initial_value, element)
     return initial_value
 

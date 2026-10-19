@@ -19,23 +19,33 @@ import os
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
-from botocore.credentials import EnvProvider
+from botocore.credentials import AssumeRoleCredentialFetcher, DeferredRefreshableCredentials, EnvProvider
 from botocore.exceptions import ClientError
 
 from ..utils.s3_utils import (
     S3ArtifactUploadConfig,
     S3TransferDirection,
     _create_boto3_session_with_retry,
+    _get_assumed_credentials_cached,
     _get_boto_client_cached,
+    _get_boto_client_for_role_cached,
     _get_boto_session_cached,
     _is_throttling_error,
     build_remote_s3_cli_command,
     generate_s3_key,
     get_boto_client,
+    get_boto_client_for_role,
     get_boto_session,
     get_s3_client_and_session,
     prefetch_and_cache_credentials,
+    region_from_queue_url,
 )
+
+# Obviously-fake placeholder ARN for tests; the helper is generic and takes any role ARN.
+_FAKE_ROLE_ARN = "arn:aws:iam::123456789012:role/ExampleRole"
+_FAKE_ROLE_ARN_2 = "arn:aws:iam::123456789012:role/AnotherExampleRole"
+_FAKE_TRANSIT_ROLE_ARN = "arn:aws:iam::123456789012:role/ExampleTransitRole"
+_FAKE_TRANSIT_ROLE_ARN_2 = "arn:aws:iam::123456789012:role/AnotherExampleTransitRole"
 
 
 class TestGenerateS3Key:
@@ -82,6 +92,7 @@ class TestBuildRemoteS3CliCommand:
         assert "AWS_ACCESS_KEY_ID=AKIATEST" in cmd
         assert "AWS_SECRET_ACCESS_KEY=secret123" in cmd
         assert "AWS_SESSION_TOKEN=token456" in cmd
+        assert "--region" not in cmd  # omitted when region not provided
 
     def test_outputs_direction_uploads_to_s3(self):
         creds = MagicMock()
@@ -100,6 +111,43 @@ class TestBuildRemoteS3CliCommand:
         # remote_path is quoted to handle special characters like < > ' in test names
         assert "aws s3 cp '/tmp/file.tar' s3://my-bucket/path/to/file.tar" in cmd
         assert "AWS_SESSION_TOKEN" not in cmd  # No token when None
+        assert "--region" not in cmd  # omitted when region not provided
+
+    def test_region_appended_for_download(self):
+        """When a region is supplied it is passed as --region so the CLI signs for
+        the bucket's region rather than resolving the remote host's own region."""
+        creds = MagicMock()
+        creds.access_key = "AKIATEST"
+        creds.secret_key = "secret123"
+        creds.token = None
+
+        cmd = build_remote_s3_cli_command(
+            s3_bucket="my-bucket",
+            s3_key="path/to/file.tar",
+            remote_path="/tmp/file.tar",
+            creds=creds,
+            direction=S3TransferDirection.INPUTS,
+            region="us-east-1",
+        )
+
+        assert cmd.endswith("aws s3 cp s3://my-bucket/path/to/file.tar '/tmp/file.tar' --region us-east-1")
+
+    def test_region_appended_for_upload(self):
+        creds = MagicMock()
+        creds.access_key = "AKIATEST"
+        creds.secret_key = "secret123"
+        creds.token = None
+
+        cmd = build_remote_s3_cli_command(
+            s3_bucket="my-bucket",
+            s3_key="path/to/file.tar",
+            remote_path="/tmp/file.tar",
+            creds=creds,
+            direction=S3TransferDirection.OUTPUTS,
+            region="us-east-1",
+        )
+
+        assert cmd.endswith("aws s3 cp '/tmp/file.tar' s3://my-bucket/path/to/file.tar --region us-east-1")
 
     def test_handles_special_characters_in_path(self):
         """Test that paths with special characters like < > are properly quoted."""
@@ -325,6 +373,8 @@ class _BotoCacheTestBase:
     def setup_method(self):
         _get_boto_session_cached.cache_clear()
         _get_boto_client_cached.cache_clear()
+        _get_boto_client_for_role_cached.cache_clear()
+        _get_assumed_credentials_cached.cache_clear()
         self._original_env = {}
         for var in [EnvProvider.ACCESS_KEY, EnvProvider.SECRET_KEY, EnvProvider.TOKENS[1]]:
             self._original_env[var] = os.environ.get(var)
@@ -333,6 +383,8 @@ class _BotoCacheTestBase:
     def teardown_method(self):
         _get_boto_session_cached.cache_clear()
         _get_boto_client_cached.cache_clear()
+        _get_boto_client_for_role_cached.cache_clear()
+        _get_assumed_credentials_cached.cache_clear()
         for var, value in self._original_env.items():
             if value is not None:
                 os.environ[var] = value
@@ -452,3 +504,305 @@ class TestGetS3ClientAndSession(_BotoCacheTestBase):
         # Should only create session once
         mock_create_session.assert_called_once()
         assert result1 == result2
+
+
+class TestRegionFromQueueUrl:
+    """Test region extraction from SQS queue URLs."""
+
+    @pytest.mark.parametrize(
+        ("queue_url", "expected"),
+        [
+            ("https://sqs.us-east-1.amazonaws.com/123456789/test-queue", "us-east-1"),
+            ("https://sqs.us-east-2.amazonaws.com/617853335428/kernel-perf-queue", "us-east-2"),
+            ("https://sqs.eu-west-1.amazonaws.com/1/q", "eu-west-1"),
+            ("https://example.internal/1/q", None),
+            ("https://queue.amazonaws.com/1/q", None),  # legacy global endpoint has no region
+            ("", None),
+        ],
+    )
+    def test_region_parsing(self, queue_url, expected):
+        assert region_from_queue_url(queue_url) == expected
+
+
+class TestGetBotoClientForRole(_BotoCacheTestBase):
+    """Test the role-assuming client factory: profile credentials -> assume role -> client."""
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_client_caches_per_key_and_distinguishes_role_arn(self, mock_create_session, mock_session_class):
+        mock_base_session = MagicMock()
+        mock_create_session.return_value = mock_base_session
+        mock_session_class.side_effect = lambda **k: MagicMock(
+            client=MagicMock(side_effect=lambda *a, **kw: MagicMock())
+        )
+
+        a1 = get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p1")
+        a2 = get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p1")
+        b = get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN_2, region="us-west-2", profile="p1")
+        c = get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="eu-west-1", profile="p1")
+        d = get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p2")
+
+        assert a1 is a2  # identical args -> same client
+        assert len({id(a1), id(b), id(c), id(d)}) == 4  # any differing key -> distinct client
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_base_credentials_come_from_shared_per_profile_session(self, mock_create_session, mock_session_class):
+        mock_base_session = MagicMock()
+        mock_create_session.return_value = mock_base_session
+        mock_session_class.return_value = MagicMock()
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, profile="p1")
+
+        # get_boto_session's cached core is exercised, so the base session is built exactly
+        # once via the shared retry-aware creator, scoped to the requested profile.
+        mock_create_session.assert_called_once_with("p1")
+        mock_base_session.get_credentials.assert_called_once()
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_assumed_credentials_are_deferred_and_scoped_to_role_arn(self, mock_create_session, mock_session_class):
+        mock_base_session = MagicMock()
+        mock_create_session.return_value = mock_base_session
+        mock_session_class.return_value = MagicMock()
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, profile="p1")
+
+        _, kwargs = mock_session_class.call_args
+        botocore_session = kwargs["botocore_session"]
+        creds = botocore_session._credentials
+
+        assert isinstance(creds, DeferredRefreshableCredentials)  # auto-refreshes before expiry
+        fetcher = creds._refresh_using.__self__
+        assert isinstance(fetcher, AssumeRoleCredentialFetcher)
+        assert fetcher._role_arn == _FAKE_ROLE_ARN
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_client_uses_shared_retry_config(self, mock_create_session, mock_session_class):
+        mock_create_session.return_value = MagicMock()
+        mock_assumed_session = MagicMock()
+        mock_session_class.return_value = mock_assumed_session
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="eu-west-1", profile="p1")
+
+        mock_assumed_session.client.assert_called_once()
+        args, kwargs = mock_assumed_session.client.call_args
+        assert args[0] == "eks"
+        assert kwargs["region_name"] == "eu-west-1"
+        assert kwargs["config"].retries["max_attempts"] == 5
+        assert kwargs["config"].retries["mode"] == "standard"
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_one_role_assumption_is_shared_by_every_client_for_that_role(self, mock_create_session, mock_session_class):
+        # Assuming a role is itself a throttled API call, and a caller that sweeps every region
+        # builds a client per region. Keying the credentials on (profile, role) rather than on the
+        # client means that sweep costs ONE assumption instead of one per region.
+        mock_create_session.return_value = MagicMock()
+        mock_session_class.side_effect = lambda **k: MagicMock(
+            client=MagicMock(side_effect=lambda *a, **kw: MagicMock())
+        )
+
+        for region in ("us-west-2", "eu-west-1", "ap-south-1"):
+            get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region=region, profile="p1")
+
+        credentials = {id(k["botocore_session"]._credentials) for _, k in mock_session_class.call_args_list}
+        assert len(credentials) == 1, "each region rebuilt its own credentials"
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_a_different_role_or_profile_still_assumes_separately(self, mock_create_session, mock_session_class):
+        # The counterpart to sharing: credentials are only reusable within one identity. A second
+        # role, or the same role assumed from different base credentials, is a different identity
+        # and must not be served the first one's credentials.
+        mock_create_session.return_value = MagicMock()
+        mock_session_class.side_effect = lambda **k: MagicMock(
+            client=MagicMock(side_effect=lambda *a, **kw: MagicMock())
+        )
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p1")
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN_2, region="us-west-2", profile="p1")
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p2")
+
+        credentials = {id(k["botocore_session"]._credentials) for _, k in mock_session_class.call_args_list}
+        assert len(credentials) == 3
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_call_bounds_are_applied_when_asked_for(self, mock_create_session, mock_session_class):
+        # A caller that sweeps regions it cannot reach needs to fail fast: on the SDK defaults an
+        # unreachable region costs a full connect timeout per attempt, which is the difference
+        # between a sweep measured in seconds and one measured in minutes.
+        mock_create_session.return_value = MagicMock()
+        mock_assumed_session = MagicMock()
+        mock_session_class.return_value = mock_assumed_session
+
+        get_boto_client_for_role(
+            "eks",
+            role_arn=_FAKE_ROLE_ARN,
+            region="eu-west-1",
+            profile="p1",
+            connect_timeout=4,
+            read_timeout=10,
+            max_attempts=2,
+        )
+
+        config = mock_assumed_session.client.call_args.kwargs["config"]
+        assert config.connect_timeout == 4
+        assert config.read_timeout == 10
+        assert config.retries["max_attempts"] == 2
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_omitting_the_bounds_leaves_the_sdk_defaults_alone(self, mock_create_session, mock_session_class):
+        # Bounds are opt-in: a caller that does not sweep should not inherit one caller's
+        # aggressive timeouts, which would turn a merely slow call into a failed one. Note the
+        # SDK default is 60s rather than no timeout, so omitting a bound must leave that default
+        # in place -- passing the option through as ``None`` would mean 'wait forever'.
+        mock_create_session.return_value = MagicMock()
+        mock_assumed_session = MagicMock()
+        mock_session_class.return_value = mock_assumed_session
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="eu-west-1", profile="p1")
+
+        config = mock_assumed_session.client.call_args.kwargs["config"]
+        assert config.connect_timeout == 60
+        assert config.read_timeout == 60
+        assert config.retries["max_attempts"] == 5
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_clients_differing_only_in_their_bounds_are_not_shared(self, mock_create_session, mock_session_class):
+        # The bounds are part of what a client IS, so they belong in its cache key: otherwise the
+        # first caller's timeouts would be silently handed to the next one asking for different
+        # ones. The credentials underneath are still shared -- only the client differs.
+        mock_create_session.return_value = MagicMock()
+        mock_session_class.side_effect = lambda **k: MagicMock(
+            client=MagicMock(side_effect=lambda *a, **kw: MagicMock())
+        )
+
+        bounded = get_boto_client_for_role(
+            "eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p1", connect_timeout=4
+        )
+        unbounded = get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p1")
+
+        assert bounded is not unbounded
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_cached_helper_key_matches_expected_shape(self, mock_create_session, mock_session_class):
+        # Sanity-check the private cached core is keyed positionally as documented:
+        # (service, region, profile, role_arn).
+        mock_create_session.return_value = MagicMock()
+        mock_session_class.return_value = MagicMock()
+
+        via_public = get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p1")
+        via_private = _get_boto_client_for_role_cached("eks", "us-west-2", "p1", _FAKE_ROLE_ARN)
+
+        assert via_public is via_private
+
+
+def _fetcher_of(credentials) -> AssumeRoleCredentialFetcher:
+    """The AssumeRoleCredentialFetcher backing a DeferredRefreshableCredentials object."""
+    return credentials._refresh_using.__self__
+
+
+class TestGetBotoClientForRoleChaining(_BotoCacheTestBase):
+    """Test the optional two-hop role chain: profile -> transit role -> target role -> client."""
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_transit_role_is_assumed_from_the_profile_and_target_from_the_transit_role(
+        self, mock_create_session, mock_session_class
+    ):
+        # The direction of the chain is the whole point: the transit role must be reachable from
+        # the base profile, and only the transit role may assume the target. Swapping the two
+        # ARNs must fail this test.
+        mock_base_session = MagicMock()
+        mock_create_session.return_value = mock_base_session
+        mock_session_class.return_value = MagicMock()
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, profile="p1", transit_role_arn=_FAKE_TRANSIT_ROLE_ARN)
+
+        target_creds = mock_session_class.call_args.kwargs["botocore_session"]._credentials
+        target_fetcher = _fetcher_of(target_creds)
+        assert target_fetcher._role_arn == _FAKE_ROLE_ARN, "the client must call as the target role"
+
+        transit_creds = target_fetcher._source_credentials
+        transit_fetcher = _fetcher_of(transit_creds)
+        assert transit_fetcher._role_arn == _FAKE_TRANSIT_ROLE_ARN, "the target must be assumed from the transit role"
+        assert transit_fetcher._source_credentials is mock_base_session.get_credentials.return_value
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_omitting_the_transit_role_performs_exactly_one_assumption(self, mock_create_session, mock_session_class):
+        mock_base_session = MagicMock()
+        mock_create_session.return_value = mock_base_session
+        mock_session_class.return_value = MagicMock()
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, profile="p1")
+
+        fetcher = _fetcher_of(mock_session_class.call_args.kwargs["botocore_session"]._credentials)
+        assert fetcher._role_arn == _FAKE_ROLE_ARN
+        # Sourced straight from the base profile: no intermediate assumption happened.
+        assert fetcher._source_credentials is mock_base_session.get_credentials.return_value
+        assert not isinstance(fetcher._source_credentials, DeferredRefreshableCredentials)
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_both_hops_refresh_themselves(self, mock_create_session, mock_session_class):
+        # A long-lived client must not go stale at either hop, so the transit credentials handed
+        # to the second hop are deferred/refreshable rather than a frozen snapshot.
+        mock_create_session.return_value = MagicMock()
+        mock_session_class.return_value = MagicMock()
+
+        get_boto_client_for_role("eks", role_arn=_FAKE_ROLE_ARN, profile="p1", transit_role_arn=_FAKE_TRANSIT_ROLE_ARN)
+
+        target_creds = mock_session_class.call_args.kwargs["botocore_session"]._credentials
+        assert isinstance(target_creds, DeferredRefreshableCredentials)
+        assert isinstance(_fetcher_of(target_creds)._source_credentials, DeferredRefreshableCredentials)
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_one_chain_is_shared_by_every_region(self, mock_create_session, mock_session_class):
+        mock_base_session = MagicMock()
+        mock_create_session.return_value = mock_base_session
+        mock_session_class.side_effect = lambda **k: MagicMock(
+            client=MagicMock(side_effect=lambda *a, **kw: MagicMock())
+        )
+
+        for region in ("us-west-2", "eu-west-1", "ap-south-1"):
+            get_boto_client_for_role(
+                "eks",
+                role_arn=_FAKE_ROLE_ARN,
+                region=region,
+                profile="p1",
+                transit_role_arn=_FAKE_TRANSIT_ROLE_ARN,
+            )
+
+        target_creds = [k["botocore_session"]._credentials for _, k in mock_session_class.call_args_list]
+        assert len({id(c) for c in target_creds}) == 1, "each region rebuilt the target assumption"
+        transit_creds = [_fetcher_of(c)._source_credentials for c in target_creds]
+        assert len({id(c) for c in transit_creds}) == 1, "each region rebuilt the transit assumption"
+        mock_base_session.get_credentials.assert_called_once()
+
+    @patch("test.utils.s3_utils.boto3.Session")
+    @patch("test.utils.s3_utils._create_boto3_session_with_retry")
+    def test_a_different_transit_role_is_a_different_chain(self, mock_create_session, mock_session_class):
+        mock_create_session.return_value = MagicMock()
+        mock_session_class.side_effect = lambda **k: MagicMock(
+            client=MagicMock(side_effect=lambda *a, **kw: MagicMock())
+        )
+
+        for transit in (_FAKE_TRANSIT_ROLE_ARN, _FAKE_TRANSIT_ROLE_ARN_2):
+            get_boto_client_for_role(
+                "eks", role_arn=_FAKE_ROLE_ARN, region="us-west-2", profile="p1", transit_role_arn=transit
+            )
+
+        target_creds = [k["botocore_session"]._credentials for _, k in mock_session_class.call_args_list]
+        assert len({id(c) for c in target_creds}) == 2, "the transit role must be part of the cache key"
+        assert [_fetcher_of(_fetcher_of(c)._source_credentials)._role_arn for c in target_creds] == [
+            _FAKE_TRANSIT_ROLE_ARN,
+            _FAKE_TRANSIT_ROLE_ARN_2,
+        ]

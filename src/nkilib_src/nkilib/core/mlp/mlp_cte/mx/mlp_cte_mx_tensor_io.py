@@ -94,6 +94,8 @@ def load_hidden_tensor_tile(
                     :H_SUBTILE_SIZE,
                     :h_subtile_count,
                 ],
+                dge_mode=nisa.dge_mode.hwdge,
+                engine=nisa.engine.sync if h_tile.index % 2 == 0 else nisa.engine.scalar,
             )
 
 
@@ -369,24 +371,13 @@ def load_source_projection_weight_scales(
     tile_info: MLPCTEMXTileInfo,
     constants: MLPCTEConstants,
     src_proj_scales_hbm: nl.NkiTensor,
-    sbm: SbufManager,
-    tensor_name: str,
+    src_proj_scales_sbuf: nl.NkiTensor,
 ) -> nl.NkiTensor:
-    alloc_heap = sbm.alloc_heap if sbm else nl.NkiTensor
-
     if mlp_params.quant_params.is_quant_row_mx():
         int_dim_tile = tile_info.intermediate_dim_tile
         INT_TILE_COUNT = int_dim_tile.tile_count  # I / 512
         INT_SUBTILE_SIZE = int_dim_tile.subtile_dim_info.tile_size  # 4
         INT_SUBTILE_COUNT = int_dim_tile.subtile_dim_info.tile_count  # 128
-
-        src_proj_scales_sbuf = alloc_heap(
-            (INT_SUBTILE_COUNT, INT_TILE_COUNT, INT_SUBTILE_SIZE),
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-            name=tensor_name,
-            align=16,
-        )
 
         nisa.dma_copy(
             dst=src_proj_scales_sbuf[:INT_SUBTILE_COUNT, :INT_TILE_COUNT, :INT_SUBTILE_SIZE],
@@ -409,37 +400,47 @@ def load_source_projection_weight_scales(
         QUADRANT_SIZE = 32
         PARTITIONS_PER_SLOT = 4  # how many partitions to load per quadrant
         NUM_SLOTS = 4
-
-        src_proj_scales_sbuf = alloc_heap(
-            (H_SUBTILE_COUNT, math.ceil(H_TILE_COUNT / NUM_SLOTS), mlp_params.intermediate_size),
-            dtype=nl.uint8,
-            buffer=nl.sbuf,
-            name=tensor_name,
-        )
-        # Scale HBM shape: [16, H/512, I/512, 4, 128] — already in physical I order
-        src_proj_scales_hbm_view = src_proj_scales_hbm.reshape(
-            (
-                src_proj_scales_hbm.shape[0],
-                H_TILE_COUNT,
-                src_proj_scales_hbm.shape[2] * I_SUBTILE_SIZE * I_SUBTILE_COUNT,
-            )
-        )
         I_SHARD_OFFSET = constants.get_intermediate_offset()
-        for quadrant_idx in range(math.ceil(H_SUBTILE_COUNT / QUADRANT_SIZE)):
-            for h_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):
-                slot_idx = h_tile.index % NUM_SLOTS
-                nisa.dma_copy(
-                    dst=src_proj_scales_sbuf[
-                        nl.ds(quadrant_idx * QUADRANT_SIZE + slot_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
-                        h_tile.index // NUM_SLOTS,
-                        : mlp_params.intermediate_size,
-                    ],
-                    src=src_proj_scales_hbm_view[
-                        nl.ds(quadrant_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
-                        h_tile.index,
-                        nl.ds(I_SHARD_OFFSET, mlp_params.intermediate_size),
-                    ],
+
+        if mlp_params.quant_params.use_folded_mx_scales:
+            # Scales are pre-folded into the physical SBUF layout [128, ceil((H/512)/4), I].
+            # A single DMA fills the whole buffer; only the I dimension is sliced for sharding.
+            nisa.dma_copy(
+                dst=src_proj_scales_sbuf[
+                    :H_SUBTILE_COUNT,
+                    :,
+                    : mlp_params.intermediate_size,
+                ],
+                src=src_proj_scales_hbm[
+                    :H_SUBTILE_COUNT,
+                    :,
+                    nl.ds(I_SHARD_OFFSET, mlp_params.intermediate_size),
+                ],
+            )
+        else:
+            # Scale HBM shape: [16, H/512, I/512, 4, 128] — already in physical I order
+            src_proj_scales_hbm_view = src_proj_scales_hbm.reshape(
+                (
+                    src_proj_scales_hbm.shape[0],
+                    H_TILE_COUNT,
+                    src_proj_scales_hbm.shape[2] * I_SUBTILE_SIZE * I_SUBTILE_COUNT,
                 )
+            )
+            for quadrant_idx in range(math.ceil(H_SUBTILE_COUNT / QUADRANT_SIZE)):
+                for h_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):
+                    slot_idx = h_tile.index % NUM_SLOTS
+                    nisa.dma_copy(
+                        dst=src_proj_scales_sbuf[
+                            nl.ds(quadrant_idx * QUADRANT_SIZE + slot_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
+                            h_tile.index // NUM_SLOTS,
+                            : mlp_params.intermediate_size,
+                        ],
+                        src=src_proj_scales_hbm_view[
+                            nl.ds(quadrant_idx * PARTITIONS_PER_SLOT, PARTITIONS_PER_SLOT),
+                            h_tile.index,
+                            nl.ds(I_SHARD_OFFSET, mlp_params.intermediate_size),
+                        ],
+                    )
     return src_proj_scales_sbuf
 
 

@@ -48,8 +48,8 @@ def alloc_tiled_psum(shape, tile_size, dtype=nl.float32, num_banks=None):
 
 @dataclass
 class _LoadWeights(nl.NKIObject):
-    mov_sb: object
-    weights: object
+    mov_sb: TiledTensor
+    weights: nl.NkiTensor
     K_TILE: int
 
     def run(self, k, n, buf):
@@ -58,7 +58,7 @@ class _LoadWeights(nl.NKIObject):
 
 @dataclass
 class _DrainBias(nl.NKIObject):
-    bias_sb: object
+    bias_sb: nl.NkiTensor
 
     def run(self, psum_tile, sbuf_tile, m, n):
         nisa.tensor_tensor(dst=sbuf_tile, data1=psum_tile, data2=self.bias_sb, op=nl.add)
@@ -66,7 +66,7 @@ class _DrainBias(nl.NKIObject):
 
 @dataclass
 class _PostMatmulScale(nl.NKIObject):
-    dst_sb: object
+    dst_sb: TiledTensor
 
     def run(self, psum_tile, k, m, n):
         nisa.activation(dst=self.dst_sb[m, n], op=nl.copy, data=psum_tile, scale=0.5)
@@ -776,8 +776,8 @@ def kernel_alloc_basic(source, weights, out):
 
 @dataclass
 class _AllocLoadWt(nl.NKIObject):
-    mov_sb: object
-    weights: object
+    mov_sb: TiledTensor
+    weights: nl.NkiTensor
     K_TILE: int
 
     def run(self, k, n, buf):

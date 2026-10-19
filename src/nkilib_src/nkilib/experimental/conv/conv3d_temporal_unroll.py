@@ -68,15 +68,15 @@ def should_use_temporal_unroll(C_out: int, D_out: int, C_in: int, K_d: int, W_ou
 
 @nki.jit
 def conv3d_temporal_unroll(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     stride: tuple[int, int, int] = (1, 1, 1),
     padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
     dilation: tuple[int, int, int] = (1, 1, 1),
     activation_fn: Optional[ActFnType] = None,
     lnc_shard: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     3D convolution with temporal unrolling and column tiling for small C_out.
 
@@ -108,9 +108,9 @@ def conv3d_temporal_unroll(
         W_out: Output width = (W + pad_w_left + pad_w_right - dilation_w * (K_w - 1) - 1) // stride_w + 1
 
     Args:
-        x_in (nl.ndarray): [B, C_in, D, H, W], Input tensor on HBM.
-        filters (nl.ndarray): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
-        bias (Optional[nl.ndarray]): [C_out], Optional bias tensor on HBM.
+        x_in (nl.NkiTensor): [B, C_in, D, H, W], Input tensor on HBM.
+        filters (nl.NkiTensor): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
+        bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM.
         stride (tuple[int, int, int]): (stride_d, stride_h, stride_w), Convolution strides.
         padding (tuple[int, int, int, int, int, int]): (pad_d_left, pad_d_right, pad_h_top,
             pad_h_bottom, pad_w_left, pad_w_right), Padding for each spatial dimension.
@@ -119,7 +119,7 @@ def conv3d_temporal_unroll(
         lnc_shard (bool): Enable LNC sharding across neuron cores (shards on H_out).
 
     Returns:
-        y_out (nl.ndarray): [B, C_out, D_out, H_out, W_out], Output tensor on HBM.
+        y_out (nl.NkiTensor): [B, C_out, D_out, H_out, W_out], Output tensor on HBM.
 
     Pseudocode:
         precompute din_to_pairs[d_in] = [(d_out, k_d), ...] at trace time

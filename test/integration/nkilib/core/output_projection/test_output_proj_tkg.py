@@ -14,7 +14,7 @@
 
 import enum
 import functools
-from typing import Optional
+from typing import Optional, TypedDict
 
 import nki
 import nki.language as nl
@@ -77,18 +77,18 @@ class TkgOutputProjClassification(enum.Enum):
 
 @nki.jit
 def output_proj_tkg_wrapper(
-    attention: nl.ndarray,
-    weight: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    weight_scale: Optional[nl.ndarray] = None,
-    input_scale: Optional[nl.ndarray] = None,
+    weight_scale: Optional[nl.NkiTensor] = None,
+    input_scale: Optional[nl.NkiTensor] = None,
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
     # Placeholder param to match torch-ref/kernel signature
     sbm: Optional[BufferManager] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     sbm = BufferManager(
         0,
         nl.tile_size.total_available_sbuf_size,
@@ -314,7 +314,7 @@ def _filter_sweep_params(B, n_heads=None, S_tkg=None, d_head=None, H=None, trans
     Strategy 2 (tp=F): n_heads*d_head<=4096, n_heads<=64, d_head<=128, B<=4, S_tkg<=8, H mult 128
     Strategy 3 (tp=T): S_tkg*B<=512, B<=128, S_tkg<=8, n_heads<=10, d_head<=128, H mult 128
     """
-    if any(v is None for v in [n_heads, S_tkg, d_head, H, transpose_out]):
+    if n_heads is None or S_tkg is None or d_head is None or H is None or transpose_out is None:
         return FilterResult.VALID
 
     if H % 128 != 0:
@@ -339,6 +339,19 @@ def _filter_sweep_params(B, n_heads=None, S_tkg=None, d_head=None, H=None, trans
             return FilterResult.VALID
 
     return FilterResult.INVALID
+
+
+class OutputProjTkgDtypeModeConfig(TypedDict):
+    """Shapes and fusion settings shared by every dtype_mode canary case."""
+
+    B: int
+    H: int
+    S_tkg: int
+    d_head: int
+    dtype: str
+    n_heads: int
+    test_bias: bool
+    transpose_out: bool
 
 
 @pytest_test_metadata(name="Output Projection TKG")
@@ -696,7 +709,7 @@ class TestOutputProjTkgKernel:
     # Torch ref: STATIC input clip is derived from dtype_mode (OCP → 448,
     # NON_OCP → 240) so goldens match.
     # ------------------------------------------------------------------
-    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG = {
+    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG: OutputProjTkgDtypeModeConfig = {
         "B": 4,
         "H": 3072,
         "S_tkg": 4,

@@ -82,22 +82,22 @@ _ABBREVS = {
 
 
 def gen_mask_tkg_wrapper(
-    pos_ids_hbm: nl.ndarray,
-    mask_out_hbm: nl.ndarray,
+    pos_ids_hbm: nl.NkiTensor,
+    mask_out_hbm: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
     is_s_prior_sharded: bool,
     s_prior_per_shard: int,
-    start_pos_hbm: nl.ndarray = None,
+    start_pos_hbm: Optional[nl.NkiTensor] = None,
     s_prior_offset: int = 0,
     block_len: int = 0,
     strided_mm1: bool = True,
-    active_mask_hbm: nl.ndarray = None,
+    active_mask_hbm: Optional[nl.NkiTensor] = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
     transposed_out: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Wrapper kernel that handles HBM↔SBUF transfers for testing gen_mask_tkg.
 
     transposed_out=False:
@@ -111,7 +111,7 @@ def gen_mask_tkg_wrapper(
     _, lnc, shard_id = get_verified_program_sharding_info("gen_mask_wrapper", (0, 1))
 
     mask_out_sbuf_shape = mask_out_hbm.shape if lnc == 1 else mask_out_hbm.shape[1:]
-    num_elts = reduce('mul', mask_out_sbuf_shape, 1)
+    num_elts = reduce('mul', list(mask_out_sbuf_shape), 1)
 
     sbm = SbufManager(0, num_elts * 8, Logger("gen_mask_wrapper"), use_auto_alloc=True)
     sbm.open_scope(name="gen_mask_wrapper")
@@ -174,11 +174,11 @@ def gen_mask_tkg_torch_ref_adapter(
     s_active: int,
     is_s_prior_sharded: bool,
     s_prior_per_shard: int,
-    start_pos_hbm: torch.Tensor = None,
+    start_pos_hbm: torch.Tensor | None = None,
     s_prior_offset: int = 0,
     block_len: int = 0,
     strided_mm1: bool = True,
-    active_mask_hbm: torch.Tensor = None,
+    active_mask_hbm: torch.Tensor | None = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
     transposed_out: bool = False,
@@ -244,9 +244,9 @@ def gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc: int):
         q_head: int,
         s_active: int,
         s_prior: int,
-        start_pos_hbm: torch.Tensor = None,
+        start_pos_hbm: torch.Tensor | None = None,
         block_len: int = 0,
-        active_mask: torch.Tensor = None,
+        active_mask: torch.Tensor | None = None,
         enable_fa_s_prior_tiling: bool = True,
         fuse_rope: bool = False,
         transposed_out: bool = False,
@@ -272,6 +272,14 @@ def gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc: int):
         # up with the kernel's uint8 output edge.
         return {"mask_out_hbm": mask.to(torch.uint8)}
 
+    # The torch-ref golden cache keys on the ref's __qualname__ (plus dep/input
+    # hashes). lnc is captured in this closure and is NOT part of the adapter's
+    # kwargs, so without stamping it here the lnc=1 and lnc=2 arms share one
+    # cache key while producing different goldens (block_len resizes per lnc) ->
+    # a warm cache serves the wrong sibling's golden. Stamp lnc into the qualname
+    # so each lnc keys a distinct cache entry.
+    gen_mask_tkg_hbm_torch_ref_adapter.__qualname__ += f"[lnc{lnc}]"
+    gen_mask_tkg_hbm_torch_ref_adapter.__name__ += f"_lnc{lnc}"
     return gen_mask_tkg_hbm_torch_ref_adapter
 
 

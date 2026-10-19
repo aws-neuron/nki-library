@@ -44,10 +44,13 @@ def rmsnorm_router_topk_tkg_torch_ref(
     quantization_type: QuantizationType = QuantizationType.NONE,
     router_mm_dtype=nl.bfloat16,
     router_act_fn: RouterActFnType = RouterActFnType.SIGMOID,
+    store_eager_affi_only: bool = False,
 ) -> dict:
     """Torch reference matching rmsnorm_router_topk_tkg outputs.
 
-    Returns dict with keys: norm_output, expert_index, expert_affinities.
+    Returns dict with keys: norm_output, expert_index, expert_affinities. When
+    store_eager_affi_only=True, expert_affinities is the dense [T, K] bf16 eager
+    affinities (co-indexed with expert_index) instead of the sparse [T, E] tensor.
     """
     B, S, H = hidden_states.shape
     T = B * S
@@ -93,8 +96,17 @@ def rmsnorm_router_topk_tkg_torch_ref(
         norm_topk_prob=False,
     )
 
+    expert_index = router_outputs["expert_index"]
+    expert_affinities = router_outputs["expert_affinities"]
+
+    if store_eager_affi_only:
+        # Dense [T, K] eager affinities co-indexed with expert_index: gather each
+        # token's top-K values out of the sparse [T, E] tensor. bf16 matches the kernel.
+        eager = torch.gather(expert_affinities, 1, expert_index.to(torch.int64))
+        expert_affinities = eager.to(torch.bfloat16)
+
     return {
         "norm_output": norm_output,
-        "expert_index": router_outputs["expert_index"],
-        "expert_affinities": router_outputs["expert_affinities"],
+        "expert_index": expert_index,
+        "expert_affinities": expert_affinities,
     }
