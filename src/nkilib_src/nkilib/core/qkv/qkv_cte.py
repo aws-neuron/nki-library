@@ -23,7 +23,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import dge_mode
 
 from ..utils.allocator import SbufManager, sizeinbytes
 
@@ -181,6 +180,8 @@ class RoPEBuffers(nl.NKIObject):
     cos_sb: Optional[List[nl.NkiTensor]] = None
     sin_sb: Optional[List[nl.NkiTensor]] = None
     scratch_sb: Optional[List[list]] = None
+    # Single wide scratch per S tile for the head-batched rotation (see _use_batched_rope).
+    wide_scratch_sb: Optional[List[nl.NkiTensor]] = None
     cos_hbm: Optional[nl.NkiTensor] = None
     sin_hbm: Optional[nl.NkiTensor] = None
     # K-specific fused caches (only when gamma_fused_in_rope_caches=True)
@@ -203,6 +204,40 @@ def _get_num_rope_scratch_bufs(has_qk_norm: bool, H: int) -> int:
     if H > MAX_H_FOR_DOUBLE_BUFFER:
         return 1
     return 2
+
+
+def _use_batched_rope(cfg, dims) -> bool:
+    """Whether RoPE can rotate every Q/K head in one instruction instead of one per head.
+
+    The per-head rotation costs four Vector instructions per head per S tile. At d_head=64
+    those instructions are 32-64 columns wide, so each is dominated by its fixed issue cost
+    rather than by arithmetic, and each is a synchronization point against the matmuls
+    filling PSUM. Rotating all heads under a single access pattern keeps the element count
+    identical while cutting the instruction count by num_q_heads + num_kv_heads.
+
+    Requires the heads to be uniform and contiguous in the eviction tile, and no per-head
+    work interleaved between the eviction and the rotation:
+
+    * QK-norm normalizes each head on its own, so it has to stay per head;
+    * gamma-fused RoPE rotates out of the per-head scratch by construction;
+    * weight dequantization applies a per-segment or per-element scale during eviction,
+      which the single bulk eviction this path uses cannot express.
+    """
+    if not cfg.fused_rope:
+        return False
+    if cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None:
+        return False
+    # quantization_config is always a populated object, so the type is what matters: any
+    # real quantization brings per-head dequant scales that the batched path cannot fold.
+    if cfg.quantization_config.quantization_type != QuantizationType.NONE:
+        return False
+    # The view splits the eviction tile into equal d_head blocks, so a partial trailing
+    # head or an I that is not a whole number of heads has no uniform access pattern.
+    if dims.I % dims.d_head != 0:
+        return False
+    if dims.I < (dims.num_q_heads + dims.num_kv_heads) * dims.d_head:
+        return False
+    return True
 
 
 def _allocate_rope_buffers(
@@ -238,6 +273,19 @@ def _allocate_rope_buffers(
     bufs.k_cos_sb = [] if _has_separate_k_caches else None
     bufs.k_sin_sb = [] if _has_separate_k_caches else None
     _num_rope_bufs = _get_num_rope_scratch_bufs(has_qk_norm, dims.H)
+    # The head-batched rotation needs one scratch as wide as all the Q/K heads together,
+    # instead of the two d_head*2 buffers the per-head rotation alternates between. The
+    # per-head buffers are kept as well: they cost 2 * d_head * 2 bytes per partition, and
+    # the eviction falls back to the per-head path when a runtime dequant scale is present.
+    _batched_rope = _use_batched_rope(cfg, dims)
+    if _batched_rope:
+        _rope_heads = dims.num_q_heads + dims.num_kv_heads
+        _wide_bytes = _rope_heads * dims.d_head * sizeinbytes(cfg.compute_mm_dtype) * num_s_tiles
+        # Ask for double the requirement so this never takes the last of SBUF from the
+        # buffers allocated after it; falling back only costs the instruction count.
+        if sbm.get_free_space() < _wide_bytes * 2:
+            _batched_rope = False
+    bufs.wide_scratch_sb = [] if _batched_rope else None
     for _ in range(num_s_tiles):
         bufs.cos_sb.append(sbm.alloc_stack((pmax, dims.d_head), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
         bufs.sin_sb.append(sbm.alloc_stack((pmax, _sin_buf_fdim), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
@@ -248,6 +296,14 @@ def _allocate_rope_buffers(
         for _ in range(_num_rope_bufs):
             scratch.append(sbm.alloc_stack((pmax, dims.d_head * 2), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
         bufs.scratch_sb.append(scratch)
+        if _batched_rope:
+            bufs.wide_scratch_sb.append(
+                sbm.alloc_stack(
+                    (pmax, (dims.num_q_heads + dims.num_kv_heads) * dims.d_head),
+                    dtype=cfg.compute_mm_dtype,
+                    buffer=nl.sbuf,
+                )
+            )
     return bufs
 
 
@@ -289,6 +345,7 @@ def qkv_cte(
     use_block_kv: bool = False,
     transpose_k_cache: bool = False,
     fp8_packed: bool = False,
+    head_split_kv_cache: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.NkiTensor] = None,
     # -----------------------------------------
@@ -298,6 +355,8 @@ def qkv_cte(
     # -----------------------------------------
     sbm: Optional[SbufManager] = None,
     use_auto_allocation: bool = False,
+    # ----------------------------------------
+    hbm_name_prefix: str = "",
     # ----------------------------------------
     load_input_with_DMA_transpose: bool = True,
     # --- Quantization Related
@@ -380,7 +439,7 @@ def qkv_cte(
         fused_norm_type (NormType): Type of normalization: NormType.NO_NORM, NormType.RMS_NORM, NormType.RMS_NORM_SKIP_GAMMA, or NormType.LAYER_NORM.
             NormType.RMS_NORM_SKIP_GAMMA assumes fused_qkv_weights have been pre-multiplied with gamma vector, so its skipped here. Default: NormType.NO_NORM
         gamma_norm_weights (Optional[nl.NkiTensor]): [1, H], Normalization gamma/scale weights (required for NormType.RMS_NORM and NormType.LAYER_NORM). Default: None
-        layer_norm_bias (Optional[nl.NkiTensor]): [1, H], Layer normalization beta/bias weights (only for NormType.LAYER_NORM). Using layer norm bias is optional. Default: None
+        layer_norm_bias (Optional[nl.NkiTensor]): [1, H], Normalization beta/bias weights, optional and supported for NormType.LAYER_NORM and NormType.RMS_NORM. With RMS_NORM it gives the affine form rms_norm(x) * gamma + beta (AdaLN modulation -- no mean subtraction). Default: None
         norm_eps (Optional[float]): Epsilon value for numerical stability in normalization. Default: 1e-6
         hidden_actual (Optional[int]): Actual hidden dimension for padded tensors (if H contains padding). Default: None
         fused_rope (Optional[bool]): Whether to apply RoPE rotation to Query and Key heads after QKV projection. Default: False
@@ -396,11 +455,23 @@ def qkv_cte(
             dim 4 index 0 = even positions and index 1 = odd positions. Enables DMA transpose on decode.
             Requires block KV, FP8 quantization, even block_size, and d_head <= 128.
             Mutually exclusive with transpose_k_cache. Default: False
+        head_split_kv_cache (bool): Store the block K and V caches head-major as
+            [num_blocks, num_kv_heads, block_size, d_head] instead of the default
+            [num_blocks, block_size, kv_dim]. The two layouts are the same memory when
+            num_kv_heads == 1 and differ by a (block_size, num_kv_heads) transpose otherwise.
+            Head-major is the layout attention_segmented_cte reads, so a fused
+            projection+attention kernel can hand the cache over with no relayout. Costs a
+            narrower scatter packet -- d_head elements per row instead of kv_dim -- and one
+            DMA per KV head instead of one per token tile. Requires block KV, and
+            power-of-2 block_size when num_kv_heads > 1. Default: False
         store_output_in_sbuf (bool): Whether to store output in SBUF (currently unsupported, must be False). Default: False
         sbm (Optional[SbufManager]): Optional SBUF manager for memory allocation control, with pre-specified bounds for SBUF usage.
             If sbm is not provided, kernel will by default be allocated and use all of the available SBUF space. Default: None
         use_auto_allocation (bool): Whether to use automatic SBUF allocation, by default kernel is manually allocated and it creates its own SbufManager.
             If 'sbm' is provided by user, user has the responsibility to set use_auto_allocation=True in the provided SbufManager. Default: False
+        hbm_name_prefix (str): Extra prefix for the allocated output HBM tensor name. Required to be
+            distinct per call when one trace calls qkv_cte more than once, since duplicate HBM op
+            names are rejected. Default: "" (single-call callers need not set it)
         load_input_with_DMA_transpose (bool): Whether to use DMA transpose optimization. Default: True
         quantization_type: QuantizationType, default=QuantizationType.NONE
         qkv_w_scale: Optional[nl.NkiTensor], default=None The weight quantization scale for qkv projection,
@@ -515,6 +586,7 @@ def qkv_cte(
         use_block_kv=use_block_kv,
         transpose_k_cache=transpose_k_cache,
         fp8_packed=fp8_packed,
+        head_split_kv_cache=head_split_kv_cache,
         block_size=block_size,
         slot_mapping=slot_mapping,
         # Performance
@@ -549,6 +621,11 @@ def qkv_cte(
 
     # HBM tensor name prefix: use sbm prefix when provided to avoid name collisions.
     _hbm_name_prefix = (sbm.get_name_prefix() + "_") if sbm is not None and sbm.get_name_prefix() else ""
+    # A caller that invokes qkv_cte more than once per trace (e.g. once per S chunk) must pass a
+    # distinct hbm_name_prefix: the output name below is otherwise identical across calls, and the
+    # compiler rejects duplicate HBM op names.
+    if hbm_name_prefix:
+        _hbm_name_prefix = f"{hbm_name_prefix}_{_hbm_name_prefix}"
 
     # Create output tensor with original dimensions
     if cfg.quantization_config.quantization_type == QuantizationType.STATIC:
@@ -566,8 +643,13 @@ def qkv_cte(
         # When q_dim == 0 (KV-only projection), skip allocation — no Q output.
         if dims.q_dim > 0:
             q_S = cfg.strided_input_config.num_local_tokens if cfg.strided_input_config != None else dims.S_orig
+            q_shape = (
+                (dims.B_orig, dims.num_q_heads, q_S, dims.d_head)
+                if cfg.output_layout == QKVOutputLayout.BNSd
+                else (dims.B_orig, q_S, dims.q_dim)
+            )
             q_tensor_hbm = nl.ndarray(
-                (dims.B_orig, q_S, dims.q_dim),
+                q_shape,
                 dtype=input.dtype,
                 buffer=nl.shared_hbm,
                 name=f"{_hbm_name_prefix}qkv_cte_output_hbm",
@@ -606,7 +688,17 @@ def qkv_cte(
             sin_cache = sin_cache.reshape((1, dims.BxS, dims.d_head))
         if cfg.use_kv_cache:
             if q_tensor_hbm is not None:
-                q_tensor_hbm = q_tensor_hbm.reshape((1, dims.BxS, dims.q_dim))
+                if cfg.output_layout == QKVOutputLayout.BNSd:
+                    # [B, N, S, d] -> [1, N, BxS, d] is the same memory only when B == 1.
+                    # With B > 1 the head axis sits between B and S, so folding B into S
+                    # would interleave batches within each head.
+                    kernel_assert(
+                        dims.B_orig == 1,
+                        "[QKV CTE Kernel] BNSd Q output with the B,S reshape requires B == 1.",
+                    )
+                    q_tensor_hbm = q_tensor_hbm.reshape((1, dims.num_q_heads, dims.BxS, dims.d_head))
+                else:
+                    q_tensor_hbm = q_tensor_hbm.reshape((1, dims.BxS, dims.q_dim))
             if not use_block_kv:
                 if transpose_k_cache:
                     # Cache layout: [B, kv_dim, max_seq_len] -> [1, kv_dim, max_seq_len]
@@ -619,7 +711,9 @@ def qkv_cte(
                 slot_mapping = slot_mapping.reshape((1, dims.BxS))
         elif cfg.output_layout == QKVOutputLayout.BSD:
             output_hbm = output_hbm.reshape((1, dims.BxS, dims.I))
-        elif cfg.output_layout == QKVOutputLayout.NBSd:
+        elif (
+            cfg.output_layout == QKVOutputLayout.NBSd
+        ):  # pragma: no branch - exhaustive within use_BxS_input_reshape: output_layout is BSD or NBSd (the use_BxS gate) and use_kv_cache/BSD handled by prior branches, so NBSd always true here
             output_hbm = output_hbm.reshape((dims.num_heads, 1, dims.BxS, dims.d_head))
 
     # Pass values and directly, and keep 'cfg' and 'dims'
@@ -692,7 +786,10 @@ def qkv_cte(
             sin_cache = sin_cache.reshape((dims.B_orig, dims.S_orig, dims.d_head))
         if cfg.use_kv_cache:
             if q_tensor_hbm is not None:
-                q_tensor_hbm = q_tensor_hbm.reshape((dims.B_orig, dims.S_orig, dims.q_dim))
+                if cfg.output_layout == QKVOutputLayout.BNSd:
+                    q_tensor_hbm = q_tensor_hbm.reshape((dims.B_orig, dims.num_q_heads, dims.S_orig, dims.d_head))
+                else:
+                    q_tensor_hbm = q_tensor_hbm.reshape((dims.B_orig, dims.S_orig, dims.q_dim))
             if not use_block_kv:
                 if transpose_k_cache:
                     # Cache layout: [1, kv_dim, max_seq_len] -> [B, kv_dim, max_seq_len]
@@ -705,7 +802,9 @@ def qkv_cte(
                 slot_mapping = slot_mapping.reshape((dims.B_orig, dims.S_orig))
         elif cfg.output_layout == QKVOutputLayout.BSD:
             output_hbm = output_hbm.reshape((dims.B_orig, dims.S_orig, dims.I))
-        elif cfg.output_layout == QKVOutputLayout.NBSd:
+        elif (
+            cfg.output_layout == QKVOutputLayout.NBSd
+        ):  # pragma: no branch - exhaustive within use_BxS_input_reshape: output_layout is BSD or NBSd and use_kv_cache/BSD handled by prior branches, so NBSd always true here
             output_hbm = output_hbm.reshape((dims.num_heads, dims.B_orig, dims.S_orig, dims.d_head))
 
     if cfg.use_kv_cache:
@@ -741,7 +840,47 @@ def _compute_and_store_squared_sum(segment_sb, squared_scratch_sb, squared_sum_s
         reduce_op=nl.add,
         reduce_res=squared_sum_sb,
     )
-    nisa.dma_copy(dst=squared_sum_dst, src=squared_sum_sb, dge_mode=dge_mode.swdge)
+    nisa.dma_copy(dst=squared_sum_dst, src=squared_sum_sb, dge_mode=nisa.dge_mode.swdge)
+
+
+def _store_q_output(q_tensor_hbm, q_tile_sb, i_batch, s_tile_global_offset, s_tile_sz, cfg, dims):
+    """Write one S tile of the Q projection from SBUF to HBM in the configured Q layout.
+
+    ``q_tile_sb`` is [s_tile_sz partitions, q_dim free], heads side by side in the free dim.
+
+    Default: q_tensor_hbm is [B, S, q_dim] and the tile is one contiguous run, so it ships
+    as a single DMA.
+
+    ``cfg.output_layout == QKVOutputLayout.BNSd``: q_tensor_hbm is [B, num_q_heads, S, d_head], the layout
+    attention kernels read. The heads are strided apart there, so this becomes one DMA per
+    head -- each still a contiguous s_tile_sz * d_head run in HBM (128 * 64 * 2 B = 16 KB at
+    d_head=64) -- in exchange for deleting a separate HBM->SBUF->HBM relayout pass and the
+    barrier a fused kernel needs around it.
+
+    These descriptors go to the Sync/Scalar DGE hardware block, not GpSimd: every address is
+    a trace-time constant so swdge buys nothing, and GpSimd is what binds the qkv stage.
+    Alternating Sync and Scalar per head splits the work over two engines that are idle here.
+    The KV-cache scatter below stays on swdge because it indexes through slot_mapping and
+    needs dynamic addressing.
+    """
+    if cfg.output_layout == QKVOutputLayout.BNSd:
+        for i_head in range(dims.num_q_heads):
+            nisa.dma_copy(
+                dst=q_tensor_hbm[i_batch, i_head, nl.ds(s_tile_global_offset, s_tile_sz), :],
+                src=q_tile_sb[0:s_tile_sz, nl.ds(i_head * dims.d_head, dims.d_head)],
+                dge_mode=nisa.dge_mode.hwdge,
+                engine=nisa.engine.sync if i_head % 2 == 0 else nisa.engine.scalar,
+            )
+    else:
+        nisa.dma_copy(
+            dst=q_tensor_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
+                0,
+                i_batch * dims.S + s_tile_global_offset,
+                i_batch * dims.S + s_tile_global_offset + s_tile_sz,
+            ),
+            src=q_tile_sb[0:s_tile_sz, 0 : dims.q_dim],
+            dge_mode=nisa.dge_mode.swdge,
+        )
 
 
 def _store_kv_cache(
@@ -818,7 +957,17 @@ def _store_kv_cache(
                     i_batch * dims.S + s_tile_global_offset,
                     i_batch * dims.S + s_tile_global_offset + s_tile_sz,
                 ),
-                dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
+                dge_mode=nisa.dge_mode.none,  # to remove gpsimd contention with the cache write
+            )
+
+        # K and V scatter to the same rows of their respective head-split caches, so
+        # derive the head-major row indices once here and hand the same tile to both.
+        # Letting each store compute its own put a dependent Vector pair between K's
+        # scatters and V's, because both took the same alloc_stack slot.
+        head_split_slot_sb = None
+        if cfg.use_block_kv and (cfg.fp8_packed or cfg.head_split_kv_cache):
+            head_split_slot_sb = _head_split_slot_indices(
+                slot_mapping_tile_sb, s_tile_sz, dims.num_kv_heads, cfg.block_size, sbm
             )
 
         if cfg.fp8_packed:
@@ -842,7 +991,7 @@ def _store_kv_cache(
                         i_batch * dims.S + fp8_pack_first_tile_offset + 2 * num_packed_rows,
                         step=2,
                     ),
-                    dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
+                    dge_mode=nisa.dge_mode.none,  # to remove gpsimd contention with the cache write
                 )
                 # slot_mapping holds flat indices into [num_blocks * block_size].
                 # Right-shift by 1 (= divide by 2) converts to packed row indices
@@ -920,6 +1069,7 @@ def _store_kv_cache(
                 dims=dims,
                 sbm=sbm,
                 slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
+                head_split_slot_sb=head_split_slot_sb,
             )
 
         _quantize_and_store_kv(
@@ -934,7 +1084,52 @@ def _store_kv_cache(
             dims=dims,
             sbm=sbm,
             slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
+            head_split_slot_sb=head_split_slot_sb,
         )
+
+
+def _head_split_slot_indices(slot_mapping_sb, s_tile_sz, num_kv_heads, block_size, sbm):
+    """Map flat slot indices to head-major KV-cache row indices.
+
+    ``slot_mapping`` holds ``slot = block * block_size + pos``, a row in the old
+    ``[num_blocks * block_size, kv_dim]`` layout. The head-major row for
+    ``(block, head, pos)`` in ``[num_blocks, num_kv_heads, block_size, d_head]`` is
+    ``block * num_kv_heads * block_size + head * block_size + pos``. The per-head term is
+    a static offset at the DMA, so all this does is promote the block term's stride by
+    ``num_kv_heads``: ``v_slot = block_idx * (num_kv_heads - 1) * block_size + slot``.
+    With ``num_kv_heads == 1`` that is the identity and ``slot_mapping_sb`` is returned
+    as is, with no instructions emitted.
+
+    Split out of ``_quantize_and_store_kv`` so the caller can compute it ONCE per S-tile
+    and hand the same buffer to both the K and the V store. It depends only on the slot
+    mapping, the block size and the head count, so K and V always want the same answer,
+    and computing it per store serializes them: both calls take the same ``alloc_stack``
+    address, so V's right_shift waits for K's DMA_INDIRECT scatters to finish reading that
+    buffer as their ``vector_offset``, which shows up as PE-idle gaps.
+    """
+    if num_kv_heads == 1:
+        return slot_mapping_sb
+    kernel_assert(
+        block_size & (block_size - 1) == 0,
+        f"[QKV CTE Kernel] head-split multi-head KV store requires power-of-2 block_size, got {block_size}",
+    )
+    log2_block_size = int(math.log2(block_size))
+    v_slot_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=v_slot_sb[0:s_tile_sz, 0:1],
+        data=slot_mapping_sb[0:s_tile_sz, 0:1],
+        op0=nl.right_shift,
+        operand0=log2_block_size,
+    )
+    nisa.scalar_tensor_tensor(
+        dst=v_slot_sb[0:s_tile_sz, 0:1],
+        data=v_slot_sb[0:s_tile_sz, 0:1],
+        op0=nl.multiply,
+        operand0=float((num_kv_heads - 1) * block_size),
+        op1=nl.add,
+        operand1=slot_mapping_sb[0:s_tile_sz, 0:1],
+    )
+    return v_slot_sb
 
 
 def _quantize_and_store_kv(
@@ -949,6 +1144,7 @@ def _quantize_and_store_kv(
     dims: QKV_CTE_Dims,
     sbm: SbufManager,
     slot_mapping_sb: Optional[nl.NkiTensor] = None,
+    head_split_slot_sb: Optional[nl.NkiTensor] = None,
 ):
     """
     Optionally quantize KV values, then store to cache.
@@ -959,6 +1155,12 @@ def _quantize_and_store_kv(
         Values are stored directly without quantization.
 
     Uses NBSd-style .ap() pattern for multi-head output.
+
+    ``head_split_slot_sb`` is the head-major row index tile from
+    ``_head_split_slot_indices``. Pass it when the caller already computed it for
+    this S-tile -- K and V share the same indices -- so the two stores' scatters do
+    not get serialized by a redundant recomputation into the same SBUF slot. When
+    None this computes its own.
     """
     kv_dim = dims.kv_dim
     d_head = dims.d_head
@@ -991,11 +1193,16 @@ def _quantize_and_store_kv(
         # bf16 path: store directly without quantization
         src_sb = output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim]
 
-    if cfg.use_block_kv and cfg.fp8_packed:
-        # Head-split V cache layout [num_blocks, num_kv_heads, block_size, d_head] (fp8_packed).
-        # V is not packed/transposed (PV matmul reads [block_size, d_head] directly); only the
-        # KV heads are pulled out to a leading dim, matching the head-major K layout the decode
-        # kernel reads. Flatten to [num_blocks * num_kv_heads * block_size, d_head] for scatter.
+    if cfg.use_block_kv and (cfg.fp8_packed or cfg.head_split_kv_cache):
+        # Head-split cache layout [num_blocks, num_kv_heads, block_size, d_head]. Flatten to
+        # [num_blocks * num_kv_heads * block_size, d_head] for the scatter.
+        #
+        # Two callers want this. Under fp8_packed it is V only: V is not packed or transposed
+        # (the PV matmul reads [block_size, d_head] directly), so only the KV heads move to a
+        # leading dim, matching the head-major K layout the decode kernel reads. Under
+        # head_split_kv_cache it is both K and V, because this is the layout
+        # attention_segmented_cte reads and a fused projection+attention kernel would
+        # otherwise have to transpose (block_size, num_kv_heads) between the two stages.
         block_size = cfg.block_size
         num_blocks = cache_hbm.shape[0]
         total_rows = num_blocks * num_kv_heads * block_size
@@ -1005,29 +1212,11 @@ def _quantize_and_store_kv(
         # layout). The head-major row for (block, head, pos) is
         #   block * num_kv_heads * block_size + head * block_size + pos.
         # The per-head term is a static offset below; promote the block term's stride by num_kv_heads.
-        v_slot_sb = slot_mapping_sb
-        if num_kv_heads > 1:
-            kernel_assert(
-                block_size & (block_size - 1) == 0,
-                f"fp8_packed multi-head V store requires power-of-2 block_size, got {block_size}",
-            )
-            log2_block_size = int(math.log2(block_size))
-            v_slot_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_scalar(
-                dst=v_slot_sb[0:s_tile_sz, 0:1],
-                data=slot_mapping_sb[0:s_tile_sz, 0:1],
-                op0=nl.right_shift,
-                operand0=log2_block_size,
-            )
-            # v_slot = block_idx * (num_kv_heads - 1) * block_size + slot
-            nisa.scalar_tensor_tensor(
-                dst=v_slot_sb[0:s_tile_sz, 0:1],
-                data=v_slot_sb[0:s_tile_sz, 0:1],
-                op0=nl.multiply,
-                operand0=float((num_kv_heads - 1) * block_size),
-                op1=nl.add,
-                operand1=slot_mapping_sb[0:s_tile_sz, 0:1],
-            )
+        v_slot_sb = (
+            head_split_slot_sb
+            if head_split_slot_sb is not None
+            else _head_split_slot_indices(slot_mapping_sb, s_tile_sz, num_kv_heads, block_size, sbm)
+        )
 
         for h in range(num_kv_heads):
             nisa.dma_copy(
@@ -1038,7 +1227,7 @@ def _quantize_and_store_kv(
                     indirect_dim=0,
                 ),
                 src=src_sb[0:s_tile_sz, nl.ds(h * d_head, d_head)],
-                dge_mode=dge_mode.swdge,
+                dge_mode=nisa.dge_mode.swdge,
             )
     elif cfg.use_block_kv:
         # Block KV layout: [num_blocks, block_size, kv_dim]
@@ -1055,7 +1244,7 @@ def _quantize_and_store_kv(
                 indirect_dim=0,
             ),
             src=src_sb,
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
     else:
         # Cache layout: [B, max_seq_len, kv_dim] - same pattern as BSD output store
@@ -1064,7 +1253,7 @@ def _quantize_and_store_kv(
         nisa.dma_copy(
             dst=cache_hbm.flatten_dims(start_dim=0, end_dim=1).slice(0, cache_row, cache_row + s_tile_sz),
             src=src_sb,
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
 
 
@@ -1187,7 +1376,7 @@ def _quantize_and_store_k_transposed(
                 src=transposed_sb.reshape_dim(1, [num_kv_heads, nl.tile_size.pmax])
                 .slice(0, 0, d_head)
                 .slice(2, token_start, token_start + block_size),
-                dge_mode=dge_mode.swdge,
+                dge_mode=nisa.dge_mode.swdge,
             )
 
         # Handle remainder (partial last block) if any.
@@ -1230,7 +1419,7 @@ def _quantize_and_store_k_transposed(
                 src=transposed_sb.reshape_dim(1, [num_kv_heads, nl.tile_size.pmax])
                 .slice(0, 0, d_head)
                 .slice(2, token_start, token_start + remainder),
-                dge_mode=dge_mode.swdge,
+                dge_mode=nisa.dge_mode.swdge,
             )
 
     else:
@@ -1249,7 +1438,7 @@ def _quantize_and_store_k_transposed(
             src=transposed_sb.reshape_dim(1, [num_kv_heads, nl.tile_size.pmax])
             .slice(0, 0, d_head)
             .slice(2, 0, s_tile_sz),
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
 
 
@@ -1384,7 +1573,7 @@ def _quantize_and_store_k_fp8_packed(
                 indirect_dim=0,
             ),
             src=packed_sb_fp8[:num_packed_rows, nl.ds(i * d_head * 2, d_head * 2)],
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
 
 
@@ -1561,7 +1750,7 @@ def _qkv_cte_impl(
     """
     Input tensor shape: [dims.B, dims.S, dims.H]
     Weight tensor shape: [dims.H, dims.I]
-    
+
     We apply QKV projection only on dims.S_shard part of input_hbm (with dims.S_shard_offset).
     """
 
@@ -1600,7 +1789,7 @@ def _qkv_cte_impl(
 
     """
     Load gamma_norm_weights_hbm (1,H) to sbuf.
-    
+
     Mathematically, we (later) need to apply elementwise multiplication: (input) [S, H] * (gamma) [1, H] for each row.
     Note: NormType.RMS_NORM_SKIP_GAMMA skips this step.
     """
@@ -1627,12 +1816,12 @@ def _qkv_cte_impl(
         nisa.dma_copy(
             dst=k_scale_sb[0 : nl.tile_size.pmax, 0:1],
             src=k_scale_hbm[0 : nl.tile_size.pmax, 0:1],
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
         nisa.dma_copy(
             dst=v_scale_sb[0 : nl.tile_size.pmax, 0:1],
             src=v_scale_hbm[0 : nl.tile_size.pmax, 0:1],
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
         # Precompute inverse scales (1/scale) once — avoids redundant reciprocal per tile.
         k_inv_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -1681,14 +1870,17 @@ def _qkv_cte_impl(
 
     """
     Multi-Buffering S: Choose max multi-buffering degree for sequence length, without spilling SBUF and PSUM space.
-    
+
     WARNING: This function needs to be updated if any new tensors get added to the kernel.
     It assumes current tensor shapes, and its "look-ahead", e.g. pre-calculates SBUF space ahead of time.
     Note: In auto-allocation mode, sbuf space calculations do not make sense, but they do not break the kernel correctness.
     """
-    s_multi_buffer_degree, projected_sbuf_taken_space_after_multi_buffer = _multi_buffering_degree_for_seqlen(
-        cfg=cfg, dims=dims, sbm=sbm, qkv_in_scale=qkv_in_scale
-    )
+    (
+        s_multi_buffer_degree,
+        projected_sbuf_taken_space_after_multi_buffer,
+        effective_num_weight_buffers,
+        sbuf_tile_space_per_s_tile,
+    ) = _multi_buffering_degree_for_seqlen(cfg=cfg, dims=dims, sbm=sbm, qkv_in_scale=qkv_in_scale)
 
     # Block is PMAX * multi_buffer_degree, e.g.  process [128 * 4, H] elements of S at once.
     S_BLOCK_SIZE = s_multi_buffer_degree * min(dims.S_shard, nl.tile_size.pmax)
@@ -1697,7 +1889,11 @@ def _qkv_cte_impl(
     ######################## Weight Prefetching: Enough Space Left ?  #########################
 
     use_weight_prefetch = _use_weight_prefetch(
-        projected_sbuf_taken_space_after_multi_buffer, cfg=cfg, dims=dims, sbm=sbm
+        projected_sbuf_taken_space_after_multi_buffer,
+        cfg=cfg,
+        dims=dims,
+        sbm=sbm,
+        effective_num_weight_buffers=effective_num_weight_buffers,
     )
 
     if use_weight_prefetch:
@@ -1733,11 +1929,51 @@ def _qkv_cte_impl(
                 src=fused_qkv_weights_hbm.slice(
                     0, i_tile_H * nl.tile_size.pmax, i_tile_H * nl.tile_size.pmax + h_tile_sz
                 ),
-                dge_mode=dge_mode.swdge,
+                dge_mode=nisa.dge_mode.swdge,
             )
         weights_sb.append(weights_prefetched_sb)
+    else:
+        # Hoisted out of the i_block_S loop. Every value here is loop-invariant and the
+        # buffers were already re-allocated at identical addresses on each block, so SBUF usage is
+        # unchanged -- but they must live OUTSIDE the rotating scope opened below, or interleaving
+        # would duplicate effective_num_weight_buffers * ~20 KB per partition and force degree 1.
+        # The per-block weight DMA loads stay in the loop.
+        # Load weights [weight_load_block_size_per_H=1024, I] at a time.
+        # Default weight constants are meant for non-prefetches case (they are over-written in case of prefetching)
+        # Note: Projection uses num_weight_buffers and weight_load_block_size_per_H for indexing regardless of use_weight_prefetch.
+        weight_load_block_size_per_H = dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT  # 1024
+        num_weight_load_blocks_per_H = math.ceil(H / weight_load_block_size_per_H)
+        # Must match the count _multi_buffering_degree_for_seqlen budgeted for, otherwise the
+        # lookahead disagrees with the real allocation. It is the default (4) whenever SBUF has
+        # room, and only reduced when the weight buffers would otherwise starve multi-buffering.
+        num_weight_buffers = effective_num_weight_buffers
+        max_num_128_H_subtiles_per_weight_block = math.ceil(weight_load_block_size_per_H / 128)  # e.g 1024 / 128 = 8.
+
+        # We load weights using a strided access pattern with only a single DMA ISA.
+        weights_sb = []
+        for _ in range(num_weight_buffers):
+            weights_sb.append(
+                sbm.alloc_stack(
+                    (nl.tile_size.pmax, max_num_128_H_subtiles_per_weight_block, I),
+                    dtype=cfg.weights_dtype,
+                    buffer=nl.sbuf,
+                )
+            )
+
+    # A rotating parent scope is the only way to get run-ahead across S blocks. The weight
+    # buffers above are now outside it, so a section costs just the multi-buffered S tiles.
+    s_block_interleave_degree = _get_safe_s_block_interleave_degree(
+        s_multi_buffer_degree * sbuf_tile_space_per_s_tile, sbm
+    )
 
     for i_batch in range(dims.B):
+        # Without this, `input_sb` lands at the same address every block, so block i+1's ~1.4 MB
+        # input DMA is WAR-blocked on block i's last matmul and PE idles through the load, showing
+        # up as repeated gaps before the projection LDWEIGHTS. Rotating
+        # sections let the next block's load issue while the current block still computes. Nested
+        # child scopes are handled by Scope.min_independent_addr, which is why the loop body below is
+        # untouched. At degree 1 increment_section() wraps immediately and this is a no-op.
+        sbm.open_scope(interleave_degree=s_block_interleave_degree, name="s_block_rotate")
         for i_block_S in nl.affine_range(num_blocks_per_S_shard):
             sbm.open_scope()
             # Adjust for the last loop iteration.
@@ -1858,7 +2094,7 @@ def _qkv_cte_impl(
                             src=input_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
                                 0, s_tile_global_offset // H, s_tile_global_offset // H + s_tile_sz
                             ),
-                            dge_mode=dge_mode.swdge,
+                            dge_mode=nisa.dge_mode.swdge,
                         )
 
                     ######################################################################################################
@@ -2117,49 +2353,25 @@ def _qkv_cte_impl(
 
             """
             Multiply transposed input_sb @ weight tensor.
-            
+
             The following loop reads from transposed input_sb(i_tile_S, 128, H),
             and outputs to psum_buffer(psum_banks_used, 128, 512).
-            
+
             * Loop Structure of QKV Projection (in the case of non-prefetched weights):
             * Here,  weight_load_block_size_per_H = 1024.
             for each WEIGHT_BLOCK of 1024 size (along H):
-                Load [1024, I] of weights to SBUF at once.  
-                * We have 8 * [128, I] sub-tiles of H in a single load.           
-                
+                Load [1024, I] of weights to SBUF at once.
+                * We have 8 * [128, I] sub-tiles of H in a single load.
+
                 for each row of S buffer:                  ( e.g. 1, [128, H] sized rows)
                     for jth_subtile 0 to 8:                       (1024 / 128 = 8)
                         for each 512 column tile of weights (along I)
                             Multiply (weights) tile [128, 512] with the corresponding (input) tile in transposes_input_row [128, 128].
-                            * Each of 512 tiles (columns in I) is accumulated to a different PSUM bank. 
+                            * Each of 512 tiles (columns in I) is accumulated to a different PSUM bank.
             """
 
-            # Allocate weights here, if not prefetched already.
-            if not use_weight_prefetch:
-                # Load weights [weight_load_block_size_per_H=1024, I] at a time.
-                # Default weight constants are meant for non-prefetches case (they are over-written in case of prefetching)
-                # Note: Projection uses num_weight_buffers and weight_load_block_size_per_H for indexing regardless of use_weight_prefetch.
-                weight_load_block_size_per_H = dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT  # 1024
-                num_weight_load_blocks_per_H = math.ceil(H / weight_load_block_size_per_H)
-                # Reduce weight buffers when SBUF budget is exceeded (mirrors lookahead in _multi_buffering_degree_for_seqlen)
-                if projected_sbuf_taken_space_after_multi_buffer > cfg.total_available_sbuf_space_to_this_kernel:
-                    num_weight_buffers = min(dims.NUM_WEIGHT_BUFFERS_DEFAULT, num_weight_load_blocks_per_H)
-                else:
-                    num_weight_buffers = dims.NUM_WEIGHT_BUFFERS_DEFAULT  # 4
-                max_num_128_H_subtiles_per_weight_block = math.ceil(
-                    weight_load_block_size_per_H / 128
-                )  # e.g 1024 / 128 = 8.
-
-                # We load weights using a strided access pattern with only a single DMA ISA.
-                weights_sb = []
-                for _ in range(num_weight_buffers):
-                    weights_sb.append(
-                        sbm.alloc_stack(
-                            (nl.tile_size.pmax, max_num_128_H_subtiles_per_weight_block, I),
-                            dtype=cfg.weights_dtype,
-                            buffer=nl.sbuf,
-                        )
-                    )
+            # Weight buffers and their loop constants are allocated once before the batch loop,
+            # so that the rotating S-block scope does not duplicate them.
 
             # If use_weight_prefetch, then NUM_WEIGHT_LOADS_PER_H == 1.
             for i_weight_load in nl.affine_range(num_weight_load_blocks_per_H):
@@ -2183,13 +2395,13 @@ def _qkv_cte_impl(
                         )
                         .slice(1, 0, min(nl.tile_size.pmax, H - weight_load_offset))
                         .permute([1, 0, 2]),
-                        dge_mode=dge_mode.swdge,
+                        dge_mode=nisa.dge_mode.swdge,
                     )
 
                     """
                     Strided HBM->SBUF weights load example, if loading 1024 x I weights at a time.
                     Here, weight_load_block_size_per_H  = 1024.
-                    
+
                     HBM Weights
                     ------------
                                         I
@@ -2200,21 +2412,21 @@ def _qkv_cte_impl(
                             |       H_8                  |
                              -----------------------------
                                         ....
-                            
+
                     SBUF Weights
                     ------------
                                                 8 * I
                             -------------------------------------------------
                         128|  H_1   |  H_2 |      ....              |  H_8   |
                             -------------------------------------------------
-                        
+
                     Note: Access pattern on HBM side is strided, we are skipping 128 * I elements each time.
                         Order:
                             [0, 0:I], [128, 0:I], [256, 0:I], ...   ( 8 rows of I elements)
                             [1, 0:I], [129, 0:I], [257, 0:I], ...   ( 8 rows of I elements)
-                        
+
                     On SBUF side,
-                            1st row of H_1, and 1st row H_2 will be both partition=0, etc.                 
+                            1st row of H_1, and 1st row H_2 will be both partition=0, etc.
                     """
 
                 for i_tile_S in nl.affine_range(num_S_tiles_in_block):
@@ -2564,21 +2776,21 @@ def _qkv_cte_impl(
             #######################################################################################################
             # This parts reads from output_matmult_sbuf and writes to out_tensor.
 
-            if cfg.use_kv_cache and cfg.output_layout == QKVOutputLayout.BSD:
+            if cfg.use_kv_cache and cfg.output_layout in (QKVOutputLayout.BSD, QKVOutputLayout.BNSd):
                 # Store Q output (skip when q_dim == 0, i.e. KV-only projection).
                 if dims.q_dim > 0:
                     for i_tile_S in range(num_S_tiles_in_block):
                         s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * nl.tile_size.pmax
                         s_tile_sz = min(nl.tile_size.pmax, S_shard - s_tile_local_offset)
                         s_tile_global_offset = dims.S_shard_offset + s_tile_local_offset
-                        nisa.dma_copy(
-                            dst=q_tensor_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
-                                0,
-                                i_batch * dims.S + s_tile_global_offset,
-                                i_batch * dims.S + s_tile_global_offset + s_tile_sz,
-                            ),
-                            src=output_sb[i_tile_S][0:s_tile_sz, 0 : dims.q_dim],
-                            dge_mode=dge_mode.swdge,
+                        _store_q_output(
+                            q_tensor_hbm=q_tensor_hbm,
+                            q_tile_sb=output_sb[i_tile_S],
+                            i_batch=i_batch,
+                            s_tile_global_offset=s_tile_global_offset,
+                            s_tile_sz=s_tile_sz,
+                            cfg=cfg,
+                            dims=dims,
                         )
                 # In-kernel KV cache write (shared with _qkv_cte_mx_impl Step 6).
                 _store_kv_cache(
@@ -2614,7 +2826,7 @@ def _qkv_cte_impl(
                             i_batch * dims.S + dims.S_shard_offset + s_tile_local_offset + s_tile_sz,
                         ),
                         src=output_sb[i_tile_S][0:s_tile_sz, 0:I],
-                        dge_mode=dge_mode.swdge,
+                        dge_mode=nisa.dge_mode.swdge,
                     )
 
             else:  # NBSd = [heads, B, S, head_dim], I = heads * head_dim
@@ -2635,7 +2847,7 @@ def _qkv_cte_impl(
                             src=output_sb[i_tile_S]
                             .slice(0, 0, s_tile_sz)
                             .slice(1, i_head * d_head, i_head * d_head + num_d),
-                            dge_mode=dge_mode.swdge,
+                            dge_mode=nisa.dge_mode.swdge,
                         )
 
             # Optional: per-segment sum of squares over the head dimension,
@@ -2700,7 +2912,13 @@ def _qkv_cte_impl(
                         )
 
             sbm.close_scope()  # Deallocate all multi-buffered tensors.
+            # Advance to the next section so the following block allocates above this one
+            # instead of on top of it. Wraps back to the scope start every
+            # s_block_interleave_degree blocks; at degree 1 that is every block, i.e. the previous
+            # behaviour exactly.
+            sbm.increment_section()
             # End of i_buffer_s loop
+        sbm.close_scope()  # Close the rotating S-block scope.
         # End of batch loop
     sbm.close_scope()
     return output_hbm
@@ -2857,7 +3075,12 @@ def _qkv_cte_mx_impl(
     H_PACKED = H // 4  # MX packs 4 elements, so weight H dimension is H/4
     I = dims.I
 
-    if dims.S_shard == 0:
+    # pragma: no branch - S_shard==0 only occurs when S < num_shards (S=1, num_shards=2 =>
+    # shard0=0), but then the other shard gets S//2+1=1 (odd), and MX matmul requires an even
+    # stationary free dimension ('matmul_mx: stationary free dimension product must be even'),
+    # so that config fails HW compilation. The MX path is therefore never entered with
+    # S_shard==0 on real hardware; this is a defensive guard (True arc HW-unreachable).
+    if dims.S_shard == 0:  # pragma: no branch
         return output_hbm
 
     P_MAX = nl.tile_size.pmax
@@ -2961,8 +3184,8 @@ def _qkv_cte_mx_impl(
     if cfg.use_kv_cache and cfg.use_kv_quantization:
         k_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         v_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=k_scale_sb[0:P_MAX, 0:1], src=k_scale_hbm[0:P_MAX, 0:1], dge_mode=dge_mode.swdge)
-        nisa.dma_copy(dst=v_scale_sb[0:P_MAX, 0:1], src=v_scale_hbm[0:P_MAX, 0:1], dge_mode=dge_mode.swdge)
+        nisa.dma_copy(dst=k_scale_sb[0:P_MAX, 0:1], src=k_scale_hbm[0:P_MAX, 0:1], dge_mode=nisa.dge_mode.swdge)
+        nisa.dma_copy(dst=v_scale_sb[0:P_MAX, 0:1], src=v_scale_hbm[0:P_MAX, 0:1], dge_mode=nisa.dge_mode.swdge)
         k_inv_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         v_inv_scale_sb = sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.reciprocal(dst=k_inv_scale_sb, data=k_scale_sb)
@@ -3014,7 +3237,7 @@ def _qkv_cte_mx_impl(
                         src=qkv_w_scale.view(nl.uint8).slice(
                             0, hbm_row_offset // I, hbm_row_offset // I + SCALE_P_PER_QUAD
                         ),
-                        dge_mode=dge_mode.hwdge,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
             # Partial last tile (if exists)
             _is_remainder = H_128_tiles > H_128_tiles_full
@@ -3026,7 +3249,7 @@ def _qkv_cte_mx_impl(
                         src=qkv_w_scale.view(nl.uint8).slice(
                             0, hbm_row_offset // I, hbm_row_offset // I + SCALE_P_PER_QUAD
                         ),
-                        dge_mode=dge_mode.hwdge,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
             weight_scale_sb.append(mx_weight_scale_sb)
 
@@ -3048,7 +3271,7 @@ def _qkv_cte_mx_impl(
                 src=fused_qkv_weights_hbm.flatten_dims(start_dim=1, end_dim=2).slice(
                     0, h_tile_idx * P_MAX, h_tile_idx * P_MAX + h_tile_sz
                 ),
-                dge_mode=dge_mode.hwdge,
+                dge_mode=nisa.dge_mode.hwdge,
             )
         mx_weights_sb = mx_weights_sb.view(nl.float8_e4m3fn_x4)
         weights_sb.append(mx_weights_sb)
@@ -3212,7 +3435,7 @@ def _qkv_cte_mx_impl(
                                 src=input_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
                                     0, s_tile_global_offset // H, s_tile_global_offset // H + s_tile_sz
                                 ),
-                                dge_mode=dge_mode.swdge,
+                                dge_mode=nisa.dge_mode.swdge,
                             )
 
                     if cfg.fused_norm_type == NormType.RMS_NORM or cfg.fused_norm_type == NormType.RMS_NORM_SKIP_GAMMA:
@@ -3430,7 +3653,7 @@ def _qkv_cte_mx_impl(
                                 src=qkv_w_scale.view(nl.uint8).slice(
                                     0, hbm_row_offset // I, hbm_row_offset // I + SCALE_P_PER_QUAD
                                 ),
-                                dge_mode=dge_mode.hwdge,
+                                dge_mode=nisa.dge_mode.hwdge,
                             )
 
                     # Load weights for this h_tile from HBM [H//4, I, 4] fp8.
@@ -3442,7 +3665,7 @@ def _qkv_cte_mx_impl(
                         src=fused_qkv_weights_hbm.flatten_dims(start_dim=1, end_dim=2).slice(
                             0, h_tile_idx * P_MAX, h_tile_idx * P_MAX + h_tile_sz
                         ),
-                        dge_mode=dge_mode.hwdge,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
                     weights_sb[buf_idx] = weights_sb_fp8.view(nl.float8_e4m3fn_x4)
 
@@ -3580,21 +3803,21 @@ def _qkv_cte_mx_impl(
                 )
 
             # Step 6: Store output to HBM
-            if cfg.use_kv_cache and cfg.output_layout == QKVOutputLayout.BSD:
+            if cfg.use_kv_cache and cfg.output_layout in (QKVOutputLayout.BSD, QKVOutputLayout.BNSd):
                 # Store Q output (skip when q_dim == 0, i.e. KV-only projection).
                 if dims.q_dim > 0:
                     for i_tile_S in range(num_output_s_tiles):
                         s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX
                         s_tile_sz = min(P_MAX, S_shard - s_tile_local_offset)
                         s_tile_global_offset = dims.S_shard_offset + s_tile_local_offset
-                        nisa.dma_copy(
-                            dst=q_tensor_hbm.flatten_dims(start_dim=0, end_dim=1).slice(
-                                0,
-                                i_batch * dims.S + s_tile_global_offset,
-                                i_batch * dims.S + s_tile_global_offset + s_tile_sz,
-                            ),
-                            src=output_sb[i_tile_S][0:s_tile_sz, 0 : dims.q_dim],
-                            dge_mode=dge_mode.swdge,
+                        _store_q_output(
+                            q_tensor_hbm=q_tensor_hbm,
+                            q_tile_sb=output_sb[i_tile_S],
+                            i_batch=i_batch,
+                            s_tile_global_offset=s_tile_global_offset,
+                            s_tile_sz=s_tile_sz,
+                            cfg=cfg,
+                            dims=dims,
                         )
                 # In-kernel KV cache write (shared with _qkv_cte_impl Step 6).
                 _store_kv_cache(
@@ -3627,7 +3850,7 @@ def _qkv_cte_mx_impl(
                             i_batch * dims.S + dims.S_shard_offset + s_tile_local_offset + s_tile_sz,
                         ),
                         src=output_sb[i_tile_S][0:s_tile_sz, 0:I],
-                        dge_mode=dge_mode.hwdge,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
             else:  # NBSd = [heads, B, S, head_dim]
                 d_head = int(dims.d_head)
@@ -3647,7 +3870,7 @@ def _qkv_cte_mx_impl(
                             src=output_sb[i_tile_S]
                             .slice(0, 0, s_tile_sz)
                             .slice(1, i_head * d_head, i_head * d_head + num_d),
-                            dge_mode=dge_mode.hwdge,
+                            dge_mode=nisa.dge_mode.hwdge,
                         )
             sbm.close_scope()
     sbm.close_scope()
@@ -3683,10 +3906,10 @@ def _dequant_row_mx(
 
 
 def _dequant_row_input_only(
-    dst: nl.ndarray,
-    psum_src: nl.ndarray,
-    row_scale: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    dst: nl.NkiTensor,
+    psum_src: nl.NkiTensor,
+    row_scale: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
 ) -> None:
     """Apply row-input-only dequant: dst = psum * row_scale [+ bias].
 
@@ -3694,10 +3917,10 @@ def _dequant_row_input_only(
     inside nc_matmul_mx; only the per-row input dequant remains.
 
     Args:
-        dst (nl.ndarray): Destination slice in SBUF.
-        psum_src (nl.ndarray): Source slice in PSUM.
-        row_scale (nl.ndarray): [s_tile_sz, 1] per-row input scale.
-        bias (Optional[nl.ndarray]): Bias slice in SBUF, or None.
+        dst (nl.NkiTensor): Destination slice in SBUF.
+        psum_src (nl.NkiTensor): Source slice in PSUM.
+        row_scale (nl.NkiTensor): [s_tile_sz, 1] per-row input scale.
+        bias (Optional[nl.NkiTensor]): Bias slice in SBUF, or None.
     """
     if bias is not None:
         nisa.scalar_tensor_tensor(
@@ -3886,12 +4109,12 @@ def _evict_psum_to_sbuf_bulk_row_mx(
 
 
 def _evict_psum_to_sbuf_bulk_row_input_only(
-    output_sb: nl.ndarray,
+    output_sb: nl.NkiTensor,
     qkv_MM_output_psum: list,
     s_tile_sz: int,
     i_tile_S: int,
-    bias_sb: Optional[nl.ndarray],
-    row_mx_input_scale: nl.ndarray,
+    bias_sb: Optional[nl.NkiTensor],
+    row_mx_input_scale: nl.NkiTensor,
     I: int,
     num_512_tiles_per_I: int,
 ) -> None:
@@ -3901,12 +4124,12 @@ def _evict_psum_to_sbuf_bulk_row_input_only(
     with row-quantized FP8 input. Post-matmul correction is: output = psum * row_input_scale.
 
     Args:
-        output_sb (nl.ndarray): Destination SBUF tile for this S-tile.
+        output_sb (nl.NkiTensor): Destination SBUF tile for this S-tile.
         qkv_MM_output_psum (list): List of PSUM bank tensors from matmul.
         s_tile_sz (int): Active rows in the S tile.
         i_tile_S (int): S-tile index within the current S-block.
-        bias_sb (Optional[nl.ndarray]): Bias tensor in SBUF, or None.
-        row_mx_input_scale (nl.ndarray): [P_MAX, 1] per-row input dequant scale.
+        bias_sb (Optional[nl.NkiTensor]): Bias tensor in SBUF, or None.
+        row_mx_input_scale (nl.NkiTensor): [P_MAX, 1] per-row input dequant scale.
         I (int): Total output dimension (Q+K+V heads * d_head).
         num_512_tiles_per_I (int): Number of 512-wide tiles spanning I.
     """
@@ -4041,7 +4264,9 @@ def _dma_xpose_input_strided_packed(
     blocks_per_tile = s_tile_sz // si.block_len
     stride_el = si.block_stride * H
     # Workaround: on gen4 (Trn3), dge_mode.unknown produces incorrect results for this 4D AP.
-    packed_dge_mode = dge_mode.none if nki.isa.get_nc_version() == nki.isa.nc_version.gen4 else dge_mode.unknown
+    packed_dge_mode = (
+        nisa.dge_mode.none if nki.isa.get_nc_version() == nki.isa.nc_version.gen4 else nisa.dge_mode.unknown
+    )
     nisa.dma_transpose(
         dst=input_sb[i_tile_S].ap(
             pattern=[[H, pmax], [si.block_len, blocks_per_tile], [pmax, H_subtiles], [1, si.block_len]],
@@ -4245,14 +4470,14 @@ def _load_and_broadcast_bias(
         nisa.dma_copy(
             dst=bias_sb[0 : nl.tile_size.pmax, 0 : dims.I],
             src=bias_hbm[0 : nl.tile_size.pmax, 0 : dims.I],
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
     else:
         # Bias is [1, I] — load and broadcast to [pmax, I] using stream_shuffle.
         nisa.dma_copy(
             dst=bias_sb[0:1, 0 : dims.I],
             src=bias_hbm[0:1, 0 : dims.I],
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
         # Stream Shuffle works on 32 partitions only, apply it nl.tile_size.pmax // 32 = 4 times.
         NUM_BROADCASTS = nl.tile_size.pmax // MAX_STREAM_SHUFFLE_PARTITIONS
@@ -4298,7 +4523,7 @@ def _load_norm_weights(
         nisa.dma_copy(
             dst=norm_weights_sb[0 : nl.tile_size.pmax, nl.ds(i_gamma_tile, 1)],
             src=norm_weights_hbm[nl.ds(i_gamma_tile * nl.tile_size.pmax, nl.tile_size.pmax), 0:1],
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
     return norm_weights_sb
 
@@ -4373,14 +4598,38 @@ def _load_norm_weights_mx(
                     src_offset + (p_count - 1) * H_pack + 1,
                     step=H_pack,
                 ),
-                dge_mode=dge_mode.swdge,
+                dge_mode=nisa.dge_mode.swdge,
             )
     return gamma_sb
 
 
+def _get_safe_s_block_interleave_degree(space_needed_per_block: int, sbm: SbufManager, max_degree: int = 2) -> int:
+    """
+    Choose how many S blocks may hold live SBUF at once, bounded by the space actually left.
+
+    Mirrors `_get_safe_batch_interleave_degree` in core/attention/attention_tkg.py: ask the
+    allocator for real free space instead of predicting it, and fall back to 1 when a second
+    section does not fit, so the caller can never overflow SBUF.
+
+    Separate knob from `s_multi_buffer_degree`, which sets how many 128-row S tiles are in
+    flight inside ONE block and is capped by PSUM rather than SBUF:
+    MAX_PSUM_TILING_GROUPS = NUM_HW_PSUM_BANKS // num_512_tiles_per_I, so I = 1280 needs
+    ceil(1280/512) = 3 banks per tile and 8 // 3 = 2. Rotation ACROSS blocks escapes that cap,
+    because `qkv_MM_output_psum` is re-allocated at fixed bank addresses on every block, so
+    only SBUF has to grow.
+    """
+    if sbm.is_auto_alloc():
+        # Addresses are compiler-assigned here, so the interleave hint is ignored anyway.
+        return 1
+    if space_needed_per_block <= 0:
+        return 1
+    # Section 0 is space the loop would have consumed regardless; each extra section is new space.
+    return max(1, min(max_degree, sbm.get_free_space() // space_needed_per_block))
+
+
 def _multi_buffering_degree_for_seqlen(
     cfg: QKV_CTE_Config, dims: QKV_CTE_Dims, sbm: SbufManager, qkv_in_scale: Optional[nl.NkiTensor] = None
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int, int]:
     """
     Compute maximum multi-buffering degree that we can use for SEQLEN without over-flowing SBUF or PSUM space.
 
@@ -4401,7 +4650,8 @@ def _multi_buffering_degree_for_seqlen(
         * All globally allocated tensors have already been allocated, so that we can use sbm.get_free_space().
             Note: Still need to do look-ahead calculation for the tensors after call to this function is made.
 
-    Returns: multi_buffer_degree, projected_total_sbuf_space_taken (including all tensors).
+    Returns: multi_buffer_degree, projected_total_sbuf_space_taken (including all tensors),
+             effective_num_weight_buffers (what the non-prefetched weight allocation must use).
     """
 
     # Cannot multi-buffer more than dims.S_shard / nl.tile_size.pmax, e.g. if S_shard=256, best we can do is 2.
@@ -4446,23 +4696,6 @@ def _multi_buffering_degree_for_seqlen(
     single_weight_buf_space = (dims.I * math.ceil(dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT / 128)) * sizeinbytes(
         cfg.compute_mm_dtype
     )
-    weights_space_per_partition = dims.NUM_WEIGHT_BUFFERS_DEFAULT * single_weight_buf_space
-    sbuf_tile_space_non_buffered += weights_space_per_partition
-
-    # If SBUF budget is exceeded, reduce weight buffers to the actual number of load iterations needed for H.
-    # With small H (e.g. H=1280, block=1024), only ceil(H/1024) loads are needed so extra buffers are unused.
-    if cfg.total_available_sbuf_space_to_this_kernel - sbuf_tile_space_non_buffered < 0:
-        num_weight_load_blocks = math.ceil(dims.H / dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT)
-        effective_num_weight_buffers = min(dims.NUM_WEIGHT_BUFFERS_DEFAULT, num_weight_load_blocks)
-        sbuf_tile_space_non_buffered -= (
-            dims.NUM_WEIGHT_BUFFERS_DEFAULT - effective_num_weight_buffers
-        ) * single_weight_buf_space
-        kernel_assert(
-            sbuf_tile_space_non_buffered < cfg.total_available_sbuf_space_to_this_kernel,
-            f"SBUF budget exceeded even after reducing weight buffers: "
-            f"sbuf_tile_space_non_buffered={sbuf_tile_space_non_buffered}, "
-            f"available={cfg.total_available_sbuf_space_to_this_kernel}",
-        )
 
     # QK-norm: gamma weights [pmax, d_head] broadcast + scratch [pmax, 1]
     _has_qk_norm = cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None
@@ -4490,11 +4723,36 @@ def _multi_buffering_degree_for_seqlen(
         cfg=cfg, dims=dims, sbm=sbm, qkv_in_scale=qkv_in_scale
     )
 
+    # ------------------------------- Size The Weight Buffers --------------------------------------#
+    #     Weight buffers are pure prefetch depth: they are indexed `i_weight_load % num_weight_buffers`,
+    #     so any count >= 1 is functionally correct and fewer buffers only costs load/compute overlap.
+    #     Spend on them only what is left after every other tensor, keeping room for at least one
+    #     multi-buffered unit. At large H the default 4 buffers can otherwise claim the whole SBUF
+    #     budget and starve multi-buffering down to degree 0.
+    effective_num_weight_buffers = 1
+    for candidate in range(dims.NUM_WEIGHT_BUFFERS_DEFAULT, 0, -1):
+        if (
+            sbuf_tile_space_non_buffered + candidate * single_weight_buf_space + sbuf_tile_space_pre_buffering
+            <= cfg.total_available_sbuf_space_to_this_kernel
+        ):
+            effective_num_weight_buffers = candidate
+            break
+    sbuf_tile_space_non_buffered += effective_num_weight_buffers * single_weight_buf_space
+    kernel_assert(
+        sbuf_tile_space_non_buffered + sbuf_tile_space_pre_buffering <= cfg.total_available_sbuf_space_to_this_kernel,
+        f"SBUF budget exceeded even with a single weight buffer: "
+        f"sbuf_tile_space_non_buffered={sbuf_tile_space_non_buffered}, "
+        f"sbuf_tile_space_pre_buffering={sbuf_tile_space_pre_buffering}, "
+        f"available={cfg.total_available_sbuf_space_to_this_kernel}",
+    )
+
     # Note: cfg.total_available_sbuf_space_to_this_kernel is total_available_sbuf_space PER PARTITION.
     max_s_buffer_without_exceeding_sbuf = (
         cfg.total_available_sbuf_space_to_this_kernel - sbuf_tile_space_non_buffered
     ) // sbuf_tile_space_pre_buffering
-    s_multi_buffer_degree = min(s_multi_buffer_degree, max_s_buffer_without_exceeding_sbuf)
+    # Floor at 1: degree 0 yields S_BLOCK_SIZE=0 and open_scope(interleave_degree=0), which silently
+    # aliases buffers instead of failing. The weight sizing above guarantees degree 1 fits.
+    s_multi_buffer_degree = min(s_multi_buffer_degree, max(1, max_s_buffer_without_exceeding_sbuf))
 
     # Step (3) Ensure multi-buffering does not exceed number of PSUM banks.
     # Later we use NUM_512_TILES_PER_H * s_multi_buffer_degree for psum_banks. (NUM_512_TILES_PER_H <= 4, since I <= 4096)
@@ -4508,7 +4766,14 @@ def _multi_buffering_degree_for_seqlen(
         s_multi_buffer_degree = max(2 * (s_multi_buffer_degree // 2), 1)
 
     projected_sbuf_taken_space = s_multi_buffer_degree * sbuf_tile_space_pre_buffering + sbuf_tile_space_non_buffered
-    return s_multi_buffer_degree, projected_sbuf_taken_space
+    # sbuf_tile_space_pre_buffering is also returned so the caller can size the S-block interleave
+    # degree from the same lookahead this function already trusts, instead of re-deriving it.
+    return (
+        s_multi_buffer_degree,
+        projected_sbuf_taken_space,
+        effective_num_weight_buffers,
+        sbuf_tile_space_pre_buffering,
+    )
 
 
 def _multi_buffering_degree_for_seqlen_mx(cfg: QKV_CTE_Config, dims: QKV_CTE_Dims, sbm: SbufManager) -> Tuple[int, int]:
@@ -4545,7 +4810,10 @@ def _multi_buffering_degree_for_seqlen_mx(cfg: QKV_CTE_Config, dims: QKV_CTE_Dim
     sbuf_tile_space_non_buffered = 0
     if not cfg.is_input_swizzled:
         sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # zero_bias_sb
-        if not _scalar_activation_bias_supported():
+        # pragma: no branch - MX path is gen4-only (nc_matmul_mx/quantize_mx are NeuronCore-v4+),
+        # so the only coverage pass that runs the MX impl is trn3_a0/gen4 where
+        # _scalar_activation_bias_supported() is always True; only the False arc is taken.
+        if not _scalar_activation_bias_supported():  # pragma: no branch
             sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # norm_eps_sb
 
     if cfg.add_bias:
@@ -4569,14 +4837,17 @@ def _multi_buffering_degree_for_seqlen_mx(cfg: QKV_CTE_Config, dims: QKV_CTE_Dim
         )  # QKNormBuffers.norm_scratch_sb [pmax, 1] × 3 (triple-buffered)
         sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # QKNormBuffers.norm_zero_bias_sb [pmax, 1]
         if cfg.qk_norm_pre_rope is not None:
-            if not _scalar_activation_bias_supported():
+            # pragma: no branch - MX path is gen4-only (see _multi_buffering_degree_for_seqlen_mx
+            # top); the only pass that runs it is trn3_a0/gen4 where this guard is always False.
+            if not _scalar_activation_bias_supported():  # pragma: no branch
                 sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # qk_norm_pre_rope_eps_sb [pmax, 1]
             if cfg.qk_norm_pre_rope.q_gamma_norm_weights is not None:
                 sbuf_tile_space_non_buffered += P_MAX * dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
             if cfg.qk_norm_pre_rope.k_gamma_norm_weights is not None:
                 sbuf_tile_space_non_buffered += P_MAX * dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
         if cfg.qk_norm_post_rope is not None:
-            if not _scalar_activation_bias_supported():
+            # pragma: no branch - MX path is gen4-only; only the False arc runs on the trn3_a0/gen4 pass.
+            if not _scalar_activation_bias_supported():  # pragma: no branch
                 sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # qk_norm_post_rope_eps_sb [pmax, 1]
             if cfg.qk_norm_post_rope.q_gamma_norm_weights is not None:
                 sbuf_tile_space_non_buffered += P_MAX * dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
@@ -4774,15 +5045,17 @@ def _use_weight_prefetch(
     cfg: QKV_CTE_Config,
     dims: QKV_CTE_Dims,
     sbm: SbufManager,
+    effective_num_weight_buffers: int,
 ) -> bool:
     """
     Returns True if we can afford weight prefetching, given projected space requirements post multi-buffering.
     """
     # This is how much space we need to prefetch weights, and keep them on SBUF through the entire kernel.
     weights_NEW_space_needed = (dims.I * dims.num_128_tiles_per_H) * sizeinbytes(cfg.compute_mm_dtype)
-    # Subtract the weights_OLD_space (non-prefetched), which was taken into account by multi-buffering space calculation.
+    # Subtract the weights_OLD_space (non-prefetched), which was taken into account by multi-buffering space
+    # calculation.
     weights_OLD_space_taken = (
-        dims.NUM_WEIGHT_BUFFERS_DEFAULT
+        effective_num_weight_buffers
         * (dims.I * math.ceil(dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT / nl.tile_size.pmax))
         * sizeinbytes(cfg.compute_mm_dtype)
     )
@@ -5074,6 +5347,62 @@ def _apply_rope_to_head(
     )
 
 
+def _apply_rope_batched(
+    out_sb: nl.NkiTensor,
+    wide_scratch: nl.NkiTensor,
+    cos_sb: nl.NkiTensor,
+    sin_sb: nl.NkiTensor,
+    s_tile_sz: int,
+    d_head: int,
+    num_rope_heads: int,
+    I: int,
+):
+    """Rotate every Q/K head of one S tile in four instructions, in place in out_sb.
+
+    Computes the same output = X * cos + [-X2, X1] * sin as _apply_rope_to_head, but views
+    the eviction tile as [s_tile_sz, num_heads, d_head] so one access pattern spans all the
+    heads. cos and sin are position-indexed and therefore identical for every head, so they
+    are broadcast along the head axis with a zero-stride view rather than replicated -- the
+    same idiom the tokengen RoPE uses.
+
+    The element count is unchanged; what changes is that it arrives as 4 instructions per S
+    tile instead of 4 per head per S tile.
+
+    Args:
+        out_sb: [pmax, I] eviction tile holding the unrotated projection. Rotated in place.
+        wide_scratch: [pmax, num_rope_heads * d_head] scratch for the sin term.
+        cos_sb: [pmax, d_head] cos cache for this S tile.
+        sin_sb: [pmax, d_head // 2] sin cache for this S tile (used for both halves).
+        s_tile_sz: Active rows in this S tile.
+        d_head: Head dimension.
+        num_rope_heads: num_q_heads + num_kv_heads. V heads follow them in out_sb and are
+            left alone.
+        I: Full free width of out_sb, a whole number of d_head blocks.
+    """
+    d_half = d_head // 2
+    x_view = out_sb.reshape_dim(1, [I // d_head, d_head])
+    r_view = wide_scratch.reshape_dim(1, [num_rope_heads, d_head])
+    x_all = x_view[0:s_tile_sz, 0:num_rope_heads, 0:d_head]
+    x_lo = x_view[0:s_tile_sz, 0:num_rope_heads, 0:d_half]
+    x_hi = x_view[0:s_tile_sz, 0:num_rope_heads, d_half:d_head]
+    r_all = r_view[0:s_tile_sz, 0:num_rope_heads, 0:d_head]
+    r_lo = r_view[0:s_tile_sz, 0:num_rope_heads, 0:d_half]
+    r_hi = r_view[0:s_tile_sz, 0:num_rope_heads, d_half:d_head]
+    cos_v = cos_sb[0:s_tile_sz, 0:d_head].expand_dim(1).broadcast(1, num_rope_heads)
+    sin_v = sin_sb[0:s_tile_sz, 0:d_half].expand_dim(1).broadcast(1, num_rope_heads)
+
+    # -X2 * sin into the low half of the scratch. The negation rides on op0 as an immediate,
+    # so it costs no separate pass.
+    nisa.scalar_tensor_tensor(dst=r_lo, data=x_hi, op0=nl.multiply, operand0=-1.0, op1=nl.multiply, operand1=sin_v)
+    # X1 * sin into the high half.
+    nisa.tensor_tensor(dst=r_hi, data1=x_lo, data2=sin_v, op=nl.multiply)
+    # X * cos in place. This reads x after the two ops above have read it, which the WAR
+    # dependency on out_sb orders.
+    nisa.tensor_tensor(dst=x_all, data1=x_all, data2=cos_v, op=nl.multiply)
+    # ...and add the sin term.
+    nisa.tensor_tensor(dst=x_all, data1=x_all, data2=r_all, op=nl.add)
+
+
 def _evict_and_postprocess_per_head(
     qkv_MM_output_psum: List[nl.NkiTensor],
     output_sb: List[nl.NkiTensor],
@@ -5216,6 +5545,42 @@ def _evict_and_postprocess_per_head(
                         qk_norm_bufs=qk_norm_bufs,
                         norm_config=cfg.qk_norm_post_rope,
                     )
+        return
+
+    # Head-batched RoPE: bulk evict the whole tile, then rotate all Q/K heads at once. The
+    # runtime dequant scales are checked here as well as in _use_batched_rope because they
+    # arrive as arguments rather than through cfg; when any is present the per-head path
+    # below runs instead and the wide scratch simply goes unused.
+    if (
+        rope_bufs is not None
+        and rope_bufs.wide_scratch_sb is not None
+        and not _gamma_fused_in_rope
+        and not _has_qk_norm
+        and w_scale_tile is None
+        and row_mx_input_scale is None
+        and row_mx_w_channel_scale_sb is None
+        and row_w_scale_sb is None
+    ):
+        _evict_psum_to_sbuf_bulk(
+            output_sb=output_sb[i_tile_S],
+            qkv_MM_output_psum=qkv_MM_output_psum,
+            s_tile_sz=s_tile_sz,
+            i_tile_S=i_tile_S,
+            bias_sb=bias_sb,
+            I=dims.I,
+            num_512_tiles_per_I=dims.num_512_tiles_per_I,
+        )
+        _load_rope_caches(rope_bufs, cfg, dims, i_tile_S, s_tile_sz, i_batch, s_tile_local_offset)
+        _apply_rope_batched(
+            out_sb=output_sb[i_tile_S],
+            wide_scratch=rope_bufs.wide_scratch_sb[i_tile_S],
+            cos_sb=rope_bufs.cos_sb[i_tile_S],
+            sin_sb=rope_bufs.sin_sb[i_tile_S],
+            s_tile_sz=s_tile_sz,
+            d_head=d_head,
+            num_rope_heads=dims.num_q_heads + dims.num_kv_heads,
+            I=dims.I,
+        )
         return
 
     # RoPE path: per-head eviction required (RoPE needs scratch buffer for out-of-place rotation)
@@ -5375,7 +5740,7 @@ def _load_rope_caches(rope_bufs, cfg, dims, i_tile_S, s_tile_sz, i_batch, s_tile
     When gamma_fused_in_rope_caches=True, sin is full d_head width (sin_lo_fused and
     sin_hi_fused packed) and separate K cos/sin caches are loaded if present.
     """
-    if not cfg.fused_rope:
+    if not cfg.fused_rope:  # pragma: no branch - _load_rope_caches is only called from _evict_and_postprocess_per_head's RoPE path (reached only when fused_rope is True; the not-fused_rope+qk_norm case returns earlier), so fused_rope is always True here
         return
     d_head = dims.d_head
     _gamma_fused_in_rope = cfg.qk_norm_pre_rope is not None and cfg.qk_norm_pre_rope.gamma_fused_in_rope_caches
@@ -5386,7 +5751,7 @@ def _load_rope_caches(rope_bufs, cfg, dims, i_tile_S, s_tile_sz, i_batch, s_tile
     nisa.dma_copy(
         dst=rope_bufs.cos_sb[i_tile_S].slice(0, 0, s_tile_sz),
         src=rope_bufs.cos_hbm.flatten_dims(start_dim=0, end_dim=1).slice(0, cos_src_row, cos_src_row + s_tile_sz),
-        dge_mode=dge_mode.swdge,
+        dge_mode=nisa.dge_mode.swdge,
     )
     sin_src_offset = i_batch * dims.S * d_head + (dims.S_shard_offset + s_tile_local_offset) * d_head
     nisa.dma_copy(
@@ -5394,21 +5759,21 @@ def _load_rope_caches(rope_bufs, cfg, dims, i_tile_S, s_tile_sz, i_batch, s_tile
         src=rope_bufs.sin_hbm.flatten_dims(start_dim=0, end_dim=1)
         .slice(0, sin_src_offset // d_head, sin_src_offset // d_head + s_tile_sz)
         .slice(1, 0, sin_fdim),
-        dge_mode=dge_mode.swdge,
+        dge_mode=nisa.dge_mode.swdge,
     )
 
     if rope_bufs.k_cos_hbm is not None:
         nisa.dma_copy(
             dst=rope_bufs.k_cos_sb[i_tile_S].slice(0, 0, s_tile_sz),
             src=rope_bufs.k_cos_hbm.flatten_dims(start_dim=0, end_dim=1).slice(0, cos_src_row, cos_src_row + s_tile_sz),
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
         nisa.dma_copy(
             dst=rope_bufs.k_sin_sb[i_tile_S].slice(0, 0, s_tile_sz),
             src=rope_bufs.k_sin_hbm.flatten_dims(start_dim=0, end_dim=1)
             .slice(0, sin_src_offset // d_head, sin_src_offset // d_head + s_tile_sz)
             .slice(1, 0, sin_fdim),
-            dge_mode=dge_mode.swdge,
+            dge_mode=nisa.dge_mode.swdge,
         )
 
 

@@ -448,6 +448,7 @@ def moe_cte_torch_ref(
     # MX path: dequantize weights to fp32, then delegate to existing torch ref
     if impl in (
         MoECTEImplementation.shard_on_block_mx,
+        MoECTEImplementation.shard_on_block_mx_v2,
         MoECTEImplementation.shard_on_i_mx,
         MoECTEImplementation.shard_on_i_mx_hybrid,
     ):
@@ -480,6 +481,7 @@ def moe_cte_torch_ref(
         # Map to BWMMFunc for torch ref
         mx_to_bwmm = {
             MoECTEImplementation.shard_on_block_mx: BWMMFunc.SHARD_ON_BLOCK,
+            MoECTEImplementation.shard_on_block_mx_v2: BWMMFunc.SHARD_ON_BLOCK,
             MoECTEImplementation.shard_on_i_mx: BWMMFunc.SHARD_ON_INTERMEDIATE,
             MoECTEImplementation.shard_on_i_mx_hybrid: BWMMFunc.SHARD_ON_INTERMEDIATE_HW,
         }

@@ -43,6 +43,7 @@ from nkilib_src.nkilib.core.utils.common_types import (
 from nkilib_src.nkilib.core.utils.torch_ref_wrapper import torch_ref_wrapper
 
 from test.integration.nkilib.core.moe_block.test_moe_block_tkg import generate_inputs
+from test.utils.mx_utils import pack64_gate_up_scale
 
 from .gptoss_mxfp4_golden import kernels as golden
 from .mxfp4_dense_adapter import (
@@ -58,8 +59,14 @@ _MX = nl.float4_e2m1fn_x4
 
 
 @pytest.mark.parametrize("H,I,E,T,top_k", [(512, 512, 8, 16, 4)])
-def test_moe_adapter_matches_nkilib_ref(H, I, E, T, top_k):
-    """The packed->dense adapter reproduces the nkilib MX ref (== the kernel's math)."""
+@pytest.mark.parametrize("pack64_scale", [False, True], ids=["scale_natural", "scale_pack64"])
+def test_moe_adapter_matches_nkilib_ref(H, I, E, T, top_k, pack64_scale):
+    """The packed->dense adapter reproduces the nkilib MX ref (== the kernel's math).
+
+    ``pack64_scale`` feeds the adapter the GIGA kernel's PACK64 scale layout, which is
+    what the collective golden tests hand it (``VLLM_NEURON_MEGA_SCALE_PACK64`` is on by
+    default); the nkilib ref always takes the natural layout.
+    """
     ki = generate_inputs(
         batch=T,
         seqlen=1,
@@ -114,7 +121,10 @@ def test_moe_adapter_matches_nkilib_ref(H, I, E, T, top_k):
     nkilib_out = np.asarray(nkilib_out, dtype=np.float32).reshape(T, H)
 
     # ── Adapter: packed MXFP4 -> dense, then the GOLDEN oracle on dense fp32. ──
-    dense_gate_up = packed_mx_to_dense_gate_up(ki["expert_gate_up_weights"], ki["expert_gate_up_weights_scale"], H, I)
+    gate_up_scale = ki["expert_gate_up_weights_scale"]
+    if pack64_scale:
+        gate_up_scale = pack64_gate_up_scale(gate_up_scale)
+    dense_gate_up = packed_mx_to_dense_gate_up(ki["expert_gate_up_weights"], gate_up_scale, H, I)
     dense_down = packed_mx_to_dense_down(ki["expert_down_weights"], ki["expert_down_weights_scale"], H, I)
     dense_gu_bias = unpack_gate_up_bias(ki["expert_gate_up_bias"], H, I)
 

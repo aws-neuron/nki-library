@@ -30,9 +30,13 @@ from typing import NamedTuple
 
 import nki.language as nl
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import MatmulMxfp8KernelConfig
-from nkilib_src.nkilib.experimental.mlp_mxfp8.common_utils import TILE_M
+from nkilib_src.nkilib.experimental.mlp_mxfp8._common_utils import TILE_M
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import AffinityOption, ShardOption
 from nkilib_src.nkilib.experimental.moe_mxfp8.bwd.config import MXFP8MOEBwdConfig, QuantScheme, TransposeMode
+
+from test.integration.nkilib.experimental.matmul_mxfp8.qwen3_moe_bwd_pe_configs import (
+    QWEN3_235B_TP1_MOE_BWD_1X32_PE_CONFIGS,
+)
 
 MAX_DGT_LOAD_WIDTH = 1024
 MAX_LOAD_TILES = 8
@@ -70,14 +74,36 @@ def tune_block_and_load_tiles(block_tiles, tile_size):
     raise ValueError(f"no legal block/load pair for {block_tiles=} and {tile_size=}")
 
 
-def _phase_config(**kwargs):
+def _phase_config(quant_scheme=QuantScheme.WRAPX, **kwargs):
     block_m = kwargs["TILES_IN_BLOCK_M"]
     block_n = kwargs["TILES_IN_BLOCK_N"]
     tile_m = kwargs.get("tile_m", TILE_M)
     tile_n = kwargs["tile_n"]
-    kwargs.setdefault("TILES_IN_LOAD_M", derive_load_tiles(block_m, tile_m))
-    kwargs.setdefault("TILES_IN_LOAD_N", derive_load_tiles(block_n, tile_n))
-    return MatmulMxfp8KernelConfig(quant_scheme=QuantScheme.WRAPX, **kwargs)
+    if "TILES_IN_LOAD_M" not in kwargs:
+        kwargs["TILES_IN_LOAD_M"] = derive_load_tiles(block_m, tile_m)
+    if "TILES_IN_LOAD_N" not in kwargs:
+        kwargs["TILES_IN_LOAD_N"] = derive_load_tiles(block_n, tile_n)
+    return MatmulMxfp8KernelConfig(quant_scheme=quant_scheme, **kwargs)
+
+
+def _qwen3_tp1_1x32_phase_config(phase_name):
+    tuned = QWEN3_235B_TP1_MOE_BWD_1X32_PE_CONFIGS[phase_name]
+    return _phase_config(
+        M=0,
+        K=0,
+        N=0,
+        tile_m=tuned.tile_m,
+        tile_k=tuned.tile_k,
+        tile_n=tuned.tile_n,
+        TILES_IN_BLOCK_M=tuned.block_m,
+        TILES_IN_BLOCK_N=tuned.block_n,
+        TILES_IN_BLOCK_K=tuned.block_k,
+        TILES_IN_LOAD_M=tuned.load_m,
+        TILES_IN_LOAD_N=tuned.load_n,
+        spill_reload=tuned.spill_reload,
+        enable_scale_packing=True,
+        quant_scheme=QuantScheme._1x32,
+    )
 
 
 class TuningKey(NamedTuple):
@@ -94,6 +120,8 @@ class TuningKey(NamedTuple):
     use_scale_packing: bool
     bias: bool
     single_expert_dense: bool
+    quant_scheme: QuantScheme
+    pe_transpose_only: bool
 
 
 # Qwen3-235B-A22B (H=4096, moe_inter=1536): TP1 I_TP=1536, TP2 768, TP4 384, TP8 192.
@@ -105,9 +133,11 @@ class TuningKey(NamedTuple):
 # start immediately (N=1: 2.342ms DMA -> 2.190ms NC, -6.5%). DMA-transpose can still win
 # END-TO-END when the transpose overlaps neighbor matmul-heavy kernels — re-measure per deployment.
 #
-# All entries below are the base identity: LNC2 (num_shards=2), SHARD_ON_FREE, AFFINITY_ON_I,
-# bf16, and no spill_reload / scale_packing / bias. A run with any other identity misses the
-# table and uses default blocking.
+# Most entries below use the base identity: LNC2 (num_shards=2), SHARD_ON_FREE,
+# AFFINITY_ON_I, bf16, and no spill_reload / scale_packing / bias. The 1x32
+# Qwen3 entries use packed scales and separate keys for PE-only and mixed
+# DMA/PE transpose paths. A run with any other identity misses the table and
+# uses default blocking.
 #
 # Entries are MXFP8MOEBwdConfig — the exact struct the kernel already accepts, so no separate
 # tuning type is needed. M/K/N on each phase_config are left 0: they follow from the run's shape
@@ -122,6 +152,8 @@ _BASE_TUNING_KEY = {
     "use_scale_packing": False,
     "bias": False,
     "single_expert_dense": False,
+    "quant_scheme": QuantScheme.WRAPX,
+    "pe_transpose_only": False,
 }
 _DENSE_TUNING_KEY = {
     "num_shards": 2,
@@ -132,7 +164,29 @@ _DENSE_TUNING_KEY = {
     "use_scale_packing": False,
     "bias": False,
     "single_expert_dense": True,
+    "quant_scheme": QuantScheme.WRAPX,
+    "pe_transpose_only": False,
 }
+
+
+def _dense_1x32_tuning_key(B, H, I_TP, *, pe_transpose_only):
+    return TuningKey(
+        B=B,
+        H=H,
+        I_TP=I_TP,
+        num_shards=2,
+        shard_option=ShardOption.SHARD_ON_FREE,
+        affinity_option=AffinityOption.AFFINITY_ON_I,
+        compute_dtype=nl.bfloat16,
+        spill_reload=False,
+        use_scale_packing=True,
+        bias=False,
+        single_expert_dense=True,
+        quant_scheme=QuantScheme._1x32,
+        pe_transpose_only=pe_transpose_only,
+    )
+
+
 SHAPE_TUNED_CONFIGS = {
     TuningKey(B=4096, H=4096, I_TP=1536, **_BASE_TUNING_KEY): MXFP8MOEBwdConfig(  # TP1, single block (B=T=4096)
         # P2 M-blocking is 16 (not 32): 32 co-resident M-tiles overflow SBUF during QuantizeMx
@@ -222,6 +276,36 @@ SHAPE_TUNED_CONFIGS = {
         phase4_config=_phase_config(
             M=0, K=0, N=0, TILES_IN_BLOCK_M=6, TILES_IN_BLOCK_N=4, TILES_IN_BLOCK_K=2, tile_n=512
         ),
+        phase3_transpose_mode=TransposeMode.NC,
+        phase4_transpose_mode=TransposeMode.NC,
+    ),
+    _dense_1x32_tuning_key(
+        B=4096,
+        H=4096,
+        I_TP=1536,
+        pe_transpose_only=True,
+    ): MXFP8MOEBwdConfig(
+        # The measured winner contracts full K in P1 and retains wider M/N
+        # residency with partial-K blocks in P2-P4.
+        phase1_config=_qwen3_tp1_1x32_phase_config("phase1"),
+        phase2_config=_qwen3_tp1_1x32_phase_config("phase2"),
+        phase3_config=_qwen3_tp1_1x32_phase_config("phase3"),
+        phase4_config=_qwen3_tp1_1x32_phase_config("phase4"),
+        phase3_transpose_mode=TransposeMode.NC,
+        phase4_transpose_mode=TransposeMode.NC,
+    ),
+    _dense_1x32_tuning_key(
+        B=4096,
+        H=4096,
+        I_TP=1536,
+        pe_transpose_only=False,
+    ): MXFP8MOEBwdConfig(
+        # Initial mixed-path entry; re-tune independently if DMA transpose
+        # changes the best blocking.
+        phase1_config=_qwen3_tp1_1x32_phase_config("phase1"),
+        phase2_config=_qwen3_tp1_1x32_phase_config("phase2"),
+        phase3_config=_qwen3_tp1_1x32_phase_config("phase3"),
+        phase4_config=_qwen3_tp1_1x32_phase_config("phase4"),
         phase3_transpose_mode=TransposeMode.NC,
         phase4_transpose_mode=TransposeMode.NC,
     ),
@@ -335,6 +419,8 @@ def get_shape_tuned_config(
     use_scale_packing=False,
     bias=False,
     single_expert_dense=False,
+    quant_scheme=QuantScheme.WRAPX,
+    pe_transpose_only=False,
 ):
     """Return the tuned MXFP8MOEBwdConfig for the full run identity, or None on a miss.
 
@@ -354,5 +440,7 @@ def get_shape_tuned_config(
             use_scale_packing=use_scale_packing,
             bias=bias,
             single_expert_dense=single_expert_dense,
+            quant_scheme=quant_scheme,
+            pe_transpose_only=pe_transpose_only,
         )
     )

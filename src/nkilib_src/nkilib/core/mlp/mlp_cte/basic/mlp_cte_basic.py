@@ -194,6 +194,8 @@ def _mlp_cte_single_shard(
             mlp_params.bias_params.gate_proj_bias_tensor,
             constants.compute_data_type,
             sbm.alloc_heap,
+            offset=constants.get_intermediate_offset(),
+            size=mlp_params.intermediate_size,
         )
         if mlpp_has_gate_projection_bias(mlp_params)
         else None
@@ -203,6 +205,8 @@ def _mlp_cte_single_shard(
             mlp_params.bias_params.up_proj_bias_tensor,
             constants.compute_data_type,
             sbm.alloc_heap,
+            offset=constants.get_intermediate_offset(),
+            size=mlp_params.intermediate_size,
         )
         if mlpp_has_up_projection_bias(mlp_params)
         else None
@@ -373,6 +377,8 @@ def _mlp_cte_single_shard(
                 sbm.alloc_stack,
                 sbm,
             )
+            gate_proj_weights_sbuf_list = src_proj_weights_sbuf_list
+            up_proj_weights_sbuf_list = src_proj_weights_sbuf_list
 
             if not mlpp_has_dma_xpose(mlp_params):
                 transpose_source_tensor_tile(
@@ -395,7 +401,7 @@ def _mlp_cte_single_shard(
                     indices,
                     GateUpDim.GATE,
                     hidden_tile_sbuf_list,
-                    src_proj_weights_sbuf_list,
+                    gate_proj_weights_sbuf_list,
                     gate_proj_bias_tensor_sbuf,
                     gate_proj_static_weight_scales_sbuf,
                     gate_proj_row_weight_scales_sbuf,
@@ -411,7 +417,7 @@ def _mlp_cte_single_shard(
                 indices,
                 GateUpDim.UP,
                 hidden_tile_sbuf_list,
-                src_proj_weights_sbuf_list,
+                up_proj_weights_sbuf_list,
                 up_proj_bias_tensor_sbuf,
                 up_proj_static_weight_scales_sbuf,
                 up_proj_row_weight_scales_sbuf,
@@ -480,6 +486,7 @@ def _mlp_cte_single_shard(
                 indices,
                 down_proj_weights_sbuf_list,
                 sbm.alloc_heap,
+                sbm,
             )
 
             transpose_intermediate_tensor_tile(
@@ -500,7 +507,10 @@ def _mlp_cte_single_shard(
                 intermediate_tensor_sbuf_list,
                 mlp_params.down_proj_weights_tensor,
                 down_proj_weights_sbuf_list,
-                down_proj_bias_tensor_sbuf,
+                # Sharded on I, the cores' partial sums are added together, so only program 0 adds the bias.
+                None
+                if constants.sharded_dim == ShardedDim.INTERMEDIATE and program_id != 0
+                else down_proj_bias_tensor_sbuf,
                 down_proj_static_weight_scales_sbuf,
                 intermediate_dequant_scales_sbuf_list,
                 output_tile_sbuf_list,

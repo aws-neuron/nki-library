@@ -468,6 +468,10 @@ def setup_config(
     # Max section length based on buffers allocated for k_loaded, v_loaded, dk and dv
     max_d_head_n_tiles = max(div_ceil(d_head_qk, d_head_qk_tile_size), div_ceil(d_head_v, d_head_v_tile_size))
     k_seq_section_len = k_seq_section_len // power_of_2(max_d_head_n_tiles)
+    # fp32 KV buffers are 2x bf16; halve the section length again so the double-buffered
+    # KV sections leave room for the transpose scratch. Only changes KV blocking, not the math.
+    if kernel_dtype == nl.float32:
+        k_seq_section_len = max(k_seq_tile_size, k_seq_section_len // 2)
 
     kernel_assert(
         d_head_qk % d_head_qk_tile_size == 0,
@@ -672,7 +676,7 @@ def transpose_tiles(
                 src_tensor[:, tile_idx * src_tile_size : (tile_idx + 1) * src_tile_size],
             )
 
-        if engine is not None:
+        if engine is not None:  # pragma: no branch - callers always pass engine (L1443/1452/1784)
             nisa.tensor_copy(
                 dst_tensor[:, start_idx * dst_tile_size : end_idx * dst_tile_size],
                 transposed_psum,
@@ -729,7 +733,7 @@ def compute_rowsum_single_tile(
         nisa.tensor_reduce(dy_o_partial[tile_idx][:, i_d_head_tile], op=nl.add, data=dy_o_mul[tile_idx], axis=1)
 
 
-def load_kv(
+def load_kv(  # pragma: no cover - no caller in module (dead helper)
     k_ref_hbm_tile: nl.NkiTensor,
     v_ref_hbm_tile: nl.NkiTensor,
     dtype: Any,

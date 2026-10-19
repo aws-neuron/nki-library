@@ -89,7 +89,9 @@ def _mlp_tkg_hw_mx_impl(
     # Section 1: Normalization (Optional)
     hidden_tensor = params.hidden_tensor
     if mlpp_has_normalization(params):
-        if mlpp_has_rms_normalization(params):
+        if mlpp_has_rms_normalization(
+            params
+        ):  # pragma: no branch - one-directional: normalization is RMS (assert forbids LayerNorm), LayerNorm else arc dead
             rmsnorm_out = nl.ndarray((dims.H0, dims.T, dims.H1), dtype=io_dtype, buffer=nl.sbuf)
             norm_weights = params.norm_params.normalization_weights_tensor
             eps = params.eps

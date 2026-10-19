@@ -11,8 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import logging
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -45,6 +48,63 @@ DUMP_AFTER_LOWERING_FLAGS = [
     "--internal-backend-options=--print-format=condensed --print-after=translate_nki_ast_to_bir,lower_klir_kernel",
 ]
 
+SEPARATION_FLAG = "--enable-experimental-separate-load-and-compute"
+SEPARATION_FLAG_LEGACY = "--internal-enable-separate-load-and-compute"
+
+# NCC-9599 (CR-307485368) promoted the separation flag from internal to public and
+# renamed its modes, removing the old spellings rather than aliasing them. The three
+# kernels pipelines do not all carry the same compiler, so the spelling has to be
+# chosen per compiler; drop this map and the probe below once the post-rename
+# compiler is in every kernels version set.
+SEPARATION_MODES_LEGACY = {
+    SeparationPassMode.DEFAULT: "indirect",
+    SeparationPassMode.SERIALIZE_LOADS: "indirect-serialize",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _has_public_separation_flag() -> bool:
+    """Whether the installed neuronx-cc carries the public separation flag (NCC-9599).
+
+    The public flag is listed in `neuronx-cc compile --help`; the internal flag it
+    replaced never was, so presence in the help text is the whole test.
+    """
+    neuronx_cc = shutil.which("neuronx-cc")
+    if neuronx_cc is None:
+        logging.warning("neuronx-cc not on PATH; assuming it has the public separation flag")
+        return True
+
+    help_text = subprocess.run([neuronx_cc, "compile", "--help"], capture_output=True, text=True, check=False).stdout
+    return SEPARATION_FLAG in help_text
+
+
+def _separation_pass_flag(mode: SeparationPassMode) -> str:
+    """Render the separation-pass flag in the spelling this compiler accepts."""
+    if _has_public_separation_flag():
+        return f"{SEPARATION_FLAG}={mode.value}"
+    return f"{SEPARATION_FLAG_LEGACY}={SEPARATION_MODES_LEGACY[mode]}"
+
+
+def _kernel_non_ssa_legalization_opts(kernel_func) -> dict:
+    """Forward an @nki.jit kernel's public non-SSA legalization opt-in."""
+    if not getattr(kernel_func, "non_ssa_legalization", False):
+        return {}
+
+    return {"non_ssa_legalization": True}
+
+
+def _record_actual_compile_flow(collector: IMetricsCollector, nir_result: Any) -> None:
+    """Record whether nki or neuronx-cc allocated the compile that ran.
+
+    nki recompiles with neuronx-cc allocation when its own allocator fails, and it
+    turns its scheduler off with it, so a compile can run a different flow than the
+    one asked for. Only the NirResult reports what ran. The field is absent on nki
+    versions that predate it.
+    """
+    allocation = getattr(nir_result, "allocation", None)
+    if allocation:
+        collector.add_dimension({"Allocation": allocation})
+
 
 def _collect_neuronx_cc_flags(compiler_args: CompilerArgs, validation_args: ValidationArgs | None = None) -> list[str]:
     """Collect neuronx-cc flags configured by compiler and validation inputs."""
@@ -63,9 +123,7 @@ def _collect_neuronx_cc_flags(compiler_args: CompilerArgs, validation_args: Vali
         additional_args.extend(birsim_flags)
 
     if compiler_args.separation_pass_mode != SeparationPassMode.NONE:
-        additional_args.append(
-            f"--internal-enable-separate-load-and-compute={compiler_args.separation_pass_mode.value}"
-        )
+        additional_args.append(_separation_pass_flag(compiler_args.separation_pass_mode))
 
     if compiler_args.dump_after_lowering:
         additional_args.extend(DUMP_AFTER_LOWERING_FLAGS)
@@ -126,6 +184,7 @@ def trace_kernel(
     output_directory,
     *,
     frontendMode,
+    compile_mode: str | None = None,
     output_names: list[str] | None = None,
     neuronx_cc_cache_path: str | None = None,
     collector: IMetricsCollector,
@@ -135,6 +194,11 @@ def trace_kernel(
     Uses the given frontend (ParserFrontend or TracerFrontend) for
     Python → MLIR compilation. The frontend handles _unwrap_kernel
     internally, so @nki.jit-decorated kernels work transparently.
+
+    compile_mode selects the allocator/scheduler flow, one of
+    nki.compiler.ncc_driver.COMPILE_MODES; None means DEFAULT_COMPILE_MODE. The
+    baremetal flow is not among them: it runs a different MLIR pipeline through
+    nki.compiler._baremetal_driver.
 
     Returns a CompiledKernel for CompileAndInfer mode, None otherwise.
     """
@@ -171,8 +235,16 @@ def trace_kernel(
         artifacts_dir=os.path.join(output_directory, "artifacts"),
         neuronx_cc_args=tuple(neuronx_cc_args),
         enable_device_dump=enable_device_dump,
+        **_kernel_non_ssa_legalization_opts(kernel_under_test.kernel_func),
     )
-    compile_opts = compile_opts.disable_backend_optimizations()
+    if compile_mode is None:
+        # Equivalent to set_compile_mode(DEFAULT_COMPILE_MODE), but keeps the default
+        # path off an nki API that older versions lack.
+        compile_opts = compile_opts.disable_backend_optimizations()
+    else:
+        # Applies the pipeline options, backend options and BIR-emission flag the flow
+        # implies, together, and rejects an unknown mode.
+        compile_opts = compile_opts.set_compile_mode(compile_mode)
 
     with collector.timer(MetricName.FRONTEND_TRACE_TIME):
         result = compile_to_bir(
@@ -182,6 +254,8 @@ def trace_kernel(
             compile_opts=compile_opts,
             output_names=output_names,
         )
+
+    _record_actual_compile_flow(collector, result)
 
     if mode not in (
         TraceMode.CompileOnly,

@@ -432,6 +432,33 @@ def _subtile_dst_ref(src):
 
 
 @nki.jit
+def _xpose_kernel_oversized_dst(src):
+    """dst= a single OVERSIZED slot: transpose-load a (128,128) tile into a
+    (128,256) buffer, landing in its top-left (128,128). Mirrors a transpose
+    stream reusing a whole-block rotating slot for a smaller remainder block."""
+    p_dim, f_dim = src.shape  # (128, 128)
+    out = nl.ndarray((f_dim, p_dim), dtype=src.dtype, buffer=nl.shared_hbm)
+    slot = nl.ndarray((f_dim, p_dim * 2), dtype=src.dtype, buffer=nl.sbuf)
+    xposed = nt.tiles(src, tile_size=src.shape)[0, 0].load(transpose=True, dst=slot)
+    nisa.dma_copy(out, xposed.data)
+    return out
+
+
+@nki.jit
+def _xpose_kernel_oversized_dst_partition(src):
+    """dst= a slot oversized in the PARTITION dim: transpose-load a (128,100)
+    tile (transposed region (100,128)) into a (128,128) buffer, landing in its
+    top (100,128). Complements the free-dim oversize case by exercising the
+    rows-oversized branch of the relaxed dst cover check."""
+    p_dim, f_dim = src.shape  # (128, 100)
+    out = nl.ndarray((f_dim, p_dim), dtype=src.dtype, buffer=nl.shared_hbm)
+    slot = nl.ndarray((p_dim, p_dim), dtype=src.dtype, buffer=nl.sbuf)  # (128, 128) >= (100, 128)
+    xposed = nt.tiles(src, tile_size=src.shape)[0, 0].load(transpose=True, dst=slot)
+    nisa.dma_copy(out, xposed.data)
+    return out
+
+
+@nki.jit
 def _xpose_kernel_remainder_f(src):
     """Gap 4: F%128!=0 (128,400). A transposed free dim >128 and not a multiple
     of 128 cannot be one coalesced DMA (the single-DMA contract), so tile F into
@@ -532,6 +559,42 @@ class TestDmaTransposeLoad:
             torch_ref=torch_ref_wrapper(_subtile_dst_ref),
             kernel_input_generator=_xpose_inputs_for(128, 256),
             output_tensor_descriptor=lambda _: {"out": np.zeros((128, 256), dtype=ml_dtypes.bfloat16)},
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_transpose_load_oversized_dst(self, test_manager: Orchestrator, platform_target: Platforms):
+        """dst= a single oversized slot: (128,128) transpose-load into a (128,256)
+        buffer's top-left == src.T."""
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_xpose_kernel_oversized_dst,
+            torch_ref=torch_ref_wrapper(_dma_xpose_ref),
+            kernel_input_generator=_xpose_inputs_for(128, 128),
+            output_tensor_descriptor=_xpose_output_for(128, 128),
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_transpose_load_oversized_dst_partition(self, test_manager: Orchestrator, platform_target: Platforms):
+        """dst= a slot oversized in the partition dim: (128,100) transpose-load
+        (region (100,128)) into a (128,128) buffer's top (100,128) == src.T."""
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_xpose_kernel_oversized_dst_partition,
+            torch_ref=torch_ref_wrapper(_dma_xpose_ref),
+            kernel_input_generator=_xpose_inputs_for(128, 100),
+            output_tensor_descriptor=_xpose_output_for(128, 100),
         )
         framework.run_test(
             test_config=None,

@@ -49,6 +49,14 @@ MODELS: dict[str, DenseModelSpec] = {
     "llama3_70b": {"hidden": 8192, "intermediate": 28672, "act_fn": ActFnType.SiLU, "bias": False},
     "qwen3_32b": {"hidden": 5120, "intermediate": 25600, "act_fn": ActFnType.SiLU, "bias": False},
     "gemma3_27b": {"hidden": 5376, "intermediate": 21504, "act_fn": ActFnType.GELU, "bias": False},
+    # GLM-5.3 dense MLP. Only layers 0-2 are dense (first_k_dense_replace=3); layers 3-77 are
+    # MoE and are covered by the bwmm kernel, not here.
+    "glm_5_3": {"hidden": 6144, "intermediate": 12288, "act_fn": ActFnType.SiLU, "bias": False},
+    # GLM-5.3 shared expert, which every MoE layer runs alongside the routed experts. Same
+    # kernel as the dense MLP but a different configuration: moe_intermediate 2048 rather than
+    # the dense 12288, and it consumes the packed pre-quantized row the norm emits. A separate
+    # MODELS entry because this dict holds one spec per key and a model needs both.
+    "glm_5_3_shared_expert": {"hidden": 6144, "intermediate": 2048, "act_fn": ActFnType.SiLU, "bias": False},
 }
 
 # (world_size, tp, cp)
@@ -76,6 +84,23 @@ DEFAULT_QUANT_TYPES: list[QuantizationType] = [
 ]
 
 OPTIMAL_CONFIGS: dict[str, MlpModelConfig] = {name: {'TP_CP_CONFIGS': DEFAULT_TP_CP, 'SEQLENS': DEFAULT_SEQLENS, 'QUANT_TYPES': DEFAULT_QUANT_TYPES} for name in MODELS}
+# Add the 8192-token prefill point for Qwen3-32B to report the isolated MLP MFU.
+OPTIMAL_CONFIGS["qwen3_32b"]["SEQLENS"] = [*DEFAULT_SEQLENS, 8192]
+# GLM-5.3 runs the dense MLP replicated on the SP shard (tp=1, cp=world), unquantized, so it
+# needs its own sharding and seqlen set rather than the dense-model grid. These seqlens match
+# the sparse-MLA attention cells so the kernels land in the same dashboard row.
+OPTIMAL_CONFIGS["glm_5_3"] = {
+    'TP_CP_CONFIGS': [(64, 1, 64)],
+    'SEQLENS': [131072, 1048576],
+    'QUANT_TYPES': [QuantizationType.NONE],
+}
+# The shared expert runs on the same SP shard and seqlens, but in MX rather than bf16: the
+# checkpoint ships it mxfp4 and it reads the packed quantized row produced by the fused norm.
+OPTIMAL_CONFIGS["glm_5_3_shared_expert"] = {
+    'TP_CP_CONFIGS': [(64, 1, 64)],
+    'SEQLENS': [131072, 1048576],
+    'QUANT_TYPES': [QuantizationType.MX],
+}
 
 def _align_intermediate(inter_raw, quant_type=None):
     """Align intermediate dim. STATIC_MX requires I % 512 == 0."""

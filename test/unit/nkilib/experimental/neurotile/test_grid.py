@@ -432,3 +432,47 @@ class TestRepr:
         r = repr(g)
         assert "Grid(" in r
         assert "shape=(4, 4)" in r
+
+
+@pytest_marks(["neurotile"])
+class TestCursorPastConsumed:
+    """Where ``with_cursor_past_consumed`` leaves the cursor, and what ``shape`` then reports.
+
+    Pinned because ``shape`` is read from the cursor onward, so the cursor decides both the
+    reported shape and what one index level selects. Changing it is a contract change for
+    every streaming kernel, not an internal detail.
+    """
+
+    @pytest.mark.fast
+    def test_stream_slot_reports_the_next_dim_not_the_revealed_interior(self):
+        # blocks((896,128), tile=(128,128), block=(16,1))[:, 0], then one stream step.
+        grid = make_tiled_grid((896, 128), (128, 128), (16, 1)).consume(1)
+        slot = grid.consume(0).with_cursor_past_consumed((0,))
+        # Consuming dim 0's block axis revealed its 16-tile interior, but the cursor stops
+        # on dim 1, so shape describes the singleton block-column. Kernels descend with
+        # slot[0] to reach the interior.
+        assert slot.cursor == 1
+        assert slot.shape == (1,)
+
+    @pytest.mark.fast
+    def test_coarser_level_on_a_peer_dim_is_reached(self):
+        # Dim 1 still has a BLOCK axis, outer to dim 0's remaining TILE walk.
+        grid = make_tiled_grid((1024, 1024), (128, 128), (2, 2))
+        after = grid.consume(0).with_cursor_past_consumed((0,))
+        assert after.cursor == 1
+
+    @pytest.mark.fast
+    def test_wraps_to_a_revealed_interior_when_nothing_follows(self):
+        # Both dims consumed: the scan runs off the end, then wraps to the first dim that
+        # still has an iteration-level outer.
+        grid = make_tiled_grid((896, 128), (128, 128), (16, 1))
+        after = grid.consume(0).consume(1).with_cursor_past_consumed((0, 1))
+        assert after.cursor == 0
+        assert after.shape == (16, 1)
+
+    @pytest.mark.fast
+    def test_cursor_passes_the_end_when_nothing_iterates(self):
+        # A single tile: both dims are leaves once their tile axes are consumed.
+        grid = make_tiled_grid((128, 128), (128, 128))
+        after = grid.consume(0).consume(1).with_cursor_past_consumed((0, 1))
+        assert after.cursor == after.ndim

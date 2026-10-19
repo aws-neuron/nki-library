@@ -31,6 +31,7 @@ from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type, get_verified_program_sharding_info
 
 _COL_TILE = 32  # Column tile size for nc_matmul tile_size=(P_MAX, 32)
+_H_TILE = 8  # Output rows sharing one input-row fetch (see tile_rows below)
 _MIN_C_IN_FOR_TEMPORAL_UNROLL = 64  # Below this, filter reuse doesn't amortize DMA overhead
 _MIN_D_OUT_FOR_TEMPORAL_UNROLL = 2  # Need at least 2 d_out positions for temporal unroll benefit
 
@@ -68,15 +69,15 @@ def should_use_temporal_unroll(C_out: int, D_out: int, C_in: int, K_d: int, W_ou
 
 @nki.jit
 def conv3d_temporal_unroll(
-    x_in: nl.ndarray,
-    filters: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     stride: tuple[int, int, int] = (1, 1, 1),
     padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
     dilation: tuple[int, int, int] = (1, 1, 1),
     activation_fn: Optional[ActFnType] = None,
     lnc_shard: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     3D convolution with temporal unrolling and column tiling for small C_out.
 
@@ -108,9 +109,9 @@ def conv3d_temporal_unroll(
         W_out: Output width = (W + pad_w_left + pad_w_right - dilation_w * (K_w - 1) - 1) // stride_w + 1
 
     Args:
-        x_in (nl.ndarray): [B, C_in, D, H, W], Input tensor on HBM.
-        filters (nl.ndarray): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
-        bias (Optional[nl.ndarray]): [C_out], Optional bias tensor on HBM.
+        x_in (nl.NkiTensor): [B, C_in, D, H, W], Input tensor on HBM.
+        filters (nl.NkiTensor): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
+        bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM.
         stride (tuple[int, int, int]): (stride_d, stride_h, stride_w), Convolution strides.
         padding (tuple[int, int, int, int, int, int]): (pad_d_left, pad_d_right, pad_h_top,
             pad_h_bottom, pad_w_left, pad_w_right), Padding for each spatial dimension.
@@ -119,30 +120,32 @@ def conv3d_temporal_unroll(
         lnc_shard (bool): Enable LNC sharding across neuron cores (shards on H_out).
 
     Returns:
-        y_out (nl.ndarray): [B, C_out, D_out, H_out, W_out], Output tensor on HBM.
+        y_out (nl.NkiTensor): [B, C_out, D_out, H_out, W_out], Output tensor on HBM.
 
     Pseudocode:
         precompute din_to_pairs[d_in] = [(d_out, k_d), ...] at trace time
         cache all filters[k_d, k_h, k_w] in SBUF once per batch
 
-        for h_out, w_tile:
-            allocate PSUM[P_MAX, w_tile_size] with column tiling (_COL_TILE=32)
-            for c_in_tile:
-                for d_in:
-                    load input_block[C_in, h_window * w_window] from HBM
-                    for k_h, k_w:
-                        input_slice = input_block[:, row_offset + kw_offset : ... : stride_w]
-                        for (d_out, k_d) in din_to_pairs[d_in]:
-                            nc_matmul(
-                                dst=PSUM[nl.ds(d_out*32, C_out), :],
-                                stationary=filter[k_d][k_h][k_w],
-                                moving=input_slice,
-                                tile_position=(0, d_out*32),
-                            )
-            for d_out:
-                tensor_copy PSUM[d_out*32 : d_out*32+C_out] → SBUF
-                apply bias + activation
-                DMA store to y_out[:, :, d_out, h_out, w_start:w_end]
+        for h_tile, w_tile:
+            for c_in_tile, d_in:
+                load input_block[C_in, tile_rows * w_window] from HBM
+            for h_out in h_tile:
+                allocate PSUM[P_MAX, w_tile_size] with column tiling (_COL_TILE=32)
+                for c_in_tile:
+                    for d_in:
+                        for k_h, k_w:
+                            input_slice = input_block[:, row_offset + kw_offset : ... : stride_w]
+                            for (d_out, k_d) in din_to_pairs[d_in]:
+                                nc_matmul(
+                                    dst=PSUM[nl.ds(d_out*32, C_out), :],
+                                    stationary=filter[k_d][k_h][k_w],
+                                    moving=input_slice,
+                                    tile_position=(0, d_out*32),
+                                )
+                for d_out:
+                    tensor_copy PSUM[d_out*32 : d_out*32+C_out] → SBUF
+                    apply bias + activation
+                    DMA store to y_out[:, :, d_out, h_out, w_start:w_end]
     """
     stride_d, stride_h, stride_w = stride
     pad_d_left, pad_d_right, pad_h_top, pad_h_bottom, pad_w_left, pad_w_right = padding
@@ -171,6 +174,9 @@ def conv3d_temporal_unroll(
     # Spatial window sizes
     w_window = (W_TILE_SIZE - 1) * stride_w + (K_w - 1) * dilation_w + 1
     h_window = (K_h - 1) * dilation_h + 1
+
+    # Rows of x_in that one h tile reads, including the K_h halo
+    tile_rows = (_H_TILE - 1) * stride_h + h_window
 
     y_out = nl.ndarray(
         shape=(B, C_out, D_out, H_out, W_out),
@@ -228,18 +234,17 @@ def conv3d_temporal_unroll(
                 tile_filters.append(k_d_filters)
             all_filter_cache.append(tile_filters)
 
-        for h_out in nl.affine_range(h_start, h_end):
+        bias_sbuf = None
+        if bias != None:
+            bias_sbuf = nl.ndarray(shape=(C_out, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=bias_sbuf, src=bias[0:C_out].reshape((C_out, 1)))
+
+        for h_tile_start in nl.affine_range(h_start, h_end, _H_TILE):
+            h_tile_end = min(h_tile_start + _H_TILE, h_end)
+
             for w_start in nl.affine_range(0, W_out, W_TILE_SIZE):
                 w_end = min(w_start + W_TILE_SIZE, W_out)
                 w_tile_size = w_end - w_start
-
-                # Column tiling: single PSUM bank, each d_out at a column-tile-aligned offset
-                psum_bank = nl.ndarray(
-                    shape=(P_MAX, w_tile_size),
-                    dtype=nl.float32,
-                    buffer=nl.psum,
-                )
-                nisa.memset(dst=psum_bank, value=0.0)
 
                 # W field bounds (constant for this w_tile)
                 field_w_start = w_start * stride_w - pad_w_left
@@ -250,39 +255,34 @@ def conv3d_temporal_unroll(
                 w_load_size = valid_w_end_global - valid_w_start_global
                 needs_w_pad = w_load_offset > 0 or w_load_offset + w_load_size < w_window
 
+                # H field bounds for the whole tile, shared by all its output rows
+                h_field_start = h_tile_start * stride_h - pad_h_top
+                valid_h_start = max(0, h_field_start)
+                valid_h_end = min(H, h_field_start + tile_rows)
+                h_load_offset = valid_h_start - h_field_start
+                h_load_size = max(0, valid_h_end - valid_h_start)
+                needs_h_pad = h_load_offset > 0 or h_load_offset + h_load_size < tile_rows
+
+                all_blocks = []
                 for c_in_tile_idx in nl.sequential_range(C_IN_TILE_COUNT):
                     c_in_start = c_in_tile_idx * P_MAX
                     c_in_end = min(c_in_start + P_MAX, C_in)
                     c_in_size = c_in_end - c_in_start
-                    filter_cache = all_filter_cache[c_in_tile_idx]
 
-                    # --- Main compute loop: one DMA per d_in covering all K_h rows ---
+                    blocks = []
                     for d_in in range(D):
-                        pairs = din_to_pairs[d_in]
-                        if not pairs:
+                        if not din_to_pairs[d_in]:
+                            blocks.append(None)
                             continue
 
-                        # Compute H field for this d_in
-                        h_field_start = h_out * stride_h - pad_h_top
-                        h_field_end = h_field_start + h_window
-                        valid_h_start = max(0, h_field_start)
-                        valid_h_end = min(H, h_field_end)
-
-                        if valid_h_start >= valid_h_end:
-                            continue
-
-                        h_load_offset = valid_h_start - h_field_start
-                        h_load_size = valid_h_end - valid_h_start
-
-                        # Load 2D input block: [C_in, h_window, w_window]
+                        # Load 2D input block: [C_in, tile_rows, w_window]
                         input_block = nl.ndarray(
-                            shape=(c_in_size, h_window * w_window),
+                            shape=(c_in_size, tile_rows * w_window),
                             dtype=x_in.dtype,
                             buffer=nl.sbuf,
                         )
 
                         # Zero the block if padding is needed on any edge
-                        needs_h_pad = h_load_offset > 0 or h_load_offset + h_load_size < h_window
                         if needs_h_pad or needs_w_pad:
                             nisa.memset(dst=input_block, value=0.0)
 
@@ -290,56 +290,78 @@ def conv3d_temporal_unroll(
                         for h_local_idx in range(h_load_size):
                             h_in = valid_h_start + h_local_idx
                             row_offset = (h_load_offset + h_local_idx) * w_window + w_load_offset
-                            input_block[:, row_offset : row_offset + w_load_size] = nl.load(
-                                x_in[
+                            nisa.dma_copy(
+                                dst=input_block[:, row_offset : row_offset + w_load_size],
+                                src=x_in[
                                     batch_idx, c_in_start:c_in_end, d_in, h_in, valid_w_start_global:valid_w_end_global
-                                ]
+                                ],
                             )
+                        blocks.append(input_block)
+                    all_blocks.append(blocks)
 
-                        # Iterate K_h, K_w using slices of loaded block
-                        for k_h_idx in range(K_h):
-                            row_start = k_h_idx * dilation_h * w_window
+                for h_out in range(h_tile_start, h_tile_end):
+                    tile_row = (h_out - h_tile_start) * stride_h
 
-                            for k_w_idx in range(K_w):
-                                kw_offset = k_w_idx * dilation_w
-                                slice_start = row_start + kw_offset
-                                input_slice = input_block[
-                                    :, slice_start : slice_start + w_tile_size * stride_w : stride_w
-                                ]
-
-                                for pair_idx in range(len(pairs)):
-                                    d_out = pairs[pair_idx][0]
-                                    k_d_val = pairs[pair_idx][1]
-                                    nisa.nc_matmul(
-                                        dst=psum_bank[nl.ds(d_out * _COL_TILE, C_out), :w_tile_size],
-                                        stationary=filter_cache[k_d_val][k_h_idx][k_w_idx],
-                                        moving=input_slice,
-                                        tile_size=(P_MAX, _COL_TILE),
-                                        tile_position=(0, d_out * _COL_TILE),
-                                    )
-
-                # Store results: extract each d_out column tile from PSUM and write to HBM
-                for d_out_idx in range(D_out):
-                    psum_tile = psum_bank[nl.ds(d_out_idx * _COL_TILE, C_out), :w_tile_size]
-                    result_sbuf = nl.ndarray(shape=(C_out, w_tile_size), dtype=x_in.dtype, buffer=nl.sbuf)
-
-                    if bias != None and activation_fn != None:
-                        bias_sbuf = nl.ndarray(shape=(C_out, 1), dtype=nl.float32, buffer=nl.sbuf)
-                        nisa.dma_copy(dst=bias_sbuf, src=bias[0:C_out].reshape((C_out, 1)))
-                        nisa.tensor_scalar(dst=result_sbuf, data=psum_tile, op0=nl.add, operand0=bias_sbuf)
-                        nisa.activation(dst=result_sbuf, data=result_sbuf, op=get_nl_act_fn_from_type(activation_fn))
-                    elif bias != None:
-                        bias_sbuf = nl.ndarray(shape=(C_out, 1), dtype=nl.float32, buffer=nl.sbuf)
-                        nisa.dma_copy(dst=bias_sbuf, src=bias[0:C_out].reshape((C_out, 1)))
-                        nisa.tensor_scalar(dst=result_sbuf, data=psum_tile, op0=nl.add, operand0=bias_sbuf)
-                    elif activation_fn != None:
-                        nisa.activation(dst=result_sbuf, data=psum_tile, op=get_nl_act_fn_from_type(activation_fn))
-                    else:
-                        nisa.tensor_copy(dst=result_sbuf, src=psum_tile)
-
-                    nisa.dma_copy(
-                        dst=y_out[batch_idx, 0:C_out, d_out_idx, h_out, w_start:w_end],
-                        src=result_sbuf,
+                    # Column tiling: single PSUM bank, each d_out at a column-tile-aligned offset
+                    psum_bank = nl.ndarray(
+                        shape=(P_MAX, w_tile_size),
+                        dtype=nl.float32,
+                        buffer=nl.psum,
                     )
+                    nisa.memset(dst=psum_bank, value=0.0)
+
+                    for c_in_tile_idx in nl.sequential_range(C_IN_TILE_COUNT):
+                        filter_cache = all_filter_cache[c_in_tile_idx]
+                        blocks = all_blocks[c_in_tile_idx]
+
+                        for d_in in range(D):
+                            pairs = din_to_pairs[d_in]
+                            if not pairs:
+                                continue
+                            input_block = blocks[d_in]
+
+                            # Iterate K_h, K_w using slices of loaded block
+                            for k_h_idx in range(K_h):
+                                row_start = (tile_row + k_h_idx * dilation_h) * w_window
+
+                                for k_w_idx in range(K_w):
+                                    kw_offset = k_w_idx * dilation_w
+                                    slice_start = row_start + kw_offset
+                                    input_slice = input_block[
+                                        :, slice_start : slice_start + w_tile_size * stride_w : stride_w
+                                    ]
+
+                                    for pair_idx in range(len(pairs)):
+                                        d_out = pairs[pair_idx][0]
+                                        k_d_val = pairs[pair_idx][1]
+                                        nisa.nc_matmul(
+                                            dst=psum_bank[nl.ds(d_out * _COL_TILE, C_out), :w_tile_size],
+                                            stationary=filter_cache[k_d_val][k_h_idx][k_w_idx],
+                                            moving=input_slice,
+                                            tile_size=(P_MAX, _COL_TILE),
+                                            tile_position=(0, d_out * _COL_TILE),
+                                        )
+
+                    # Store results: extract each d_out column tile from PSUM and write to HBM
+                    for d_out_idx in range(D_out):
+                        psum_tile = psum_bank[nl.ds(d_out_idx * _COL_TILE, C_out), :w_tile_size]
+                        result_sbuf = nl.ndarray(shape=(C_out, w_tile_size), dtype=x_in.dtype, buffer=nl.sbuf)
+
+                        if bias != None and activation_fn != None:
+                            nisa.tensor_scalar(dst=result_sbuf, data=psum_tile, op0=nl.add, operand0=bias_sbuf)
+                            nisa.activation(
+                                dst=result_sbuf, data=result_sbuf, op=get_nl_act_fn_from_type(activation_fn)
+                            )
+                        elif bias != None:
+                            nisa.tensor_scalar(dst=result_sbuf, data=psum_tile, op0=nl.add, operand0=bias_sbuf)
+                        elif activation_fn != None:
+                            nisa.activation(dst=result_sbuf, data=psum_tile, op=get_nl_act_fn_from_type(activation_fn))
+                        else:
+                            nisa.tensor_copy(dst=result_sbuf, src=psum_tile)
+
+                        nisa.dma_copy(
+                            dst=y_out[batch_idx, 0:C_out, d_out_idx, h_out, w_start:w_end],
+                            src=result_sbuf,
+                        )
 
     return y_out

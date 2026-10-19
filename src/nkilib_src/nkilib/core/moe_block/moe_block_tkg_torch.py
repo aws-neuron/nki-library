@@ -90,8 +90,16 @@ def moe_block_tkg_torch_ref(
     T = B * S
     dtype = inp.dtype
 
+    # Optional fused residual add: the kernel computes hidden = input + residual and
+    # both feeds it into RMSNorm and returns it as residual_out (see rmsnorm_mx_quantize_tkg).
+    if residual is not None:
+        residual_t = residual if isinstance(residual, torch.Tensor) else torch.as_tensor(np.asarray(residual))
+        hidden_in = inp + residual_t.reshape(inp.shape).to(inp.dtype)
+    else:
+        hidden_in = inp
+
     # Step 1: RMSNorm
-    rmsnorm_out = rms_norm_torch_ref(inp, gamma, eps=eps, hidden_actual=hidden_actual)
+    rmsnorm_out = rms_norm_torch_ref(hidden_in, gamma, eps=eps, hidden_actual=hidden_actual)
     rmsnorm_out = rmsnorm_out.to(dtype).reshape(T, H)
 
     # Step 2: Router TopK
@@ -170,5 +178,7 @@ def moe_block_tkg_torch_ref(
         result["out"] = out_np.reshape(T, n_prgs_out, H0, H1_shard_out).transpose(2, 1, 3, 0)
     if not skip_router_logits:
         result["router_logits"] = router_outputs["router_logits"]
+    if residual is not None:
+        result["residual_out"] = hidden_in.reshape(T, H).to(dtype)
 
     return result

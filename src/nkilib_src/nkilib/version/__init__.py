@@ -1,2 +1,2 @@
-__version__ = '0.0.0.0dev0+3b542be2'
-__buildtime__ = 'Jul 15 2026, 16:15:10 UTC'
+__version__ = '0.0.0.0a0+aca8145b'
+__buildtime__ = 'Oct 12 2026, 23:14:56 UTC'

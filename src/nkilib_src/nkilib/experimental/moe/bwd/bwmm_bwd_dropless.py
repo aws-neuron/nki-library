@@ -2013,6 +2013,7 @@ def _compute_down_projection_weight_grad(
     block_token_pos_to_id_full=None,
     skip_dma=None,
     iota_vec=None,
+    expert_idx_broadcast=None,
     manage_scope=True,
     BUFFER_DEGREE=3,
 ):
@@ -2037,7 +2038,8 @@ def _compute_down_projection_weight_grad(
         BLOCK_I_TP (int): I dimension blocking factor.
         block_token_pos_to_id_full (nl.ndarray, optional): Token position mapping for indirect addressing.
         skip_dma (SkipMode, optional): Controls OOB handling for DMA operations.
-        iota_vec (nl.ndarray, optional): Precomputed [0, 1, 2, ..., TILE_SIZE-1] vector (unused, kept for interface consistency).
+        iota_vec (nl.ndarray): Precomputed [0, 1, 2, ..., TILE_SIZE-1] vector.
+        expert_idx_broadcast (nl.ndarray): [TILE_SIZE, N], Expert index of every block on all lanes.
 
     Returns:
         None: Weight gradient is accumulated in-place.
@@ -2076,7 +2078,6 @@ def _compute_down_projection_weight_grad(
         sbm.open_scope(name=f"Down Projection Weight Grad")
 
     result_tiles = []
-    existing_weight_grad = []
 
     for n_buffer in range(BUFFER_DEGREE):
         # Weight-grad accumulators follow grad-output HBM dtype (adaptive): bf16 -> baseline
@@ -2088,13 +2089,17 @@ def _compute_down_projection_weight_grad(
                 align=32,
             )
         )
-        existing_weight_grad.append(
-            sbm.alloc_stack(
-                (I_TP_TILE_SIZE, NUM_I_TP_TILES, H_BLOCK_SIZE),
-                dtype=down_projection_weight_grad.dtype,
-                align=32,
-            )
-        )
+
+    # dma_compute takes no scalar_offset: per-lane rows expert_rows[p] = expert_idx * I_TP + p.
+    down_grad_rows = down_projection_weight_grad.reshape((E * I_TP_DIM, H_DIM))
+    expert_rows = sbm.alloc_stack((I_TP_TILE_SIZE, 1), dtype=nl.int32, align=32)
+    nisa.tensor_scalar(
+        dst=expert_rows,
+        data=expert_idx_broadcast[0:I_TP_TILE_SIZE, block_idx : block_idx + 1],
+        op0=nl.multiply,
+        operand0=I_TP_DIM,
+    )
+    nisa.tensor_tensor(dst=expert_rows, op=nl.add, data1=expert_rows, data2=iota_vec[0:I_TP_TILE_SIZE, 0:1])
 
     sbm.open_scope(name=f"Down Projection Weight Grad Double buffer", interleave_degree=BUFFER_DEGREE)
 
@@ -2210,76 +2215,43 @@ def _compute_down_projection_weight_grad(
 
                 sbm.increment_section()
 
-            # Write Down Projection weight - load all I_TP tiles in a single DMA
+            # Accumulate into HBM with dma_compute: a separate load/add/store loses other blocks' updates.
+            # All full I tiles in one call, the partial last tile in another.
+            dn_offset = i_block_start * H_DIM + H_SHARD_OFFSET + h_block_start
             num_full_i_tp_tiles = valid_i_block // I_TP_TILE_SIZE
             partial_i_tile = valid_i_block % I_TP_TILE_SIZE
-
-            # Bulk load/accumulate/store for all full tiles
             if num_full_i_tp_tiles > 0:
-                nisa.dma_copy(
-                    dst=existing_weight_grad[result_tile_idx][:, 0:num_full_i_tp_tiles, 0:valid_h_block],
-                    src=down_projection_weight_grad.ap(
-                        pattern=[
-                            [H_DIM, I_TP_TILE_SIZE],
-                            [H_DIM * I_TP_TILE_SIZE, num_full_i_tp_tiles],
-                            [1, valid_h_block],
-                        ],
-                        offset=i_block_start * H_DIM + H_SHARD_OFFSET + h_block_start,
-                        scalar_offset=expert_idx,
-                        indirect_dim=0,
-                    ),
-                    dge_mode=dge_mode.hwdge,
+                dst_ap = down_grad_rows.ap(
+                    pattern=[
+                        [H_DIM, I_TP_TILE_SIZE],
+                        [H_DIM * I_TP_TILE_SIZE, num_full_i_tp_tiles],
+                        [1, valid_h_block],
+                    ],
+                    offset=dn_offset,
+                    vector_offset=expert_rows[0:I_TP_TILE_SIZE, 0:1],
+                    indirect_dim=0,
                 )
-                nisa.tensor_tensor(
-                    dst=result_tiles[result_tile_idx][:, 0:num_full_i_tp_tiles, 0:valid_h_block],
-                    op=nl.add,
-                    data1=existing_weight_grad[result_tile_idx][:, 0:num_full_i_tp_tiles, 0:valid_h_block],
-                    data2=result_tiles[result_tile_idx][:, 0:num_full_i_tp_tiles, 0:valid_h_block],
+                nisa.dma_compute(
+                    dst=dst_ap,
+                    srcs=[dst_ap, result_tiles[result_tile_idx][:, 0:num_full_i_tp_tiles, 0:valid_h_block]],
+                    scales=[1.0, 1.0],
+                    reduce_op=nl.add,
                 )
-                nisa.dma_copy(
-                    dst=down_projection_weight_grad.ap(
-                        pattern=[
-                            [H_DIM, I_TP_TILE_SIZE],
-                            [H_DIM * I_TP_TILE_SIZE, num_full_i_tp_tiles],
-                            [1, valid_h_block],
-                        ],
-                        offset=i_block_start * H_DIM + H_SHARD_OFFSET + h_block_start,
-                        scalar_offset=expert_idx,
-                        indirect_dim=0,
-                    ),
-                    src=result_tiles[result_tile_idx][:, 0:num_full_i_tp_tiles, 0:valid_h_block],
-                    dge_mode=dge_mode.hwdge,
-                )
-
-            # Handle partial last tile
             if partial_i_tile > 0:
-                last_tile_idx = num_full_i_tp_tiles
-                i_offset = i_block_start + last_tile_idx * I_TP_TILE_SIZE
-                nisa.dma_copy(
-                    dst=existing_weight_grad[result_tile_idx][0:partial_i_tile, last_tile_idx, 0:valid_h_block],
-                    src=down_projection_weight_grad.ap(
-                        pattern=[[H_DIM, partial_i_tile], [1, 1], [1, valid_h_block]],
-                        offset=i_offset * H_DIM + H_SHARD_OFFSET + h_block_start,
-                        scalar_offset=expert_idx,
-                        indirect_dim=0,
-                    ),
-                    dge_mode=dge_mode.hwdge,
+                dst_ap = down_grad_rows.ap(
+                    pattern=[[H_DIM, partial_i_tile], [1, valid_h_block]],
+                    offset=dn_offset + num_full_i_tp_tiles * I_TP_TILE_SIZE * H_DIM,
+                    vector_offset=expert_rows[0:partial_i_tile, 0:1],
+                    indirect_dim=0,
                 )
-                nisa.tensor_tensor(
-                    dst=result_tiles[result_tile_idx][0:partial_i_tile, last_tile_idx, 0:valid_h_block],
-                    op=nl.add,
-                    data1=existing_weight_grad[result_tile_idx][0:partial_i_tile, last_tile_idx, 0:valid_h_block],
-                    data2=result_tiles[result_tile_idx][0:partial_i_tile, last_tile_idx, 0:valid_h_block],
-                )
-                nisa.dma_copy(
-                    dst=down_projection_weight_grad.ap(
-                        pattern=[[H_DIM, partial_i_tile], [1, 1], [1, valid_h_block]],
-                        offset=i_offset * H_DIM + H_SHARD_OFFSET + h_block_start,
-                        scalar_offset=expert_idx,
-                        indirect_dim=0,
-                    ),
-                    src=result_tiles[result_tile_idx][0:partial_i_tile, last_tile_idx, 0:valid_h_block],
-                    dge_mode=dge_mode.hwdge,
+                nisa.dma_compute(
+                    dst=dst_ap,
+                    srcs=[
+                        dst_ap,
+                        result_tiles[result_tile_idx][0:partial_i_tile, num_full_i_tp_tiles, 0:valid_h_block],
+                    ],
+                    scales=[1.0, 1.0],
+                    reduce_op=nl.add,
                 )
 
     sbm.close_scope()
@@ -2369,7 +2341,6 @@ def _compute_hidden_states_grad(
     matmul_psum_idx = 0
     transpose_psum_idx = 0
     result_tiles = []
-    existing_hidden_grad = []
     rhs_temp = []
     for n_buffer in range(BUFFER_DEGREE):
         rhs_temp.append(
@@ -2390,14 +2361,12 @@ def _compute_hidden_states_grad(
             )
         )
 
-        if is_tensor_update_accumulating:
-            existing_hidden_grad.append(
-                sbm.alloc_stack(
-                    (B_TILE_SIZE, NUM_B_TILES, H_BLOCK_SIZE),
-                    dtype=hidden_states_grad.dtype,
-                    align=32,
-                )
-            )
+    scatter_ids = block_token_pos_to_id_full
+    if is_tensor_update_accumulating and not skip_dma.skip_token:
+        # dma_compute needs unique rows: move the padding token (row T - 1) out of bounds and skip it.
+        scatter_ids = sbm.alloc_stack(block_token_pos_to_id_full.shape, dtype=nl.int32, align=32)
+        nisa.tensor_scalar(dst=scatter_ids, data=block_token_pos_to_id_full, op0=nl.greater_equal, operand0=T - 1)
+        nisa.tensor_tensor(dst=scatter_ids, op=nl.add, data1=scatter_ids, data2=block_token_pos_to_id_full)
 
     sbm.open_scope(interleave_degree=BUFFER_DEGREE, name=f"hidden_grad Buffer")
 
@@ -2589,49 +2558,34 @@ def _compute_hidden_states_grad(
 
                     sbm.increment_section()
 
-            # Write hidden states grad
+            # Write hidden states grad: dma_compute accumulates atomically (top_k blocks write each token row).
             for b_tile_idx in range(NUM_B_TILES):
                 global_tile_idx = b_block_idx * NUM_B_TILES + b_tile_idx
                 h_offset = h_block_idx * H_BLOCK_SIZE
-
+                dst_ap = hidden_states_grad.ap(
+                    pattern=[[H_DIM, B_TILE_SIZE], [1, valid_h_block]],
+                    offset=H_SHARD_OFFSET + h_offset,
+                    vector_offset=scatter_ids.ap(
+                        pattern=[[scatter_ids.shape[-1], B_TILE_SIZE], [1, 1]],
+                        offset=global_tile_idx,
+                    ),
+                    indirect_dim=0,
+                )
+                src_tile = result_tiles[result_buffer_idx][:, b_tile_idx, 0:valid_h_block]
                 if is_tensor_update_accumulating:
-                    if skip_dma.skip_token:
-                        nisa.memset(existing_hidden_grad[result_buffer_idx], value=0.0)
-
+                    nisa.dma_compute(
+                        dst=dst_ap,
+                        srcs=[dst_ap, src_tile],
+                        scales=[1.0, 1.0],
+                        reduce_op=nl.add,
+                        oob_mode=oob_mode.skip,
+                    )
+                else:
                     nisa.dma_copy(
-                        dst=existing_hidden_grad[result_buffer_idx][:, b_tile_idx, 0:valid_h_block],
-                        src=hidden_states_grad.ap(
-                            pattern=[[H_DIM, B_TILE_SIZE], [1, 1], [1, valid_h_block]],
-                            offset=H_SHARD_OFFSET + h_offset,
-                            vector_offset=block_token_pos_to_id_full.ap(
-                                pattern=[[block_token_pos_to_id_full.shape[-1], B_TILE_SIZE], [1, 1]],
-                                offset=global_tile_idx,
-                            ),
-                            indirect_dim=0,
-                        ),
+                        dst=dst_ap,
+                        src=src_tile,
                         oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
                     )
-
-                    nisa.tensor_tensor(
-                        dst=result_tiles[result_buffer_idx][:, b_tile_idx, 0:valid_h_block],
-                        op=nl.add,
-                        data1=existing_hidden_grad[result_buffer_idx][:, b_tile_idx, 0:valid_h_block],
-                        data2=result_tiles[result_buffer_idx][:, b_tile_idx, 0:valid_h_block],
-                    )
-
-                nisa.dma_copy(
-                    dst=hidden_states_grad.ap(
-                        pattern=[[H_DIM, B_TILE_SIZE], [1, 1], [1, valid_h_block]],
-                        offset=H_SHARD_OFFSET + h_offset,
-                        vector_offset=block_token_pos_to_id_full.ap(
-                            pattern=[[block_token_pos_to_id_full.shape[-1], B_TILE_SIZE], [1, 1]],
-                            offset=global_tile_idx,
-                        ),
-                        indirect_dim=0,
-                    ),
-                    src=result_tiles[result_buffer_idx][:, b_tile_idx, 0:valid_h_block],
-                    oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-                )
 
     sbm.close_scope()
     if manage_scope:
@@ -2656,6 +2610,8 @@ def _compute_gate_up_projection_weight_grad(
     manage_scope=True,
     BUFFER_DEGREE=3,
     skip_gate_proj=False,
+    iota_vec=None,
+    expert_idx_broadcast=None,
 ):
     """
     Compute gate and up projection weight gradient with H-dimension sharding.
@@ -2679,6 +2635,8 @@ def _compute_gate_up_projection_weight_grad(
         BLOCK_B (int): B dimension blocking factor.
         BLOCK_I_TP (int): I dimension blocking factor.
         skip_gate_proj (bool): Whether to omit the gate-projection contribution.
+        iota_vec (nl.ndarray): Precomputed [0, 1, 2, ..., TILE_SIZE-1] vector.
+        expert_idx_broadcast (nl.ndarray): [TILE_SIZE, N], Expert index of every block on all lanes.
 
     Returns:
         None: Weight gradient is accumulated in-place.
@@ -2691,6 +2649,7 @@ def _compute_gate_up_projection_weight_grad(
     PSUM_SIZE = nl.tile_size.gemm_moving_fmax
     B_DIM, GATE_UP_WEIGHT_COUNT, I_TP_DIM = gate_up_proj_output_grad_hbm.shape
     _, H_DIM = hidden_states.shape
+    E_DIM = gate_up_proj_weight_grad.shape[0]
     H_DIM_SHARDED = H_DIM // num_shards
     H_SHARD_OFFSET = H_DIM_SHARDED * shard_id
 
@@ -2714,7 +2673,6 @@ def _compute_gate_up_projection_weight_grad(
         sbm.open_scope(name=f"Gate Up Weight Grad")
 
     weight_grad_accum = []
-    existing_weight_grad = []
     matmul_psum_idx = 0
 
     for n_buffer in range(BUFFER_DEGREE):
@@ -2723,9 +2681,17 @@ def _compute_gate_up_projection_weight_grad(
         weight_grad_accum.append(
             sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES, I_TP_BLOCK_SIZE), dtype=gate_up_proj_weight_grad.dtype, align=32)
         )
-        existing_weight_grad.append(
-            sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES, I_TP_BLOCK_SIZE), dtype=gate_up_proj_weight_grad.dtype, align=32)
-        )
+    # dma_compute takes no scalar_offset: per-lane rows expert_rows[p] = expert_idx * H + p.
+    gu_grad_rows = gate_up_proj_weight_grad.reshape((E_DIM * H_DIM, GATE_UP_WEIGHT_COUNT * I_TP_DIM))
+    expert_rows = sbm.alloc_stack((H_TILE_SIZE, 1), dtype=nl.int32, align=32)
+    nisa.tensor_scalar(
+        dst=expert_rows,
+        data=expert_idx_broadcast[0:H_TILE_SIZE, block_idx : block_idx + 1],
+        op0=nl.multiply,
+        operand0=H_DIM,
+    )
+    nisa.tensor_tensor(dst=expert_rows, op=nl.add, data1=expert_rows, data2=iota_vec[0:H_TILE_SIZE, 0:1])
+
     sbm.open_scope(name=f"Gate Up Weight Grad Double Buffer", interleave_degree=BUFFER_DEGREE)
     # Process one (h_tile, i_tile) at a time to minimize memory
     for h_block_idx in range(NUM_H_BLOCKS):
@@ -2844,84 +2810,44 @@ def _compute_gate_up_projection_weight_grad(
 
                     sbm.increment_section()
 
-                # Accumulate Gradients - load all H tiles in a single DMA
+                # Accumulate into HBM with dma_compute (see the down projection weight grad), all full H tiles
+                # in one call and the partial last tile in another.
+                gu_stride = GATE_UP_WEIGHT_COUNT * I_TP_DIM
+                gu_offset = (H_SHARD_OFFSET + h_block_start) * gu_stride + gate_or_up * I_TP_DIM + i_block_start
                 num_full_h_tiles = valid_h_block // H_TILE_SIZE
                 partial_h_tile = valid_h_block % H_TILE_SIZE
-
-                # Bulk load/accumulate/store for all full tiles
                 if num_full_h_tiles > 0:
-                    nisa.dma_copy(
-                        dst=existing_weight_grad[result_buffer_idx][:, 0:num_full_h_tiles, 0:valid_i_block],
-                        src=gate_up_proj_weight_grad.ap(
-                            pattern=[
-                                [GATE_UP_WEIGHT_COUNT * I_TP_DIM, H_TILE_SIZE],
-                                [GATE_UP_WEIGHT_COUNT * I_TP_DIM * H_TILE_SIZE, num_full_h_tiles],
-                                [1, valid_i_block],
-                            ],
-                            offset=(H_SHARD_OFFSET + h_block_start) * GATE_UP_WEIGHT_COUNT * I_TP_DIM
-                            + gate_or_up * I_TP_DIM
-                            + i_block_start,
-                            scalar_offset=expert_idx,
-                            indirect_dim=0,
-                        ),
-                        dge_mode=dge_mode.hwdge,
+                    dst_ap = gu_grad_rows.ap(
+                        pattern=[
+                            [gu_stride, H_TILE_SIZE],
+                            [gu_stride * H_TILE_SIZE, num_full_h_tiles],
+                            [1, valid_i_block],
+                        ],
+                        offset=gu_offset,
+                        vector_offset=expert_rows[0:H_TILE_SIZE, 0:1],
+                        indirect_dim=0,
                     )
-                    nisa.tensor_tensor(
-                        dst=existing_weight_grad[result_buffer_idx][:, 0:num_full_h_tiles, 0:valid_i_block],
-                        op=nl.add,
-                        data1=existing_weight_grad[result_buffer_idx][:, 0:num_full_h_tiles, 0:valid_i_block],
-                        data2=weight_grad_accum[result_buffer_idx][:, 0:num_full_h_tiles, 0:valid_i_block],
+                    nisa.dma_compute(
+                        dst=dst_ap,
+                        srcs=[dst_ap, weight_grad_accum[result_buffer_idx][:, 0:num_full_h_tiles, 0:valid_i_block]],
+                        scales=[1.0, 1.0],
+                        reduce_op=nl.add,
                     )
-                    nisa.dma_copy(
-                        dst=gate_up_proj_weight_grad.ap(
-                            pattern=[
-                                [GATE_UP_WEIGHT_COUNT * I_TP_DIM, H_TILE_SIZE],
-                                [GATE_UP_WEIGHT_COUNT * I_TP_DIM * H_TILE_SIZE, num_full_h_tiles],
-                                [1, valid_i_block],
-                            ],
-                            offset=(H_SHARD_OFFSET + h_block_start) * GATE_UP_WEIGHT_COUNT * I_TP_DIM
-                            + gate_or_up * I_TP_DIM
-                            + i_block_start,
-                            scalar_offset=expert_idx,
-                            indirect_dim=0,
-                        ),
-                        src=existing_weight_grad[result_buffer_idx][:, 0:num_full_h_tiles, 0:valid_i_block],
-                        dge_mode=dge_mode.hwdge,
-                    )
-
-                # Handle partial last tile
                 if partial_h_tile > 0:
-                    last_tile_idx = num_full_h_tiles
-                    h_tile_start = last_tile_idx * H_TILE_SIZE
-                    nisa.dma_copy(
-                        dst=existing_weight_grad[result_buffer_idx][0:partial_h_tile, last_tile_idx, 0:valid_i_block],
-                        src=gate_up_proj_weight_grad.ap(
-                            pattern=[[GATE_UP_WEIGHT_COUNT * I_TP_DIM, partial_h_tile], [1, 1], [1, valid_i_block]],
-                            offset=(H_SHARD_OFFSET + h_block_start + h_tile_start) * GATE_UP_WEIGHT_COUNT * I_TP_DIM
-                            + gate_or_up * I_TP_DIM
-                            + i_block_start,
-                            scalar_offset=expert_idx,
-                            indirect_dim=0,
-                        ),
-                        dge_mode=dge_mode.hwdge,
+                    dst_ap = gu_grad_rows.ap(
+                        pattern=[[gu_stride, partial_h_tile], [1, valid_i_block]],
+                        offset=gu_offset + num_full_h_tiles * H_TILE_SIZE * gu_stride,
+                        vector_offset=expert_rows[0:partial_h_tile, 0:1],
+                        indirect_dim=0,
                     )
-                    nisa.tensor_tensor(
-                        dst=existing_weight_grad[result_buffer_idx][0:partial_h_tile, last_tile_idx, 0:valid_i_block],
-                        op=nl.add,
-                        data1=existing_weight_grad[result_buffer_idx][0:partial_h_tile, last_tile_idx, 0:valid_i_block],
-                        data2=weight_grad_accum[result_buffer_idx][0:partial_h_tile, last_tile_idx, 0:valid_i_block],
-                    )
-                    nisa.dma_copy(
-                        dst=gate_up_proj_weight_grad.ap(
-                            pattern=[[GATE_UP_WEIGHT_COUNT * I_TP_DIM, partial_h_tile], [1, 1], [1, valid_i_block]],
-                            offset=(H_SHARD_OFFSET + h_block_start + h_tile_start) * GATE_UP_WEIGHT_COUNT * I_TP_DIM
-                            + gate_or_up * I_TP_DIM
-                            + i_block_start,
-                            scalar_offset=expert_idx,
-                            indirect_dim=0,
-                        ),
-                        src=existing_weight_grad[result_buffer_idx][0:partial_h_tile, last_tile_idx, 0:valid_i_block],
-                        dge_mode=dge_mode.hwdge,
+                    nisa.dma_compute(
+                        dst=dst_ap,
+                        srcs=[
+                            dst_ap,
+                            weight_grad_accum[result_buffer_idx][0:partial_h_tile, num_full_h_tiles, 0:valid_i_block],
+                        ],
+                        scales=[1.0, 1.0],
+                        reduce_op=nl.add,
                     )
 
     sbm.close_scope()
@@ -3062,7 +2988,7 @@ def _compute_function_sbuf_budgets(params, num_shards):
     return budgets
 
 
-def _group_functions_by_sbuf_budget(budgets, available_sbuf):
+def _group_functions_by_sbuf_budget(budgets, available_sbuf, force_new_group_before=()):
     """
     Greedily group consecutive functions whose combined SBUF fits in available space.
 
@@ -3076,6 +3002,7 @@ def _group_functions_by_sbuf_budget(budgets, available_sbuf):
     Args:
         budgets (list[int]): Per-function peak SBUF bytes (length 5).
         available_sbuf (int): Total available SBUF bytes.
+        force_new_group_before (Collection[int]): Function indices that must begin a new group.
 
     Returns:
         tuple: (manage_scope, open_merged_before, close_merged_after, increment_after, group_size_at_open)
@@ -3094,7 +3021,7 @@ def _group_functions_by_sbuf_budget(budgets, available_sbuf):
         usage = budgets[func_idx]
         if usage == 0:
             continue
-        if current_start == -1 or running_total + usage > available_sbuf:
+        if current_start == -1 or func_idx in force_new_group_before or running_total + usage > available_sbuf:
             # Start a new group — finalize previous first
             if current_start != -1:
                 for g_idx in range(current_start, current_end + 1):
@@ -3293,8 +3220,14 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
     # are allocated inside each block scope before the compute functions run.
     per_block_overhead = NUM_B_TILES * align_to(TILE_SIZE * sizeinbytes(nl.float32), 32)
     available_sbuf = MAX_AVAILABLE_SBUF_SIZE - persistent_overhead - per_block_overhead
+    # An accumulating hidden-grad scatter lowers to a dma_compute scratch allocation that can
+    # consume almost the whole TRN2 SBUF (213,120 B for H4096/I1536/B256). Its compiler-generated
+    # scratch is not represented by SbufManager allocations, so do not extend the preceding
+    # output-grad scope across it. Later phases may still share the hidden-grad scope when their
+    # explicit lifetimes fit.
+    force_new_group_before = (2,) if params.is_tensor_update_accumulating else ()
     ms_flags, open_before, close_after, inc_after, grp_sizes = _group_functions_by_sbuf_budget(
-        sbuf_budgets, available_sbuf
+        sbuf_budgets, available_sbuf, force_new_group_before
     )
 
     # Log SBUF scope merging decisions (print directly — NKI compiler may not
@@ -3482,6 +3415,8 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             manage_scope=ms_flags[3],
             BUFFER_DEGREE=bp.gate_up_weight_grad.get_buffer_degree(gate_up_wgrad_dtype),
             skip_gate_proj=params.skip_gate_proj,
+            iota_vec=iota_vec,
+            expert_idx_broadcast=expert_idx_broadcast,
         )
 
         if inc_after[3]:
@@ -3511,6 +3446,7 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
             else None,
             skip_dma=params.skip_dma if params.affinity_option == AffinityOption.AFFINITY_ON_I else None,
             iota_vec=iota_vec,
+            expert_idx_broadcast=expert_idx_broadcast,
             manage_scope=ms_flags[4],
             BUFFER_DEGREE=bp.down_weight_grad.get_buffer_degree(down_wgrad_dtype),
         )

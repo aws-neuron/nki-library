@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -90,7 +91,12 @@ MIN_CLIENT_VERSION_KEY = "minClientLockingVersion"
 # doubles as the truthful worst-case release time. The on-core capture is wrapped
 # in a shorter shell ``timeout`` so the cap never truncates a real in-progress
 # capture.
-DEFAULT_LOCK_TIMEOUT_SECONDS = 60
+# MEGA_LOCK_TIMEOUT raises the cap for long-running single-tenant captures. The GPT-OSS
+# 36-layer fp8-packed KV-update NEFF executes for ~56 s on device, which overruns the derived
+# capture timeout (DEFAULT_LOCK_TIMEOUT_SECONDS - 5 = 55 s in profiler_utils) and truncates the
+# capture. The default stays 60 so shared-fleet behaviour is unchanged; the GPT-OSS runners
+# under steering_private/gptoss_dma_json_rev15_nki07/run_scripts/ export MEGA_LOCK_TIMEOUT=900.
+DEFAULT_LOCK_TIMEOUT_SECONDS = int(os.environ.get("MEGA_LOCK_TIMEOUT", "60"))
 
 # Path to the local helper script that gets deployed to remote hosts
 _LOCAL_LOCK_HELPERS_PATH = Path(__file__).parent / "scripts" / "remote_lock_scripts.py"
@@ -216,6 +222,8 @@ def _remote_lock_operation(lock_file, helpers_file, command, args, kwargs=None, 
         "worst_case_eta": lr.worst_case_eta,
         "bumped": lr.bumped,
         "re_enqueued": lr.re_enqueued,
+        # An older deployed helper's LockResult has no assembled field.
+        "assembled": getattr(lr, "assembled", False),
         "should_reset_cores": lr.should_reset_cores,
     }
     return result
@@ -318,6 +326,7 @@ def _run_lock_helper(executor, command: str, *args, **kwargs) -> LockResult:
         worst_case_eta=resp.get("worst_case_eta"),
         bumped=resp.get("bumped", False),
         re_enqueued=resp.get("re_enqueued", False),
+        assembled=resp.get("assembled", False),
         should_reset_cores=resp.get("should_reset_cores", True),
     )
 
@@ -347,8 +356,21 @@ def poll(
     ready: bool,
     lnc_config: int,
     caller_id: str | None = None,
+    hold: bool = False,
+    hold_cap_seconds: int | None = None,
 ) -> LockResult:
-    """Poll the FIFO core-allocation queue (fast-path / enqueue / commit)."""
+    """Poll the FIFO core-allocation queue (fast-path / enqueue / commit).
+
+    ``hold`` is sent only when True so a default call stays compatible with an
+    older deployed helper that does not accept it. ``hold_cap_seconds`` bounds
+    how long a held entry keeps an assembled region before it is bumped; it is
+    sent only together with ``hold`` and only when not None.
+    """
+    extra_kwargs: dict[str, bool | int] = {}
+    if hold:
+        extra_kwargs["hold"] = True
+        if hold_cap_seconds is not None:
+            extra_kwargs["hold_cap_seconds"] = hold_cap_seconds
     return _run_lock_helper(
         executor,
         "poll",
@@ -361,6 +383,7 @@ def poll(
         ready,
         lnc_config,
         caller_id=caller_id,
+        **extra_kwargs,
     )
 
 

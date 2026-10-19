@@ -677,23 +677,24 @@ class TiledTensor(nl.NKIObject):
                     elem_step = tile_step * self._tile_size[d]
                     n_tiles = self._grid_shape[gd]
 
-                    if elem_step > self._tile_size[d]:
-                        # Take a range divisible by elem_step from start_elem
-                        n_full_blocks = self._source_shape[d] // elem_step
-                        range_end = n_full_blocks * elem_step
-                        view = view.slice(view_dim, start_elem, range_end)
-                        # Reshape into (n_full_blocks, elem_step)
-                        view = view.reshape_dim(view_dim, (n_full_blocks, elem_step))
-                        # Slice outer dim to select only the n_tiles blocks
-                        view = view.slice(view_dim, 0, n_tiles)
-                        # Slice inner dim to tile_size
-                        view = view.slice(view_dim + 1, 0, self._tile_size[d])
-                        # This source dim produced 2 view dims
-                        view_dim = view_dim + 2
-                    else:
-                        end_elem = min(start_elem + total_count * self._tile_size[d], self._source_shape[d])
-                        view = view.slice(view_dim, start_elem, end_elem)
-                        view_dim = view_dim + 1
+                    # A non-contiguous group has grid stride = (factor >= 2) * suffix_product,
+                    # so tile_step >= 2 and elem_step is always > tile_size[d] here.
+                    kernel_assert(
+                        elem_step > self._tile_size[d],
+                        "non-contiguous strided group must have elem_step > tile_size",
+                    )
+                    # Take a range divisible by elem_step from start_elem
+                    n_full_blocks = self._source_shape[d] // elem_step
+                    range_end = n_full_blocks * elem_step
+                    view = view.slice(view_dim, start_elem, range_end)
+                    # Reshape into (n_full_blocks, elem_step)
+                    view = view.reshape_dim(view_dim, (n_full_blocks, elem_step))
+                    # Slice outer dim to select only the n_tiles blocks
+                    view = view.slice(view_dim, 0, n_tiles)
+                    # Slice inner dim to tile_size
+                    view = view.slice(view_dim + 1, 0, self._tile_size[d])
+                    # This source dim produced 2 view dims
+                    view_dim = view_dim + 2
 
         return view
 

@@ -33,8 +33,10 @@ import numpy.typing as npt
 import pytest
 from nkilib_src.nkilib.experimental.topk.gpsimd_topk import (
     BFLOAT16_MIN,
+    _validate_gpsimd_topk,
     create_gpsimd_topk_config,
     gpsimd_topk,
+    snake_padded_n,
 )
 from nkilib_src.nkilib.experimental.topk.gpsimd_topk_torch import gpsimd_topk_torch_ref
 from typing_extensions import override
@@ -143,6 +145,47 @@ class TestGpsimdTopKKernel:
             inp = np.random.randn(BxS, vocab).astype(np.float32)
             inp[0, :] = np.nan
             inp[0, : k - 1] = np.arange(k - 1, dtype=np.float32)
+            inp = inp.astype(np_dtype)
+        elif data == "tie_levels":
+            # The REALISTIC tie shape, and the adversarial one. Values come from only L distinct
+            # levels, so each level has multiplicity ~vocab/L and the k-th boundary falls INSIDE a
+            # tie group -- the kernel must pick a subset of equal values and still name distinct
+            # positions. This is what bf16 logits actually look like at k=256: the observed
+            # production row held ~57 distinct values among its 256 winners.
+            #
+            # Multiplicities deliberately exceed max8's batch of 8, which is the regime the
+            # nc_match_replace8 contract warns about ("duplicate extremes let one pass consume a
+            # slot a later pass still searches for"). tie_groups above keeps groups of 5, inside
+            # one batch, and does NOT reproduce the defect -- so this mode is the one that
+            # actually exercises the failing path.
+            levels = 8
+            rng = np.random.default_rng(4242)
+            inp = rng.integers(0, levels, size=(BxS, vocab)).astype(np.float32)
+            inp = inp * 0.5  # distinct, exactly representable in bf16, all ties exact
+            inp = inp.astype(np_dtype)
+        elif data == "tie_groups":
+            # PARTIAL ties, which is the realistic case and the one "dup_finite" misses.
+            # Row 0 gets exactly k winners arranged as tie GROUPS: group g holds M copies of
+            # one value, every group's value is distinct and strictly greater than the filler,
+            # and the winners are SCATTERED across the row rather than contiguous so the snake
+            # maps them onto different partitions.
+            #
+            # So "the k largest" is exactly the placed set, and the correct answer must name all
+            # k placed positions -- one index per copy. If a tie group of M copies comes back as
+            # fewer than M DISTINCT indices, the kernel has eaten a duplicate: it reported the
+            # same vocab id more than once and silently dropped a token that belonged in the
+            # top-k. Value-set and pairing checks cannot see that (a repeated index still
+            # carries the right value), which is why the distinctness gate exists.
+            inp = np.full((BxS, vocab), -30.0, dtype=np.float32)
+            if BxS > 1:
+                inp[1:, :] = np.random.randn(BxS - 1, vocab).astype(np.float32)
+            m_tie = 5
+            pos = np.linspace(0, vocab - 1, num=k, dtype=np.int64)
+            pos = np.unique(pos)
+            assert pos.size == k, f"need {k} distinct scatter positions, got {pos.size}"
+            for slot in range(k):
+                group = slot // m_tie
+                inp[0, pos[slot]] = float(100 - group)  # distinct per group, all > filler
             inp = inp.astype(np_dtype)
         elif data == "dup_finite":
             # Control for neg_inf_masked: row 0 holds ONE repeated FINITE value, so the
@@ -327,6 +370,44 @@ class TestGpsimdTopKKernel:
                 )
                 return False
 
+            def check_index_distinctness(validator: CustomValidator, indices: npt.NDArray[Any]) -> bool:
+                """Every returned index must be DISTINCT within its row.
+
+                A top-k of k slots selects k different elements, so k different indices, always
+                -- ties change which elements are chosen, never how many. A repeated index means
+                one element was reported twice and another that belonged in the top-k was
+                dropped, which for sampling means a token id double-counted in the softmax and a
+                legitimate token missing.
+
+                Nothing else in this suite can catch that. The value-set check sorts both sides,
+                so a duplicate index paired with a duplicate value passes it; the pairing check
+                is deliberately elementwise and tie-safe, so a repeated index carrying the right
+                value passes it too. Distinctness is the only invariant that bites.
+
+                Skipped only when index_bounds_only, i.e. NaN/uninitialised input, where the ISA
+                contract makes the reported position undefined and "the k largest" has no answer.
+                """
+                if index_bounds_only:
+                    return True
+                bad = []
+                for i in range(indices.shape[0]):
+                    uniq = np.unique(indices[i])
+                    if uniq.size != indices.shape[1]:
+                        vals, counts = np.unique(indices[i], return_counts=True)
+                        worst = vals[np.argmax(counts)]
+                        bad.append((i, indices.shape[1] - uniq.size, int(worst), int(counts.max())))
+                if not bad:
+                    return True
+                i, missing, worst, rep_n = bad[0]
+                validator._print_with_log(
+                    f"FAIL: duplicate topk_indices. {len(bad)} row(s) return fewer than "
+                    f"{indices.shape[1]} distinct indices; worst row {i} is short by {missing}, "
+                    f"index {worst} repeated {rep_n} times. A tie group of m equal values must "
+                    f"come back as m DISTINCT indices -- reporting one of them m times drops "
+                    f"m-1 tokens that belonged in the top-k."
+                )
+                return False
+
             def check_value_index_pairing(validator: CustomValidator) -> bool:
                 """Check input[i, indices[i, j]] == values[i, j] elementwise.
 
@@ -349,6 +430,8 @@ class TestGpsimdTopKKernel:
                 values = kernel_out["topk_values"]
                 indices = kernel_out["topk_indices"]
                 if report_out_of_range(validator, indices):
+                    return False
+                if not check_index_distinctness(validator, indices):
                     return False
                 if index_bounds_only:
                     return check_pairing_nan_tolerant(validator, values, indices)
@@ -481,25 +564,25 @@ class TestGpsimdTopKKernel:
     topk_unit_params = "lnc_degree, batch, seqlen, vocab_size, K, dtype"
     _ABBREVS = {"lnc_degree": "lnc", "batch": "b", "seqlen": "s", "vocab_size": "v", "K": "K", "dtype": "dt"}
 
-    # A/B head-to-head shapes vs the rotational baseline (all bf16, lnc=2).
+    # A/B head-to-head shapes vs the rotational baseline (all bf16, LNC=1).
     topk_ab_perms = [
         # BxS=1,  v=3168,  k=256
         pytest.param(2, 1, 1, 3168, 256, nl.bfloat16, marks=pytest.mark.fast),
         # BxS=32, v=3168,  k=256
-        [2, 32, 1, 3168, 256, nl.bfloat16],
+        [1, 16, 1, 3168, 256, nl.bfloat16],
         # BxS=40, v=4058,  k=256  (b=8, s=5 -> BxS=40)
-        [2, 8, 5, 4058, 256, nl.bfloat16],
+        [1, 4, 5, 4058, 256, nl.bfloat16],
         # BxS=1,  v=16000, k=256
-        [2, 1, 1, 16000, 256, nl.bfloat16],
+        [1, 1, 1, 16000, 256, nl.bfloat16],
     ]
 
     # bf16 edge cases.
     topk_edge_perms = [
         pytest.param(2, 1, 1, 8, 8, nl.bfloat16, marks=pytest.mark.fast),  # n == 8 minimum, k == n
-        [2, 1, 1, 64, 1, nl.bfloat16],         # k == 1
+        [1, 1, 1, 64, 1, nl.bfloat16],         # k == 1
         pytest.param(2, 1, 1, 3168, 7, nl.bfloat16, marks=pytest.mark.fast),  # k non-multiple-of-16 remainder
-        [2, 1, 1, 3168, 99, nl.bfloat16],      # k remainder, multi-column
-        [2, 4, 1, 3168, 256, nl.bfloat16],     # partial tile (4 rows < 8 groups)
+        [1, 1, 1, 3168, 99, nl.bfloat16],      # k remainder, multi-column
+        [1, 2, 1, 3168, 256, nl.bfloat16],     # partial tile (4 rows < 8 groups)
         pytest.param(2, 17, 1, 3168, 256, nl.bfloat16, marks=pytest.mark.fast),  # multi-tile + partial last tile
     ]
 
@@ -511,13 +594,13 @@ class TestGpsimdTopKKernel:
     topk_gptoss_perms = [
         # GBS=128 -> n_rows=16
         pytest.param(2, 16, 1, 3142, 256, nl.bfloat16, marks=pytest.mark.fast),   # local
-        [2, 16, 1, 16384, 256, nl.bfloat16],                                      # global
+        [1, 8, 1, 16384, 256, nl.bfloat16],                                      # global
         # GBS=512 -> n_rows=64
-        [2, 64, 1, 3142, 256, nl.bfloat16],                                       # local
-        [2, 64, 1, 16384, 256, nl.bfloat16],                                      # global
+        [1, 32, 1, 3142, 256, nl.bfloat16],                                       # local
+        [1, 32, 1, 16384, 256, nl.bfloat16],                                      # global
         # GBS=1024 -> n_rows=128
-        [2, 128, 1, 3142, 256, nl.bfloat16],                                      # local
-        [2, 128, 1, 16384, 256, nl.bfloat16],                                     # global
+        [1, 64, 1, 3142, 256, nl.bfloat16],                                      # local
+        [1, 64, 1, 16384, 256, nl.bfloat16],                                     # global
     ]
 
     # Regression guard for the small-tile (partial-tile, par_dim <= 32) cross-engine
@@ -538,46 +621,45 @@ class TestGpsimdTopKKernel:
     #             cross-engine read raced the last gather pass at n_srows==1. k=99
     #             covers scattered padding too, but at a different k_cols; k=50 is the
     #             common sampling value and its own case.
-    # All at lnc=2 with small BxS (per_lnc_BxS not a multiple of 8 -> the safe DMA
-    # path), mirroring decode sampling (batch ~1 per sequence). A second row (BxS=2)
-    # keeps the shape a normal 2D case. The BxS=16 gptoss rows are the large-batch
+    # All at small BxS (per_lnc_BxS not a multiple of 8 -> the safe DMA path), mirroring
+    # decode sampling (batch ~1 per sequence). The BxS=16 gptoss rows are the large-batch
     # controls (fast_dma_safe path), which were always correct.
     topk_kbug_perms = [
         pytest.param(2, 2, 1, 1024, 16, nl.bfloat16, marks=pytest.mark.fast),   # split, HALF=8
         pytest.param(2, 2, 1, 1024, 32, nl.bfloat16, marks=pytest.mark.fast),   # split, odd stages, value+index path
         pytest.param(2, 2, 1, 1024, 50, nl.bfloat16, marks=pytest.mark.fast),   # full-width, scattered padding
-        [2, 16, 1, 3142, 16, nl.bfloat16],    # gptoss local vocab, k=16 (decode-realistic)
-        [2, 16, 1, 3142, 32, nl.bfloat16],    # gptoss local vocab, k=32
-        [2, 16, 1, 3142, 50, nl.bfloat16],    # gptoss local vocab, k=50
+        [1, 8, 1, 3142, 16, nl.bfloat16],    # gptoss local vocab, k=16 (decode-realistic)
+        [1, 8, 1, 3142, 32, nl.bfloat16],    # gptoss local vocab, k=32
+        [1, 8, 1, 3142, 50, nl.bfloat16],    # gptoss local vocab, k=50
     ]
 
     # Dense k-sweep across the full small-tile path-selection surface: every k below
     # hits a distinct sort-path regime (SPLIT vs FULL-width; small/large HALF; k%16==0
-    # vs scattered padding), all on the fixed shape (BxS=2, v=1024, lnc=2) that isolates
+    # vs scattered padding), all on the fixed shape (BxS=1, v=1024, LNC=1) that isolates
     # k on the safe (partial-tile) DMA path. This is the broad guard that any future
     # change keeps every path correct across k, not just the representative kbug values.
     topk_ksweep_perms = [
         # FULL-width, no padding (k%16==0 or k_cols==1 tail).
-        [2, 2, 1, 1024, 8, nl.bfloat16],    # FULL HALF8-region, k_cols=1
-        [2, 2, 1, 1024, 48, nl.bfloat16],   # FULL, k_pad==k, no pad
-        [2, 2, 1, 1024, 80, nl.bfloat16],   # FULL, k_pad==k
-        [2, 2, 1, 1024, 96, nl.bfloat16],   # FULL, k_pad==k
+        [1, 1, 1, 1024, 8, nl.bfloat16],    # FULL HALF8-region, k_cols=1
+        [1, 1, 1, 1024, 48, nl.bfloat16],   # FULL, k_pad==k, no pad
+        [1, 1, 1, 1024, 80, nl.bfloat16],   # FULL, k_pad==k
+        [1, 1, 1, 1024, 96, nl.bfloat16],   # FULL, k_pad==k
         # SPLIT path, smallest HALF (8): k=10,12,16.
-        [2, 2, 1, 1024, 10, nl.bfloat16],
-        [2, 2, 1, 1024, 12, nl.bfloat16],
+        [1, 1, 1, 1024, 10, nl.bfloat16],
+        [1, 1, 1, 1024, 12, nl.bfloat16],
         # SPLIT, HALF=16: k=30,32.
-        [2, 2, 1, 1024, 30, nl.bfloat16],
+        [1, 1, 1, 1024, 30, nl.bfloat16],
         # SPLIT, HALF>=32: k=60,64,128.
-        [2, 2, 1, 1024, 60, nl.bfloat16],
-        [2, 2, 1, 1024, 64, nl.bfloat16],
-        [2, 2, 1, 1024, 128, nl.bfloat16],
+        [1, 1, 1, 1024, 60, nl.bfloat16],
+        [1, 1, 1, 1024, 64, nl.bfloat16],
+        [1, 1, 1, 1024, 128, nl.bfloat16],
         # FULL-width, SCATTERED padding (k%16!=0, non-pow2 k_pad): k=20,24,40,100,150,200.
-        [2, 2, 1, 1024, 20, nl.bfloat16],
-        [2, 2, 1, 1024, 24, nl.bfloat16],
-        [2, 2, 1, 1024, 40, nl.bfloat16],
-        [2, 2, 1, 1024, 100, nl.bfloat16],
-        [2, 2, 1, 1024, 150, nl.bfloat16],
-        [2, 2, 1, 1024, 200, nl.bfloat16],
+        [1, 1, 1, 1024, 20, nl.bfloat16],
+        [1, 1, 1, 1024, 24, nl.bfloat16],
+        [1, 1, 1, 1024, 40, nl.bfloat16],
+        [1, 1, 1, 1024, 100, nl.bfloat16],
+        [1, 1, 1, 1024, 150, nl.bfloat16],
+        [1, 1, 1, 1024, 200, nl.bfloat16],
     ]
 
     # Full-width-path index guard across the partial-tile boundary. The full-width sort
@@ -585,25 +667,29 @@ class TestGpsimdTopKKernel:
     # path) and were always correct at BxS=16 (full 128-partition tiles, fast path) --
     # the SAME partial-tile cross-engine race as the split path, not a distinct
     # padding-mask defect. Pair each k across both regimes so a regression on either the
-    # small-tile fix or the large-batch path is caught. v=1024, lnc=2. BxS=2 -> par_dim=16
-    # (safe path, fix active); BxS=16 -> per_lnc=8 -> par_dim=128 (fast path).
+    # small-tile fix or the large-batch path is caught. v=1024, LNC=1. BxS=1 -> par_dim=16
+    # (safe path, fix active); BxS=8 -> par_dim=128 (fast path).
     topk_fullpath_batch_perms = [
-        [2, 2, 1, 1024, 20, nl.bfloat16],    # BxS=2 (par_dim=16, safe path)
-        [2, 16, 1, 1024, 20, nl.bfloat16],   # BxS=16 (par_dim=128, fast path)
-        [2, 2, 1, 1024, 24, nl.bfloat16],
-        [2, 16, 1, 1024, 24, nl.bfloat16],
-        [2, 2, 1, 1024, 150, nl.bfloat16],
-        [2, 16, 1, 1024, 150, nl.bfloat16],
+        [1, 1, 1, 1024, 20, nl.bfloat16],    # BxS=1 (par_dim=16, safe path)
+        [1, 8, 1, 1024, 20, nl.bfloat16],   # BxS=8 (par_dim=128, fast path)
+        [1, 1, 1, 1024, 24, nl.bfloat16],
+        [1, 8, 1, 1024, 24, nl.bfloat16],
+        [1, 1, 1, 1024, 150, nl.bfloat16],
+        [1, 8, 1, 1024, 150, nl.bfloat16],
     ]
 
     topk_batchsweep_perms = [
-        [2, 1, 1, 1024, 32, nl.bfloat16],    # BxS=1 -> n_prgs=1, per_lnc=1, par_dim=16 (TRUE decode shape)
-        [2, 2, 1, 1024, 32, nl.bfloat16],    # per_lnc=1, par_dim=16
-        [2, 4, 1, 1024, 32, nl.bfloat16],    # per_lnc=2, par_dim=32 (partial tile)
-        [2, 8, 1, 1024, 32, nl.bfloat16],    # per_lnc=4, par_dim=64 (partial tile)
-        [2, 9, 1, 1024, 32, nl.bfloat16],    # per_lnc=5 (odd, partial tile)
-        [2, 16, 1, 1024, 32, nl.bfloat16],   # per_lnc=8 (full tile, fast_dma_safe=True)
-        [2, 128, 1, 1024, 32, nl.bfloat16],  # per_lnc=64 (many full tiles)
+        [1, 1, 1, 1024, 32, nl.bfloat16],    # BxS=1 -> n_prgs=1, per_lnc=1, par_dim=16 (TRUE decode shape)
+        [1, 2, 1, 1024, 32, nl.bfloat16],    # per_lnc=2, par_dim=32 (partial tile)
+        [1, 4, 1, 1024, 32, nl.bfloat16],    # per_lnc=4, par_dim=64 (partial tile)
+        [1, 5, 1, 1024, 32, nl.bfloat16],    # per_lnc=5 (odd, partial tile)
+        [1, 8, 1, 1024, 32, nl.bfloat16],   # per_lnc=8 (full tile, fast_dma_safe=True)
+        [1, 64, 1, 1024, 32, nl.bfloat16],  # per_lnc=64 (many full tiles)
+        # CLAMPED LAST SHARD: per_lnc = ceil(9/2) = 5 but program 1 holds only 4 rows, so
+        # fast_dma_safe's SECOND clause (BxS == n_prgs * per_lnc_BxS) trips. That clause can
+        # never be false at lnc=1 (BxS == 1 * per_lnc_BxS by construction), so the lnc=1
+        # per_lnc=5 case above is NOT a substitute -- this arrangement needs two programs.
+        [2, 9, 1, 1024, 32, nl.bfloat16],
     ]
 
     # ---- Spec-decoding shapes, as the KERNEL actually sees them ----------------
@@ -622,12 +708,25 @@ class TestGpsimdTopKKernel:
         # vocab from the failing run's own `[topk] kernel=` lines: 16384 for the local
         # stage and 3142 (= 201088/64, TP8 x DP8 shards) for the final stage. Rows are
         # the per-rank top-k row counts logged for each batch size.
-        [2, 32, 1, 16384, 256, nl.bfloat16],    # bs4  local  (reported PASS post-patch)
-        [2, 128, 1, 16384, 256, nl.bfloat16],   # bs4  final  (the shape that faulted 60x)
-        [2, 128, 1, 3142, 256, nl.bfloat16],    # bs4  final, sharded vocab
-        [2, 256, 1, 16384, 256, nl.bfloat16],   # bs8  (reported PASS post-patch)
-        [2, 512, 1, 16384, 256, nl.bfloat16],   # bs16 rows
-        [2, 1024, 1, 16384, 256, nl.bfloat16],  # bs32 rows
+        [1, 16, 1, 16384, 256, nl.bfloat16],    # bs4  local  (reported PASS post-patch)
+        [1, 64, 1, 16384, 256, nl.bfloat16],   # bs4  final, single-core half of the faulting shape
+        [1, 64, 1, 3142, 256, nl.bfloat16],    # bs4  final, sharded vocab
+        [1, 128, 1, 16384, 256, nl.bfloat16],   # bs8  (reported PASS post-patch)
+        [1, 256, 1, 16384, 256, nl.bfloat16],   # bs16 rows
+        [1, 512, 1, 16384, 256, nl.bfloat16],  # bs32 rows
+        # THE ORIGINAL FAULT ENVIRONMENT, verbatim: the shape that faulted 60x ran TWO
+        # programs (lnc=2), both cores driving de-snake/reload DMA concurrently. The lnc=1
+        # BxS=64 half above keeps the per-core shape but halves the DMA pressure, so it is
+        # a weaker repro of a defect that was load-dependent to begin with.
+        [2, 128, 1, 16384, 256, nl.bfloat16],
+        # HIGH-PRESSURE two-program arrangements. The de-snake defect class this suite
+        # exists for is purely LOAD-dependent (the original fault showed on 2/128 blocks at
+        # the highest row count and was clean below), so the sweep's MAXIMUM concurrent-DMA
+        # pressure is itself a covered property, not an incidental one: these keep the
+        # two-core bs16/bs32-row deployments (256 and 512 rows per core) in the suite
+        # rather than only their half-pressure lnc=1 shadows above.
+        [2, 512, 1, 16384, 256, nl.bfloat16],
+        [2, 1024, 1, 16384, 256, nl.bfloat16],
     ]
 
     # ---- Padded-vocab index range (the "padded" cause) -------------------------
@@ -651,21 +750,24 @@ class TestGpsimdTopKKernel:
     topk_padded_index_range_perms = [
         # (lnc, BxS, seqlen, vocab, k, dtype, data)
         # The two shapes the CR's evidence table quotes, at both distributions.
-        [2, 128, 1, 3142, 256, nl.bfloat16, "floor"],
-        [2, 128, 1, 3142, 256, nl.bfloat16, "ninf"],
-        [2, 2, 1, 1022, 32, nl.bfloat16, "floor"],
-        [2, 2, 1, 1022, 32, nl.bfloat16, "ninf"],
+        [1, 64, 1, 3142, 256, nl.bfloat16, "floor"],
+        [1, 64, 1, 3142, 256, nl.bfloat16, "ninf"],
+        [1, 1, 1, 1022, 32, nl.bfloat16, "floor"],
+        [1, 1, 1, 1022, 32, nl.bfloat16, "ninf"],
         # Other vocab % 16 residues: 10, 14, 8 and the single-padding-slot case.
-        [2, 2, 1, 4058, 256, nl.bfloat16, "ninf"],
-        [2, 4, 1, 2050, 64, nl.bfloat16, "ninf"],
-        [2, 2, 1, 1000, 32, nl.bfloat16, "ninf"],
-        [2, 2, 1, 3151, 256, nl.bfloat16, "ninf"],
+        [1, 1, 1, 4058, 256, nl.bfloat16, "ninf"],
+        [1, 2, 1, 2050, 64, nl.bfloat16, "ninf"],
+        [1, 1, 1, 1000, 32, nl.bfloat16, "ninf"],
+        [1, 1, 1, 3151, 256, nl.bfloat16, "ninf"],
         # 16 | vocab control: no padding exists, so this must pass either way.
-        [2, 2, 1, 16384, 256, nl.bfloat16, "ninf"],
+        [1, 1, 1, 16384, 256, nl.bfloat16, "ninf"],
+        # Deterministic padding selection under TWO-program concurrent DMA (see the
+        # two-program pressure note in topk_specdecode_stage1_perms).
+        [2, 64, 1, 3142, 256, nl.bfloat16, "ninf"],
         # Padding-only attribution: k-1 distinct finite values + one padding slot, so the
         # selected set is orderable and the unmatchable-value cause cannot contribute.
-        [2, 2, 1, 3151, 256, nl.bfloat16, "pad_isolate"],
-        [2, 2, 1, 1023, 32, nl.bfloat16, "pad_isolate"],
+        [1, 1, 1, 3151, 256, nl.bfloat16, "pad_isolate"],
+        [1, 1, 1, 1023, 32, nl.bfloat16, "pad_isolate"],
     ]
 
     # ---- Real -inf in the DATA: value<->index pairing (the imm-collision cause) -----
@@ -685,15 +787,25 @@ class TestGpsimdTopKKernel:
     #       FINITE and therefore strictly outranks real -inf, so nisa.topk itself pulls a
     #       padding slot into the top-k before phase 2 ever runs. That is a SECOND,
     #       independent defect; these perms carry both.
-    # BxS is varied so both phase-2 sort paths are covered: BxS<=128 -> per_lnc<=64 ->
-    # SPLIT path; BxS=256 -> full-width path.
+    # BxS is varied so both phase-2 sort paths are covered: BxS<=64 -> SPLIT path
+    # (2*per_lnc_BxS <= 128 partitions); BxS=128 -> FULL-WIDTH path (the split's
+    # 2*per_lnc_BxS <= 128 precondition fails, so use_split is False), which has its own
+    # -inf handling (memset of invalid cv columns) and needs its own -inf coverage.
     topk_neg_inf_perms = [
         # (lnc, BxS, seqlen, vocab, k, dtype)
-        [2, 16, 1, 1024, 32, nl.bfloat16],     # 16 | vocab, split path  (no-padding control)
-        [2, 16, 1, 16384, 256, nl.bfloat16],   # 16 | vocab, split path  (no-padding control)
-        [2, 16, 1, 3142, 256, nl.bfloat16],    # vocab % 16 = 6, split path
-        [2, 128, 1, 3142, 256, nl.bfloat16],   # vocab % 16 = 6, split path, per_lnc=64
-        [2, 2, 1, 1022, 32, nl.bfloat16],      # vocab % 16 = 14, split path, par_dim=16
+        [1, 8, 1, 1024, 32, nl.bfloat16],     # 16 | vocab, split path  (no-padding control)
+        [1, 8, 1, 16384, 256, nl.bfloat16],   # 16 | vocab, split path  (no-padding control)
+        [1, 8, 1, 3142, 256, nl.bfloat16],    # vocab % 16 = 6, split path
+        [1, 64, 1, 3142, 256, nl.bfloat16],   # vocab % 16 = 6, split path, per_lnc=64
+        [1, 1, 1, 1022, 32, nl.bfloat16],      # vocab % 16 = 14, split path, par_dim=16
+        [1, 128, 1, 16384, 256, nl.bfloat16],  # 16 | vocab, FULL-WIDTH path (no-padding control)
+        [1, 128, 1, 3142, 256, nl.bfloat16],   # vocab % 16 = 6, FULL-WIDTH path (both mechanisms)
+        # Both mechanisms under TWO-program concurrent DMA: split path (per_lnc=64) and
+        # full-width path (per_lnc=128; 2*128 > 128 partitions). The imm-collision and
+        # padding-sentinel causes are value-driven, but the de-snake stores they ride on
+        # are load-dependent, so the two-core pressure belongs in this gate too.
+        [2, 128, 1, 3142, 256, nl.bfloat16],
+        [2, 256, 1, 3142, 256, nl.bfloat16],
     ]
 
     # NaN pairing probe: is the value<->index pairing ALSO broken for NaN input? The
@@ -702,22 +814,50 @@ class TestGpsimdTopKKernel:
     # These perms run pairing_only: no golden/value comparison (meaningless with NaN),
     # just input[i, indices[i, j]] == values[i, j] with NaN==NaN treated as paired.
     topk_nan_pairing_perms = [
-        [2, 16, 1, 1024, 32, nl.bfloat16],
-        [2, 16, 1, 16384, 256, nl.bfloat16],
-        [2, 16, 1, 3142, 256, nl.bfloat16],
+        [1, 8, 1, 1024, 32, nl.bfloat16],
+        [1, 8, 1, 16384, 256, nl.bfloat16],
+        [1, 8, 1, 3142, 256, nl.bfloat16],
     ]
 
     # sorted=False fast path (skips the descending sort, compacts the K results in
     # arbitrary order). Covers both the k % 16 == 0 single-run compaction (k=256) and
     # the k % 16 != 0 scattered-column compaction (v=3168, k=99 and k=7).
+    # PARTIAL tie groups: k winners in groups of 5 equal values, scattered. Includes the
+    # production GPT-OSS geometries -- the 1571 LNC=1 vocab shard and the 4096/1024 reduce
+    # widths chunked_topk feeds back into this kernel -- because that is where the defect was
+    # actually observed.
+    # Few distinct levels => huge tie groups straddling the k-th boundary.
+    # lnc_degree = 1 THROUGHOUT. At LNC=2 per_lnc_BxS halves (BxS=8 -> 4), fast_dma_safe flips off
+    # and gpsimd_topk takes a different de-snake path -- so an LNC=2 tie test does not exercise the
+    # arrangement production runs, which is the whole point of these cases.
+    topk_tie_level_perms = [
+        # BxS=8 x width 1024 and 2048 IS chunked_topk's reduce at the production shape: P*k
+        # candidates for gbs/VTP rows (P=4, k=256 at gbs=1024; P=8 at gbs=128). Exactly one
+        # 8-row GROUPS_PER_TILE group, which is where the duplicate positions were observed.
+        [1, 8, 1, 1024, 256, nl.bfloat16],
+        [1, 8, 1, 2048, 256, nl.bfloat16],
+        # BxS=4 pads to 8 and is clean downstream, kept as the contrast.
+        [1, 4, 1, 1024, 256, nl.bfloat16],
+        # Wider rows and the LNC=1 vocab shard, well inside gpsimd_topk's 65536 ceiling.
+        [1, 16, 1, 4096, 256, nl.bfloat16],
+        [1, 16, 1, 1571, 256, nl.bfloat16],
+    ]
+
+    topk_tie_group_perms = [
+        [1, 16, 1, 1024, 256, nl.bfloat16],
+        [1, 16, 1, 4096, 256, nl.bfloat16],
+        [1, 16, 1, 1571, 256, nl.bfloat16],
+        [1, 16, 1, 2048, 32, nl.bfloat16],
+    ]
+
     topk_unsorted_perms = [
         # k % 16 == 0: valid de-snaked columns are already a contiguous prefix
         # (single full-width compaction run).
         pytest.param(2, 16, 1, 3142, 256, nl.bfloat16, marks=pytest.mark.fast),   # gptoss-style local
-        [2, 1, 1, 3168, 256, nl.bfloat16],                                        # BxS=1
+        [1, 1, 1, 3168, 256, nl.bfloat16],                                        # BxS=1
         # k % 16 != 0: valid columns are scattered, multi-run compaction.
         pytest.param(2, 1, 1, 3168, 99, nl.bfloat16, marks=pytest.mark.fast),     # multi-column compaction
-        [2, 1, 1, 3168, 7, nl.bfloat16],                                          # k <= 16, single-run compaction
+        [1, 1, 1, 3168, 7, nl.bfloat16],                                          # k <= 16, single-run compaction
     ]
     # fmt: on
 
@@ -836,7 +976,7 @@ class TestGpsimdTopKKernel:
         K,
         dtype,
     ):
-        """Cross-check: do the full-width-path k failures also clear at BxS=16 (full tile)?"""
+        """Cross-check: do the full-width-path k failures also clear at a full 128-partition tile?"""
         self.run_topk_test(
             test_manager=test_manager,
             platform_target=platform_target,
@@ -1037,6 +1177,75 @@ class TestGpsimdTopKKernel:
             data="dup_finite",
         )
 
+    @pytest_parametrize(topk_unit_params, topk_tie_group_perms, abbrevs=_ABBREVS)
+    def test_gpsimd_topk_tie_groups_keep_distinct_indices(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        vocab_size,
+        K,
+        dtype,
+    ):
+        """m equal values inside the top-k must return m DISTINCT indices, never m copies of one.
+
+        Row 0 holds exactly k winners in tie groups of 5, scattered across the vocab, every
+        group's value distinct and above a strictly smaller filler. So the correct answer is
+        precisely the placed positions, one index per copy, and any sort order among equals is
+        fine. Eating a duplicate is what this catches, and only the distinctness gate can: the
+        value multiset still matches and each returned index still carries the value reported
+        beside it.
+        """
+        self.run_topk_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            lnc_degree=lnc_degree,
+            batch=batch,
+            seqlen=seqlen,
+            vocab=vocab_size,
+            k=K,
+            dtype=dtype,
+            data="tie_groups",
+        )
+
+    @pytest_parametrize(topk_unit_params, topk_tie_level_perms, abbrevs=_ABBREVS)
+    def test_gpsimd_topk_tie_levels_keep_distinct_indices(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        vocab_size,
+        K,
+        dtype,
+    ):
+        """Only 8 distinct values across the whole vocab, so the k-th boundary sits inside a tie.
+
+        Every returned index must still appear AT MOST ONCE. Which of the many equal elements get
+        chosen is arbitrary and unchecked; how MANY distinct positions come back is not -- a top-k
+        of k slots selects k different elements no matter how the values tie.
+
+        This is the mode that mirrors real bf16 logits (tie multiplicity in the thousands, far
+        above max8's batch of 8) and therefore the one that can actually exercise the
+        nc_match_replace8 duplicate-consumption path, unlike tie_groups above.
+        """
+        self.run_topk_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            lnc_degree=lnc_degree,
+            batch=batch,
+            seqlen=seqlen,
+            vocab=vocab_size,
+            k=K,
+            dtype=dtype,
+            data="tie_levels",
+        )
+
     @pytest_parametrize(topk_unit_params, topk_nan_pairing_perms, abbrevs=_ABBREVS)
     def test_gpsimd_topk_nan_pairing(
         self,
@@ -1168,6 +1377,30 @@ class TestGpsimdTopKKernel:
 # compile-only. Validated on trn2 and trn3_a0 (full suite, abs diff = 0). Delegates to
 # TestGpsimdTopKKernel.run_topk_test (a second @pytest_test_metadata per file is rejected,
 # so this class carries only the marks).
+# Typed Any so the bf16 marker passes the config builder's np.dtype annotation (as in the
+# chunked_topk suite).
+_BF16_ANY: Any = nl.bfloat16
+
+
+class TestGpsimdTopkValidation:
+    """Hardware-free: the validator bounds what nisa.topk ACTUALLY receives."""
+
+    @pytest.mark.parametrize("vocab", [65528, 65535, 65521])
+    def test_padded_snake_width_is_bounded(self, vocab):
+        """nisa.topk gets n = 16*ceil(vocab/16), which is 65,536 for every raw width in
+        65,521..65,535 -- past the instruction bound. The validator used to check the RAW
+        width and let these die inside the ISA stub instead of at a named assert."""
+        assert snake_padded_n(vocab) == 65536
+        cfg = create_gpsimd_topk_config(inp_shape=(128, vocab), inp_dtype=_BF16_ANY, k=256, num_programs=1)
+        with pytest.raises(AssertionError, match="16-padded snake width"):
+            _validate_gpsimd_topk(cfg)
+
+    def test_largest_fitting_width_is_accepted(self):
+        cfg = create_gpsimd_topk_config(inp_shape=(128, 65520), inp_dtype=_BF16_ANY, k=256, num_programs=1)
+        _validate_gpsimd_topk(cfg)
+        assert snake_padded_n(65520) == 65520 and snake_padded_n(1571) == 1584
+
+
 @pytest_marks(["topk", "gpsimd", "model"])
 @final
 class TestGpsimdTopKModel:
@@ -1175,14 +1408,20 @@ class TestGpsimdTopKModel:
 
     topk_model_params = "lnc_degree, batch, seqlen, vocab_size, K, dtype"
     # (lnc, BxS, seqlen, vocab, k): split-path race (k=16/32), full-width index race
-    # (k=50), split-path padding (k=60) -- all at the small partial-tile BxS=2 that
-    # triggers the bugs -- plus a large-batch GPT-OSS control (fast_dma_safe path).
+    # (k=50), split-path padding (k=60) -- all at the small partial-tile per-core row
+    # count that triggers the bugs -- plus a large-batch GPT-OSS control
+    # (fast_dma_safe path). THIS list is LNC=1 only: BxS is halved relative to the
+    # original lnc=2 rows so per_lnc_BxS, and therefore par_dim and the phase-2 path,
+    # are unchanged. That does NOT hold for the whole file -- gpsimd_topk itself supports
+    # two programs, and the unit sweeps above keep lnc=2 perms for the arrangements that
+    # only exist with two programs (the clamped last shard, and the two-program DMA
+    # pressure of the original spec-decode fault).
     _MODEL_PARAMS = [
-        (2, 2, 1, 1024, 16, nl.bfloat16),
-        (2, 2, 1, 1024, 32, nl.bfloat16),
-        (2, 2, 1, 1024, 50, nl.bfloat16),
-        (2, 2, 1, 1024, 60, nl.bfloat16),
-        (2, 16, 1, 3142, 256, nl.bfloat16),
+        (1, 1, 1, 1024, 16, nl.bfloat16),
+        (1, 1, 1, 1024, 32, nl.bfloat16),
+        (1, 1, 1, 1024, 50, nl.bfloat16),
+        (1, 1, 1, 1024, 60, nl.bfloat16),
+        (1, 8, 1, 3142, 256, nl.bfloat16),
     ]
     _MODEL_IDS = [f"lnc-{p[0]}_b-{p[1]}_s-{p[2]}_v-{p[3]}_K-{p[4]}_dt-bfloat16" for p in _MODEL_PARAMS]
 

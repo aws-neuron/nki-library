@@ -57,7 +57,7 @@ ts = tile_stream.tile(buf, tile_shape=(128, 64), tile_view=spec)
 | `.expand(dim)` | Insert a size-1 dimension (unsqueeze) |
 | `.stride(dim, stride)` | Override stride for a dimension |
 
-ViewSpec affects the **effective tile shape** (what `get_tile_shape()` returns) and the actual `TensorView` returned by `get_tile()`.
+ViewSpec affects the **effective tile shape** (what `get_tile_shape()` returns) and the actual `nl.NkiTensor` returned by `get_tile()`.
 
 ViewSpec is used in two contexts: as a `tile_view` parameter (transforms each tile after extraction), and as part of `ViewOrder` iteration orders (reshapes the grid for non-standard iteration patterns like quadrant-stride access). Both use the same composable operation set.
 
@@ -80,7 +80,7 @@ buf = tile_stream.alloc_logical((512, 64), pdim_size=128, dtype=nl.float16, name
 - `sbm`: Optional `BufferManager` for stack allocation
 - `collapse_trivial_p_tile`: When `True` and `n_p_tiles == 1`, skips the p_tile dimension
 
-**Returns:** `TensorView` wrapping the allocated `nl.ndarray`.
+**Returns:** `nl.NkiTensor` view of the allocated buffer.
 
 ### `tile(tensor, tile_shape, tile_dims=None, tile_view=None, virtual_grid=None, iter_order=None)`
 
@@ -91,10 +91,10 @@ ts = tile_stream.tile(buf, tile_shape=(128, 32), iter_order=RowMajor())
 ```
 
 **Parameters:**
-- `tensor`: SBUF tensor (from `alloc_logical` or `nl.ndarray`), HBM tensor, or `TensorView`. Returns `None` if `tensor` is `None`.
+- `tensor`: SBUF tensor (from `alloc_logical` or `nl.NkiTensor`), HBM tensor, or any `nl.NkiTensor` view. Returns `None` if `tensor` is `None`.
 - `tile_shape`: `(p_tile, *f_tiles)` — the size of each tile in logical dimensions. First element is the partition tile size. Must be `<= pdim_size` or an exact multiple of it.
 - `tile_dims`: Which logical dimensions to tile. Defaults to all dims (trailing). Remaining dims become grid-only.
-- `tile_view`: Optional `ViewSpec` to transform each extracted tile (reshape, broadcast, permute, etc.). **Note:** `tile_view` may be removed in a future version. All current use cases (broadcast, reshape+broadcast) can be expressed by applying `TensorView` operations on the tensor before tiling and using `tile_dims` to make the original dimensions grid-only. See the bias broadcast example in Common Patterns.
+- `tile_view`: Optional `ViewSpec` to transform each extracted tile (reshape, broadcast, permute, etc.). **Note:** `tile_view` may be removed in a future version. All current use cases (broadcast, reshape+broadcast) can be expressed by applying view methods on the tensor before tiling and using `tile_dims` to make the original dimensions grid-only. See the bias broadcast example in Common Patterns.
 - `virtual_grid`: Extra outer grid dimensions prepended to `tile_grid` for iteration count matching without extra allocation. Used for data reuse (e.g., weights consumed by multiple output tiles).
 - `iter_order`: `RowMajor()` (default), `ColMajor()`, `DimOrder(order)`, or `ViewOrder(spec)`.
 
@@ -108,8 +108,8 @@ The core class. Provides tile-by-tile iteration over a tiled tensor.
 
 | Method | Returns | Description |
 |---|---|---|
-| `get_tile()` | `TensorView` | Get current tile and advance the iterator |
-| `get_tile_at_index(grid_pos)` | `TensorView` | Get tile at a specific grid position |
+| `get_tile()` | `nl.NkiTensor` | Get current tile and advance the iterator |
+| `get_tile_at_index(grid_pos)` | `nl.NkiTensor` | Get tile at a specific grid position |
 | `reset_cur_tile()` | `None` | Reset iteration back to the first tile |
 | `get_tile_shape()` | `tuple` | Effective tile shape (after `tile_view` transforms) |
 | `get_base_tile_shape()` | `tuple` | Original tile shape (before transforms) |
@@ -118,7 +118,7 @@ The core class. Provides tile-by-tile iteration over a tiled tensor.
 | `get_logical_shape()` | `tuple` | Logical shape `(P, *F)` |
 | `get_pdim_size()` | `int` | Partition dimension size |
 | `get_n_p_tiles()` | `int` | Number of p_tiles this tile spans |
-| `get_container()` | `TensorView` | Underlying container tensor |
+| `get_container()` | `nl.NkiTensor` | Underlying container tensor |
 | `get_iter_order()` | `IterOrder` | Iteration order strategy |
 | `get_tile_dims()` | `tuple` | Which logical dims are tiled |
 | `get_grid_dims()` | `tuple` | Which logical dims are grid-only |
@@ -146,7 +146,7 @@ DimOrder(order=(2, 1, 0))  # dim 2 fastest, dim 0 slowest
 
 ### ViewOrder
 
-Reshapes the tile grid before iteration using a `ViewSpec`. The ViewSpec transforms are applied to the grid shape (not the tile data), producing a new iteration space with potentially more dimensions, reordered dimensions, or selected slices. ViewOrder exists for iteration patterns that cannot be expressed by reordering tile dimensions alone — specifically when the grid itself needs restructuring. In most cases, the preferred approach is to apply `TensorView` operations on the tensor before passing it to `tile()`, so that the tiling naturally produces the desired grid; ViewOrder is reserved for cases where the iteration order depends on grid structure rather than tile content.
+Reshapes the tile grid before iteration using a `ViewSpec`. The ViewSpec transforms are applied to the grid shape (not the tile data), producing a new iteration space with potentially more dimensions, reordered dimensions, or selected slices. ViewOrder exists for iteration patterns that cannot be expressed by reordering tile dimensions alone — specifically when the grid itself needs restructuring. In most cases, the preferred approach is to apply view methods on the tensor before passing it to `tile()`, so that the tiling naturally produces the desired grid; ViewOrder is reserved for cases where the iteration order depends on grid structure rather than tile content.
 
 ```python
 # Split grid dim 0 (size 32) into (4, 8), then iterate dim 1 (quadrant) slowest
@@ -316,7 +316,7 @@ This is useful when a tensor fits within a single tile and no custom iteration o
 # Instead of:
 dma.Load(
     dst=tile_stream.tile(sbuf_buf, (128, H)),
-    src=tile_stream.tile(TensorView(hbm_tensor), (128, H)),
+    src=tile_stream.tile(hbm_tensor, (128, H)),
 ).execute()
 
 # Write:
@@ -348,13 +348,13 @@ blas.Matmul(
 ).execute()
 ```
 
-### TensorView Before Tiling
+### Views Before Tiling
 
 Apply `reshape_dim`, `permute`, `slice` on the tensor before `tile()` to match the desired layout.
 
 ```python
 wght_view = (
-    TensorView(weight)
+    weight
     .slice(1, h_start, h_start + h_sharded)
     .reshape_dim(1, (h0, h1))
     .reshape_dim(0, (n_p_tiles, d_packed))
@@ -372,7 +372,7 @@ Use `tile_dims` to tile only specific dimensions while iterating others as grid-
 stat_ts = tile_stream.tile(weight_buf, (_pmax, I128_tile), tile_dims=(0, 2), iter_order=ColMajor())
 ```
 
-### Bias Broadcast via TensorView (Preferred over tile_view)
+### Bias Broadcast via a View (Preferred over tile_view)
 
 Instead of using `tile_view` to broadcast per-tile, apply `expand` and `broadcast` on the tensor before tiling, then use `tile_dims` to make the original dimension grid-only.
 
@@ -383,7 +383,7 @@ Instead of using `tile_view` to broadcast per-tile, apply `expand` and `broadcas
 # With tile_view (may be removed):
 bias_ts = tile_stream.tile(bias_buf, (h0, 1), tile_view=view().broadcast(-1, bxs_tile))
 
-# Preferred: TensorView before tiling
+# Preferred: build the view before tiling
 bias_expanded = bias_buf.expand(2).broadcast(2, bxs_tile)  # (h0, h1, bxs_tile)
 bias_ts = tile_stream.tile(bias_expanded, (h0, bxs_tile), tile_dims=(0, 2))
 # h1 is grid-only → each tile is (h0, bxs_tile), iterating h1 times
@@ -402,7 +402,7 @@ blas.Matmul(
 
 ### Slice Before Tiling
 
-When the allocated buffer is larger than needed (e.g., output P < allocated P), slice the TensorView before `tile()`.
+When the allocated buffer is larger than needed (e.g., output P < allocated P), slice the view before `tile()`.
 
 ```python
 out_sb = tile_stream.alloc_logical((_pmax * n_tiles, BxS * _q_width), _pmax, nl.bfloat16)
@@ -412,8 +412,8 @@ dst_ts = tile_stream.tile(out_sb_sliced, (I128_tile, BxS * _q_width))
 
 ### Store with Reshape to HBM
 
-Apply TensorView reshaping on source and destination when storing back to HBM.
+Apply view reshaping on source and destination when storing back to HBM.
 
 ```python
-dma.store(dst=TensorView(output).select(1, lnc_id), src=out_buf.reshape_dim(1, (h1, bxs)))
+dma.store(dst=output.select(1, lnc_id), src=out_buf.reshape_dim(1, (h1, bxs)))
 ```

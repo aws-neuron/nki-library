@@ -122,6 +122,7 @@ def build_attention_cte_input(
     position_bias=None,
     bias_layout="dense",
     bias_band_params=None,
+    d_v=None,
 ):
     """Generate kernel inputs as a dict matching the attention_cte kernel signature."""
     softmax_dtype = dtype_mapping[softmax_dtype]
@@ -136,12 +137,13 @@ def build_attention_cte_input(
     random_gen = np_random_sample()
     q = random_gen(shape=(bs, seqlen_q, d) if tp_q else (bs, d, seqlen_q), dtype=dtype)
     k = random_gen(shape=(bs_kv, seqlen_kv, d) if tp_k else (bs_kv, d, seqlen_kv), dtype=dtype)
-    v = random_gen(shape=(bs_kv, seqlen_kv, d), dtype=dtype)
+    d_v_actual = d_v if d_v is not None else d
+    v = random_gen(shape=(bs_kv, seqlen_kv, d_v_actual), dtype=dtype)
 
     k_prior, v_prior, prior_used_len_t = None, None, None
     if is_prefix_caching:
         k_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d) if tp_k else (bs_kv, d, seqlen_kv_prior), dtype=dtype)
-        v_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d), dtype=dtype)
+        v_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d_v_actual), dtype=dtype)
         prior_used_len_t = dt.static_cast(np.full(shape=(1,), fill_value=prior_used_len, dtype=nl.int32), nl.int32)
 
     # Make sink a big value to be sensitive
@@ -426,6 +428,8 @@ class TestRangedAttentionCTEKernels:
         softmax_dtype=np.float32,
         mm_out_dtype=np.float32,
         n_packed_sequences=None,
+        d_v=None,
+        allow_vector_exp=None,
     ):
         skip_validation = False
         seqlen_kv_total = (seqlen_kv + seqlen_kv_prior) if seqlen_kv_prior else seqlen_kv
@@ -433,7 +437,7 @@ class TestRangedAttentionCTEKernels:
             skip_validation = True
 
         def input_generator(test_config):
-            return build_attention_cte_input(
+            kernel_input = build_attention_cte_input(
                 bs=bs,
                 bs_kv=bs_kv,
                 d=d,
@@ -458,7 +462,11 @@ class TestRangedAttentionCTEKernels:
                 softmax_dtype=softmax_dtype,
                 mm_out_dtype=mm_out_dtype,
                 n_packed_sequences=n_packed_sequences,
+                d_v=d_v,
             )
+            if allow_vector_exp is not None:
+                kernel_input["allow_vector_exp"] = allow_vector_exp
+            return kernel_input
 
         # Build custom validation args when skipping validation for large configs
         custom_validation = None
@@ -545,6 +553,20 @@ class TestRangedAttentionCTEKernels:
         [1, 9216, 9216, 512, 1.000, nl.bfloat16, True, False, False, None],
         # 32k seqlen
         [1, 32768, 32768, 256, 1.000, nl.bfloat16, True, False, True, None],
+        # Wan VAE attention regression: d=384 selects three D tiles and flash sections.
+        pytest.param(
+            1,
+            4096,
+            128,
+            384,
+            1.000,
+            nl.bfloat16,
+            False,
+            True,
+            False,
+            None,
+            marks=pytest.mark.fast,
+        ),
 
     ]
     # fmt: on
@@ -566,6 +588,10 @@ class TestRangedAttentionCTEKernels:
         tp_out,
         tpbSgCyclesSum,  # FIXME: use qor once framework supports
     ):
+        # Deterministic timeout at skv=sq=16400, d=128: inference exceeds the 55s
+        # profile-capture limit on trn3.
+        if platform_target == Platforms.TRN3 and seqlen_kv == 16 * 1024 + 16 and d == 128:
+            pytest.xfail("Persistent inference timeout (55s profile-capture limit) on trn3 at skv=sq=16400, d=128")
         compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
@@ -591,6 +617,72 @@ class TestRangedAttentionCTEKernels:
             softmax_scale=softmax_scale,
             cp_rank_id=None,
             use_cp=False,
+        )
+
+    # fmt: off
+    # DeepSeek V3 MLA: d_v != d (V head dim differs from Q/K head dim)
+    attention_cte_mla_dv_unit_params = "bs, seqlen_kv, seqlen_q, d, d_v, softmax_scale, dtype, causal_mask, tp_q, tp_out, tpbSgCyclesSum"
+    attention_cte_mla_dv_unit_perms = [
+        # DeepSeek V3 MLA: d=192 (Q/K latent), d_v=128 (V head dim)
+        [1, 4096, 4096, 192, 128, 1.000, nl.bfloat16, True, True, False, None],
+        [1, 4096, 4096, 192, 128, 1.000, nl.bfloat16, True, False, True, None],
+        [1, 4096, 4096, 192, 128, 1.000, nl.bfloat16, False, True, False, None],
+        # Larger seqlen
+        [1, 8192, 8192, 192, 128, 1.000, nl.bfloat16, True, True, False, None],
+        # GQA: bs > 1
+        [4, 4096, 4096, 192, 128, 1.000, nl.bfloat16, True, True, False, None],
+        # d=256, d_v=128 (hypothetical MLA variant)
+        [1, 4096, 4096, 256, 128, 1.000, nl.bfloat16, True, False, False, None],
+        # d=128, d_v=64 (smaller MLA variant)
+        [1, 4096, 4096, 128, 64, 1.000, nl.bfloat16, True, True, False, None],
+    ]
+    # fmt: on
+
+    @pytest_parametrize(attention_cte_mla_dv_unit_params, attention_cte_mla_dv_unit_perms, abbrevs=_ATTN_CTE_ABBREVS)
+    def test_attention_cte_mla_dv_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        seqlen_kv,
+        seqlen_q,
+        d,
+        d_v,
+        softmax_scale,
+        dtype,
+        causal_mask,
+        tp_q,
+        tp_out,
+        tpbSgCyclesSum,
+    ):
+        """Test attention_cte with d_v != d (MLA: Multi-Latent Attention)."""
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        self.run_attention_cte_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            collector=collector,
+            bool_dims={
+                CAUSAL_MASK_DIM_NAME: causal_mask,
+                TP_Q_DIM_NAME: tp_q,
+                TP_OUT_DIM_NAME: tp_out,
+                TP_K_DIM_NAME: False,
+                SINK_DIM_NAME: False,
+            },
+            bs=bs,
+            bs_kv=bs,
+            cache_softmax=False,
+            cp_degree=None,
+            d=d,
+            dtype=dtype,
+            seqlen_kv=seqlen_kv,
+            seqlen_kv_prior=None,
+            seqlen_q=seqlen_q,
+            sliding_window=0,
+            softmax_scale=softmax_scale,
+            cp_rank_id=None,
+            use_cp=False,
+            d_v=d_v,
         )
 
     # fmt: off
@@ -727,6 +819,71 @@ class TestRangedAttentionCTEKernels:
             cp_rank_id=None,
             use_cp=False,
             prior_used_len=prior_used_len,
+        )
+
+    # fmt: off
+    attention_cte_allow_vector_exp_unit_params = \
+        "vnc_degree, bs, seqlen_kv, seqlen_q, prior_len, prior_used_len, d, softmax_scale, dtype, causal_mask, tp_q, tp_k, tp_out"
+    attention_cte_allow_vector_exp_unit_perms = [
+        # d=128 causal, without and with prior KV
+        [2, 1, 4096, 4096, None, None, 128, 1.0, nl.bfloat16, True, False, False, True],
+        [2, 1, 4096, 4096, 2048, 1543, 128, 1.0, nl.bfloat16, True, False, False, True],
+    ]
+    # fmt: on
+
+    @pytest.mark.parametrize("allow_vector_exp", [True, False])
+    @pytest_parametrize(
+        attention_cte_allow_vector_exp_unit_params,
+        attention_cte_allow_vector_exp_unit_perms,
+        abbrevs=_ATTN_CTE_ABBREVS,
+    )
+    def test_attention_cte_allow_vector_exp_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        vnc_degree,
+        bs,
+        seqlen_kv,
+        seqlen_q,
+        prior_len,
+        prior_used_len,
+        d,
+        softmax_scale,
+        dtype,
+        causal_mask,
+        tp_q,
+        tp_k,
+        tp_out,
+        allow_vector_exp,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
+        self.run_attention_cte_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            collector=collector,
+            bool_dims={
+                CAUSAL_MASK_DIM_NAME: causal_mask,
+                TP_Q_DIM_NAME: tp_q,
+                TP_OUT_DIM_NAME: tp_out,
+                TP_K_DIM_NAME: tp_k,
+                SINK_DIM_NAME: False,
+            },
+            bs=bs,
+            bs_kv=bs,
+            cache_softmax=False,
+            cp_degree=None,
+            d=d,
+            dtype=dtype,
+            seqlen_kv=seqlen_kv,
+            seqlen_kv_prior=prior_len,
+            seqlen_q=seqlen_q,
+            sliding_window=0,
+            softmax_scale=softmax_scale,
+            cp_rank_id=None,
+            use_cp=False,
+            prior_used_len=prior_used_len,
+            allow_vector_exp=allow_vector_exp,
         )
 
     # fmt: off
@@ -1173,6 +1330,9 @@ class TestRangedAttentionCTEKernels:
         [3, 2048, 4096, 64, 1.0, nl.bfloat16, True, False, False, 0, 2, True, 0, 263e6],
         [3, 2048, 4096, 64, 1.0, nl.bfloat16, True, False, False, 0, 2, True, 256, 212e6],
         [1, 2048, 2048, 64, 1.0, nl.bfloat16, True, False, False, 0, 1, True, 512, 95e6],
+        # SWA + CP + tp_k, cp_strided_q_slicing=False variant -> dynamic-offset K load
+        # (arcs 2597/2635/2637/2692/2694/2696); sliding_window=128 leaves partial final sub-transposes.
+        [1, 512, 1024, 64, 1.0, nl.bfloat16, True, True, False, 0, 2, False, 128, None],
 
         # d > 128 support (CP without prefix caching)
         [4, 1024, 16384, 192, 1.0, nl.bfloat16, True, False, False, 0, 16, False, 0, None],
@@ -2683,6 +2843,9 @@ class TestRangedAttentionCTEKernels:
             (1, None, 2048, 128, 128, 0, None, None, False),
             (1, None, 4096, 128, 128, 0, None, None, False),
             (1, None, 8192, 128, 128, 0, None, None, False),
+            # Prior band spans two 512 K-tiles with a narrow band -> banded prior
+            # out-of-band (return False) + partial-band memset arcs (3562/3567/3737).
+            pytest.param(1, None, 256, 64, 128, 128, 640, 600, False, marks=pytest.mark.fast),
         ],
         ids=[
             "swa_s256_d64",
@@ -2697,6 +2860,7 @@ class TestRangedAttentionCTEKernels:
             "swa_s2048_d128",
             "swa_s4096_d128",
             "swa_s8192_d128",
+            "swa_prefix_prior_oob_s256_prior640_pul600",
         ],
     )
     def test_attention_cte_position_bias_banded(
@@ -2848,6 +3012,7 @@ class TestRangedAttentionCTEKernels:
             bias_band_params,
             cp_striped_input=False,
             skip_output_normalization=False,
+            allow_vector_exp=True,
         ):
             return attention_cte_torch_ref(
                 q=q,

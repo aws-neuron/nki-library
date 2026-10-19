@@ -383,11 +383,12 @@ class DownWeightGradBlocking(nl.NKIObject):
         NUM_I_TP_TILES = div_ceil(I_TP_BLOCK_SIZE, I_TP_TILE_SIZE)
         NUM_B_TILES = div_ceil(B_BLOCK_SIZE, B_TILE_SIZE)
 
-        # Persistent: buffer_degree × (result_tiles + existing_weight_grad)
+        # Persistent: buffer_degree × result_tiles, plus one int32 expert_rows column for the dma_compute scatter
         # Shape: (I_TP_TILE_SIZE, NUM_I_TP_TILES, H_BLOCK_SIZE) → free = NUM_I_TP_TILES * H_BLOCK_SIZE
-        # Both accumulators follow the grad-output dtype (fp32 when caller preallocates fp32 grad HBM).
+        # The accumulator follows the grad-output dtype (fp32 when caller preallocates fp32 grad HBM).
         grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
-        persistent_bytes = 2 * self.get_buffer_degree(grad_accum_dtype) * NUM_I_TP_TILES * H_BLOCK_SIZE * grad_elem
+        accum_bytes = self.get_buffer_degree(grad_accum_dtype) * NUM_I_TP_TILES * H_BLOCK_SIZE * grad_elem
+        persistent_bytes = accum_bytes + sizeinbytes(nl.int32)
 
         # Inner section: lhs_tiles (B_TILE, NUM_B_TILES, I_TP_BLOCK) + rhs_tiles (B_TILE, NUM_B_TILES, H_BLOCK)
         inner_section_bytes = NUM_B_TILES * (I_TP_BLOCK_SIZE + H_BLOCK_SIZE) * elem
@@ -457,7 +458,7 @@ class HiddenGradBlocking(nl.NKIObject):
             dtype: Compute data type.
             shard_option: Unused, kept for uniform interface.
             affinity_option: Unused, kept for uniform interface.
-            is_tensor_update_accumulating (bool): Whether accumulation buffers are allocated.
+            is_tensor_update_accumulating (bool): Whether the scatter_ids copy may be allocated.
 
         Returns:
             int: Estimated peak SBUF bytes.
@@ -482,15 +483,16 @@ class HiddenGradBlocking(nl.NKIObject):
         NUM_I_TP_TILES = div_ceil(I_TP_BLOCK_SIZE, I_TP_TILE_SIZE)
         NUM_H_INNER_TILES = div_ceil(H_TILE_SIZE, TILE_SIZE)
 
-        # Persistent: buffer_degree × (rhs_temp + result_tiles + optional existing_hidden_grad)
+        # Persistent: buffer_degree × (rhs_temp + result_tiles)
         # rhs_temp: (TILE_SIZE, NUM_H_INNER_TILES, I_TP_BLOCK_SIZE) → free = NUM_H_INNER_TILES * I_TP_BLOCK_SIZE
         # result_tiles: (B_TILE, NUM_B_TILES, H_BLOCK_SIZE) → free = NUM_B_TILES * H_BLOCK_SIZE
-        # rhs_temp stays compute_dtype; the result/existing accumulators follow the grad-output dtype.
+        # rhs_temp stays compute_dtype; the result accumulator follows the grad-output dtype.
         grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
-        result_count = 2 if is_tensor_update_accumulating else 1
-        persistent_bytes = _bd * (
-            NUM_H_INNER_TILES * I_TP_BLOCK_SIZE * elem + result_count * NUM_B_TILES * H_BLOCK_SIZE * grad_elem
-        )
+        persistent_bytes = _bd * (NUM_H_INNER_TILES * I_TP_BLOCK_SIZE * elem + NUM_B_TILES * H_BLOCK_SIZE * grad_elem)
+        if is_tensor_update_accumulating:
+            # scatter_ids: (TILE_SIZE, ceil(B / TILE_SIZE)) int32 copy of the token ids with the padding row
+            # remapped out of bounds. Allocated only when skip_token is False, which is not known here.
+            persistent_bytes += div_ceil(B, TILE_SIZE) * sizeinbytes(nl.int32)
 
         # Inner section: lhs_tiles (I_TP_TILE, NUM_I_TP_TILES, B_BLOCK) + rhs_tiles (I_TP_TILE, NUM_I_TP_TILES, H_BLOCK)
         inner_section_bytes = NUM_I_TP_TILES * (B_BLOCK_SIZE + H_BLOCK_SIZE) * elem
@@ -570,11 +572,12 @@ class GateUpWeightGradBlocking(nl.NKIObject):
         NUM_H_TILES = div_ceil(H_BLOCK_SIZE, H_TILE_SIZE)
         NUM_B_TILES = div_ceil(B_BLOCK_SIZE, B_TILE_SIZE)
 
-        # Persistent: buffer_degree × (weight_grad_accum + existing_weight_grad)
+        # Persistent: buffer_degree × weight_grad_accum, plus one int32 expert_rows column for the dma_compute scatter
         # Shape: (H_TILE, NUM_H_TILES, I_TP_BLOCK_SIZE) → free = NUM_H_TILES * I_TP_BLOCK_SIZE
-        # Both accumulators follow the grad-output dtype (fp32 when caller preallocates fp32 grad HBM).
+        # The accumulator follows the grad-output dtype (fp32 when caller preallocates fp32 grad HBM).
         grad_elem = sizeinbytes(grad_accum_dtype) if grad_accum_dtype is not None else elem
-        persistent_bytes = 2 * self.get_buffer_degree(grad_accum_dtype) * NUM_H_TILES * I_TP_BLOCK_SIZE * grad_elem
+        accum_bytes = self.get_buffer_degree(grad_accum_dtype) * NUM_H_TILES * I_TP_BLOCK_SIZE * grad_elem
+        persistent_bytes = accum_bytes + sizeinbytes(nl.int32)
 
         # Inner section: gate_up_proj_output_grad (B_TILE, NUM_B_TILES, I_TP_BLOCK) + block_hidden_states (B_TILE, NUM_B_TILES, H_BLOCK)
         inner_section_bytes = NUM_B_TILES * (I_TP_BLOCK_SIZE + H_BLOCK_SIZE) * elem
@@ -631,26 +634,26 @@ class MOEBwdParameters(nl.NKIObject):
         N: Number of blocks
 
     Args:
-        hidden_states (nl.ndarray): [T, H], Input hidden states.
-        hidden_states_grad (nl.ndarray): [T, H], Output gradient for hidden states.
-        expert_affinities_masked (nl.ndarray): [T * E, 1], Expert affinities.
-        expert_affinities_masked_grad (nl.ndarray): [T * E, 1], Output gradient for affinities.
-        gate_up_proj_weight (nl.ndarray): [E, H, 2, I_TP], Gate/up projection weights.
-        gate_up_proj_weight_grad (nl.ndarray): [E, H, 2, I_TP], Output gradient for gate/up weights.
-        gate_up_proj_act_checkpoint_T (nl.ndarray): [N, 2, I_TP, B], Checkpointed activations.
-        down_proj_weight (nl.ndarray): [E, I_TP, H], Down projection weights.
-        down_proj_weight_grad (nl.ndarray): [E, I_TP, H], Output gradient for down weights.
-        down_proj_act_checkpoint (nl.ndarray): [N, B, H], Checkpointed down activations.
-        token_position_to_id (nl.ndarray): [N * B], Token position mapping.
-        block_to_expert (nl.ndarray): [N, 1], Expert index per block.
-        output_hidden_states_grad (nl.ndarray): [T, H], Upstream gradient.
+        hidden_states (nl.NkiTensor): [T, H], Input hidden states.
+        hidden_states_grad (nl.NkiTensor): [T, H], Output gradient for hidden states.
+        expert_affinities_masked (nl.NkiTensor): [T * E, 1], Expert affinities.
+        expert_affinities_masked_grad (nl.NkiTensor): [T * E, 1], Output gradient for affinities.
+        gate_up_proj_weight (nl.NkiTensor): [E, H, 2, I_TP], Gate/up projection weights.
+        gate_up_proj_weight_grad (nl.NkiTensor): [E, H, 2, I_TP], Output gradient for gate/up weights.
+        gate_up_proj_act_checkpoint_T (nl.NkiTensor): [N, 2, I_TP, B], Checkpointed activations.
+        down_proj_weight (nl.NkiTensor): [E, I_TP, H], Down projection weights.
+        down_proj_weight_grad (nl.NkiTensor): [E, I_TP, H], Output gradient for down weights.
+        down_proj_act_checkpoint (nl.NkiTensor): [N, B, H], Checkpointed down activations.
+        token_position_to_id (nl.NkiTensor): [N * B], Token position mapping.
+        block_to_expert (nl.NkiTensor): [N, 1], Expert index per block.
+        output_hidden_states_grad (nl.NkiTensor): [T, H], Upstream gradient.
         block_size (int): Tokens per block (128, 256, 512, 1024, 2048, or 4096).
         skip_dma (SkipMode): OOB handling mode.
         compute_dtype (nki.dtype): Computation dtype (default: nl.bfloat16).
         is_tensor_update_accumulating (bool): Accumulate into existing gradients.
         clamp_limits (ClampLimits): Gradient clamping limits.
-        gate_and_up_proj_bias_grad (nl.ndarray, optional): [E, 2, I_TP], Bias gradients.
-        down_proj_bias_grad (nl.ndarray, optional): [E, H], Down bias gradients.
+        gate_and_up_proj_bias_grad (nl.NkiTensor, optional): [E, 2, I_TP], Bias gradients.
+        down_proj_bias_grad (nl.NkiTensor, optional): [E, H], Down bias gradients.
         activation_type (ActFnType): Activation function type.
         blocking_params (MOEBwdDroplessBlockingParams): Blocking hyperparameters.
 
@@ -661,27 +664,27 @@ class MOEBwdParameters(nl.NKIObject):
     """
 
     # Input tensors
-    hidden_states: nl.ndarray
-    expert_affinities_masked: nl.ndarray
-    gate_up_proj_weight: nl.ndarray
-    gate_up_proj_act_checkpoint_T: nl.ndarray
-    down_proj_weight: nl.ndarray
-    token_position_to_id: nl.ndarray
-    block_to_expert: nl.ndarray
-    output_hidden_states_grad: nl.ndarray
+    hidden_states: nl.NkiTensor
+    expert_affinities_masked: nl.NkiTensor
+    gate_up_proj_weight: nl.NkiTensor
+    gate_up_proj_act_checkpoint_T: nl.NkiTensor
+    down_proj_weight: nl.NkiTensor
+    token_position_to_id: nl.NkiTensor
+    block_to_expert: nl.NkiTensor
+    output_hidden_states_grad: nl.NkiTensor
 
     # Output gradient tensors
-    hidden_states_grad: nl.ndarray
-    expert_affinities_masked_grad: nl.ndarray
-    gate_up_proj_weight_grad: nl.ndarray
-    down_proj_weight_grad: nl.ndarray
+    hidden_states_grad: nl.NkiTensor
+    expert_affinities_masked_grad: nl.NkiTensor
+    gate_up_proj_weight_grad: nl.NkiTensor
+    down_proj_weight_grad: nl.NkiTensor
 
     # Optional bias gradients
-    gate_and_up_proj_bias_grad: Optional[nl.ndarray] = None
-    down_proj_bias_grad: Optional[nl.ndarray] = None
+    gate_and_up_proj_bias_grad: Optional[nl.NkiTensor] = None
+    down_proj_bias_grad: Optional[nl.NkiTensor] = None
 
     # Optional Down Projection Activation Checkpoint
-    down_proj_act_checkpoint: Optional[nl.ndarray] = None
+    down_proj_act_checkpoint: Optional[nl.NkiTensor] = None
 
     # Configuration
     block_size: int = 512

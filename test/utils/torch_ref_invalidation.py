@@ -69,9 +69,11 @@ import ast
 import functools
 import hashlib
 import importlib
+import inspect
 import logging
 import os
 import sys
+import textwrap
 from typing import Callable
 
 log = logging.getLogger(__name__)
@@ -264,10 +266,89 @@ def dependency_hash(root_module: str) -> str | None:
     return h.hexdigest()[:16]
 
 
+def _side_effect_writes(torch_ref_fn: Callable) -> list[str]:
+    """Return the distinct captured variables a reference writes into by subscript — the
+    comparator-visible side effect that makes it unsafe to cache. Empty list means none
+    were found (the reference looks cacheable).
+
+    A reference is only safe to cache if its result flows entirely through the returned
+    golden dict. Some test refs instead stash a value in a closure ``holder`` dict as a
+    side effect of running, which a comparator reads back. The cache serves the golden on
+    a HIT without invoking the reference, so the stash never fires and the comparator
+    raises KeyError. Declining to cache such a reference (recompute every run) keeps the
+    stash firing — the fail-closed choice, matching mark_uncacheable's manual opt-out.
+
+    Detection is static and unwraps functools.wraps layers to reach the real closure. It
+    targets the subscript-store form (``holder[k] = v``) because that is how every stash
+    in this codebase is written; other mutation forms (holder.append(...), an aliased or
+    helper-driven write) can evade it, so mark_uncacheable remains the explicit override.
+    A miss here only reverts to needing that decorator, never serves a stale golden.
+    """
+    # inspect.unwrap peels the functools.wraps layers torch_ref_wrapper adds, so we parse the
+    # inner closure's own body (where any stash lives), not the numpy<->torch adapter's.
+    fn = inspect.unwrap(torch_ref_fn)
+    try:
+        # dedent because these refs are nested in test methods -> getsource returns indented text
+        # that ast.parse would reject.
+        src = textwrap.dedent(inspect.getsource(fn))
+    except (OSError, TypeError):
+        return []  # sourceless (builtin / __main__): dependency hashing already declines it
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return []
+    # The first function definition in the parsed source is the reference itself.
+    func = next((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if func is None:
+        return []
+
+    # Phase 1: collect the names bound LOCALLY in the function. Writing a local can't leak to a
+    # comparator, so it is safe; only a write to a name NOT in this set is a captured (free)
+    # variable — the dangerous case. Locals are the parameters plus everything the body binds.
+    local_names: set[str] = {a.arg for a in [*func.args.args, *func.args.kwonlyargs, *func.args.posonlyargs]}
+    if func.args.vararg:
+        local_names.add(func.args.vararg.arg)
+    if func.args.kwarg:
+        local_names.add(func.args.kwarg.arg)
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            local_names.update(t.id for t in node.targets if isinstance(t, ast.Name))  # x = ...
+            for t in node.targets:
+                if isinstance(t, (ast.Tuple, ast.List)):
+                    local_names.update(e.id for e in t.elts if isinstance(e, ast.Name))  # a, b = ...
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            local_names.add(node.target.id)  # x: T = ...
+        elif isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name):
+            local_names.add(node.target.id)  # for x in ...
+
+    # Phase 2: find subscript stores (holder[k] = v / holder[k] += v) whose base is a captured
+    # variable — the stash pattern. Collect the distinct captured names written (deduped).
+    captured: list[str] = []
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Subscript)]  # a[i] = b[j] = v -> both
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Subscript):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            # target.value is the object being indexed (the `holder` in holder[k]); flag it when
+            # it is a bare captured name (not a local, not already recorded).
+            if (
+                isinstance(target.value, ast.Name)
+                and target.value.id not in local_names
+                and target.value.id not in captured
+            ):
+                captured.append(target.value.id)
+    return captured
+
+
 def ref_dependency_hash(torch_ref_fn: Callable) -> str | None:
     """Dependency hash for a torch_ref function, over its module's full transitive
-    in-package import graph. Returns None (uncacheable -> recompute) when the
-    module can't be resolved to a .py file.
+    in-package import graph. Returns None (uncacheable -> recompute) when the reference
+    is unsafe to cache: its module can't be resolved to a .py file, its transitive source
+    fails the purity scan, or it has a comparator-visible side effect (see
+    _side_effect_writes).
 
     Without the module the transitive import graph is invisible, so a body-only
     hash would miss edits to helper functions the reference calls and skip the
@@ -275,6 +356,11 @@ def ref_dependency_hash(torch_ref_fn: Callable) -> str | None:
     fail-closed and preserves the "never a wrong hit" invariant; an unresolvable
     module is a rare edge case (a builtin, or a ref defined in __main__).
     """
+    side_effects = _side_effect_writes(torch_ref_fn)
+    if side_effects:
+        captured = ", ".join(repr(name) for name in side_effects)
+        log.debug("torch-ref cache: declining to cache — writes captured %s by subscript", captured)
+        return None
     module_name = getattr(torch_ref_fn, "__module__", None)
     if module_name and _module_file(module_name):
         # dependency_hash also runs the purity scan (points 1-3) and returns None

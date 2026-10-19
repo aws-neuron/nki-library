@@ -239,10 +239,16 @@ def load_hidden_tensor_tile_opt_fused_add(
             load_packed_hidden_scales(mlp_params, tile_info, constants, indices, output_tile_scales_sbuf_list)
 
 
-def load_bias_vector(bias_tensor_hbm: nl.NkiTensor, data_type: nki.dtype, allocator: Callable) -> nl.NkiTensor:
+def load_bias_vector(
+    bias_tensor_hbm: nl.NkiTensor,
+    data_type: nki.dtype,
+    allocator: Callable,
+    offset: int = 0,
+    size: Optional[int] = None,
+) -> nl.NkiTensor:
     shuffle_group_size = 32
     num_broadcasts = nl.tile_size.pmax // shuffle_group_size
-    bias_vector_len = bias_tensor_hbm.shape[1]
+    bias_vector_len = bias_tensor_hbm.shape[1] - offset if size is None else size
     bias_tensor_sbuf = allocator((nl.tile_size.pmax, bias_vector_len), dtype=data_type)
 
     kernel_assert(
@@ -253,7 +259,7 @@ def load_bias_vector(bias_tensor_hbm: nl.NkiTensor, data_type: nki.dtype, alloca
     shuffle_mask = [0] * shuffle_group_size
     nisa.dma_copy(
         dst=bias_tensor_sbuf[0:1, 0:bias_vector_len],
-        src=bias_tensor_hbm[0:1, 0:bias_vector_len],
+        src=bias_tensor_hbm[0:1, offset : offset + bias_vector_len],
     )
     for b in range(num_broadcasts):
         nisa.nc_stream_shuffle(

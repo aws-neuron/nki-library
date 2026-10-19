@@ -24,10 +24,9 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from neuronxcc.nki._private.private_api import float8_e4m3fn_x4, float8_e5m2_x4  # ty: ignore[unresolved-import]
-from neuronxcc.nki._private.test import mx_util  # ty: ignore[unresolved-import]
 from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_kernel
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
 from typing_extensions import override
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import (
@@ -37,11 +36,8 @@ from test.integration.nkilib.experimental.matmul_mxfp8 import (
     random_input_generator,
 )
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
-from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_utils import (
-    Q_TILE_K,
-    generate_golden_packed_scales,
-)
 from test.utils import common_dataclasses, coverage_parametrized_tests, test_orchestrator
+from test.utils.mx_utils import quantize_mx_golden
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.unit_test_framework import UnitTestFramework
 
@@ -70,7 +66,7 @@ def get_mx_max_exp(dst_dtype: Any) -> int:
     # subtracted one for TRN3 rounding mode
     MAX_EXP_E5M2 = 15 - 1
     MAX_EXP_E4M3FN = 8 - 1
-    max_exp_values = {float8_e5m2_x4: MAX_EXP_E5M2, float8_e4m3fn_x4: MAX_EXP_E4M3FN}
+    max_exp_values = {dtype.float8_e5m2_x4: MAX_EXP_E5M2, dtype.float8_e4m3fn_x4: MAX_EXP_E4M3FN}
     assert dst_dtype in max_exp_values, f"no max exp value provided for {dst_dtype}"
     return max_exp_values.get(dst_dtype)
 
@@ -331,7 +327,7 @@ GRID_PACKED_SCALES = [
         seed=52,
         tile_k=512,
         enable_scale_packing=True,
-        fast_subset={0, 1, 2},
+        fast_subset={0},
     ),
     config_helper.TestConfig(
         M=2048,
@@ -437,7 +433,6 @@ GRID_UNSWIZZLED = [
         TILES_IN_LOAD_N=1,
         description="Square Matrix",
         seed=52,
-        fast_subset={2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -521,7 +516,6 @@ GRID_UNSWIZZLED = [
         description="lhs not swizzled, rhs swizzled",
         seed=52,
         spill_reload=False,
-        fast_subset={1, 2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -542,7 +536,6 @@ GRID_UNSWIZZLED = [
         description="rhs not swizzled, lhs swizzled",
         seed=52,
         spill_reload=False,
-        fast_subset={1, 2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -563,7 +556,7 @@ GRID_UNSWIZZLED = [
         description="lhs pre quantized, rhs not swizzled",
         seed=52,
         spill_reload=False,
-        fast_subset={1, 2},
+        fast_subset={1},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -820,7 +813,6 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Unswizzled LHS only, K=640",
         seed=52,
         spill_reload=False,
-        fast_subset={2},
     ),
     # Non divisible N
     config_helper.TestConfig(
@@ -879,7 +871,6 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Unswizzled LHS only, K=640",
         seed=52,
         spill_reload=False,
-        fast_subset={0, 1},
     ),
     # Spill reload
     config_helper.TestConfig(
@@ -899,7 +890,6 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Spill reload",
         seed=52,
         spill_reload=True,
-        fast_subset={0, 1},
     ),
     # Scale packing
     config_helper.TestConfig(
@@ -918,7 +908,6 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         TILES_IN_LOAD_N=1,
         description="Enable scale packing",
         enable_scale_packing=True,
-        fast_subset={1},
     ),
 ]
 
@@ -942,7 +931,6 @@ GRID_PE_SWIZZLE = [
         description="PE swizzle: minimal",
         seed=52,
         load_with_PE_swizzle=True,
-        fast_subset={2},
     ),
     config_helper.TestConfig(
         M=2048,
@@ -1046,8 +1034,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: both sides",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     config_helper.TestConfig(
         M=1024,
@@ -1067,7 +1055,7 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: LHS only, RHS swizzled",
         seed=52,
-        lhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
     ),
     config_helper.TestConfig(
         M=1024,
@@ -1087,8 +1075,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: K remainder 256",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     # K%512=384
     config_helper.TestConfig(
@@ -1109,8 +1097,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: K%512=384",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     # K%512=256
     config_helper.TestConfig(
@@ -1131,8 +1119,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: K=256 (no full tiles)",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     # K%512=128
     config_helper.TestConfig(
@@ -1153,8 +1141,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: K%512=128",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     # Large shape
     config_helper.TestConfig(
@@ -1175,8 +1163,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: large 4096x4096x3072",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     # Partial-F K-by-F: F multiple of 128 but partial vs the 512-wide load-tile (N=768 RHS, M=768 LHS).
     config_helper.TestConfig(
@@ -1197,8 +1185,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: N%512=256 partial F load-tile",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     config_helper.TestConfig(
         M=768,
@@ -1218,8 +1206,8 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: M%512=256 partial F load-tile",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
     ),
     # Sub-128 partial-F K-by-F: F multiple of 8 but not 128, so the loader reads a partial (<128)
     # final sub-tile (N=520 RHS, M=520 LHS).
@@ -1241,8 +1229,9 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: N=520 sub-128 partial F",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
+        fast_subset={2},
     ),
     config_helper.TestConfig(
         M=520,
@@ -1262,8 +1251,9 @@ GRID_K_BY_F = [
         TILES_IN_LOAD_N=1,
         description="K-by-F: M=520 sub-128 partial F",
         seed=52,
-        lhs_is_f_by_k=False,
-        rhs_is_f_by_k=False,
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
+        fast_subset={2},
     ),
     # NOTE: K-by-F requires F (M for LHS, N for RHS) to be a multiple of MIN_F_FOR_QUANTIZATION (8).
 ]
@@ -1304,8 +1294,6 @@ def build_matmul_inputs(conf):
     Returns:
         dict: kernel_input arguments for kernel execution.
     """
-    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
-
     lhs_fp32, rhs_fp32 = random_input_generator.get_random_inputs(
         {
             "shapes": (conf.M, conf.K, conf.N),
@@ -1319,18 +1307,7 @@ def build_matmul_inputs(conf):
     # wrapX scatters a feature's K into four quarters; 1x32 packs four consecutive
     # K values per feature. Pre-quantized operands are quantized from this layout,
     # so it must match the scheme the kernel loads with.
-    # wrapX must also match the DGT loader the kernel uses: fast DMA reads a K remainder
-    # as one partial tile, the legacy path decomposes it into 256/128 sub-tiles. These are
-    # different (both valid) K permutations at remainder 384, so a pre-swizzled operand
-    # built with the wrong one mispairs k-terms against a DGT-loaded operand.
-    if conf.quant_scheme == "1x32":
-        swizzle = matmul_utils.swizzle_tensor_1x32
-    else:
-
-        def swizzle(src_tensor):
-            return matmul_utils.swizzle_tensor(
-                src_tensor, fast_dma_transpose=getattr(conf, 'fast_dma_transpose', False)
-            )
+    swizzle = matmul_utils.swizzle_tensor_1x32 if conf.quant_scheme == "1x32" else matmul_utils.swizzle_tensor
 
     lhs_swizzled = swizzle(lhs_fp32.numpy().astype(nl.bfloat16).T)
     rhs_swizzled = swizzle(rhs_fp32.numpy().astype(nl.bfloat16))
@@ -1338,50 +1315,42 @@ def build_matmul_inputs(conf):
     # For kernel input, use swizzled or unswizzled based on config
     if conf.lhs_is_swizzled:
         lhs = lhs_swizzled
-    elif not getattr(conf, 'lhs_is_f_by_k', True):
+    elif conf.lhs_orientation == TensorOrientation.K_BY_F:
         # K-by-F: [K, M] layout
-        lhs = lhs_fp32.numpy().astype(nl.bfloat16).T
+        lhs = np.ascontiguousarray(lhs_fp32.numpy().astype(nl.bfloat16).T)
     else:
         lhs = lhs_fp32.numpy().astype(nl.bfloat16)
 
     if conf.rhs_is_swizzled:
         rhs = rhs_swizzled
-    elif not getattr(conf, 'rhs_is_f_by_k', True):
+    elif conf.rhs_orientation == TensorOrientation.K_BY_F:
         # K-by-F: [K, N] layout
         rhs = rhs_fp32.numpy().astype(nl.bfloat16)
     else:
-        rhs = rhs_fp32.numpy().astype(nl.bfloat16).T
+        rhs = np.ascontiguousarray(rhs_fp32.numpy().astype(nl.bfloat16).T)
 
     float8_dtype_x4 = conf.float8_dtype + "_x4" if not conf.float8_dtype.endswith("_x4") else conf.float8_dtype
     float8_dtype_non_x4 = (
         conf.float8_dtype if not conf.float8_dtype.endswith("_x4") else conf.float8_dtype.replace("_x4", "")
     )
-    neuron_float8_dtype_x4 = getattr(dtype, float8_dtype_x4)
     neuron_float8_dtype_non_x4 = getattr(dtype, float8_dtype_non_x4)
+    # quantize_mx_golden keys its internal max-exp/max-val tables on nki.language
+    # dtypes, so pass the nl.* x4 dtype here (views below still use neuron_dtypes).
+    nl_float8_dtype_x4 = getattr(nl, float8_dtype_x4)
     lhs_scales = None
     rhs_scales = None
 
     if conf.lhs_dtype == constants.MatrixPrecision.MXFP8 or conf.lhs_dtype == constants.MatrixPrecision.MXFP8_X4:
-        lhs_quantized_data, lhs_quantized_scales_packed = mx_util.quantize_mx_golden(
-            lhs_swizzled, neuron_float8_dtype_x4, custom_mx_max_exp=_get_mx_max_exp
-        )
-        if conf.enable_scale_packing:
-            lhs_quantized_scales = generate_golden_packed_scales(lhs_quantized_scales_packed, conf.K, conf.M, Q_TILE_K)
-        else:
-            lhs_quantized_scales = matmul_utils.resize_scales_compact_to_oversized_2d(lhs_quantized_scales_packed)
+        lhs_quantized_data, lhs_quantized_scales_packed = quantize_mx_golden(lhs_swizzled, nl_float8_dtype_x4)
+        lhs_quantized_scales = matmul_utils.to_hbm_scales(lhs_quantized_scales_packed)
         lhs = lhs_quantized_data
         lhs_scales = lhs_quantized_scales
         if conf.lhs_dtype == constants.MatrixPrecision.MXFP8:
             lhs = lhs.view(neuron_float8_dtype_non_x4)
 
     if conf.rhs_dtype == constants.MatrixPrecision.MXFP8 or conf.rhs_dtype == constants.MatrixPrecision.MXFP8_X4:
-        rhs_quantized_data, rhs_quantized_scales_packed = mx_util.quantize_mx_golden(
-            rhs_swizzled, neuron_float8_dtype_x4, custom_mx_max_exp=_get_mx_max_exp
-        )
-        if conf.enable_scale_packing:
-            rhs_quantized_scales = generate_golden_packed_scales(rhs_quantized_scales_packed, conf.K, conf.N, Q_TILE_K)
-        else:
-            rhs_quantized_scales = matmul_utils.resize_scales_compact_to_oversized_2d(rhs_quantized_scales_packed)
+        rhs_quantized_data, rhs_quantized_scales_packed = quantize_mx_golden(rhs_swizzled, nl_float8_dtype_x4)
+        rhs_quantized_scales = matmul_utils.to_hbm_scales(rhs_quantized_scales_packed)
         rhs = rhs_quantized_data
         rhs_scales = rhs_quantized_scales
         if conf.rhs_dtype == constants.MatrixPrecision.MXFP8:
@@ -1409,19 +1378,26 @@ def build_matmul_inputs(conf):
         "lhs_is_swizzled": conf.lhs_is_swizzled,
         "rhs_is_swizzled": conf.rhs_is_swizzled,
         **({"load_with_PE_swizzle": True} if conf.load_with_PE_swizzle else {}),
+        **({"fast_dma_transpose": True} if getattr(conf, 'fast_dma_transpose', False) else {}),
         **(
-            {"lhs_is_f_by_k": False}
-            if not conf.lhs_is_swizzled and getattr(conf, 'lhs_is_f_by_k', None) is False
+            {"lhs_orientation": TensorOrientation.K_BY_F}
+            if not conf.lhs_is_swizzled and conf.lhs_orientation == TensorOrientation.K_BY_F
             else {}
         ),
         **(
-            {"rhs_is_f_by_k": False}
-            if not conf.rhs_is_swizzled and getattr(conf, 'rhs_is_f_by_k', None) is False
+            {"rhs_orientation": TensorOrientation.K_BY_F}
+            if not conf.rhs_is_swizzled and conf.rhs_orientation == TensorOrientation.K_BY_F
             else {}
         ),
         **({"lnc_2_shard_rhs": conf.lnc_2_shard_rhs} if conf.lnc_2_shard_rhs is not None else {}),
         "quant_scheme": conf.quant_scheme,
-        "enable_psum_copy_in": conf.enable_psum_copy_in,
+        "psum_copy_in_ratio": conf.psum_copy_in_ratio,
+        **(
+            {"strided_copy_swizzle_1x32_ratio": conf.strided_copy_swizzle_1x32_ratio}
+            if conf.strided_copy_swizzle_1x32_ratio is not None
+            else {}
+        ),
+        **({"disable_dma_transpose": True} if getattr(conf, "disable_dma_transpose", False) else {}),
     }
 
 
@@ -1479,14 +1455,14 @@ def generate_chain(dimension):
 # coverage; bump to widen coverage once the short sweeps are green.
 PE_SWIZZLE_SWEEP_NUM_VALUES = 8
 
-# TODO: expand divisibility coverage in the F (M/N) and K dimensions. generate_pe_swizzle_chain
+# TODO: expand divisibility coverage in the F (M/N) dimension. generate_pe_swizzle_chain
 # currently constrains M and N to multiples of 512 because the folded PE-swizzle load DMA cannot
 # express a partial F-tile (non-512 F shards are rejected by the static bounds checker,
-# NCC_IBIR243), and for the 1x32 path K to multiples of 512 because the FP32-reinterpret transpose
-# asserts tile_k == 512. Once the loaders gain partial-F-tile / K-remainder support, relax these to
-# M/N % 128 and (for 1x32) K % 128 so these sweeps cover non-tile-aligned F and K like
-# test_matmul_mxfp8_sweep does. See also filter_pe_swizzle_combinations' LNC2 N%1024/M%1024 rule,
-# which exists for the same partial-F-tile reason and can be loosened at the same time.
+# NCC_IBIR243). K is sampled on the 128 grid for both loaders: wrapX handles a K remainder tile and
+# the 1x32 FP32-reinterpret transpose now accepts any tile_k that is a multiple of Q_TILE_K (128).
+# Once the loaders gain partial-F-tile support, relax M/N to % 128 so these sweeps cover
+# non-tile-aligned F like test_matmul_mxfp8_sweep does. See also filter_pe_swizzle_combinations'
+# LNC2 N%1024/M%1024 rule, which exists for the same partial-F-tile reason.
 
 
 def generate_pe_swizzle_chain(dimension, num_values=PE_SWIZZLE_SWEEP_NUM_VALUES, seed=52, k_multiple_of_512=False):
@@ -1534,9 +1510,7 @@ def generate_pe_swizzle_chain(dimension, num_values=PE_SWIZZLE_SWEEP_NUM_VALUES,
             chain.append((n_value, *rng.choice(temp)))
     elif dimension == "K":
         rng = random.Random(seed + 2)
-        # wrapX handles a K remainder tile (tile_k < 512), so sample on the 128 grid for
-        # remainder coverage. The 1x32 FP32-reinterpret transpose requires every K-tile to
-        # be a full 512 (asserts tile_k == 512), so for it sample multiples of 512 only.
+        # Both loaders accept any tile_k multiple of 128, so sample the 128 grid for non-%512 K.
         k_population = range(512, 4609, 512) if k_multiple_of_512 else range(128, 2561, 128)
         for k_value in rng.sample(k_population, num_values):
             dummy_config = config_helper.TestConfig(M=1024, N=1024, K=k_value, tile_k=512)
@@ -1680,6 +1654,20 @@ def filter_illegal_combinations(
     )
 
 
+def _orientation_from_token(token):
+    """Map a short orientation node-ID token to a TensorOrientation.
+
+    The 1x32 sweep parametrizes its orientation axes on single-char string tokens
+    ("f"/"k") so the parametrized node IDs stay within the path-length limit without a
+    special case in the shared test-ID formatter. "k" -> K_BY_F, "f" -> F_BY_K. Any
+    non-string value (e.g. None from sweeps that do not parametrize orientation) is
+    returned unchanged.
+    """
+    if isinstance(token, str):
+        return TensorOrientation.K_BY_F if token == "k" else TensorOrientation.F_BY_K
+    return token
+
+
 def filter_pe_swizzle_combinations(
     m_chain,
     n_chain,
@@ -1698,11 +1686,13 @@ def filter_pe_swizzle_combinations(
     lhs_dist=None,
     rhs_dist=None,
     spill_reload=None,
+    lhs_orientation=None,
+    rhs_orientation=None,
 ) -> coverage_parametrized_tests.FilterResult:
     """Filter for the PE-swizzle (wrapX / 1x32) sweeps.
 
     Delegates to filter_illegal_combinations (identical argument order, so partial
-    combinations prune in the same order), then adds three PE-swizzle-specific rules:
+    combinations prune in the same order), then adds four PE-swizzle-specific rules:
 
     1. Prequantized operands (MXFP8 / MXFP8_X4) are pre-swizzled offline, so they must
        carry is_swizzled=True; a prequantized-but-unswizzled operand is nonsensical.
@@ -1715,6 +1705,13 @@ def filter_pe_swizzle_combinations(
        tile or the static bounds checker rejects the load (NCC_IBIR243): N % 1024 == 0
        when sharding RHS, M % 1024 == 0 when sharding LHS. Applied conservatively
        regardless of which operand is sharded (never rejects a compilable config).
+    4. K-by-F (orientation=TensorOrientation.K_BY_F) is only meaningful for a BF16
+       *unswizzled* operand: that is the only layout the PE-swizzle loader consumes as
+       K-by-F. On a swizzled/prequantized operand the orientation is layout-irrelevant
+       (coerced away), so pairing K-by-F with such an operand would not exercise the
+       K-by-F load and is pruned. lhs_orientation / rhs_orientation are None for the
+       wrapX sweep (which does not parametrize them), so this rule only fires for the
+       1x32 sweep.
     """
     base = filter_illegal_combinations(
         m_chain,
@@ -1761,6 +1758,20 @@ def filter_pe_swizzle_combinations(
         if lnc_2_shard_rhs and N % 1024 != 0:
             return coverage_parametrized_tests.FilterResult.INVALID
         if not lnc_2_shard_rhs and M % 1024 != 0:
+            return coverage_parametrized_tests.FilterResult.INVALID
+
+    # Rule 4: K-by-F only valid on a BF16 unswizzled operand (see docstring). Only
+    # enforceable once the operand's dtype and swizzled flag are both known, so
+    # partial combinations during AllPairs generation are not pruned prematurely.
+    # The 1x32 sweep passes short string tokens ("f"/"k"); normalize them to
+    # TensorOrientation here (None from the wrapX sweep is unaffected).
+    lhs_orientation = _orientation_from_token(lhs_orientation)
+    rhs_orientation = _orientation_from_token(rhs_orientation)
+    if lhs_orientation == TensorOrientation.K_BY_F and lhs_dtype is not None and lhs_is_swizzled is not None:
+        if not (lhs_dtype == constants.MatrixPrecision.BFLOAT16 and lhs_is_swizzled is False):
+            return coverage_parametrized_tests.FilterResult.INVALID
+    if rhs_orientation == TensorOrientation.K_BY_F and rhs_dtype is not None and rhs_is_swizzled is not None:
+        if not (rhs_dtype == constants.MatrixPrecision.BFLOAT16 and rhs_is_swizzled is False):
             return coverage_parametrized_tests.FilterResult.INVALID
 
     return coverage_parametrized_tests.FilterResult.VALID
@@ -1837,13 +1848,13 @@ def _mxfp8_comparator(conf, output_dtype, gpu_golden_enabled=False):
 
 
 _ABBREVS = {
-    "lhs_is_swizzled": "lw",
-    "rhs_is_swizzled": "rw",
-    "lhs_dtype": "ld",
-    "rhs_dtype": "rd",
-    "output_dtype": "od",
-    "tile_loop_order": "tl",
-    "block_loop_order": "bl",
+    "lhs_is_swizzled": "u",
+    "rhs_is_swizzled": "v",
+    "lhs_dtype": "a",
+    "rhs_dtype": "b",
+    "output_dtype": "o",
+    "tile_loop_order": "t",
+    "block_loop_order": "g",
     "float8_dtype": "f",
     "lhs_dist": "x",
     "rhs_dist": "y",
@@ -1852,9 +1863,11 @@ _ABBREVS = {
     "k_chain": "k",
     "spill_reload": "s",
     "enable_scale_packing": "p",
-    "enable_psum_copy_in": "c",
+    "psum_copy_in_ratio": "c",
     "lnc_2_shard_rhs": "h",
     "run_with_lnc2": "l",
+    "lhs_orientation": "i",
+    "rhs_orientation": "j",
 }
 
 # TODO: Add quant_scheme=["wrapX", "1x32"] to test_matmul_mxfp8_sweep once pre-quantized/pre-swizzled
@@ -1881,7 +1894,6 @@ GRID_1X32 = [
         description="1x32: minimal",
         seed=52,
         quant_scheme="1x32",
-        fast_subset={0, 1, 2},
     ),
     config_helper.TestConfig(
         M=2048,
@@ -1902,7 +1914,6 @@ GRID_1X32 = [
         description="1x32: square matrix",
         seed=52,
         quant_scheme="1x32",
-        fast_subset={2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -1943,7 +1954,6 @@ GRID_1X32 = [
         description="1x32: non-divisible M",
         seed=52,
         quant_scheme="1x32",
-        fast_subset={0, 1, 2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -1965,7 +1975,6 @@ GRID_1X32 = [
         run_with_lnc2=False,
         seed=52,
         quant_scheme="1x32",
-        fast_subset={0, 1, 2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -1986,7 +1995,6 @@ GRID_1X32 = [
         description="1x32: non-divisible K",
         seed=52,
         quant_scheme="1x32",
-        fast_subset={0, 1, 2},
     ),
     config_helper.TestConfig(
         M=640,
@@ -2008,7 +2016,6 @@ GRID_1X32 = [
         run_with_lnc2=False,
         seed=52,
         quant_scheme="1x32",
-        fast_subset={0, 1, 2},
     ),
     config_helper.TestConfig(
         M=4096,
@@ -2029,7 +2036,142 @@ GRID_1X32 = [
         description="1x32: large shape 4096x4096x1536",
         seed=52,
         quant_scheme="1x32",
-        fast_subset={0, 1, 2},
+    ),
+    # K-by-F 1x32 (both operands unswizzled K-by-F): the layout the fused backward feeds.
+    config_helper.TestConfig(
+        M=512,
+        K=512,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32 K-by-F: both sides",
+        seed=52,
+        quant_scheme="1x32",
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=1536,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=3,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=4,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32 K-by-F: non-square",
+        seed=52,
+        quant_scheme="1x32",
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
+    ),
+    # K-by-F 1x32 with a sub-128 partial-F operand (N=520 -> RHS free dim not %128).
+    config_helper.TestConfig(
+        M=512,
+        K=512,
+        N=520,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32 K-by-F: partial-F N=520",
+        run_with_lnc2=False,
+        seed=52,
+        quant_scheme="1x32",
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
+    ),
+    # Flexible K: K=2304 (K % 512 != 0) tiles as 4 x 512 + a 256 remainder that load_block
+    # loads via the 1x32 path. Mirrors the Qwen3-235B TP4 QKV backward dX contraction.
+    config_helper.TestConfig(
+        M=512,
+        K=2304,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=4,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32 flexible-K: K=2304 tile_k=512 (256 remainder)",
+        seed=52,
+        quant_scheme="1x32",
+        fast_subset={0},
+    ),
+    # Flexible K with a K-by-F operand (the layout the fused QKV backward dX phase feeds).
+    config_helper.TestConfig(
+        M=512,
+        K=2304,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=4,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32 flexible-K K-by-F: K=2304 tile_k=512 (256 remainder)",
+        seed=52,
+        quant_scheme="1x32",
+        lhs_orientation=TensorOrientation.K_BY_F,
+        rhs_orientation=TensorOrientation.K_BY_F,
+    ),
+    # Flexible K where the 384 remainder splits into a 256 + a 128 sub-tile (K=1920 = 3 x 512 + 384).
+    config_helper.TestConfig(
+        M=512,
+        K=1920,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=4,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="1x32 flexible-K: K=1920 tile_k=512 (256+128 remainder)",
+        seed=52,
+        quant_scheme="1x32",
     ),
 ]
 
@@ -2216,7 +2358,6 @@ class TestMatmulMxfp8GenericKernel:
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID_K_BY_F))
     def test_matmul_mxfp8_k_by_f(self, test_manager, conf, platform_target):
         """Test matmul with K-by-F unswizzled BF16 inputs (PE swizzle auto-forced)."""
@@ -2319,7 +2460,7 @@ class TestMatmulMxfp8GenericKernel:
         rhs_dist=get_dists(num=SWEEP_NUM_VALUES, edge_rate=0.3),
         spill_reload=[True, False],
         enable_scale_packing=[True, False],
-        enable_psum_copy_in=[True, False],
+        psum_copy_in_ratio=[1, 0],
         filter=filter_illegal_combinations,
         coverage="singles",
         enable_automatic_boundary_tests=False,  # TODO: Fix assertions
@@ -2348,7 +2489,7 @@ class TestMatmulMxfp8GenericKernel:
         rhs_is_swizzled,
         spill_reload,
         lnc_2_shard_rhs,
-        enable_psum_copy_in,
+        psum_copy_in_ratio,
     ):
         if not platform_target.is_trn3():
             pytest.skip("MX is only supported on TRN3.")
@@ -2384,7 +2525,7 @@ class TestMatmulMxfp8GenericKernel:
             enable_scale_packing=enable_scale_packing,
             lnc_2_shard_rhs=lnc_2_shard_rhs,
         )
-        conf.enable_psum_copy_in = enable_psum_copy_in
+        conf.psum_copy_in_ratio = psum_copy_in_ratio
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if run_with_lnc2 else 1,
             platform_target=platform_target,
@@ -2415,15 +2556,19 @@ class TestMatmulMxfp8GenericKernel:
         rhs_is_swizzled,
         spill_reload,
         lnc_2_shard_rhs,
-        enable_psum_copy_in,
+        psum_copy_in_ratio,
         *,
         load_with_PE_swizzle=False,
         quant_scheme="wrapX",
+        lhs_orientation=None,
+        rhs_orientation=None,
     ):
         """Build the TestConfig for a PE-swizzle sweep case and run it.
 
         Mirrors test_matmul_mxfp8_sweep's config construction, adding the load-path
         discriminator (load_with_PE_swizzle for wrapX, quant_scheme="1x32" for 1x32).
+        lhs_orientation / rhs_orientation default to None (F-by-K); pass
+        TensorOrientation.K_BY_F to feed a K-by-F operand through the loader.
         fast_dma_transpose is intentionally never set so these sweeps stay A0-safe.
         """
         M, tile_m, TILES_IN_BLOCK_M, TILES_IN_LOAD_M = m_chain
@@ -2459,8 +2604,10 @@ class TestMatmulMxfp8GenericKernel:
             lnc_2_shard_rhs=lnc_2_shard_rhs,
             load_with_PE_swizzle=load_with_PE_swizzle,
             quant_scheme=quant_scheme,
+            lhs_orientation=lhs_orientation,
+            rhs_orientation=rhs_orientation,
         )
-        conf.enable_psum_copy_in = enable_psum_copy_in
+        conf.psum_copy_in_ratio = psum_copy_in_ratio
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if run_with_lnc2 else 1,
             platform_target=platform_target,
@@ -2495,7 +2642,7 @@ class TestMatmulMxfp8GenericKernel:
         rhs_dist=get_dists(num=3, edge_rate=0.3),
         spill_reload=[True, False],
         enable_scale_packing=[True, False],
-        enable_psum_copy_in=[True, False],
+        psum_copy_in_ratio=[1, 0],
         filter=filter_pe_swizzle_combinations,
         coverage="singles",
         enable_automatic_boundary_tests=False,
@@ -2524,7 +2671,7 @@ class TestMatmulMxfp8GenericKernel:
         rhs_is_swizzled,
         spill_reload,
         lnc_2_shard_rhs,
-        enable_psum_copy_in,
+        psum_copy_in_ratio,
     ):
         """Coverage sweep for the wrapX PE-swizzle load path (unswizzled BF16, on-chip
         nc_transpose). Same parameter order as test_matmul_mxfp8_sweep, restricted to
@@ -2553,14 +2700,15 @@ class TestMatmulMxfp8GenericKernel:
             rhs_is_swizzled,
             spill_reload,
             lnc_2_shard_rhs,
-            enable_psum_copy_in,
+            psum_copy_in_ratio,
             load_with_PE_swizzle=True,
         )
 
     @pytest.mark.coverage_parametrize(
         m_chain=generate_pe_swizzle_chain("M"),
         n_chain=generate_pe_swizzle_chain("N"),
-        k_chain=generate_pe_swizzle_chain("K", k_multiple_of_512=True),
+        # Flexible K: sample on the 128 grid (non-%512), now that the 1x32 loader accepts it.
+        k_chain=generate_pe_swizzle_chain("K"),
         lhs_is_swizzled=[True, False],
         rhs_is_swizzled=[True, False],
         lnc_2_shard_rhs=[True, False],
@@ -2583,7 +2731,15 @@ class TestMatmulMxfp8GenericKernel:
         rhs_dist=get_dists(num=3, edge_rate=0.3),
         spill_reload=[True, False],
         enable_scale_packing=[True, False],
-        enable_psum_copy_in=[True, False],
+        psum_copy_in_ratio=[1, 0],
+        # Orientation axes are parametrized on single-char string tokens ("f"/"k")
+        # that map to TensorOrientation.{F_BY_K,K_BY_F} in the test body. The token
+        # renders as a one-char node-ID value, keeping IDs within the path limit
+        # without a special case in the shared test-ID formatter. "f" (rather than
+        # None) marks the F-by-K arm: it is behaviorally identical to None on this
+        # load path (both resolve to the kernel's F-by-K default).
+        lhs_orientation=["f", "k"],
+        rhs_orientation=["f", "k"],
         filter=filter_pe_swizzle_combinations,
         coverage="singles",
         enable_automatic_boundary_tests=False,
@@ -2612,13 +2768,19 @@ class TestMatmulMxfp8GenericKernel:
         rhs_is_swizzled,
         spill_reload,
         lnc_2_shard_rhs,
-        enable_psum_copy_in,
+        psum_copy_in_ratio,
+        lhs_orientation,
+        rhs_orientation,
     ):
         """Coverage sweep for the 1x32 PE-swizzle load path (unswizzled BF16, FP32-reinterpret
         nc_transpose). Same parameter order as test_matmul_mxfp8_sweep, restricted to BF16
-        unswizzled operands with quant_scheme="1x32". No fast_dma_transpose (A0-safe)."""
+        unswizzled operands with quant_scheme="1x32". Sweeps both F-by-K and K-by-F operand
+        layouts (lhs_orientation / rhs_orientation); K-by-F is the layout the fused backward feeds.
+        No fast_dma_transpose (A0-safe)."""
         if not platform_target.is_trn3():
             pytest.skip("MX is only supported on TRN3.")
+        # Orientation axes are parametrized on short string tokens ("f"/"k") to keep
+        # node IDs within the path-length limit; map them back to TensorOrientation.
         self._run_pe_swizzle_sweep_case(
             test_manager,
             platform_target,
@@ -2640,8 +2802,10 @@ class TestMatmulMxfp8GenericKernel:
             rhs_is_swizzled,
             spill_reload,
             lnc_2_shard_rhs,
-            enable_psum_copy_in,
+            psum_copy_in_ratio,
             quant_scheme="1x32",
+            lhs_orientation=_orientation_from_token(lhs_orientation),
+            rhs_orientation=_orientation_from_token(rhs_orientation),
         )
 
     @pytest.mark.parametrize("conf", populate_tests(GRID_1X32))
@@ -2681,6 +2845,45 @@ class TestMatmulMxfp8GenericKernel:
         )
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("K", [512, 896])
+    @pytest.mark.parametrize("enable_scale_packing", [False, True])
+    @pytest.mark.parametrize("spill_reload", [False, True])
+    def test_matmul_mxfp8_1x32_f_tail(self, test_manager, platform_target, K, enable_scale_packing, spill_reload):
+        """Validate F tails without BF16 zero-fill, including spill reload and K remainders."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        np.random.seed(42)
+        conf = config_helper.TestConfig(
+            M=400,
+            K=K,
+            N=1040,
+            lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+            lhs_is_swizzled=False,
+            rhs_is_swizzled=False,
+            lhs_orientation=TensorOrientation.K_BY_F,
+            rhs_orientation=TensorOrientation.K_BY_F,
+            tile_m=128,
+            tile_n=512,
+            tile_k=512,
+            TILES_IN_BLOCK_K=1 if K == 512 else 2,
+            TILES_IN_BLOCK_M=2,
+            TILES_IN_BLOCK_N=1,
+            TILES_IN_LOAD_M=2,
+            TILES_IN_LOAD_N=1,
+            run_with_lnc2=False,
+            quant_scheme="1x32",
+            disable_dma_transpose=True,
+            enable_scale_packing=enable_scale_packing,
+            spill_reload=spill_reload,
+        )
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=1,
             platform_target=platform_target,
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)

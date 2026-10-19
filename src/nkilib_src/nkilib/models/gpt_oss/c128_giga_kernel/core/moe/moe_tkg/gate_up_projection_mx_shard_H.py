@@ -39,7 +39,6 @@ from ...utils.kernel_helpers import (
     div_ceil,
     get_nl_act_fn_from_type,
 )
-from ...utils.tensor_view import as_nki_tensor
 from .mlp_parameters import MLPParameters
 from .mlp_tkg_constants import MLPTKGConstantsDimensionSizes
 from .projection_mx_constants import (
@@ -433,7 +432,7 @@ def _load_gate_up_weights(
         gate_up_weights_view = gate_up_weights.select(dim=0, index=gate_up_weights_E_offset).slice(
             dim=2, start=shard_id * n_H512_tile_sharded, end=(shard_id + 1) * n_H512_tile_sharded
         )
-        nisa.dma_copy(dst=weight_sb, src=as_nki_tensor(gate_up_weights_view), dge_mode=nisa.dge_mode.hwdge)
+        nisa.dma_copy(dst=weight_sb, src=gate_up_weights_view, dge_mode=nisa.dge_mode.hwdge)
     return weight_sb.view(gate_up_weights.dtype)
 
 

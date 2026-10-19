@@ -11,11 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""All-to-all-v combine plus unpermute kernel for MoE training.
-
-Mirror of ``permute_a2av`` that re-permutes fixed-stride expert output into a packed send buffer, exchanges via
-``ncc.all_to_all_v``, then scatter-adds received rows to original token positions.
-"""
+"""Capacity-bounded all-to-all-v combine and unpermute for MoE training."""
 
 import nki
 import nki.collectives as ncc
@@ -27,249 +23,218 @@ from nki.isa.constants import oob_mode
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
 from .a2av_train_utils import (
+    _A2AV_METADATA_NUM_ROWS,
+    _LNC2_CORE_IDS,
     _exclusive_cumsum_u32,
-    _validate_a2av_indices_counts,
-    _write_a2av_v_metadata,
+    _validate_metadata_extent,
+    _validate_packed_indices_counts,
+    _validate_trn3_a2av_group_size,
+    _write_packed_a2av_v_metadata,
 )
 
 TILE_SIZE = 128
 
 
-@nki.jit
-def unpermute_a2av(
-    output: nl.ndarray,
-    send_indices: nl.ndarray,
-    recv_counts: nl.ndarray,
-    replica_group: ReplicaGroup,
-) -> nl.ndarray:
-    """All-to-all-v combine and unpermute to original token order.
-
-    Accepts fixed-stride expert output (source ``s`` at rows ``[s*T, s*T + recv_counts[s])``),
-    re-permutes into a packed send buffer using ``cumsum(recv_counts)`` offsets, builds the
-    ``(4, EP)`` metadata, exchanges via ``ncc.all_to_all_v``, then scatter-adds received rows
-    to original token positions via ``send_indices``.
-
-    TODO: Specify intended usage range (e.g., T per rank, H, EP degree, top-k).
-
-    Dimensions:
-        T:  number of original local tokens (SP sharded).
-        H:  hidden dimension.
-        EP: number of expert-parallel ranks.
-
-    Args:
-        output (nl.ndarray): [EP*T, H]@HBM. Expert output in fixed-stride
-            layout: source ``s`` contributes at rows
-            ``[s*T, s*T + recv_counts[s])``.
-        send_indices (nl.ndarray): [T, EP]@HBM, int32. MoE routing table
-            shared with dispatch: ``send_indices[t, d]`` is the original
-            local-token row that source rank ``d`` produces the ``t``-th
-            contribution for. On combine we scatter-add the received rows
-            into those original positions. Entries with value = T are
-            skipped (via ``oob_mode.skip``).
-        recv_counts (nl.ndarray): [1, EP]@HBM, int32/uint32. Original dispatch
-            ``recv_counts`` — used as combine's send-counts (metadata row 0).
-        replica_group (ReplicaGroup): EP replica group.
-
-    Returns:
-        result (nl.ndarray): [T, H]@HBM. Output in original token order.
-
-    Notes:
-        - Supports top-k > 1 because the scatter accumulates across all EP
-          contributions.
-        - With LNC=2, EP is partitioned across cores and partial results are
-          combined via ``nisa.sendrecv`` before core 0 writes the final output.
-
-    Pseudocode:
-        rdispls = exclusive_cumsum(recv_counts)                # [EP]
-        send_hbm = zeros((EP*T, H))
-        for src_rank_idx in range(EP):
-            for tile_idx in range(div_ceil(T, TILE_SIZE)):
-                tile_start = tile_idx * TILE_SIZE
-                tile_end = min(tile_start + TILE_SIZE, T)
-                tile = output[src_rank_idx*T + tile_start : src_rank_idx*T + tile_end]
-                dst_rows = arange(tile_start, tile_end) + rdispls[src_rank_idx]
-                send_hbm[dst_rows] = tile
-        metadata = build_metadata(recv_counts, rdispls, H, EP)  # [4, EP]
-        got_hbm = all_to_all_v(send_hbm, metadata, replica_group)
-
-        partial = zeros((T, H))  # per core shard
-        for dest_rank_idx in shard(range(EP), across_cores):
-            base = dest_rank_idx * T
-            for tile_idx in range(div_ceil(T, TILE_SIZE)):
-                idx = send_indices[tile_start:tile_end, dest_rank_idx]   # with OOB skip
-                partial[idx] += got_hbm[base + tile_start : base + tile_end]
-        result = all_reduce_across_cores(partial)   # via sendrecv
-        return result  # only core 0 writes result
-    """
-    _, H = output.shape
-    T = send_indices.shape[0]
-    EP = send_indices.shape[1]
-    dtype = output.dtype
-    NUM_TILES = div_ceil(T, TILE_SIZE)
-
-    # Shape / dtype validation.
-    _validate_a2av_indices_counts(send_indices, recv_counts, T, EP)
-    kernel_assert(
-        tuple(output.shape) == (EP * T, H),
-        f"output must be (EP*T={EP * T}, H={H}), got {tuple(output.shape)}",
-    )
-
-    # Step 1: exclusive cumsum of recv_counts -> scatter displacements.
-    rc_sb, sdispls_sb, sdispls_hbm = _exclusive_cumsum_u32(recv_counts, EP)
-
-    # Step 2: unpermute fixed-stride `output` into packed `send_hbm`.
-    send_hbm = nl.ndarray((EP * T, H), dtype=dtype, buffer=nl.shared_hbm, name="comb_send_pk")
-    sdispls_hbm_1d = sdispls_hbm.reshape((EP,))
-
-    for src_rank_idx in nl.sequential_range(EP):
-        for tile_idx in nl.affine_range(NUM_TILES):
-            ts = tile_idx * TILE_SIZE
-            te = min(ts + TILE_SIZE, T)
-            tsize = te - ts
-
-            tile_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
-            # Slice src to the actual tile width (tsize). The final tile is shorter
-            # than TILE_SIZE when T is not a multiple of TILE_SIZE (e.g. T=64 when
-            # the per-device token count b_local*s_local < 128), so a fixed
-            # +TILE_SIZE src read has more elements than dst=tile_sb[0:tsize] and
-            # dma_copy asserts "src and dst have the same number of elements"
-            # (src=TILE_SIZE*H, dst=tsize*H). Downstream only consumes tsize rows.
+def _scatter_expert_rows(
+    data: nl.NkiTensor,
+    row_indices: nl.NkiTensor,
+    send_buffer: nl.NkiTensor,
+):
+    """Scatter a full row permutation directly into the communication buffer."""
+    rows, hidden = data.shape
+    num_programs = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1
+    program_id = nl.program_id(axis=0) if nl.program_ndim() != 0 else 0
+    num_tiles = div_ceil(rows, TILE_SIZE)
+    tiles_per_program = div_ceil(num_tiles, num_programs)
+    first_tile = program_id * tiles_per_program
+    indices_2d = row_indices.reshape((rows, 1))
+    for tile_offset in nl.sequential_range(tiles_per_program):
+        tile_index = min(first_tile + tile_offset, num_tiles - 1)
+        if first_tile + tile_offset < num_tiles:
+            start = tile_index * TILE_SIZE
+            end = min(start + TILE_SIZE, rows)
+            tile_rows = end - start
+            indices_sb = nl.ndarray((TILE_SIZE, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.memset(dst=indices_sb, value=rows)
+            nisa.dma_copy(dst=indices_sb[:tile_rows, :], src=indices_2d[start:end, :])
+            data_sb = nl.ndarray((TILE_SIZE, hidden), dtype=data.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=data_sb[:tile_rows, :], src=data[start:end, :])
             nisa.dma_copy(
-                dst=tile_sb[0:tsize, :],
-                src=output[src_rank_idx * T + ts : src_rank_idx * T + ts + tsize, :],
-            )
-
-            disp_tile = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.dma_copy(
-                dst=disp_tile,
-                src=sdispls_hbm_1d.ap(pattern=[[0, TILE_SIZE], [1, 1]], offset=src_rank_idx),
-            )
-            iota_sb = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.iota(dst=iota_sb, pattern=[[0, 1]], offset=0, channel_multiplier=1)
-            row_idx = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_scalar(data=iota_sb, op0=nl.add, operand0=ts, dst=row_idx)
-            nisa.tensor_tensor(row_idx, row_idx, disp_tile, op=nl.add)
-
-            nisa.dma_copy(
-                dst=send_hbm.ap(
-                    pattern=[[EP * T, TILE_SIZE], [1, H]],
+                dst=send_buffer.ap(
+                    pattern=[[hidden, TILE_SIZE], [1, hidden]],
                     offset=0,
-                    vector_offset=row_idx,
+                    vector_offset=indices_sb,
                     indirect_dim=0,
                 ),
-                src=tile_sb,
+                src=data_sb,
                 oob_mode=oob_mode.skip,
             )
 
-    # Step 3: build metadata.
-    metadata = nl.ndarray((4, EP), dtype=nl.uint32, buffer=nl.shared_hbm, name="comb_meta")
-    _write_a2av_v_metadata(metadata, rc_sb, sdispls_sb, H, EP)
 
-    # Step 4: all-to-all-v. Runtime handles recv_counts and recv_displs.
-    got_hbm = nl.ndarray((EP * T, H), dtype=dtype, buffer=nl.shared_hbm, name="comb_got_pk")
+@nki.jit
+def unpermute_a2av(
+    output: nl.NkiTensor,
+    packed_source_indices: nl.NkiTensor,
+    send_counts: nl.NkiTensor,
+    recv_counts: nl.NkiTensor,
+    replica_group: ReplicaGroup,
+    regroup_indices: nl.NkiTensor = None,
+    num_local_experts: int = 1,
+) -> nl.NkiTensor:
+    """Return packed expert output to origin ranks and restore routed rows.
+
+    Summary:
+        Reverses packed dispatch for Trn3 LNC=2 by sending only active rows
+        from ``[C, H]``, receiving exactly ``N`` routed rows with explicit
+        displacements, and restoring routed-row order. Supports ``EP >= 8`` in
+        complete four-rank device groups and count totals below ``2**24`` so
+        float32 prefix scans remain exact.
+
+    This reverses :func:`permute_a2av`. Dispatch receive counts and
+    displacements become combine send metadata; dispatch send counts and
+    displacements become explicit combine receive metadata. ``packed_source_indices`` must be a permutation of the routed-row IDs:
+    indirect DMA stores are not atomic duplicate-safe scatter-add operations.
+    The dispatch routing vector satisfies this invariant. The kernel requires
+    an LNC=2 launch and a sequential
+    replica-group rank list that contains all four ranks from each of at least
+    two participating devices.
+
+    Dimensions:
+        N:  Number of original local routed rows.
+        H:  Hidden dimension.
+        EP: Number of expert-parallel ranks.
+        C:  Static packed expert-output capacity; may be smaller than N when
+            the local dispatch receive total fits C.
+
+    Args:
+        output (nl.NkiTensor): [C, H]@HBM packed expert output.
+        packed_source_indices (nl.NkiTensor): [N]@HBM, int32 permutation
+            mapping packed return rows to original routed-row indices, in the
+            same destination-major order used for dispatch.
+        send_counts (nl.NkiTensor): [1, EP]@HBM original dispatch send counts.
+        recv_counts (nl.NkiTensor): [1, EP]@HBM original dispatch receive counts.
+        replica_group (ReplicaGroup): EP replica group.
+        regroup_indices (nl.NkiTensor): Required int32/uint32 [C] permutation
+            for ``num_local_experts > 1``. Maps each expert-major row to its
+            source-major send-buffer position. Every position must occur once.
+        num_local_experts (int): Number of local experts, in [1, 128]. Values
+            above one select expert-major input and internal row scatter.
+            The default retains the source-major input contract.
+
+    Returns:
+        result (nl.NkiTensor): [N, H]@HBM in original routed-row order.
+
+    Notes:
+        Active routing entries must assign every routed-row index exactly once.
+        For multiple local experts, the inverse indices returned by dispatch
+        restore source-major order directly in the communication send buffer.
+        The unused capacity tail must also be covered by the permutation.
+        Every count and displacement multiplied by ``H`` must fit uint32
+        because A2AV metadata is measured in elements.
+
+    Pseudocode:
+        Prefix-sum dispatch send and receive counts.
+        Reverse dispatch metadata for combine A2AV.
+        Scatter expert-major rows into the send buffer when NLE > 1.
+        Send only the active prefix of packed expert output.
+        Receive source-major returned rows into a packed N-row buffer.
+        Scatter packed rows to their unique original routed-row indices.
+        Return routed-row order.
+    """
+    C, H = output.shape
+    N = packed_source_indices.shape[0]
+    EP = send_counts.shape[1]
+    dtype = output.dtype
+    NUM_TILES = div_ceil(N, TILE_SIZE)
+
+    _validate_packed_indices_counts(packed_source_indices, send_counts, N, EP)
+    _validate_trn3_a2av_group_size(EP)
+    kernel_assert(
+        tuple(recv_counts.shape) == (1, EP),
+        f"recv_counts must be (1, EP={EP}), got {tuple(recv_counts.shape)}",
+    )
+    kernel_assert(
+        recv_counts.dtype in (nl.int32, nl.uint32),
+        f"recv_counts must be int32/uint32, got {recv_counts.dtype}",
+    )
+    kernel_assert(C >= 1, f"output capacity must be >= 1, got C={C}")
+    kernel_assert(
+        1 <= num_local_experts <= TILE_SIZE,
+        f"num_local_experts must be in [1, {TILE_SIZE}], got {num_local_experts}",
+    )
+    if num_local_experts > 1:
+        kernel_assert(regroup_indices is not None, "regroup_indices is required when num_local_experts > 1")
+        kernel_assert(regroup_indices.shape == (C,), f"regroup_indices must have shape ({C},)")
+        kernel_assert(
+            regroup_indices.dtype in (nl.int32, nl.uint32),
+            "regroup_indices must be int32/uint32",
+        )
+    _validate_metadata_extent(C, H, "output")
+    _validate_metadata_extent(N, H, "result")
+
+    send_counts_sb, send_displs_sb = _exclusive_cumsum_u32(send_counts, EP)
+    recv_counts_sb, recv_displs_sb = _exclusive_cumsum_u32(recv_counts, EP)
+
+    metadata = nl.ndarray(
+        (_A2AV_METADATA_NUM_ROWS, EP),
+        dtype=nl.uint32,
+        buffer=nl.shared_hbm,
+        name="packed_combine_meta",
+    )
+    _write_packed_a2av_v_metadata(
+        metadata,
+        recv_counts_sb,
+        recv_displs_sb,
+        send_counts_sb,
+        send_displs_sb,
+        H,
+        EP,
+    )
+    nisa.core_barrier(metadata, _LNC2_CORE_IDS)
+
+    output_hbm = nl.ndarray((C, H), dtype=dtype, buffer=nl.shared_hbm, name="packed_combine_send")
+    if num_local_experts > 1:
+        _scatter_expert_rows(output, regroup_indices, output_hbm)
+    else:
+        nisa.dma_copy(dst=output_hbm, src=output)
+    # Reverse receive counts sum to N; C bounds only the local send buffer.
+    got_hbm = nl.ndarray((N, H), dtype=dtype, buffer=nl.shared_hbm, name="packed_combine_recv")
+    nisa.core_barrier(output_hbm, _LNC2_CORE_IDS)
+    nisa.core_barrier(metadata, _LNC2_CORE_IDS)
     ncc.all_to_all_v(
-        srcs=[send_hbm],
+        srcs=[output_hbm],
         dsts=[got_hbm],
         replica_group=replica_group,
         metadata_tensor=metadata,
-        recv_counts_known=False,
-        has_rdispls=False,
+        recv_counts_known=True,
+        has_rdispls=True,
     )
+    nisa.core_barrier(got_hbm, _LNC2_CORE_IDS)
 
-    nisa.core_barrier(got_hbm, (0, 1))
-
-    """
-    Step 5: scatter-add to original token positions.
-
-    With LNC=2, partition EP across cores, accumulate into HBM
-    per LNC, then all-reduce across cores via sendrecv.
-    """
     n_prgs = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1
     prg_id = nl.program_id(axis=0) if nl.program_ndim() != 0 else 0
-
-    ep_per_shard_0 = div_ceil(EP, n_prgs)
-    ep_per_shard_1 = EP // n_prgs
-    ep_per_shard = ep_per_shard_0 if prg_id == 0 else ep_per_shard_1
-    d_start = 0 if prg_id == 0 else ep_per_shard_0
-    max_ep_per_shard = ep_per_shard_0
-
-    partial = nl.ndarray((T, H), dtype=dtype, buffer=nl.private_hbm, name="comb_partial")
-
-    zero_tile_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
-    nisa.memset(zero_tile_sb, 0)
+    result = nl.ndarray((N, H), dtype=dtype, buffer=nl.shared_hbm, name="packed_combine_result")
+    # The permutation gives each result row one writer across both cores.
     for tile_idx in nl.affine_range(NUM_TILES):
-        ts = tile_idx * TILE_SIZE
-        te = min(ts + TILE_SIZE, T)
-        nisa.dma_copy(dst=partial[ts:te, :], src=zero_tile_sb[0 : te - ts, :])
-
-    for d_off in nl.sequential_range(max_ep_per_shard):
-        dest_rank_idx = min(d_start + d_off, EP - 1)
-        base = dest_rank_idx * T
-        for tile_idx in nl.sequential_range(NUM_TILES):
-            ts = tile_idx * TILE_SIZE
-            te = min(ts + TILE_SIZE, T)
-            tsize = te - ts
-
-            idx_sb = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.memset(idx_sb, T)
-            if d_off < ep_per_shard:
-                nisa.dma_copy(
-                    dst=idx_sb[0:tsize, 0:1],
-                    src=send_indices[ts:te, dest_rank_idx : dest_rank_idx + 1],
-                )
-
-            data_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
-            # Slice both dst and src to tsize: on the final partial tile
-            # (T % TILE_SIZE != 0) a fixed +TILE_SIZE read of the last dest_rank's
-            # region runs past got_hbm's end (base+ts+TILE_SIZE > EP*T -> OOB read
-            # / dma_copy size assert). Zero the full buffer first so the tail rows
-            # [tsize:TILE_SIZE] the downstream tensor_tensor still reads are defined
-            # (they are OOB-skipped on the final scatter, so they never reach output).
-            nisa.memset(data_sb, 0)
-            nisa.dma_copy(dst=data_sb[0:tsize, :], src=got_hbm[base + ts : base + ts + tsize, :])
-
-            cur_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
+        if tile_idx % n_prgs == prg_id:
+            start = tile_idx * TILE_SIZE
+            end = min(start + TILE_SIZE, N)
+            tile_rows = end - start
+            scatter_indices = nl.ndarray((tile_rows, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.dma_copy(
-                dst=cur_sb,
-                src=partial.ap(
-                    pattern=[[T, TILE_SIZE], [1, H]],
+                dst=scatter_indices,
+                src=packed_source_indices[start:end].reshape((tile_rows, 1)),
+            )
+            data_sb = nl.ndarray((tile_rows, H), dtype=dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=data_sb, src=got_hbm[start:end, :])
+            nisa.dma_copy(
+                dst=result.ap(
+                    pattern=[[N, tile_rows], [1, H]],
                     offset=0,
-                    vector_offset=idx_sb,
+                    vector_offset=scatter_indices,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip,
+                src=data_sb,
             )
-            nisa.tensor_tensor(cur_sb, cur_sb, data_sb, op=nl.add)
-            nisa.dma_copy(
-                dst=partial.ap(
-                    pattern=[[T, TILE_SIZE], [1, H]],
-                    offset=0,
-                    vector_offset=idx_sb,
-                    indirect_dim=0,
-                ),
-                src=cur_sb,
-                oob_mode=oob_mode.skip,
-            )
-
-    # All-reduce across cores via sendrecv; core 0 writes the final result.
-    result = nl.ndarray((T, H), dtype=dtype, buffer=nl.shared_hbm, name="comb_result")
-    for tile_idx in nl.affine_range(NUM_TILES):
-        ts = tile_idx * TILE_SIZE
-        te = min(ts + TILE_SIZE, T)
-        tsize = te - ts
-        my_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=my_sb[0:tsize, :], src=partial[ts:te, :])
-        if n_prgs > 1:
-            other_sb = nl.ndarray((TILE_SIZE, H), dtype=dtype, buffer=nl.sbuf)
-            nisa.sendrecv(
-                src=my_sb,
-                dst=other_sb,
-                send_to_rank=(1 - prg_id),
-                recv_from_rank=(1 - prg_id),
-                pipe_id=0,
-            )
-            nisa.tensor_tensor(dst=my_sb, data1=my_sb, data2=other_sb, op=nl.add)
-        if prg_id == 0:
-            nisa.dma_copy(dst=result[ts:te, :], src=my_sb[0:tsize, :])
-
+    nisa.core_barrier(result, _LNC2_CORE_IDS)
     return result

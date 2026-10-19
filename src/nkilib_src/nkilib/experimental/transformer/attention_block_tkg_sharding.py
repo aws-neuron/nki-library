@@ -677,7 +677,7 @@ def _KVDP_attn_output_all_gather_slice(
 
 
 def _CP_attention_input_collectives(
-    Q_tkg_sb: nl.ndarray,
+    Q_tkg_sb: nl.NkiTensor,
     q_heads: int,
     d_head: int,
     CP: int,
@@ -769,9 +769,9 @@ def _CP_attention_input_collectives(
 
 
 def _CP_attention_output_collectives(
-    attn_sb: nl.ndarray,
-    softmax_max: nl.ndarray,
-    softmax_sum: nl.ndarray,
+    attn_sb: nl.NkiTensor,
+    softmax_max: nl.NkiTensor,
+    softmax_sum: nl.NkiTensor,
     CP: int,
     B: int,
     q_heads: int,

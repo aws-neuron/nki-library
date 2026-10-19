@@ -141,6 +141,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         KVDP_collective_mode=None,
         KVDP_rank: Optional[torch.Tensor] = None,
         enable_fa_s_prior_tiling: bool = True,
+        enable_pv_moving_free_dim_padding: bool = False,
+        enable_pv_swapped_column_tiling: bool = False,
         fp8_packed: bool = False,
         pos_ids: Optional[torch.Tensor] = None,
         swa_start_pos_ids: Optional[torch.Tensor] = None,
@@ -269,6 +271,10 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 Used for K/V batch slicing. Shape: ``[1]``, dtype ``uint32``.
             enable_fa_s_prior_tiling: Accepted for signature compatibility
                  (kernel-only, whether to enable flash attention in kernel).
+            enable_pv_moving_free_dim_padding: Accepted for signature compatibility
+                (kernel-only, whether to widen dense PV moving operands).
+            enable_pv_swapped_column_tiling: Accepted for signature compatibility
+                (kernel-only, whether to use column-tiled P@V).
             CP: Context parallelism degree (1 = disabled). When > 1, the torch
                 ref performs CP collectives (Q all_gather, distributed softmax
                 correction, output all_to_all) to match the kernel's per-rank behavior.
@@ -310,11 +316,9 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 fuse_rope=False,
                 kv_heads=kv_heads_mask,
             ):
-                # Partition banding: for small per-NC batch the kernel folds s_prior onto the partition
+                # Partition banding: for small batch the mask has s_prior folded onto the partition
                 # axis, so the mask arrives banded as [bs_n_prgs * P_MAX, S_ctx // band_factor] (2D).
-                # Un-band it back to the logical [B, N, S, S_ctx] this ref computes on — inverse of the
-                # banding in gen_mask_tkg_hbm_torch_ref (and gen_mask_tkg_hbm), using the same (bs, q_head)
-                # the mask was generated with (B == B_attn, q_heads_mask == num_mask_heads).
+                # Un-band it back to the logical [B, N, S, S_ctx] this ref and kernel computes on.
                 if attention_mask.dim() == 2:
                     sqh = q_heads_mask * S_tkg_mask
                     batch_sharded = self.lnc > 1 and is_batch_sharded(B, q_heads_mask, S_tkg_mask, S_ctx_mask, P_MAX)
@@ -329,9 +333,11 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                     use_fa, fa_tile_size = uses_flash_attention(enable_fa_s_prior_tiling, S_ctx_mask)
                     if not use_fa:
                         fa_tile_size = S_ctx_mask
-                    fa_offset = 0
-                    band_free = 0
-                    while fa_offset < S_ctx_mask:
+                    # Full FA tiles are fa_tile_size wide (band_free stride fa_tile_size // bf); the last tile
+                    # may be smaller (ragged), so clamp both the s_prior and band-free extents per tile.
+                    for fa_idx in range(math.ceil(S_ctx_mask / fa_tile_size)):
+                        fa_offset = fa_idx * fa_tile_size
+                        band_free = fa_idx * (fa_tile_size // bf)
                         tile_sp = min(fa_tile_size, S_ctx_mask - fa_offset)
                         band_sp = tile_sp // bf
                         # banded chunk -> [n_prgs, bs_per_nc, bf, sqh, band_sp], inverse of the gen-side permute.
@@ -342,8 +348,6 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                         logical[:, :, fa_offset : fa_offset + tile_sp] = chunk.reshape(
                             bs_n_prgs, bs_per_nc * sqh, tile_sp
                         )
-                        fa_offset += tile_sp
-                        band_free += band_sp
                     attention_mask = logical.reshape(B * sqh, S_ctx_mask).reshape(
                         B, q_heads_mask, S_tkg_mask, S_ctx_mask
                     )

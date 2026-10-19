@@ -356,8 +356,15 @@ def _selective_expert_moe_tkg_mxfp4(
         input_sb_shfl = _layout_adapter_hbm(params.hidden_tensor, n_prgs=1, prg_id=0)
 
     input_flat = input_sb_shfl.reshape((_pmax, n_H512_tile_sharded * T_padded * 4))
-    inp_qtz = nl.ndarray((_pmax, n_H512_tile_sharded * T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-    inp_scale = nl.ndarray(inp_qtz.shape, dtype=nl.uint8, buffer=nl.sbuf)
+
+    # ROW_MX / hardware MX pre-quantize the whole input here and gather per token below.
+    # STATIC_MX's scale depends on the routed expert, so it quantizes inside the loop instead.
+    prequant_whole_input = not is_static_quant
+
+    inp_scale = nl.ndarray((_pmax, n_H512_tile_sharded * T_padded), dtype=nl.uint8, buffer=nl.sbuf)
+    inp_qtz = None
+    if prequant_whole_input:
+        inp_qtz = nl.ndarray((_pmax, n_H512_tile_sharded * T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
 
     # Per-token input dequant scale for ROW_MX
     row_mx_input_dequant_scale = None
@@ -397,8 +404,9 @@ def _selective_expert_moe_tkg_mxfp4(
         # Hardware MX quantization
         nisa.quantize_mx(dst=inp_qtz, src=input_flat, dst_scale=inp_scale)
 
-    inp_qtz = inp_qtz.reshape((_pmax, n_H512_tile_sharded, T_padded))
-    inp_scale = inp_scale.reshape(inp_qtz.shape)
+    if prequant_whole_input:
+        inp_qtz = inp_qtz.reshape((_pmax, n_H512_tile_sharded, T_padded))
+    inp_scale = inp_scale.reshape((_pmax, n_H512_tile_sharded, T_padded))
 
     # Allocate SBUF location to accumulate output which has shape [128, H_per_shard] to store the outputs for
     # four tokens on each of the four SBUF quadrants. This is to save sendrecvs (reduced by 4x).
@@ -622,20 +630,23 @@ def _selective_expert_moe_tkg_mxfp4(
 
             # Even with static ranges, NKI has undefined behaviour when using breaks
             if i_t < dims.T:
-                inp_qtz_cur_t = nl.ndarray((_pmax, n_H512_tile_sharded, 4), dtype=inp_qtz.dtype, buffer=nl.sbuf)
-                inp_scale_cur_t = nl.ndarray((_pmax, n_H512_tile_sharded, 4), dtype=inp_scale.dtype, buffer=nl.sbuf)
+                inp_qtz_cur_t = nl.ndarray((_pmax, n_H512_tile_sharded, 4), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+                inp_scale_cur_t = nl.ndarray((_pmax, n_H512_tile_sharded, 4), dtype=nl.uint8, buffer=nl.sbuf)
                 nisa.memset(dst=inp_scale_cur_t, value=0)
-                nisa.tensor_copy(
-                    dst=inp_qtz_cur_t.ap(
-                        pattern=[[n_H512_tile_sharded * 4, _pmax], [4, n_H512_tile_sharded]], offset=0, dtype=nl.float32
-                    ),
-                    src=inp_qtz.ap(
-                        pattern=[[n_H512_tile_sharded * T_padded, _pmax], [T_padded, n_H512_tile_sharded]],
-                        offset=i_t,
-                        dtype=nl.float32,
-                    ),
-                    engine=nisa.vector_engine,
-                )
+                if prequant_whole_input:
+                    nisa.tensor_copy(
+                        dst=inp_qtz_cur_t.ap(
+                            pattern=[[n_H512_tile_sharded * 4, _pmax], [4, n_H512_tile_sharded]],
+                            offset=0,
+                            dtype=nl.float32,
+                        ),
+                        src=inp_qtz.ap(
+                            pattern=[[n_H512_tile_sharded * T_padded, _pmax], [T_padded, n_H512_tile_sharded]],
+                            offset=i_t,
+                            dtype=nl.float32,
+                        ),
+                        engine=nisa.vector_engine,
+                    )
                 nisa.tensor_copy(
                     dst=inp_scale_cur_t[:, :, :1], src=inp_scale[:, :, i_t : i_t + 1], engine=nisa.vector_engine
                 )

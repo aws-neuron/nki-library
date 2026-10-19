@@ -24,7 +24,7 @@ import nki.language as nl
 from ....experimental.moe.moe_cte.bwmm_shard_on_block_v2 import bwmm_shard_on_block as bwmm_shard_on_block_v2
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType
 from .bwmm_shard_on_block import bwmm_shard_on_block
-from .bwmm_shard_on_block_mx import bwmm_shard_on_block_mx
+from .bwmm_shard_on_block_mx import bwmm_shard_on_block_mx, bwmm_shard_on_block_mx_v2
 from .bwmm_shard_on_I import (
     blockwise_mm_baseline_shard_intermediate,
     blockwise_mm_baseline_shard_intermediate_hybrid,
@@ -45,6 +45,7 @@ class MoECTEImplementation(Enum):
         shard_on_block_mx: Shard on block with MxFP4/MxFP8 quantization. (TRN3)
         shard_on_i_mx: Shard on I with MxFP4/MxFP8 quantization. (TRN3)
         shard_on_i_mx_hybrid: Shard on I with MxFP4/MxFP8 and hybrid loop. (TRN3)
+        shard_on_block_mx_v2: shard_on_block_mx that returns [T, H] instead of [2, T, H]. (TRN3)
     """
 
     shard_on_block = 0
@@ -54,6 +55,7 @@ class MoECTEImplementation(Enum):
     shard_on_block_mx = 4
     shard_on_i_mx = 5
     shard_on_i_mx_hybrid = 6
+    shard_on_block_mx_v2 = 7
 
 
 # =============================================================================
@@ -230,14 +232,14 @@ class MoECTESpec(nl.NKIObject):
     MoECTEShardingSpecs which handles default initialization based on the implementation.
 
     Uses composition pattern with two config objects based on sharding strategy:
-        - shard_on_block: For block-sharding implementations (shard_on_block, shard_on_block_mx)
+        - shard_on_block: For block-sharding implementations (shard_on_block, shard_on_block_mx, shard_on_block_mx_v2)
         - shard_on_I: For I-sharding implementations (shard_on_i, shard_on_i_hybrid, shard_on_i_dropping)
 
     Attributes:
         implementation (MoECTEImplementation): Which implementation variant to use.
 
         shard_on_block (ShardOnBlockConfig, optional): Config for block-sharding implementations.
-            Required for: shard_on_block, shard_on_block_mx
+            Required for: shard_on_block, shard_on_block_mx, shard_on_block_mx_v2
             Auto-initialized with defaults if not provided.
 
         shard_on_I (ShardOnIConfig, optional): Config for I-sharding implementations.
@@ -297,7 +299,7 @@ class MoECTEShardingSpecs(nl.NKIObject):
 
         shard_on_block (ShardOnBlockConfig, optional): Config for block-sharding implementations.
             Initialized with ShardOnBlockConfig() defaults if the implementation is
-            shard_on_block or shard_on_block_mx and no config was provided.
+            shard_on_block, shard_on_block_mx or shard_on_block_mx_v2 and no config was provided.
 
         shard_on_I (ShardOnIConfig, optional): Config for I-sharding implementations.
             Initialized with ShardOnIConfig() defaults if the implementation is
@@ -324,6 +326,7 @@ class MoECTEShardingSpecs(nl.NKIObject):
         if (
             spec.implementation == MoECTEImplementation.shard_on_block
             or spec.implementation == MoECTEImplementation.shard_on_block_mx
+            or spec.implementation == MoECTEImplementation.shard_on_block_mx_v2
         ):
             if spec.shard_on_block is None:
                 self.shard_on_block = ShardOnBlockConfig()
@@ -433,7 +436,7 @@ def moe_cte(
 
     Notes:
         - shard_on_block, shard_on_i, shard_on_i_hybrid, shard_on_i_dropping target TRN2
-        - shard_on_block_mx, shard_on_i_mx target TRN3 with MxFP4/MxFP8 quantization
+        - shard_on_block_mx, shard_on_block_mx_v2, shard_on_i_mx target TRN3 with MxFP4/MxFP8 quantization
         - Implementation-specific parameters are passed via MoECTESpec
 
     Pseudocode:
@@ -447,6 +450,8 @@ def moe_cte(
             return blockwise_mm_shard_intermediate_dropping(...)
         elif spec.implementation == shard_on_block_mx:
             return bwmm_shard_on_block_mx(...)
+        elif spec.implementation == shard_on_block_mx_v2:
+            return bwmm_shard_on_block_mx_v2(...)
         elif spec.implementation == shard_on_i_mx:
             return blockwise_mm_shard_intermediate_mx(...)
         elif spec.implementation == shard_on_i_mx_hybrid:
@@ -610,9 +615,17 @@ def moe_cte(
             accumulation_dtype=accumulation_dtype,
         )
 
-    elif sharding_spec.implementation == MoECTEImplementation.shard_on_block_mx:
+    elif sharding_spec.implementation in (
+        MoECTEImplementation.shard_on_block_mx,
+        MoECTEImplementation.shard_on_block_mx_v2,
+    ):
         cfg = sharding_spec.shard_on_block or ShardOnBlockConfig()
-        return bwmm_shard_on_block_mx(
+        kernel = (
+            bwmm_shard_on_block_mx_v2
+            if sharding_spec.implementation == MoECTEImplementation.shard_on_block_mx_v2
+            else bwmm_shard_on_block_mx
+        )
+        return kernel(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
             gate_up_proj_weight=gate_up_proj_weight,

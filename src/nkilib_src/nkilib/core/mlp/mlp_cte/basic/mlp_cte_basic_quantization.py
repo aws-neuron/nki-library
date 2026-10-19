@@ -52,7 +52,9 @@ def perform_intermediate_quantization(
             quantized_output_sbuf_list,
             static_input_quant_scale_sbuf,
         )
-    elif mlp_params.quant_params.is_quant_row():
+    elif (
+        mlp_params.quant_params.is_quant_row()
+    ):  # pragma: no branch - quant is STATIC or ROW under is_quant(), exhaustive elif false arc dead
         _perform_intermediate_row_quantization(
             mlp_params,
             tile_info,
@@ -134,7 +136,7 @@ def _perform_intermediate_row_quantization(
     max_pos_val = get_max_positive_value_for_dtype(constants.down_proj_quant_data_type)
     rounded_intermediate_dim = int_dim_tile.tile_count * int_dim_tile.tile_size
 
-    if sbm != None:
+    if sbm != None:  # pragma: no branch - sbm always non-None (alloc used unconditionally), sbm-None arc dead
         sbm.open_scope("row_quantization")
 
     quant_abs_sbuf_list = []
@@ -178,6 +180,11 @@ def _perform_intermediate_row_quantization(
     for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
         p_bxs_size = bxs_dim_tile.get_subtile_bound(bxs_tile_idx, bxs_subtile_idx)
 
+        # The last BxS tile can be partial, leaving trailing subtiles with no valid rows.
+        # Skip them: engines require a partition count in [1, 128], zero is rejected.
+        if p_bxs_size <= 0:
+            continue
+
         if mlp_params.quant_params.has_clipping_bound():
             nisa.tensor_scalar(
                 dst=src_proj_res_sbuf_view_list[bxs_subtile_idx][:p_bxs_size, : mlp_params.intermediate_size],
@@ -217,5 +224,5 @@ def _perform_intermediate_row_quantization(
             bias=bias_vector[:p_bxs_size, 0:1],
         )
 
-    if sbm != None:
+    if sbm != None:  # pragma: no branch - sbm always non-None, sbm-None arc dead
         sbm.close_scope()  # row_quantization

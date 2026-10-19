@@ -13,7 +13,7 @@
 # limitations under the License.
 import nki.language as nl
 
-from ._helpers import MIN_TILED_DIMS, ceiling_div
+from ._helpers import MIN_TILED_DIMS, ceiling_div, replace_at
 from .axis import Axis, AxisLabel
 
 # ============================================================================
@@ -110,8 +110,9 @@ class Grid(nl.NKIObject):
         """Return a copy with the named fields overridden (others preserved).
 
         ``is_remainder`` and ``remainder_dims`` are re-derived in
-        ``__init__`` from the new axes; only ``truncate_to_source``
-        passes them explicitly when it clamps a leaf.
+        ``__init__`` from the new axes; callers that clamp a leaf or an
+        extent (``truncate_to_source``, ``clamp_source_extent``) pass
+        them explicitly instead.
         """
         if remainder_dims is None:
             remainder_dims = ()
@@ -674,9 +675,10 @@ class Grid(nl.NKIObject):
         elem_leaf = self._elem_leaf_on_dim(dim)
         if elem_leaf is None:
             return self
-        # Leaf already capped at the per-dim element extent: no multi-tile
-        # parent to truncate from.
-        if elem_leaf.count >= self.element_shape[dim]:
+        # Leaf already capped at the per-dim element extent: nothing to truncate
+        # from -- unless a TILE wrapper above it can still over-walk, which is
+        # what a region smaller than one block looks like.
+        if elem_leaf.count >= self.element_shape[dim] and self.outer_axis(dim) == elem_leaf:
             return self
         addressable = self.element_shape[dim] - elements_consumed
         if addressable <= 0:
@@ -716,6 +718,23 @@ class Grid(nl.NKIObject):
             axes=tuple(new_axes),
             is_remainder=True,
             remainder_dims=(dim,),
+        )
+
+    def clamp_source_extent(self, dim, extent):
+        """Shrink ``element_shape[dim]`` to ``extent``, keeping remainder flags.
+
+        Where ``truncate_to_source`` clamps the axis walk, this clamps the extent the
+        walk is measured against, so a view over part of a source reports what it
+        covers rather than what the source holds.
+
+        No-op unless ``extent`` is a positive int shorter than the current extent.
+        """
+        if not isinstance(extent, int) or extent <= 0 or extent >= self.element_shape[dim]:
+            return self
+        return self._replace(
+            element_shape=replace_at(self.element_shape, dim, extent),
+            is_remainder=self.is_remainder,
+            remainder_dims=self.remainder_dims,
         )
 
     def split(self, dim, factor, outer_label, inner_label):

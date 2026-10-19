@@ -196,7 +196,9 @@ class MLPTKGConstants(nl.NKIObject):
             column_tiling_dim = 128
 
         # Adjust hardware-specific logic for column tiling on NeuronCore-v2
-        if nisa.get_nc_version() == nisa.nc_version.gen2:
+        if (
+            nisa.get_nc_version() == nisa.nc_version.gen2
+        ):  # pragma: no branch - gen2/TRN1 legacy path; fleet is trn2(gen3)/trn3(gen4), gen2 arc dead
             # Both the row and column sizes in tile_size cannot be 32
             column_tiling_dim = 64
 

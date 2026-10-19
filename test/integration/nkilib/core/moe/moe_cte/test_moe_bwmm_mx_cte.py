@@ -57,7 +57,10 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
-from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx import bwmm_shard_on_block_mx
+from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx import (
+    bwmm_shard_on_block_mx,
+    bwmm_shard_on_block_mx_v2,
+)
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx_torch import bwmm_shard_on_block_mx_torch_ref
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I_mx import (
     blockwise_mm_shard_intermediate_mx,
@@ -85,6 +88,9 @@ _SHARD_BLOCK_FULL_ONLY = [
     [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
     [2, 3072, 8192, 1536, 64, 256, 4, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
+    # LNC1 twin of the row above, so the one-core path is measured at the same shape. Kept
+    # adjacent: suite chunking is strided, so neighbours land in different Fargate tasks.
+    [1, 3072, 8192, 1536, 64, 256, 4, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
     [2, 3072, 2048, 3072, 16, 256, 4, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
     [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
@@ -122,6 +128,13 @@ _SHARD_BLOCK_FULL_ONLY = [
     [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, False, None, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # STATIC_MX with smaller block (demoted from fast by min-set workflow)
     [2, 4096, 4096, 1536, 2, 128, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
+    # LNC1 static-unroll pressure: one shard unrolls N block bodies, not N/2. N has no H term,
+    # so H stays at 512 to bound host input-gen (E*H*I) without weakening that coverage.
+    [1, 512, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [1, 512, 10240, 384, 128, 512, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    # Demoted from fast by min-set workflow: skip_weight without skip_token adds no branch
+    # coverage over skip_mode=3, but keeps the two flags separable in full runs.
+    [1, 3072, 1024, 384, 16, 256, 2, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 2, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
 ]
 
 
@@ -134,6 +147,26 @@ _SHARD_BLOCK_FAST_RAW = [
     [2, 4096, 4096, 1536, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
     [2, 4096, 10240, 768, 4, 256, 2, 32, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
     [2, 4096, 4096, 384, 16, 256, 2, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, True, None, False, QuantizationType.STATIC_MX],
+    # LNC1 (vnc_degree=1): one core walks every block. Explicit n_static_blocks, then auto-split.
+    # skip_mode=3 (skip_weight) is required on one of these: it is what traces the dynamic
+    # weight-skip masks, whose DMA strides are the num_shards-derived ones.
+    [1, 3072, 4096, 384, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
+    [1, 4096, 4096, 384, 16, 256, 2, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [1, 4096, 4096, 384, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, False, 2, False, QuantizationType.MX],
+    # LNC1 border cases.
+    # skip_mode=0 runs the token gathers at oob_mode.error and the block_old pre-zero.
+    [1, 3072, 1024, 384, 16, 256, 2, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    # is_dynamic=False: no conditions vector, so all N blocks run on the static path.
+    [1, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, False, None, None, None, None, False, False, None, False, QuantizationType.MX],
+    # n_active=7 < _DYN_INNER: the chunked loop never runs, so the whole dynamic range comes
+    # from the remainder loop. The only case that isolates the remainder trip count.
+    [1, 3072, 1024, 384, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    # I > 512 turns on the tiled gate/up path and its three weight-sourcing regimes. That path
+    # keys off I alone, so E stays at 2 to bound the generator's E*H*I host allocation.
+    [1, 3072, 2048, 1536, 2, 256, 2, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    # block_size=512 with E=128 and fp4 weights; largest per-core unroll of the LNC1 set. N has
+    # no H term, so H is held at the 512 minimum to keep the host allocation in budget.
+    [1, 512, 10240, 384, 128, 512, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
 ]
 
 SHARD_ON_BLOCK_UNIT_PERMS = [
@@ -255,14 +288,14 @@ def filter_moe_bwmm_mx_shard_block_combinations(
     """Filter invalid parameter combinations for MoE BWMM MX CTE kernel (shard-on-block).
 
     Checks constraints from kernel_assert statements in bwmm_shard_on_block_mx.py:
-    - vnc_degree == 2 (num_shards)
+    - vnc_degree in (1, 2) (num_shards)
     - block_size % 128 == 0
     - 512 <= hidden <= 8192 and hidden % 512 == 0
     - intermediate % 16 == 0 and MX tiling rules
     - expert_affinities_scaling_mode == POST_SCALE
     - skip_mode == 3 requires intermediate (I_TP) <= 512
     """
-    if vnc_degree is not None and vnc_degree != 2:
+    if vnc_degree is not None and vnc_degree not in (1, 2):
         return FilterResult.INVALID
     if (
         expert_affinities_scaling_mode is not None
@@ -337,6 +370,7 @@ def _gen_block_inputs(
     use_prequant_hidden: bool = False,
     pack_affinities_into_hidden: bool = False,
     packed_affinities_dtype=nl.bfloat16,
+    tight_blocks: bool = False,
 ) -> dict:
     assert skewness_pct is not None or top_k is not None, "Either skewness_pct or top_k must be provided"
     assert not (use_uint_weights and unpacked_weights), "use_uint_weights and unpacked_weights are mutually exclusive"
@@ -396,6 +430,7 @@ def _gen_block_inputs(
             packed_affinities_dtype=packed_affinities_dtype,
             ep_degree=ep_degree,
             ep_rank=ep_rank,
+            tight_blocks=tight_blocks,
         )
     ordered = order_kernel_input(ki, variant='shard_on_block_mx')
     # Forward routing shape to the kernel for its best-case static-block estimate.
@@ -597,19 +632,31 @@ def _gen_I_inputs(
     return order_kernel_input(ki, variant=variant)
 
 
+def _is_stacked_output(kernel_entry, is_accumulating: bool, vnc_degree: int) -> bool:
+    """Whether the kernel returns [vnc_degree, T, H]: the deprecated entry point when accumulating at LNC2."""
+    return kernel_entry is bwmm_shard_on_block_mx and is_accumulating and vnc_degree > 1
+
+
 def _block_output(
-    ki: dict, tokens: int, hidden: int, dtype, skip_mode: int, is_accumulating: bool, vnc_degree: int
+    ki: dict,
+    tokens: int,
+    hidden: int,
+    dtype,
+    skip_mode: int,
+    is_accumulating: bool,
+    vnc_degree: int,
+    kernel_entry=None,
 ) -> dict:
     dma_skip = map_skip_mode(skip_mode)
     out_T = tokens if dma_skip.skip_token else tokens + 1
     numpy_dtype = dt.finfo(dtype).dtype
-    if is_accumulating:
+    if _is_stacked_output(kernel_entry, is_accumulating, vnc_degree):
         return {"output": np.zeros((vnc_degree, out_T, hidden), dtype=numpy_dtype)}
     return {"output": np.zeros((out_T, hidden), dtype=numpy_dtype)}
 
 
-def _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol, atol):
-    """Return a custom_comparator that compares only output[0, :tokens, :hidden].
+def _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol, atol, kernel_entry):
+    """Return a custom_comparator that compares only output[0, :tokens, :hidden] ([:tokens, :hidden] for [T, H]).
 
     After reduce_outputs, output[0] has the correct reduced result but output[1]
     contains garbage (not zeroed); this ignores shard 1. The golden comes from the
@@ -619,6 +666,7 @@ def _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol, atol):
     from test.utils.comparators import maxAllClose
 
     numpy_dtype = dt.finfo(dtype).dtype
+    stacked = _is_stacked_output(kernel_entry, True, vnc_degree)
 
     def comparator(golden_dict, output_tensors):
         golden = golden_dict["output"]
@@ -629,15 +677,14 @@ def _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol, atol):
         class Shard0Validator(CustomValidator):
             @override
             def validate(self, inference_output: npt.NDArray[Any]) -> bool:
-                actual = (
-                    np.frombuffer(inference_output, dtype=numpy_dtype)
-                    .reshape(vnc_degree, -1, hidden)
-                    .astype(np.float32)
-                )
-                # Only compare shard 0, real tokens
+                actual = np.frombuffer(inference_output, dtype=numpy_dtype).astype(np.float32)
+                actual = actual.reshape(vnc_degree, -1, hidden)[0] if stacked else actual.reshape(-1, hidden)
+                # The accumulating reference keeps the result in slot 0
+                expected = golden[0] if golden.ndim == 3 else golden
+                # Only compare real tokens
                 return maxAllClose(
-                    actual[0, :tokens, :hidden],
-                    golden[0, :tokens, :hidden],
+                    actual[:tokens, :hidden],
+                    expected[:tokens, :hidden],
                     rtol=rtol,
                     atol=atol,
                     verbose=1,
@@ -668,10 +715,14 @@ class TestMoeBwmmMxShardBlockKernel:
     """Test class for MoE BWMM MX CTE kernel (shard-on-block)."""
 
     @pytest_parametrize(SHARD_ON_BLOCK_PARAMS, SHARD_ON_BLOCK_UNIT_PERMS, abbrevs=_ABBREVS)
+    @pytest.mark.parametrize(
+        "kernel_entry", [bwmm_shard_on_block_mx_v2, bwmm_shard_on_block_mx], ids=["v2", "deprecated"]
+    )
     def test_moe_bwmm_mx_shard_block_unit(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
+        kernel_entry,
         vnc_degree: int,
         hidden: int,
         tokens: int,
@@ -733,16 +784,18 @@ class TestMoeBwmmMxShardBlockKernel:
         )
 
         def out_desc(ki):
-            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree, kernel_entry)
 
         is_accumulating = top_k != 1
         custom_comparator = None
         if is_accumulating:
-            custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
+            custom_comparator = _shard0_comparator(
+                tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5, kernel_entry=kernel_entry
+            )
 
         UnitTestFramework(
             test_manager=test_manager,
-            kernel_entry=bwmm_shard_on_block_mx,
+            kernel_entry=kernel_entry,
             torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
             kernel_input_generator=input_gen,
             output_tensor_descriptor=out_desc,
@@ -752,6 +805,188 @@ class TestMoeBwmmMxShardBlockKernel:
             rtol=5e-2,
             atol=1e-5,
             custom_comparator=custom_comparator,
+        )
+
+    # fmt: off
+    # Zero-padding-block routing. The default harness sizes N from a worst-case bound, so
+    # conditions always ends in zeros and the ping-pong's trailing iteration lands on an
+    # inactive block. tight_blocks sizes N to the routing (as production does), removing the
+    # slack: with an odd n_dynamic that iteration reaches block index n_static + n_active == N.
+    # ep_degree is what decouples n_static from N -- it only feeds the best-case static-block
+    # estimate, so a larger value shrinks n_static and leaves an odd n_dynamic behind.
+    # ep_degree=12 gives N=32, n_padding_block=0, n_static=3, n_dynamic=29.
+    _TIGHT_BLOCK_PARAMS = "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, ep_degree, skip_mode"
+    _TIGHT_BLOCK_PERMS = [
+        # skip_token=True: the token gather/scatter carry oob_mode.skip.
+        [2, 3072, 4096, 384, 2, 256, 2, 12, 3],
+        # skip_token=False: gather and scatter run at oob_mode.error, so the trailing
+        # iteration has to be in bounds on its own.
+        [2, 3072, 4096, 384, 2, 256, 2, 12, 0],
+        # Each skip in isolation, so a failure points at one of them.
+        [2, 3072, 4096, 384, 2, 256, 2, 12, 1],
+        [2, 3072, 4096, 384, 2, 256, 2, 12, 2],
+        # ep_degree=8 gives n_static=4, n_dynamic=28 -- already even, so the parity
+        # normalization is a no-op. Control for whether zero padding alone is enough.
+        [2, 3072, 4096, 384, 2, 256, 2, 8, 2],
+        [2, 3072, 4096, 384, 2, 256, 2, 8, 0],
+        [2, 3072, 4096, 384, 2, 256, 2, 8, 3],
+        # LNC1: at one shard the parity normalization is skipped, so with ep_degree=12 the
+        # odd n_dynamic survives and the remainder loop must land exactly on N-1 with no
+        # padding slack. skip_mode=0 runs the gather/scatter at oob_mode.error, so an
+        # overrun faults instead of being silently skipped.
+        [1, 3072, 4096, 384, 2, 256, 2, 12, 0],
+        [1, 3072, 4096, 384, 2, 256, 2, 12, 3],
+        # ep_degree=8 leaves n_dynamic even: control for odd-vs-tight.
+        [1, 3072, 4096, 384, 2, 256, 2, 8, 0],
+    ]
+
+    # Same shapes with the default (worst-case) N, i.e. padding blocks present. Isolates
+    # whether a failure needs zero padding or is independent of it.
+    _TIGHT_BLOCK_CONTROL_PERMS = [
+        # skip_mode 3 is the production mode (skip_token + skip_weight): does it fail
+        # without zero padding?
+        [2, 3072, 4096, 384, 2, 256, 2, 8, 3],
+        [2, 3072, 4096, 384, 2, 256, 2, 12, 3],
+        [2, 3072, 4096, 384, 2, 256, 2, 8, 2],
+        [2, 3072, 4096, 384, 2, 256, 2, 12, 2],
+        # LNC1 counterpart of the tight rows: same shapes with padding present, so a
+        # tight-blocks failure localizes to the missing slack rather than the shape.
+        [1, 3072, 4096, 384, 2, 256, 2, 12, 3],
+    ]
+    # fmt: on
+
+    @pytest_parametrize(_TIGHT_BLOCK_PARAMS, _TIGHT_BLOCK_PERMS, abbrevs=_ABBREVS)
+    @pytest.mark.fast
+    def test_moe_bwmm_mx_shard_block_tight_blocks(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree: int,
+        hidden: int,
+        tokens: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        ep_degree: int,
+        skip_mode: int,
+    ):
+        """Dynamic-block routing with no padding blocks (N sized to the routing)."""
+        dtype, weight_dtype = nl.bfloat16, nl.float8_e4m3fn_x4
+
+        def input_gen(tc):
+            return _gen_block_inputs(
+                vnc_degree=vnc_degree,
+                hidden=hidden,
+                tokens=tokens,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                ep_degree=ep_degree,
+                act_fn=ActFnType.SiLU,
+                expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                skip_mode=skip_mode,
+                bias=True,
+                is_dynamic=True,
+                gate_clamp_upper=7.0,
+                gate_clamp_lower=None,
+                up_clamp_upper=7.0,
+                up_clamp_lower=-7.0,
+                n_static_blocks=None,
+                quantization_type=QuantizationType.MX,
+                tight_blocks=True,
+            )
+
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
+
+        kernel_entry = bwmm_shard_on_block_mx_v2
+
+        def out_desc(ki):
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree, kernel_entry)
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kernel_entry,
+            torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=5e-2,
+            atol=1e-5,
+            custom_comparator=_shard0_comparator(
+                tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5, kernel_entry=kernel_entry
+            ),
+        )
+
+    @pytest_parametrize(_TIGHT_BLOCK_PARAMS, _TIGHT_BLOCK_CONTROL_PERMS, abbrevs=_ABBREVS)
+    @pytest.mark.fast
+    def test_moe_bwmm_mx_shard_block_padded_control(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree: int,
+        hidden: int,
+        tokens: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        ep_degree: int,
+        skip_mode: int,
+    ):
+        """Same shapes as the tight_blocks test but with padding blocks present."""
+        dtype, weight_dtype = nl.bfloat16, nl.float8_e4m3fn_x4
+
+        def input_gen(tc):
+            return _gen_block_inputs(
+                vnc_degree=vnc_degree,
+                hidden=hidden,
+                tokens=tokens,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                ep_degree=ep_degree,
+                act_fn=ActFnType.SiLU,
+                expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                skip_mode=skip_mode,
+                bias=True,
+                is_dynamic=True,
+                gate_clamp_upper=7.0,
+                gate_clamp_lower=None,
+                up_clamp_upper=7.0,
+                up_clamp_lower=-7.0,
+                n_static_blocks=None,
+                quantization_type=QuantizationType.MX,
+                tight_blocks=False,
+            )
+
+        kernel_entry = bwmm_shard_on_block_mx_v2
+
+        def out_desc(ki):
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree, kernel_entry)
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kernel_entry,
+            torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-5,
+            custom_comparator=_shard0_comparator(
+                tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5, kernel_entry=kernel_entry
+            ),
         )
 
     # fmt: off
@@ -765,6 +1000,8 @@ class TestMoeBwmmMxShardBlockKernel:
     # full-only list below.
     _PREQUANT_HIDDEN_PERMS = [
         # vnc, hidden, tokens, inter, exp, blk, k, act, eas, dtype, wdt, sk, bias, dyn, gcu, gcl, ucu, ucl, pack, pack_affin, affin_dt
+        # Regression: T not a multiple of 128 (top_k>1, lnc2) exercises the reduce_outputs last-tile clamp.
+        [2, 512, 300, 384, 16, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True, nl.bfloat16],
         [2, 512, 1024, 384, 16, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True, nl.bfloat16],
         # Odd E=17 -> E*2 not a multiple of 4: exercises the row pad-to-4 (bf16 tail).
         [2, 512, 1024, 384, 17, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True, nl.bfloat16],
@@ -808,6 +1045,8 @@ class TestMoeBwmmMxShardBlockKernel:
         [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, True, nl.bfloat16],
         [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, True, nl.bfloat16],
         [2, 3072, 8192, 1536, 64, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True, nl.bfloat16],
+        # LNC1 twin of the row above: the fp8-hidden path at one shard.
+        [1, 3072, 8192, 1536, 64, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, True, True, nl.bfloat16],
         [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, True, nl.bfloat16],
         [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, True, nl.bfloat16],
         [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, True, nl.bfloat16],
@@ -818,6 +1057,9 @@ class TestMoeBwmmMxShardBlockKernel:
         [2, 7168, 1024, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, True, nl.bfloat16],
         [2, 7168, 4096, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, True, True, nl.bfloat16],
         [2, 7168, 8192, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, True, nl.bfloat16],
+        [2, 7168, 1024, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, False, nl.bfloat16],
+        [2, 7168, 4096, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, True, False, nl.bfloat16],
+        [2, 7168, 8192, 1024, 8, 256, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, False, True, None, None, None, None, True, False, nl.bfloat16],
     ]
     # fmt: on
 
@@ -896,17 +1138,21 @@ class TestMoeBwmmMxShardBlockKernel:
             platform_target=platform_target,
         )
 
+        kernel_entry = bwmm_shard_on_block_mx_v2
+
         def out_desc(ki):
-            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree, kernel_entry)
 
         is_accumulating = top_k != 1
         custom_comparator = None
         if is_accumulating:
-            custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
+            custom_comparator = _shard0_comparator(
+                tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5, kernel_entry=kernel_entry
+            )
 
         UnitTestFramework(
             test_manager=test_manager,
-            kernel_entry=bwmm_shard_on_block_mx,
+            kernel_entry=kernel_entry,
             torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
             kernel_input_generator=input_gen,
             output_tensor_descriptor=out_desc,
@@ -919,7 +1165,7 @@ class TestMoeBwmmMxShardBlockKernel:
         )
 
     @pytest.mark.coverage_parametrize(
-        vnc_degree=BoundedRange([2], boundary_values=[]),
+        vnc_degree=BoundedRange([1, 2], boundary_values=[]),
         # change back to 6144 upper bound after accuracy issue is resolved. NKI-1582
         hidden=BoundedRange([1536, 3072] + random.sample(range(1024, 4096, 512), 2), boundary_values=[]),
         tokens=BoundedRange([1024, 10240, 32768] + random.sample([2048, 4096, 8192], 2), boundary_values=[]),
@@ -989,17 +1235,21 @@ class TestMoeBwmmMxShardBlockKernel:
                 quantization_type=quant_type,
             )
 
+        kernel_entry = bwmm_shard_on_block_mx_v2
+
         def out_desc(ki):
-            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree, kernel_entry)
 
         is_accumulating = top_k != 1
         custom_comparator = None
         if is_accumulating and not is_negative_test_case:
-            custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
+            custom_comparator = _shard0_comparator(
+                tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5, kernel_entry=kernel_entry
+            )
 
         UnitTestFramework(
             test_manager=test_manager,
-            kernel_entry=bwmm_shard_on_block_mx,
+            kernel_entry=kernel_entry,
             torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
             kernel_input_generator=input_gen,
             output_tensor_descriptor=out_desc,
@@ -1395,17 +1645,23 @@ class TestMoeBwmmMxCteModel:
                     ep_degree=ep_degree,
                 )
 
+            kernel_entry = bwmm_shard_on_block_mx_v2
+
             def out_desc(ki):
-                return _block_output(ki, tokens, hidden, dtype, skip_mode, min(expert, global_top_k) > 1, vnc_degree)
+                return _block_output(
+                    ki, tokens, hidden, dtype, skip_mode, min(expert, global_top_k) > 1, vnc_degree, kernel_entry
+                )
 
             is_accumulating = min(expert, global_top_k) > 1
             custom_comparator = None
             if is_accumulating:
-                custom_comparator = _shard0_comparator(tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5)
+                custom_comparator = _shard0_comparator(
+                    tokens, hidden, vnc_degree, dtype, rtol=5e-2, atol=1e-5, kernel_entry=kernel_entry
+                )
 
             UnitTestFramework(
                 test_manager=test_manager,
-                kernel_entry=bwmm_shard_on_block_mx,
+                kernel_entry=kernel_entry,
                 torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
                 kernel_input_generator=input_gen,
                 output_tensor_descriptor=out_desc,

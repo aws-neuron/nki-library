@@ -27,7 +27,7 @@ from .mlp_tkg_constants import (
     MLPTKGConstantsDimensionSizes,
     MLPTKGConstantsDownTileCounts,
 )
-from .projection_utils import adaptive_dge_mode
+from .projection_utils import _down_proj_dge_mode
 
 
 def down_projection_lhs_rhs_swap(
@@ -113,7 +113,7 @@ def down_projection_lhs_rhs_swap(
             nisa.dma_copy(
                 dst=weight_sb_tile_slice,
                 src=weight_hbm_tile_slice.slice(dim=0, start=i_tile.start_offset, end=i_tile.end_offset),
-                dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(weight),
+                dge_mode=_down_proj_dge_mode(weight, use_dge, sbm.is_auto_alloc()),
             )
 
             """

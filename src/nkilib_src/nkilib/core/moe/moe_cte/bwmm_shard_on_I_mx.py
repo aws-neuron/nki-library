@@ -41,8 +41,6 @@ from typing import Any, Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import sendrecv
-from nki.isa.constants import dge_mode, oob_mode
 
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
@@ -1055,12 +1053,12 @@ def compute_one_block_mx(
 
     # activation
     """
-    when activation function is silu, 
+    when activation function is silu,
     intermediate = silu(gate_proj) * up_proj
 
-    when activation function is swiglu, 
+    when activation function is swiglu,
     intermediate = swiglu(gate_proj) * (up_proj + 1)
-    Note that we expect up_proj_bias already contains +1 
+    Note that we expect up_proj_bias already contains +1
     (ie the framework should give the kernel up_bias + 1 instead of just bias)
     """
     nisa.activation(
@@ -1187,8 +1185,8 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
     nisa.dma_copy(
         dst=gup_weights_qtz_sb,
         src=gup_weight_view,
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-        dge_mode=dge_mode.hwdge,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+        dge_mode=nisa.dge_mode.hwdge,
     )
 
     """
@@ -1245,8 +1243,8 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip,
+                dge_mode=nisa.dge_mode.hwdge,
             )
 
         # Stage 2: vector-engine broadcast each block scale 128x along N into gup_scales_sb.
@@ -1299,7 +1297,7 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
                 indirect_dim=0,
             ),
             dst=inps.gup_scales_sb[:_pmax, :2, : prj_cfg.n_H512_tile, : prj_cfg.I // 2],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
 
     """
@@ -1336,8 +1334,8 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+                dge_mode=nisa.dge_mode.hwdge,
             )
         else:
             # gate_and_up_proj_bias shape: (E, _pmax, 2, n_total_I512_tile, _q_width)
@@ -1357,8 +1355,8 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+                dge_mode=nisa.dge_mode.hwdge,
             )
 
     return gup_weights_qtz_sb, inps.gup_scales_sb, gup_bias_sb, token_indices_on_p, gup_n_quadrants_needed
@@ -1438,8 +1436,8 @@ def load_down_proj_weights_shard_on_intermediate_mx(
     nisa.dma_copy(
         src=down_weight_view,
         dst=dst_weight[: dims.p_I, :, :],
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-        dge_mode=dge_mode.hwdge,
+        oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+        dge_mode=nisa.dge_mode.hwdge,
     )
 
     """
@@ -1502,8 +1500,8 @@ def load_down_proj_weights_shard_on_intermediate_mx(
                     scalar_offset=block_expert,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip,
-                dge_mode=dge_mode.hwdge,
+                oob_mode=nisa.oob_mode.skip,
+                dge_mode=nisa.dge_mode.hwdge,
             )
 
         # Stage 2: vector-engine broadcast each block scale 128x along H into down_scale_sb.
@@ -1557,7 +1555,7 @@ def load_down_proj_weights_shard_on_intermediate_mx(
                 indirect_dim=0,
             ),
             dst=down_scale_sb[:128, : prj_cfg.n_I512_tile_lnc_sharded, : prj_cfg.H],
-            oob_mode=oob_mode.skip,
+            oob_mode=nisa.oob_mode.skip,
         )
 
     # load bias
@@ -1570,8 +1568,8 @@ def load_down_proj_weights_shard_on_intermediate_mx(
                 pattern=[[dims.H, 1], [1, dims.H]], offset=0, scalar_offset=block_expert, indirect_dim=0
             ),
             dst=down_bias_sb,
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_weight else nisa.oob_mode.error,
+            dge_mode=nisa.dge_mode.hwdge,
         )
 
     return down_scale_sb, down_bias_sb
@@ -1583,7 +1581,7 @@ def accumulation_after_down_proj(block_new_lst, block_old, expert_affinity, dims
     for b_tile_idx in range(dims.n_B128_tiles_sharded):
         block_new_lnc_recv_sbuf_lst.append(nl.ndarray((_pmax, 1, dims.H), dtype=cfg.io_dtype, buffer=nl.sbuf))
     for b_shard_tile_idx in range(dims.n_B128_tiles_sharded):
-        sendrecv(
+        nisa.sendrecv(
             src=block_new_lst[0:_pmax, b_shard_tile_idx + dims.n_B128_tiles_sharded * (1 - shard_id), 0 : dims.H],
             dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:_pmax, 0, 0 : dims.H],
             send_to_rank=(1 - shard_id),
@@ -1682,7 +1680,7 @@ def load_old_block(
                     vector_offset=block_token_mapping,
                     indirect_dim=0,
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             )
         else:
             """
@@ -1698,7 +1696,7 @@ def load_old_block(
                 src=output.ap(
                     pattern=[[H, _pmax], [1, H]], offset=0, vector_offset=block_token_mapping, indirect_dim=0
                 ),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+                oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
             )
 
     return block_old_lst
@@ -1764,7 +1762,7 @@ def store_block_output_shard_over_block_size(
                 indirect_dim=0,
             ),
             src=block_new[b_shard_tile_idx].reshape((_pmax, dims.H))[0:_pmax, 0 : dims.H],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            oob_mode=nisa.oob_mode.skip if skip_dma.skip_token else nisa.oob_mode.error,
         )
 
 
@@ -1898,14 +1896,14 @@ def gate_up_projection_mx_tp_shard_I(
 
             """
             Copy output while adding bias if needed.
-            
+
             out_sb shape: [_pmax, cfg.n_total_I512_tile, BxS, _q_width]
             out_psum shape: [_pmax, _q_width, BxS_tile_sz] (for each item in out_psum_lst)
             """
             if bias_sb is not None:
                 """
                 Use NkiTensor to slice and broadcast bias.
-                
+
                 For combined gate+up: bias_t_shared_base_offset // _q_width gives starting tile index
                 For already-sliced: bias_t_shared_base_offset is 0
                 """
@@ -2113,7 +2111,7 @@ def _down_proj_prep_inter_and_weights(
             nisa.memset(dst=weight_qtz[:, cfg.n_total_I512_tile_lnc_sharded - 1, :], value=0.0)
 
         kernel_assert(weight.shape == (p_I, cfg.n_total_I512_tile_lnc_sharded, H), "Incorrect weight shape")
-        nisa.dma_copy(src=weight[:, :, 0:H], dst=weight_qtz[:p_I, :, :], dge_mode=dge_mode.hwdge)
+        nisa.dma_copy(src=weight[:, :, 0:H], dst=weight_qtz[:p_I, :, :], dge_mode=nisa.dge_mode.hwdge)
 
     # Check if weight scale is already in SBUF or needs to be loaded from HBM
     weight_qtz_scale = None
@@ -2148,7 +2146,7 @@ def _down_proj_prep_inter_and_weights(
                             :,
                             :,
                         ],
-                        dge_mode=dge_mode.hwdge,
+                        dge_mode=nisa.dge_mode.hwdge,
                     )
 
     return inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale

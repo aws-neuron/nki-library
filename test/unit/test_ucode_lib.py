@@ -13,9 +13,11 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _pytest.config import Config
 
 from test.utils.common_dataclasses import (
     CompilerArgs,
@@ -25,7 +27,9 @@ from test.utils.common_dataclasses import (
     Platforms,
     TraceMode,
 )
-from test.utils.test_orchestrator import Orchestrator
+from test.utils.host_management import HostManager
+from test.utils.metrics_collector import IMetricsCollector
+from test.utils.test_orchestrator import FilesystemArgs, Orchestrator
 
 
 def _make_orchestrator(tmp_path, ucode_lib_path):
@@ -49,9 +53,9 @@ def _make_orchestrator(tmp_path, ucode_lib_path):
         ),
     ):
         return Orchestrator(
-            config=MagicMock(),  # ty: ignore — test double for Config
+            config=cast(Config, MagicMock()),
             trace_mode=TraceMode.CompileOnly,
-            host_manager=MagicMock(),  # ty: ignore — test double for HostManager
+            host_manager=cast(HostManager, MagicMock()),
             collector=MagicMock(),
             nki_compilation_mode=NKICompilationMode.tracer,
         )
@@ -86,10 +90,13 @@ def test_stages_lib_into_artifacts_dir(tmp_path):
     orchestrator.trace_mode = TraceMode.CompileAndInfer
     orchestrator.ucode_lib_path = str(ucode_lib)
     orchestrator.collector = MagicMock()
-    orchestrator.fs_config = SimpleNamespace(
-        artifacts_output_directory_path=str(artifacts_dir),
-        host_manager=SimpleNamespace(
-            get_host_assignment_with_retry=lambda **kwargs: no_host_assignments(),
+    orchestrator.fs_config = cast(
+        FilesystemArgs,
+        SimpleNamespace(
+            artifacts_output_directory_path=str(artifacts_dir),
+            host_manager=SimpleNamespace(
+                get_host_assignment_with_retry=lambda **kwargs: no_host_assignments(),
+            ),
         ),
     )
     kernel_under_test = SimpleNamespace(
@@ -100,7 +107,7 @@ def test_stages_lib_into_artifacts_dir(tmp_path):
         inference_args=SimpleNamespace(collective_ranks=1),
     )
 
-    orchestrator._run_inference(kernel_under_test, {})
+    orchestrator._run_inference(cast(KernelArgs, kernel_under_test), {})
 
     assert (artifacts_dir / ucode_lib.name).read_bytes() == b"ucode"
 
@@ -121,8 +128,8 @@ def test_env_var_points_at_uploaded_lib(tmp_path):
     orchestrator.profiler_binary_path = "neuron-explorer"
     orchestrator.explorer_binary_path = "neuron-explorer"
     orchestrator.skip_core_reset = False
-    orchestrator.collector = SimpleNamespace(metrics_enabled=False)
-    orchestrator.fs_config = SimpleNamespace(artifacts_output_directory_path=str(artifacts_dir))
+    orchestrator.collector = cast(IMetricsCollector, SimpleNamespace(metrics_enabled=False))
+    orchestrator.fs_config = cast(FilesystemArgs, SimpleNamespace(artifacts_output_directory_path=str(artifacts_dir)))
 
     kernel_under_test = KernelArgs(
         kernel_func=lambda: None,

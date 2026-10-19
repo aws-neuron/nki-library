@@ -90,3 +90,20 @@ def _rope_non_interleaved_ref(x, cos, sin):
     y1 = x1 * cos - x2 * sin
     y2 = x1 * sin + x2 * cos
     return torch.cat([y1, y2], dim=-1)
+
+
+def _rope_interleaved_ref(x, cos, sin):
+    """Interleaved RoPE: pairs (x_{2j}, x_{2j+1}) — the adjacent/complex pairing.
+
+    Same angles as :func:`_rope_non_interleaved_ref`, only the pairing differs. The rotated
+    lanes are written back INTERLEAVED (stride-2 stack), matching the kernel's
+    ``_rope_interleaved``. Note HuggingFace's ``apply_rotary_pos_emb_interleave`` instead
+    concatenates the even lane then the odd lane; that is one shared permutation of Q's and K's
+    rope columns, which leaves q . k unchanged, so scores agree either way — but an elementwise
+    comparison against HF's Q/K would not.
+    """
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    y_even = x_even * cos - x_odd * sin
+    y_odd = x_even * sin + x_odd * cos
+    return torch.stack([y_even, y_odd], dim=-1).flatten(-2)

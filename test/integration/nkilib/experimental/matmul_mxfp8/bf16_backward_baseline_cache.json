@@ -1,0 +1,28 @@
+{
+  "4096x4096x2304": {
+    "shape_name": "Qwen3-235B-TP4 - FWD-FuseQKV [BF16 backward]",
+    "M": 4096,
+    "K": 4096,
+    "N": 2304,
+    "input_grad_shape": "4096x2304x4096",
+    "weight_grad_shape": "2304x4096x4096",
+    "num_lnc": 2,
+    "inference_time": 0.001044810034,
+    "active_inference_time": 0.001039888,
+    "mfu_percent": 94.08791722993732,
+    "mbu_percent": 18.918753249460515
+  },
+  "4096x2048x4096": {
+    "shape_name": "Qwen3-235B-TP4 - FWD-OProj [BF16 backward]",
+    "M": 4096,
+    "K": 2048,
+    "N": 4096,
+    "input_grad_shape": "4096x4096x2048",
+    "weight_grad_shape": "4096x4096x2048",
+    "num_lnc": 2,
+    "inference_time": 0.000958615168,
+    "active_inference_time": 0.0009558090000000001,
+    "mfu_percent": 91.06346951559709,
+    "mbu_percent": 14.84806104177276
+  }
+}

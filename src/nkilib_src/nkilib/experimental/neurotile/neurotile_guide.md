@@ -103,7 +103,7 @@ prerequisite — NeuroTile makes NKI easier to *write*, but it is still NKI unde
 | `.load(...)` | Single coalesced DMA, HBM → SBUF | `NDSlice` | [§1](#data-movement-load-and-store) | the data-movement docstrings |
 | `.store(data, ...)` | Single coalesced DMA, SBUF → HBM | — | [§1](#data-movement-load-and-store) | the data-movement docstrings |
 | `.stream(dim=, buffer_count=, ...)` | Rotating-buffer DMA/compute overlap | `BlockStream` | [§2](#streaming) / [§3](#streaming-in-depth) | the data-movement docstrings |
-| `.data` | Underlying NKI tensor view — compute operand and escape hatch | `nl.ndarray` | [§1](#data-movement-load-and-store) | the data-movement docstrings |
+| `.data` | Underlying NKI tensor view — compute operand and escape hatch | `nl.NkiTensor` | [§1](#data-movement-load-and-store) | the data-movement docstrings |
 | `.tolist(dim=)` | Materialize sub-views as a Python list | `list` | — | the data-movement docstrings |
 | `.whole_tiles()` / `.remainder_tiles()` | Split clean vs boundary sub-views | `list` | [§3](#remainder-handling) | the data-movement docstrings |
 
@@ -382,7 +382,7 @@ dst_tiles[i, j].store(tile.data)              # one DMA: SBUF -> HBM
 ```
 
 
-A loaded view exposes its underlying NKI tensor as `.data`: the same `nl.ndarray` you pass to
+A loaded view exposes its underlying NKI tensor as `.data`: the same `nl.NkiTensor` you pass to
 `nisa.*` compute ops, hand to `.store()`, or drop into a raw `nisa.dma_copy`. `.data` is also
 the escape hatch behind the "transparent and overridable" promise — when the high-level methods
 don't express what you need, it gives you the raw tensor to pair with a hand-written DMA.
@@ -904,7 +904,7 @@ acc = nt.alloc_tiles(
     dtype=nl.float32,
 )
 nisa.memset(acc.data, 0.0)
-acc[m, n].data                  # a tile slot -- an nl.ndarray for nisa.*
+acc[m, n].data                  # a tile slot -- an nl.NkiTensor for nisa.*
 acc.data                        # view over the whole buffer (for one coalesced store)
 ```
 
@@ -1386,7 +1386,7 @@ use. The options, with the rule each obeys:
 |---|---|
 | `dtype=` | allocate the SBUF destination at this dtype; the DMA hardware casts on a mismatch (allocation-driven, no separate cast op) |
 | `transpose=` / `transpose_axes=` | DMA-transpose path (see [Transpose](#transpose)); `transpose_axes` is gather-only |
-| `dst=` | load into a caller-provided SBUF destination — a raw `nl.ndarray` *or* a `.data` view |
+| `dst=` | load into a caller-provided SBUF destination — a raw `nl.NkiTensor` *or* a `.data` view |
 | `oob_mode=` / `oob_value=` | suppress out-of-bounds DMA faults / pre-fill (see [Remainder](#remainder-handling)) |
 | `priority=` | DMA QoS level, int in `[0, 3]` (lower = higher priority) |
 | `pattern_override=` / `out_shape=` | custom HBM access pattern + its SBUF shape (see [Access patterns](#access-patterns)) |
@@ -1765,7 +1765,7 @@ Two cases that are *not* tiling and so skip `nt.tiles()` entirely:
   `nisa.tensor_tensor(out, x, gamma.expand_dim(1).broadcast(1, n), nl.multiply)`.
 
 
-See `examples/_03_tile_ops/_03_tensor_view.py`.
+See `examples/_03_tile_ops/_03_views.py`.
 
 
 
@@ -2070,7 +2070,7 @@ See `examples/_03_tile_ops/_02_fold_pattern_override.py` (fold and `pattern_over
 Everything so far addressed tiles at compile-time-known positions. Production kernels also
 need **runtime-dynamic** access: gathering rows by an index vector, selecting an expert by a
 runtime id, shifting a KV-cache window by a computed offset. NeuroTile expresses all of these
-through the same `[]` operator — you pass a *loaded index* (an SBUF view or raw `nl.ndarray`)
+through the same `[]` operator — you pass a *loaded index* (an SBUF view or raw `nl.NkiTensor`)
 where you would otherwise pass an `int`. The anchors are `examples/_05_indirect/*`.
 
 
@@ -2273,14 +2273,14 @@ kv_data  = kv_iter[batch_id, seq_tile].load()       # batch_id static, seq_tile 
 
 
 The index need not be wrapped by `nt.tiles`. If you already have an index in SBUF — for
-instance one you computed with `nisa.*` — pass the raw `nl.ndarray` directly; the same shape
+instance one you computed with `nisa.*` — pass the raw `nl.NkiTensor` directly; the same shape
 rule applies (`(1, 1)` → scalar, `[K, 1]` → vector):
 
 
 ```python
 seq_sbuf = nl.ndarray((1, 1), dtype=seq_offset_tensor.dtype, buffer=nl.sbuf)
 nisa.dma_copy(seq_sbuf, seq_offset_tensor)
-kv_data = kv_iter[batch_id, seq_sbuf].load()        # raw nl.ndarray as the index
+kv_data = kv_iter[batch_id, seq_sbuf].load()        # raw nl.NkiTensor as the index
 ```
 
 

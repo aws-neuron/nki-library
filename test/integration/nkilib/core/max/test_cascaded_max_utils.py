@@ -24,7 +24,7 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
-from nkilib_src.nkilib.core.max.cascaded_max_utils import predicated_folded_load, unfolded_store
+from nkilib_src.nkilib.core.max.cascaded_max_utils import predicated_folded_load, reduce, unfolded_store
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_program_sharding_info
 
 from test.utils.common_dataclasses import CompilerArgs, Platforms
@@ -416,3 +416,28 @@ class TestCascadedMaxUtils:
         framework.run_test(
             test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
         )
+
+
+# ===================== Host-side reduce() unit tests =====================
+# reduce() is a plain-Python helper (no device component), so its per-op
+# branches are exercised directly rather than through a kernel invocation.
+
+
+@pytest.mark.fast
+def test_reduce_mul():
+    assert reduce("mul", [2, 3, 4], 1) == 24
+
+
+@pytest.mark.fast
+def test_reduce_add():
+    assert reduce("add", [1, 2, 3], 0) == 6
+
+
+@pytest.mark.fast
+def test_reduce_min():
+    assert reduce("min", [3, 1, 2], 5) == 1
+
+
+@pytest.mark.fast
+def test_reduce_max():
+    assert reduce("max", [3, 1, 2], 0) == 3

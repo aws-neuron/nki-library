@@ -17,9 +17,15 @@ from functools import cache
 
 import nki.language as nl
 import numpy as np
+import pytest
 import torch
 from nkilib_src.nkilib.core.attention.attention_tkg import INACTIVE_BLOCK_IDX
-from nkilib_src.nkilib.core.attention.attention_tkg_utils import AttnTKGConfig, is_batch_sharded
+from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
+    AttnTKGConfig,
+    get_total_n_prgs,
+    is_batch_sharded,
+    uses_batch_tiling,
+)
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
 
 
@@ -29,12 +35,21 @@ class AttnTKGTestParams:
     test_sink: bool = False
     fp8_kv: bool = False
     sliding_window: int = 0
+    DBG: bool = False
+    use_auto_alloc: bool = False
 
 
 def cfg_repr(cfg: AttnTKGConfig | AttnTKGTestParams):
     if isinstance(cfg, AttnTKGTestParams):
         return "-".join(
-            [f"dt_{cfg.dtype}", f"sink_{int(cfg.test_sink)}", f"fp8_{int(cfg.fp8_kv)}", f"sw_{cfg.sliding_window}"]
+            [
+                f"dt_{cfg.dtype}",
+                f"sink_{int(cfg.test_sink)}",
+                f"fp8_{int(cfg.fp8_kv)}",
+                f"sw_{cfg.sliding_window}",
+                f"dbg_{int(cfg.DBG)}",
+                f"aa_{int(cfg.use_auto_alloc)}",
+            ]
         )
     elif isinstance(cfg, AttnTKGConfig):
         return "-".join(
@@ -275,3 +290,42 @@ def generate_cache_lens(bs, s_ctx, s_tkg, mode="normal", mean_frac=0.5, stddev_f
     assert cache_lens.min() >= 1
     assert cache_lens.max() <= max_pos
     return cache_lens
+
+
+# Host-side unit tests for the pure-Python tiling/sharding helpers (no device, run everywhere).
+_P_MAX = 128
+
+
+@pytest.mark.fast
+def test_uses_batch_tiling_zero_cost_returns_no_tiling():
+    # per_batch_cost == 0 (fa_tile_s_prior == 0) short-circuits to (False, bs_per_nc).
+    assert uses_batch_tiling(4, 1, 1, 0, is_auto_alloc=False, dtype_size=2) == (False, 4)
+
+
+def test_uses_batch_tiling_auto_alloc_allows_single_tile():
+    # is_auto_alloc=True takes the "allow at least one batch tile" path.
+    use_tiling, tile = uses_batch_tiling(4, 1, 1, 8, is_auto_alloc=True, dtype_size=2)
+    assert tile >= 1
+
+
+def test_uses_batch_tiling_qk_swapped_rounds_to_col_tiling_factor():
+    # qk_swapped=True exercises the col-tiling-factor rounding branch.
+    use_tiling, tile = uses_batch_tiling(4, 1, 1, 8, is_auto_alloc=False, dtype_size=2, qk_swapped=True)
+    assert tile >= 1
+
+
+def test_get_total_n_prgs_single_core():
+    # lnc <= 1 always returns 1 program.
+    assert get_total_n_prgs(4, 2, 1, 512, lnc=1, p_max=_P_MAX) == 1
+
+
+def test_get_total_n_prgs_sharded_returns_lnc():
+    # lnc=2 with a batch-sharded config returns lnc.
+    assert is_batch_sharded(2, 128, 1, 8192, _P_MAX)
+    assert get_total_n_prgs(2, 128, 1, 8192, lnc=2, p_max=_P_MAX) == 2
+
+
+def test_get_total_n_prgs_unsharded_returns_one():
+    # lnc=2 but neither batch- nor s_prior-sharded returns 1.
+    assert not is_batch_sharded(1, 1, 1, 128, _P_MAX)
+    assert get_total_n_prgs(1, 1, 1, 128, lnc=2, p_max=_P_MAX) == 1

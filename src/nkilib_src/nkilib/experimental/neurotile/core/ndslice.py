@@ -456,10 +456,10 @@ class NDSlice(nl.NKIObject):
            This API is experimental and may change in future releases.
 
         Args:
-            key (int | slice | tuple | NDSlice | nl.ndarray): What to select along one or
+            key (int | slice | tuple | NDSlice | nl.NkiTensor): What to select along one or
                 more dimensions. An ``int`` or ``slice`` selects at tile granularity (or
                 block granularity for a block view); a tuple applies one key per leading
-                dimension, left to right; a loaded index view (or raw SBUF ``nl.ndarray``)
+                dimension, left to right; a loaded index view (or raw SBUF ``nl.NkiTensor``)
                 performs a runtime gather or scatter. See the sections below.
 
         Returns:
@@ -628,7 +628,7 @@ class NDSlice(nl.NKIObject):
             preconditions for a correct result, not validated constraints, so a second
             runtime index or a misplaced gather is silently mishandled rather than
             rejected. The index tensor must reside in SBUF (a loaded view, or a raw
-            ``nl.ndarray``) and the data tensor must reside in HBM.
+            ``nl.NkiTensor``) and the data tensor must reside in HBM.
 
         .. warning::
 
@@ -757,20 +757,24 @@ class NDSlice(nl.NKIObject):
                 else:
                     grid = grid.consume(dim)
                     layout = layout.advance(dim, normalized_k, advance_step)
-                    # Elements consumed on this dim = index * tile extent. The P dim
-                    # folds its tiles into F, so layout.dim_offset_elements(P) is always
-                    # 0 -- use the P-tile index * tile_p directly so a trailing partial
-                    # P-tile (element_shape[P] not a multiple of tile_p) is narrowed and
-                    # flagged is_remainder, just like a trailing F-tile.
+                    # SBUF folds its P-tiles into F, so the layout reports no element
+                    # offset on a P dim; derive it from the index instead, scaled by the
+                    # indexed axis's own step (one tile for a TILE axis, block_size tiles
+                    # for a BLOCK axis) so a trailing partial P-tile is narrowed and
+                    # flagged is_remainder like a trailing F-tile would be.
                     leaf = grid._elem_leaf_on_dim(dim)
                     is_folded_partition = (
                         leaf is not None and leaf.label == AxisLabel.PARTITION and hasattr(layout, "alloc_tile_size")
                     )
                     if is_folded_partition:
-                        p_consumed = normalized_k * layout.alloc_tile_size[dim]
+                        p_consumed = normalized_k * advance_step * layout.alloc_tile_size[dim]
                     else:
                         p_consumed = layout.dim_offset_elements(dim, grid.element_shape)
                     grid = grid.truncate_to_source(dim, p_consumed)
+                    if is_folded_partition:
+                        # Record the origin in the extent, for the same reason. Must follow
+                        # truncate_to_source, which measures against the un-shrunk extent.
+                        grid = grid.clamp_source_extent(dim, grid.element_shape[dim] - p_consumed)
                 consumed_dims.append(dim)
 
             elif isinstance(k, ElementOffset):
@@ -807,6 +811,20 @@ class NDSlice(nl.NKIObject):
 
                 grid = grid.narrow(dim, count)
                 layout = layout.advance(dim, start, advance_step)
+                leaf = grid._elem_leaf_on_dim(dim)
+                is_folded_partition = (
+                    leaf is not None and leaf.label == AxisLabel.PARTITION and hasattr(layout, "alloc_tile_size")
+                )
+                if is_folded_partition:
+                    # No element offset is reported on a folded P dim, so record the origin
+                    # in the extent: bounded below by the start so a later descent measures
+                    # from the right place, above by the walk so a re-tile of this view
+                    # cannot reach past its end.
+                    skipped = start * advance_step * layout.alloc_tile_size[dim]
+                    covered = grid.element_shape[dim] - skipped
+                    if grid.remaining[dim] < covered:
+                        covered = grid.remaining[dim]
+                    grid = grid.clamp_source_extent(dim, covered)
                 grid = grid.truncate_to_source(dim, layout.dim_offset_elements(dim, grid.element_shape))
 
             else:
@@ -1154,12 +1172,13 @@ class NDSlice(nl.NKIObject):
         oob_mode=None,
         oob_value: Optional[float] = None,
         priority: Optional[int] = None,
-        dst: Optional[nl.ndarray] = None,
+        dst: Optional[nl.NkiTensor] = None,
         pattern_override: Optional[list] = None,
         out_shape: Optional[tuple[int, ...]] = None,
         engine=None,
+        name: Optional[str] = None,
     ) -> "NDSlice":
-        """load(dtype=None, transpose=False, transpose_axes=None, dge_mode=None, oob_mode=None, oob_value=None, priority=None, dst=None, pattern_override=None, out_shape=None, engine=None) -> NDSlice
+        """load(dtype=None, transpose=False, transpose_axes=None, dge_mode=None, oob_mode=None, oob_value=None, priority=None, dst=None, pattern_override=None, out_shape=None, engine=None, name=None) -> NDSlice
 
         Transfer this view's region from HBM to SBUF and return a view over the SBUF
         result.
@@ -1190,7 +1209,7 @@ class NDSlice(nl.NKIObject):
                 Requires ``oob_mode``.
             priority (int | None): DMA QoS level in ``[0, 3]`` (lower = higher priority);
                 omitted when None.
-            dst (nl.ndarray | .data view | None): Pre-allocated SBUF destination. The
+            dst (nl.NkiTensor | .data view | None): Pre-allocated SBUF destination. The
                 library allocates one (at ``dtype``) when omitted. On a transpose its shape
                 must equal the transposed output shape.
             pattern_override (list[[int, int]] | None): Custom HBM access pattern replacing
@@ -1204,11 +1223,17 @@ class NDSlice(nl.NKIObject):
                 ``dge_mode``. Only ``nisa.engine.sync`` or ``nisa.engine.scalar`` pin a
                 specific engine, and only with ``dge_mode=nisa.dge_mode.hwdge``. Not
                 supported on the transpose path.
+            name (str | None): Instruction name for the emitted DMA; the profiler shows it
+                as ``U-<name>``. Must be unique across every named instruction in the
+                kernel, so vary it per iteration in a loop
+                (``name="lhs_" + str(i)``) -- a repeat fails to compile with
+                ``duplicate op name``. A partition-dim ``fold()`` load emits K DMAs and
+                suffixes each with ``_k<k>``.
 
         Returns:
             NDSlice: A view over the freshly loaded (or caller-provided) SBUF buffer --
             see ``NDSlice`` for the view's attributes. ``.data`` is the underlying
-            ``nl.ndarray``. A coalesced whole-row / whole-column selection (``tiles[i]`` or
+            ``nl.NkiTensor``. A coalesced whole-row / whole-column selection (``tiles[i]`` or
             ``tiles[:, m]``) packs the selected tiles contiguously along the SBUF free axis
             in one DMA, and the result is indexed in SBUF with no further DMA.
 
@@ -1355,6 +1380,7 @@ class NDSlice(nl.NKIObject):
                 oob_mode=oob_mode,
                 priority=priority,
                 engine=engine,
+                name=name,
             )
             return NDSlice(sbuf_grid, sbuf_layout)
 
@@ -1396,6 +1422,7 @@ class NDSlice(nl.NKIObject):
             priority=priority,
             pattern_override=pattern_override,
             engine=engine,
+            name=name,
         )
         return NDSlice(sbuf_grid, sbuf_layout)
 
@@ -1408,8 +1435,9 @@ class NDSlice(nl.NKIObject):
         priority: Optional[int] = None,
         pattern_override: Optional[list] = None,
         engine=None,
+        name: Optional[str] = None,
     ) -> None:
-        """store(data, dtype=None, dge_mode=None, oob_mode=None, priority=None, pattern_override=None, engine=None) -> None
+        """store(data, dtype=None, dge_mode=None, oob_mode=None, priority=None, pattern_override=None, engine=None, name=None) -> None
 
         Transfer SBUF data into this view's HBM region -- the mirror of ``load()``.
 
@@ -1421,7 +1449,7 @@ class NDSlice(nl.NKIObject):
            This API is experimental and may change in future releases.
 
         Args:
-            data (nl.ndarray | .data view): The SBUF source -- either a raw ``nl.ndarray``
+            data (nl.NkiTensor | .data view): The SBUF source -- either a raw ``nl.NkiTensor``
                 or the ``.data`` view of a loaded view. Pass ``view.data``, not the view
                 object itself.
             dtype: Currently ignored -- ``store()`` performs no cast (the destination dtype
@@ -1437,6 +1465,8 @@ class NDSlice(nl.NKIObject):
                 transfer -- ``nisa.engine.sync`` or ``nisa.engine.scalar``. It applies only
                 with ``dge_mode=nisa.dge_mode.hwdge``; with the default None the compiler
                 selects the engine.
+            name (str | None): Instruction name for the emitted DMA, Must be unique across
+                every named instruction in the kernel.
 
         Returns:
             None.
@@ -1457,7 +1487,7 @@ class NDSlice(nl.NKIObject):
             .. code-block:: python
 
                 dst_tiles[i, j].store(tile.data)          # store a loaded tile
-                dst_tiles[i, j].store(sbuf_result)        # store a raw nl.ndarray
+                dst_tiles[i, j].store(sbuf_result)        # store a raw nl.NkiTensor
                 out_blocks[0, nb].store(acc.data)         # coalesced multi-tile store
 
         See Also:
@@ -1498,6 +1528,7 @@ class NDSlice(nl.NKIObject):
                 priority=priority,
                 oob_mode=oob_mode,
                 engine=engine,
+                name=name,
             )
             return
 
@@ -1514,6 +1545,7 @@ class NDSlice(nl.NKIObject):
             priority=priority,
             pattern_override=pattern_override,
             engine=engine,
+            name=name,
         )
 
     # ================================================================
@@ -2590,8 +2622,9 @@ class BlockStream(nl.NKIObject):
         oob_value: Optional[float] = None,
         priority: Optional[int] = None,
         engine=None,
+        name: Optional[str] = None,
     ) -> "NDSlice":
-        """load(index, dtype=None, transpose=False, transpose_axes=None, dge_mode=None, oob_mode=None, oob_value=None, priority=None, engine=None) -> NDSlice
+        """load(index, dtype=None, transpose=False, transpose_axes=None, dge_mode=None, oob_mode=None, oob_value=None, priority=None, engine=None, name=None) -> NDSlice
 
         DMA stream position ``index`` into rotating slot ``index % buffer_count`` and return
         the slot's ``NDSlice``.
@@ -2627,10 +2660,13 @@ class BlockStream(nl.NKIObject):
                 ``unknown`` / ``dma`` let the compiler pick). A transpose load takes no
                 ``engine``. The stream's own ``pattern_override`` / ``out_shape`` apply on
                 the non-transpose path only (the transpose slot is pre-sized).
+            name (str | None): Instruction name for this step's DMA, suffixed with
+                ``_<index>`` so a constant name stays unique across steps -- ``name="lhs"``
+                at step 3 emits ``lhs_3``.
 
         Returns:
             NDSlice: the rotating slot's view (or a fresh SBUF buffer on a dtype mismatch).
-            ``.data`` is the underlying ``nl.ndarray``. A step advances one position along
+            ``.data`` is the underlying ``nl.NkiTensor``. A step advances one position along
             the streamed dimension (like a single integer index on that dimension), so the
             loaded view exposes whatever one step contains -- for example the tile grid
             inside one block when streaming a block dimension -- for further indexing.
@@ -2659,6 +2695,7 @@ class BlockStream(nl.NKIObject):
         dst = self._buffers[index % self._buffer_count]
         if dtype is not None and dtype != self._dtype:
             dst = None
+        step_name = None if name is None else name + "_" + str(index)
         # transpose ignores pattern_override/out_shape (its dst slot is pre-sized).
         # engine= is invalid on the transpose path (NDSlice.load asserts); pass it
         # through so that assert fires with a clear message rather than silently.
@@ -2673,6 +2710,7 @@ class BlockStream(nl.NKIObject):
                 oob_value=oob_value,
                 priority=priority,
                 engine=engine,
+                name=step_name,
             )
         return child.load(
             dst=dst,
@@ -2684,6 +2722,7 @@ class BlockStream(nl.NKIObject):
             pattern_override=self._pattern_override,
             out_shape=self._out_shape,
             engine=engine,
+            name=step_name,
         )
 
     def __getitem__(self, index: int) -> "NDSlice":
@@ -2694,7 +2733,7 @@ class BlockStream(nl.NKIObject):
 
         The buffer is the pre-allocated SBUF region, typed at the step's tile grid (and
         transpose-aware), so it is tile-addressable (``stream[k][ti, tj]``) and its
-        ``data`` attribute is the raw ``nl.ndarray``. It serves three roles: output
+        ``data`` attribute is the raw ``nl.NkiTensor``. It serves three roles: output
         streaming, reading a buffer that an earlier step loaded, and acting as a per-tile
         ``dst=`` target. Indexing is **not** ordinary sequence indexing -- ``index`` is
         taken modulo ``buffer_count`` to pick a rotating slot, so out-of-range or large
@@ -2726,6 +2765,14 @@ class BlockStream(nl.NKIObject):
             declare ``transpose=True`` at construction or issue a transpose ``load()``
             before any plain access.
 
+        .. note::
+
+            The slot is uniformly sized for a whole step, so on a partial step it
+            reports the **full** extent, unlike ``load(index)``; only the valid
+            prefix holds data. ``store(index)`` writes back just that prefix, so do
+            not take a step's valid tile count from ``stream[k].shape`` -- use
+            ``load(index).shape`` or the source view's.
+
         See Also:
             load: DMA a step into its slot.
             store: write a slot back to HBM.
@@ -2734,8 +2781,16 @@ class BlockStream(nl.NKIObject):
         self._ensure_buffers_for_access()
         return self._slot_view(self._buffers[index % self._buffer_count])
 
-    def store(self, index: int, oob_mode=None, dge_mode=None, priority: Optional[int] = None, engine=None) -> None:
-        """store(index, oob_mode=None, dge_mode=None, priority=None, engine=None) -> None
+    def store(
+        self,
+        index: int,
+        oob_mode=None,
+        dge_mode=None,
+        priority: Optional[int] = None,
+        engine=None,
+        name: Optional[str] = None,
+    ) -> None:
+        """store(index, oob_mode=None, dge_mode=None, priority=None, engine=None, name=None) -> None
 
         Transfer rotating buffer ``index % buffer_count`` back to its HBM position -- the
         mirror of ``load(index)``.
@@ -2760,6 +2815,8 @@ class BlockStream(nl.NKIObject):
                 ``NDSlice.store``.
             engine (nisa.engine.* | None): The HWDGE descriptor-generation engine;
                 forwarded to ``NDSlice.store`` (applies only with ``dge_mode=hwdge``).
+            name (str | None): Instruction name for this step's DMA, suffixed with
+                ``_<index>`` so a constant name stays unique across steps.
 
         Returns:
             None.
@@ -2780,6 +2837,11 @@ class BlockStream(nl.NKIObject):
             that slot has been reused by a later step writes the later step's data. Store a
             position before its slot is overwritten.
 
+            The slot goes back through the same pattern builder ``load(index)`` filled it
+            with, so a store is that load's exact reverse: on a partial step only the
+            prefix the step owns is written. No caller-side adjustment exists or is
+            needed -- this path owns both sides.
+
         See Also:
             __getitem__: get the slot to fill.
             load: the read mirror.
@@ -2788,11 +2850,14 @@ class BlockStream(nl.NKIObject):
         self._ensure_buffers_for_access()
         sbuf = self._buffers[index % self._buffer_count]
         child = self._child(index)
+        step_name = None if name is None else name + "_" + str(index)
+        # slot_ap is the same helper load() uses, so this is that load's reverse.
         child.store(
-            SBUFLayout.contiguous_ap(sbuf),
+            child._layout.slot_ap(sbuf, child._grid, self._out_shape),
             oob_mode=oob_mode,
             dge_mode=dge_mode,
             priority=priority,
             pattern_override=self._pattern_override,
             engine=engine,
+            name=step_name,
         )

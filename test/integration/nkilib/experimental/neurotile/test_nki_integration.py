@@ -297,3 +297,88 @@ class TestSequentialRange:
             rtol=1e-2,
             atol=1e-2,
         )
+
+
+# =============================================================================
+# load(name=) -- instruction naming
+# =============================================================================
+
+
+@nki.jit
+def _kernel_named_load(src):
+    """Per-iteration names on a tile-grid walk."""
+    out = nl.ndarray(src.shape, dtype=src.dtype, buffer=nl.shared_hbm)
+    v = nt.tiles(src, tile_size=(128, 512))
+    out_v = nt.tiles(out, tile_size=(128, 512))
+    for i in range(v.shape[0]):
+        tile = v[i, 0].load(name="src_" + str(i))
+        out_v[i, 0].store(tile.data)
+    return out
+
+
+@nki.jit
+def _kernel_named_load_duplicate(src):
+    """One name reused across iterations -- rejected at compile time."""
+    out = nl.ndarray(src.shape, dtype=src.dtype, buffer=nl.shared_hbm)
+    v = nt.tiles(src, tile_size=(128, 512))
+    out_v = nt.tiles(out, tile_size=(128, 512))
+    for i in range(v.shape[0]):
+        tile = v[i, 0].load(name="src")
+        out_v[i, 0].store(tile.data)
+    return out
+
+
+@nki.jit
+def _kernel_named_stream_load(src):
+    """A constant name per stream step; BlockStream appends the step index."""
+    out = nl.ndarray(src.shape, dtype=src.dtype, buffer=nl.shared_hbm)
+    v = nt.tiles(src, tile_size=(128, 512))
+    out_v = nt.tiles(out, tile_size=(128, 512))
+    stream = v[:, 0].stream()
+    for k in range(v.shape[0]):
+        tile = stream.load(k, name="step")
+        out_v[k, 0].store(tile.data)
+    return out
+
+
+@pytest_marks(["neurotile"])
+class TestLoadName:
+    """load(name=) names the emitted DMA; NKI requires the name to be unique."""
+
+    @pytest.mark.fast
+    def test_named_load(self, test_manager: Orchestrator, platform_target: Platforms):
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_kernel_named_load,
+            torch_ref=torch_ref_wrapper(_identity_ref),
+            kernel_input_generator=_src_inputs((512, 512), seed=42),
+            output_tensor_descriptor=_src_output,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_named_stream_load(self, test_manager: Orchestrator, platform_target: Platforms):
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=_kernel_named_stream_load,
+            torch_ref=torch_ref_wrapper(_identity_ref),
+            kernel_input_generator=_src_inputs((512, 512), seed=42),
+            output_tensor_descriptor=_src_output,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @pytest.mark.fast
+    def test_duplicate_name_rejected(self):
+        src = np.zeros((512, 512), dtype=ml_dtypes.bfloat16)
+        with pytest.raises(Exception, match="duplicate op name"):
+            _kernel_named_load_duplicate(src)

@@ -23,10 +23,10 @@ TiledRangeIterator represents a single tile with size, index, and start_offset p
 import math
 from typing import Tuple, Union
 
-from nki.language import NKIObject
+import nki.language as nl
 
 
-class TiledRangeIterator(NKIObject):
+class TiledRangeIterator(nl.NKIObject):
     """
     Represents a single tile in a tiled range.
 

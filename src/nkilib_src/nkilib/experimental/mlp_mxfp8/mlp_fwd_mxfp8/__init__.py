@@ -12,30 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MLP Forward MXFP8 kernel implementations."""
+"""MLP Forward MXFP8 kernel implementation."""
 
-from .config import (
-    DEFAULT_MATMUL_CONFIG,
-    L_TILE_K,
-    TILE_K,
-    TILE_M,
-    TILE_N,
-    BlockConfig,
-    MatmulConfig,
-    get_config_for_shape,
-)
-from .mlp_fwd_mxfp8_kernel import (
-    mlp_forward_mxfp8_nki,
-)
+from .mlp_fwd_mxfp8_kernel import mlp_forward_mxfp8_nki
 
-__all__ = [
-    'mlp_forward_mxfp8_nki',
-    'BlockConfig',
-    'MatmulConfig',
-    'DEFAULT_MATMUL_CONFIG',
-    'TILE_M',
-    'TILE_K',
-    'TILE_N',
-    'L_TILE_K',
-    'get_config_for_shape',
-]
+__all__ = ["mlp_forward_mxfp8_nki"]

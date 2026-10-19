@@ -580,7 +580,9 @@ def load_mx_compact_weight_scales(
     w_scale_sbuf_list = []
     for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
         padded_size, actual_size = cfg.d_tile.get_bounds(d_tile_idx)
-        if padded_size <= 0:
+        if (
+            padded_size <= 0
+        ):  # pragma: no branch - dead arc: range(tile_count) is exact ceil; every d_tile padded_size >= 1
             break
 
         # Final destination: dense MX layout for nc_matmul_mx.
@@ -704,7 +706,9 @@ def load_mx_input_interleaved(
 
     for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
         padded_d_size, actual_d_size = cfg.d_tile.get_bounds(d_tile_idx)
-        if padded_d_size <= 0:
+        if (
+            padded_d_size <= 0
+        ):  # pragma: no branch - dead arc: range(tile_count) is exact ceil; every d_tile padded_d_size >= 1
             break
 
         tmp_sbuf = nl.ndarray(
@@ -785,7 +789,9 @@ def load_mx_prequantized_input(
 
     for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
         padded_d_size, actual_d_size = cfg.d_tile.get_bounds(d_tile_idx)
-        if padded_d_size <= 0:
+        if (
+            padded_d_size <= 0
+        ):  # pragma: no branch - dead arc: range(tile_count) is exact ceil; every d_tile padded_d_size >= 1
             break
 
         # Load quantized attention (similar to load_mx_quantized_weights)

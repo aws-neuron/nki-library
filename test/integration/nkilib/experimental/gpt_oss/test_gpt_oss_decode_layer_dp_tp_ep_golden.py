@@ -76,6 +76,7 @@ from test.integration.nkilib.experimental.transformer.test_attention_block_tkg_u
     AttnBlkTestConfig,
 )
 from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
+from test.utils.mx_utils import maybe_pack64_gate_up_scale
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -228,6 +229,15 @@ def make_golden_ref(tp_group, ep_group, tp_size, ep_size):
         gate_clamp_upper_limit,
         up_clamp_upper_limit,
         up_clamp_lower_limit,
+        # validate_torch_ref_signature compares kernel and ref parameter names as
+        # sets, so the kernel's optional packed metadata must appear here. This ref
+        # is the dense oracle; packing changes the schedule, not the math.
+        seq_packed_attention_mask=None,
+        seq_packed_active_blocks_table=None,
+        seq_packed_q_index_table=None,
+        seq_packed_seq_id_table=None,
+        seq_packed_accumulator_partial_route_table=None,
+        seq_packed_accumulator_group_state_route_table=None,
     ):
         tp_pg = get_pg(tp_replica_group)
         ep_pg = get_pg(ep_replica_group)
@@ -466,7 +476,9 @@ class TestGptOssDecodeLayerGolden:
                 "router_bias": moe_global["router_bias"],
                 "expert_gate_up_weights": moe_global["expert_gate_up_weights"][e : e + 1],
                 "expert_down_weights": moe_global["expert_down_weights"][e : e + 1],
-                "expert_gate_up_weights_scale": moe_global["expert_gate_up_weights_scale"][e : e + 1],
+                "expert_gate_up_weights_scale": maybe_pack64_gate_up_scale(
+                    moe_global["expert_gate_up_weights_scale"][e : e + 1]
+                ),
                 "expert_down_weights_scale": moe_global["expert_down_weights_scale"][e : e + 1],
                 "expert_gate_up_bias": moe_global["expert_gate_up_bias"][e : e + 1],
                 "expert_down_bias": moe_global["expert_down_bias"][e : e + 1],
@@ -500,7 +512,13 @@ class TestGptOssDecodeLayerGolden:
                 additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             output_keys=["out"],
-            rtol=7e-2,
+            # rtol widened 7e-2 -> 9e-2 for the GK default bundle. VLLM_NEURON_MEGA_FP8_RS
+            # (on by default) FP8-quantizes the EP reduce-scatter, which ~doubles this path's
+            # worst-rank relative error (mainline ~3.9-4.1% -> ~7.5-7.8%). Isolated on trn3:
+            # disabling only FP8_RS drops dp-8 back to ~3.9% and dp-1 to ~5.9%, so FP8_RS is
+            # the confirmed cause. 9e-2 covers the ~7.8% worst case with margin while still
+            # catching gross errors.
+            rtol=9e-2,
             atol=1e-2,
             inference_args=InferenceArgs(collective_ranks=collective_ranks, enable_determinism_check=False),
         )

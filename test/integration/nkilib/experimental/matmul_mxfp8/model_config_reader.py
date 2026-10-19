@@ -46,7 +46,7 @@ class TorchTitanModelConfig:
         return cfg
 
 
-def generate_attention_shapes(config_path: str, TP=1, CP=1):
+def generate_attention_shapes(config_path: str, TP=1, CP=1, UBS=1):
     """
     Generate attention matmul shapes for one transformer block.
 
@@ -66,6 +66,8 @@ def generate_attention_shapes(config_path: str, TP=1, CP=1):
         config_path (str): Path to model configuration JSON file.
         TP (int): Tensor parallelism degree.
         CP (int): Context parallelism degree.
+        UBS (int): Micro-batch size. The projections see UBS * S / CP tokens; the
+            per-head attention matmuls stay per sequence.
 
     Returns:
         list: List of [name, M, K, N] shape tuples.
@@ -79,6 +81,7 @@ def generate_attention_shapes(config_path: str, TP=1, CP=1):
     h = cfg["head_dim"]
 
     seq = S / CP
+    tokens = UBS * seq
 
     all_shapes = []
 
@@ -90,13 +93,13 @@ def generate_attention_shapes(config_path: str, TP=1, CP=1):
     qkv_out = (Q * h + 2 * KV * h) / TP
 
     # FWD: [S/CP, H] @ [H, qkv_out]
-    all_shapes.append(["FWD-FuseQKV", seq, H, qkv_out])
+    all_shapes.append(["FWD-FuseQKV", tokens, H, qkv_out])
 
     # BWD input grad: [S/CP, qkv_out] @ [qkv_out, H]
-    all_shapes.append(["BWD-FuseQKV-IPGrad", seq, qkv_out, H])
+    all_shapes.append(["BWD-FuseQKV-IPGrad", tokens, qkv_out, H])
 
     # BWD weight grad: [qkv_out, S/CP] @ [S/CP, H]
-    all_shapes.append(["BWD-FuseQKV-WTGrad", qkv_out, seq, H])
+    all_shapes.append(["BWD-FuseQKV-WTGrad", qkv_out, tokens, H])
 
     # ================================================================
     # 2. Attention Computation (per-head matmuls)
@@ -134,18 +137,18 @@ def generate_attention_shapes(config_path: str, TP=1, CP=1):
     attn_out = Q * h / TP
 
     # FWD: [S/CP, Q*h/TP] @ [Q*h/TP, H]
-    all_shapes.append(["FWD-OProj", seq, attn_out, H])
+    all_shapes.append(["FWD-OProj", tokens, attn_out, H])
 
     # BWD input grad: [S/CP, H] @ [H, Q*h/TP]
-    all_shapes.append(["BWD-OProj-IPGrad", seq, H, attn_out])
+    all_shapes.append(["BWD-OProj-IPGrad", tokens, H, attn_out])
 
     # BWD weight grad: [H, S/CP] @ [S/CP, Q*h/TP]
-    all_shapes.append(["BWD-OProj-WTGrad", H, seq, attn_out])
+    all_shapes.append(["BWD-OProj-WTGrad", H, tokens, attn_out])
 
     return all_shapes
 
 
-def generate_dense_mlp_shapes(config_path: str, TP=1, CP=1):
+def generate_dense_mlp_shapes(config_path: str, TP=1, CP=1, UBS=1, fuse_gate_up=True):
     """
     Generate dense MLP matmul shapes (SwiGLU gate+up and down projections).
 
@@ -156,6 +159,9 @@ def generate_dense_mlp_shapes(config_path: str, TP=1, CP=1):
         config_path (str): Path to model configuration JSON file.
         TP (int): Tensor parallelism degree.
         CP (int): Context parallelism degree.
+        UBS (int): Micro-batch size; every matmul sees UBS * S / CP tokens.
+        fuse_gate_up (bool): Emit gate and up as one fused matmul (N = 2*FFN/TP).
+            False emits the separate w1/w3 matmuls (N = FFN/TP each).
 
     Returns:
         list: List of [name, M, K, N] shape tuples.
@@ -166,18 +172,18 @@ def generate_dense_mlp_shapes(config_path: str, TP=1, CP=1):
     H = cfg["dim"]
     FFN = cfg["hidden_dim"]
 
-    seq = S / CP
+    seq = UBS * S / CP
 
     all_shapes = []
 
     # ================================================================
-    # MLP — Fused Gate + Up Projection  (SwiGLU)
-    #    gate_proj and up_proj are fused into one matmul.
+    # MLP — Gate + Up Projection  (SwiGLU)
+    #    Fused: gate_proj and up_proj run as one matmul.
     #    Input:  [S/CP, H]
-    #    Weight: [H, 2*FFN/TP]   (gate and up concatenated)
+    #    Weight: [H, 2*FFN/TP]   (gate and up concatenated), or [H, FFN/TP] each
     # ================================================================
 
-    gate_up_out = 2 * FFN // TP
+    gate_up_out = (2 if fuse_gate_up else 1) * FFN // TP
 
     # FWD: [S/CP, H] @ [H, 2*FFN/TP]
     all_shapes.append(["FWD-MLP-FuseGateUp", seq, H, gate_up_out])

@@ -67,9 +67,10 @@ class Mxfp8AttnTkgTestConfig:
     bs: int = 1
     q_head: int = 64
     lnc: int = 2
+    s_active: int = 1
 
     def __repr__(self):
-        return f"bs{self.bs}_qh{self.q_head}_pos{self.pos_id}_lnc{self.lnc}"
+        return f"bs{self.bs}_qh{self.q_head}_pos{self.pos_id}_lnc{self.lnc}_sa{self.s_active}"
 
 
 TEST_CONFIGS = [
@@ -90,6 +91,17 @@ TEST_CONFIGS = [
     # q_head=32
     pytest.param(Mxfp8AttnTkgTestConfig(pos_id=2048, q_head=32), marks=pytest.mark.fast),
     Mxfp8AttnTkgTestConfig(pos_id=524288, q_head=32, lnc=1),
+    # Speculative decoding: q_head=32, s_active=2 (band_p=64, reuses the q_head=64 geometry)
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=32, s_active=2),
+    # Speculative decoding: band_p=128 (single Q variant, no cross-band packing)
+    pytest.param(Mxfp8AttnTkgTestConfig(pos_id=2048, q_head=32, s_active=4), marks=pytest.mark.fast),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=32, s_active=4),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=64, s_active=2),
+    # Speculative decoding: band_p>128 (row-tiled query rows)
+    pytest.param(Mxfp8AttnTkgTestConfig(pos_id=2048, q_head=64, s_active=4), marks=pytest.mark.fast),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=64, s_active=4),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=64, s_active=8),
+    Mxfp8AttnTkgTestConfig(pos_id=131072, q_head=32, s_active=8),
 ]
 
 
@@ -124,20 +136,33 @@ def _make_mxfp8_comparator(label):
     return comparator
 
 
-def _build_token_mask(bs, q_head, pos_id_val):
-    """Build a token-sequential mask [bs, q_head, 1, pos_id] with per-head interior zeros.
+def _build_token_mask(bs, q_head, pos_id_val, s_active):
+    """Build a unified mask [bs, q_head, s_active, pos_id + s_active] with per-row interior zeros.
 
-    An all-ones mask would validate nothing: the kernel scatters this mask into its
+    The pos_id prefix masks the prior context; the trailing s_active columns mask the
+    active tokens (here a causal triangle: query token s attends to active tokens 0..s).
+
+    An all-ones prior mask would validate nothing: the kernel scatters this mask into its
     eviction layout, so masked positions must exist inside the valid range (where V is
-    non-zero) and must differ per head, otherwise a wrong partition band or a transposed
-    H/s_prior axis still produces the correct output.
+    non-zero) and must differ per (head, active-token) row, otherwise a wrong partition
+    band or a transposed axis still produces the correct output. The per-row phase folds
+    the active-token index so those rows differ too.
     """
     tokens = np.arange(pos_id_val)
-    head_phase = np.arange(q_head) * MASK_HEAD_SHIFT
-    # mask[h, t] == 0 where (t + h * shift) % stride == 0
-    masked = ((tokens[np.newaxis, :] + head_phase[:, np.newaxis]) % MASK_ZERO_STRIDE) == 0
-    mask_head = np.where(masked, 0, 1).astype(np.uint8)  # [q_head, pos_id]
-    return np.broadcast_to(mask_head[np.newaxis, :, np.newaxis, :], (bs, q_head, 1, pos_id_val)).copy()
+    # One phase per query row (h * s_active + s), head-major.
+    row_phase = np.arange(q_head * s_active) * MASK_HEAD_SHIFT
+    # prior[r, t] == 0 where (t + r * shift) % stride == 0
+    masked = ((tokens[np.newaxis, :] + row_phase[:, np.newaxis]) % MASK_ZERO_STRIDE) == 0
+    prior = np.where(masked, 0, 1).astype(np.uint8)  # [q_head*s_active, pos_id]
+
+    # Active tail: causal triangle over s_active, broadcast to every head. Row (h, s)
+    # attends to active tokens 0..s.
+    causal = np.tril(np.ones((s_active, s_active), dtype=np.uint8))  # [s, s']
+    active = np.tile(causal, (q_head, 1))  # [q_head*s_active, s_active]
+
+    unified = np.concatenate([prior, active], axis=1)  # [q_head*s_active, pos_id + s_active]
+    unified = unified.reshape(q_head, s_active, pos_id_val + s_active)
+    return np.broadcast_to(unified[np.newaxis], (bs, q_head, s_active, pos_id_val + s_active)).copy()
 
 
 def _build_active_blocks_table(batch, num_blocks):
@@ -146,13 +171,13 @@ def _build_active_blocks_table(batch, num_blocks):
     return np.tile(table, (batch, 1))
 
 
-def _generate_inputs(bs, q_head, bucket_size, pos_id_val, seed=42):
+def _generate_inputs(bs, q_head, bucket_size, pos_id_val, s_active, seed=42):
     """Generate all kernel inputs for the given config."""
     _rng.reset(seed)
 
     num_blocks = bucket_size // BLOCK_LEN
 
-    q_bf16 = static_cast(_rng.randn(bs, q_head, 1, D_HEAD).numpy(), nl.bfloat16)
+    q_bf16 = static_cast(_rng.randn(bs, q_head, s_active, D_HEAD).numpy(), nl.bfloat16)
     k_blocks_bf16 = static_cast(_rng.randn(num_blocks, BLOCK_LEN, D_HEAD).numpy(), nl.bfloat16)
     v_blocks_bf16 = static_cast(_rng.randn(num_blocks, BLOCK_LEN, D_HEAD).numpy(), nl.bfloat16)
 
@@ -172,11 +197,11 @@ def _generate_inputs(bs, q_head, bucket_size, pos_id_val, seed=42):
 
     return {
         "q": q_bf16,
-        "k_active": static_cast(_rng.randn(bs, D_HEAD).numpy(), nl.bfloat16),
-        "v_active": static_cast(_rng.randn(bs, D_HEAD).numpy(), nl.bfloat16),
+        "k_active": static_cast(_rng.randn(bs, s_active, D_HEAD).numpy(), nl.bfloat16),
+        "v_active": static_cast(_rng.randn(bs, s_active, D_HEAD).numpy(), nl.bfloat16),
         "k_prior": k_cache_3d,
         "v_prior": v_cache_3d,
-        "mask": _build_token_mask(bs, q_head, pos_id_val),
+        "mask": _build_token_mask(bs, q_head, pos_id_val, s_active),
         "identity_hbm": np.eye(P_MAX, dtype=ml_dtypes.bfloat16),
         "active_blocks_table": _build_active_blocks_table(bs, num_blocks),
     }
@@ -193,7 +218,7 @@ def _run_attention_mxfp8_tkg_test(
     bucket_size = max(cfg.pos_id, min_chunks * CHUNK_TOKENS)
     bucket_size = (bucket_size + CHUNK_TOKENS - 1) // CHUNK_TOKENS * CHUNK_TOKENS
 
-    kernel_input = _generate_inputs(cfg.bs, cfg.q_head, bucket_size, cfg.pos_id)
+    kernel_input = _generate_inputs(cfg.bs, cfg.q_head, bucket_size, cfg.pos_id, cfg.s_active)
 
     framework = UnitTestFramework(
         test_manager=test_manager,
@@ -201,7 +226,7 @@ def _run_attention_mxfp8_tkg_test(
         kernel_input_generator=lambda _: kernel_input,
         torch_ref=attention_mxfp8_tkg_torch_ref,
         output_tensor_descriptor=lambda _: {
-            "out_hbm": np.zeros((cfg.bs, cfg.q_head, D_HEAD), dtype=ml_dtypes.bfloat16)
+            "out_hbm": np.zeros((cfg.bs, cfg.q_head, cfg.s_active, D_HEAD), dtype=ml_dtypes.bfloat16)
         },
     )
     framework.run_test(
@@ -231,6 +256,7 @@ class TestAttentionMxfp8Tkg:
         q_head=[32, 64],
         pos_id=[2048, 3000, 8192, 65536, 131072, 524288],
         lnc=[1, 2],
+        s_active=[1, 2, 4, 8],
         coverage="pairs",
         enable_automatic_boundary_tests=False,
     )
@@ -242,12 +268,13 @@ class TestAttentionMxfp8Tkg:
         q_head: int,
         pos_id: int,
         lnc: int,
+        s_active: int,
         is_negative_test_case: bool,
     ):
         """Pairwise sweep over bs/pos_id/lnc plus boundary negative tests for kernel asserts."""
         _run_attention_mxfp8_tkg_test(
             test_manager=test_manager,
             platform_target=platform_target,
-            cfg=Mxfp8AttnTkgTestConfig(pos_id=pos_id, bs=bs, q_head=q_head, lnc=lnc),
+            cfg=Mxfp8AttnTkgTestConfig(pos_id=pos_id, bs=bs, q_head=q_head, lnc=lnc, s_active=s_active),
             is_negative_test_case=is_negative_test_case,
         )

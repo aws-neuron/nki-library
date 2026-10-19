@@ -206,7 +206,7 @@ class Load(nl.NKIObject):
                 # Vector DGE: each partition row uses its own index
                 physical_index_dim = self._find_pattern_dim_by_stride(src_tile, self._indexed_stride)
 
-                ap_pattern, ap_offset = src_tile._get_pattern_and_offset()
+                ap_pattern = src_tile.get_pattern()
 
                 # Override the indexed dimension's size to match destination pdim_size
                 pdim_size = self._dst.get_pdim_size()
@@ -220,9 +220,10 @@ class Load(nl.NKIObject):
 
                 nisa.dma_copy(
                     dst=dst_tile,
+                    # No offset= here: NkiTensor.ap() adds its argument to the
+                    # tensor's own offset, which src_tile already carries.
                     src=src_tile.ap(
                         pattern=modified_pattern,
-                        offset=ap_offset,
                         vector_offset=self._vector_index,
                         indirect_dim=physical_index_dim,
                     ),

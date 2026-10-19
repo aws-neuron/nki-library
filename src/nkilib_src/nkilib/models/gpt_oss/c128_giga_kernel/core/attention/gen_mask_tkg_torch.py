@@ -23,6 +23,7 @@ Usage:
     gen_mask_tkg_torch_ref[lnc](pos_ids=..., mask_out=..., ...)
 """
 
+import math
 from typing import Optional, Protocol
 
 import torch
@@ -607,16 +608,16 @@ def _gen_mask_tkg_hbm_torch_ref_impl(
             fa_tile_size = s_prior
         p_max = bs_per_nc * bf * sqh  # == P_MAX in the banding regime
         out = torch.zeros((bs_n_prgs, p_max, banded_sprior), dtype=full_mask.dtype)
-        fa_offset = 0
-        band_free = 0
-        while fa_offset < s_prior:
+        # Full FA tiles are fa_tile_size wide (band_free stride fa_tile_size // bf); the last tile may be
+        # smaller (ragged), so clamp both the s_prior and band-free extents per tile.
+        for fa_idx in range(math.ceil(s_prior / fa_tile_size)):
+            fa_offset = fa_idx * fa_tile_size
+            band_free = fa_idx * (fa_tile_size // bf)
             tile_sp = min(fa_tile_size, s_prior - fa_offset)
             band_sp = tile_sp // bf
             tile = m[:, :, fa_offset : fa_offset + tile_sp].reshape(bs_n_prgs, bs_per_nc, sqh, bf, band_sp)
             tile = tile.permute(0, 1, 3, 2, 4)  # [n_prgs, bs_per_nc, bf, sqh, band_sp]
             out[:, :, band_free : band_free + band_sp] = tile.reshape(bs_n_prgs, p_max, band_sp)
-            fa_offset += tile_sp
-            band_free += band_sp
 
         return out.reshape(bs_n_prgs * p_max, banded_sprior).contiguous()
     else:

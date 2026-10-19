@@ -3,26 +3,36 @@
 Documentation and tools for testing NKI Library kernels.
 ## Set up
 
+Run the following commands from the root of your Git checkout. No separate package build is needed before local tests.
+The development Make targets require [uv](https://docs.astral.sh/uv/getting-started/installation/).
+They use the project environment (`.venv`, or an exported `UV_PROJECT_ENVIRONMENT`), not an unrelated activated environment.
+
 ```bash
-# 1. Initialize Python virtual environment
-python3 -m venv .venv
+# Create the environment and install locked dependencies.
+# Python defaults to the development pin in .python-version.
+make install                     # uv sync --frozen --extra test
 
-# 2. Activate the virtual environment
-source .venv/bin/activate
+# Run against the prepared environment without synchronization.
+make unit_test                   # test/unit
+make compile_test                # fast compile-only gate (trn2,trn3_a0)
+make build                       # ty + unit_test + compile_test
+make test ARGS="test/integration/nkilib/core/cumsum --test-mode simulation"
 
-# 3. Install nki-library + all dependencies
-make install
-
-# 4. run below to install latest supported versions
-make install_neuron
-# OR
-# 4. Download the Neuron compiler, Neuron Kernel Interface (NKI) wheels into `wheelhouse` directory
-# 4.a Install the compiler and NKI wheels
-make install_wheelhouse
-
-# 5. Now you can run regular make targets
-make test
+# Or call pytest directly.
+uv run --no-sync python -m pytest -c test/pytest.ini test/unit
 ```
+
+Execution targets do not create an environment or install/synchronize dependencies. Use an SDK-compatible source revision as described in the [main README](../README.md).
+
+`wheel`, `install_wheelhouse`, and `clean` use uv and the same project environment. `clean` removes build caches and uninstalls non-editable packages from that environment. `venv` creates an empty environment with `uv venv`; `install` also installs dependencies. `install_neuron` installs the project using the Neuron index without frozen synchronization; it does not imply `--upgrade`.
+
+Conventions:
+- `UV=/path/to/uv` selects the uv executable; `UV_PROJECT_ENVIRONMENT` selects the environment. Local uv setup and CodeBuild use the major/minor development pin in `.python-version`; `pyproject.toml` declares the supported Python range. `UV_PYTHON` can override the local setup interpreter within that range. There is no plain-Python Make mode.
+- Pytest nodeids remain relative to the `test/` configuration directory, matching the simulator xfail list.
+- Type checking targets the project interpreter; set `TY_PYTHON` to check a different environment.
+- `unit_test` and `compile_test` retain their standard suite defaults. Use `make test ARGS="path/to/test.py ..."` for selected tests or a different test mode.
+- `ARGS="..."` passes ordinary pytest arguments; `MAXPROCS` sets the compile gate worker limit.
+- Standard `PYTEST_ADDOPTS` is honored.
 
 ## Directory Structure
 
@@ -194,6 +204,8 @@ def filter_invalid_combinations(batch_size, seq_len, dtype=None):
 
 Use tensor generators from `test.integration.nkilib.utils.tensor_generators` for consistent input creation. **Always set random seed** (`np.random.seed(42)`) for deterministic tests when using random generation.
 
+Kernel input arrays must not be Fortran-ordered (column-major); `UnitTestFramework.run_test` rejects them. Such arrays are usually created by accident, e.g. by `.T` on a 2D array, `np.broadcast_to(...).astype(...)`, or `.numpy()` on a permuted torch tensor. Wrap the array in `np.ascontiguousarray(...)`; the values do not change.
+
 ### Minimal Test Example
 
 ```python
@@ -328,13 +340,11 @@ for f in $(find . -path '*/metrics/*.json'); do
 done
 ```
 
-The CSV contains: `TestName`, `TpbSgCyclesSum` (cycles), `MbuEstimatedPercent` (memory bandwidth utilization), `ProfilerMFU`, `InferenceTime`.
+The CSV contains: `TestName`, `TpbSgCyclesSum` (a duration in **picoseconds**, despite the name — `InferenceTime` in seconds is exactly `TpbSgCyclesSum * 1e-12`), `MbuEstimatedPercent` (memory bandwidth utilization), `ProfilerMFU`, `InferenceTime`.
 
 **Note:** If you just need the resulting metrics file and none of the other test artifacts, you can conserve disk space by using `--force-local-cleanup` along with `--force-local-cleanup-keep metrics`.
 
 ### Tips
 
 - **Always rebuild before testing** - Tests run against built artifacts
-- **Redirect output for analysis:** `brazil-build integration-test ... > /tmp/test.txt 2>&1`
 - **Use parallelism** (`-n auto --maxprocesses 64 --dist worksteal`) - Always use unless <20 test configs
-- **Use timeouts** for long runs: `timeout 300 brazil-build integration-test ...`

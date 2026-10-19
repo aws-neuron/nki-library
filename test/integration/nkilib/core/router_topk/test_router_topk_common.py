@@ -20,7 +20,10 @@ import nki.language as nl
 import numpy as np
 import torch
 from nkilib_src.nkilib.core.router_topk.router_topk import (
+    P_MAX,
     XHBMLayout_T_H__1,
+    XSBLayout_tp2013__1,
+    _hbm_tiled_store_view,
     router_topk,
     router_topk_input_x_load,
 )
@@ -74,6 +77,7 @@ def router_topk_kernel_wrapper(
     shard_on_tokens=False,
     skip_store_expert_index=False,
     skip_store_router_logits=False,
+    expert_affinities_eager_out=None,
 ):
     """Wrapper for router_topk that handles SBUF I/O."""
     # Infer x_input_in_sbuf: if x is (T, H) but x_hbm_layout says (H, T), x was intended for SBUF
@@ -93,7 +97,7 @@ def router_topk_kernel_wrapper(
         expert_index_to_kernel = expert_index
         expert_affinities_to_kernel = expert_affinities
 
-    router_topk(
+    kernel_outputs = router_topk(
         x=x_input,
         w=w,
         w_bias=w_bias,
@@ -113,14 +117,20 @@ def router_topk_kernel_wrapper(
         shard_on_tokens=shard_on_tokens,
         skip_store_expert_index=skip_store_expert_index,
         skip_store_router_logits=skip_store_router_logits,
+        expert_affinities_eager_out=expert_affinities_eager_out,
     )
 
-    # Copy SBUF results to HBM for validation
+    # Copy SBUF results to HBM for validation. The non-sharded SBUF path rebinds
+    # expert_affinities to a reshaped internal buffer, so read it from the kernel's return.
     if output_in_sbuf:
+        scattered_expert_affinities = kernel_outputs[2]
         nisa.dma_copy(src=expert_index_to_kernel, dst=expert_index)
-        nisa.dma_copy(src=expert_affinities_to_kernel, dst=expert_affinities)
+        nisa.dma_copy(src=scattered_expert_affinities, dst=expert_affinities)
 
-    return [router_logits, expert_index, expert_affinities]
+    result = [router_logits, expert_index, expert_affinities]
+    if expert_affinities_eager_out is not None:
+        result.append(expert_affinities_eager_out)
+    return result
 
 
 def router_topk_torch_wrapper(
@@ -144,6 +154,7 @@ def router_topk_torch_wrapper(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
+    expert_affinities_eager_out=None,
 ) -> list[torch.Tensor]:
     """Wrapper for router_topk_torch_ref matching router_topk_kernel_wrapper API."""
     # Infer if x is in T×H layout from shape: w is always (H, E), so w.shape[0] == H.
@@ -151,7 +162,7 @@ def router_topk_torch_wrapper(
     # handles the transpose correctly.
     H = w.shape[0]
     x_in_th_layout = x.shape[0] != H
-    return router_topk_torch_ref(
+    result = router_topk_torch_ref(
         x=x,
         w=w,
         w_bias=w_bias,
@@ -172,6 +183,21 @@ def router_topk_torch_wrapper(
         skip_store_expert_index=skip_store_expert_index,
         skip_store_router_logits=skip_store_router_logits,
     )
+
+    # When a store is skipped, the kernel never writes that output, so its buffer stays
+    # at its zero-initialized value. Mirror that in the golden so validation matches.
+    if skip_store_router_logits:
+        result["router_logits"] = torch.zeros_like(result["router_logits"])
+    if skip_store_expert_index:
+        result["expert_index"] = torch.zeros_like(result["expert_index"])
+
+    # HBM-direct eager output: the dense [T, k] top-K affinities in top-K order. These are
+    # exactly the scattered affinities gathered back at the top-K expert indices.
+    if expert_affinities_eager_out is not None:
+        eager = torch.gather(result["expert_affinities"], 1, result["expert_index"].long())
+        result["expert_affinities_eager_out"] = eager
+
+    return result
 
 
 def generate_router_topk_inputs(
@@ -218,3 +244,157 @@ def generate_router_topk_inputs(
         "shard_on_tokens": shard_on_tokens,
         "output_in_sbuf": output_in_sbuf,
     }
+
+
+# ---------------------------------------------------------------------------
+# Dedicated wrappers for two branches the standard wrapper cannot express:
+#   1) sharded SBUF expert_index with T>128 (needs a 3-D [128, num_t_tiles, k]
+#      SBUF output tensor, not the 2-D [T, k] the standard wrapper builds), and
+#   2) the layout-1 weight load with an ODD num_h_tiles (the "unbalanced" path),
+#      which requires a layout-1 SBUF x that router_topk_input_x_load cannot
+#      produce for odd num_h_tiles.
+# ---------------------------------------------------------------------------
+
+
+def router_topk_sharded_sbuf_index_kernel_wrapper(
+    x,
+    w,
+    w_bias,
+    router_logits,
+    expert_affinities,
+    expert_index,
+    act_fn,
+    k,
+    x_hbm_layout,
+    x_sb_layout,
+):
+    """Sharded run with expert_index in SBUF for T>128 (3-D tile-based store path)."""
+    T = expert_index.shape[0]
+    num_t_tiles_total = (T + P_MAX - 1) // P_MAX
+    # SBUF expert_index must be [128, num_t_tiles, k] for the T>128 sharded path;
+    # a flat [T, k] would exceed the 128-partition limit. expert_affinities stays in HBM.
+    expert_index_sb = nl.ndarray((P_MAX, num_t_tiles_total, k), dtype=nl.uint32, buffer=nl.sbuf)
+    router_topk(
+        x=x,
+        w=w,
+        w_bias=w_bias,
+        router_logits=router_logits,
+        expert_affinities=expert_affinities,
+        expert_index=expert_index_sb,
+        act_fn=act_fn,
+        k=k,
+        x_hbm_layout=x_hbm_layout,
+        x_sb_layout=x_sb_layout,
+        router_pre_norm=False,
+        shard_on_tokens=True,
+    )
+    # Fold the [128, num_t_tiles, k] SBUF result back into the [T, k] HBM output.
+    nisa.dma_copy(src=expert_index_sb, dst=_hbm_tiled_store_view(expert_index, 0, num_t_tiles_total, P_MAX))
+    return [router_logits, expert_index, expert_affinities]
+
+
+def router_topk_sharded_sbuf_index_torch_wrapper(
+    x,
+    w,
+    w_bias,
+    router_logits,
+    expert_affinities,
+    expert_index,
+    act_fn,
+    k,
+    x_hbm_layout,
+    x_sb_layout,
+):
+    """Torch golden for the sharded SBUF-index wrapper (standard [T,E]/[T,k] outputs)."""
+    return router_topk_torch_ref(
+        x=x,
+        w=w,
+        w_bias=w_bias,
+        router_logits=router_logits,
+        expert_affinities=expert_affinities,
+        expert_index=expert_index,
+        act_fn=act_fn,
+        k=k,
+        x_hbm_layout=x_hbm_layout,
+        x_sb_layout=x_sb_layout,
+        router_pre_norm=False,
+        shard_on_tokens=True,
+    )
+
+
+def router_topk_layout1_odd_kernel_wrapper(
+    x,
+    w,
+    w_bias,
+    router_logits,
+    expert_affinities,
+    expert_index,
+    act_fn,
+    k,
+    x_hbm_layout,
+    x_sb_layout,
+):
+    """Feed a layout-1 SBUF x built with the unbalanced (odd num_h_tiles) split.
+
+    router_topk_input_x_load's sb_layout=1 path requires an even num_h_tiles
+    (H % 256 == 0), so it cannot produce this input. We build the SBUF layout
+    directly, mirroring router_topk_input_w_load's odd-num_h_tiles halves so the
+    x and w H-index mappings agree and the matmul is correct.
+    """
+    T, H = x.shape
+    num_h_tiles = H // P_MAX
+    h2_first = num_h_tiles // 2
+    h2_second = num_h_tiles - h2_first
+    x_sb = nl.ndarray((P_MAX, T, num_h_tiles), dtype=x.dtype, buffer=nl.sbuf)
+    # Half 0: H rows [0, h2_first*128) -> [128, T, h2_first], H-index = p*h2_first + tile
+    x_half0 = (
+        x.slice(dim=1, start=0, end=h2_first * P_MAX).reshape_dim(dim=1, shape=[P_MAX, h2_first]).permute([1, 0, 2])
+    )
+    nisa.dma_copy(src=x_half0, dst=x_sb.slice(dim=2, start=0, end=h2_first))
+    # Half 1: H rows [h2_first*128, H) -> [128, T, h2_second], H-index = h2_first*128 + p*h2_second + tile
+    x_half1 = (
+        x.slice(dim=1, start=h2_first * P_MAX, end=H).reshape_dim(dim=1, shape=[P_MAX, h2_second]).permute([1, 0, 2])
+    )
+    nisa.dma_copy(src=x_half1, dst=x_sb.slice(dim=2, start=h2_first, end=num_h_tiles))
+    router_topk(
+        x=x_sb,
+        w=w,
+        w_bias=w_bias,
+        router_logits=router_logits,
+        expert_affinities=expert_affinities,
+        expert_index=expert_index,
+        act_fn=act_fn,
+        k=k,
+        x_hbm_layout=x_hbm_layout,
+        x_sb_layout=XSBLayout_tp2013__1,
+        router_pre_norm=False,
+    )
+    return [router_logits, expert_index, expert_affinities]
+
+
+def router_topk_layout1_odd_torch_wrapper(
+    x,
+    w,
+    w_bias,
+    router_logits,
+    expert_affinities,
+    expert_index,
+    act_fn,
+    k,
+    x_hbm_layout,
+    x_sb_layout,
+):
+    """Torch golden for the layout-1 odd-num_h_tiles wrapper (x is [T, H])."""
+    return router_topk_torch_ref(
+        x=x,
+        w=w,
+        w_bias=w_bias,
+        router_logits=router_logits,
+        expert_affinities=expert_affinities,
+        expert_index=expert_index,
+        act_fn=act_fn,
+        k=k,
+        x_hbm_layout=1,
+        x_sb_layout=x_sb_layout,
+        router_pre_norm=False,
+    )

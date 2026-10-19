@@ -25,9 +25,57 @@ import numpy as np
 import torch
 
 from ....core.utils.mx_torch_common import mx_matmul, quantize_to_mx, unpack_float8_e4m3fn_x4
+from .mla_common_cte import MlaPrecision
 
 _Q_WIDTH = 4
 _DS_SCALE_BLOCK = 128
+
+
+def _as_bf16_fp32(t) -> torch.Tensor:
+    """Round a tensor/array through bf16 and return it as fp32.
+
+    The bf16 kernel feeds bf16 operands to a tensor engine that accumulates in fp32, so the
+    reference rounds every matmul input to bf16 and does the product in fp32.
+    """
+    if not isinstance(t, torch.Tensor):
+        t = torch.from_numpy(np.asarray(t).astype(np.float32))
+    return t.to(torch.bfloat16).to(torch.float32)
+
+
+def _mla_vup_oproj_cte_torch_ref_bf16(
+    out_attn_hbm,  # [B, S, H*L] bf16 latent attention output, NATURAL latent column order
+    wuv_hbm,  # [H*L, d_v] bf16 V-up weight
+    wo_hbm,  # [H*d_v, HID] bf16 o_proj weight
+    kv_lora_rank: int,
+) -> Dict[str, torch.Tensor]:
+    """PyTorch reference for the BF16 (``MlaPrecision.BF16``) V-up + o_proj path.
+
+    Two plain matmuls. Unlike the MX reference there is no 4-pack de-permutation of the latent
+    (bf16 kernel A writes natural order), no activation quantize and no weight dequant — only
+    bf16 rounding at each matmul boundary.
+
+    Returns a dict with ``out``: [B, S, HID] bf16.
+    """
+    attn = _as_bf16_fp32(out_attn_hbm)
+    B, S, HL = attn.shape
+    L = kv_lora_rank
+    H = HL // L
+    wuv = _as_bf16_fp32(wuv_hbm)
+    d_v = wuv.shape[1]
+    wo = _as_bf16_fp32(wo_hbm)
+    HID = wo.shape[1]
+    Hdv = H * d_v
+
+    # ---- V-up per head: attn[b, :, h, :] @ W_uv[h] ----
+    attn = attn.reshape(B, S, H, L)
+    attn_v = torch.zeros((B, S, H, d_v), dtype=torch.float32)
+    for h in range(H):
+        attn_v[:, :, h, :] = attn[:, :, h, :] @ wuv[h * L : (h + 1) * L, :]
+
+    # ---- o_proj over H*d_v ----
+    attn_v = _as_bf16_fp32(attn_v).reshape(B * S, Hdv)
+    out = (attn_v @ wo).reshape(B, S, HID)
+    return {"out": out.to(torch.bfloat16)}
 
 
 def _broadcast_compact_scales(compact_scale, in_dim, out_dim, compact_scales=True):
@@ -65,8 +113,23 @@ def mla_vupmx_oproj_cte_torch_ref(
     wo_qtz_hbm: np.ndarray,  # [H*d_v // 4, HID] fp8x4 packed MX o_proj weight
     wo_scale_hbm: np.ndarray,  # [H*d_v // 128, ceil(HID/128)] uint8 compact scales
     compact_scales: bool = True,
+    precision: MlaPrecision = MlaPrecision.MX,
+    kv_lora_rank: int = 512,
 ) -> Dict[str, torch.Tensor]:
-    """Reference for MX V-up + MX o_proj. Returns Dict with "out": [B, S, HID] bf16."""
+    """Reference for V-up + o_proj, MX or BF16. Returns Dict with "out": [B, S, HID] bf16.
+
+    With ``precision=MlaPrecision.BF16`` this delegates to
+    :func:`_mla_vup_oproj_cte_torch_ref_bf16`; the weights are then bf16 ``[K, N]``, both scale
+    args are ignored, and the latent is in natural (un-4-packed) column order.
+    """
+    if precision.is_bf16():
+        return _mla_vup_oproj_cte_torch_ref_bf16(
+            out_attn_hbm=out_attn_hbm,
+            wuv_hbm=wuv_qtz_hbm,
+            wo_hbm=wo_qtz_hbm,
+            kv_lora_rank=kv_lora_rank,
+        )
+
     B, S, HL = out_attn_hbm.shape
     L = 512  # fixed (one MX 512-tile per head); H recovered from H*L
     H = HL // L

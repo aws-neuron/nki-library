@@ -18,7 +18,6 @@ scenarios where the active sequence length is small (typically 8 or smaller).
 """
 
 import math
-import os as _os
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -31,14 +30,17 @@ from nki.isa import dge_mode, dma_engine, oob_mode, reduce_cmd
 from ..utils.allocator import SbufManager, sizeinbytes
 from ..utils.common_types import DtypeMode
 from ..utils.cross_partition_copy import cross_partition_copy
+from ..utils.dma_names import dma_name
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import div_ceil, is_trn3_b1, resolve_fp8_e4m3_dtype
+from ..utils.kernel_helpers import div_ceil, is_trn3_b1, mega_flag_default_on, resolve_fp8_e4m3_dtype
+from ..utils.sched_hints import record_pv_matmul
 from ..utils.stream_shuffle_broadcast import (
     stream_shuffle_broadcast,
 )
 from .attention_tkg_utils import (
     AttnTKGConfig,
     TileConstants,
+    get_qk_row_tile_factor,
     is_batch_sharded,
     is_fp8_e4m3,
     is_fp8_e5m2,
@@ -55,6 +57,8 @@ _MAX_S_PRIOR_ACCURATE_ROPE = 2**17
 
 _MIN_FLOAT32 = float(np.finfo(np.float32).min)
 _MAX_FLOAT32 = float(np.finfo(np.float32).max)
+
+_SWAP_8_ROW_BANDS_MASK = [i ^ 8 for i in range(32)]
 
 # Sentinel value for inactive block slots in active_blocks_table.
 # A batch only needs ceil((prior_tokens + active_tokens) / block_len) blocks;
@@ -86,6 +90,7 @@ def attention_tkg(
     DBG_TENSORS: Optional[tuple] = None,
     max_context_len: Optional[nl.NkiTensor] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    schedule_handles: Optional[dict] = None,
 ) -> Tuple[nl.NkiTensor, Optional[nl.NkiTensor]]:
     """Attention specifically optimized for token-gen (where s_active is small). Can optionally fuse RoPE at the start.
     Please refer to attention_tkg_torch.attention_tkg_torch for an equivalent torch implementation.
@@ -153,9 +158,9 @@ def attention_tkg(
                         distributed softmax correction. Caller provides pre-allocated tensors;
                         the kernel writes results into them.
                         Caller-provided keys:
-                        - "fa_running_max" (nl.ndarray): Local softmax max.
+                        - "fa_running_max" (nl.NkiTensor): Local softmax max.
                           Shape [s_active_bqh_tile, n_bsq_tiles].
-                        - "fa_running_sum" (nl.ndarray): Local softmax sum of exp values.
+                        - "fa_running_sum" (nl.NkiTensor): Local softmax sum of exp values.
                           Shape [s_active_bqh_tile, n_bsq_tiles].
                         Kernel-added keys:
                         - "max_negated" (bool): Whether max values are negated. Caller must pass
@@ -183,6 +188,8 @@ def attention_tkg(
                   ``AUTO`` → ``nl.float8_e4m3fn`` on TRN3 else ``nl.float8_e4m3``.
                   Compiler enforces a single E4M3 variant per traced module
                   (``EOCP001``); pick one variant for the whole call graph.
+      schedule_handles: Optional dictionary populated with instruction handles
+                        needed for explicit caller-side scheduling dependencies.
 
     Returns:
       out: Attention output tensor.
@@ -360,6 +367,7 @@ def attention_tkg(
 
     TC = TileConstants.get_tile_constants()
     atp = _compute_tile_params(cfg, TC, q, k_prior, v_prior, k_active, v_active, active_blocks_table, dtype_mode)
+    atp.queue_pin_early_after = schedule_handles.get("early_ops_after") if schedule_handles is not None else None
     # Initialize batch-dependent fields with full per-NC batch (before any batch tiling)
     # This is used to set up the debug tensor shapes.
     _update_atp_for_batch_tile(atp, atp.bs_per_nc, TC, cfg)
@@ -388,10 +396,11 @@ def attention_tkg(
     if DBG_TENSORS:
         _setup_debug_tensors(DBG_TENSORS, atp, TC, bufs)
 
-    bufs.one_vec = sbm.alloc_stack(
-        (TC.p_max, 1), dtype=atp.io_type, buffer=nl.sbuf, align=4
-    )  # align to 4 bytes to prevent race condition (TODO: fix properly in NKILIB-876)
-    nisa.memset(bufs.one_vec, value=1.0)
+    if not _use_small_sprior_transposed_softmax(sink, atp, cfg, TC, sbm):
+        bufs.one_vec = sbm.alloc_stack(
+            (TC.p_max, 1), dtype=atp.io_type, buffer=nl.sbuf, align=4
+        )  # align to 4 bytes to prevent race condition (TODO: fix properly in NKILIB-876)
+        nisa.memset(bufs.one_vec, value=1.0)
 
     # Load position IDs (needed for RoPE and mask generation)
     _load_position_ids(rope_pos_ids, start_pos_ids, atp, cfg, TC, sbm, bufs)
@@ -421,6 +430,7 @@ def attention_tkg(
         qk_swapped=atp.qk_swapped,
     )
     num_batch_tiles = div_ceil(atp.bs_per_nc, batch_tile_size)
+    last_v_prior_load = None
 
     # Pre-compute dynamic FA trip count (outside batch loop — doesn't depend on batch tile)
     num_non_last_tiles_reg = None
@@ -543,7 +553,7 @@ def attention_tkg(
             last_fa_ctx.dynamic_tile_offset_f32 = dynamic_tile_offset_f32
 
             sbm.open_scope()
-            _execute_fa_tile_body(
+            last_v_prior_load = _execute_fa_tile_body(
                 active_blocks_table,
                 mask,
                 k_prior,
@@ -567,7 +577,7 @@ def attention_tkg(
                 fa_ctx = _compute_fa_tile_context(fa_tile_idx, atp, TC)
 
                 sbm.open_scope()
-                _execute_fa_tile_body(
+                last_v_prior_load = _execute_fa_tile_body(
                     active_blocks_table,
                     mask,
                     k_prior,
@@ -603,6 +613,9 @@ def attention_tkg(
 
         # Close scope for this batch tile's buffers
         sbm.close_scope()
+
+    if schedule_handles is not None:
+        schedule_handles["v_prior_load"] = last_v_prior_load
 
     return out, k_out
 
@@ -643,6 +656,19 @@ def _execute_fa_tile_body(
         _fold_sink_and_update_max_swapped(sink, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
         # Step 3+4. Exp(KQ^T - max(KQ^T)) with fused sum reduction, then transpose for PV
         _compute_exp_sum_and_transpose_swapped(sink, DBG_TENSORS, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
+    elif _use_small_sprior_transposed_softmax(sink, atp, cfg, TC, sbm):
+        _compute_qk_matmul(k_prior, DBG_TENSORS, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
+        _compute_small_sprior_transposed_softmax(
+            sink,
+            DBG_TENSORS,
+            atp,
+            cfg,
+            TC,
+            sbm,
+            bufs,
+            fa_ctx,
+            btc,
+        )
     else:
         _compute_qk_matmul(k_prior, DBG_TENSORS, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
         # Step 2. Cascaded max reduce of KQ^T (includes FA running max update)
@@ -652,7 +678,7 @@ def _execute_fa_tile_body(
         # Step 4. Cascaded sum reduction of exp
         _cascaded_sum_reduction(sink, DBG_TENSORS, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
     # Step 5. Matmult 2 of (exp @ V)^T and store output
-    _compute_pv_matmul_and_store(v_prior, v_active, out, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
+    return _compute_pv_matmul_and_store(v_prior, v_active, out, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
 
 
 OOB_MODE_SKIP = nisa.oob_mode.skip  # FIXME: needs to be instantiated externally from kernel
@@ -660,8 +686,8 @@ OOB_MODE_SKIP = nisa.oob_mode.skip  # FIXME: needs to be instantiated externally
 
 def _copy_and_export_softmax_stats(
     cp_softmax_stats_out: dict,
-    max_src: nl.ndarray,
-    sum_src: nl.ndarray,
+    max_src: nl.NkiTensor,
+    sum_src: nl.NkiTensor,
     max_negated: bool,
     atp: 'AttnTileParams',
     TC: 'TileConstants',
@@ -769,6 +795,9 @@ class AttnTileParams(nl.NKIObject):
     is_block_kv: bool = None
     """Whether block KV cache is being used (True when active_blocks_table is provided)."""
 
+    queue_pin_early_after = None
+    """Instruction handle the early sink ops take a schedule-only dependency on
+    (schedule_handles["early_ops_after"], the previous layer's residual add #2); None = unchanged."""
     # KV FP8 Quantization Flag
     is_fp8_kv: bool = None
     """Whether FP8 quantization is used for KV cache tensors. When True, all KV
@@ -952,6 +981,9 @@ class AttnInternalBuffers(nl.NKIObject):
 
     qk_max_buf: nl.NkiTensor = None
     """Buffer for max reduction across tiles and LNC2 cores. Shape [AttnTileParams.s_active_bqh_tile, AttnTileParams.n_bsq_tiles * AttnTileParams.softmax_final_reduction_length]."""
+
+    exp_max_banded: nl.NkiTensor = None
+    """Tile max duplicated in the QK-swap partition-banded layout for the exponential fast path."""
 
     exp_sum: nl.NkiTensor = None
     """Sum of exp(QK - max) for softmax normalization. Shape [AttnTileParams.s_active_bqh_tile, AttnTileParams.n_bsq_tiles * AttnTileParams.softmax_final_reduction_length]."""
@@ -1498,12 +1530,13 @@ def _setup_block_kv_cache(
     atp.block_len = block_len
     atp.blk_cache_resize_factor = blk_cache_resize_factor
 
-    _min_block_len = 4 if cfg.fp8_packed else 2
     # Manual PSUM allocation does not currently reserve separate banks for the row tiles.
-    atp.qk_row_tile_factor = (
-        2
-        if (sbm.is_auto_alloc() and cfg.d_head == 64 and atp.use_dma_transpose and atp.block_len >= _min_block_len)
-        else 1
+    atp.qk_row_tile_factor = get_qk_row_tile_factor(
+        is_auto_alloc=sbm.is_auto_alloc(),
+        d_head=cfg.d_head,
+        block_len=atp.block_len,
+        fp8_packed=cfg.fp8_packed,
+        use_dma_transpose=atp.use_dma_transpose,
     )
     k_new_cache_shape = (k_prior.shape[0] * blk_cache_resize_factor, atp.block_len * cfg.d_head)
     bufs.k_prior_reshaped = k_prior.reshape(k_new_cache_shape)
@@ -2210,15 +2243,23 @@ def _perform_rope(
 
 def _replicate_q_for_row_tiling(bufs, atp, cfg, TC, sbm):
     """Row-tiling (qk_row_tile_factor == 2, d_head == 64) contracts Q against both partition halves of
-    K, so Q must be present in both halves. bufs.q_sb comes in with d_head partitions filled; copy it
-    into a 2*d_head-partition buffer and replicate the second half via cross_partition_copy. No-op when
-    qk_row_tile_factor == 1. Shared by the swap and unswapped MM1 paths (both read bufs.q_sb).
+    K, so Q must be present in both halves. Reuse an already row-tiled input when provided; otherwise
+    copy d_head input partitions into a 2*d_head buffer and replicate the second half. Shared by the
+    swap and unswapped MM1 paths (both read bufs.q_sb).
     """
     if atp.qk_row_tile_factor <= 1:
         return
     kernel_assert(
         atp.qk_row_tile_factor == 2,
         f"Q row-tiling replication only supports qk_row_tile_factor 2, got {atp.qk_row_tile_factor}.",
+    )
+    row_tiled_pdim = cfg.d_head * atp.qk_row_tile_factor
+    if bufs.q_sb.shape[0] == row_tiled_pdim:
+        return
+    kernel_assert(
+        bufs.q_sb.shape[0] == cfg.d_head,
+        f"Q partition dimension must be d_head ({cfg.d_head}) or row-tiled ({row_tiled_pdim}), "
+        f"got {bufs.q_sb.shape[0]}.",
     )
     q_sb_row_tile = sbm.alloc_stack((TC.p_max, bufs.q_sb.shape[1]), dtype=bufs.q_sb.dtype, buffer=nl.sbuf)
     nisa.tensor_copy(dst=q_sb_row_tile[0 : cfg.d_head, :], src=bufs.q_sb[0 : cfg.d_head, :])
@@ -2418,6 +2459,10 @@ def _compute_qk_matmul(
                         ),
                         axes=(3, 1, 2, 0),
                         dge_mode=dge_mode.swdge,
+                        name=dma_name(
+                            f"{sbm.get_name_prefix()}k_prior_block_load_fa{fa_ctx.fa_tile_idx}"
+                            f"_bt{btc.batch_tile_idx}_b{i_b}_f{i_fold_rel}"
+                        ),
                     )
                 else:
                     # PE transpose path: indirect DMA load + PE transposes per fold
@@ -2924,6 +2969,16 @@ def _compute_kq_matmul_and_max_swapped(
         dtype=atp.inter_type,
         buffer=nl.sbuf,
     )
+    bufs.exp_max_banded = None
+    if _use_swapped_tile0_banded_max(sink, atp, cfg, TC, fa_ctx):
+        bufs.exp_max_banded = sbm.alloc_stack(
+            (s_active_bqh_banded_tile, n_bsq_banded_tiles),
+            dtype=atp.inter_type,
+            buffer=nl.sbuf,
+        )
+        sink_offset = atp.n_bsq_tiles * atp.softmax_final_reduction_sink_idx
+        sink_max_banded = bufs.qk_max_buf[:s_active_bqh_banded_tile, nl.ds(sink_offset, atp.n_bsq_tiles)]
+        _prep_sink_8_row_banded(sink, sink_max_banded, cfg, TC, sbm)
 
     # Row-tile to pack qk_row_tile_factor consecutive k_block_len_dma rows into K moving
     if cfg.fp8_packed:
@@ -2992,11 +3047,7 @@ def _compute_kq_matmul_and_max_swapped(
             n_mm1_grps_total, k_block_len_row_tile, n_pos_per_mm1_grp, gather_batches, all_groups_full, cap=K_CAP
         )
 
-    # Split the per-position max reduce across two engines: even evicts fuse the reduce into the Vector
-    # select_reduce (accumulator column 0), odd evicts skip the Vector reduce and reduce the evicted tile
-    # on the Scalar engine via activate2 (column 1). The two accumulators are combined per bsq tile. Breaks
-    # the single serial Vector reduce chain. activate2 is gen4+; older HW falls back to the Vector chain.
-    split_max_reduce = nisa.get_nc_version() >= nisa.nc_version.gen4
+    n_max_reduce_evicts = n_mm1_grps_total * atp.qk_row_tile_factor
 
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="qk_matmul")
     # Loop over s_active_bqh tiles: each iteration is the batches whose scores fill one PMAX of output.
@@ -3005,12 +3056,6 @@ def _compute_kq_matmul_and_max_swapped(
         bsq_tile_batch_start = i_bsq_tile * batches_per_psum
 
         atp.max_negated = False
-        # Per-bsq-tile two-column max accumulator (col 0 = Vector, col 1 = Scalar) and running call index.
-        if split_max_reduce:
-            qk_max_2col = sbm.alloc_stack((s_active_bqh_banded_tile, 2), dtype=atp.inter_type, buffer=nl.sbuf)
-        reduce_call_idx = 0
-        vector_reduce_used = False
-        scalar_reduce_used = False
         for i_k_tile in range(n_k_tiles):
             sbm.open_scope()
             k_tile_mm1_grp_start = i_k_tile * mm1_grps_per_k_tile
@@ -3031,7 +3076,7 @@ def _compute_kq_matmul_and_max_swapped(
             # dependence on MoE. That is what leaves RS-EP's ~19 us shadow empty. Giving k_sb a
             # dedicated buffer removes the aliasing so the gather can float into the shadow.
             # SBUF is only ~40% utilised, so the extra live range fits.
-            if _os.environ.get("VLLM_NEURON_MEGA_KSB_NOALIAS"):
+            if mega_flag_default_on("VLLM_NEURON_MEGA_KSB_NOALIAS"):
                 k_sb = nl.ndarray(
                     (k_d_head_row_tile, k_tile_n_pos * gather_batches * TC.p_max),
                     dtype=nl.bfloat16 if cfg.fp8_packed else _k_sb_dtype,
@@ -3089,6 +3134,11 @@ def _compute_kq_matmul_and_max_swapped(
                         ),
                         axes=(3, 1, 2, 0),
                         dge_mode=dge_mode.swdge,
+                        name=dma_name(
+                            f"{sbm.get_name_prefix()}k_prior_swapped_load_fa{fa_ctx.fa_tile_idx}"
+                            f"_bt{btc.batch_tile_idx}_bsq{i_bsq_tile}_kt{i_k_tile}"
+                            f"_l{i_load}_c{chunk_start}"
+                        ),
                     )
 
             # On the final NC + last FA tile, stitch each batch's K_active onto the end of its K.
@@ -3158,7 +3208,7 @@ def _compute_kq_matmul_and_max_swapped(
                 # and reuse the loaded stationary rows (halves LDWEIGHTS at this site).
                 # The inner row_idx loop must then run only the ONE row this pair owns --
                 # running the full range there double-accumulates into the same PSUM bank.
-                _qk_ts = bool(_os.environ.get("VLLM_NEURON_MEGA_QK_TIMESTEP_ORDER"))
+                _qk_ts = mega_flag_default_on("VLLM_NEURON_MEGA_QK_TIMESTEP_ORDER")
                 _qk_pairs = (
                     [(_r, _b) for _r in range(atp.qk_row_tile_factor) for _b in range(batches_per_psum)]
                     if _qk_ts
@@ -3245,72 +3295,21 @@ def _compute_kq_matmul_and_max_swapped(
                 # De-interleaved evict, one select_reduce per row-tile bank.
                 for i_row_tile in range(atp.qk_row_tile_factor):
                     evicted = dst_mm1_grp[:, :, i_row_tile]
-                    if not split_max_reduce:
-                        is_first_reduce = i_mm1_grp == 0 and i_row_tile == 0
-                        nisa.select_reduce(
-                            dst=evicted,
-                            predicate=mask_mm1_grp[:, :, i_row_tile],
-                            on_true=qk_psum_banks[i_row_tile][:, : mm1_grp_n_mm1_per_bank * TC.p_max],
-                            on_false=-np.inf,
-                            reduce_res=bufs.qk_max_buf[:, i_bsq_tile : i_bsq_tile + 1],
-                            reduce_cmd=nisa.reduce_cmd.reset_reduce if is_first_reduce else nisa.reduce_cmd.reduce,
-                            reduce_op=nl.max,
-                        )
-                    elif reduce_call_idx % 2 == 0:
-                        # Even: fuse the max reduce into the Vector select_reduce (accumulator col 0).
-                        nisa.select_reduce(
-                            dst=evicted,
-                            predicate=mask_mm1_grp[:, :, i_row_tile],
-                            on_true=qk_psum_banks[i_row_tile][:, : mm1_grp_n_mm1_per_bank * TC.p_max],
-                            on_false=-np.inf,
-                            reduce_res=qk_max_2col[:, 0:1],
-                            reduce_cmd=nisa.reduce_cmd.reset_reduce
-                            if not vector_reduce_used
-                            else nisa.reduce_cmd.reduce,
-                            reduce_op=nl.max,
-                        )
-                        vector_reduce_used = True
-                    else:
-                        # Odd: evict only (no Vector reduce), then reduce the evicted tile on the Scalar
-                        # engine via activate2 (accumulator col 1) so the two reduces run concurrently.
-                        nisa.select_reduce(
-                            dst=evicted,
-                            predicate=mask_mm1_grp[:, :, i_row_tile],
-                            on_true=qk_psum_banks[i_row_tile][:, : mm1_grp_n_mm1_per_bank * TC.p_max],
-                            on_false=-np.inf,
-                            reduce_cmd=nisa.reduce_cmd.idle,
-                        )
-                        nisa.activate2(
-                            dst=evicted,
-                            op=nl.copy,
-                            data=evicted,
-                            imm0=1.0,
-                            imm1=0.0,
-                            op0=nl.multiply,
-                            op1=nl.add,
-                            reduce_op=nl.max,
-                            reduce_res=qk_max_2col[:, 1:2],
-                            reduce_cmd=nisa.reduce_cmd.reset_reduce
-                            if not scalar_reduce_used
-                            else nisa.reduce_cmd.reduce,
-                        )
-                        scalar_reduce_used = True
-                    reduce_call_idx += 1
+                    # Flattened eviction index across the bsq tile's (mm1_grp, row_tile) evicts.
+                    evict_idx = i_mm1_grp * atp.qk_row_tile_factor + i_row_tile
+                    is_first_reduce = evict_idx == 0
+                    is_last_reduce = evict_idx == n_max_reduce_evicts - 1
+                    nisa.select_reduce(
+                        dst=evicted,
+                        predicate=mask_mm1_grp[:, :, i_row_tile],
+                        on_true=qk_psum_banks[i_row_tile][:, : mm1_grp_n_mm1_per_bank * TC.p_max],
+                        on_false=-np.inf,
+                        reduce_res=bufs.qk_max_buf[:, i_bsq_tile : i_bsq_tile + 1] if is_last_reduce else None,
+                        reduce_cmd=nisa.reduce_cmd.reset_reduce if is_first_reduce else nisa.reduce_cmd.reduce,
+                        reduce_op=nl.max,
+                    )
 
             sbm.close_scope()  # i_k_tile
-
-        # Combine the two per-engine max accumulators into the single downstream max column. If only the
-        # Vector engine ran (a single reduce call), col 0 already holds the full max -- just copy it.
-        if split_max_reduce:
-            if scalar_reduce_used:
-                nisa.tensor_tensor(
-                    bufs.qk_max_buf[:, i_bsq_tile : i_bsq_tile + 1],
-                    qk_max_2col[:, 0:1],
-                    qk_max_2col[:, 1:2],
-                    op=nl.maximum,
-                )
-            else:
-                nisa.tensor_copy(bufs.qk_max_buf[:, i_bsq_tile : i_bsq_tile + 1], qk_max_2col[:, 0:1])
 
         sbm.close_scope()  # i_bsq_tile
         sbm.increment_section()
@@ -3323,10 +3322,41 @@ def _fold_sink_and_update_max_swapped(sink, atp, cfg, TC, sbm, bufs, fa_ctx, btc
     """
     QK_SWAP: the per-position max along s_prior is computed in _compute_kq_matmul_and_max_swapped
     (fused into the select_reduce evict, in bufs.qk_max_buf). Fold the sink into that max and
-    update the FA running max (online softmax).
+    update the FA running max when using online softmax.
     """
 
-    # Reduce banded max across partitions
+    if bufs.exp_max_banded is not None:
+        qk_max_banded = bufs.qk_max_buf[: bufs.exp_max_banded.shape[0], : atp.n_bsq_tiles]
+        sink_offset = atp.n_bsq_tiles * atp.softmax_final_reduction_sink_idx
+        sink_max_banded = bufs.qk_max_buf[: bufs.exp_max_banded.shape[0], nl.ds(sink_offset, atp.n_bsq_tiles)]
+        nisa.nc_stream_shuffle(
+            dst=bufs.exp_max_banded,
+            src=qk_max_banded,
+            shuffle_mask=_SWAP_8_ROW_BANDS_MASK,
+        )
+        nisa.tensor_scalar(
+            bufs.exp_max_banded,
+            qk_max_banded,
+            op0=nl.maximum,
+            operand0=bufs.exp_max_banded,
+            op1=nl.maximum,
+            operand1=sink_max_banded,
+        )
+
+        if atp.use_online_softmax:
+            for col in range(atp.n_bsq_tiles):
+                _band_combine(
+                    bufs.exp_max_banded[:, col : col + 1],
+                    bufs.running_max[:, col : col + 1],
+                    nl.maximum,
+                    atp,
+                    TC,
+                )
+            nisa.memset(bufs.correction_factor, value=1.0)
+        atp.max_negated = False
+        return
+
+    # Materialize the unbanded max for the online-softmax running state.
     if _swap_band_factor(atp, TC) > 1:
         for col in range(atp.n_bsq_tiles):
             _band_combine(bufs.qk_max_buf[:, col : col + 1], bufs.qk_max_buf[:, col : col + 1], nl.maximum, atp, TC)
@@ -3334,11 +3364,16 @@ def _fold_sink_and_update_max_swapped(sink, atp, cfg, TC, sbm, bufs, fa_ctx, btc
     atp.max_negated = False
     # Sharded paths defer cross-NC sync (and sink fold) to _finalize_and_store.
     if sink is not None and fa_ctx.fa_tile_idx == 0 and atp.sync_softmax_per_fa_tile:
-        # Prep the per-bqh-row sink logit into qk_max_buf's reserved sink slot then fold
-        # it into the per-position max (slot 0) so exp(sink - max) stays bounded (e.g. fully-masked tiles).
         sink_offset = atp.n_bsq_tiles * atp.softmax_final_reduction_sink_idx
+        # Prep the per-bqh-row sink logit into qk_max_buf's reserved sink slot.
         _prep_sink(
-            sink, bufs.qk_max_buf[: atp.s_active_bqh_tile, nl.ds(sink_offset, atp.n_bsq_tiles)], atp, cfg, TC, sbm, btc
+            sink,
+            bufs.qk_max_buf[: atp.s_active_bqh_tile, nl.ds(sink_offset, atp.n_bsq_tiles)],
+            atp,
+            cfg,
+            TC,
+            sbm,
+            btc,
         )
         for i_bsq in range(atp.n_bsq_tiles):
             bsq_size = min(TC.p_max, atp.s_active_bqh - i_bsq * TC.p_max)
@@ -3417,21 +3452,26 @@ def _compute_exp_sum_and_transpose_swapped(
         # bufs.qk holds this bsq tile's QK in [s_active_bqh_banded, band_s_prior] layout.
         qk_transposed = bufs.qk[:, i_bsq * tile_free : (i_bsq + 1) * tile_free]
 
-        # Step 1: Max for the exponential. The running/qk max is in the un-banded s_active_bqh (64) layout;
-        # broadcast it up to the banded rows so exp subtracts each query's max from all its band rows.
-        max_src = (
-            bufs.running_max[:, i_bsq : i_bsq + 1] if atp.use_online_softmax else bufs.qk_max_buf[:, i_bsq : i_bsq + 1]
-        )
-        if band_factor > 1:
-            qk_max_tile = nl.ndarray((bsq_size, 1), dtype=nl.float32, buffer=nl.sbuf)
-            _band_broadcast(max_src, qk_max_tile, atp, TC)
-            if atp.max_negated:
-                nisa.tensor_scalar(qk_max_tile, qk_max_tile, op0=nl.multiply, operand0=-1.0)
-        elif atp.max_negated:
-            qk_max_tile = nl.ndarray((bsq_size, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(qk_max_tile, max_src[:bsq_size, :], op0=nl.multiply, operand0=-1.0)
+        # Step 1: Max for the exponential. The running/qk max is in the un-banded s_active_bqh layout;
+        # broadcast it up to the banded size so exp subtracts each query's max from all its band rows.
+        if bufs.exp_max_banded is not None:
+            qk_max_tile = bufs.exp_max_banded[:bsq_size, i_bsq : i_bsq + 1]
         else:
-            qk_max_tile = max_src[:bsq_size, :]
+            max_src = (
+                bufs.running_max[:, i_bsq : i_bsq + 1]
+                if atp.use_online_softmax
+                else bufs.qk_max_buf[:, i_bsq : i_bsq + 1]
+            )
+            if band_factor > 1:
+                qk_max_tile = nl.ndarray((bsq_size, 1), dtype=nl.float32, buffer=nl.sbuf)
+                _band_broadcast(max_src, qk_max_tile, atp, TC)
+                if atp.max_negated:
+                    nisa.tensor_scalar(qk_max_tile, qk_max_tile, op0=nl.multiply, operand0=-1.0)
+            elif atp.max_negated:
+                qk_max_tile = nl.ndarray((bsq_size, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(qk_max_tile, max_src[:bsq_size, :], op0=nl.multiply, operand0=-1.0)
+            else:
+                qk_max_tile = max_src[:bsq_size, :]
 
         # Step 2: exp(qk - max) with fused per-position sum accumulation into exp_sum.
         # trn3 has the Vector-Engine nisa.exponential (subtracts max_value directly).
@@ -3468,68 +3508,65 @@ def _compute_exp_sum_and_transpose_swapped(
         if sink is not None and fa_ctx.fa_tile_idx == 0 and atp.sync_softmax_per_fa_tile:
             sink_offset = atp.n_bsq_tiles * atp.softmax_final_reduction_sink_idx
             sink_exp = nl.ndarray((bsq_size, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(
-                sink_exp,
-                bufs.qk_max_buf[:bsq_size, sink_offset + i_bsq : sink_offset + i_bsq + 1],
-                qk_max_tile,
-                op=nl.subtract,
+            nisa.activation(
+                dst=sink_exp,
+                op=nl.exp,
+                data=qk_max_tile,
+                bias=bufs.qk_max_buf[:bsq_size, sink_offset + i_bsq : sink_offset + i_bsq + 1],
+                scale=-1.0,
             )
-            nisa.activation(sink_exp, nl.exp, sink_exp)
-            nisa.tensor_tensor(
-                bufs.exp_sum[:bsq_size, i_bsq : i_bsq + 1],
-                bufs.exp_sum[:bsq_size, i_bsq : i_bsq + 1],
-                sink_exp,
-                op=nl.add,
-            )
-
-        # Step 3: Transpose exp back into qk_io_type [tile_n_sprior, s_active_bqh(un-banded)] for PV.
-        # Group tp_grp_sz transposes into one wide PSUM bank and evict with a single strided copy.
-        tp_grp_sz = max(1, TC.psum_f_max // bsq_size)
-        qk_io_dst = bufs.qk_io_type.reshape_dim(1, [fa_ctx.tile_n_sprior, atp.s_active_bqh])
-        if band_factor == 1:
-            # Original path: qk_io_transposed rows are the un-banded s_active_bqh queries; transpose each
-            # 128-wide s_prior chunk onto qk_io_type's query columns at this bsq tile's offset.
-            for i_grp in range(div_ceil(band_n_sprior, tp_grp_sz)):
-                sp_start = i_grp * tp_grp_sz
-                grp_n = min(tp_grp_sz, band_n_sprior - sp_start)
-                tp_psum = nl.ndarray((TC.p_max, grp_n * bsq_size), dtype=atp.io_type, buffer=nl.psum)
-                tp_psum_3d = tp_psum.reshape((TC.p_max, grp_n, bsq_size))
-                for j in range(grp_n):
-                    i_sp = sp_start + j
-                    src_slice = qk_io_transposed[:bsq_size, i_sp * TC.p_max : (i_sp + 1) * TC.p_max]
-                    nisa.nc_transpose(tp_psum_3d[:, j, :], src_slice)
-                dst_view = qk_io_dst[:, sp_start : sp_start + grp_n, bsq_start : bsq_start + bsq_size]
-                nisa.tensor_copy(
-                    dst_view, tp_psum_3d, engine=nisa.scalar_engine if is_trn3_b1() else nisa.vector_engine
+            exp_sum = bufs.exp_sum[:bsq_size, i_bsq : i_bsq + 1]
+            if bufs.exp_max_banded is not None:
+                # The direct-max path duplicates the sink across every band. Split one sink
+                # contribution across those rows before _band_combine sums the bands.
+                nisa.tensor_scalar(
+                    dst=exp_sum,
+                    data=sink_exp,
+                    op0=nl.multiply,
+                    operand0=1.0 / band_factor,
+                    op1=nl.add,
+                    operand1=exp_sum,
                 )
+            else:
+                nisa.tensor_tensor(exp_sum, exp_sum, sink_exp, op=nl.add)
+
+        # Step 3: Transpose exp back into qk_io_type for PV.
+        # Fills psum and evicts multiple transpose tiles at once.
+        tp_grp_sz = max(1, TC.psum_f_max // bsq_size)
+        sqh = atp.s_active_qh
+        # dst free axis [tile_n_sprior, s_active_bqh] split as [band, band_n_sprior, query, sqh]. Each evict
+        # writes band (all) x grp_n s_prior tiles x this tile's queries.
+        q_total = atp.s_active_bqh // sqh
+        q_start = bsq_start // (band_factor * sqh)
+        q_n = bsq_size // (band_factor * sqh)
+        pv_swapped_layout = _use_pv_swapped_column_tiling(atp, cfg, sbm, fa_ctx)
+        if pv_swapped_layout:
+            qk_io_dst = bufs.qk_io_type.reshape_dim(1, [q_total, band_factor, band_n_sprior, sqh])
         else:
-            # Banded (n_bsq_tiles==1): transpose the full 128 banded rows in 128x128 s_prior tiles (same
-            # as the non-banded path). After transpose the PSUM free axis is the banded row order
-            # (q, band, p) = [bs_per_nc, band_factor, sqh]. The evict de-bands in ONE strided copy: band
-            # is an affine axis on both sides -- src middle axis, dst s_prior-tile offset (band occupies
-            # tiles [band*band_n_sprior : (band+1)*band_n_sprior), this tile at band*band_n_sprior + i_sp).
-            # View qk_io_dst as [p_max, band, tile_in_band, bs_per_nc, sqh], select this tile across bands,
-            # and permute src to the matching [p_max, band, bs_per_nc, sqh] axis order.
-            sqh = atp.s_active_qh
-            qk_io_dst_banded = bufs.qk_io_type.reshape_dim(1, [band_factor, band_n_sprior, atp.bs_per_nc, sqh])
-            # Group grp_n s_prior tiles' transposes into one wide PSUM bank, then evict the whole group in
-            # one strided copy (band de-interleave folded into the dst AP) -- same op-count reduction as the
-            # non-banded path, avoiding one transpose+copy per single s_prior position.
-            for i_grp in range(div_ceil(band_n_sprior, tp_grp_sz)):
-                sp_start = i_grp * tp_grp_sz
-                grp_n = min(tp_grp_sz, band_n_sprior - sp_start)
-                tp_psum = nl.ndarray((TC.p_max, grp_n * s_active_bqh_banded_tile), dtype=atp.io_type, buffer=nl.psum)
-                tp_psum_g = tp_psum.reshape((TC.p_max, grp_n, atp.bs_per_nc, band_factor, sqh))
-                for j in range(grp_n):
-                    i_sp = sp_start + j
-                    nisa.nc_transpose(
-                        tp_psum.reshape((TC.p_max, grp_n, s_active_bqh_banded_tile))[:, j, :],
-                        qk_io_transposed[:s_active_bqh_banded_tile, i_sp * TC.p_max : (i_sp + 1) * TC.p_max],
-                    )
-                # dst [p_max, band, grp_n s_prior tiles, bs_per_nc, sqh]; src permute (q,band)->(band,q).
+            qk_io_dst = bufs.qk_io_type.reshape_dim(1, [band_factor, band_n_sprior, q_total, sqh])
+        for i_grp in range(div_ceil(band_n_sprior, tp_grp_sz)):
+            sp_start = i_grp * tp_grp_sz
+            grp_n = min(tp_grp_sz, band_n_sprior - sp_start)
+            tp_psum = nl.ndarray((TC.p_max, grp_n * bsq_size), dtype=atp.io_type, buffer=nl.psum)
+            tp_psum_tiles = tp_psum.reshape((TC.p_max, grp_n, bsq_size))
+            for j in range(grp_n):
+                i_sp = sp_start + j
+                nisa.nc_transpose(
+                    tp_psum_tiles[:, j, :],
+                    qk_io_transposed[:bsq_size, i_sp * TC.p_max : (i_sp + 1) * TC.p_max],
+                )
+            tp_view = tp_psum.reshape((TC.p_max, grp_n, q_n, band_factor, sqh))
+            if pv_swapped_layout:
                 nisa.tensor_copy(
-                    qk_io_dst_banded[:, :, sp_start : sp_start + grp_n, :, :],
-                    tp_psum_g.permute([0, 3, 1, 2, 4]),  # [p_max, grp_n, q, band, sqh] -> [p_max, band, grp_n, q, sqh]
+                    qk_io_dst[:, q_start : q_start + q_n, :, sp_start : sp_start + grp_n, :],
+                    tp_view.permute([0, 2, 3, 1, 4]),
+                    engine=nisa.scalar_engine if is_trn3_b1() else nisa.vector_engine,
+                )
+            else:
+                # Transposed PSUM free order is (q, band); restore the ordinary band-major layout.
+                nisa.tensor_copy(
+                    qk_io_dst[:, :, sp_start : sp_start + grp_n, q_start : q_start + q_n, :],
+                    tp_view.permute([0, 3, 1, 2, 4]),
                     engine=nisa.scalar_engine if is_trn3_b1() else nisa.vector_engine,
                 )
 
@@ -3550,6 +3587,140 @@ def _compute_exp_sum_and_transpose_swapped(
 
     if atp.use_online_softmax:
         _update_running_sum(atp, sbm, bufs, fa_ctx)
+
+
+def _use_small_sprior_transposed_softmax(sink, atp, cfg, TC, sbm):
+    """Use a query-major softmax for the two-tile, single-NC offline case."""
+    return (
+        is_trn3_b1()
+        and sbm.is_auto_alloc()
+        and sink is not None
+        and not atp.qk_swapped
+        and not atp.use_online_softmax
+        and atp.sprior_n_prgs == 1
+        and atp.n_sprior_tile == 2
+        and atp.n_bsq_tiles == 1
+        and atp.s_active_bqh <= TC.p_max
+        and atp.n_d_tiles == 1
+        and cfg.d_head <= TC.p_max
+        and cfg.s_active == 1
+        and sink.shape[0] == cfg.q_head
+        and atp.s_active_bqh % cfg.q_head == 0
+        and not cfg.return_cp_softmax_stats
+    )
+
+
+def _compute_small_sprior_transposed_softmax(
+    sink,
+    DBG_TENSORS,
+    atp: AttnTileParams,
+    cfg: AttnTKGConfig,
+    TC: TileConstants,
+    sbm: SbufManager,
+    bufs: AttnInternalBuffers,
+    fa_ctx: FATileContext,
+    btc: BatchTileContext,
+):
+    """Compute two-tile softmax in query-major layout with fused exp/sum reduction."""
+    kernel_assert(
+        fa_ctx.tile_n_sprior == 2 and fa_ctx.tile_s_prior == 2 * TC.p_max,
+        "small-sprior transposed softmax requires exactly two full s_prior tiles",
+    )
+
+    # Convert [p_max keys, 2, bqh] to [bqh queries, 2 * p_max keys].
+    softmax_row_size = fa_ctx.tile_s_prior + 1
+    qk_query_major_psum = nl.ndarray(
+        (atp.s_active_bqh, softmax_row_size),
+        dtype=atp.inter_type,
+        buffer=nl.psum,
+    )
+    qk_src_tiles = bufs.qk.reshape_dim(1, [fa_ctx.tile_n_sprior, atp.s_active_bqh])
+    qk_dst_tiles = qk_query_major_psum[:, : fa_ctx.tile_s_prior].reshape_dim(1, [fa_ctx.tile_n_sprior, TC.p_max])
+    for i_sprior in range(fa_ctx.tile_n_sprior):
+        nisa.nc_transpose(qk_dst_tiles[:, i_sprior, :], qk_src_tiles[:, i_sprior, :])
+
+    sink_column = qk_query_major_psum[:, fa_ctx.tile_s_prior : softmax_row_size]
+    _load_small_sprior_sink_column(
+        sink,
+        sink_column,
+        atp,
+        cfg,
+        sbm,
+        btc,
+    )
+
+    row_max = sbm.alloc_stack((atp.s_active_bqh, 1), dtype=atp.inter_type, buffer=nl.sbuf)
+    nisa.tensor_reduce(row_max, op=nl.maximum, data=qk_query_major_psum, axis=1, keepdims=True)
+    # This path requires a sink, whose finite value guarantees a finite row maximum.
+    # Restore the clamp if -Inf sinks with fully masked rows need to be supported.
+    # _clamp_max_to_finite(row_max, row_max)
+    atp.max_negated = False
+    bufs.qk_max_buf = row_max
+
+    if DBG_TENSORS and atp.bs == atp.bs_per_nc:
+        _store_dbg_qk_max(row_max, False, "small_transposed", atp, TC, sbm, bufs)
+    elif DBG_TENSORS and btc.batch_tile_idx == 0:
+        _store_dbg_qk_max_zeros_full_batch(atp, sbm, bufs)
+
+    # Trn3 exponential subtracts row_max and accumulates each query's denominator.
+    qk_exp_query_major = sbm.alloc_stack(
+        (atp.s_active_bqh, fa_ctx.tile_s_prior),
+        dtype=atp.io_type,
+        buffer=nl.sbuf,
+    )
+    bufs.exp_sum = sbm.alloc_stack((atp.s_active_bqh, 1), dtype=atp.inter_type, buffer=nl.sbuf)
+    nisa.exponential(
+        dst=qk_exp_query_major,
+        src=qk_query_major_psum[:, : fa_ctx.tile_s_prior],
+        max_value=row_max,
+        reduce_res=bufs.exp_sum,
+        reduce_cmd=reduce_cmd.reset_reduce,
+    )
+
+    sink_exp = sbm.alloc_stack((atp.s_active_bqh, 1), dtype=atp.inter_type, buffer=nl.sbuf)
+    nisa.activation(
+        dst=sink_exp,
+        op=nl.exp,
+        data=row_max,
+        scale=-1.0,
+        bias=sink_column,
+    )
+    nisa.tensor_tensor(bufs.exp_sum, bufs.exp_sum, sink_exp, op=nl.add)
+
+    # Restore the ordinary [p_max keys, 2, bqh] layout consumed by PV.
+    qk_exp_psum = nl.ndarray(
+        (TC.p_max, fa_ctx.tile_n_sprior * atp.s_active_bqh),
+        dtype=atp.io_type,
+        buffer=nl.psum,
+    )
+    qk_exp_src_tiles = qk_exp_query_major.reshape_dim(1, [fa_ctx.tile_n_sprior, TC.p_max])
+    qk_exp_dst_tiles = qk_exp_psum.reshape_dim(1, [fa_ctx.tile_n_sprior, atp.s_active_bqh])
+    for i_sprior in range(fa_ctx.tile_n_sprior):
+        nisa.nc_transpose(qk_exp_dst_tiles[:, i_sprior, :], qk_exp_src_tiles[:, i_sprior, :])
+    nisa.tensor_copy(bufs.qk_io_type, qk_exp_psum)
+
+    _store_dbg_qk_exp(DBG_TENSORS, atp, cfg, TC, sbm, bufs, fa_ctx, btc)
+    if DBG_TENSORS and atp.bs == atp.bs_per_nc:
+        _store_dbg_exp_sum(bufs.exp_sum, "small_transposed", atp, TC, sbm, bufs)
+    elif DBG_TENSORS and btc.batch_tile_idx == 0:
+        _store_dbg_exp_sum_zeros_full_batch(atp, sbm, bufs)
+
+    nisa.reciprocal(bufs.exp_sum, bufs.exp_sum)
+
+    # The reciprocal is query-major. A single transpose of a broadcast forms the
+    # [d_head, bqh] scale used by the existing PV output normalization.
+    recip_psum = nl.ndarray(
+        (atp.d_tile_size, atp.s_active_bqh),
+        dtype=atp.inter_type,
+        buffer=nl.psum,
+    )
+    nisa.nc_transpose(recip_psum, bufs.exp_sum.broadcast(1, atp.d_tile_size))
+    bufs.exp_sum_recip = sbm.alloc_stack(
+        (atp.d_tile_size, atp.s_active_bqh),
+        dtype=atp.inter_type,
+        buffer=nl.sbuf,
+    )
+    nisa.tensor_copy(bufs.exp_sum_recip, recip_psum)
 
 
 def _cascaded_max_reduce(
@@ -3600,7 +3771,7 @@ def _cascaded_max_reduce(
             keepdims=False,
         )
 
-        # Second half with ACT (activate2 with reduction accumulator)
+        # Second half with ACT (activate2 with reduce op)
         for i_s_active_bqh_half in nl.affine_range(s_active_bqh_second_half):
             qk_i_s_view = qk_view.select(1, s_active_bqh_first_half + i_s_active_bqh_half)
             nisa.activate2(
@@ -4048,6 +4219,353 @@ def _s_active_bqh_tile_transpose_broadcast_d_tiled(src, dst, atp: AttnTileParams
         )
 
 
+def _use_pv_swapped_column_tiling(atp, cfg, sbm, fa_ctx):
+    """Select the narrow experimental P@V layout used by the GPT-OSS B8 study."""
+    return (
+        cfg.enable_pv_swapped_column_tiling
+        and sbm.is_auto_alloc()
+        and atp.is_block_kv
+        and not atp.use_fa
+        and not atp.use_online_softmax
+        and cfg.out_in_sb
+        and atp.sprior_n_prgs == 1
+        and atp.bs == 8
+        and cfg.s_active == 1
+        and atp.s_active_qh == 8
+        and cfg.d_head == 64
+        and atp.d_tile_size == 64
+        and atp.n_d_tiles == 1
+        and atp.block_len == 16
+        and fa_ctx.tile_n_sprior == 80
+    )
+
+
+def _load_pv_swapped_v_batch(
+    v_active,
+    v_sb,
+    atp,
+    cfg,
+    TC,
+    sbm,
+    bufs,
+    fa_ctx,
+    btc,
+    i_b,
+    v_idx_src,
+    v_idx_table,
+    v_dma_batch_n_folds,
+    v_dma_batch_n_batches,
+    v_batched_load_dst,
+):
+    """Load one batch of block V into the ordinary fold-major PV layout."""
+    last_v_prior_load = None
+    fa_tile_s_prior = fa_ctx.tile_s_prior
+    fa_tile_n_sprior = fa_ctx.tile_n_sprior
+    fa_tile_offset = fa_ctx.tile_offset
+    fold_s_prior = atp.block_len * TC.p_max
+    fold_start = fa_tile_offset // fold_s_prior
+    fold_end = div_ceil(fa_tile_offset + fa_tile_s_prior, fold_s_prior)
+    num_folds_this_tile = fold_end - fold_start
+
+    if atp.use_v_dma_skipping:
+        nisa.memset(v_sb, value=0)
+
+    v_dma_batch_size = v_dma_batch_n_folds * v_dma_batch_n_batches
+    for i_fold_rel in range(num_folds_this_tile):
+        if i_fold_rel % v_dma_batch_n_folds != 0:
+            continue
+        if i_b % v_dma_batch_n_batches != 0:
+            continue
+        i_fold = fold_start + i_fold_rel
+        idx_start = i_b * atp.num_folds_per_batch + i_fold_rel
+        if v_dma_batch_size > 1:
+            v_idx_slice = v_idx_table.slice(
+                dim=1,
+                start=idx_start,
+                end=idx_start + v_dma_batch_size,
+            )
+        else:
+            v_idx_slice = v_idx_src.slice(dim=1, start=idx_start, end=idx_start + 1)
+
+        if v_dma_batch_n_batches > 1:
+            load_dst = v_batched_load_dst
+        else:
+            load_start = i_fold_rel * atp.block_len * cfg.d_head
+            load_len = v_dma_batch_n_folds * atp.block_len * cfg.d_head
+            load_dst = v_sb[:, load_start : load_start + load_len]
+        last_v_prior_load = nisa.dma_copy(
+            dst=load_dst,
+            src=bufs.v_prior_reshaped.ap(
+                [
+                    [atp.block_len * cfg.d_head, TC.p_max * v_dma_batch_size],
+                    [1, atp.block_len * cfg.d_head],
+                ],
+                offset=0,
+                vector_offset=v_idx_slice,
+                indirect_dim=0,
+            ),
+            oob_mode=oob_mode.skip if atp.use_v_dma_skipping else oob_mode.error,
+            name=f"{sbm.get_name_prefix()}v_prior_swapped_col_load_fa{fa_ctx.fa_tile_idx}_b{i_b}_f{i_fold}_bt{btc.batch_tile_idx}",
+        )
+
+    if atp.sprior_prg_id != atp.sprior_n_prgs - 1 or not fa_ctx.is_last_fa_tile:
+        return last_v_prior_load
+
+    num_blks_covering_s_active = div_ceil(cfg.s_active, atp.block_len)
+    extra_covered = num_blks_covering_s_active * atp.block_len - cfg.s_active
+    v_sb_partition_base = TC.p_max - num_blks_covering_s_active
+    v_sb_s_prior_base = (num_folds_this_tile - 1) * atp.block_len
+    v_active_batch_pos = btc.global_batch_offset + i_b
+
+    if extra_covered > 0:
+        if atp.block_len > extra_covered:
+            dst = (
+                v_sb[v_sb_partition_base : v_sb_partition_base + 1]
+                .reshape_dim(1, [fa_tile_n_sprior, cfg.d_head])
+                .slice(
+                    1,
+                    start=v_sb_s_prior_base + extra_covered,
+                    end=v_sb_s_prior_base + atp.block_len,
+                )
+            )
+            src = (
+                bufs.v_active_reshaped[v_active_batch_pos : v_active_batch_pos + 1]
+                .reshape_dim(1, [cfg.s_active, cfg.d_head])
+                .slice(1, start=0, end=atp.block_len - extra_covered)
+            )
+            nisa.dma_copy(
+                dst=dst,
+                src=src,
+                name=f"{sbm.get_name_prefix()}v_active_swapped_col_partial_b{i_b}",
+            )
+        if num_blks_covering_s_active > 1:
+            dst = (
+                v_sb[v_sb_partition_base + 1 : v_sb_partition_base + num_blks_covering_s_active]
+                .reshape_dim(1, [fa_tile_n_sprior, cfg.d_head])
+                .slice(
+                    1,
+                    start=v_sb_s_prior_base,
+                    end=v_sb_s_prior_base + atp.block_len,
+                )
+            )
+            s_active_pos = atp.block_len - extra_covered
+            src = (
+                bufs.v_active_reshaped.select(0, v_active_batch_pos)
+                .reshape_dim(0, [cfg.s_active, cfg.d_head])
+                .slice(
+                    0,
+                    start=s_active_pos,
+                    end=s_active_pos + atp.block_len * (num_blks_covering_s_active - 1),
+                )
+                .reshape_dim(0, [num_blks_covering_s_active - 1, atp.block_len])
+            )
+            nisa.dma_copy(
+                dst=dst,
+                src=src,
+                name=f"{sbm.get_name_prefix()}v_active_swapped_col_remaining_b{i_b}",
+            )
+    else:
+        dst = (
+            v_sb[v_sb_partition_base : v_sb_partition_base + num_blks_covering_s_active]
+            .reshape_dim(1, [fa_tile_n_sprior, cfg.d_head])
+            .slice(
+                1,
+                start=v_sb_s_prior_base,
+                end=v_sb_s_prior_base + atp.block_len,
+            )
+        )
+        src = (
+            bufs.v_active_reshaped.select(0, v_active_batch_pos)
+            .reshape_dim(0, [cfg.s_active, cfg.d_head])
+            .slice(0, start=0, end=atp.block_len * num_blks_covering_s_active)
+            .reshape_dim(0, [num_blks_covering_s_active, atp.block_len])
+        )
+        nisa.dma_copy(
+            dst=dst,
+            src=src,
+            name=f"{sbm.get_name_prefix()}v_active_swapped_col_full_b{i_b}",
+        )
+    return last_v_prior_load
+
+
+def _compute_pv_matmul_and_store_swapped_column_tiled(
+    v_active,
+    out,
+    atp,
+    cfg,
+    TC,
+    sbm,
+    bufs,
+    fa_ctx,
+    btc,
+):
+    """Compute P@V with four dense fold packs on each of four hardware column tiles."""
+    last_v_prior_load = None
+    batch_tile = 4
+    fold_pack = 4
+    q_width = atp.s_active_qh
+    col_tile_width = fold_pack * q_width
+    moving_width = fold_pack * cfg.d_head
+    per_batch_v_size = cfg.d_head * fa_ctx.tile_n_sprior
+
+    bufs.exp_v = sbm.alloc_stack(
+        (atp.d_tile_size, atp.bs * q_width),
+        dtype=atp.inter_type,
+        buffer=nl.sbuf,
+    )
+
+    V_CAP = 160
+    v_dma_batch_n_folds, v_dma_batch_n_batches = _compute_dma_batch_params(
+        atp.num_folds_per_batch,
+        atp.bs,
+        atp.block_len,
+        cap=V_CAP,
+        sbm=sbm,
+    )
+    kernel_assert(
+        batch_tile % v_dma_batch_n_batches == 0,
+        "swapped column PV requires each V DMA batch to fit within a column-tile batch group",
+    )
+    v_dma_batch_size = v_dma_batch_n_folds * v_dma_batch_n_batches
+    v_idx_src = bufs.active_blocks_sb if atp.use_v_dma_skipping else bufs.active_blocks_sb_u32
+    v_idx_table = None
+    if v_dma_batch_size > 1:
+        v_idx_table = _get_or_create_rearranged_v_indices(
+            v_idx_src,
+            atp.bs * atp.num_folds_per_batch,
+            v_dma_batch_size,
+            atp,
+            fa_ctx,
+            TC,
+            sbm,
+        )
+
+    v_sb_dtype = atp.kv_e4m3_tile_dtype if atp.is_fp8_kv else bufs.v_prior_reshaped.dtype
+    p_all = bufs.qk_io_type.reshape_dim(1, [atp.bs, fa_ctx.tile_n_sprior, q_width])
+
+    sbm.open_scope(name="pv_matmul_swapped_column_tiled")
+    for batch_base in range(0, atp.bs, batch_tile):
+        sbm.open_scope()
+        v_group = sbm.alloc_stack(
+            (TC.p_max, batch_tile * per_batch_v_size),
+            dtype=v_sb_dtype,
+            buffer=nl.sbuf,
+        )
+        for batch_in_tile in range(batch_tile):
+            i_b = batch_base + batch_in_tile
+            v_sb = v_group[
+                :,
+                batch_in_tile * per_batch_v_size : (batch_in_tile + 1) * per_batch_v_size,
+            ]
+            v_batched_load_dst = None
+            if batch_in_tile % v_dma_batch_n_batches == 0:
+                v_batched_load_dst = v_group[
+                    :,
+                    batch_in_tile * per_batch_v_size : (batch_in_tile + v_dma_batch_n_batches) * per_batch_v_size,
+                ]
+            v_prior_load = _load_pv_swapped_v_batch(
+                v_active,
+                v_sb,
+                atp,
+                cfg,
+                TC,
+                sbm,
+                bufs,
+                fa_ctx,
+                btc,
+                i_b,
+                v_idx_src,
+                v_idx_table,
+                v_dma_batch_n_folds,
+                v_dma_batch_n_batches,
+                v_batched_load_dst,
+            )
+            if v_prior_load is not None:
+                last_v_prior_load = v_prior_load
+
+        pv_psum = nl.ndarray(
+            (TC.p_max, moving_width),
+            dtype=nl.float32,
+            buffer=nl.psum,
+        )
+        for sprior_tile_start in range(0, fa_ctx.tile_n_sprior, fold_pack):
+            for batch_in_tile in range(batch_tile):
+                i_b = batch_base + batch_in_tile
+                p_stationary = (
+                    p_all.select(1, i_b)
+                    .slice(1, start=sprior_tile_start, end=sprior_tile_start + fold_pack)
+                    .reshape((TC.p_max, col_tile_width))
+                )
+                v_moving = (
+                    v_group[
+                        :,
+                        batch_in_tile * per_batch_v_size : (batch_in_tile + 1) * per_batch_v_size,
+                    ]
+                    .reshape_dim(1, [fa_ctx.tile_n_sprior, cfg.d_head])
+                    .slice(1, start=sprior_tile_start, end=sprior_tile_start + fold_pack)
+                    .reshape((TC.p_max, moving_width))
+                )
+                col_start = batch_in_tile * col_tile_width
+                _pv_mm = nisa.nc_matmul(
+                    dst=pv_psum[col_start : col_start + col_tile_width, :],
+                    stationary=p_stationary,
+                    moving=v_moving,
+                    tile_position=(0, col_start),
+                    tile_size=(TC.p_max, col_tile_width),
+                    accumulate=(sprior_tile_start != 0),
+                )
+                record_pv_matmul(_pv_mm)
+
+        diagonal = sbm.alloc_stack(
+            (TC.p_max, cfg.d_head),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+        )
+        for fold_in_pack in range(fold_pack):
+            shuffle_mask = [255] * col_tile_width
+            for q_idx in range(q_width):
+                shuffle_mask[q_idx * fold_pack + fold_in_pack] = fold_in_pack * q_width + q_idx
+            nisa.nc_stream_shuffle(
+                dst=diagonal,
+                src=pv_psum[
+                    :,
+                    fold_in_pack * cfg.d_head : (fold_in_pack + 1) * cfg.d_head,
+                ],
+                shuffle_mask=shuffle_mask,
+            )
+
+        transposed = nl.ndarray(
+            (cfg.d_head, TC.p_max),
+            dtype=nl.float32,
+            buffer=nl.psum,
+        )
+        nisa.nc_transpose(transposed, diagonal)
+        reduced_dst = bufs.exp_v[
+            :,
+            batch_base * q_width : (batch_base + batch_tile) * q_width,
+        ].reshape_dim(1, [batch_tile, q_width])
+        nisa.tensor_reduce(
+            dst=reduced_dst,
+            op=nl.add,
+            data=transposed.reshape((cfg.d_head, batch_tile, q_width, fold_pack)),
+            axis=3,
+        )
+        sbm.close_scope()
+        sbm.increment_section()
+    sbm.close_scope()
+
+    _gather_and_store_output(
+        out,
+        bufs.exp_v,
+        atp,
+        cfg,
+        sbm,
+        btc,
+        normalization_scale=bufs.exp_sum_recip,
+    )
+    return last_v_prior_load
+
+
 def _compute_pv_matmul_and_store(
     v_prior,
     v_active,
@@ -4061,6 +4579,19 @@ def _compute_pv_matmul_and_store(
     btc: BatchTileContext,
 ):
     """Step 5. Matmult 2 of (exp @ V)^T and store output"""
+    if _use_pv_swapped_column_tiling(atp, cfg, sbm, fa_ctx):
+        return _compute_pv_matmul_and_store_swapped_column_tiled(
+            v_active,
+            out,
+            atp,
+            cfg,
+            TC,
+            sbm,
+            bufs,
+            fa_ctx,
+            btc,
+        )
+
     fa_tile_s_prior = fa_ctx.tile_s_prior
     fa_tile_n_sprior = fa_ctx.tile_n_sprior
     fa_tile_offset = fa_ctx.tile_offset
@@ -4094,7 +4625,7 @@ def _compute_pv_matmul_and_store(
     """
 
     # V-load DMA batching setup
-    V_CAP = 128  # cap effective block size after batching to keep V-load memory reasonable
+    V_CAP = 160  # cap effective block size after batching; keeps V-load memory reasonable.
     v_block_len = atp.block_len if atp.is_block_kv else 0
     v_dma_batch_n_folds = 1
     v_dma_batch_n_batches = 1
@@ -4110,7 +4641,8 @@ def _compute_pv_matmul_and_store(
     # Block KV only: both schemes assume the block-KV V-load layout in v_sb. The flat-KV
     # (strided_mm1) load produces a different v_sb layout that the tile packing has not been
     # validated against, so array tiling is disabled there.
-    _PV_ARRAY_TILING_THRESHOLD = 8192
+    _PV_ARRAY_TILING_THRESHOLD = 2048
+    _PV_PADDED_MOVING_FREE_DIM = 64
     pv_array_tiling_factor = TC.p_max // cfg.d_head
     pv_array_tiling_ok = (
         atp.is_block_kv
@@ -4121,9 +4653,8 @@ def _compute_pv_matmul_and_store(
     # Dense tiling is preferred where usable (fewer instructions, never slower than col in testing).
     # Its grid PSUM is [g*d_head, g*s_active_qh], so the free dim must also fit psum_f_max. When above
     # that (s_active_qh > psum_f_max / factor) fall back to HW col tiling, whose free dim is s_active_qh.
-    # At EP128/sl10240 fa_tile_s_prior is below the 8192 threshold, so PV runs untiled here.
-    # Lowering the threshold to enable dense tiling was measured twice and lost (1024: tie at
-    # 5.930 vs 5.923; 2048: 6.079). Leave the threshold at 8192.
+    # Enable dense or column tiling when the FA tile is large enough to amortize
+    # the additional tile-packing and result-folding work.
     pv_dense_factor = (
         pv_array_tiling_factor
         if (pv_array_tiling_ok and pv_array_tiling_factor * atp.s_active_qh <= TC.psum_f_max)
@@ -4136,20 +4667,21 @@ def _compute_pv_matmul_and_store(
         # V's batched dma_copy reads a [128, N] vector_offset in column-major ("snake") order, so the
         # index table must be pre-rearranged into that layout. The K path uses dma_transpose instead,
         # which consumes a contiguous slice of active_blocks_sb_u32 directly and needs no rearrange.
-        v_idx_total_columns = atp.bs * atp.num_folds_per_batch
-        v_idx_cache_key = None
-        if _os.environ.get("VLLM_NEURON_MEGA_ABT_REUSE") and fa_ctx.dynamic_tile_offset_sbuf is None:
-            v_idx_cache_key = (id(v_idx_src), v_idx_total_columns, v_dma_batch_size)
-            v_idx_table = _ABT_V_REARRANGED_CACHE.get(v_idx_cache_key)
-        if v_idx_table is None:
-            v_idx_table = _rearrange_indices_for_batched_dma(v_idx_src, v_idx_total_columns, v_dma_batch_size, TC, sbm)
-            if v_idx_cache_key is not None:
-                _ABT_V_REARRANGED_CACHE[v_idx_cache_key] = v_idx_table
+        v_idx_table = _get_or_create_rearranged_v_indices(
+            v_idx_src,
+            atp.bs * atp.num_folds_per_batch,
+            v_dma_batch_size,
+            atp,
+            fa_ctx,
+            TC,
+            sbm,
+        )
 
     # FP8 KV: use the resolved FP8 dtype (caller's concrete dtype, or
     # dtype_mode resolution for opaque "float8e4"). Otherwise pass through v_prior.dtype.
     _v_sb_dtype = atp.kv_e4m3_tile_dtype if atp.is_fp8_kv else v_prior.dtype
     v_sb_shared = None
+    last_v_prior_load = None
 
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="pv_matmul")
     for i_b in range(atp.bs):
@@ -4208,7 +4740,7 @@ def _compute_pv_matmul_and_store(
                     load_start = i_fold_rel * atp.block_len * cfg.d_head
                     load_dst_view = (v_sb).slice(1, start=load_start, end=load_start + load_len)
 
-                nisa.dma_copy(
+                last_v_prior_load = nisa.dma_copy(
                     dst=load_dst_view,
                     # TODO: Port to NkiTensor once dynamic vector_offset is supported
                     src=bufs.v_prior_reshaped.ap(
@@ -4233,7 +4765,7 @@ def _compute_pv_matmul_and_store(
                 .slice(0, start=s_prior_pos, end=s_prior_pos + (TC.p_max * fa_tile_n_sprior))
                 .reshape_dim(0, [TC.p_max, fa_tile_n_sprior])
             )
-            nisa.dma_copy(
+            last_v_prior_load = nisa.dma_copy(
                 v_sb_view,
                 v_prior_view,
                 name=f"{sbm.get_name_prefix()}v_prior_load_strided_mm1_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
@@ -4248,7 +4780,7 @@ def _compute_pv_matmul_and_store(
                 .reshape_dim(0, [fa_tile_n_sprior, TC.p_max])
                 .permute((1, 0, 2))
             )
-            nisa.dma_copy(
+            last_v_prior_load = nisa.dma_copy(
                 dst=v_sb_view,
                 src=v_prior_view,
                 name=f"{sbm.get_name_prefix()}v_prior_load_sequential_fa{fa_ctx.fa_tile_idx}_b{i_b}_bt{btc.batch_tile_idx}",
@@ -4411,12 +4943,29 @@ def _compute_pv_matmul_and_store(
         #    Valid data in PSUM is on the diagonal blocks.
         dense_tiling = pv_dense_factor > 1
         pv_tile_factor = pv_dense_factor if dense_tiling else pv_col_tile_factor
+        pv_moving_batch_group_size = 1
+        if cfg.enable_pv_moving_free_dim_padding and dense_tiling:
+            unpadded_moving_free_dim = pv_tile_factor * atp.s_active_qh
+            if _PV_PADDED_MOVING_FREE_DIM % unpadded_moving_free_dim == 0:
+                target_batch_group_size = _PV_PADDED_MOVING_FREE_DIM // unpadded_moving_free_dim
+                max_batch_group_size = TC.psum_f_max // unpadded_moving_free_dim
+                pv_moving_batch_group_size = min(atp.bs, target_batch_group_size, max_batch_group_size)
+        pv_moving_s_active_qh = atp.s_active_qh * pv_moving_batch_group_size
         # Per-tile stride along the PSUM free axis between valid blocks: dense results walk the grid
-        # diagonal (stride s_active_qh), col results all share the same free columns (stride 0).
-        psum_free_stride = atp.s_active_qh if dense_tiling else 0
+        # diagonal (stride moving_s_active_qh), col results all share the same free columns (stride 0).
+        psum_free_stride = pv_moving_s_active_qh if dense_tiling else 0
+        actual_col_tiles_used = min(pv_tile_factor, fa_tile_n_sprior)
+        defer_normalization_to_store = cfg.out_in_sb and not atp.use_online_softmax and actual_col_tiles_used > 1
+        batch_group_start = min(
+            (i_b // pv_moving_batch_group_size) * pv_moving_batch_group_size,
+            atp.bs - pv_moving_batch_group_size,
+        )
+        batch_in_group = i_b - batch_group_start
+        batch_s_active_qh_pos = batch_group_start * atp.s_active_qh
+        psum_batch_offset = batch_in_group * atp.s_active_qh
         for i_d in range(atp.n_d_tiles):
             exp_v_psum = nl.ndarray(
-                (atp.d_tile_size * pv_tile_factor, atp.s_active_qh * (pv_tile_factor if dense_tiling else 1)),
+                (atp.d_tile_size * pv_tile_factor, pv_moving_s_active_qh * (pv_tile_factor if dense_tiling else 1)),
                 dtype=nl.float32,
                 buffer=nl.psum,
                 address=None
@@ -4425,19 +4974,19 @@ def _compute_pv_matmul_and_store(
             )
             for i_t in range(0, fa_tile_n_sprior, pv_tile_factor):
                 n_col_tiles = min(pv_tile_factor, fa_tile_n_sprior - i_t)
-                batch_s_active_qh_pos = i_b * atp.s_active_qh
                 if dense_tiling:
                     # Densely pack n_col_tiles stationary [V_i_t|...] + strided moving [P_i_t|...] into
-                    # one matmul; results land on the diagonal blocks of the grid PSUM.
+                    # one matmul; results land on the diagonal blocks of the grid PSUM. Optional
+                    # padding includes neighboring batches' P columns and evicts only batch i_b.
                     v_sb_d_view = v_sb[:, i_t * cfg.d_head : (i_t + n_col_tiles) * cfg.d_head]
                     qk_io_type_view = (
                         (bufs.qk_io_type)
                         .reshape_dim(1, [fa_tile_n_sprior, atp.s_active_bqh])
                         .slice(1, start=i_t, end=i_t + n_col_tiles)
-                        .slice(2, start=batch_s_active_qh_pos, end=batch_s_active_qh_pos + atp.s_active_qh)
+                        .slice(2, start=batch_s_active_qh_pos, end=batch_s_active_qh_pos + pv_moving_s_active_qh)
                     )
                     nisa.nc_matmul(
-                        exp_v_psum[: n_col_tiles * atp.d_tile_size, : n_col_tiles * atp.s_active_qh],
+                        exp_v_psum[: n_col_tiles * atp.d_tile_size, : n_col_tiles * pv_moving_s_active_qh],
                         stationary=v_sb_d_view,
                         moving=qk_io_type_view,
                     )
@@ -4461,21 +5010,26 @@ def _compute_pv_matmul_and_store(
 
             # Fold partition slices: sum all column tiles' results together.
             # Only fold slices that were actually written (handles fa_tile_n_sprior < pv_tile_factor).
-            actual_col_tiles_used = min(pv_tile_factor, fa_tile_n_sprior)
-            # Copy mm2 output from psum -> sb while multiplying recip(sum)
-            # When online softmax is active, we don't multiply by recip(sum) here — that's done in finalize.
             # exp_v layout: [d_tile_size, n_d_tiles * bs * s_active_qh]
             exp_v_offset = i_d * atp.bs * atp.s_active_qh + i_b * atp.s_active_qh
             exp_v_view = bufs.exp_v[: atp.d_tile_size, exp_v_offset : exp_v_offset + atp.s_active_qh]
             if atp.use_online_softmax:
-                nisa.tensor_copy(exp_v_view, exp_v_psum[0 : atp.d_tile_size, 0 : atp.s_active_qh])
+                nisa.tensor_copy(
+                    exp_v_view,
+                    exp_v_psum[
+                        0 : atp.d_tile_size,
+                        psum_batch_offset : psum_batch_offset + atp.s_active_qh,
+                    ],
+                    engine=nisa.scalar_engine,
+                )
                 for i_col in range(1, actual_col_tiles_used):
+                    psum_col_offset = i_col * psum_free_stride + psum_batch_offset
                     nisa.tensor_tensor(
                         exp_v_view,
                         exp_v_view,
                         exp_v_psum[
                             i_col * atp.d_tile_size : (i_col + 1) * atp.d_tile_size,
-                            i_col * psum_free_stride : i_col * psum_free_stride + atp.s_active_qh,
+                            psum_col_offset : psum_col_offset + atp.s_active_qh,
                         ],
                         op=nl.add,
                     )
@@ -4486,36 +5040,49 @@ def _compute_pv_matmul_and_store(
                     .select(1, i_b)
                     .slice(0, start=0, end=atp.d_tile_size)
                 )
-                nisa.tensor_tensor(
-                    exp_v_view, exp_v_psum[0 : atp.d_tile_size, 0 : atp.s_active_qh], exp_sum_recip_view, op=nl.multiply
-                )
                 if actual_col_tiles_used > 1:
-                    sbm.open_scope()
-                    exp_v_second = sbm.alloc_stack(
-                        (atp.d_tile_size, atp.s_active_qh), dtype=atp.inter_type, buffer=nl.sbuf
+                    nisa.tensor_copy(
+                        exp_v_view,
+                        exp_v_psum[
+                            0 : atp.d_tile_size,
+                            psum_batch_offset : psum_batch_offset + atp.s_active_qh,
+                        ],
+                        engine=nisa.scalar_engine,
                     )
                     for i_col in range(1, actual_col_tiles_used):
+                        psum_col_offset = i_col * psum_free_stride + psum_batch_offset
                         nisa.tensor_tensor(
-                            exp_v_second,
+                            exp_v_view,
+                            exp_v_view,
                             exp_v_psum[
                                 i_col * atp.d_tile_size : (i_col + 1) * atp.d_tile_size,
-                                i_col * psum_free_stride : i_col * psum_free_stride + atp.s_active_qh,
+                                psum_col_offset : psum_col_offset + atp.s_active_qh,
                             ],
-                            exp_sum_recip_view,
-                            op=nl.multiply,
+                            op=nl.add,
                         )
-                        nisa.tensor_tensor(exp_v_view, exp_v_view, exp_v_second, op=nl.add)
-                    sbm.close_scope()
+                    if not defer_normalization_to_store:
+                        nisa.tensor_tensor(exp_v_view, exp_v_view, exp_sum_recip_view, op=nl.multiply)
+                else:
+                    nisa.tensor_tensor(
+                        exp_v_view,
+                        exp_v_psum[
+                            0 : atp.d_tile_size,
+                            psum_batch_offset : psum_batch_offset + atp.s_active_qh,
+                        ],
+                        exp_sum_recip_view,
+                        op=nl.multiply,
+                    )
         sbm.increment_section()
     sbm.close_scope()
 
-    # When online softmax is active, accumulate the tile output into running_output and defer the
-    # cross-NC gather+store to _finalize_and_store. Otherwise, the per-tile reciprocal above has
-    # already normalized exp_v — gather-and-store it directly.
+    # Online softmax accumulates into running_output and defers the cross-NC gather+store to
+    # _finalize_and_store. The offline path normalizes either during PV eviction or the final SBUF write.
     if atp.use_online_softmax:
         _accumulate_output(atp, cfg, TC, sbm, bufs, fa_ctx)
     else:
-        _gather_and_store_output(out, bufs.exp_v, atp, cfg, sbm, btc)
+        normalization_scale = bufs.exp_sum_recip if defer_normalization_to_store else None
+        _gather_and_store_output(out, bufs.exp_v, atp, cfg, sbm, btc, normalization_scale)
+    return last_v_prior_load
 
 
 def _gather_and_store_output(
@@ -4525,6 +5092,7 @@ def _gather_and_store_output(
     cfg: AttnTKGConfig,
     sbm: SbufManager,
     btc: BatchTileContext,
+    normalization_scale: nl.NkiTensor = None,
 ):
     """Gather partial results from other NC if sharded, then store output to HBM/SBUF.
 
@@ -4533,6 +5101,8 @@ def _gather_and_store_output(
         res: Result tensor in SBUF with shape [d_tile_size, n_d_tiles * s_active_bqh]
              (same as [d_head, s_active_bqh] when n_d_tiles == 1)
         btc: Batch tile context for correct output offset
+        normalization_scale: Optional reciprocal softmax sum applied while writing SBUF output.
+                             When None, res is already normalized.
     """
     sbm.open_scope()
     # Gather and add partial results from other NC if sprior is sharded
@@ -4552,12 +5122,12 @@ def _gather_and_store_output(
 
     # Store to output
     if cfg.out_in_sb:
-        # exp_v and out may have different dtype, easier to just always keep this tensor copy to do the conversion
+        # The final SBUF write performs dtype conversion and, when requested, output normalization.
         # out is in tiled layout: [d_tile_size, n_d_tiles * total_bqh] where total_bqh = bs_full * s_active_qh
         # res is [d_tile_size, n_d_tiles * s_active_bqh]
         out_offset = btc.global_batch_offset * atp.s_active_qh
         total_bqh = atp.bs_full * atp.s_active_qh
-        if total_bqh == atp.s_active_bqh:
+        if total_bqh == atp.s_active_bqh and normalization_scale is None:
             # No batch tiling: res and out have matching strides, single copy suffices
             total_size = atp.n_d_tiles * atp.s_active_bqh
             nisa.tensor_copy(
@@ -4568,10 +5138,17 @@ def _gather_and_store_output(
             for i_d in range(atp.n_d_tiles):
                 d_src_offset = i_d * atp.s_active_bqh
                 d_out_offset = i_d * total_bqh + out_offset
-                nisa.tensor_copy(
-                    out[:, d_out_offset : d_out_offset + atp.s_active_bqh],
-                    src=res[:, d_src_offset : d_src_offset + atp.s_active_bqh],
-                )
+                out_view = out[:, d_out_offset : d_out_offset + atp.s_active_bqh]
+                res_view = res[:, d_src_offset : d_src_offset + atp.s_active_bqh]
+                if normalization_scale is None:
+                    nisa.tensor_copy(out_view, src=res_view)
+                else:
+                    nisa.tensor_tensor(
+                        out_view,
+                        res_view,
+                        normalization_scale[: atp.d_tile_size, : atp.s_active_bqh],
+                        op=nl.multiply,
+                    )
         if atp.bs_n_prgs > 1 and not cfg.return_cp_softmax_stats:
             # Skip sendrecv for CP: each NC keeps only its local batch portion in SBUF.
             # CP output collectives operate on each NC's local data independently.
@@ -4885,6 +5462,69 @@ def _modulo(x, y: float, out, sbm=None):
 
 
 ### Sink
+def _prep_sink_8_row_banded(
+    sink_hbm: nl.NkiTensor,
+    result: nl.NkiTensor,
+    cfg: AttnTKGConfig,
+    TC: TileConstants,
+    sbm: SbufManager,
+):
+    """Prepare the selected shape's sink directly in its 128-row banded layout."""
+    sbm.open_scope()
+
+    sink_sb = sbm.alloc_stack((1, cfg.q_head), dtype=sink_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(sink_sb, sink_hbm.reshape((1, cfg.q_head)), name=dma_name(f"{sbm.get_name_prefix()}sink_load_banded"))
+
+    n_repeats = TC.p_max // cfg.q_head
+    sink_repeated = sbm.alloc_stack((1, TC.p_max), dtype=sink_hbm.dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=sink_repeated.reshape((1, n_repeats, cfg.q_head)),
+        data=sink_sb.expand_dim(1).broadcast(1, size=n_repeats),
+        op0=nl.maximum,
+        operand0=_MIN_FLOAT32,
+    )
+
+    sink_tp_psum = nl.ndarray((TC.p_max, 1), dtype=sink_hbm.dtype, buffer=nl.psum)
+    nisa.nc_transpose(sink_tp_psum, sink_repeated)
+    nisa.tensor_copy(result, sink_tp_psum)
+
+    sbm.close_scope()
+
+
+def _load_small_sprior_sink_column(
+    sink_hbm: nl.NkiTensor,
+    sink_column: nl.NkiTensor,
+    atp: AttnTileParams,
+    cfg: AttnTKGConfig,
+    sbm: SbufManager,
+    btc: BatchTileContext,
+):
+    """Repeat the head sinks and transpose them into the appended score column."""
+    kernel_assert(atp.n_bsq_tiles == 1, "small-sprior sink requires one BxQ tile")
+    kernel_assert(cfg.s_active == 1, "appended sink column requires one active token")
+    kernel_assert(sink_hbm.shape[0] == cfg.q_head, "appended sink column requires one KV head")
+
+    sbm.open_scope()
+    sink_sb = sbm.alloc_stack((1, cfg.q_head), dtype=sink_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(
+        sink_sb,
+        sink_hbm.reshape((1, cfg.q_head)),
+        name=f"{sbm.get_name_prefix()}sink_load_bt{btc.batch_tile_idx}",
+    )
+
+    n_repeats = atp.s_active_bqh // cfg.q_head
+    sink_repeated = sbm.alloc_stack((1, atp.s_active_bqh), dtype=sink_hbm.dtype, buffer=nl.sbuf)
+    _cp = nisa.tensor_copy(
+        sink_repeated.reshape((1, n_repeats, cfg.q_head)),
+        sink_sb.expand_dim(1).broadcast(1, size=n_repeats),
+    )
+    if atp.queue_pin_early_after is not None:
+        kernel_assert(_cp is not None, "QUEUE_PIN: tensor_copy returned no instruction handle")
+        _cp.depends_on(atp.queue_pin_early_after, kind=nisa.dependency.schedule)
+    nisa.nc_transpose(sink_column, sink_repeated)
+    sbm.close_scope()
+
+
 def _prep_sink(
     sink_hbm: nl.NkiTensor,
     result: nl.NkiTensor,
@@ -4920,10 +5560,13 @@ def _prep_sink(
     sink_repeated = sbm.alloc_stack(
         (1, n_repeats * kv_heads * cfg.q_head * cfg.s_active), buffer=nl.sbuf, dtype=sink_hbm.dtype
     )
-    nisa.tensor_copy(
+    _cp = nisa.tensor_copy(
         dst=sink_repeated.reshape((1, n_repeats, kv_heads, cfg.q_head, cfg.s_active)),
         src=sink_sb.expand_dim(3).broadcast(3, size=cfg.s_active).expand_dim(1).broadcast(1, size=n_repeats),
     )
+    if atp.queue_pin_early_after is not None:
+        kernel_assert(_cp is not None, "QUEUE_PIN: tensor_copy returned no instruction handle")
+        _cp.depends_on(atp.queue_pin_early_after, kind=nisa.dependency.schedule)
 
     # Slice out only the section of sink included in this nc
     sink_repeated_view = sink_repeated[:, nl.ds(kv_offset * cfg.q_head * cfg.s_active, atp.s_active_bqh)]
@@ -4976,7 +5619,7 @@ def _tile_sink_transpose(
     nisa.tensor_copy(sink_tp_repeated[:tile_size, index], sink_tp_psum)
 
 
-def _fill_inactive_block_slots_with_spread(dst_u32, signed_table, num_columns, TC, sbm):
+def _fill_inactive_block_slots_with_spread(dst_u32, signed_table, num_columns, num_resized_physical_blocks, TC, sbm):
     """Replace inactive-block padding in a u32 index table with a cross-column-spread block id.
 
     dst_u32 is a [p_max, num_columns] uint32 gather-index table produced by a plain tensor_copy from
@@ -4986,27 +5629,85 @@ def _fill_inactive_block_slots_with_spread(dst_u32, signed_table, num_columns, T
     inactive slot read block 0, and at partial cache the inactive columns all collide on the same
     128-block window in HBM, throttling DMA.
 
-    Fill each inactive slot with (partition_id + column * p_max) via an iota so every slot targets a
-    distinct block, spreading the padding gathers across HBM. signed_table carries the sentinels
-    (negative values); dst_u32 receives the spread. Both fold-major and batch-major index tables use
-    this (identical num_columns and p_max, so the spread is the same set of indices for both).
+    For each inactive slot, generate:
+        partition_id + (column % valid_iota_columns) * p_max
+    where valid_iota_columns is the number of whole p_max columns that fit in the physical cache.
+    This spreads padding gathers across distinct physical blocks before repeating the pattern.
+    signed_table carries the sentinels (negative values); dst_u32 receives the generated indices.
+    Both fold-major and batch-major index tables use the same pattern.
 
-    The iota's access pattern generates values directly in [0, num_columns * p_max), which are all
-    valid block indices: num_columns * p_max = batch_size * (num_folds_this_tile * p_max) is the number
-    of block-slots this FA tile gathers, and a tile can gather no more blocks than the cache holds
-    (num_folds_this_tile * p_max <= blocks_per_batch), so the max index stays within the gathered cache.
+    num_resized_physical_blocks has the following implications:
+      - It is the physical cache block count after block resizing, including the resize factor applied
+        to both the cache and active block indices.
+      - The physical cache can still contain fewer blocks than the logical table, so an iota spanning
+        all table columns can generate out-of-bounds indices.
+      - The largest whole-p_max range that fits both the physical cache and this table is used, then
+        repeated across the remaining columns. This maximizes distinct aligned block indices before
+        repetition while keeping every generated index below num_resized_physical_blocks.
+      - For a non-p_max-aligned cache, up to p_max - 1 tail blocks are intentionally unused to avoid
+        partial-column remapping.
+      - If the cache has fewer than p_max blocks, inactive entries retain the original cast-to-zero
+        result.
+      - The iota's zero-stride outer dimension repeats the range to a whole-pattern column count, and
+        the source is sliced back to num_columns before the predicated copy.
     """
+    valid_iota_columns = min(num_columns, num_resized_physical_blocks // TC.p_max)
+    if valid_iota_columns == 0:
+        return
+
     sbm.open_scope()
     inactive_mask = sbm.alloc_stack((TC.p_max, num_columns), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=inactive_mask, data=signed_table, op0=nl.less, operand0=0)
-    spread_ids = sbm.alloc_stack((TC.p_max, num_columns), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.iota(dst=spread_ids, pattern=[[TC.p_max, num_columns]], offset=0, channel_multiplier=1)
-    nisa.tensor_copy_predicated(dst=dst_u32, src=spread_ids, predicate=inactive_mask)
+    num_iota_repeats = div_ceil(num_columns, valid_iota_columns)
+    rounded_num_columns = num_iota_repeats * valid_iota_columns
+    spread_ids = sbm.alloc_stack((TC.p_max, rounded_num_columns), dtype=nl.uint32, buffer=nl.sbuf)
+    nisa.iota(
+        dst=spread_ids,
+        pattern=[[0, num_iota_repeats], [TC.p_max, valid_iota_columns]],
+        offset=0,
+        channel_multiplier=1,
+    )
+    nisa.tensor_copy_predicated(
+        dst=dst_u32,
+        src=spread_ids.slice(1, start=0, end=num_columns),
+        predicate=inactive_mask,
+    )
     sbm.close_scope()
 
 
 _ABT_CACHE: dict = {}
 _ABT_V_REARRANGED_CACHE: dict = {}
+
+
+def _get_or_create_rearranged_v_indices(
+    v_idx_src,
+    total_columns,
+    group_size,
+    atp: AttnTileParams,
+    fa_ctx: FATileContext,
+    TC,
+    sbm,
+):
+    cache_key = None
+    if mega_flag_default_on("VLLM_NEURON_MEGA_ABT_REUSE") and fa_ctx.dynamic_tile_offset_sbuf is None:
+        # The source identity follows the ABT cache, while the geometry fields
+        # explicitly prevent the trimmed SWA table from aliasing the full table.
+        cache_key = (
+            id(v_idx_src),
+            atp.s_prior,
+            fa_ctx.tile_offset,
+            fa_ctx.tile_s_prior,
+            total_columns,
+            group_size,
+        )
+        cached = _ABT_V_REARRANGED_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    idx_table = _rearrange_indices_for_batched_dma(v_idx_src, total_columns, group_size, TC, sbm)
+    if cache_key is not None:
+        _ABT_V_REARRANGED_CACHE[cache_key] = idx_table
+    return idx_table
 
 
 def _load_and_reshape_active_blk_table(
@@ -5081,7 +5782,7 @@ def _load_and_reshape_active_blk_table(
     # gates the MM1 K gather-transposes, putting redundant work directly on the critical path.
     # Cache by table identity + geometry; SWA and full tables have different ids so they
     # cannot collide. Trace-time only (tracer frontend), matching the prefetch FIFOs.
-    _abt_reuse = _os.environ.get("VLLM_NEURON_MEGA_ABT_REUSE")
+    _abt_reuse = mega_flag_default_on("VLLM_NEURON_MEGA_ABT_REUSE")
     _abt_key = None
     if _abt_reuse and not is_dynamic:
         _abt_key = (
@@ -5282,7 +5983,12 @@ def _load_and_reshape_active_blk_table(
         )
         nisa.tensor_copy(bufs.active_blocks_sb_u32_fold_major, active_blk_table_sb, engine=nisa.vector_engine)
         _fill_inactive_block_slots_with_spread(
-            bufs.active_blocks_sb_u32_fold_major, active_blk_table_sb, fold_major_num_folds, TC, sbm
+            bufs.active_blocks_sb_u32_fold_major,
+            active_blk_table_sb,
+            fold_major_num_folds,
+            bufs.k_prior_reshaped.shape[0],
+            TC,
+            sbm,
         )
 
     # Reorder from fold-major [p_max, num_folds * bs] to batch-major [p_max, bs * num_folds]
@@ -5310,7 +6016,12 @@ def _load_and_reshape_active_blk_table(
         )
         nisa.tensor_copy(bufs.active_blocks_sb_u32, bufs.active_blocks_sb, engine=nisa.vector_engine)
         _fill_inactive_block_slots_with_spread(
-            bufs.active_blocks_sb_u32, bufs.active_blocks_sb, total_num_folds, TC, sbm
+            bufs.active_blocks_sb_u32,
+            bufs.active_blocks_sb,
+            total_num_folds,
+            bufs.k_prior_reshaped.shape[0],
+            TC,
+            sbm,
         )
 
     # Store to debug tensor if available (incrementally per FA tile and batch tile)
@@ -5710,7 +6421,7 @@ def _build_swap_q_packed_col(bufs, atp, cfg, TC, sbm, sprior_band_factor, col_ti
     q_pad_tiles = q_pad_sb[:, left_zeros : left_zeros + atp.bs_full * col_tile_width].reshape(
         (k_d_head_row_tile, atp.bs_full, col_tile_width)
     )
-    nisa.tensor_copy(dst=q_pad_tiles[:, :, : atp.s_active_qh], src=q_sb_batched)
+    nisa.tensor_copy(dst=q_pad_tiles[:, :, : atp.s_active_qh], src=q_sb_batched, engine=nisa.scalar_engine)
     return q_pad_sb, left_zeros
 
 
@@ -5733,6 +6444,24 @@ def _swap_band_factor(atp, TC):
     """
     batches_per_psum = TC.p_max // atp.s_active_qh
     return batches_per_psum // min(atp.bs_per_nc, batches_per_psum)
+
+
+def _use_swapped_tile0_banded_max(sink, atp, cfg, TC, fa_ctx):
+    """Use the direct duplicated-max path for the two-band Trn3 tile-0 layout."""
+    return (
+        is_trn3_b1()
+        and sink is not None
+        and sink.shape[0] == cfg.q_head
+        and fa_ctx.fa_tile_idx == 0
+        and fa_ctx.dynamic_tile_offset_sbuf is None
+        and atp.sync_softmax_per_fa_tile
+        and atp.s_active_qh == 8
+        and atp.s_active_bqh == 64
+        and atp.n_bsq_tiles == 1
+        and cfg.q_head == 8
+        and cfg.s_active == 1
+        and _swap_band_factor(atp, TC) == 2
+    )
 
 
 def _band_combine(src, dst, op, atp, TC):
@@ -5920,6 +6649,7 @@ def _rearrange_indices_for_batched_dma(active_blocks_sb_u32, total_columns, grou
             offset=0,
         ),
         src=(active_blocks_sb_u32).reshape_dim(1, [num_groups, N]),
+        name=dma_name(f"{sbm.get_name_prefix()}v_idx_deinterleave_store_g{num_groups}_n{N}"),
     )
     # Step 2: reshape HBM as [num_groups*N, 128] and dma_transpose (1,0) → SBUF [128, num_groups*N].
     # The reshape interprets the flat HBM as num_groups*N rows of 128 columns each.
@@ -5931,6 +6661,7 @@ def _rearrange_indices_for_batched_dma(active_blocks_sb_u32, total_columns, grou
         dst=idx_table,
         src=v_idx_hbm.reshape((num_groups * N, TC.p_max)),
         axes=(1, 0),
+        name=dma_name(f"{sbm.get_name_prefix()}v_idx_table_load_g{num_groups}_n{N}"),
     )
     return idx_table
 
@@ -6152,6 +6883,14 @@ def _store_dbg_qk_exp(
     """
     if DBG_TENSORS and not atp.use_online_softmax and not (cfg.strided_mm1 and atp.bs != atp.bs_per_nc):
         bqh_offset = btc.tile_batch_offset * atp.s_active_qh
+        if _use_pv_swapped_column_tiling(atp, cfg, sbm, fa_ctx):
+            qk_exp_src = (
+                bufs.qk_io_type.reshape_dim(1, [atp.bs, fa_ctx.tile_n_sprior, atp.s_active_qh])
+                .permute([0, 2, 1, 3])
+                .reshape((TC.p_max, 1, fa_ctx.tile_n_sprior, 1, atp.s_active_bqh))
+            )
+        else:
+            qk_exp_src = bufs.qk_io_type.reshape((TC.p_max, 1, fa_ctx.tile_n_sprior, 1, atp.s_active_bqh))
         nisa.dma_copy(
             bufs.DBG_QK_EXP[
                 :,
@@ -6160,7 +6899,7 @@ def _store_dbg_qk_exp(
                 atp.bs_prg_id,
                 bqh_offset : bqh_offset + atp.s_active_bqh,
             ],
-            bufs.qk_io_type.reshape((TC.p_max, 1, fa_ctx.tile_n_sprior, 1, atp.s_active_bqh)),
+            qk_exp_src,
             name=f"{sbm.get_name_prefix()}dbg_qk_exp_store_bt{btc.batch_tile_idx}",
         )
     elif DBG_TENSORS and fa_ctx.is_last_fa_tile and btc.batch_tile_idx == 0:

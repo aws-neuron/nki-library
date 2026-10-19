@@ -26,13 +26,11 @@ from typing import Optional
 
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa.constants import oob_mode
 
 from ...quantization.fp8_quantize import pre_combine_dequant_scales
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, _psum_alloc, _sbm_alloc, div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import as_nki_tensor
 from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
@@ -92,7 +90,7 @@ def _load_down_weight(
     )
     nisa.dma_copy(
         dst=weight_sb[:p_I, :, :],
-        src=as_nki_tensor(down_weights_view),
+        src=down_weights_view,
         dge_mode=nisa.dge_mode.hwdge,
     )
     return weight_sb.view(down_weights.dtype)
@@ -146,7 +144,7 @@ def _load_down_scale(
             vector_offset=token_indices_on_p,
             indirect_dim=0,
         ),
-        oob_mode=oob_mode.skip,
+        oob_mode=nisa.oob_mode.skip,
     )
 
 
@@ -182,7 +180,7 @@ def _down_proj_prep_inter_and_weights(
 
     """
     Quantize intermediate state to MXFP8.
-    
+
     Quantize inter_sb into mxfp4_x4[_pmax, ceil(I/512), BxS] @ SB.
     When I%512 != 0, the final I512 tile of inter_sb will contain garbage.
     nc_matmul_mx requires 32/64/128 partitions input so all 128 partitions are used (including garbage).
@@ -512,10 +510,10 @@ def down_projection_mx_shard_H(
 
     """
     Bias handling with two paths based on input bias shape.
-    
+
     Path 1: bias_sb is (1, H) - broadcast to (128, H_sharded) using configured method
     Path 2: bias_sb is already (128, H) - use tensor_tensor add after psum copy
-    
+
     Broadcast methods (controlled by cfg.use_stream_shuffle_broadcast):
     - True (default): Use stream_shuffle_broadcast (nc_stream_shuffle)
     - False: Use PE broadcast via matmul with ones

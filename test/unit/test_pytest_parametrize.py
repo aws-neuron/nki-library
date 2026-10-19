@@ -18,7 +18,8 @@ from enum import Enum
 
 import pytest
 
-from test.utils.coverage_parametrized_tests import MAX_PATH_COMPONENT_LENGTH, format_param_value
+from test.utils.common_dataclasses import MAX_PATH_COMPONENT_LENGTH
+from test.utils.coverage_parametrized_tests import format_param_value
 from test.utils.pytest_parametrize import pytest_parametrize, tag_params
 
 

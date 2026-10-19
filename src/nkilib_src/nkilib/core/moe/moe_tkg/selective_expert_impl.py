@@ -330,6 +330,9 @@ def _selective_expert_moe_tkg(
                 dims=dims,
                 sbm=sbm,
                 share_memory_scope=True,
+                gate_up_weights=initial_gate_proj_weights.select(dim=0, index=expert_id_scalar_offset).flatten_dims(
+                    start_dim=1, end_dim=2
+                ),
             )
 
             # Down projection

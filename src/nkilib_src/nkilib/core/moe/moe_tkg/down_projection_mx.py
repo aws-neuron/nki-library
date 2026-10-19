@@ -32,7 +32,6 @@ from typing import Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import oob_mode
 
 # Common utils
 from ...utils.common_types import ExpertAffinityScaleMode, MoELNCShardingStrategy
@@ -40,7 +39,6 @@ from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import as_nki_tensor
 from .all_expert_mx_utils import SUPPORTED_MOE_SHARDING_STRATEGIES
 
 # Shared MX constants
@@ -121,12 +119,12 @@ def load_broadcast_down_weight_scale_bias(
         weight_view = base_weight.select(dim=0, index=expert_idx).slice(
             dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=weight_view, dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
     else:
         weight_view = base_weight.select(dim=0, index=expert_idx).slice(
             dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=weight_view, dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -200,7 +198,7 @@ def load_broadcast_down_weight_scale_bias(
         bias_view = bias.slice(dim=0, start=expert_idx, end=expert_idx + 1).slice(
             dim=1, start=H_offset, end=H_offset + H_size_local
         )
-        nisa.dma_copy(src=as_nki_tensor(bias_view), dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=bias_view, dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
 
         # Broadcast bias using PE
         if use_PE_bias_broadcast:
@@ -412,6 +410,11 @@ def down_projection_mx(
                 need_down_dequant=need_down_dequant,
                 activation_compute_dtype=activation_compute_dtype,
                 is_software_quant=is_software_quant,
+                perform_accumulation=not use_hbm_accumulation,
+                accumulation_result_tile=out_sb[
+                    :tile_T_actual, tile_t : tile_t + 1, tile_H_offset : tile_H_offset + TILE_H
+                ],
+                overwrite_accum_result=is_first_expert or is_blockwise,
             )
 
             tile_T_out_actual = min(tile_T_actual, T_out - tile_T_offset)
@@ -446,20 +449,8 @@ def down_projection_mx(
                             scales=[1.0, 1.0],
                             reduce_op=nl.add,
                         )
-            else:
-                # SBUF accumulation: accumulate across experts, spill later
-                if is_first_expert or is_blockwise:
-                    nisa.tensor_copy(
-                        dst=out_sb[:tile_T_actual, tile_t : tile_t + 1, tile_H_offset : tile_H_offset + TILE_H],
-                        src=expert_out_tile_sb[:tile_T_actual, :],
-                    )
-                else:
-                    nisa.tensor_tensor(
-                        dst=out_sb[:tile_T_actual, tile_t : tile_t + 1, tile_H_offset : tile_H_offset + TILE_H],
-                        data1=out_sb[:tile_T_actual, tile_t : tile_t + 1, tile_H_offset : tile_H_offset + TILE_H],
-                        op=nl.add,
-                        data2=expert_out_tile_sb[:tile_T_actual, :],
-                    )
+            # SBUF accumulation (not use_hbm_accumulation): accumulation into out_sb is already fused into
+            # the expert affinity scaling inside _down_proj_tile_compute; spill happens below.
 
     # Deferred spill for SBUF accumulation path (after all H-tiles complete)
     if not use_hbm_accumulation:
@@ -495,14 +486,16 @@ def down_projection_mx(
                 if n_prgs == 1:
                     # Single core: write directly without cross-NC synchronization.
                     if is_first_expert:
-                        nisa.dma_copy(src=out_src, dst=dst_ap, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge)
+                        nisa.dma_copy(
+                            src=out_src, dst=dst_ap, oob_mode=nisa.oob_mode.skip, dge_mode=nisa.dge_mode.swdge
+                        )
                     else:
                         nisa.dma_compute(
                             dst=dst_ap,
                             srcs=[dst_ap, out_src],
                             scales=[1.0, 1.0],
                             reduce_op=nl.add,
-                            oob_mode=oob_mode.skip,
+                            oob_mode=nisa.oob_mode.skip,
                         )
                     continue
 
@@ -532,11 +525,13 @@ def down_projection_mx(
                     )
                     if nl.program_id(0) == 0:
                         if is_first_expert:
-                            nisa.dma_copy(src=out_src, dst=dst_ap, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge)
+                            nisa.dma_copy(
+                                src=out_src, dst=dst_ap, oob_mode=nisa.oob_mode.skip, dge_mode=nisa.dge_mode.swdge
+                            )
                             nisa.dma_compute(
                                 srcs=[dst_ap_other_core, out_src_other],
                                 dst=dst_ap_other_core,
-                                oob_mode=oob_mode.skip,
+                                oob_mode=nisa.oob_mode.skip,
                                 reduce_op=nl.add,
                             )
                         else:
@@ -545,14 +540,14 @@ def down_projection_mx(
                                 srcs=[dst_ap, out_src],
                                 scales=[1.0, 1.0],
                                 reduce_op=nl.add,
-                                oob_mode=oob_mode.skip,
+                                oob_mode=nisa.oob_mode.skip,
                             )
                             nisa.dma_compute(
                                 dst=dst_ap_other_core,
                                 srcs=[dst_ap_other_core, out_src_other],
                                 scales=[1.0, 1.0],
                                 reduce_op=nl.add,
-                                oob_mode=oob_mode.skip,
+                                oob_mode=nisa.oob_mode.skip,
                             )
                 elif sharding_strategy == MoELNCShardingStrategy.SHARD_I:
                     # This only works in shard on I, as both cores has the same index
@@ -561,7 +556,7 @@ def down_projection_mx(
                     if nl.program_id(0) == 0:
                         if is_first_expert:
                             nisa.dma_copy(
-                                src=out_src_agg, dst=dst_ap, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge
+                                src=out_src_agg, dst=dst_ap, oob_mode=nisa.oob_mode.skip, dge_mode=nisa.dge_mode.swdge
                             )
                         else:
                             nisa.dma_compute(
@@ -569,7 +564,7 @@ def down_projection_mx(
                                 srcs=[dst_ap, out_src_agg],
                                 scales=[1.0, 1.0],
                                 reduce_op=nl.add,
-                                oob_mode=oob_mode.skip,
+                                oob_mode=nisa.oob_mode.skip,
                             )
                 elif sharding_strategy == MoELNCShardingStrategy.SHARD_T:
                     out_idx_other = nl.ndarray((tile_T_actual, 1), dtype=token_position_to_id_T.dtype, buffer=nl.sbuf)
@@ -588,11 +583,13 @@ def down_projection_mx(
                     )
                     if nl.program_id(0) == 0:
                         if is_first_expert:
-                            nisa.dma_copy(src=out_src, dst=dst_ap, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge)
+                            nisa.dma_copy(
+                                src=out_src, dst=dst_ap, oob_mode=nisa.oob_mode.skip, dge_mode=nisa.dge_mode.swdge
+                            )
                             nisa.dma_compute(
                                 srcs=[dst_ap_other_core, out_src_other],
                                 dst=dst_ap_other_core,
-                                oob_mode=oob_mode.skip,
+                                oob_mode=nisa.oob_mode.skip,
                                 reduce_op=nl.add,
                             )
                         else:
@@ -601,14 +598,14 @@ def down_projection_mx(
                                 srcs=[dst_ap, out_src],
                                 scales=[1.0, 1.0],
                                 reduce_op=nl.add,
-                                oob_mode=oob_mode.skip,
+                                oob_mode=nisa.oob_mode.skip,
                             )
                             nisa.dma_compute(
                                 dst=dst_ap_other_core,
                                 srcs=[dst_ap_other_core, out_src_other],
                                 scales=[1.0, 1.0],
                                 reduce_op=nl.add,
-                                oob_mode=oob_mode.skip,
+                                oob_mode=nisa.oob_mode.skip,
                             )
                 nisa.core_barrier(out_hbm, cores=[0, 1])
 
@@ -707,6 +704,7 @@ def _lnc_reduce_and_write(
 
 def _apply_down_dequant(
     expert_out_tile_sb: nl.NkiTensor,
+    out_psum: nl.NkiTensor,
     down_dequant_scale: nl.NkiTensor,
     down_input_dequant_scale: Optional[nl.NkiTensor],
     bias_sb: Optional[nl.NkiTensor],
@@ -717,23 +715,38 @@ def _apply_down_dequant(
     TILE_H: int,
     pmax: int,
 ):
-    """Apply post-matmul software dequantization and optional bias.
+    """Evict PSUM into SBUF fused with software dequantization and optional bias.
+
+    The first instruction reads `out_psum` directly, so no separate PSUM eviction is needed.
 
     Handles two quantization modes:
-    - STATIC_MX (down_dequant_scale.shape[1] == 1): single combined scale broadcast over H.
-    - ROW_MX (down_dequant_scale.shape[1] > 1): per-column weight dequant scale,
-      followed by optional per-token input dequant scale.
-
-    Bias is added after dequant (deferred from PSUM eviction to preserve precision).
+    - STATIC_MX (down_dequant_scale.shape[1] == 1): single combined scale broadcast over H; eviction,
+      dequant, and bias all collapse into one instruction.
+    - ROW_MX (down_dequant_scale.shape[1] > 1): per-column weight dequant scale fused into the eviction,
+      followed by optional per-token input dequant scale (which also absorbs the bias add).
     """
+    bias_tile = bias_sb[:tile_T_actual, tile_H_offset : tile_H_offset + TILE_H] if bias_sb != None else None
+    bias_applied = False
+
     if down_dequant_scale.shape[1] == 1:
         # STATIC_MX: combined input*weight scale broadcasts over TILE_H
-        nisa.activation(
-            dst=expert_out_tile_sb[:tile_T_actual, :],
-            op=nl.copy,
-            data=expert_out_tile_sb[:tile_T_actual, :],
-            scale=down_dequant_scale[:tile_T_actual, :],
-        )
+        if bias_tile != None:
+            nisa.scalar_tensor_tensor(
+                dst=expert_out_tile_sb[:tile_T_actual, :],
+                data=out_psum[:tile_T_actual, :],
+                op0=nl.multiply,
+                operand0=down_dequant_scale[:tile_T_actual, :],
+                op1=nl.add,
+                operand1=bias_tile,
+            )
+            bias_applied = True
+        else:
+            nisa.tensor_scalar(
+                dst=expert_out_tile_sb[:tile_T_actual, :],
+                data=out_psum[:tile_T_actual, :],
+                op0=nl.multiply,
+                operand0=down_dequant_scale[:tile_T_actual, :],
+            )
     else:
         # ROW_MX: per-column weight dequant, then per-token input dequant
         n_H128_in_tile = TILE_H // pmax
@@ -743,7 +756,7 @@ def _apply_down_dequant(
             h_slice = nl.ds(i_h128 * pmax, pmax)
             interleave_copy(
                 dst=expert_out_tile_sb[:tile_T_actual, h_slice],
-                src=expert_out_tile_sb[:tile_T_actual, h_slice],
+                src=out_psum[:tile_T_actual, h_slice],
                 scale=dequant_scale_view.slice(dim=1, start=h_col, end=h_col + 1),
                 index=i_h128,
             )
@@ -753,18 +766,29 @@ def _apply_down_dequant(
             token_scale_1d = down_input_dequant_scale[0:1, tile_T_offset : tile_T_offset + tile_T_actual, 0]
             nisa.nc_transpose(data=token_scale_1d, dst=token_scale_psum[:tile_T_actual, 0])
             nisa.tensor_copy(dst=token_scale_sb[:tile_T_actual, :], src=token_scale_psum[:tile_T_actual, :])
-            nisa.activation(
-                dst=expert_out_tile_sb[:tile_T_actual, :],
-                op=nl.copy,
-                data=expert_out_tile_sb[:tile_T_actual, :],
-                scale=token_scale_sb[:tile_T_actual, :],
-            )
-    if bias_sb != None:
+            if bias_tile != None:
+                nisa.scalar_tensor_tensor(
+                    dst=expert_out_tile_sb[:tile_T_actual, :],
+                    data=expert_out_tile_sb[:tile_T_actual, :],
+                    op0=nl.multiply,
+                    operand0=token_scale_sb[:tile_T_actual, :],
+                    op1=nl.add,
+                    operand1=bias_tile,
+                )
+                bias_applied = True
+            else:
+                nisa.tensor_scalar(
+                    dst=expert_out_tile_sb[:tile_T_actual, :],
+                    data=expert_out_tile_sb[:tile_T_actual, :],
+                    op0=nl.multiply,
+                    operand0=token_scale_sb[:tile_T_actual, :],
+                )
+    if bias_tile != None and not bias_applied:
         nisa.tensor_tensor(
             dst=expert_out_tile_sb[:tile_T_actual, :],
             data1=expert_out_tile_sb[:tile_T_actual, :],
             op=nl.add,
-            data2=bias_sb[:tile_T_actual, tile_H_offset : tile_H_offset + TILE_H],
+            data2=bias_tile,
         )
 
 
@@ -790,19 +814,23 @@ def _down_proj_tile_compute(
     need_down_dequant: bool,
     activation_compute_dtype: nki.dtype,
     is_software_quant: bool = False,
-) -> nl.ndarray:
+    perform_accumulation: bool = False,
+    accumulation_result_tile: Optional[nl.NkiTensor] = None,
+    overwrite_accum_result: bool = False,
+) -> nl.NkiTensor:
     """Compute one (T-tile, H-tile) of the down projection for a single expert.
 
     Performs: matmul over I tiles → optional dequant → expert affinity scaling.
 
     Steps:
     1. MX matmul: act[I, T_tile] × weight[I, H_tile] → out[T_tile, H_tile] in PSUM
-    2. PSUM eviction to SBUF (fused with bias add if no software dequant needed)
-    3. Software dequantization (if need_down_dequant):
-       - STATIC_MX: single combined scale broadcast over H
-       - ROW_MX: per-column weight scale + optional per-token input scale
-       - Bias add (deferred to after dequant)
-    4. Expert affinity scaling: element-wise multiply by per-token affinity score
+    2. PSUM eviction to SBUF, fused with whatever else applies:
+       - need_down_dequant: the dequant reads PSUM directly (STATIC_MX: single combined scale broadcast
+         over H, plus bias, in one instruction; ROW_MX: per-column weight scale, then optional per-token
+         input scale which also absorbs the bias)
+       - otherwise: bias add
+    3. Expert affinity scaling: element-wise multiply by per-token affinity score, fused with the
+       cross-expert accumulation into `accumulation_result_tile` when `perform_accumulation` is set
 
     Args:
         act_sb: Activation in SBUF [128_I, n_I512_tiles, T].
@@ -828,10 +856,22 @@ def _down_proj_tile_compute(
         is_software_quant (bool): When True, weight_scale_sb is a 2D [128, H] dummy tile indexed
             as [:, :TILE_H] instead of the normal 3D [:, tile_i, H_slice]; and act_scale_sb is a 2D [128, T] dummy tile indexed
             as [:, :T] instead of the normal 3D [:, tile_i, T_slice].
+        perform_accumulation (bool): When True, the affinity-scaled result is written into
+            `accumulation_result_tile` instead of `expert_out_tile_sb` (SBUF accumulation path).
+        accumulation_result_tile (Optional[nl.NkiTensor]): [tile_T_actual, 1, TILE_H] destination slice of the
+            caller's cross-expert accumulator. Required when perform_accumulation=True.
+        overwrite_accum_result (bool): When True, `accumulation_result_tile` is overwritten (first expert);
+            otherwise this expert's contribution is added to it.
 
     Returns:
-        expert_out_tile_sb: Result in SBUF [TILE_T, TILE_H], affinity-scaled.
+        expert_out_tile_sb: Result in SBUF [TILE_T, TILE_H]. Affinity-scaled only when
+            perform_accumulation=False; otherwise the affinity-scaled result lands in
+            `accumulation_result_tile`.
     """
+    kernel_assert(
+        not perform_accumulation or accumulation_result_tile != None,
+        "accumulation_result_tile is required when perform_accumulation=True",
+    )
     out_psum = nl.ndarray((TILE_T, TILE_H), dtype=nl.bfloat16, buffer=nl.psum)
     expert_out_tile_sb = nl.ndarray((TILE_T, TILE_H), dtype=activation_compute_dtype, buffer=nl.sbuf)
     for tile_i in nl.sequential_range(n_I512_tiles):
@@ -847,19 +887,11 @@ def _down_proj_tile_compute(
             else weight_scale_sb[:, tile_i, weight_H_slice],
         )
 
-    if bias_sb != None and down_dequant_scale == None:
-        nisa.tensor_tensor(
-            dst=expert_out_tile_sb[:tile_T_actual, :],
-            data1=out_psum[:tile_T_actual, :],
-            op=nl.add,
-            data2=bias_sb[:tile_T_actual, tile_H_offset : tile_H_offset + TILE_H],
-        )
-    else:
-        nisa.tensor_copy(dst=expert_out_tile_sb[:tile_T_actual, :], src=out_psum[:tile_T_actual, :])
-
     if need_down_dequant:
+        # PSUM eviction is fused into the dequant instruction
         _apply_down_dequant(
             expert_out_tile_sb=expert_out_tile_sb,
+            out_psum=out_psum,
             down_dequant_scale=down_dequant_scale,
             down_input_dequant_scale=down_input_dequant_scale,
             bias_sb=bias_sb,
@@ -870,13 +902,35 @@ def _down_proj_tile_compute(
             TILE_H=TILE_H,
             pmax=pmax,
         )
+    elif bias_sb != None:
+        # Hardware MX: no dequant, so fuse the bias add into the PSUM eviction
+        nisa.tensor_tensor(
+            dst=expert_out_tile_sb[:tile_T_actual, :],
+            data1=out_psum[:tile_T_actual, :],
+            op=nl.add,
+            data2=bias_sb[:tile_T_actual, tile_H_offset : tile_H_offset + TILE_H],
+        )
+    else:
+        nisa.tensor_copy(dst=expert_out_tile_sb[:tile_T_actual, :], src=out_psum[:tile_T_actual, :])
 
-    # Expert affinity scaling
-    nisa.tensor_scalar(
-        dst=expert_out_tile_sb[:tile_T_actual, :],
-        data=expert_out_tile_sb.ap([[TILE_H, tile_T_actual], [1, TILE_H]]),
-        op0=nl.multiply,
-        operand0=expert_affinities_masked_fp32_sb[:tile_T_actual, t_tile_idx : t_tile_idx + 1],
-        engine=nisa.scalar_engine,
-    )
+    # Expert affinity scaling, fused with cross-expert accumulation when accumulating in SBUF
+    affinity_vec = expert_affinities_masked_fp32_sb[:tile_T_actual, t_tile_idx : t_tile_idx + 1]
+    tile_ap = expert_out_tile_sb.ap([[TILE_H, tile_T_actual], [1, TILE_H]])
+    if perform_accumulation and not overwrite_accum_result:
+        nisa.scalar_tensor_tensor(
+            dst=accumulation_result_tile,
+            data=tile_ap,
+            op0=nl.multiply,
+            operand0=affinity_vec,
+            op1=nl.add,
+            operand1=accumulation_result_tile,
+        )
+    else:
+        nisa.tensor_scalar(
+            dst=accumulation_result_tile if perform_accumulation else expert_out_tile_sb[:tile_T_actual, :],
+            data=tile_ap,
+            op0=nl.multiply,
+            operand0=affinity_vec,
+            engine=nisa.scalar_engine,
+        )
     return expert_out_tile_sb

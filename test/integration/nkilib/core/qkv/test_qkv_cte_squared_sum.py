@@ -147,6 +147,80 @@ def _qkv_cte_squared_sum_wrapper_ref(
     }
 
 
+@nki.jit
+def _qkv_cte_squared_sum_q_only_kernel(input, fused_qkv_weights, q_squared_sum_out, d_head, num_q_heads, num_kv_heads):
+    """qkv_cte with ONLY q_squared_sum_out set (k/v None) so the
+    "k/v_squared_sum_out is None" false-arcs run (qkv_cte_utils.py L939/L945;
+    qkv_cte.py L2604/L2618)."""
+    out = qkv_cte(
+        input=input,
+        fused_qkv_weights=fused_qkv_weights,
+        output_layout=QKVOutputLayout.BSD,
+        fused_norm_type=NormType.NO_NORM,
+        d_head=d_head,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        use_auto_allocation=True,
+        q_squared_sum_out=q_squared_sum_out,
+        k_squared_sum_out=None,
+        v_squared_sum_out=None,
+    )
+    return out, q_squared_sum_out
+
+
+def _qkv_cte_squared_sum_q_only_ref(input, fused_qkv_weights, q_squared_sum_out, d_head, num_q_heads, num_kv_heads):  # noqa: ARG001
+    result = qkv_cte_torch_ref(
+        input=input,
+        fused_qkv_weights=fused_qkv_weights,
+        output_layout=QKVOutputLayout.BSD,
+        fused_norm_type=NormType.NO_NORM,
+        d_head=d_head,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        q_squared_sum_out=q_squared_sum_out,
+        k_squared_sum_out=None,
+        v_squared_sum_out=None,
+    )
+    return {"out": result["out"], "q_squared_sum_out": result["q_squared_sum_out"]}
+
+
+@nki.jit
+def _qkv_cte_squared_sum_v_only_kernel(input, fused_qkv_weights, v_squared_sum_out, d_head, num_q_heads, num_kv_heads):
+    """qkv_cte with ONLY v_squared_sum_out set (q/k None) so the
+    "q/k_squared_sum_out is None" false-arcs run (qkv_cte_utils.py L933/L939;
+    qkv_cte.py L2590/L2604)."""
+    out = qkv_cte(
+        input=input,
+        fused_qkv_weights=fused_qkv_weights,
+        output_layout=QKVOutputLayout.BSD,
+        fused_norm_type=NormType.NO_NORM,
+        d_head=d_head,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        use_auto_allocation=True,
+        q_squared_sum_out=None,
+        k_squared_sum_out=None,
+        v_squared_sum_out=v_squared_sum_out,
+    )
+    return out, v_squared_sum_out
+
+
+def _qkv_cte_squared_sum_v_only_ref(input, fused_qkv_weights, v_squared_sum_out, d_head, num_q_heads, num_kv_heads):  # noqa: ARG001
+    result = qkv_cte_torch_ref(
+        input=input,
+        fused_qkv_weights=fused_qkv_weights,
+        output_layout=QKVOutputLayout.BSD,
+        fused_norm_type=NormType.NO_NORM,
+        d_head=d_head,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        q_squared_sum_out=None,
+        k_squared_sum_out=None,
+        v_squared_sum_out=v_squared_sum_out,
+    )
+    return {"out": result["out"], "v_squared_sum_out": result["v_squared_sum_out"]}
+
+
 @pytest_test_metadata(name="QKV CTE Squared Sum", tags=["qkv", "cte", "squared_sum"])
 @pytest_marks(["qkv", "cte"])
 @final
@@ -247,3 +321,64 @@ class TestQkvCteSquaredSum:
             rtol=5e-2,
             atol=1e-1,
         )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("which", ["q", "v"])
+    def test_qkv_cte_squared_sum_partial(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        which,
+    ):
+        # Set only ONE of q/v squared-sum outputs so the "<other> is None"
+        # false-arcs run (qkv_cte_utils.py L933/L939/L945; qkv_cte.py L2590/L2604/L2618).
+        np.random.seed(42)
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        batch, seqlen, n_q_heads, n_kv_heads, d_head = 1, 128, 8, 1, 128
+        fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
+        dtype = nl.bfloat16
+        out_key = f"{which}_squared_sum_out"
+        kernel = _qkv_cte_squared_sum_q_only_kernel if which == "q" else _qkv_cte_squared_sum_v_only_kernel
+        ref = _qkv_cte_squared_sum_q_only_ref if which == "q" else _qkv_cte_squared_sum_v_only_ref
+
+        def input_generator(test_config):
+            full_input = build_qkv_input(
+                batch=batch,
+                seqlen=seqlen,
+                hidden_dim=8192,
+                fused_qkv_dim=fused_qkv_dim,
+                dtype=dtype,
+                eps=1e-6,
+                d_head=d_head,
+                norm_type=NormType.NO_NORM,
+                fused_add=False,
+                output_layout=QKVOutputLayout.BSD,
+                lnc_degree=2,
+                num_q_heads=n_q_heads,
+                num_kv_heads=n_kv_heads,
+                quantization_type=QuantizationType.NONE,
+            )
+            kernel_input = {
+                "input": full_input["input"],
+                "fused_qkv_weights": full_input["fused_qkv_weights"],
+                "d_head": d_head,
+                "num_q_heads": n_q_heads,
+                "num_kv_heads": n_kv_heads,
+            }
+            kernel_input[f"{out_key}.must_alias_input"] = np.zeros((batch, seqlen, 1), dtype=np.float32)
+            return kernel_input
+
+        def output_tensor_descriptor(kernel_input):
+            return {
+                "out": np.zeros((batch, seqlen, fused_qkv_dim), dtype=dtype),
+                out_key: np.zeros((batch, seqlen, 1), dtype=np.float32),
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref_wrapper(ref, preserve_lower_precision=True),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensor_descriptor,
+        )
+        framework.run_test(test_config=None, compiler_args=compiler_args, rtol=5e-2, atol=1e-1)

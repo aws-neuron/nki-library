@@ -20,8 +20,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 
+from test.utils.common_dataclasses import MAX_PATH_COMPONENT_LENGTH
 from test.utils.coverage_parametrized_tests import (
-    MAX_PATH_COMPONENT_LENGTH,
     BoundedRange,
     CoverageTestCase,
     FilterResult,

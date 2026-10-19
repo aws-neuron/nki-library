@@ -86,6 +86,16 @@ def _run_groups(grp_start, grp_end, ac, atp, sp, bufs, q, batch_id, o, sbuf_addr
         _write_back_impl(grp_end - 1, ac, atp, sp, bufs, o, batch_id)
 
 
+# Chunk-level multi-buffering for the tp_out transpose->write pipeline. A chunk's
+# groups are staged side by side in the free dim and shipped with a SINGLE result-write
+# DMA per (chunk, d-tile) instead of one per group, cutting descriptor count by the
+# chunk width (8x at num_grps >= _MAX_FREE_TILES) and making each descriptor's per-
+# partition run 8x longer -- the d_head=64 case needs the length, since one group is
+# only sb_p*2 = 256 bytes per partition. The stages let chunk n+1's transposes fill one
+# staging region while chunk n's batched write drains out of another.
+_NORM_TP_CHUNK_STAGES = 4
+
+
 def _normalize_and_write_head(
     result,
     o_src_hbm,
@@ -103,6 +113,7 @@ def _normalize_and_write_head(
     d_tile_size_par_dim,
     num_free,
     dge_mode=nisa.dge_mode.unknown,
+    dge_engine=nisa.engine.unknown,
 ):
     """Normalize one head's UNnormalized output and write it to ``result``.
 
@@ -116,30 +127,51 @@ def _normalize_and_write_head(
     calls to inner functions, so this must live at module scope to be callable
     directly from both sites.
 
-    ``dge_mode`` steers the o-load and result-write DMAs: ``nisa.dge_mode.swdge``
-    routes descriptor generation to the GPSIMD engine (opt4 interleaved path, so
-    the write overlaps the next head's HWDGE KV load); ``nisa.dge_mode.unknown``
-    (default) lets the compiler pick (post-pass, nothing to overlap).
+    ``dge_mode`` and ``dge_engine`` steer the result-write DMAs (the o-load takes
+    neither -- see the comment at its call site). ``nisa.dge_mode.unknown``
+    (default) lets the compiler pick, which is what the post-pass wants. The
+    interleaved path passes ``hwdge`` plus ``engine.sync``: these addresses are all
+    trace-time constants, so swdge only buys the ability to overlap some other
+    engine, and now that the head-invariant KV load is hoisted out of the head loop
+    there is no longer anything on the other side to overlap with. Sync is the
+    idlest sequencer inside the attention window after GpSimd itself, and Scalar is
+    deliberately not used here even though qkv alternates onto it -- Scalar carries
+    the exp ACTIVATE during attention and is close to binding, whereas during qkv
+    it is free.
 
     This function does NO allocator interaction: ``o_batch`` / ``o_tp_sb`` /
-    ``sum_recip_sb`` are pre-allocated by the caller. The transpose PSUM is a fresh
-    literal allocation each call (safe inside a dynamic_range loop body).
+    ``sum_recip_sb`` are pre-allocated by the caller.
+
+    ``o_batch`` is ``(sb_p, _NORM_TP_CHUNK_STAGES, num_free, head_dim)``: the chunk loop
+    alternates stages so the next chunk's o-load DMA does not wait on this chunk's reads.
+
+    When ``tp_out``, ``o_tp_sb`` is
+    ``(d_tile_size_par_dim, num_d_tiles, _NORM_TP_CHUNK_STAGES, num_free * sb_p)``. Each
+    chunk's groups are staged adjacently in the free dim so the whole chunk ships in one
+    result-write DMA per d-tile; the chunk stages let the next chunk's transposes run
+    while the previous chunk's write is still draining.
     """
     for chunk_base in range(0, num_grps, num_free):
         cur_chunk = min(num_free, num_grps - chunk_base)
+        chunk_stage = (chunk_base // num_free) % _NORM_TP_CHUNK_STAGES
         nisa.dma_copy(
-            dst=o_batch[:, 0:cur_chunk, :],
+            dst=o_batch[:, chunk_stage, 0:cur_chunk, :],
             src=o_src_hbm.ap(
                 pattern=[[head_dim, sb_p], [sb_p * head_dim, cur_chunk], [1, head_dim]],
                 offset=chunk_base * sb_p * head_dim,
             ),
-            dge_mode=dge_mode,
+            # No dge_mode here on purpose: neuronx-cc rejects HWDGE for this DMA with
+            # NCC_IBIR098 ("expect one of DGE types None, SWDGE, but got HWDGE"). It is the
+            # only DMA in this function with a 3-D pattern, and every hwdge DMA that does
+            # compile emits DMA_DIRECT2D, so the HW DGE block generates 2-D descriptors
+            # only. The dge_mode/dge_engine params still apply to the 2-D result writes
+            # below, which the compiler accepts.
         )
         for k in range(cur_chunk):
             grp_i = chunk_base + k
             for d_idx in range(num_d_tiles):
                 d_offset = d_idx * d_tile_size_par_dim
-                o_tile = o_batch[:, k, d_offset : d_offset + d_tile_size_par_dim]
+                o_tile = o_batch[:, chunk_stage, k, d_offset : d_offset + d_tile_size_par_dim]
                 if v_scale_sb is not None:
                     nisa.tensor_scalar(
                         dst=o_tile,
@@ -157,18 +189,18 @@ def _normalize_and_write_head(
                         operand0=sum_recip_sb[:, grp_i],
                     )
                 if tp_out:
-                    o_tp_psum = nl.ndarray(
-                        (d_tile_size_par_dim, sb_p), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0)
-                    )
-                    nisa.nc_transpose(dst=o_tp_psum, data=o_tile)
-                    nisa.tensor_copy(dst=o_tp_sb, src=o_tp_psum)
-                    nisa.dma_copy(
-                        dst=result.ap(
-                            pattern=[[seqlen_q, d_tile_size_par_dim], [1, sb_p]],
-                            offset=batch_id * head_dim * seqlen_q + d_offset * seqlen_q + grp_i * sb_p,
-                        ),
-                        src=o_tp_sb,
-                        dge_mode=dge_mode,
+                    # Stage only: group k occupies free slot [k*sb_p, (k+1)*sb_p) of this
+                    # chunk's buffer. The write is hoisted out of the k loop below.
+                    # Transpose on the DMA engine, not the PE array: o_tile is already in
+                    # SBUF and (q, d) -> (d, q) is the 2-d dma_transpose permutation, so
+                    # nc_transpose and its PSUM->SBUF eviction collapse into one DMA.
+                    # That trades a small increase in DMA bytes for Tensor and Vector
+                    # time on two engines that sit near the DMA floor, and the transpose
+                    # no longer needs a PSUM bank, so it cannot collide with MM1's banks
+                    # 0..3 or MM2's 4 + d_idx.
+                    nisa.dma_transpose(
+                        dst=o_tp_sb[:, d_idx, chunk_stage, k * sb_p : (k + 1) * sb_p],
+                        src=o_tile,
                     )
                 else:
                     nisa.dma_copy(
@@ -178,13 +210,43 @@ def _normalize_and_write_head(
                         ),
                         src=o_tile,
                         dge_mode=dge_mode,
+                        engine=dge_engine,
                     )
+        if tp_out:
+            # Groups chunk_base..chunk_base+cur_chunk-1 are adjacent in `result` (sb_p
+            # apart, stride 1) and adjacent in the staging tile's free dim, so the chunk
+            # is one contiguous run of cur_chunk*sb_p elements per partition: one
+            # descriptor instead of cur_chunk.
+            for d_idx in range(num_d_tiles):
+                d_offset = d_idx * d_tile_size_par_dim
+                nisa.dma_copy(
+                    dst=result.ap(
+                        pattern=[[seqlen_q, d_tile_size_par_dim], [1, cur_chunk * sb_p]],
+                        offset=batch_id * head_dim * seqlen_q + d_offset * seqlen_q + chunk_base * sb_p,
+                    ),
+                    src=o_tp_sb[:, d_idx, chunk_stage, 0 : cur_chunk * sb_p],
+                    dge_mode=dge_mode,
+                    engine=dge_engine,
+                )
 
 
 def _make_ac_atp(
     seqlen_q, seqlen_k, head_dim, dtype, causal, scale, tp_q, tp_out, num_sections, use_cp=False, global_cp_deg=None
 ):
     """Create AttnConfig + AttnTileParams."""
+    # Move a power-of-two softmax scale onto Q so the evict runs at scale == 1.0, which lets
+    # _compute_tile_parameters set atp.static_causal_range_sel for the diagonal tile. See the
+    # same fold in attention_cte._attention_cte for why Q is the cheap side.
+    #
+    # Causal only: the non-causal prior sections have no diagonal tile, and their evict applies
+    # the scale for free as the tensor_scalar operand it already carries.
+    q_prescale = 1.0
+    # frexp returns (mantissa, exponent) with mantissa in [0.5, 1); exactly 0.5 means a
+    # power of two.
+    if causal and scale != 1.0 and scale > 0.0 and math.frexp(scale)[0] == 0.5:
+        q_prescale = scale
+        scale = 1.0
+
     ac = AttnConfig(
         seqlen_q=seqlen_q,
         seqlen_k_active=seqlen_k,
@@ -202,6 +264,7 @@ def _make_ac_atp(
         cp_strided_q_slicing=False,
         cp_striped_input=False,
         scale=scale,
+        q_prescale=q_prescale,
         cache_softmax=True,
         skip_output_normalization=True,
         dtype=dtype,
@@ -250,6 +313,7 @@ def _kvp_partial_prior_attention(
     sliding_window=0,
     kvp_prior_load_blocks=0,
     kvp_prior_fully_visible=False,
+    allow_vector_exp=True,
 ):
     """KVP partial prior: handles the boundary segment that straddles active and prior KV.
 
@@ -295,6 +359,7 @@ def _kvp_partial_prior_attention(
         block_size=block_size,
         kvp_seg_block_offset=seg_offset_hbm if kvp_group_size > 0 else None,
         sliding_window=sliding_window,
+        allow_vector_exp=allow_vector_exp,
     )
     allocator.set_current_address(init_sbuf_addr)
 
@@ -355,6 +420,7 @@ def _kvp_partial_prior_attention(
             init_sbuf_addr=call2_sbuf_addr,
             k_scale_sb=k_scale_sb,
             block_size=block_size,
+            allow_vector_exp=allow_vector_exp,
         )
     elif kvp_group_size > 0:
         # Interleaved without fully-visible prior: use causal masking (original path)
@@ -397,6 +463,7 @@ def _kvp_partial_prior_attention(
             block_size=block_size,
             kvp_seg_block_offset=seg_offset_prior_hbm,
             sliding_window=sliding_window,
+            allow_vector_exp=allow_vector_exp,
         )
     else:
         # Contiguous: prior-only with causal_mask=False and effective_prior_used_len.
@@ -421,6 +488,7 @@ def _kvp_partial_prior_attention(
             out_sum_hbm=sum_curr_hbm,
             init_sbuf_addr=call2_sbuf_addr,
             k_scale_sb=k_scale_sb,
+            allow_vector_exp=allow_vector_exp,
         )
     allocator.set_current_address(call2_sbuf_addr)
 
@@ -504,6 +572,7 @@ def _nonkvp_partial_prior_attention(
     sink=None,
     k_pre_transposed=False,
     fp8_packed=False,
+    allow_vector_exp=True,
 ):
     """Non-KVP partial prior: two sequential attention_cte calls then reduce.
 
@@ -545,6 +614,7 @@ def _nonkvp_partial_prior_attention(
         out_sum_hbm=sum_prev_hbm,
         init_sbuf_addr=init_sbuf_addr,
         sink=sink,
+        allow_vector_exp=allow_vector_exp,
     )
     allocator.set_current_address(init_sbuf_addr)
 
@@ -609,6 +679,7 @@ def _nonkvp_partial_prior_attention(
         out_neg_max_hbm=neg_max_curr_hbm,
         out_sum_hbm=sum_curr_hbm,
         init_sbuf_addr=call2_sbuf_addr,
+        allow_vector_exp=allow_vector_exp,
     )
     allocator.set_current_address(call2_sbuf_addr)
 
@@ -661,6 +732,7 @@ def _nonkvp_partial_prior_attention(
 def _run_prior_segment(
     h,
     do_normalize,
+    do_kv_load,
     bufs_list,
     prior_block_offset_list,
     num_blocks_per_seg,
@@ -719,6 +791,7 @@ def _run_prior_segment(
     num_d_tiles,
     d_tile_size_par_dim,
     do_interleaved_normalize,
+    allow_vector_exp=True,
 ):
     """Run one full-prior segment (region C) for head ``h``.
 
@@ -742,20 +815,25 @@ def _run_prior_segment(
         operand0=num_blocks_per_seg,
     )
     allocator.set_current_address(sbuf_outer)
-    load_kv_cache_fn(
-        k_cache,
-        v_cache,
-        block_tables,
-        k_cache_sbuf,
-        v_cache_sbuf,
-        b_i_list[h],
-        h_i_list[h],
-        prior_block_offset_list[h],
-        num_blocks_per_seg,
-        allocator,
-        k_pre_transposed=k_pre_transposed,
-        fp8_packed=fp8_packed,
-    )
+    # do_kv_load is False for every head past the first when all heads on this core read
+    # the same KV head -- the offset above still decrements so the next segment stays in
+    # lockstep, but the bytes are already in the shared k_cache_sbuf / v_cache_sbuf.
+    # Reloading them is the single largest source of PE idle on a long prior.
+    if do_kv_load:
+        load_kv_cache_fn(
+            k_cache,
+            v_cache,
+            block_tables,
+            k_cache_sbuf,
+            v_cache_sbuf,
+            b_i_list[h],
+            h_i_list[h],
+            prior_block_offset_list[h],
+            num_blocks_per_seg,
+            allocator,
+            k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
+        )
     _allocate_attention_buffers(
         allocator,
         ac_p,
@@ -802,6 +880,7 @@ def _run_prior_segment(
                 k_scale_sb=k_scale_sb,
                 block_size=block_size,
                 sliding_window=0,
+                allow_vector_exp=allow_vector_exp,
             )
         else:
             attention_cte_fn(
@@ -830,6 +909,7 @@ def _run_prior_segment(
                 kvp_seg_block_offset=kvp_seg_offset_hbm,
                 sliding_window=sliding_window,
                 kvp_k_threshold_sb=bufs.k_threshold_sb,
+                allow_vector_exp=allow_vector_exp,
             )
         allocator.set_current_address(init_sbuf_addr)
 
@@ -968,6 +1048,7 @@ def fused_segmented_attention_impl_multihead(
     v_scale_sb=None,
     tp_out: bool = False,
     bs_offset: int = 0,
+    allow_vector_exp: bool = True,
 ):
     """Segmented attention with the head loop nested inside the dynamic loops.
 
@@ -1092,12 +1173,43 @@ def fused_segmented_attention_impl_multihead(
     norm_o_tp = None
     if do_interleaved_normalize:
         norm_num_free = min(num_grps, _MAX_FREE_TILES)
-        norm_o_batch = allocator.alloc_sbuf_tensor(shape=(sb_p, norm_num_free, head_dim), dtype=nl.bfloat16)
+        # _NORM_TP_CHUNK_STAGES stages, matching norm_o_tp below: chunk n+1's o-load DMA
+        # writes one stage while chunk n's normalize still reads another. With a single
+        # stage the load carries a WAR hazard against the in-flight normalize and cannot
+        # be prefetched, which costs dead time on every chunk.
+        norm_o_batch = allocator.alloc_sbuf_tensor(
+            shape=(sb_p, _NORM_TP_CHUNK_STAGES, norm_num_free, head_dim),
+            dtype=nl.bfloat16,
+            # Source of the DMA XBar transpose; same 32B alignment requirement as norm_o_tp.
+            align_to=32,
+        )
         norm_sum_recip = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
         if tp_out:
-            norm_o_tp = allocator.alloc_sbuf_tensor(shape=(d_tile_size_par_dim, sb_p), dtype=nl.bfloat16)
+            # num_d_tiles is not in scope here; recompute it the same way the callee tiles d.
+            norm_num_d_tiles = (head_dim + d_tile_size_par_dim - 1) // d_tile_size_par_dim
+            norm_o_tp = allocator.alloc_sbuf_tensor(
+                shape=(
+                    d_tile_size_par_dim,
+                    norm_num_d_tiles,
+                    _NORM_TP_CHUNK_STAGES,
+                    norm_num_free * sb_p,
+                ),
+                dtype=nl.bfloat16,
+                # The DMA XBar transpose requires a 32B-aligned destination offset. Every
+                # stride inside this tensor is a multiple of sb_p*2 = 256 B, so aligning
+                # the base is sufficient.
+                align_to=32,
+            )
 
     sbuf_outer = allocator.get_current_address()
+
+    # Every head on this core reads the same KV head whenever the GQA ratio is at least
+    # the number of heads per core, which is the common case: 16 Q : 2 KV over LNC2 gives
+    # core 0 h_i == 0 for all eight of its heads. load_kv_cache_fn writes into the single
+    # shared k_cache_sbuf / v_cache_sbuf, so in that case the per-head calls all move the
+    # same bytes into the same place and only the first is needed, which collapses the
+    # per-head V-cache DMAs and K reshuffle copies to one set.
+    kv_load_is_head_invariant = len(set(zip(b_i_list, h_i_list))) == 1
 
     sm_pat = [[num_grps, sb_p], [1, num_grps]]
 
@@ -1199,6 +1311,7 @@ def fused_segmented_attention_impl_multihead(
                     sliding_window=sliding_window,
                     kvp_prior_load_blocks=kvp_prior_load_blocks,
                     kvp_prior_fully_visible=kvp_prior_fully_visible,
+                    allow_vector_exp=allow_vector_exp,
                 )
                 allocator.set_current_address(init_sbuf_addr)
             else:
@@ -1251,6 +1364,7 @@ def fused_segmented_attention_impl_multihead(
                     sink=sink_h,
                     k_pre_transposed=k_pre_transposed,
                     fp8_packed=fp8_packed,
+                    allow_vector_exp=allow_vector_exp,
                 )
                 # opt5: interleave this head's normalize (region A: active + partial
                 # prior). After _nonkvp_partial_prior_attention, o_prev_hbm[h] holds
@@ -1262,7 +1376,7 @@ def fused_segmented_attention_impl_multihead(
                 # The persistent norm buffers live below sbuf_outer, so the helper's
                 # internal set_current_address(init_sbuf_addr) reset does not touch
                 # them. KVP never enters this branch.
-                if do_interleaved_normalize:
+                if do_interleaved_normalize:  # pragma: no branch - always True in non-KVP else (== not is_kvp)
                     nisa.dma_copy(dst=norm_sum_recip, src=sum_prev_hbm[h : h + 1].ap(pattern=sm_pat, offset=0))
                     nisa.reciprocal(norm_sum_recip, norm_sum_recip)
                     _normalize_and_write_head(
@@ -1303,10 +1417,7 @@ def fused_segmented_attention_impl_multihead(
     nisa.register_load(dst=is_not_partial_reg, src=is_not_partial_prior_segment)
 
     def _mh_active_no_partial(_):
-        for h in range(num_heads):
-            allocator.set_current_address(sbuf_outer)
-            bufs = bufs_list[h]
-            sink_h = bufs.sink_sb if sink_list is not None else None
+        def _load_active_kv(h):
             load_kv_cache_fn(
                 k_cache,
                 v_cache,
@@ -1321,6 +1432,21 @@ def fused_segmented_attention_impl_multihead(
                 k_pre_transposed=k_pre_transposed,
                 fp8_packed=fp8_packed,
             )
+
+        if kv_load_is_head_invariant:
+            # The load's scratch (block index tile, K transpose staging) is dead once the
+            # load has drained, so reset the allocator afterwards and let the per-head
+            # buffers reuse that space exactly as they do in the per-head form.
+            allocator.set_current_address(sbuf_outer)
+            _load_active_kv(0)
+            allocator.set_current_address(sbuf_outer)
+
+        for h in range(num_heads):
+            allocator.set_current_address(sbuf_outer)
+            bufs = bufs_list[h]
+            sink_h = bufs.sink_sb if sink_list is not None else None
+            if not kv_load_is_head_invariant:
+                _load_active_kv(h)
             if is_kvp:
                 # KVP: attention_cte_fn with cp_offset for shifted causal mask.
                 init_sbuf_addr = allocator.get_current_address()
@@ -1356,6 +1482,7 @@ def fused_segmented_attention_impl_multihead(
                     kvp_cp_offset_int=kvp_cp_offset_int,
                     kvp_seg_block_offset_int=kvp_seg_block_offset_int,
                     kvp_k_threshold_sb=bufs.k_threshold_sb,
+                    allow_vector_exp=allow_vector_exp,
                 )
                 allocator.set_current_address(init_sbuf_addr)
             else:
@@ -1378,14 +1505,15 @@ def fused_segmented_attention_impl_multihead(
                 # opt4: interleave this head's output normalize into the compute
                 # loop. On the non-KVP no-partial-prior path, _run_groups leaves the
                 # final softmax SUM in bufs.exp_running_sum and the UNnormalized
-                # output in o_prev_hbm[h] (skip_output_normalization=True). Issuing
-                # the normalize here (o-load + result-write ride SWDGE/GPSIMD)
-                # overlaps head h+1's load_kv_cache_fn on sync/scalar, since we are
-                # still inside the barrier-free `for h` loop. The result it writes is
+                # output in o_prev_hbm[h] (skip_output_normalization=True). The
+                # o-load and result-write ride HWDGE on Sync rather than SWDGE/GPSIMD:
+                # load_kv_cache_fn is hoisted out of the head loop, so there is no
+                # head h+1 load left to overlap and GpSimd would sit on the critical
+                # path as PE-idle gaps. The result it writes is
                 # the FINAL value only when prior_tokens==0; when a full prior exists
                 # the caller's post-pass overwrites result with the accumulated
                 # value (see caller has_prior gating). KVP never enters this branch.
-                if do_interleaved_normalize:
+                if do_interleaved_normalize:  # pragma: no branch - always True in non-KVP else (== not is_kvp)
                     nisa.reciprocal(norm_sum_recip, bufs.exp_running_sum)
                     _normalize_and_write_head(
                         result=result,
@@ -1403,7 +1531,8 @@ def fused_segmented_attention_impl_multihead(
                         num_d_tiles=num_d_tiles,
                         d_tile_size_par_dim=d_tile_size_par_dim,
                         num_free=min(num_grps, _MAX_FREE_TILES),
-                        dge_mode=nisa.dge_mode.swdge,
+                        dge_mode=nisa.dge_mode.hwdge,
+                        dge_engine=nisa.engine.sync,
                     )
 
     nl.fori_loop(0, is_not_partial_reg, _mh_active_no_partial)
@@ -1477,6 +1606,7 @@ def fused_segmented_attention_impl_multihead(
             _run_prior_segment(
                 h,
                 False,
+                h == 0 or not kv_load_is_head_invariant,
                 bufs_list=bufs_list,
                 prior_block_offset_list=prior_block_offset_list,
                 num_blocks_per_seg=num_blocks_per_seg,
@@ -1535,6 +1665,7 @@ def fused_segmented_attention_impl_multihead(
                 num_d_tiles=num_d_tiles,
                 d_tile_size_par_dim=d_tile_size_par_dim,
                 do_interleaved_normalize=do_interleaved_normalize,
+                allow_vector_exp=allow_vector_exp,
             )
 
     nl.fori_loop(0, num_prior_m1_reg, _mh_accumulate_prior_segment)
@@ -1548,6 +1679,7 @@ def fused_segmented_attention_impl_multihead(
             _run_prior_segment(
                 h,
                 True,
+                h == 0 or not kv_load_is_head_invariant,
                 bufs_list=bufs_list,
                 prior_block_offset_list=prior_block_offset_list,
                 num_blocks_per_seg=num_blocks_per_seg,
@@ -1606,6 +1738,7 @@ def fused_segmented_attention_impl_multihead(
                 num_d_tiles=num_d_tiles,
                 d_tile_size_par_dim=d_tile_size_par_dim,
                 do_interleaved_normalize=do_interleaved_normalize,
+                allow_vector_exp=allow_vector_exp,
             )
 
     nl.fori_loop(0, has_full_reg, _mh_final_prior_segment)
@@ -1669,6 +1802,7 @@ def fused_segmented_attention_impl(
     kvp_seg_block_offset_int: int = 0,
     kvp_prior_load_blocks: int = 0,
     kvp_prior_fully_visible: bool = False,
+    allow_vector_exp: bool = True,
 ):
     """Fused segmented-attention impl with SBUF aliasing across active/prior passes.
 
@@ -1891,6 +2025,7 @@ def fused_segmented_attention_impl(
                 sliding_window=sliding_window,
                 kvp_prior_load_blocks=kvp_prior_load_blocks,
                 kvp_prior_fully_visible=kvp_prior_fully_visible,
+                allow_vector_exp=allow_vector_exp,
             )
             allocator.set_current_address(init_sbuf_addr)
         else:
@@ -1932,6 +2067,7 @@ def fused_segmented_attention_impl(
                 sink=sink,
                 k_pre_transposed=k_pre_transposed,
                 fp8_packed=fp8_packed,
+                allow_vector_exp=allow_vector_exp,
             )
             allocator.set_current_address(init_sbuf_addr)
         allocator.set_current_address(init_sbuf_addr)
@@ -1980,6 +2116,7 @@ def fused_segmented_attention_impl(
                 kvp_cp_offset_int=kvp_cp_offset_int,
                 kvp_seg_block_offset_int=kvp_seg_block_offset_int,
                 kvp_k_threshold_sb=bufs.k_threshold_sb,
+                allow_vector_exp=allow_vector_exp,
             )
             allocator.set_current_address(init_sbuf_addr)
         else:
@@ -2113,6 +2250,7 @@ def fused_segmented_attention_impl(
                     False,
                     total_sections,
                 )
+                allocator.set_current_address(sbuf_outer)
                 _allocate_attention_buffers(allocator, ac_pv, atp_pv, bufs, sink, k_cache_sbuf, v_cache_sbuf)
                 _setup_range_select_bounds(ac_pv, atp_pv, bufs, allocator, None, None, None, None, batch_id=0)
                 sbuf_inner_p = allocator.get_current_address()
@@ -2173,6 +2311,7 @@ def fused_segmented_attention_impl(
                         kvp_seg_block_offset=kvp_seg_offset_hbm,
                         sliding_window=sliding_window,
                         kvp_k_threshold_sb=bufs.k_threshold_sb,
+                        allow_vector_exp=allow_vector_exp,
                     )
                     allocator.set_current_address(init_sbuf_addr)
 

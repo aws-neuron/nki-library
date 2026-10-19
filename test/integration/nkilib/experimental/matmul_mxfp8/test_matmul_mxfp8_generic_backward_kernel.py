@@ -21,6 +21,7 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 from nkilib_src.nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_generic_backward_kernel
+from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
 from typing_extensions import override
 
 from test.integration.nkilib.experimental.matmul_mxfp8 import utils as matmul_utils
@@ -84,16 +85,77 @@ def matmul_mxfp8_backward_torch_ref(
     output_grad_is_swizzled=False,
     weights_is_swizzled=False,
     input_is_swizzled=False,
+    fast_dma_transpose=False,
+    quant_scheme="wrapX",
+    disable_dma_transpose=False,
+    weights_is_f_by_k=False,
+    input_is_f_by_k=False,
+    psum_copy_in_ratio=None,
+    strided_copy_swizzle_1x32_ratio=None,
 ):
-    """Compute golden backward pass: dX = dY @ W, dW = dY^T @ X."""
-    dy = output_grad.astype(np.float32)
-    w = weights.astype(np.float32)
-    x = input_activation.astype(np.float32)
+    """Compute golden backward pass: dX = dY @ W, dW = dY^T @ X.
 
-    return {
-        "input_grad": (dy @ w).astype(np.float32),
-        "weight_grad": (dy.T @ x).astype(np.float32),
-    }
+    disable_dma_transpose is a load-mechanism choice with identical numerics, so this
+    reference accepts it for signature parity and ignores it.
+
+    Delegates each phase to the forward matmul golden so the MXFP8 quantization
+    error is modelled the same way the kernel produces it. Computing the two
+    matmuls in FP32 here instead would make every quantized arm fail on
+    quantization error rather than on a real defect.
+    """
+    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
+
+    def _phase(lhs, rhs, lhs_scales, rhs_scales, lhs_swizzled, rhs_swizzled, lhs_f_by_k, rhs_f_by_k, config):
+        return matmul_mxfp8_torch_ref(
+            lhs=lhs,
+            rhs=rhs,
+            lhs_scales=lhs_scales,
+            rhs_scales=rhs_scales,
+            lhs_is_swizzled=lhs_swizzled,
+            rhs_is_swizzled=rhs_swizzled,
+            lhs_orientation=None if lhs_f_by_k else TensorOrientation.K_BY_F,
+            rhs_orientation=None if rhs_f_by_k else TensorOrientation.K_BY_F,
+            TILES_IN_BLOCK_M=config.TILES_IN_BLOCK_M if config else None,
+            TILES_IN_BLOCK_N=config.TILES_IN_BLOCK_N if config else None,
+            TILES_IN_BLOCK_K=config.TILES_IN_BLOCK_K if config else None,
+            TILES_IN_LOAD_M=config.TILES_IN_LOAD_M if config else None,
+            TILES_IN_LOAD_N=config.TILES_IN_LOAD_N if config else None,
+            tile_loop_order=tile_loop_order,
+            float8_dtype=float8_dtype,
+            output_dtype=output_dtype,
+            run_with_lnc2=run_with_lnc2,
+            lnc_2_shard_rhs=lnc_2_shard_rhs,
+            use_scale_packing=use_scale_packing,
+            spill_reload=spill_reload,
+            fast_dma_transpose=fast_dma_transpose,
+            quant_scheme=quant_scheme,
+        )["out"]
+
+    # Layout flags mirror matmul_mxfp8_backward exactly: a swizzled operand is
+    # already stored K-by-F and must not also claim an explicit K_BY_F orientation.
+    input_grad = _phase(
+        output_grad,
+        weights,
+        output_grad_scales,
+        weight_scales,
+        output_grad_is_swizzled,
+        weights_is_swizzled,
+        True,
+        weights_is_swizzled or weights_is_f_by_k,
+        input_grad_config,
+    )
+    weight_grad = _phase(
+        output_grad,
+        input_activation,
+        output_grad_scales,
+        input_scales,
+        output_grad_is_swizzled,
+        input_is_swizzled,
+        output_grad_is_swizzled,
+        input_is_swizzled or input_is_f_by_k,
+        weight_grad_config,
+    )
+    return {"input_grad": input_grad, "weight_grad": weight_grad}
 
 
 # ============================================================================
@@ -179,3 +241,63 @@ class TestMatmulMxfp8GenericBackwardKernel:
     def test_matmul_mxfp8_backward(self, test_manager, platform_target, M, K, N, description):
         """Test backward pass computes correct input and weight gradients."""
         self._run_backward_test(test_manager, platform_target, M, K, N)
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("ratio", [0.0, 0.25, 0.5, 1.0], ids=["off", "quarter", "half", "all"])
+def test_backward_feature_ratios(test_manager, platform_target, ratio):
+    """Exercise both standalone backward phases, including a split K tail."""
+    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import MatmulMxfp8KernelConfig
+    from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses import LncShardingMode, QuantScheme
+
+    if not platform_target.is_trn3():
+        pytest.skip("MXFP8 requires TRN3.")
+    M, K, N = 896, 128, 1536
+    rng = np.random.RandomState(42)
+
+    def phase_config(m, k, n):
+        return MatmulMxfp8KernelConfig(
+            m,
+            k,
+            n,
+            tile_m=128,
+            tile_k=512,
+            tile_n=128,
+            TILES_IN_BLOCK_M=1,
+            TILES_IN_BLOCK_N=1,
+            TILES_IN_BLOCK_K=1,
+            TILES_IN_LOAD_M=1,
+            TILES_IN_LOAD_N=1,
+            quant_scheme=QuantScheme._1x32,
+            lnc_sharding=LncShardingMode.OFF,
+        )
+
+    kwargs = {
+        "output_grad": rng.normal(size=(M, N)).astype(nl.bfloat16),
+        "weights": rng.normal(size=(N, K)).astype(nl.bfloat16),
+        "input_activation": rng.normal(size=(M, K)).astype(nl.bfloat16),
+        "input_grad_config": phase_config(M, N, K),
+        "weight_grad_config": phase_config(N, M, K),
+        "output_dtype": nl.float32,
+        "run_with_lnc2": False,
+        "quant_scheme": "1x32",
+        "float8_dtype": "float8_e4m3fn",
+        "disable_dma_transpose": True,
+        "psum_copy_in_ratio": ratio,
+        "strided_copy_swizzle_1x32_ratio": ratio,
+    }
+    framework = UnitTestFramework(
+        test_manager=test_manager,
+        kernel_entry=matmul_mxfp8_generic_backward_kernel.matmul_mxfp8_backward,
+        torch_ref=matmul_mxfp8_backward_torch_ref,
+        kernel_input_generator=lambda _: kwargs,
+        output_tensor_descriptor=lambda _: {
+            "input_grad": np.zeros((M, K), dtype=np.float32),
+            "weight_grad": np.zeros((N, K), dtype=np.float32),
+        },
+    )
+    framework.run_test(
+        None,
+        compiler_args=common_dataclasses.CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+        custom_comparator=_bwd_comparator,
+    )

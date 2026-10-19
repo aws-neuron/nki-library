@@ -24,8 +24,8 @@ from ...core.utils.kernel_helpers import div_ceil
 
 @nki.jit
 def depthwise_conv1d_implicit_gemm(
-    img_ref: nl.ndarray,
-    filter_ref: nl.ndarray,
+    img_ref: nl.NkiTensor,
+    filter_ref: nl.NkiTensor,
     padding: tuple = ((0, 0), (0, 0)),
     stride: tuple = (1, 1),
     rhs_dilation: tuple = (1, 1),
@@ -35,7 +35,7 @@ def depthwise_conv1d_implicit_gemm(
     in_perm: tuple = None,
     kern_perm: tuple = None,
     out_perm: tuple = None,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Depthwise Conv1D using implicit GEMM without full im2col materialization.
 
@@ -54,8 +54,8 @@ def depthwise_conv1d_implicit_gemm(
         Q: Output width ((W + W_pad_l + W_pad_r - S) // stride_w + 1)
 
     Args:
-        img_ref (nl.ndarray): [N, C, 1, W], Input tensor on HBM
-        filter_ref (nl.ndarray): [C, 1, 1, S], Depthwise kernel weights on HBM
+        img_ref (nl.NkiTensor): [N, C, 1, W], Input tensor on HBM
+        filter_ref (nl.NkiTensor): [C, 1, 1, S], Depthwise kernel weights on HBM
         padding (tuple): Padding as ((H_pad_l, H_pad_r), (W_pad_l, W_pad_r)) (default: ((0,0),(0,0)), zero padding supported)
         stride (tuple): Stride values (stride_h, stride_w) (default: (1, 1), stride_h must be 1, stride_w can be any positive integer)
         rhs_dilation (tuple): RHS dilation (default: (1, 1))
@@ -67,7 +67,7 @@ def depthwise_conv1d_implicit_gemm(
         out_perm (tuple): Output permutation (default: None)
 
     Returns:
-        output (nl.ndarray): [N, C, 1, Q], Convolution output on HBM where Q = (W + W_pad_l + W_pad_r - S) // stride_w + 1
+        output (nl.NkiTensor): [N, C, 1, Q], Convolution output on HBM where Q = (W + W_pad_l + W_pad_r - S) // stride_w + 1
 
     Notes:
         - Only supports stride_h=1, stride_w can be any positive integer

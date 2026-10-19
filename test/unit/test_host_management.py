@@ -13,15 +13,17 @@
 # limitations under the License.
 """Unit tests for host_management retry logic and error reporting."""
 
+import collections
 import contextlib
 import json
 import os
 import random
+import re
 import subprocess
 import tempfile
 from contextlib import closing
 from dataclasses import replace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from paramiko import SSHException
@@ -33,9 +35,26 @@ from test.utils.exceptions import (
     RequestTooLargeError,
     TimeoutException,
 )
-from test.utils.host_management import Host, HostManager, LocalHost, detect_local_neuron_devices
-from test.utils.host_state import HostRecord, HostState, HostStateStore, OwnerHostStateStore, temporary_random_seed
+from test.utils.host_management import (
+    Host,
+    HostManager,
+    LocalHost,
+    SshHostGroup,
+    _run_neuron_ls,
+    detect_local_neuron_devices,
+    detect_local_platform,
+)
+from test.utils.host_state import (
+    HostGroup,
+    HostRecord,
+    HostState,
+    HostStateStore,
+    OwnerHostStateStore,
+    temporary_random_seed,
+)
 from test.utils.metrics_collector import MetricName
+
+pytestmark = pytest.mark.usefixtures("controller_environment")
 
 
 def _initialized_store(base_dir, target_hosts, cores_by_alias=None):
@@ -1071,13 +1090,18 @@ class TestSizeBasedHostRouting:
     def _build_manager(self, temp_dir, host_cores: dict[str, int]):
         """Build a HostManager over a state store whose TRN2 host rows carry the given
         persisted physical-core counts (the single source of truth capacity routing
-        ranks by). SshHost is patched so claimed hosts are alias-carrying mocks."""
+        ranks by). Host construction is patched so claimed hosts are alias-carrying SshHost mocks."""
         target_hosts = [TargetHost(ssh_host=a, host_type=Platforms.TRN2) for a in host_cores]
 
-        def fake_make(alias, **_kwargs):
-            return MagicMock(get_host_id=MagicMock(return_value=alias), connection=MagicMock())
+        def fake_get_host(manager, alias):
+            host = manager.target_hosts.get(alias)
+            if host is None:
+                host = create_autospec(SshHost, instance=True)
+                host.get_host_id.return_value = alias
+                manager.target_hosts[alias] = host
+            return host
 
-        patcher = patch("test.utils.host_management.SshHost", side_effect=fake_make)
+        patcher = patch.object(HostManager, "_get_host", fake_get_host)
         patcher.start()
         self._patchers.append(patcher)
         return HostManager(
@@ -1102,6 +1126,21 @@ class TestSizeBasedHostRouting:
 
     def _depths(self, manager) -> dict[str, int]:
         return {rec.resolved.ssh_host: rec.work_queue_depth for rec in manager.state_store.read().hosts}
+
+    @staticmethod
+    def _member(
+        alias: str, logical_host_id: str, rank: int, *, size: int, depth: int = 0, cores: int = 128
+    ) -> HostRecord:
+        """Build a ``cores``-core TRN2 HostRecord belonging to multi-node deployment ``logical_host_id``."""
+        resolved = ResolvedHost(
+            ssh_host=alias,
+            host_type=Platforms.TRN2,
+            num_physical_cores=cores,
+            logical_host_id=logical_host_id,
+            logical_host_rank=rank,
+            logical_host_size=size,
+        )
+        return HostRecord(resolved=resolved, work_queue_depth=depth)
 
     def test_too_small_host_is_filtered_out(self, temp_dir):
         """A host with fewer physical cores than needed is never selected; the
@@ -1219,6 +1258,354 @@ class TestSizeBasedHostRouting:
         manager.release_host(host, needed)
         assert self._depths(manager)["big"] == 0
 
+    def test_retry_releases_exactly_the_claimed_members(self, temp_dir):
+        """A multi-node claim is released from the members it reserved, even if another member of
+        the same deployment joins the pool while the attempt is held."""
+        manager = self._build_manager(temp_dir, {})
+        owner = OwnerHostStateStore(temp_dir)
+        owner._update(
+            lambda state: HostState(hosts=[self._member("m0", "L", 0, size=3), self._member("m1", "L", 1, size=3)])
+        )
+
+        chosen = []
+        with closing(
+            manager.get_host_assignment_with_retry(
+                platform_target=Platforms.TRN2,
+                collector=MagicMock(),
+                collective_ranks=130,
+                lnc_config=1,
+                backoff_seconds=0,
+            )
+        ) as host_generator:
+            for host_attempt in host_generator:
+                with host_attempt as host:
+                    chosen.append(host.get_host_id())
+                    assert self._depths(manager) == {"m0": 130, "m1": 130}
+                    owner._update(
+                        lambda state: replace(state, hosts=[*state.hosts, self._member("m2", "L", 2, size=3, depth=64)])
+                    )
+        assert chosen == ["m0"]
+        assert self._depths(manager) == {"m0": 0, "m1": 0, "m2": 64}
+
+    def test_retry_releases_claim_when_host_construction_fails(self, temp_dir):
+        """A claim is released even when building the host connection for it fails."""
+        manager = self._build_manager(temp_dir, {})
+        owner = OwnerHostStateStore(temp_dir)
+        owner._update(
+            lambda state: HostState(hosts=[self._member("m0", "L", 0, size=2), self._member("m1", "L", 1, size=2)])
+        )
+
+        with patch.object(HostManager, "_get_host", side_effect=ValueError("bad host config")):
+            with pytest.raises(ValueError, match="bad host config"):
+                with closing(
+                    manager.get_host_assignment_with_retry(
+                        platform_target=Platforms.TRN2,
+                        collector=MagicMock(),
+                        collective_ranks=130,
+                        lnc_config=1,
+                        backoff_seconds=0,
+                    )
+                ) as host_generator:
+                    for host_attempt in host_generator:
+                        with host_attempt:
+                            pass
+        assert self._depths(manager) == {"m0": 0, "m1": 0}
+
+    def test_patience_rotation_excludes_busy_multinode_group(self, temp_dir):
+        """A busy multi-node group is excluded from the next pick, and the busy set resets once
+        every eligible group has been tried, so rotation alternates between the groups."""
+        from test.utils.exceptions import QueuePatienceRotation
+
+        manager = self._build_manager(temp_dir, {})
+        owner = OwnerHostStateStore(temp_dir)
+
+        # B's seeded depth of 1 makes A the strict first pick whenever neither group is excluded;
+        # each attempt's claim is released before the next pick, so it never affects the order.
+        seeded = {"a0": 0, "a1": 0, "b0": 1, "b1": 1}
+        owner._update(
+            lambda state: HostState(
+                hosts=[
+                    self._member("a0", "A", 0, size=2, depth=seeded["a0"]),
+                    self._member("a1", "A", 1, size=2, depth=seeded["a1"]),
+                    self._member("b0", "B", 0, size=2, depth=seeded["b0"]),
+                    self._member("b1", "B", 1, size=2, depth=seeded["b1"]),
+                ]
+            )
+        )
+
+        chosen = []
+        with closing(
+            manager.get_host_assignment_with_retry(
+                platform_target=Platforms.TRN2,
+                collector=MagicMock(),
+                collective_ranks=130,
+                lnc_config=1,
+                backoff_seconds=0,
+            )
+        ) as host_generator:
+            for host_attempt in host_generator:
+                with host_attempt as host:
+                    chosen.append(host.get_host_id())
+                    if len(chosen) <= 3:
+                        raise QueuePatienceRotation("queue ETA exceeds patience")
+        assert chosen == ["a0", "b0", "a0", "b0"]
+        assert self._depths(manager) == seeded
+
+    @staticmethod
+    def _three_of_four(depth: int = 0) -> list[HostRecord]:
+        return [TestSizeBasedHostRouting._member(f"t{rank}", "T", rank, size=4, depth=depth) for rank in range(3)]
+
+    # 129 ranks at LNC2 (258 physical cores). The idle 2-member deployment I has 256 cores per member:
+    # it fits 129 physical cores per member at LNC1 but cannot split 129 logical ranks at LNC2. The
+    # busier 3-member deployments V and W (128 cores each) host 43 ranks (86 physical) per member.
+    _LNC_RANKS = 129
+
+    def _unsplittable_pair(self) -> list[HostRecord]:
+        return [self._member(f"i{rank}", "I", rank, size=2, cores=256) for rank in range(2)]
+
+    def _valid_triple(self, name: str, depth: int) -> list[HostRecord]:
+        return [self._member(f"{name}{rank}", name.upper(), rank, size=3, depth=depth) for rank in range(3)]
+
+    def test_retry_propagates_lnc_through_claim_and_rotation(self, temp_dir):
+        """At LNC2 the idle deployment I is never picked, and the rotation's busy-set reset counts
+        only V and W as eligible, so rotation alternates V, W, V, W. Dropping LNC from the claim
+        picks I first; dropping it from the eligibility query keeps I in the eligible set, so the
+        reset never fires and the fallback re-picks the less busy V."""
+        from test.utils.exceptions import QueuePatienceRotation
+
+        manager = self._build_manager(temp_dir, {})
+        OwnerHostStateStore(temp_dir)._update(
+            lambda state: HostState(
+                hosts=[*self._unsplittable_pair(), *self._valid_triple("v", 1), *self._valid_triple("w", 2)]
+            )
+        )
+        store = manager.state_store
+        chosen = []
+        with (
+            patch.object(store, "eligible_host_aliases", wraps=store.eligible_host_aliases) as eligible,
+            closing(
+                manager.get_host_assignment_with_retry(
+                    platform_target=Platforms.TRN2,
+                    collector=MagicMock(),
+                    collective_ranks=self._LNC_RANKS,
+                    lnc_config=2,
+                    backoff_seconds=0,
+                )
+            ) as host_generator,
+        ):
+            for host_attempt in host_generator:
+                with host_attempt as host:
+                    chosen.append(host.get_host_id())
+                    if len(chosen) <= 3:
+                        raise QueuePatienceRotation("queue ETA exceeds patience")
+        assert chosen == ["v0", "w0", "v0", "w0"]
+        # The forwarded LNC is the caller's (one argument pin; the selection above is the behaviour).
+        assert {call.kwargs["lnc_config"] for call in eligible.call_args_list} == {2}
+        assert self._depths(manager)["i0"] == self._depths(manager)["i1"] == 0
+
+    def test_retry_diagnostic_explains_unsplittable_group(self, temp_dir):
+        manager = self._build_manager(temp_dir, {})
+        OwnerHostStateStore(temp_dir)._update(lambda state: HostState(hosts=self._three_of_four()))
+        with pytest.raises(FleetEmptyError, match="cannot evenly split 128 logical ranks"):
+            with closing(
+                manager.get_host_assignment_with_retry(
+                    platform_target=Platforms.TRN2,
+                    collector=MagicMock(),
+                    collective_ranks=128,
+                    lnc_config=2,
+                    backoff_seconds=0,
+                )
+            ) as host_generator:
+                for host_attempt in host_generator:
+                    with host_attempt:
+                        pass
+        assert self._depths(manager) == {"t0": 0, "t1": 0, "t2": 0}
+
+    def test_recoverable_wait_propagates_lnc(self, temp_dir):
+        """The recoverable wait claims with the caller's LNC: the idle unsplittable I is never
+        claimed, and the 3-member V added during the wait is."""
+        manager = self._build_manager(temp_dir, {})
+        manager.hosts_recoverable = True
+        owner = OwnerHostStateStore(temp_dir)
+        owner._update(lambda state: HostState(hosts=self._unsplittable_pair()))
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                owner._update(lambda s: replace(s, hosts=[*s.hosts, *self._valid_triple("v", 1)]))
+
+        with patch.object(host_management.time, "sleep", side_effect=sleep):
+            unit = manager._claim_unit(Platforms.TRN2, 2 * self._LNC_RANKS, lnc_config=2)
+        assert unit.member_ids == ("v0", "v1", "v2")
+        assert len(sleeps) == 1
+        depths = self._depths(manager)
+        assert (depths["i0"], depths["i1"]) == (0, 0)
+        assert (depths["v0"], depths["v1"], depths["v2"]) == (259, 259, 259)
+
+    def test_recoverable_timeout_explains_unsplittable_group(self, temp_dir):
+        """A wait that can never succeed names the placement reason, not only a stalled re-resolver."""
+        manager = self._build_manager(temp_dir, {})
+        manager.hosts_recoverable = True
+        manager._RECOVERABLE_CLAIM_DEADLINE_SECONDS = 0
+        OwnerHostStateStore(temp_dir)._update(lambda state: HostState(hosts=self._unsplittable_pair()))
+        with pytest.raises(TimeoutException, match="whose 2 hosts cannot evenly split 129 logical ranks"):
+            manager._claim_unit(Platforms.TRN2, 2 * self._LNC_RANKS, lnc_config=2)
+        assert self._depths(manager) == {"i0": 0, "i1": 0}
+
+    @staticmethod
+    def _record_patience_rotation_flags(manager, rotations: int) -> list[tuple[str, bool]]:
+        """Run the retry loop, rotating on patience ``rotations`` times; return each attempt's
+        (target id, rotate_on_patience)."""
+        from test.utils.exceptions import QueuePatienceRotation
+
+        real_get_target = manager._get_target
+        flags: list[tuple[str, bool]] = []
+
+        def get_target(unit, *, rotate_on_patience=True):
+            flags.append((unit.host_id, rotate_on_patience))
+            return real_get_target(unit, rotate_on_patience=rotate_on_patience)
+
+        with patch.object(manager, "_get_target", side_effect=get_target):
+            with closing(
+                manager.get_host_assignment_with_retry(
+                    platform_target=Platforms.TRN2,
+                    collector=MagicMock(),
+                    collective_ranks=130,
+                    lnc_config=1,
+                    backoff_seconds=0,
+                )
+            ) as host_generator:
+                for host_attempt in host_generator:
+                    with host_attempt:
+                        if len(flags) <= rotations:
+                            raise QueuePatienceRotation("queue ETA exceeds patience")
+        return flags
+
+    def test_sole_deployment_joins_without_patience_rotation(self, temp_dir):
+        """With no other eligible unit, a group never rotates on patience: it would re-pick itself."""
+        manager = self._two_member_deployment(temp_dir)
+        assert self._record_patience_rotation_flags(manager, rotations=0) == [("m0", False)]
+
+    def test_group_rotates_on_patience_only_while_another_unit_is_untried(self, temp_dir):
+        """The first group rotates to the untried one; the last untried group joins. After a full
+        sweep the busy set resets, so the next pass rotates once more before joining."""
+        manager = self._build_manager(temp_dir, {})
+        OwnerHostStateStore(temp_dir)._update(
+            lambda state: HostState(
+                hosts=[
+                    self._member("a0", "A", 0, size=2),
+                    self._member("a1", "A", 1, size=2),
+                    self._member("b0", "B", 0, size=2, depth=1),
+                    self._member("b1", "B", 1, size=2, depth=1),
+                ]
+            )
+        )
+        flags = self._record_patience_rotation_flags(manager, rotations=2)
+        assert flags == [("a0", True), ("b0", False), ("a0", True)]
+
+    def _two_member_deployment(self, temp_dir):
+        manager = self._build_manager(temp_dir, {})
+        OwnerHostStateStore(temp_dir)._update(
+            lambda state: HostState(hosts=[self._member("m1", "L", 1, size=2), self._member("m0", "L", 0, size=2)])
+        )
+        return manager
+
+    def test_get_target_rejects_non_ssh_member(self, temp_dir):
+        manager = self._build_manager(temp_dir, {})
+        manager.target_hosts["m1"] = MagicMock(spec=LocalHost)
+        group_unit = HostGroup(members=(self._member("m0", "L", 0, size=2), self._member("m1", "L", 1, size=2)))
+        with pytest.raises(TypeError, match="m1"):
+            manager._get_target(group_unit)
+
+    def test_retry_marks_tagged_member_unavailable_not_primary(self, temp_dir):
+        """A failure tagged with a member id marks that member unavailable, leaves the primary
+        available, and the error history names the member."""
+        manager = self._two_member_deployment(temp_dir)
+        error = OSError("connection reset")
+        error.failed_host_id = "m1"  # ty: ignore[unresolved-attribute]
+        with pytest.raises(InferenceException) as exc:
+            with closing(
+                manager.get_host_assignment_with_retry(
+                    platform_target=Platforms.TRN2,
+                    collector=MagicMock(),
+                    collective_ranks=130,
+                    lnc_config=1,
+                    backoff_seconds=0,
+                )
+            ) as host_generator:
+                for host_attempt in host_generator:
+                    with host_attempt:
+                        raise error
+        available = {rec.resolved.ssh_host: rec.available for rec in manager.state_store.read().hosts}
+        assert available == {"m0": True, "m1": False}
+        assert "m1: OSError: connection reset" in str(exc.value)
+
+    def test_tagged_member_failure_clears_busy_primary(self, temp_dir):
+        """After a busy group fails on a tagged member, its primary is no longer deprioritized."""
+        from test.utils.exceptions import QueuePatienceRotation
+
+        manager = self._build_manager(temp_dir, {})
+        owner = OwnerHostStateStore(temp_dir)
+        # L's lower depth makes it the first pick whenever it is not deprioritized.
+        owner._update(
+            lambda state: HostState(
+                hosts=[
+                    self._member("m0", "L", 0, size=2),
+                    self._member("m1", "L", 1, size=2),
+                    self._member("k0", "K", 0, size=2, depth=1),
+                    self._member("k1", "K", 1, size=2, depth=1),
+                ]
+            )
+        )
+
+        def set_available(aliases: set[str], available: bool) -> None:
+            owner._update(
+                lambda state: replace(
+                    state,
+                    hosts=[
+                        replace(rec, available=available) if rec.resolved.ssh_host in aliases else rec
+                        for rec in state.hosts
+                    ],
+                )
+            )
+
+        real_claim = manager.state_store.claim_least_busy
+        excludes: list[set[str]] = []
+
+        def claim(platform, cores, exclude=None, **kwargs):
+            excludes.append(set(exclude or ()))
+            if len(excludes) == 2:
+                # K drops out after L rotated, so L is the only eligible pick despite being busy.
+                set_available({"k0"}, False)
+            elif len(excludes) == 3:
+                # Both hosts come back before the next pick.
+                set_available({"k0", "m1"}, True)
+            return real_claim(platform, cores, exclude=exclude, **kwargs)
+
+        error = OSError("connection reset")
+        error.failed_host_id = "m1"  # ty: ignore[unresolved-attribute]
+        chosen = []
+        with patch.object(manager.state_store, "claim_least_busy", side_effect=claim):
+            with closing(
+                manager.get_host_assignment_with_retry(
+                    platform_target=Platforms.TRN2,
+                    collector=MagicMock(),
+                    collective_ranks=130,
+                    lnc_config=1,
+                    backoff_seconds=0,
+                )
+            ) as host_generator:
+                for host_attempt in host_generator:
+                    with host_attempt as host:
+                        chosen.append(host.get_host_id())
+                        if len(chosen) == 1:
+                            raise QueuePatienceRotation("queue ETA exceeds patience")
+                        if len(chosen) == 2:
+                            raise error
+        assert excludes == [set(), {"m0"}, set()]
+        assert chosen == ["m0", "m0", "m0"]
+
     def test_pick_prefers_lower_load_ratio_not_absolute_depth(self, temp_dir):
         """Selection picks the single least-loaded host by load ratio
         (``work_queue_depth / num_physical_cores``), not by absolute queue depth:
@@ -1293,6 +1680,54 @@ class TestSizeBasedHostRouting:
         assert host.get_host_id() == "small"
 
 
+class TestUniqueRemoteDirName:
+    """The remote work directory is unique per client (16 random hex), bounded by NAME_MAX,
+    and fails loudly for a test name that cannot take the suffix."""
+
+    def test_16_hex_suffix(self):
+        assert re.fullmatch(r"out-test_short_[0-9a-f]{16}", unique_remote_dir_name("out-test_short"))
+
+    def test_two_calls_differ_even_in_the_same_process(self):
+        # Two sandboxed clients share os.getpid(); the suffix must not depend on it.
+        assert unique_remote_dir_name("out-test_short") != unique_remote_dir_name("out-test_short")
+
+    def test_longest_possible_local_name_fits(self):
+        # construct_test_output_directory_name caps the local name at 200 characters;
+        # the L0-separation path appends "_l0_separated". Both must take the suffix.
+        base = "x" * 200 + "_l0_separated"
+        assert len(unique_remote_dir_name(base).encode()) <= 255
+
+    def test_exactly_at_name_max(self):
+        base = "x" * (255 - 1 - 16)
+        assert len(unique_remote_dir_name(base).encode()) == 255
+
+    def test_fails_when_suffix_does_not_fit(self):
+        base = "x" * (255 - 16)  # one byte too many for "_" + 16 hex
+        with pytest.raises(ValueError, match="Test name is too long") as e:
+            unique_remote_dir_name(base)
+        assert base in str(e.value) and "255" in str(e.value)
+
+    def test_name_max_counts_bytes_not_characters(self):
+        base = "\u00e9" * 120  # 120 characters but 240 bytes: no room for the suffix
+        with pytest.raises(ValueError, match="Test name is too long"):
+            unique_remote_dir_name(base)
+
+    def test_prepare_host_uses_the_unique_name(self, tmp_path):
+        host = _make_ssh_host(tmp_path)
+        remote_dir = MagicMock()
+        host._comm = MagicMock()
+        host._comm.directory.return_value = remote_dir
+        with patch.object(host, "__install_prerequisites__"):
+            local = tmp_path / "out-test_some_case"
+            local.mkdir()
+            with host.prepare_host(str(local), MagicMock()) as remote_full_path:
+                pass
+        assert re.fullmatch(r"/tmp/neuronx-cc/tests/out-test_some_case_[0-9a-f]{16}", remote_full_path)
+        assert "_pid" not in remote_full_path
+        remote_dir.upload.assert_called_once()
+        remote_dir.cleanup.assert_called_once()
+
+
 class TestSshHostTotalPhysicalCores:
     """Explicit coverage for SshHost.get_total_physical_cores(): physical cores =
     sum over devices of ``len(neuroncore_ids) * logical_neuroncore_config``,
@@ -1344,13 +1779,100 @@ SAMPLE_NEURON_LS_OUTPUT = json.dumps(
 )
 
 
+# --output-format json carries instance_type once under instance_info, not on each device.
+SAMPLE_NEURON_LS_INSTANCE_OUTPUT = json.dumps(
+    {
+        "instance_info": {
+            "instance_type": "trn3-dev1.48xlarge",
+            "instance_id": "i-05aa9dd8c8eba4ae4",
+            "logical_neuroncore_config": 2,
+            "ultraserver_info": {"ultraserver_id": "456", "ultraserver_size": 4, "ultraserver_instance_index": 2},
+        },
+        "devices": [
+            {k: v for k, v in device.items() if k != "instance_type"} for device in json.loads(SAMPLE_NEURON_LS_OUTPUT)
+        ],
+    }
+)
+
+
+class TestLocalNeuronLsFlagFallback:
+    """Most hosts run a neuron-ls that predates --output-format and exits non-zero on it, so the
+    local invocation must retry with the legacy flag before giving up."""
+
+    def setup_method(self):
+        _run_neuron_ls.cache_clear()
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_uses_the_new_flag_when_supported(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_NEURON_LS_INSTANCE_OUTPUT)
+        devices = _run_neuron_ls("/opt/aws/neuron/bin")
+        assert devices is not None and [d.neuron_device for d in devices] == [0]
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0][1:] == ["--output-format", "json"]
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_falls_back_to_the_legacy_flag(self, mock_run, _mock_isfile):
+        mock_run.side_effect = [
+            MagicMock(returncode=2, stdout=""),  # older neuron-ls rejects --output-format
+            MagicMock(returncode=0, stdout=SAMPLE_NEURON_LS_OUTPUT),
+        ]
+        devices = _run_neuron_ls("/opt/aws/neuron/bin")
+        assert devices is not None and [d.neuron_device for d in devices] == [0]
+        assert [c.args[0][1:] for c in mock_run.call_args_list] == [["--output-format", "json"], ["--json-output"]]
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_returns_none_when_no_flag_is_supported(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(returncode=2, stdout="")
+        assert _run_neuron_ls("/opt/aws/neuron/bin") is None
+        assert mock_run.call_count == 2
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_detects_devices_from_the_instance_format(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_NEURON_LS_INSTANCE_OUTPUT)
+        assert detect_local_neuron_devices("/opt/aws/neuron/bin") is True
+
+
+class TestDetectLocalPlatform:
+    """The local platform comes from instance_type, which the two neuron-ls formats place differently."""
+
+    def setup_method(self):
+        _run_neuron_ls.cache_clear()
+
+    @pytest.mark.parametrize(
+        "stdout,expected",
+        [
+            (SAMPLE_NEURON_LS_OUTPUT, Platforms.TRN2),  # legacy: per-device instance_type
+            (SAMPLE_NEURON_LS_INSTANCE_OUTPUT, Platforms.TRN3),  # structured: instance_info only
+        ],
+    )
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_detects_platform_in_either_format(self, mock_run, _mock_isfile, stdout, expected):
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout)
+        assert detect_local_platform("/opt/aws/neuron/bin") == expected
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_unknown_instance_type_yields_none(self, mock_run, _mock_isfile):
+        stdout = json.dumps(
+            {
+                "instance_info": {"instance_type": "inf2.48xlarge"},
+                "devices": json.loads(SAMPLE_NEURON_LS_INSTANCE_OUTPUT)["devices"],
+            }
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout)
+        assert detect_local_platform("/opt/aws/neuron/bin") is None
+
+
 class TestDetectLocalNeuronDevices:
     """Tests for detect_local_neuron_devices()."""
 
     def setup_method(self):
         # Clear lru_cache between tests so each test gets a fresh call
-        from test.utils.host_management import _run_neuron_ls
-
         _run_neuron_ls.cache_clear()
 
     @patch("test.utils.host_management.os.path.isfile", return_value=True)
@@ -1466,6 +1988,7 @@ from test.utils.host_management import (  # noqa: E402
     SshHost,
     select_poll_base,
     should_rotate,
+    unique_remote_dir_name,
 )
 from test.utils.metrics_collector import NoopMetricsCollector  # noqa: E402
 from test.utils.remote_executor import RemoteExecutorError  # noqa: E402
@@ -1527,13 +2050,16 @@ def _cm_collector() -> MagicMock:
 
 
 def _make_ssh_host(
-    tmp_path, total_physical_cores: int = 8, patience_seconds: int = DEFAULT_PATIENCE_SECONDS
+    tmp_path,
+    total_physical_cores: int = 8,
+    patience_seconds: int = DEFAULT_PATIENCE_SECONDS,
+    ssh_alias: str = "fakehost",
 ) -> SshHost:
     """Construct an SshHost without any real SSH; locking version/core count pre-seeded."""
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text("")
     host = SshHost(
-        ssh_alias="fakehost",
+        ssh_alias=ssh_alias,
         test_base_path=str(tmp_path),
         remote_neuron_install_dir="/opt/aws/neuron/bin",
         ssh_config_path=str(ssh_config),
@@ -1554,6 +2080,8 @@ class _FakeManager:
 
     def __init__(self, outcomes, probe_outcomes=None, release_error=None):
         self._outcomes = list(outcomes)
+        # Set by _ctor_returning, like CoreLockManager binds its collector.
+        self.collector = None
         # When set, release() raises this exception to exercise the best-effort
         # release teardown path (locks auto-expire, so a failed release is
         # swallowed after logging + recording a failure metric).
@@ -1580,12 +2108,16 @@ class _FakeManager:
             raise item
         return item
 
-    def acquire(self, num_logical_cores, lnc_config, ready=True):  # noqa: ARG002
+    def acquire(self, num_logical_cores, lnc_config, ready=True, hold=False, hold_cap_seconds=None):  # noqa: ARG002
         self.acquire_calls += 1
         item = self._outcomes[0] if len(self._outcomes) == 1 else self._outcomes.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
+
+    @property
+    def has_enqueued(self) -> bool:
+        return self.acquire_calls > 0
 
     def dequeue(self) -> None:
         self.dequeue_calls += 1
@@ -1599,6 +2131,16 @@ class _FakeManager:
     def record_contention_metrics(self) -> None:
         self.metrics_calls += 1
         self.events.append("metrics")
+
+
+def _ctor_returning(fake) -> MagicMock:
+    """CoreLockManager stand-in returning ``fake`` bound to the collector it is built with."""
+
+    def _build(ssh_alias, total_physical_cores, collector, **kwargs):  # noqa: ARG001
+        fake.collector = collector
+        return fake
+
+    return MagicMock(side_effect=_build)
 
 
 class TestShouldRotate:
@@ -1748,7 +2290,7 @@ class TestSshHostPollLoop:
     def _run(self, host, fake_mgr, clock=None, **kwargs):
         clock = clock or _FakeClock()
         with (
-            patch.object(host_management, "CoreLockManager", return_value=fake_mgr),
+            patch.object(host_management, "CoreLockManager", _ctor_returning(fake_mgr)),
             patch.object(host, "_get_remote_executor", return_value=MagicMock()),
             patch.object(host, "get_instance_type", return_value="trn1"),
             patch("time.sleep", clock.sleep),
@@ -2077,7 +2619,7 @@ class TestSshHostReleaseFailureHandling:
         the test can assert on record_metric calls."""
         clock = clock or _FakeClock()
         with (
-            patch.object(host_management, "CoreLockManager", return_value=fake_mgr),
+            patch.object(host_management, "CoreLockManager", _ctor_returning(fake_mgr)),
             patch.object(host, "_get_remote_executor", return_value=MagicMock()),
             patch.object(host, "get_instance_type", return_value="trn1"),
             patch("time.sleep", clock.sleep),
@@ -2206,6 +2748,21 @@ class TestSshHostPollLoopIntegration:
 
         with open(locks_json) as f:
             return _json.load(f).get("queue", [])
+
+    def _read_events(self, locks_json) -> list:
+        """Read the helper's daily-rotated event log(s) beside locks.json."""
+        import glob
+        import json as _json
+
+        d = os.path.dirname(locks_json)
+        events = []
+        for fn in sorted(glob.glob(os.path.join(d, "events-*.log"))):
+            with open(fn) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        events.append(_json.loads(line))
+        return events
 
     def test_enqueues_polls_then_yields_once_cores_free(self, tmp_path) -> None:
         """Within-patience QUEUED caller stays, then commits once cores free."""
@@ -2539,7 +3096,7 @@ class _RecordingManager:
         self.probe_calls += 1
         return AllocationOutcome(status=AllocationStatus.QUEUED, worst_case_eta=0)
 
-    def acquire(self, num_logical_cores, lnc_config, ready=True):  # noqa: ARG002
+    def acquire(self, num_logical_cores, lnc_config, ready=True, hold=False, hold_cap_seconds=None):  # noqa: ARG002
         self.acquire_ready_args.append(ready)
         if self._seq:
             item = self._seq.pop(0)
@@ -2547,6 +3104,10 @@ class _RecordingManager:
                 raise item
             return item
         return AllocationOutcome(status=AllocationStatus.QUEUED, position=0, worst_case_eta=10)
+
+    @property
+    def has_enqueued(self) -> bool:
+        return bool(self.acquire_ready_args)
 
     def record_contention_metrics(self) -> None:
         pass
@@ -2564,7 +3125,7 @@ class TestSoftJoinQueue:
     def test_soft_join_enqueues_ready_false_and_caches_manager(self, tmp_path) -> None:
         host = _make_ssh_host(tmp_path)
         rec = _RecordingManager()
-        ctor = MagicMock(return_value=rec)
+        ctor = _ctor_returning(rec)
         with (
             patch.object(host_management, "CoreLockManager", ctor),
             patch.object(host, "_get_remote_executor", return_value=MagicMock()),
@@ -2619,7 +3180,7 @@ class TestSoftJoinQueue:
         rec = _RecordingManager()
         rec._seq = [LockAcquisitionError("boom")]
         with (
-            patch.object(host_management, "CoreLockManager", MagicMock(return_value=rec)),
+            patch.object(host_management, "CoreLockManager", _ctor_returning(rec)),
             patch.object(host, "_get_remote_executor", return_value=MagicMock()),
             patch.object(host, "get_instance_type", return_value="trn1"),
         ):
@@ -2631,7 +3192,7 @@ class TestSoftJoinQueue:
     def _soft_join(self, host, fake_mgr, **kwargs) -> None:
         """Drive soft_join_queue with a scripted fake manager (no real SSH)."""
         with (
-            patch.object(host_management, "CoreLockManager", MagicMock(return_value=fake_mgr)),
+            patch.object(host_management, "CoreLockManager", _ctor_returning(fake_mgr)),
             patch.object(host, "_get_remote_executor", return_value=MagicMock()),
             patch.object(host, "get_instance_type", return_value="trn1"),
         ):
@@ -2677,6 +3238,11 @@ class TestSoftJoinQueue:
         assert fake_mgr.dequeue_calls == 0
         # ... and the cached manager is retained for the next attempt.
         assert host._core_lock_manager is fake_mgr
+        # The retry loop's end-of-attempt abandon keeps it too and sends no dequeue.
+        host.abandon_queue()
+        assert host._core_lock_manager is fake_mgr
+        assert fake_mgr.dequeue_calls == 0
+        assert fake_mgr.metrics_calls == 0
 
     def test_soft_join_within_patience_queued_does_not_raise(self, tmp_path) -> None:
         """A QUEUED probe whose ETA is within patience falls through to a single
@@ -2800,6 +3366,169 @@ class TestSoftJoinQueue:
             str(tmp_path),
         )
         assert local.soft_join_queue(collector=MagicMock(), collective_ranks=2, lnc_config=2) is None
+
+    def test_base_and_local_abandon_queue_is_noop(self, tmp_path) -> None:
+        assert LocalHost.abandon_queue is host_management.Host.abandon_queue
+        assert LocalHost("/opt/aws/neuron/bin", "localhost", str(tmp_path)).abandon_queue() is None
+
+    def test_abandon_queue_swallows_metric_flush_error_and_drops_manager(self, tmp_path, caplog) -> None:
+        host = _make_ssh_host(tmp_path)
+        assert host.abandon_queue() is None
+        manager = MagicMock()
+        manager.record_contention_metrics.side_effect = RuntimeError("flush broke")
+        host._core_lock_manager = manager
+        with caplog.at_level("WARNING"):
+            host.abandon_queue()
+        assert any("flush broke" in r.getMessage() for r in caplog.records)
+        assert host._core_lock_manager is None
+
+    def test_lock_signal_counts_read_the_cached_manager(self, tmp_path) -> None:
+        host = _make_ssh_host(tmp_path)
+        assert host._lock_signal_counts() == (0, 0)
+        host._core_lock_manager = MagicMock(bump_count=2, reenqueue_count=1)
+        assert host._lock_signal_counts() == (2, 1)
+
+
+_UNKNOWN_KWARG_ERROR = "poll() got an unexpected keyword argument 'hold_cap_seconds'"
+
+
+class _FailingFirstExecutor(_HelperExecutor):
+    """A _HelperExecutor whose first ``failures`` calls raise like a helper that rejects an argument."""
+
+    def __init__(self, *args, failures: int = 1, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._failures = failures
+
+    def call_function(self, func, **kwargs):
+        if self._failures > 0:
+            self._failures -= 1
+            raise RemoteExecutorError(f"TypeError: {_UNKNOWN_KWARG_ERROR}")
+        return super().call_function(func, **kwargs)
+
+
+class TestSshHostHeldPoll:
+    """Held ``_poll_queue`` against the real helper: hold cap, assembly signal, capability gate."""
+
+    _paths = TestSshHostPollLoopIntegration._paths
+    _write_locks = TestSshHostPollLoopIntegration._write_locks
+    _read_queue = TestSshHostPollLoopIntegration._read_queue
+
+    def _host(self, tmp_path, executor_cls=_HelperExecutor, patience_seconds=DEFAULT_PATIENCE_SECONDS, **kwargs):
+        helpers_file, lock_file, locks_json = self._paths(tmp_path)
+        executor = executor_cls(helpers_file, lock_file, locks_json, **kwargs)
+        host = _make_ssh_host(tmp_path, patience_seconds=patience_seconds)
+        return host, executor, locks_json
+
+    @contextlib.contextmanager
+    def _wired(self, host, executor, clock):
+        with (
+            patch.object(host, "_get_remote_executor", return_value=executor),
+            patch.object(host, "get_instance_type", return_value="trn1"),
+            patch("time.sleep", clock.sleep),
+            patch("time.time", clock.time),
+        ):
+            yield
+
+    def test_held_poll_sends_patience_as_hold_cap(self, tmp_path) -> None:
+        host, executor, locks_json = self._host(tmp_path, patience_seconds=321)
+        self._write_locks(locks_json)
+        with self._wired(host, executor, _FakeClock(start=_REALISTIC_EPOCH)):
+            host._poll_queue(_cm_collector(), 2, 2, ready=False, hold=True)
+        (entry,) = self._read_queue(locks_json)
+        assert entry["hold"] is True
+        assert entry["hold_cap"] == 321
+
+    @pytest.mark.parametrize("patience_seconds", [0, -1])
+    def test_non_positive_patience_sends_default_hold_cap(self, tmp_path, patience_seconds) -> None:
+        """Patience <= 0 disables rotation; it is not a usable cap, so the default patience is sent."""
+        host, executor, locks_json = self._host(tmp_path, patience_seconds=patience_seconds)
+        self._write_locks(locks_json)
+        with self._wired(host, executor, _FakeClock(start=_REALISTIC_EPOCH)):
+            host._poll_queue(_cm_collector(), 2, 2, ready=False, hold=True)
+        (entry,) = self._read_queue(locks_json)
+        assert entry["hold"] is True
+        assert entry["hold_cap"] == DEFAULT_PATIENCE_SECONDS
+
+    def test_non_held_poll_sends_no_hold_cap(self, tmp_path) -> None:
+        host, executor, locks_json = self._host(tmp_path, patience_seconds=321)
+        self._write_locks(locks_json)
+        with self._wired(host, executor, _FakeClock(start=_REALISTIC_EPOCH)):
+            host._poll_queue(_cm_collector(), 2, 2, ready=False)
+        (entry,) = self._read_queue(locks_json)
+        assert "hold_cap" not in entry
+
+    def test_assembled_once_held_region_is_free(self, tmp_path) -> None:
+        host, executor, locks_json = self._host(tmp_path)
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        self._write_locks(locks_json, locked_until=int(_REALISTIC_EPOCH) + 100)
+        collector = _cm_collector()
+        with self._wired(host, executor, clock):
+            first = host._poll_queue(collector, 2, 2, ready=False, hold=True)
+            clock.sleep(5)
+            busy = host._poll_queue(collector, 2, 2, ready=False, hold=True)
+            with open(locks_json) as f:
+                state = json.load(f)
+            state["physical_neuron_cores_lock_timeout"] = {}
+            with open(locks_json, "w") as f:
+                json.dump(state, f)
+            clock.sleep(5)
+            free = host._poll_queue(collector, 2, 2, ready=False, hold=True)
+        assert (first.assembled, busy.assembled, free.assembled) == (False, False, True)
+        assert free.status == AllocationStatus.QUEUED
+
+    def test_unknown_argument_redeploys_once_and_retries(self, tmp_path, caplog) -> None:
+        host, executor, locks_json = self._host(tmp_path, executor_cls=_FailingFirstExecutor, failures=1)
+        self._write_locks(locks_json)
+        init = MagicMock(return_value=3)
+        with (
+            self._wired(host, executor, _FakeClock(start=_REALISTIC_EPOCH)),
+            patch.object(host_management.lock_client, "initialize_and_deploy", init),
+            caplog.at_level("WARNING"),
+        ):
+            outcome = host._poll_queue(_cm_collector(), 2, 2, ready=False, hold=True)
+        init.assert_called_once_with(executor)
+        assert outcome.status == AllocationStatus.QUEUED
+        (entry,) = self._read_queue(locks_json)
+        assert entry["hold"] is True
+        assert any("fakehost" in r.getMessage() and "redeploy" in r.getMessage() for r in caplog.records)
+
+    def test_second_unknown_argument_failure_propagates(self, tmp_path) -> None:
+        host, executor, locks_json = self._host(tmp_path, executor_cls=_FailingFirstExecutor, failures=2)
+        self._write_locks(locks_json)
+        init = MagicMock(return_value=3)
+        with (
+            self._wired(host, executor, _FakeClock(start=_REALISTIC_EPOCH)),
+            patch.object(host_management.lock_client, "initialize_and_deploy", init),
+            pytest.raises(LockAcquisitionError, match="unexpected keyword argument"),
+        ):
+            host._poll_queue(_cm_collector(), 2, 2, ready=False, hold=True)
+        init.assert_called_once_with(executor)
+        assert self._read_queue(locks_json) == []
+
+    def test_non_held_unknown_argument_does_not_redeploy(self, tmp_path) -> None:
+        host, executor, locks_json = self._host(tmp_path, executor_cls=_FailingFirstExecutor, failures=1)
+        self._write_locks(locks_json)
+        init = MagicMock(return_value=3)
+        with (
+            self._wired(host, executor, _FakeClock(start=_REALISTIC_EPOCH)),
+            patch.object(host_management.lock_client, "initialize_and_deploy", init),
+            pytest.raises(LockAcquisitionError, match="unexpected keyword argument"),
+        ):
+            host._poll_queue(_cm_collector(), 2, 2, ready=False)
+        init.assert_not_called()
+
+    def test_other_lock_errors_do_not_redeploy(self, tmp_path) -> None:
+        host = _make_ssh_host(tmp_path)
+        rec = _RecordingManager()
+        rec._seq = [LockAcquisitionError("flock timed out after 30s")]
+        init = MagicMock(return_value=3)
+        with (
+            patch.object(host, "_attempt_manager", return_value=rec),
+            patch.object(host_management.lock_client, "initialize_and_deploy", init),
+            pytest.raises(LockAcquisitionError, match="flock timed out"),
+        ):
+            host._poll_queue(_cm_collector(), 2, 2, ready=False, hold=True)
+        init.assert_not_called()
 
 
 class TestSoftJoinIntegration(TestSshHostPollLoopIntegration):
@@ -3020,21 +3749,6 @@ class TestManagerConcurrentReservationE2E(TestSshHostPollLoopIntegration):
             executor=executor,
             host_locking_version=3,
         )
-
-    def _read_events(self, locks_json) -> list:
-        """Read the helper's daily-rotated event log(s) beside locks.json."""
-        import glob
-        import json as _json
-
-        d = os.path.dirname(locks_json)
-        events = []
-        for fn in sorted(glob.glob(os.path.join(d, "events-*.log"))):
-            with open(fn) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        events.append(_json.loads(line))
-        return events
 
     def _free_all_cores(self, locks_json) -> None:
         """Clear all live core locks while preserving the queue/drain fields."""
@@ -3729,3 +4443,2066 @@ class TestNeuronEnvPassthrough:
                 env = self._build_env(local_host)
         assert "NEURON_RT_TEST_PASSTHROUGH" not in env
         assert env["NEURON_RT_VISIBLE_CORES"] == "0"
+
+
+# =============================================================================
+# SshHostGroup: a Host over a multi-node deployment's SshHost members
+# =============================================================================
+
+import threading  # noqa: E402
+
+
+def _fake_member(alias: str, events: list, cores: int = 64, devices: list | None = None) -> MagicMock:
+    """Autospec SshHost member that records the group-facing calls in the shared ``events`` list."""
+    member = create_autospec(SshHost, instance=True)
+    member.get_host_id.return_value = alias
+    member.get_total_physical_cores.return_value = cores
+    member.get_neuron_device_info.return_value = list(devices) if devices is not None else [f"{alias}-dev"]
+    member._check_patience.side_effect = lambda *a, **k: events.append(("check", alias, a, k))
+    member._join_queue.side_effect = lambda *a, **k: events.append(("join", alias, a, k))
+    member._lock_signal_counts.return_value = (0, 0)
+    member.patience_seconds = DEFAULT_PATIENCE_SECONDS
+    return member
+
+
+def _recording_prepare(alias: str, events: list, barrier: threading.Barrier | None = None, error=None):
+    """Return a ``prepare_host`` side effect whose context manager records enter/exit and can fail on enter."""
+
+    @contextlib.contextmanager
+    def _prepare(*args, **kwargs):  # noqa: ARG001
+        if barrier is not None:
+            barrier.wait()
+        if error is not None:
+            events.append(("enter-failed", alias))
+            raise error
+        events.append(("enter", alias))
+        try:
+            yield f"/remote/{alias}"
+        except BaseException as e:
+            events.append(("exit-error", alias, e))
+            raise
+        finally:
+            events.append(("exit", alias))
+
+    return _prepare
+
+
+class TestSshHostGroup:
+    """SshHostGroup identity, two-phase soft-join, and concurrent prepare."""
+
+    @staticmethod
+    def _group(*members):
+        return host_management.SshHostGroup(tuple(members))
+
+    def test_rejects_empty_members(self) -> None:
+        with pytest.raises(ValueError):
+            self._group()
+
+    def test_rejects_duplicate_members(self) -> None:
+        events: list = []
+        with pytest.raises(ValueError):
+            self._group(_fake_member("a", events), _fake_member("a", events))
+
+    def test_identity_cores_and_devices(self) -> None:
+        events: list = []
+        a = _fake_member("a", events, cores=64, devices=["a0", "a1"])
+        b = _fake_member("b", events, cores=32, devices=["b0"])
+        group = self._group(a, b)
+        assert group.hosts == (a, b)
+        assert group.get_host_id() == "a"
+        assert group.get_total_physical_cores() == 96
+        assert group.get_neuron_device_info() == ["a0", "a1", "b0"]
+
+    def test_base_host_spans_itself(self) -> None:
+        local = LocalHost.__new__(LocalHost)
+        assert local.hosts == (local,)
+
+    def test_soft_join_passes_ranks_per_member_and_hold(self) -> None:
+        events: list = []
+        collector = _cm_collector()
+        group = self._group(_fake_member("a", events), _fake_member("b", events))
+        group.soft_join_queue(collector, collective_ranks=8, lnc_config=1)
+        checks = [e for e in events if e[0] == "check"]
+        joins = [e for e in events if e[0] == "join"]
+        assert all(args[1:] == (4, 1) for _, _, args, _ in checks)
+        assert all(args[1:] == (4, 1) for _, _, args, _ in joins)
+        # Every member joins with the same sampled hold cap, within [0.9, 1.1] x patience.
+        caps = {kwargs.pop("hold_cap_seconds") for _, _, _, kwargs in joins}
+        assert len(caps) == 1 and 0.9 * DEFAULT_PATIENCE_SECONDS <= caps.pop() <= 1.1 * DEFAULT_PATIENCE_SECONDS
+        assert all(kwargs == {"hold": True} for _, _, _, kwargs in joins)
+
+    def test_soft_join_without_patience_rotation_joins_every_member_unprobed(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a._check_patience.side_effect = QueuePatienceRotation("over patience")
+        group = host_management.SshHostGroup((a, b), rotate_on_patience=False)
+        group.soft_join_queue(_cm_collector(), collective_ranks=8, lnc_config=1)
+        a._check_patience.assert_not_called()
+        b._check_patience.assert_not_called()
+        joins = [e for e in events if e[0] == "join"]
+        assert [alias for _, alias, _, _ in joins] == ["a", "b"]
+        assert all(args[1:] == (4, 1) and kwargs["hold"] is True for _, _, args, kwargs in joins)
+
+    def test_soft_join_patience_error_is_logged_and_that_member_is_not_joined(self, caplog) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a._check_patience.side_effect = OSError("probe down")
+        with caplog.at_level("WARNING"):
+            self._group(a, b).soft_join_queue(_cm_collector(), collective_ranks=2, lnc_config=2)
+        assert "[a] Best-effort patience check failed: probe down" in caplog.text
+        assert [alias for kind, alias, *_ in events if kind == "join"] == ["b"]
+        a._join_queue.assert_not_called()
+
+    def test_soft_join_member_join_error_is_logged_and_others_join(self, caplog) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a._join_queue.side_effect = OSError("ssh down")
+        with caplog.at_level("WARNING"):
+            self._group(a, b).soft_join_queue(_cm_collector(), collective_ranks=2, lnc_config=2)
+        assert "[a] Best-effort soft-join failed: ssh down" in caplog.text
+        assert [alias for kind, alias, *_ in events if kind == "join"] == ["b"]
+        a._join_queue.assert_called_once()
+
+    def test_prepare_host_yields_paths_in_rank_order_and_exits_every_member(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a.prepare_host.side_effect = _recording_prepare("a", events)
+        b.prepare_host.side_effect = _recording_prepare("b", events)
+        with self._group(a, b).prepare_host("/local/dir", _cm_collector()) as paths:
+            assert paths == ("/remote/a", "/remote/b")
+            assert {e for e in events if e[0] == "exit"} == set()
+        assert sorted(e for e in events if e[0] == "exit") == [("exit", "a"), ("exit", "b")]
+
+    def test_prepare_host_enters_members_concurrently(self) -> None:
+        events: list = []
+        barrier = threading.Barrier(3, timeout=5)
+        members = [_fake_member(alias, events) for alias in ("a", "b", "c")]
+        for member in members:
+            member.prepare_host.side_effect = _recording_prepare(member.get_host_id(), events, barrier=barrier)
+        # Sequential entry would block on the barrier and time out with BrokenBarrierError.
+        with self._group(*members).prepare_host("/local/dir", _cm_collector()) as paths:
+            assert paths == ("/remote/a", "/remote/b", "/remote/c")
+
+    def test_prepare_host_body_error_reaches_every_member_exit_and_propagates(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a.prepare_host.side_effect = _recording_prepare("a", events)
+        b.prepare_host.side_effect = _recording_prepare("b", events)
+        error = RuntimeError("body failed")
+        with pytest.raises(RuntimeError) as excinfo:
+            with self._group(a, b).prepare_host("/local/dir", _cm_collector()):
+                raise error
+        assert excinfo.value is error
+        assert sorted((e[1], e[2]) for e in events if e[0] == "exit-error") == [("a", error), ("b", error)]
+        assert sorted(e for e in events if e[0] == "exit") == [("exit", "a"), ("exit", "b")]
+
+    def test_prepare_host_forwards_arguments(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        a.prepare_host.side_effect = _recording_prepare("a", events)
+        collector = _cm_collector()
+        with self._group(a).prepare_host("/local/dir", collector, skip_remote_cleanup=True, force_local_cleanup=False):
+            pass
+        a.prepare_host.assert_called_once_with("/local/dir", collector, True, False)
+
+    def test_prepare_host_partial_failure_exits_entered_and_reraises_original(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        error = OSError("upload failed")
+        a.prepare_host.side_effect = _recording_prepare("a", events)
+        b.prepare_host.side_effect = _recording_prepare("b", events, error=error)
+        with pytest.raises(OSError) as excinfo:
+            with self._group(a, b).prepare_host("/local/dir", _cm_collector()):
+                raise pytest.fail.Exception("body must not run when a member fails to prepare")
+        assert excinfo.value is error
+        assert excinfo.value.failed_host_id == "b"
+        assert ("exit", "a") in events
+
+    def test_prepare_host_reraises_first_failure_in_rank_order(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        first, second = OSError("a failed"), OSError("b failed")
+        b_failed = threading.Event()
+
+        @contextlib.contextmanager
+        def a_fails_after_b(*args, **kwargs):  # noqa: ARG001
+            # Completion order (b, then a) differs from rank order (a, then b).
+            assert b_failed.wait(timeout=5)
+            events.append(("enter-failed", "a"))
+            raise first
+            yield  # pragma: no cover
+
+        @contextlib.contextmanager
+        def b_fails(*args, **kwargs):  # noqa: ARG001
+            events.append(("enter-failed", "b"))
+            try:
+                raise second
+            finally:
+                b_failed.set()
+            yield  # pragma: no cover
+
+        a.prepare_host.side_effect = a_fails_after_b
+        b.prepare_host.side_effect = b_fails
+        with pytest.raises(OSError) as excinfo:
+            with self._group(a, b).prepare_host("/local/dir", _cm_collector()):
+                pass
+        assert [e[1] for e in events if e[0] == "enter-failed"] == ["b", "a"]
+        assert excinfo.value is first
+        assert excinfo.value.failed_host_id == "a"  # ty: ignore[unresolved-attribute]
+
+    def test_prepare_host_logs_every_member_error_and_notes_secondary_ones(self, caplog) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        c = _fake_member("c", events)
+        first, second = OSError("a failed"), OSError("c failed")
+        a.prepare_host.side_effect = _recording_prepare("a", events, error=first)
+        b.prepare_host.side_effect = _recording_prepare("b", events)
+        c.prepare_host.side_effect = _recording_prepare("c", events, error=second)
+        with caplog.at_level("WARNING"):
+            with pytest.raises(OSError) as excinfo:
+                with self._group(a, b, c).prepare_host("/local/dir", _cm_collector()):
+                    pass
+        assert excinfo.value is first
+        assert any("[c]" in note and "c failed" in note for note in excinfo.value.__notes__)
+        assert "[a]" in caplog.text and "a failed" in caplog.text
+        assert "[c]" in caplog.text and "c failed" in caplog.text
+        assert ("exit", "b") in events
+
+    def test_prepare_host_interrupted_wait_still_exits_every_entered_member(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a.prepare_host.side_effect = _recording_prepare("a", events)
+        b.prepare_host.side_effect = _recording_prepare("b", events)
+
+        def _interrupted_wait(*args, **kwargs):  # noqa: ARG001
+            raise KeyboardInterrupt
+
+        with patch.object(host_management, "wait", side_effect=_interrupted_wait):
+            with pytest.raises(KeyboardInterrupt):
+                with self._group(a, b).prepare_host("/local/dir", _cm_collector()):
+                    raise pytest.fail.Exception("body must not run after an interrupt")
+        assert sorted(e for e in events if e[0] == "enter") == [("enter", "a"), ("enter", "b")]
+        assert sorted(e for e in events if e[0] == "exit") == [("exit", "a"), ("exit", "b")]
+
+    def test_execution_not_supported(self) -> None:
+        events: list = []
+        group = self._group(_fake_member("a", events), _fake_member("b", events))
+        with pytest.raises(NotImplementedError):
+            group.execute_command("cmd", "/local/dir", _cm_collector(), collective_ranks=2, lnc_config=2)
+        with pytest.raises(NotImplementedError):
+            group._get_debug_output_dir("/local/dir")
+
+    def test_tag_failed_host_keeps_existing_attribution(self) -> None:
+        error = OSError("boom")
+        host_management.tag_failed_host(error, "inner")
+        host_management.tag_failed_host(error, "outer")
+        assert error.failed_host_id == "inner"  # ty: ignore[unresolved-attribute]
+
+    def test_attempt_manager_rebuilds_when_cached_manager_has_another_collector(self, tmp_path) -> None:
+        host = _make_ssh_host(tmp_path)
+        stale, fresh = MagicMock(), MagicMock()
+        stale.collector = _cm_collector()
+        host._core_lock_manager = stale
+        collector = _cm_collector()
+        with patch.object(host, "_ensure_core_lock_manager", return_value=fresh) as ensure:
+            assert host._attempt_manager(collector) is fresh
+        ensure.assert_called_once_with(collector)
+
+    def test_attempt_manager_reuses_cached_manager_for_same_collector(self, tmp_path) -> None:
+        host = _make_ssh_host(tmp_path)
+        collector = _cm_collector()
+        cached = MagicMock()
+        cached.collector = collector
+        host._core_lock_manager = cached
+        with patch.object(host, "_ensure_core_lock_manager") as ensure:
+            assert host._attempt_manager(collector) is cached
+        ensure.assert_not_called()
+
+
+# =============================================================================
+# SshHostGroup coordinated core allocation
+# =============================================================================
+
+from types import SimpleNamespace  # noqa: E402
+
+from test.utils.core_lock_client import COMMIT_WINDOW  # noqa: E402
+from test.utils.core_lock_manager import GroupCoreAllocation, LockVersionError  # noqa: E402
+from test.utils.host_management import MAX_RETRYABLE_LOCK_ERRORS  # noqa: E402
+
+
+def _queued(eta: int, position: int | None = 0) -> AllocationOutcome:
+    return AllocationOutcome(status=AllocationStatus.QUEUED, position=position, worst_case_eta=eta)
+
+
+# Queued with a region set aside and none of its cores locked: ready to commit.
+_ASSEMBLED = AllocationOutcome(status=AllocationStatus.QUEUED, position=0, worst_case_eta=0, assembled=True)
+_DRAINING = AllocationOutcome(status=AllocationStatus.DRAINING, position=0, worst_case_eta=0)
+
+
+def _allocated(physical: list[int], should_reset: bool | None = False) -> AllocationOutcome:
+    return AllocationOutcome(
+        status=AllocationStatus.ALLOCATED,
+        logical_cores=[core // 2 for core in physical[::2]],
+        physical_cores=physical,
+        should_reset_cores=should_reset,
+    )
+
+
+def _next_step(script: list):
+    """Consume the next scripted step; the last step repeats forever. Callables are evaluated per poll."""
+    step = script.pop(0) if len(script) > 1 else script[0]
+    if callable(step):
+        step = step()
+    if isinstance(step, BaseException):
+        raise step
+    return step
+
+
+def _alloc_member(alias: str, events: list, wait: list, commit: list) -> MagicMock:
+    """Member whose ``ready=False``/``ready=True`` polls follow the ``wait``/``commit`` scripts."""
+    member = _fake_member(alias, events)
+    member.get_instance_type.return_value = "trn2.48xlarge"
+
+    def _poll(collector, ranks, lnc_config, *, ready, hold=False, hold_cap_seconds=None):  # noqa: ARG001
+        events.append(("poll", alias, ranks, lnc_config, ready, hold))
+        return _next_step(commit if ready else wait)
+
+    member._poll_queue.side_effect = _poll
+    member._release_cores.side_effect = lambda collector, cores, **kwargs: events.append(("release", alias, cores))
+    member._abandon_queue.side_effect = lambda: events.append(("abandon", alias))
+    member._record_contention_metrics.side_effect = lambda: events.append(("contention", alias))
+    return member
+
+
+class _SleepAdvancedClock:
+    """Deterministic clock whose ``sleep`` advances ``time`` and records the sleep in ``events``."""
+
+    def __init__(self, events: list):
+        self.now = 1_000.0
+        self._events = events
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self._events.append(("sleep", seconds))
+        self.now += seconds
+
+
+@pytest.fixture
+def group_timed_clock():
+    """Patch the clock and jitter used by host_management; yields the shared event list and the clock."""
+    events: list = []
+    clock = _SleepAdvancedClock(events)
+    with (
+        patch.object(host_management, "time", SimpleNamespace(time=clock.time, sleep=clock.sleep)),
+        patch.object(host_management, "random", SimpleNamespace(uniform=lambda low, high: 0.0)),  # noqa: ARG005
+    ):
+        yield events, clock
+
+
+@pytest.fixture
+def group_clock(group_timed_clock):
+    """``group_timed_clock`` without the clock: yields the shared event list."""
+    return group_timed_clock[0]
+
+
+def _polls(events: list, *, ready: bool | None = None) -> list[tuple]:
+    return [e for e in events if e[0] == "poll" and (ready is None or e[4] is ready)]
+
+
+def _kinds(events: list, kind: str) -> list[tuple]:
+    return [e for e in events if e[0] == kind]
+
+
+def _non_retryable_lock_error() -> LockAcquisitionError:
+    error = LockAcquisitionError("corrupt lock state")
+    error.retryable = False
+    return error
+
+
+class TestSshHostGroupCoreAllocation:
+    """Coordinated wait/commit core allocation across SshHostGroup members."""
+
+    @staticmethod
+    def _group(*members):
+        return host_management.SshHostGroup(tuple(members))
+
+    def test_waits_with_hold_and_commits_only_when_all_assembled_in_same_cycle(self, group_clock) -> None:
+        events = group_clock
+        # a is assembled in cycles 1 and 3, b in cycles 2 and 3: only cycle 3 has both.
+        a = _alloc_member("a", events, wait=[_ASSEMBLED, _queued(5), _ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_queued(30), _ASSEMBLED, _ASSEMBLED], commit=[_allocated([4, 5])])
+        with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=8, lnc_config=2):
+            pass
+        waits = _polls(events, ready=False)
+        assert all(e[2:] == (4, 2, False, True) for e in waits)
+        # Members are polled concurrently, so each cycle's polls are compared as a set.
+        assert [sorted(e[1] for e in waits[i : i + 2]) for i in range(0, len(waits), 2)] == [["a", "b"]] * 3
+        first_commit = events.index(_polls(events, ready=True)[0])
+        assert events.index(waits[-1]) < first_commit
+        assert len(_kinds(events[:first_commit], "sleep")) == 2
+        assert [(e[1], e[5]) for e in _polls(events, ready=True)] == [("a", True), ("b", True)]
+
+    def test_queued_with_zero_eta_but_not_assembled_is_not_ready(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_queued(0), _queued(0), _ASSEMBLED], commit=[_allocated([2, 3])])
+        with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+            pass
+        first_commit = events.index(_polls(events, ready=True)[0])
+        assert len(_polls(events[:first_commit], ready=False)) == 6
+
+    def test_success_yields_group_allocation_and_releases_each_member_after_body(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1], should_reset=False)])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([6, 7], should_reset=None)])
+        collector = _cm_collector()
+        with self._group(a, b).get_core_allocation(collector, collective_ranks=2, lnc_config=2) as allocation:
+            assert isinstance(allocation, GroupCoreAllocation)
+            assert isinstance(allocation, CoreAllocation)
+            assert allocation.host_id == "a"
+            assert allocation.logical_core_ids == [0]
+            assert allocation.lnc_config == 2
+            assert allocation.should_reset_cores is True
+            assert [m.logical_core_ids for m in allocation.member_allocations] == [[0], [3]]
+            assert [m.host_id for m in allocation.member_allocations] == ["a", "b"]
+            assert _kinds(events, "release") == []
+            assert _kinds(events, "contention") == [("contention", "a"), ("contention", "b")]
+        assert _kinds(events, "release") == [("release", "a", [0, 1]), ("release", "b", [6, 7])]
+        assert _kinds(events, "abandon") == []
+        a._ensure_core_lock_manager.assert_called_once_with(collector)
+        b._ensure_core_lock_manager.assert_called_once()
+        collector.timer.assert_called_once_with(MetricName.CORE_ALLOCATION_TIME)
+        collector.add_dimension.assert_called_once_with({MetricName.INSTANCE_TYPE: "trn2.48xlarge"})
+
+    def test_releases_every_member_when_body_raises(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        with pytest.raises(RuntimeError, match="body failed"):
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise RuntimeError("body failed")
+        assert _kinds(events, "release") == [("release", "a", [0, 1]), ("release", "b", [2, 3])]
+
+    def test_draining_member_is_never_ready(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_DRAINING, _DRAINING, _ASSEMBLED], commit=[_allocated([2, 3])])
+        with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+            pass
+        first_commit = events.index(_polls(events, ready=True)[0])
+        assert len(_polls(events[:first_commit], ready=False)) == 6
+
+    def test_missed_commit_releases_committed_and_returns_to_wait(self, group_clock, caplog) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        # b's region is reclaimed between polls: its first commit poll finds it queued again.
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_ASSEMBLED, _allocated([2, 3])])
+        with caplog.at_level("WARNING"):
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                releases_before_success = list(_kinds(events, "release"))
+        assert releases_before_success == [("release", "a", [0, 1])]
+        rollback = events.index(releases_before_success[0])
+        first_commit = events.index(_polls(events, ready=True)[0])
+        # One commit round with no re-poll window: one poll per member, no sleep.
+        assert [e[1] for e in _polls(events[first_commit:rollback], ready=True)] == ["a", "b"]
+        assert _kinds(events[first_commit:rollback], "sleep") == []
+        after = events[rollback:]
+        assert sorted(e[1] for e in _polls(after, ready=False)) == ["a", "b"]
+        assert [e[1] for e in _polls(after, ready=True)] == ["a", "b"]
+        assert _kinds(after[: after.index(_polls(after, ready=False)[0])], "sleep") != []
+        assert _kinds(events, "abandon") == []
+        assert "did not commit" in caplog.text
+
+    def test_retryable_error_in_commit_round_releases_committed_then_succeeds(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[LockAcquisitionError("ssh blip"), _allocated([2, 3])])
+        with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2) as allocation:
+            releases_before_success = list(_kinds(events, "release"))
+            assert [m.host_id for m in allocation.member_allocations] == ["a", "b"]
+        assert releases_before_success == [("release", "a", [0, 1])]
+        assert [e[1] for e in _polls(events, ready=True)] == ["a", "b", "a", "b"]
+        assert _kinds(events, "abandon") == []
+
+    def test_retryable_errors_in_commit_rounds_count_as_failed_cycles(self, group_clock) -> None:
+        events = group_clock
+        error = LockAcquisitionError("ssh blip")
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[error])
+        with pytest.raises(OSError) as excinfo:
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        assert excinfo.value.__cause__ is error
+        assert excinfo.value.failed_host_id == "b"
+        assert _kinds(events, "release") == [("release", "a", [0, 1])] * MAX_RETRYABLE_LOCK_ERRORS
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            pytest.param(_non_retryable_lock_error, id="non_retryable_lock_error"),
+            pytest.param(lambda: RuntimeError("unexpected"), id="unexpected_error"),
+        ],
+    )
+    def test_non_retryable_error_releases_committed_abandons_all_and_tags_member(self, group_clock, make_error) -> None:
+        events = group_clock
+        error = make_error()
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[error])
+        with pytest.raises(type(error)) as excinfo:
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        assert excinfo.value is error
+        assert excinfo.value.failed_host_id == "b"
+        assert _kinds(events, "release") == [("release", "a", [0, 1])]
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+
+    def test_ten_consecutive_retryable_error_cycles_raise_oserror(self, group_clock) -> None:
+        events = group_clock
+        error = LockVersionError(required_version=99, current_version=3)
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[error], commit=[_allocated([2, 3])])
+        with pytest.raises(OSError) as excinfo:
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        assert excinfo.value.__cause__ is error
+        assert excinfo.value.failed_host_id == "b"
+        assert len(_polls(events, ready=False)) == 20
+        assert _polls(events, ready=True) == []
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+
+    def test_clean_cycle_resets_retryable_error_budget(self, group_clock) -> None:
+        events = group_clock
+        errors = [LockAcquisitionError("ssh blip") for _ in range(9)]
+        b_wait = [*errors, _queued(30), *errors, _ASSEMBLED]
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=b_wait, commit=[_allocated([2, 3])])
+        with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2) as allocation:
+            assert len(allocation.member_allocations) == 2
+
+    def test_timeout_is_tagged_with_member_not_ready_in_last_cycle(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_queued(300)], commit=[_allocated([2, 3])])
+        with pytest.raises(TimeoutException) as excinfo:
+            with self._group(a, b).get_core_allocation(
+                _cm_collector(), collective_ranks=2, lnc_config=2, timeout_seconds=20
+            ):
+                raise pytest.fail.Exception("body must not run")
+        assert excinfo.value.failed_host_id == "b"
+
+    def test_timeout_after_commit_phase_is_tagged_with_first_uncommitted_member(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_ASSEMBLED])
+        with pytest.raises(TimeoutException) as excinfo:
+            with self._group(a, b).get_core_allocation(
+                _cm_collector(), collective_ranks=2, lnc_config=2, timeout_seconds=COMMIT_WINDOW
+            ):
+                raise pytest.fail.Exception("body must not run")
+        assert excinfo.value.failed_host_id == "b"
+
+    def test_timeout_before_any_cycle_is_untagged(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        with pytest.raises(TimeoutException) as excinfo:
+            with self._group(a).get_core_allocation(
+                _cm_collector(), collective_ranks=1, lnc_config=2, timeout_seconds=0
+            ):
+                raise pytest.fail.Exception("body must not run")
+        assert getattr(excinfo.value, "failed_host_id", None) is None
+
+    def test_setup_failure_on_later_member_abandons_every_member(self, group_clock) -> None:
+        events = group_clock
+        error = OSError("ssh down")
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        b._ensure_core_lock_manager.side_effect = error
+        with pytest.raises(OSError) as excinfo:
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        assert excinfo.value is error
+        assert excinfo.value.failed_host_id == "b"
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+
+    def test_instance_type_failure_abandons_every_member(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        a.get_instance_type.side_effect = OSError("neuron-ls failed")
+        with pytest.raises(OSError, match="neuron-ls failed"):
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+
+    def test_abandon_failure_on_one_member_does_not_skip_others_or_mask_error(self, group_clock, caplog) -> None:
+        events = group_clock
+        error = LockAcquisitionError("corrupt lock state")
+        error.retryable = False
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[error], commit=[_allocated([2, 3])])
+        a._abandon_queue.side_effect = RuntimeError("dequeue exploded")
+        with caplog.at_level("WARNING"):
+            with pytest.raises(LockAcquisitionError) as excinfo:
+                with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                    raise pytest.fail.Exception("body must not run")
+        assert excinfo.value is error
+        b._abandon_queue.assert_called_once_with()
+        assert "dequeue exploded" in caplog.text
+
+    def test_release_failure_on_one_committed_member_does_not_skip_others(self, group_clock, caplog) -> None:
+        events = group_clock
+        error = LockAcquisitionError("corrupt lock state")
+        error.retryable = False
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        c = _alloc_member("c", events, wait=[_ASSEMBLED], commit=[error])
+        a._release_cores.side_effect = RuntimeError("release exploded")
+        with caplog.at_level("WARNING"):
+            with pytest.raises(LockAcquisitionError) as excinfo:
+                with self._group(a, b, c).get_core_allocation(_cm_collector(), collective_ranks=3, lnc_config=2):
+                    raise pytest.fail.Exception("body must not run")
+        assert excinfo.value is error
+        assert _kinds(events, "release") == [("release", "b", [2, 3])]
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b"), ("abandon", "c")]
+        assert "release exploded" in caplog.text
+
+    def test_wait_cycle_logs_every_member_retryable_error(self, group_clock, caplog) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[LockAcquisitionError("a blip"), _ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[LockAcquisitionError("b blip"), _ASSEMBLED], commit=[_allocated([2, 3])])
+        with caplog.at_level("WARNING"):
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                pass
+        assert "a blip" in caplog.text
+        assert "b blip" in caplog.text
+
+    def test_allocated_without_cores_releases_committed_and_abandons_all(self, group_clock) -> None:
+        events = group_clock
+        no_cores = AllocationOutcome(status=AllocationStatus.ALLOCATED, logical_cores=None, physical_cores=None)
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[no_cores])
+        with pytest.raises(TimeoutException, match="without a core assignment"):
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        assert _kinds(events, "release") == [("release", "a", [0, 1])]
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+
+    @pytest.mark.parametrize("entry_point", ["soft_join_queue", "get_core_allocation"])
+    def test_uneven_ranks_raise_before_any_member_call(self, group_clock, entry_point) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        group = self._group(a, b)
+
+        def call() -> None:
+            if entry_point == "soft_join_queue":
+                group.soft_join_queue(_cm_collector(), collective_ranks=3, lnc_config=2)
+            else:
+                with group.get_core_allocation(_cm_collector(), collective_ranks=3, lnc_config=2):
+                    raise pytest.fail.Exception("body must not run")
+
+        with pytest.raises(ValueError, match="3 collective ranks cannot be split evenly across 2 hosts"):
+            call()
+        assert events == []
+        for member in (a, b):
+            member._ensure_core_lock_manager.assert_not_called()
+
+
+class _FractionRng(random.Random):
+    """A ``random.Random`` whose ``uniform`` returns the next fraction of each range, cycling."""
+
+    def __init__(self, *fractions: float) -> None:
+        super().__init__()
+        self._fractions = list(fractions)
+        self._next = 0
+
+    def uniform(self, a: float, b: float) -> float:
+        fraction = self._fractions[self._next % len(self._fractions)]
+        self._next += 1
+        return a + fraction * (b - a)
+
+
+class TestSshHostGroupAttemptPolicy:
+    """Per-attempt hold cap and the partial-readiness withdrawal of SshHostGroup."""
+
+    @staticmethod
+    def _group(*members, rng=None):
+        return host_management.SshHostGroup(tuple(members), rng=rng)
+
+    @staticmethod
+    def _caps(*members) -> list:
+        calls = [c for m in members for c in (*m._join_queue.call_args_list, *m._poll_queue.call_args_list)]
+        return [c.kwargs.get("hold_cap_seconds") for c in calls]
+
+    def test_sampled_bounds_keep_partial_wait_below_cap(self) -> None:
+        for fraction in (0.0, 1.0):
+            policy = host_management.sample_group_attempt_policy(180, _FractionRng(fraction))
+            assert policy.hold_cap_seconds == (162 if fraction == 0.0 else 198)
+            assert policy.partial_wait_seconds == (90.0 if fraction == 0.0 else 135.0)
+            assert policy.retry_backoff_seconds == (POLL_PERIOD if fraction == 0.0 else 2 * POLL_PERIOD)
+
+    def test_default_policy_is_independent_of_the_global_random_seed(self) -> None:
+        events: list = []
+        policies = []
+        for _ in range(2):
+            random.seed(42)
+            group = self._group(_fake_member("a", events), _fake_member("b", events))
+            policies.append(group._attempt_policy())
+        assert policies[0] != policies[1]
+        for policy in policies:
+            assert 162 <= policy.hold_cap_seconds <= 198
+            assert 90 <= policy.partial_wait_seconds <= 135
+
+    def test_one_cap_per_attempt_across_join_wait_and_commit_then_resampled(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_queued(5), _ASSEMBLED], commit=[_allocated([2, 3])])
+        a.patience_seconds = 200
+        group = self._group(a, b, rng=_FractionRng(0.0, 0.0, 0.0, 1.0, 1.0, 1.0))
+        collector = _cm_collector()
+        group.soft_join_queue(collector, collective_ranks=2, lnc_config=2)
+        with group.get_core_allocation(collector, collective_ranks=2, lnc_config=2):
+            pass
+        # The smallest positive member patience (b's 180s) is the base; every held call sent one cap.
+        assert set(self._caps(a, b)) == {162}
+        assert len(self._caps(a, b)) == 2 + len(_polls(events))
+        # All members assembled: committed on the first attempt with no withdrawal.
+        assert _kinds(events, "abandon") == []
+        for member in (a, b):
+            member._join_queue.reset_mock()
+            member._poll_queue.reset_mock()
+        with group.get_core_allocation(collector, collective_ranks=2, lnc_config=2):
+            pass
+        assert set(self._caps(a, b)) == {198}
+
+    def test_non_positive_patience_falls_back_to_default_base(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        a.patience_seconds = b.patience_seconds = 0
+        with self._group(a, b, rng=_FractionRng(1.0)).get_core_allocation(
+            _cm_collector(), collective_ranks=2, lnc_config=2
+        ):
+            pass
+        assert set(self._caps(a, b)) == {round(1.1 * DEFAULT_PATIENCE_SECONDS)}
+
+    def test_partial_readiness_withdraws_every_member_then_backs_off_then_rotates(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_queued(30, position=1)], commit=[_allocated([2, 3])])
+        start = host_management.time.time()
+        with pytest.raises(QueuePatienceRotation, match="stalled behind a predecessor for 90s") as excinfo:
+            with self._group(a, b, rng=_FractionRng(0.0)).get_core_allocation(
+                _cm_collector(), collective_ranks=2, lnc_config=2
+            ):
+                raise pytest.fail.Exception("body must not run")
+        # Partial since the first cycle; withdrawn in the first cycle at least 90s later.
+        assert host_management.time.time() - start == 90 + POLL_PERIOD
+        abandons = [events.index(e) for e in _kinds(events, "abandon")]
+        assert [events[i][1] for i in abandons] == ["a", "b"]
+        # Both entries are dequeued before the backoff sleep, which is the last thing before the rotation.
+        assert events[-1] == ("sleep", POLL_PERIOD) and max(abandons) < len(events) - 1
+        assert _polls(events, ready=True) == []
+        assert getattr(excinfo.value, "failed_host_id", None) is None
+
+    def test_partial_wait_is_not_restarted_when_readiness_is_lost(self, group_clock) -> None:
+        """Stalled at 0s, all unready from 5s to 120s (past the 90s budget), stalled again at 125s."""
+        events = group_clock
+        a_wait = [_ASSEMBLED, *[_queued(30)] * 24, _ASSEMBLED]
+        a = _alloc_member("a", events, wait=a_wait, commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_queued(30, position=1)], commit=[_allocated([2, 3])])
+        start = host_management.time.time()
+        with pytest.raises(QueuePatienceRotation):
+            with self._group(a, b, rng=_FractionRng(0.0)).get_core_allocation(
+                _cm_collector(), collective_ranks=2, lnc_config=2
+            ):
+                raise pytest.fail.Exception("body must not run")
+        # All-unready cycles do not withdraw; the resumed stall uses the clock started at 0s.
+        assert host_management.time.time() - start == 125 + POLL_PERIOD
+
+    def test_stalled_member_back_at_queue_head_waits_on_an_old_stall_clock(self, group_clock) -> None:
+        """B heads its queue, stalls behind a predecessor from 5s, then heads it again past the budget."""
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b_wait = [_queued(30), *[_queued(30, position=1)] * 4, *[_queued(150)] * 40, _ASSEMBLED]
+        b = _alloc_member("b", events, wait=b_wait, commit=[_allocated([2, 3])])
+        start = host_management.time.time()
+        with self._group(a, b, rng=_FractionRng(1.0)).get_core_allocation(
+            _cm_collector(), collective_ranks=2, lnc_config=2
+        ):
+            committed_at = host_management.time.time()
+        # Position 0 again is not a new best, but a lagging member at the head is not stalled.
+        assert committed_at - start == 225
+        assert _kinds(events, "abandon") == []
+
+    @pytest.mark.parametrize(
+        ("a_wait", "b_wait"),
+        [
+            pytest.param([_queued(30)], [_queued(30)], id="all_unready"),
+            pytest.param([_ASSEMBLED], [_DRAINING], id="member_draining"),
+        ],
+    )
+    def test_no_partial_withdrawal_while_all_unready_or_draining(self, group_clock, a_wait, b_wait) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=a_wait, commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=b_wait, commit=[_allocated([2, 3])])
+        # Past the largest partial wait (135s) and cap (198s): only the deadline ends the wait.
+        with pytest.raises(TimeoutException, match="within 400s") as excinfo:
+            with self._group(a, b, rng=_FractionRng(1.0)).get_core_allocation(
+                _cm_collector(), collective_ranks=2, lnc_config=2, timeout_seconds=400
+            ):
+                raise pytest.fail.Exception("body must not run")
+        assert not isinstance(excinfo.value, QueuePatienceRotation)
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+
+    @staticmethod
+    def _slow_abandon(
+        member, events: list, clock: _SleepAdvancedClock, seconds: float, error: Exception | None = None
+    ) -> None:
+        """Make ``member``'s abandon advance the shared fake clock by ``seconds`` (and optionally fail)."""
+
+        def abandon() -> None:
+            events.append(("abandon", member.get_host_id()))
+            clock.now += seconds
+            if error is not None:
+                raise error
+
+        member._abandon_queue.side_effect = abandon
+
+    def _withdrawn(self, events: list, a, b, timeout_seconds: int = 9000) -> None:
+        with pytest.raises(QueuePatienceRotation):
+            with self._group(a, b, rng=_FractionRng(0.0)).get_core_allocation(
+                _cm_collector(), collective_ranks=2, lnc_config=2, timeout_seconds=timeout_seconds
+            ):
+                raise pytest.fail.Exception("body must not run")
+
+    def _stalled_pair(self, events: list):
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_queued(30, position=1)], commit=[_allocated([2, 3])])
+        return a, b
+
+    def test_backoff_never_extends_past_the_allocation_timeout(self, group_clock) -> None:
+        events = group_clock
+        a, b = self._stalled_pair(events)
+        start = host_management.time.time()
+        self._withdrawn(events, a, b, timeout_seconds=92)
+        assert events[-1] == ("sleep", 2)
+        assert host_management.time.time() - start == 92
+
+    def test_backoff_is_the_budget_left_after_cleanup(self, group_timed_clock) -> None:
+        events, clock = group_timed_clock
+        a, b = self._stalled_pair(events)
+        for member in (a, b):
+            self._slow_abandon(member, events, clock, 1.0)
+        start = host_management.time.time()
+        # Withdrawal starts at 90s of a 94s budget; cleanup takes 2s, leaving 2s of the 5s backoff.
+        self._withdrawn(events, a, b, timeout_seconds=94)
+        assert events[-1] == ("sleep", 2)
+        assert host_management.time.time() - start == 94
+
+    def test_no_backoff_once_cleanup_passes_the_deadline(self, group_timed_clock) -> None:
+        events, clock = group_timed_clock
+        a, b = self._stalled_pair(events)
+        for member in (a, b):
+            self._slow_abandon(member, events, clock, 2.0)
+        start = host_management.time.time()
+        # Cleanup runs from 90s to 94s, past the 92s deadline: it completes, then no sleep is added.
+        self._withdrawn(events, a, b, timeout_seconds=92)
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+        assert events[-1] == ("sleep", 0)
+        assert host_management.time.time() - start == 94
+
+    def test_failed_withdrawal_cleanup_attempts_every_member_and_is_not_reported_as_done(
+        self, group_timed_clock, caplog
+    ) -> None:
+        events, clock = group_timed_clock
+        a, b = self._stalled_pair(events)
+        self._slow_abandon(a, events, clock, 0.0, error=OSError("ssh dropped"))
+        with caplog.at_level("INFO"):
+            self._withdrawn(events, a, b)
+        # The failing first member does not skip the second.
+        assert _kinds(events, "abandon") == [("abandon", "a"), ("abandon", "b")]
+        assert "[a] Abandoning the core queue entry failed: ssh dropped" in caplog.text
+        assert "withdrawal incomplete on a" in caplog.text
+        assert "withdrew every queue entry" not in caplog.text
+
+    def test_lagging_member_at_queue_head_waits_without_withdrawing(self, group_clock) -> None:
+        """B at the head of its queue waits for active work to release, past the largest partial wait."""
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[*[_queued(150)] * 30, _ASSEMBLED], commit=[_allocated([2, 3])])
+        start = host_management.time.time()
+        with self._group(a, b, rng=_FractionRng(1.0)).get_core_allocation(
+            _cm_collector(), collective_ranks=2, lnc_config=2
+        ):
+            committed_at = host_management.time.time()
+        assert committed_at - start == 150
+        assert _kinds(events, "abandon") == []
+
+    def test_queue_position_progress_restarts_the_stall_budget(self, group_clock) -> None:
+        """B moves up within every 90s budget, so a 180s stall behind predecessors never withdraws."""
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        steps = [_queued(240 - 60 * step, position=3 - step) for step in range(3) for _ in range(12)]
+        b = _alloc_member("b", events, wait=[*steps, _queued(30), _ASSEMBLED], commit=[_allocated([2, 3])])
+        start = host_management.time.time()
+        with self._group(a, b, rng=_FractionRng(0.0)).get_core_allocation(
+            _cm_collector(), collective_ranks=2, lnc_config=2
+        ):
+            committed_at = host_management.time.time()
+        assert committed_at - start == 185
+        assert _kinds(events, "abandon") == []
+
+    @pytest.mark.parametrize(
+        ("a_wait", "b_wait"),
+        [
+            pytest.param([_ASSEMBLED], [_queued(30, position=1)], id="frozen"),
+            pytest.param(
+                [_ASSEMBLED],
+                [*[_queued(30, position=1)] * 6, *[_queued(30, position=2)] * 6, _queued(30, position=1)],
+                id="worsened_then_back_to_best",
+            ),
+            pytest.param(
+                [*[_ASSEMBLED] * 6, *[_queued(30, position=1)] * 6],
+                [*[_queued(30, position=1)] * 6, _ASSEMBLED],
+                id="crossed_swap_after_cap_bump",
+            ),
+            pytest.param(
+                [_ASSEMBLED],
+                [*[_queued(30, position=1)] * 3, LockAcquisitionError("blip"), _queued(30, position=1)],
+                id="retryable_error",
+            ),
+            pytest.param([_ASSEMBLED], [_queued(30, position=None)], id="unknown_position"),
+        ],
+    )
+    def test_stall_budget_is_not_restarted_without_a_new_best_position(self, group_clock, a_wait, b_wait) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=a_wait, commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=b_wait, commit=[_allocated([2, 3])])
+        start = host_management.time.time()
+        self._withdrawn(events, a, b)
+        assert host_management.time.time() - start == 90 + POLL_PERIOD
+        assert _polls(events, ready=True) == []
+
+
+class TestSshHostGroupIntegration(TestSshHostPollLoopIntegration):
+    """No-hardware integration: an SshHostGroup of two real SshHosts, each running the
+    real lock helper against its own locks.json, sharing one fake clock."""
+
+    _ALIASES = ("host-a", "host-b")
+
+    def _member_setup(
+        self, tmp_path, alias, total_physical_cores=8, on_call=None, patience_seconds=DEFAULT_PATIENCE_SECONDS
+    ):
+        """Build a real SshHost with its own helper executor and locks.json under tmp_path/alias."""
+        root = tmp_path / alias
+        root.mkdir()
+        helpers_file, lock_file, locks_json = self._paths(root)
+        executor = _HelperExecutor(helpers_file, lock_file, locks_json, on_call=on_call)
+        host = _make_ssh_host(
+            root, total_physical_cores=total_physical_cores, patience_seconds=patience_seconds, ssh_alias=alias
+        )
+        return host, executor, locks_json
+
+    @contextlib.contextmanager
+    def _wired(self, clock, members):
+        """Route each member's lock calls to its own helper and patch the shared clock."""
+        with contextlib.ExitStack() as stack:
+            for host, executor in members:
+                stack.enter_context(patch.object(host, "_get_remote_executor", return_value=executor))
+                stack.enter_context(patch.object(host, "get_instance_type", return_value="trn1"))
+            stack.enter_context(patch("time.sleep", clock.sleep))
+            stack.enter_context(patch("time.time", clock.time))
+            yield
+
+    def _locked(self, locks_json) -> dict:
+        with open(locks_json) as f:
+            return json.load(f).get("physical_neuron_cores_lock_timeout", {})
+
+    def _live_locks(self, locks_json, now) -> dict:
+        return {core: until for core, until in self._locked(locks_json).items() if until > now}
+
+    def test_soft_join_then_lock_commits_both_members_together(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        for path in (locks_a, locks_b):
+            self._write_locks(path)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            entry_ids = [[e["entry_id"] for e in self._read_queue(p)] for p in (locks_a, locks_b)]
+            assert all(len(ids) == 1 for ids in entry_ids)
+
+            with group.get_core_allocation(
+                collector, collective_ranks=4, lnc_config=2, timeout_seconds=300
+            ) as allocation:
+                assert isinstance(allocation, GroupCoreAllocation)
+                assert [m.host_id for m in allocation.member_allocations] == list(self._ALIASES)
+                assert all(len(m.logical_core_ids) == 2 for m in allocation.member_allocations)
+                # 2 logical cores at lnc=2 hold 4 physical cores on each member.
+                for path in (locks_a, locks_b):
+                    assert len(self._live_locks(path, clock.time())) == 4
+                    assert self._read_queue(path) == []
+                # The soft-joined entries are the ones that committed.
+                for path, ids in zip((locks_a, locks_b), entry_ids, strict=True):
+                    commits = [e for e in self._read_events(path) if e["event"] == "COMMIT"]
+                    assert len(commits) == 1
+                    assert [e["entry_id"] for e in self._read_events(path) if e["event"] == "ENQUEUE"] == ids
+
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+            assert self._live_locks(path, clock.time()) == {}
+
+    def test_member_waits_in_queue_with_hold_until_sibling_is_ready(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        # Long past the readiness grace, but within patience.
+        b_free_at = int(_REALISTIC_EPOCH) + 6 * COMMIT_WINDOW
+        assert b_free_at - _REALISTIC_EPOCH < DEFAULT_PATIENCE_SECONDS
+        snapshots: list[tuple[float, list, dict]] = []
+        b_snapshots: list[tuple[float, dict]] = []
+
+        def record_a(_call_n, path):
+            snapshots.append((clock.time(), self._read_queue(path), self._locked(path)))
+
+        def record_b(_call_n, path):
+            # Read from B's own hook: wait-phase polls run concurrently, so A's hook could race B's write.
+            b_snapshots.append((clock.time(), self._locked(path)))
+
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a", on_call=record_a)
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b", on_call=record_b)
+        self._write_locks(locks_a)
+        self._write_locks(locks_b, locked_until=b_free_at)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            (entry_a,) = self._read_queue(locks_a)
+            with group.get_core_allocation(
+                collector, collective_ranks=4, lnc_config=2, timeout_seconds=300
+            ) as allocation:
+                assert clock.time() >= b_free_at
+                assert len(allocation.member_allocations) == 2
+                for path in (locks_a, locks_b):
+                    assert len(self._live_locks(path, clock.time())) == 4
+
+        waiting = [s for s in snapshots if s[0] < b_free_at and s[1]]
+        # A was polled across many readiness grace windows while B was busy.
+        assert waiting and waiting[-1][0] - waiting[0][0] > 2 * COMMIT_WINDOW
+        assert [e for e in self._read_events(locks_a) if e["event"] == "BUMP"] == []
+        for _t, queue_a, locked_a in waiting:
+            assert [(e["entry_id"], e.get("hold", False)) for e in queue_a] == [(entry_a["entry_id"], True)]
+            assert locked_a == {}
+        b_waiting = [(t, locked_b) for t, locked_b in b_snapshots if t < b_free_at]
+        # B was polled across the same span as A and stayed locked by its holder throughout.
+        assert b_waiting and b_waiting[-1][0] - b_waiting[0][0] > 2 * COMMIT_WINDOW
+        assert all(set(locked_b.values()) == {b_free_at} for _t, locked_b in b_waiting)
+        commits_a = [e for e in self._read_events(locks_a) if e["event"] == "COMMIT"]
+        commits_b = [e for e in self._read_events(locks_b) if e["event"] == "COMMIT"]
+        assert len(commits_a) == len(commits_b) == 1
+        assert commits_a[0]["ts"] >= b_free_at
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+
+    def test_rotation_on_one_member_leaves_no_entry_on_any_member(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        self._write_locks(locks_a)
+        self._write_locks(locks_b, locked_until=int(_REALISTIC_EPOCH) + 100000)
+        group = SshHostGroup((host_a, host_b))
+
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            with pytest.raises(QueuePatienceRotation, match="host-b"):
+                group.soft_join_queue(_cm_collector(), collective_ranks=4, lnc_config=2)
+
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+            assert [e for e in self._read_events(path) if e["event"] == "ENQUEUE"] == []
+
+    def test_timeout_abandons_both_queues(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        self._write_locks(locks_a)
+        # Within patience, so the join succeeds, but past the allocation timeout.
+        self._write_locks(locks_b, locked_until=int(_REALISTIC_EPOCH) + 120)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            assert [len(self._read_queue(p)) for p in (locks_a, locks_b)] == [1, 1]
+            with pytest.raises(TimeoutException, match=r"\[host-a\] Unable to allocate 4 logical cores across 2"):
+                with group.get_core_allocation(collector, collective_ranks=4, lnc_config=2, timeout_seconds=30):
+                    raise pytest.fail.Exception("body must not run")
+
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+            # Never committed, as opposed to committed and then released.
+            assert [e for e in self._read_events(path) if e["event"] == "COMMIT"] == []
+        assert self._live_locks(locks_a, clock.time()) == {}
+
+    def test_ssh_host_soft_join_is_unheld_and_held_join_persists_hold(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        solo, exec_solo, locks_solo = self._member_setup(tmp_path, "host-a")
+        held, exec_held, locks_held = self._member_setup(tmp_path, "host-b")
+        for path in (locks_solo, locks_held):
+            self._write_locks(path)
+        collector = _cm_collector()
+
+        with self._wired(clock, [(solo, exec_solo), (held, exec_held)]):
+            solo.soft_join_queue(collector, collective_ranks=2, lnc_config=2)
+            held._join_queue(collector, 2, 2, hold=True)
+
+        (solo_entry,) = self._read_queue(locks_solo)
+        assert "hold" not in solo_entry
+        assert "hold_cap" not in solo_entry
+        (held_entry,) = self._read_queue(locks_held)
+        assert held_entry["hold"] is True
+        assert held_entry["hold_cap"] == held.patience_seconds
+
+    def test_retry_loop_yields_group_that_locks_both_members(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        store_dir = tmp_path / "store"
+        store_dir.mkdir()
+        manager = HostManager(
+            state_store=_initialized_store(str(store_dir), []),
+            neuron_installation_path="/opt/aws/neuron/bin",
+            ssh_config_path="~/.ssh/config",
+            testrun_uid="test-run",
+            needs_local_host=False,
+        )
+        OwnerHostStateStore(str(store_dir))._update(
+            lambda state: HostState(
+                hosts=[
+                    TestSizeBasedHostRouting._member("host-b", "L", 1, size=2),
+                    TestSizeBasedHostRouting._member("host-a", "L", 0, size=2),
+                ]
+            )
+        )
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a", total_physical_cores=128)
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b", total_physical_cores=128)
+        for path in (locks_a, locks_b):
+            self._write_locks(path, ncores=128)
+        # HostManager._get_host serves cached connections, so the claim resolves to these hosts.
+        manager.target_hosts.update({"host-a": host_a, "host-b": host_b})
+        collector = _cm_collector()
+
+        def depths() -> dict[str, int]:
+            state = manager.state_store.read()
+            assert state is not None
+            return {rec.resolved.ssh_host: rec.work_queue_depth for rec in state.hosts}
+
+        targets = []
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            # 128 ranks at lnc=2 is 256 physical cores: above the multi-node threshold.
+            with closing(
+                manager.get_host_assignment_with_retry(
+                    platform_target=Platforms.TRN2,
+                    collector=collector,
+                    collective_ranks=128,
+                    lnc_config=2,
+                    backoff_seconds=0,
+                )
+            ) as host_generator:
+                for host_attempt in host_generator:
+                    with host_attempt as target:
+                        targets.append(target)
+                        assert isinstance(target, SshHostGroup)
+                        assert target.hosts == (host_a, host_b)
+                        assert depths() == {"host-a": 256, "host-b": 256}
+                        # prepare_host needs a real transport (unit-tested separately), so it is skipped.
+                        target.soft_join_queue(collector, collective_ranks=128, lnc_config=2)
+                        with target.get_core_allocation(
+                            collector, collective_ranks=128, lnc_config=2, timeout_seconds=300
+                        ) as allocation:
+                            assert [m.host_id for m in allocation.member_allocations] == ["host-a", "host-b"]
+                            for path in (locks_a, locks_b):
+                                assert len(self._live_locks(path, clock.time())) == 128
+
+        assert len(targets) == 1
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+            assert self._live_locks(path, clock.time()) == {}
+        assert depths() == {"host-a": 0, "host-b": 0}
+
+    def _retry_manager(self, tmp_path, records, hosts) -> HostManager:
+        """A HostManager over ``records`` that serves the given real SshHosts from its connection cache."""
+        store_dir = tmp_path / "store"
+        store_dir.mkdir()
+        manager = HostManager(
+            state_store=_initialized_store(str(store_dir), []),
+            neuron_installation_path="/opt/aws/neuron/bin",
+            ssh_config_path="~/.ssh/config",
+            testrun_uid="test-run",
+            needs_local_host=False,
+        )
+        OwnerHostStateStore(str(store_dir))._update(lambda state: HostState(hosts=list(records)))
+        manager.target_hosts.update({host.get_host_id(): host for host in hosts})
+        return manager
+
+    def _two_member_manager(self, tmp_path):
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a", total_physical_cores=128)
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b", total_physical_cores=128)
+        for path in (locks_a, locks_b):
+            self._write_locks(path, ncores=128)
+        records = [
+            TestSizeBasedHostRouting._member("host-a", "L", 0, size=2),
+            TestSizeBasedHostRouting._member("host-b", "L", 1, size=2),
+        ]
+        manager = self._retry_manager(tmp_path, records, (host_a, host_b))
+        return manager, [(host_a, exec_a), (host_b, exec_b)], (locks_a, locks_b)
+
+    def _single_host_manager(self, tmp_path):
+        host, executor, locks_json = self._member_setup(tmp_path, "host-a")
+        self._write_locks(locks_json)
+        record = HostRecord(resolved=ResolvedHost(ssh_host="host-a", host_type=Platforms.TRN2, num_physical_cores=8))
+        manager = self._retry_manager(tmp_path, [record], (host,))
+        return manager, host, executor, locks_json
+
+    @staticmethod
+    def _run_attempt(manager, collector, collective_ranks, body) -> None:
+        """Run ``body(target)`` inside one retry-loop attempt; exceptions from ``body`` propagate."""
+        with closing(
+            manager.get_host_assignment_with_retry(
+                platform_target=Platforms.TRN2,
+                collector=collector,
+                collective_ranks=collective_ranks,
+                lnc_config=2,
+                backoff_seconds=0,
+            )
+        ) as host_generator:
+            for host_attempt in host_generator:
+                with host_attempt as target:
+                    body(target)
+
+    def test_retry_loop_abandons_group_entries_when_the_attempt_fails(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        manager, members, paths = self._two_member_manager(tmp_path)
+        collector = _cm_collector()
+
+        def body(target):
+            target.soft_join_queue(collector, collective_ranks=128, lnc_config=2)
+            assert [len(self._read_queue(p)) for p in paths] == [1, 1]
+            target.execute_command("cmd", "/remote", collector, 128, 2)
+
+        with self._wired(clock, members), pytest.raises(NotImplementedError, match="multi-node"):
+            self._run_attempt(manager, collector, 128, body)
+        for path in paths:
+            assert self._read_queue(path) == []
+
+    def test_retry_loop_abandons_single_host_entry_when_the_attempt_fails(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        manager, host, executor, locks_json = self._single_host_manager(tmp_path)
+        collector = _cm_collector()
+
+        def body(target):
+            target.soft_join_queue(collector, collective_ranks=2, lnc_config=2)
+            assert len(self._read_queue(locks_json)) == 1
+            raise RuntimeError("upload failed")
+
+        with self._wired(clock, [(host, executor)]), pytest.raises(RuntimeError, match="upload failed"):
+            self._run_attempt(manager, collector, 2, body)
+        assert self._read_queue(locks_json) == []
+
+    def test_retry_loop_abandon_after_successful_allocation_is_a_noop(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        manager, host, executor, locks_json = self._single_host_manager(tmp_path)
+        collector = _cm_collector()
+        real_dequeue = CoreLockManager.dequeue
+
+        def body(target):
+            target.soft_join_queue(collector, collective_ranks=2, lnc_config=2)
+            with target.get_core_allocation(collector, collective_ranks=2, lnc_config=2, timeout_seconds=300):
+                pass
+
+        with (
+            self._wired(clock, [(host, executor)]),
+            patch.object(CoreLockManager, "dequeue", autospec=True, side_effect=real_dequeue) as dequeue,
+        ):
+            self._run_attempt(manager, collector, 2, body)
+        dequeue.assert_not_called()
+        assert self._read_queue(locks_json) == []
+        assert [e for e in self._read_events(locks_json) if e["event"] == "COMMIT"] != []
+
+    def test_retry_loop_abandon_failure_does_not_mask_the_attempt_error(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        manager, host, executor, _locks_json = self._single_host_manager(tmp_path)
+
+        def body(_target):
+            raise RuntimeError("upload failed")
+
+        with (
+            self._wired(clock, [(host, executor)]),
+            patch.object(host, "abandon_queue", side_effect=ValueError("abandon broke")) as abandon,
+            pytest.raises(RuntimeError, match="upload failed"),
+        ):
+            self._run_attempt(manager, _cm_collector(), 2, body)
+        abandon.assert_called_once_with()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _counting_teardown():
+        """Count real ``record_contention_metrics`` and ``dequeue`` calls per manager host."""
+        flushes: collections.Counter = collections.Counter()
+        dequeues: collections.Counter = collections.Counter()
+        real_flush = CoreLockManager.record_contention_metrics
+        real_dequeue = CoreLockManager.dequeue
+
+        def flush(manager):
+            flushes[manager.host] += 1
+            return real_flush(manager)
+
+        def dequeue(manager):
+            dequeues[manager.host] += 1
+            return real_dequeue(manager)
+
+        with (
+            patch.object(CoreLockManager, "record_contention_metrics", autospec=True, side_effect=flush),
+            patch.object(CoreLockManager, "dequeue", autospec=True, side_effect=dequeue),
+        ):
+            yield flushes, dequeues
+
+    def test_single_host_timeout_then_abandon_flushes_metrics_once(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host, executor, locks_json = self._member_setup(tmp_path, "host-a")
+        self._write_locks(locks_json, locked_until=int(_REALISTIC_EPOCH) + 100000)
+        collector = _cm_collector()
+
+        with self._wired(clock, [(host, executor)]), self._counting_teardown() as (flushes, dequeues):
+            with pytest.raises(TimeoutException, match="Unable to allocate"):
+                with host.get_core_allocation(collector, collective_ranks=2, lnc_config=2, timeout_seconds=30):
+                    raise pytest.fail.Exception("body must not run")
+            host.abandon_queue()
+
+        no_cores = [
+            c for c in collector.record_metric.call_args_list if c.args[0] == MetricName.CORE_LOCK_NO_CORES_COUNT
+        ]
+        assert len(no_cores) == 1
+        assert flushes == {"host-a": 1}
+        assert dequeues == {"host-a": 1}
+        assert host._core_lock_manager is None
+        assert self._read_queue(locks_json) == []
+
+    def test_group_acquire_failure_then_abandon_tears_down_each_member_once(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        self._write_locks(locks_a)
+        self._write_locks(locks_b, locked_until=int(_REALISTIC_EPOCH) + 120)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+
+        with (
+            self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]),
+            self._counting_teardown() as (flushes, dequeues),
+        ):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            with pytest.raises(TimeoutException):
+                with group.get_core_allocation(collector, collective_ranks=4, lnc_config=2, timeout_seconds=30):
+                    raise pytest.fail.Exception("body must not run")
+            group.abandon_queue()
+
+        assert flushes == {"host-a": 1, "host-b": 1}
+        assert dequeues == {"host-a": 1, "host-b": 1}
+        assert host_a._core_lock_manager is None and host_b._core_lock_manager is None
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+
+    def test_patience_rotation_then_abandon_keeps_the_manager_and_sends_no_dequeue(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host, executor, locks_json = self._member_setup(tmp_path, "host-a")
+        self._write_locks(locks_json, locked_until=int(_REALISTIC_EPOCH) + 100000)
+
+        with self._wired(clock, [(host, executor)]), self._counting_teardown() as (flushes, dequeues):
+            with pytest.raises(QueuePatienceRotation):
+                host.soft_join_queue(_cm_collector(), collective_ranks=2, lnc_config=2)
+            manager = host._core_lock_manager
+            assert manager is not None
+            host.abandon_queue()
+
+        assert host._core_lock_manager is manager
+        assert flushes == {}
+        assert dequeues == {}
+
+    def test_group_rotation_then_abandon_sends_no_dequeue(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        self._write_locks(locks_a)
+        self._write_locks(locks_b, locked_until=int(_REALISTIC_EPOCH) + 100000)
+        group = SshHostGroup((host_a, host_b))
+
+        with (
+            self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]),
+            self._counting_teardown() as (flushes, dequeues),
+        ):
+            with pytest.raises(QueuePatienceRotation):
+                group.soft_join_queue(_cm_collector(), collective_ranks=4, lnc_config=2)
+            group.abandon_queue()
+
+        assert flushes == {}
+        assert dequeues == {}
+
+    def test_member_release_failure_is_recorded_on_the_caller_collector(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        for path in (locks_a, locks_b):
+            self._write_locks(path)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+        real_release = CoreLockManager.release
+
+        def release(manager, cores):
+            if manager.host == "host-b":
+                raise LockAcquisitionError("ssh blip")
+            return real_release(manager, cores)
+
+        with (
+            self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]),
+            patch.object(CoreLockManager, "release", autospec=True, side_effect=release),
+        ):
+            with group.get_core_allocation(collector, collective_ranks=4, lnc_config=2, timeout_seconds=300):
+                pass
+        failures = [
+            c.args[1:]
+            for c in collector.record_metric.call_args_list
+            if c.args[0] == MetricName.CORE_LOCK_RELEASE_FAILED_COUNT
+        ]
+        assert failures == [(1,)]
+
+    def _competitor(self, tmp_path, alias, locks_json) -> CoreLockManager:
+        """A single-host caller on ``alias``'s helper files, outside the group."""
+        helpers_file, lock_file, _ = self._paths(tmp_path / alias)
+        return CoreLockManager(
+            alias,
+            total_physical_cores=8,
+            collector=NoopMetricsCollector(),
+            executor=_HelperExecutor(helpers_file, lock_file, locks_json),
+            host_locking_version=3,
+        )
+
+    @pytest.mark.parametrize(
+        "locked_cores",
+        [
+            pytest.param(tuple(range(8)), id="all_cores_locked"),
+            # Free cores cover the request by count, but no aligned 4-core block is free.
+            pytest.param((2, 3, 4, 5), id="lock_straddles_aligned_blocks"),
+        ],
+    )
+    def test_group_beats_ready_backfill_on_busy_member_host(self, tmp_path, locked_cores) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        # Past the readiness grace, within patience.
+        b_free_at = int(_REALISTIC_EPOCH) + 6 * COMMIT_WINDOW
+        assert b_free_at - _REALISTIC_EPOCH < DEFAULT_PATIENCE_SECONDS
+        competitor: list[CoreLockManager] = []
+        s1_polls: list[tuple[float, AllocationStatus]] = []
+
+        def poll_s1(_call_n, _path):
+            # S1 is ready and wants all 8 cores of host B; it polls just before each group call on B.
+            if competitor and not any(status == AllocationStatus.ALLOCATED for _t, status in s1_polls):
+                outcome = competitor[0].acquire(num_logical_cores=4, lnc_config=2, ready=True)
+                s1_polls.append((clock.time(), outcome.status))
+
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b", on_call=poll_s1)
+        self._write_locks(locks_a)
+        self._write_locks(locks_b)
+        with open(locks_b) as f:
+            state = json.load(f)
+        # S0 holds these cores of B until b_free_at.
+        state["physical_neuron_cores_lock_timeout"] = {str(core): b_free_at for core in locked_cores}
+        with open(locks_b, "w") as f:
+            json.dump(state, f)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            (entry_a,) = self._read_queue(locks_a)
+            (entry_b,) = self._read_queue(locks_b)
+            # S1 enqueues on B after the group member joined.
+            competitor.append(self._competitor(tmp_path, "host-b", locks_b))
+            with group.get_core_allocation(
+                collector, collective_ranks=4, lnc_config=2, timeout_seconds=300
+            ) as allocation:
+                assert len(allocation.member_allocations) == 2
+                for path in (locks_a, locks_b):
+                    assert len(self._live_locks(path, clock.time())) == 4
+                events_a_in_body = self._read_events(locks_a)
+                events_b_in_body = self._read_events(locks_b)
+
+        s1_id = competitor[0].entry_id
+        # S1 polled ready=True both while S0 held B and after S0's lock expired, and never got cores.
+        assert any(t < b_free_at for t, _s in s1_polls) and any(t >= b_free_at for t, _s in s1_polls)
+        assert all(status == AllocationStatus.QUEUED for _t, status in s1_polls)
+
+        def commits(events, entry_id=None):
+            return [
+                e
+                for e in events
+                if e["event"] == "COMMIT" and (entry_id is None or e["caller"].startswith(f"{entry_id}:"))
+            ]
+
+        # B's region went to the group member: the only COMMIT on B is the group's.
+        assert commits(events_b_in_body) == commits(events_b_in_body, entry_b["entry_id"])
+        # A did not commit while B's cores were still locked.
+        assert [e["ts"] for e in commits(events_a_in_body) if e["ts"] < b_free_at] == []
+        # Exactly one commit per member, in the same cycle.
+        assert len(commits(events_a_in_body)) == len(commits(events_b_in_body)) == 1
+        ((commit_a,), (commit_b,)) = (commits(events_a_in_body), commits(events_b_in_body))
+        assert commit_a["caller"].startswith(f"{entry_a['entry_id']}:")
+        assert abs(commit_a["ts"] - commit_b["ts"]) < POLL_PERIOD
+        # No rollback: A held nothing it had to give back, and no group entry lost its place.
+        assert [e for e in events_a_in_body if e["event"] == "RELEASE"] == []
+        for events, entry in ((events_a_in_body, entry_a), (events_b_in_body, entry_b)):
+            assert [e for e in events if e.get("entry_id") == entry["entry_id"] and e["event"] == "BUMP"] == []
+
+        assert self._read_queue(locks_a) == []
+        assert [e["entry_id"] for e in self._read_queue(locks_b)] == [s1_id]
+        for path in (locks_a, locks_b):
+            assert self._live_locks(path, clock.time()) == {}
+            assert len(commits(self._read_events(path))) == 1
+            assert len([e for e in self._read_events(path) if e["event"] == "RELEASE"]) == 1
+
+    def test_hold_cap_lapse_bumps_member_then_group_still_completes(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        # A's patience is the base of the hold cap; B stays locked well past it, within B's patience.
+        a_hold_cap = 2 * COMMIT_WINDOW
+        b_free_at = int(_REALISTIC_EPOCH) + 6 * COMMIT_WINDOW
+        assert b_free_at - _REALISTIC_EPOCH > 2 * a_hold_cap
+        assert b_free_at - _REALISTIC_EPOCH < DEFAULT_PATIENCE_SECONDS
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a", patience_seconds=a_hold_cap)
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        self._write_locks(locks_a)
+        self._write_locks(locks_b, locked_until=b_free_at)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+        # Pin the cap at A's patience and disable the partial-readiness withdrawal, which would
+        # otherwise end the attempt before the cap lapses, to isolate the helper's cap behaviour.
+        policy = host_management.GroupAttemptPolicy(
+            hold_cap_seconds=a_hold_cap, partial_wait_seconds=float("inf"), retry_backoff_seconds=0.0
+        )
+
+        with (
+            self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]),
+            patch.object(host_management, "sample_group_attempt_policy", return_value=policy),
+        ):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            (entry_a,) = self._read_queue(locks_a)
+            assert entry_a["hold_cap"] == a_hold_cap
+            with group.get_core_allocation(
+                collector, collective_ranks=4, lnc_config=2, timeout_seconds=300
+            ) as allocation:
+                assert len(allocation.member_allocations) == 2
+                for path in (locks_a, locks_b):
+                    assert len(self._live_locks(path, clock.time())) == 4
+
+        events_a = self._read_events(locks_a)
+        entry_events_a = [e for e in events_a if e.get("entry_id") == entry_a["entry_id"]]
+        # A's assembled region was reclaimed and A bumped once its cap lapsed, while B was still locked.
+        expired_ts = [e["ts"] for e in entry_events_a if e["event"] == "RESERVE_EXPIRED"]
+        bump_ts = [e["ts"] for e in entry_events_a if e["event"] == "BUMP"]
+        assert bump_ts and bump_ts == expired_ts
+        assert _REALISTIC_EPOCH + a_hold_cap < bump_ts[0] < b_free_at
+        # The group kept waiting on the same entry: one join, no commit until B freed.
+        assert [e for e in events_a if e["event"] == "ENQUEUE"] == [entry_events_a[0]]
+        commits_a = [e for e in events_a if e["event"] == "COMMIT"]
+        commits_b = [e for e in self._read_events(locks_b) if e["event"] == "COMMIT"]
+        assert len(commits_a) == len(commits_b) == 1
+        assert commits_a[0]["caller"].startswith(f"{entry_a['entry_id']}:")
+        assert commits_a[0]["ts"] >= b_free_at
+        assert abs(commits_a[0]["ts"] - commits_b[0]["ts"]) < POLL_PERIOD
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+            assert self._live_locks(path, clock.time()) == {}
+
+    def test_members_share_one_set_of_lock_metrics_and_keep_their_managers(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        for path in (locks_a, locks_b):
+            self._write_locks(path)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            joined = (host_a._core_lock_manager, host_b._core_lock_manager)
+            assert joined[0] is not None and joined[1] is not None
+            assert joined[0].collector is collector
+            secondary = joined[1].collector
+            assert secondary is not collector
+            assert isinstance(secondary, NoopMetricsCollector)
+            assert secondary.test_name == collector.test_name
+            with group.get_core_allocation(collector, collective_ranks=4, lnc_config=2, timeout_seconds=300):
+                assert (host_a._core_lock_manager, host_b._core_lock_manager) == joined
+
+        queue_waits = [
+            c for c in collector.record_timer.call_args_list if c.args[0] == MetricName.CORE_LOCK_QUEUE_WAIT_TIME
+        ]
+        assert len(queue_waits) == 1
+        # The secondary's lock-helper events still name the test.
+        commits_b = [e for e in self._read_events(locks_b) if e["event"] == "COMMIT"]
+        assert commits_b and commits_b[0]["caller"].endswith(f":{collector.test_name}")
+
+    def test_missed_commit_rollback_keeps_entry_and_counts_once(self, tmp_path) -> None:
+        clock = _FakeClock(start=_REALISTIC_EPOCH)
+        host_a, exec_a, locks_a = self._member_setup(tmp_path, "host-a")
+        host_b, exec_b, locks_b = self._member_setup(tmp_path, "host-b")
+        for path in (locks_a, locks_b):
+            self._write_locks(path)
+        group = SshHostGroup((host_a, host_b))
+        collector = _cm_collector()
+        real_poll_a = host_a._poll_queue
+        reclaimed: list[float] = []
+
+        def poll_a(*args, ready, hold=False, **kwargs):
+            outcome = real_poll_a(*args, ready=ready, hold=hold, **kwargs)
+            if ready and outcome.status == AllocationStatus.ALLOCATED and not reclaimed:
+                # B's region is taken between its wait and commit polls, so B misses this commit round.
+                reclaimed.append(clock.time())
+                with open(locks_b) as f:
+                    state = json.load(f)
+                until = int(clock.time()) + 2 * POLL_PERIOD
+                state["physical_neuron_cores_lock_timeout"] = {str(core): until for core in range(8)}
+                with open(locks_b, "w") as f:
+                    json.dump(state, f)
+            return outcome
+
+        with self._wired(clock, [(host_a, exec_a), (host_b, exec_b)]):
+            group.soft_join_queue(collector, collective_ranks=4, lnc_config=2)
+            (entry_a,) = self._read_queue(locks_a)
+            with patch.object(host_a, "_poll_queue", side_effect=poll_a):
+                with group.get_core_allocation(
+                    collector, collective_ranks=4, lnc_config=2, timeout_seconds=300
+                ) as allocation:
+                    assert reclaimed
+                    assert len(allocation.member_allocations) == 2
+
+        rollbacks = [
+            c for c in collector.record_metric.call_args_list if c.args[0] == MetricName.GROUP_COMMIT_ROLLBACK_COUNT
+        ]
+        assert [c.args[1:] for c in rollbacks] == [(1.0, "Count")]
+        commits_a = [e for e in self._read_events(locks_a) if e["event"] == "COMMIT"]
+        assert len(commits_a) == 2
+        # The rolled-back member re-joined under the same entry id.
+        assert all(e["caller"].startswith(f"{entry_a['entry_id']}:") for e in commits_a)
+        enqueues_a = [e for e in self._read_events(locks_a) if e["event"] == "ENQUEUE"]
+        assert len(enqueues_a) >= 2
+        assert {e["entry_id"] for e in enqueues_a} == {entry_a["entry_id"]}
+        for path in (locks_a, locks_b):
+            assert self._read_queue(path) == []
+            assert self._live_locks(path, clock.time()) == {}
+
+
+class TestSshHostGroupMemberCollectorsAndConcurrency:
+    """Per-member collectors, rollback accounting and concurrent wait-phase polls."""
+
+    @staticmethod
+    def _group(*members):
+        return host_management.SshHostGroup(tuple(members))
+
+    @staticmethod
+    def _collectors(mock_method) -> list:
+        return [c.args[0] for c in mock_method.call_args_list]
+
+    def test_primary_gets_caller_collector_and_others_one_stable_discarding_collector(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        c = _alloc_member("c", events, wait=[_ASSEMBLED], commit=[_allocated([4, 5])])
+        collector = _cm_collector()
+        group = self._group(a, b, c)
+        group.soft_join_queue(collector, collective_ranks=3, lnc_config=2)
+        with group.get_core_allocation(collector, collective_ranks=3, lnc_config=2):
+            pass
+        member_collectors = []
+        for member in (b, c):
+            used = {
+                id(x)
+                for method in (
+                    member._check_patience,
+                    member._join_queue,
+                    member._ensure_core_lock_manager,
+                    member._poll_queue,
+                )
+                for x in self._collectors(method)
+            }
+            assert len(used) == 1
+            (member_collector,) = {
+                x for method in (member._check_patience, member._poll_queue) for x in self._collectors(method)
+            }
+            assert member_collector is not collector
+            assert isinstance(member_collector, NoopMetricsCollector)
+            assert member_collector.test_name == collector.test_name
+            member_collectors.append(member_collector)
+        assert member_collectors[0] is not member_collectors[1]
+        for method in (a._check_patience, a._join_queue, a._ensure_core_lock_manager, a._poll_queue, a._release_cores):
+            assert all(x is collector for x in self._collectors(method))
+        # Release failures are recorded on the caller's collector for every member.
+        for member in (b, c):
+            assert all(x is collector for x in self._collectors(member._release_cores))
+
+    def test_rollback_releases_record_on_the_caller_collector(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        c = _alloc_member("c", events, wait=[_ASSEMBLED], commit=[_ASSEMBLED, _allocated([4, 5])])
+        collector = _cm_collector()
+        with self._group(a, b, c).get_core_allocation(collector, collective_ranks=3, lnc_config=2):
+            pass
+        assert [call.kwargs for call in b._release_cores.call_args_list] == [{"end_attempt": False}, {}]
+        for member in (a, b, c):
+            assert all(x is collector for x in self._collectors(member._release_cores))
+
+    def test_records_member_max_lock_signal_counts_once_per_allocation(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_ASSEMBLED, _allocated([2, 3])])
+        c = _alloc_member("c", events, wait=[_ASSEMBLED], commit=[_allocated([4, 5])])
+        a._lock_signal_counts.return_value = (1, 0)
+        b._lock_signal_counts.return_value = (3, 0)
+        c._lock_signal_counts.side_effect = lambda: events.append(("counts", "c")) or (0, 2)
+        collector = _cm_collector()
+        with self._group(a, b, c).get_core_allocation(collector, collective_ranks=3, lnc_config=2):
+            pass
+        recorded = [
+            call.args
+            for call in collector.record_metric.call_args_list
+            if call.args[0] in (MetricName.GROUP_MEMBER_MAX_BUMP_COUNT, MetricName.GROUP_MEMBER_MAX_REENQUEUE_COUNT)
+        ]
+        assert recorded == [
+            (MetricName.GROUP_MEMBER_MAX_BUMP_COUNT, 3, "Count"),
+            (MetricName.GROUP_MEMBER_MAX_REENQUEUE_COUNT, 2, "Count"),
+        ]
+        # Read while every member still holds its cores, before any end-of-attempt release.
+        counts_at = events.index(("counts", "c"))
+        final_releases = [i for i, e in enumerate(events) if e[0] == "release"][-3:]
+        assert all(counts_at < i for i in final_releases)
+
+    def test_failed_allocation_records_no_member_max_counts(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_non_retryable_lock_error()])
+        collector = _cm_collector()
+        with pytest.raises(LockAcquisitionError):
+            with self._group(a, b).get_core_allocation(collector, collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        names = [c.args[0] for c in collector.record_metric.call_args_list]
+        assert MetricName.GROUP_MEMBER_MAX_BUMP_COUNT not in names
+        assert MetricName.GROUP_MEMBER_MAX_REENQUEUE_COUNT not in names
+
+    def test_prepare_host_times_the_group_preparation_once(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a.prepare_host.side_effect = _recording_prepare("a", events)
+        b.prepare_host.side_effect = _recording_prepare("b", events)
+        collector = _cm_collector()
+        with self._group(a, b).prepare_host("/local/dir", collector):
+            pass
+        timers = [c.args[0] for c in collector.timer.call_args_list]
+        assert timers.count(MetricName.GROUP_PREPARE_TIME) == 1
+
+    def test_new_caller_collector_gets_new_member_collectors(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_allocated([2, 3])])
+        group = self._group(a, b)
+        first, second = _cm_collector(), _cm_collector()
+        second.test_name = "other-test"
+        group.soft_join_queue(first, collective_ranks=2, lnc_config=2)
+        group.soft_join_queue(second, collective_ranks=2, lnc_config=2)
+        first_b, second_b = self._collectors(b._check_patience)
+        assert first_b is not second_b
+        assert first_b is not first and second_b is not second
+        assert self._collectors(a._check_patience) == [first, second]
+        assert second_b.test_name == "other-test"
+
+    def test_prepare_host_passes_caller_collector_only_to_primary(self) -> None:
+        events: list = []
+        a = _fake_member("a", events)
+        b = _fake_member("b", events)
+        a.prepare_host.side_effect = _recording_prepare("a", events)
+        b.prepare_host.side_effect = _recording_prepare("b", events)
+        collector = _cm_collector()
+        group = self._group(a, b)
+        with group.prepare_host("/local/dir", collector):
+            pass
+        group.soft_join_queue(collector, collective_ranks=2, lnc_config=2)
+        assert a.prepare_host.call_args.args[1] is collector
+        b_collector = b.prepare_host.call_args.args[1]
+        assert b_collector is not collector
+        assert isinstance(b_collector, NoopMetricsCollector)
+        assert b._check_patience.call_args.args[0] is b_collector
+
+    def test_missed_commit_records_one_rollback_and_keeps_the_attempt(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[_ASSEMBLED, _ASSEMBLED, _allocated([2, 3])])
+        collector = _cm_collector()
+        with self._group(a, b).get_core_allocation(collector, collective_ranks=2, lnc_config=2):
+            pass
+        rollbacks = [
+            c.args[1:]
+            for c in collector.record_metric.call_args_list
+            if c.args[0] == MetricName.GROUP_COMMIT_ROLLBACK_COUNT
+        ]
+        assert rollbacks == [(1.0, "Count")] * 2
+        rollback_releases = a._release_cores.call_args_list[:-1]
+        assert len(rollback_releases) == 2
+        assert all(c.kwargs == {"end_attempt": False} for c in rollback_releases)
+        # The release after the body ends the attempt.
+        assert a._release_cores.call_args_list[-1].kwargs.get("end_attempt", True) is True
+        assert b._release_cores.call_args.kwargs.get("end_attempt", True) is True
+
+    def test_retryable_error_after_partial_commit_records_one_rollback(self, group_clock) -> None:
+        events = group_clock
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[LockAcquisitionError("ssh blip"), _allocated([2, 3])])
+        collector = _cm_collector()
+        with self._group(a, b).get_core_allocation(collector, collective_ranks=2, lnc_config=2):
+            pass
+        rollbacks = [
+            c for c in collector.record_metric.call_args_list if c.args[0] == MetricName.GROUP_COMMIT_ROLLBACK_COUNT
+        ]
+        assert len(rollbacks) == 1
+        assert a._release_cores.call_args_list[0].kwargs == {"end_attempt": False}
+
+    def test_abandon_after_partial_commit_ends_the_attempt(self, group_clock) -> None:
+        events = group_clock
+        error = LockAcquisitionError("corrupt lock state")
+        error.retryable = False
+        a = _alloc_member("a", events, wait=[_ASSEMBLED], commit=[_allocated([0, 1])])
+        b = _alloc_member("b", events, wait=[_ASSEMBLED], commit=[error])
+        with pytest.raises(LockAcquisitionError):
+            with self._group(a, b).get_core_allocation(_cm_collector(), collective_ranks=2, lnc_config=2):
+                raise pytest.fail.Exception("body must not run")
+        assert a._release_cores.call_args.kwargs.get("end_attempt", True) is True
+
+    def test_wait_phase_polls_members_concurrently(self, group_clock) -> None:
+        events = group_clock
+        members = [
+            _alloc_member(alias, events, wait=[_ASSEMBLED], commit=[_allocated([2 * i, 2 * i + 1])])
+            for i, alias in enumerate(("a", "b", "c"))
+        ]
+        barrier = threading.Barrier(len(members), timeout=5)
+        for member in members:
+            scripted = member._poll_queue.side_effect
+
+            def _poll(*args, _scripted=scripted, **kwargs):
+                if not kwargs["ready"]:
+                    # Sequential polls would block here and break the barrier.
+                    barrier.wait()
+                return _scripted(*args, **kwargs)
+
+            member._poll_queue.side_effect = _poll
+        with self._group(*members).get_core_allocation(_cm_collector(), collective_ranks=3, lnc_config=2) as allocation:
+            assert [m.host_id for m in allocation.member_allocations] == ["a", "b", "c"]
+        assert [e[1] for e in _polls(events, ready=True)] == ["a", "b", "c"]
+
+
+from typing import cast  # noqa: E402
+
+from test.utils.exceptions import RemoteExecutionException  # noqa: E402
+
+
+def _neuron_ls_stdout(num_devices: int = 8, ultraserver: dict | None = None) -> str:
+    """neuron-ls JSON for ``num_devices`` 4-core lnc2 devices (8 physical cores each). With
+    ``ultraserver`` it is the instance-level format carrying that deployment, else the legacy
+    flat device list."""
+    base = {k: v for k, v in json.loads(SAMPLE_NEURON_LS_OUTPUT)[0].items() if k != "instance_type"}
+    devices = [{**base, "neuron_device": i, "nc_count": 4, "neuroncore_ids": [0, 1, 2, 3]} for i in range(num_devices)]
+    if ultraserver is None:
+        return json.dumps([{**device, "instance_type": "trn2.48xlarge"} for device in devices])
+    return json.dumps(
+        {"instance_info": {"instance_type": "trn2.48xlarge", "ultraserver_info": ultraserver}, "devices": devices}
+    )
+
+
+def _neuron_ls_host(tmp_path, alias: str, stdout: str | None = None, error: Exception | None = None) -> SshHost:
+    """A real SshHost whose only remote call, the neuron-ls RPC, is faked."""
+    host = _make_ssh_host(tmp_path, ssh_alias=alias)
+    host._total_physical_cores = None  # computed from the faked neuron-ls report
+    rpc = (
+        MagicMock(side_effect=error)
+        if error is not None
+        else MagicMock(return_value=MagicMock(failed=False, stdout=stdout))
+    )
+    host.__run_with_retry__ = rpc
+    return host
+
+
+def _rpc(host: SshHost) -> MagicMock:
+    """The faked neuron-ls RPC installed by ``_neuron_ls_host``."""
+    return cast(MagicMock, host.__run_with_retry__)
+
+
+def _store_rows(manager: HostManager) -> list[HostRecord]:
+    state = manager.state_store.read()
+    assert state is not None
+    return state.hosts
+
+
+def _deployment(rank: int, size: int = 4, deployment_id: str = "dep-1") -> dict:
+    return {"ultraserver_id": deployment_id, "ultraserver_size": size, "ultraserver_instance_index": rank}
+
+
+class TestSshHostNeuronLsReport:
+    """One cached neuron-ls report serves devices, core count and probed identity alike."""
+
+    def test_structured_report_is_fetched_once_and_carries_the_deployment(self, tmp_path):
+        host = _neuron_ls_host(tmp_path, "h1", _neuron_ls_stdout(ultraserver=_deployment(rank=2)))
+        assert len(host.get_neuron_device_info()) == 8
+        identity = host.probe_identity(Platforms.TRN2)
+        assert identity == ResolvedHost(
+            ssh_host="h1",
+            host_type=Platforms.TRN2,
+            num_physical_cores=64,
+            logical_host_id="dep-1",
+            logical_host_rank=2,
+            logical_host_size=4,
+        )
+        assert host.get_total_physical_cores() == 64
+        assert len(host.get_neuron_device_info()) == 8
+        _rpc(host).assert_called_once()
+
+    def test_legacy_flat_report_probes_as_single_node(self, tmp_path):
+        host = _neuron_ls_host(tmp_path, "h1", SAMPLE_NEURON_LS_OUTPUT)
+        assert [d.neuron_device for d in host.get_neuron_device_info()] == [0]
+        assert host.probe_identity(Platforms.TRN2) == ResolvedHost("h1", Platforms.TRN2, num_physical_cores=4)
+        _rpc(host).assert_called_once()
+
+    @pytest.mark.parametrize("ultraserver", [None, _deployment(rank=0)])
+    def test_instance_type_is_reported_in_either_format(self, tmp_path, ultraserver):
+        host = _neuron_ls_host(tmp_path, "h1", _neuron_ls_stdout(ultraserver=ultraserver))
+        assert host.get_instance_type() == "trn2.48xlarge"
+
+    def test_device_list_is_a_copy_of_the_cache(self, tmp_path):
+        host = _neuron_ls_host(tmp_path, "h1", SAMPLE_NEURON_LS_OUTPUT)
+        host.get_neuron_device_info().clear()
+        assert len(host.get_neuron_device_info()) == 1
+
+    def test_failed_rpc_is_not_cached(self, tmp_path):
+        host = _neuron_ls_host(tmp_path, "h1")
+        host.__run_with_retry__ = MagicMock(
+            side_effect=[MagicMock(failed=True, stdout=""), MagicMock(failed=False, stdout=SAMPLE_NEURON_LS_OUTPUT)]
+        )
+        with pytest.raises(RemoteExecutionException):
+            host.get_neuron_device_info()
+        assert host.probe_identity(Platforms.TRN2).num_physical_cores == 4
+        assert _rpc(host).call_count == 2
+
+    def test_group_has_no_single_identity(self, tmp_path):
+        group = SshHostGroup((_neuron_ls_host(tmp_path, "a"), _neuron_ls_host(tmp_path, "b")))
+        with pytest.raises(NotImplementedError):
+            group.probe_identity(Platforms.TRN2)
+
+
+class TestPlainTargetProbe:
+    """HostManager.probe_and_record_capacity on plain SSH targets persists what neuron-ls reports."""
+
+    @staticmethod
+    def _manager(tmp_path, rows: list[HostRecord], hosts: list[SshHost]) -> HostManager:
+        store = HostStateStore(str(tmp_path / "state"))
+        store._update(lambda s: HostState(hosts=list(rows)))
+        manager = HostManager(
+            state_store=store,
+            neuron_installation_path="/opt/aws/neuron/bin",
+            ssh_config_path="~/.ssh/config",
+            testrun_uid="test-run",
+            needs_local_host=False,
+        )
+        # Pre-built fake-SSH hosts so _get_host never opens a connection.
+        manager.target_hosts.update({host.get_host_id(): host for host in hosts})
+        return manager
+
+    @staticmethod
+    def _rows(*aliases: str) -> list[HostRecord]:
+        return [HostRecord(resolved=ResolvedHost(alias, Platforms.TRN2)) for alias in aliases]
+
+    def test_four_member_deployment_is_claimed_as_one_group(self, tmp_path):
+        # Aliases listed out of rank order: membership and order come from neuron-ls, not names.
+        ranks = {"node-c": 2, "node-a": 0, "node-d": 3, "node-b": 1}
+        hosts = [
+            _neuron_ls_host(tmp_path, alias, _neuron_ls_stdout(ultraserver=_deployment(rank)))
+            for alias, rank in ranks.items()
+        ]
+        manager = self._manager(tmp_path, self._rows(*ranks), hosts)
+
+        manager.probe_and_record_capacity(list(ranks))
+
+        unit = manager._claim_unit(Platforms.TRN2, 256)
+        assert isinstance(unit, HostGroup)
+        assert unit.member_ids == ("node-a", "node-b", "node-c", "node-d")
+        target = manager._get_target(unit)
+        assert isinstance(target, SshHostGroup)
+        assert [member.get_host_id() for member in target.hosts] == ["node-a", "node-b", "node-c", "node-d"]
+        assert all(member is manager.target_hosts[member.get_host_id()] for member in target.hosts)
+        for host in hosts:
+            _rpc(host).assert_called_once()
+
+    def test_failed_probe_keeps_known_state_and_others_are_recorded(self, tmp_path):
+        known = HostRecord(
+            resolved=ResolvedHost("bad", Platforms.TRN2, 64, "dep-1", 1, 2), work_queue_depth=3, available=True
+        )
+        rows = [known, *self._rows("good")]
+        hosts = [
+            _neuron_ls_host(tmp_path, "bad", error=OSError("unreachable")),
+            _neuron_ls_host(tmp_path, "good", _neuron_ls_stdout(ultraserver=_deployment(0, size=2))),
+        ]
+        manager = self._manager(tmp_path, rows, hosts)
+
+        manager.probe_and_record_capacity(["bad", "good"])
+
+        by_alias = {rec.resolved.ssh_host: rec for rec in _store_rows(manager)}
+        assert by_alias["bad"] == known
+        assert by_alias["good"].resolved == ResolvedHost("good", Platforms.TRN2, 64, "dep-1", 0, 2)
+
+    def test_legacy_report_keeps_a_known_deployment(self, tmp_path):
+        known = HostRecord(resolved=ResolvedHost("h1", Platforms.TRN2, 32, "dep-1", 0, 2), work_queue_depth=5)
+        manager = self._manager(tmp_path, [known], [_neuron_ls_host(tmp_path, "h1", _neuron_ls_stdout())])
+
+        manager.probe_and_record_capacity(["h1"])
+
+        rec = _store_rows(manager)[0]
+        assert rec.resolved == ResolvedHost("h1", Platforms.TRN2, 64, "dep-1", 0, 2)
+        assert (rec.available, rec.work_queue_depth) == (True, 5)
+
+    def test_single_node_hosts_stay_single(self, tmp_path):
+        hosts = [_neuron_ls_host(tmp_path, alias, _neuron_ls_stdout()) for alias in ("h1", "h2")]
+        manager = self._manager(tmp_path, self._rows("h1", "h2"), hosts)
+
+        manager.probe_and_record_capacity(["h1", "h2"])
+
+        assert [rec.resolved for rec in _store_rows(manager)] == [
+            ResolvedHost("h1", Platforms.TRN2, 64),
+            ResolvedHost("h2", Platforms.TRN2, 64),
+        ]
+
+    def test_alias_without_a_row_is_neither_probed_nor_added(self, tmp_path):
+        host = _neuron_ls_host(tmp_path, "h1", _neuron_ls_stdout())
+        manager = self._manager(tmp_path, self._rows("h1"), [host])
+
+        manager.probe_and_record_capacity(["h1", "ghost"])
+
+        assert "ghost" not in manager.target_hosts
+        assert [rec.resolved.ssh_host for rec in _store_rows(manager)] == ["h1"]

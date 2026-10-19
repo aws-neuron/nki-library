@@ -382,7 +382,7 @@ def _all_expert_static_mx(
     kernel_cfg: AllExpertMXKernelConfig,
     dims: AllExpertMXDimensions,
     output_t_offset: int = 0,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Static all-expert MoE computation with per-expert STATIC_MX quantization.
 
@@ -398,7 +398,7 @@ def _all_expert_static_mx(
         output_t_offset (int): T offset for output writes (used in tiling).
 
     Returns:
-        nl.ndarray: Output tensor with MoE computation results.
+        nl.NkiTensor: Output tensor with MoE computation results.
     """
     # Compute dimensions for swizzle
     pmax = dims.pmax
@@ -1824,8 +1824,8 @@ def _compute_expert_mlp(
     output_t_offset: int = 0,
     is_software_quant: bool = False,
     T_physical: int = None,
-    down_in_scale_sb: nl.ndarray = None,
-) -> nl.ndarray:
+    down_in_scale_sb: nl.NkiTensor = None,
+) -> nl.NkiTensor:
     """
     Compute expert MLP for one block of input.
 

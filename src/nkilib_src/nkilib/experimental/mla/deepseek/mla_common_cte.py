@@ -16,6 +16,7 @@
 MX V-up + MX o_proj), the single source of truth so those kernel files stay independent
 of each other and of the qkv_cte MLA utilities."""
 
+from enum import Enum
 from typing import List, Tuple
 
 import nki.isa as nisa
@@ -26,6 +27,71 @@ from ....core.qkv.qkv_cte import _get_psum_bank_size
 from ....core.utils.allocator import SbufManager, get_logger, sizeinbytes
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
+
+
+class MlaPrecision(Enum):
+    """Arithmetic precision for the split sparse-MLA CTE kernels (qkv, V-up + o_proj,
+    sparse-attention indexer).
+
+    MX (default): the DeepSeek-V3.2 path. Activations arrive pre-quantized and PACKED
+        (``rmsnorm_mx_prefill(pack_scales=True)``), weights are fp8x4 4-packed with
+        block-128 (or native block-32) e8m0 scales, and the LoRA output columns of the
+        first projection are pre-swizzled offline with the MLA column permutation
+        (``[w//512, 128, 4] -> [4, w//512, 128]``) so the in-kernel MX transpose can read
+        contiguous slices. Matmuls issue ``nisa.nc_matmul_mx``.
+
+    BF16: plain back-to-back ``nisa.nc_matmul``. Activations are bf16 ``[B, S, H]``,
+        weights are bf16 ``[K, N]`` in NATURAL column order, and no scale tensors are
+        used (pass ``None``). There is no packing, no swizzle and no un-swizzle, so the
+        column permutation helpers and the MX quantize/dequantize steps drop out; the
+        cost is 2 bytes per weight element on the K-slab budget instead of ~1.25.
+        Required for GLM-MoE-DSA (GLM 5.2 / 5.3), whose checkpoints are bf16.
+
+    Only the numeric format changes: layouts of the kernel OUTPUTS (q_lift, q_pe, c_kv,
+    k_pe) are identical in both modes, so downstream kernels are unaffected.
+    """
+
+    MX = 0
+    BF16 = 1
+
+    def is_mx(self) -> bool:
+        return self is MlaPrecision.MX
+
+    def is_bf16(self) -> bool:
+        return self is MlaPrecision.BF16
+
+
+class RopeLayout(Enum):
+    """Element PAIRING used by Rotary Position Embedding.
+
+    Both layouts rotate ``rope_dim / 2`` pairs by the same ``rope_dim / 2`` angles theta_j and
+    read those angles from the first half of the cos/sin caches (HF ships
+    ``cos = cat(freqs, freqs)``). Only WHICH two elements form a pair differs, so the two are
+    NOT interchangeable — picking the wrong one silently produces plausible-looking but wrong
+    scores rather than failing.
+
+    HALF_SPLIT: pair j = (j, j + rope_dim/2).
+        out[j]              = x[j]*cos_j - x[j + rope_dim/2]*sin_j
+        out[j + rope_dim/2] = x[j]*sin_j + x[j + rope_dim/2]*cos_j
+        HuggingFace ``apply_rotary_pos_emb`` / ``rotate_half``. Used by the DeepSeek-V3.2
+        INDEXER.
+
+    INTERLEAVED: pair j = (2j, 2j+1) — adjacent elements, i.e. the complex-number view.
+        out[2j]   = x[2j]*cos_j - x[2j+1]*sin_j
+        out[2j+1] = x[2j]*sin_j + x[2j+1]*cos_j
+        HuggingFace ``apply_rotary_pos_emb_interleave``. Used by DeepSeek-V3.2's MAIN MLA
+        attention, and by ALL of GLM-MoE-DSA (GLM 5.2 / 5.3) — main attention AND indexer.
+
+    So the main-attention Q/K path is INTERLEAVED for both models (which is why the MLA QKV
+    kernel hardcodes it), and the indexer is the one place the two models disagree.
+    """
+
+    HALF_SPLIT = 0
+    INTERLEAVED = 1
+
+    def is_interleaved(self) -> bool:
+        return self is RopeLayout.INTERLEAVED
+
 
 # Tensor-engine partition cap.
 _P_MAX = 128

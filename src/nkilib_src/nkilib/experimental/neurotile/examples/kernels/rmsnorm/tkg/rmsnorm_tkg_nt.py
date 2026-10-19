@@ -31,11 +31,11 @@ _PARTITION_DIM = 128  # SBUF partition dimension (H0 split)
 
 
 def rmsnorm_tkg(
-    hidden: nl.ndarray,
-    gamma: nl.ndarray,
+    hidden: nl.NkiTensor,
+    gamma: nl.NkiTensor,
     eps: float,
     H_actual: Optional[int],
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """RMSNorm sub-kernel for token-generation (TKG) hidden states.
 
     Computes ``X_norm = X * rsqrt(mean(X^2) + eps) * gamma`` with optional
@@ -44,8 +44,8 @@ def rmsnorm_tkg(
     kernel.
 
     Args:
-        hidden (nl.ndarray): [B, S_tkg, H], input hidden states in HBM.
-        gamma (nl.ndarray): [1, H], per-element scale weights in HBM.
+        hidden (nl.NkiTensor): [B, S_tkg, H], input hidden states in HBM.
+        gamma (nl.NkiTensor): [1, H], per-element scale weights in HBM.
         eps (float): epsilon for rsqrt numerical stability.
         H_actual (int | None): actual hidden dim when H is padded (e.g.,
             H=3072 but H_actual=2880). Used in mean computation:
@@ -53,7 +53,7 @@ def rmsnorm_tkg(
             padded and ``H`` is used directly.
 
     Returns:
-        nl.ndarray: [H0, BxS, H1] result in SBUF, complete on both cores
+        nl.NkiTensor: [H0, BxS, H1] result in SBUF, complete on both cores
         after the sendrecv exchange.
 
     Notes:
@@ -160,11 +160,11 @@ def rmsnorm_tkg(
 
 @nki.jit
 def rmsnorm_tkg_kernel(
-    hidden: nl.ndarray,
-    gamma: nl.ndarray,
+    hidden: nl.NkiTensor,
+    gamma: nl.NkiTensor,
     eps: float,
     H_actual: Optional[int],
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Standalone TKG RMSNorm kernel for independent testing and profiling.
 
     Wraps :func:`rmsnorm_tkg` and copies the SBUF result back to HBM. Use this
@@ -183,14 +183,14 @@ def rmsnorm_tkg_kernel(
         BxS: B * S_tkg
 
     Args:
-        hidden (nl.ndarray): [B, S_tkg, H] input hidden states in HBM.
-        gamma (nl.ndarray): [1, H] per-element scale weights in HBM.
+        hidden (nl.NkiTensor): [B, S_tkg, H] input hidden states in HBM.
+        gamma (nl.NkiTensor): [1, H] per-element scale weights in HBM.
         eps (float): epsilon for rsqrt numerical stability.
         H_actual (int | None): actual hidden dim when H is padded; ``None``
             uses ``H`` directly.
 
     Returns:
-        dst (nl.ndarray): [H0, BxS, H1] RMSNorm result in HBM.
+        dst (nl.NkiTensor): [H0, BxS, H1] RMSNorm result in HBM.
 
     Notes:
         - LNC-2 sharding kicks in when ``BxS > 18`` and ``BxS`` is even.

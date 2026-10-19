@@ -35,7 +35,7 @@ import logging
 import os
 import random
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -47,6 +47,7 @@ from _pytest.python import Metafunc
 from _pytest.stash import Stash, StashKey
 
 from .common_dataclasses import (
+    DEFAULT_COMPILE_MODE,
     HostProvisioningMode,
     HostProvisioningResult,
     NKICompilationMode,
@@ -78,6 +79,9 @@ from .suite_chunking import get_chunked_tests
 from .test_orchestrator import Orchestrator
 
 _RNG_SEED_ENV_KEY = "NEURON_PYTHONHASHSEED"
+
+#: junit ``<property>`` name carrying a ``keep_fast`` test's reason.
+KEEP_FAST_PROPERTY = "keep_fast"
 
 logging.getLogger("paramiko.transport").setLevel(logging.WARNING)
 
@@ -111,6 +115,17 @@ class _MarkerSource(Protocol):
     """The only thing marker inspection needs from a collected test: its resolved markers."""
 
     def iter_markers(self, name: str | None = None) -> Iterator[Mark]: ...
+
+
+class _KeepFastCandidate(Protocol):
+    """What keep_fast recording needs from a collected test: its id, closest marker and junit properties."""
+
+    @property
+    def nodeid(self) -> str: ...
+
+    user_properties: list[tuple[str, object]]
+
+    def get_closest_marker(self, name: str) -> Mark | None: ...
 
 
 # ─── Session state on ``config`` ───
@@ -282,6 +297,25 @@ def get_pytest_mark_names(node: _MarkerSource) -> list[str]:
     return sorted({marker.name for marker in node.iter_markers()})
 
 
+def record_keep_fast(items: Iterable[_KeepFastCandidate]) -> None:
+    """Record each ``keep_fast`` test's reason as a junit property.
+
+    The property puts the author's decision to keep the test in the junit report. The
+    reason is required so the justification stays next to the test it keeps.
+
+    Raises:
+        pytest.UsageError: if a ``keep_fast`` marker has no ``reason``.
+    """
+    for item in items:
+        marker = item.get_closest_marker("keep_fast")
+        if marker is None:
+            continue
+        reason = marker.kwargs.get("reason")
+        if not reason:
+            raise pytest.UsageError(f'{item.nodeid}: keep_fast needs a reason, e.g. keep_fast(reason="...")')
+        item.user_properties.append((KEEP_FAST_PROPERTY, reason))
+
+
 def make_collector(
     request: pytest.FixtureRequest,
     metric_output_mode: OutputMode | None,
@@ -434,9 +468,10 @@ def make_host_manager(
     )
 
     # Static --target-host hosts enter the store with unknown (0) capacity, which makes them
-    # ineligible for capacity-based routing. Probe their real core counts once here (bounded
-    # by the xdist worker cap) and persist them. The plug-in/fleet path instead probes at
-    # resolution time, so it needs no probe here. Local runs bypass the store entirely.
+    # ineligible for capacity-based routing. Probe their real core counts and any multi-node
+    # deployment neuron-ls reports once here (bounded by the xdist worker cap) and persist them
+    # onto the existing rows. The plug-in/fleet path instead probes at resolution time, so it
+    # needs no probe here. Local runs bypass the store entirely.
     if target_hosts and not is_local_run(config):
         hm.probe_and_record_capacity(
             [th.ssh_host for th in target_hosts],
@@ -465,6 +500,7 @@ def make_test_manager(
         hw_profile_enabled=hw_profile_enabled,
         kernel_name=kernel_name,
         nki_compilation_mode=NKICompilationMode[get_feature_flag(config, "nki_compilation_mode")],
+        compile_mode=get_feature_flag(config, "compile_mode"),
     )
 
 
@@ -538,6 +574,21 @@ def pytest_addoption(parser):
         default=NKICompilationMode.tracer.value,
         choices=[m.value for m in NKICompilationMode],
         help="NKI compiler frontend to use",
+    )
+    group.addoption(
+        "--compile-mode",
+        action="store",
+        # None = unspecified; kernel_tracer resolves it. No choices= on purpose: nki
+        # validates the mode, and importing its list here would make every test
+        # require a newer nki.
+        default=None,
+        help=(
+            "Allocator/scheduler flow: enable-alloc=legacy (neuronx-cc owns "
+            "both), enable-alloc=linear (NKI LinearScanAllocation allocates, "
+            "neuronx-cc schedules), or 'enable-alloc=linear enable-sched=asap' "
+            "(NKI owns both). Validated by nki, which rejects anything else. "
+            f"Unset means {DEFAULT_COMPILE_MODE}, today's flow."
+        ),
     )
     group.addoption(
         "--debugger-interactive",
@@ -924,8 +975,8 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
     deselect_by_mark (a plain hookimpl that runs during the yield):
 
       * Pre-yield: add platform marks so deselect_by_mark can honour the
-        platform markexpr set in pytest_configure, plus coverage_parametrize
-        and simulation-skip handling.
+        platform markexpr set in pytest_configure, plus coverage_parametrize,
+        keep_fast recording, and simulation-skip handling.
       * Post-yield: `items` now reflects -m/-k deselection, so it is the truly
         eligible set. Chunk it here and fire pytest_deselected for the dropped
         tests so the collected/deselected counts (and --collect-only output,
@@ -953,8 +1004,10 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
         for p in supported:
             item.add_marker(pytest.mark.__getattr__(p.value))
 
+    record_keep_fast(items)
+
     if is_simulation_mode(config):
-        from .simulation_setup import skip_slow_simulation_tests
+        from .simulation_setup import apply_xfail_simulation, skip_slow_simulation_tests
 
         # Skip tests that carry an explicit TraceMode marker override (e.g.
         # trace_only, compile_only, compile_and_infer).  The trace_mode fixture
@@ -976,6 +1029,10 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
         for item in items:
             if item.get_closest_marker("skip_simulation"):
                 item.add_marker(skip_incompatible)
+
+        # Translate xfail_simulation -> a non-strict xfail (simulation only). Unlike
+        # skip_simulation the test still runs; it just isn't counted as a failure.
+        apply_xfail_simulation(items)
 
     # Let builtin deselect_by_mark (and -k) run; afterwards `items` is the eligible set.
     yield

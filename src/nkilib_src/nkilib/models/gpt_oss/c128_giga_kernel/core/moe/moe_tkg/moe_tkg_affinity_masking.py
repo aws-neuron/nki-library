@@ -21,6 +21,7 @@ import nki.language as nl
 from nki.isa import engine
 from nki.isa.constants import dge_mode
 
+from ...utils.dma_names import dma_name
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
@@ -30,7 +31,9 @@ _PARTITION_ALIGNMENT = 32  # Partition alignment for tensor operations
 _DGE_ALIGNMENT = 16  # DMA gather engine alignment requirement
 
 
-_AFFINITY_DMA_ENGINE = _os.environ.get("VLLM_NEURON_MEGA_AFFINITY_DMA_ENGINE", "")
+# Default "sync" is the measured-optimal placement; set the var to "" to let the
+# compiler place it.
+_AFFINITY_DMA_ENGINE = _os.environ.get("VLLM_NEURON_MEGA_AFFINITY_DMA_ENGINE", "sync")
 
 
 def mask_expert_affinities(
@@ -77,7 +80,7 @@ def mask_expert_affinities(
 
     # Load rank_id to SBUF
     rank_id_sbuf = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.dma_copy(src=rank_id[0:1, 0:1], dst=rank_id_sbuf[0:1, 0:1])
+    nisa.dma_copy(src=rank_id[0:1, 0:1], dst=rank_id_sbuf[0:1, 0:1], name=dma_name("moe_rank_id_load"))
 
     # Calculate expert offset: expert_offset = rank_id * E_L
     expert_offset_sbuf = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
@@ -129,6 +132,13 @@ def _load_slice_affinities_sbuf(expert_affinities, expert_offset_sbuf, E_L, T, i
     if T <= 128:
         # 2D output [T, E_L]
         expert_affinities_masked = nl.ndarray((T, E_L), dtype=io_dtype, buffer=nl.sbuf)
+        # An explicit engine= is only legal together with dge_mode=hwdge (ISA assert in
+        # nki/isa/_validation.py::validate_dma_copy_engine), and hwdge itself needs T to be
+        # DGE-aligned. So BOTH must hang off the same predicate: pinning the engine while an
+        # unaligned T forced dge_mode=swdge raised "dma_copy engine param can only be set when
+        # dge_mode=dge_mode.hwdge". Latent while AFFINITY_DMA_ENGINE defaulted off and every
+        # profiled arm had T_ep a multiple of 16; the 8-rank golden config (T=8) hits it.
+        _pin_engine = bool(_AFFINITY_DMA_ENGINE) and T % _DGE_ALIGNMENT == 0
         nisa.dma_copy(
             src=expert_affinities.ap(
                 pattern=[[E, T], [1, E_L]],
@@ -138,15 +148,14 @@ def _load_slice_affinities_sbuf(expert_affinities, expert_offset_sbuf, E_L, T, i
             ),
             dst=expert_affinities_masked[0:T, 0:E_L],
             dge_mode=(
-                dge_mode.hwdge
-                if (_AFFINITY_DMA_ENGINE and T % _DGE_ALIGNMENT == 0)
-                else (dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else dge_mode.swdge)
+                dge_mode.hwdge if _pin_engine else (dge_mode.unknown if T % _DGE_ALIGNMENT == 0 else dge_mode.swdge)
             ),
             # When the affinities come from a collective (pre-gather router), this DMA gets
             # hoisted to the top of the layer and then blocks on the CC semaphore. It runs on
             # GpSimd, which is also the engine that issues the KV gather-transposes, so the wait
             # occupies the engine on the critical path (~18 us measured). Pin it elsewhere.
-            engine=getattr(nisa.engine, _AFFINITY_DMA_ENGINE) if _AFFINITY_DMA_ENGINE else nisa.engine.unknown,
+            engine=getattr(nisa.engine, _AFFINITY_DMA_ENGINE) if _pin_engine else nisa.engine.unknown,
+            name=dma_name("moe_affinity_load"),
         )
     else:
         # 3D tiled output [T_par, n_T128_tiles, E_L] for T > 128

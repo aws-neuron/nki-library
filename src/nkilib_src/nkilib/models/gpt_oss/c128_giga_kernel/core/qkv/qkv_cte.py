@@ -3519,10 +3519,10 @@ def _dequant_row_mx(
 
 
 def _dequant_row_input_only(
-    dst: nl.ndarray,
-    psum_src: nl.ndarray,
-    row_scale: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    dst: nl.NkiTensor,
+    psum_src: nl.NkiTensor,
+    row_scale: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
 ) -> None:
     """Apply row-input-only dequant: dst = psum * row_scale [+ bias].
 
@@ -3530,10 +3530,10 @@ def _dequant_row_input_only(
     inside nc_matmul_mx; only the per-row input dequant remains.
 
     Args:
-        dst (nl.ndarray): Destination slice in SBUF.
-        psum_src (nl.ndarray): Source slice in PSUM.
-        row_scale (nl.ndarray): [s_tile_sz, 1] per-row input scale.
-        bias (Optional[nl.ndarray]): Bias slice in SBUF, or None.
+        dst (nl.NkiTensor): Destination slice in SBUF.
+        psum_src (nl.NkiTensor): Source slice in PSUM.
+        row_scale (nl.NkiTensor): [s_tile_sz, 1] per-row input scale.
+        bias (Optional[nl.NkiTensor]): Bias slice in SBUF, or None.
     """
     if bias is not None:
         nisa.scalar_tensor_tensor(
@@ -3722,12 +3722,12 @@ def _evict_psum_to_sbuf_bulk_row_mx(
 
 
 def _evict_psum_to_sbuf_bulk_row_input_only(
-    output_sb: nl.ndarray,
+    output_sb: nl.NkiTensor,
     qkv_MM_output_psum: list,
     s_tile_sz: int,
     i_tile_S: int,
-    bias_sb: Optional[nl.ndarray],
-    row_mx_input_scale: nl.ndarray,
+    bias_sb: Optional[nl.NkiTensor],
+    row_mx_input_scale: nl.NkiTensor,
     I: int,
     num_512_tiles_per_I: int,
 ) -> None:
@@ -3737,12 +3737,12 @@ def _evict_psum_to_sbuf_bulk_row_input_only(
     with row-quantized FP8 input. Post-matmul correction is: output = psum * row_input_scale.
 
     Args:
-        output_sb (nl.ndarray): Destination SBUF tile for this S-tile.
+        output_sb (nl.NkiTensor): Destination SBUF tile for this S-tile.
         qkv_MM_output_psum (list): List of PSUM bank tensors from matmul.
         s_tile_sz (int): Active rows in the S tile.
         i_tile_S (int): S-tile index within the current S-block.
-        bias_sb (Optional[nl.ndarray]): Bias tensor in SBUF, or None.
-        row_mx_input_scale (nl.ndarray): [P_MAX, 1] per-row input dequant scale.
+        bias_sb (Optional[nl.NkiTensor]): Bias tensor in SBUF, or None.
+        row_mx_input_scale (nl.NkiTensor): [P_MAX, 1] per-row input dequant scale.
         I (int): Total output dimension (Q+K+V heads * d_head).
         num_512_tiles_per_I (int): Number of 512-wide tiles spanning I.
     """

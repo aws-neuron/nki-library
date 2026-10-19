@@ -38,8 +38,13 @@ CONFIG_KEYS = [
     "TILES_IN_BLOCK_K",
     "TILES_IN_LOAD_M",
     "TILES_IN_LOAD_N",
+    "TILES_IN_LOAD_K",
     "spill_reload",
+    "psum_copy_in_ratio",
+    "strided_copy_swizzle_1x32_ratio",
 ]
+# Optional knobs: written only when the winning run set them (None = kernel default).
+RATIO_KEYS = ("psum_copy_in_ratio", "strided_copy_swizzle_1x32_ratio")
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_PY = os.path.join(
@@ -67,8 +72,18 @@ def _cache_key_for(data):
     config_helper.TestConfig.to_metrics_dict(); raises KeyError if any are
     missing (e.g. a record from an older sweep).
     """
-    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_constants import autotune_cache_key
+    from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_constants import QuantScheme, autotune_cache_key
 
+    fast_dma = data.get("fast_dma_transpose", False)
+    # Metrics store quant_scheme as a string; map it to the enum the key logic compares.
+    quant_scheme = QuantScheme._1x32 if data.get("quant_scheme", "wrapX") == "1x32" else QuantScheme.WRAPX
+    # Mirror matmul_mxfp8's TensorDescriptor rules: an unswizzled operand loads through
+    # the PE swizzle when load_with_PE_swizzle is set, under 1x32, or when it is K-by-F;
+    # a PE-swizzled K-by-F operand keys as "*_kbyf". Records predating the orientation
+    # fields carry neither, which reproduces the legacy key.
+    lhs_kbyf = data.get("lhs_orientation") == "k_by_f" and not data["lhs_is_swizzled"]
+    rhs_kbyf = data.get("rhs_orientation") == "k_by_f" and not data["rhs_is_swizzled"]
+    pe = data.get("load_with_PE_swizzle", False) or quant_scheme == QuantScheme._1x32
     return autotune_cache_key(
         data["M"],
         data["K"],
@@ -77,10 +92,25 @@ def _cache_key_for(data):
         data["rhs_dtype"],
         data["lhs_is_swizzled"],
         data["rhs_is_swizzled"],
-        data.get("load_with_PE_swizzle", False),
-        data.get("quant_scheme", "wrapX"),
+        # PE swizzle and fast_dma_transpose only take effect on an unswizzled
+        # operand, matching how matmul_mxfp8 builds the per-operand
+        # TensorDescriptors. A swizzled operand's token short-circuits before the
+        # PE check, so masking here keeps mixed pairs (e.g. PE-LHS / DGT-RHS) keyed
+        # per operand instead of OR-reduced.
+        (pe or lhs_kbyf) and not data["lhs_is_swizzled"],
+        (pe or rhs_kbyf) and not data["rhs_is_swizzled"],
+        quant_scheme,
         data["run_with_lnc2"],
         data["lnc_2_shard_rhs"],
+        lhs_fast_dma_transpose=fast_dma and not data["lhs_is_swizzled"],
+        rhs_fast_dma_transpose=fast_dma and not data["rhs_is_swizzled"],
+        # No-DMA-transpose 1x32 loads get a distinct "_nodma" key. Records emit the
+        # flag directly; sweeps predating that field are recovered from the method
+        # label in shape_name (e.g. "dw_pe_1x32_no_dma_..."). Default False reproduces
+        # the legacy (DMA) key.
+        disable_dma_transpose=data.get("disable_dma_transpose", "no_dma" in data.get("shape_name", "")),
+        lhs_k_by_f=lhs_kbyf,
+        rhs_k_by_f=rhs_kbyf,
     )
 
 
@@ -128,10 +158,13 @@ def collect_best_configs(output_dir):
             except KeyError:
                 continue
 
-            config = {k: data[k] for k in CONFIG_KEYS if k in data}
+            config = {k: data[k] for k in CONFIG_KEYS if k in data and k not in RATIO_KEYS}
             sr = data.get("spill_reload")
             if sr is not None:
                 config["spill_reload"] = sr in (True, "True")
+            for k in RATIO_KEYS:
+                if data.get(k) not in (None, "None"):
+                    config[k] = float(data[k])
             by_key[shape_key].append((inference_us, config))
 
     best = {}
@@ -161,21 +194,10 @@ def update_config_py(existing, new_best, dry_run=False):
     with open(_CONFIG_PY) as f:
         content = f.read()
 
-    py_keys = [
-        "tile_m",
-        "tile_k",
-        "tile_n",
-        "TILES_IN_BLOCK_M",
-        "TILES_IN_BLOCK_N",
-        "TILES_IN_BLOCK_K",
-        "TILES_IN_LOAD_M",
-        "TILES_IN_LOAD_N",
-        "spill_reload",
-    ]
     lines = ["_AUTOTUNE_CACHE = {"]
     for key in sorted(merged.keys()):
         entry = merged[key]
-        parts = ", ".join(f"'{k}': {entry[k]}" for k in py_keys if k in entry)
+        parts = ", ".join(f"'{k}': {entry[k]}" for k in CONFIG_KEYS if k in entry)
         lines.append(f"    \"{key}\": {{{parts}}},")
     lines.append("}")
     new_dict = "\n".join(lines)

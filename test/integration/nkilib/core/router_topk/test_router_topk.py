@@ -17,6 +17,8 @@
 import itertools
 import random
 
+import nki.language as nl
+import numpy as np
 import pytest
 from nkilib_src.nkilib.core.router_topk.router_topk import (
     XHBMLayout_H_T__0,
@@ -30,6 +32,11 @@ from nkilib_src.nkilib.core.utils.common_types import RouterActFnType
 from test.integration.nkilib.core.router_topk.test_router_topk_common import (
     generate_router_topk_inputs,
     router_topk_kernel_wrapper,
+    router_topk_layout1_odd_kernel_wrapper,
+    router_topk_layout1_odd_torch_wrapper,
+    router_topk_sharded_sbuf_index_kernel_wrapper,
+    router_topk_sharded_sbuf_index_torch_wrapper,
+    router_topk_tensor_gen,
     router_topk_torch_wrapper,
 )
 from test.utils.common_dataclasses import CompilerArgs, Platforms
@@ -426,4 +433,275 @@ class TestRouterTopkKernel:
             rtol=2e-2,
             atol=1e-5,
             is_negative_test=is_negative_test_case,
+        )
+
+    # ------------------------------------------------------------------
+    # Targeted single-config tests exercising feature branches that the
+    # pairwise sweep above leaves at only-large-shape (sim-skipped) or
+    # unparametrized configs. Each carries the smallest shape that still
+    # reaches the intended path, and validates against the torch golden.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            # ACT1 (router_pre_norm) with no scatter stores the full [T, E] affinities
+            # directly. T=128 exercises the whole-tile store (num_t_whole_tiles>0) and the
+            # no-remainder path; single-core (LNC1) exercises the n_prgs==1 barrier skip.
+            pytest.param(
+                {"overrides": {"T": 128, "router_pre_norm": True}, "lnc": 1},
+                marks=pytest.mark.fast,
+                id="prenorm_full_affinities_store_single_core",
+            ),
+            # PE-array column tiling with 32 < T <= 64 selects the 64-wide column tile.
+            pytest.param(
+                {"overrides": {"T": 48, "use_column_tiling": True}},
+                marks=pytest.mark.fast,
+                id="column_tiling_medium_T",
+            ),
+            # E < 8 forces padding of the router-logits buffer to 8 (memset of the pad).
+            pytest.param(
+                {"overrides": {"T": 8, "E": 4, "k": 2}},
+                marks=pytest.mark.fast,
+                id="expert_count_below_eight",
+            ),
+            # SBUF outputs without token sharding: expert_index/affinities copied in-place
+            # on a single core (the shard_on_tokens=False SBUF path).
+            pytest.param(
+                {"overrides": {"T": 32, "output_in_sbuf": True}, "lnc": 1},
+                marks=pytest.mark.fast,
+                id="sbuf_output_no_shard",
+            ),
+            # return_eager_affi on a single core (LNC1) also exercises the n_prgs==1 branch
+            # of the one-hot HBM store, plus the SBUF eager reshape (no eager HBM output).
+            pytest.param(
+                {"overrides": {"T": 64}, "extra": {"return_eager_affi": True}, "lnc": 1},
+                marks=pytest.mark.fast,
+                id="eager_affinities_sbuf_single_core",
+            ),
+            # return_eager_affi with token sharding: cross-core sendrecv assembly of the
+            # eager [T, k] output (both program ids).
+            pytest.param(
+                {"overrides": {"T": 64, "shard_on_tokens": True}, "extra": {"return_eager_affi": True}},
+                marks=pytest.mark.fast,
+                id="eager_affinities_shard_on_tokens",
+            ),
+            # Skipping the router_logits and expert_index stores (the kernel leaves those
+            # output buffers untouched; the torch golden mirrors the skip).
+            pytest.param(
+                {
+                    "overrides": {"T": 8},
+                    "extra": {"skip_store_expert_index": True, "skip_store_router_logits": True},
+                },
+                marks=pytest.mark.fast,
+                id="skip_router_logits_and_expert_index_store",
+            ),
+        ],
+    )
+    def test_router_topk_feature_branches(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        cfg,
+    ):
+        """Single-config tests for feature branches not reached by the pairwise sweep."""
+        params = {
+            "T": 8,
+            "H": 512,
+            "E": 128,
+            "k": 4,
+            "act_fn": RouterActFnType.SOFTMAX,
+            "has_bias": True,
+            "router_pre_norm": False,
+            "norm_topk_prob": False,
+            "use_column_tiling": False,
+            "use_indirect_dma_scatter": False,
+            "use_PE_broadcast_w_bias": False,
+            "shard_on_tokens": False,
+            "output_in_sbuf": False,
+            "x_input_in_sb": False,
+            "x_hbm_layout": XHBMLayout_H_T__0,
+            "x_sb_layout": XSBLayout_tp102__0,
+        }
+        params.update(cfg["overrides"])
+        extra_flags = cfg.get("extra", {})
+        lnc = cfg.get("lnc")
+
+        def input_generator(test_config):
+            inputs = generate_router_topk_inputs(**params)
+            inputs.update(extra_flags)
+            return inputs
+
+        def output_tensors(kernel_input):
+            return {
+                "router_logits": kernel_input["router_logits.must_alias_input"].copy(),
+                "expert_index": kernel_input["expert_index.must_alias_input"].copy(),
+                "expert_affinities": kernel_input["expert_affinities.must_alias_input"].copy(),
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=router_topk_kernel_wrapper,
+            torch_ref=torch_ref_wrapper(router_topk_torch_wrapper),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+            check_unused_params=True,
+        )
+
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=lnc),
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    @pytest.mark.parametrize(
+        "T",
+        [
+            # T=128: whole-tile eager HBM store, no remainder.
+            pytest.param(128, marks=pytest.mark.fast, id="whole_tile"),
+            # T=64: remainder-only eager HBM store (no whole tile).
+            pytest.param(64, marks=pytest.mark.fast, id="remainder_tile"),
+        ],
+    )
+    def test_router_topk_eager_affinities_hbm_out(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        T,
+    ):
+        """return_eager_affi with an HBM-direct eager output tensor [T, k]."""
+        H, E, k = 512, 128, 4
+
+        def input_generator(test_config):
+            inputs = generate_router_topk_inputs(
+                T=T,
+                H=H,
+                E=E,
+                k=k,
+                act_fn=RouterActFnType.SOFTMAX,
+                has_bias=True,
+                router_pre_norm=False,
+                norm_topk_prob=False,
+                use_column_tiling=False,
+                use_indirect_dma_scatter=False,
+                use_PE_broadcast_w_bias=False,
+                shard_on_tokens=False,
+                output_in_sbuf=False,
+                x_input_in_sb=False,
+                x_hbm_layout=XHBMLayout_H_T__0,
+                x_sb_layout=XSBLayout_tp102__0,
+            )
+            inputs["return_eager_affi"] = True
+            inputs["expert_affinities_eager_out.must_alias_input"] = np.zeros((T, k), dtype=np.float32)
+            return inputs
+
+        def output_tensors(kernel_input):
+            return {
+                "router_logits": kernel_input["router_logits.must_alias_input"].copy(),
+                "expert_index": kernel_input["expert_index.must_alias_input"].copy(),
+                "expert_affinities": kernel_input["expert_affinities.must_alias_input"].copy(),
+                "expert_affinities_eager_out": kernel_input["expert_affinities_eager_out.must_alias_input"].copy(),
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=router_topk_kernel_wrapper,
+            torch_ref=torch_ref_wrapper(router_topk_torch_wrapper),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+            check_unused_params=True,
+        )
+
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    def _standard_output_tensors(self, kernel_input):
+        return {
+            "router_logits": kernel_input["router_logits.must_alias_input"].copy(),
+            "expert_index": kernel_input["expert_index.must_alias_input"].copy(),
+            "expert_affinities": kernel_input["expert_affinities.must_alias_input"].copy(),
+        }
+
+    @pytest.mark.fast
+    def test_router_topk_sharded_sbuf_index_large_t(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Sharded run (LNC2) with expert_index in SBUF and T>128 (tile-based sendrecv store)."""
+        T, H, E, k = 256, 512, 128, 4
+
+        def input_generator(test_config):
+            return {
+                "x": router_topk_tensor_gen("x", (H, T), nl.bfloat16),  # HBM [H, T], layout 0
+                "w": router_topk_tensor_gen("w", (H, E), nl.bfloat16),
+                "w_bias": router_topk_tensor_gen("w_bias", (1, E), nl.bfloat16),
+                "router_logits.must_alias_input": np.zeros((T, E), dtype=nl.bfloat16),
+                "expert_affinities.must_alias_input": np.zeros((T, E), dtype=nl.bfloat16),
+                "expert_index.must_alias_input": np.zeros((T, k), dtype=np.uint32),
+                "act_fn": RouterActFnType.SOFTMAX,
+                "k": k,
+                "x_hbm_layout": XHBMLayout_H_T__0,
+                "x_sb_layout": XSBLayout_tp102__0,
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=router_topk_sharded_sbuf_index_kernel_wrapper,
+            torch_ref=torch_ref_wrapper(router_topk_sharded_sbuf_index_torch_wrapper),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=self._standard_output_tensors,
+            check_unused_params=True,
+        )
+
+        # LNC2 (default) is required: shard_on_tokens needs n_prgs > 1.
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    @pytest.mark.fast
+    def test_router_topk_layout1_odd_num_h_tiles(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Layout-1 weight load with an odd num_h_tiles (H=384 -> 3): the unbalanced path."""
+        T, H, E, k = 16, 384, 128, 4  # num_h_tiles = 3 (odd)
+
+        def input_generator(test_config):
+            return {
+                "x": router_topk_tensor_gen("x", (T, H), nl.bfloat16),  # [T, H]
+                "w": router_topk_tensor_gen("w", (H, E), nl.bfloat16),
+                "w_bias": router_topk_tensor_gen("w_bias", (1, E), nl.bfloat16),
+                "router_logits.must_alias_input": np.zeros((T, E), dtype=nl.bfloat16),
+                "expert_affinities.must_alias_input": np.zeros((T, E), dtype=nl.bfloat16),
+                "expert_index.must_alias_input": np.zeros((T, k), dtype=np.uint32),
+                "act_fn": RouterActFnType.SOFTMAX,
+                "k": k,
+                "x_hbm_layout": XHBMLayout_T_H__1,
+                "x_sb_layout": XSBLayout_tp2013__1,
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=router_topk_layout1_odd_kernel_wrapper,
+            torch_ref=torch_ref_wrapper(router_topk_layout1_odd_torch_wrapper),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=self._standard_output_tensors,
+            check_unused_params=True,
+        )
+
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+            rtol=2e-2,
+            atol=1e-5,
         )

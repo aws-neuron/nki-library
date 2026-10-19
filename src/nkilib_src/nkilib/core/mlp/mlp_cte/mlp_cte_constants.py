@@ -20,7 +20,6 @@ from typing import Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.language import NKIObject
 
 from ...utils.allocator import SbufManager
 from ...utils.kernel_helpers import (
@@ -41,7 +40,7 @@ BN_AGGR_ELEMENTS_PER_TILE = 2
 
 
 @dataclass(frozen=True)
-class MlpBxsIndices(NKIObject):
+class MlpBxsIndices(nl.NKIObject):
     program_id: int
     shard_idx: int
     batch_idx: int
@@ -68,7 +67,7 @@ MAX_AVAILABLE_SBUF_SIZE = 224 * 1024 - 16384 - 8 - 256
 # Primary tuple that holds miscellaneous constants required by the kernel
 #
 @dataclass
-class MLPCTEConstants(NKIObject):
+class MLPCTEConstants(nl.NKIObject):
     # Compute data type used for matmuls, etc.
     compute_data_type: nki.dtype
     # Data type used for activations
@@ -92,6 +91,9 @@ class MLPCTEConstants(NKIObject):
     src_proj_weights_max_buffer_count: int
     down_proj_weights_buffer_count: int
     down_proj_weights_scales_buffer_count: int
+    # Floors on the weight ring buffer counts (they scale down as the DMA buffers widen)
+    min_weights_ring_buffer_count: int
+    min_weights_scales_ring_buffer_count: int
     # True if PE transpose should be used
     use_pe_xpose_flag: bool
     # The data type to be used for writing to PSUM for transposes
@@ -148,7 +150,9 @@ def _get_xpose_data_type(
     compute_data_type: nki.dtype,
     src_proj_quant_data_type: nki.dtype,
 ):
-    if use_pe_xpose_flag and nisa.get_nc_version() >= nisa.nc_version.gen3:
+    if (
+        use_pe_xpose_flag and nisa.get_nc_version() >= nisa.nc_version.gen3
+    ):  # pragma: no branch - use_pe_xpose hardcoded True and fleet is gen3+, nc<gen3 (pre-trn2) arc dead
         if mlpp_has_quantized_weights(mlp_params):
             return src_proj_quant_data_type
         else:
@@ -190,6 +194,9 @@ def build_mlp_cte_constants(
     src_proj_weights_max_buffer_count = 8
     down_proj_weights_buffer_count = 8
     down_proj_weights_scales_buffer_count = 4
+    # Floors on the weight ring buffer counts (they scale down as the DMA buffers widen)
+    min_weights_ring_buffer_count = 2
+    min_weights_scales_ring_buffer_count = 1
 
     # Data types
     compute_data_type = _get_compute_data_type(mlp_params)
@@ -266,6 +273,8 @@ def build_mlp_cte_constants(
         src_proj_weights_max_buffer_count=src_proj_weights_max_buffer_count,
         down_proj_weights_buffer_count=down_proj_weights_buffer_count,
         down_proj_weights_scales_buffer_count=down_proj_weights_scales_buffer_count,
+        min_weights_ring_buffer_count=min_weights_ring_buffer_count,
+        min_weights_scales_ring_buffer_count=min_weights_scales_ring_buffer_count,
         use_pe_xpose_flag=use_pe_xpose_flag,
         xpose_data_type=xpose_data_type,
         sharded_dim=sharded_dim,
@@ -290,7 +299,7 @@ def cleanup_mlp_cte_constants(mlp_params: MLPParameters, sbm: SbufManager):
     Intended Usage:
         Called at end of shard execution to clean up allocated memory
     """
-    if sbm != None:
+    if sbm != None:  # pragma: no branch - sbm always non-None from callers, sbm-None arc dead
         if mlp_params.quant_params.is_dtype_mx():
             sbm.pop_heap()  # mx_moving_neutral_scale_sbuf
             sbm.pop_heap()  # mx_stationary_neutral_scale_sbuf

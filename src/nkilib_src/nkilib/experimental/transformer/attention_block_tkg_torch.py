@@ -1197,6 +1197,20 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
 # present in the actual attention_block_tkg kernel for dispatch audit compliance.
 
 
+# Packed metadata accepted by the kernel but not by AttentionBlockTkgTorchRef.forward.
+# forward's signature is a separate contract shared with the block test wrappers
+# (it carries X_in_sb, which the kernel does not have), so the packed parameters are
+# added to the dispatch signature here instead of to forward.
+_SEQ_PACKED_DISPATCH_ONLY_PARAMS = (
+    "seq_packed_attention_mask",
+    "seq_packed_active_blocks_table",
+    "seq_packed_q_index_table",
+    "seq_packed_seq_id_table",
+    "seq_packed_accumulator_partial_route_table",
+    "seq_packed_accumulator_group_state_route_table",
+)
+
+
 def attention_block_tkg_torch_ref(**kwargs):
     """Dispatch-compatible torch reference for attention_block_tkg.
 
@@ -1225,10 +1239,16 @@ def attention_block_tkg_torch_ref(**kwargs):
         kv_quant_dtype = str(nl.float8_e4m3)
 
     ref = AttentionBlockTkgTorchRef(lnc=2, kv_quant_dtype=kv_quant_dtype)
-    return ref(**kwargs)
+    return ref(**{name: value for name, value in kwargs.items() if name not in _SEQ_PACKED_DISPATCH_ONLY_PARAMS})
 
 
-# Set __signature__ to match the kernel (forward minus X_in_sb)
+# Set __signature__ to match the kernel: forward minus X_in_sb (a test-wrapper
+# concept absent from the kernel), plus the packed-schedule metadata (kernel-only,
+# so absent from forward). This dispatch-level signature is what the torch-ref
+# dispatch audit compares against attention_block_tkg.
 _fwd_sig = inspect.signature(AttentionBlockTkgTorchRef(lnc=2).forward)
 _dispatch_params = [p for name, p in _fwd_sig.parameters.items() if name != "X_in_sb"]
+_dispatch_params += [
+    inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, default=None) for name in _SEQ_PACKED_DISPATCH_ONLY_PARAMS
+]
 attention_block_tkg_torch_ref.__signature__ = _fwd_sig.replace(parameters=_dispatch_params)

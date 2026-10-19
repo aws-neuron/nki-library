@@ -23,6 +23,7 @@ from ....utils.allocator import SbufManager
 from ....utils.kernel_assert import kernel_assert
 from ....utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, get_ceil_quotient
 from ....utils.tile_info import TiledDimInfo
+from ....utils.tiled_range import TiledRange
 from ...mlp_parameters import MLPParameters, mlpp_has_quantized_weights
 from ..mlp_cte_constants import MlpBxsIndices, MLPCTEConstants
 from .mlp_cte_basic_tile_info import MLPCTEBasicTileInfo
@@ -55,7 +56,7 @@ def transpose_source_tensor_tile(
     tensor_bxs_size = constants.get_bxs_size(mlp_params)
 
     if apply_scale or apply_bias:
-        if apply_scale:
+        if apply_scale:  # pragma: no branch - apply_bias implies apply_scale (LayerNorm weights), false arc dead
             kernel_assert(
                 (scale_sbuf.shape[0] == nl.tile_size.pmax) and (H_SUBTILE_SIZE == nl.tile_size.pmax),
                 "Scale tile must equal the hidden dimension subtile size and they must equal PMAX",
@@ -92,7 +93,7 @@ def transpose_source_tensor_tile(
 
         for hidden_tile_idx in range(hidden_dim_tile.tile_count):
             hidden_tile_rest = mlp_params.hidden_size - (hidden_tile_idx * hidden_dim_tile.tile_size)
-            if hidden_tile_rest > 0:
+            if hidden_tile_rest > 0:  # pragma: no branch - tile index < tile_count implies remainder>0, false arc dead
                 psum_bank = (bxs_subtile_idx * hidden_dim_tile.tile_count + hidden_tile_idx) % NUM_HW_PSUM_BANKS
 
                 _perform_hidden_transpose(
@@ -171,7 +172,7 @@ def transpose_intermediate_tensor_tile(
             for int_tile_idx in range(int_dim_tile.tile_count):
                 int_tile_rest = mlp_params.intermediate_size - (int_tile_idx * int_dim_tile.tile_size)
 
-                if int_tile_rest > 0:
+                if int_tile_rest > 0:  # pragma: no branch - tile index < tile_count implies remainder>0, false arc dead
                     psum_bank = (bxs_subtile_idx * int_dim_tile.tile_count + int_tile_idx) % NUM_HW_PSUM_BANKS
 
                     _perform_intermediate_transpose(
@@ -330,39 +331,47 @@ def _perform_intermediate_transpose(
     bxs_dim_tile = tile_info.bxs_dim_tile
     int_dim_tile = tile_info.xpose_intermediate_dim_tile
     BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
-    I_SUBTILE_COUNT = int_dim_tile.subtile_dim_info.tile_count
     I_SUBTILE_SIZE = int_dim_tile.subtile_dim_info.tile_size
 
-    for int_subtile_idx in range(I_SUBTILE_COUNT):
-        int_subtile_rest = int_tile_rest - (int_subtile_idx * I_SUBTILE_SIZE)
+    bxs_subtile_bound = min(bxs_subtile_rest, BXS_SUBTILE_SIZE)
+    int_tile_bound = min(int_tile_rest, int_dim_tile.tile_size)
 
-        if int_subtile_rest > 0:
-            bxs_subtile_bound = min(bxs_subtile_rest, BXS_SUBTILE_SIZE)
-            int_subtile_bound = min(int_subtile_rest, I_SUBTILE_SIZE)
-            int_tile_sbuf_view = int_tile_sbuf.reshape(
-                (
-                    int_tile_sbuf.shape[0],
-                    int_dim_tile.tile_count,
-                    I_SUBTILE_COUNT,
-                    I_SUBTILE_SIZE,
-                )
+    # Each block of rows is transposed into its own I_SUBTILE_SIZE-wide column block, so a down
+    # projection matmul can only contract rows that share a block. The quantized down projection
+    # contracts 2 * I_SUBTILE_SIZE rows in one double_row matmul, which requires two equally sized
+    # row groups, so those rows are split into two equal blocks instead of a full block plus a
+    # remainder. A trailing group that already fits on the partitions is contracted by a plain
+    # matmul and stays a single block.
+    if mlp_params.quant_params.is_quant_row() or mlp_params.quant_params.is_quant_static():
+        int_blocks = []
+        for int_group in TiledRange(int_tile_bound, 2 * I_SUBTILE_SIZE):
+            block_count = 2 if int_group.size > I_SUBTILE_SIZE else 1
+            kernel_assert(
+                int_group.size % block_count == 0,
+                f'Intermediate size per core must be even for the double row down projection, got {int_group.size}',
             )
-            nisa.nc_transpose(
-                dst=res_psum_tensor.ap(
-                    pattern=[
-                        [psum_tile_info.tile_count * psum_tile_info.tile_size * psum_step_size, int_subtile_bound],
-                        [1, 1],
-                        [psum_step_size, bxs_subtile_bound],
-                    ],
-                    offset=int_subtile_idx * I_SUBTILE_SIZE * psum_step_size,
-                ),
-                data=int_tile_sbuf_view[
-                    :bxs_subtile_bound,
-                    int_tile_idx,
-                    int_subtile_idx,
-                    :int_subtile_bound,
+            block_size = int_group.size // block_count
+            int_blocks += [(int_group.start_offset + i * block_size, block_size) for i in range(block_count)]
+    else:
+        int_blocks = [
+            (int_subtile.start_offset, int_subtile.size) for int_subtile in TiledRange(int_tile_bound, I_SUBTILE_SIZE)
+        ]
+
+    for block_idx, (block_start, block_size) in enumerate(int_blocks):
+        nisa.nc_transpose(
+            dst=res_psum_tensor.ap(
+                pattern=[
+                    [psum_tile_info.tile_count * psum_tile_info.tile_size * psum_step_size, block_size],
+                    [1, 1],
+                    [psum_step_size, bxs_subtile_bound],
                 ],
-            )
+                offset=block_idx * I_SUBTILE_SIZE * psum_step_size,
+            ),
+            data=int_tile_sbuf[
+                :bxs_subtile_bound,
+                nl.ds(int_tile_idx * int_dim_tile.tile_size + block_start, block_size),
+            ],
+        )
 
 
 def _copy_intermediate_transpose_result(

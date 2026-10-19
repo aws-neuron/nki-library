@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -20,11 +22,15 @@ from test.utils.common_dataclasses import (
     InstanceSize,
     LazyGoldenGenerator,
     ModelTestType,
+    NeuronDeviceInfo,
+    NeuronLsReport,
     Platforms,
     ValidationArgs,
     _iter_model_configs,
     is_model_test_type,
     is_xdist_worker,
+    looks_like_json,
+    neuron_ls_json_command,
     prepare_model_parametrize,
     resolve_probe_worker_count,
     unpack_model_config,
@@ -261,3 +267,220 @@ class TestInstanceSize:
     )
     def test_get_core_count(self, size, cores):
         assert size.get_core_count() == cores
+
+
+def _device(
+    neuron_device: int = 0,
+    neuroncore_ids: list[int] | None = None,
+    lnc: int = 2,
+    instance_type: str | None = None,
+) -> dict:
+    """One neuron-ls device entry (from_dict requires every key below). ``instance_type`` is
+    omitted by default, as ``--output-format json`` does; legacy ``--json-output`` sets it."""
+    device = {
+        "neuron_device": neuron_device,
+        "bdf": "0000:aa:00.0",
+        "cpu_affinity": "48-95",
+        "numa_node": "1",
+        "connected_to": [1, 2],
+        "nc_count": 4,
+        "logical_neuroncore_config": lnc,
+        "memory_size": 154618822656,
+        "neuroncore_ids": [0, 1, 2, 3] if neuroncore_ids is None else neuroncore_ids,
+        "neuron_processes": [],
+    }
+    if instance_type is not None:
+        device["instance_type"] = instance_type
+    return device
+
+
+_ULTRASERVER_INFO = {
+    "ultraserver_id": "4569742665279272783",
+    "ultraserver_mode": "unset",
+    "ultraserver_type": "Switch",
+    "ultraserver_size": 4,
+    "ultraserver_instance_index": 2,
+    "ultraserver_supported_modes": "1: 4-node, 3: 2-node-vertical, 4: single-node",
+}
+
+
+class TestNeuronLsJsonCommand:
+    """The remote/local neuron-ls invocation must survive a fleet where only some hosts have a
+    neuron-ls new enough to support instance-level output.
+
+    These tests execute the generated command against stub binaries rather than asserting on its
+    text, because the failure that matters is behavioural: an old neuron-ls reports an unknown flag
+    on STDOUT, so a command that streams the first attempt prepends that complaint to the
+    fallback's JSON and the parse fails.
+    """
+
+    @staticmethod
+    def _stub(tmp_path, body: str):
+        """Write an executable stub neuron-ls that logs each invocation's arguments."""
+        log = tmp_path / "calls.log"
+        stub = tmp_path / "neuron-ls"
+        stub.write_text(f'#!/bin/sh\necho "$@" >> {log}\n{body}\n')
+        stub.chmod(0o755)
+        return stub, log
+
+    @staticmethod
+    def _run(cmd: str) -> str:
+        result = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True, timeout=30)
+        return result.stdout
+
+    def test_legacy_neuron_ls_yields_only_the_fallback_json(self, tmp_path):
+        # Reproduces the real old binary: "unknown flag" on STDOUT with a non-zero exit.
+        legacy_json = json.dumps([_device(neuroncore_ids=[0, 1], lnc=1)])
+        stub, log = self._stub(
+            tmp_path,
+            'case "$*" in\n'
+            "  *--output-format*) echo \"unknown flag \\`output-format'\"; exit 1 ;;\n"
+            f"  *--json-output*) echo '{legacy_json}' ;;\n"
+            "esac",
+        )
+        stdout = self._run(neuron_ls_json_command(str(stub)))
+
+        # The complaint must not reach the parser, and the payload must be the legacy device list.
+        assert "unknown flag" not in stdout
+        assert NeuronLsReport.from_stdout(stdout).total_physical_cores == 2
+        assert "--output-format json" in log.read_text()  # the new flag was still attempted first
+
+    def test_modern_neuron_ls_skips_the_legacy_flag(self, tmp_path):
+        new_json = json.dumps({"devices": [_device(neuroncore_ids=[0], lnc=1)]})
+        stub, log = self._stub(
+            tmp_path,
+            'case "$*" in\n'
+            f"  *--output-format*) echo '{new_json}' ;;\n"
+            '  *--json-output*) echo "legacy should not run" ;;\n'
+            "esac",
+        )
+        stdout = self._run(neuron_ls_json_command(str(stub)))
+
+        assert NeuronLsReport.from_stdout(stdout).total_physical_cores == 1
+        assert "--json-output" not in log.read_text()  # one round trip, no wasted invocation
+
+    def test_falls_back_when_the_unknown_flag_exits_zero(self, tmp_path):
+        # Acceptance keys off the payload shape, so a usage message on a zero exit also falls back.
+        legacy_json = json.dumps([_device(neuroncore_ids=[0, 1, 2, 3], lnc=1)])
+        stub, _ = self._stub(
+            tmp_path,
+            'case "$*" in\n'
+            '  *--output-format*) echo "usage: neuron-ls [options]"; exit 0 ;;\n'
+            f"  *--json-output*) echo '{legacy_json}' ;;\n"
+            "esac",
+        )
+        stdout = self._run(neuron_ls_json_command(str(stub)))
+
+        assert "usage:" not in stdout
+        assert NeuronLsReport.from_stdout(stdout).total_physical_cores == 4
+
+    def test_forces_lnc_for_both_attempts(self):
+        # LNC is forced so the probe counts physical cores the way the worker will see them;
+        # the fallback is a separate process and needs the same environment.
+        env = f"NEURON_LOGICAL_NC_CONFIG={NeuronDeviceInfo.logical_neuroncore_config}"
+        assert neuron_ls_json_command("/bin/neuron-ls").count(env) == 2
+
+
+class TestLooksLikeJson:
+    """Shape check that decides whether a neuron-ls attempt produced a payload or a complaint."""
+
+    @pytest.mark.parametrize("stdout", ['{"devices": []}', "[]", "  \n [1]", '\n{"a": 1}'])
+    def test_accepts_json_payloads(self, stdout):
+        assert looks_like_json(stdout)
+
+    @pytest.mark.parametrize("stdout", ["", "   ", "unknown flag `output-format'", "usage: neuron-ls", "null"])
+    def test_rejects_non_payloads(self, stdout):
+        # "null" is valid JSON but never a device list, so treating it as a miss is intended.
+        assert not looks_like_json(stdout)
+
+
+class TestNeuronLsReportFromStdout:
+    """One parser for both neuron-ls JSON formats: the newer object (with instance-level info,
+    including the multi-node deployment) and the legacy bare device list."""
+
+    def test_parses_instance_format_with_multi_node_deployment(self):
+        stdout = json.dumps(
+            {
+                "instance_info": {
+                    "instance_type": "trn3-dev1.48xlarge",
+                    "instance_id": "i-05aa9dd8c8eba4ae4",
+                    "logical_neuroncore_config": 2,
+                    "ultraserver_info": _ULTRASERVER_INFO,
+                },
+                "devices": [_device(0), _device(1)],
+            }
+        )
+        report = NeuronLsReport.from_stdout(stdout)
+        assert len(report.devices) == 2
+        assert [d.instance_type for d in report.devices] == ["trn3-dev1.48xlarge"] * 2
+        assert report.logical_host_id == "4569742665279272783"
+        assert (report.logical_host_rank, report.logical_host_size) == (2, 4)
+        assert report.total_physical_cores == 16  # 2 devices * 4 neuroncore_ids * lnc 2
+
+    def test_single_node_host_reports_no_deployment(self):
+        # A host outside a multi-node deployment omits ultraserver_info; its devices still parse.
+        stdout = json.dumps({"instance_info": {"instance_type": "trn2.48xlarge"}, "devices": [_device(0)]})
+        report = NeuronLsReport.from_stdout(stdout)
+        assert len(report.devices) == 1
+        assert report.devices[0].instance_type == "trn2.48xlarge"
+        assert report.logical_host_id is None
+
+    def test_device_level_instance_type_wins_over_instance_info(self):
+        stdout = json.dumps(
+            {
+                "instance_info": {"instance_type": "trn2.48xlarge"},
+                "devices": [_device(0, instance_type="trn3-dev1.48xlarge")],
+            }
+        )
+        assert NeuronLsReport.from_stdout(stdout).devices[0].instance_type == "trn3-dev1.48xlarge"
+
+    def test_instance_format_without_instance_type_leaves_it_empty(self):
+        stdout = json.dumps({"instance_info": {}, "devices": [_device(0)]})
+        assert NeuronLsReport.from_stdout(stdout).devices[0].instance_type == ""
+
+    @pytest.mark.parametrize("ultraserver_info", [None, {}, {"ultraserver_id": ""}, {"ultraserver_size": 4}])
+    def test_deployment_membership_requires_an_id(self, ultraserver_info):
+        # The id alone decides membership: without it there is no deployment to join, whatever
+        # else the host reports.
+        stdout = json.dumps(
+            {"instance_info": {"ultraserver_info": ultraserver_info}, "devices": [_device(0)]},
+        )
+        report = NeuronLsReport.from_stdout(stdout)
+        assert (report.logical_host_id, report.logical_host_rank, report.logical_host_size) == (None, None, None)
+
+    def test_deployment_is_reported_whatever_the_mode_is(self):
+        # An unset/undecided mode still names a deployment — the id is what groups hosts.
+        stdout = json.dumps(
+            {
+                "instance_info": {"ultraserver_info": {**_ULTRASERVER_INFO, "ultraserver_mode": "unset"}},
+                "devices": [_device(0)],
+            }
+        )
+        assert NeuronLsReport.from_stdout(stdout).logical_host_id == "4569742665279272783"
+
+    def test_parses_legacy_device_list_without_a_deployment(self):
+        # Legacy --json-output carries no instance-level info, so the deployment is unknown (None)
+        # rather than wrongly reported as single-node.
+        report = NeuronLsReport.from_stdout(json.dumps([_device(0, instance_type="trn2.48xlarge")]))
+        assert [d.neuron_device for d in report.devices] == [0]
+        assert report.devices[0].instance_type == "trn2.48xlarge"
+        assert report.logical_host_id is None
+        assert report.total_physical_cores == 8
+
+    @pytest.mark.parametrize("stdout", ["[]", "{}", "null"])
+    def test_empty_output_yields_no_devices(self, stdout):
+        report = NeuronLsReport.from_stdout(stdout)
+        assert report.devices == []
+        assert report.total_physical_cores == 0
+
+    def test_instance_format_without_devices_yields_no_devices(self):
+        report = NeuronLsReport.from_stdout(json.dumps({"instance_info": {"ultraserver_info": _ULTRASERVER_INFO}}))
+        assert report.devices == []
+        assert report.logical_host_id == "4569742665279272783"
+
+    def test_malformed_output_raises(self):
+        # The caller decides what an unreadable host means; the parser does not guess.
+        with pytest.raises(json.JSONDecodeError):
+            NeuronLsReport.from_stdout("neuron-ls: unrecognized option")
+        with pytest.raises(ValueError, match="unexpected neuron-ls JSON type"):
+            NeuronLsReport.from_stdout("42")

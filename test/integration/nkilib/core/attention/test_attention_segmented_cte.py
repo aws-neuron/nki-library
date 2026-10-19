@@ -38,7 +38,7 @@ from test.utils.common_dataclasses import (
     Platforms,
     prepare_model_parametrize,
 )
-from test.utils.metrics_collector import IMetricsCollector
+from test.utils.metrics_collector import IMetricsCollector, MetricName
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -58,6 +58,7 @@ def generate_inputs(
     sliding_window: int | None = None,
     seqlen_q: int | None = None,
     use_sink: bool = False,
+    force_no_sink: bool = False,
     sink_value: float | None = None,
     active_seqlen: int | None = None,
     k_pre_transposed: bool = False,
@@ -143,7 +144,11 @@ def generate_inputs(
 
     # Sink tensor: constant override takes priority over the default random [0,1)
     # sampling so we can exercise sink magnitudes outside the default range.
-    if sink_value is not None:
+    if force_no_sink:
+        # Force sink=None even under SWA (where a sink is otherwise auto-populated)
+        # to exercise the sink-absent path.
+        sink = None
+    elif sink_value is not None:
         sink = dt.static_cast(np.full(shape=(bs_q, 1), fill_value=sink_value, dtype=np.float32), dtype)
     elif sliding_window is not None or use_sink:
         sink = random_gen(shape=(bs_q, 1), dtype=dtype)
@@ -442,6 +447,7 @@ class TestSegmentedAttentionCTE:
         q_active,
         sliding_window=None,
         use_sink=False,
+        force_no_sink=False,
         sink_value=None,
         k_pre_transposed=False,
         fp8_packed=False,
@@ -449,6 +455,7 @@ class TestSegmentedAttentionCTE:
         v_scale_val=None,
         prescale_q=False,
         kv_dtype=None,
+        allow_vector_exp=None,
     ):
         def _gen(test_config, input_tensor_def=None):
             inputs = generate_inputs(
@@ -465,6 +472,7 @@ class TestSegmentedAttentionCTE:
                 seqlen_q=q_active,
                 sliding_window=sliding_window,
                 use_sink=use_sink,
+                force_no_sink=force_no_sink,
                 sink_value=sink_value,
                 k_pre_transposed=k_pre_transposed,
                 fp8_packed=fp8_packed,
@@ -480,6 +488,8 @@ class TestSegmentedAttentionCTE:
                 q_fp = q_fp * inv_sqrt_d
                 inputs["q"] = dt.static_cast(q_fp, dtype)
                 inputs["scale"] = 1.0
+            if allow_vector_exp is not None:
+                inputs["allow_vector_exp"] = allow_vector_exp
             return inputs
 
         return _gen
@@ -509,6 +519,7 @@ class TestSegmentedAttentionCTE:
         lnc=2,
         sliding_window=None,
         use_sink=False,
+        force_no_sink=False,
         sink_value=None,
         k_pre_transposed=False,
         fp8_packed=False,
@@ -518,6 +529,7 @@ class TestSegmentedAttentionCTE:
         kv_dtype=None,
         rtol=1e-2,
         atol=1e-2,
+        allow_vector_exp=None,
     ):
         bs_q = bs * num_q_heads
         input_gen = self._matrix_input_generator(
@@ -534,6 +546,7 @@ class TestSegmentedAttentionCTE:
             q_active=q_active,
             sliding_window=sliding_window,
             use_sink=use_sink,
+            force_no_sink=force_no_sink,
             sink_value=sink_value,
             k_pre_transposed=k_pre_transposed,
             fp8_packed=fp8_packed,
@@ -541,6 +554,7 @@ class TestSegmentedAttentionCTE:
             v_scale_val=v_scale_val,
             prescale_q=prescale_q,
             kv_dtype=kv_dtype,
+            allow_vector_exp=allow_vector_exp,
         )
         output_desc = self._matrix_output_descriptor(
             bs_q=bs_q,
@@ -1191,6 +1205,93 @@ class TestSegmentedAttentionCTE:
             sink_value=2.0,
         )
 
+    # head_dim=64 device latency budgets. Configs A/B/C run at 8Q:1KV, a fixed shape kept as a
+    # cheap relative gate; config A-TP4 is the production gpt-oss TP4/LNC2 shape (16Q:2KV) and is
+    # the one to quote. budget_ps is compared against TpbSgCyclesSum, which is a duration in
+    # PICOSECONDS despite its name, so 4.40e9 = 4.4 ms.
+    _DHEAD64_BUDGET_PARAMS = _MATRIX_PARAMS_BASE + ", budget_ps"
+    _dhead64_budget_perms = [
+        # config A: active 8192, prior 0.
+        pytest.param(1, 8, 1, 128, 2048, 64, 0, True, True, nl.bfloat16, 8192, 2.20e9),
+        # config B: active 8192, prior 128k.
+        pytest.param(1, 8, 1, 128, 2048, 64, 122880, True, True, nl.bfloat16, 8192, 55.0e9),
+        # config C: active 8192, prior 8192. Short-prior point: prior>0 puts the kernel on the
+        # segmented multi-chunk path without paying config B's ~55 ms sweep cost.
+        pytest.param(1, 8, 1, 128, 2048, 64, 8192, True, True, nl.bfloat16, 8192, 5.20e9),
+        # config A-TP4: production gpt-oss TP4/LNC2 shape -- 16Q:2KV, active 8192, prior 0.
+        # Same 8:1 q-per-kv grouping as config A but twice the heads, so twice the per-core work.
+        pytest.param(1, 16, 2, 128, 2048, 64, 0, True, True, nl.bfloat16, 8192, 4.40e9),
+    ]
+
+    @pytest.mark.parametrize(_DHEAD64_BUDGET_PARAMS, _dhead64_budget_perms)
+    def test_attention_segmented_cte_dhead64_latency_budget(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+        budget_ps,
+    ):
+        """head_dim=64 device latency must come in under budget.
+
+        Correctness is still checked by _run_matrix_test, so a regression shows up as a
+        comparison failure rather than a slow pass.
+        """
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            use_sink=True,
+            sink_value=2.0,
+        )
+        # Read back the latency the orchestrator recorded during _run_matrix_test.
+        # Prefer the collector's get_metric() accessor. Fall back to the metrics
+        # context when running against a prebuilt nkilib_testing wheel that predates
+        # it: setup.py republishes test/utils as nkilib_testing, so a source-only
+        # edit stays invisible until the wheel is regenerated.
+        # get_finalized_metrics_context() is not usable here because it appends an
+        # extra ElapsedAllSec sample on every call, and teardown calls it again.
+        metric_name = MetricName.TPB_SG_CYCLES_SUM
+        read_metric = getattr(collector, "get_metric", None)
+        if read_metric is not None:
+            measured_ps = read_metric(metric_name)
+        else:
+            # getattr rather than attribute access: _metrics_context is declared on the
+            # concrete MetricsCollector, not on the IMetricsCollector interface this is
+            # annotated as, so naming it directly fails static type checking.
+            context = getattr(collector, "_metrics_context", None)
+            recorded = context.metrics.get(metric_name) if context is not None else None
+            measured_ps = float(recorded.values[-1]) if recorded and recorded.values else None
+        if measured_ps is None:
+            pytest.skip("device latency metric unavailable (metrics disabled or simulation-only run)")
+        if platform_target in (Platforms.TRN3, Platforms.TRN3_PDS):
+            assert measured_ps <= budget_ps, (
+                f"head_dim=64 latency {measured_ps / 1e9:.3f} ms exceeds budget {budget_ps / 1e9:.3f} ms "
+                f"(prior_tokens={prior_tokens}, q_active={q_active}); "
+                f"ratio {measured_ps / budget_ps:.2f}x"
+            )
+
     # --- #5c. Multi-batch sink (bs>1) — exercises per-batch sink slicing ---
 
     @pytest.mark.parametrize(
@@ -1411,6 +1512,60 @@ class TestSegmentedAttentionCTE:
             q_active=q_active,
             lnc=2,
             k_pre_transposed=True,
+        )
+
+    # --- #7b. Vector vs Scalar Engine exp (allow_vector_exp) --------------
+    # GQA 8:1, d=128, without and with one full prior segment.
+    allow_vector_exp_perms = _build_perms(
+        q_actives=[2048],
+        prior_seg_sizes=[2048],
+        block_sizes=[128],
+        head_ratios=[(8, 1)],
+        head_dims=[128],
+        prior_fn=lambda seg, q: [0, seg],
+        tp_q=True,
+        tp_out=True,
+        dtype=nl.bfloat16,
+        lnc=2,
+    )
+
+    @pytest.mark.parametrize("allow_vector_exp", [True, False])
+    @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, allow_vector_exp_perms)
+    def test_attention_segmented_cte_allow_vector_exp(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+        allow_vector_exp,
+    ):
+        """Segmented attention with the Vector or Scalar Engine exp."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            allow_vector_exp=allow_vector_exp,
         )
 
     # --- #8. FP8 KV cache dequantization (k_pre_transposed=True + scales) -
@@ -1833,6 +1988,69 @@ class TestSegmentedAttentionCTE:
             dtype=nl.bfloat16,
             q_active=q_active,
             lnc=2,
+        )
+
+    # --- tp_q=False / tp_out=False remainder coverage (non-SWA) -----------
+    # Closes the main segmented path's tp_q=False arcs and its tp_out=False
+    # remainder arcs in one config. Odd num_q_heads=3 -> bs_q=3: under LNC2 the
+    # primary shard runs AND the remainder shard runs. q_active=256 keeps two
+    # groups so Core 1's remainder slice is non-empty. Mirrors the proven
+    # remainder shape, only flipping tp_q/tp_out to False.
+    @pytest.mark.fast
+    def test_attention_segmented_cte_tp_qout_false_remainder(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+    ):
+        """Non-SWA tp_q=False + tp_out=False with odd bs_q (remainder path)."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=1,
+            num_q_heads=3,
+            num_kv_heads=1,
+            block_size=128,
+            prior_seg_size=2048,
+            head_dim=128,
+            prior_tokens=0,
+            tp_q=False,
+            tp_out=False,
+            dtype=nl.bfloat16,
+            q_active=256,
+            lnc=2,
+        )
+
+    # --- SWA tp_q=False / tp_out=False / sink=None / v_scale remainder ----
+    # Closes the remaining SWA-path config arcs in one small config: tp_q=False,
+    # tp_out=False, sink=None (force_no_sink suppresses the SWA auto-sink), and
+    # v_scale (delayed V-dequant on the remainder path, applied on a bf16 cache).
+    @pytest.mark.fast
+    def test_attention_segmented_cte_swa_tp_qout_false_no_sink(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+    ):
+        """SWA with tp_q=False, tp_out=False, sink=None, and v_scale (odd bs_q remainder)."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=1,
+            num_q_heads=3,
+            num_kv_heads=1,
+            block_size=128,
+            prior_seg_size=512,
+            head_dim=64,
+            prior_tokens=0,
+            tp_q=False,
+            tp_out=False,
+            dtype=nl.bfloat16,
+            q_active=256,
+            lnc=2,
+            sliding_window=128,
+            force_no_sink=True,
+            v_scale_val=1.5,
         )
 
 

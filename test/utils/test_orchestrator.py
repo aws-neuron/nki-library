@@ -43,10 +43,11 @@ from .common_dataclasses import (
     TraceMode,
     UploadProfileMode,
     normalize_golden_output,
+    normalize_kernel_input,
 )
 from .determinism_checker import DeterminismChecker
 from .exceptions import CompilationException, InferenceException, TestStatus, ValidationException
-from .host_management import Host, HostManager
+from .host_management import Host, HostManager, tag_failed_host
 from .metrics_collector import IMetricsCollector, MetricName
 from .negative_test_helpers import is_in_negative_test_context
 from .output_validator import OutputValidator
@@ -56,6 +57,7 @@ from .profiler_utils import (
     NEURON_RT_ENABLE_DGE_NOTIFICATIONS,
     NEURON_RT_INSTR_FETCH_ON_H2D,
     NEURON_RT_UCODE_LIB_PATH,
+    NEURON_RT_ULTRASERVER_MODE,
     ProfilerCommands,
     extract_and_filter_output_files,
 )
@@ -196,6 +198,9 @@ class Orchestrator:
         perf_analysis_enabled: bool = False,
         hw_profile_enabled: bool = True,
         kernel_name: str | None = None,
+        # Allocator/scheduler flow, one of nki.compiler.ncc_driver.COMPILE_MODES.
+        # None means unspecified; kernel_tracer resolves it to DEFAULT_COMPILE_MODE.
+        compile_mode: str | None = None,
     ):
         # Perf analysis reads NTFF artifacts, so it requires HW profiling enabled.
         if perf_analysis_enabled and not hw_profile_enabled:
@@ -228,6 +233,7 @@ class Orchestrator:
             config, "validation_histograms", False
         )
         self.nki_compilation_mode = nki_compilation_mode
+        self.compile_mode = compile_mode
         self.debugger_interactive: bool = feature_flag_helper.get_feature_flag(config, "debugger_interactive", False)
         self.debugger_core_id: int = feature_flag_helper.get_feature_flag(config, "debugger_core_id", 0)
         self.debugger_replay: bool = feature_flag_helper.get_feature_flag(config, "debugger_replay", False)
@@ -517,6 +523,9 @@ class Orchestrator:
                     output_directory=self.fs_config.artifacts_output_directory_path,
                     output_names=output_names,
                     frontendMode=frontend_mode,
+                    # A test may pin the flow via CompilerArgs.compile_mode;
+                    # otherwise use the session/CLI default (--compile-mode).
+                    compile_mode=(kernel_under_test.compiler_input.compile_mode or self.compile_mode),
                     neuronx_cc_cache_path=self.neuronx_cc_cache_path,
                     collector=collector,
                 )
@@ -569,10 +578,16 @@ class Orchestrator:
                     with host_assignment_attempt as execution_host:
                         with self.collector.timer(MetricName.INFERENCE_TIME_TOTAL):
                             with self.collector.timer(MetricName.HOST_ARCH_VALIDATION_TIME):
-                                self.__confirm_host_arch__(
-                                    execution_host,
-                                    kernel_under_test.compiler_input.platform_target,
-                                )
+                                # The check is per node, so validate every physical host of the target.
+                                for host in execution_host.hosts:
+                                    try:
+                                        self.__confirm_host_arch__(
+                                            host,
+                                            kernel_under_test.compiler_input.platform_target,
+                                        )
+                                    except Exception as e:
+                                        tag_failed_host(e, host.get_host_id())
+                                        raise
 
                             # Soft-join the core-allocation FIFO queue before
                             # uploading artifacts so upload latency does not cost
@@ -619,7 +634,7 @@ class Orchestrator:
         """Run neuron-explorer on the prepared host."""
         kernel_input_args = self.__format_profiler_kernel_input_args__(kernel_under_test, input_file_paths)
 
-        env_vars: Optional[dict[str, str]] = kernel_under_test.inference_args.env_vars
+        env_vars: dict[str, str] = kernel_under_test.inference_args.env_vars or {}
         separation_pass_enabled = kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE
         single_compile_separation_enabled = self.trace_mode == TraceMode.CompileAndInferAndSeparate
         if (
@@ -629,38 +644,29 @@ class Orchestrator:
             or single_compile_separation_enabled
             or self.perf_analysis_enabled
         ):
-            if env_vars is None:
-                env_vars = {}
-
             if NEURON_RT_ENABLE_DGE_NOTIFICATIONS not in env_vars:
                 env_vars[NEURON_RT_ENABLE_DGE_NOTIFICATIONS] = "1"
 
-        if kernel_under_test.compiler_input.platform_target.value == "trn3_a0":
-            if env_vars is None:
-                env_vars = {}
+        if env_vars.get(NEURON_RT_ULTRASERVER_MODE) is not None:
+            env_vars[NEURON_RT_ULTRASERVER_MODE] = "4"  # force single node mode on Ultraservers by default
 
+        if kernel_under_test.compiler_input.platform_target.value == "trn3_a0":
             env_vars["NEURON_RT_ALLOW_LEGACY_NEFF"] = "1"
 
         # Point the runtime at the uploaded uCode lib
         if self.ucode_lib_path:
-            if env_vars is None:
-                env_vars = {}
             env_vars[NEURON_RT_UCODE_LIB_PATH] = f"./{os.path.basename(self.ucode_lib_path)}"
 
         # Forward the IRAM cache block size config to the execution host if set locally.
         # Value-only passthrough — no file to stage.
         iram_block_size = os.environ.get(NEURON_RT_DBG_SEQ_IRAM_BLOCK_SIZES_KB)
         if iram_block_size:
-            if env_vars is None:
-                env_vars = {}
             env_vars[NEURON_RT_DBG_SEQ_IRAM_BLOCK_SIZES_KB] = iram_block_size
 
         # Forward the instruction-fetch-on-H2D toggle to the execution host if set locally.
         # Value-only passthrough — no file to stage.
         instr_fetch_on_h2d = os.environ.get(NEURON_RT_INSTR_FETCH_ON_H2D)
         if instr_fetch_on_h2d is not None:
-            if env_vars is None:
-                env_vars = {}
             env_vars[NEURON_RT_INSTR_FETCH_ON_H2D] = instr_fetch_on_h2d
 
         # Save and download all outputs when determinism check or profile all runs is enabled.
@@ -958,10 +964,7 @@ class Orchestrator:
 
         Per-rank inputs are materialised for rank 0, the rank these paths look at.
         """
-        kernel_input = kernel_under_test.kernel_input
-        if isinstance(kernel_input, PerRankLazyInputGenerator):
-            return kernel_input.for_rank(0)
-        return kernel_input or {}
+        return normalize_kernel_input(kernel_under_test.kernel_input)
 
     def __dump_tensors__(
         self,

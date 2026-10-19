@@ -99,7 +99,7 @@ def load_gate_up_weight(sbm, w_hbm, i_tile, n_H512_tile_sharded, num_shards, sha
             nisa.dma_copy(dst=w_sb, src=w_hbm[:, :, i_start:i_end])
         return w_sb.view(nl.float8_e4m3fn_x4)
 
-    else:
+    else:  # pragma: no cover - the only callers (mlp_tkg_quad_fp8_static / _row) always feed scalar fp8 gate/up weights (6D->3D reshape to float8_e4m3fn before this call), so is_scalar_fp8 is always True; the non-scalar (pre-packed x4) branch is unreachable for STATIC_MX/ROW_MX
         w_sb = sbm.alloc_stack((_pmax, n_H512_tile_sharded, i_tile.size), dtype=w_hbm.dtype, buffer=nl.sbuf, align=32)
         if num_shards > 1:
             nisa.dma_copy(
@@ -196,7 +196,10 @@ def load_down_weight(sbm, down_w_hbm, i_tile, H_sharded, num_shards, shard_id, o
     if is_scalar_fp8:
         return down_w_sb.view(nl.float8_e4m3fn_x4)
 
-    return down_w_sb
+    # The only callers (mlp_tkg_quad_fp8_static / _row) always feed scalar fp8 down weights (4D->3D
+    # reshape to float8_e4m3fn before this call), so is_scalar_fp8 is always True; the non-scalar
+    # (pre-packed x4) return below is unreachable for STATIC_MX/ROW_MX.
+    return down_w_sb  # pragma: no cover
 
 
 def load_gate_up_bias_mx(bias_hbm, I, _pmax, n_I512_tile, _q_width):

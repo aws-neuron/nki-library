@@ -35,7 +35,15 @@ import pytest
 from _pytest.stash import Stash
 
 from test.utils.common_dataclasses import HostProvisioningResult, TraceMode
-from test.utils.pytest_plugin import apply_host_provisioning_result, get_pytest_mark_names, resolve_session_trace_mode
+from test.utils.pytest_plugin import (
+    KEEP_FAST_PROPERTY,
+    apply_host_provisioning_result,
+    get_pytest_mark_names,
+    record_keep_fast,
+    resolve_session_trace_mode,
+)
+from test.utils.simulation_setup import apply_xfail_simulation
+from test.utils.simulation_xfails import SIMULATION_XFAIL_NODEIDS, SIMULATION_XFAIL_REASON
 
 
 def _flags(**overrides):
@@ -66,6 +74,88 @@ class _MarkerNode:
 
     def iter_markers(self, name: str | None = None) -> Iterator[pytest.Mark]:
         return (marker for marker in self._markers if name is None or marker.name == name)
+
+
+class _CollectedItem:
+    """Stands in for a collected test: resolves and records markers like a pytest Item."""
+
+    def __init__(self, markers: list[pytest.Mark], nodeid: str = "") -> None:
+        self._markers = list(markers)
+        self.nodeid = nodeid
+        self.added: list[pytest.Mark] = []
+        self.user_properties: list[tuple[str, object]] = []
+
+    def get_closest_marker(self, name: str) -> pytest.Mark | None:
+        for marker in reversed(self._markers):
+            if marker.name == name:
+                return marker
+        return None
+
+    def add_marker(self, marker) -> None:
+        mark = getattr(marker, "mark", marker)
+        self._markers.append(mark)
+        self.added.append(mark)
+
+
+class TestApplyXfailSimulation:
+    """apply_xfail_simulation translates the xfail_simulation marker into a
+    non-strict xfail, and only for tagged tests (it is called in simulation mode only)."""
+
+    def test_marks_tagged_item_with_its_reason(self):
+        item = _CollectedItem([pytest.mark.xfail_simulation(reason="sim numerical gap").mark])
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1
+        assert xfails[0].kwargs["reason"] == "sim numerical gap"
+        assert xfails[0].kwargs["strict"] is False
+
+    def test_defaults_reason_when_marker_has_none(self):
+        item = _CollectedItem([pytest.mark.xfail_simulation.mark])
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1 and xfails[0].kwargs["reason"]
+
+    def test_ignores_untagged_item(self):
+        item = _CollectedItem([pytest.mark.fast.mark], nodeid="test/x.py::test_ok")
+        apply_xfail_simulation([item])
+        assert item.added == []
+
+    def test_marks_item_listed_in_nodeid_registry(self):
+        listed = next(iter(SIMULATION_XFAIL_NODEIDS))
+        item = _CollectedItem([], nodeid=listed)
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1
+        assert xfails[0].kwargs["reason"] == SIMULATION_XFAIL_REASON
+        assert xfails[0].kwargs["strict"] is False
+
+    def test_inline_marker_takes_precedence_over_registry(self):
+        listed = next(iter(SIMULATION_XFAIL_NODEIDS))
+        item = _CollectedItem([pytest.mark.xfail_simulation(reason="inline reason").mark], nodeid=listed)
+        apply_xfail_simulation([item])
+        xfails = [m for m in item.added if m.name == "xfail"]
+        assert len(xfails) == 1 and xfails[0].kwargs["reason"] == "inline reason"
+
+
+class TestRecordKeepFast:
+    """record_keep_fast carries a keep_fast test's reason to the junit report and
+    rejects a keep_fast marker without one."""
+
+    def test_records_reason_as_property(self):
+        item = _CollectedItem([pytest.mark.fast.mark, pytest.mark.keep_fast(reason="production config").mark])
+        record_keep_fast([item])
+        assert item.user_properties == [(KEEP_FAST_PROPERTY, "production config")]
+
+    def test_ignores_unmarked_item(self):
+        item = _CollectedItem([pytest.mark.fast.mark], nodeid="test/x.py::test_ok")
+        record_keep_fast([item])
+        assert item.user_properties == []
+
+    @pytest.mark.parametrize("mark", [pytest.mark.keep_fast, pytest.mark.keep_fast(reason="")])
+    def test_rejects_marker_without_reason(self, mark):
+        item = _CollectedItem([getattr(mark, "mark", mark)], nodeid="test/x.py::test_kept")
+        with pytest.raises(pytest.UsageError, match="test/x.py::test_kept: keep_fast needs a reason"):
+            record_keep_fast([item])
 
 
 def test_get_pytest_mark_names_returns_sorted_unique_names():

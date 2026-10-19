@@ -28,20 +28,28 @@ import nki.language as nl
 
 from ...core.utils.allocator import SbufManager
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.kernel_helpers import get_verified_program_sharding_info
+from ...core.utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...core.utils.logging import get_logger
-from ...core.utils.tensor_view import TensorView
 from ...core.utils.tiled_range import TiledRange
+from ..mla.deepseek.mla_common_cte import MlaPrecision, RopeLayout
 from .sparse_attention_indexer_bf16_helpers import (
     fused_layernorm_rope_k,
 )
+from .sparse_attention_indexer_bf16_proj import (
+    k_projection_bf16,
+    load_weights_bf16,
+    q_projection_bf16,
+)
 from .sparse_attention_indexer_mx_bf16score_helpers import (
+    POS_BLOCK,
     persist_k_bf16,
-    score_against_cache_bf16,
+    score_and_persist_blocked_bf16,
     transpose_k_for_cache,
 )
 from .sparse_attention_indexer_mx_helpers import (
+    DS_SCALE_BLOCK,
     H_PACK,
+    MX_BLOCK,
     k_and_weights_projection_mx,
     load_wk_mx_weights,
     q_projection_mx,
@@ -94,8 +102,14 @@ def sparse_attention_indexer_mx_bf16score(
     # topk output format (see Args); default = snake.
     emit_flat_topk: bool = False,
     emit_tiled_topk: bool = False,
+    # Weight-scale layout (see Args); default = native block-32.
+    compact_scales: bool = False,
+    # Projection precision and RoPE pairing (see Args).
+    precision: MlaPrecision = MlaPrecision.MX,
+    rope_layout: RopeLayout = RopeLayout.HALF_SPLIT,
+    qr_bf16_hbm: Optional[nl.NkiTensor] = None,
 ) -> tuple[nl.NkiTensor, nl.NkiTensor]:
-    """DeepSeek Sparse Attention Indexer — MX projections + BF16 score.
+    """Sparse Attention Indexer — MX or BF16 projections + BF16 score.
 
     Supported/optimal usage: head_dim == 128; dim and q_lora_rank multiples of
     512; batch_size == 1 and S a multiple of P_MAX (=128) on the validated
@@ -121,9 +135,15 @@ def sparse_attention_indexer_mx_bf16score(
             upstream QKV kernel.
         qr_scale_hbm: matching uint8 block-32 e8m0 scales for qr_qtz_hbm.
         wq_b: [q_lora_rank // 4, n_heads * head_dim] fp8_e4m3fn_x4.
-        wq_b_scale: [q_lora_rank // 32, n_heads * head_dim] uint8 e8m0.
+            BF16: [q_lora_rank, n_heads * head_dim] bfloat16. All the MX scale args below are
+            ignored in BF16 (pass ``None``), and ``wk`` becomes [dim, head_dim] bfloat16.
+        wq_b_scale: uint8 e8m0 weight scale; layout selected by compact_scales --
+            [q_lora_rank // 32, n_heads * head_dim] native block-32, or
+            [q_lora_rank // 128, ceil(n_heads * head_dim / 128)] compact block-128.
         wk: [dim // 4, head_dim] fp8_e4m3fn_x4 (contraction dim on partition).
-        wk_scale: [dim // 32, head_dim] uint8 e8m0.
+        wk_scale: uint8 e8m0 weight scale; layout selected by compact_scales --
+            [dim // 32, head_dim] native block-32, or
+            [dim // 128, ceil(head_dim / 128)] compact block-128.
         k_norm_gamma, k_norm_beta: [head_dim] LayerNorm gamma/beta.
         weights_proj: [n_heads, dim] per-head weights projection (always bf16).
         cos, sin: [S, rope_head_dim // 2] RoPE caches.
@@ -155,6 +175,29 @@ def sparse_attention_indexer_mx_bf16score(
             per-query by the paired attention kernel. Mutually exclusive with
             emit_flat_topk; both default False (snake output, decoded by the
             consumer, e.g. the fused mega kernel).
+        compact_scales: select the wq_b_scale / wk_scale layout. False (default) is the
+            NATIVE block-32 MX layout (one e8m0 byte per 32-K x 1-N group), already at
+            hardware granularity. True is the DeepSeek ``scale_fmt=ue8m0`` checkpoint
+            layout -- ONE byte per 128-K x 128-N weight block -- broadcast to the native
+            granularity in-kernel, so callers can feed checkpoint scales directly instead
+            of pre-expanding them (128x smaller scale tensors in HBM). Applies to the
+            WEIGHT scales only; qr_scale_hbm / x_mx_scale stay native block-32 since they
+            come from an upstream quantizer, not a checkpoint.
+        precision: arithmetic format of the Q and K PROJECTIONS. ``MX`` (default) or ``BF16``.
+            The score matmul and the W projection are bf16 in both — the W projection was
+            always bf16 despite ``w_projection_mx_batch``'s name, and the score path already
+            dropped MX (see Notes). BF16 additionally drops the ``dim``/``q_lora_rank``
+            multiple-of-512 requirement down to 128. Required for GLM-MoE-DSA, whose
+            checkpoints are bf16; pass ``qr_bf16_hbm`` instead of ``qr_qtz_hbm``/``qr_scale_hbm``.
+        rope_layout: element pairing for the Q and K RoPE. ``HALF_SPLIT`` (default) is what
+            DeepSeek-V3.2's indexer uses; ``INTERLEAVED`` is what GLM-MoE-DSA's indexer uses.
+            This is the ONE place the two models' RoPE genuinely differs — their main-attention
+            RoPE is identical (both interleaved). Applied to Q and K together; they are
+            contracted against each other, so a mismatch silently corrupts the scores rather
+            than failing.
+        qr_bf16_hbm: [B*S, q_lora_rank] bf16 q-normed compressed query — the BF16 Q-path input,
+            replacing the MX ``qr_qtz_hbm``/``qr_scale_hbm`` pair. This is what the bf16 MLA QKV
+            kernel exports (it has no MX-quantized qr to hand over). Already gamma-normed.
 
     Returns:
         index_score: [B*S, end_pos] f32 — pre-topk per-position scores.
@@ -193,10 +236,22 @@ def sparse_attention_indexer_mx_bf16score(
     """
     M, dim = x.shape
     S = M // batch_size
-    # qr is always supplied pre-quantized via qr_qtz_hbm (an upstream QKV kernel).
-    # Derive q_lora_rank from its layout [num_s_tiles, P_MAX, num_K_tiles, P_MAX]
-    # (num_K_tiles = q_lora_rank // (P_MAX * H_PACK)).
-    q_lora_rank = qr_qtz_hbm.shape[2] * P_MAX * H_PACK
+    """
+    q_lora_rank comes from whichever qr the selected precision consumes:
+      * MX: qr arrives pre-quantized as [num_s_tiles, P_MAX, num_K_tiles, P_MAX] with
+        num_K_tiles = q_lora_rank // (P_MAX * H_PACK).
+      * BF16: qr arrives as plain [B*S, q_lora_rank] (the bf16 QKV kernel has no MX-quantized
+        qr to export), so it is just the trailing dim.
+    """
+    if precision.is_bf16():
+        kernel_assert(
+            qr_bf16_hbm is not None,
+            "precision=BF16 requires qr_bf16_hbm ([B*S, q_lora_rank] bf16); qr_qtz_hbm/qr_scale_hbm "
+            "are the MX-only inputs.",
+        )
+        q_lora_rank = qr_bf16_hbm.shape[1]
+    else:
+        q_lora_rank = qr_qtz_hbm.shape[2] * P_MAX * H_PACK
     end_pos = end_pos_arg if (phase == "score" and end_pos_arg is not None) else start_pos + S
 
     # bf16-score path: Hadamard is mathematically a no-op when there's no
@@ -213,7 +268,61 @@ def sparse_attention_indexer_mx_bf16score(
         use_hadamard=False,
         batch_size=batch_size,
     )
-    validate_sai_config(cfg, M)
+    validate_sai_config(cfg, M, precision=precision)
+
+    """
+    Weight-scale layout check. Both layouts carry the same information at different
+    granularity, so a mismatched flag would silently read the wrong bytes (garbage
+    exponents -> corrupted scores) instead of failing. Check the shapes the selected
+    layout implies. Skipped when a scale is absent (phase splits that don't project) and
+    entirely on the bf16 path, which has no scales.
+    """
+    _DS_BLOCK = DS_SCALE_BLOCK
+    _total_out = n_heads * head_dim
+    if precision.is_bf16():
+        # BF16 weights are plain [K, N] with the contraction on rows.
+        kernel_assert(
+            tuple(wq_b.shape) == (q_lora_rank, _total_out),
+            f"precision=BF16 expects wq_b [q_lora_rank, n_heads*head_dim] = "
+            f"{(q_lora_rank, _total_out)}, got {tuple(wq_b.shape)}.",
+        )
+        kernel_assert(
+            wk is None or tuple(wk.shape) == (dim, head_dim),
+            f"precision=BF16 expects wk [dim, head_dim] = {(dim, head_dim)}, got "
+            f"{tuple(wk.shape) if wk is not None else None}.",
+        )
+    elif compact_scales:
+        if wq_b_scale is not None:
+            _want = (div_ceil(q_lora_rank, _DS_BLOCK), div_ceil(_total_out, _DS_BLOCK))
+            kernel_assert(
+                tuple(wq_b_scale.shape) == _want,
+                f"compact_scales=True expects wq_b_scale [q_lora_rank//{_DS_BLOCK}, "
+                f"ceil(n_heads*head_dim/{_DS_BLOCK})] = {_want}, got {tuple(wq_b_scale.shape)}. "
+                f"Pass compact_scales=False for the native block-32 layout.",
+            )
+        if wk_scale is not None:
+            _want = (div_ceil(dim, _DS_BLOCK), div_ceil(head_dim, _DS_BLOCK))
+            kernel_assert(
+                tuple(wk_scale.shape) == _want,
+                f"compact_scales=True expects wk_scale [dim//{_DS_BLOCK}, ceil(head_dim/{_DS_BLOCK})] "
+                f"= {_want}, got {tuple(wk_scale.shape)}.",
+            )
+    else:
+        if wq_b_scale is not None:
+            _want = (q_lora_rank // MX_BLOCK, _total_out)
+            kernel_assert(
+                tuple(wq_b_scale.shape) == _want,
+                f"wq_b_scale must be the native block-{MX_BLOCK} layout [q_lora_rank//{MX_BLOCK}, "
+                f"n_heads*head_dim] = {_want}, got {tuple(wq_b_scale.shape)}. "
+                f"Pass compact_scales=True for the DeepSeek compact block-{_DS_BLOCK} layout.",
+            )
+        if wk_scale is not None:
+            _want = (dim // MX_BLOCK, head_dim)
+            kernel_assert(
+                tuple(wk_scale.shape) == _want,
+                f"wk_scale must be the native block-{MX_BLOCK} layout [dim//{MX_BLOCK}, head_dim] "
+                f"= {_want}, got {tuple(wk_scale.shape)}.",
+            )
 
     T = round_up_to_chunks(end_pos)
     num_s_tiles_per_batch = (S + P_MAX - 1) // P_MAX
@@ -308,6 +417,10 @@ def sparse_attention_indexer_mx_bf16score(
         k_seq_out_hbm=k_seq_out_hbm,
         topk_flat_hbm=topk_flat_hbm,
         topk_tiled_hbm=topk_tiled_hbm,
+        compact_scales=compact_scales,
+        precision=precision,
+        rope_layout=rope_layout,
+        qr_bf16_hbm=qr_bf16_hbm,
         # Seq-shard the score+topk phase across LNC cores by query (the performant
         # path). score[q,:] depends only on query q, so cores split disjoint query
         # rows / topk batches with no cross-core barrier; K-proj stays replicated.
@@ -361,9 +474,13 @@ def _sai_indexer_bf16score_stage(
     k_seq_out_hbm=None,
     topk_flat_hbm=None,
     topk_tiled_hbm=None,
+    compact_scales=False,
+    precision=MlaPrecision.MX,
+    rope_layout=RopeLayout.HALF_SPLIT,
+    qr_bf16_hbm=None,
     seq_shard_score=False,
 ):
-    """SAI MX-projection + BF16-score body as an sbm-taking stage.
+    """SAI Q/K-projection + BF16-score body as an sbm-taking stage.
 
     Same logic as the ``sparse_attention_indexer_mx_bf16score`` entry, but driven by a
     caller-provided ``sbm`` and caller-allocated HBM outputs so a fused mega-kernel can
@@ -396,7 +513,9 @@ def _sai_indexer_bf16score_stage(
     S = M // batch_size
     # qr may be None on the pre-quantized path (qr_qtz_hbm supplied by an upstream stage);
     # then derive q_lora_rank from qr_qtz_hbm [num_s_tiles, P_MAX, num_K_tiles, P_MAX].
-    if qr is not None:
+    if precision.is_bf16():
+        q_lora_rank = qr_bf16_hbm.shape[1]
+    elif qr is not None:
         q_lora_rank = qr.shape[1]
     else:
         q_lora_rank = qr_qtz_hbm.shape[2] * P_MAX * H_PACK
@@ -423,10 +542,10 @@ def _sai_indexer_bf16score_stage(
     if do_kproj:
         gamma_sb = sbm.alloc_stack((P_MAX, head_dim), nl.float32)
         beta_sb = sbm.alloc_stack((P_MAX, head_dim), nl.float32)
-        gamma_hbm_view = TensorView(k_norm_gamma.reshape((1, head_dim))).broadcast(dim=0, size=P_MAX)
-        beta_hbm_view = TensorView(k_norm_beta.reshape((1, head_dim))).broadcast(dim=0, size=P_MAX)
-        nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view.get_view())
-        nisa.dma_copy(dst=beta_sb, src=beta_hbm_view.get_view())
+        gamma_hbm_view = k_norm_gamma.reshape((1, head_dim)).broadcast(dim=0, size=P_MAX)
+        beta_hbm_view = k_norm_beta.reshape((1, head_dim)).broadcast(dim=0, size=P_MAX)
+        nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view)
+        nisa.dma_copy(dst=beta_sb, src=beta_hbm_view)
 
     # No Hadamard needed in the bf16-score path: H @ H.T = I, so rotating
     # both Q and K and then doing a bf16 matmul is identical to the un-rotated
@@ -445,22 +564,38 @@ def _sai_indexer_bf16score_stage(
             # beats query-sharding Q, which drops M to 64 (half array) and, being on
             # the critical path before the score loop, costs more than the cheap
             # cross-core barrier it would remove (measured: query-shard Q 219->242us).
-            q_projection_mx(
-                sbm,
-                qr,
-                b_offset,
-                S,
-                wq_b,
-                wq_b_scale,
-                q_lora_rank,
-                n_heads,
-                head_dim,
-                num_shards=q_num_shards,
-                shard_id=q_shard_id,
-                q_out_hbm=q_full_hbm[b_idx, :, :],
-                qr_qtz_hbm=qr_qtz_hbm,
-                qr_scale_hbm=qr_scale_hbm,
-            )
+            if precision.is_bf16():
+                q_projection_bf16(
+                    sbm,
+                    qr_bf16_hbm,
+                    b_offset,
+                    S,
+                    wq_b,
+                    q_lora_rank,
+                    n_heads,
+                    head_dim,
+                    num_shards=q_num_shards,
+                    shard_id=q_shard_id,
+                    q_out_hbm=q_full_hbm[b_idx, :, :],
+                )
+            else:
+                q_projection_mx(
+                    sbm,
+                    qr,
+                    b_offset,
+                    S,
+                    wq_b,
+                    wq_b_scale,
+                    q_lora_rank,
+                    n_heads,
+                    head_dim,
+                    num_shards=q_num_shards,
+                    shard_id=q_shard_id,
+                    q_out_hbm=q_full_hbm[b_idx, :, :],
+                    qr_qtz_hbm=qr_qtz_hbm,
+                    qr_scale_hbm=qr_scale_hbm,
+                    compact_scales=compact_scales,
+                )
             sbm.close_scope()
         # NOTE: core_barrier deferred until just before chunk_loop reads
         # q_full_hbm. Q-proj is LNC-sharded; both cores must finish before
@@ -483,13 +618,18 @@ def _sai_indexer_bf16score_stage(
         wk_fp8_sb = None
         wk_scale_sb_loaded = None
         if do_kproj:
-            wk_fp8_sb, wk_scale_sb_loaded = load_wk_mx_weights(
-                sbm,
-                wk,
-                wk_scale,
-                dim,
-                head_dim,
-            )
+            if precision.is_bf16():
+                # Plain [dim, head_dim] bf16, hoisted K-major in one DMA; no scale companion.
+                wk_fp8_sb = load_weights_bf16(sbm, wk, dim, head_dim)
+            else:
+                wk_fp8_sb, wk_scale_sb_loaded = load_wk_mx_weights(
+                    sbm,
+                    wk,
+                    wk_scale,
+                    dim,
+                    head_dim,
+                    compact_scales=compact_scales,
+                )
         # weights_proj hoist + batch W-projection feed the score's per-head
         # weighted accumulate — only the score phase needs them.
         wp_tile_T_hoist = None
@@ -581,34 +721,57 @@ def _sai_indexer_bf16score_stage(
             # ---- K-projection phase: project + LayerNorm + RoPE this rank's K. ----
             if do_kproj:
                 k_sb = sbm.alloc_stack((P_MAX, head_dim), nl.float32)
-                # skip_w=True: W-projection ran at batch level (score phase) or is
-                # not needed at all (kproj-only phase); this call is K-proj only.
-                k_and_weights_projection_mx(
-                    sbm,
-                    x,
-                    row_start,
-                    tile_size,
-                    wk_fp8_sb,
-                    wk_scale_sb_loaded,
-                    weights_proj,
-                    dim,
-                    head_dim,
-                    n_heads,
-                    combined_scale,
-                    x_non_mx=x_non_mx,
-                    x_mx_data=x_mx_data,
-                    x_mx_scale=x_mx_scale,
-                    wp_tile_T_hoist=wp_tile_T_hoist,
-                    s_tile_idx=local_s_tile_idx + b_idx * num_s_tiles_per_batch,
-                    k_sb=k_sb,
-                    weights_sb=None,
-                    skip_w=True,
-                )
+                if precision.is_bf16():
+                    # x_non_mx is the bf16 view of x the W-projection already relies on.
+                    k_projection_bf16(
+                        sbm,
+                        x_non_mx if x_non_mx is not None else x,
+                        row_start,
+                        tile_size,
+                        wk_fp8_sb,
+                        dim,
+                        head_dim,
+                        k_sb,
+                    )
+                else:
+                    # skip_w=True: W-projection ran at batch level (score phase) or is
+                    # not needed at all (kproj-only phase); this call is K-proj only.
+                    k_and_weights_projection_mx(
+                        sbm,
+                        x,
+                        row_start,
+                        tile_size,
+                        wk_fp8_sb,
+                        wk_scale_sb_loaded,
+                        weights_proj,
+                        dim,
+                        head_dim,
+                        n_heads,
+                        combined_scale,
+                        x_non_mx=x_non_mx,
+                        x_mx_data=x_mx_data,
+                        x_mx_scale=x_mx_scale,
+                        wp_tile_T_hoist=wp_tile_T_hoist,
+                        s_tile_idx=local_s_tile_idx + b_idx * num_s_tiles_per_batch,
+                        k_sb=k_sb,
+                        weights_sb=None,
+                        skip_w=True,
+                    )
 
                 # No K Hadamard: K stays as LayerNorm + RoPE'd bf16.
                 k_processed = sbm.alloc_stack((P_MAX, head_dim), nl.float32)
                 fused_layernorm_rope_k(
-                    sbm, k_sb, gamma_sb, beta_sb, cos_sb, sin_sb, k_processed, tile_size, head_dim, rope_head_dim
+                    sbm,
+                    k_sb,
+                    gamma_sb,
+                    beta_sb,
+                    cos_sb,
+                    sin_sb,
+                    k_processed,
+                    tile_size,
+                    head_dim,
+                    rope_head_dim,
+                    rope_layout=rope_layout,
                 )
                 # Cast f32 K to bf16 for cache writeback + score matmul.
                 k_processed_bf16 = sbm.alloc_stack((P_MAX, head_dim), nl.bfloat16)
@@ -692,78 +855,61 @@ def _sai_indexer_bf16score_stage(
                         cos_shard_sb = cos_sb
                         sin_shard_sb = sin_sb
                         weights_sb = weights_full_sb[:P_MAX, local_s_tile_idx, :n_heads]
-                    score_row_sb = sbm.alloc_stack((P_MAX, end_pos), nl.bfloat16)
                     q_hbm_tile_view = q_full_hbm[
                         b_idx, s_tile.start_offset + sc_start : s_tile.start_offset + sc_start + sc_S, :total_out
                     ]
-
-                    # "all" phase forwards the just-transposed current K (avoids the
-                    # HBM-write-commit-before-read race + a redundant load). CP "score"
-                    # phase has no local K (k_cache is fully pre-populated by the gather),
-                    # so load the full cache from HBM (k_current_T_sb=None).
-                    if phase == "all":
-                        score_against_cache_bf16(
-                            sbm,
-                            q_hbm_tile_view,
-                            cos_shard_sb,
-                            sin_shard_sb,
-                            k_cache,
-                            weights_sb=weights_sb,
-                            score_row_sb=score_row_sb,
-                            b_idx=b_idx,
-                            S=sc_S,
-                            end_pos=end_pos,
-                            n_heads=n_heads,
-                            head_dim=head_dim,
-                            rope_head_dim=rope_head_dim,
-                            k_current_T_sb=k_T_current_sb,
-                            current_start=cache_pos,
-                            current_size=tile_size,
-                        )
-                    else:
-                        score_against_cache_bf16(
-                            sbm,
-                            q_hbm_tile_view,
-                            cos_shard_sb,
-                            sin_shard_sb,
-                            k_cache,
-                            weights_sb=weights_sb,
-                            score_row_sb=score_row_sb,
-                            b_idx=b_idx,
-                            S=sc_S,
-                            end_pos=end_pos,
-                            n_heads=n_heads,
-                            head_dim=head_dim,
-                            rope_head_dim=rope_head_dim,
-                        )
-
-                    mask_sb = sbm.alloc_stack((P_MAX, end_pos), nl.bfloat16)
-                    nisa.dma_copy(
-                        dst=mask_sb[:sc_S, :end_pos],
-                        src=mask[row_start + sc_start : row_start + sc_start + sc_S, :end_pos],
-                    )
-                    nisa.tensor_tensor(
-                        dst=score_row_sb[:sc_S, :end_pos],
-                        data1=score_row_sb[:sc_S, :end_pos],
-                        data2=mask_sb[:sc_S, :end_pos],
-                        op=nl.add,
-                    )
-
-                    nisa.dma_copy(
-                        dst=index_score_hbm[row_start + sc_start : row_start + sc_start + sc_S, :end_pos],
-                        src=score_row_sb[:sc_S, :end_pos],
-                    )
-
-                    # Hardware topk over the score row. Each core writes its queries
-                    # to their global partition rows of the s-tile's score_padded slot
-                    # (part_offset=sc_start) and runs only its own topk batches
-                    # (batch_start..batch_end over the 8-query groups it owns).
                     global_s_tile_idx = b_idx * num_s_tiles_per_batch + local_s_tile_idx
+
+                    """
+                    Streamed (position-blocked) score path. The former full-width flow held
+                    five end_pos-wide SBUF buffers live (12 B/partition per position), which
+                    made anything past ~16k global untraceable; this keeps SBUF flat in
+                    end_pos by inverting the loop nest to position-major. It folds the
+                    mask-add and the padded-score persist in, so score_row_sb / mask_sb and
+                    the separate _pad_and_persist_score staging are all gone.
+                    """
+                    # Owned by THIS scope so it stays live across the topk phase below; see the
+                    # persist_buf note in score_and_persist_blocked_bf16.
+                    persist_buf = sbm.alloc_stack(
+                        (P_MAX, POS_BLOCK), nl.float32, name=f"score_persist_{global_s_tile_idx}_{sc_start}"
+                    )
+                    score_and_persist_blocked_bf16(
+                        sbm,
+                        q_hbm_tile_view,
+                        cos_shard_sb,
+                        sin_shard_sb,
+                        k_cache,
+                        weights_sb=weights_sb,
+                        mask_hbm=mask,
+                        mask_row_start=row_start + sc_start,
+                        score_padded_hbm=score_padded_hbm,
+                        s_tile_idx=global_s_tile_idx,
+                        T=round_up_to_chunks(end_pos),
+                        b_idx=b_idx,
+                        S=sc_S,
+                        end_pos=end_pos,
+                        n_heads=n_heads,
+                        head_dim=head_dim,
+                        rope_head_dim=rope_head_dim,
+                        index_score_hbm=index_score_hbm,
+                        index_score_row_start=row_start + sc_start,
+                        persist_buf=persist_buf,
+                        part_offset=sc_start,
+                        k_current_T_sb=k_T_current_sb if phase == "all" else None,
+                        current_start=cache_pos if phase == "all" else None,
+                        current_size=tile_size if phase == "all" else None,
+                        rope_layout=rope_layout,
+                    )
+
+                    # Hardware topk over the score row, which score_and_persist_blocked_bf16
+                    # has already written (masked, fp32, -inf padded) to this s-tile's
+                    # score_padded_hbm slot at partition offset sc_start. topk gathers its
+                    # snake from that HBM staging tensor, so it needs no resident score row.
                     b_start = sc_start // TOPK_QUERIES_PER_BATCH
                     b_end = (sc_start + sc_S + TOPK_QUERIES_PER_BATCH - 1) // TOPK_QUERIES_PER_BATCH
                     topk_over_score(
                         sbm,
-                        score_row_sb,
+                        None,  # score already persisted per block by the streamed path
                         sc_S,
                         end_pos,
                         index_topk,

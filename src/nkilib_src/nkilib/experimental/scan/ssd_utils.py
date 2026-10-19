@@ -21,15 +21,15 @@ from ...core.utils.kernel_helpers import get_program_sharding_info
 from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 
-def broadcast_scalar_to_column(scalar: nl.ndarray, num_rows: int) -> nl.ndarray:
+def broadcast_scalar_to_column(scalar: nl.NkiTensor, num_rows: int) -> nl.NkiTensor:
     """Broadcast a [1, 1] SBUF scalar to a [num_rows, 1] column vector.
 
     Args:
-        scalar (nl.ndarray): [1, 1], SBUF tensor containing the scalar value.
+        scalar (nl.NkiTensor): [1, 1], SBUF tensor containing the scalar value.
         num_rows (int): Number of rows in the output column vector.
 
     Returns:
-        nl.ndarray: [num_rows, 1], SBUF tensor with the scalar broadcast across all rows.
+        nl.NkiTensor: [num_rows, 1], SBUF tensor with the scalar broadcast across all rows.
     """
     result = nl.ndarray((num_rows, 1), dtype=nl.float32, buffer=nl.sbuf)
     stream_shuffle_broadcast(src=scalar, dst=result)
@@ -53,15 +53,15 @@ def compute_lnc_sharding(nheads: int) -> tuple:
     return heads_per_core, head_offset
 
 
-def transpose_row_to_column(row: nl.ndarray, seq_len: int) -> nl.ndarray:
+def transpose_row_to_column(row: nl.NkiTensor, seq_len: int) -> nl.NkiTensor:
     """Transpose a [1, seq_len] row to a [seq_len, 1] column via PSUM nc_transpose.
 
     Args:
-        row (nl.ndarray): [1, seq_len], SBUF tensor (row in free dimension).
+        row (nl.NkiTensor): [1, seq_len], SBUF tensor (row in free dimension).
         seq_len (int): Length of the row / number of elements.
 
     Returns:
-        nl.ndarray: [seq_len, 1], SBUF tensor (column in partition dimension).
+        nl.NkiTensor: [seq_len, 1], SBUF tensor (column in partition dimension).
     """
     transposed_psum = nl.ndarray((seq_len, 1), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(
@@ -74,26 +74,26 @@ def transpose_row_to_column(row: nl.ndarray, seq_len: int) -> nl.ndarray:
 
 
 def compute_cumulative_decay(
-    dt_row: nl.ndarray,
-    A_scalar: nl.ndarray,
-    ones_row: nl.ndarray,
-    zero_scalar: nl.ndarray,
+    dt_row: nl.NkiTensor,
+    A_scalar: nl.NkiTensor,
+    ones_row: nl.NkiTensor,
+    zero_scalar: nl.NkiTensor,
     chunk_size: int,
 ) -> tuple:
     """Compute cumulative decay cs = cumsum(dt * A) and exp(cs), exp(-cs).
 
     Args:
-        dt_row (nl.ndarray): [1, Q], Softplus'd timestep for one head.
-        A_scalar (nl.ndarray): [1, 1], State transition scalar (negative).
-        ones_row (nl.ndarray): [1, Q], Ones buffer for scan.
-        zero_scalar (nl.ndarray): [1, 1], Zero buffer for scan initial value.
+        dt_row (nl.NkiTensor): [1, Q], Softplus'd timestep for one head.
+        A_scalar (nl.NkiTensor): [1, 1], State transition scalar (negative).
+        ones_row (nl.NkiTensor): [1, Q], Ones buffer for scan.
+        zero_scalar (nl.NkiTensor): [1, 1], Zero buffer for scan initial value.
         chunk_size (int): Chunk size Q.
 
     Returns:
         tuple: (cs_row, exp_cs_col, exp_neg_cs_col)
-            - cs_row (nl.ndarray): [1, Q], Cumulative sum in free dimension.
-            - exp_cs_col (nl.ndarray): [Q, 1], exp(cs) in partition dimension.
-            - exp_neg_cs_col (nl.ndarray): [Q, 1], exp(-cs) in partition dimension.
+            - cs_row (nl.NkiTensor): [1, Q], Cumulative sum in free dimension.
+            - exp_cs_col (nl.NkiTensor): [Q, 1], exp(cs) in partition dimension.
+            - exp_neg_cs_col (nl.NkiTensor): [Q, 1], exp(-cs) in partition dimension.
     """
     Q = chunk_size
     log_decay = nl.ndarray((1, Q), dtype=nl.float32, buffer=nl.sbuf)

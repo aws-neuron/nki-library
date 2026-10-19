@@ -56,21 +56,32 @@ except ImportError:
 from nki.isa.constants import oob_mode
 
 from ...core.attention.attention_tkg import AttnTKGConfig, attention_tkg
-from ...core.attention.attention_tkg_utils import is_batch_sharded, is_fp8_e4m3, is_qk_swapped
+from ...core.attention.attention_tkg_seq_packed import attention_tkg_seq_packed
+from ...core.attention.attention_tkg_utils import (
+    get_qk_row_tile_factor,
+    is_batch_sharded,
+    is_fp8_e4m3,
+    is_qk_swapped,
+    resize_cache_block_len_for_attention_tkg_kernel,
+)
 from ...core.embeddings.rope import RoPE_sbuf
 from ...core.output_projection.output_projection_tkg import output_projection_tkg
 from ...core.qkv.qkv import qkv
 from ...core.utils.allocator import SbufManager, create_auto_alloc_manager, sizeinbytes
 from ...core.utils.common_types import DtypeMode, NormType, QKVOutputLayout, QuantizationType
+from ...core.utils.dma_names import dma_name
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import (
     div_ceil,
     get_max_positive_value_for_dtype,
     get_verified_program_sharding_info,
     is_hbm_buffer,
+    is_trn3_b1,
+    mega_flag_default_on,
     resolve_fp8_e4m3_dtype,
 )
 from ...core.utils.logging import get_logger
+from ...core.utils.rotation_matrix import build_rotation_matrix
 from .attention_block_tkg_sharding import (
     CPCollectiveMode,
     KVDPCollectiveMode,
@@ -81,6 +92,39 @@ from .attention_block_tkg_sharding import (
 )
 
 _ABT_FOLD_CACHE: dict = {}
+
+# Cross-layer cache for the constant [n,1] uint32 iota tiles used by the fp8_packed KV-cache
+# scatter (ones_tile=iota(offset=1), zero_tile=iota(offset=0)). These are compile-time constants
+# (stride-0 [[0,1]] pattern -> every element == offset), identical in all 36 layers, but are
+# otherwise regenerated per layer (ones_tile) / per K-tile (zero_tile). When
+# VLLM_NEURON_MEGA_IOTA_CACHE is set, one instance is generated and READ by every layer, so its
+# live range spans the whole kernel and the allocator keeps it resident (no clobber) while the
+# iota op is emitted once. Env-gated + module-global (like _ABT_FOLD_CACHE): NOT cleared between
+# traces, so keep it OFF outside the single-trace mega decode.
+_CONST_IOTA_CACHE: dict = {}
+
+
+def _const_iota_tile(n_part: int, offset: int) -> nl.NkiTensor:
+    """Return a [n_part, 1] uint32 iota(offset) tile, reused across layers when
+    VLLM_NEURON_MEGA_IOTA_CACHE is set (else freshly generated each call).
+
+    Example:
+        ones_tile = _const_iota_tile(nl.tile_size.pmax, 1)  # all == 1
+    """
+
+    def _make():
+        t = nl.ndarray((n_part, 1), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.iota(t, [[0, 1]], offset=offset)
+        return t
+
+    if not mega_flag_default_on("VLLM_NEURON_MEGA_IOTA_CACHE"):
+        return _make()
+    key = (n_part, offset)
+    t = _CONST_IOTA_CACHE.get(key)
+    if t is None:
+        t = _make()
+        _CONST_IOTA_CACHE[key] = t
+    return t
 
 
 # TODO(NKI-699): Refactor API to use configuration dataclasses for better clarity
@@ -120,7 +164,7 @@ def attention_block_tkg(
     active_blocks_table: Optional[nl.NkiTensor],
     K_cache: nl.NkiTensor,
     V_cache: nl.NkiTensor,
-    attention_mask: nl.NkiTensor,
+    attention_mask: Optional[nl.NkiTensor],
     sink: Optional[nl.NkiTensor],
     # -- KV cache update
     update_cache: bool,
@@ -139,6 +183,8 @@ def attention_block_tkg(
     # -- optional params with defaults
     softmax_scale: Optional[float] = None,
     enable_fa_s_prior_tiling: bool = True,
+    enable_pv_moving_free_dim_padding: bool = False,
+    enable_pv_swapped_column_tiling: bool = False,
     fp8_packed: bool = False,
     k_scale: Optional[nl.NkiTensor] = None,
     v_scale: Optional[nl.NkiTensor] = None,
@@ -158,6 +204,18 @@ def attention_block_tkg(
     CP: int = 1,
     CP_replica_group: Optional[ReplicaGroup] = None,
     CP_collective_mode: Optional[CPCollectiveMode] = None,
+    S_tkg: Optional[int] = None,
+    use_swdge_for_out_proj_weight_load: Optional[bool] = None,
+    out_proj_weight_load_engine: Optional[str] = None,
+    order_out_proj_after_v_prior_load: bool = False,
+    seq_packed_attention_mask: Optional[nl.NkiTensor] = None,
+    seq_packed_active_blocks_table: Optional[nl.NkiTensor] = None,
+    seq_packed_q_index_table: Optional[nl.NkiTensor] = None,
+    seq_packed_seq_id_table: Optional[nl.NkiTensor] = None,
+    seq_packed_accumulator_partial_route_table: Optional[nl.NkiTensor] = None,
+    seq_packed_accumulator_group_state_route_table: Optional[nl.NkiTensor] = None,
+    queue_pin_attn: bool = False,
+    queue_pin_early_after=None,
 ):
     """
     Fused Attention Block for Token Generation (TKG).
@@ -247,7 +305,9 @@ def attention_block_tkg(
             Block KV:
                 kv_heads == 1: [num_blocks, block_len, d_head] or [num_blocks, 1, block_len, d_head].
                 kv_heads >  1: [num_blocks, kv_heads, block_len, d_head].
-        attention_mask (nl.NkiTensor): Attention mask @ HBM.
+        attention_mask (Optional[nl.NkiTensor]): Attention mask @ HBM.
+            Required for ordinary attention. Sequence-packed attention uses
+            ``seq_packed_attention_mask`` instead, so this may be None.
             When pos_ids is provided: [S_tkg, B, q_heads_attn, S_tkg], active-only portion of the mask
             (the prior mask is generated in-kernel; layout is the same for swap and default).
             When pos_ids is None (full pre-generated mask): the layout MUST match the QK-swap decision.
@@ -265,6 +325,10 @@ def attention_block_tkg(
             responsible for incorporating k_scale (e.g., ``softmax_scale = scaling / k_scale``).
         enable_fa_s_prior_tiling: bool: Whether to enable flash attention (FA) for attention computation.
             When enabled, the attention computation is tiled along the context (s_prior) to reduce peak memory usage.
+        enable_pv_moving_free_dim_padding: Whether dense PV matmuls may compute neighboring batches
+            to target a moving free dimension of 64. Default: False.
+        enable_pv_swapped_column_tiling: Whether to use the experimental column-tiled P@V
+            formulation for eligible single-tile attention shapes. Default: False.
         fp8_packed (bool): When True with block KV, K_cache is fp8 [num_blocks, block_len // 2, d_head, 2]
             where the last dimension packs two consecutive sequence positions. Enables DMA transpose
             for FP8 block KV, avoiding the slower PE transpose fallback.
@@ -345,6 +409,17 @@ def attention_block_tkg(
             - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
             - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
             - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
+        use_swdge_for_out_proj_weight_load: Optional SWDGE override for W_out loads.
+        out_proj_weight_load_engine: Optional explicit HWDGE trigger engine for W_out loads.
+        order_out_proj_after_v_prior_load: Make the first W_out load wait for the final V-prior load.
+        queue_pin_attn: the two GpSimd parity-mask subtracts of the packed-K cache update take a
+            SCHEDULE-ONLY dependency (nki.isa.dependency.schedule: issue order for the compiler, no
+            semaphore, no numeric change) on the last V-prior load, so the in-order GpSimd queue never
+            holds them between the V-prior gathers.
+        queue_pin_early_after: an instruction handle (the previous layer's residual add #2); this layer's
+            early attention ops that wait on DMAs (RoPE trig shuffles, K-update index masks, sink column
+            copy) take a schedule-only dependency on it instead of being parked ahead of the previous
+            layer's MoE epilogue in the in-order Vector queue. None = unchanged.
 
         CP (int): Context parallelism degree - number of ranks that shard the KV cache
             along the sequence (context) dimension (1 = disabled). Each rank holds an
@@ -354,6 +429,21 @@ def attention_block_tkg(
             Required when CP > 1.
         CP_collective_mode (Optional[CPCollectiveMode]): Collective mode for CP output
             redistribution (ALL_TO_ALL or REDUCE_SCATTER). Defaults to ALL_TO_ALL when None.
+        seq_packed_attention_mask (Optional[nl.NkiTensor]): Packed schedule-row mask.
+            When provided, the active-block, Q-index, and sequence-ID tables are required
+            and the kernel dispatches to attention_tkg_seq_packed. The two accumulator
+            route tables are an optional all-or-none pair. This is the only attention mask
+            consumed on the packed path; ``attention_mask`` may be None, because B and S_tkg
+            are then derived from X and the block table (see _validate_and_extract_config).
+            See nkilib/core/attention/attention_tkg_sequence_packing_design_spec.md for the
+            schedule contract.
+        seq_packed_active_blocks_table (Optional[nl.NkiTensor]): Packed physical block routes.
+        seq_packed_q_index_table (Optional[nl.NkiTensor]): Packed Q tensor-indirection routes.
+        seq_packed_seq_id_table (Optional[nl.NkiTensor]): Packed absolute sequence IDs.
+        seq_packed_accumulator_partial_route_table (Optional[nl.NkiTensor]): Tensor Indirection routes that
+            scatter each row's slot partials into sequence groups. Must be supplied with the group-state route.
+        seq_packed_accumulator_group_state_route_table (Optional[nl.NkiTensor]): Tensor Indirection routes that
+            gather and scatter each group's persistent sequence state. Must be supplied with the partial route.
 
     KV Data Parallelism (KVDP > 1):
         KV-DP partitions the KV cache across ranks along the batch dimension. Each rank holds
@@ -454,6 +544,7 @@ def attention_block_tkg(
     """
 
     # ========== Validation and Setup ==========
+    use_seq_packed_attention = seq_packed_attention_mask != None
     config = _validate_and_extract_config(
         X,
         W_qkv,
@@ -482,6 +573,8 @@ def attention_block_tkg(
         is_h_transposed_by_4,
         dtype_mode,
         CP,
+        S_tkg,
+        use_seq_packed_attention,
     )
 
     B, S_tkg = config['B'], config['S_tkg']
@@ -506,6 +599,7 @@ def attention_block_tkg(
     bxs_tile = config['bxs_tile']
     kv_heads = config['kv_heads']
     is_CP = config['is_CP']
+    qk_swapped = config['qk_swapped']
     if is_CP:
         kernel_assert(CP_replica_group is not None, "CP_replica_group is required when CP > 1")
     I = d_head * (q_heads + 2 * kv_heads)
@@ -527,6 +621,61 @@ def attention_block_tkg(
         f"In-kernel KV cache update (update_cache=True) is not supported for d_head > {nl.tile_size.pmax} "
         f"(got d_head={d_head}); pass update_cache=False and update the cache externally.",
     )
+    if use_seq_packed_attention:
+        # Sequence-packed dispatch. See attention_tkg_sequence_packing_design_spec.md in
+        # core/attention for the schedule invariant and the metadata contract validated
+        # below and inside attention_tkg_seq_packed.
+        kernel_assert(
+            seq_packed_active_blocks_table != None
+            and seq_packed_q_index_table != None
+            and seq_packed_seq_id_table != None,
+            "Packed attention requires active-block, Q-index, and sequence-ID tables.",
+        )
+        has_any_accumulator_route = (
+            seq_packed_accumulator_partial_route_table != None or seq_packed_accumulator_group_state_route_table != None
+        )
+        has_all_accumulator_routes = (
+            seq_packed_accumulator_partial_route_table != None
+            and seq_packed_accumulator_group_state_route_table != None
+        )
+        kernel_assert(
+            not has_any_accumulator_route or has_all_accumulator_routes,
+            "Packed accumulator route tables must be supplied together.",
+        )
+        kernel_assert(KVDP == 1, f"Packed attention requires KVDP=1, got {KVDP}")
+        kernel_assert(CP == 1, f"Packed attention requires CP=1, got {CP}")
+        kernel_assert(
+            swa_start_pos_ids == None,
+            "Packed attention does not support sliding-window positions.",
+        )
+        kernel_assert(is_block_kv, "Packed attention requires block KV cache.")
+        # Packed rows are batch-sharded across the two logical NCs, so the batch
+        # must split evenly. Row counts and per-slot routing are validated
+        # against the schedule metadata inside attention_tkg_seq_packed.
+        kernel_assert(B % 2 == 0, f"Packed attention requires an even batch size, got {B}")
+        kernel_assert(S_tkg == 1, f"Packed attention requires s_active=1, got {S_tkg}")
+        kernel_assert(kv_heads == 1, f"Packed attention requires one KV head, got {kv_heads}")
+        kernel_assert(enable_fa_s_prior_tiling, "Packed attention requires FA prior-sequence tiling.")
+        # attention_tkg_seq_packed takes none of these three dense-path options, so the
+        # call site drops them: it emits no v_prior_load schedule handle and has its own
+        # PV formulation. Rejecting them beats silently ignoring a flag the caller set.
+        kernel_assert(
+            not order_out_proj_after_v_prior_load,
+            "Packed attention cannot order the output projection after the v_prior load.",
+        )
+        kernel_assert(
+            not enable_pv_moving_free_dim_padding and not enable_pv_swapped_column_tiling,
+            "Packed attention does not support the dense PV padding or column-tiling options.",
+        )
+    else:
+        kernel_assert(
+            seq_packed_active_blocks_table == None
+            and seq_packed_q_index_table == None
+            and seq_packed_seq_id_table == None
+            and seq_packed_accumulator_partial_route_table == None
+            and seq_packed_accumulator_group_state_route_table == None,
+            "Packed attention metadata must be supplied all together.",
+        )
 
     sbm = sbm if sbm != None else create_auto_alloc_manager(logger=get_logger("attn-block-tkg"))
     sbm.open_scope(name="attn-blk-tkg-scope")
@@ -537,6 +686,64 @@ def attention_block_tkg(
             (1, 1), dtype=KVDP_rank.dtype, buffer=nl.sbuf, name=sbm.get_name_prefix() + "dynamic_KVDP_rank_sb"
         )
         nisa.dma_copy(dynamic_KVDP_rank_sb, KVDP_rank)
+
+    enable_rope = cos != None and sin != None
+    use_packed_qk_rope = _use_packed_qk_rope(
+        B=B,
+        S_tkg=S_tkg,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        d_head=d_head,
+        n_bxs_tiles=n_bxs_tiles,
+        enable_rope=enable_rope,
+        rope_contiguous_layout=rope_contiguous_layout,
+        rmsnorm_pre_enabled=rmsnorm_QK_pre_rope_enabled,
+        rmsnorm_post_enabled=rmsnorm_QK_post_rope_enabled,
+    )
+    fuse_packed_q_scale = use_packed_qk_rope and not skip_attention and not is_KVDP and not is_CP
+    # The packed kernel folds the same replication into its own seq-id gather, and its
+    # TI index has d_head partitions, so a pre-duplicated 2*d_head Q fails the
+    # index/data partition-match assert instead of saving a pass.
+    row_tile_q_for_attention = (
+        not use_seq_packed_attention
+        and fuse_packed_q_scale
+        and _can_attention_consume_row_tiled_q(
+            qk_swapped=qk_swapped,
+            is_block_kv=is_block_kv,
+            K_cache=K_cache,
+            V_cache=V_cache,
+            active_blocks_table=active_blocks_table,
+            B_attn=B_attn,
+            q_heads_attn=q_heads_attn,
+            kv_heads=kv_heads,
+            S_tkg=S_tkg,
+            S_max_ctx=S_max_ctx,
+            d_head=d_head,
+            block_len=blk_len,
+            fp8_packed=fp8_packed,
+            kv_quant=kv_quant,
+            enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            sbm=sbm,
+        )
+    )
+    packed_q_scale = softmax_scale if softmax_scale != None else d_head ** (-0.5)
+    packed_k_scale_sb = None
+    packed_q_scale_sb = None
+    if fuse_packed_q_scale and softmax_scale == None and kv_quant and k_scale != None:
+        packed_k_scale_sb = nl.ndarray((d_head, 1), dtype=nl.float32, buffer=nl.sbuf)
+        packed_q_scale_sb = nl.ndarray((d_head, 1), dtype=nl.float32, buffer=nl.sbuf)
+        if k_scale.shape == (nl.tile_size.pmax, 1):
+            nisa.dma_copy(packed_k_scale_sb, k_scale[0:d_head, 0:1])
+        else:
+            nisa.dma_copy(packed_k_scale_sb, k_scale.broadcast(dim=0, size=d_head))
+        nisa.reciprocal(packed_q_scale_sb, packed_k_scale_sb)
+        nisa.tensor_scalar(
+            packed_q_scale_sb,
+            packed_q_scale_sb,
+            nl.multiply,
+            packed_q_scale,
+            engine=nisa.scalar_engine,
+        )
 
     # ========== QKV Projection ==========
     # Input:  X [B, S_tkg, H] @ HBM
@@ -602,6 +809,11 @@ def attention_block_tkg(
         v_scale=v_scale,
         io_dtype=X.dtype,
         sbm=sbm,
+        packed_q_scale=packed_q_scale if fuse_packed_q_scale else None,
+        packed_k_scale_sb=packed_k_scale_sb,
+        packed_q_scale_sb=packed_q_scale_sb,
+        row_tile_q_for_attention=row_tile_q_for_attention,
+        early_ops_after=queue_pin_early_after,
     )
 
     # ========== KV Data Parallelism: Input Collectives ==========
@@ -653,6 +865,11 @@ def attention_block_tkg(
     #         V_tkg_hbm [B_attn, 1, S_tkg, d_head] @ HBM
     # Output: attn_out [d_head, B_attn*q_heads_attn*S_tkg] @ SBUF or [B_attn, q_heads_attn, d_head, S_tkg] @ HBM
 
+    attention_schedule_handles = (
+        {} if (order_out_proj_after_v_prior_load or queue_pin_attn or queue_pin_early_after is not None) else None
+    )
+    if queue_pin_early_after is not None:
+        attention_schedule_handles["early_ops_after"] = queue_pin_early_after
     if skip_attention:
         attn_out = Q_tkg_sb
     else:
@@ -661,7 +878,9 @@ def attention_block_tkg(
         # without explicit softmax_scale, also divide by k_scale to dequantize
         # the KV cache values in the QK matmul.
         _softmax_scale = softmax_scale if softmax_scale != None else d_head ** (-0.5)
-        if softmax_scale == None and kv_quant and k_scale != None:
+        if fuse_packed_q_scale:
+            pass
+        elif softmax_scale == None and kv_quant and k_scale != None:
             # Fuse 1/k_scale into the Q scaling to dequantize KV cache in QK matmul.
             # Load k_scale to SBUF, compute reciprocal, apply both scales in one instruction.
             _q_pdim = Q_tkg_sb.shape[0]
@@ -717,20 +936,22 @@ def attention_block_tkg(
             Q_folded = Q_tkg_sb
             K_folded = K_tkg_sb
         else:
-            Q_folded = Q_tkg_sb.reshape((d_head, B_folded * q_per_group * S_tkg))
+            Q_folded = Q_tkg_sb.reshape((Q_tkg_sb.shape[0], B_folded * q_per_group * S_tkg))
             K_folded = K_tkg_sb.reshape((d_head, B_folded * S_tkg))
         V_folded = V_tkg_hbm.reshape((B_folded, 1, S_tkg, d_head))
-        # Swap consumes the mask bqh-major with s_prior last ([B, N, S, S_ctx]); default is s_prior-major
-        # ([S_ctx, B, N, S]). attention_tkg's swap _load_mask reshapes from [.., full_s_active_bqh, S_ctx].
-        if transposed_mask and swap_band_factor > 1:
-            # Partition banding: mask is already the fully-folded banded HBM array
-            # [bs_n_prgs * p_max, S_ctx // band_factor]; attention_tkg's banded _load_mask reshapes it to
-            # [bs_n_prgs, p_max, banded_sprior]. Pass through unchanged.
-            mask_folded = attention_mask
-        elif transposed_mask:
-            mask_folded = attention_mask.reshape((B_folded, q_per_group, S_tkg, attention_mask.shape[-1]))
-        else:
-            mask_folded = attention_mask.reshape((attention_mask.shape[0], B_folded, q_per_group, S_tkg))
+        mask_folded = None
+        if not use_seq_packed_attention:
+            # Swap consumes the mask bqh-major with s_prior last ([B, N, S, S_ctx]); default is s_prior-major
+            # ([S_ctx, B, N, S]). attention_tkg's swap _load_mask reshapes from [.., full_s_active_bqh, S_ctx].
+            if transposed_mask and swap_band_factor > 1:
+                # Partition banding: mask is already the fully-folded banded HBM array
+                # [bs_n_prgs * p_max, S_ctx // band_factor]; attention_tkg's banded _load_mask reshapes it to
+                # [bs_n_prgs, p_max, banded_sprior]. Pass through unchanged.
+                mask_folded = attention_mask
+            elif transposed_mask:
+                mask_folded = attention_mask.reshape((B_folded, q_per_group, S_tkg, attention_mask.shape[-1]))
+            else:
+                mask_folded = attention_mask.reshape((attention_mask.shape[0], B_folded, q_per_group, S_tkg))
         if is_block_kv and active_blocks_table is not None:
             # Memoize the fold view per (source table, shape) so the identity-keyed reuse of the
             # derived SBUF index tables downstream (attention_tkg._ABT_CACHE) can hit: a fresh
@@ -740,7 +961,7 @@ def attention_block_tkg(
             # leaving it always-on leaks views across independent traces in the same process
             # (that regressed the golden gate to cosine 0.887). Only enable it alongside
             # attention_tkg's matching cache, which the same flag gates.
-            if _os.environ.get("VLLM_NEURON_MEGA_ABT_REUSE"):
+            if mega_flag_default_on("VLLM_NEURON_MEGA_ABT_REUSE"):
                 _abt_fold_key = (id(active_blocks_table), B_folded, active_blocks_table.shape[-1])
                 active_blocks_table_folded = _ABT_FOLD_CACHE.get(_abt_fold_key)
                 if active_blocks_table_folded is None:
@@ -808,6 +1029,8 @@ def attention_block_tkg(
             # writing the de-tiled [B_folded, q_per_group, d_head, S] layout directly.
             out_in_sb=(do_out_proj or out_in_sb or is_KVDP or is_CP) and (d_head <= nl.tile_size.pmax),
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            enable_pv_moving_free_dim_padding=enable_pv_moving_free_dim_padding,
+            enable_pv_swapped_column_tiling=enable_pv_swapped_column_tiling,
             fp8_packed=fp8_packed,
             return_cp_softmax_stats=is_CP,
         )
@@ -829,24 +1052,46 @@ def attention_block_tkg(
                 "fa_running_sum": sbm.alloc_stack(stats_shape, dtype=nl.float32, buffer=nl.sbuf),
             }
 
-        attention_tkg(
-            q=Q_folded,
-            k_active=K_folded,
-            v_active=V_folded,  # Attention_tkg() wants V @ HBM
-            k_prior=k_prior,
-            v_prior=v_prior,
-            mask=mask_folded,
-            out=attn_out,  # OUT
-            cfg=attn_cfg,
-            sbm=sbm,
-            rope_pos_ids=pos_ids_folded,  # attention_tkg uses rope_pos_ids for in-kernel causal mask generation
-            start_pos_ids=swa_start_pos_ids_folded,
-            sink=sink_folded,
-            active_blocks_table=active_blocks_table_folded,
-            max_context_len=max_context_len,
-            dtype_mode=dtype_mode,
-            cp_softmax_stats_out=cp_softmax_stats_out,
-        )
+        if use_seq_packed_attention:
+            attention_tkg_seq_packed(
+                q=Q_folded,
+                k_active=K_folded,
+                v_active=V_folded,
+                k_prior=k_prior,
+                v_prior=v_prior,
+                mask=seq_packed_attention_mask,
+                out=attn_out,
+                cfg=attn_cfg,
+                sbm=sbm,
+                rope_pos_ids=pos_ids_folded,
+                sink=sink_folded,
+                active_blocks_table=seq_packed_active_blocks_table,
+                q_index_table=seq_packed_q_index_table,
+                seq_id_table=seq_packed_seq_id_table,
+                accumulator_partial_route_table=seq_packed_accumulator_partial_route_table,
+                accumulator_group_state_route_table=seq_packed_accumulator_group_state_route_table,
+                dtype_mode=dtype_mode,
+            )
+        else:
+            attention_tkg(
+                q=Q_folded,
+                k_active=K_folded,
+                v_active=V_folded,  # Attention_tkg() wants V @ HBM
+                k_prior=k_prior,
+                v_prior=v_prior,
+                mask=mask_folded,
+                out=attn_out,  # OUT
+                cfg=attn_cfg,
+                sbm=sbm,
+                rope_pos_ids=pos_ids_folded,  # attention_tkg uses rope_pos_ids for in-kernel causal mask generation
+                start_pos_ids=swa_start_pos_ids_folded,
+                sink=sink_folded,
+                active_blocks_table=active_blocks_table_folded,
+                max_context_len=max_context_len,
+                dtype_mode=dtype_mode,
+                cp_softmax_stats_out=cp_softmax_stats_out,
+                schedule_handles=attention_schedule_handles,
+            )
 
     # ========== Context Parallelism: Output Collectives ==========
     # CP output runs before KVDP output so that head reduction is:
@@ -943,6 +1188,12 @@ def attention_block_tkg(
             is_block_kv=is_block_kv,
             fp8_packed=fp8_packed,
             oob_skip=is_CP,
+            sched_after=queue_pin_early_after,
+            v_prior_last=(
+                attention_schedule_handles.get("v_prior_load")
+                if (queue_pin_attn and attention_schedule_handles is not None)
+                else None
+            ),
         )
         K_cache, V_cache = __internal_unsqueeze_head_dim(K_cache, V_cache, cache_had_head_dim, kv_heads)
     else:  # No cache update: return new K/V tokens
@@ -1003,6 +1254,13 @@ def attention_block_tkg(
             OUT_IN_SB=out_in_sb,
             sbm=sbm,
             dtype_mode=dtype_mode,
+            use_swdge_for_weight_load=use_swdge_for_out_proj_weight_load,
+            weight_load_engine=out_proj_weight_load_engine,
+            weight_load_dependency=(
+                attention_schedule_handles.get("v_prior_load")
+                if (order_out_proj_after_v_prior_load and attention_schedule_handles is not None)
+                else None
+            ),
         )
     else:
         kernel_assert(not transposed_out, "transposed_out requires output projection (W_out must be provided)")
@@ -1036,7 +1294,7 @@ def _validate_and_extract_config(
     W_qkv: nl.NkiTensor,
     K_cache: nl.NkiTensor,
     V_cache: nl.NkiTensor,
-    attention_mask: nl.NkiTensor,
+    attention_mask: Optional[nl.NkiTensor],
     cos: Optional[nl.NkiTensor],
     sin: Optional[nl.NkiTensor],
     rmsnorm_X_gamma: Optional[nl.NkiTensor],
@@ -1059,6 +1317,8 @@ def _validate_and_extract_config(
     is_h_transposed_by_4: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     CP: int = 1,
+    S_tkg_param: Optional[int] = None,
+    use_seq_packed_attention: bool = False,
 ) -> Dict[str, Any]:
     """
     Validate inputs and extract configuration parameters for attention block.
@@ -1068,7 +1328,8 @@ def _validate_and_extract_config(
         W_qkv (nl.NkiTensor): QKV projection weights
         K_cache (nl.NkiTensor): Key cache
         V_cache (nl.NkiTensor): Value cache
-        attention_mask (nl.NkiTensor): Attention mask
+        attention_mask (Optional[nl.NkiTensor]): Ordinary attention mask. May be
+            None for sequence-packed attention.
         cos (Optional[nl.NkiTensor]): RoPE cosine embeddings
         sin (Optional[nl.NkiTensor]): RoPE sine embeddings
         rmsnorm_X_gamma (Optional[nl.NkiTensor]): RMSNorm weights
@@ -1100,6 +1361,10 @@ def _validate_and_extract_config(
     use_pos_id = pos_ids is not None
 
     is_block_kv = active_blocks_table != None
+    if use_seq_packed_attention:
+        kernel_assert(is_block_kv, "Packed attention requires block KV cache.")
+    else:
+        kernel_assert(attention_mask != None, "attention_mask is required for ordinary attention")
     if use_pos_id and not is_block_kv:
         kernel_assert(S_ctx_param is not None, "S_ctx is required when using pos_ids with flat KV")
     else:
@@ -1113,17 +1378,34 @@ def _validate_and_extract_config(
         kernel_assert(X.shape[1] >= 2, f"transposed_in requires LNC>=2, got n_prgs={X.shape[1]}")
         H = X.shape[0] * X.shape[1] * X.shape[2]  # H0 * n_prgs * H1_shard = full H
         BxS = X.shape[3]
-        S_tkg = attention_mask.shape[3]  # mask is (_, B_attn, q_heads, S_tkg)
-        kernel_assert(BxS % S_tkg == 0, f"transposed_in BxS={BxS} must be divisible by S_tkg={S_tkg}")
-        B = BxS // S_tkg
+        if use_seq_packed_attention:
+            # Packed masks encode schedule rows and prior-cache positions, not S_tkg.
+            # The ordinary block table still carries the per-sequence batch dimension.
+            B = active_blocks_table.shape[0] * KVDP
+            kernel_assert(BxS % B == 0, f"transposed_in BxS={BxS} must be divisible by B={B}")
+            S_tkg = BxS // B
+        else:
+            S_tkg = attention_mask.shape[3]  # mask is (_, B_attn, q_heads, S_tkg)
+            kernel_assert(BxS % S_tkg == 0, f"transposed_in BxS={BxS} must be divisible by S_tkg={S_tkg}")
+            B = BxS // S_tkg
     elif X.buffer == nl.sbuf:
         # X.shape = (pmax, B*S, H // pmax) @ SBUF
         kernel_assert(len(X.shape) == 3, "SBUF input X must have 3 dimensions")
         kernel_assert(X.shape[0] == nl.tile_size.pmax, f"SBUF input X dim0 must be {nl.tile_size.pmax}")
         H = X.shape[2] * nl.tile_size.pmax
-        S_tkg = attention_mask.shape[3]  # mask is (_, B_attn, q_heads, S_tkg)
-        kernel_assert(X.shape[1] % S_tkg == 0, f"SBUF input X dim1={X.shape[1]} must be divisible by S_tkg={S_tkg}")
-        B = X.shape[1] // S_tkg
+        BxS = X.shape[1]
+        if use_seq_packed_attention:
+            B = active_blocks_table.shape[0] * KVDP
+            kernel_assert(BxS % B == 0, f"SBUF input X dim1={BxS} must be divisible by B={B}")
+            S_tkg = BxS // B
+        else:
+            kernel_assert(
+                S_tkg_param is not None or len(attention_mask.shape) >= 4,
+                "S_tkg is required for SBUF input when attention_mask is not 4D",
+            )
+            S_tkg = S_tkg_param if S_tkg_param is not None else attention_mask.shape[3]
+            kernel_assert(BxS % S_tkg == 0, f"SBUF input X dim1={BxS} must be divisible by S_tkg={S_tkg}")
+            B = BxS // S_tkg
     else:
         # X.shape = (B,S,H) @ HBM
         kernel_assert(is_hbm_buffer(X), "Input X must be in HBM or SBUF")
@@ -1270,6 +1552,7 @@ def _validate_and_extract_config(
                 f"Block KV cache shape mismatch: K={K_cache.shape} vs V={V_cache.shape}",
             )
     else:
+        kernel_assert(not use_seq_packed_attention, "Packed attention requires block KV cache.")
         S_ctx = attention_mask.shape[0] if not use_pos_id else S_ctx_param
         blk_len = 0
         # After the head-dim merge, flat KV is uniformly [B_folded, S_max, d] (B_folded = B_attn * kv_heads)
@@ -1307,7 +1590,9 @@ def _validate_and_extract_config(
         fuse_rope=False,
         kv_heads=kv_heads,
     )
-    transposed_mask = qk_swapped and not use_pos_id
+    # qk_swapped stays derived for every path (it is shape-only and the caller reads it back),
+    # but packed attention consumes seq_packed_attention_mask, so no ordinary-mask layout applies.
+    transposed_mask = qk_swapped and not use_pos_id and not use_seq_packed_attention
     # Partition banding (small per-NC batch): the swap mask arrives fully folded as
     # [bs_n_prgs * p_max, S_ctx // band_factor] instead of the logical [B, N, S, S_ctx]. Detect it the
     # same way attention_tkg does (bs_per_nc < batches_per_psum) so the shape check + fold below accept it.
@@ -1322,20 +1607,21 @@ def _validate_and_extract_config(
         bs_per_nc_ = bs_folded_ // (lnc_ if _bshard else 1)
         swap_band_factor = batches_per_psum // min(bs_per_nc_, batches_per_psum)
         _bs_n_prgs = lnc_ if _bshard else 1
-    if transposed_mask and swap_band_factor > 1:
-        expected_mask_shape = (_bs_n_prgs * nl.tile_size.pmax, S_ctx // swap_band_factor)
-    elif transposed_mask:
-        expected_mask_shape = (B_attn, q_heads_attn, S_tkg, S_ctx)
-    else:
-        expected_mask_dim0 = S_tkg if use_pos_id else S_ctx
-        expected_mask_shape = (expected_mask_dim0, B_attn, q_heads_attn, S_tkg)
-    mask_layout = "transposed (QK-swap)" if transposed_mask else "default"
-    kernel_assert(
-        tuple(attention_mask.shape) == expected_mask_shape,
-        f"attention_mask shape mismatch for {mask_layout} layout: expected {expected_mask_shape}, "
-        f"got {attention_mask.shape}. QK-swap (pre-generated mask) expects the transposed "
-        f"[B, N, S, S_ctx] mask; the default path expects [S_ctx, B, N, S] (or [S_tkg, B, N, S] with pos_ids).",
-    )
+    if not use_seq_packed_attention:
+        if transposed_mask and swap_band_factor > 1:
+            expected_mask_shape = (_bs_n_prgs * nl.tile_size.pmax, S_ctx // swap_band_factor)
+        elif transposed_mask:
+            expected_mask_shape = (B_attn, q_heads_attn, S_tkg, S_ctx)
+        else:
+            expected_mask_dim0 = S_tkg if use_pos_id else S_ctx
+            expected_mask_shape = (expected_mask_dim0, B_attn, q_heads_attn, S_tkg)
+        mask_layout = "transposed (QK-swap)" if transposed_mask else "default"
+        kernel_assert(
+            tuple(attention_mask.shape) == expected_mask_shape,
+            f"attention_mask shape mismatch for {mask_layout} layout: expected {expected_mask_shape}, "
+            f"got {attention_mask.shape}. QK-swap (pre-generated mask) expects the transposed "
+            f"[B, N, S, S_ctx] mask; the default path expects [S_ctx, B, N, S] (or [S_tkg, B, N, S] with pos_ids).",
+        )
     if swa_start_pos_ids is not None:
         kernel_assert(
             use_pos_id,
@@ -1405,6 +1691,7 @@ def _validate_and_extract_config(
         'kv_heads': kv_heads,
         'is_KVDP': is_KVDP,
         'use_pos_id': use_pos_id,
+        'qk_swapped': qk_swapped,
         'transposed_mask': transposed_mask,
         'swap_band_factor': swap_band_factor,
         'n_bxs_tiles': n_bxs_tiles,
@@ -1689,6 +1976,229 @@ def _process_head_group(
         nisa.tensor_copy(dst_4d, out)
 
 
+def _use_packed_qk_rope(
+    B: int,
+    S_tkg: int,
+    q_heads: int,
+    kv_heads: int,
+    d_head: int,
+    n_bxs_tiles: int,
+    enable_rope: bool,
+    rope_contiguous_layout: bool,
+    rmsnorm_pre_enabled: bool,
+    rmsnorm_post_enabled: bool,
+) -> bool:
+    """Use the GPT-OSS single-tile layout that packs Q-head pairs before RoPE."""
+    return (
+        is_trn3_b1()
+        and (B == 1 or S_tkg == 1)
+        and q_heads == 8
+        and kv_heads == 1
+        and d_head == 64
+        and n_bxs_tiles == 1
+        and enable_rope
+        and rope_contiguous_layout
+        and not rmsnorm_pre_enabled
+        and not rmsnorm_post_enabled
+    )
+
+
+def _can_attention_consume_row_tiled_q(
+    *,
+    qk_swapped: bool,
+    is_block_kv: bool,
+    K_cache: nl.NkiTensor,
+    V_cache: nl.NkiTensor,
+    active_blocks_table: Optional[nl.NkiTensor],
+    B_attn: int,
+    q_heads_attn: int,
+    kv_heads: int,
+    S_tkg: int,
+    S_max_ctx: int,
+    d_head: int,
+    block_len: int,
+    fp8_packed: bool,
+    kv_quant: bool,
+    enable_fa_s_prior_tiling: bool,
+    sbm: SbufManager,
+) -> bool:
+    """Match attention_tkg's row-tiling decision before producing a duplicated Q."""
+    if not qk_swapped or not is_block_kv:
+        return False
+
+    bs = B_attn * kv_heads
+    q_head = q_heads_attn // kv_heads
+    resized_block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
+        num_blocks_per_batch=active_blocks_table.shape[-1],
+        block_len=block_len,
+        lnc=nl.num_programs(0),
+        p_max=nl.tile_size.pmax,
+        bs=bs,
+        q_head=q_head,
+        s_active=S_tkg,
+        full_sprior=S_max_ctx,
+        enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+        fuse_rope=False,
+    )
+
+    is_fp8_kv = kv_quant and is_fp8_e4m3(K_cache.dtype) and is_fp8_e4m3(V_cache.dtype)
+    k_prior_load_size = 2 if is_fp8_kv else sizeinbytes(K_cache.dtype)
+    use_dma_transpose = k_prior_load_size == 2 and (not is_fp8_kv or fp8_packed) and d_head <= nl.tile_size.pmax
+    if not fp8_packed and (
+        resized_block_len < 8 or (resized_block_len <= 16 and d_head <= 16 and bs < 4 and nl.num_programs(0) == 2)
+    ):
+        use_dma_transpose = False
+
+    return (
+        get_qk_row_tile_factor(
+            is_auto_alloc=sbm.is_auto_alloc(),
+            d_head=d_head,
+            block_len=resized_block_len,
+            fp8_packed=fp8_packed,
+            use_dma_transpose=use_dma_transpose,
+        )
+        > 1
+    )
+
+
+def _process_packed_qk_rope(
+    QKV: nl.NkiTensor,
+    Q_out: nl.NkiTensor,
+    K_out: nl.NkiTensor,
+    trig_packed: nl.NkiTensor,
+    B: int,
+    S: int,
+    q_heads: int,
+    d_head: int,
+    sbm: SbufManager,
+    quantize_k: bool,
+    k_scale: Optional[nl.NkiTensor],
+    kv_quant_dtype,
+    q_scale: Optional[float],
+    k_scale_sb: Optional[nl.NkiTensor],
+    q_scale_sb: Optional[nl.NkiTensor],
+    sched_after=None,
+) -> Optional[nl.NkiTensor]:
+    """Extract Q/K pairs, apply RoPE in the packed layout, and write scaled Q.
+
+    ``sched_after``: the rotation-matrix build and the three trig-packing stream shuffles take a schedule-only
+    dependency on it (the previous layer's residual add #2) so they are not issued ahead of that layer's MoE
+    epilogue while waiting for the rope cos/sin DMA.
+    """
+    q_pair_count = q_heads // 2
+    packed_slot_count = q_pair_count + 1
+    tile_size = B * S
+
+    # Slot 0 contains K/V; slots 1..4 each contain two adjacent Q heads.
+    packed = sbm.alloc_stack(
+        (2 * d_head, B, packed_slot_count, S),
+        dtype=QKV.dtype,
+        buffer=nl.sbuf,
+    )
+    for pair_idx in range(q_pair_count):
+        pair_psum = nl.ndarray((2 * d_head, tile_size), dtype=QKV.dtype, buffer=nl.psum)
+        nisa.nc_transpose(
+            pair_psum,
+            QKV[:, nl.ds(pair_idx * 2 * d_head, 2 * d_head)],
+        )
+        nisa.tensor_copy(
+            packed[:, :, pair_idx + 1, :],
+            pair_psum.reshape((2 * d_head, B, S)),
+            engine=nisa.vector_engine if pair_idx % 2 == 0 else nisa.scalar_engine,
+        )
+
+    kv_psum = nl.ndarray((2 * d_head, tile_size), dtype=QKV.dtype, buffer=nl.psum)
+    nisa.nc_transpose(kv_psum, QKV[:, nl.ds(q_heads * d_head, 2 * d_head)])
+    nisa.tensor_copy(packed[:, :, 0, :], kv_psum.reshape((2 * d_head, B, S)))
+
+    rotate = build_rotation_matrix(
+        block_size=d_head,
+        num_blocks=2,
+        shifts=d_head // 2,
+        dtype=QKV.dtype,
+        negate=True,
+        engine=nisa.scalar_engine,
+        sched_after=sched_after,
+    )
+    half_d = d_head // 2
+    identity_shuffle = list(range(half_d))
+    trig_source = trig_packed[:half_d, :, :, :]
+    for block_idx in range(1, 4):
+        block = nl.ds(block_idx * half_d, half_d)
+        _shf = nisa.nc_stream_shuffle(
+            trig_packed[block, :, :, :].reshape((half_d, 2 * tile_size)),
+            trig_source.reshape((half_d, 2 * tile_size)),
+            identity_shuffle,
+        )
+        if sched_after is not None:
+            kernel_assert(_shf is not None, "QUEUE_PIN: nc_stream_shuffle returned no instruction handle")
+            _shf.depends_on(sched_after, kind=nisa.dependency.schedule)
+
+    packed_flat = packed.reshape((2 * d_head, packed_slot_count * tile_size))
+    rotated_psum = nl.ndarray(packed_flat.shape, dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(rotated_psum, rotate, packed_flat)
+
+    cos_packed = trig_packed[:, 0, :, :]
+    sin_packed = trig_packed[:, 1, :, :]
+    cos_broadcast = cos_packed.expand_dim(2).broadcast(2, packed_slot_count)
+    sin_broadcast = sin_packed.expand_dim(2).broadcast(2, packed_slot_count)
+    x_cos = sbm.alloc_stack(packed.shape, dtype=QKV.dtype, buffer=nl.sbuf)
+    rotated_sin = sbm.alloc_stack(packed.shape, dtype=QKV.dtype, buffer=nl.sbuf)
+    nisa.tensor_tensor(x_cos, packed, cos_broadcast, nl.multiply)
+    nisa.tensor_tensor(rotated_sin, rotated_psum.reshape(packed.shape), sin_broadcast, nl.multiply)
+    nisa.tensor_tensor(packed, x_cos, rotated_sin, nl.add)
+
+    q_even = Q_out.slice(2, start=0, end=q_heads, step=2)
+    q_odd = Q_out.slice(2, start=1, end=q_heads, step=2)
+    if q_scale is None:
+        nisa.tensor_copy(
+            q_even,
+            packed[:d_head, :, 1:packed_slot_count, :],
+            engine=nisa.vector_engine,
+        )
+        nisa.tensor_copy(
+            q_odd,
+            packed[d_head : 2 * d_head, :, 1:packed_slot_count, :],
+            engine=nisa.scalar_engine,
+        )
+    elif q_scale_sb is None:
+        nisa.tensor_scalar(
+            q_even,
+            packed[:d_head, :, 1:packed_slot_count, :],
+            nl.multiply,
+            q_scale,
+            engine=nisa.vector_engine,
+        )
+        nisa.tensor_scalar(
+            q_odd,
+            packed[d_head : 2 * d_head, :, 1:packed_slot_count, :],
+            nl.multiply,
+            q_scale,
+            engine=nisa.scalar_engine,
+        )
+    else:
+        nisa.tensor_scalar(
+            q_even,
+            packed[:d_head, :, 1:packed_slot_count, :],
+            nl.multiply,
+            q_scale_sb,
+            engine=nisa.vector_engine,
+        )
+        nisa.tensor_scalar(
+            q_odd,
+            packed[d_head : 2 * d_head, :, 1:packed_slot_count, :],
+            nl.multiply,
+            q_scale_sb,
+            engine=nisa.scalar_engine,
+        )
+
+    if quantize_k:
+        k_view = packed[:d_head, :, 0:1, :].reshape((d_head, B * S))
+        return _quantize_to_fp8(k_view, k_scale, sbm, kv_quant_dtype, scale_sb=k_scale_sb, name_tag="k_pre")
+    nisa.tensor_copy(K_out, packed[:d_head, :, 0:1, :])
+    return None
+
+
 def _QKV_processing(
     QKV: nl.NkiTensor,
     q_heads: int,
@@ -1715,6 +2225,11 @@ def _QKV_processing(
     v_scale: Optional[nl.NkiTensor],
     io_dtype,
     sbm: SbufManager,
+    packed_q_scale: Optional[float] = None,
+    packed_k_scale_sb: Optional[nl.NkiTensor] = None,
+    packed_q_scale_sb: Optional[nl.NkiTensor] = None,
+    row_tile_q_for_attention: bool = False,
+    early_ops_after=None,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor, Optional[nl.NkiTensor]]:
     """
     Unified Q/K/V processing with tiling. For each tile:
@@ -1756,6 +2271,20 @@ def _QKV_processing(
         V_sb: [B*kv_heads*S_tkg, d_head] @ SBUF for small batch KV cache update, None for large batch
     """
     I = d_head * (q_heads + 2 * kv_heads)
+    enable_rope = cos != None and sin != None
+    use_packed_qk_rope = _use_packed_qk_rope(
+        B=B,
+        S_tkg=S_tkg,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        d_head=d_head,
+        n_bxs_tiles=n_bxs_tiles,
+        enable_rope=enable_rope,
+        rope_contiguous_layout=rope_contiguous_layout,
+        rmsnorm_pre_enabled=rmsnorm_pre_enabled,
+        rmsnorm_post_enabled=rmsnorm_post_enabled,
+    )
+    produce_row_tiled_q = use_packed_qk_rope and packed_q_scale is not None and row_tile_q_for_attention
 
     # d_head > 128: Q/K are produced in the tiled [nl.tile_size.pmax, n_d_tiles*B*H*S] layout that
     # mainline attention_tkg's native d>128 path consumes (d-tile outermost). The tiled
@@ -1771,7 +2300,8 @@ def _QKV_processing(
         K_sb = sbm.alloc_stack((nl.tile_size.pmax, n_d_tiles * B * kv_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
     else:
         # Allocate full output buffers
-        Q_sb = sbm.alloc_stack((d_head, B * q_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
+        q_pdim = 2 * d_head if produce_row_tiled_q else d_head
+        Q_sb = sbm.alloc_stack((q_pdim, B * q_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
         K_sb = sbm.alloc_stack((d_head, B * kv_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
     V_hbm = nl.ndarray(
         (B, kv_heads, S_tkg, d_head),
@@ -1780,18 +2310,46 @@ def _QKV_processing(
         name=f"{sbm.get_name_prefix()}v_attention_hbm",
     )
 
-    enable_rope = cos != None and sin != None
-
     # Load RoPE embeddings to SBUF if needed
-    sb_cos, sb_sin = None, None
+    sb_cos, sb_sin, packed_trig = None, None, None
     if enable_rope:
-        sb_cos = _to_sbuf(cos, sbm)
-        sb_sin = _to_sbuf(sin, sbm)
+        if use_packed_qk_rope:
+            half_d = d_head // 2
+            packed_trig = sbm.alloc_stack((2 * d_head, 2, B, S_tkg), dtype=cos.dtype, buffer=nl.sbuf)
+            if cos.buffer == nl.sbuf:
+                nisa.tensor_copy(
+                    packed_trig[:half_d, 0, :, :],
+                    cos,
+                    engine=nisa.vector_engine,
+                )
+            else:
+                nisa.dma_copy(
+                    packed_trig[:half_d, 0, :, :],
+                    cos,
+                    name=f"{sbm.get_name_prefix()}packed_rope_cos_load",
+                )
+            if sin.buffer == nl.sbuf:
+                nisa.tensor_copy(
+                    packed_trig[:half_d, 1, :, :],
+                    sin,
+                    engine=nisa.vector_engine,
+                )
+            else:
+                nisa.dma_copy(
+                    packed_trig[:half_d, 1, :, :],
+                    sin,
+                    name=f"{sbm.get_name_prefix()}packed_rope_sin_load",
+                )
+        else:
+            sb_cos = _to_sbuf(cos, sbm)
+            sb_sin = _to_sbuf(sin, sbm)
 
     # Q_4d/K_4d are only used by the d<=128 (non-d-tiled) _process_head_group path below.
     if not is_d_tiled:
-        Q_4d = Q_sb.reshape((d_head, B, q_heads, S_tkg))
+        Q_4d = Q_sb[:d_head].reshape((d_head, B, q_heads, S_tkg))
         K_4d = K_sb.reshape((d_head, B, kv_heads, S_tkg))
+
+    packed_K_quantized = None
 
     for tile_idx in range(n_bxs_tiles):
         tile_start = tile_idx * bxs_tile
@@ -1810,7 +2368,7 @@ def _QKV_processing(
         # Slice cos/sin for this tile. Use nl.NkiTensor so the slice's parent strides survive
         # the rewrap inside RoPE_sbuf; a bare ndarray slice would lose its parent strides.
         tile_cos, tile_sin = None, None
-        if enable_rope:
+        if enable_rope and not use_packed_qk_rope:
             tile_cos = sb_cos.slice(1, start=tile_b_start, end=tile_b_start + tile_B)
             tile_sin = sb_sin.slice(1, start=tile_b_start, end=tile_b_start + tile_B)
 
@@ -1861,6 +2419,31 @@ def _QKV_processing(
                 B=B,
                 S=S_tkg,
             )
+        elif use_packed_qk_rope:
+            packed_K_quantized = _process_packed_qk_rope(
+                QKV=qkv_sb,
+                Q_out=Q_4d,
+                K_out=K_4d,
+                trig_packed=packed_trig,
+                B=B,
+                S=S_tkg,
+                q_heads=q_heads,
+                d_head=d_head,
+                sbm=sbm,
+                quantize_k=kv_quant,
+                k_scale=k_scale,
+                kv_quant_dtype=kv_quant_dtype,
+                q_scale=packed_q_scale,
+                k_scale_sb=packed_k_scale_sb,
+                q_scale_sb=packed_q_scale_sb,
+                sched_after=early_ops_after,
+            )
+            if produce_row_tiled_q:
+                nisa.tensor_copy(
+                    Q_sb[d_head : 2 * d_head],
+                    Q_sb[:d_head],
+                    engine=nisa.scalar_engine,
+                )
         else:
             # Process Q tile directly into Q_sb's [:, tile_b_start:tile_b_start+tile_B, :, :] slice
             _process_head_group(
@@ -1903,16 +2486,16 @@ def _QKV_processing(
             V_tile_sb = sbm.alloc_stack((tile_size, d_head), dtype=io_dtype, buffer=nl.sbuf)
             nisa.tensor_copy(V_tile_sb, qkv_sb[:, nl.ds(d_head * (q_heads + kv_heads), d_head)])
             if kv_quant:
-                V_tile_sb = _quantize_to_fp8(V_tile_sb, v_scale, sbm, kv_quant_dtype)
+                V_tile_sb = _quantize_to_fp8(V_tile_sb, v_scale, sbm, kv_quant_dtype, name_tag="v")
             V_hbm_view = (V_hbm.reshape((B * S_tkg, d_head))).slice(0, start=tile_start, end=tile_start + tile_size)
-            nisa.dma_copy(V_hbm_view, V_tile_sb)
+            nisa.dma_copy(V_hbm_view, V_tile_sb, name=dma_name(f"kv_v_new_store_t{tile_start}"))
         else:
             # Multi-KV-head V extraction. QKV packs V as [tile_B*S, kv_heads*d_head] (token-major);
             # V_hbm is [B, kv_heads, S_tkg, d_head])
             v_all_sb = sbm.alloc_stack((tile_size, kv_heads * d_head), dtype=io_dtype, buffer=nl.sbuf)
             nisa.tensor_copy(v_all_sb, qkv_sb[:, nl.ds(d_head * (q_heads + kv_heads), kv_heads * d_head)])
             if kv_quant:
-                v_all_sb = _quantize_to_fp8(v_all_sb, v_scale, sbm, kv_quant_dtype)
+                v_all_sb = _quantize_to_fp8(v_all_sb, v_scale, sbm, kv_quant_dtype, name_tag="v_all")
             V_hbm_flat = V_hbm.reshape((B * kv_heads * S_tkg, d_head))
             for batch_idx in range(tile_B):
                 src_start = batch_idx * S_tkg
@@ -1924,8 +2507,10 @@ def _QKV_processing(
                     )
 
     # Quantize K to FP8 for attention when kv_quant=True
-    if kv_quant:
-        K_sb = _quantize_to_fp8(K_sb, k_scale, sbm, kv_quant_dtype)
+    if packed_K_quantized is not None:
+        K_sb = packed_K_quantized
+    elif kv_quant:
+        K_sb = _quantize_to_fp8(K_sb, k_scale, sbm, kv_quant_dtype, name_tag="k")
 
     # For small batch (single tile), keep V in SBUF for KV cache update.
     V_sb = V_tile_sb if kv_heads == 1 and n_bxs_tiles == 1 else None
@@ -2027,9 +2612,13 @@ def _kv_cache_update(
     is_block_kv: bool,
     fp8_packed: bool = False,
     oob_skip: bool = False,
+    sched_after=None,
+    v_prior_last=None,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Update KV cache with new tokens for token generation.
+
+    ``sched_after`` / ``v_prior_last`` (block fp8_packed path only): see _k_update_fp8_packed.
 
     Args:
         K_cache: K cache @ HBM
@@ -2072,7 +2661,18 @@ def _kv_cache_update(
         )
 
     if is_block_kv:
-        _update_block_cache(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B, fp8_packed=fp8_packed)
+        _update_block_cache(
+            K_cache,
+            V_cache,
+            K_tkg,
+            V_tkg,
+            kv_cache_update_idx,
+            S_tkg,
+            B,
+            fp8_packed=fp8_packed,
+            sched_after=sched_after,
+            v_prior_last=v_prior_last,
+        )
     elif S_tkg == 1 and B > 1 and (not K_cache_transposed or B > 16):
         # vector DMA with indirect addressing, tiled over batch dim. Bug for S_tkg > 1.
         _update_flat_cache_batched(
@@ -2379,6 +2979,8 @@ def _update_block_cache(
     S_tkg: int,
     B: int,
     fp8_packed: bool = False,
+    sched_after=None,
+    v_prior_last=None,
 ) -> None:
     """
     Update block KV cache with new tokens.
@@ -2395,7 +2997,18 @@ def _update_block_cache(
         B: batch size
         fp8_packed: when True, K_cache packs two fp8 rows into one bf16 row using parity-split scatter DMA.
     """
-    _update_block_cache_vectorized(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B, fp8_packed=fp8_packed)
+    _update_block_cache_vectorized(
+        K_cache,
+        V_cache,
+        K_tkg,
+        V_tkg,
+        kv_cache_update_idx,
+        S_tkg,
+        B,
+        fp8_packed=fp8_packed,
+        sched_after=sched_after,
+        v_prior_last=v_prior_last,
+    )
 
 
 def _update_block_cache_vectorized(
@@ -2407,6 +3020,8 @@ def _update_block_cache_vectorized(
     S_tkg: int,
     B: int,
     fp8_packed: bool = False,
+    sched_after=None,
+    v_prior_last=None,
 ) -> None:
     """Update block KV cache with new tokens using vectorized scatter DMA.
 
@@ -2455,8 +3070,6 @@ def _update_block_cache_vectorized(
     if fp8_packed:
         num_packed_rows = K_cache.shape[0] * K_cache.shape[1]
         K_cache_bf16 = (K_cache.reshape((num_packed_rows, d_head * 2))).view(nl.bfloat16)
-        ones_tile = nl.ndarray((tile_sz, 1), dtype=nl.uint32, buffer=nl.sbuf)
-        nisa.iota(ones_tile, [[0, 1]], offset=1)
 
     # LNC2 sharding strategy for the scatter:
     #   - Batch sharding (preferred): split the BxS tokens evenly across the cores so that BOTH
@@ -2483,11 +3096,22 @@ def _update_block_cache_vectorized(
         tile_B = min(tile_sz, prg_end - b_start)
 
         idx_tile = nl.ndarray((tile_B, 1), dtype=kv_cache_update_idx.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(idx_tile, idx_flat[nl.ds(b_start, tile_B)])
+        # Keep this index load on HWDGE so the JSON schedule can issue it before the
+        # software-DGE V-cache loads without occupying their queue.
+        nisa.dma_copy(
+            idx_tile,
+            idx_flat[nl.ds(b_start, tile_B)],
+            dge_mode=nisa.dge_mode.hwdge,
+            name=dma_name(f"kv_update_idx_load_b{b_start}"),
+        )
 
         if v_on_hbm:
             v_tile = nl.ndarray((tile_B, d_head), dtype=V_tkg.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(v_tile, V_tkg.reshape((BxS, d_head))[nl.ds(b_start, tile_B), :])
+            nisa.dma_copy(
+                v_tile,
+                V_tkg.reshape((BxS, d_head))[nl.ds(b_start, tile_B), :],
+                name=dma_name(f"kv_v_tkg_load_b{b_start}"),
+            )
         else:
             v_tile = V_tkg[nl.ds(b_start, tile_B), :]
 
@@ -2502,6 +3126,7 @@ def _update_block_cache_vectorized(
                 ),
                 src=v_tile,
                 oob_mode=oob_mode.skip,
+                name=dma_name(f"kv_v_cache_scatter_b{b_start}"),
             )
 
         # K update
@@ -2510,7 +3135,16 @@ def _update_block_cache_vectorized(
             _transpose_sbuf(K_tkg[:, nl.ds(b_start, tile_B)], K_tile_sb)
 
             if fp8_packed:
-                _k_update_fp8_packed(K_cache_bf16, K_tile_sb, idx_tile, ones_tile, tile_B, d_head)
+                _k_update_fp8_packed(
+                    K_cache_bf16,
+                    K_tile_sb,
+                    idx_tile,
+                    tile_B,
+                    d_head,
+                    name_tag=f"b{b_start}",
+                    sched_after=sched_after,
+                    v_prior_last=v_prior_last,
+                )
             else:
                 nisa.dma_copy(
                     dst=K_cache.reshape((num_blocks * blk_len, d_head)).ap(
@@ -2521,6 +3155,7 @@ def _update_block_cache_vectorized(
                     ),
                     src=K_tile_sb,
                     oob_mode=oob_mode.skip,
+                    name=dma_name(f"kv_k_cache_scatter_b{b_start}"),
                 )
 
 
@@ -2528,31 +3163,75 @@ def _k_update_fp8_packed(
     K_cache_bf16: nl.NkiTensor,
     K_tile_sb: nl.NkiTensor,
     idx_tile: nl.NkiTensor,
-    ones_tile: nl.NkiTensor,
     tile_B: int,
     d_head: int,
+    name_tag: str = "",
+    sched_after=None,
+    v_prior_last=None,
 ) -> None:
-    """Parity-split load-modify-store for fp8_packed K cache update."""
+    """Parity-split load-modify-store for fp8_packed K cache update.
+
+    Schedule-only dependencies (issue-order hints for the compiler, no semaphore, no numeric change, no engine move):
+      ``sched_after``: the two index-mask ``tensor_scalar`` ops are issued after the previous layer's residual
+        add #2, so this layer's K-update chain is not hoisted into that layer's MoE window.
+      ``v_prior_last``: the two parity subtracts are issued after the last V-prior load, so they do not sit
+        between the V-prior gathers waiting for the parity mask.
+    """
+    # Free bit reinterpret to signed: the bitvec ops below require dst and src to share a dtype, and
+    # in int32 the all-ones OOB sentinel is just -1, so no unsigned underflow is needed to build it.
+    # The caller's uint32_max "skip this slot" sentinel reinterprets to -1, which stays out of bounds.
+    idx_tile_i32 = idx_tile.view(nl.int32)
+
     # Packed row index: slot_idx >> 1
-    packed_row_idx = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.tensor_scalar(packed_row_idx, idx_tile, nl.right_shift, 1)
+    packed_row_idx = nl.ndarray((tile_B, 1), dtype=nl.int32, buffer=nl.sbuf)
+    _h_shift = nisa.tensor_scalar(packed_row_idx, idx_tile_i32, nl.right_shift, 1)
 
     # Parity: slot_idx & 1 (0=even/low byte, 1=odd/high byte)
-    parity_mask = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.tensor_scalar(parity_mask, idx_tile, nl.bitwise_and, 1)
+    parity_mask = nl.ndarray((tile_B, 1), dtype=nl.int32, buffer=nl.sbuf)
+    _h_par = nisa.tensor_scalar(parity_mask, idx_tile_i32, nl.bitwise_and, 1)
+    if sched_after is not None:
+        kernel_assert(
+            _h_shift is not None and _h_par is not None, "QUEUE_PIN: tensor_scalar returned no instruction handle"
+        )
+        _h_shift.depends_on(sched_after, kind=nisa.dependency.schedule)
+        _h_par.depends_on(sched_after, kind=nisa.dependency.schedule)
 
-    # Even-parity row indices (odd partitions get 0xFFFFFFFF -> OOB skip)
-    zero_tile = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.iota(zero_tile, [[0, 1]], offset=0)
-    even_oob_mask = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.tensor_tensor(even_oob_mask, zero_tile, parity_mask, nl.subtract)
-    packed_rows_even = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
+    # Both masks come from scalar immediates, so every value stays in {-1, 0, 1}: in range for int32
+    # and exactly representable. The previous uint32 form built the all-ones mask by underflowing
+    # 0 - 1, which only wraps on some engines -- Vector computes integers in float32 and saturates
+    # 0 - 1 to 0, leaving both masks zero so every row passed BOTH scatters and its fp8 K landed in
+    # both bytes of its packed pair. That required pinning the subtracts to GpSimd; nothing here
+    # depends on wrap behaviour. The explicit Scalar placement below is only a scheduling choice.
+
+    # Even-parity row indices (odd partitions get -1 = 0xFFFFFFFF -> OOB skip)
+    even_oob_mask = nl.ndarray((tile_B, 1), dtype=nl.int32, buffer=nl.sbuf)
+    _h_even = nisa.tensor_scalar(
+        even_oob_mask,
+        parity_mask,
+        nl.subtract,
+        0,
+        reverse0=True,
+        engine=nisa.engine.scalar if nisa.get_nc_version() == nisa.nc_version.gen4 else nisa.engine.vector,
+    )
+    packed_rows_even = nl.ndarray((tile_B, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_tensor(packed_rows_even, packed_row_idx, even_oob_mask, nl.bitwise_or)
 
-    # Odd-parity row indices (even partitions get 0xFFFFFFFF -> OOB skip)
-    odd_oob_mask = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
-    nisa.tensor_tensor(odd_oob_mask, parity_mask, ones_tile[nl.ds(0, tile_B), :], nl.subtract)
-    packed_rows_odd = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
+    # Odd-parity row indices (even partitions get -1 = 0xFFFFFFFF -> OOB skip)
+    odd_oob_mask = nl.ndarray((tile_B, 1), dtype=nl.int32, buffer=nl.sbuf)
+    _h_odd = nisa.tensor_scalar(
+        odd_oob_mask,
+        parity_mask,
+        nl.subtract,
+        1,
+        engine=nisa.engine.scalar if nisa.get_nc_version() == nisa.nc_version.gen4 else nisa.engine.vector,
+    )
+    if v_prior_last is not None:
+        kernel_assert(
+            _h_even is not None and _h_odd is not None, "QUEUE_PIN: tensor_scalar returned no instruction handle"
+        )
+        _h_even.depends_on(v_prior_last, kind=nisa.dependency.schedule)
+        _h_odd.depends_on(v_prior_last, kind=nisa.dependency.schedule)
+    packed_rows_odd = nl.ndarray((tile_B, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_tensor(packed_rows_odd, packed_row_idx, odd_oob_mask, nl.bitwise_or)
 
     # Pass 1 (even): gather packed rows, write fp8 into low bytes, scatter back
@@ -2566,6 +3245,7 @@ def _k_update_fp8_packed(
             indirect_dim=0,
         ),
         oob_mode=oob_mode.skip,
+        name=dma_name(f"kv_k_packed_gather_even_{name_tag}"),
     )
     row_buf_even_fp8 = row_buf_even.view(nl.float8_e4m3)
     nisa.tensor_copy(
@@ -2581,6 +3261,7 @@ def _k_update_fp8_packed(
         ),
         src=row_buf_even,
         oob_mode=oob_mode.skip,
+        name=dma_name(f"kv_k_packed_scatter_even_{name_tag}"),
     )
 
     # Pass 2 (odd): gather packed rows (with updated even bytes), write fp8 into high bytes, scatter back
@@ -2594,6 +3275,7 @@ def _k_update_fp8_packed(
             indirect_dim=0,
         ),
         oob_mode=oob_mode.skip,
+        name=dma_name(f"kv_k_packed_gather_odd_{name_tag}"),
     )
     row_buf_odd_fp8 = row_buf_odd.view(nl.float8_e4m3)
     nisa.tensor_copy(
@@ -2609,13 +3291,14 @@ def _k_update_fp8_packed(
         ),
         src=row_buf_odd,
         oob_mode=oob_mode.skip,
+        name=dma_name(f"kv_k_packed_scatter_odd_{name_tag}"),
     )
 
 
 ############################# FP8 Quantization Helpers #############################
 
 
-def _quantize_to_fp8(tensor, scale, sbm, dtype):
+def _quantize_to_fp8(tensor, scale, sbm, dtype, scale_sb=None, name_tag=""):
     """
     Quantize a tensor to FP8 E4M3 format using a single scalar scale.
 
@@ -2633,6 +3316,7 @@ def _quantize_to_fp8(tensor, scale, sbm, dtype):
                Supported dtypes: float32, float16, bfloat16.
         sbm: SbufManager for allocations
         dtype: Target quantized dtype (e.g. nl.float8_e4m3)
+        scale_sb: Optional preloaded FP32 scale in SBUF, shape (P, 1).
 
     Returns:
         FP8 E4M3 quantized tensor in SBUF, same shape as input
@@ -2645,22 +3329,40 @@ def _quantize_to_fp8(tensor, scale, sbm, dtype):
 
     partition_dim = tensor.shape[0]
 
-    # Copy scale to SBUF
-    # ndarray avoids anti-dependency with other stack values
-    scale_sb = nl.ndarray(shape=(partition_dim, 1), dtype=nl.float32, buffer=nl.sbuf)
-    if scale.shape == (nl.tile_size.pmax, 1):
-        nisa.dma_copy(dst=scale_sb, src=scale[0:partition_dim, :])
+    if scale_sb is None:
+        # ndarray avoids anti-dependency with other stack values
+        scale_sb = nl.ndarray(shape=(partition_dim, 1), dtype=nl.float32, buffer=nl.sbuf)
+        if scale.shape == (nl.tile_size.pmax, 1):
+            nisa.dma_copy(dst=scale_sb, src=scale[0:partition_dim, :], name=dma_name(f"kv_quant_scale_load_{name_tag}"))
+        else:
+            kernel_assert(scale.shape == (1, 1), f"scale must be (pmax, 1) or (1, 1), got {scale.shape}")
+            nisa.dma_copy(
+                dst=scale_sb,
+                src=scale.broadcast(dim=0, size=partition_dim),
+                name=dma_name(f"kv_quant_scale_bcast_load_{name_tag}"),
+            )
     else:
-        kernel_assert(scale.shape == (1, 1), f"scale must be (pmax, 1) or (1, 1), got {scale.shape}")
-        nisa.dma_copy(dst=scale_sb, src=scale.broadcast(dim=0, size=partition_dim))
+        kernel_assert(scale_sb.buffer == nl.sbuf, "preloaded quantization scale must be in SBUF")
+        kernel_assert(
+            scale_sb.shape == (partition_dim, 1),
+            f"preloaded quantization scale must be ({partition_dim}, 1), got {scale_sb.shape}",
+        )
 
-    # Scale: multiply by scale
-    tensor_scaled = sbm.alloc_stack(tensor.shape, dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(tensor_scaled, tensor, nl.multiply, scale_sb)
-
-    # Clip to FP8 range and cast
     tensor_fp8 = sbm.alloc_stack(tensor.shape, dtype=dtype, buffer=nl.sbuf)
-    nisa.tensor_scalar(tensor_fp8, tensor_scaled, nl.minimum, fp8_max, op1=nl.maximum, operand1=fp8_min)
+    use_direct_saturating_cast = (
+        is_trn3_b1() and len(tensor.shape) == 2 and min(tensor.shape) == 8 and max(tensor.shape) == 64
+    )
+    if use_direct_saturating_cast:
+        # Equivalent to the explicit clip only with saturating FP8 conversion. Hardware runs must
+        # keep NEURON_RT_ENABLE_OCP_SATURATION=1, and compiler FP8 saturation must not be disabled.
+        nisa.tensor_scalar(tensor_fp8, tensor, nl.multiply, scale_sb)
+    else:
+        # Scale: multiply by scale
+        tensor_scaled = sbm.alloc_stack(tensor.shape, dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(tensor_scaled, tensor, nl.multiply, scale_sb)
+
+        # Clip to FP8 range and cast
+        nisa.tensor_scalar(tensor_fp8, tensor_scaled, nl.minimum, fp8_max, op1=nl.maximum, operand1=fp8_min)
 
     return tensor_fp8
 

@@ -140,6 +140,88 @@ class TestPollWrapperUnit:
         ]
         assert kwargs["kwargs"] == {"caller_id": "gw1:test"}
 
+    def test_poll_hold_false_sends_no_hold_kwarg(self) -> None:
+        """hold=False leaves the wire call unchanged so older deployed helpers still accept it."""
+        executor = MagicMock()
+        executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "worst_case_eta": 1}
+        poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-9", False, LNC_CONFIG, hold=False)
+        _, kwargs = executor.call_function.call_args
+        assert kwargs["kwargs"] == {"caller_id": None}
+
+    def test_poll_hold_with_cap_sends_hold_cap_kwarg(self) -> None:
+        executor = MagicMock()
+        executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "worst_case_eta": 1}
+        poll(
+            executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-9", False, LNC_CONFIG, "gw1",
+            hold=True, hold_cap_seconds=300,
+        )  # fmt: skip
+        _, kwargs = executor.call_function.call_args
+        assert kwargs["kwargs"] == {"caller_id": "gw1", "hold": True, "hold_cap_seconds": 300}
+
+    def test_poll_cap_without_hold_is_not_sent(self) -> None:
+        """A cap is meaningless without hold, so a non-held call stays unchanged on the wire."""
+        executor = MagicMock()
+        executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "worst_case_eta": 1}
+        poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-9", False, LNC_CONFIG, hold_cap_seconds=300)
+        _, kwargs = executor.call_function.call_args
+        assert kwargs["kwargs"] == {"caller_id": None}
+
+    def test_poll_hold_without_cap_sends_no_cap(self) -> None:
+        executor = MagicMock()
+        executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "worst_case_eta": 1}
+        poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-9", False, LNC_CONFIG, hold=True)
+        _, kwargs = executor.call_function.call_args
+        assert "hold_cap_seconds" not in kwargs["kwargs"]
+
+    def test_poll_maps_assembled_flag(self) -> None:
+        executor = MagicMock()
+        executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0, "assembled": True}
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
+        assert result.assembled is True
+
+    def test_poll_assembled_defaults_false_when_absent(self) -> None:
+        executor = MagicMock()
+        executor.call_function.return_value = {"status": "IN_QUEUE", "position": 0}
+        result = poll(executor, TOTAL_CORES, NUM_PHYSICAL, TIMEOUT, VERSION, "entry-1", False, LNC_CONFIG)
+        assert result.assembled is False
+
+
+class TestRemoteLockOperationResult:
+    """The result dict built on the host from the deployed helper's LockResult."""
+
+    def _run(self, tmp_path, helper_source: str) -> dict:
+        helpers_file = tmp_path / "lock_helpers.py"
+        helpers_file.write_text(helper_source)
+        return core_lock_client._remote_lock_operation(
+            str(tmp_path / "atomic_lock"), str(helpers_file), "poll", [], None, flock_timeout=1
+        )
+
+    def test_reports_assembled_from_helper(self, tmp_path) -> None:
+        source = (
+            "from test.utils.scripts.remote_lock_scripts import LockResult, LockStatus\n"
+            "def poll():\n"
+            "    return LockResult(status=LockStatus.IN_QUEUE, assembled=True)\n"
+        )
+        assert self._run(tmp_path, source)["assembled"] is True
+
+    def test_tolerates_helper_result_without_assembled(self, tmp_path) -> None:
+        """An older deployed helper's LockResult has no ``assembled`` field."""
+        source = (
+            "import enum\n"
+            "class _Status(enum.Enum):\n"
+            "    IN_QUEUE = 'IN_QUEUE'\n"
+            "class _OldResult:\n"
+            "    status = _Status.IN_QUEUE\n"
+            "    cores = message = expiry = max_lock_expiry = position = worst_case_eta = None\n"
+            "    bumped = re_enqueued = False\n"
+            "    should_reset_cores = True\n"
+            "def poll():\n"
+            "    return _OldResult()\n"
+        )
+        result = self._run(tmp_path, source)
+        assert result["status"] == "IN_QUEUE"
+        assert result["assembled"] is False
+
 
 class TestDequeueWrapperUnit:
     """Unit tests for dequeue() response -> LockResult mapping."""
@@ -424,10 +506,11 @@ class TestScriptVersionBumpGuard:
     def test_script_version_was_bumped_past_one(self) -> None:
         assert remote_lock_scripts.SCRIPT_VERSION > 1
 
-    def test_script_version_bumped_for_lnc_reset_tracking(self) -> None:
-        # The LNC reset-tracking change (poll gains lnc_config, LockResult gains
-        # should_reset_cores) redeploys the helper; the bump is the deploy gate.
-        assert remote_lock_scripts.SCRIPT_VERSION == 5
+    def test_script_version_bumped_for_held_placement(self) -> None:
+        # Held placement (held entries get regions, poll gains hold_cap_seconds
+        # and reports assembled) redeploys the helper; the whole feature ships
+        # as one bump from 5. The lock-file protocol is unchanged.
+        assert remote_lock_scripts.SCRIPT_VERSION == 6
         assert core_lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION == 5
 
 

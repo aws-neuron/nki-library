@@ -99,6 +99,9 @@ LAYER_NORM_CONFIG = {
 # Parameters: vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, rtol, norm_type, quantization_type,
 #             fused_add, store_add, skip_gate, act_fn_type, gate_bias, up_bias, down_bias, norm_bias
 MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_FALSE = [
+    [2, 1, 128, 4096, 1792, None, 3e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    # Compute-bound BF16 regression sentinel: Qwen3-VL TP32 S8k (baseline ~80% MFU) — must not slow down
+    [2, 1, 8192, 5120, 800, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
     [2, 1, 128, 8192, 896, 238002211, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
     [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
     [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
@@ -177,6 +180,12 @@ MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_FALSE = [
     [2, 1, 578, 1408, 352, 105223169, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, True, ActFnType.GELU, False, True, True, True],
     [2, 1, 36864, 8192, 512, 8367215426, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, False, False, False, False],
     [2, 1, 512, 8192, 3584, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    # LNC=2, I >= 4096 with projection biases shards on I: each core must use its own up-bias slice and the
+    # down bias must be added once. ViT-L/14 (odd token count), ViT-H/14, V-JEPA2 ViT-L.
+    pytest.param(2, 1, 257, 1024, 4096, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, False, marks=pytest.mark.fast),
+    [2, 1, 257, 1280, 5120, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, False],
+    [2, 1, 2048, 1024, 4096, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, False],
+    [2, 1, 257, 1024, 4096, None, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, True, ActFnType.GELU, False, True, True, True],
 ]
 
 MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_TRUE = [
@@ -233,6 +242,8 @@ MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_TRUE = [
     [2, 1, 578, 1408, 352, 81332790, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, True, False, False, False],
     [1, 1, 578, 1408, 352, 99168579, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.GELU, True, True, True, False],
     [2, 1, 578, 1408, 352, 88505279, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.GELU, True, True, True, False],
+    # LNC=2, I >= 4096 with gate/up/down biases shards on I (gate-bias slice offset).
+    [2, 1, 256, 1024, 4096, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, True, True, False],
 ]
 
 def ceilalign(n, a):
@@ -244,14 +255,22 @@ MLP_CTE_UNIT_TEST_CASES_ROW_QUANT = [
     pytest.param(2, 1, 256, 16384, ceilalign(896, 128), 8.05e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
     [2, 4, 1024, 16384, ceilalign(896, 128), 1.96e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
     [2, 2, 1024, 16384, ceilalign(896, 128), 1.01e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    # Intermediate size whose 256-row remainder exceeds 128, i.e. the double-row down projection
+    # has a trailing pair of intermediate blocks that cannot be fed as one double-row matmul.
+    pytest.param(1, 1, 256, 1024, 448, None, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
 ]
 
 MLP_CTE_UNIT_TEST_CASES_STATIC_QUANT = [
     # Llama 3.3 70B
     [2, 1, 10240, 8192, ceilalign(1792, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    # Compute-bound STATIC regression sentinel: Llama-3.3-70B TP16 S8k (baseline ~84% MFU) — must not slow down
+    [2, 1, 8192, 8192, ceilalign(1792, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
     # Qwen 3 32B
     [2, 1, 10240, 5120, ceilalign(3200, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
     [2, 1, 10240, 5120, ceilalign(1600, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    # Intermediate size whose 256-row remainder exceeds 128, i.e. the double-row down projection
+    # has a trailing pair of intermediate blocks that cannot be fed as one double-row matmul.
+    [1, 1, 384, 1024, 448, None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
 ]
 
 # Slow-compile
@@ -616,6 +635,141 @@ class TestMlpCteKernel:
             test_manager=test_manager,
             kernel_input=kernel_input,
             compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            rtol=5e-2,
+        )
+
+    # ============================================================================
+    # CTE small-shape coverage mirrors
+    #
+    # The existing skip_gate / up_bias / quant-clipping / fp32-input / non-SPMD
+    # branches are exercised only by large-hidden model configs that the simulator
+    # silently skips, so these branches read 50% on the sim coverage run. The
+    # small-hidden (1024/2048) configs below run in simulation and close those gaps
+    # while reusing the shared torch reference + harness.
+    # ============================================================================
+    def _build_cte_kernel_input(
+        self,
+        vnc_degree,
+        batch,
+        seqlen,
+        hidden,
+        intermediate,
+        quant_type,
+        *,
+        skip_gate=False,
+        up_bias=False,
+        dtype=nl.bfloat16,
+        norm_type=NormType.NO_NORM,
+        gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
+    ):
+        """Build a CTE kernel_input directly (mirrors _kernel_input_generator's quant handling)."""
+        if quant_type.is_logical_row():
+            tensor_generator = mlp_row_quant_tensor_generator()
+        elif quant_type.is_logical_static():
+            tensor_generator = gaussian_tensor_generator(
+                mean=0.0,
+                std=5.0,
+                modifier_fn=modify_fp8_static_scale,
+                lnc=vnc_degree,
+            )
+        else:
+            tensor_generator = gaussian_tensor_generator()
+
+        if quant_type == QuantizationType.MX:
+            quant_dtype = nl.float8_e4m3fn
+        elif quant_type != QuantizationType.NONE:
+            quant_dtype = nl.float8_e4m3
+        else:
+            quant_dtype = None
+
+        kernel_input = build_fused_norm_mlp(
+            batch=batch,
+            seqlen=seqlen,
+            hidden=hidden,
+            intermediate=intermediate,
+            dtype=dtype,
+            quantization_type=quant_type,
+            quant_dtype=quant_dtype,
+            is_input_quantized=(quant_type != QuantizationType.NONE),
+            fused_add=False,
+            store_add=False,
+            lnc_degree=vnc_degree if vnc_degree > 1 else None,
+            skip_gate=skip_gate,
+            act_fn_type=ActFnType.SiLU,
+            gate_bias=False,
+            up_bias=up_bias,
+            down_bias=False,
+            norm_type=norm_type,
+            norm_bias=False,
+            mode=ComputationMode.PREFILL,
+            gate_up_w_layout=gate_up_w_layout,
+            tensor_generator=tensor_generator,
+        )
+        kernel_input["quant_clipping_bound"] = 0.0
+        kernel_input["force_cte_mode"] = False
+        kernel_input["sbm"] = None
+        return kernel_input
+
+    @pytest.mark.fast
+    def test_mlp_cte_up_bias_row_quant(self, test_manager: Orchestrator, platform_target: Platforms):
+        # ROW-quant up_proj_bias present (doublerow projection): mlp_cte_basic_projection.py L660/L784.
+        kernel_input = self._build_cte_kernel_input(
+            vnc_degree=2,
+            batch=1,
+            seqlen=256,
+            hidden=1024,
+            intermediate=896,
+            quant_type=QuantizationType.ROW,
+            up_bias=True,
+        )
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            rtol=4e-2,
+        )
+
+    @pytest.mark.fast
+    def test_mlp_cte_row_quant_clipping(self, test_manager: Orchestrator, platform_target: Platforms):
+        # ROW-quant with clipping bound > 0: mlp_cte_basic_quantization.py L181. A very large
+        # bound keeps the clip a numerical no-op (matches the unclipped torch reference) while
+        # still exercising has_clipping_bound()==True.
+        kernel_input = self._build_cte_kernel_input(
+            vnc_degree=2,
+            batch=1,
+            seqlen=256,
+            hidden=1024,
+            intermediate=896,
+            quant_type=QuantizationType.ROW,
+        )
+        kernel_input["quant_clipping_bound"] = 1.0e30
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            rtol=4e-2,
+        )
+
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.fast
+    def test_mlp_cte_mx_non_spmd(self, test_manager: Orchestrator, platform_target: Platforms):
+        # Non-SPMD (LNC1, single-program) MX launch path: mlp_cte_mx.py L91 else-branch.
+        kernel_input = self._build_cte_kernel_input(
+            vnc_degree=1,
+            batch=1,
+            seqlen=256,
+            hidden=2048,
+            intermediate=2048,
+            quant_type=QuantizationType.ROW_MX,
+            gate_up_w_layout=MLPGateUpWeightLayout.H_X4_MIDDLE,
+        )
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=CompilerArgs(logical_nc_config=1, platform_target=platform_target),
             output_tensor_descriptor=mlp_output_tensor_descriptor,
             rtol=5e-2,
         )

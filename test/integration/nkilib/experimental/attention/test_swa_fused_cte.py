@@ -150,8 +150,10 @@ def generate_inputs(
 
         k_cache = _pack_k(k_cache, k_scale_val)
         v_cache = _quant_v(v_cache, v_scale_val)
-        k_scale = np.full((1, 1), k_scale_val, dtype=np.float32)
-        v_scale = np.full((1, 1), v_scale_val, dtype=np.float32)
+        # [128,1]: per-tensor scale replicated across partitions, matching qkv_proj so the framework
+        # can hoist a single k_scale/v_scale tensor into both kernels.
+        k_scale = np.full((128, 1), k_scale_val, dtype=np.float32)
+        v_scale = np.full((128, 1), v_scale_val, dtype=np.float32)
 
     # block_tables: contiguous logical->physical mapping [0, 1, ..., total_blocks-1], sized EXACTLY
     # to total_blocks (NO tail padding). Production block_tables come from the model runtime and we

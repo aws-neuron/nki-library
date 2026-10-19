@@ -125,6 +125,12 @@ def pytest_addoption(parser):
     )
 
     group.addoption(
+        "--pytest-outcome-file",
+        action="store",
+        default=None,
+        help="Write the final controller exit status as JSON (env: NKILIB_PYTEST_OUTCOME_FILE)",
+    )
+    group.addoption(
         "--disable-no-tests-failure",
         action="store_true",
         default=False,
@@ -356,6 +362,7 @@ def test_manager(
             kernel_name=kernel_name,
             dice_endpoint=dice_endpoint,
             nki_compilation_mode=NKICompilationMode[get_feature_flag(request.config, "nki_compilation_mode")],
+            compile_mode=get_feature_flag(request.config, "compile_mode"),
         )
 
     return make_test_manager(
@@ -554,9 +561,20 @@ def _duration_monitor(request: pytest.FixtureRequest) -> Generator[None, None, N
 
 
 def pytest_ignore_collect(collection_path, config):
-    """Skip collecting model_config modules directly when --skip-model-tests is active."""
+    """Skip collecting model config modules directly when --skip-model-tests is active.
+
+    Matched two ways because the layout is in transition: the older modules are named
+    ``*_model_config.py`` and sit beside their tests, the newer ones sit in a ``config/``
+    subpackage. Both raise ImportError under SKIP_MODEL_TESTS, and an ImportError during
+    collection is a hard error rather than a skip, so collection has to be prevented rather
+    than left to fail. Keying only on the basename is what broke when the first module moved
+    into ``config/``: it kept the ``test_`` prefix that pytest collects on, but lost the
+    ``model_config`` substring that suppressed it.
+    """
     if config.getoption("--skip-model-tests", default=False):
         if "model_config" in collection_path.name:
+            return True
+        if collection_path.parent.name == "config":
             return True
 
 
@@ -653,6 +671,7 @@ def pytest_configure(config: Config):
         target=",".join(p.value for p in get_platform_targets(config)),
         trace_mode=resolve_session_trace_mode(config).value,
         nki_compilation_mode=get_feature_flag(config, "nki_compilation_mode"),
+        compile_mode=get_feature_flag(config, "compile_mode"),
         kernel_name=os.environ.get("KERNEL_NAME"),
         run_type=os.environ.get("RUN_TYPE"),
         is_release=os.environ.get("IS_RELEASE", "").lower() == "true",
@@ -702,6 +721,26 @@ def pytest_configure_node(node):
         recoverable=is_recoverable_run(node.config),
     )
     node.workerinput["host_provisioning_result"] = asdict(result)
+
+
+@pytest.hookimpl(specname="pytest_sessionfinish", hookwrapper=True, tryfirst=True)
+def pytest_record_session_outcome(session: pytest.Session):
+    """Expose the final controller status to an opt-in external test runner."""
+    result = yield
+    # Do not publish a result if session-finish reporting failed. A wrapper runs after
+    # ordinary hooks, including the no-tests override below.
+    if result.excinfo is not None or hasattr(session.config, "workerinput"):
+        return
+    output_path = get_feature_flag(session.config, "pytest_outcome_file")
+    if not output_path:
+        return
+    try:
+        path = Path(output_path)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps({"exitstatus": int(session.exitstatus)}), encoding="utf-8")
+        temporary.replace(path)
+    except (OSError, ValueError):
+        logging.warning("Could not record pytest session outcome at %s", output_path, exc_info=True)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:

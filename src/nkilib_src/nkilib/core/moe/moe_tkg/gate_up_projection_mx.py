@@ -33,7 +33,6 @@ import nki.language as nl
 from ...utils.common_types import ActFnType
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type
-from ...utils.tensor_view import as_nki_tensor
 
 # Shared MX constants
 from .projection_mx_constants import (
@@ -126,7 +125,9 @@ def gate_up_projection_mx(
             gate_bias_sb.shape == up_bias_sb.shape,
             f"expected gate and up biases to have the same shapes, got {gate_bias_sb.shape=}, {up_bias_sb.shape=}",
         )
-    elif gate_bias_sb != None or up_bias_sb != None:
+    elif (
+        gate_bias_sb != None or up_bias_sb != None
+    ):  # pragma: no cover - validation guard; gate/up biases are always both-None or both-present
         kernel_assert(
             False,
             f"expected gate and up biases to be both None or both not None",
@@ -142,6 +143,18 @@ def gate_up_projection_mx(
     n_T256_tiles = div_ceil(T, TILE_T)
     n_total_I512_tiles = div_ceil(I_local, MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM)
     I_4, TILE_I = _q_width, nl.tile_size.pmax
+
+    # Software dequant mode: STATIC_MX passes one [TILE_I, 1] scale per projection (already combined with the
+    # input scale), ROW_MX passes a per-output-column weight scale plus a per-token input scale. Hardware MX
+    # passes no dequant scales at all.
+    is_gate_row_dequant = gate_dequant_scale != None and gate_dequant_scale.shape[1] > 1
+    is_up_row_dequant = up_dequant_scale != None and up_dequant_scale.shape[1] > 1
+    gate_static_dequant = gate_dequant_scale if gate_dequant_scale != None and not is_gate_row_dequant else None
+    up_static_dequant = up_dequant_scale if up_dequant_scale != None and not is_up_row_dequant else None
+    act_fn = get_nl_act_fn_from_type(hidden_act_fn) if hidden_act_fn != None else None
+    fold_gate_multiply = _is_gate_multiply_foldable(
+        up_dequant_scale, up_bias_sb, up_clamp_upper_limit, up_clamp_lower_limit
+    )
 
     # Step 2: Allocate output buffers
     out_shape = (TILE_I, n_total_I512_tiles, T, I_4)
@@ -205,7 +218,7 @@ def gate_up_projection_mx(
             is_software_quant=is_software_quant,
         )
 
-        # Step 3.2: PSUM eviction + bias + clamp + activation (after all H tiles complete)
+        # Step 3.2: PSUM eviction + dequant + bias + clamp + activation (after all H tiles complete)
         for tile_i in range(n_total_I512_tiles):
             cur_tile_I_size = min(
                 MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
@@ -213,89 +226,36 @@ def gate_up_projection_mx(
             cur_I_pdim_sz = cur_tile_I_size // _q_width
 
             """
-            Accumulate bias during PSUM eviction (skip for STATIC_MX).
+            Evict PSUM, applying the dequant scales, bias, clamp and activation function in as few
+            instructions as possible (single instruction for hardware MX / STATIC_MX without bias or clamp).
             out_sb shape: [TILE_I, n_total_I512_tiles, T, I_4]
             out_psum shape: [TILE_I, I_4, TILE_T]
             gate_bias_sb shape: [TILE_I, n_total_I512_tiles, I_4]
             Use strided access pattern to reorder from [TILE_I, I_4, TILE_T] to [TILE_I, TILE_T, I_4].
             """
-            is_software_dequant = gate_dequant_scale != None
-            if gate_bias_sb != None and not is_software_dequant:
-                nisa.tensor_tensor(
-                    dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    data1=out_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
-                    op=nl.add,
-                    data2=gate_bias_sb.ap(
-                        [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]], offset=tile_i * I_4
-                    ),
-                )
-            else:
-                nisa.tensor_copy(
-                    dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    src=out_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
-                )
-
-            # STATIC_MX: dequant then bias
-            if gate_dequant_scale != None and gate_dequant_scale.shape[1] == 1:
-                nisa.activation(
-                    dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    op=nl.copy,
-                    data=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    scale=gate_dequant_scale[:cur_I_pdim_sz, :],
-                )
-                if gate_bias_sb != None:
-                    nisa.tensor_tensor(
-                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                        data1=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                        op=nl.add,
-                        data2=gate_bias_sb.ap(
-                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
-                            offset=tile_i * I_4,
-                        ),
-                    )
-
-            # ROW_MX: per-column weight dequant, then per-token input dequant, then bias
-            if gate_dequant_scale != None and gate_dequant_scale.shape[1] > 1:
-                for i_q in nl.affine_range(I_4):
-                    i_col = tile_i * I_4 + i_q
-                    nisa.activation(
-                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
-                        op=nl.copy,
-                        data=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
-                        scale=gate_dequant_scale[:cur_I_pdim_sz, i_col : i_col + 1],
-                    )
-                for i_q in nl.affine_range(I_4):
-                    nisa.tensor_tensor(
-                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
-                        data1=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
-                        data2=input_dequant_scale[:cur_I_pdim_sz, :tile_T_actual, 0],
-                        op=nl.multiply,
-                    )
-                if gate_bias_sb != None:
-                    nisa.tensor_tensor(
-                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                        data1=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                        op=nl.add,
-                        data2=gate_bias_sb.ap(
-                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
-                            offset=tile_i * I_4,
-                        ),
-                    )
-
-            # Step 3.3: Clamp projection output to [clamp_lower_limit, clamp_upper_limit] (optional)
-            _clamp_tensor(
-                tensor=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+            _evict_projection_tile(
+                dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                psum_access=out_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
+                static_dequant_vec=gate_static_dequant[:cur_I_pdim_sz, :] if gate_static_dequant != None else None,
+                row_w_dequant_ap=(
+                    _col_broadcast_access(gate_dequant_scale, cur_I_pdim_sz, tile_T_actual, I_4, tile_i)
+                    if is_gate_row_dequant
+                    else None
+                ),
+                row_in_dequant_ap=(
+                    _token_broadcast_access(input_dequant_scale, cur_I_pdim_sz, tile_T_actual, I_4, tile_T_offset)
+                    if is_gate_row_dequant
+                    else None
+                ),
+                bias_ap=(
+                    _col_broadcast_access(gate_bias_sb, cur_I_pdim_sz, tile_T_actual, I_4, tile_i)
+                    if gate_bias_sb != None
+                    else None
+                ),
                 clamp_upper_limit=gate_clamp_upper_limit,
                 clamp_lower_limit=gate_clamp_lower_limit,
+                act_fn=act_fn,
             )
-
-            # Step 3.4: Compute activation function
-            if hidden_act_fn != None:
-                nisa.activation(
-                    dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    data=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    op=get_nl_act_fn_from_type(hidden_act_fn),
-                )
 
     """
     Step 4: Fused up projection, projection clamp (optional), gate * up, MX quantization.
@@ -345,100 +305,54 @@ def gate_up_projection_mx(
             is_software_quant=is_software_quant,
         )
 
-        # Step 4.2: PSUM eviction + bias + clamp + gate*up + quantize (after all H tiles complete)
+        # Step 4.2: PSUM eviction + dequant + bias + clamp + gate*up + quantize (after all H tiles complete)
         for tile_i in range(n_total_I512_tiles):
             cur_tile_I_size = min(
                 MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             )
             cur_I_pdim_sz = cur_tile_I_size // _q_width
-            intermediate_tile_sb = nl.ndarray((TILE_I, 1, TILE_T, I_4), dtype=out_sb.dtype, buffer=nl.sbuf)
 
             """
-            Accumulate bias during PSUM eviction (skip for STATIC_MX).
+            Evict PSUM, applying the dequant scales, bias, clamp and the gate * up multiply in as few
+            instructions as possible (single instruction for hardware MX / STATIC_MX without bias or clamp).
             intermediate_tile_sb shape: [TILE_I, 1, TILE_T, I_4]
             out_psum shape: [TILE_I, I_4, TILE_T]
             up_bias_sb shape: [TILE_I, n_total_I512_tiles, I_4]
             Use strided access pattern to reorder from [TILE_I, I_4, TILE_T] to [TILE_I, TILE_T, I_4].
             """
-            is_up_software_dequant = up_dequant_scale != None
-            if up_bias_sb != None and not is_up_software_dequant:
-                nisa.tensor_tensor(
-                    dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                    data1=up_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
-                    op=nl.add,
-                    data2=up_bias_sb.ap(
-                        [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]], offset=tile_i * I_4
-                    ),
-                )
-            else:
-                nisa.tensor_copy(
-                    dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                    src=up_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
-                )
+            # Scratch is only needed when the gate * up multiply cannot be folded into the eviction instruction
+            intermediate_tile_sb = None
+            if not fold_gate_multiply:
+                intermediate_tile_sb = nl.ndarray((TILE_I, 1, TILE_T, I_4), dtype=out_sb.dtype, buffer=nl.sbuf)
 
-            # STATIC_MX: dequant then bias
-            if up_dequant_scale != None and up_dequant_scale.shape[1] == 1:
-                nisa.activation(
-                    dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                    op=nl.copy,
-                    data=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                    scale=up_dequant_scale[:cur_I_pdim_sz, :],
-                )
-                if up_bias_sb != None:
-                    nisa.tensor_tensor(
-                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                        data1=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                        op=nl.add,
-                        data2=up_bias_sb.ap(
-                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
-                            offset=tile_i * I_4,
-                        ),
-                    )
-
-            # ROW_MX: per-column weight dequant, then per-token input dequant, then bias
-            if up_dequant_scale != None and up_dequant_scale.shape[1] > 1:
-                for i_q in nl.affine_range(I_4):
-                    i_col = tile_i * I_4 + i_q
-                    nisa.activation(
-                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
-                        op=nl.copy,
-                        data=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
-                        scale=up_dequant_scale[:cur_I_pdim_sz, i_col : i_col + 1],
-                    )
-                for i_q in nl.affine_range(I_4):
-                    nisa.tensor_tensor(
-                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
-                        data1=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
-                        data2=input_dequant_scale[:cur_I_pdim_sz, :tile_T_actual, 0],
-                        op=nl.multiply,
-                    )
-                if up_bias_sb != None:
-                    nisa.tensor_tensor(
-                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                        data1=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                        op=nl.add,
-                        data2=up_bias_sb.ap(
-                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
-                            offset=tile_i * I_4,
-                        ),
-                    )
-
-            # Step 4.3: Clamp projection output to [clamp_lower_limit, clamp_upper_limit]
-            _clamp_tensor(
-                tensor=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
+            _evict_projection_tile(
+                dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                psum_access=up_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
+                static_dequant_vec=up_static_dequant[:cur_I_pdim_sz, :] if up_static_dequant != None else None,
+                row_w_dequant_ap=(
+                    _col_broadcast_access(up_dequant_scale, cur_I_pdim_sz, tile_T_actual, I_4, tile_i)
+                    if is_up_row_dequant
+                    else None
+                ),
+                row_in_dequant_ap=(
+                    _token_broadcast_access(input_dequant_scale, cur_I_pdim_sz, tile_T_actual, I_4, tile_T_offset)
+                    if is_up_row_dequant
+                    else None
+                ),
+                bias_ap=(
+                    _col_broadcast_access(up_bias_sb, cur_I_pdim_sz, tile_T_actual, I_4, tile_i)
+                    if up_bias_sb != None
+                    else None
+                ),
                 clamp_upper_limit=up_clamp_upper_limit,
                 clamp_lower_limit=up_clamp_lower_limit,
+                mul_operand=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                scratch=(
+                    intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :] if intermediate_tile_sb != None else None
+                ),
             )
 
-            # Step 4.4: Multiply completed up tile with corresponding gate tile
-            nisa.tensor_tensor(
-                dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                data1=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                op=nl.multiply,
-                data2=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-            )
-
-            # Step 4.5: MX quantize combined gate * up tile
+            # Step 4.3: MX quantize combined gate * up tile
             # Skip for ROW_MX (uses external row_quantization) and STATIC_MX (uses external static_quantization)
             if not is_software_quant:
                 # Pad partition count to valid quantize_mx size {32, 64, 96, 128}.
@@ -532,9 +446,9 @@ def load_gate_up_weight_scale_bias(
     )
     if needs_padding:
         nisa.memset(dst=weight_sb[...], value=0, engine=nisa.gpsimd_engine)
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:, :, :I_local], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=weight_view, dst=weight_sb[:, :, :I_local], dge_mode=nisa.dge_mode.none)
     else:
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=weight_view, dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -593,12 +507,177 @@ def load_gate_up_weight_scale_bias(
             .slice(dim=1, start=tile_offset, end=tile_offset + n_I512_tiles_local)
         )
         nisa.dma_copy(
-            src=as_nki_tensor(bias_view),
+            src=bias_view,
             dst=bias_sb[:I_p_bias_in_hbm, :, :],
             dge_mode=nisa.dge_mode.none,
         )
 
     return weight_sb, scale_sb, bias_sb
+
+
+def _partition_pitch(tensor: nl.NkiTensor) -> int:
+    """Number of elements per SBUF partition, i.e. the partition-dim stride of an access pattern on `tensor`."""
+    pitch = 1
+    for dim_size in tensor.shape[1:]:
+        pitch *= dim_size
+    return pitch
+
+
+def _col_broadcast_access(
+    tensor: nl.NkiTensor,
+    n_partitions: int,
+    n_tokens: int,
+    i_4: int,
+    tile_i: int,
+) -> nl.NkiTensor:
+    """
+    Access pattern for a per-output-column tile (bias or ROW_MX weight dequant scale), broadcast over the T dim.
+
+    Columns of one I512 tile are contiguous, so the tile is traversed as [TILE_I, T, 4_I] with a stride-0 T dim
+    to match the [TILE_I, T, 4_I] layout of the evicted projection output.
+    """
+    return tensor.ap([[_partition_pitch(tensor), n_partitions], [0, n_tokens], [1, i_4]], offset=tile_i * i_4)
+
+
+def _token_broadcast_access(
+    tensor: nl.NkiTensor,
+    n_partitions: int,
+    n_tokens: int,
+    i_4: int,
+    tile_T_offset: int,
+) -> nl.NkiTensor:
+    """
+    Access pattern for a per-token tile ([TILE_I, T, 1] ROW_MX input dequant scale), broadcast over the 4_I dim.
+
+    Traversed as [TILE_I, T, 4_I] with a stride-0 4_I dim to match the evicted projection output layout.
+    """
+    return tensor.ap([[_partition_pitch(tensor), n_partitions], [1, n_tokens], [0, i_4]], offset=tile_T_offset)
+
+
+def _evict_projection_tile(
+    dst: nl.NkiTensor,
+    psum_access: nl.NkiTensor,
+    static_dequant_vec: Optional[nl.NkiTensor] = None,
+    row_w_dequant_ap: Optional[nl.NkiTensor] = None,
+    row_in_dequant_ap: Optional[nl.NkiTensor] = None,
+    bias_ap: Optional[nl.NkiTensor] = None,
+    clamp_upper_limit: Optional[float] = None,
+    clamp_lower_limit: Optional[float] = None,
+    act_fn=None,
+    mul_operand: Optional[nl.NkiTensor] = None,
+    scratch: Optional[nl.NkiTensor] = None,
+) -> None:
+    """
+    Evict one projection PSUM tile to SBUF, computing
+    `dst = act_fn(clamp(psum * dequant_scales + bias)) * mul_operand` in as few instructions as possible.
+
+    `psum_access` must already carry the [TILE_I, 4_I, T] -> [TILE_I, T, 4_I] reorder access pattern, and the
+    scale/bias access patterns must already broadcast over the dims they are constant in, so that every
+    instruction below covers a full tile instead of looping over the 4_I quad lanes.
+
+    Instruction count with no bias and no clamping:
+      - hardware MX (no dequant scales): 1 (reorder + activation function, or reorder + gate*up multiply)
+      - STATIC_MX ([TILE_I, 1] scale):   1 (reorder + dequant + activation function / gate*up multiply)
+      - ROW_MX (per-column + per-token): 3 (one per scale, plus the activation function / gate*up multiply)
+
+    Args:
+        dst (nl.NkiTensor): [TILE_I, T, 4_I] SBUF tile to write.
+        psum_access (nl.NkiTensor): [TILE_I, T, 4_I] reordered view of the projection PSUM tile.
+        static_dequant_vec (Optional[nl.NkiTensor]): STATIC_MX [TILE_I, 1] fp32 combined dequant scale.
+        row_w_dequant_ap (Optional[nl.NkiTensor]): ROW_MX per-output-column weight dequant scale access.
+        row_in_dequant_ap (Optional[nl.NkiTensor]): ROW_MX per-token input dequant scale access.
+        bias_ap (Optional[nl.NkiTensor]): Projection bias access.
+        clamp_upper_limit (Optional[float]): Upper clamp limit, applied before `act_fn`.
+        clamp_lower_limit (Optional[float]): Lower clamp limit, applied before `act_fn`.
+        act_fn: Activation function applied last (None to skip).
+        mul_operand (Optional[nl.NkiTensor]): Tile the result is multiplied by, used to fold the gate * up
+            multiply into the up projection eviction. Must alias `dst`.
+        scratch (Optional[nl.NkiTensor]): Tile with the same shape as `dst`, required when `mul_operand` is set
+            and the multiply cannot be folded into the eviction (see `_is_gate_multiply_foldable`).
+
+    Returns:
+        None. Result is written to `dst`.
+    """
+    kernel_assert(
+        act_fn == None or mul_operand == None,
+        f"expected at most one of act_fn / mul_operand to be fused into the eviction",
+    )
+    is_row_dequant = row_w_dequant_ap != None
+    has_clamp = clamp_upper_limit != None or clamp_lower_limit != None
+    # `dst` still holds the gate result when a gate * up multiply is pending, so build the up tile in `scratch`
+    work = scratch if scratch != None else dst
+    # The trailing activation function or gate * up multiply only folds into the eviction when the eviction
+    # itself collapses to a single instruction with a free operand slot
+    is_single_instruction = not is_row_dequant and bias_ap == None and not has_clamp
+
+    if is_single_instruction and act_fn != None:
+        nisa.activation(
+            dst=work,
+            op=act_fn,
+            data=psum_access,
+            scale=static_dequant_vec if static_dequant_vec != None else 1.0,
+        )
+    elif is_single_instruction and mul_operand != None and scratch == None:
+        if static_dequant_vec != None:
+            nisa.scalar_tensor_tensor(
+                dst=work,
+                data=psum_access,
+                op0=nl.multiply,
+                operand0=static_dequant_vec,
+                op1=nl.multiply,
+                operand1=mul_operand,
+            )
+        else:
+            nisa.tensor_tensor(dst=work, data1=psum_access, op=nl.multiply, data2=mul_operand)
+        return
+    else:
+        # Apply the dequant scales and the bias, then clamp and apply the activation function separately
+        if is_row_dequant:
+            nisa.tensor_tensor(dst=work, data1=psum_access, op=nl.multiply, data2=row_w_dequant_ap)
+            nisa.tensor_tensor(dst=work, data1=work, op=nl.multiply, data2=row_in_dequant_ap)
+            if bias_ap != None:
+                nisa.tensor_tensor(dst=work, data1=work, op=nl.add, data2=bias_ap)
+        elif bias_ap != None and static_dequant_vec != None:
+            nisa.scalar_tensor_tensor(
+                dst=work,
+                data=psum_access,
+                op0=nl.multiply,
+                operand0=static_dequant_vec,
+                op1=nl.add,
+                operand1=bias_ap,
+            )
+        elif bias_ap != None:
+            nisa.tensor_tensor(dst=work, data1=psum_access, op=nl.add, data2=bias_ap)
+        elif static_dequant_vec != None:
+            nisa.activation(dst=work, op=nl.copy, data=psum_access, scale=static_dequant_vec)
+        else:
+            nisa.tensor_copy(dst=work, src=psum_access)
+
+        _clamp_tensor(tensor=work, clamp_upper_limit=clamp_upper_limit, clamp_lower_limit=clamp_lower_limit)
+
+        if act_fn != None:
+            nisa.activation(dst=work, op=act_fn, data=work)
+
+    if mul_operand != None:
+        nisa.tensor_tensor(dst=dst, data1=mul_operand, op=nl.multiply, data2=work)
+
+
+def _is_gate_multiply_foldable(
+    up_dequant_scale: Optional[nl.NkiTensor],
+    up_bias_sb: Optional[nl.NkiTensor],
+    up_clamp_upper_limit: Optional[float],
+    up_clamp_lower_limit: Optional[float],
+) -> bool:
+    """
+    Whether the gate * up multiply can be folded into the up projection PSUM eviction instruction.
+
+    A bias, a clamp, or the ROW_MX per-token input scale each need an extra full-tile operand, forcing the up
+    tile to be materialized in scratch first.
+    """
+    is_up_row_dequant = up_dequant_scale != None and up_dequant_scale.shape[1] > 1
+    return (
+        up_bias_sb == None and up_clamp_upper_limit == None and up_clamp_lower_limit == None and not is_up_row_dequant
+    )
 
 
 def _clamp_tensor(

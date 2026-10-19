@@ -33,6 +33,19 @@ from .kernel_assert import kernel_assert
 
 _NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE = _os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "").lower() == "true"
 
+_FLAG_OFF_VALUES = ("", "0", "false", "False")
+
+
+def mega_flag_default_on(name: str) -> bool:
+    """Return True unless the env var disables the flag.
+
+    The GIGA-kernel decode perf and numerics flags are on by default (the
+    measured-optimal bundle). Set the env var to "0" to disable one for perf
+    iteration. Lives here rather than in the kernel entry module so the core
+    sub-kernels that read the same flags share one truthiness definition.
+    """
+    return _os.environ.get(name, "1") not in _FLAG_OFF_VALUES
+
 
 # Temporary: will be replaced by nl.tile_size.psum_num_banks once the NKI API exposes it.
 def _psum_num_banks() -> int:
@@ -178,7 +191,7 @@ def get_floor_aligned_size(size: int, alignment_multiple: int) -> int:
     return get_floor_quotient(size, alignment_multiple) * alignment_multiple
 
 
-def is_hbm_buffer(tensor: nl.ndarray) -> bool:
+def is_hbm_buffer(tensor: nl.NkiTensor) -> bool:
     """Check if tensor buffer is any HBM type (hbm, shared_hbm, private_hbm)."""
     return tensor.buffer in (nl.hbm, nl.shared_hbm, nl.private_hbm)
 
@@ -612,7 +625,7 @@ def resolve_dtype_to_nki(dtype):
 
 
 def _sbm_alloc(sbm, shape, dtype, buffer=nl.sbuf, name=None, align=None):
-    """Allocate SBUF tensor via SbufManager if available, else fall back to nl.ndarray."""
+    """Allocate SBUF tensor via SbufManager if available, else fall back to nl.NkiTensor."""
     if sbm is not None:
         return sbm.alloc_stack(shape=shape, dtype=dtype, buffer=buffer, name=name, align=align)
     return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=name)

@@ -17,6 +17,7 @@ import functools
 from typing import Optional, TypedDict
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import
 from nkilib_src.nkilib.core.utils.allocator import BufferManager, Logger
 from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+from nkilib_src.nkilib.core.utils.kernel_helpers import get_program_sharding_info
 
 from test.integration.nkilib.utils.tensor_generators import (
     FP8_E4M3_MAX,
@@ -77,18 +79,18 @@ class TkgOutputProjClassification(enum.Enum):
 
 @nki.jit
 def output_proj_tkg_wrapper(
-    attention: nl.ndarray,
-    weight: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    weight_scale: Optional[nl.ndarray] = None,
-    input_scale: Optional[nl.ndarray] = None,
+    weight_scale: Optional[nl.NkiTensor] = None,
+    input_scale: Optional[nl.NkiTensor] = None,
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
     # Placeholder param to match torch-ref/kernel signature
     sbm: Optional[BufferManager] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     sbm = BufferManager(
         0,
         nl.tile_size.total_available_sbuf_size,
@@ -108,6 +110,163 @@ def output_proj_tkg_wrapper(
         sbm,
         dtype_mode=dtype_mode,
     )
+
+
+# Tuned so the full-h_sharded weight block overflows but a halved block fits,
+# forcing the manual weight-budget loop to halve + circular-buffer.
+_SMALL_BUDGET_BYTES = 28 * 1024
+
+
+@nki.jit
+def output_proj_tkg_small_budget_wrapper(
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    weight_scale: Optional[nl.NkiTensor] = None,
+    input_scale: Optional[nl.NkiTensor] = None,
+    TRANSPOSE_OUT: bool = False,
+    OUT_IN_SB: bool = False,
+    sbm: Optional[BufferManager] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+) -> nl.NkiTensor:
+    """Constrain the SBUF budget so a SMALL (non-sim-skipped) H still forces the
+    manual weight-budget loop to halve the block size and use circular buffering.
+
+    This reaches the block-halving arcs (_budget_weight_blocks L1196 /
+    _budget_weight_blocks_transpose L1562/L1566) and the
+    ``not all_weights_preloaded`` circular-buffer arcs (L1693/L1718) that
+    otherwise only trigger at large H (which the sim skips).
+    """
+    # Constrain the manual budget so the full h_sharded weight block does NOT
+    # fit but a halved block does, forcing _budget_weight_blocks to iterate to
+    # the next candidate and use circular buffering (num_w_h_blocks < num_blocks).
+    sbm = BufferManager(
+        0,
+        _SMALL_BUDGET_BYTES,
+        logger=Logger("test_output_projection_tkg_small_budget"),
+        use_auto_alloc=False,
+    )
+    return output_projection_tkg(
+        attention,
+        weight,
+        bias,
+        quantization_type,
+        weight_scale,
+        input_scale,
+        TRANSPOSE_OUT,
+        OUT_IN_SB,
+        sbm,
+        dtype_mode=dtype_mode,
+    )
+
+
+@nki.jit
+def output_proj_tkg_sbuf_input_wrapper(
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    weight_scale: Optional[nl.NkiTensor] = None,
+    input_scale: Optional[nl.NkiTensor] = None,
+    TRANSPOSE_OUT: bool = False,
+    OUT_IN_SB: bool = False,
+    sbm: Optional[BufferManager] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+) -> nl.NkiTensor:
+    """Exercise the attention-in-SBUF path (attention.buffer == nl.sbuf).
+
+    Builds attention on-chip in the kernel's expected [D, B, N, S] layout via a
+    direct DMA, then calls the kernel. The kernel returns HBM output (OUT_IN_SB
+    left False), validated against the stock torch ref.
+    """
+    sbm = BufferManager(
+        0,
+        nl.tile_size.total_available_sbuf_size,
+        logger=Logger("test_output_projection_tkg_sbuf_in"),
+        use_auto_alloc=False,
+    )
+    sbm.open_scope(name="output_proj_tkg_sbuf_input_wrapper")
+
+    d_head, B, n_heads, S = attention.shape
+    attn_sb = sbm.alloc_heap((d_head, B, n_heads, S), dtype=attention.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=attn_sb[...], src=attention[...])
+
+    out = output_projection_tkg(
+        attn_sb,
+        weight,
+        bias,
+        quantization_type,
+        weight_scale,
+        input_scale,
+        TRANSPOSE_OUT,
+        False,  # OUT_IN_SB
+        sbm,
+        dtype_mode=dtype_mode,
+    )
+    sbm.close_scope()
+    return out
+
+
+@nki.jit
+def output_proj_tkg_out_in_sb_wrapper(
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    weight_scale: Optional[nl.NkiTensor] = None,
+    input_scale: Optional[nl.NkiTensor] = None,
+    TRANSPOSE_OUT: bool = False,
+    OUT_IN_SB: bool = True,
+    sbm: Optional[BufferManager] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+) -> nl.NkiTensor:
+    """Exercise the OUT_IN_SB=True path (output kept in SBUF).
+
+    The kernel returns this core's SBUF shard. To validate against the stock
+    HBM torch ref, spill that shard into its prg_id slice of a full HBM output,
+    mirroring the kernel's own non-SBUF out_hbm_view slicing.
+    """
+    sbm = BufferManager(
+        0,
+        nl.tile_size.total_available_sbuf_size,
+        logger=Logger("test_output_projection_tkg_out_in_sb"),
+        use_auto_alloc=False,
+    )
+
+    d_head, B, n_heads, S = attention.shape
+    _, H = weight.shape
+    _, n_prgs, prg_id = get_program_sharding_info()
+    h_sharded = H // n_prgs
+    bxs = B * S
+
+    out_sb = output_projection_tkg(
+        attention,
+        weight,
+        bias,
+        quantization_type,
+        weight_scale,
+        input_scale,
+        TRANSPOSE_OUT,
+        True,  # OUT_IN_SB
+        sbm,
+        dtype_mode=dtype_mode,
+    )
+
+    if not TRANSPOSE_OUT:
+        # out_sb: [bxs, h_sharded]; full HBM out: [bxs, H]
+        out_hbm = nl.ndarray((bxs, H), dtype=out_sb.dtype, buffer=nl.shared_hbm, name="oproj_tkg_sb_out")
+        out_hbm_view = out_hbm.reshape_dim(1, (n_prgs, h_sharded)).select(dim=1, index=prg_id)
+        nisa.dma_copy(dst=out_hbm_view, src=out_sb)
+    else:
+        # out_sb: [h_1, h_2*bxs]; full HBM out: [h_1, h_0, h_2, bxs], h_0 = n_prgs
+        h_1 = P_MAX
+        h_2 = H // n_prgs // P_MAX
+        out_hbm = nl.ndarray((h_1, n_prgs, h_2, bxs), dtype=out_sb.dtype, buffer=nl.shared_hbm, name="oproj_tkg_sb_out")
+        out_hbm_view = out_hbm.select(dim=1, index=prg_id)
+        nisa.dma_copy(dst=out_hbm_view, src=out_sb.reshape((h_1, h_2, bxs)))
+
+    return out_hbm
 
 
 def build_output_proj_tkg_input(
@@ -280,6 +439,11 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [3, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
     [1, 2, 5, 128, 4096, QuantizationType.STATIC_MX, False, False],
     [3, 2, 6, 128, 4096, QuantizationType.STATIC_MX, False, False],
+    # Small-H (2048, not a large-shape sim-skip pattern) mirrors to exercise the
+    # STATIC_MX no-bias path (mx_impl L385/L532) and the BxS % 4 != 0 pad path
+    # (mx_impl L439) under the plain sim run.
+    pytest.param(64, 2, 1, 128, 2048, QuantizationType.STATIC_MX, False, False, marks=pytest.mark.fast),
+    pytest.param(3, 2, 1, 128, 2048, QuantizationType.STATIC_MX, False, False, marks=pytest.mark.fast),
 )
 
 # Manual sweep cases: H=602 (not divisible by 128) for negative test coverage
@@ -627,6 +791,11 @@ class TestOutputProjTkgKernel:
             [3, 2, 1, 128, 4096, False, False, QuantizationType.MX],
             [1, 2, 5, 128, 4096, False, False, QuantizationType.MX],
             [3, 2, 6, 128, 4096, False, False, QuantizationType.MX],
+            # Small-H (2048, not a large-shape sim-skip pattern) no-bias mirror to
+            # exercise the MX no-bias tensor_copy path (mx_impl L540) and the
+            # BxS % 4 != 0 pad path (L439) under the plain sim run.
+            pytest.param(64, 2, 1, 128, 2048, False, False, QuantizationType.MX, marks=pytest.mark.fast),
+            pytest.param(3, 2, 1, 128, 2048, False, False, QuantizationType.MX, marks=pytest.mark.fast),
         ],
     )
     def test_output_proj_tkg_mxfp(
@@ -746,4 +915,278 @@ class TestOutputProjTkgKernel:
             lnc_degree=compiler_args.logical_nc_config,
             dtype_mode=dtype_mode,
             **self._OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG,
+        )
+
+    # ------------------------------------------------------------------
+    # Auto-alloc coverage: calling output_projection_tkg directly with sbm=None
+    # reaches create_auto_alloc_manager (L204->L205) and the is_auto_alloc()
+    # True arcs in _budget_weight_blocks / _budget_weight_blocks_transpose.
+    # Small H=512 avoids large-shape sim skip.
+    # ------------------------------------------------------------------
+    @pytest.mark.fast
+    @pytest.mark.parametrize("transpose_out", [False, True])
+    def test_output_proj_tkg_auto_alloc(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        transpose_out: bool,
+    ):
+        B, n_heads, S_tkg, d_head, H = 4, 8, 4, 64, 512
+        dtype = nl.bfloat16
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        lnc_degree = compiler_args.logical_nc_config
+
+        def input_generator(test_config):
+            return build_output_proj_tkg_input(
+                lnc_degree=lnc_degree,
+                d_head=d_head,
+                B=B,
+                n_heads=n_heads,
+                S_tkg=S_tkg,
+                quantization_type=QuantizationType.NONE,
+                H=H,
+                test_bias=True,
+                transpose_out=transpose_out,
+            )
+
+        def output_tensors(kernel_input):
+            if transpose_out:
+                H0 = 128
+                output_shape = (H0, lnc_degree, H // lnc_degree // H0, B * S_tkg)
+            else:
+                output_shape = (B * S_tkg, H)
+            return {"out": np.zeros(output_shape, dtype=dtype)}
+
+        # kernel_entry is output_projection_tkg directly (no wrapper) -> sbm=None -> auto-alloc.
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_tkg,
+            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
+    # ------------------------------------------------------------------
+    # fp32 + transpose_out: reaches the weight.dtype==nl.float32 size-limit
+    # branch in _validate_and_create_config (L725). N*H must be small (fp32
+    # limit). H=512 (H%(128*lnc)==0 for lnc<=2), N=2 -> N*H=1024.
+    # ------------------------------------------------------------------
+    @pytest.mark.fast
+    def test_output_proj_tkg_fp32_transpose(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        B, n_heads, S_tkg, d_head, H = 4, 2, 4, 64, 512
+        dtype = nl.float32
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        lnc_degree = compiler_args.logical_nc_config
+
+        def input_generator(test_config):
+            random_gen = gaussian_tensor_generator()
+            attention = random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention")
+            weight = random_gen(shape=(d_head * n_heads, H), dtype=dtype, name="weight")
+            return {
+                "attention": attention,
+                "weight": weight,
+                "bias": None,
+                "quantization_type": QuantizationType.NONE,
+                "weight_scale": None,
+                "input_scale": None,
+                "TRANSPOSE_OUT": True,
+                "OUT_IN_SB": False,
+                "dtype_mode": DtypeMode.NON_OCP,
+            }
+
+        def output_tensors(kernel_input):
+            H0 = 128
+            return {"out": np.zeros((H0, lnc_degree, H // lnc_degree // H0, B * S_tkg), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_proj_tkg_wrapper,
+            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
+    # ------------------------------------------------------------------
+    # OUT_IN_SB=True coverage: output stays in SBUF. The wrapper spills the
+    # per-core SBUF shard to HBM so it validates against the stock torch ref.
+    # Small non-large-shape H (=384) so the sim doesn't skip it; B*S<=128 for
+    # the non-transpose OUT_IN_SB constraint.
+    # ------------------------------------------------------------------
+    @pytest.mark.fast
+    @pytest.mark.parametrize("transpose_out", [False, True])
+    @pytest.mark.parametrize("test_bias", [True, False])
+    def test_output_proj_tkg_out_in_sb(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        transpose_out: bool,
+        test_bias: bool,
+    ):
+        B, n_heads, S_tkg, d_head, H = 8, 8, 4, 64, 512
+        dtype = nl.bfloat16
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        lnc_degree = compiler_args.logical_nc_config
+
+        def input_generator(test_config):
+            return build_output_proj_tkg_input(
+                lnc_degree=lnc_degree,
+                d_head=d_head,
+                B=B,
+                n_heads=n_heads,
+                S_tkg=S_tkg,
+                quantization_type=QuantizationType.NONE,
+                H=H,
+                test_bias=test_bias,
+                transpose_out=transpose_out,
+            )
+
+        def output_tensors(kernel_input):
+            if transpose_out:
+                H0 = 128
+                output_shape = (H0, lnc_degree, H // lnc_degree // H0, B * S_tkg)
+            else:
+                output_shape = (B * S_tkg, H)
+            return {"out": np.zeros(output_shape, dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_proj_tkg_out_in_sb_wrapper,
+            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
+    # ------------------------------------------------------------------
+    # attention-in-SBUF coverage: reaches the attention.buffer == nl.sbuf arcs
+    # (skip the HBM->SBUF load in _load_attn_to_sbuf L1018, and the "don't
+    # pop attn_sb heap" arc L284). Wrapper builds attention on-chip.
+    # ------------------------------------------------------------------
+    @pytest.mark.fast
+    @pytest.mark.parametrize("transpose_out", [False, True])
+    def test_output_proj_tkg_sbuf_input(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        transpose_out: bool,
+    ):
+        B, n_heads, S_tkg, d_head, H = 4, 8, 4, 64, 512
+        dtype = nl.bfloat16
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        lnc_degree = compiler_args.logical_nc_config
+
+        def input_generator(test_config):
+            return build_output_proj_tkg_input(
+                lnc_degree=lnc_degree,
+                d_head=d_head,
+                B=B,
+                n_heads=n_heads,
+                S_tkg=S_tkg,
+                quantization_type=QuantizationType.NONE,
+                H=H,
+                test_bias=True,
+                transpose_out=transpose_out,
+            )
+
+        def output_tensors(kernel_input):
+            if transpose_out:
+                H0 = 128
+                output_shape = (H0, lnc_degree, H // lnc_degree // H0, B * S_tkg)
+            else:
+                output_shape = (B * S_tkg, H)
+            return {"out": np.zeros(output_shape, dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_proj_tkg_sbuf_input_wrapper,
+            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
+    # ------------------------------------------------------------------
+    # Constrained-SBUF budget: forces the manual weight-budget loop to halve the
+    # block size and use circular buffering at small H, reaching the block-halving
+    # arcs (_budget_weight_blocks L1196 / _budget_weight_blocks_transpose
+    # L1562/L1566) and not-all-preloaded arcs (L1693/L1718) that otherwise need
+    # large (sim-skipped) H.
+    # ------------------------------------------------------------------
+    @pytest.mark.fast
+    @pytest.mark.parametrize("transpose_out", [False, True])
+    def test_output_proj_tkg_small_budget_multiblock(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        transpose_out: bool,
+    ):
+        B, n_heads, S_tkg, d_head, H = 4, 16, 4, 128, 2048
+        dtype = nl.bfloat16
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        lnc_degree = compiler_args.logical_nc_config
+
+        def input_generator(test_config):
+            return build_output_proj_tkg_input(
+                lnc_degree=lnc_degree,
+                d_head=d_head,
+                B=B,
+                n_heads=n_heads,
+                S_tkg=S_tkg,
+                quantization_type=QuantizationType.NONE,
+                H=H,
+                test_bias=True,
+                transpose_out=transpose_out,
+            )
+
+        def output_tensors(kernel_input):
+            if transpose_out:
+                H0 = 128
+                output_shape = (H0, lnc_degree, H // lnc_degree // H0, B * S_tkg)
+            else:
+                output_shape = (B * S_tkg, H)
+            return {"out": np.zeros(output_shape, dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_proj_tkg_small_budget_wrapper,
+            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            inference_args=TKG_INFERENCE_ARGS,
         )

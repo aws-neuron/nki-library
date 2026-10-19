@@ -61,6 +61,8 @@ class AllocationOutcome:
         position: 0-based FIFO queue position (set only when QUEUED/DRAINING).
         worst_case_eta: Worst-case wait estimate in relative seconds from now
             (QUEUED/DRAINING).
+        assembled: The entry holds a region with no locked core, so a
+            ``ready=True`` poll would commit it (QUEUED/DRAINING).
     """
 
     status: AllocationStatus
@@ -69,6 +71,7 @@ class AllocationOutcome:
     position: int | None = None
     worst_case_eta: int | None = None
     should_reset_cores: bool | None = None
+    assembled: bool = False
 
 
 @dataclass
@@ -93,6 +96,18 @@ class CoreAllocation:
     def get_core_list_str(self) -> str:
         """Get comma-separated logical core IDs for NEURON_RT_VISIBLE_CORES."""
         return ",".join(str(core_id) for core_id in self.logical_core_ids)
+
+
+@dataclass
+class GroupCoreAllocation(CoreAllocation):
+    """Allocation across a host group.
+
+    The inherited host and core fields describe the primary member;
+    ``should_reset_cores`` is True when any member needs a reset. Per-member
+    cores are in ``member_allocations``, in rank order.
+    """
+
+    member_allocations: tuple[CoreAllocation, ...] = ()
 
 
 class LockVersionError(Exception):
@@ -221,6 +236,21 @@ class CoreLockManager:
         return self._entry_id
 
     @property
+    def has_enqueued(self) -> bool:
+        """Whether any poll of this attempt observed its entry in the queue."""
+        return self._enqueue_ts is not None
+
+    @property
+    def bump_count(self) -> int:
+        """Times this attempt's entry was bumped to the tail of the queue."""
+        return self._bump_count
+
+    @property
+    def reenqueue_count(self) -> int:
+        """Times this attempt's entry was pruned and re-appended at the tail."""
+        return self._reenqueue_count
+
+    @property
     def collector(self) -> IMetricsCollector:
         """Get the metrics collector that owns this manager's allocation attempt.
 
@@ -276,6 +306,8 @@ class CoreLockManager:
         lnc_config: int,
         timeout_seconds: int = lock_client.DEFAULT_LOCK_TIMEOUT_SECONDS,
         ready: bool = True,
+        hold: bool = False,
+        hold_cap_seconds: int | None = None,
     ) -> AllocationOutcome:
         """Acquire logical cores via one FIFO-queue ``poll`` call.
 
@@ -291,6 +323,10 @@ class CoreLockManager:
             timeout_seconds: How long the lock should be held before auto-expiring
             ready: Whether the caller is ready to commit. A ``ready=False`` poll
                 enqueues/refreshes a queue slot but never grabs cores.
+            hold: Keep a not-ready entry's FIFO position when its readiness
+                grace lapses instead of being bumped to the tail.
+            hold_cap_seconds: With ``hold``, how long the entry may keep an
+                assembled region before it is bumped (helper default when None).
 
         Returns:
             AllocationOutcome with status:
@@ -327,6 +363,8 @@ class CoreLockManager:
                     ready,
                     lnc_config,
                     caller_id=self._caller_id,
+                    hold=hold,
+                    hold_cap_seconds=hold_cap_seconds,
                 )
         except Exception as e:
             raise LockAcquisitionError(str(e)) from e
@@ -369,6 +407,7 @@ class CoreLockManager:
                 status=AllocationStatus.DRAINING if draining else AllocationStatus.QUEUED,
                 position=lock_result.position,
                 worst_case_eta=lock_result.worst_case_eta,
+                assembled=lock_result.assembled,
             )
 
         if lock_result.status == LockStatus.ERROR:

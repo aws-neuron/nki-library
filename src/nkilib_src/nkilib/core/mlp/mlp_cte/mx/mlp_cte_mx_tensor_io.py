@@ -390,7 +390,7 @@ def load_source_projection_weight_scales(
                 :INT_SUBTILE_SIZE,
             ],
         )
-    elif mlp_params.quant_params.is_quant_mx():
+    elif mlp_params.quant_params.is_quant_mx():  # pragma: no branch - exhaustive (ROW_MX/MX only), false arc dead
         hidden_dim_tile = tile_info.src_proj_hidden_dim_tile
         int_dim_tile = tile_info.intermediate_dim_tile
         H_TILE_COUNT = hidden_dim_tile.tile_count  # H / 512

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Parameter dataclasses, supported-dtype definitions, and argument validation for the MLP kernel."""
 
 import math
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ from typing import Optional
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
-from nki.language import NKIObject
 
 # common utils
 from ..utils.common_types import (
@@ -103,7 +103,7 @@ _Q_HEIGHT = 8  # Quantization height (elements per quantization group on partiti
 # ****************************
 #
 @dataclass
-class MLPQuantizationParameters(NKIObject):
+class MLPQuantizationParameters(nl.NKIObject):
     quantization_type: QuantizationType
     gate_w_scale: Optional[nl.NkiTensor]
     up_w_scale: Optional[nl.NkiTensor]
@@ -319,7 +319,7 @@ class MLPQuantizationParameters(NKIObject):
 
 
 @dataclass
-class MLPFusedAddParameters(NKIObject):
+class MLPFusedAddParameters(nl.NKIObject):
     fused_add_tensor: Optional[nl.NkiTensor]
     store_fused_add_result: bool
 
@@ -344,7 +344,7 @@ class MLPFusedAddParameters(NKIObject):
 
 
 @dataclass
-class MLPNormalizationParameters(NKIObject):
+class MLPNormalizationParameters(nl.NKIObject):
     normalization_type: NormType
     normalization_weights_tensor: Optional[nl.NkiTensor]
     normalization_bias_tensor: Optional[nl.NkiTensor]
@@ -381,7 +381,7 @@ class MLPNormalizationParameters(NKIObject):
 
 
 @dataclass
-class MLPExpertParameters(NKIObject):
+class MLPExpertParameters(nl.NKIObject):
     expert_affinities: nl.NkiTensor
     expert_index: nl.NkiTensor
     expert_affinities_eager: Optional[nl.NkiTensor]
@@ -399,7 +399,7 @@ class MLPExpertParameters(NKIObject):
 
 
 @dataclass
-class MLPBiasParameters(NKIObject):
+class MLPBiasParameters(nl.NKIObject):
     gate_proj_bias_tensor: Optional[nl.NkiTensor]
     up_proj_bias_tensor: Optional[nl.NkiTensor]
     down_proj_bias_tensor: Optional[nl.NkiTensor]
@@ -443,7 +443,7 @@ class MLPBiasParameters(NKIObject):
 
 
 @dataclass
-class MLPParameters(NKIObject):
+class MLPParameters(nl.NKIObject):
     hidden_tensor: nl.NkiTensor
     gate_proj_weights_tensor: nl.NkiTensor
     up_proj_weights_tensor: nl.NkiTensor
@@ -788,7 +788,10 @@ def _validate_mlp_gate_up_weight_layout(params: MLPParameters):
         kernel_assert(
             shape == [H, I], f"MLPGateUpWeightLayout.CONTIGUOUS expects up proj weight to have shape [H, I].Got {shape}"
         )
-    elif params.gate_up_w_layout in [MLPGateUpWeightLayout.H_X4_INNERMOST, MLPGateUpWeightLayout.H_X4_MIDDLE]:
+    elif params.gate_up_w_layout in [
+        MLPGateUpWeightLayout.H_X4_INNERMOST,
+        MLPGateUpWeightLayout.H_X4_MIDDLE,
+    ]:  # pragma: no branch - MLPGateUpWeightLayout enum exhaustive (3 values), fall-through dead
         # I is padded to nearest 512 in the 6D layout, so inner dims are always full (128, 4)
         n_I512 = math.ceil(I / 512)
         expected_shape = [min(H // 4, 128), H // 512, n_I512, 4, 128, 4]
@@ -853,7 +856,9 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
             f"MX quantization (mxfp) requires H to be divisible by 512, got H={H}. "
             f"This ensures proper alignment for quantization groups (128 * 4).",
         )
-        if params.quant_params.is_quant_mx():
+        if (
+            params.quant_params.is_quant_mx()
+        ):  # pragma: no branch - is_quant_mx() always False inside not-is_quant_mx() block, true arc dead
             kernel_assert(
                 I % 512 == 0 or (I < 512 and I % 32 == 0),
                 f"MX quantization (mxfp) requires I to be I % 512 == 0 or (I < 512 and I % 32 ==0), got I={I}. "

@@ -38,6 +38,7 @@ from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     generate_token_position_to_id_and_experts,
     get_n_blocks,
+    get_n_blocks_tight,
     map_skip_mode,
 )
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
@@ -525,6 +526,7 @@ def _compute_golden_cache_key(
     up_clamp_upper_limit,
     up_clamp_lower_limit,
     alpha,
+    tight_blocks: bool = False,
 ) -> str:
     """Compute a hash key from test parameters for caching."""
     key_data = (
@@ -549,6 +551,7 @@ def _compute_golden_cache_key(
         up_clamp_upper_limit,
         up_clamp_lower_limit,
         alpha,
+        tight_blocks,
     )
     key_str = str(key_data)
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
@@ -779,6 +782,7 @@ def build_moe_bwmm_mx_cte(
     packed_affinities_dtype=nl.bfloat16,
     ep_degree: int = 1,
     ep_rank: int = 0,
+    tight_blocks: bool = False,
 ) -> dict:
     """
     Build input tensors for MoE BWMM MXFP4/MXFP8 CTE kernel testing.
@@ -806,6 +810,8 @@ def build_moe_bwmm_mx_cte(
         up_clamp_lower_limit: Lower clamp limit for up projection
         alpha: Expert distribution sparsity parameter (None for uniform distribution)
         use_cache: Whether to use cached inputs if available (default: False)
+        tight_blocks: Size N to the blocks the routing actually occupies instead of the
+            worst-case bound, so conditions has no trailing zeros (default: False)
 
     Returns:
         Dictionary with all kernel input tensors and parameters
@@ -831,6 +837,7 @@ def build_moe_bwmm_mx_cte(
         up_clamp_upper_limit,
         up_clamp_lower_limit,
         alpha,
+        tight_blocks,
     )
     cache_file = os.path.join(_GOLDEN_CACHE_DIR, f"input_{cache_key}.pkl")
 
@@ -842,7 +849,10 @@ def build_moe_bwmm_mx_cte(
     np.random.seed(0)
 
     dma_skip = map_skip_mode(skip_mode)
-    if is_shard_on_I:
+    if tight_blocks:
+        # Size N to the routing so conditions has no trailing zeros, as production does.
+        N = get_n_blocks_tight(T, TOPK, E, B, alpha=alpha)
+    elif is_shard_on_I:
         N = get_n_blocks(T, TOPK, E, B, n_block_per_iter=1)
     else:
         N = get_n_blocks(T, TOPK, E, B, n_block_per_iter=vnc_degree)

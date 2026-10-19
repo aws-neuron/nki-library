@@ -26,9 +26,10 @@ from functools import lru_cache
 from urllib.parse import urlparse
 
 import boto3
+import botocore.session
 from botocore.client import BaseClient
 from botocore.config import Config
-from botocore.credentials import EnvProvider
+from botocore.credentials import AssumeRoleCredentialFetcher, DeferredRefreshableCredentials, EnvProvider
 from botocore.exceptions import ClientError
 
 # Retry configuration for credential fetching
@@ -70,6 +71,23 @@ def parse_s3_uri(uri: str) -> S3Uri:
     bucket = parsed.netloc
     prefix = parsed.path.lstrip("/").rstrip("/")
     return S3Uri(bucket=bucket, prefix=prefix)
+
+
+def region_from_queue_url(queue_url: str) -> str | None:
+    """Extract the AWS region from an SQS queue URL host (``sqs.<region>.amazonaws.com``).
+
+    A queue may live in a different region than the process (e.g. the coverage
+    pipeline step runs in us-east-2 while the queue is in us-east-1). boto3 routes
+    SendMessage to the client's region, not the region in the QueueUrl, so a client
+    must be pinned to the queue's region or the send hits a non-existent queue in
+    the wrong region. Returns None when the host is not a standard SQS endpoint,
+    letting boto3 fall back to its default region resolution.
+    """
+    host = urlparse(queue_url).hostname or ""
+    parts = host.split(".")
+    if len(parts) >= 3 and parts[0] == "sqs" and parts[2] == "amazonaws":
+        return parts[1]
+    return None
 
 
 class S3TransferDirection(Enum):
@@ -180,9 +198,8 @@ def get_bucket_region(bucket: str, profile: str | None = None) -> str:
     ``get_bucket_location``, which returns ``None`` for us-east-1 and requires
     the ``s3:GetBucketLocation`` permission.
 
-    The lookup runs against the local (Hydra worker) boto3 session, whose region
-    already matches the bucket, so it does not incur the redirect it exists to
-    prevent on the remote host.
+    The lookup runs against the local worker's boto3 session, whose region already matches the
+    bucket, so it does not incur the redirect it exists to prevent on the remote host.
     """
     s3_client = get_boto_client("s3", profile=profile)
     response = s3_client.head_bucket(Bucket=bucket)
@@ -323,8 +340,23 @@ def prefetch_and_cache_credentials(profile: str | None = None) -> None:
 # normalizes a Config's ``retries`` dict IN PLACE when constructing a client (e.g.
 # ``max_attempts`` -> ``total_max_attempts``), so a shared module-global Config would be
 # mutated out from under later callers (and tests asserting on it).
-def _boto_client_retry_config() -> Config:
-    return Config(retries={"max_attempts": 5, "mode": "standard"})
+def _boto_client_retry_config(
+    *,
+    connect_timeout: float | None = None,
+    read_timeout: float | None = None,
+    max_attempts: int | None = None,
+) -> Config:
+    # Each bound is applied only when asked for, because the SDK's own default is 60s rather than
+    # no timeout: passing the option through as ``None`` would replace a 60s wait with an
+    # unbounded one, which is the opposite of what an opt-in bound is for.
+    options: dict[str, object] = {
+        "retries": {"max_attempts": max_attempts if max_attempts is not None else 5, "mode": "standard"}
+    }
+    if connect_timeout is not None:
+        options["connect_timeout"] = connect_timeout
+    if read_timeout is not None:
+        options["read_timeout"] = read_timeout
+    return Config(**options)  # type: ignore[arg-type]
 
 
 @lru_cache(maxsize=None)
@@ -365,6 +397,125 @@ def get_boto_client(service: str, *, region: str | None = None, profile: str | N
         profile: Optional AWS profile name for authentication.
     """
     return _get_boto_client_cached(service, region, profile)
+
+
+# Stable role-session name for assumed-role clients built by get_boto_client_for_role. Fixed
+# (not time-suffixed) so repeated assumptions of the same role are identifiable as the same
+# logical caller.
+_ASSUMED_ROLE_SESSION_NAME = "test-infra-assumed-role"
+
+
+@lru_cache(maxsize=None)
+def _get_assumed_credentials_cached(
+    profile: str | None, role_arn: str, transit_role_arn: str | None = None
+) -> DeferredRefreshableCredentials:
+    """Helper to ensure canonical form for caching
+
+    Keyed on the identity being assumed rather than on the client using it, so every client for
+    one role shares a single assumption. That matters for a caller that builds a client per
+    region: assuming a role is itself a throttled API call, so keying this per client would turn
+    one assumption into one per region, concurrently, every time such a sweep runs.
+
+    When ``transit_role_arn`` is given, ``role_arn`` is assumed from that intermediate role
+    instead of from the base profile. The transit hop is obtained by recursing into this same
+    memoised function, so it is itself deferred and refreshable (rather than a frozen snapshot)
+    and is shared by every target role that chains through it.
+    """
+    base_session = get_boto_session(profile)
+    if transit_role_arn is None:
+        source_credentials = base_session.get_credentials()
+    else:
+        source_credentials = _get_assumed_credentials_cached(profile, transit_role_arn)
+    fetcher = AssumeRoleCredentialFetcher(
+        client_creator=base_session._session.create_client,
+        source_credentials=source_credentials,
+        role_arn=role_arn,
+        extra_args={"RoleSessionName": _ASSUMED_ROLE_SESSION_NAME},
+    )
+    return DeferredRefreshableCredentials(
+        method="assume-role",
+        refresh_using=fetcher.fetch_credentials,
+    )
+
+
+@lru_cache(maxsize=None)
+def _get_boto_client_for_role_cached(
+    service: str,
+    region: str | None,
+    profile: str | None,
+    role_arn: str,
+    connect_timeout: float | None = None,
+    read_timeout: float | None = None,
+    max_attempts: int | None = None,
+    transit_role_arn: str | None = None,
+) -> BaseClient:
+    "Helper to ensure canonical form for caching"
+    assumed_botocore_session = botocore.session.Session()
+    assumed_botocore_session._credentials = _get_assumed_credentials_cached(profile, role_arn, transit_role_arn)
+    assumed_session = boto3.Session(botocore_session=assumed_botocore_session)
+    return assumed_session.client(
+        service,
+        region_name=region,
+        config=_boto_client_retry_config(
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        ),
+    )
+
+
+def get_boto_client_for_role(
+    service: str,
+    *,
+    role_arn: str,
+    region: str | None = None,
+    profile: str | None = None,
+    connect_timeout: float | None = None,
+    read_timeout: float | None = None,
+    max_attempts: int | None = None,
+    transit_role_arn: str | None = None,
+) -> BaseClient:
+    """Get or create a boto3 client that calls ``service`` as an assumed IAM role (cached per
+    service/region/profile/role_arn/transit_role_arn and per call bounds).
+
+    Base credentials come from the shared per-profile session (see ``get_boto_session``), so
+    assuming a role still costs at most one base credential fetch per profile. The assumed-role
+    credentials are wrapped in botocore's ``DeferredRefreshableCredentials``, backed by an
+    ``AssumeRoleCredentialFetcher`` scoped to ``role_arn``: the role is re-assumed automatically
+    shortly before the temporary credentials expire, so a client held for the life of the
+    process never presents stale credentials, and no manual or time-based expiry handling is
+    needed here. Those credentials are shared by every client for the same profile and role, so
+    building a client per region costs one role assumption rather than one per region.
+
+    The call bounds are optional because they are a property of the caller, not of the service: a
+    caller that sweeps many regions needs to fail fast on the ones it cannot reach, while an
+    ordinary caller is better served by the SDK's more forgiving defaults. Omitting a bound leaves
+    that default in place (note the SDK default is a 60s timeout, not an unbounded wait).
+
+    Passing ``transit_role_arn`` turns the single hop into a two-hop role chain: the base profile
+    credentials assume the transit role, and the transit role's credentials assume ``role_arn``.
+    Both hops refresh themselves independently, so neither can expire mid-run. Omitting it means
+    ``role_arn`` is assumed directly from the base profile credentials, as a single hop.
+
+    Limitation: results are memoised with an unbounded cache (``lru_cache(maxsize=None)``) that
+    never evicts, so one client is retained per distinct combination of the arguments below for
+    the life of the process. This is a bounded-memory note, not a freshness concern -- each cached
+    client's own credentials keep themselves current via the mechanism above.
+
+    Args:
+        service: AWS service name (e.g. "eks", "sts").
+        role_arn: ARN of the IAM role to assume before making calls.
+        region: Region for the client; None uses the session/default region.
+        profile: Optional AWS profile name supplying the base credentials to assume from.
+        connect_timeout: Seconds to wait for a connection; None keeps the SDK default.
+        read_timeout: Seconds to wait for a response; None keeps the SDK default.
+        max_attempts: Total attempts per call; None keeps the shared default.
+        transit_role_arn: Optional ARN of an intermediate role to assume first, from which
+            ``role_arn`` is then assumed; None assumes ``role_arn`` directly.
+    """
+    return _get_boto_client_for_role_cached(
+        service, region, profile, role_arn, connect_timeout, read_timeout, max_attempts, transit_role_arn
+    )
 
 
 def get_s3_client_and_session(profile: str | None = None):

@@ -619,7 +619,7 @@ def _process_row_quantized_batch_tile(
 
         quant_nd = quant_sub.reshape((curr_s_sub, n_orig, d_orig))
         for head_idx in range(n_orig):
-            if quant_config.use_double_row:
+            if quant_config.use_double_row:  # pragma: no cover - dead for ROW: use_double_row derives from is_fp8_quantized, which is False for ROW (only is_row_fp8_quantized is set)
                 # Double row: cast to FP8, nc_transpose with step-of-2 PSUM (HW constraint for 1-byte dtype)
                 fp8_head = nl.ndarray((curr_s_sub, d_orig), dtype=quant_config.quant_data_type, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=fp8_head, src=quant_nd[:curr_s_sub, head_idx, :d_orig])
@@ -646,7 +646,9 @@ def _process_row_quantized_batch_tile(
                 )
 
     # Pass transposed heads — for double row, pack into [D, 2, S]
-    if quant_config.use_double_row:
+    if (
+        quant_config.use_double_row
+    ):  # pragma: no cover - dead for ROW: use_double_row is always False on the ROW path (see above)
         if n_orig == cfg.n_size // 2:
             # D was split: n_orig heads, each [D_orig, S] -> split into [D, 2, S]
             for head_idx in range(n_orig):
@@ -830,7 +832,9 @@ def _compute_row_matmul_dequantize(
             # Accumulate matmul across heads
             num_matmul_heads = cfg.n_size // 2 if quant_config.use_double_row else cfg.n_size
             for head_idx in range(num_matmul_heads):
-                if quant_config.use_double_row:
+                if (
+                    quant_config.use_double_row
+                ):  # pragma: no cover - dead for ROW: use_double_row is always False on the ROW path
                     attention_slice = quant_attention_sb[head_idx][
                         : cfg.d_size,
                         0:2,
@@ -1127,7 +1131,9 @@ def _quantize_mx_attention_tensors(
     attn_scale_list = []
     for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
         curr_d_tile_size, _ = cfg.d_tile.get_bounds(d_tile_idx)
-        if curr_d_tile_size <= 0:
+        if (
+            curr_d_tile_size <= 0
+        ):  # pragma: no branch - dead arc: range(tile_count) is exact ceil; every d_tile bound >= 1
             break
 
         attn_2d = attn_sbuf_list[d_tile_idx].reshape((curr_d_tile_size, padded_s_tile_size * _q_width))
@@ -1448,7 +1454,9 @@ def _quantize_static_mx_attention(
 
     for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
         curr_d_tile_size, _ = cfg.d_tile.get_bounds(d_tile_idx)
-        if curr_d_tile_size <= 0:
+        if (
+            curr_d_tile_size <= 0
+        ):  # pragma: no branch - dead arc: range(tile_count) is exact ceil; every d_tile bound >= 1
             break
         attn_sbuf = attn_sbuf_list[d_tile_idx].reshape(
             (curr_d_tile_size, padded_s_tile_size * _q_width)

@@ -45,6 +45,7 @@ def attention_segmented_cte_torch_ref(
     kvp_seg_block_offset_int: int = 0,
     kvp_prior_load_blocks: int = 0,
     kvp_prior_fully_visible: bool = False,
+    allow_vector_exp: bool = True,
 ) -> torch.Tensor:
     """
     Torch reference for segmented attention with block-based KV cache.

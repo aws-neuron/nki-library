@@ -61,21 +61,21 @@ class QKV_CTE_UserInput(nl.NKIObject):
     Used for initial input validation and to construct QKV_CTE_Config and QKV_CTE_Dims objects.
 
     Attributes:
-        input (nl.ndarray): [B, S, H], Input hidden states tensor
-        fused_qkv_weights (nl.ndarray): [H, I], Fused QKV weight matrix
+        input (nl.NkiTensor): [B, S, H], Input hidden states tensor
+        fused_qkv_weights (nl.NkiTensor): [H, I], Fused QKV weight matrix
         output_layout (QKVOutputLayout): Desired output tensor layout
-        bias (Optional[nl.ndarray]): [1, I], Optional bias tensor
+        bias (Optional[nl.NkiTensor]): [1, I], Optional bias tensor
         fused_residual_add (Optional[bool]): Whether to perform residual addition
-        mlp_prev (Optional[nl.ndarray]): [B, S, H], Previous MLP output for residual
-        attention_prev (Optional[nl.ndarray]): [B, S, H], Previous attention output for residual
+        mlp_prev (Optional[nl.NkiTensor]): [B, S, H], Previous MLP output for residual
+        attention_prev (Optional[nl.NkiTensor]): [B, S, H], Previous attention output for residual
         fused_norm_type (NormType): Type of normalization to apply
-        gamma_norm_weights (Optional[nl.ndarray]): [1, H], Normalization gamma weights
-        layer_norm_bias (Optional[nl.ndarray]): [1, H], Layer norm beta weights
+        gamma_norm_weights (Optional[nl.NkiTensor]): [1, H], Normalization gamma weights
+        layer_norm_bias (Optional[nl.NkiTensor]): [1, H], Layer norm beta weights
         norm_eps (Optional[float]): Epsilon for normalization stability
         hidden_actual (Optional[int]): Actual hidden dimension if H is padded
         fused_rope (Optional[bool]): Whether to apply RoPE
-        cos_cache (Optional[nl.ndarray]): [B, S, d_head], RoPE cosine cache
-        sin_cache (Optional[nl.ndarray]): [B, S, d_head], RoPE sine cache
+        cos_cache (Optional[nl.NkiTensor]): [B, S, d_head], RoPE cosine cache
+        sin_cache (Optional[nl.NkiTensor]): [B, S, d_head], RoPE sine cache
         d_head (Optional[int]): Dimension per attention head
         num_q_heads (Optional[int]): Number of query heads
         num_kv_heads (Optional[int]): Number of key/value heads
@@ -84,39 +84,39 @@ class QKV_CTE_UserInput(nl.NKIObject):
         use_auto_allocation (bool): Whether to use automatic SBUF allocation
         load_input_with_DMA_transpose (bool): Whether to use DMA transpose
         quantization_type (QuantizationType): Quantization type for QKV projection
-        qkv_w_scale (Optional[nl.ndarray]): Quantization scale for QKV weights
-        qkv_in_scale (Optional[nl.ndarray]): Quantization scale for QKV input
+        qkv_w_scale (Optional[nl.NkiTensor]): Quantization scale for QKV weights
+        qkv_in_scale (Optional[nl.NkiTensor]): Quantization scale for QKV input
         is_input_swizzled (bool): If input tensor is swizzled for MX
         weight_layout (QKVWeightLayout): Layout of fused_qkv_weights
     """
 
-    input: nl.ndarray
-    fused_qkv_weights: nl.ndarray
+    input: nl.NkiTensor
+    fused_qkv_weights: nl.NkiTensor
     output_layout: QKVOutputLayout
     # -- Bias
-    bias: Optional[nl.ndarray]
+    bias: Optional[nl.NkiTensor]
     # -- Fused Residual Add
     fused_residual_add: Optional[bool]
-    mlp_prev: Optional[nl.ndarray]
-    attention_prev: Optional[nl.ndarray]
+    mlp_prev: Optional[nl.NkiTensor]
+    attention_prev: Optional[nl.NkiTensor]
     # --- Fused Norm Related
     fused_norm_type: NormType
-    gamma_norm_weights: Optional[nl.ndarray]
-    layer_norm_bias: Optional[nl.ndarray]
+    gamma_norm_weights: Optional[nl.NkiTensor]
+    layer_norm_bias: Optional[nl.NkiTensor]
     norm_eps: Optional[float]
     hidden_actual: Optional[int]
     # --- Fused RoPE Related
     fused_rope: Optional[bool]
-    cos_cache: Optional[nl.ndarray]
-    sin_cache: Optional[nl.ndarray]
+    cos_cache: Optional[nl.NkiTensor]
+    sin_cache: Optional[nl.NkiTensor]
     d_head: Optional[int]
     num_q_heads: Optional[int]
     num_kv_heads: Optional[int]
     # --- KV Cache Related
-    k_cache: Optional[nl.ndarray]
-    v_cache: Optional[nl.ndarray]
-    k_scale: Optional[nl.ndarray]
-    v_scale: Optional[nl.ndarray]
+    k_cache: Optional[nl.NkiTensor]
+    v_cache: Optional[nl.NkiTensor]
+    k_scale: Optional[nl.NkiTensor]
+    v_scale: Optional[nl.NkiTensor]
     fp8_max: Optional[float]
     fp8_min: Optional[float]
     kv_dtype: Optional[Any]
@@ -125,7 +125,7 @@ class QKV_CTE_UserInput(nl.NKIObject):
     transpose_k_cache: bool
     fp8_packed: bool
     block_size: Optional[int]
-    slot_mapping: Optional[nl.ndarray]
+    slot_mapping: Optional[nl.NkiTensor]
     # --- Performance Related
     store_output_in_sbuf: bool
     sbm: Optional[SbufManager]
@@ -133,8 +133,8 @@ class QKV_CTE_UserInput(nl.NKIObject):
     load_input_with_DMA_transpose: bool
     # --- Quantization Related
     quantization_type: QuantizationType
-    qkv_w_scale: Optional[nl.ndarray]
-    qkv_in_scale: Optional[nl.ndarray]
+    qkv_w_scale: Optional[nl.NkiTensor]
+    qkv_in_scale: Optional[nl.NkiTensor]
     is_input_swizzled: bool
     weight_layout: QKVWeightLayout
     # --- QK-Norm Related
@@ -142,11 +142,11 @@ class QKV_CTE_UserInput(nl.NKIObject):
     qk_norm_post_rope: Optional[QKNormConfig]
     # --- Strided Input
     strided_input_config: Optional[StridedInputConfig]
-    output_hbm: Optional[nl.ndarray]
+    output_hbm: Optional[nl.NkiTensor]
     # --- Optional per-segment sum-of-squares outputs (each [B, S, 1])
-    q_squared_sum_out: Optional[nl.ndarray] = None
-    k_squared_sum_out: Optional[nl.ndarray] = None
-    v_squared_sum_out: Optional[nl.ndarray] = None
+    q_squared_sum_out: Optional[nl.NkiTensor] = None
+    k_squared_sum_out: Optional[nl.NkiTensor] = None
+    v_squared_sum_out: Optional[nl.NkiTensor] = None
     # --- FP8 E4M3 dtype mode. See DtypeMode enum.
     dtype_mode: DtypeMode = DtypeMode.NON_OCP
 
@@ -155,8 +155,8 @@ class QKV_CTE_UserInput(nl.NKIObject):
 @dataclass
 class QKV_Quant_Config(nl.NKIObject):
     quantization_type: QuantizationType
-    qkv_w_scale: Optional[nl.ndarray] = None  # weight quant scale for qkv projection
-    qkv_in_scale: Optional[nl.ndarray] = None  # in_scale are same for q, k, v
+    qkv_w_scale: Optional[nl.NkiTensor] = None  # weight quant scale for qkv projection
+    qkv_in_scale: Optional[nl.NkiTensor] = None  # in_scale are same for q, k, v
     quant_dtype: Optional[Any] = None  # Follow _fp8_e4m3_dtype for fp8 and fused_qkv_weights.dtype for other cases
     has_mx_static_dequant_scales: bool = False
     has_row_mx_dequant: bool = False

@@ -21,16 +21,18 @@ from nki.collectives import ReplicaGroup
 
 
 @nki.jit
-def all_reduce_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup) -> nl.ndarray:
+def all_reduce_hbm_kernel(input: nl.NkiTensor, replica_group: ReplicaGroup) -> nl.NkiTensor:
     """Sum tensors across all ranks.
 
     Example with replica_group=[[0,1]], input shape (2, 3) -> output shape (2, 3):
       rank0: [[1,2,3], [4,5,6]] -> [[2,4,6], [8,10,12]]
       rank1: [[1,2,3], [4,5,6]] -> [[2,4,6], [8,10,12]]
     """
-    # name= required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it
-    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="src")
-    dst = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="dst")
+    # Keep both operands private_hbm for compatibility with old same-buffer validation and the
+    # newer LNC1 rule that collective sources must not use shared_hbm.
+    # name= is required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it.
+    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.private_hbm, name="src")
+    dst = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.private_hbm, name="dst")
     out = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm)
     # dma_copy required: Collective instruction cannot read/write IO tensors
     nisa.dma_copy(dst=src, src=input)
@@ -40,7 +42,7 @@ def all_reduce_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup) -> nl.
 
 
 @nki.jit
-def all_gather_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup, num_ranks: int) -> nl.ndarray:
+def all_gather_hbm_kernel(input: nl.NkiTensor, replica_group: ReplicaGroup, num_ranks: int) -> nl.NkiTensor:
     """Gather tensors from all ranks along dim 0.
 
     Example with replica_group=[[0,1]], input shape (2, 3) -> output shape (4, 3):
@@ -48,9 +50,11 @@ def all_gather_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup, num_ra
       rank1: [[7,8,9], [10,11,12]]    -> [[1,2,3], [4,5,6], [7,8,9], [10,11,12]]
     """
     H, W = input.shape
-    # name= required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it
-    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="src")
-    dst = nl.ndarray((H * num_ranks, W), dtype=input.dtype, buffer=nl.shared_hbm, name="dst")
+    # Keep both operands private_hbm for compatibility with old same-buffer validation and the
+    # newer LNC1 rule that collective sources must not use shared_hbm.
+    # name= is required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it.
+    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.private_hbm, name="src")
+    dst = nl.ndarray((H * num_ranks, W), dtype=input.dtype, buffer=nl.private_hbm, name="dst")
     out = nl.ndarray((H * num_ranks, W), dtype=input.dtype, buffer=nl.shared_hbm)
     # dma_copy required: Collective instruction cannot read/write IO tensors
     nisa.dma_copy(dst=src, src=input)
@@ -60,7 +64,7 @@ def all_gather_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup, num_ra
 
 
 @nki.jit
-def reduce_scatter_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup, num_ranks: int) -> nl.ndarray:
+def reduce_scatter_hbm_kernel(input: nl.NkiTensor, replica_group: ReplicaGroup, num_ranks: int) -> nl.NkiTensor:
     """Sum then scatter chunks along dim 0. Dim 0 is split into num_ranks chunks.
 
     Example with replica_group=[[0,1]], input shape (4, 3) -> output shape (2, 3):
@@ -68,9 +72,11 @@ def reduce_scatter_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup, nu
       rank1: [[1,1,1], [2,2,2], [3,3,3], [4,4,4]] -> [[6,6,6], [8,8,8]]   (sum of inputs[2:,:])
     """
     H, W = input.shape
-    # name= required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it
-    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="src")
-    dst = nl.ndarray((H // num_ranks, W), dtype=input.dtype, buffer=nl.shared_hbm, name="dst")
+    # Keep both operands private_hbm for compatibility with old same-buffer validation and the
+    # newer LNC1 rule that collective sources must not use shared_hbm.
+    # name= is required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it.
+    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.private_hbm, name="src")
+    dst = nl.ndarray((H // num_ranks, W), dtype=input.dtype, buffer=nl.private_hbm, name="dst")
     out = nl.ndarray((H // num_ranks, W), dtype=input.dtype, buffer=nl.shared_hbm)
     # dma_copy required: Collective instruction cannot read/write IO tensors
     nisa.dma_copy(dst=src, src=input)
@@ -80,16 +86,18 @@ def reduce_scatter_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup, nu
 
 
 @nki.jit
-def all_to_all_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup) -> nl.ndarray:
+def all_to_all_hbm_kernel(input: nl.NkiTensor, replica_group: ReplicaGroup) -> nl.NkiTensor:
     """Exchange chunks across ranks along dim 0. Each rank sends input[i,:] to rank[i].
 
     Example with replica_group=[[0,1]], input shape (2, 3) -> output shape (2, 3):
       rank0: [[1,2,3], [4,5,6]] -> [[1,2,3], [7,8,9]]     (keeps input[0,:], gets rank1's input[0,:])
       rank1: [[7,8,9], [10,11,12]] -> [[4,5,6], [10,11,12]] (gets rank0's input[1,:], keeps input[1,:])
     """
-    # name= required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it
-    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="src")
-    dst = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="dst")
+    # Keep both operands private_hbm for compatibility with old same-buffer validation and the
+    # newer LNC1 rule that collective sources must not use shared_hbm.
+    # name= is required on collective src/dst: NCC_IBIR440 DRAM allocation failure without it.
+    src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.private_hbm, name="src")
+    dst = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.private_hbm, name="dst")
     out = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm)
     # dma_copy required: Collective instruction cannot read/write IO tensors
     nisa.dma_copy(dst=src, src=input)
@@ -99,7 +107,7 @@ def all_to_all_hbm_kernel(input: nl.ndarray, replica_group: ReplicaGroup) -> nl.
 
 
 @nki.jit
-def rank_id_kernel(in_tensor: nl.ndarray) -> nl.ndarray:
+def rank_id_kernel(in_tensor: nl.NkiTensor) -> nl.NkiTensor:
     """Select per-rank slice using rank_id as scalar_offset.
 
     Example with 2 ranks, input shape (2, 2, 3) -> output shape (2, 3):
@@ -118,7 +126,7 @@ def rank_id_kernel(in_tensor: nl.ndarray) -> nl.ndarray:
 
 
 @nki.jit
-def dma_copy_rank_id_kernel(in_tensor: nl.ndarray, rank_id_lookup: nl.ndarray) -> nl.ndarray:
+def dma_copy_rank_id_kernel(in_tensor: nl.NkiTensor, rank_id_lookup: nl.NkiTensor) -> nl.NkiTensor:
     """Load rank_id into SBUF via lookup table, then use as scalar_offset.
 
     ncc.rank_id() returns a value in a register. Due to currently unsupported

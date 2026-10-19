@@ -120,7 +120,7 @@ def generate_inputs(
         cp_offset=cp_offset,
     )
     o_ref = dt.static_cast(o_proj.float().numpy(), dtype)
-    lse_ref = lse.float().numpy()
+    lse_ref = np.ascontiguousarray(lse.float().numpy())
 
     result = {
         "q_ref": q,

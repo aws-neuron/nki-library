@@ -151,7 +151,7 @@ def transpose_hidden_states(block_hidden_states, dims, compute_dtype):
         compute_dtype: Data type for transposed output tensors.
 
     Returns:
-        List[List[nl.ndarray]]: 2D list of transposed tensors with shape
+        List[List[nl.NkiTensor]]: 2D list of transposed tensors with shape
             [h_outer_tripcount][h_inner_tripcount], each element is
             [TILE_SIZE, block_psum_tiles, free_size].
     """
@@ -210,7 +210,7 @@ def load_gate_up_proj_weights_shard(gate_up_proj_weight, block_expert, cfg, dims
         shard_id: Current shard/core ID for H offset calculation.
 
     Returns:
-        List[List[nl.ndarray]]: 2D list [h_outer][h_inner] of [TILE_SIZE, 2, I_TP]
+        List[List[nl.NkiTensor]]: 2D list [h_outer][h_inner] of [TILE_SIZE, 2, I_TP]
             weight tensors in SBUF.
     """
     _, H, _, I_TP = gate_up_proj_weight.shape
@@ -261,7 +261,7 @@ def load_down_proj_weight_shard(down_proj_weight, block_expert, cfg, dims, shard
         shard_id: Current shard/core ID for H offset calculation.
 
     Returns:
-        List[nl.ndarray]: List of [TILE_SIZE, H_per_shard] weight tensors in SBUF.
+        List[nl.NkiTensor]: List of [TILE_SIZE, H_per_shard] weight tensors in SBUF.
     """
     _, I_TP, H = down_proj_weight.shape
     gup_n_tile = div_ceil(I_TP, TILE_SIZE)
@@ -307,7 +307,7 @@ def compute_gate_and_up_projections_shard(
         shard_id: Current shard/core ID for sendrecv partner calculation.
 
     Returns:
-        List[List[List[nl.ndarray]]]: 3D list [gate_or_up][b_tile][i_tile] of
+        List[List[List[nl.NkiTensor]]]: 3D list [gate_or_up][b_tile][i_tile] of
             [TILE_SIZE, free_size] tensors containing all-reduced projections.
     """
     N_PSUM_TILE = div_ceil(dims.B, PSUM_SIZE)
@@ -439,7 +439,7 @@ def compute_block_output_shard(
         shard_id: Current shard/core ID for H offset calculation.
 
     Returns:
-        List[nl.ndarray]: List of [TILE_SIZE, H_per_shard] output tensors in SBUF.
+        List[nl.NkiTensor]: List of [TILE_SIZE, H_per_shard] output tensors in SBUF.
     """
     gup_n_tile = div_ceil(dims.I_TP, TILE_SIZE)
     H_NUM_PSUM_TILES = div_ceil(dims.H_per_shard, PSUM_SIZE)
@@ -550,15 +550,15 @@ def store_block_output_shard(output, block_new, token_indices, dims, shard_id, s
 
 @nki.jit
 def blockwise_mm_baseline_shard_hidden(
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
     block_size: int,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    gate_up_activations_T: nl.ndarray = None,
-    down_activations: nl.ndarray = None,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    gate_up_activations_T: nl.NkiTensor = None,
+    down_activations: nl.NkiTensor = None,
     skip_dma: SkipMode = SkipMode(),
     compute_dtype: nki.dtype = nl.bfloat16,
     is_tensor_update_accumulating: bool = True,
@@ -582,15 +582,15 @@ def blockwise_mm_baseline_shard_hidden(
         I_TP: Intermediate size / tp degree
 
     Args:
-        hidden_states (nl.ndarray): [T+1, H], Input hidden states. T+1 for padding token at index T.
-        expert_affinities_masked (nl.ndarray): [(T+1) * E, 1], Expert affinities per token.
-        gate_up_proj_weight (nl.ndarray): [E, H, 2, I_TP], Gate and up projection weights.
-        down_proj_weight (nl.ndarray): [E, I_TP, H], Down projection weights.
+        hidden_states (nl.NkiTensor): [T+1, H], Input hidden states. T+1 for padding token at index T.
+        expert_affinities_masked (nl.NkiTensor): [(T+1) * E, 1], Expert affinities per token.
+        gate_up_proj_weight (nl.NkiTensor): [E, H, 2, I_TP], Gate and up projection weights.
+        down_proj_weight (nl.NkiTensor): [E, I_TP, H], Down projection weights.
         block_size (int): Tokens per block.
-        token_position_to_id (nl.ndarray): [N * B], Token to block index mapping.
-        block_to_expert (nl.ndarray): [N, 1], Block to expert mapping.
-        gate_up_activations_T (nl.ndarray): Optional [N, 2, I_TP, B] for activation checkpointing.
-        down_activations (nl.ndarray): Optional [N, B, H] for activation checkpointing.
+        token_position_to_id (nl.NkiTensor): [N * B], Token to block index mapping.
+        block_to_expert (nl.NkiTensor): [N, 1], Block to expert mapping.
+        gate_up_activations_T (nl.NkiTensor): Optional [N, 2, I_TP, B] for activation checkpointing.
+        down_activations (nl.NkiTensor): Optional [N, B, H] for activation checkpointing.
         skip_dma (SkipMode): DMA skip configuration.
         compute_dtype (nki.dtype): Compute data type (default: bfloat16).
         is_tensor_update_accumulating (bool): Accumulate results over blocks (default: True).
@@ -598,8 +598,8 @@ def blockwise_mm_baseline_shard_hidden(
 
     Returns:
         tuple:
-            - output (nl.ndarray): [T+1, H], Output hidden states.
-            - gate_up_activations_T (nl.ndarray or None): [N, 2, I_TP, B], Checkpointed gate/up
+            - output (nl.NkiTensor): [T+1, H], Output hidden states.
+            - gate_up_activations_T (nl.NkiTensor or None): [N, 2, I_TP, B], Checkpointed gate/up
               activations if gate_up_activations_T was provided, otherwise None.
 
     Notes:

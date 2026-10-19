@@ -222,6 +222,20 @@ class TestEntryId:
         mgr = self._make_manager(NoopMetricsCollector())
         assert mgr.entry_id == mgr.entry_id == mgr._entry_id
 
+    def test_bump_and_reenqueue_counts_reflect_enqueue_signals(self):
+        mgr = self._make_manager(NoopMetricsCollector())
+        assert (mgr.bump_count, mgr.reenqueue_count) == (0, 0)
+        mgr._note_enqueued(1.0, 0, 10, bumped=True)
+        mgr._note_enqueued(2.0, 1, 10, bumped=True)
+        mgr._note_enqueued(3.0, 1, 10, bumped=False, re_enqueued=True)
+        assert (mgr.bump_count, mgr.reenqueue_count) == (2, 1)
+
+    def test_has_enqueued_turns_true_on_the_first_enqueue(self):
+        mgr = self._make_manager(NoopMetricsCollector())
+        assert mgr.has_enqueued is False
+        mgr._note_enqueued(1.0, 0, 10, bumped=False)
+        assert mgr.has_enqueued is True
+
 
 class TestAcquireOutcome:
     """Tests for queue-aware CoreLockManager.acquire -> AllocationOutcome mapping."""
@@ -280,6 +294,29 @@ class TestAcquireOutcome:
         mgr = self._make_manager()
         mgr.acquire(num_logical_cores=1, lnc_config=2, ready=False)
         assert False in mock_poll.call_args[0]
+
+    @patch("test.utils.core_lock_client.poll")
+    def test_hold_cap_forwarded(self, mock_poll):
+        """acquire forwards hold_cap_seconds to the poll wire call; default is None."""
+        mock_poll.return_value = LockResult(status=LockStatus.IN_QUEUE, position=0, worst_case_eta=1)
+        mgr = self._make_manager()
+        mgr.acquire(num_logical_cores=1, lnc_config=2, ready=False, hold=True, hold_cap_seconds=120)
+        assert mock_poll.call_args.kwargs["hold_cap_seconds"] == 120
+        mgr.acquire(num_logical_cores=1, lnc_config=2, ready=False)
+        assert mock_poll.call_args.kwargs["hold_cap_seconds"] is None
+
+    @patch("test.utils.core_lock_client.poll")
+    def test_assembled_surfaced_on_queued(self, mock_poll):
+        mock_poll.return_value = LockResult(status=LockStatus.IN_QUEUE, position=0, worst_case_eta=0, assembled=True)
+        outcome = self._make_manager().acquire(num_logical_cores=1, lnc_config=2, ready=False, hold=True)
+        assert outcome.status == AllocationStatus.QUEUED
+        assert outcome.assembled is True
+
+    @patch("test.utils.core_lock_client.poll")
+    def test_assembled_defaults_false(self, mock_poll):
+        mock_poll.return_value = LockResult(status=LockStatus.DRAINING, position=0, worst_case_eta=1)
+        outcome = self._make_manager().acquire(num_logical_cores=1, lnc_config=2, ready=False)
+        assert outcome.assembled is False
 
 
 class TestDequeueProbe:

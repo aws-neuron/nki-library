@@ -25,7 +25,7 @@ Failure modes that were caught at production-kernel scale:
    tile-walk axis (step > nested walk) merged with an outer block axis
    must clamp the merged count using inner-walk-aware arithmetic.
 
-3. HBM addressable extent (`dim_addressable`): an `nt.tensor_view`
+3. HBM addressable extent (`dim_addressable`): a native view chain
    chain that `slice`s a reshaped dim must keep the full sliced extent
    addressable -- the offset is subtracted only for remainder dims. The
    under-report collapsed a dim and made `dma_copy` reject the element
@@ -131,7 +131,7 @@ def _interleaved_block_ref(src: torch.Tensor) -> torch.Tensor:
     return src.clone()
 
 
-# --- nt.tensor_view addressable-extent chains (conv3d_neurotile) ---
+# --- native view addressable-extent chains (conv3d_neurotile) ---
 
 _P_MAX = 128
 _NUM_DH_STACKED = 4
@@ -152,7 +152,7 @@ def _dh_group_width(dh, dh_end, h_out):
 @nki.jit
 def _output_store_chain_kernel(inp):
     """Copy ``inp`` -> ``out`` by storing each (c_out_tile, dh_group) region
-    through the nt.tensor_view flatten -> reshape_dim -> slice output-store
+    through the flatten -> reshape_dim -> slice view output-store
     chain. dh positions split into two shards (mirroring lnc_shard) so the
     second shard's first group starts at a non-multiple of the stacking
     width -- the condition that exposed the addressable-extent bug."""
@@ -205,7 +205,7 @@ def _output_store_chain_kernel(inp):
 @nki.jit
 def _filter_load_chain_kernel(filters):
     """Gather each (C_in_tile, C_out_tile) plane of a 5-D filter through the
-    nt.tensor_view 3x slice+squeeze_dim chain, then store it to ``out``."""
+    3x slice+squeeze_dim view chain, then store it to ``out``."""
     K_d, K_h, K_w, C_in, C_out = filters.shape
     c_in_tile = min(_P_MAX, C_in)
     c_out_tile = min(256, C_out)
@@ -398,7 +398,7 @@ class TestSBUFAPPartitionStride:
 
     @pytest.mark.fast
     @pytest.mark.parametrize("shape", _OUTPUT_STORE_SHAPES)
-    def test_tensor_view_output_store_chain(self, test_manager: Orchestrator, platform_target: Platforms, shape):
+    def test_view_output_store_chain(self, test_manager: Orchestrator, platform_target: Platforms, shape):
         """HBMLayout.dim_addressable: flatten_dims -> reshape_dim -> slice output
         store keeps the full sliced extent addressable (round-trips identity)."""
         framework = UnitTestFramework(
@@ -418,7 +418,7 @@ class TestSBUFAPPartitionStride:
 
     @pytest.mark.fast
     @pytest.mark.parametrize("shape", _FILTER_SHAPES)
-    def test_tensor_view_filter_load_chain(self, test_manager: Orchestrator, platform_target: Platforms, shape):
+    def test_view_filter_load_chain(self, test_manager: Orchestrator, platform_target: Platforms, shape):
         """HBMLayout.dim_addressable: 3x slice+squeeze_dim filter load gathers
         the correct C_in/C_out plane from a 5-D filter."""
         K_d, K_h, K_w, C_in, C_out = shape

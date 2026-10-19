@@ -29,7 +29,7 @@ _QUANTIZED_FREE_DIM = 512  # Free dimension for quantize_mx input (_K_BLOCK_SIZE
 
 
 @nki.jit
-def mxfp_load_performance_wrapper(tensor: nl.ndarray):
+def mxfp_load_performance_wrapper(tensor: nl.NkiTensor):
     """Load a BF16 [M, K] tensor from HBM, swizzle, and quantize to MXFP8.
 
     Wrapper for benchmarking the swizzled load + quantize pipeline across
@@ -40,12 +40,12 @@ def mxfp_load_performance_wrapper(tensor: nl.ndarray):
         K: Number of BF16 columns, must be a multiple of 512.
 
     Args:
-        tensor (nl.ndarray): [M, K] bfloat16 in HBM. Input tensor to quantize.
+        tensor (nl.NkiTensor): [M, K] bfloat16 in HBM. Input tensor to quantize.
 
     Returns:
-        out_data_hbm (nl.ndarray): [P_MAX, M * K // 512] float8_e4m3fn_x4 in HBM.
+        out_data_hbm (nl.NkiTensor): [P_MAX, M * K // 512] float8_e4m3fn_x4 in HBM.
             Quantized MXFP8 data with K blocks concatenated along free dimension.
-        out_scale_hbm (nl.ndarray): [P_MAX, M * K // 512] float8_e8m0fnu in HBM.
+        out_scale_hbm (nl.NkiTensor): [P_MAX, M * K // 512] float8_e8m0fnu in HBM.
             MX scales with 16 active rows at partition offsets [0, 32, 64, 96].
 
     Notes:
@@ -79,9 +79,9 @@ def mxfp_load_performance_wrapper(tensor: nl.ndarray):
 
 
 def load_and_quantize_mxfp_mk(
-    tensor: nl.ndarray,
-    mx_data_sbuf: nl.ndarray,
-    mx_scales_sbuf: nl.ndarray,
+    tensor: nl.NkiTensor,
+    mx_data_sbuf: nl.NkiTensor,
+    mx_scales_sbuf: nl.NkiTensor,
 ) -> None:
     """Load a BF16 [M, K] tensor from HBM and quantize to MXFP8 in SBUF.
 
@@ -90,10 +90,10 @@ def load_and_quantize_mxfp_mk(
     The input has contraction dimension K along the free axis (M-by-K layout).
 
     Args:
-        tensor (nl.ndarray): [M, K] bfloat16 in HBM. Input tensor.
-        mx_data_sbuf (nl.ndarray): [P_MAX, M * K // 512] float8_e4m3fn_x4 in SBUF.
+        tensor (nl.NkiTensor): [M, K] bfloat16 in HBM. Input tensor.
+        mx_data_sbuf (nl.NkiTensor): [P_MAX, M * K // 512] float8_e4m3fn_x4 in SBUF.
             Pre-allocated output for quantized data.
-        mx_scales_sbuf (nl.ndarray): [P_MAX, M * K // 512] float8_e8m0fnu in SBUF.
+        mx_scales_sbuf (nl.NkiTensor): [P_MAX, M * K // 512] float8_e8m0fnu in SBUF.
             Pre-allocated output for MX scales.
 
     Notes:

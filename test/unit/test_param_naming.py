@@ -63,7 +63,6 @@ _GRANDFATHERED_FILES = {
     "experimental/subkernels/test_permute_routed_tokens.py",
     "experimental/subkernels/test_topk_reduce.py",
     "experimental/transformer/test_transformer_tkg.py",
-    "experimental/gdn/test_gdn_cte.py",
     "experimental/gdn/test_gdn_tkg.py",
 }
 

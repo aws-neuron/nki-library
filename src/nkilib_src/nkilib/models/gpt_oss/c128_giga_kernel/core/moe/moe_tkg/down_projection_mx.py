@@ -44,13 +44,21 @@ from nki.isa import oob_mode
 # per layer during the single-threaded trace.
 _MOE_OUT_SBUF_CAPTURE: list = []
 
+# On the LNC=1 (H_size_local == H) + PE-broadcast path, the full bias_sb memset is redundant:
+# the DMA writes bias row 0 over the full H and the PE matmul broadcast repopulates ALL
+# partitions sourced only from that row 0, so the memset's zeros are never read. The tile keeps
+# ONE cheap first write (one u32 column) so its SBUF allocation / live range is unchanged.
+# Only applied on the PE-broadcast path (use_PE_bias_broadcast=True); the DVE broadcast path
+# and the LNC=2 sharded partial-memset are left untouched.
+_DOWN_PREFETCH_ISPLIT = 2
+
 # Common utils
 from ...utils.common_types import ExpertAffinityScaleMode, MoELNCShardingStrategy
+from ...utils.dma_names import dma_name
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import as_nki_tensor
 from .all_expert_mx_utils import SUPPORTED_MOE_SHARDING_STRATEGIES
 
 # Shared MX constants
@@ -58,9 +66,112 @@ from .projection_mx_constants import (
     NUM_QUADRANTS_IN_SBUF,
     SBUF_QUADRANT_SIZE,
     SCALE_P_ELEM_PER_QUADRANT,
+    moe_load_dge_mode,
+    moe_updown_priority,
 )
 
 _DOWN_PREFETCH_FIFO: list = []
+
+_DOWN_BIAS_PREFETCH_FIFO: list = []
+
+
+def prefetch_down_bias_sb(
+    bias, expert_idx, H, tile_T, activation_compute_dtype=nl.bfloat16, use_PE_bias_broadcast=True
+):
+    """Load + PE-broadcast the down bias [E_L, H] -> [tile_T, H] early and enqueue it (loader pops FIFO).
+
+    Mirrors the bias section of load_broadcast_down_weight_scale_bias exactly (same statements, same
+    DMA name down_bias_e{expert_idx}, same PE broadcast + Scalar PSUM copies), under the LNC=1 program
+    sharding the caller runs with; the loader asserts the popped tile's shape and dtype.
+    """
+    _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx", (0, 1))
+    bias_sb = _load_broadcast_down_bias(
+        bias,
+        expert_idx,
+        H,
+        tile_T,
+        activation_compute_dtype,
+        use_PE_bias_broadcast,
+        MoELNCShardingStrategy.SHARD_I,
+        n_prgs,
+        prg_id,
+    )
+    _DOWN_BIAS_PREFETCH_FIFO.append(bias_sb)
+    return bias_sb
+
+
+def _load_broadcast_down_bias(
+    bias, expert_idx, H, tile_T, activation_compute_dtype, use_PE_bias_broadcast, sharding_strategy, n_prgs, prg_id
+):
+    """The bias section of load_broadcast_down_weight_scale_bias:
+    Load + broadcast bias, sharding on H dim when LNC=2.
+    In LNC=2, NC0 bias_sb will have first half of H filled with bias,
+    second half with zeros; NC1 will have the inverse.
+    Shape: [E_L, H] -> [1, H_size_local]
+    """
+    bias_sb_shape = (tile_T, H)
+    bias_sb = nl.ndarray(bias_sb_shape, dtype=activation_compute_dtype, buffer=nl.sbuf)
+    H_size_local = H // 2 if (sharding_strategy == MoELNCShardingStrategy.SHARD_I and n_prgs > 1) else H
+    H_offset = H_size_local * prg_id if (sharding_strategy == MoELNCShardingStrategy.SHARD_I and n_prgs > 1) else 0
+    if H_size_local < H:
+        other_H_offset = H_size_local * (1 - prg_id)
+        nisa.memset(dst=bias_sb[:, nl.ds(other_H_offset, H_size_local)], value=0.0, engine=nisa.gpsimd_engine)
+    else:
+        # LNC=1 full-memset: redundant when the PE broadcast fully repopulates bias_sb from the
+        # DMA-written row 0; one u32 column keeps the tile's first write (PE path only).
+        # Keep GpSimd and Vector free while zeroing through an integer view so
+        # NaN/Inf bit patterns cannot survive multiplication by zero.
+        bias_sb_u32 = bias_sb.view(nl.uint32)
+        if use_PE_bias_broadcast:
+            bias_sb_u32 = bias_sb_u32[:, 0:1]
+        nisa.tensor_scalar(
+            dst=bias_sb_u32,
+            data=bias_sb_u32,
+            op0=nl.multiply,
+            operand0=0,
+            op1=None,
+            engine=nisa.engine.scalar,
+        )
+    H_slice_local = nl.ds(H_offset, H_size_local)
+    bias_view = bias.slice(dim=0, start=expert_idx, end=expert_idx + 1).slice(
+        dim=1, start=H_offset, end=H_offset + H_size_local
+    )
+    nisa.dma_copy(
+        src=bias_view,
+        dst=bias_sb[0:1, H_slice_local],
+        dge_mode=nisa.dge_mode.none,
+        name=dma_name(f"down_bias_e{expert_idx}"),
+    )
+
+    # Broadcast bias using PE
+    if use_PE_bias_broadcast:
+        is_bias_16bit = activation_compute_dtype in (nl.bfloat16, nl.float16)
+        psum_fmax = nl.tile_size.psum_fmax * 2 if is_bias_16bit else nl.tile_size.psum_fmax
+        psum_dtype = activation_compute_dtype if is_bias_16bit else nl.float32
+        H_tile_size_local = min(H_size_local, psum_fmax)
+        ones_mask = nl.ndarray((1, tile_T), dtype=bias_sb.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=ones_mask[...], value=1.0, engine=nisa.gpsimd_engine)
+        n_H_tiles_local = div_ceil(H_size_local, H_tile_size_local)
+        for h_tile_idx in nl.affine_range(n_H_tiles_local):
+            h_tile_actual = min(H_tile_size_local, H_size_local - h_tile_idx * H_tile_size_local)
+            bias_bc_psum = nl.ndarray((tile_T, h_tile_actual), dtype=psum_dtype, buffer=nl.psum)
+            H_tile_slice = nl.ds(H_offset + h_tile_idx * H_tile_size_local, h_tile_actual)
+            nisa.nc_matmul(
+                dst=bias_bc_psum,
+                stationary=ones_mask[...],
+                moving=bias_sb[0:1, H_tile_slice],
+                is_stationary_onezero=True,
+            )
+            nisa.tensor_copy(
+                dst=bias_sb[:, H_tile_slice],
+                src=bias_bc_psum[...],
+                engine=nisa.scalar_engine,
+            )
+
+    # Broadcast on DVE
+    else:
+        stream_shuffle_broadcast(src=bias_sb, dst=bias_sb)
+    return bias_sb
 
 
 def prefetch_down_weight_sb(weight, expert_idx, H, tile_I, n_I512_tiles, tile_offset, name):
@@ -77,11 +188,38 @@ def prefetch_down_weight_sb(weight, expert_idx, H, tile_I, n_I512_tiles, tile_of
     weight_sb = nl.ndarray(weight_sb_shape, dtype=weight.dtype, buffer=nl.sbuf, name=name)
     I_p_in_hbm = weight.shape[1]
     weight_view = weight.select(dim=0, index=expert_idx).slice(dim=1, start=tile_offset, end=tile_offset + n_I512_tiles)
-    if I_p_in_hbm < tile_I:
+    _dma_name = dma_name(f"down_w_prefetch_e{expert_idx}_t{tile_offset}")
+    _n_pieces = min(_DOWN_PREFETCH_ISPLIT, n_I512_tiles)
+    if _n_pieces > 1:
+        if I_p_in_hbm < tile_I:
+            nisa.memset(dst=weight_sb[...], value=0)
+        _bounds = [round(_k * n_I512_tiles / _n_pieces) for _k in range(_n_pieces)] + [n_I512_tiles]
+        for _p in range(_n_pieces):
+            _lo, _hi = _bounds[_p], _bounds[_p + 1]
+            nisa.dma_copy(
+                src=weight_view.slice(dim=1, start=_lo, end=_hi),
+                dst=weight_sb[:I_p_in_hbm, _lo:_hi, :],
+                dge_mode=moe_load_dge_mode(),
+                priority=moe_updown_priority(),
+                name=dma_name(f"down_w_prefetch_e{expert_idx}_t{tile_offset}_p{_p}"),
+            )
+    elif I_p_in_hbm < tile_I:
         nisa.memset(dst=weight_sb[...], value=0)
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(
+            src=weight_view,
+            dst=weight_sb[:I_p_in_hbm, :, :],
+            dge_mode=moe_load_dge_mode(),
+            priority=moe_updown_priority(),
+            name=_dma_name,
+        )
     else:
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(
+            src=weight_view,
+            dst=weight_sb[...],
+            dge_mode=moe_load_dge_mode(),
+            priority=moe_updown_priority(),
+            name=_dma_name,
+        )
     _DOWN_PREFETCH_FIFO.append(weight_sb)
     return weight_sb
 
@@ -164,12 +302,12 @@ def load_broadcast_down_weight_scale_bias(
         weight_view = base_weight.select(dim=0, index=expert_idx).slice(
             dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=weight_view, dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=moe_load_dge_mode())
     else:
         weight_view = base_weight.select(dim=0, index=expert_idx).slice(
             dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles
         )
-        nisa.dma_copy(src=as_nki_tensor(weight_view), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
+        nisa.dma_copy(src=weight_view, dst=weight_sb[...], dge_mode=moe_load_dge_mode())
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -205,6 +343,7 @@ def load_broadcast_down_weight_scale_bias(
                     src=scale_view,
                     dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, actual_scale_p), :, :],
                     dge_mode=nisa.dge_mode.none,
+                    name=dma_name(f"down_scale_e{expert_idx}_q{quadrant_idx}"),
                 )
             else:
                 hbm_p_idx = SCALE_P_ELEM_PER_QUADRANT * quadrant_idx
@@ -222,57 +361,35 @@ def load_broadcast_down_weight_scale_bias(
                         offset=sb_p_idx * scale_f_per_partition,
                     ),
                     dge_mode=nisa.dge_mode.none,
+                    name=dma_name(f"down_scale_row_e{expert_idx}_q{quadrant_idx}"),
                 )
 
     """
-    Load + broadcast bias, sharding on H dim when LNC=2.
-    In LNC=2, NC0 bias_sb will have first half of H filled with bias,
-    second half with zeros; NC1 will have the inverse.
-    Shape: [E_L, H] -> [1, H_size_local]
+    Load + broadcast bias, sharding on H dim when LNC=2 (body in _load_broadcast_down_bias).
+    When the layer pre-broadcast the bias (prefetch_down_bias_sb), pop the enqueued [tile_T, H] tile
+    instead -- same DMA name, so emitting it again here would trip dma_name()'s duplicate guard; the
+    layout is asserted so a mismatch fails the trace instead of mis-biasing.
     """
     if bias != None:
-        bias_sb = nl.ndarray(bias_sb_shape, dtype=activation_compute_dtype, buffer=nl.sbuf)
-        H_size_local = H // 2 if (sharding_strategy == MoELNCShardingStrategy.SHARD_I and n_prgs > 1) else H
-        H_offset = H_size_local * prg_id if (sharding_strategy == MoELNCShardingStrategy.SHARD_I and n_prgs > 1) else 0
-        if H_size_local < H:
-            other_H_offset = H_size_local * (1 - prg_id)
-            nisa.memset(dst=bias_sb[:, nl.ds(other_H_offset, H_size_local)], value=0.0, engine=nisa.gpsimd_engine)
+        if len(_DOWN_BIAS_PREFETCH_FIFO) > 0:
+            bias_sb = _DOWN_BIAS_PREFETCH_FIFO.pop(0)
+            kernel_assert(
+                tuple(bias_sb.shape) == tuple(bias_sb_shape) and bias_sb.dtype == activation_compute_dtype,
+                f"pre-broadcast down bias is {tuple(bias_sb.shape)}/{bias_sb.dtype}, "
+                f"loader expects {tuple(bias_sb_shape)}/{activation_compute_dtype}",
+            )
         else:
-            nisa.memset(dst=bias_sb[...], value=0.0, engine=nisa.gpsimd_engine)
-        H_slice_local = nl.ds(H_offset, H_size_local)
-        bias_view = bias.slice(dim=0, start=expert_idx, end=expert_idx + 1).slice(
-            dim=1, start=H_offset, end=H_offset + H_size_local
-        )
-        nisa.dma_copy(src=as_nki_tensor(bias_view), dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
-
-        # Broadcast bias using PE
-        if use_PE_bias_broadcast:
-            is_bias_16bit = activation_compute_dtype in (nl.bfloat16, nl.float16)
-            psum_fmax = nl.tile_size.psum_fmax * 2 if is_bias_16bit else nl.tile_size.psum_fmax
-            psum_dtype = activation_compute_dtype if is_bias_16bit else nl.float32
-            H_tile_size_local = min(H_size_local, psum_fmax)
-            ones_mask = nl.ndarray((1, tile_T), dtype=bias_sb.dtype, buffer=nl.sbuf)
-            nisa.memset(dst=ones_mask[...], value=1.0, engine=nisa.gpsimd_engine)
-            n_H_tiles_local = div_ceil(H_size_local, H_tile_size_local)
-            for h_tile_idx in nl.affine_range(n_H_tiles_local):
-                h_tile_actual = min(H_tile_size_local, H_size_local - h_tile_idx * H_tile_size_local)
-                bias_bc_psum = nl.ndarray((tile_T, h_tile_actual), dtype=psum_dtype, buffer=nl.psum)
-                H_tile_slice = nl.ds(H_offset + h_tile_idx * H_tile_size_local, h_tile_actual)
-                nisa.nc_matmul(
-                    dst=bias_bc_psum,
-                    stationary=ones_mask[...],
-                    moving=bias_sb[0:1, H_tile_slice],
-                    is_stationary_onezero=True,
-                )
-                nisa.tensor_copy(
-                    dst=bias_sb[:, H_tile_slice],
-                    src=bias_bc_psum[...],
-                    engine=nisa.scalar_engine,
-                )
-
-        # Broadcast on DVE
-        else:
-            stream_shuffle_broadcast(src=bias_sb, dst=bias_sb)
+            bias_sb = _load_broadcast_down_bias(
+                bias,
+                expert_idx,
+                H,
+                tile_T,
+                activation_compute_dtype,
+                use_PE_bias_broadcast,
+                sharding_strategy,
+                n_prgs,
+                prg_id,
+            )
 
     return weight_sb, scale_sb, bias_sb
 
@@ -372,7 +489,12 @@ def down_projection_mx(
     )
     # PROTOTYPE: mega-decode SBUF-collective hack keeps out_hbm (harmless dead HBM
     # tensor) but captures the SBUF accumulator instead of spilling. Skip the assert then.
-    _moe_out_sbuf_capture = bool(os.environ.get("VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE"))
+    _moe_out_sbuf_capture = os.environ.get("VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE", "1") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
     kernel_assert(
         out_hbm != None or _moe_out_sbuf_capture,
         f"Output in SBUF is not yet supported, got out_hbm=None",
@@ -427,9 +549,28 @@ def down_projection_mx(
     use_hbm_accumulation = (out_sb_per_partition_bytes > _HBM_ACCUM_THRESHOLD_BYTES) and not is_blockwise
     # PROTOTYPE: when the mega-decode SBUF-collective hack is on, force SBUF accumulation
     # so the complete MoE result lives in out_sb (which we hand to reduce_scatter).
-    _moe_out_sbuf_capture = bool(os.environ.get("VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE"))
+    _moe_out_sbuf_capture = os.environ.get("VLLM_NEURON_MEGA_MOE_SBUF_COLLECTIVE", "1") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
     if _moe_out_sbuf_capture:
         use_hbm_accumulation = False
+    # MOE_OUT_FP8 (VLLM_NEURON_MEGA_MOE_OUT_FP8=1, single-expert SBUF-capture path only): the
+    # affinity-scaled tile is written ONCE, as fp8, into the buffer the EP reduce_scatter reads. The stock
+    # path runs four full [T, H] elementwise passes on the output (PSUM+bias evacuation, affinity scale,
+    # copy into out_sb, and the caller's bf16->fp8 cast of the whole [128, 3072] tile = 2.2 us); the last
+    # two are removed, and the ones after the final matmul sit on the moe_rs critical path.
+    _fuse_out_fp8 = (
+        _moe_out_sbuf_capture
+        and is_first_expert
+        and is_last_expert
+        and not is_blockwise
+        and not need_down_dequant
+        and bool(os.environ.get("VLLM_NEURON_MEGA_MOE_OUT_FP8"))
+    )
+    out_fp8 = nl.ndarray(out_sb.shape, dtype=nl.float8_e4m3fn, buffer=nl.sbuf) if _fuse_out_fp8 else None
 
     # Unified loop: always for_h{for_t}. Accumulation strategy selected by heuristic above.
     for tile_h in nl.sequential_range(n_H1024_tiles):
@@ -463,7 +604,14 @@ def down_projection_mx(
                 need_down_dequant=need_down_dequant,
                 activation_compute_dtype=activation_compute_dtype,
                 is_software_quant=is_software_quant,
+                final_dst=(
+                    out_fp8[:tile_T_actual, tile_t : tile_t + 1, tile_H_offset : tile_H_offset + TILE_H]
+                    if _fuse_out_fp8
+                    else None
+                ),
             )
+            if _fuse_out_fp8:
+                continue  # the tile was written straight into out_fp8; nothing to accumulate or copy
 
             tile_T_out_actual = min(tile_T_actual, T_out - tile_T_offset)
 
@@ -516,6 +664,9 @@ def down_projection_mx(
     # the mega-decode kernel can feed reduce_scatter straight from SBUF. Only valid for
     # the single-tile no-shard case this hack targets (LNC=1, n_T128_tiles==1).
     if _moe_out_sbuf_capture and is_last_expert and not is_blockwise:
+        if _fuse_out_fp8:
+            _MOE_OUT_SBUF_CAPTURE.append(out_fp8)
+            return out_fp8
         _MOE_OUT_SBUF_CAPTURE.append(out_sb)
         return out_sb
 
@@ -848,8 +999,12 @@ def _down_proj_tile_compute(
     need_down_dequant: bool,
     activation_compute_dtype: nki.dtype,
     is_software_quant: bool = False,
-) -> nl.ndarray:
+    final_dst=None,
+) -> nl.NkiTensor:
     """Compute one (T-tile, H-tile) of the down projection for a single expert.
+
+    final_dst (optional): when given, the affinity-scaled result is written there (any dtype, e.g. the
+    fp8 reduce_scatter source) instead of in place into the bf16 tile (MOE_OUT_FP8).
 
     Performs: matmul over I tiles → optional dequant → expert affinity scaling.
 
@@ -929,9 +1084,9 @@ def _down_proj_tile_compute(
             pmax=pmax,
         )
 
-    # Expert affinity scaling
+    # Expert affinity scaling (MOE_OUT_FP8: written straight into the caller's fp8 destination)
     nisa.tensor_scalar(
-        dst=expert_out_tile_sb[:tile_T_actual, :],
+        dst=final_dst if final_dst is not None else expert_out_tile_sb[:tile_T_actual, :],
         data=expert_out_tile_sb.ap([[TILE_H, tile_T_actual], [1, TILE_H]]),
         op0=nl.multiply,
         operand0=expert_affinities_masked_fp32_sb[:tile_T_actual, t_tile_idx : t_tile_idx + 1],

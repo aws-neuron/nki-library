@@ -49,8 +49,10 @@ from nki.language import affine_range, static_range
 
 from ..utils.allocator import BufferManager, align_to, create_auto_alloc_manager, sizeinbytes
 from ..utils.common_types import DtypeMode, QuantizationType
+from ..utils.dma_names import dma_name
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_program_sharding_info
+from ..utils.sched_hints import take_pv_matmul
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ..utils.tiled_range import TiledRange
 from .output_projection_tkg_mx_impl import _output_projection_tkg_mx
@@ -63,6 +65,15 @@ NUM_PSUM_BANKS = 8
 # Conservative limit assuming 2 bytes per scalar and LNC=2, ~20MB SBUF per core for projection weights
 MAX_VALIDATED_N_TIMES_H_SIZE = 163840
 MAX_VALIDATED_N_TIMES_H_SIZE_FP32 = MAX_VALIDATED_N_TIMES_H_SIZE // 2
+
+# Merge the per-head W_out weight loads into one DMA per h_block. The baseline allocates one
+# SBUF tensor per head and issues one DMA each (n_size DMAs per h_block); with this enabled the
+# heads share a single [D, N, max_h_block] buffer so a single permuted DMA covers all of them.
+# Purely an instruction-count reduction: descriptor count and per-descriptor run are unchanged
+# (the run is bounded by h_block_size because H is the contiguous dim of the [N, D, H] weight).
+# Requires max_h_block_size * dtype to be a multiple of cfg.align so each head sub-view stays
+# aligned. Non-double-row path only.
+_WOUT_MERGE_HEADS = _os.environ.get("VLLM_NEURON_MEGA_WOUT_MERGE_HEADS") == "1"
 
 
 @nki.jit
@@ -77,6 +88,9 @@ def output_projection_tkg(
     OUT_IN_SB: bool = False,
     sbm: Optional[BufferManager] = None,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    use_swdge_for_weight_load: Optional[bool] = None,
+    weight_load_engine: Optional[str] = None,
+    weight_load_dependency=None,
 ) -> nl.NkiTensor:
     """
     Output Projection Kernel
@@ -144,6 +158,13 @@ def output_projection_tkg(
             ``nl.float8_e4m3fn`` (OCP) or ``nl.float8_e4m3`` (NON_OCP) so the
             whole traced module agrees on a single E4M3 variant
             (compiler enforces ``EOCP001``).
+        use_swdge_for_weight_load (Optional[bool]): Override the W_out weight-load
+            engine. ``True`` uses SWDGE, ``False`` uses Scalar-triggered HWDGE,
+            and ``None`` preserves the environment-controlled default.
+        weight_load_engine (Optional[str]): Explicit HWDGE trigger engine. When
+            set, overrides ``use_swdge_for_weight_load``.
+        weight_load_dependency: Optional instruction that the first W_out load
+            must wait for.
 
     Returns:
         out (nl.NkiTensor): Output tensor in HBM. Shape depends on `TRANSPOSE_OUT` parameter.
@@ -229,15 +250,18 @@ def output_projection_tkg(
     DMA streams (bias, attention, weights), eliminating
     anti-dependencies so they can all proceed in parallel.
 
-    bias_sb_1d is a temporary heap buffer used to broadcast bias from
-    [1, H] to [B*S, H]. Crucially, bias_sb_1d is freed (pop_heap) only
-    *after* attn_sb is freed (which happens after _shuffle_attn returns).
-    This ordering ensures bias_sb_1d and
-    attn_sb occupy separate heap addresses during the load phase. If we
-    freed bias_sb_1d before allocating attn_sb, the heap would reclaim
-    that address range and attn_sb would overlap with bias_sb_1d,
-    creating an anti-dependency between the bias and attention DMA loads.
-    Allocating on the stack will cause the same anti-dependency with weight load.
+    In the broadcast-bias path, bias_sb_1d is a temporary heap buffer used
+    to broadcast bias from [1, H] to [B*S, H]. Crucially, bias_sb_1d is
+    freed (pop_heap) only *after* attn_sb is freed (which happens after
+    _shuffle_attn returns). This ordering ensures bias_sb_1d and attn_sb
+    occupy separate heap addresses during the load phase. If we freed
+    bias_sb_1d before allocating attn_sb, the heap would reclaim that
+    address range and attn_sb would overlap with bias_sb_1d, creating an
+    anti-dependency between the bias and attention DMA loads. Allocating
+    on the stack will cause the same anti-dependency with weight load.
+
+    The PSUM initialization path keeps bias as an unbroadcast [1, H]
+    and does not allocate bias_sb_1d.
 
       SBUF address space (stack grows ↓ from top, heap grows ↑ from bottom)
       ┌─────────────────────────┐ ◄─ upper bound (stack starts here, grows ↓)
@@ -264,9 +288,9 @@ def output_projection_tkg(
     preventing anti-dependencies.
     """
     if not cfg.transpose_out and cfg.has_bias:
-        BxS_block_size = min(P_MAX, bxs_size)
-        bias_sb = _prepare_bias(bias=bias, cfg=cfg, sbm=sbm)
-        bias_sb_1d_allocated = True
+        bias_psum_init = _use_bias_psum_init(cfg)
+        bias_sb = _prepare_bias(bias=bias, cfg=cfg, sbm=sbm, for_psum_init=bias_psum_init)
+        bias_sb_1d_allocated = not bias_psum_init
     else:
         bias_sb = None
         bias_sb_1d_allocated = False
@@ -324,6 +348,9 @@ def output_projection_tkg(
             attn_shuffled=attn_shuffled,
             cfg=cfg,
             sbm=sbm,
+            use_swdge_for_weight_load=use_swdge_for_weight_load,
+            weight_load_engine=weight_load_engine,
+            weight_load_dependency=weight_load_dependency,
         )
 
     else:  # TRANSPOSE_OUT == True
@@ -831,19 +858,38 @@ def _prepare_quant_scales(
         return None, None
 
 
+def _use_bias_psum_init(cfg: OutputProjectionTkgConfig) -> bool:
+    """Whether bias can initialize the column-tiled output PSUM directly."""
+    bxs_size = cfg.b_size * cfg.s_size
+    return (
+        cfg.has_bias
+        and cfg.quantization_type == QuantizationType.NONE
+        and not cfg.transpose_out
+        and not cfg.use_double_row
+        and bxs_size <= 32
+    )
+
+
 def _prepare_bias(
     bias: nl.NkiTensor,
     cfg: OutputProjectionTkgConfig,
     sbm: BufferManager,
+    for_psum_init: bool = False,
 ) -> nl.NkiTensor:
-    """Prepare bias for non-transposed path: slice by prg_id, DMA, broadcast.
+    """Prepare bias for the non-transposed path.
 
-    Allocates bias_sb on stack and bias_sb_1d on heap. The caller MUST call
-    sbm.pop_heap() after _shuffle_attn to free bias_sb_1d.
-    See the SBUF memory layout comment in output_projection_tkg for details.
+    The PSUM path loads one unbroadcast [1, H] row for direct initialization. The
+    fallback broadcasts to [B*S, H], allocating bias_sb_1d on the heap; its
+    caller must pop that allocation after _shuffle_attn.
 
-    Returns bias_sb [BxS_block_size, h_sharded] in SBUF.
+    Returns bias_sb in SBUF.
     """
+    if for_psum_init:
+        bias_shard = bias.reshape_dim(1, (cfg.num_prgs, cfg.h_sharded)).select(dim=1, index=cfg.prg_id)
+        bias_sb = sbm.alloc_stack((1, cfg.h_sharded), dtype=bias.dtype, buffer=nl.sbuf, align=cfg.align)
+        nisa.dma_copy(dst=bias_sb, src=bias_shard, name=dma_name("wout_bias_psum_init_load"))
+        return bias_sb
+
     bxs_size = cfg.b_size * cfg.s_size
     BxS_block_size = min(P_MAX, bxs_size)
     bias_sb = sbm.alloc_stack((BxS_block_size, cfg.h_sharded), dtype=bias.dtype, buffer=nl.sbuf, align=cfg.align)
@@ -867,7 +913,7 @@ def _prepare_bias(
             .expand_dim(0)
             .broadcast(dim=0, size=BxS_block_size)
         )
-        nisa.dma_copy(bias_sb, bias_src)
+        nisa.dma_copy(bias_sb, bias_src, dge_mode=nisa.dge_mode.none)
     return bias_sb
 
 
@@ -1241,17 +1287,22 @@ def _budget_weight_blocks(
 
 
 def _load_weight_h_block(
-    w_sbuf_slot: List[nl.NkiTensor],
+    w_sbuf_slot: Union[List[nl.NkiTensor], nl.NkiTensor],
     w_shard_hbm: nl.NkiTensor,
     h_block_size: int,
     h_block_offset: int,
     cfg: OutputProjectionTkgConfig,
+    use_swdge_for_weight_load: Optional[bool],
+    weight_load_engine: Optional[str] = None,
+    weight_load_dependency=None,
 ):
     """
     Load weights for a single h_block into the given SBUF slot.
 
     Args:
-        w_sbuf_slot: List of pre-allocated weight tensors for one h_block slot.
+        w_sbuf_slot: Pre-allocated weight tensors for one h_block slot. A list of
+            per-head [D, max_h_block] tensors, or - when head-merging is enabled - a
+            single [D, N, max_h_block] tensor covering all heads.
         w_shard_hbm: [N, D, h_sharded] pre-sharded weight nl.NkiTensor.
         h_block_size: Size of this h_block.
         h_block_offset: Offset of this h_block within h_sharded.
@@ -1261,14 +1312,67 @@ def _load_weight_h_block(
     # These W_out loads land on GpSimd, which also issues the KV gather-transposes (the largest
     # exposed GpSimd item). They have no dependency on the gathers, so pinning them to an idle
     # sequencer keeps GpSimd free. engine= requires dge_mode=hwdge (ISA assert).
-    _eng = _os.environ.get("VLLM_NEURON_MEGA_WOUT_DMA_ENGINE", "")
-    _eng_kw = {"engine": getattr(nisa.engine, _eng), "dge_mode": nisa.dge_mode.hwdge} if _eng else {}
-    if not cfg.use_double_row:
-        for head_idx in affine_range(cfg.n_size):
+    # Special value "none": issue with dge_mode=none and DO NOT set engine (let the compiler place it).
+    # Precedence: an explicit weight_load_engine wins (O9 selects Sync-triggered HWDGE for
+    # full-attention W_out so the V-prior dependency has a trigger engine of its own), then
+    # use_swdge_for_weight_load (O1/O7 mixed-W_out experiments select per-layer-parity), then the
+    # env var, whose default "scalar" is the measured-optimal placement. Set the var to "" to let
+    # the compiler place it. The mega kernel passes one of the first two for every layer, so the
+    # env fallback is only reached by other callers.
+    if weight_load_engine is not None:
+        _eng = weight_load_engine
+    elif use_swdge_for_weight_load is None:
+        _eng = _os.environ.get("VLLM_NEURON_MEGA_WOUT_DMA_ENGINE", "scalar")
+    else:
+        _eng = "swdge" if use_swdge_for_weight_load else "scalar"
+    if _eng == "none":
+        _eng_kw = {"dge_mode": nisa.dge_mode.none}
+    elif _eng == "swdge":
+        # Issue the W_out load on the software-DGE queue, the same queue the KV-cache
+        # gather loads use (dge_mode.swdge in attention_tkg). This preserves the required
+        # V-load -> W_out-load order. With "scalar"/hwdge the load lands on a different
+        # engine's sequencer, so DMA-order constraints between it and the V-cache loads
+        # are not respected. No engine= here: swdge is queue-based, and engine= asserts
+        # it must pair with hwdge.
+        _eng_kw = {"dge_mode": nisa.dge_mode.swdge}
+    elif _eng:
+        _eng_kw = {"engine": getattr(nisa.engine, _eng), "dge_mode": nisa.dge_mode.hwdge}
+    else:
+        _eng_kw = {}
+    if _WOUT_MERGE_HEADS and not cfg.use_double_row:
+        # One DMA for ALL heads instead of n_size per-head DMAs. The HBM view is
+        # [N, D, h_block]; permute to [D, N, h_block] so it matches the merged
+        # [D, N, max_h_block] SBUF buffer (D stays the partition dim). Descriptor count
+        # and the per-descriptor run (h_block elements, source row stride h_sharded) are
+        # unchanged - this only collapses n_size DMA instructions into one.
+        weight_load = nisa.dma_copy(
+            src=w_h_sliced.permute((1, 0, 2)),
+            dst=w_sbuf_slot[:, :, :h_block_size],
+            **_eng_kw,
+            name=dma_name(f"wout_w_h{h_block_offset}_all"),
+        )
+        if weight_load_dependency is not None:
+            weight_load.depends_on(weight_load_dependency)
+    elif not cfg.use_double_row:
+        first_head = 0
+        if weight_load_dependency is not None:
+            # Peeled out of the loop only so the V-prior dependency has a single instruction to
+            # attach to. It keeps head 0's name, so the emitted name set is identical whether or
+            # not the dependency is requested and one DMA-order JSON binds both ways.
+            weight_load = nisa.dma_copy(
+                src=w_h_sliced.select(dim=0, index=first_head),
+                dst=w_sbuf_slot[first_head][:, :h_block_size],
+                **_eng_kw,
+                name=dma_name(f"wout_w_h{h_block_offset}_n{first_head}"),
+            )
+            weight_load.depends_on(weight_load_dependency)
+            first_head = 1
+        for head_idx in affine_range(first_head, cfg.n_size):
             nisa.dma_copy(
                 src=w_h_sliced.select(dim=0, index=head_idx),
                 dst=w_sbuf_slot[head_idx][:, :h_block_size],
                 **_eng_kw,
+                name=dma_name(f"wout_w_h{h_block_offset}_n{head_idx}"),
             )
     else:
         for head_idx in affine_range(0, cfg.n_size, 2):
@@ -1293,6 +1397,9 @@ def _output_projection_tkg_impl(
     attn_shuffled: nl.NkiTensor,
     cfg: OutputProjectionTkgConfig,
     sbm: BufferManager,
+    use_swdge_for_weight_load: Optional[bool],
+    weight_load_engine: Optional[str],
+    weight_load_dependency,
 ) -> nl.NkiTensor:
     """
     Core implementation for regular (non-transposed) output projection.
@@ -1308,7 +1415,7 @@ def _output_projection_tkg_impl(
         out_hbm_buffer (Optional[nl.NkiTensor]): Full output buffer in HBM [B*S, H], returned as-is.
         out_hbm_view: Pre-sliced nl.NkiTensor of out_hbm_buffer for this shard [B*S, h_sharded].
         out_sb (Optional[nl.NkiTensor]): Pre-allocated output buffer in SBUF or None.
-        bias_sb (Optional[nl.NkiTensor]): [B*S, H] broadcast bias in SBUF, or None if no bias.
+        bias_sb (Optional[nl.NkiTensor]): Unbroadcast [1, H] or broadcast [B*S, H] bias in SBUF.
         w_shard_hbm: [N, D, h_sharded] pre-sharded weight nl.NkiTensor.
         quant_config (Optional[Union[StaticQuantConfig, RowQuantConfig]]): Quantization config.
         attn_shuffled (nl.NkiTensor): [D, N*B*S], Shuffled attention tensor in SBUF.
@@ -1323,6 +1430,14 @@ def _output_projection_tkg_impl(
     bxs_size = cfg.b_size * cfg.s_size
 
     w_scale_dtype = quant_config.weight_scale_hbm.dtype if cfg.quantization_type == QuantizationType.ROW else None
+    bias_psum_init = _use_bias_psum_init(cfg)
+    _last_pv = take_pv_matmul() if bias_psum_init else None
+
+    bias_broadcast_ones = None
+    if bias_psum_init:
+        bias_broadcast_ones = sbm.alloc_stack((1, bxs_size), dtype=bias_sb.dtype, buffer=nl.sbuf, align=cfg.align)
+        nisa.memset(dst=bias_broadcast_ones, value=1.0)
+
     num_bxs_tiles = div_ceil(bxs_size, P_MAX)
     h_block_sizes, h_block_offsets, num_w_h_blocks, out_sb_interleave_degree = _budget_weight_blocks(
         num_bxs_tiles, w_shard_hbm.dtype, cfg, sbm, w_scale_dtype
@@ -1349,6 +1464,17 @@ def _output_projection_tkg_impl(
     w_sbuf_blocks = []
     for _h_block_idx in affine_range(num_w_h_blocks):
         w_heads = []
+        if _WOUT_MERGE_HEADS and not cfg.use_double_row:
+            # One buffer for all heads so the whole h_block loads in a single DMA.
+            w_sbuf_blocks.append(
+                sbm.alloc_stack(
+                    (cfg.d_size, cfg.n_size, max_h_block_size),
+                    dtype=w_shard_hbm.dtype,
+                    buffer=nl.sbuf,
+                    align=cfg.align,
+                )
+            )
+            continue
         if not cfg.use_double_row:
             for head_idx in affine_range(cfg.n_size):
                 w_tensor = sbm.alloc_stack(
@@ -1364,13 +1490,25 @@ def _output_projection_tkg_impl(
         w_sbuf_blocks.append(w_heads)
 
     if all_weights_preloaded:
-        for h_block_idx in affine_range(num_h_blocks_per_prg):
+        _load_weight_h_block(
+            w_sbuf_blocks[0],
+            w_shard_hbm,
+            h_block_sizes[0],
+            h_block_offsets[0],
+            cfg,
+            use_swdge_for_weight_load,
+            weight_load_engine,
+            weight_load_dependency,
+        )
+        for h_block_idx in affine_range(1, num_h_blocks_per_prg):
             _load_weight_h_block(
                 w_sbuf_blocks[h_block_idx],
                 w_shard_hbm,
                 h_block_sizes[h_block_idx],
                 h_block_offsets[h_block_idx],
                 cfg,
+                use_swdge_for_weight_load,
+                weight_load_engine,
             )
 
     global_psum_idx = 0
@@ -1393,6 +1531,9 @@ def _output_projection_tkg_impl(
                     cur_h_block_size,
                     cur_h_block_offset,
                     cfg,
+                    use_swdge_for_weight_load,
+                    weight_load_engine,
+                    weight_load_dependency,
                 )
 
             # Column tiling: pack multiple h_block_f_tiles at different partition offsets
@@ -1427,6 +1568,21 @@ def _output_projection_tkg_impl(
                 )
 
                 global_psum_idx = 0 if global_psum_idx + 1 >= NUM_PSUM_BANKS else global_psum_idx + 1
+                if bias_psum_init:
+                    for col_idx in range(n_col_tiles):
+                        f_offset = h_block_f_tile_group.start_offset + col_idx * F_MAX
+                        f_size = min(F_MAX, h_block_f_tile_group.size - col_idx * F_MAX)
+                        h_offset = cur_h_block_offset + f_offset
+                        _bias_init_mm = nisa.nc_matmul(
+                            dst=res_psum[nl.ds(col_tiling_dim * col_idx, bxs_block.size), 0:f_size],
+                            stationary=bias_broadcast_ones,
+                            moving=bias_sb[:, nl.ds(h_offset, f_size)],
+                            tile_position=(0, col_tiling_dim * col_idx),
+                            tile_size=(1, col_tiling_dim),
+                            is_stationary_onezero=True,
+                        )
+                        if _last_pv is not None:
+                            _bias_init_mm.depends_on(_last_pv, kind=nisa.dependency.runtime)
 
                 if not cfg.use_double_row:
                     for head_idx in affine_range(cfg.n_size):
@@ -1436,7 +1592,10 @@ def _output_projection_tkg_impl(
                         for col_idx in range(n_col_tiles):
                             f_offset = h_block_f_tile_group.start_offset + col_idx * F_MAX
                             f_size = min(F_MAX, h_block_f_tile_group.size - col_idx * F_MAX)
-                            moving = w_sbuf_blocks[w_slot][head_idx][:, nl.ds(f_offset, f_size)]
+                            if _WOUT_MERGE_HEADS:
+                                moving = w_sbuf_blocks[w_slot][:, head_idx, nl.ds(f_offset, f_size)]
+                            else:
+                                moving = w_sbuf_blocks[w_slot][head_idx][:, nl.ds(f_offset, f_size)]
                             nisa.nc_matmul(
                                 res_psum[nl.ds(col_tiling_dim * col_idx, bxs_block.size), 0:f_size],
                                 stationary,
@@ -1483,7 +1642,7 @@ def _output_projection_tkg_impl(
                         )
 
                     res_slice = out_sb_slice if cfg.is_quantized else res_psum_slice
-                    if cfg.has_bias:
+                    if cfg.has_bias and not bias_psum_init:
                         nisa.tensor_tensor(
                             dst=out_sb_slice,
                             data1=res_slice,

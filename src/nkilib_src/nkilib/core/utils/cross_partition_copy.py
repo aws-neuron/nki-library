@@ -23,13 +23,15 @@ alignment constraints, and falls back to efficient tensor_copy when alignment pe
 import nki.isa as nisa
 import nki.language as nl
 
+from .kernel_assert import kernel_assert
+
 QUADRANT = 32
 MASK_NO_CHANGE = 255  # Special value meaning the output tensor in partition [i] will be unmodified.
 
 
 def cross_partition_copy(
-    src: nl.ndarray,
-    dst: nl.ndarray,
+    src: nl.NkiTensor,
+    dst: nl.NkiTensor,
     src_start_partition: int,
     dst_start_partition: int,
     num_partitions_to_copy: int,
@@ -46,8 +48,8 @@ def cross_partition_copy(
     direct tensor_copy instead.
 
     Args:
-        src (nl.ndarray): Source tensor in SBUF
-        dst (nl.ndarray): Destination tensor in SBUF
+        src (nl.NkiTensor): Source tensor in SBUF
+        dst (nl.NkiTensor): Destination tensor in SBUF
         src_start_partition (int): Starting partition index in src
         dst_start_partition (int): Starting partition index in dst
         num_partitions_to_copy (int): Number of partitions to copy
@@ -127,20 +129,20 @@ def cross_partition_copy(
         # Process at most QUADRANT elements per iteration
         chunk_count = min(remaining_count, QUADRANT)
 
-        if remaining_src_start % QUADRANT == 0:
-            nisa.tensor_copy(
-                src=src[remaining_src_start : remaining_src_start + chunk_count, :free_dim_size],
-                dst=dst[remaining_dst_start : remaining_dst_start + chunk_count, :free_dim_size],
-            )
-        else:
-            _aligned_copy_from_unaligned_src(
-                src,
-                dst,
-                remaining_src_start,
-                remaining_dst_start,
-                chunk_count,
-                free_dim_size,
-            )
+        # Case 3 starts from a quadrant-aligned dst with dst_offset in [1, 31], so
+        # the src carried into the remainder loop is never quadrant-aligned.
+        kernel_assert(
+            remaining_src_start % QUADRANT != 0,
+            "Case 3 remainder src is never quadrant-aligned",
+        )
+        _aligned_copy_from_unaligned_src(
+            src,
+            dst,
+            remaining_src_start,
+            remaining_dst_start,
+            chunk_count,
+            free_dim_size,
+        )
 
         remaining_src_start += chunk_count
         remaining_dst_start += chunk_count
@@ -148,8 +150,8 @@ def cross_partition_copy(
 
 
 def _shuffle_within_quadrant(
-    src: nl.ndarray,
-    dst: nl.ndarray,
+    src: nl.NkiTensor,
+    dst: nl.NkiTensor,
     src_start_partition: int,
     dst_start_partition: int,
     num_partitions_to_copy: int,
@@ -162,8 +164,8 @@ def _shuffle_within_quadrant(
     tensors may be smaller. We use quadrant-sized temp buffers to satisfy the hardware requirements.
 
     Args:
-        src (nl.ndarray): Source tensor
-        dst (nl.ndarray): Destination tensor
+        src (nl.NkiTensor): Source tensor
+        dst (nl.NkiTensor): Destination tensor
         src_start_partition (int): Starting partition in source
         dst_start_partition (int): Starting partition in destination
         num_partitions_to_copy (int): Number of partitions to copy
@@ -176,13 +178,9 @@ def _shuffle_within_quadrant(
     dst_offset_in_quadrant = dst_start_partition % QUADRANT
     dst_quadrant_base = dst_quadrant * QUADRANT
 
-    # If dst offset within quadrant is 0, use direct tensor_copy
-    if dst_offset_in_quadrant == 0:
-        nisa.tensor_copy(
-            src=src[src_start_partition : src_start_partition + num_partitions_to_copy, :free_dim_size],
-            dst=dst[dst_start_partition : dst_start_partition + num_partitions_to_copy, :free_dim_size],
-        )
-        return
+    # Callers reach _shuffle_within_quadrant only after cross_partition_copy's
+    # dst-aligned early return, so dst is never quadrant-aligned here.
+    kernel_assert(dst_offset_in_quadrant != 0, "dst must not be quadrant-aligned here")
 
     # SHUFFLE PATH
     temp_src = nl.ndarray((QUADRANT, free_dim_size), dtype=src.dtype, buffer=nl.sbuf)
@@ -195,11 +193,12 @@ def _shuffle_within_quadrant(
         dst=temp_src[0:num_partitions_to_copy, :free_dim_size],
     )
 
-    if dst_offset_in_quadrant > 0:
-        nisa.tensor_copy(
-            src=dst[dst_quadrant_base : dst_quadrant_base + dst_offset_in_quadrant, :free_dim_size],
-            dst=temp_dst[0:dst_offset_in_quadrant, :free_dim_size],
-        )
+    # dst_offset_in_quadrant is > 0 here (asserted above), so preserve the
+    # partitions before the write region by copying them into temp_dst.
+    nisa.tensor_copy(
+        src=dst[dst_quadrant_base : dst_quadrant_base + dst_offset_in_quadrant, :free_dim_size],
+        dst=temp_dst[0:dst_offset_in_quadrant, :free_dim_size],
+    )
 
     shuffle_mask = [MASK_NO_CHANGE] * QUADRANT
     for i in range(num_partitions_to_copy):
@@ -219,8 +218,8 @@ def _shuffle_within_quadrant(
 
 
 def _aligned_copy_from_unaligned_src(
-    src: nl.ndarray,
-    dst: nl.ndarray,
+    src: nl.NkiTensor,
+    dst: nl.NkiTensor,
     src_start_partition: int,
     dst_start_partition: int,
     num_partitions_to_copy: int,
@@ -234,8 +233,8 @@ def _aligned_copy_from_unaligned_src(
     multiple quadrants using double-shuffle approach.
 
     Args:
-        src (nl.ndarray): Source tensor
-        dst (nl.ndarray): Destination tensor (dst_start_partition must be QUADRANT-aligned)
+        src (nl.NkiTensor): Source tensor
+        dst (nl.NkiTensor): Destination tensor (dst_start_partition must be QUADRANT-aligned)
         src_start_partition (int): Starting partition in source (may be non-aligned)
         dst_start_partition (int): Starting partition in destination (must be aligned)
         num_partitions_to_copy (int): Number of partitions to copy

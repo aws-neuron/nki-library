@@ -34,12 +34,12 @@ from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 @nki.jit
 def ring_attention_spmd_bwd(
-    q_ref: nl.ndarray,
-    k_ref: nl.ndarray,
-    v_ref: nl.ndarray,
-    o_ref: nl.ndarray,
-    dy_ref: nl.ndarray,
-    lse_ref: nl.ndarray,
+    q_ref: nl.NkiTensor,
+    k_ref: nl.NkiTensor,
+    v_ref: nl.NkiTensor,
+    o_ref: nl.NkiTensor,
+    dy_ref: nl.NkiTensor,
+    lse_ref: nl.NkiTensor,
     use_causal_mask: bool = False,
     mixed_precision: bool = True,
     softmax_scale: float = None,
@@ -47,8 +47,8 @@ def ring_attention_spmd_bwd(
     lnc_size: int = 1,
     replica_groups: tuple = None,
     striped_attention: bool = False,
-    bound_min: nl.ndarray = None,
-    bound_max: nl.ndarray = None,
+    bound_min: nl.NkiTensor = None,
+    bound_max: nl.NkiTensor = None,
 ):
     """
     Ring Attention Backward SPMD kernel.
@@ -65,12 +65,12 @@ def ring_attention_spmd_bwd(
         S: Sequence length per shard
 
     Args:
-        q_ref (nl.ndarray): [B, N, D, S], Query tensor in HBM.
-        k_ref (nl.ndarray): [B, N, D, S], Key tensor in HBM.
-        v_ref (nl.ndarray): [B, N, D, S], Value tensor in HBM.
-        o_ref (nl.ndarray): [B, N, D, S], Forward output tensor in HBM.
-        dy_ref (nl.ndarray): [B, N, D, S], Upstream gradient tensor in HBM.
-        lse_ref (nl.ndarray): [B, N, 128, S//128], Log-sum-exp from forward pass in HBM.
+        q_ref (nl.NkiTensor): [B, N, D, S], Query tensor in HBM.
+        k_ref (nl.NkiTensor): [B, N, D, S], Key tensor in HBM.
+        v_ref (nl.NkiTensor): [B, N, D, S], Value tensor in HBM.
+        o_ref (nl.NkiTensor): [B, N, D, S], Forward output tensor in HBM.
+        dy_ref (nl.NkiTensor): [B, N, D, S], Upstream gradient tensor in HBM.
+        lse_ref (nl.NkiTensor): [B, N, 128, S//128], Log-sum-exp from forward pass in HBM.
         use_causal_mask (bool): Whether to apply causal masking. Default: False.
         mixed_precision (bool): Whether to use mixed precision (fp32 accumulators). Default: True.
         softmax_scale (float): Softmax scale factor. Default: 1/sqrt(D).
@@ -78,20 +78,20 @@ def ring_attention_spmd_bwd(
         lnc_size (int): LNC size (number of logical cores). Default: 1.
         replica_groups (list): Replica groups for collective communication. Default: None.
         striped_attention (bool): Whether to use striped attention layout. Default: False.
-        bound_min (nl.ndarray, optional): Sequence packing lower bound. Shape
+        bound_min (nl.NkiTensor, optional): Sequence packing lower bound. Shape
             (bs, seqlen_per_rank), fp32. Per-local-Q-token inclusive lower bound on
             the local K index of the document this Q token belongs to. Requires
             use_causal_mask=True and striped_attention=True. Identical across ranks
             (striped CP invariant with doc length divisible by num_workers).
             Use test/integration/nkilib/utils/sequence_packing_helpers.py::
             cu_seqlens_to_striped_bounds() to build it.
-        bound_max (nl.ndarray, optional): Sequence packing upper bound (exclusive).
+        bound_max (nl.NkiTensor, optional): Sequence packing upper bound (exclusive).
             Same shape/dtype/semantics as bound_min. Must be provided together.
 
     Returns:
-        out_dq (nl.ndarray): [B, N, D, S], Query gradient in HBM (float32).
-        out_dk (nl.ndarray): [B, N, D, S], Key gradient in HBM (float32).
-        out_dv (nl.ndarray): [B, N, D, S], Value gradient in HBM (float32).
+        out_dq (nl.NkiTensor): [B, N, D, S], Query gradient in HBM (float32).
+        out_dk (nl.NkiTensor): [B, N, D, S], Key gradient in HBM (float32).
+        out_dv (nl.NkiTensor): [B, N, D, S], Value gradient in HBM (float32).
 
     Notes:
         - Sequence length S must be divisible by 128.
@@ -246,9 +246,9 @@ def _build_causal_bounds(qts, qnt, striped, recv_rank_sb=None, my_rank_sb=None, 
         qts (int): Q sequence tile size.
         qnt (int): Number of Q sequence tiles.
         striped (bool): Whether striped attention layout is used.
-        recv_rank_sb (nl.ndarray): [qts, 1], Receiver rank ID in SBUF.
-        my_rank_sb (nl.ndarray): [qts, 1], Current rank ID in SBUF.
-        gko_sb (nl.ndarray): [qts, 1], Global K offset in SBUF.
+        recv_rank_sb (nl.NkiTensor): [qts, 1], Receiver rank ID in SBUF.
+        my_rank_sb (nl.NkiTensor): [qts, 1], Current rank ID in SBUF.
+        gko_sb (nl.NkiTensor): [qts, 1], Global K offset in SBUF.
 
     Returns:
         tuple: (rs_ub, rs_lb) upper and lower bound tensors for range_select.
@@ -299,14 +299,14 @@ def _build_bound_max_clamped(
     Args:
         qts (int): Q sequence tile size.
         qnt (int): Number of Q sequence tiles.
-        bound_max_sb (nl.ndarray): [qts, qnt] fp32, base packing upper bound (exclusive).
+        bound_max_sb (nl.NkiTensor): [qts, qnt] fp32, base packing upper bound (exclusive).
         striped (bool): Whether striped attention layout is used.
-        recv_rank_sb (nl.ndarray): [qts, 1], Receiver rank ID in SBUF (striped only).
-        my_rank_sb (nl.ndarray): [qts, 1], Current rank ID in SBUF (striped only).
-        gko_sb (nl.ndarray): [qts, 1], Global K offset in SBUF (contiguous only).
+        recv_rank_sb (nl.NkiTensor): [qts, 1], Receiver rank ID in SBUF (striped only).
+        my_rank_sb (nl.NkiTensor): [qts, 1], Current rank ID in SBUF (striped only).
+        gko_sb (nl.NkiTensor): [qts, 1], Global K offset in SBUF (contiguous only).
 
     Returns:
-        nl.ndarray: [qts, qnt] fp32, the composed exclusive upper bound.
+        nl.NkiTensor: [qts, qnt] fp32, the composed exclusive upper bound.
     """
     # iota + 1 gives the exclusive causal upper bound (k < iota + 1 means k <= iota).
     causal_ub = nl.ndarray((qts, qnt), dtype=nl.float32, buffer=nl.sbuf)
@@ -332,12 +332,12 @@ def _load_rank_sb(iota_nw, scalar_rank, qts):
     Load a scalar rank ID into a (qts, 1) SBUF tensor via dma_copy and broadcast.
 
     Args:
-        iota_nw (nl.ndarray): Shared constant iota tensor for rank lookup.
+        iota_nw (nl.NkiTensor): Shared constant iota tensor for rank lookup.
         scalar_rank (int): Scalar rank ID to load.
         qts (int): Q sequence tile size (partition dimension).
 
     Returns:
-        nl.ndarray: [qts, 1], Rank ID broadcast to all partitions in SBUF.
+        nl.NkiTensor: [qts, 1], Rank ID broadcast to all partitions in SBUF.
     """
     sb = nl.ndarray((qts, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(
@@ -353,14 +353,14 @@ def _permute_all(sq, rq, sdy, rdy, slse, rlse, sdos, rdos, rg, ch, lnc, barrier=
     Collective permute Q, dY, LSE, and dy_o_sum buffers to the next ring step.
 
     Args:
-        sq (nl.ndarray): Send buffer for Q.
-        rq (nl.ndarray): Receive buffer for Q.
-        sdy (nl.ndarray): Send buffer for dY.
-        rdy (nl.ndarray): Receive buffer for dY.
-        slse (nl.ndarray): Send buffer for LSE.
-        rlse (nl.ndarray): Receive buffer for LSE.
-        sdos (nl.ndarray): Send buffer for dy_o_sum.
-        rdos (nl.ndarray): Receive buffer for dy_o_sum.
+        sq (nl.NkiTensor): Send buffer for Q.
+        rq (nl.NkiTensor): Receive buffer for Q.
+        sdy (nl.NkiTensor): Send buffer for dY.
+        rdy (nl.NkiTensor): Receive buffer for dY.
+        slse (nl.NkiTensor): Send buffer for LSE.
+        rlse (nl.NkiTensor): Receive buffer for LSE.
+        sdos (nl.NkiTensor): Send buffer for dy_o_sum.
+        rdos (nl.NkiTensor): Receive buffer for dy_o_sum.
         rg (ReplicaGroup): Replica group for collective communication.
         ch (int): Channel ID for collective permute.
         lnc (int): LNC size (number of logical cores).
@@ -424,11 +424,11 @@ def _compute_step(
 
     Args:
         cfg (AttentionBwdConfig): Backward attention configuration.
-        q_buf (nl.ndarray): Flat HBM buffer containing Q tiles.
-        dy_buf (nl.ndarray): Flat HBM buffer containing dY tiles.
-        exp_bias (nl.ndarray): [q_seq_tile_size, q_seq_n_tiles], Softmax exp bias (-LSE) in SBUF.
-        dos (nl.ndarray): [q_seq_tile_size, q_seq_n_tiles], dy_o_sum in SBUF.
-        dq_buf (nl.ndarray): Flat HBM buffer for dQ output.
+        q_buf (nl.NkiTensor): Flat HBM buffer containing Q tiles.
+        dy_buf (nl.NkiTensor): Flat HBM buffer containing dY tiles.
+        exp_bias (nl.NkiTensor): [q_seq_tile_size, q_seq_n_tiles], Softmax exp bias (-LSE) in SBUF.
+        dos (nl.NkiTensor): [q_seq_tile_size, q_seq_n_tiles], dy_o_sum in SBUF.
+        dq_buf (nl.NkiTensor): Flat HBM buffer for dQ output.
         k_loaded (list): List of K tiles loaded in SBUF, one per d_head tile.
         v_loaded (list): List of V tiles loaded in SBUF, one per d_head tile.
         dk_red (list): Accumulator for dK reduction, one per d_head tile.
@@ -583,27 +583,27 @@ def _ring_bwd_impl(
     dK/dV locally and reducing dQ across workers.
 
     Args:
-        q_ref (nl.ndarray): [B, N, D, S], Query tensor in HBM.
-        k_ref (nl.ndarray): [B, N, D, S], Key tensor in HBM.
-        v_ref (nl.ndarray): [B, N, D, S], Value tensor in HBM.
-        o_ref (nl.ndarray): [B, N, D, S], Forward output tensor in HBM.
-        dy_ref (nl.ndarray): [B, N, D, S], Upstream gradient tensor in HBM.
-        lse_ref (nl.ndarray): [B, N, 128, S//128], Log-sum-exp from forward pass.
-        out_dq (nl.ndarray): Output dQ buffer in HBM.
-        out_dk (nl.ndarray): Output dK buffer in HBM.
-        out_dv (nl.ndarray): Output dV buffer in HBM.
-        sq (nl.ndarray): Send buffer for Q.
-        rq (nl.ndarray): Receive buffer for Q.
-        sdy (nl.ndarray): Send buffer for dY.
-        rdy (nl.ndarray): Receive buffer for dY.
-        slse (nl.ndarray): Send buffer for LSE.
-        rlse (nl.ndarray): Receive buffer for LSE.
-        sdos (nl.ndarray): Send buffer for dy_o_sum.
-        rdos (nl.ndarray): Receive buffer for dy_o_sum.
-        sdq (nl.ndarray): Send buffer for dQ.
-        rdq (nl.ndarray): Receive buffer for dQ.
-        dq_scr0 (nl.ndarray): dQ scratch buffer 0.
-        dq_scr1 (nl.ndarray): dQ scratch buffer 1.
+        q_ref (nl.NkiTensor): [B, N, D, S], Query tensor in HBM.
+        k_ref (nl.NkiTensor): [B, N, D, S], Key tensor in HBM.
+        v_ref (nl.NkiTensor): [B, N, D, S], Value tensor in HBM.
+        o_ref (nl.NkiTensor): [B, N, D, S], Forward output tensor in HBM.
+        dy_ref (nl.NkiTensor): [B, N, D, S], Upstream gradient tensor in HBM.
+        lse_ref (nl.NkiTensor): [B, N, 128, S//128], Log-sum-exp from forward pass.
+        out_dq (nl.NkiTensor): Output dQ buffer in HBM.
+        out_dk (nl.NkiTensor): Output dK buffer in HBM.
+        out_dv (nl.NkiTensor): Output dV buffer in HBM.
+        sq (nl.NkiTensor): Send buffer for Q.
+        rq (nl.NkiTensor): Receive buffer for Q.
+        sdy (nl.NkiTensor): Send buffer for dY.
+        rdy (nl.NkiTensor): Receive buffer for dY.
+        slse (nl.NkiTensor): Send buffer for LSE.
+        rlse (nl.NkiTensor): Receive buffer for LSE.
+        sdos (nl.NkiTensor): Send buffer for dy_o_sum.
+        rdos (nl.NkiTensor): Receive buffer for dy_o_sum.
+        sdq (nl.NkiTensor): Send buffer for dQ.
+        rdq (nl.NkiTensor): Receive buffer for dQ.
+        dq_scr0 (nl.NkiTensor): dQ scratch buffer 0.
+        dq_scr1 (nl.NkiTensor): dQ scratch buffer 1.
         bid (int): Batch index.
         hid (int): Head index.
         lnc (int): LNC size.

@@ -28,8 +28,8 @@ MASK_NO_CHANGE = 255  # Special value meaning the output tensor in partition [i]
 
 
 def cross_partition_copy(
-    src: nl.ndarray,
-    dst: nl.ndarray,
+    src: nl.NkiTensor,
+    dst: nl.NkiTensor,
     src_start_partition: int,
     dst_start_partition: int,
     num_partitions_to_copy: int,
@@ -46,8 +46,8 @@ def cross_partition_copy(
     direct tensor_copy instead.
 
     Args:
-        src (nl.ndarray): Source tensor in SBUF
-        dst (nl.ndarray): Destination tensor in SBUF
+        src (nl.NkiTensor): Source tensor in SBUF
+        dst (nl.NkiTensor): Destination tensor in SBUF
         src_start_partition (int): Starting partition index in src
         dst_start_partition (int): Starting partition index in dst
         num_partitions_to_copy (int): Number of partitions to copy
@@ -148,8 +148,8 @@ def cross_partition_copy(
 
 
 def _shuffle_within_quadrant(
-    src: nl.ndarray,
-    dst: nl.ndarray,
+    src: nl.NkiTensor,
+    dst: nl.NkiTensor,
     src_start_partition: int,
     dst_start_partition: int,
     num_partitions_to_copy: int,
@@ -162,8 +162,8 @@ def _shuffle_within_quadrant(
     tensors may be smaller. We use quadrant-sized temp buffers to satisfy the hardware requirements.
 
     Args:
-        src (nl.ndarray): Source tensor
-        dst (nl.ndarray): Destination tensor
+        src (nl.NkiTensor): Source tensor
+        dst (nl.NkiTensor): Destination tensor
         src_start_partition (int): Starting partition in source
         dst_start_partition (int): Starting partition in destination
         num_partitions_to_copy (int): Number of partitions to copy
@@ -219,8 +219,8 @@ def _shuffle_within_quadrant(
 
 
 def _aligned_copy_from_unaligned_src(
-    src: nl.ndarray,
-    dst: nl.ndarray,
+    src: nl.NkiTensor,
+    dst: nl.NkiTensor,
     src_start_partition: int,
     dst_start_partition: int,
     num_partitions_to_copy: int,
@@ -234,8 +234,8 @@ def _aligned_copy_from_unaligned_src(
     multiple quadrants using double-shuffle approach.
 
     Args:
-        src (nl.ndarray): Source tensor
-        dst (nl.ndarray): Destination tensor (dst_start_partition must be QUADRANT-aligned)
+        src (nl.NkiTensor): Source tensor
+        dst (nl.NkiTensor): Destination tensor (dst_start_partition must be QUADRANT-aligned)
         src_start_partition (int): Starting partition in source (may be non-aligned)
         dst_start_partition (int): Starting partition in destination (must be aligned)
         num_partitions_to_copy (int): Number of partitions to copy

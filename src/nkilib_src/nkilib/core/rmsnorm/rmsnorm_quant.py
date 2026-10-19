@@ -40,6 +40,11 @@ from .rmsnorm_quant_tile_info import (
     build_rms_norm_quant_tile_info,
 )
 
+# Minimum number of 128-row tiles per core at which the write-only squared-values scratch is shared across
+# tiles instead of allocated per tile. Measured on trn2 (LNC2, bf16 in, hidden 5376, STATIC and ROW fp8 out):
+# sharing is -4..-6% at 8 tiles per core and -19% at 64, but +5% at 4 tiles, hence the threshold.
+_SHARED_SQUARED_SCRATCH_MIN_TILES = 8
+
 
 @dataclass(frozen=True)
 class RmsNormQuantKernelArgs(nl.NKIObject):
@@ -204,7 +209,7 @@ def rmsnorm_quant_kernel(
         # Create the output tensor with the same shape as the input tensor but with the
         # innermost dimension extended to hold the dequantizing scale factors.
         out_tsr_shape = tuple(list(hidden.shape)[:-1] + [hidden.shape[-1] + constants.dequant_scale_size])
-    elif kargs.is_static_quant():
+    elif kargs.is_static_quant():  # pragma: no branch - quant type is asserted ROW or STATIC in __post_init__; reaching this elif means not ROW, so it is always STATIC
         out_tsr_shape = hidden.shape
     out_tsr_proc_shape = _collapse_shape_major_dimensions(out_tsr_shape)
     out_tsr_hbm = nl.ndarray(out_tsr_shape, dtype=constants.quant_data_type, buffer=nl.shared_hbm)
@@ -325,7 +330,9 @@ def _validate_kernel_input(
             hidden.shape[2] <= constants.MAX_H,
             f"Hidden dimension {hidden.shape[2]} exceeds maximum {constants.MAX_H}",
         )
-    elif len(hidden.shape) == 2:
+    elif (
+        len(hidden.shape) == 2
+    ):  # pragma: no branch - hidden rank is asserted >= 2 above; reaching this elif means rank < 3, so it is always exactly 2
         # For 2D inputs, validate as [outer_dim, processing_dim]
         # The outer dimension is the product of all dimensions except the last
         outer_dim_size = hidden.shape[0]
@@ -353,7 +360,9 @@ def _validate_kernel_input(
                 ln_w.shape[1] <= constants.MAX_H,
                 f"ln_w last dimension {ln_w.shape[1]} exceeds maximum {constants.MAX_H}",
             )
-        elif len(ln_w.shape) == 1:
+        elif (
+            len(ln_w.shape) == 1
+        ):  # pragma: no branch - ln_w rank is asserted 1 or 2 above; reaching this elif means not 2, so it is always exactly 1
             kernel_assert(
                 ln_w.shape[0] <= constants.MAX_H,
                 f"ln_w dimension {ln_w.shape[0]} exceeds maximum {constants.MAX_H}",
@@ -785,7 +794,7 @@ def _quantize_tile(
         _row_quantize_tile(
             kargs, tile_info, constants, outer_dim_tile_num, in_tile_sbuf, out_tile_sbuf, out_row_dequant_scales_sbuf
         )
-    elif kargs.is_static_quant():
+    elif kargs.is_static_quant():  # pragma: no branch - quant type is asserted ROW or STATIC in __post_init__; reaching this elif means not ROW, so it is always STATIC
         _static_quantize_tile(
             tile_info,
             constants,
@@ -845,16 +854,23 @@ def _rmsnorm_quant_single_core_kernel(
     else:
         static_quant_scale_sbuf = None
 
+    # The squared-values scratch (write-only) is shared across tiles when there are enough tiles per core
+    # to amortize it; see _SHARED_SQUARED_SCRATCH_MIN_TILES. The effect is empirical (compiler placement).
+    needs_rms_scratch = kargs.needs_rms_normalization() or has_pre_norm
+    share_squared_scratch = tile_info.outer_dim_tile.tile_count >= _SHARED_SQUARED_SCRATCH_MIN_TILES
+    squared_in_tsr_sbuf = None
+
     # Loop over all the tiles in the outer dimension and process them one at a time
     for outer_tile_num in range(tile_info.outer_dim_tile.tile_count):
         # We need RMS norm scratch buffers when either the main norm or the pre-norm path is active
-        if kargs.needs_rms_normalization() or has_pre_norm:
+        if needs_rms_scratch:
             # Declare some allocations required throughout RMS norm calculations
-            squared_in_tsr_sbuf = nl.ndarray(
-                (tile_info.outer_dim_tile.tile_size, constants.proc_dim_size),
-                dtype=nl.float32,
-                buffer=nl.sbuf,
-            )
+            if not share_squared_scratch or outer_tile_num == 0:
+                squared_in_tsr_sbuf = nl.ndarray(
+                    (tile_info.outer_dim_tile.tile_size, constants.proc_dim_size),
+                    dtype=nl.float32,
+                    buffer=nl.sbuf,
+                )
             inverse_rms_scale_sbuf = nl.ndarray(
                 (tile_info.outer_dim_tile.tile_size, 1),
                 dtype=nl.float32,

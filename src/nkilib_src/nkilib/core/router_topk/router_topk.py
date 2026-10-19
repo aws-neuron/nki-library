@@ -18,11 +18,9 @@ It computes router logits, applies activation functions, and performs top-K sele
 with expert affinity scattering.
 """
 
-import neuronxcc.nki.typing as nt
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import core_barrier, engine, reduce_cmd
 
 from ..utils import (
     cross_partition_copy,
@@ -57,13 +55,13 @@ def router_topk(
     x: nl.NkiTensor,
     w: nl.NkiTensor,
     w_bias: nl.NkiTensor,
-    router_logits: nt.mutable_tensor,
-    expert_affinities: nt.mutable_tensor,
-    expert_index: nt.mutable_tensor,
+    router_logits: nl.NkiTensor,
+    expert_affinities: nl.NkiTensor,
+    expert_index: nl.NkiTensor,
     act_fn: RouterActFnType,
     k: int,
-    x_hbm_layout: XHBMLayout_H_T__0,
-    x_sb_layout: XSBLayout_tp102__0,
+    x_hbm_layout: int,
+    x_sb_layout: int,
     router_pre_norm: bool = True,
     norm_topk_prob: bool = False,
     use_column_tiling: bool = False,
@@ -74,7 +72,7 @@ def router_topk(
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
     skip_store_expert_affinities: bool = False,
-    expert_affinities_eager_out: nt.mutable_tensor = None,
+    expert_affinities_eager_out: nl.NkiTensor = None,
 ):
     """
     Router top-K kernel for Mixture of Experts (MoE) models.
@@ -99,10 +97,10 @@ def router_topk(
                         If in SBUF: a permutation of [128, T, H/128] depending on x_sb_layout.
         w (nl.NkiTensor): Weight tensor [H, E] in HBM
         w_bias (nl.NkiTensor): Optional bias tensor [1, E] or [E] in HBM
-        router_logits (nt.mutable_tensor): Output router logits [T, E] in HBM
-        expert_affinities (nt.mutable_tensor): Output expert affinities [T, E] in HBM or SBUF.
+        router_logits (nl.NkiTensor): Output router logits [T, E] in HBM
+        expert_affinities (nl.NkiTensor): Output expert affinities [T, E] in HBM or SBUF.
                         Buffer type is auto-detected.
-        expert_index (nt.mutable_tensor): Output expert indices [T, K] in HBM or SBUF.
+        expert_index (nl.NkiTensor): Output expert indices [T, K] in HBM or SBUF.
                         Buffer type is auto-detected.
         act_fn (RouterActFnType): Activation function (SOFTMAX or SIGMOID)
         k (int): Number of top experts to select (must be <= 8)
@@ -121,7 +119,7 @@ def router_topk(
                         affinities. Only valid with return_eager_affi=True, where the dense [T, k]
                         eager affinities carry all the affinity values the caller needs. Avoids the
                         [T, E] HBM allocation, the zero-init, and the indirect-DMA scatter.
-        expert_affinities_eager_out (nt.mutable_tensor): Optional [T, k] HBM output for the dense
+        expert_affinities_eager_out (nl.NkiTensor): Optional [T, k] HBM output for the dense
                         eager affinities. When provided (requires return_eager_affi=True), each LNC
                         core writes ONLY its own T_local slice directly to
                         expert_affinities_eager_out[T_offset : T_offset + T_local] — the two cores'
@@ -213,7 +211,7 @@ def router_topk(
             x_H, T = x.shape
         elif x_hbm_layout == XHBMLayout_T_H__1:  # [T,H]
             T, x_H = x.shape
-        else:
+        else:  # pragma: no cover - arg validation; x_hbm_layout asserted to be 0 or 1 above
             kernel_assert(False, f"Unsupported x_hbm_layout: {x_hbm_layout}. Expected 0,1")
 
         kernel_assert(x_H == H, f"x shape {x.shape} has an H: {x_H}) that mismatches w's H {H}. w.shape: {w.shape}")
@@ -298,7 +296,7 @@ def router_topk(
 
     """
     TensorEngine/PEArray column tiling setup.
-    
+
     The 'x' tensor's T is on the free-dim in SBUF. If T<128 then some of the PEArray columns
     are unused. Hence we engage the column-tiling feature to split the array in multiple tiles
     (column-wise), each of which can execute an independent matmul in parallel.
@@ -334,7 +332,7 @@ def router_topk(
 
     """
     Internal x_sb_layout defaults to x_sb_layout, which makes sense when the 'x' input is in SBUF.
-    
+
     But when we load 'x' from HBM, we override internal_x_sb_layout to be the SBUF layout we load into.
     To be clear, when loading from HBM, the SB layout is chosen by this kernel, below. It is *not*
     specified by the user via x_sb_layout.
@@ -376,7 +374,7 @@ def router_topk(
         )
         if use_PE_broadcast_w_bias:  # Use TensorE/matmul to do the broadcast
             ones_mask = nl.ndarray((1, t_tile_size), dtype=router_logits_bias_vector_sb.dtype, buffer=nl.sbuf)
-            nisa.memset(dst=ones_mask, value=1.0, engine=engine.gpsimd)
+            nisa.memset(dst=ones_mask, value=1.0, engine=nisa.engine.gpsimd)
             bias_bc_psum = nl.ndarray((t_tile_size, E), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_matmul(
                 dst=bias_bc_psum,
@@ -384,7 +382,7 @@ def router_topk(
                 moving=router_logits_bias_vector_sb[...],
                 is_stationary_onezero=True,
             )
-            nisa.tensor_copy(dst=router_logits_bias_broadcasted_sb, src=bias_bc_psum[...], engine=engine.scalar)
+            nisa.tensor_copy(dst=router_logits_bias_broadcasted_sb, src=bias_bc_psum[...], engine=nisa.engine.scalar)
         else:
             stream_shuffle_broadcast.stream_shuffle_broadcast(
                 router_logits_bias_vector_sb, router_logits_bias_broadcasted_sb
@@ -397,7 +395,7 @@ def router_topk(
         t_tile_size_actual = t_tile.size
         """
         Initialize PSUM buffer.
-        
+
         We allocate [pmax, E] (i.e. the full pmax) because each column-tile writes into
         a separate p-dim range. If T < pmax we'll use an access pattern to get the correct data.
         """
@@ -409,7 +407,7 @@ def router_topk(
 
             """
             Form 'x' tile that is a multiple of t_tile_size.
-            
+
             This will be oversized on the last tile if T is not a multiple of pmax.
             But the correct remainder amount is selected using the mask in the matmul.
             Compute the start/end indexes for this T-tile slice where T_offset is the LNC shard offset.
@@ -448,7 +446,7 @@ def router_topk(
         if has_bias:
             """
             Apply the bias to router-logits.
-            
+
             Element-wise add with the broadcasted bias tensor while copying from PSUM->SBUF.
             Tensor shapes:
             - router_logits_sb: [t_p_dim, num_t_tiles, E]
@@ -511,12 +509,12 @@ def router_topk(
     """
     After computing router-logits, the subsequent operations in this kernel are set up in a pipeline
     where individual stages can be enabled/disabled. Only certain combinations are valid.
-    
+
     The pipeline is:
     ACT1 --> topK --> ACT2 --> Norm --> Scatter
-    
+
     ACT* is an activation function. Norm is an L1 norm (normalize by sum of all values).
-    
+
     Valid combinations:
       (topK, ACT2, Scatter)
       (ACT1, topK)
@@ -525,7 +523,7 @@ def router_topk(
 
     """
     The following flags specify which stages to enable. topK is always enabled.
-    
+
     Rather than simply accept these flags as kernel arguments, they are derived from
     the existing arguments to maintain kernel interface backwards compatibility.
     """
@@ -594,13 +592,13 @@ def router_topk(
                 )
 
             if n_prgs > 1:
-                core_barrier(expert_affinities, (0, 1))
+                nisa.core_barrier(expert_affinities, (0, 1))
 
     """topK."""
 
     """
     Top-K operation finds the largest K values in each partition along with their indexes.
-    
+
     Select input for topK operation. If ACT1 is enabled, use its output. Otherwise use router-logits.
     """
     topk_input_sb = router_logits_sb if (not pipeline_enable_act1) else expert_affinities_full_sb
@@ -725,7 +723,9 @@ def router_topk(
                 )
         else:
             # For SBUF output, copy router_indexes_topk_sb to expert_index
-            if num_t_tiles == 1:
+            # SBUF expert_index caps T at the 128-partition max, so num_t_tiles is always 1
+            # here; the num_t_tiles>1 arc is unreachable for this path.
+            if num_t_tiles == 1:  # pragma: no branch
                 router_indexes_topk_sb = router_indexes_topk_sb.reshape((t_p_dim, k))
             nisa.tensor_copy(src=router_indexes_topk_sb, dst=expert_index)
     elif not skip_store_expert_index:
@@ -764,7 +764,7 @@ def router_topk(
 
     if T_pad > 0:
         nisa.memset(dst=expert_affinities_topk_sb[:t_p_dim, num_t_tiles - 1, :], value=0.0)
-        nisa.memset(dst=expert_affinities_one_hot_scattered_sb, value=0.0, engine=engine.gpsimd)
+        nisa.memset(dst=expert_affinities_one_hot_scattered_sb, value=0.0, engine=nisa.engine.gpsimd)
 
     # for t_tile_idx in range(num_t_tiles):
     for t_tile in tiled_range.TiledRange(T_local, ST_F_MAX):
@@ -938,7 +938,9 @@ def router_topk(
                 # Now multiply with the mask to select the affinities we want in the topK positions
                 if pipeline_enable_act1:
                     # ACT1 path: activation already computed on full tensor (expert_affinities_full_sb)
-                    if pipeline_enable_norm:
+                    # Reaching the scatter on the ACT1 path requires pipeline_enable_scatter, which for
+                    # ACT1 means (act1 and norm) -> pipeline_enable_norm is always True here.
+                    if pipeline_enable_norm:  # pragma: no branch
                         # Apply L1 normalization in-place: scale by 1/sum(topk_affinities)
                         nisa.tensor_scalar(
                             dst=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
@@ -980,10 +982,10 @@ def router_topk(
                 Here we perform the scatter using indirect DMA which allows the destination HBM tensor
                 (expert_affinities_hbm) to be accessed using an index tensor that is dynamically constructed
                 during execution (router_indexes_topk_sb).
-                
+
                 But indirect-DMA does not support a 2D index tensor (ie. we cannot directly use router_indexes_topk_sb).
                 We must transform both expert_affinities_hbm and router_indexes_topk_sb into 1D.
-                
+
                 The procedure is:
                 - Create expert_affinities_hbm = [T,E] in HBM as a tensor of zeroes
                 - Reshape it to a 1D tensor of shape [T*E] = expert_affinities_hbm_1d (just a view change)
@@ -1004,7 +1006,7 @@ def router_topk(
                 """
                 Indirect-DMA requires us to take the indexes from router_indexes_topk_sb and transform them
                 into equivalent indexes into a flattened 1D HBM tensor of shape [T*E].
-                
+
                 Create a column-vector in SBUF with values (0, E, 2E, 3E, 4E, ...) but offset into the
                 current T-tile. When sharding is enabled, T_offset accounts for the global token offset.
                 """
@@ -1025,16 +1027,16 @@ def router_topk(
                 """
                 Recall that router_indexes_topk_sb = [128,T/128,K], meaning each Row (token) contains a list
                 of K indexes (the indexes of the top-K experts).
-                
+
                 index_offset_sb = [T/128,1]
                 tensor_scalar will broadcast index_offset_sb in the free-dim.
-                
+
                 This op will therefore take router_indexes_topk_sb and:
                 - add 0 to all values in Row T=0
                 - add E to all values in Row T=1
                 - add 2E to all values in Row T=2
                 - etc
-                
+
                 The result is that each expert index gets mapped into the corresponding index into the
                 flattened 1D tensor shape [T*E]. Not shown above is the additional offset, contained in
                 index_offset_sb, to shift us into the current T-tile.
@@ -1084,7 +1086,7 @@ def router_topk(
                 )
 
             if n_prgs > 1:
-                core_barrier(expert_affinities, cores=[0, 1])
+                nisa.core_barrier(expert_affinities, cores=[0, 1])
 
         # When expert_affin_in_sb and shard_on_tokens, exchange data between cores via sendrecv
         if expert_affin_in_sb and shard_on_tokens and (not use_indirect_dma_scatter):
@@ -1307,19 +1309,21 @@ def router_topk_input_x_load(x: nl.NkiTensor, hbm_layout=XHBMLayout_H_T__0, sb_l
         - Layout 3: H-tiles arranged in dim-1, T in dim-2
     """
     # Input validation
-    if hbm_layout not in (XHBMLayout_H_T__0, XHBMLayout_T_H__1):
+    if hbm_layout not in (XHBMLayout_H_T__0, XHBMLayout_T_H__1):  # pragma: no cover - arg validation
         kernel_assert(
             False, f"router_topk_input_x_load only hbm_layout=0,1 are supported. Specified layout value: {hbm_layout}"
         )
 
-    if sb_layout not in (0, 1, 2, 3):
+    if sb_layout not in (0, 1, 2, 3):  # pragma: no cover - arg validation
         kernel_assert(
             False,
             f"router_topk_input_x_load only sb_layout=0,1,2,3 are supported. Specified layout value: {sb_layout}",
         )
 
     # Check for unsupported layout combinations
-    if hbm_layout == XHBMLayout_H_T__0 and sb_layout != XSBLayout__128_Hdiv128_T__3:
+    if (
+        hbm_layout == XHBMLayout_H_T__0 and sb_layout != XSBLayout__128_Hdiv128_T__3
+    ):  # pragma: no cover - arg validation
         kernel_assert(False, f"hbm_layout=0 only supports sb_layout=3, got sb_layout={sb_layout}")
     if hbm_layout == XHBMLayout_T_H__1 and sb_layout not in [
         XSBLayout_tp102__0,
@@ -1532,7 +1536,7 @@ def router_topk_input_x_load(x: nl.NkiTensor, hbm_layout=XHBMLayout_H_T__0, sb_l
             dst=x_sb,
         )
 
-    else:
+    else:  # pragma: no cover - arg validation; all supported layout combinations handled above
         # Should never reach here.
         kernel_assert(False, f"Combination of hbm_layout {hbm_layout} and sb_layout {sb_layout} not supported.")
 
@@ -1569,7 +1573,7 @@ def router_topk_input_w_load(w: nl.NkiTensor, x_sb_layout):
 
     w_sb = None
 
-    if x_sb_layout not in [0, 1, 2, 3]:
+    if x_sb_layout not in [0, 1, 2, 3]:  # pragma: no cover - arg validation
         kernel_assert(
             False,
             f"router_topk_input_w_load only x_sb_layout=0,1,2,3 are supported. Specified layout value: {x_sb_layout}",
@@ -1841,7 +1845,7 @@ def compute_activation(
             bias=local_negmax_sb[:t_tile_size, t_tile_idx : t_tile_idx + 1],
             reduce_op=nl.add,
             reduce_res=(local_exp_sum_sb.slice(dim=0, start=0, end=t_tile_size).select(dim=1, index=t_tile_idx)),
-            reduce_cmd=reduce_cmd.reset_reduce,
+            reduce_cmd=nisa.reduce_cmd.reset_reduce,
         )
 
         nisa.reciprocal(

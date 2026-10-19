@@ -291,7 +291,7 @@ def _load_full_down_weight_scales_compact(
     staging_sbm.close_scope()
 
 
-def _load_down_scale_tile_compact(scale_hbm, sbuf, staging_sbm, int_tile_global, h_start, h_size, name="down_scale"):
+def _load_down_scale_tile_compact(scale_hbm, sbuf, staging_sbm, int_tile_global, h_start, h_size):
     """Stream ONE (int_tile, H-window) COMPACT down-scale slice and expand it in-kernel.
 
     Compact-scale analogue of ``_load_down_scale_tile``: reads compact block-128 down scales
@@ -306,7 +306,7 @@ def _load_down_scale_tile_compact(scale_hbm, sbuf, staging_sbm, int_tile_global,
     n_h128_full = scale_hbm.shape[-1]  # compact H-blocks in the full tensor
 
     staging_sbm.open_scope()
-    compact = staging_sbm.alloc_stack((_PMAX, n_h128), dtype=nl.uint8, buffer=nl.sbuf, name=f"{name}_tile_compact")
+    compact = staging_sbm.alloc_stack((_PMAX, n_h128), dtype=nl.uint8, buffer=nl.sbuf)
     for quadrant_idx in range(div_ceil(_PMAX, QUADRANT_SIZE)):
         compact_i_row = int_tile_global * _H_PACK + quadrant_idx
         nisa.dma_copy(

@@ -29,7 +29,7 @@ from .mlp_tkg_constants import (
     MLPTKGConstantsGateUpTileCounts,
 )
 from .mlp_tkg_down_projection_lhs_rhs_swap import down_projection_lhs_rhs_swap
-from .projection_utils import adaptive_dge_mode, prepare_down_bias_and_scale
+from .projection_utils import _down_proj_dge_mode, adaptive_dge_mode, prepare_down_bias_and_scale
 
 _DGE_MODE_UNKNOWN = 0  # Compiler decides best DMA mode internally
 _DGE_MODE_NONE = 3  # Use STATIC DMA mode
@@ -264,7 +264,7 @@ def process_down_projection(
         nisa.dma_copy(
             dst=dequant_tile,
             src=down_w_scale,
-            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(down_w_scale),
+            dge_mode=_down_proj_dge_mode(down_w_scale, use_dge, sbm.is_auto_alloc()),
         )
 
     # ---------------- Allocate Weight Tiles ----------------

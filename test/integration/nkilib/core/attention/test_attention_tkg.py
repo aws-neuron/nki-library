@@ -19,6 +19,12 @@ from functools import lru_cache
 
 import nki
 
+from test.integration.nkilib.core.attention.test_attention_tkg_seq_packed import (
+    FP8_PACKED_AUTO_ALLOC_UNPACKED_CASES,
+    GPT_OSS_20B_TP8_UTIL50_LENGTHS,
+    GPT_OSS_120B_TP8_UTIL50_LENGTHS,
+    UNPACKED_SWEEP_CASES,
+)
 from test.integration.nkilib.core.attention.test_attention_tkg_utils import (
     AttnTKGTestParams,
     build_active_attention_mask,
@@ -268,7 +274,9 @@ def run_attention_tkg_test(
     sliding_window: int,
     is_negative_test_case: bool = False,
     DBG: bool = False,
+    use_auto_alloc: bool = False,
     max_context_len_value: Optional[int] = None,
+    sequence_lengths: Optional[list[int]] = None,
 ):
     np.random.seed(42)
 
@@ -313,9 +321,17 @@ def run_attention_tkg_test(
         attn_out_sb_shape = None
     k_out_shape = (cfg.d_head, cfg.bs * cfg.s_active) if cfg.k_out_in_sb else (cfg.bs, 1, cfg.d_head, cfg.s_active)
 
-    # Generate pos_id outside of tensor_gen so it stays the same for all inputs
-    pos_id = generate_cache_lens(cfg.bs, cfg.curr_sprior, cfg.s_active, mode="normal")
+    # Generate pos_id outside of tensor_gen so it stays the same for all inputs.
+    if sequence_lengths is not None:
+        lengths = np.asarray(sequence_lengths, dtype=np.int32)
+        assert lengths.shape == (cfg.bs,)
+        assert np.all(lengths >= cfg.s_active)
+        assert np.all(lengths <= cfg.curr_sprior)
+        pos_id = lengths[:, None] - cfg.s_active
+    else:
+        pos_id = generate_cache_lens(cfg.bs, cfg.curr_sprior, cfg.s_active, mode="normal")
     if max_context_len_value is not None:
+        assert sequence_lengths is None
         max_pos = cfg.curr_sprior - cfg.s_active
         pos_id = generate_cache_lens(
             cfg.bs, cfg.curr_sprior, cfg.s_active, mean_frac=max_context_len_value / (2 * max_pos)
@@ -383,7 +399,7 @@ def run_attention_tkg_test(
                 fuse_rope=cfg.fuse_rope,
             ):
                 active_mask = np.ascontiguousarray(active_mask.transpose(1, 2, 3, 0))  # [s_ctx,B,N,S]->[B,N,S,s_ctx]
-        active_mask = active_mask.astype(np.uint8)
+        active_mask = np.ascontiguousarray(active_mask, dtype=np.uint8)
 
         inv_freqs = np.random.random(size=(cfg.d_head // 2, 1)).astype(np.float32) if cfg.fuse_rope else None
         start_pos_ids, rope_pos_ids = None, None
@@ -429,7 +445,7 @@ def run_attention_tkg_test(
             "cfg": cfg,
             "dtype": dtype,
             "lnc": lnc,
-            "use_auto_alloc": False,
+            "use_auto_alloc": use_auto_alloc,
             "DBG": DBG,
             "max_context_len": np.array([max_context_len_value], dtype=np.int32)
             if max_context_len_value is not None
@@ -1011,6 +1027,14 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(1, 2, 1, 256, 256, 512, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(fp8_kv=True)],
     # FP8 KV with d_head=512, production-like (TP=16, BS=64, s_prior=1024, block_len=16)
     [AttnTKGConfig(64, 2, 1, 1024, 1024, 512, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(fp8_kv=True)],
+    # Same, at TP=32 (q_head=1): s_active * q_head == 1 with out in HBM, which takes the
+    # unit-stride output store instead of the permuted per-element strided store.
+    pytest.param(AttnTKGConfig(64, 1, 1, 1024, 1024, 512, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(fp8_kv=True), marks=pytest.mark.fast),
+    # Same family with flat KV instead of block KV, and at bs == pmax, which is the upper bound
+    # the unit-stride store is gated on (the transposed staging tile is [bs, d_head]).
+    # Not fast: its branch coverage is a subset of the other fast configs.
+    [AttnTKGConfig(4, 1, 1, 1024, 1024, 128, 0, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams()],
+    pytest.param(AttnTKGConfig(128, 1, 1, 1024, 1024, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(), marks=pytest.mark.fast),
 
     #################### SWA (Sliding Window Attention) Tests ####################
     # SWA requires use_pos_id=True, sliding_window > 0
@@ -1038,6 +1062,21 @@ attention_tkg_fast_configs = [
     # SWA + flash attention (s_prior > 8K triggers FA tiling)
     [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 0, tp_k_prior=True, use_pos_id=True, fuse_rope=True), AttnTKGTestParams(sliding_window=256)],
     [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(sliding_window=256)],
+
+    #################### Debug tensor export (DBG_TENSORS) ####################
+    # Exercises the DBG_TENSORS setup/store path on both lnc1 and lnc2.
+    pytest.param(AttnTKGConfig(1, 1, 1, 256, 256, 64, 0, tp_k_prior=True, strided_mm1=False, qk_in_sb=True), AttnTKGTestParams(DBG=True), marks=pytest.mark.fast),
+
+    #################### use_auto_alloc (compiler SBUF coloring allocator) ####################
+    # Exercises the is_auto_alloc() row-tiling / DMA-batching / swapped-PV allocation paths.
+    # s_prior=12288 (>=10240 for swapped-PV) is a real bucket size that runs in plain sim
+    # (not in _LARGE_SHAPE_PATTERNS), unlike 8192/10240 which are sim-skipped.
+    [AttnTKGConfig(4, 1, 5, 12288, 12288, 128, 0, qk_in_sb=True), AttnTKGTestParams(use_auto_alloc=True)],
+    [AttnTKGConfig(4, 1, 5, 12288, 12288, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(use_auto_alloc=True)],
+    [AttnTKGConfig(4, 8, 7, 12288, 12288, 64, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(use_auto_alloc=True)],
+    # Swapped-PV path (_compute_swapped_pv_matmul_and_store): block-KV, out_in_sb, d_head=64,
+    # block_len=16, s_active_qh=32, bs%4==0, curr_sprior>=10240.
+    [AttnTKGConfig(4, 8, 4, 12288, 12288, 64, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(use_auto_alloc=True)],
 ]
 
 
@@ -1146,6 +1185,219 @@ class TestAttentionTkgKernel:
     ):
         compiler_args = CompilerArgs(logical_nc_config=lnc, platform_target=platform_target)
         run_attention_tkg_test(test_manager=test_manager, compiler_args=compiler_args, cfg=attn_cfg, **asdict(test_cfg))
+
+    def test_attn_tkg_unpacked_mixed32k8k_lnc2_d64_baseline(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        cfg = AttnTKGConfig(
+            bs=16,
+            q_head=8,
+            s_active=1,
+            curr_sprior=32768,
+            full_sprior=32768,
+            d_head=64,
+            block_len=16,
+            tp_k_prior=True,
+            strided_mm1=False,
+            use_pos_id=True,
+            enable_fa_s_prior_tiling=True,
+            qk_in_sb=True,
+            k_out_in_sb=True,
+            out_in_sb=True,
+        )
+        sequence_lengths = [32768] * 4 + [8192] * 4 + [32768] * 4 + [8192] * 4
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        run_attention_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            cfg=cfg,
+            sequence_lengths=sequence_lengths,
+            **asdict(AttnTKGTestParams()),
+        )
+
+    def test_attn_tkg_unpacked_gpt_oss_20b_tp8_util50_b8_h8_d64_sprior32k_block64(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        # GPT-OSS 20B has 64 Q heads and 8 KV heads globally. TP8 gives
+        # this rank-local kernel 8 Q heads and one KV head, both at d_head=64.
+        sequence_lengths: list[int] = list(GPT_OSS_20B_TP8_UTIL50_LENGTHS)
+        cfg = AttnTKGConfig(
+            bs=8,
+            q_head=8,
+            s_active=1,
+            curr_sprior=32768,
+            full_sprior=32768,
+            d_head=64,
+            block_len=64,
+            tp_k_prior=True,
+            strided_mm1=False,
+            use_pos_id=True,
+            enable_fa_s_prior_tiling=True,
+            qk_in_sb=True,
+            k_out_in_sb=True,
+            out_in_sb=True,
+        )
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        run_attention_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            cfg=cfg,
+            sequence_lengths=sequence_lengths,
+            **asdict(AttnTKGTestParams(test_sink=True)),
+        )
+
+    def test_attn_tkg_unpacked_gpt_oss_120b_tp8_util50_b8_h8_d64_sprior32k_block64(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        # GPT-OSS 120B also has 64 Q heads and 8 KV heads globally. TP8 gives
+        # this rank-local kernel 8 Q heads and one KV head, both at d_head=64.
+        sequence_lengths: list[int] = list(GPT_OSS_120B_TP8_UTIL50_LENGTHS)
+        cfg = AttnTKGConfig(
+            bs=8,
+            q_head=8,
+            s_active=1,
+            curr_sprior=32768,
+            full_sprior=32768,
+            d_head=64,
+            block_len=64,
+            tp_k_prior=True,
+            strided_mm1=False,
+            use_pos_id=True,
+            enable_fa_s_prior_tiling=True,
+            qk_in_sb=True,
+            k_out_in_sb=True,
+            out_in_sb=True,
+        )
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        run_attention_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            cfg=cfg,
+            sequence_lengths=sequence_lengths,
+            **asdict(AttnTKGTestParams(test_sink=True)),
+        )
+
+    def test_attn_tkg_unpacked_uniform16k_lnc2_d64_baseline(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        cfg = AttnTKGConfig(
+            bs=16,
+            q_head=8,
+            s_active=1,
+            curr_sprior=16384,
+            full_sprior=16384,
+            d_head=64,
+            block_len=16,
+            tp_k_prior=True,
+            strided_mm1=False,
+            use_pos_id=True,
+            enable_fa_s_prior_tiling=True,
+            qk_in_sb=True,
+            k_out_in_sb=True,
+            out_in_sb=True,
+        )
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        run_attention_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            cfg=cfg,
+            sequence_lengths=[16384] * 16,
+            **asdict(AttnTKGTestParams()),
+        )
+
+    @pytest.mark.parametrize(
+        "use_auto_alloc",
+        [False, True],
+        ids=["manualalloc", "autoalloc"],
+    )
+    @pytest.mark.parametrize(
+        "case",
+        UNPACKED_SWEEP_CASES,
+        ids=[case["id"] for case in UNPACKED_SWEEP_CASES],
+    )
+    def test_attn_tkg_unpacked_packing_sweep(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        case,
+        use_auto_alloc,
+    ):
+        self._run_unpacked_packing_sweep_case(
+            test_manager,
+            platform_target,
+            case,
+            use_auto_alloc=use_auto_alloc,
+            fp8_packed=False,
+        )
+
+    @pytest.mark.parametrize(
+        "case",
+        FP8_PACKED_AUTO_ALLOC_UNPACKED_CASES,
+        ids=[case["id"] for case in FP8_PACKED_AUTO_ALLOC_UNPACKED_CASES],
+    )
+    def test_attn_tkg_unpacked_fp8_packed_auto_alloc_sweep(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        case,
+    ):
+        self._run_unpacked_packing_sweep_case(
+            test_manager,
+            platform_target,
+            case,
+            use_auto_alloc=True,
+            fp8_packed=True,
+        )
+
+    def _run_unpacked_packing_sweep_case(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        case,
+        *,
+        use_auto_alloc: bool,
+        fp8_packed: bool,
+    ):
+        """Run one unpacked baseline shared by matching packed geometries.
+
+        ``s_prior`` may exceed the longest request for fixed-capacity regression
+        cases; otherwise the longest sequence defines the cache extent.
+        """
+        sequence_lengths = list(case["lengths"])
+        s_prior = case.get("s_prior", max(sequence_lengths))
+        cfg = AttnTKGConfig(
+            bs=len(sequence_lengths),
+            q_head=8,
+            s_active=1,
+            curr_sprior=s_prior,
+            full_sprior=s_prior,
+            d_head=64,
+            block_len=64,
+            tp_k_prior=True,
+            strided_mm1=False,
+            use_pos_id=True,
+            enable_fa_s_prior_tiling=True,
+            qk_in_sb=True,
+            k_out_in_sb=True,
+            out_in_sb=True,
+            fp8_packed=fp8_packed,
+        )
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        run_attention_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            cfg=cfg,
+            sequence_lengths=sequence_lengths,
+            **asdict(AttnTKGTestParams(fp8_kv=fp8_packed, use_auto_alloc=use_auto_alloc)),
+        )
 
     @pytest.mark.parametrize(
         "attn_cfg, test_cfg",

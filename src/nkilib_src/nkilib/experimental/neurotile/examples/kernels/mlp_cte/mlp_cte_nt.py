@@ -383,12 +383,12 @@ def compute_down_matmul(gated_T_block, down, config: MLPConfig):
 
 @nki.jit
 def mlp_cte(
-    x: nl.ndarray,
-    gate_proj: nl.ndarray,
-    up_proj: nl.ndarray,
-    down_proj: nl.ndarray,
+    x: nl.NkiTensor,
+    gate_proj: nl.NkiTensor,
+    up_proj: nl.NkiTensor,
+    down_proj: nl.NkiTensor,
     config: MLPConfig,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """Single-rank MLP SwiGLU kernel using NeuroTile.
 
     Computes ``y = (silu(x @ gate_proj) * (x @ up_proj)) @ down_proj`` for a
@@ -408,14 +408,14 @@ def mlp_cte(
         M: Flattened B * S
 
     Args:
-        x (nl.ndarray): [B, S, H] input hidden states in HBM.
-        gate_proj (nl.ndarray): [K, I] gate projection weights in HBM.
-        up_proj (nl.ndarray): [K, I] up projection weights in HBM.
-        down_proj (nl.ndarray): [I, H] down projection weights in HBM.
+        x (nl.NkiTensor): [B, S, H] input hidden states in HBM.
+        gate_proj (nl.NkiTensor): [K, I] gate projection weights in HBM.
+        up_proj (nl.NkiTensor): [K, I] up projection weights in HBM.
+        down_proj (nl.NkiTensor): [I, H] down projection weights in HBM.
         config (MLPConfig): Kernel configuration (tile/block sizes, buffering).
 
     Returns:
-        output (nl.ndarray): [B, S, H] MLP result in HBM.
+        output (nl.NkiTensor): [B, S, H] MLP result in HBM.
 
     Notes:
         - LNC sharding partitions the M = B * S axis across cores; each core

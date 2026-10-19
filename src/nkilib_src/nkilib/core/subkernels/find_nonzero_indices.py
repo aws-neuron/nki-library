@@ -21,8 +21,8 @@ Multi-chunk path uses double-buffered input loading to overlap DMA with compute.
 
 import nki
 import nki.isa as nisa
+import nki.isa.constants as nisa_constants
 import nki.language as nl
-from nki.isa import constants as nisa_constants
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil

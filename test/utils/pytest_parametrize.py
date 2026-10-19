@@ -16,7 +16,8 @@
 
 import pytest
 
-from .coverage_parametrized_tests import MAX_PATH_COMPONENT_LENGTH, format_param_value
+from .common_dataclasses import MAX_PATH_COMPONENT_LENGTH
+from .coverage_parametrized_tests import format_param_value
 
 
 def pytest_parametrize(param_names, param_values, abbrevs=None, prefix=None, test_func_name=None):

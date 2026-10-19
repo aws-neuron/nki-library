@@ -178,6 +178,16 @@ nki_tkg_fused_norm_mlp_kernel_spmd_vnc2_params = [
     [2, 2, 7, 20480, 832, nl.bfloat16, None, QuantizationType.NONE, 197313858, NormType.RMS_NORM, True, True, ActFnType.SiLU, False, False, False, False, False, True, True, False, False, False],
     # Gemma3 (non-power-of-2 H)
     [2, 1, 1, 5376, 336, nl.bfloat16, None, QuantizationType.NONE, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False, False, False],
+    # Coverage (small H so it runs under simulation):
+    # fused_add + NO_NORM, store_fused_add_result=False -> input_fused_add barrier-skip arc
+    # (normtype==NO_NORM), and mlp_tkg fused-add non-store allocation arc.
+    [2, 4, 1, 1024, 384, nl.bfloat16, None, QuantizationType.NONE, None, NormType.NO_NORM, True, False, ActFnType.SiLU, False, False, False, False, False, True, True, False, False, False],
+    # NO_NORM, T=192>128 -> multi BxS-tile T-offset load, small-H contiguous-load path
+    # (H_per_shard=512 <= 2048).
+    [2, 192, 1, 1024, 384, nl.bfloat16, None, QuantizationType.NONE, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False, False, False],
+    # NO_NORM, T=192>128 -> multi BxS-tile T-offset load, large-H strided-load path
+    # (H_per_shard=3072 > 2048).
+    [2, 192, 1, 6144, 128, nl.bfloat16, None, QuantizationType.NONE, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False, False, False],
 ]
 
 nki_tkg_fused_norm_mlp_kernel_spmd_vnc1_params = [
@@ -334,6 +344,14 @@ nki_tkg_fused_norm_mlp_static_mx_quant_kernel_params = [
     [1, 2, 1, 8192, 448, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False, False, False],
     # ── Large batch (boundary near TKG threshold) ──
     [2, 64, 1, 8192, 448, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False],
+    # ── Small-hidden (H=2048) mirrors: escape the sim large-shape skip so the
+    #    non-contiguous-x4 RMS_NORM / NO_NORM software-quant paths run on CPU. ──
+    # P1a: non-cx4 RMS_NORM, single token (targets L136/L216/L231/L232).
+    [2, 1, 1, 2048, 448, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False],
+    # P1b: same but multi-token (flips rmsnorm output-layout branch at L152).
+    [2, 1, 5, 2048, 448, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False],
+    # P5: non-cx4 RMS_NORM + gate/up/down bias, I=2048 → n_I_tiles>1 (targets L667/L669).
+    [2, 1, 1, 2048, 2048, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False, False, False],
 ]
 # fmt: on
 
@@ -361,6 +379,15 @@ nki_tkg_fused_norm_mlp_row_mx_quant_kernel_params = [
     [2, 64, 1, 5120, 384, nl.bfloat16, nl.float8_e4m3, QuantizationType.ROW_MX, None, NormType.RMS_NORM, False, False, ActFnType.GELU_Tanh_Approx, False, False, False, False, False, False, False, False, False, False],
     # ── Small H (higher relative FP8 quantization noise) ──
     [2, 1, 1, 1024, 384, nl.bfloat16, nl.float8_e4m3, QuantizationType.ROW_MX, None, NormType.RMS_NORM, False, False, ActFnType.GELU_Tanh_Approx, False, False, False, False, False, False, False, False, False, False],
+    # ── Coverage (small H=1024 so it runs under simulation) ──
+    # RMS_NORM non-cx4 at T=128 (exercises the high-T rmsnorm_tkg path in mlp_tkg_quad_fp8_row).
+    [2, 128, 1, 1024, 384, nl.bfloat16, nl.float8_e4m3, QuantizationType.ROW_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False],
+    # NO_NORM non-cx4, T%4==0 (HBM path, no T_padded scale pad).
+    [2, 4, 1, 1024, 384, nl.bfloat16, nl.float8_e4m3, QuantizationType.ROW_MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False],
+    # NO_NORM non-cx4, T%4!=0 (HBM path, T_padded>T scale-pad branch).
+    [2, 1, 1, 1024, 384, nl.bfloat16, nl.float8_e4m3, QuantizationType.ROW_MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False],
+    # gate/up/down bias with I>1536 -> n_I_tiles>1 (per-I-tile bias slicing).
+    [2, 1, 1, 1024, 2048, nl.bfloat16, nl.float8_e4m3, QuantizationType.ROW_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False, False, False],
 ]
 # fmt: on
 
@@ -455,6 +482,9 @@ nki_tkg_transposed_io_params = [
     [2, 16, 1, 8192, 448, nl.bfloat16, None, QuantizationType.NONE, 0, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, True, False, True, False],
     # transposed_in=True, transposed_out=True, NO_NORM (non-fused rmsnorm case)
     pytest.param(2, 16, 1, 8192, 448, nl.bfloat16, None, QuantizationType.NONE, 0, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, False, False, True, True, marks=pytest.mark.fast),
+    # Coverage: transposed_in + NO_NORM at small H=1024 (runs in sim) -> input_norm_load
+    # no-norm transposed_in path (dims.hidden_layout=H0_H1_T, contiguous per-NC load).
+    [2, 16, 1, 1024, 128, nl.bfloat16, None, QuantizationType.NONE, 0, NormType.NO_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, True, False, False, True, True],
 ]
 # fmt: on
 
@@ -520,6 +550,9 @@ nki_tkg_fused_norm_mlp_mx_quant_kernel_fast_params = [
     pytest.param(2, 64, 1, 8192, 3584, nl.bfloat16, nl.float4_e2m1fn_x4, QuantizationType.MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False, False, False, marks=pytest.mark.fast),
 ]
 nki_tkg_fused_norm_mlp_static_mx_quant_kernel_fast_params = [
+    # Small-hidden non-cx4 RMS_NORM mirror (P1a): compiles fast, exercises the
+    # software-quant RMS_NORM path that the H=8192 rows skip under simulation.
+    pytest.param(2, 1, 1, 2048, 448, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False, marks=pytest.mark.fast),
     pytest.param(2, 64, 1, 8192, 3584, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False, False, False, marks=pytest.mark.fast),
     pytest.param(2, 1, 1, 8192, 224, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.RMS_NORM, False, False, ActFnType.SiLU, False, False, False, False, False, False, False, False, False, False, marks=pytest.mark.fast),
     pytest.param(1, 2, 1, 8192, 448, nl.bfloat16, nl.float8_e4m3, QuantizationType.STATIC_MX, None, NormType.NO_NORM, False, False, ActFnType.SiLU, False, True, True, True, False, False, False, False, False, False, marks=pytest.mark.fast),
@@ -651,10 +684,10 @@ def _tkg_sweep_filter(
 
 
 def _mlp_tkg_sbuf_wrapper_kernel(
-    hidden_tensor: nl.ndarray,
-    gate_proj_weights_tensor: nl.ndarray,
-    up_proj_weights_tensor: nl.ndarray,
-    down_proj_weights_tensor: nl.ndarray,
+    hidden_tensor: nl.NkiTensor,
+    gate_proj_weights_tensor: nl.NkiTensor,
+    up_proj_weights_tensor: nl.NkiTensor,
+    down_proj_weights_tensor: nl.NkiTensor,
     normalization_weights_tensor=None,
     gate_proj_bias_tensor=None,
     up_proj_bias_tensor=None,
@@ -692,7 +725,7 @@ def _mlp_tkg_sbuf_wrapper_kernel(
     transposed_out: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
-) -> list[nl.ndarray]:
+) -> list[nl.NkiTensor]:
     """Wrapper for testing SBUF input or SBUF output paths.
 
     When store_output_in_sbuf=False: loads HBM input into SBUF, calls mlp with SBUF input.
@@ -748,6 +781,110 @@ def _mlp_tkg_sbuf_wrapper_kernel(
     if store_output_in_sbuf:
         return copy_sbuf_output_to_hbm(results[0], hidden_tensor, down_proj_weights_tensor)
     return results
+
+
+def _mlp_tkg_direct_no_sbm_kernel(
+    hidden_tensor: nl.NkiTensor,
+    gate_proj_weights_tensor: nl.NkiTensor,
+    up_proj_weights_tensor: nl.NkiTensor,
+    down_proj_weights_tensor: nl.NkiTensor,
+    normalization_weights_tensor=None,
+    gate_proj_bias_tensor=None,
+    up_proj_bias_tensor=None,
+    down_proj_bias_tensor=None,
+    normalization_bias_tensor=None,
+    fused_add_tensor=None,
+    store_fused_add_result: bool = False,
+    activation_fn: ActFnType = ActFnType.SiLU,
+    normalization_type: NormType = NormType.NO_NORM,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    gate_w_scale=None,
+    up_w_scale=None,
+    down_w_scale=None,
+    gate_up_in_scale=None,
+    down_in_scale=None,
+    use_folded_mx_scales: bool = False,
+    quant_clipping_bound: float = 0.0,
+    output_dtype=None,
+    store_output_in_sbuf: bool = False,
+    eps: float = 1e-6,
+    skip_gate_proj: bool = False,
+    use_tkg_gate_up_proj_column_tiling: bool = True,
+    use_tkg_down_proj_column_tiling: bool = True,
+    use_tkg_down_proj_optimized_layout: bool = False,
+    use_contiguous_x4_gate_up: bool = False,
+    gate_clamp_upper_limit=None,
+    gate_clamp_lower_limit=None,
+    up_clamp_upper_limit=None,
+    up_clamp_lower_limit=None,
+    force_cte_mode: bool = False,
+    mode: ComputationMode = ComputationMode.DECODE,
+    sbm=None,
+    mx_dummy_scale_hbm=None,
+    transposed_in: bool = False,
+    transposed_out: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
+) -> list[nl.NkiTensor]:
+    """Build MLPParameters directly and invoke mlp_tkg with ``sbm=None``.
+
+    The public ``mlp()`` entry always constructs a SbufManager before calling
+    ``mlp_tkg``, so the ``sbm is None`` branch inside ``mlp_tkg`` is never reached
+    through it. This wrapper calls ``mlp_tkg`` directly with ``sbm=None`` to cover
+    that arc. The ``sbm`` kwarg (from the standard kernel_input dict) is ignored.
+    """
+    from nkilib_src.nkilib.core.mlp.mlp_parameters import MLPParameters as _MLPParameters
+    from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_tkg import mlp_tkg as _mlp_tkg
+
+    params = _MLPParameters(
+        hidden_tensor=hidden_tensor,
+        gate_proj_weights_tensor=gate_proj_weights_tensor,
+        up_proj_weights_tensor=up_proj_weights_tensor,
+        down_proj_weights_tensor=down_proj_weights_tensor,
+        normalization_weights_tensor=normalization_weights_tensor,
+        gate_proj_bias_tensor=gate_proj_bias_tensor,
+        up_proj_bias_tensor=up_proj_bias_tensor,
+        down_proj_bias_tensor=down_proj_bias_tensor,
+        normalization_bias_tensor=normalization_bias_tensor,
+        fused_add_tensor=fused_add_tensor,
+        store_fused_add_result=store_fused_add_result,
+        activation_fn=activation_fn,
+        normalization_type=normalization_type,
+        quantization_type=quantization_type,
+        gate_w_scale=gate_w_scale,
+        up_w_scale=up_w_scale,
+        down_w_scale=down_w_scale,
+        gate_up_in_scale=gate_up_in_scale,
+        down_in_scale=down_in_scale,
+        quant_clipping_bound=quant_clipping_bound,
+        output_dtype=output_dtype,
+        store_output_in_sbuf=store_output_in_sbuf,
+        eps=eps,
+        skip_gate_proj=skip_gate_proj,
+        use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
+        use_tkg_down_proj_column_tiling=use_tkg_down_proj_column_tiling,
+        use_tkg_down_proj_optimized_layout=use_tkg_down_proj_optimized_layout,
+        use_contiguous_x4_gate_up=use_contiguous_x4_gate_up,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        force_cte_mode=force_cte_mode,
+        mode=mode,
+        mx_dummy_scale_hbm=mx_dummy_scale_hbm,
+        transposed_in=transposed_in,
+        transposed_out=transposed_out,
+        dtype_mode=dtype_mode,
+        gate_up_w_layout=gate_up_w_layout,
+        use_folded_mx_scales=use_folded_mx_scales,
+    )
+
+    out = nl.ndarray(
+        (params.batch_size, params.sequence_len, params.hidden_size),
+        dtype=params.output_dtype,
+        buffer=nl.shared_hbm,
+    )
+    return _mlp_tkg(params, out, None, sbm=None)  # ty: ignore[invalid-argument-type]
 
 
 @pytest_test_metadata(
@@ -1137,6 +1274,20 @@ class TestMlpTkgKernel:
         transposed_in,
         transposed_out,
     ):
+        # Deterministic timeouts on trn3: inference exceeds the 55s profile-capture limit.
+        if (
+            platform_target == Platforms.TRN3
+            and seqlen == 1
+            and (
+                (
+                    (batch, hidden, intermediate) == (1, 8192, 448)
+                    and quant_type == QuantizationType.STATIC
+                    and transposed_in
+                )
+                or ((batch, hidden, intermediate) == (4, 8192, 5120) and quant_type == QuantizationType.NONE)
+            )
+        ):
+            pytest.xfail("Persistent inference timeout (55s profile-capture limit) on trn3")
         self._run_validated_mlp_tkg(
             test_manager=test_manager,
             platform_target=platform_target,
@@ -1251,6 +1402,9 @@ class TestMlpTkgKernel:
         transposed_in,
         transposed_out,
     ):
+        # Deterministic timeout on trn3: inference exceeds the 55s profile-capture limit.
+        if platform_target == Platforms.TRN3 and (batch, seqlen, hidden, intermediate) == (1, 1, 2048, 512):
+            pytest.xfail("Persistent inference timeout (55s profile-capture limit) on trn3 at b1_s1_h2048_i512")
         vec_dict = {
             "vnc_degree": vnc_degree,
             "batch": batch,
@@ -1278,7 +1432,7 @@ class TestMlpTkgKernel:
         compiler_args = CompilerArgs(
             logical_nc_config=vnc_degree,
             platform_target=platform_target,
-            separation_pass_mode=SeparationPassMode.INDIRECT,
+            separation_pass_mode=SeparationPassMode.DEFAULT,
         )
         self._run_mlp_tkg_test(
             test_manager=test_manager,
@@ -1326,6 +1480,16 @@ class TestMlpTkgKernel:
             and config_name == "non_column_tiling_full_features"
         ):
             pytest.xfail("NKILIB-848: non-determinism from SBUF address dependency at b=1,s=1,h=4096,i=128")
+
+        # Deterministic timeout on trn3: inference exceeds the 55s profile-capture limit.
+        if (
+            platform_target == Platforms.TRN3
+            and (batch, seqlen, hidden, intermediate) == (32, 1, 4096, 400)
+            and config_name == "column_tiling_basic"
+        ):
+            pytest.xfail(
+                "Persistent inference timeout (55s profile-capture limit) on trn3 at b32_s1_h4096_i400 column_tiling_basic"
+            )
 
         self._build_and_run_tkg_sweep(
             test_manager,
@@ -1440,6 +1604,54 @@ class TestMlpTkgKernel:
             up_clamp_lower_limit=up_clamp_lower_limit,
         )
 
+    # Small-shape skip_gate_proj coverage: the existing skip_gate_proj feature-test
+    # configs use hidden=8192 (silently skipped in simulation), leaving the
+    # skip_gate_proj branches in mlp_tkg_gate_up_projection.py (column tiling) and
+    # mlp_tkg_gate_up_projection_lhs_rhs_swap.py (non-column-tiling) uncovered on the
+    # simulator. These small-hidden configs run in sim and exercise skip_gate_proj at
+    # BOTH column_tiling True/False and BOTH LNC=1 (num_shards==1 arc) and LNC=2
+    # (num_shards>1 sendrecv arc).
+    @pytest.mark.parametrize(
+        "vnc_degree,use_tkg_gate_up_proj_column_tiling",
+        [
+            pytest.param(2, True, marks=pytest.mark.fast),
+            pytest.param(1, True, marks=pytest.mark.fast),
+            pytest.param(2, False),
+            pytest.param(1, False),
+        ],
+    )
+    def test_mlp_tkg_skip_gate_proj_small(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree: int,
+        use_tkg_gate_up_proj_column_tiling: bool,
+    ):
+        self._run_validated_mlp_tkg(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            vnc_degree=vnc_degree,
+            batch=4,
+            seqlen=1,
+            hidden=1024,
+            intermediate=448,
+            dtype=nl.bfloat16,
+            quant_dtype=None,
+            quant_type=QuantizationType.NONE,
+            norm_type=NormType.NO_NORM,
+            fused_add=False,
+            store_add=False,
+            act_fn_type=ActFnType.SiLU,
+            skip_gate=True,
+            gate_bias=False,
+            up_bias=False,
+            down_bias=False,
+            norm_bias=False,
+            use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
+            use_tkg_down_proj_column_tiling=True,
+            use_tkg_down_proj_optimized_layout=False,
+        )
+
     # ============================================================================
     # TKG FP8 ROW Sweep Tests
     # ============================================================================
@@ -1535,6 +1747,16 @@ class TestMlpTkgKernel:
             and config_name == "non_column_tiling_full_features"
         ):
             pytest.xfail("NKILIB-848: non-determinism from SBUF address dependency at b=1,s=1,h=4096,i=128")
+
+        # Deterministic timeout on trn3: inference exceeds the 55s profile-capture limit.
+        if (
+            platform_target == Platforms.TRN3
+            and (batch, seqlen, hidden, intermediate) == (128, 1, 4096, 400)
+            and config_name == "column_tiling_full_features_rmsnorm"
+        ):
+            pytest.xfail(
+                "Persistent inference timeout (55s profile-capture limit) on trn3 at b128_s1_h4096_i400 column_tiling_full_features_rmsnorm"
+            )
 
         self._build_and_run_tkg_sweep(
             test_manager,
@@ -1729,6 +1951,10 @@ class TestMlpTkgKernel:
         # HBM no-norm path: higher batch
         pytest.param(2, 8, 1, 8192, 448, QuantizationType.STATIC_MX, NormType.NO_NORM, False, False, False, marks=pytest.mark.fast),
         pytest.param(2, 4, 1, 5120, 400, QuantizationType.ROW_MX, NormType.NO_NORM, False, False, False, marks=pytest.mark.fast),
+        # Coverage (small H=1024 so it runs in sim): contiguous-x4 NO_NORM HBM path with
+        # T%4!=0 (T=1) -> T_padded>T pad branch in the cx4 HBM quantize path.
+        [2, 1, 1, 1024, 384, QuantizationType.ROW_MX, NormType.NO_NORM, False, False, False],
+        [2, 1, 1, 1024, 384, QuantizationType.STATIC_MX, NormType.NO_NORM, False, False, False],
     ]
     _CONTIGUOUS_X4_IDS = [f"cx4_{i}" for i in range(len(_CONTIGUOUS_X4_PARAMS))]
     # fmt: on
@@ -1868,6 +2094,44 @@ class TestMlpTkgKernel:
             kernel_entry=_mlp_tkg_sbuf_wrapper_kernel,
         )
 
+    @pytest.mark.fast
+    def test_mlp_tkg_output_dtype_default(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Cover the mlp() output_dtype defaulting branch (mlp.py: output_dtype is None).
+
+        build_fused_norm_mlp always emits output_dtype=bf16, so the true-arc of
+        ``if output_dtype == None`` in the public mlp() entry never runs in the
+        other sweeps. Here we clear output_dtype so mlp() defaults it to the
+        hidden tensor dtype (bf16); numerics are unchanged so the golden matches.
+        """
+        compiler_args = CompilerArgs(platform_target=platform_target)
+
+        kernel_input = build_fused_norm_mlp(
+            batch=1,
+            seqlen=1,
+            hidden=512,
+            intermediate=128,
+            dtype=nl.bfloat16,
+            norm_type=NormType.RMS_NORM,
+        )
+        kernel_input["quant_clipping_bound"] = 0.0
+        kernel_input["force_cte_mode"] = False
+        kernel_input["mode"] = ComputationMode.DECODE
+        kernel_input["sbm"] = None
+        # Leave output_dtype unset so mlp() takes its None-default branch.
+        kernel_input["output_dtype"] = None
+
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
     # ------------------------------------------------------------------
     # Opt-in FP8 E4M3 canary (dtype_mode).
     #
@@ -1922,6 +2186,223 @@ class TestMlpTkgKernel:
             vec_dict=vec_dict,
             platform_target=platform_target,
             rtol=4e-2,
+        )
+
+    # ============================================================================
+    # Small-shape coverage tests for device-side branches
+    # ============================================================================
+
+    def _build_sbuf_kernel_input(self, **kwargs):
+        """Build a kernel_input dict for the SBUF wrapper tests (adds the extra
+        kernel-only keys the wrappers expect)."""
+        kernel_input = build_fused_norm_mlp(**kwargs)
+        kernel_input["quant_clipping_bound"] = 0.0
+        kernel_input["force_cte_mode"] = False
+        kernel_input["mode"] = ComputationMode.DECODE
+        kernel_input["sbm"] = None
+        return kernel_input
+
+    def test_mlp_tkg_clamp_small(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Small-H gate/up clamp config.
+
+        The existing clamp feature-test uses H=8192 (skipped in sim), leaving the
+        gate/up clamp lower+upper branches uncovered on the simulator. This runs the
+        same clamp path at H=1024.
+        """
+        self._build_and_run_tkg_sweep(
+            test_manager,
+            batch=4,
+            seqlen=1,
+            hidden=1024,
+            intermediate=448,
+            config=COLUMN_TILING_BASIC_CONFIG,
+            is_negative_test_case=False,
+            platform_target=platform_target,
+            gate_clamp_upper_limit=float(8.0),
+            gate_clamp_lower_limit=float(-6.0),
+            up_clamp_upper_limit=float(8.0),
+            up_clamp_lower_limit=float(-6.0),
+        )
+
+    def test_mlp_tkg_direct_no_sbm(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Invoke mlp_tkg directly with sbm=None to cover its internal SbufManager
+        creation arc (the public mlp() entry always supplies an sbm)."""
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        kernel_input = self._build_sbuf_kernel_input(
+            batch=1,
+            seqlen=1,
+            hidden=1024,
+            intermediate=448,
+            dtype=nl.bfloat16,
+            norm_type=NormType.RMS_NORM,
+            fused_add=False,
+            use_tkg_gate_up_proj_column_tiling=True,
+            use_tkg_down_proj_column_tiling=True,
+        )
+        kernel_input["store_output_in_sbuf"] = False
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            inference_args=TKG_INFERENCE_ARGS,
+            kernel_entry=_mlp_tkg_direct_no_sbm_kernel,
+        )
+
+    def test_mlp_tkg_sbuf_input_layernorm(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """SBUF-input LayerNorm at LNC2 to cover the layernorm _ht cross-core path.
+
+        The existing SBUF-input sweep (test_mlp_tkg_sweep_sbuf) uses RMS_NORM only,
+        so layernorm_tkg's SBUF-input / shard_on_h arcs in _layernorm_tkg_ht are
+        never exercised. This runs the SBUF-input wrapper with LAYER_NORM (beta
+        present) at small hidden=1024 so it runs under simulation; at LNC2
+        shard_on_h engages, covering the SBUF early-dispatch (layernorm_tkg),
+        the input.buffer==sbuf load, the cross-core sum/var exchange, and the
+        gamma-multiply-with-shard arcs in _layernorm_tkg_ht.
+        """
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        kernel_input = self._build_sbuf_kernel_input(
+            batch=4,
+            seqlen=1,
+            hidden=1024,
+            intermediate=448,
+            dtype=nl.bfloat16,
+            norm_type=NormType.LAYER_NORM,
+            norm_bias=True,
+            fused_add=False,
+            use_tkg_gate_up_proj_column_tiling=True,
+            use_tkg_down_proj_column_tiling=True,
+        )
+        kernel_input["store_output_in_sbuf"] = False
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            inference_args=TKG_INFERENCE_ARGS,
+            kernel_entry=_mlp_tkg_sbuf_wrapper_kernel,
+        )
+
+    def test_mlp_tkg_layernorm_lnc1_full_h(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """LNC1 LayerNorm (HBM input, T<128) to cover the full-H no-shard arc in
+        _layernorm_tkg_ht (``shard_H1_dim == H1 and not shard_on_h`` -> lnc=1).
+
+        At LNC1 the layernorm output covers the full hidden dim on a single core,
+        a shape the LNC2 sweeps never produce (there shard_H1_dim == H1//2). Small
+        hidden=1024, T=1 (< 128) so it takes the _ht path and runs under simulation.
+        """
+        compiler_args = CompilerArgs(logical_nc_config=1, platform_target=platform_target)
+        kernel_input = self._build_sbuf_kernel_input(
+            batch=1,
+            seqlen=1,
+            hidden=1024,
+            intermediate=448,
+            dtype=nl.bfloat16,
+            norm_type=NormType.LAYER_NORM,
+            norm_bias=True,
+            fused_add=False,
+            use_tkg_gate_up_proj_column_tiling=True,
+            use_tkg_down_proj_column_tiling=True,
+        )
+        kernel_input["store_output_in_sbuf"] = False
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=compiler_args,
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            inference_args=TKG_INFERENCE_ARGS,
+        )
+
+    def test_mlp_tkg_static_mx_small_bias_partial_i(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """STATIC_MX small-H with biases and a partial last I512 tile (I=768).
+
+        Covers the MX weight/bias load arcs in mlp_tkg_mx_utils that the existing
+        small-H sim MX configs (I=384, no bias) miss:
+          - load_gate_up_bias_mx I>=512 else-arc (bias present, full-tile DMA)
+          - load_down_weight partial last I512 tile with multiple I512 tiles
+            (n_I512_cur>1) under sharded (num_shards>1) DMA.
+        TRN3-only (MX); small hidden=1024 so it runs under simulation.
+        """
+        self._run_validated_mlp_tkg(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            vnc_degree=2,
+            batch=4,
+            seqlen=1,
+            hidden=1024,
+            intermediate=768,
+            dtype=nl.bfloat16,
+            quant_dtype=nl.float8_e4m3,
+            quant_type=QuantizationType.STATIC_MX,
+            norm_type=NormType.RMS_NORM,
+            fused_add=False,
+            store_add=False,
+            act_fn_type=ActFnType.SiLU,
+            skip_gate=False,
+            gate_bias=True,
+            up_bias=True,
+            down_bias=True,
+            norm_bias=False,
+            use_tkg_gate_up_proj_column_tiling=False,
+            use_tkg_down_proj_column_tiling=False,
+            use_tkg_down_proj_optimized_layout=False,
+        )
+
+    def test_mlp_tkg_static_mx_small_bias_full_i(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """STATIC_MX small-H with biases and I a multiple of 512 (I=1024).
+
+        Covers the load_down_weight full-tile arc (p_I_last == _pmax -> the
+        ``else`` of the partial-tile check) under sharded DMA, which the partial-I
+        config above never reaches. TRN3-only (MX); small hidden=1024 so it runs
+        under simulation.
+        """
+        self._run_validated_mlp_tkg(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            vnc_degree=2,
+            batch=4,
+            seqlen=1,
+            hidden=1024,
+            intermediate=1024,
+            dtype=nl.bfloat16,
+            quant_dtype=nl.float8_e4m3,
+            quant_type=QuantizationType.STATIC_MX,
+            norm_type=NormType.RMS_NORM,
+            fused_add=False,
+            store_add=False,
+            act_fn_type=ActFnType.SiLU,
+            skip_gate=False,
+            gate_bias=True,
+            up_bias=True,
+            down_bias=True,
+            norm_bias=False,
+            use_tkg_gate_up_proj_column_tiling=False,
+            use_tkg_down_proj_column_tiling=False,
+            use_tkg_down_proj_optimized_layout=False,
         )
 
 

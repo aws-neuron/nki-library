@@ -46,6 +46,7 @@ def attention_kv_parallel_segmented_cte_torch_ref(
     fp8_packed: bool = False,
     k_scale: Optional[np.ndarray] = None,
     v_scale: Optional[np.ndarray] = None,
+    allow_vector_exp: bool = True,
 ) -> dict:
     """PyTorch reference for attention_kv_parallel_segmented_cte. Same signature as the kernel.
 
