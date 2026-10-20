@@ -4295,14 +4295,24 @@ def _banded_cost_wins(cfg: "Conv3dConfig") -> bool:
     )
 
 
-def _banded_wins(cfg: "Conv3dConfig", dtype, has_caller_sbm: bool) -> bool:
+def _banded_wins(cfg: "Conv3dConfig", dtype, has_caller_sbm: bool, n_prgs: int = 1) -> bool:
     """
     True when this call is routed to _conv3d_banded_compute: a 2D call (D = 1, K_d = 1, no depth padding, so D_out = 1) that
     path supports (no fused batchnorm or residual, no caller SbufManager, the activations this kernel supports,
     16-bit operands, unit dilation and strides up to 2, filters up to 8 x 8, at most 64 channels) where
-    _banded_cost_wins expects it to be faster. conv3d additionally requires trn2, the only target the cost model was
-    measured on.
+    _banded_cost_wins expects it to be faster, on n_prgs programs (LNC=2: 2). conv3d additionally requires trn2, the
+    only target the cost model was measured on.
+
+    The cost model is per image, but the low-channel path is not: it packs up to _get_low_chan_replication(C_in)
+    images of one program into separate tensor-engine row tiles. With 33 to 64 input channels two images fill the
+    engine with no zero blocks, while a 3 x 3 band keeps a zero block for every three useful ones (75% density), so
+    once a program holds two or more images (ceil(B / n_prgs) >= 2) those layers stay on the low-channel path.
+    Measured on trn2 (bf16, 368 x 960, 3 x 3) with B = 2 on one program: 0.79x for 64 -> 64, 0.82x for 48 -> 48, 1.04x
+    for 64 -> 32; with B = 4 on two programs 0.85x and 0.88x. Up to 32 input channels the banded path stayed 1.06x
+    to 17x faster at every batch measured (1 to 8, one and two programs).
     """
+    c_in_repl, _ = _get_low_chan_replication(cfg.C_in)
+    low_chan_packs_two = c_in_repl == _MAX_K_REP_AT_64 and div_ceil(cfg.B, n_prgs) >= 2
     structural = (
         not has_caller_sbm
         and not cfg.has_batch_norm()
@@ -4325,7 +4335,7 @@ def _banded_wins(cfg: "Conv3dConfig", dtype, has_caller_sbm: bool) -> bool:
         and cfg.C_in <= _BANDED_MAX_CHANNELS
         and cfg.C_out <= _BANDED_MAX_CHANNELS
     )
-    return structural and _banded_cost_wins(cfg)
+    return structural and not low_chan_packs_two and _banded_cost_wins(cfg)
 
 
 # ---------------------------------------------------------------------------------------------------------------

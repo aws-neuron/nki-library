@@ -415,6 +415,156 @@ def test_every_routed_layer_has_a_banded_plan():
     assert not unplanned, f"{len(unplanned)} routed layers have no banded plan, first: {unplanned[:3]}"
 
 
+# (C_in, C_out, K, stride, H, W, B, programs, measured speedup of the banded path over conv3d's low-channel path):
+# padding K // 2, bf16, trn2, profiled device time of the fifth of five back-to-back calls, one program = LNC=1 and two =
+# LNC=2. The low-channel path packs a program's images into separate tensor-engine row tiles, the banded path does not.
+_BANDED_BATCH_MEASURED = [
+    (16, 16, 3, 1, 368, 960, 1, 1, 6.83),
+    (16, 16, 3, 1, 368, 960, 2, 1, 3.95),
+    (16, 16, 3, 1, 368, 960, 4, 1, 3.58),
+    (16, 16, 3, 1, 368, 960, 8, 1, 3.99),
+    (16, 16, 3, 1, 368, 960, 1, 2, 5.88),
+    (16, 16, 3, 1, 368, 960, 2, 2, 3.38),
+    (16, 16, 3, 1, 368, 960, 4, 2, 1.87),
+    (16, 16, 3, 1, 368, 960, 8, 2, 1.87),
+    (32, 32, 3, 1, 368, 960, 1, 1, 2.78),
+    (32, 32, 3, 1, 368, 960, 2, 1, 1.59),
+    (32, 32, 3, 1, 368, 960, 4, 1, 1.47),
+    (32, 32, 3, 1, 368, 960, 8, 1, 1.44),
+    (32, 32, 3, 1, 368, 960, 1, 2, 4.90),
+    (32, 32, 3, 1, 368, 960, 2, 2, 2.71),
+    (32, 32, 3, 1, 368, 960, 4, 2, 1.58),
+    (32, 32, 3, 1, 368, 960, 8, 2, 1.42),
+    (64, 64, 3, 1, 368, 960, 1, 1, 2.88),
+    (64, 64, 3, 1, 368, 960, 2, 1, 0.79),
+    (64, 64, 3, 1, 368, 960, 4, 1, 0.80),
+    (64, 64, 3, 1, 368, 960, 8, 1, 0.79),
+    (64, 64, 3, 1, 368, 960, 1, 2, 5.22),
+    (64, 64, 3, 1, 368, 960, 2, 2, 2.79),
+    (64, 64, 3, 1, 368, 960, 4, 2, 0.85),
+    (64, 64, 3, 1, 368, 960, 8, 2, 0.89),
+    (16, 16, 3, 1, 368, 480, 1, 1, 5.49),
+    (16, 16, 3, 1, 368, 480, 2, 1, 3.96),
+    (16, 16, 3, 1, 368, 480, 4, 1, 4.49),
+    (16, 16, 3, 1, 368, 480, 8, 1, 4.32),
+    (16, 16, 3, 1, 368, 480, 1, 2, 3.17),
+    (16, 16, 3, 1, 368, 480, 2, 2, 1.79),
+    (16, 16, 3, 1, 368, 480, 4, 2, 1.12),
+    (16, 16, 3, 1, 368, 480, 8, 2, 1.13),
+    (32, 32, 3, 1, 368, 480, 1, 1, 2.56),
+    (32, 32, 3, 1, 368, 480, 2, 1, 1.81),
+    (32, 32, 3, 1, 368, 480, 4, 1, 1.69),
+    (32, 32, 3, 1, 368, 480, 8, 1, 1.84),
+    (32, 32, 3, 1, 368, 480, 1, 2, 2.76),
+    (32, 32, 3, 1, 368, 480, 2, 2, 1.61),
+    (32, 32, 3, 1, 368, 480, 4, 2, 1.08),
+    (32, 32, 3, 1, 368, 480, 8, 2, 1.06),
+    (16, 3, 3, 1, 368, 960, 1, 1, 6.15),
+    (16, 3, 3, 1, 368, 960, 2, 1, 4.21),
+    (16, 3, 3, 1, 368, 960, 4, 1, 4.35),
+    (16, 3, 3, 1, 368, 960, 8, 1, 4.30),
+    (16, 3, 3, 1, 368, 960, 1, 2, 5.23),
+    (16, 3, 3, 1, 368, 960, 2, 2, 3.27),
+    (16, 3, 3, 1, 368, 960, 4, 2, 1.96),
+    (16, 3, 3, 1, 368, 960, 8, 2, 2.00),
+    (32, 64, 3, 1, 368, 960, 1, 1, 5.36),
+    (32, 64, 3, 1, 368, 960, 2, 1, 2.82),
+    (32, 64, 3, 1, 368, 960, 4, 1, 1.52),
+    (32, 64, 3, 1, 368, 960, 1, 2, 6.79),
+    (32, 64, 3, 1, 368, 960, 2, 2, 3.63),
+    (32, 64, 3, 1, 368, 960, 4, 2, 1.94),
+    (16, 64, 3, 1, 368, 960, 1, 1, 5.61),
+    (16, 64, 3, 1, 368, 960, 2, 1, 2.92),
+    (16, 64, 3, 1, 368, 960, 4, 1, 1.41),
+    (16, 64, 3, 1, 368, 960, 1, 2, 5.32),
+    (16, 64, 3, 1, 368, 960, 2, 2, 3.11),
+    (16, 64, 3, 1, 368, 960, 4, 2, 1.57),
+    (64, 32, 3, 1, 368, 960, 1, 1, 1.99),
+    (64, 32, 3, 1, 368, 960, 2, 1, 1.04),
+    (64, 32, 3, 1, 368, 960, 4, 1, 1.01),
+    (64, 32, 3, 1, 368, 960, 1, 2, 3.53),
+    (64, 32, 3, 1, 368, 960, 2, 2, 1.86),
+    (64, 32, 3, 1, 368, 960, 4, 2, 1.05),
+    (64, 16, 3, 1, 368, 960, 1, 1, 2.33),
+    (64, 16, 3, 1, 368, 960, 2, 1, 1.19),
+    (64, 16, 3, 1, 368, 960, 4, 1, 1.16),
+    (64, 16, 3, 1, 368, 960, 1, 2, 4.04),
+    (64, 16, 3, 1, 368, 960, 2, 2, 2.17),
+    (64, 16, 3, 1, 368, 960, 4, 2, 1.25),
+    (48, 48, 3, 1, 368, 960, 1, 1, 2.92),
+    (48, 48, 3, 1, 368, 960, 2, 1, 0.82),
+    (48, 48, 3, 1, 368, 960, 4, 1, 0.82),
+    (48, 48, 3, 1, 368, 960, 1, 2, 5.45),
+    (48, 48, 3, 1, 368, 960, 2, 2, 2.90),
+    (48, 48, 3, 1, 368, 960, 4, 2, 0.88),
+    (16, 32, 3, 2, 736, 960, 1, 1, 4.66),
+    (16, 32, 3, 2, 736, 960, 2, 1, 3.06),
+    (16, 32, 3, 2, 736, 960, 4, 1, 3.01),
+    (16, 32, 3, 2, 736, 960, 1, 2, 4.27),
+    (16, 32, 3, 2, 736, 960, 2, 2, 2.31),
+    (16, 32, 3, 2, 736, 960, 4, 2, 1.45),
+    (3, 16, 3, 2, 736, 960, 1, 1, 6.71),
+    (3, 16, 3, 2, 736, 960, 2, 1, 4.70),
+    (3, 16, 3, 2, 736, 960, 4, 1, 4.63),
+    (3, 16, 3, 2, 736, 960, 8, 1, 4.91),
+    # RGB stems on two programs, without the tap fold there (_tap_fold): with it they measured 1.82x, 0.98x, 0.59x and
+    # 0.55x (3 -> 16) and 4.91x, 2.53x, 1.34x (3 -> 64, 7 x 7).
+    (3, 16, 3, 2, 736, 960, 1, 2, 4.07),
+    (3, 16, 3, 2, 736, 960, 2, 2, 2.24),
+    (3, 16, 3, 2, 736, 960, 4, 2, 1.39),
+    (3, 16, 3, 2, 736, 960, 8, 2, 1.31),
+    (3, 64, 7, 2, 544, 960, 1, 1, 17.43),
+    (3, 64, 7, 2, 544, 960, 2, 1, 9.87),
+    (3, 64, 7, 2, 544, 960, 4, 1, 5.99),
+    (3, 64, 7, 2, 544, 960, 1, 2, 13.51),
+    (3, 64, 7, 2, 544, 960, 2, 2, 7.27),
+    (3, 64, 7, 2, 544, 960, 4, 2, 3.93),
+]
+# A routed layer must have measured at least this much faster; one measured slower must not be routed.
+_BANDED_BATCH_MIN_ROUTED_SPEEDUP = 1.1
+
+
+def test_routed_layers_win_at_every_measured_batch():
+    """
+    Every measured (layer, batch, programs) point: routed implies the banded path won, and a point it lost on is not
+    routed. Covers the 33 to 64 input-channel layers the low-channel path's image packing wins once a program holds
+    two or more images.
+    """
+    points = []
+    for C_in, C_out, K, stride, H, W, B, n_prgs, speedup in _BANDED_BATCH_MEASURED:
+        cfg = _banded_conv3d_config(C_in=C_in, C_out=C_out, K=K, stride=stride, H=H, W=W, B=B)
+        points.append((f"{C_in}->{C_out} k{K} s{stride} {H}x{W} B={B} programs={n_prgs}", cfg, n_prgs, speedup))
+    decisions = _on_host(lambda: [_banded_wins(cfg, nl.bfloat16, False, n_prgs) for _, cfg, n_prgs, _ in points])
+    routed_batched = 0
+    for (layer, cfg, n_prgs, speedup), routed in zip(points, decisions, strict=True):
+        if routed:
+            assert speedup >= _BANDED_BATCH_MIN_ROUTED_SPEEDUP, f"{layer} routed but measured {speedup}x"
+            routed_batched += cfg.B > n_prgs
+        if speedup < 1.0:
+            assert not routed, f"{layer} measured {speedup}x but routed"
+    assert routed_batched >= 25, "the thin layers should stay routed with several images per program"
+
+
+@pytest.mark.parametrize(
+    "C_in, B, n_prgs, routed",
+    [
+        (64, 1, 1, True),
+        (64, 2, 1, False),
+        (64, 2, 2, True),
+        (64, 3, 2, False),
+        (48, 2, 1, False),
+        (33, 2, 1, False),
+        (32, 2, 1, True),
+        (32, 16, 2, True),
+        (16, 8, 1, True),
+    ],
+)
+def test_two_packed_images_keep_wide_layers_off_the_banded_path(C_in, B, n_prgs, routed):
+    """33 to 64 input channels are routed only while each program holds one image; up to 32 at any batch."""
+    cfg = _banded_conv3d_config(C_in=C_in, C_out=C_in, K=3, H=368, W=960, B=B)
+    assert _on_host(lambda: _banded_wins(cfg, nl.bfloat16, False, n_prgs)) == routed
+
+
 # (C_in, C_out, K, stride, H, W, tap fold on one program): RGB stems fold filter columns onto the empty contraction
 # rows on one program; thin layers with more input channels have no rows to spare.
 _TAP_FOLD_LAYERS = [
@@ -563,6 +713,77 @@ def test_routed_transposed_layers_are_never_slower_on_measured_points(measured):
         if speedup < _BANDED_NO_GAIN:
             assert not is_routed, f"{layer} routed to the banded path but measured {speedup}x"
     assert sum(routed) >= 12, "the cost model should still route the wide thin layers"
+
+
+# (C_in, C_out, K, H, W, B, programs, measured speedup of the banded path over conv3d_transpose's own path): stride 2,
+# padding and output_padding of _TRANSPOSE_PADDING, input H x W, bf16, trn2, profiled device time of the fifth of five
+# back-to-back calls, one program = LNC=1 and two = LNC=2. conv3d_transpose's own path scales linearly with the batch
+# (it has no image packing), so the gain holds or grows with B and the router needs no batch term.
+_TRANSPOSE_BATCH_MEASURED = [
+    (64, 16, 4, 368, 480, 1, 1, 24.12),
+    (64, 16, 4, 368, 480, 2, 1, 25.84),
+    (64, 16, 4, 368, 480, 4, 1, 26.74),
+    (64, 16, 4, 368, 480, 1, 2, 16.37),
+    (64, 16, 4, 368, 480, 2, 2, 18.24),
+    (64, 16, 4, 368, 480, 4, 2, 19.78),
+    (32, 16, 2, 270, 480, 1, 1, 17.98),
+    (32, 16, 2, 270, 480, 2, 1, 19.81),
+    (32, 16, 2, 270, 480, 4, 1, 20.72),
+    (32, 16, 2, 270, 480, 1, 2, 9.75),
+    (32, 16, 2, 270, 480, 2, 2, 10.91),
+    (32, 16, 2, 270, 480, 4, 2, 11.55),
+    (128, 32, 4, 184, 240, 1, 1, 3.45),
+    (128, 32, 4, 184, 240, 2, 1, 3.65),
+    (128, 32, 4, 184, 240, 4, 1, 3.79),
+    (128, 32, 4, 184, 240, 1, 2, 2.68),
+    (128, 32, 4, 184, 240, 2, 2, 3.00),
+    (128, 32, 4, 184, 240, 4, 2, 3.26),
+    (16, 16, 3, 184, 480, 1, 1, 22.51),
+    (16, 16, 3, 184, 480, 2, 1, 26.15),
+    (16, 16, 3, 184, 480, 4, 1, 28.24),
+    (16, 16, 3, 184, 480, 1, 2, 11.98),
+    (16, 16, 3, 184, 480, 2, 2, 13.62),
+    (16, 16, 3, 184, 480, 4, 2, 14.70),
+    (64, 32, 4, 184, 480, 1, 1, 16.84),
+    (64, 32, 4, 184, 480, 2, 1, 18.56),
+    (64, 32, 4, 184, 480, 4, 1, 19.58),
+    (64, 32, 4, 184, 480, 1, 2, 12.72),
+    (64, 32, 4, 184, 480, 2, 2, 14.18),
+    (64, 32, 4, 184, 480, 4, 2, 14.93),
+    (16, 3, 4, 368, 480, 1, 1, 59.62),
+    (16, 3, 4, 368, 480, 2, 1, 77.21),
+    (16, 3, 4, 368, 480, 4, 1, 95.75),
+    (16, 3, 4, 368, 480, 1, 2, 16.43),
+    (16, 3, 4, 368, 480, 4, 2, 20.96),
+    (64, 64, 4, 184, 240, 1, 1, 7.62),
+    (64, 64, 4, 184, 240, 2, 1, 8.16),
+    (64, 64, 4, 184, 240, 4, 1, 8.52),
+    (64, 64, 4, 184, 240, 1, 2, 5.88),
+    (64, 64, 4, 184, 240, 2, 2, 6.01),
+    (64, 64, 4, 184, 240, 4, 2, 6.33),
+]
+
+
+@pytest.mark.fast
+def test_routed_transposed_layers_win_at_every_measured_batch():
+    """
+    Every measured (layer, batch, programs) point: a routed layer won clearly at that batch on that many programs, so
+    the transposed router needs no batch term (unlike conv3d's, whose low-channel path packs images).
+    """
+
+    def decide():
+        return [
+            _transpose_banded_wins(C_in=c_in, C_out=c_out, K=k, H=h, W=w, B=b)
+            for c_in, c_out, k, h, w, b, _, _ in _TRANSPOSE_BATCH_MEASURED
+        ]
+
+    routed = _on_host(decide)
+    for (c_in, c_out, k, h, w, b, n_prgs, speedup), is_routed in zip(_TRANSPOSE_BATCH_MEASURED, routed, strict=True):
+        layer = f"{c_in}->{c_out} k{k} {h}x{w} B={b} programs={n_prgs}"
+        if is_routed:
+            assert speedup >= _BANDED_MIN_ROUTED_SPEEDUP, f"{layer} routed to the banded path but measured {speedup}x"
+    batched = [r for (*_, b, _, _), r in zip(_TRANSPOSE_BATCH_MEASURED, routed, strict=True) if b > 1]
+    assert sum(batched) >= 20, "the thin transposed layers should stay routed with several images"
 
 
 @pytest.mark.fast

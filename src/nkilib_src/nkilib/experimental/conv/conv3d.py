@@ -22,6 +22,7 @@ import nki.language as nl
 
 from ...core.utils.allocator import SbufManager
 from ...core.utils.common_types import ActFnType
+from ...core.utils.kernel_helpers import get_verified_program_sharding_info
 from ...core.utils.logging import get_logger
 from .conv3d_helpers import (
     BatchNormMode,
@@ -269,7 +270,8 @@ def conv3d(
         residuals_in=residuals_in,
         transpose_taps=False,
     )
-    if nisa.get_nc_version() == nisa.nc_version.gen3 and _banded_wins(cfg, x_in.dtype, sbm != None):
+    _, n_prgs, _ = get_verified_program_sharding_info("conv3d", (0, 1))
+    if nisa.get_nc_version() == nisa.nc_version.gen3 and _banded_wins(cfg, x_in.dtype, sbm != None, n_prgs):
         return _conv3d_banded_compute(x_in, filters, bias, cfg)
 
     conv_out = nl.ndarray(
