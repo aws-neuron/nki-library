@@ -934,6 +934,19 @@ CONV3D_BANDED_DIRECT_PARAMS = [
     (1, 128, 128, 1, 3, 9000, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
     (1, 64, 64, 1, 4, 20000, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
 ]
+# The layers above whose band plan folds filter columns onto the contraction rows (_tap_fold). The fold is used on one
+# program only (LNC=2 always plans fold 1), so these also run the row-banded path on one core.
+CONV3D_BANDED_FOLD_PARAMS = [
+    pytest.param(1, 3, 16, 1, 24, 40, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(1, 3, 64, 1, 40, 64, 1, 7, 7, 1, 2, 2, 0, 0, 3, 3, 3, 3, 1, 1, 1, True, None, False, nl.bfloat16, marks=pytest.mark.fast),
+    (1, 3, 16, 1, 96, 1536, 1, 3, 3, 1, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
+    (3, 4, 6, 1, 15, 16, 1, 3, 5, 1, 1, 2, 0, 0, 1, 1, 2, 2, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 3, 16, 1, 5, 8, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 3, 8, 1, 24, 40, 1, 8, 8, 1, 1, 1, 0, 0, 3, 4, 3, 4, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16),
+    (1, 8, 24, 1, 19, 22, 1, 4, 4, 1, 2, 2, 0, 0, 1, 2, 1, 2, 1, 1, 1, True, ActFnType.SiLU, False, nl.bfloat16),
+    (2, 3, 16, 1, 11, 14, 1, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 6, 32, 1, 14, 37, 1, 5, 5, 1, 1, 2, 0, 0, 2, 2, 2, 2, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16),
+]
 # Grouped and depthwise 2D layers (groups > 1, trn2 only): conv3d runs them on the block-diagonal banded path
 # (_conv3d_grouped_compute). MobileNet / EfficientNet depthwise 3 x 3 and 5 x 5 at stride 1 and 2, ConvNeXt 7 x 7
 # with GELU, RepLKNet 31 x 31, ResNeXt groups of 8 channels, channel multipliers, small planes with many channels
@@ -2416,6 +2429,72 @@ class TestConv3DKernel:
             kernel_entry=_conv3d_banded_kernel,
         )
 
+    @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_BANDED_FOLD_PARAMS)
+    def test_conv3d_banded_direct_one_core(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        height: int,
+        width: int,
+        filter_d: int,
+        filter_h: int,
+        filter_w: int,
+        stride_d: int,
+        stride_h: int,
+        stride_w: int,
+        pad_d_left: int,
+        pad_d_right: int,
+        pad_h_top: int,
+        pad_h_bottom: int,
+        pad_w_left: int,
+        pad_w_right: int,
+        dilation_d: int,
+        dilation_h: int,
+        dilation_w: int,
+        use_bias: bool,
+        activation_fn: Optional[ActFnType],
+        lnc_shard: bool,
+        dtype,
+    ) -> None:
+        """The row-banded path at LNC=1, the only place its tap fold is used (trn2 only, like the routing)."""
+        if platform_target != Platforms.TRN2:
+            pytest.skip("conv3d runs the row-banded path on trn2 only")
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=batch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            height=height,
+            width=width,
+            filter_d=filter_d,
+            filter_h=filter_h,
+            filter_w=filter_w,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d_left=pad_d_left,
+            pad_d_right=pad_d_right,
+            pad_h_top=pad_h_top,
+            pad_h_bottom=pad_h_bottom,
+            pad_w_left=pad_w_left,
+            pad_w_right=pad_w_right,
+            dilation_d=dilation_d,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+            use_bias=use_bias,
+            activation_fn=activation_fn,
+            lnc_shard=lnc_shard,
+            dtype=dtype,
+            kernel_entry=_conv3d_banded_kernel,
+            logical_nc_config=1,
+        )
+
     @pytest.mark.fast
     @pytest.mark.parametrize("bias_shape", [(16, 1), (24,)], ids=["column", "longer"])
     def test_conv3d_banded_route_bias_shape(
@@ -2592,6 +2671,7 @@ class TestConv3DKernel:
         groups: int = 1,
         torch_ref=conv3d_torch_ref,
         kernel_entry=conv3d,
+        logical_nc_config: Optional[int] = None,
     ) -> None:
         """
         Execute a Conv3D kernel test with specified parameters using UnitTestFramework.
@@ -2628,6 +2708,7 @@ class TestConv3DKernel:
             x_in_mean: Mean of the generated x_in; non-zero exercises rescale precision
             bias_shape: Shape of the generated bias (default [C_out])
             groups: Number of channel groups (default 1)
+            logical_nc_config: LNC to compile and run with (default: the platform's, 2 on trn2)
         """
         # Calculate output shape
         D_out = (depth + pad_d_left + pad_d_right - dilation_d * (filter_d - 1) - 1) // stride_d + 1
@@ -2710,7 +2791,7 @@ class TestConv3DKernel:
 
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(platform_target=platform_target),
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=logical_nc_config),
             rtol=rtol,
             atol=atol,
         )

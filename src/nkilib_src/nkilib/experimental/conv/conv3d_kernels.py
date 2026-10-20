@@ -3598,9 +3598,10 @@ def _conv3d_banded_compute(
     input is not copied into an im2col layout. Only when a block's rows leave most contraction rows
     empty (few input channels, e.g. RGB stems) does the kernel fold filter columns: each input row is
     loaded up to K_w times, shifted one filter column apart, so one matmul covers several filter
-    columns. The banded stationaries are built in the kernel from the filters, one DMA per
-    contraction row. Supports stride, asymmetric zero padding, an optional bias, a fused ActFnType
-    activation and LNC sharding over (batch, row block) work items.
+    columns. It folds on one program (LNC=1) only, see _tap_fold. The banded stationaries are
+    built in the kernel from the filters, one DMA per contraction row. Supports stride, asymmetric
+    zero padding, an optional bias, a fused ActFnType activation and LNC sharding over (batch, row
+    block) work items.
 
     Args:
         x_in (nl.NkiTensor): [B, C_in, 1, H, W], conv3d's input on HBM.
@@ -3665,7 +3666,9 @@ def _conv3d_banded_compute(
         Tile size selection:
         - Fold f (1 to K_w, filter columns per matmul): the one with the fewest passes (blocks x
           contraction tiles x G, each with its own best rows per block), a larger fold only when it
-          cuts the passes by at least a quarter (it costs one input DMA per row and fold step).
+          cuts the passes by at least a quarter (it costs one input DMA per row and fold step). On
+          more than one program (LNC=2) f is 1, where the row DMAs rather than the passes set the time
+          (_tap_fold).
         - rows_per_tile = 128 // (C_in * f); rows_per_block <= 128 // C_out, the row count with the
           fewest passes over the output height, balanced over the row blocks and reduced only if
           the stationaries leave no room for one matmul chunk.
@@ -3692,10 +3695,9 @@ def _conv2d_banded_into(
     cfg: Conv3dConfig,
 ) -> None:
     """Compute the convolution into y_out [B, C_out, H_out, W_out]."""
-    tile_cfg = _build_conv2d_band_tile_config(cfg, sizeinbytes(x_in.dtype))
-
     # SPMD sharding info: n_prgs = core count, prg_id = this core (0/1 at LNC=2).
     _, n_prgs, prg_id = get_verified_program_sharding_info("conv3d", (0, 1))
+    tile_cfg = _build_conv2d_band_tile_config(cfg, sizeinbytes(x_in.dtype), n_prgs)
     work_start, work_end = _program_work_range(cfg.B * tile_cfg.block_count, n_prgs, prg_id)
 
     if work_start < work_end:
@@ -3756,9 +3758,9 @@ def _conv2d_banded_into(
                 _store_band_rows(y_out, result, batch_idx, row0, rows_valid, col0, cols, tile_cfg)
 
 
-def _build_conv2d_band_tile_config(cfg: Conv3dConfig, compute_bytes: int) -> _BandTileConfig:
+def _build_conv2d_band_tile_config(cfg: Conv3dConfig, compute_bytes: int, n_prgs: int = 1) -> _BandTileConfig:
     """
-    Plan the band tiling of a forward convolution.
+    Plan the band tiling of a forward convolution on n_prgs programs (LNC=2: 2).
 
     A block of R output rows reads (R - 1) * stride_h + dilation_h * (K_h - 1) + 1 input rows. The
     tap fold f (_tap_fold) sets the image rows per contraction tile, 128 // (C_in * f). R is the row
@@ -3766,7 +3768,7 @@ def _build_conv2d_band_tile_config(cfg: Conv3dConfig, compute_bytes: int) -> _Ba
     (_fewest_pass_rows), balanced over the blocks it needs, and shrinks only if the stationaries
     leave no room for one matmul chunk.
     """
-    fold = _tap_fold(cfg)
+    fold = _tap_fold(cfg, n_prgs)
     groups = div_ceil(cfg.K_w, fold)
     rows_per_tile = nl.tile_size.pmax // (cfg.C_in * fold)
     rows_per_block = _balanced_rows(cfg.H_out, _fewest_pass_rows(cfg, rows_per_tile, nl.tile_size.pmax // cfg.C_out), 1)
@@ -3811,7 +3813,7 @@ def _build_conv2d_band_tile_config(cfg: Conv3dConfig, compute_bytes: int) -> _Ba
     )
 
 
-def _tap_fold(cfg: Conv3dConfig) -> int:
+def _tap_fold(cfg: Conv3dConfig, n_prgs: int = 1) -> int:
     """
     Filter columns folded onto the contraction rows, 1 (none) to K_w.
 
@@ -3821,7 +3823,16 @@ def _tap_fold(cfg: Conv3dConfig) -> int:
     contraction rows empty (few input channels, many output channels: RGB stems). Each fold step
     costs one more input DMA per image row, so a larger fold must cut the passes (blocks x tiles x
     filter-column groups, each fold with its own fewest-pass rows) by at least a quarter.
+
+    On more than one program (LNC=2) the fold is always 1. There the compiler issues each of this
+    path's static row DMAs on its own (each started by a Sync-engine write) instead of merging them,
+    so the DMA count, not the tensor engine, sets the time, and the fold multiplies it. Measured on
+    trn2 at LNC=2 (bf16, B=1): a 3 -> 16 3 x 3 stride-2 stem at 736 x 960 took 341 us with fold 3 and
+    153 us with fold 1, a 3 -> 64 7 x 7 stride-2 stem at 544 x 960 608 us with fold 4 and 220 us
+    with fold 1. On one program the fold still pays: 172 us with fold 4 against 409 us with fold 1.
     """
+    if n_prgs > 1:
+        return 1
     best_fold = 1
     best_passes = 0
     for fold in range(1, cfg.K_w + 1):

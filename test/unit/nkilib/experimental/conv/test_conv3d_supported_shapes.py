@@ -402,15 +402,42 @@ def test_every_routed_layer_has_a_banded_plan():
                 continue
             routed += 1
             layer = f"{c_in}->{c_out} k{k_h}x{k_w} s{stride} unpadded={unpadded} {h}x{w} B={batch}"
-            try:
-                _build_conv2d_band_tile_config(conv3d_cfg, sizeinbytes(nl.bfloat16))
-            except Exception as error:  # noqa: BLE001 - any failure of the plan is a routing bug
-                unplanned.append(f"{layer}: {error}")
+            # One program (LNC=1, tap fold allowed) and two (LNC=2, no tap fold): both plans must exist.
+            for n_prgs in (1, 2):
+                try:
+                    _build_conv2d_band_tile_config(conv3d_cfg, sizeinbytes(nl.bfloat16), n_prgs)
+                except Exception as error:  # noqa: BLE001 - any failure of the plan is a routing bug
+                    unplanned.append(f"{layer} n_prgs={n_prgs}: {error}")
         return routed, unplanned
 
     routed, unplanned = _on_host(decide)
     assert routed >= 100, "the grid should route a good share of its layers"
     assert not unplanned, f"{len(unplanned)} routed layers have no banded plan, first: {unplanned[:3]}"
+
+
+# (C_in, C_out, K, stride, H, W, tap fold on one program): RGB stems fold filter columns onto the empty contraction
+# rows on one program; thin layers with more input channels have no rows to spare.
+_TAP_FOLD_LAYERS = [
+    (3, 16, 3, 2, 736, 960, 3),
+    (3, 64, 7, 2, 544, 960, 4),
+    (3, 16, 3, 2, 1472, 1920, 3),
+    (16, 16, 3, 1, 368, 960, 1),
+    (16, 3, 3, 1, 368, 960, 1),
+    (64, 64, 3, 1, 368, 960, 1),
+]
+
+
+@pytest.mark.parametrize("C_in, C_out, K, stride, H, W, fold_one_program", _TAP_FOLD_LAYERS)
+def test_tap_fold_on_one_program_only(C_in, C_out, K, stride, H, W, fold_one_program):
+    """
+    The tap fold is chosen on one program (LNC=1) and is always 1 on two (LNC=2), where the row DMAs, which the fold
+    multiplies, set the time; the plans carry the fold they were built with.
+    """
+    cfg = _banded_conv3d_config(C_in=C_in, C_out=C_out, K=K, stride=stride, H=H, W=W)
+    folds = _on_host(
+        lambda: [_build_conv2d_band_tile_config(cfg, sizeinbytes(nl.bfloat16), n_prgs).taps_folded for n_prgs in (1, 2)]
+    )
+    assert folds == [fold_one_program, 1]
 
 
 # (C_in, C_out, K, H, W, measured speedup of the banded path over conv3d_transpose): stride 2, filter K x K, torch
