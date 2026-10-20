@@ -39,7 +39,9 @@ from .conv3d_kernels import (
     _banded_wins,
     _conv3d_banded_compute,
     _conv3d_fallback_compute,
+    _conv3d_grouped_compute,
     _conv3d_low_chan_compute,
+    _validate_grouped_inputs,
 )
 
 
@@ -65,6 +67,7 @@ def conv3d(
     residuals_in: Optional[nl.NkiTensor] = None,
     sbm: Optional[SbufManager] = None,
     use_auto_allocation: bool = False,
+    groups: int = 1,
 ) -> nl.NkiTensor:
     """
     3D Convolution using tensor engine with K-replication strategy and W-contiguous tiling.
@@ -78,6 +81,9 @@ def conv3d(
     _banded_wins expects that to be faster. The result is equal up to rounding: 16-bit operands and fp32 PSUM
     accumulation as here, in a different summation order, so a few elements differ by under one ulp. A caller-provided
     sbm keeps the original path.
+    Grouped and depthwise layers (groups > 1) run on the block-diagonal banded path of _conv3d_grouped_compute, which
+    supports 2D calls (D = 1, K_d = 1, no depth padding) on trn2 without fused batchnorm, residual add, SquaredReLU or
+    a caller-provided sbm; such calls are rejected while tracing.
 
     Intended Usage Range:
         B: 1-128
@@ -103,7 +109,8 @@ def conv3d(
 
     Args:
         x_in (nl.NkiTensor): [B, C_in, D, H, W], Input tensor on HBM.
-        filters (nl.NkiTensor): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
+        filters (nl.NkiTensor): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM;
+            [K_d, K_h, K_w, C_in / groups, C_out] with groups > 1.
         bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM.
         stride (tuple[int, int, int]): (stride_d, stride_h, stride_w), Convolution strides.
         padding (tuple[int, int, int, int, int, int]): (pad_d_left, pad_d_right, pad_h_top,
@@ -164,6 +171,9 @@ def conv3d(
         sbm (Optional[SbufManager]): Optional caller-provided SBUF manager for allocation. When
             provided, its allocation mode must match use_auto_allocation.
         use_auto_allocation (bool): Whether to use auto allocation for SBUF buffers.
+        groups (int): Number of channel groups; C_in and C_out must be multiples of it. Output channel o reads input
+            channels (o // (C_out / groups)) * (C_in / groups) + i, as in torch.nn.Conv3d(groups=groups). groups > 1
+            runs on _conv3d_grouped_compute (see above). Default 1.
 
     Returns:
         y_out (nl.NkiTensor): [B, C_out, D_out, H_out, W_out], Output tensor on HBM. NONE and
@@ -242,6 +252,11 @@ def conv3d(
         residual_add_loc=residual_add_loc,
         transpose_taps=False,
     )
+    if groups != 1:
+        _validate_grouped_inputs(
+            x_in=x_in, filters=filters, bias=bias, cfg=cfg, groups=groups, has_caller_sbm=sbm != None
+        )
+        return _conv3d_grouped_compute(x_in=x_in, filters=filters, bias=bias, cfg=cfg, groups=groups)
     _validate_conv3d_inputs(
         x_in=x_in,
         filters=filters,

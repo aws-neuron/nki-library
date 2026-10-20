@@ -82,13 +82,14 @@ def conv3d_torch_ref(
     use_auto_allocation: bool = False,
     residual_add_loc: ResidualAddLoc = ResidualAddLoc.NONE,
     residuals_in: Optional[torch.Tensor] = None,
+    groups: int = 1,
 ) -> dict[str, torch.Tensor]:
     """
     PyTorch reference implementation of 3D convolution kernel.
 
     Args:
         x_in (torch.Tensor): Input tensor of shape [B, C_in, D, H, W]
-        filters (torch.Tensor): Filter weights of shape [K_d, K_h, K_w, C_in, C_out]
+        filters (torch.Tensor): Filter weights of shape [K_d, K_h, K_w, C_in / groups, C_out]
         bias (Optional[torch.Tensor]): Optional bias tensor of shape [C_out]
         stride (tuple[int, int, int]): Stride for convolution. Default (1, 1, 1).
         padding (tuple[int, int, int, int, int, int]):
@@ -113,12 +114,13 @@ def conv3d_torch_ref(
             kernel's. Default None.
         use_auto_allocation (bool): Unused in the reference; accepted for signature parity with the
             kernel. Default False.
+        groups (int): Number of channel groups, as in torch.nn.Conv3d(groups=groups). Default 1.
 
     Returns:
         dict[str, torch.Tensor]: Dictionary with key "out" containing output tensor of shape
             [B, C_out, D_out, H_out, W_out]
     """
-    K_d, K_h, K_w, C_in, C_out = filters.shape
+    K_d, K_h, K_w, C_in_g, C_out = filters.shape
     pad_d_left, pad_d_right, pad_h_top, pad_h_bottom, pad_w_left, pad_w_right = padding
 
     # Handle asymmetric padding by manually padding the input
@@ -132,16 +134,17 @@ def conv3d_torch_ref(
 
     # Create nn.Conv3d module
     conv = nn.Conv3d(
-        in_channels=C_in,
+        in_channels=C_in_g * groups,
         out_channels=C_out,
         kernel_size=(K_d, K_h, K_w),
         stride=stride,
         padding=conv_padding,
         dilation=dilation,
+        groups=groups,
         bias=(bias != None),
     )
 
-    # Set weights: transpose from [K_d, K_h, K_w, C_in, C_out] to [C_out, C_in, K_d, K_h, K_w]
+    # Set weights: transpose from [K_d, K_h, K_w, C_in / groups, C_out] to [C_out, C_in / groups, K_d, K_h, K_w]
     with torch.no_grad():
         conv.weight.copy_(filters.permute(4, 3, 0, 1, 2))
         if bias != None:

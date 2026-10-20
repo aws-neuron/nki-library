@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Conv3D supported-shape limits and the routing to the row-banded path, asserted on the pure config builders
-without allocating tensors."""
+"""Conv3D supported-shape limits, the routing to the row-banded path and the plans of the grouped path (with the
+depthwise_conv1d route to it), asserted on the pure config builders without allocating tensors."""
 
 import itertools
 from typing import cast
@@ -23,6 +23,7 @@ import nki.language as nl
 import pytest
 from nkilib_src.nkilib.core.utils.allocator import sizeinbytes
 from nkilib_src.nkilib.core.utils.common_types import ActFnType
+from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
 from nkilib_src.nkilib.experimental.conv.conv3d import (
     BatchNormMode,
     Conv3dConfig,
@@ -33,7 +34,17 @@ from nkilib_src.nkilib.experimental.conv.conv3d_helpers import (
     _build_memory_config,
     _build_tile_config,
 )
-from nkilib_src.nkilib.experimental.conv.conv3d_kernels import _banded_wins, _build_conv2d_band_tile_config
+from nkilib_src.nkilib.experimental.conv.conv3d_kernels import (
+    _GROUPED_1D_MAX_TAPS,
+    _GROUPED_1D_MIN_CHANNELS,
+    _GROUPED_1D_MIN_OUTPUTS,
+    _banded_wins,
+    _build_conv2d_band_tile_config,
+    _grouped_1d_wins,
+    _grouped_one_row_sbuf_bytes,
+    _grouped_planes_cheaper,
+    _plan_grouped_band,
+)
 from nkilib_src.nkilib.experimental.conv.conv3d_transpose import (
     _banded_transpose_wins,
     _build_conv2d_transpose_banded_config,
@@ -616,3 +627,275 @@ def test_every_routed_transposed_layer_has_a_banded_plan():
     routed, unplanned = _on_host(decide)
     assert routed >= 100, "the grid should route a good share of its layers"
     assert not unplanned, f"{len(unplanned)} routed layers have no banded plan, first: {unplanned[:3]}"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Grouped path (conv3d with groups > 1) and the depthwise_conv1d route to its one-row diagonal path.
+# ---------------------------------------------------------------------------------------------------------------
+
+_PMAX = 128
+_PSUM_COLS = 512
+
+
+def _grouped_out_size(n, pad_lo, pad_hi, k, stride, dilation):
+    return (n + pad_lo + pad_hi - dilation * (k - 1) - 1) // stride + 1
+
+
+def _grouped_plan(B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation):
+    """_plan_grouped_band for one layer (pads = (top, bottom, left, right)), as the grouped path calls it."""
+    H_out = _grouped_out_size(H, pads[0], pads[1], K_h, stride[0], dilation[0])
+    return _on_host(
+        lambda: _plan_grouped_band(
+            B,
+            C_in // groups,
+            C_out // groups,
+            groups,
+            H_out,
+            W,
+            K_h,
+            stride[0],
+            stride[1],
+            pads[2] + pads[3],
+            dilation[0],
+            dilation[1] * (K_w - 1),
+        )
+    )
+
+
+def _grouped_span(rows, stride_h, K_h, dilation_h):
+    return (rows - 1) * stride_h + dilation_h * (K_h - 1) + 1
+
+
+# (B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation): the layers of the integration test and of the
+# grouped-conv benchmarks (MobileNetV2/V3, EfficientNet, ConvNeXt, RepLKNet, ResNeXt, YOLO26, SANA, Evo 2).
+_GROUPED_LAYERS = [
+    (2, 16, 16, 16, 20, 20, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (2, 32, 32, 4, 20, 20, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (2, 8, 16, 8, 18, 18, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (1, 4, 4, 4, 300, 40, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (2, 16, 16, 16, 21, 21, 3, 3, (2, 2), (1, 1, 1, 1), (1, 1)),
+    (2, 8, 8, 8, 24, 24, 3, 3, (1, 1), (2, 2, 2, 2), (2, 2)),
+    (16, 96, 96, 96, 56, 56, 7, 7, (1, 1), (3, 3, 3, 3), (1, 1)),
+    (32, 144, 144, 144, 56, 56, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (16, 256, 256, 32, 56, 56, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (4, 128, 128, 128, 56, 56, 31, 31, (1, 1), (15, 15, 15, 15), (1, 1)),
+    (32, 96, 96, 96, 112, 112, 3, 3, (2, 2), (1, 1, 1, 1), (1, 1)),
+    (16, 384, 384, 384, 14, 14, 7, 7, (1, 1), (3, 3, 3, 3), (1, 1)),
+    (2, 11200, 11200, 11200, 32, 32, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (16, 256, 256, 256, 20, 20, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)),
+    (1, 4096, 4096, 4096, 1, 8192, 1, 7, (1, 1), (0, 0, 6, 6), (1, 1)),
+    (1, 4096, 4096, 4096, 1, 8192, 1, 128, (1, 1), (0, 0, 127, 127), (1, 1)),
+    (2, 130, 130, 130, 1, 600, 1, 4, (1, 2), (0, 0, 3, 0), (1, 1)),
+]
+
+
+@pytest.mark.parametrize("B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation", _GROUPED_LAYERS)
+def test_grouped_plan_fits_and_covers(B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation):
+    """Every pass fits the 128 contraction rows and 128 stationary columns, and the blocks cover every output row."""
+    plan = _grouped_plan(B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation)
+    C_in_g, C_out_g = C_in // groups, C_out // groups
+    H_out = _grouped_out_size(H, pads[0], pads[1], K_h, stride[0], dilation[0])
+    assert plan.in_parts == plan.g_pack * C_in_g * plan.span <= _PMAX
+    assert plan.out_parts == plan.g_pack * C_out_g * plan.rows_out <= _PMAX
+    assert plan.span == _grouped_span(plan.rows_out, stride[0], K_h, dilation[0])
+    assert plan.n_blocks * plan.rows_out >= H_out
+    assert (plan.n_blocks - 1) * plan.rows_out < H_out
+    assert plan.n_packs == div_ceil(groups, plan.g_pack)
+    assert plan.n_img_groups * plan.n_img >= B
+    if plan.seg_out <= _PSUM_COLS:
+        assert plan.n_img * plan.seg_out <= _PSUM_COLS
+    assert plan.seg_in % stride[1] == 0 and plan.seg_in >= W + pads[2] + pads[3]
+    assert plan.tile_cols == plan.n_img * plan.seg_in + dilation[1] * (K_w - 1)
+
+
+@pytest.mark.parametrize("B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation", _GROUPED_LAYERS)
+def test_grouped_plan_takes_the_fewest_passes(B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation):
+    """No (groups per pass, rows per block) choice that fits needs fewer passes than the plan's."""
+    plan = _grouped_plan(B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation)
+    C_in_g, C_out_g = C_in // groups, C_out // groups
+    H_out = _grouped_out_size(H, pads[0], pads[1], K_h, stride[0], dilation[0])
+    best = None
+    for g_pack, rows in itertools.product(range(1, min(groups, _PMAX) + 1), range(1, H_out + 1)):
+        span = _grouped_span(rows, stride[0], K_h, dilation[0])
+        if g_pack * C_in_g * span <= _PMAX and g_pack * C_out_g * rows <= _PMAX:
+            passes = div_ceil(groups, g_pack) * div_ceil(H_out, rows)
+            best = passes if best is None else min(best, passes)
+    assert plan.n_packs * plan.n_blocks == best
+
+
+# (layer, expected path): the whole-plane path for small planes with many channels, banded where the band amortizes
+_GROUPED_PATHS = [
+    ((2, 11200, 11200, 11200, 32, 32, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)), True),  # SANA-1.6B Mix-FFN 1K
+    ((16, 256, 256, 256, 20, 20, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)), True),  # YOLO26 P5 head
+    ((32, 144, 144, 144, 56, 56, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)), False),  # MobileNetV2 56 x 56
+    ((16, 96, 96, 96, 56, 56, 7, 7, (1, 1), (3, 3, 3, 3), (1, 1)), False),  # ConvNeXt stage 1
+    ((32, 768, 768, 768, 7, 7, 7, 7, (1, 1), (3, 3, 3, 3), (1, 1)), False),  # ConvNeXt stage 4
+    ((4, 128, 128, 128, 56, 56, 31, 31, (1, 1), (15, 15, 15, 15), (1, 1)), False),  # RepLKNet: too many taps
+    ((32, 96, 96, 96, 112, 112, 3, 3, (2, 2), (1, 1, 1, 1), (1, 1)), False),  # stride 2: banded only
+    ((16, 256, 256, 32, 56, 56, 3, 3, (1, 1), (1, 1, 1, 1), (1, 1)), False),  # grouped (8 per group): banded only
+    ((1, 4096, 4096, 4096, 1, 8192, 1, 7, (1, 1), (0, 0, 6, 6), (1, 1)), False),  # 1-D: the one-row path
+]
+
+
+@pytest.mark.parametrize("layer, planes", _GROUPED_PATHS)
+def test_grouped_planes_choice(layer, planes):
+    """The cost model sends small planes with many channels to the whole-plane path and keeps the rest banded."""
+    B, C_in, C_out, groups, H, W, K_h, K_w, stride, pads, dilation = layer
+    plan = _grouped_plan(*layer)
+    H_out = _grouped_out_size(H, pads[0], pads[1], K_h, stride[0], dilation[0])
+    W_out = _grouped_out_size(W, pads[2], pads[3], K_w, stride[1], dilation[1])
+    got = _on_host(
+        lambda: _grouped_planes_cheaper(
+            plan, B, C_in, H, W, H_out, W_out, K_h, K_w, C_in // groups, C_out // groups, stride, pads, nl.bfloat16
+        )
+    )
+    assert got == planes
+
+
+def _grouped_1d_routes(N, C, W, S, stride_w, pad_l, pad_r, dtype=nl.bfloat16, pad_h=(0, 0), filter_dtype=None):
+    img = _ShapeOnlyTensor((N, C, 1, W), dtype)
+    filt = _ShapeOnlyTensor((C, 1, 1, S), dtype if filter_dtype is None else filter_dtype)
+    return _on_host(lambda: _grouped_1d_wins(_as_tensor(img), _as_tensor(filt), (pad_h, (pad_l, pad_r)), (1, stride_w)))
+
+
+# (N, C, W, S, stride_w, pad_l, pad_r, dtype, measured speedup of the one-row diagonal path over
+# depthwise_conv1d_implicit_gemm's own kernel), trn2, LNC=2, back-to-back calls. The suite's small layers run at the
+# launch floor (about 0.09 ms) on both kernels.
+_GROUPED_1D_MEASURED = [
+    (1, 1536, 2048, 4, 1, 3, 0, nl.bfloat16, 40.8),  # Mamba causal conv1d (d_inner 1536, d_conv 4)
+    (8, 1536, 2048, 4, 1, 3, 0, nl.bfloat16, 189.8),
+    (8, 512, 1000, 31, 1, 15, 15, nl.bfloat16, 54.9),  # Conformer convolution module
+    (1, 12288, 8192, 3, 1, 2, 0, nl.bfloat16, 191.9),  # Evo 2 7B featurizer
+    (1, 4096, 8192, 7, 1, 6, 0, nl.bfloat16, 119.2),  # Evo 2 Hyena-SE
+    (1, 4096, 8192, 128, 1, 127, 0, nl.bfloat16, 38.9),  # Evo 2 Hyena-MR
+    (1, 512, 5000, 8, 1, 0, 0, nl.bfloat16, 21.7),  # the suite's FS-ASR layer
+    (1, 256, 4096, 64, 2, 0, 0, nl.bfloat16, 5.1),
+    (1, 256, 4096, 64, 1, 0, 0, nl.float32, 3.6),
+    # long sequences; past the SBUF fit the diagonal path still compiled and won here, but is not routed
+    (1, 256, 32768, 4, 1, 3, 0, nl.bfloat16, 61.0),
+    (1, 256, 49152, 4, 1, 3, 0, nl.bfloat16, 97.9),
+    (1, 256, 65536, 4, 1, 3, 0, nl.bfloat16, 46.5),  # past the SBUF fit
+    (1, 256, 16384, 4, 1, 3, 0, nl.float32, 43.6),
+    (1, 256, 24576, 4, 1, 3, 0, nl.float32, 46.7),
+    (1, 256, 32768, 4, 1, 3, 0, nl.float32, 37.2),  # past the SBUF fit
+    (1, 256, 16384, 128, 1, 127, 0, nl.bfloat16, 16.5),
+    (1, 256, 24576, 128, 1, 127, 0, nl.bfloat16, 11.2),
+    (1, 256, 32768, 128, 1, 127, 0, nl.bfloat16, 12.5),
+    (1, 256, 65536, 128, 1, 127, 0, nl.bfloat16, 11.0),  # past the SBUF fit
+    (1, 256, 8192, 128, 1, 127, 0, nl.float32, 7.44),
+    (1, 256, 12288, 128, 1, 127, 0, nl.float32, 4.42),
+    (1, 256, 16384, 128, 1, 127, 0, nl.float32, 5.20),
+    (1, 256, 32768, 128, 1, 127, 0, nl.float32, 4.25),  # past the SBUF fit
+    (1, 256, 4096, 256, 1, 0, 0, nl.bfloat16, 2.13),
+    (1, 4096, 8192, 256, 1, 255, 0, nl.bfloat16, 35.2),
+    (1, 256, 1024, 512, 1, 0, 0, nl.bfloat16, 2.07),
+    (1, 16, 512, 200, 1, 0, 0, nl.bfloat16, 0.96),
+    (1, 16, 512, 3, 1, 0, 0, nl.bfloat16, 0.92),
+    (1, 16, 512, 64, 1, 0, 0, nl.bfloat16, 1.02),
+    (1, 2, 512, 64, 1, 0, 0, nl.bfloat16, 0.97),
+    (1, 256, 512, 64, 1, 0, 0, nl.bfloat16, 2.01),
+    (1, 256, 512, 64, 2, 5, 5, nl.bfloat16, 59.1),
+    (1, 256, 256, 128, 1, 0, 0, nl.bfloat16, 1.11),
+    (1, 1024, 1024, 128, 1, 0, 0, nl.bfloat16, 2.83),
+    (4, 256, 512, 128, 1, 0, 0, nl.bfloat16, 3.56),
+    (1, 256, 2048, 128, 1, 10, 10, nl.bfloat16, 14.1),
+    (1, 256, 512, 64, 1, 0, 0, nl.float32, 2.35),
+    (1, 256, 512, 128, 1, 0, 0, nl.float16, 1.63),
+]
+# Routed layers must have measured at least this much faster; a layer measured slower must not be routed.
+_GROUPED_1D_MIN_ROUTED_SPEEDUP = 1.1
+# Layers that failed to compile on the one-row diagonal path (a tile past the SBUF partition size).
+_GROUPED_1D_FAILS_ON_DIAGONAL = [
+    (1, 256, 131072, 4, 1, 3, 0, nl.bfloat16),
+    (1, 256, 262144, 4, 1, 3, 0, nl.bfloat16),
+    (1, 256, 65536, 4, 1, 3, 0, nl.float32),
+    (1, 256, 4096, 1024, 1, 0, 0, nl.bfloat16),
+]
+
+
+def test_grouped_1d_route_on_measured_points():
+    """Every measured layer: routed implies the diagonal path won, and a layer it lost on is not routed."""
+    routed = 0
+    for N, C, W, S, stride_w, pad_l, pad_r, dtype, speedup in _GROUPED_1D_MEASURED:
+        layer = f"N={N} C={C} W={W} S={S} s={stride_w} pad=({pad_l}, {pad_r}) {dtype}"
+        is_routed = _grouped_1d_routes(N, C, W, S, stride_w, pad_l, pad_r, dtype)
+        if is_routed:
+            routed += 1
+            assert speedup >= _GROUPED_1D_MIN_ROUTED_SPEEDUP, (
+                f"{layer} routed to the diagonal path but measured {speedup}x"
+            )
+        if speedup < 1.0:
+            assert not is_routed, f"{layer} routed to the diagonal path but measured {speedup}x"
+    assert routed >= 28, "the sequence-model layers should stay routed"
+
+
+@pytest.mark.parametrize("N, C, W, S, stride_w, pad_l, pad_r, dtype", _GROUPED_1D_FAILS_ON_DIAGONAL)
+def test_grouped_1d_route_skips_layers_that_do_not_fit(N, C, W, S, stride_w, pad_l, pad_r, dtype):
+    """Layers whose tiles do not fit SBUF stay on the original kernel."""
+    assert not _grouped_1d_routes(N, C, W, S, stride_w, pad_l, pad_r, dtype)
+
+
+@pytest.mark.parametrize(
+    "N, C, W, S, stride_w, pad_l, pad_r, kwargs",
+    [
+        (1, 256, 512, _GROUPED_1D_MAX_TAPS + 1, 1, 0, 0, {}),  # longer than any filter measured
+        (1, 8192, 4096, 4093, 1, 0, 0, {}),  # the suite's Qwen3 layer: 4 outputs of a 4093-tap filter
+        (1, 256, 129, 128, 1, 0, 0, {}),  # 2 outputs
+        (1, 256, 20, 8, 1, 0, 0, {}),  # 13 outputs, under _GROUPED_1D_MIN_OUTPUTS
+        (1, _GROUPED_1D_MIN_CHANNELS - 1, 4096, 8, 1, 0, 0, {}),  # too few channels
+        (1, 256, 4096, 512, 1, 0, 0, {"dtype": nl.float32}),  # fp32 stationaries of 512 taps: past SBUF
+        (1, 256, 512, 8, 1, 0, 0, {"pad_h": (1, 0)}),  # padding of the unit height axis
+        (1, 256, 512, 8, 1, 0, 0, {"filter_dtype": nl.float32}),  # mixed dtypes
+    ],
+)
+def test_grouped_1d_route_keeps_the_rest(N, C, W, S, stride_w, pad_l, pad_r, kwargs):
+    """Long filters, short outputs, few channels and options the diagonal path does not take stay put."""
+    assert not _grouped_1d_routes(N, C, W, S, stride_w, pad_l, pad_r, **kwargs)
+
+
+def test_every_routed_grouped_1d_call_has_a_one_row_plan():
+    """
+    Over a grid of batch, channel, width, tap, stride and padding choices, every routed call plans one row per pass
+    (the diagonal path) and its tiles fit the SBUF budget, so routing never turns a call the original kernel takes
+    into a failure.
+    """
+    grid = itertools.product(
+        (1, 3),
+        (128, 300, 4096),
+        (64, 1000, 8192, 40000),
+        (1, 4, 31, 128, 300, 512),
+        (1, 2, 5),
+        ((0, 0), (3, 0), (15, 15)),
+        (nl.bfloat16, nl.float32),
+    )
+
+    def decide():
+        routed = 0
+        bad = []
+        budget = nl.tile_size.total_available_sbuf_size
+        for N, C, W, S, stride_w, (pad_l, pad_r), dtype in grid:
+            if (W + pad_l + pad_r - S) // stride_w + 1 < 1:
+                continue
+            img = _as_tensor(_ShapeOnlyTensor((N, C, 1, W), dtype))
+            filt = _as_tensor(_ShapeOnlyTensor((C, 1, 1, S), dtype))
+            if not _grouped_1d_wins(img, filt, ((0, 0), (pad_l, pad_r)), (1, stride_w)):
+                continue
+            routed += 1
+            plan = _plan_grouped_band(N, 1, 1, C, 1, W, 1, 1, stride_w, pad_l + pad_r, 1, S - 1)
+            dsize = 4 if dtype == nl.float32 else 2
+            if not (plan.span == 1 and plan.rows_out == 1 and plan.n_packs == div_ceil(C, _PMAX)):
+                bad.append(f"N={N} C={C} W={W} S={S} s={stride_w}: not a one-row plan")
+            if _grouped_one_row_sbuf_bytes(plan, S, dsize) > budget:
+                bad.append(f"N={N} C={C} W={W} S={S} s={stride_w}: tiles past the SBUF budget")
+        return routed, bad
+
+    routed, bad = _on_host(decide)
+    assert routed >= 200, "the grid should route a good share of its layers"
+    assert not bad, f"{len(bad)} routed layers without a one-row plan that fits, first: {bad[:3]}"
+
+
+def test_grouped_1d_route_constants():
+    """The routing limits the docstrings promise."""
+    assert _GROUPED_1D_MAX_TAPS == 512
+    assert _GROUPED_1D_MIN_CHANNELS == 128
+    assert _GROUPED_1D_MIN_OUTPUTS == 16
