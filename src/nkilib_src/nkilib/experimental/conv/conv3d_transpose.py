@@ -30,6 +30,27 @@ from ...core.utils.kernel_helpers import (
     get_verified_program_sharding_info,
 )
 from ...core.utils.logging import get_logger
+from .conv3d_kernels import (
+    _BAND_SBUF_RESERVE,
+    _BANDED_DMA_NS,
+    _BANDED_MARGIN_X5,
+    _BANDED_MIN_TAPS,
+    _BANDED_TAP_PIXEL_NS_X20,
+    _alloc_band_result,
+    _append_band_dma,
+    _balanced_rows,
+    _band_epilogue,
+    _band_fixed_bytes,
+    _BandTileConfig,
+    _evict_band_psum,
+    _fit_window_cols,
+    _load_band_input_tiles,
+    _load_band_stationaries,
+    _load_partition_vector,
+    _pick_chunk_cols,
+    _program_work_range,
+    _store_band_rows,
+)
 
 _PARTITION_STRIDE_32 = 32
 _PARTITION_STRIDE_64 = 64
@@ -43,7 +64,18 @@ _DMA_TRANSPOSE_ALIGN = 32
 _FILTER_SHAPE_KDHW_CI_CO = "KDHW_CI_CO"
 _FILTER_SHAPE_KDHW_CO_CI = "KDHW_CO_CI"
 _SUPPORTED_FILTER_SHAPES = (_FILTER_SHAPE_KDHW_CI_CO, _FILTER_SHAPE_KDHW_CO_CI)
-_SBUF_RESERVE = 1024
+# Row-banded path routing (_banded_transpose_wins). The DMA cost, the minimum taps and the margin (conv3d_kernels._BANDED_*)
+# are shared with conv3d. This path runs all K_h x K_w taps of the dilated input, each costing a per-pixel time: about
+# 0.55 ns measured on trn2 with up to 64 input channels and 0.23 ns above, taken as 0.45 and 0.20 ns. Measured on stride
+# 2, filters 2 x 2 to 4 x 4, batches up to 2 and images up to 736 x 960 (bf16).
+_BANDED_STRIDE = 2
+_BANDED_MAX_FILTER = 4
+_BANDED_MAX_BATCH = 16
+_BANDED_MAX_SIZE = 2048
+_BANDED_TAP_PIXEL_NS_X20_WIDE = 4  # more than 64 input channels
+_BANDED_NARROW_CHANNELS = 64
+_BANDED_MIN_WORK_NS = 150_000  # below this both paths sit at the launch floor, at LNC=2 where each core gets half
+_BAND_SBUF_RESERVE = 1024
 
 
 @nki.jit
@@ -855,7 +887,7 @@ def _build_memory_config(
     """Build memory configuration for SBUF buffer allocation and interleaving."""
     has_input_dilation = cfg.input_dilation_d > 1 or cfg.input_dilation_h > 1 or cfg.input_dilation_w > 1
     base_budget = total_sbuf_budget if total_sbuf_budget != None else nl.tile_size.total_available_sbuf_size
-    TOTAL_SBUF = base_budget - _SBUF_RESERVE
+    TOTAL_SBUF = base_budget - _BAND_SBUF_RESERVE
     num_w_out_tiles = div_ceil(cfg.W_out, tile_cfg.W_tile)
     bias_size_per_tile = _BIAS_DTYPE_SIZE if cfg.has_bias else 0
     filters_per_c_out_tile = (
@@ -2537,6 +2569,13 @@ def conv3d_transpose(
     forward stride to input_dilation, remapping padding to dilation * (K - 1) - padding,
     and fixing kernel stride at 1.
 
+    On trn2, a 2D call (D = 1, K_d = 1) of a thin layer with stride 2 runs on the row-banded path of
+    _conv3d_transpose_banded (no zero insertion, no per-tap input copies) when _banded_transpose_wins expects that
+    to be faster. The result is equal up to rounding: fp32 PSUM accumulation in a different summation order, and one
+    rounding of the bias-and-activation eviction where this path rounds twice (bias added into a tile of the output
+    dtype, then the activation), so with both the banded result is the closer one to the exact value. A
+    caller-provided sbm keeps the original path.
+
     Dimensions:
         B: Batch size
         C_in: Number of input channels
@@ -2663,6 +2702,22 @@ def conv3d_transpose(
         f"conv3d_transpose: output_padding must be non-negative, got {output_padding}",
     )
 
+    if nisa.get_nc_version() == nisa.nc_version.gen3 and _banded_transpose_wins(
+        x_in.shape,
+        filters.shape,
+        x_in.dtype,
+        stride,
+        padding,
+        dilation,
+        output_padding,
+        activation_fn,
+        filter_shape,
+        sbm != None,
+    ):
+        return _conv3d_transpose_banded(
+            x_in, filters, bias, stride, padding, dilation, output_padding, activation_fn, flip_filter_taps_in_kernel
+        )
+
     if sbm == None:
         sbm = SbufManager(
             0,
@@ -2717,3 +2772,513 @@ def conv3d_transpose(
         return y_out
 
     return core_out
+
+
+def _banded_transpose_wins(
+    x_shape,
+    filters_shape,
+    dtype,
+    stride,
+    padding,
+    dilation,
+    output_padding,
+    activation_fn,
+    filter_shape,
+    has_caller_sbm: bool,
+) -> bool:
+    """
+    True when this call is routed to _conv3d_transpose_banded: a 2D call (D = 1, K_d = 1, no depth padding) that path
+    supports (filters in KDHW_CI_CO layout, no caller SbufManager, the activations this kernel supports, 16-bit
+    operands, unit dilation, stride 2, filters of 2 x 2 to 4 x 4, C_out * stride_h <= 128, every output column phase hit
+    by a filter column) where the cost model expects it to be at least 1.2x faster. On one core a routed layer was at
+    least 2.3x faster on every one of the measured trn2 layers, and at least 1.3x on two cores (the weakest of 16
+    measured), and none was slower. conv3d_transpose additionally requires trn2, the only target the banded path was
+    measured on.
+    """
+    B, C_in, D, H, W = x_shape
+    K_d, K_h, K_w, _, C_out = filters_shape
+    stride_d, stride_h, stride_w = stride
+    pad_d_lo, pad_d_hi, pad_h_lo, pad_h_hi, pad_w_lo, pad_w_hi = padding
+    dilation_d, dilation_h, dilation_w = dilation
+    out_pad_d, out_pad_h, out_pad_w = output_padding
+    H_out = (H - 1) * stride_h - pad_h_lo - pad_h_hi + dilation_h * (K_h - 1) + out_pad_h + 1
+    W_out = (W - 1) * stride_w - pad_w_lo - pad_w_hi + dilation_w * (K_w - 1) + out_pad_w + 1
+    structural = (
+        not has_caller_sbm
+        and filter_shape == _FILTER_SHAPE_KDHW_CI_CO
+        and (dtype == nl.bfloat16 or dtype == nl.float16)
+        and activation_fn != ActFnType.SquaredReLU
+        and D == 1
+        and K_d == 1
+        and stride_d == 1
+        and dilation_d == 1
+        and pad_d_lo == 0
+        and pad_d_hi == 0
+        and out_pad_d == 0
+        and dilation_h == 1
+        and dilation_w == 1
+        and stride_h == _BANDED_STRIDE
+        and stride_w == _BANDED_STRIDE
+        and K_h >= 2
+        and K_w >= 2
+        and K_h <= _BANDED_MAX_FILTER
+        and K_w <= _BANDED_MAX_FILTER
+        and pad_h_lo >= 0
+        and pad_h_hi >= 0
+        and pad_w_lo >= 0
+        and pad_w_hi >= 0
+        and out_pad_h >= 0
+        and out_pad_w >= 0
+        and H_out >= 1
+        and W_out >= 1
+        and B <= _BANDED_MAX_BATCH
+        and H <= _BANDED_MAX_SIZE
+        and W <= _BANDED_MAX_SIZE
+        and C_in <= nl.tile_size.pmax
+        and C_out * stride_h <= nl.tile_size.pmax
+    )
+    if not structural:
+        return False
+    # The banded kernel asserts that every output column phase receives a filter column. With stride 2, filters of at
+    # least 2 and unit dilation each phase always does, so this never fires today; it keeps the gate right if those
+    # limits are relaxed.
+    taps = _transpose_phase_taps(K_w, stride_w, pad_w_lo, dilation_w)
+    for phase in range(min(stride_w, W_out)):
+        if len(taps[phase]) == 0:
+            return False
+    # Cost model: ns per output row. A banded block holds rows output rows (whole row phases) and reads span input rows.
+    rows = nl.tile_size.pmax // C_out // stride_h * stride_h
+    shift_lo, shift_hi = _transpose_shift_range(K_h, stride_h, pad_h_lo, dilation_h)
+    span = rows // stride_h + shift_hi - shift_lo
+    banded_row_ns = _BANDED_DMA_NS * (span + rows) // rows
+    tap_pixel_ns_x20 = _BANDED_TAP_PIXEL_NS_X20
+    if C_in > _BANDED_NARROW_CHANNELS:
+        tap_pixel_ns_x20 = _BANDED_TAP_PIXEL_NS_X20_WIDE
+    conv_row_ns = tap_pixel_ns_x20 * max(K_h * K_w, _BANDED_MIN_TAPS) * W_out // 20
+    return 5 * conv_row_ns >= _BANDED_MARGIN_X5 * banded_row_ns and B * H_out * conv_row_ns >= _BANDED_MIN_WORK_NS
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Row-banded path for thin 2D layers (conv3d_transpose routes here on trn2 via _banded_transpose_wins; the band
+# helpers live in conv3d_kernels.py).
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class _BandedTransposeConfig(nl.NKIObject):
+    """Shapes and options of one banded 2D transposed convolution."""
+
+    B: int
+    C_in: int
+    C_out: int
+    H: int
+    W: int
+    K_h: int
+    K_w: int
+    H_out: int
+    W_out: int
+    stride_h: int
+    stride_w: int
+    pad_h_top: int
+    pad_h_bottom: int
+    pad_w_left: int
+    pad_w_right: int
+    dilation_h: int
+    dilation_w: int
+    out_pad_h: int
+    out_pad_w: int
+    flip_filter_taps_in_kernel: bool
+    has_bias: bool
+    activation_fn: Optional[ActFnType]
+    # Input rows / columns an output row / column phase reads lie at group + shift, shift in [lo, hi].
+    row_shift_lo: int
+    row_shift_hi: int
+    col_shift_lo: int
+    col_shift_hi: int
+
+
+def _conv3d_transpose_banded(
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
+    stride: tuple[int, int, int],
+    padding: tuple[int, int, int, int, int, int],
+    dilation: tuple[int, int, int],
+    output_padding: tuple[int, int, int],
+    activation_fn: Optional[ActFnType],
+    flip_filter_taps_in_kernel: bool,
+) -> nl.NkiTensor:
+    """
+    Row-banded conv3d_transpose for thin 2D layers: the D = 1, K_d = 1 case, y = act(conv_transpose2d(x_in, filters)
+    + bias), computed without dilating the input.
+
+    conv3d_transpose calls this on trn2 when it expects it to be faster (conv3d_transpose._banded_transpose_wins); it
+    takes conv3d_transpose's inputs (filters in KDHW_CI_CO layout) and returns its [B, C_out, 1, H_out, W_out] output. Output row stride_h * q + a (phase a) reads input rows q + e through the filter rows k_h
+    with stride_h * e = a + pad_h_top - dilation_h * k_h, so a block of rows_per_block output rows
+    (a multiple of stride_h) reads rows_per_block / stride_h + (e_hi - e_lo) input rows. As in
+    _conv3d_banded_compute, rows_per_tile = 128 // C_in input rows with their channels fill the contraction
+    rows and the block's (output row, output channel) pairs fill the columns, so every output row
+    phase is computed by the same banded stationaries; each output column phase b accumulates its
+    own PSUM tile over the filter columns k_w with stride_w * e = b + pad_w_left - dilation_w * k_w,
+    moving contiguous input columns, and is written to every stride_w-th output column. Supports
+    stride, asymmetric padding, output_padding, an optional bias, a fused ActFnType activation and
+    LNC sharding over (batch, row block) work items.
+
+    Args:
+        x_in (nl.NkiTensor): [B, C_in, 1, H, W], conv3d_transpose's input on HBM.
+        filters (nl.NkiTensor): [1, K_h, K_w, C_in, C_out], conv3d_transpose's filters (KDHW_CI_CO) on HBM.
+        bias (Optional[nl.NkiTensor]): conv3d_transpose's bias; its first C_out elements are read.
+        stride, padding, dilation, output_padding, activation_fn, flip_filter_taps_in_kernel: conv3d_transpose's
+            arguments (the depth entries are unused). padding removes rows / columns from each side of the full
+            transposed convolution output.
+
+    Returns:
+        y_out (nl.NkiTensor): [B, C_out, 1, H_out, W_out], Output tensor on HBM in x_in's dtype.
+
+    Notes:
+        - x_in, filters and bias share one 16-bit dtype (conv3d_transpose routes only bfloat16 / float16 here).
+          The matmuls run in that dtype and accumulate in fp32 PSUM; the result is rounded once.
+        - Requires C_out * stride_h <= 128 (a block holds whole row phases) and at least one filter
+          column per output column phase.
+        - No zeros are inserted: every matmul multiplies real input columns, unlike lowering the
+          transposed convolution to a convolution over the dilated input.
+        - Against conv3d_transpose (nki-library main, bf16, one NeuronCore, stride 2) it was faster at
+          every output width tried (120 to 1920 pixels): for 64 to 16 channels with a 4x4 filter
+          1.6x at 120 pixels, 2.4x at 240, 3.7x at 480, 7.5x at 960 and 15x at 1920; for 32 to 16
+          channels with a 2x2 filter 1.4x at 240 pixels and 4.4x at 960. Unlike the forward
+          convolution, no narrow-row regime favored conv3d_transpose in these shapes.
+
+    Pseudocode:
+        plan = build_band_plan(cfg)                    # rows per block (multiple of stride_h), windows
+        stationaries = zeros(128, tiles_per_block * K_w, rows_per_block * C_out)
+        for each contraction row (t, j) of a block:
+            DMA the filter rows it meets into stationaries[(j, :), t * K_w : (t + 1) * K_w, band]
+        bias_col = replicate(bias, rows_per_block)
+
+        for (b, block) in this program's work items:
+            for window in column-group windows:
+                load the input tiles: tile t, partition (j, c_in) <- x_in[b, c_in, row(t, j), cols]
+                for chunk in window, for column phase p in range(stride_w):
+                    for t, k_w in phase p's filter columns:
+                        psum += stationaries[t, k_w].T @ tile_t[:, group + shift(k_w)]
+                    result[:, stride_w * group + p] = act(psum + bias_col)
+                store each output row: y_out[b, :, row, window] <- result[(r, :), :]
+
+    Tiling Strategy:
+        Loop nest: (batch, row block) work items -> column-group windows -> matmul chunks -> column
+        phases -> contraction tiles -> the phase's filter columns.
+
+        SBUF layout: as _conv3d_banded_compute; the stationary slot of filter column k_w is its index in
+        filters, and window / chunk widths count column groups (stride_w output columns each).
+    """
+    B, C_in, _, H, W = x_in.shape
+    K_h, K_w, C_out = filters.shape[1], filters.shape[2], filters.shape[4]
+    x_nchw = x_in.reshape((B, C_in, H, W))
+    filters_hwio = filters.reshape((K_h, K_w, C_in, C_out))
+    # conv3d_transpose reads the first C_out elements of the bias without checking its shape: [C_out], [C_out, 1] or longer.
+    bias_vec = None
+    if bias != None:
+        bias_vec = bias.slice(dim=0, start=0, end=C_out, step=1).reshape((C_out,))
+    cfg = _build_conv2d_transpose_banded_config(
+        x_nchw,
+        filters_hwio,
+        bias_vec,
+        (stride[1], stride[2]),
+        (padding[2], padding[3], padding[4], padding[5]),
+        (dilation[1], dilation[2]),
+        (output_padding[1], output_padding[2]),
+        activation_fn,
+        flip_filter_taps_in_kernel,
+    )
+    col_taps = _transpose_phase_taps(cfg.K_w, cfg.stride_w, cfg.pad_w_left, cfg.dilation_w)
+    y_out = nl.ndarray(shape=(B, C_out, 1, cfg.H_out, cfg.W_out), dtype=x_in.dtype, buffer=nl.shared_hbm)
+    _conv2d_transpose_banded_into(
+        y_out.reshape((B, C_out, cfg.H_out, cfg.W_out)), x_nchw, filters_hwio, bias_vec, cfg, col_taps
+    )
+    return y_out
+
+
+def _conv2d_transpose_banded_into(
+    y_out: nl.NkiTensor,
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
+    cfg: "_BandedTransposeConfig",
+    col_taps: list,
+) -> None:
+    """Compute the transposed convolution into y_out [B, C_out, H_out, W_out]."""
+    tile_cfg = _build_transpose_band_tile_config(cfg, sizeinbytes(x_in.dtype))
+
+    # SPMD sharding info: n_prgs = core count, prg_id = this core (0/1 at LNC=2).
+    _, n_prgs, prg_id = get_verified_program_sharding_info("conv3d_transpose", (0, 1))
+    work_start, work_end = _program_work_range(cfg.B * tile_cfg.block_count, n_prgs, prg_id)
+
+    if work_start < work_end:
+        stationaries = _load_band_stationaries(
+            filters, _transpose_stationary_dmas(cfg, tile_cfg), tile_cfg, cfg.C_in, cfg.C_out, cfg.K_w
+        )
+        bias_col = _load_partition_vector(bias, cfg.C_out, tile_cfg)
+        groups_per_block = tile_cfg.rows_per_block // cfg.stride_h
+        col_groups = div_ceil(cfg.W_out, cfg.stride_w)
+
+        for work_idx in range(work_start, work_end):
+            batch_idx = work_idx // tile_cfg.block_count
+            block_idx = work_idx % tile_cfg.block_count
+            row0 = tile_cfg.rows_per_block * block_idx
+            rows_valid = min(tile_cfg.rows_per_block, cfg.H_out - row0)
+            for window_idx in range(tile_cfg.window_count):
+                group0 = window_idx * tile_cfg.window_cols
+                groups = min(tile_cfg.window_cols, col_groups - group0)
+                col0 = cfg.stride_w * group0
+                cols = min(cfg.W_out, cfg.stride_w * (group0 + groups)) - col0
+                tiles = _load_band_input_tiles(
+                    x_in,
+                    batch_idx,
+                    groups_per_block * block_idx + cfg.row_shift_lo,
+                    group0 + cfg.col_shift_lo,
+                    groups + cfg.col_shift_hi - cfg.col_shift_lo,
+                    tile_cfg,
+                )
+                result = _alloc_band_result(cols, x_in.dtype, tile_cfg)
+                for chunk_start in range(0, groups, tile_cfg.chunk_cols):
+                    for phase in range(cfg.stride_w):
+                        phase_groups = min(groups, div_ceil(cfg.W_out - phase, cfg.stride_w) - group0)
+                        count = min(tile_cfg.chunk_cols, phase_groups - chunk_start)
+                        if count > 0:
+                            psum = nl.ndarray(
+                                (nl.tile_size.pmax, tile_cfg.chunk_cols), dtype=nl.float32, buffer=nl.psum
+                            )
+                            _transpose_band_matmuls(
+                                psum, stationaries, tiles, col_taps[phase], chunk_start, count, cfg, tile_cfg
+                            )
+                            _evict_band_psum(
+                                result,
+                                psum,
+                                bias_col,
+                                cfg.stride_w * chunk_start + phase,
+                                count,
+                                cfg.stride_w,
+                                tile_cfg,
+                                cfg.activation_fn,
+                            )
+                _store_band_rows(y_out, result, batch_idx, row0, rows_valid, col0, cols, tile_cfg)
+
+
+def _transpose_phase_taps(K: int, stride: int, pad_lo: int, dilation: int) -> list:
+    """
+    taps[p] = [(k, shift), ...]: output position stride * g + p reads input g + shift through tap k,
+    where stride * shift = p + pad_lo - dilation * k.
+    """
+    taps = []
+    for phase in range(stride):
+        phase_taps = []
+        for k_idx in range(K):
+            num = phase + pad_lo - dilation * k_idx
+            if num % stride == 0:
+                phase_taps.append((k_idx, num // stride))
+        taps.append(phase_taps)
+    return taps
+
+
+def _transpose_shift_range(K: int, stride: int, pad_lo: int, dilation: int) -> tuple[int, int]:
+    """(lowest, highest) input shift any tap of any phase reads."""
+    taps = _transpose_phase_taps(K, stride, pad_lo, dilation)
+    shift_lo = 0
+    shift_hi = 0
+    first = True
+    for phase in range(stride):
+        for tap_idx in range(len(taps[phase])):
+            shift = taps[phase][tap_idx][1]
+            if first:
+                shift_lo = shift
+                shift_hi = shift
+                first = False
+            shift_lo = min(shift_lo, shift)
+            shift_hi = max(shift_hi, shift)
+    return shift_lo, shift_hi
+
+
+def _build_conv2d_transpose_banded_config(
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
+    stride: tuple[int, int],
+    padding: tuple[int, int, int, int],
+    dilation: tuple[int, int],
+    output_padding: tuple[int, int],
+    activation_fn: Optional[ActFnType],
+    flip_filter_taps_in_kernel: bool,
+) -> _BandedTransposeConfig:
+    """
+    Build _BandedTransposeConfig from the input tensors and transposed convolution parameters.
+
+    Extracts dimensions from the input and filter shapes, computes the output spatial dimensions and
+    the range of input shifts the output phases read.
+    """
+    kernel_assert(len(x_in.shape) == 4, f"x_in must be [B, C_in, H, W], got shape {x_in.shape}")
+    kernel_assert(len(filters.shape) == 4, f"filters must be [K_h, K_w, C_in, C_out], got shape {filters.shape}")
+    kernel_assert(len(stride) == 2, f"stride must be (stride_h, stride_w), got {stride}")
+    kernel_assert(
+        len(padding) == 4,
+        f"padding must be (pad_h_top, pad_h_bottom, pad_w_left, pad_w_right), got {padding}",
+    )
+    kernel_assert(len(dilation) == 2, f"dilation must be (dilation_h, dilation_w), got {dilation}")
+    kernel_assert(len(output_padding) == 2, f"output_padding must be (out_pad_h, out_pad_w), got {output_padding}")
+    B, C_in, H, W = x_in.shape
+    K_h, K_w, _, C_out = filters.shape
+    stride_h, stride_w = stride
+    pad_h_top, pad_h_bottom, pad_w_left, pad_w_right = padding
+    dilation_h, dilation_w = dilation
+    out_pad_h, out_pad_w = output_padding
+    kernel_assert(stride_h >= 1 and stride_w >= 1, f"Stride must be >= 1, got {stride}")
+    kernel_assert(dilation_h >= 1 and dilation_w >= 1, f"Dilation must be >= 1, got {dilation}")
+    H_out = (H - 1) * stride_h - pad_h_top - pad_h_bottom + dilation_h * (K_h - 1) + out_pad_h + 1
+    W_out = (W - 1) * stride_w - pad_w_left - pad_w_right + dilation_w * (K_w - 1) + out_pad_w + 1
+    row_shift_lo, row_shift_hi = _transpose_shift_range(K_h, stride_h, pad_h_top, dilation_h)
+    col_shift_lo, col_shift_hi = _transpose_shift_range(K_w, stride_w, pad_w_left, dilation_w)
+    return _BandedTransposeConfig(
+        B=B,
+        C_in=C_in,
+        C_out=C_out,
+        H=H,
+        W=W,
+        K_h=K_h,
+        K_w=K_w,
+        H_out=H_out,
+        W_out=W_out,
+        stride_h=stride_h,
+        stride_w=stride_w,
+        pad_h_top=pad_h_top,
+        pad_h_bottom=pad_h_bottom,
+        pad_w_left=pad_w_left,
+        pad_w_right=pad_w_right,
+        dilation_h=dilation_h,
+        dilation_w=dilation_w,
+        out_pad_h=out_pad_h,
+        out_pad_w=out_pad_w,
+        flip_filter_taps_in_kernel=flip_filter_taps_in_kernel,
+        has_bias=bias != None,
+        activation_fn=activation_fn,
+        row_shift_lo=row_shift_lo,
+        row_shift_hi=row_shift_hi,
+        col_shift_lo=col_shift_lo,
+        col_shift_hi=col_shift_hi,
+    )
+
+
+def _build_transpose_band_tile_config(cfg: _BandedTransposeConfig, compute_bytes: int) -> _BandTileConfig:
+    """
+    Plan the band tiling of a transposed convolution.
+
+    A block holds a multiple of stride_h output rows, i.e. whole row phases, so every block starts on
+    phase 0 and shares one set of stationaries. Its rows_per_block / stride_h row groups read
+    rows_per_block / stride_h + (row_shift_hi - row_shift_lo) input rows. Windows and chunks count
+    column groups.
+    """
+    pmax = nl.tile_size.pmax
+    rows_per_tile = pmax // cfg.C_in
+    rows_max = (pmax // cfg.C_out) // cfg.stride_h * cfg.stride_h
+    rows_per_block = _balanced_rows(cfg.H_out, rows_max, cfg.stride_h)
+    epilogue = _band_epilogue(cfg.activation_fn)
+    col_groups = div_ceil(cfg.W_out, cfg.stride_w)
+    chunk_cols = _pick_chunk_cols(col_groups)
+    budget = nl.tile_size.sbuf_fmax_bytes - _BAND_SBUF_RESERVE
+    window_cols = 0
+    span = 0
+    tiles_per_block = 0
+    while window_cols == 0 and rows_per_block >= cfg.stride_h:
+        span = rows_per_block // cfg.stride_h + cfg.row_shift_hi - cfg.row_shift_lo
+        tiles_per_block = div_ceil(span, rows_per_tile)
+        fixed = _band_fixed_bytes(tiles_per_block * cfg.K_w, rows_per_block * cfg.C_out, compute_bytes)
+        window_cols = _fit_window_cols(
+            col_groups,
+            chunk_cols,
+            budget - fixed,
+            tiles_per_block * compute_bytes + cfg.stride_w * compute_bytes,
+            tiles_per_block * compute_bytes * (cfg.col_shift_hi - cfg.col_shift_lo),
+        )
+        if window_cols == 0:
+            rows_per_block = rows_per_block - cfg.stride_h
+    kernel_assert(
+        window_cols > 0,
+        f"conv3d_transpose (banded): the banded stationaries of K_h={cfg.K_h}, K_w={cfg.K_w}, C_in={cfg.C_in}, "
+        f"C_out={cfg.C_out} do not fit the SBUF budget even with one row phase group per block.",
+    )
+    return _BandTileConfig(
+        rows_per_tile=rows_per_tile,
+        rows_per_block=rows_per_block,
+        block_count=div_ceil(cfg.H_out, rows_per_block),
+        block_span=span,
+        tiles_per_block=tiles_per_block,
+        out_partitions=rows_per_block * cfg.C_out,
+        stationary_count=tiles_per_block * cfg.K_w,
+        taps_folded=1,
+        rows_reversed=not cfg.flip_filter_taps_in_kernel,
+        chunk_cols=min(chunk_cols, window_cols),
+        window_cols=window_cols,
+        window_count=div_ceil(col_groups, window_cols),
+        epilogue=epilogue,
+    )
+
+
+def _transpose_stationary_dmas(cfg: _BandedTransposeConfig, tile_cfg: _BandTileConfig) -> list:
+    """
+    Filter-row DMAs that build the transposed conv's banded stationaries.
+
+    Contraction row j of tile t holds block input row s = t * rows_per_tile + j, i.e. input row
+    q0 + row_shift_lo + s for the block's first row group q0. Output row r = stride_h * g + a of the
+    block reads it through filter row k_h with stride_h * (s + row_shift_lo - g) = a + pad_h_top -
+    dilation_h * k_h, so k_h grows with r. Filters stored flipped (flip_filter_taps_in_kernel False)
+    hold tap k_h at K_h - 1 - k_h; their rows go to reversed slots so every DMA stride stays positive.
+    """
+    dmas = []
+    for tile_idx in range(tile_cfg.tiles_per_block):
+        for row_idx in range(tile_cfg.rows_per_tile):
+            in_row = tile_idx * tile_cfg.rows_per_tile + row_idx
+            if in_row < tile_cfg.block_span:
+                slots = []
+                k_rows = []
+                for slot in range(tile_cfg.rows_per_block):
+                    out_row = slot
+                    if tile_cfg.rows_reversed:
+                        out_row = tile_cfg.rows_per_block - 1 - slot
+                    shift = in_row + cfg.row_shift_lo - out_row // cfg.stride_h
+                    num = out_row % cfg.stride_h + cfg.pad_h_top - cfg.stride_h * shift
+                    if num >= 0 and num % cfg.dilation_h == 0 and num // cfg.dilation_h < cfg.K_h:
+                        k_row = num // cfg.dilation_h
+                        if not cfg.flip_filter_taps_in_kernel:
+                            k_row = cfg.K_h - 1 - k_row
+                        slots.append(slot)
+                        k_rows.append(k_row)
+                _append_band_dma(dmas, tile_idx, row_idx, slots, k_rows)
+    return dmas
+
+
+def _transpose_band_matmuls(
+    psum: nl.NkiTensor,
+    stationaries: nl.NkiTensor,
+    tiles: list,
+    phase_taps: list,
+    chunk_start: int,
+    count: int,
+    cfg: _BandedTransposeConfig,
+    tile_cfg: _BandTileConfig,
+) -> None:
+    """Accumulate one column phase over one chunk of column groups: the block's tiles x the phase's taps."""
+    parts = tile_cfg.out_partitions
+    for list_idx in range(len(tiles)):
+        tile = tiles[list_idx][0]
+        tile_rows = tiles[list_idx][1]
+        tile_idx = tiles[list_idx][2]
+        for tap_idx in range(len(phase_taps)):
+            k_w_idx = phase_taps[tap_idx][0]
+            col_start = chunk_start + phase_taps[tap_idx][1] - cfg.col_shift_lo
+            k_w_slot = k_w_idx
+            if not cfg.flip_filter_taps_in_kernel:
+                k_w_slot = cfg.K_w - 1 - k_w_idx
+            nisa.nc_matmul(
+                dst=psum[0:parts, 0:count],
+                stationary=stationaries[0:tile_rows, tile_idx * cfg.K_w + k_w_slot, 0:parts],
+                moving=tile[0:tile_rows, col_start : col_start + count],
+                accumulate=(list_idx > 0 or tap_idx > 0),
+            )

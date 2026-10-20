@@ -34,6 +34,9 @@ def conv3d(
     running_means=None, running_variances=None,
     # Fused residual add (residuals_in is required whenever residual_add_loc is not NONE):
     residual_add_loc=ResidualAddLoc.NONE, residuals_in=None,
+    sbm=None, use_auto_allocation=False,
+    # Grouped and depthwise 2D layers, trn2 only (see below):
+    groups=1,
 ) -> y_out  # or a 5- / 6-tuple in BatchNormMode.TRAINING (see below)
 ```
 
@@ -53,7 +56,7 @@ W_out = (W + pad_w_left + pad_w_right - dilation_w * (K_w - 1) - 1) // stride_w 
 | Tensor  | Shape                              | Notes |
 |---------|------------------------------------|-------|
 | Input   | `[B, C_in, D, H, W]`              | Standard channels-first, unchanged from PyTorch |
-| Filters | `[K_d, K_h, K_w, C_in, C_out]`    | Reshaped from PyTorch's `[C_out, C_in, K_d, K_h, K_w]` |
+| Filters | `[K_d, K_h, K_w, C_in, C_out]`    | Reshaped from PyTorch's `[C_out, C_in, K_d, K_h, K_w]`; `C_in / groups` instead of `C_in` with `groups > 1` |
 | Bias    | `[C_out]`                          | Standard 1D, unchanged from PyTorch |
 | Residual| `[B, C_out, D_out, H_out, W_out]` | Same layout as the output (only with a fused residual add) |
 | Output  | `[B, C_out, D_out, H_out, W_out]` | Standard channels-first, unchanged from PyTorch |
@@ -61,6 +64,18 @@ W_out = (W + pad_w_left + pad_w_right - dilation_w * (K_w - 1) - 1) // stride_w 
 The input, output, and bias tensors use the same layout as standard PyTorch convolution.
 
 The filter tensor is reshaped to `[K_d, K_h, K_w, C_in, C_out]`. This is done because for a given filter position `(k_d, k_h, k_w)`, we need to load a `[C_in, C_out]` slice as the stationary tensor for the matmul. With this layout, the `C_in` and `C_out` dimensions are contiguous in memory for each filter position, making the DMA copies to load filters into SBUF more efficent. As filters are a weight this reshape can be done once on host at a negligible amortized cost.
+
+### Routing thin 2D layers to the row-banded kernel
+
+On trn2, not every call runs the strategy described in the rest of this document. A 2D call (`D = 1`, `K_d = 1`) of a thin layer with wide rows is handed to `_conv3d_banded_compute` (`conv3d_kernels.py`), which stacks image rows next to the channels on the tensor engine and needs no per-tap input copies. `_banded_wins` decides: bf16 or fp16, at most 64 channels in and out, unit dilation, strides up to 2, filters up to 8 x 8, no fused batchnorm or residual, no `SquaredReLU`, no caller-provided `sbm`, and a cost model (`_banded_cost_wins`) that expects the banded path to be at least 1.2x faster on a layer with enough work. Layers with 33 to 64 input channels stay off the banded path once a program holds two or more images (`ceil(B / n_prgs) >= 2`): the low-channel path then packs two images onto the tensor engine with no zero blocks, which beats the band's 75% density for 3 x 3 filters. Every other call runs the strategy of this document, unchanged.
+
+The signature, the output shape and the dtype do not change, and the routed result is equal up to rounding (fp32 accumulation in a different order, so a few elements differ by under one ulp). A caller-provided `sbm` keeps the original path, which is the way to force it for an A/B comparison. `conv3d_transpose` routes thin stride-2 upsamplers to `_conv3d_transpose_banded` in the same way (`_banded_transpose_wins`).
+
+### Grouped and depthwise 2D layers (`groups > 1`)
+
+The strategy of this document contracts over `C_in`, which a grouped layer splits into `groups` independent slices (one channel per slice for depthwise), so it has no grouped mapping of its own. With `groups > 1`, `conv3d` hands the call to `_conv3d_grouped_compute` (`conv3d_kernels.py`), which puts each input channel's block of image rows on the contraction partitions and builds block-diagonal banded filter matrices on chip, several groups per pass. Depthwise layers with small planes and many channels run instead with one whole plane per partition and diagonal stationaries when its cost model (`_grouped_planes_cheaper`) expects that to be faster, and one-row depthwise layers (`H = 1`, `K_h = 1`) use diagonal stationaries directly. The filters are then `[K_d, K_h, K_w, C_in / groups, C_out]` (PyTorch's `Conv3d(groups=...)` weight `[C_out, C_in / groups, K_d, K_h, K_w]` permuted the same way), and output channel `o` reads input channels `(o // (C_out / groups)) * (C_in / groups) + i`. Grouped calls must be 2D (`D = 1`, `K_d = 1`, no depth padding) on trn2, without fused batchnorm or residual add, `SquaredReLU` or a caller-provided `sbm`, with at most 128 channels per group; anything else is rejected while tracing (`_validate_grouped_inputs`). `groups = 1`, the default, runs as before.
+
+`depthwise_conv1d_implicit_gemm` routes its trn2 calls with at least 128 channels, at most 512 taps and at least 16 outputs whose tiles fit in SBUF to the same path's one-row diagonal mapping (`_depthwise_conv1d_grouped_compute`, decided by `_grouped_1d_wins`): 128 channels per matmul, one matmul per tap, each channel's row loaded once.
 
 ### Tiling Strategy
 

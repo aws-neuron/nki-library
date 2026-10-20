@@ -17,10 +17,12 @@
 from typing import Optional
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.allocator import SbufManager
 from ...core.utils.common_types import ActFnType
+from ...core.utils.kernel_helpers import get_verified_program_sharding_info
 from ...core.utils.logging import get_logger
 from .conv3d_helpers import (
     BatchNormMode,
@@ -33,7 +35,15 @@ from .conv3d_helpers import (
     apply_bn_rescale,
     compute_bn_momentum_update,
 )
-from .conv3d_kernels import _LOW_CHAN_MAX, _conv3d_fallback_compute, _conv3d_low_chan_compute
+from .conv3d_kernels import (
+    _LOW_CHAN_MAX,
+    _banded_wins,
+    _conv3d_banded_compute,
+    _conv3d_fallback_compute,
+    _conv3d_grouped_compute,
+    _conv3d_low_chan_compute,
+    _validate_grouped_inputs,
+)
 
 
 @nki.jit
@@ -58,6 +68,7 @@ def conv3d(
     residuals_in: Optional[nl.NkiTensor] = None,
     sbm: Optional[SbufManager] = None,
     use_auto_allocation: bool = False,
+    groups: int = 1,
 ) -> nl.NkiTensor:
     """
     3D Convolution using tensor engine with K-replication strategy and W-contiguous tiling.
@@ -66,6 +77,14 @@ def conv3d(
     using a K-replication strategy for filter loading and W-contiguous tiling for output
     computation. Supports configurable stride, padding, dilation, optional bias, and
     optional activation function.
+    On trn2, a 2D call (D = 1, K_d = 1) of a thin layer (at most 64 channels) with wide rows runs on the row-banded
+    path of _conv3d_banded_compute (image rows stacked on the tensor engine, no per-tap input copies) when the cost model in
+    _banded_wins expects that to be faster. The result is equal up to rounding: 16-bit operands and fp32 PSUM
+    accumulation as here, in a different summation order, so a few elements differ by under one ulp. A caller-provided
+    sbm keeps the original path.
+    Grouped and depthwise layers (groups > 1) run on the block-diagonal banded path of _conv3d_grouped_compute, which
+    supports 2D calls (D = 1, K_d = 1, no depth padding) on trn2 without fused batchnorm, residual add, SquaredReLU or
+    a caller-provided sbm; such calls are rejected while tracing.
 
     Intended Usage Range:
         B: 1-128
@@ -91,7 +110,8 @@ def conv3d(
 
     Args:
         x_in (nl.NkiTensor): [B, C_in, D, H, W], Input tensor on HBM.
-        filters (nl.NkiTensor): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM.
+        filters (nl.NkiTensor): [K_d, K_h, K_w, C_in, C_out], Filter weights on HBM;
+            [K_d, K_h, K_w, C_in / groups, C_out] with groups > 1.
         bias (Optional[nl.NkiTensor]): [C_out], Optional bias tensor on HBM.
         stride (tuple[int, int, int]): (stride_d, stride_h, stride_w), Convolution strides.
         padding (tuple[int, int, int, int, int, int]): (pad_d_left, pad_d_right, pad_h_top,
@@ -152,6 +172,9 @@ def conv3d(
         sbm (Optional[SbufManager]): Optional caller-provided SBUF manager for allocation. When
             provided, its allocation mode must match use_auto_allocation.
         use_auto_allocation (bool): Whether to use auto allocation for SBUF buffers.
+        groups (int): Number of channel groups; C_in and C_out must be multiples of it. Output channel o reads input
+            channels (o // (C_out / groups)) * (C_in / groups) + i, as in torch.nn.Conv3d(groups=groups). groups > 1
+            runs on _conv3d_grouped_compute (see above). Default 1.
 
     Returns:
         y_out (nl.NkiTensor): [B, C_out, D_out, H_out, W_out], Output tensor on HBM. NONE and
@@ -230,6 +253,11 @@ def conv3d(
         residual_add_loc=residual_add_loc,
         transpose_taps=False,
     )
+    if groups != 1:
+        _validate_grouped_inputs(
+            x_in=x_in, filters=filters, bias=bias, cfg=cfg, groups=groups, has_caller_sbm=sbm != None
+        )
+        return _conv3d_grouped_compute(x_in=x_in, filters=filters, bias=bias, cfg=cfg, groups=groups)
     _validate_conv3d_inputs(
         x_in=x_in,
         filters=filters,
@@ -242,6 +270,9 @@ def conv3d(
         residuals_in=residuals_in,
         transpose_taps=False,
     )
+    _, n_prgs, _ = get_verified_program_sharding_info("conv3d", (0, 1))
+    if nisa.get_nc_version() == nisa.nc_version.gen3 and _banded_wins(cfg, x_in.dtype, sbm != None, n_prgs):
+        return _conv3d_banded_compute(x_in, filters, bias, cfg)
 
     conv_out = nl.ndarray(
         shape=(cfg.B, cfg.C_out, cfg.D_out, cfg.H_out, cfg.W_out),

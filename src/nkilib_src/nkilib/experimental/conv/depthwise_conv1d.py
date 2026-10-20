@@ -20,6 +20,8 @@ import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
+from ...core.utils.logging import get_logger
+from .conv3d_kernels import _depthwise_conv1d_grouped_compute, _grouped_1d_wins
 
 
 @nki.jit
@@ -70,6 +72,10 @@ def depthwise_conv1d_implicit_gemm(
         output (nl.NkiTensor): [N, C, 1, Q], Convolution output on HBM where Q = (W + W_pad_l + W_pad_r - S) // stride_w + 1
 
     Notes:
+        - On trn2, calls with at least 128 channels, at most 512 taps and at least 16 outputs whose tiles fit in SBUF
+          run on the one-row diagonal path of conv3d's grouped path (_depthwise_conv1d_grouped_compute in
+          conv3d_kernels.py: 128 channels per matmul, one matmul per tap, each channel's row loaded once), see
+          _grouped_1d_wins; the result is equal up to the summation order of the fp32 PSUM accumulation.
         - Only supports stride_h=1, stride_w can be any positive integer
         - Only supports zero padding
         - Requires C to be divisible by NUM_SHARDS (2)
@@ -119,6 +125,9 @@ def depthwise_conv1d_implicit_gemm(
         feature_group_count == C,
         f"Only depthwise convolution is supported (feature_group_count must equal C={C}), got {feature_group_count}",
     )
+    if nisa.get_nc_version() == nisa.nc_version.gen3 and _grouped_1d_wins(img_ref, filter_ref, padding, stride):
+        get_logger("depthwise_conv1d").info("diagonal path (_depthwise_conv1d_grouped_compute), see _grouped_1d_wins")
+        return _depthwise_conv1d_grouped_compute(img_ref, filter_ref, padding, stride)
 
     """
     Calculate tiling parameters for depthwise convolution.

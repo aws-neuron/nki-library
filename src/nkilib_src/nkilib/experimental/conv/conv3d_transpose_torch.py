@@ -74,7 +74,8 @@ def conv3d_transpose_torch_ref(
                 - "KDHW_CI_CO": [K_d, K_h, K_w, C_in, C_out]
                 - "KDHW_CO_CI": [K_d, K_h, K_w, C_out, C_in]
         bias (Optional[torch.Tensor]): Optional bias of shape [C_out].
-        stride, padding, dilation: Forward-conv hyperparameters.
+        stride, padding, dilation: Forward-conv hyperparameters. padding is (pad_d_lo, pad_d_hi, pad_h_lo, pad_h_hi,
+            pad_w_lo, pad_w_hi); where lo != hi on an axis the result is the unpadded output cropped by (lo, hi).
         output_padding: Extra size added to the output spatial dims.
         activation_fn: Optional activation applied after ConvTranspose3d.
         lnc_shard: Does nothing. Will be deprecated next release.
@@ -88,9 +89,9 @@ def conv3d_transpose_torch_ref(
     w_ci_co_kdhw = _filters_to_co_ci_kdhw(filters, filter_shape, flip_filter_taps_in_kernel)
     C_in, C_out, K_d, K_h, K_w = w_ci_co_kdhw.shape
     pad_d_lo, pad_d_hi, pad_h_lo, pad_h_hi, pad_w_lo, pad_w_hi = padding
-    if pad_d_lo != pad_d_hi or pad_h_lo != pad_h_hi or pad_w_lo != pad_w_hi:
-        raise ValueError(f"conv3d_transpose_torch_ref only supports symmetric padding per dimension, got {padding}")
-    conv_padding = (pad_d_lo, pad_h_lo, pad_w_lo)
+    # ConvTranspose3d pads symmetrically; an asymmetric padding is the unpadded output cropped by (lo, hi) per axis.
+    asymmetric = pad_d_lo != pad_d_hi or pad_h_lo != pad_h_hi or pad_w_lo != pad_w_hi
+    conv_padding = (0, 0, 0) if asymmetric else (pad_d_lo, pad_h_lo, pad_w_lo)
 
     conv_t = nn.ConvTranspose3d(
         in_channels=C_in,
@@ -106,9 +107,17 @@ def conv3d_transpose_torch_ref(
     with torch.no_grad():
         conv_t.weight.copy_(w_ci_co_kdhw)
         if bias is not None:
-            conv_t.bias.copy_(bias)
+            conv_t.bias.copy_(bias.reshape(-1)[:C_out])  # the kernel reads the first C_out elements
 
     output = conv_t(x_in)
+    if asymmetric:
+        output = output[
+            :,
+            :,
+            pad_d_lo : output.shape[2] - pad_d_hi,
+            pad_h_lo : output.shape[3] - pad_h_hi,
+            pad_w_lo : output.shape[4] - pad_w_hi,
+        ]
 
     if activation_fn is not None:
         if activation_fn == ActFnType.SiLU:

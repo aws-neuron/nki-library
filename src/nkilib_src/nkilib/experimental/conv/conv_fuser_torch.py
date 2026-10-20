@@ -47,6 +47,7 @@ def conv_fuser_torch_ref(
     use_auto_allocation: bool = False,
     residual_add_loc: ResidualAddLoc = ResidualAddLoc.NONE,
     residuals_in: Optional[torch.Tensor] = None,
+    groups: int = 1,
 ) -> dict[str, torch.Tensor]:
     """
     PyTorch reference implementation of ConvFuser model.
@@ -67,6 +68,8 @@ def conv_fuser_torch_ref(
             (not at all), PRE_ACT (before) or POST_ACT (after). Default ResidualAddLoc.NONE.
         residuals_in (Optional[torch.Tensor]): [B, C_out, 1, H_out, W_out] residual tensor added to
             the output. Required when residual_add_loc is not NONE. Default None.
+        groups (int): Must be 1, the ConvFuser convolution is dense; accepted for signature parity with the
+            kernel. Default 1.
 
     Returns:
         dict[str, torch.Tensor]: Dictionary with key "out" containing output tensor of shape
@@ -86,6 +89,7 @@ def conv_fuser_torch_ref(
     kernel_assert(activation_fn == ActFnType.ReLU, f"Activation function must be relu, got {activation_fn}")
     kernel_assert(batch_norm_mode.is_fused(), f"batch_norm_mode must be EVAL or TRAINING, got {batch_norm_mode}")
     kernel_assert(bias == None, f"bias must be None, got {bias}")
+    kernel_assert(groups == 1, f"groups must be 1, got {groups}")
 
     # Create the convfuser layers
     conv = nn.Conv2d(C_in, C_out, kernel_size=3, stride=1, padding=1, dilation=1, bias=False)
