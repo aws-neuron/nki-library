@@ -17,6 +17,7 @@
 from typing import Optional
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.allocator import SbufManager
@@ -33,7 +34,13 @@ from .conv3d_helpers import (
     apply_bn_rescale,
     compute_bn_momentum_update,
 )
-from .conv3d_kernels import _LOW_CHAN_MAX, _conv3d_fallback_compute, _conv3d_low_chan_compute
+from .conv3d_kernels import (
+    _LOW_CHAN_MAX,
+    _banded_wins,
+    _conv3d_banded_compute,
+    _conv3d_fallback_compute,
+    _conv3d_low_chan_compute,
+)
 
 
 @nki.jit
@@ -66,6 +73,11 @@ def conv3d(
     using a K-replication strategy for filter loading and W-contiguous tiling for output
     computation. Supports configurable stride, padding, dilation, optional bias, and
     optional activation function.
+    On trn2, a 2D call (D = 1, K_d = 1) of a thin layer (at most 64 channels) with wide rows runs on the row-banded
+    path of _conv3d_banded_compute (image rows stacked on the tensor engine, no per-tap input copies) when the cost model in
+    _banded_wins expects that to be faster. The result is equal up to rounding: 16-bit operands and fp32 PSUM
+    accumulation as here, in a different summation order, so a few elements differ by under one ulp. A caller-provided
+    sbm keeps the original path.
 
     Intended Usage Range:
         B: 1-128
@@ -242,6 +254,8 @@ def conv3d(
         residuals_in=residuals_in,
         transpose_taps=False,
     )
+    if nisa.get_nc_version() == nisa.nc_version.gen3 and _banded_wins(cfg, x_in.dtype, sbm != None):
+        return _conv3d_banded_compute(x_in, filters, bias, cfg)
 
     conv_out = nl.ndarray(
         shape=(cfg.B, cfg.C_out, cfg.D_out, cfg.H_out, cfg.W_out),

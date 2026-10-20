@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Conv3D supported-shape limits, asserted on the pure config builders without allocating tensors."""
+"""Conv3D supported-shape limits and the routing to the row-banded path, asserted on the pure config builders
+without allocating tensors."""
 
+import itertools
 from typing import cast
 
 import nki
@@ -23,12 +25,20 @@ from nkilib_src.nkilib.core.utils.allocator import sizeinbytes
 from nkilib_src.nkilib.core.utils.common_types import ActFnType
 from nkilib_src.nkilib.experimental.conv.conv3d import (
     BatchNormMode,
+    Conv3dConfig,
     ResidualAddLoc,
 )
 from nkilib_src.nkilib.experimental.conv.conv3d_helpers import (
     _build_conv3d_config,
     _build_memory_config,
     _build_tile_config,
+)
+from nkilib_src.nkilib.experimental.conv.conv3d_kernels import _banded_wins, _build_conv2d_band_tile_config
+from nkilib_src.nkilib.experimental.conv.conv3d_transpose import (
+    _banded_transpose_wins,
+    _build_conv2d_transpose_banded_config,
+    _build_transpose_band_tile_config,
+    _transpose_phase_taps,
 )
 
 
@@ -150,3 +160,459 @@ def test_training_batch_bound_is_exact():
         else:
             hi = mid
     assert builds(lo) and not builds(lo + 1), f"bound is not a clean boundary at B={lo}"
+
+
+def _on_host(decide):
+    """Run decide() under a simulator backend (nl.tile_size needs one) and return its result."""
+    result = {}
+
+    def traced():
+        result["value"] = decide()
+        return nl.ndarray(shape=(1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    nki.simulate(traced)()
+    return result["value"]
+
+
+# (C_in, C_out, K, stride, H, W, measured speedup of the banded path over conv3d), 3 x 3 stride 1 unless noted,
+# bf16, one trn2 core, filter K x K with padding K // 2 (bench_conv.py: grid h<C>_<W>, u_*, g_*, k_*, sh*_<H>).
+_BANDED_MEASURED = [
+    (16, 16, 3, 1, 368, 120, 0.50),
+    (16, 16, 3, 1, 368, 240, 0.89),
+    (16, 16, 3, 1, 368, 480, 1.69),
+    (16, 16, 3, 1, 368, 640, 2.31),
+    (16, 16, 3, 1, 368, 960, 3.34),
+    (16, 16, 3, 1, 368, 1920, 6.17),
+    (32, 32, 3, 1, 368, 120, 0.39),
+    (32, 32, 3, 1, 368, 240, 0.71),
+    (32, 32, 3, 1, 368, 480, 1.36),
+    (32, 32, 3, 1, 368, 640, 1.93),
+    (32, 32, 3, 1, 368, 960, 2.65),
+    (32, 32, 3, 1, 368, 1920, 4.10),
+    (64, 64, 3, 1, 368, 120, 0.41),
+    (64, 64, 3, 1, 368, 240, 0.78),
+    (64, 64, 3, 1, 368, 480, 1.50),
+    (64, 64, 3, 1, 368, 640, 2.06),
+    (64, 64, 3, 1, 368, 960, 2.57),
+    (64, 64, 3, 1, 368, 1920, 3.25),
+    (128, 128, 3, 1, 368, 120, 0.23),
+    (128, 128, 3, 1, 368, 480, 0.69),
+    (128, 128, 3, 1, 368, 640, 1.50),
+    (128, 128, 3, 1, 368, 960, 1.04),
+    (128, 128, 3, 1, 368, 1920, 1.05),
+    (16, 16, 3, 1, 736, 960, 3.34),
+    (3, 16, 3, 2, 1472, 1920, 9.4),
+    (16, 32, 3, 2, 736, 960, 1.62),
+    (32, 64, 3, 2, 368, 480, 0.77),
+    (64, 128, 3, 2, 184, 240, 0.45),
+    (64, 64, 3, 1, 184, 240, 0.79),
+    (128, 128, 3, 1, 92, 120, 0.33),
+    (16, 3, 3, 1, 1472, 1920, 12.5),
+    (3, 64, 7, 2, 1088, 1920, 12.1),
+    (16, 16, 5, 1, 540, 960, 8.0),
+    (32, 16, 1, 1, 540, 960, 1.89),
+    (8, 32, 3, 1, 1152, 1104, 3.5),
+    (64, 64, 3, 1, 92, 480, 1.48),
+    (16, 16, 3, 1, 8, 512, 1.02),
+    (16, 16, 3, 1, 16, 512, 0.96),
+    (16, 16, 3, 1, 32, 512, 1.28),
+    (16, 16, 3, 1, 64, 512, 1.74),
+    (64, 64, 3, 1, 8, 640, 0.96),
+    (64, 64, 3, 1, 16, 640, 1.08),
+    (64, 64, 3, 1, 32, 640, 1.77),
+]
+# The cost model may send a layer to the banded path only when that path won by at least this much.
+_BANDED_MIN_ROUTED_SPEEDUP = 1.2
+# Layers within this much of the break-even must stay on conv3d.
+_BANDED_NO_GAIN = 1.05
+
+
+def _banded_conv3d_config(
+    C_in=16,
+    C_out=16,
+    K=3,
+    stride=1,
+    H=128,
+    W=640,
+    B=1,
+    activation_fn=None,
+    batch_norm_mode=BatchNormMode.NONE,
+    residual_add_loc=ResidualAddLoc.NONE,
+    D=1,
+    K_d=1,
+    dilation=1,
+    pad_d=0,
+    K_w=None,
+    pads=None,
+    stride_w=None,
+) -> Conv3dConfig:
+    """
+    A Conv3dConfig for a K x K_w filter (K_w defaults to K) with padding (top, bottom, left, right), by default
+    K // 2 on every side, as bench_conv.py builds its layers. stride_w defaults to stride.
+    """
+    K_w = K if K_w is None else K_w
+    stride_w = stride if stride_w is None else stride_w
+    pad_top, pad_bottom, pad_left, pad_right = (K // 2, K // 2, K_w // 2, K_w // 2) if pads is None else pads
+    H_out = (H + pad_top + pad_bottom - dilation * (K - 1) - 1) // stride + 1
+    W_out = (W + pad_left + pad_right - dilation * (K_w - 1) - 1) // stride_w + 1
+    D_out = (D + 2 * pad_d - (K_d - 1) - 1) + 1
+    return Conv3dConfig(
+        stride_d=1,
+        stride_h=stride,
+        stride_w=stride_w,
+        pad_d_left=pad_d,
+        pad_d_right=pad_d,
+        pad_h_top=pad_top,
+        pad_h_bottom=pad_bottom,
+        pad_w_left=pad_left,
+        pad_w_right=pad_right,
+        dilation_d=1,
+        dilation_h=dilation,
+        dilation_w=dilation,
+        has_bias=True,
+        has_activation=activation_fn is not None,
+        activation_fn=activation_fn,
+        batch_norm_mode=batch_norm_mode,
+        output_pre_norm=False,
+        residual_add_loc=residual_add_loc,
+        B=B,
+        C_in=C_in,
+        C_out=C_out,
+        D=D,
+        H=H,
+        W=W,
+        K_d=K_d,
+        K_h=K,
+        K_w=K_w,
+        D_out=D_out,
+        H_out=H_out,
+        W_out=W_out,
+    )
+
+
+@pytest.mark.fast
+def test_routed_layers_are_never_slower_on_measured_points():
+    """Every measured layer: routed implies the banded path won clearly, and a layer without a gain is not routed."""
+
+    def decide():
+        return [
+            _banded_wins(
+                _banded_conv3d_config(C_in=c_in, C_out=c_out, K=k, stride=stride, H=h, W=w), nl.bfloat16, False
+            )
+            for c_in, c_out, k, stride, h, w, _ in _BANDED_MEASURED
+        ]
+
+    routed = _on_host(decide)
+    for (c_in, c_out, k, stride, h, w, speedup), is_routed in zip(_BANDED_MEASURED, routed, strict=True):
+        layer = f"{c_in}->{c_out} k{k} s{stride} {h}x{w}"
+        if is_routed:
+            assert speedup >= _BANDED_MIN_ROUTED_SPEEDUP, f"{layer} routed to the banded path but measured {speedup}x"
+        if speedup < _BANDED_NO_GAIN:
+            assert not is_routed, f"{layer} routed to the banded path but measured {speedup}x"
+    assert sum(routed) >= 15, "the cost model should still route the wide thin layers"
+
+
+@pytest.mark.fast
+def test_thin_wide_layer_is_routed_and_the_rest_are_not():
+    def decide():
+        return {
+            "thin_wide": _banded_wins(_banded_conv3d_config(), nl.bfloat16, False),
+            "fp16": _banded_wins(_banded_conv3d_config(), nl.float16, False),
+            "fp32": _banded_wins(_banded_conv3d_config(), nl.float32, False),
+            "narrow": _banded_wins(_banded_conv3d_config(W=128), nl.bfloat16, False),
+            "few_rows": _banded_wins(_banded_conv3d_config(H=8), nl.bfloat16, False),
+            "channels_128": _banded_wins(_banded_conv3d_config(C_in=128, C_out=128, W=960), nl.bfloat16, False),
+            "caller_sbm": _banded_wins(_banded_conv3d_config(), nl.bfloat16, True),
+            "batch_norm": _banded_wins(_banded_conv3d_config(batch_norm_mode=BatchNormMode.EVAL), nl.bfloat16, False),
+            "residual": _banded_wins(
+                _banded_conv3d_config(residual_add_loc=ResidualAddLoc.POST_ACT), nl.bfloat16, False
+            ),
+            "squared_relu": _banded_wins(
+                _banded_conv3d_config(activation_fn=ActFnType.SquaredReLU), nl.bfloat16, False
+            ),
+            "relu": _banded_wins(_banded_conv3d_config(activation_fn=ActFnType.ReLU), nl.bfloat16, False),
+            "unequal_strides": _banded_wins(
+                _banded_conv3d_config(
+                    C_in=16, C_out=16, K=5, K_w=3, stride=2, stride_w=1, H=128, W=640, pads=(2, 1, 0, 2)
+                ),
+                nl.bfloat16,
+                False,
+            ),
+            "depth": _banded_wins(_banded_conv3d_config(D=4, K_d=3), nl.bfloat16, False),
+            "depth_padding": _banded_wins(_banded_conv3d_config(pad_d=1), nl.bfloat16, False),
+            "dilated": _banded_wins(_banded_conv3d_config(dilation=2), nl.bfloat16, False),
+            "stride_3": _banded_wins(_banded_conv3d_config(stride=3, W=1920), nl.bfloat16, False),
+            "filter_9": _banded_wins(_banded_conv3d_config(K=9), nl.bfloat16, False),
+            "batch_17": _banded_wins(_banded_conv3d_config(B=17), nl.bfloat16, False),
+        }
+
+    decision = _on_host(decide)
+    assert decision["thin_wide"] and decision["fp16"] and decision["relu"] and decision["unequal_strides"]
+    assert not decision["fp32"]
+    for name in (
+        "narrow",
+        "few_rows",
+        "channels_128",
+        "caller_sbm",
+        "batch_norm",
+        "residual",
+        "squared_relu",
+        "depth",
+        "depth_padding",
+        "dilated",
+        "stride_3",
+        "filter_9",
+        "batch_17",
+    ):
+        assert not decision[name], name
+
+
+@pytest.mark.fast
+def test_every_routed_layer_has_a_banded_plan():
+    """
+    The router must never turn a call conv3d accepts into a failure: every layer it routes, over a grid of channel
+    counts, filters, strides, paddings and image sizes up to the routing limits, has a band plan.
+    """
+    channels = (1, 3, 16, 33, 64)
+    filters = ((1, 1), (2, 2), (3, 3), (5, 5), (7, 7), (8, 8), (1, 7), (7, 1), (3, 8))
+    layers = list(
+        itertools.product(channels, channels, filters, (1, 2), (False, True), (64, 4096), (300, 1024, 4096), (1, 16))
+    )
+
+    def decide():
+        routed = 0
+        unplanned = []
+        for c_in, c_out, (k_h, k_w), stride, unpadded, h, w, batch in layers:
+            pads = (0, 0, 0, 0) if unpadded else None
+            conv3d_cfg = _banded_conv3d_config(
+                C_in=c_in, C_out=c_out, K=k_h, K_w=k_w, stride=stride, H=h, W=w, B=batch, pads=pads
+            )
+            if conv3d_cfg.H_out < 1 or conv3d_cfg.W_out < 1 or not _banded_wins(conv3d_cfg, nl.bfloat16, False):
+                continue
+            routed += 1
+            layer = f"{c_in}->{c_out} k{k_h}x{k_w} s{stride} unpadded={unpadded} {h}x{w} B={batch}"
+            try:
+                _build_conv2d_band_tile_config(conv3d_cfg, sizeinbytes(nl.bfloat16))
+            except Exception as error:  # noqa: BLE001 - any failure of the plan is a routing bug
+                unplanned.append(f"{layer}: {error}")
+        return routed, unplanned
+
+    routed, unplanned = _on_host(decide)
+    assert routed >= 100, "the grid should route a good share of its layers"
+    assert not unplanned, f"{len(unplanned)} routed layers have no banded plan, first: {unplanned[:3]}"
+
+
+# (C_in, C_out, K, H, W, measured speedup of the banded path over conv3d_transpose): stride 2, filter K x K, torch
+# padding and output_padding of bench_conv.py (K = 2: 0 / 0, K = 3: 1 / 1, K = 4: 1 / 0), input H x W, bf16, one trn2 core.
+_TRANSPOSE_MEASURED = [
+    (64, 16, 4, 736, 960, 15.25),
+    (64, 16, 4, 368, 576, 10.30),
+    (32, 16, 2, 540, 960, 8.96),
+    (16, 3, 4, 184, 240, 8.44),
+    (64, 16, 4, 184, 480, 7.47),
+    (32, 16, 2, 184, 480, 4.43),
+    (64, 16, 4, 184, 240, 3.69),
+    (8, 8, 4, 92, 240, 3.40),
+    (32, 16, 4, 92, 240, 3.36),
+    (128, 32, 4, 368, 480, 3.24),
+    (64, 16, 4, 32, 240, 3.06),
+    (64, 32, 4, 92, 240, 3.06),
+    (16, 16, 3, 92, 240, 2.66),
+    (3, 3, 2, 92, 240, 2.56),
+    (32, 32, 3, 92, 240, 2.40),
+    (64, 64, 4, 92, 240, 2.39),
+    (64, 16, 4, 184, 120, 2.38),
+    (16, 16, 2, 92, 240, 1.94),
+    (64, 16, 4, 24, 128, 1.89),
+    (32, 16, 2, 32, 240, 1.78),
+    (64, 16, 4, 16, 240, 1.74),
+    (64, 16, 4, 184, 60, 1.56),
+    (32, 16, 2, 184, 120, 1.36),
+    (128, 32, 4, 92, 240, 1.30),
+    (64, 16, 4, 8, 240, 1.07),
+    (32, 16, 2, 16, 240, 1.03),
+    (128, 64, 4, 92, 240, 1.00),
+    (32, 16, 2, 8, 240, 0.98),
+    (64, 16, 4, 4, 240, 0.91),
+]
+# The same on a logical core of two physical cores (LNC=2), where each core gets half of the work: near the work floor
+# both paths sit at the launch floor.
+_TRANSPOSE_MEASURED_LNC2 = [
+    (64, 16, 4, 736, 960, 14.80),
+    (64, 16, 4, 368, 576, 9.93),
+    (32, 16, 2, 540, 960, 8.72),
+    (64, 16, 4, 184, 480, 6.99),
+    (32, 16, 2, 184, 480, 4.00),
+    (16, 3, 4, 184, 240, 3.53),
+    (64, 16, 4, 184, 240, 3.50),
+    (128, 32, 4, 368, 480, 3.12),
+    (32, 16, 2, 64, 480, 2.98),
+    (8, 8, 4, 92, 240, 2.93),
+    (64, 32, 4, 92, 240, 2.87),
+    (16, 16, 3, 92, 240, 2.39),
+    (32, 32, 3, 92, 240, 2.31),
+    (16, 16, 3, 48, 240, 1.84),
+    (64, 16, 4, 32, 240, 1.77),
+    (64, 16, 4, 24, 240, 1.37),
+    (32, 16, 2, 16, 240, 1.05),
+    (64, 16, 4, 8, 240, 1.02),
+    (64, 16, 4, 16, 240, 1.00),
+    (16, 16, 3, 32, 240, 1.00),
+    (128, 64, 4, 92, 240, 1.00),
+]
+_TRANSPOSE_PADDING = {2: (0, 0), 3: (1, 1), 4: (1, 0)}
+
+
+def _transpose_banded_wins(
+    C_in=64,
+    C_out=16,
+    K=4,
+    H=64,
+    W=240,
+    B=1,
+    dtype=nl.bfloat16,
+    stride=2,
+    pad=None,
+    out_pad=None,
+    activation_fn=None,
+    filter_shape="KDHW_CI_CO",
+    has_caller_sbm=False,
+    D=1,
+    K_d=1,
+    stride_d=1,
+    dilation=1,
+    K_w=None,
+    padding=None,
+    output_padding=None,
+):
+    """
+    _banded_transpose_wins for a K x K_w filter, torch-style padding and output_padding (K defaults of bench_conv.py).
+    padding (pad_d_lo, pad_d_hi, pad_h_lo, pad_h_hi, pad_w_lo, pad_w_hi) and output_padding override pad and out_pad.
+    """
+    K_w = K if K_w is None else K_w
+    default_pad, default_out_pad = _TRANSPOSE_PADDING.get(K, (0, 0))
+    pad = default_pad if pad is None else pad
+    out_pad = default_out_pad if out_pad is None else out_pad
+    padding = (0, 0, pad, pad, pad, pad) if padding is None else padding
+    output_padding = (0, out_pad, out_pad) if output_padding is None else output_padding
+    return _banded_transpose_wins(
+        (B, C_in, D, H, W),
+        (K_d, K, K_w, C_in, C_out),
+        dtype,
+        (stride_d, stride, stride),
+        padding,
+        (1, dilation, dilation),
+        output_padding,
+        activation_fn,
+        filter_shape,
+        has_caller_sbm,
+    )
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("measured", [_TRANSPOSE_MEASURED, _TRANSPOSE_MEASURED_LNC2], ids=["lnc1", "lnc2"])
+def test_routed_transposed_layers_are_never_slower_on_measured_points(measured):
+    """Every measured layer: routed implies the banded path won clearly, and a layer without a gain is not routed."""
+
+    def decide():
+        return [_transpose_banded_wins(C_in=c_in, C_out=c_out, K=k, H=h, W=w) for c_in, c_out, k, h, w, _ in measured]
+
+    routed = _on_host(decide)
+    for (c_in, c_out, k, h, w, speedup), is_routed in zip(measured, routed, strict=True):
+        layer = f"{c_in}->{c_out} k{k} {h}x{w}"
+        if is_routed:
+            assert speedup >= _BANDED_MIN_ROUTED_SPEEDUP, f"{layer} routed to the banded path but measured {speedup}x"
+        if speedup < _BANDED_NO_GAIN:
+            assert not is_routed, f"{layer} routed to the banded path but measured {speedup}x"
+    assert sum(routed) >= 12, "the cost model should still route the wide thin layers"
+
+
+@pytest.mark.fast
+def test_thin_transposed_layer_is_routed_and_the_rest_are_not():
+    def decide():
+        return {
+            "thin": _transpose_banded_wins(),
+            "fp16": _transpose_banded_wins(dtype=nl.float16),
+            "fp32": _transpose_banded_wins(dtype=nl.float32),
+            "relu": _transpose_banded_wins(activation_fn=ActFnType.ReLU),
+            # the integration tests' layers: K_h != K_w with unequal padding and output_padding, padding past K - 1, lo != hi
+            "unequal_padding": _transpose_banded_wins(
+                K=4, K_w=2, H=40, W=480, padding=(0, 0, 1, 1, 0, 0), output_padding=(0, 1, 0)
+            ),
+            "crop_padding": _transpose_banded_wins(K=4, H=40, W=480, pad=4),
+            "asymmetric_padding": _transpose_banded_wins(K=4, H=40, W=240, padding=(0, 0, 2, 0, 1, 3)),
+            "squared_relu": _transpose_banded_wins(activation_fn=ActFnType.SquaredReLU),
+            "co_ci_layout": _transpose_banded_wins(filter_shape="KDHW_CO_CI"),
+            "caller_sbm": _transpose_banded_wins(has_caller_sbm=True),
+            "depth": _transpose_banded_wins(D=4, K_d=3),
+            "stride_d": _transpose_banded_wins(stride_d=2),
+            "dilated": _transpose_banded_wins(dilation=2),
+            "stride_1": _transpose_banded_wins(stride=1),
+            "stride_3": _transpose_banded_wins(stride=3),
+            "filter_1": _transpose_banded_wins(K=1),
+            "filter_5": _transpose_banded_wins(K=5),
+            "wide_cout": _transpose_banded_wins(C_in=64, C_out=96),
+            "channels_256": _transpose_banded_wins(C_in=256, C_out=16),
+            "batch_17": _transpose_banded_wins(B=17),
+            "huge": _transpose_banded_wins(H=4096, W=4096),
+            "empty_output": _transpose_banded_wins(K=2, H=1, W=1, pad=1),
+        }
+
+    decision = _on_host(decide)
+    routed_names = ("thin", "fp16", "relu", "unequal_padding", "crop_padding", "asymmetric_padding")
+    for name in routed_names:
+        assert decision[name], name
+    for name, routed in decision.items():
+        if name not in routed_names:
+            assert not routed, name
+
+
+@pytest.mark.fast
+def test_every_routed_transposed_layer_has_a_banded_plan():
+    """
+    The router must never turn a call conv3d_transpose accepts into a failure: every layer it routes, over a grid of
+    channel counts, filters, paddings, output paddings and image sizes up to the routing limits, has a banded config
+    and band plan.
+    """
+    channels = (1, 3, 16, 33, 64, 128)
+    filters = ((2, 2), (3, 3), (4, 4), (2, 4), (4, 2), (3, 2))
+    layers = list(
+        itertools.product(channels, channels, filters, (0, 1, 2), (0, 1), (8, 2048), (60, 240, 2048), (1, 16))
+    )
+
+    def decide():
+        routed = 0
+        unplanned = []
+        for c_in, c_out, (k_h, k_w), pad, out_pad, h, w, batch in layers:
+            if not _transpose_banded_wins(
+                C_in=c_in, C_out=c_out, K=k_h, K_w=k_w, pad=pad, out_pad=out_pad, H=h, W=w, B=batch
+            ):
+                continue
+            routed += 1
+            layer = f"{c_in}->{c_out} k{k_h}x{k_w} pad={pad} out_pad={out_pad} {h}x{w} B={batch}"
+            try:
+                cfg = _build_conv2d_transpose_banded_config(
+                    _as_tensor(_ShapeOnlyTensor((batch, c_in, h, w), nl.bfloat16)),
+                    _as_tensor(_ShapeOnlyTensor((k_h, k_w, c_in, c_out), nl.bfloat16)),
+                    None,
+                    (2, 2),
+                    (pad, pad, pad, pad),
+                    (1, 1),
+                    (out_pad, out_pad),
+                    None,
+                    True,
+                )
+                col_taps = _transpose_phase_taps(cfg.K_w, cfg.stride_w, cfg.pad_w_left, cfg.dilation_w)
+                if cfg.H_out < 1 or cfg.W_out < 1:
+                    unplanned.append(f"{layer}: empty output")
+                for phase in range(min(cfg.stride_w, cfg.W_out)):
+                    if len(col_taps[phase]) == 0:
+                        unplanned.append(f"{layer}: output column phase {phase} gets no filter column")
+                _build_transpose_band_tile_config(cfg, sizeinbytes(nl.bfloat16))
+            except Exception as error:  # noqa: BLE001 - any failure of the plan is a routing bug
+                unplanned.append(f"{layer}: {error}")
+        return routed, unplanned
+
+    routed, unplanned = _on_host(decide)
+    assert routed >= 100, "the grid should route a good share of its layers"
+    assert not unplanned, f"{len(unplanned)} routed layers have no banded plan, first: {unplanned[:3]}"

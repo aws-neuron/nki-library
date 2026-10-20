@@ -145,7 +145,7 @@ def conv3d_torch_ref(
     with torch.no_grad():
         conv.weight.copy_(filters.permute(4, 3, 0, 1, 2))
         if bias != None:
-            conv.bias.copy_(bias)
+            conv.bias.copy_(bias.reshape(-1)[:C_out])  # the kernel reads the first C_out elements
 
     # Perform convolution
     conv_out = conv(x_in)

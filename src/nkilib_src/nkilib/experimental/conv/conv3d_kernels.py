@@ -22,8 +22,14 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.allocator import SbufManager, sizeinbytes
+from ...core.utils.common_types import ActFnType
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.kernel_helpers import _psum_num_banks, div_ceil, get_verified_program_sharding_info
+from ...core.utils.kernel_helpers import (
+    _psum_num_banks,
+    div_ceil,
+    get_nl_act_fn_from_type,
+    get_verified_program_sharding_info,
+)
 from ...core.utils.logging import get_logger
 from .conv3d_helpers import (
     _BN_EVAL_COEFF_PER_TILE,
@@ -3500,3 +3506,812 @@ def _conv3d_low_chan_compute(
         )
 
     return None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Row-banded path for thin 2D layers (conv3d routes here on trn2 via _banded_wins; conv3d_transpose shares the
+# band helpers below).
+# ---------------------------------------------------------------------------------------------------------------
+
+# Blocks whose input / output tiles the SBUF budget leaves room for at once, so the compiler can load
+# the next block while the current one computes.
+_BLOCKS_IN_FLIGHT = 2
+# Per-partition SBUF bytes left to the compiler beyond the kernel's own tiles.
+_BAND_SBUF_RESERVE = 8 * 1024
+# The narrowest balanced matmul chunk worth keeping before falling back to the widest one.
+_MIN_BALANCED_CHUNK = 128
+# Stationaries start at multiples of this many elements within a partition, so the tensor engine loads
+# each one from an aligned address whatever rows_per_block * C_out is.
+_STATIONARY_ALIGN = 32
+
+# Epilogue kinds applied as results leave PSUM.
+_EPILOGUE_COPY = 0
+_EPILOGUE_ACT_FN = 1
+
+# Matmul chunks (one PSUM bank each) that one eviction instruction moves out of PSUM: fewer, wider evictions pay the
+# engine's fixed per-instruction cost less often.
+_EVICT_GROUP_CHUNKS = 4
+
+# Cost model shared by the routers of conv3d (_banded_cost_wins) and conv3d_transpose (_banded_transpose_wins), which
+# send a layer here when they expect to win. This path paid about one DMA per image row in and per output row out:
+# 0.63 to 0.69 us measured on trn2 (bf16, one core) while those DMAs had their descriptors generated on GpSimd, taken as
+# _BANDED_DMA_NS. Static descriptors and the fewer-pass plan have since made the path 1.0x to 5.8x faster per layer
+# (bf16, one core, NEURON_RT_IO_RING_CACHE_SIZE=64), so the constants are now conservative: the routers send fewer
+# layers here than they could. The original path pays a time per output pixel and filter tap: 0.38 to 0.78 ns measured
+# for 3 x 3 filters at up to 64 channels (median 0.55), taken as _BANDED_TAP_PIXEL_NS_X20 / 20 = 0.45 ns, and at least
+# _BANDED_MIN_TAPS taps' worth (1 x 1 filters still cost like a few taps). The constants are rounded middles of the
+# measurements, not bounds: the two fastest measured layers (32 channels, rows 1100 pixels or wider) run 6 to 15% below
+# 0.45 ns. The gain a layer must reach, _BANDED_MARGIN_X5 / 5 = 1.2, covers that.
+_BANDED_DMA_NS = 700
+_BANDED_TAP_PIXEL_NS_X20 = 9
+_BANDED_MIN_TAPS = 5
+_BANDED_MARGIN_X5 = 6
+
+
+@dataclass
+class _BandTileConfig(nl.NKIObject):
+    """
+    Band tiling plan shared by the banded convolution kernels.
+
+    The tensor engine's 128 rows hold (input row, input channel) pairs and its 128 columns hold
+    (output row, output channel) pairs. This records how many of each fit, the contraction tiles one
+    block of output rows needs, the column window the SBUF budget allows and the PSUM epilogue.
+    With taps_folded = f > 1 each input row sits f times on the contraction rows, at the column
+    shifts of f consecutive filter columns, so one matmul covers f filter columns (forward conv only;
+    the transposed conv keeps 1).
+    """
+
+    rows_per_tile: int
+    rows_per_block: int
+    block_count: int
+    block_span: int
+    tiles_per_block: int
+    out_partitions: int
+    stationary_count: int
+    taps_folded: int
+    rows_reversed: bool
+    chunk_cols: int
+    window_cols: int
+    window_count: int
+    epilogue: int
+
+
+def _conv3d_banded_compute(
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
+    cfg: Conv3dConfig,
+) -> nl.NkiTensor:
+    """
+    Row-banded conv3d for thin 2D layers: the D = 1, K_d = 1 case, y = act(conv2d(x_in, filters) + bias).
+
+    conv3d calls this on trn2 when its cost model expects it to be faster (conv3d._banded_wins); it takes conv3d's
+    inputs and returns its [B, C_out, 1, H_out, W_out] output. Thin layers' channel counts are too small to fill the
+    tensor engine on their own. A channels-only mapping puts C_in
+    on the contraction rows and C_out on the stationary columns, leaving most of the 128 x 128
+    engine idle for thin layers. This kernel instead packs rows_per_tile = 128 // C_in image rows
+    with their channels on the contraction rows and rows_per_block = 128 // C_out output rows with
+    their channels on the columns. The filter taps become banded block matrices (output row r of a
+    block reads input rows stride_h * r + dilation_h * k_h) that stay loaded while whole image rows
+    stream through as the moving operand, so a layer with C channels needs about 128 // C times
+    fewer matmul passes. A tap's horizontal shift is an offset into the rows already in SBUF: the
+    input is not copied into an im2col layout. Only when a block's rows leave most contraction rows
+    empty (few input channels, e.g. RGB stems) does the kernel fold filter columns: each input row is
+    loaded up to K_w times, shifted one filter column apart, so one matmul covers several filter
+    columns. The banded stationaries are built in the kernel from the filters, one DMA per
+    contraction row. Supports stride, asymmetric zero padding, an optional bias, a fused ActFnType
+    activation and LNC sharding over (batch, row block) work items.
+
+    Args:
+        x_in (nl.NkiTensor): [B, C_in, 1, H, W], conv3d's input on HBM.
+        filters (nl.NkiTensor): [1, K_h, K_w, C_in, C_out], conv3d's filters on HBM.
+        bias (Optional[nl.NkiTensor]): conv3d's bias; its first C_out elements are read.
+        cfg (Conv3dConfig): conv3d's config (D = 1, K_d = 1).
+
+    Returns:
+        y_out (nl.NkiTensor): [B, C_out, 1, H_out, W_out], Output tensor on HBM in x_in's dtype.
+
+    Notes:
+        - x_in, filters and bias share one 16-bit dtype (conv3d routes only bfloat16 / float16 here).
+          The matmuls run in that dtype and accumulate in fp32 PSUM; the result is rounded once.
+        - With C_in or C_out above 64 a channels-only mapping already fills most of the engine and
+          the gain shrinks; at 128 channels nothing stacks.
+        - The input and output move one (image row, all channels) DMA at a time, the transfer the
+          NCHW layout allows for a partition range, with static descriptors (dge_mode none) built
+          before the run. When x_in or y_out is also an input or output of the NEFF, the runtime
+          rewrites those descriptors for the call's tensors on every execution unless it caches
+          them: set NEURON_RT_IO_RING_CACHE_SIZE (e.g. 64). Inside a larger graph they cost nothing
+          per call. Software-generated descriptors bounded thin layers on GpSimd at about 0.6 us
+          per DMA; static ones leave the tensor engine as the limit.
+        - Measured on trn2 (bf16, one NeuronCore, 3x3 stride 1) with NEURON_RT_IO_RING_CACHE_SIZE=64,
+          against the compiler's convolution: 66x for 16 -> 16 at 1080p (0.51 vs 33.7 ms), 64x for
+          8 -> 8, 46x for 3 -> 3 at 4K, 11x for 32 -> 32 and 5.8x for 64 -> 64 at 1080p, 2.5x for a
+          16 -> 32 stride-2 layer at 320 x 320. Against conv3d (nki-library main, measured with the
+          previous, software-descriptor version of this kernel) it broke even at output rows of
+          about 300 pixels for 16 to 64 channels and lost on narrow rows (0.4x to 0.5x at 120
+          pixels) and at 128 channels below 512 pixels; conv3d's router still uses those
+          measurements.
+        - Image rows outside the input and padded columns are zero in SBUF; contraction tiles that
+          hold no image row are skipped.
+
+    Pseudocode:
+        plan = build_band_plan(cfg)                    # fold f, rows per tile / block, column windows
+        G = ceil(K_w / f)                              # matmuls per contraction tile
+        stationaries = zeros(128, tiles_per_block * G, rows_per_block * C_out)
+        for each contraction row (t, j) of a block and each fold shift q < f:
+            DMA the filter rows it meets, filter columns g * f + q, into
+            stationaries[(j, q, :), t * G : (t + 1) * G, band]
+        bias_col = replicate(bias, rows_per_block)     # partition (r, c_out) <- bias[c_out]
+
+        for (b, block) in this program's work items:
+            for window in column windows:
+                load the input tiles: tile t, partition (j, q, c_in) <- x_in[b, c_in, row(t, j),
+                    cols + q * dilation_w]
+                for each group of up to 4 matmul chunks (<= 512 output columns each, one PSUM bank):
+                    for chunk in group, t, g < G:
+                        psum[bank] += stationaries[t, g].T @ tile_t[:, stride_w * col + dilation_w * f * g]
+                    result[:, group] = act(psum + bias_col)   # one eviction per group
+                store each output row: y_out[b, :, row, window] <- result[(r, :), :]
+
+    Tiling Strategy:
+        Loop nest: (batch, row block) work items -> column windows -> groups of matmul chunks ->
+        chunks -> contraction tiles -> filter-column groups.
+
+        SBUF layout:
+        - Stationaries: [128, tiles_per_block * G, rows_per_block * C_out], loaded once.
+        - Input tiles: tiles_per_block x [128, window input columns], fresh per (block, window).
+        - Result: [rows_per_block * C_out, window columns] in the output dtype.
+
+        Tile size selection:
+        - Fold f (1 to K_w, filter columns per matmul): the one with the fewest passes (blocks x
+          contraction tiles x G, each with its own best rows per block), a larger fold only when it
+          cuts the passes by at least a quarter (it costs one input DMA per row and fold step).
+        - rows_per_tile = 128 // (C_in * f); rows_per_block <= 128 // C_out, the row count with the
+          fewest passes over the output height, balanced over the row blocks and reduced only if
+          the stationaries leave no room for one matmul chunk.
+        - The column window spans the full output width when the tiles of two blocks fit, otherwise
+          the widest multiple of the matmul chunk that does.
+        - Matmul chunk: the widest divisor of the output width in [128, 512], else 512.
+    """
+    x_nchw = x_in.reshape((cfg.B, cfg.C_in, cfg.H, cfg.W))
+    filters_hwio = filters.reshape((cfg.K_h, cfg.K_w, cfg.C_in, cfg.C_out))
+    # conv3d reads the first C_out elements of the bias without checking its shape: [C_out], [C_out, 1] or longer.
+    bias_vec = None
+    if bias != None:
+        bias_vec = bias.slice(dim=0, start=0, end=cfg.C_out, step=1).reshape((cfg.C_out,))
+    y_out = nl.ndarray(shape=(cfg.B, cfg.C_out, 1, cfg.H_out, cfg.W_out), dtype=x_in.dtype, buffer=nl.shared_hbm)
+    _conv2d_banded_into(y_out.reshape((cfg.B, cfg.C_out, cfg.H_out, cfg.W_out)), x_nchw, filters_hwio, bias_vec, cfg)
+    return y_out
+
+
+def _conv2d_banded_into(
+    y_out: nl.NkiTensor,
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor],
+    cfg: Conv3dConfig,
+) -> None:
+    """Compute the convolution into y_out [B, C_out, H_out, W_out]."""
+    tile_cfg = _build_conv2d_band_tile_config(cfg, sizeinbytes(x_in.dtype))
+
+    # SPMD sharding info: n_prgs = core count, prg_id = this core (0/1 at LNC=2).
+    _, n_prgs, prg_id = get_verified_program_sharding_info("conv3d", (0, 1))
+    work_start, work_end = _program_work_range(cfg.B * tile_cfg.block_count, n_prgs, prg_id)
+
+    if work_start < work_end:
+        stationaries = _load_band_stationaries(
+            filters, _conv2d_stationary_dmas(cfg, tile_cfg), tile_cfg, cfg.C_in, cfg.C_out, cfg.K_w
+        )
+        bias_col = _load_partition_vector(bias, cfg.C_out, tile_cfg)
+
+        groups = div_ceil(cfg.K_w, tile_cfg.taps_folded)
+        for work_idx in range(work_start, work_end):
+            batch_idx = work_idx // tile_cfg.block_count
+            row0 = tile_cfg.rows_per_block * (work_idx % tile_cfg.block_count)
+            rows_valid = min(tile_cfg.rows_per_block, cfg.H_out - row0)
+            for window_idx in range(tile_cfg.window_count):
+                col0 = window_idx * tile_cfg.window_cols
+                cols = min(tile_cfg.window_cols, cfg.W_out - col0)
+                tiles = _load_band_input_tiles(
+                    x_in,
+                    batch_idx,
+                    cfg.stride_h * row0 - cfg.pad_h_top,
+                    cfg.stride_w * col0 - cfg.pad_w_left,
+                    cfg.stride_w * (cols - 1) + cfg.dilation_w * tile_cfg.taps_folded * (groups - 1) + 1,
+                    tile_cfg,
+                    cfg.dilation_w,
+                )
+                result = _alloc_band_result(cols, x_in.dtype, tile_cfg)
+                # Whole chunks in groups of up to _EVICT_GROUP_CHUNKS PSUM banks, one eviction per group; a
+                # partial last chunk alone.
+                full_chunks = cols // tile_cfg.chunk_cols
+                group_banks = max(1, min(_EVICT_GROUP_CHUNKS, full_chunks))
+                for group_start in range(0, full_chunks, group_banks):
+                    banks = min(group_banks, full_chunks - group_start)
+                    psum = nl.ndarray(
+                        (nl.tile_size.pmax, group_banks, nl.tile_size.psum_fmax), dtype=nl.float32, buffer=nl.psum
+                    )
+                    for bank in range(banks):
+                        chunk_start = (group_start + bank) * tile_cfg.chunk_cols
+                        _conv2d_band_matmuls(
+                            psum, bank, stationaries, tiles, chunk_start, tile_cfg.chunk_cols, cfg, tile_cfg
+                        )
+                    _evict_band_banks(
+                        result,
+                        psum,
+                        bias_col,
+                        group_start * tile_cfg.chunk_cols,
+                        banks,
+                        tile_cfg.chunk_cols,
+                        tile_cfg,
+                        cfg.activation_fn,
+                    )
+                tail_start = full_chunks * tile_cfg.chunk_cols
+                if tail_start < cols:
+                    psum = nl.ndarray((nl.tile_size.pmax, 1, nl.tile_size.psum_fmax), dtype=nl.float32, buffer=nl.psum)
+                    _conv2d_band_matmuls(psum, 0, stationaries, tiles, tail_start, cols - tail_start, cfg, tile_cfg)
+                    _evict_band_banks(
+                        result, psum, bias_col, tail_start, 1, cols - tail_start, tile_cfg, cfg.activation_fn
+                    )
+                _store_band_rows(y_out, result, batch_idx, row0, rows_valid, col0, cols, tile_cfg)
+
+
+def _build_conv2d_band_tile_config(cfg: Conv3dConfig, compute_bytes: int) -> _BandTileConfig:
+    """
+    Plan the band tiling of a forward convolution.
+
+    A block of R output rows reads (R - 1) * stride_h + dilation_h * (K_h - 1) + 1 input rows. The
+    tap fold f (_tap_fold) sets the image rows per contraction tile, 128 // (C_in * f). R is the row
+    count up to 128 // C_out with the fewest tensor-engine passes over the output height
+    (_fewest_pass_rows), balanced over the blocks it needs, and shrinks only if the stationaries
+    leave no room for one matmul chunk.
+    """
+    fold = _tap_fold(cfg)
+    groups = div_ceil(cfg.K_w, fold)
+    rows_per_tile = nl.tile_size.pmax // (cfg.C_in * fold)
+    rows_per_block = _balanced_rows(cfg.H_out, _fewest_pass_rows(cfg, rows_per_tile, nl.tile_size.pmax // cfg.C_out), 1)
+    epilogue = _band_epilogue(cfg.activation_fn)
+    chunk_cols = _pick_chunk_cols(cfg.W_out)
+    budget = nl.tile_size.sbuf_fmax_bytes - _BAND_SBUF_RESERVE
+    window_cols = 0
+    span = 0
+    tiles_per_block = 0
+    while window_cols == 0 and rows_per_block >= 1:
+        span = (rows_per_block - 1) * cfg.stride_h + cfg.dilation_h * (cfg.K_h - 1) + 1
+        tiles_per_block = div_ceil(span, rows_per_tile)
+        fixed = _band_fixed_bytes(tiles_per_block * groups, rows_per_block * cfg.C_out, compute_bytes)
+        window_cols = _fit_window_cols(
+            cfg.W_out,
+            chunk_cols,
+            budget - fixed,
+            tiles_per_block * compute_bytes * cfg.stride_w + compute_bytes,
+            tiles_per_block * compute_bytes * (cfg.dilation_w * fold * (groups - 1) + 1 - cfg.stride_w),
+        )
+        if window_cols == 0:
+            rows_per_block = rows_per_block - 1
+    kernel_assert(
+        window_cols > 0,
+        f"conv3d (banded): the banded stationaries of K_h={cfg.K_h}, K_w={cfg.K_w}, C_in={cfg.C_in}, "
+        f"C_out={cfg.C_out} do not fit the SBUF budget even with one output row per block.",
+    )
+    return _BandTileConfig(
+        rows_per_tile=rows_per_tile,
+        rows_per_block=rows_per_block,
+        block_count=div_ceil(cfg.H_out, rows_per_block),
+        block_span=span,
+        tiles_per_block=tiles_per_block,
+        out_partitions=rows_per_block * cfg.C_out,
+        stationary_count=tiles_per_block * groups,
+        taps_folded=fold,
+        rows_reversed=True,
+        chunk_cols=min(chunk_cols, window_cols),
+        window_cols=window_cols,
+        window_count=div_ceil(cfg.W_out, window_cols),
+        epilogue=epilogue,
+    )
+
+
+def _tap_fold(cfg: Conv3dConfig) -> int:
+    """
+    Filter columns folded onto the contraction rows, 1 (none) to K_w.
+
+    With fold f a contraction tile holds 128 // (C_in * f) image rows, each f times at the column
+    shifts of f consecutive filter columns, so one matmul covers f filter columns and a block needs
+    ceil(K_w / f) matmuls per tile instead of K_w. That pays when a block's rows leave most
+    contraction rows empty (few input channels, many output channels: RGB stems). Each fold step
+    costs one more input DMA per image row, so a larger fold must cut the passes (blocks x tiles x
+    filter-column groups, each fold with its own fewest-pass rows) by at least a quarter.
+    """
+    best_fold = 1
+    best_passes = 0
+    for fold in range(1, cfg.K_w + 1):
+        if cfg.C_in * fold <= nl.tile_size.pmax:
+            rows_per_tile = nl.tile_size.pmax // (cfg.C_in * fold)
+            rows = _fewest_pass_rows(cfg, rows_per_tile, nl.tile_size.pmax // cfg.C_out)
+            span = (rows - 1) * cfg.stride_h + cfg.dilation_h * (cfg.K_h - 1) + 1
+            passes = div_ceil(cfg.H_out, rows) * div_ceil(span, rows_per_tile) * div_ceil(cfg.K_w, fold)
+            if best_passes == 0 or 4 * passes <= 3 * best_passes:
+                best_fold = fold
+                best_passes = passes
+    return best_fold
+
+
+def _fewest_pass_rows(cfg: Conv3dConfig, rows_per_tile: int, rows_max: int) -> int:
+    """
+    Output rows per block, at most rows_max, with the fewest tensor-engine passes over the output height.
+
+    Passes = blocks x contraction tiles per block (each tile is a fixed number of matmuls). A block
+    whose input span just overflows a tile costs a whole extra tile of passes, so a slightly shorter
+    block that needs one tile fewer is often cheaper overall. Ties keep more rows (fewer blocks).
+    """
+    best_rows = rows_max
+    best_passes = 0
+    for row_idx in range(rows_max):
+        rows = rows_max - row_idx
+        span = (rows - 1) * cfg.stride_h + cfg.dilation_h * (cfg.K_h - 1) + 1
+        passes = div_ceil(cfg.H_out, rows) * div_ceil(span, rows_per_tile)
+        if best_passes == 0 or passes < best_passes:
+            best_rows = rows
+            best_passes = passes
+    return best_rows
+
+
+def _conv2d_stationary_dmas(cfg: Conv3dConfig, tile_cfg: _BandTileConfig) -> list:
+    """
+    Filter-row DMAs that build the forward conv's banded stationaries.
+
+    Contraction row (j, q) of tile t holds block input row s = t * rows_per_tile + j at fold shift
+    q < taps_folded. Output row r of the block reads it through filter row k_h = (s - stride_h * r) /
+    dilation_h when that is an integer in [0, K_h). Output rows sit in reversed slots
+    (slot = rows_per_block - 1 - r) so the filter row grows with the slot and each (t, j, q) is one
+    DMA with positive strides.
+    """
+    dmas = []
+    for tile_idx in range(tile_cfg.tiles_per_block):
+        for row_idx in range(tile_cfg.rows_per_tile):
+            in_row = tile_idx * tile_cfg.rows_per_tile + row_idx
+            if in_row < tile_cfg.block_span:
+                slots = []
+                k_rows = []
+                for slot in range(tile_cfg.rows_per_block):
+                    offset = in_row - cfg.stride_h * (tile_cfg.rows_per_block - 1 - slot)
+                    if offset >= 0 and offset % cfg.dilation_h == 0 and offset // cfg.dilation_h < cfg.K_h:
+                        slots.append(slot)
+                        k_rows.append(offset // cfg.dilation_h)
+                for shift in range(tile_cfg.taps_folded):
+                    _append_band_dma(dmas, tile_idx, row_idx, slots, k_rows, shift)
+    return dmas
+
+
+def _conv2d_band_matmuls(
+    psum: nl.NkiTensor,
+    bank: int,
+    stationaries: nl.NkiTensor,
+    tiles: list,
+    chunk_start: int,
+    chunk: int,
+    cfg: Conv3dConfig,
+    tile_cfg: _BandTileConfig,
+) -> None:
+    """
+    Accumulate one chunk of output columns into PSUM bank `bank` of a [128, banks, psum_fmax] PSUM
+    tile, over the block's tiles and their ceil(K_w / taps_folded) filter-column groups.
+    """
+    parts = tile_cfg.out_partitions
+    fold = tile_cfg.taps_folded
+    groups = div_ceil(cfg.K_w, fold)
+    for list_idx in range(len(tiles)):
+        tile = tiles[list_idx][0]
+        tile_rows = tiles[list_idx][1]
+        tile_idx = tiles[list_idx][2]
+        for group_idx in range(groups):
+            col_start = cfg.stride_w * chunk_start + cfg.dilation_w * fold * group_idx
+            if cfg.stride_w == 1:
+                moving = tile[0:tile_rows, col_start : col_start + chunk]
+            else:
+                moving = tile[0:tile_rows, col_start : col_start + cfg.stride_w * (chunk - 1) + 1 : cfg.stride_w]
+            nisa.nc_matmul(
+                dst=psum[0:parts, bank, 0:chunk],
+                stationary=stationaries[0:tile_rows, tile_idx * groups + group_idx, 0:parts],
+                moving=moving,
+                accumulate=(list_idx > 0 or group_idx > 0),
+            )
+
+
+def _balanced_rows(out_rows: int, rows_max: int, row_multiple: int) -> int:
+    """Rows per block: the fewest blocks rows_max allows, then the smallest multiple of row_multiple that covers them."""
+    block_count = div_ceil(out_rows, rows_max)
+    return min(rows_max, div_ceil(div_ceil(out_rows, block_count), row_multiple) * row_multiple)
+
+
+def _append_band_dma(dmas: list, tile_idx: int, row_idx: int, slots: list, k_rows: list, shift: int = 0) -> None:
+    """
+    Append (tile, row, fold shift, first slot, slot step, first filter row, filter row step, count)
+    for one band. shift is the contraction row's fold shift (always 0 without a tap fold).
+    """
+    count = len(slots)
+    if count > 0:
+        slot_step = 1
+        k_row_step = 1
+        if count > 1:
+            slot_step = slots[1] - slots[0]
+            k_row_step = k_rows[1] - k_rows[0]
+        for idx in range(count):
+            kernel_assert(
+                slots[idx] == slots[0] + idx * slot_step and k_rows[idx] == k_rows[0] + idx * k_row_step,
+                "banded stationary rows must form an arithmetic progression",
+            )
+        kernel_assert(slot_step >= 1 and k_row_step >= 1, "banded stationary DMA strides must be positive")
+        dmas.append((tile_idx, row_idx, shift, slots[0], slot_step, k_rows[0], k_row_step, count))
+
+
+def _band_epilogue(activation_fn: Optional[ActFnType]) -> int:
+    """Epilogue kind applied as results leave PSUM."""
+    if activation_fn == None:
+        return _EPILOGUE_COPY
+    return _EPILOGUE_ACT_FN
+
+
+def _pick_chunk_cols(cols: int) -> int:
+    """Widest matmul chunk within the PSUM / moving free limits that divides cols, else the limit."""
+    chunk_max = min(nl.tile_size.psum_fmax, nl.tile_size.gemm_moving_fmax)
+    for chunk in range(min(cols, chunk_max), _MIN_BALANCED_CHUNK - 1, -1):
+        if cols % chunk == 0:
+            return chunk
+    return min(cols, chunk_max)
+
+
+def _band_fixed_bytes(stationary_count: int, out_partitions: int, compute_bytes: int) -> int:
+    """Per-partition SBUF bytes held for the whole kernel: stationaries plus the partition vectors."""
+    vectors = 2 * (out_partitions * (4 + compute_bytes) + 4) + 8
+    return stationary_count * _stationary_stride(out_partitions) * compute_bytes + vectors
+
+
+def _stationary_stride(out_partitions: int) -> int:
+    """Elements between consecutive stationaries in a partition: out_partitions rounded up to _STATIONARY_ALIGN."""
+    return div_ceil(out_partitions, _STATIONARY_ALIGN) * _STATIONARY_ALIGN
+
+
+def _fit_window_cols(out_cols: int, chunk_cols: int, budget: int, bytes_per_col: int, bytes_fixed: int) -> int:
+    """
+    Widest column window whose per-block tiles fit the budget for _BLOCKS_IN_FLIGHT blocks.
+
+    Returns out_cols when the whole width fits, else the widest multiple of chunk_cols that does,
+    else 0.
+    """
+    window_cols = 0
+    if budget > 0:
+        if _BLOCKS_IN_FLIGHT * (bytes_fixed + bytes_per_col * out_cols) <= budget:
+            window_cols = out_cols
+        else:
+            cols = (budget // _BLOCKS_IN_FLIGHT - bytes_fixed) // bytes_per_col
+            if cols >= chunk_cols:
+                window_cols = (cols // chunk_cols) * chunk_cols
+    return window_cols
+
+
+def _program_work_range(total: int, n_prgs: int, prg_id: int) -> tuple[int, int]:
+    """Contiguous [start, end) slice of the (batch, row block) work items owned by this program."""
+    per_program = div_ceil(total, n_prgs)
+    start = min(total, per_program * prg_id)
+    return start, min(total, start + per_program)
+
+
+def _load_band_stationaries(
+    filters: nl.NkiTensor, dmas: list, tile_cfg: _BandTileConfig, C_in: int, C_out: int, K_w: int
+) -> nl.NkiTensor:
+    """
+    Build the banded stationaries [128, tiles_per_block * G, rows_per_block * C_out] in SBUF, with
+    G = ceil(K_w / taps_folded) filter-column groups per tile (G = K_w without a tap fold).
+
+    Zeroed once, then each DMA writes filter rows k_row0 + q * k_row_step, filter columns
+    g * taps_folded + shift of every group g, into slots slot0 + q * slot_step of partitions
+    [(row * taps_folded + shift) * C_in, + C_in) of tile t.
+    """
+    pmax = nl.tile_size.pmax
+    parts = tile_cfg.out_partitions
+    stride = _stationary_stride(parts)
+    fold = tile_cfg.taps_folded
+    groups = div_ceil(K_w, fold)
+    stationaries = nl.ndarray((pmax, tile_cfg.stationary_count, stride), dtype=filters.dtype, buffer=nl.sbuf)
+    nisa.memset(dst=stationaries[0:pmax, 0 : tile_cfg.stationary_count, 0:stride], value=0.0)
+    for dma_idx in range(len(dmas)):
+        tile_idx = dmas[dma_idx][0]
+        row_idx = dmas[dma_idx][1]
+        shift = dmas[dma_idx][2]
+        slot0 = dmas[dma_idx][3]
+        slot_step = dmas[dma_idx][4]
+        k_row0 = dmas[dma_idx][5]
+        k_row_step = dmas[dma_idx][6]
+        count = dmas[dma_idx][7]
+        shift_groups = div_ceil(K_w - shift, fold)
+        part0 = (row_idx * fold + shift) * C_in
+        dst = (
+            stationaries[part0 : part0 + C_in, tile_idx * groups : tile_idx * groups + shift_groups, 0:parts]
+            .reshape_dim(2, (tile_cfg.rows_per_block, C_out))
+            .slice(dim=2, start=slot0, end=slot0 + (count - 1) * slot_step + 1, step=slot_step)
+        )
+        src = filters.ap(
+            pattern=[
+                [C_out, C_in],
+                [fold * C_in * C_out, shift_groups],
+                [k_row_step * K_w * C_in * C_out, count],
+                [1, C_out],
+            ],
+            offset=k_row0 * K_w * C_in * C_out + shift * C_in * C_out,
+        )
+        _issue_setup_dma(dst, src, dma_idx)
+    return stationaries
+
+
+def _issue_setup_dma(dst, src, dma_idx: int) -> None:
+    """
+    Issue one of the many small stationary-building DMAs, rotating over three descriptor generators.
+
+    Each carries C_out-element runs (a few bytes for thin outputs), so the descriptor rate rather than
+    the bandwidth bounds the setup: the sync-engine DGE, the scalar-engine DGE and the GpSimd SWDGE
+    process their share in parallel.
+    """
+    queue = dma_idx % 3
+    if queue == 0:
+        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge)
+    elif queue == 1:
+        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge, engine=nisa.scalar_engine)
+    else:
+        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.swdge)
+
+
+def _load_partition_vector(vec: Optional[nl.NkiTensor], C_out: int, tile_cfg: _BandTileConfig) -> nl.NkiTensor:
+    """
+    Load a [C_out] vector as an fp32 [128, 1] column with partition (slot, c_out) <- vec[c_out].
+
+    One stride-0 DMA lays rows_per_block copies along partition 0, and a K = 1 matmul against a one
+    turns that row into the column. A missing vector becomes zeros.
+    """
+    pmax = nl.tile_size.pmax
+    parts = tile_cfg.out_partitions
+    column = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+    if vec == None:
+        nisa.memset(dst=column[0:pmax, 0:1], value=0.0)
+    else:
+        row = nl.ndarray((1, parts), dtype=vec.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=row[0:1, 0:parts].reshape_dim(1, (tile_cfg.rows_per_block, C_out)),
+            src=vec.ap(pattern=[[C_out, 1], [0, tile_cfg.rows_per_block], [1, C_out]], offset=0),
+        )
+        row_f32 = nl.ndarray((1, parts), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=row_f32[0:1, 0:parts], src=row[0:1, 0:parts])
+        one = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=one[0:1, 0:1], value=1.0)
+        column_psum = nl.ndarray((pmax, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=column_psum[0:parts, 0:1], stationary=row_f32[0:1, 0:parts], moving=one[0:1, 0:1])
+        nisa.tensor_copy(dst=column[0:parts, 0:1], src=column_psum[0:parts, 0:1])
+    return column
+
+
+def _load_band_input_tiles(
+    x_in: nl.NkiTensor,
+    batch_idx: int,
+    in_row0: int,
+    in_col0: int,
+    tile_cols: int,
+    tile_cfg: _BandTileConfig,
+    col_shift: int = 1,
+) -> list:
+    """
+    Load one block's contraction tiles for one column window.
+
+    Tile t, partition (j, q, c_in) holds x_in[batch_idx, c_in, in_row0 + t * rows_per_tile + j, :]
+    at tile column c <- input column in_col0 + c + q * col_shift, for the fold shifts
+    q < taps_folded (q = 0 only without a tap fold). Rows outside [0, H) and columns outside [0, W)
+    are zero; only the rows the stationaries use are loaded. Tiles that hold no image row are
+    skipped (their products are zero); if none is left, one zero tile keeps the PSUM
+    initialization. Each row moves with static DMA descriptors. Returns
+    [(tile, contraction rows, tile index)].
+    """
+    _, C_in, H, W = x_in.shape
+    pmax = nl.tile_size.pmax
+    fold = tile_cfg.taps_folded
+    # Tile columns that hold image columns for every fold shift: [lo_max, hi_min).
+    lo_max = 0
+    hi_min = tile_cols
+    any_cols = False
+    for shift in range(fold):
+        shifted = in_col0 + shift * col_shift
+        lo_max = max(lo_max, max(0, -shifted))
+        hi_min = min(hi_min, min(tile_cols, W - shifted))
+        if max(0, -shifted) < min(tile_cols, W - shifted):
+            any_cols = True
+    tiles = []
+    for tile_idx in range(tile_cfg.tiles_per_block):
+        tile_row0 = tile_idx * tile_cfg.rows_per_tile
+        rows = min(tile_cfg.rows_per_tile, tile_cfg.block_span - tile_row0)
+        tile_parts = rows * fold * C_in
+        first_row = in_row0 + tile_row0
+        valid_lo = min(rows, max(0, -first_row))
+        valid_hi = max(valid_lo, min(rows, H - first_row))
+        if any_cols and valid_lo < valid_hi:
+            tile = nl.ndarray((pmax, tile_cols), dtype=x_in.dtype, buffer=nl.sbuf)
+            if valid_lo > 0 or valid_hi < rows or lo_max >= hi_min:
+                # A partly padded tile: zero it whole (an instruction starting off partition 0 may span
+                # only one quadrant), then the image rows land on top.
+                nisa.memset(dst=tile[0:tile_parts, 0:tile_cols], value=0.0)
+            else:
+                if lo_max > 0:
+                    nisa.memset(dst=tile[0:tile_parts, 0:lo_max], value=0.0)
+                if hi_min < tile_cols:
+                    nisa.memset(dst=tile[0:tile_parts, hi_min:tile_cols], value=0.0)
+            for row_idx in range(valid_lo, valid_hi):
+                for shift in range(fold):
+                    shifted = in_col0 + shift * col_shift
+                    col_lo = max(0, -shifted)
+                    col_hi = min(tile_cols, W - shifted)
+                    if col_lo < col_hi:
+                        part0 = (row_idx * fold + shift) * C_in
+                        nisa.dma_copy(
+                            dst=tile[part0 : part0 + C_in, col_lo:col_hi],
+                            src=x_in.ap(
+                                pattern=[[H * W, C_in], [1, col_hi - col_lo]],
+                                offset=(batch_idx * C_in * H + first_row + row_idx) * W + shifted + col_lo,
+                            ),
+                            dge_mode=nisa.dge_mode.none,
+                        )
+            tiles.append((tile, tile_parts, tile_idx))
+    if len(tiles) == 0:
+        tile = nl.ndarray((pmax, tile_cols), dtype=x_in.dtype, buffer=nl.sbuf)
+        tile_parts = min(tile_cfg.rows_per_tile, tile_cfg.block_span) * fold * C_in
+        nisa.memset(dst=tile[0:tile_parts, 0:tile_cols], value=0.0)
+        tiles.append((tile, tile_parts, 0))
+    return tiles
+
+
+def _alloc_band_result(cols: int, out_dtype, tile_cfg: _BandTileConfig) -> nl.NkiTensor:
+    """The stored tile of one column window, in the output dtype."""
+    return nl.ndarray((nl.tile_size.pmax, cols), dtype=out_dtype, buffer=nl.sbuf)
+
+
+def _evict_band_psum(
+    result: nl.NkiTensor,
+    psum: nl.NkiTensor,
+    bias_col: nl.NkiTensor,
+    col_start: int,
+    count: int,
+    col_step: int,
+    tile_cfg: _BandTileConfig,
+    activation_fn: Optional[ActFnType],
+) -> None:
+    """
+    PSUM -> SBUF with the bias and the activation applied, into columns col_start, col_start + col_step, ... of
+    the window. The stored tile is written directly, so the result is rounded once.
+    """
+    parts = tile_cfg.out_partitions
+    dst_tile = result
+    op = nl.copy
+    if tile_cfg.epilogue == _EPILOGUE_ACT_FN:
+        op = get_nl_act_fn_from_type(activation_fn)
+    if col_step == 1:
+        dst = dst_tile[0:parts, col_start : col_start + count]
+    else:
+        dst = dst_tile[0:parts, col_start : col_start + col_step * (count - 1) + 1 : col_step]
+    nisa.activation(dst=dst, op=op, data=psum[0:parts, 0:count], bias=bias_col[0:parts, 0:1], scale=1.0)
+
+
+def _evict_band_banks(
+    result: nl.NkiTensor,
+    psum: nl.NkiTensor,
+    bias_col: nl.NkiTensor,
+    col_start: int,
+    banks: int,
+    chunk: int,
+    tile_cfg: _BandTileConfig,
+    activation_fn: Optional[ActFnType],
+) -> None:
+    """
+    _evict_band_psum for the forward conv's multi-bank PSUM tile: banks 0..banks-1 of a
+    [128, banks, psum_fmax] tile (chunk columns each) -> window columns [col_start, col_start +
+    banks * chunk), in one instruction.
+    """
+    parts = tile_cfg.out_partitions
+    dst_tile = result
+    op = nl.copy
+    if tile_cfg.epilogue == _EPILOGUE_ACT_FN:
+        op = get_nl_act_fn_from_type(activation_fn)
+    nisa.activation(
+        dst=dst_tile[0:parts, col_start : col_start + banks * chunk].reshape_dim(1, (banks, chunk)),
+        op=op,
+        data=psum[0:parts, 0:banks, 0:chunk],
+        bias=bias_col[0:parts, 0:1],
+        scale=1.0,
+    )
+
+
+def _store_band_rows(
+    y_out: nl.NkiTensor,
+    result: nl.NkiTensor,
+    batch_idx: int,
+    row0: int,
+    rows_valid: int,
+    col0: int,
+    cols: int,
+    tile_cfg: _BandTileConfig,
+) -> None:
+    """
+    Store partitions (slot, c_out) as y_out[batch_idx, c_out, row0 + r, col0 : col0 + cols], one DMA
+    per row with static descriptors.
+    """
+    _, C_out, H_out, W_out = y_out.shape
+    for out_row in range(rows_valid):
+        slot = out_row
+        if tile_cfg.rows_reversed:
+            slot = tile_cfg.rows_per_block - 1 - out_row
+        nisa.dma_copy(
+            dst=y_out.ap(
+                pattern=[[H_out * W_out, C_out], [1, cols]],
+                offset=(batch_idx * C_out * H_out + row0 + out_row) * W_out + col0,
+            ),
+            src=result[slot * C_out : (slot + 1) * C_out, 0:cols],
+            dge_mode=nisa.dge_mode.none,
+        )
+
+
+# Row-banded path routing (_banded_wins). The cost constants _BANDED_* above are shared with conv3d_transpose; these
+# are specific to conv3d.
+_BANDED_MIN_WORK_NS = 100_000  # below this both paths sit at the launch floor (one core)
+_BANDED_MAX_CHANNELS = 64
+_BANDED_MAX_STRIDE = 2
+
+
+def _banded_cost_wins(cfg: "Conv3dConfig") -> bool:
+    """
+    Cost model of the row-banded path: True when it is expected to beat the K-replication path.
+    Per output row the banded path issues (span + rows) / rows DMAs, where rows = 128 // C_out output rows
+    share the span input rows they read; this path costs a per-pixel, per-tap time times the row width. The cost
+    constants (_BANDED_*) are rounded middles of the measurements, and the gain must reach
+    _BANDED_MARGIN_X5 / 5 so a layer near the break-even stays on this path. Fitted against the K-replication path: on
+    one core a routed layer was at least 1.6x faster on every one of 66 measured trn2 layers, and at least 1.2x on two
+    cores (the weakest of 18 measured). Re-measured against the current conv3d (low-channel path included) together
+    with conv3d_transpose's router: every routed layer of 41 measured trn2 layers (bf16, one core) was faster, 1.3x to
+    28x, and none was slower.
+    """
+    rows_per_block = nl.tile_size.pmax // cfg.C_out
+    span = (rows_per_block - 1) * cfg.stride_h + cfg.K_h
+    banded_row_ns = _BANDED_DMA_NS * (span + rows_per_block) // rows_per_block
+    taps = max(cfg.K_h * cfg.K_w, _BANDED_MIN_TAPS)
+    conv3d_row_ns = _BANDED_TAP_PIXEL_NS_X20 * taps * cfg.W_out // 20
+    return (
+        5 * conv3d_row_ns >= _BANDED_MARGIN_X5 * banded_row_ns
+        and cfg.B * cfg.H_out * conv3d_row_ns >= _BANDED_MIN_WORK_NS
+    )
+
+
+def _banded_wins(cfg: "Conv3dConfig", dtype, has_caller_sbm: bool) -> bool:
+    """
+    True when this call is routed to _conv3d_banded_compute: a 2D call (D = 1, K_d = 1, no depth padding, so D_out = 1) that
+    path supports (no fused batchnorm or residual, no caller SbufManager, the activations this kernel supports,
+    16-bit operands, unit dilation and strides up to 2, filters up to 8 x 8, at most 64 channels) where
+    _banded_cost_wins expects it to be faster. conv3d additionally requires trn2, the only target the cost model was
+    measured on.
+    """
+    structural = (
+        not has_caller_sbm
+        and not cfg.has_batch_norm()
+        and not cfg.has_residual_add()
+        and cfg.activation_fn != ActFnType.SquaredReLU
+        and (dtype == nl.bfloat16 or dtype == nl.float16)
+        and cfg.D == 1
+        and cfg.K_d == 1
+        and cfg.pad_d_left == 0
+        and cfg.pad_d_right == 0
+        and cfg.dilation_h == 1
+        and cfg.dilation_w == 1
+        and cfg.stride_h <= _BANDED_MAX_STRIDE
+        and cfg.stride_w <= _BANDED_MAX_STRIDE
+        and cfg.K_h <= 8
+        and cfg.K_w <= 8
+        and cfg.B <= 16
+        and cfg.H <= 4096
+        and cfg.W <= 4096
+        and cfg.C_in <= _BANDED_MAX_CHANNELS
+        and cfg.C_out <= _BANDED_MAX_CHANNELS
+    )
+    return structural and _banded_cost_wins(cfg)

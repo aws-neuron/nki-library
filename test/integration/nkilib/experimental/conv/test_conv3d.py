@@ -16,6 +16,7 @@
 
 from typing import Optional, final
 
+import nki
 import nki.language as nl
 import numpy as np
 import pytest
@@ -24,7 +25,11 @@ import torch.nn.functional as F
 from nkilib_src.nkilib.core.utils.common_types import ActFnType
 from nkilib_src.nkilib.experimental.conv.conv3d import BatchNormMode, ResidualAddLoc, conv3d
 from nkilib_src.nkilib.experimental.conv.conv3d_helpers import _build_conv3d_config, _validate_conv3d_inputs
-from nkilib_src.nkilib.experimental.conv.conv3d_kernels import _conv3d_low_chan_compute
+from nkilib_src.nkilib.experimental.conv.conv3d_kernels import (
+    _banded_wins,
+    _conv3d_banded_compute,
+    _conv3d_low_chan_compute,
+)
 from nkilib_src.nkilib.experimental.conv.conv3d_torch import conv3d_torch_ref
 from nkilib_src.nkilib.experimental.conv.conv_fuser_torch import conv_fuser_torch_ref
 
@@ -68,6 +73,7 @@ def generate_conv3d_inputs(
     residual_add_loc: ResidualAddLoc = ResidualAddLoc.NONE,
     omit_residuals_in: bool = False,
     x_in_mean: float = 0.0,
+    bias_shape: Optional[tuple[int, ...]] = None,
 ):
     """
     Generate inputs for conv3d kernel test.
@@ -103,6 +109,7 @@ def generate_conv3d_inputs(
             to exercise the kernel's input validation
         x_in_mean: Mean of the generated x_in (default 0.0). A non-zero mean makes the conv output's
             per-channel mean large relative to its std, exercising batchnorm-rescale precision
+        bias_shape: Shape of the generated bias (default [C_out]); e.g. [C_out, 1], which conv3d reads the same way
 
     Returns:
         dict: Dictionary of input tensors and parameters for kernel
@@ -119,7 +126,7 @@ def generate_conv3d_inputs(
     filters = generate_tensor(
         name="filters", shape=(filter_d, filter_h, filter_w, in_channels, out_channels), dtype=dtype
     )
-    bias = generate_tensor(name="bias", shape=(out_channels,), dtype=dtype) if use_bias else None
+    bias = generate_tensor(name="bias", shape=bias_shape or (out_channels,), dtype=dtype) if use_bias else None
 
     inputs = {
         "x_in": x_in,
@@ -880,6 +887,45 @@ CONV3D_CONV2D_STYLE_PARAMS = [
     (1, 256, 512, 1, 28, 28, 1, 3, 3, 1, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
 ]
 
+# Thin layers with wide rows that conv3d routes to the row-banded path on trn2 (expect_banded, conv3d._banded_wins),
+# and narrow / 128-channel twins that stay on the K-replication path. Both must match the torch reference.
+CONV3D_BANDED_ROUTE_PARAMS = [
+    pytest.param(1, 16, 16, 1, 64, 640, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16, True, marks=pytest.mark.fast),
+    pytest.param(2, 32, 32, 1, 32, 640, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16, True, marks=pytest.mark.fast),
+    (1, 3, 16, 1, 96, 1536, 1, 3, 3, 1, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16, True),
+    (1, 16, 3, 1, 64, 640, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16, True),
+    (1, 16, 16, 1, 64, 320, 1, 5, 5, 1, 1, 1, 0, 0, 2, 2, 2, 2, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16, True),
+    (1, 16, 16, 1, 64, 640, 1, 3, 3, 1, 1, 1, 0, 0, 2, 0, 0, 1, 1, 1, 1, False, None, False, nl.bfloat16, True),
+    # K_h != K_w, stride_h != stride_w and four different paddings (a swapped pair in the routed wrapper would go unnoticed otherwise)
+    pytest.param(1, 16, 16, 1, 128, 640, 1, 5, 3, 1, 2, 1, 0, 0, 2, 1, 0, 2, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16, True, marks=pytest.mark.fast),
+    (1, 16, 16, 1, 64, 128, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16, False),
+    (1, 128, 128, 1, 16, 640, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16, False),
+]
+# Layers the router keeps on conv3d's K-replication path (small, odd and 128-channel shapes, column windows), run on the
+# row-banded path directly so its tiling corner cases stay covered.
+CONV3D_BANDED_DIRECT_PARAMS = [
+    pytest.param(1, 3, 16, 1, 24, 40, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(2, 16, 16, 1, 20, 36, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(1, 16, 32, 1, 24, 48, 1, 3, 3, 1, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, ActFnType.SiLU, False, nl.bfloat16, marks=pytest.mark.fast),
+    (1, 3, 64, 1, 40, 64, 1, 7, 7, 1, 2, 2, 0, 0, 3, 3, 3, 3, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 64, 64, 1, 12, 40, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
+    (1, 32, 16, 1, 20, 30, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 16, 16, 1, 17, 33, 1, 3, 3, 1, 2, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU_Tanh_Approx, False, nl.bfloat16),
+    (1, 128, 128, 1, 6, 40, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
+    (3, 4, 6, 1, 15, 16, 1, 3, 5, 1, 1, 2, 0, 0, 1, 1, 2, 2, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 24, 10, 1, 13, 21, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, ActFnType.Swish, False, nl.bfloat16),
+    (1, 16, 16, 1, 16, 32, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.ReLU, False, nl.float16),
+    (1, 3, 16, 1, 5, 8, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 3, 8, 1, 24, 40, 1, 8, 8, 1, 1, 1, 0, 0, 3, 4, 3, 4, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16),
+    # Asymmetric padding: (pad_h_top, pad_h_bottom, pad_w_left, pad_w_right) differ, no padding on one side.
+    pytest.param(1, 16, 16, 1, 20, 24, 1, 3, 3, 1, 1, 1, 0, 0, 2, 0, 0, 1, 1, 1, 1, True, None, False, nl.bfloat16, marks=pytest.mark.fast),
+    (1, 8, 24, 1, 19, 22, 1, 4, 4, 1, 2, 2, 0, 0, 1, 2, 1, 2, 1, 1, 1, True, ActFnType.SiLU, False, nl.bfloat16),
+    (2, 3, 16, 1, 11, 14, 1, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 6, 32, 1, 14, 37, 1, 5, 5, 1, 1, 2, 0, 0, 2, 2, 2, 2, 1, 1, 1, True, ActFnType.ReLU, False, nl.bfloat16),
+    # Output width above the SBUF window of one pass: the column windows are walked in turn.
+    (1, 128, 128, 1, 3, 9000, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
+    (1, 64, 64, 1, 4, 20000, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
+]
 CONV_FUSER_PARAMS = [
     # Default ConvFuser Config with representative batch sizes
     pytest.param(1, 128, 64, 1, 64, 64, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, ActFnType.ReLU, True, nl.bfloat16, 1e-5, 0.1, BatchNormMode.TRAINING, False, ResidualAddLoc.NONE),
@@ -917,6 +963,90 @@ CONV_FUSER_PARAMS = [
 ]
 
 # fmt: on
+
+
+def _conv3d_banded_kernel(
+    x_in: nl.NkiTensor,
+    filters: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
+    stride: tuple[int, int, int] = (1, 1, 1),
+    padding: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
+    dilation: tuple[int, int, int] = (1, 1, 1),
+    activation_fn: Optional[ActFnType] = None,
+    lnc_shard: bool = False,
+    batch_norm_mode: BatchNormMode = BatchNormMode.NONE,
+    output_pre_norm: Optional[bool] = False,
+    batch_norm_eps: Optional[float] = 1e-5,
+    gamma: Optional[nl.NkiTensor] = None,
+    beta: Optional[nl.NkiTensor] = None,
+    momentum: Optional[float] = 0.1,
+    running_means: Optional[nl.NkiTensor] = None,
+    running_variances: Optional[nl.NkiTensor] = None,
+    sbm=None,
+    use_auto_allocation: bool = False,
+    residual_add_loc: ResidualAddLoc = ResidualAddLoc.NONE,
+    residuals_in: Optional[nl.NkiTensor] = None,
+):
+    """conv3d's row-banded path called directly, with conv3d's arguments (the fused options must be off)."""
+    assert batch_norm_mode == BatchNormMode.NONE and residual_add_loc == ResidualAddLoc.NONE and sbm is None  # noqa: S101
+    cfg = _build_conv3d_config(
+        x_in=x_in,
+        filters=filters,
+        bias=bias,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        activation_fn=activation_fn,
+        batch_norm_mode=batch_norm_mode,
+        output_pre_norm=False,
+        residual_add_loc=residual_add_loc,
+        transpose_taps=False,
+    )
+    return _conv3d_banded_compute(x_in, filters, bias, cfg)
+
+
+def _conv3d_routes_to_banded(
+    batch: int,
+    in_channels: int,
+    out_channels: int,
+    depth: int,
+    height: int,
+    width: int,
+    filter_d: int,
+    filter_h: int,
+    filter_w: int,
+    stride: tuple[int, int, int],
+    padding: tuple[int, int, int, int, int, int],
+    dilation: tuple[int, int, int],
+    activation_fn: Optional[ActFnType],
+    dtype,
+) -> bool:
+    """Whether conv3d sends this layer to the row-banded path on trn2 (conv3d._banded_wins)."""
+
+    result = {}
+
+    def decide(x_in, filters):
+        cfg = _build_conv3d_config(
+            x_in=x_in,
+            filters=filters,
+            bias=None,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            activation_fn=activation_fn,
+            batch_norm_mode=BatchNormMode.NONE,
+            output_pre_norm=False,
+            residual_add_loc=ResidualAddLoc.NONE,
+            transpose_taps=False,
+        )
+        result["routed"] = _banded_wins(cfg, dtype, False)
+        return nl.ndarray(shape=(1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    nki.simulate(decide)(
+        np.zeros((batch, in_channels, depth, height, width), dtype=dtype),
+        np.zeros((filter_d, filter_h, filter_w, in_channels, out_channels), dtype=dtype),
+    )
+    return result["routed"]
 
 
 @pytest_test_metadata(name="Conv3D")
@@ -2038,6 +2168,188 @@ class TestConv3DKernel:
             dtype=dtype,
         )
 
+    @pytest.mark.parametrize(CONV3D_PARAM_NAMES + ", expect_banded", CONV3D_BANDED_ROUTE_PARAMS)
+    def test_conv3d_banded_route(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        height: int,
+        width: int,
+        filter_d: int,
+        filter_h: int,
+        filter_w: int,
+        stride_d: int,
+        stride_h: int,
+        stride_w: int,
+        pad_d_left: int,
+        pad_d_right: int,
+        pad_h_top: int,
+        pad_h_bottom: int,
+        pad_w_left: int,
+        pad_w_right: int,
+        dilation_d: int,
+        dilation_h: int,
+        dilation_w: int,
+        use_bias: bool,
+        activation_fn: Optional[ActFnType],
+        lnc_shard: bool,
+        dtype,
+        expect_banded: bool,
+    ) -> None:
+        """Thin layers with wide rows (routed to the row-banded path on trn2) and their narrow twins."""
+        routed = _conv3d_routes_to_banded(
+            batch,
+            in_channels,
+            out_channels,
+            depth,
+            height,
+            width,
+            filter_d,
+            filter_h,
+            filter_w,
+            (stride_d, stride_h, stride_w),
+            (pad_d_left, pad_d_right, pad_h_top, pad_h_bottom, pad_w_left, pad_w_right),
+            (dilation_d, dilation_h, dilation_w),
+            activation_fn,
+            dtype,
+        )
+        assert routed == expect_banded, f"conv3d._banded_wins returned {routed}, expected {expect_banded}"  # noqa: S101
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=batch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            height=height,
+            width=width,
+            filter_d=filter_d,
+            filter_h=filter_h,
+            filter_w=filter_w,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d_left=pad_d_left,
+            pad_d_right=pad_d_right,
+            pad_h_top=pad_h_top,
+            pad_h_bottom=pad_h_bottom,
+            pad_w_left=pad_w_left,
+            pad_w_right=pad_w_right,
+            dilation_d=dilation_d,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+            use_bias=use_bias,
+            activation_fn=activation_fn,
+            lnc_shard=lnc_shard,
+            dtype=dtype,
+        )
+
+    @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_BANDED_DIRECT_PARAMS)
+    def test_conv3d_banded_direct(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        height: int,
+        width: int,
+        filter_d: int,
+        filter_h: int,
+        filter_w: int,
+        stride_d: int,
+        stride_h: int,
+        stride_w: int,
+        pad_d_left: int,
+        pad_d_right: int,
+        pad_h_top: int,
+        pad_h_bottom: int,
+        pad_w_left: int,
+        pad_w_right: int,
+        dilation_d: int,
+        dilation_h: int,
+        dilation_w: int,
+        use_bias: bool,
+        activation_fn: Optional[ActFnType],
+        lnc_shard: bool,
+        dtype,
+    ) -> None:
+        """The row-banded path on layers the router does not send it (trn2 only, like the routing)."""
+        if platform_target != Platforms.TRN2:
+            pytest.skip("conv3d runs the row-banded path on trn2 only")
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=batch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            height=height,
+            width=width,
+            filter_d=filter_d,
+            filter_h=filter_h,
+            filter_w=filter_w,
+            stride_d=stride_d,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            pad_d_left=pad_d_left,
+            pad_d_right=pad_d_right,
+            pad_h_top=pad_h_top,
+            pad_h_bottom=pad_h_bottom,
+            pad_w_left=pad_w_left,
+            pad_w_right=pad_w_right,
+            dilation_d=dilation_d,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+            use_bias=use_bias,
+            activation_fn=activation_fn,
+            lnc_shard=lnc_shard,
+            dtype=dtype,
+            kernel_entry=_conv3d_banded_kernel,
+        )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("bias_shape", [(16, 1), (24,)], ids=["column", "longer"])
+    def test_conv3d_banded_route_bias_shape(
+        self, test_manager: Orchestrator, platform_target: Platforms, bias_shape: tuple[int, ...]
+    ) -> None:
+        """conv3d reads the first C_out elements of the bias without checking its shape; the routed path must too."""
+        self._run_conv3d_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            batch=1,
+            in_channels=16,
+            out_channels=16,
+            depth=1,
+            height=64,
+            width=640,
+            filter_d=1,
+            filter_h=3,
+            filter_w=3,
+            stride_d=1,
+            stride_h=1,
+            stride_w=1,
+            pad_d_left=0,
+            pad_d_right=0,
+            pad_h_top=1,
+            pad_h_bottom=1,
+            pad_w_left=1,
+            pad_w_right=1,
+            dilation_d=1,
+            dilation_h=1,
+            dilation_w=1,
+            use_bias=True,
+            activation_fn=None,
+            lnc_shard=False,
+            dtype=nl.bfloat16,
+            bias_shape=bias_shape,
+        )
+
     def _run_conv3d_test(
         self,
         test_manager: Orchestrator,
@@ -2074,6 +2386,7 @@ class TestConv3DKernel:
         residual_add_loc: ResidualAddLoc = ResidualAddLoc.NONE,
         omit_residuals_in: bool = False,
         x_in_mean: float = 0.0,
+        bias_shape: Optional[tuple[int, ...]] = None,
         torch_ref=conv3d_torch_ref,
         kernel_entry=conv3d,
     ) -> None:
@@ -2110,6 +2423,7 @@ class TestConv3DKernel:
             residual_add_loc: Where the fused residual add goes relative to the activation
             omit_residuals_in: Skip generating residuals_in to exercise input validation
             x_in_mean: Mean of the generated x_in; non-zero exercises rescale precision
+            bias_shape: Shape of the generated bias (default [C_out])
         """
         # Calculate output shape
         D_out = (depth + pad_d_left + pad_d_right - dilation_d * (filter_d - 1) - 1) // stride_d + 1
@@ -2150,6 +2464,7 @@ class TestConv3DKernel:
                 residual_add_loc=residual_add_loc,
                 omit_residuals_in=omit_residuals_in,
                 x_in_mean=x_in_mean,
+                bias_shape=bias_shape,
             )
 
         def output_tensors(kernel_input):
@@ -2179,9 +2494,14 @@ class TestConv3DKernel:
             output_tensor_descriptor=output_tensors,
         )
 
-        # Use higher tolerance for bfloat16
-        rtol = 1e-2 if dtype == nl.bfloat16 else 1e-5
-        atol = 1e-2 if dtype == nl.bfloat16 else 1e-5
+        # bfloat16 / float16 results are rounded once from fp32 PSUM sums.
+        tol = 1e-5
+        if dtype == nl.bfloat16:
+            tol = 1e-2
+        elif dtype == nl.float16:
+            tol = 2e-3
+        rtol = tol
+        atol = tol
 
         framework.run_test(
             test_config=None,

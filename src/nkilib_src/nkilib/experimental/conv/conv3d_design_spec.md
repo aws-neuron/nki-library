@@ -62,6 +62,12 @@ The input, output, and bias tensors use the same layout as standard PyTorch conv
 
 The filter tensor is reshaped to `[K_d, K_h, K_w, C_in, C_out]`. This is done because for a given filter position `(k_d, k_h, k_w)`, we need to load a `[C_in, C_out]` slice as the stationary tensor for the matmul. With this layout, the `C_in` and `C_out` dimensions are contiguous in memory for each filter position, making the DMA copies to load filters into SBUF more efficent. As filters are a weight this reshape can be done once on host at a negligible amortized cost.
 
+### Routing thin 2D layers to the row-banded kernel
+
+On trn2, not every call runs the strategy described in the rest of this document. A 2D call (`D = 1`, `K_d = 1`) of a thin layer with wide rows is handed to `_conv3d_banded_compute` (`conv3d_kernels.py`), which stacks image rows next to the channels on the tensor engine and needs no per-tap input copies. `_banded_wins` decides: bf16 or fp16, at most 64 channels in and out, unit dilation, strides up to 2, filters up to 8 x 8, no fused batchnorm or residual, no `SquaredReLU`, no caller-provided `sbm`, and a cost model (`_banded_cost_wins`) that expects the banded path to be at least 1.2x faster on a layer with enough work. Every other call runs the strategy of this document, unchanged.
+
+The signature, the output shape and the dtype do not change, and the routed result is equal up to rounding (fp32 accumulation in a different order, so a few elements differ by under one ulp). A caller-provided `sbm` keeps the original path, which is the way to force it for an A/B comparison. `conv3d_transpose` routes thin stride-2 upsamplers to `_conv3d_transpose_banded` in the same way (`_banded_transpose_wins`).
+
 ### Tiling Strategy
 
 The outermost loop is over batch. Within each batch, we keep a set of C_out tiles (filter weights) resident in SBUF, these are the filters needed to fully compute a portion of the output channels across all `C_in` tiles.
