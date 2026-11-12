@@ -116,5 +116,6 @@ def compute_cumulative_decay(
     exp_cs_col = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(op=nl.exp, data=cs_col[0:Q, 0:1], dst=exp_cs_col[0:Q, 0:1])
     exp_neg_cs_col = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(op=nl.reciprocal, data=exp_cs_col[0:Q, 0:1], dst=exp_neg_cs_col[0:Q, 0:1])
+    # exp(-cs) via exp with scale=-1 (not reciprocal) so the activation table never switches
+    nisa.activation(op=nl.exp, data=cs_col[0:Q, 0:1], dst=exp_neg_cs_col[0:Q, 0:1], scale=-1.0)
     return cs_row, exp_cs_col, exp_neg_cs_col
