@@ -65,6 +65,8 @@ FEATURES:
    - Positions outside the range are masked with -inf, preventing cross-sequence attention
    - Compatible with causal masking (both masks are applied simultaneously)
    - Not compatible with prefix caching
+   - Optional segment_cu_seqlens: compile-time copy of the layout that lets the kernel skip
+     K tiles which lie entirely outside every segment of a Q group
 
 7. Grouped Query Attention (GQA, batch_size_kv < batch_size):
    - Kernel handles GQA natively without explicit K/V replication
@@ -236,6 +238,7 @@ def attention_cte(
     bias_layout: str = "dense",
     bias_band_params: Optional[dict] = None,
     allow_vector_exp: bool = True,
+    segment_cu_seqlens: Optional[tuple] = None,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
 
@@ -276,6 +279,21 @@ def attention_cte(
                      together with bound_max. Not compatible with prefix caching.
       bound_max (nt.tensor, optional): (Sequence packing) Per-query upper bound (exclusive) of the KV range
                      to attend to, with shape (batch, seqlen_q, 1). Must be provided together with bound_min.
+      segment_cu_seqlens (tuple of int, optional): (Sequence packing) Compile-time copy of the packed
+                     layout as cumulative segment lengths ``(0, len_0, len_0 + len_1, ..., seqlen)``, in
+                     global sequence coordinates. Must describe the same layout as bound_min/bound_max
+                     and be the same for every batch entry. When provided, K tiles that no query row
+                     of a 128-row Q group can attend to are skipped at trace time (MM1, masking and
+                     exp are not emitted for them), and (Q group, flash section) pairs with no work are
+                     skipped entirely. Results match the call without it to within accumulation-order
+                     rounding (the skipped work only ever contributes zeros). Because the layout is
+                     baked into the traced program, each distinct layout compiles a distinct kernel:
+                     only pass it when the set of layouts is small and repeats (for example fixed-length
+                     or bucketed documents). Layouts that change on every call (arbitrary per-batch
+                     document lengths) cause a recompile per call; omit the argument there. Not applied
+                     with prefix caching, interleaved KV, or strided Q slicing; under striped CP it is
+                     applied only when every boundary is a multiple of global_cp_deg. Default None
+                     (no pruning).
       cp_striped_input (bool, optional): Whether the input sequence was distributed across CP ranks
                      in round-robin (striped) order rather than contiguous chunks. When True, the
                      caller must set cp_offset to 0 (include diagonal, q_rank >= kv_rank) or -1
@@ -449,6 +467,7 @@ def attention_cte(
         cp_strided_q_slicing=cp_strided_q_slicing,
         bound_min=bound_min,
         bound_max=bound_max,
+        segment_cu_seqlens=segment_cu_seqlens,
         cp_striped_input=cp_striped_input,
         skip_output_normalization=skip_output_normalization,
         position_bias=position_bias,
@@ -509,6 +528,7 @@ def _attention_cte(
     kvp_k_threshold_sb=None,
     kvp_seg_block_offset_int: int = 0,
     allow_vector_exp: bool = True,
+    segment_cu_seqlens: Optional[tuple] = None,
 ):
     """Internal attention implementation with full parameter set including SBUF I/O.
 
@@ -596,6 +616,30 @@ def _attention_cte(
     # Sequence packing is active when per-query KV bounds are provided
     is_sequence_packed = bound_min is not None
 
+    # Compile-time segment layout for sequence packing. Trace-time metadata that
+    # mirrors what bound_min/bound_max encode on the device; enables tile pruning.
+    segment_spans = None
+    if segment_cu_seqlens != None:
+        kernel_assert(
+            is_sequence_packed,
+            "segment_cu_seqlens requires bound_min/bound_max (it describes the same layout)",
+        )
+        # Plain loops: comprehensions are rejected ("unsupported expression") when traced through
+        # torch.compile(backend="neuron"). This is all trace-time Python.
+        _cu = []
+        for _x in segment_cu_seqlens:
+            _cu.append(int(_x))
+        kernel_assert(len(_cu) >= 2, f"segment_cu_seqlens must have at least 2 entries, got {len(_cu)}")
+        kernel_assert(_cu[0] == 0, f"segment_cu_seqlens must start at 0, got {_cu[0]}")
+        for _i in range(len(_cu) - 1):
+            kernel_assert(
+                _cu[_i + 1] > _cu[_i],
+                f"segment_cu_seqlens must be strictly increasing, got _cu[{_i}]={_cu[_i]} >= _cu[{_i + 1}]={_cu[_i + 1]}",
+            )
+        segment_spans = []
+        for _i in range(len(_cu) - 1):
+            segment_spans.append((_cu[_i], _cu[_i + 1]))
+
     # Validate kv_used_len: dynamic active-KV upper bound. Restricted to the
     # non-APC, non-SWA, non-CP, non-sequence-packed, non-causal path. Shape
     # must be (1,) for HBM or (1, 1) for SBUF (same convention as prior_used_len).
@@ -668,6 +712,22 @@ def _attention_cte(
             f"bound_max shape must be (batch, seqlen_q, 1)=({batch_size}, {seqlen_q}, 1), got {bound_max.shape}",
         )
         kernel_assert(not is_prefix_caching, "is_sequence_packed is not supported with prefix caching")
+
+        # The descriptor must cover the whole query sequence, or tiles the device bounds treat as live
+        # could be pruned. Checked here because seqlen_q is only known after shape resolution.
+        if segment_spans != None:
+            # The descriptor is in GLOBAL coordinates (like bound_min/bound_max): seqlen_q without CP
+            # striping, seqlen_q * cp_deg under striped CP (each rank holds every cp_deg-th position).
+            expected_global = seqlen_q
+            if cp_striped_input and global_cp_deg != None and global_cp_deg > 1:
+                expected_global = seqlen_q * global_cp_deg
+            kernel_assert(
+                segment_spans[-1][1] == expected_global,
+                f"segment_cu_seqlens must be in GLOBAL coordinates and end at "
+                f"{expected_global}, got {segment_spans[-1][1]} "
+                f"(seqlen_q={seqlen_q}, cp_striped_input={cp_striped_input}, "
+                f"global_cp_deg={global_cp_deg})",
+            )
         if global_cp_deg is not None and global_cp_deg > 1:
             kernel_assert(
                 cp_striped_input,
@@ -908,6 +968,7 @@ def _attention_cte(
         softmax_dtype=softmax_dtype,
         mm_out_dtype=mm_out_dtype,
         is_sequence_packed=is_sequence_packed,
+        segment_spans=segment_spans,
         has_kv_used_len=has_kv_used_len,
         use_position_bias=position_bias is not None,
         bias_layout=bias_layout,
@@ -1149,6 +1210,9 @@ class AttnConfig(nl.NKIObject):
     kvp_k_threshold_sb: Any = None  # Pre-generated static k_threshold pattern in SBUF
     kvp_all_tiles_visible: bool = False  # Compile-time: all tiles in this segment are fully visible
     allow_vector_exp: bool = True
+    # Sequence packing: trace-time segment spans [(start, end_exclusive), ...] from segment_cu_seqlens.
+    # None => no compile-time pruning (compute every tile, mask to -inf as before).
+    segment_spans: Any = None
 
 
 def _attention_cte_impl(
@@ -3043,6 +3107,10 @@ def _load_q_impl(
             if (atp.is_causal and not sp.section_contains_prefix)
             else True
         )
+        if ac.is_sequence_packed and not sp.section_contains_prefix:
+            has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+                grp_i, ac, atp, sp.section_offset_active, atp.num_q_grps_per_load
+            )
         if has_any_compute_pred:
             q_seqlen_offset = grp_i * _Q_GRP_SZ
             _load_q_tile(
@@ -3099,6 +3167,10 @@ def _qk_and_max_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if has_any_compute_pred:
         nisa.memset(
             bufs.mm1_partial_max[grp_i % _MM1_PARTIAL_MAX_STAGES][:, : atp.num_k_tiles_per_section],
@@ -3123,17 +3195,17 @@ def _update_max_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if not has_any_compute_pred:
         return
 
-    # Step 1: Compute section max. The sink lives permanently in the last column of
-    # mm1_partial_max (see _allocate_attention_buffers), so it needs no per-section copy.
-    #
-    # On the first section mm1_section_max and mm1_running_max hold the same value, so reduce
-    # straight into the running max and skip a GpSimd copy between this reduce and the exp that
-    # consumes the max. Only section_idx > 0 needs the two kept apart, because there the section
-    # max is combined with the surviving running max.
-    reduce_into_running = sp.section_idx == 0 or atp.num_sections == 1
+    # Step 1: section max (the sink lives in the last column of mm1_partial_max, so no per-section copy). On a group's
+    # first live section the section and running max are equal, so reduce straight into the running max.
+    first_live = _is_first_live_section(grp_i, ac, atp, sp)
+    reduce_into_running = first_live or atp.num_sections == 1
     nisa.tensor_reduce(
         bufs.mm1_running_max[:, grp_i] if reduce_into_running else bufs.mm1_section_max[grp_i][:, 0],
         nl.maximum,
@@ -3144,9 +3216,9 @@ def _update_max_impl(
 
     # Step 2: compute and store running max, and flash attention correction factor
     if atp.num_sections != 1:
-        if sp.section_idx == 0:
+        if first_live:
             nisa.memset(bufs.flash_attn_correction_factor[grp_i][...], value=0.0)
-        if sp.section_idx > 0:
+        else:
             nisa.activation(
                 bufs.prev_mm1_running_max[grp_i][...],
                 nl.copy,
@@ -3301,6 +3373,10 @@ def _exp_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if not has_any_compute_pred:
         return
 
@@ -3331,9 +3407,10 @@ def _exp_impl(
             operand0=-1.0,
         )
 
-    # Precompute each exp tile's selection once (shared by the loop below) and chain the fused
-    # sum: reset on the first executed tile, accumulate on the rest, single read-out on the last.
+    # Precompute each exp tile's selection once and chain the fused sum (reset, accumulate, read out on the last).
+    # Segment-pruned tiles are not exponentiated, are left out of the chain and are zero-filled below.
     exp_selections = []
+    exp_pruned = []
     exp_first_tile = None
     exp_last_tile = None
     for large_tile_idx in range(atp.num_large_tiles_per_section):
@@ -3341,7 +3418,21 @@ def _exp_impl(
             should_process_tile, num_valid_k_remaining = _exp_tile_selection(
                 grp_i, large_tile_idx, exp_tile_idx, ac, atp, sp
             )
+            is_pruned = should_process_tile and _is_bounds_pruned_tile(
+                grp_i,
+                _classify_and_mask_tile(
+                    grp_i,
+                    sp.section_offset + large_tile_idx * _LARGE_TILE_SZ + exp_tile_idx * atp.exp_inst_elems,
+                    atp.exp_inst_elems,
+                    ac,
+                    atp,
+                ),
+                ac,
+            )
+            if is_pruned:
+                should_process_tile = False
             exp_selections.append((should_process_tile, num_valid_k_remaining))
+            exp_pruned.append(is_pruned)
             if should_process_tile:
                 current_exp_tile = (large_tile_idx, exp_tile_idx)
                 exp_first_tile = exp_first_tile or current_exp_tile
@@ -3357,10 +3448,21 @@ def _exp_impl(
 
     for large_tile_idx in range(atp.num_large_tiles_per_section):
         for exp_tile_idx in range(atp.num_exp_insts_per_large_tile):
-            should_process_tile, num_valid_k_remaining = exp_selections[
-                large_tile_idx * atp.num_exp_insts_per_large_tile + exp_tile_idx
-            ]
+            exp_sel_idx = large_tile_idx * atp.num_exp_insts_per_large_tile + exp_tile_idx
+            should_process_tile, num_valid_k_remaining = exp_selections[exp_sel_idx]
 
+            if exp_pruned[exp_sel_idx]:
+                # MM2 is not pruned and exp buffers are reused across Q groups, so these slices must be zero;
+                # alternate the fill between GpSimd and Vector (the two engines nisa.memset accepts) to balance them.
+                fill_engine = nisa.gpsimd_engine if exp_sel_idx % 2 == 0 else nisa.vector_engine
+                num_f = min(num_valid_k_remaining, atp.exp_inst_elems)
+                nisa.memset(
+                    bufs.exp_sb[grp_i][large_tile_idx][:num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)],
+                    value=0.0,
+                    engine=fill_engine,
+                )
+                nisa.memset(bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx][...], value=0.0, engine=fill_engine)
+                continue
             if not should_process_tile:
                 continue
             num_f = min(num_valid_k_remaining, atp.exp_inst_elems)
@@ -3461,7 +3563,7 @@ def _exp_impl(
                 )
 
     # If there is sink, subtract max from it, then take its exp, then append it to sums
-    if (sink is not None) and (sp.section_idx == 0):
+    if (sink is not None) and _is_first_live_section(grp_i, ac, atp, sp):
         frs_sink_idx = bufs.exp_partial_sum[grp_i].shape[-1] - 1
         nisa.activation(
             bufs.exp_partial_sum[grp_i][:, frs_sink_idx],
@@ -3484,6 +3586,10 @@ def _pv_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if has_any_compute_pred:
         for _d_tile in range(atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim):
             nisa.memset(bufs.mm2_sb[grp_i][_d_tile][...], value=0.0)
@@ -3513,6 +3619,15 @@ def _fused_qkmax_and_pv_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        # Both halves of the fused stage must use the SAME skip decision as their
+        # non-fused counterparts, or one pass would write buffers the other skips.
+        has_any_compute_pred_pv = has_any_compute_pred_pv and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
+        has_any_compute_pred_qkmax = has_any_compute_pred_qkmax and _has_any_compute_bounds_section(
+            qkmax_grp, ac, atp, sp.section_offset_active
+        )
     nisa.memset(
         bufs.mm1_partial_max[qkmax_grp % _MM1_PARTIAL_MAX_STAGES][:, : atp.num_k_tiles_per_section],
         value=_FLOAT32_MIN,
@@ -3542,6 +3657,10 @@ def _write_back_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     # if we have compute for this section but not the next section,
     # then this is the last section to have compute, and we need to
     # execute the final section logic to write final results
@@ -3550,6 +3669,12 @@ def _write_back_impl(
         if (atp.is_causal and not sp.next_section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.next_section_contains_prefix:
+        # Must mirror the has_any_compute_pred gate for the NEXT section; otherwise a group's final
+        # normalize-and-write-to-HBM step can be skipped entirely (or run twice).
+        next_has_compute_pred = next_has_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.next_section_offset_active
+        )
     is_last_section_with_compute = has_any_compute_pred and (not next_has_compute_pred)
 
     if not has_any_compute_pred:
@@ -3557,11 +3682,10 @@ def _write_back_impl(
 
     # Step 1: Compute/update exp-sum and its reciprocal
     q_seqlen_offset = grp_i * atp.sb_p
-    # Same aliasing as the running max above: on the first section exp_section_sum and
-    # exp_running_sum hold the same value, so reduce straight into the running sum and skip the
-    # GpSimd copy. Only section_idx > 0 needs them apart, where the section
-    # sum is folded into the running sum through the flash correction factor.
-    reduce_into_running = sp.section_idx == 0 or atp.num_sections == 1
+    # Same aliasing as the running max: on the first live section reduce straight into the running sum; later
+    # sections fold the section sum in through the flash correction factor.
+    first_live = _is_first_live_section(grp_i, ac, atp, sp)
+    reduce_into_running = first_live or atp.num_sections == 1
     nisa.tensor_reduce(
         bufs.exp_running_sum[:, grp_i] if reduce_into_running else bufs.exp_section_sum[grp_i][...],
         nl.add,
@@ -3569,7 +3693,7 @@ def _write_back_impl(
         axis=1,
     )
     if atp.num_sections != 1:
-        if sp.section_idx > 0:
+        if not first_live:
             nisa.tensor_copy(
                 bufs.prev_exp_running_sum[grp_i][...],
                 bufs.exp_running_sum[:, grp_i],
@@ -3612,7 +3736,7 @@ def _write_back_impl(
     num_d_tiles_iter = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
     d_tile_size = atp.d_tile_size_par_dim_v if ac.tp_out else atp.d_tile_size_free_dim
     if atp.num_sections != 1:
-        if sp.section_idx == 0:
+        if _is_first_live_section(grp_i, ac, atp, sp):
             if is_last_section_with_compute:
                 if ac.skip_output_normalization:
                     _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
@@ -3623,7 +3747,7 @@ def _write_back_impl(
             else:
                 _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
 
-        if sp.section_idx > 0:
+        else:
             # Load previous output, scale by flash_attn_correction_factor and accumulate
             for d_tile in range(num_d_tiles_iter):
                 d = min(d_tile_size, ac.d_v - d_tile * d_tile_size)
@@ -4079,6 +4203,10 @@ def _qk_and_max_large_tile_impl(
 
         if not should_process:
             continue
+        # Segment pruning: skip MM1 and masking for a tile with no in-segment keys. The exp pass uses the same predicate,
+        # so the skipped mm1_masked slice is never read (mm1_partial_max was memset to _FLOAT32_MIN per group).
+        if _is_bounds_pruned_tile(qkmax_grp, tile, ac):
+            continue
         # Extract relevant tensor tiles for convenience
         mm1_psum_tile = bufs.mm1_psum[qkmax_grp][large_tile_idx][k_tile_idx]
         # Keyed off the allocation, not off dynamic_sel_mask: the range_select diagonal path
@@ -4490,6 +4618,208 @@ def _pv_large_tile_impl(
                 nisa.tensor_tensor(dst, dst, psum, nl.add)
             else:
                 nisa.tensor_copy(dst, psum)
+
+
+def _is_bounds_pruned_tile(q_grp: int, tile_info: KTileInfo, ac: AttnConfig):
+    """Return True when a K tile can be skipped because no row of ``q_grp`` attends to any key in it.
+
+    Only active-K tiles are pruned, and only when a compile-time segment layout
+    (``segment_cu_seqlens``) was supplied. Shared by the QK and exp passes so both make the same
+    decision for the same tile.
+    """
+    if ac.segment_spans == None or tile_info.is_prior:
+        return False
+    return not _has_any_compute_bounds(q_grp, tile_info.k_start_pos, _K_TILE_SZ, ac)
+
+
+def _has_any_compute_bounds(q_grp: int, k_start_pos: int, k_tile_size: int, ac: AttnConfig):
+    """Sequence-packing compute skipping (compile-time).
+
+    Return True if the given Q group has any in-bounds key in the tile starting at
+    ``k_start_pos``. Returns False only when EVERY (q, k) pair in the tile lies outside
+    the packed-sequence bounds -- i.e. the tile's entire QK^T result is destined for
+    -inf, so its MM1 matmul, masking and exp/transpose are pure waste.
+
+    Bounds analogue of ``_has_any_compute_causal`` / ``_has_any_compute_swa``, evaluated
+    with the same pure-Python integer arithmetic on loop indices, so a False result
+    removes instructions from the emitted graph rather than merely masking them.
+
+    Conservative by construction: returns True (no pruning, exact previous behavior)
+    whenever no compile-time layout was supplied or the addressing mode remaps
+    query/key coordinates.
+
+    Each query attends to one contiguous key span [start, end), so a tile is live iff
+    some segment overlapping this Q group's rows also overlaps the tile's key range.
+    """
+    if ac.segment_spans == None:
+        return True
+    # Round-robin KV: k_start_pos is an SBUF position, not a global one.
+    if ac.kvp_group_size > 0:
+        return True
+    # Strided Q slicing remaps queries differently from the striped layout we model.
+    if ac.cp_strided_q_slicing:
+        return True
+    # Striped CP is supported, but only while the layout keeps the decision rank-independent.
+    if not _striped_prune_is_safe(ac):
+        return True
+    q_start = q_grp * _Q_GRP_SZ
+    q_end = min(q_start + _Q_GRP_SZ, ac.seqlen_q)
+    k_end = min(k_start_pos + k_tile_size, ac.seqlen_q)
+    if q_end <= q_start or k_end <= k_start_pos:
+        return True
+    # Local coordinates: the layout is block-diagonal, so the tile is live iff some segment owns a
+    # query row in this group AND overlaps the tile's key range.
+    for _seg in _segment_spans_local(ac):
+        if _seg[0] < q_end and q_start < _seg[1]:
+            if _seg[0] < k_end and k_start_pos < _seg[1]:
+                return True
+    return False
+
+
+def _segment_spans_local(ac: AttnConfig):
+    """Segment spans in the LOCAL coordinate system the kernel's mask actually uses.
+
+    Matches the bound builder in
+    ``test/integration/nkilib/utils/sequence_packing_helpers.py::cu_seqlens_to_striped_bounds``:
+
+        local_start = cu_seqlens[i]     // cp_degree
+        local_end   = cu_seqlens[i + 1] // cp_degree
+
+    Under striped CP with every document boundary a multiple of ``cp_degree``, striping yields an
+    **identical local document layout on every rank**, so the same bound tensors are valid
+    everywhere and in local coordinates the layout is still plain block-diagonal. Scaling the spans
+    by ``1 / cp_degree`` is therefore all that is needed -- no stride walk is involved.
+
+    Why the coordinate system matters: ``nisa.range_select`` compares ``range_start + lane``
+    against the bounds, and the kernel passes ``range_start = k_start_pos``, a **local** tile
+    offset. The bounds must therefore be local too, which is exactly what the caller builds.
+
+    Returns the spans unchanged when not striping, where local == global.
+
+    :param ac: AttnConfig
+    :return: list of (start, end_exclusive) in local coordinates
+    """
+    if not ac.cp_striped_input:
+        return ac.segment_spans
+    d = ac.global_cp_deg
+    out = []
+    for _seg in ac.segment_spans:
+        out.append((_seg[0] // d, _seg[1] // d))
+    return out
+
+
+def _striped_prune_is_safe(ac: AttnConfig):
+    """May we prune under the current CP layout?
+
+    Requires the same precondition the caller's bound builder asserts: **every segment boundary
+    must be a multiple of ``cp_degree``**. That is what makes the local layout identical on all
+    ranks, and therefore what makes a single compile-time decision valid for a single SPMD binary.
+    If a boundary is not divisible the local layout differs per rank, no rank-independent prune
+    exists, and we decline -- falling back to computing every tile, which is correct.
+
+    Also declines on an unknown degree. That should be unreachable through supported entry points
+    (``cp_striped_input`` asserts ``use_cp``), but it is cheap to guard and avoids a crash.
+    """
+    if not ac.cp_striped_input:
+        return True
+    d = ac.global_cp_deg
+    if d == None:
+        return False
+    if d <= 1:
+        return True
+    for _seg in ac.segment_spans:
+        if _seg[0] % d != 0 or _seg[1] % d != 0:
+            return False
+    return True
+
+
+def _is_first_live_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
+    """Is this the FIRST section in which ``q_grp`` has any work?
+
+    The flash-attention accumulators (``mm1_running_max``, ``exp_running_sum``,
+    ``flash_attn_correction_factor``) must be INITIALIZED on a group's first live section and
+    UPDATED on every subsequent one. The kernel normally spells that as ``sp.section_idx == 0``,
+    which is correct for causal and dense masking because their liveness is **monotone** in
+    section index: if section s is live for a group, so is every earlier section, hence the
+    first live section is always section 0.
+
+    **Sequence packing breaks that assumption.** A Q group belongs to one packed segment
+    ``[a, b)`` and is live only in the sections that overlap ``[a, b)`` -- a contiguous *middle
+    band*, not a prefix. A group whose segment starts past the first section is skipped in
+    section 0, so an ``sp.section_idx == 0`` initializer never runs for it, and the
+    ``section_idx > 0`` update path then reads uninitialized accumulators (observed as ``nan``).
+
+    Returns True when ``sp`` is the earliest live section for ``q_grp``, so callers can use it
+    in place of ``sp.section_idx == 0``. Falls back to ``sp.section_idx == 0`` whenever no
+    compile-time segment layout is available, preserving existing behavior exactly.
+
+    :param q_grp: q group index
+    :param ac: AttnConfig
+    :param atp: AttnTileParams
+    :param sp: SectionParams for the current section
+    """
+    if ac.segment_spans == None or not ac.is_sequence_packed:
+        return sp.section_idx == 0
+    if ac.kvp_group_size > 0 or ac.cp_strided_q_slicing or ac.is_prefix_caching:
+        return sp.section_idx == 0
+    if not _striped_prune_is_safe(ac):
+        # Includes striped-with-unknown-degree, where we cannot reason about liveness at all.
+        return sp.section_idx == 0
+    # Scan earlier sections; if any was live for this group, this is not the first.
+    for earlier in range(sp.section_idx):
+        if _has_any_compute_bounds_section(q_grp, ac, atp, earlier * atp.section_len):
+            return False
+    return True
+
+
+def _has_any_compute_bounds_section(
+    q_grp: int, ac: AttnConfig, atp: AttnTileParams, section_offset_active: int, num_grps: int = 1
+):
+    """Whole-(Q group, section) sequence-packing skip.
+
+    Returns False only when the ENTIRE active-K span of this flash section is out of bounds
+    for every query row in the group -- i.e. the group has no work at all in this section.
+
+    This is the coarse gate: it composes with the existing ``has_any_compute_pred`` gates,
+    which skip every pass (Q load, QK, max, exp, PV, write-back) consistently for a group.
+    Inside a live section, individual K tiles are pruned by ``_is_bounds_pruned_tile``. The
+    working buffers are reused across Q groups by the software pipeline, so a pruned tile's
+    exp slices are zero-filled (MM2 still consumes them) rather than left stale.
+
+    :param q_grp: q group index
+    :param ac: AttnConfig
+    :param atp: AttnTileParams
+    :param section_offset_active: active-K offset of the section being asked about (pass
+        ``sp.section_offset_active`` for the current section or ``sp.next_section_offset_active``
+        for the next one)
+    :param num_grps: number of consecutive q groups covered (for the fused Q-load path)
+    """
+    if ac.segment_spans == None:
+        return True
+    if ac.kvp_group_size > 0:
+        return True
+    if ac.cp_strided_q_slicing:
+        return True
+    if ac.is_prefix_caching:
+        return True
+    if not _striped_prune_is_safe(ac):
+        return True
+    # Active-K span covered by this section.
+    k_start = section_offset_active
+    k_end = min(k_start + atp.section_len, atp.seqlen_k_active_updated)
+    if k_end <= k_start:
+        # Empty span (section past the end of active K): return False, NOT True. Callers also ask this about the NEXT
+        # section for is_last_section_with_compute, where True would suppress the final 1/sum normalization.
+        return False
+    q_start = q_grp * _Q_GRP_SZ
+    q_end = min(q_start + _Q_GRP_SZ * num_grps, ac.seqlen_q)
+    if q_end <= q_start:
+        return False
+    for _seg in _segment_spans_local(ac):
+        if _seg[0] < q_end and q_start < _seg[1]:
+            if _seg[0] < k_end and k_start < _seg[1]:
+                return True
+    return False
 
 
 def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_grps: int = 1):

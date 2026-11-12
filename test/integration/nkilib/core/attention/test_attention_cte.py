@@ -2923,6 +2923,7 @@ class TestRangedAttentionCTEKernels:
             cp_striped_input=False,
             skip_output_normalization=False,
             allow_vector_exp=True,
+            segment_cu_seqlens=None,
         ):
             return attention_cte_torch_ref(
                 q=q,

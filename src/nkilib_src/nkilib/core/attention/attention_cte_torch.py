@@ -52,6 +52,7 @@ def attention_cte_torch_ref(
     bias_layout=None,
     bias_band_params=None,
     allow_vector_exp: bool = True,
+    segment_cu_seqlens=None,
 ):
     """PyTorch reference implementation for attention_cte NKI kernel.
 
@@ -87,6 +88,9 @@ def attention_cte_torch_ref(
             sequence packing. Shape [bs, seqlen_q, 1]. Default: None
         bound_max (torch.tensor, optional): Per-query upper bound (exclusive) for
             sequence packing. Shape [bs, seqlen_q, 1]. Default: None
+        segment_cu_seqlens (tuple, optional): Kernel-only compile-time pruning hint; accepted
+            for signature compatibility and ignored here (the kernel output does not depend
+            on it). Default: None
         position_bias (torch.tensor, optional): Position bias added to QK scores
             before scaling and masking. Shape ``(bs, seqlen_q, seqlen_kv)`` in the
             kernel's padded KV layout. Semantics: ``mask(scale * (QK + bias))``.
