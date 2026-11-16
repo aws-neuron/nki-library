@@ -24,6 +24,10 @@ from .ssd_utils import compute_lnc_sharding
 P_MAX = nl.tile_size.pmax
 F_MAX = nl.tile_size.psum_fmax
 
+# Per-partition SBUF bytes the resident SSM states may use (heads_per_core * headdim * fp32).
+# Leaves ample room for the per-chunk tiles; larger configs park states in HBM.
+_STATE_SBUF_BUDGET_BYTES = 64 * 1024
+
 
 def ssd_block(
     x: nl.NkiTensor,
@@ -94,11 +98,11 @@ def ssd_block(
             B_T, C_T, B_f32, CB_masked = shared_projections(B, C, causal_mask)
             for each block of <= 128 heads (LNC sharded):
                 cs[heads, Q] = cumsum(dt * A)       # one scan, heads on partitions
-                for each head in block:
-                    Y_intra = exp(cs) * (CB_masked @ (exp(-cs) * dt * x))
-                    Y_off = exp(cs) * (C @ state)
-                    state = exp(cs[-1]) * state + B^T @ (dt * x * decay)
-                    y = Y_intra + Y_off + D * x
+                w_intra, w_state = dt * exp(-cs), dt * exp(cs[-1] - cs)
+                for each head in block:             # state resident in SBUF
+                    P = CB_masked @ (x * w_intra) + C @ state    # one PSUM tile
+                    y = exp(cs) * P + D * x
+                    state = exp(cs[-1]) * state + B^T @ (x * w_state)
     """
     batch = x.shape[0]
     nheads = x.shape[1]
@@ -158,18 +162,33 @@ def ssd_block(
         buffer=nl.shared_hbm,
     )
 
-    # max(., 1) ensures valid allocation shape when a core has no heads assigned
-    state_hbm = nl.ndarray(
-        (batch, max(heads_per_core, 1), dstate, headdim),
-        dtype=nl.float32,
-        buffer=nl.shared_hbm,
-    )
+    # Keep every head's running state resident in SBUF across chunks when it fits.
+    # The chunk-outer loop revisits each head once per chunk, so all heads' states
+    # are live at once; resident state removes a per-head, per-chunk HBM round trip
+    # from the critical path. Otherwise fall back to parking states in HBM.
+    state_resident = heads_per_core * headdim * 4 <= _STATE_SBUF_BUDGET_BYTES
+
+    if state_resident:
+        # One tile per head (not one wide tile) so heads carry no false dependencies
+        state_tiles = []
+        for local_head_idx in range(heads_per_core):
+            state_tiles.append(nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf))
+    else:
+        # max(., 1) ensures valid allocation shape when a core has no heads assigned
+        state_hbm = nl.ndarray(
+            (batch, max(heads_per_core, 1), dstate, headdim),
+            dtype=nl.float32,
+            buffer=nl.shared_hbm,
+        )
 
     for batch_idx in range(batch):
         # Initialize state
         for local_head_idx in range(heads_per_core):
             global_head_idx = head_offset + local_head_idx
-            state_init = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
+            if state_resident:
+                state_init = state_tiles[local_head_idx]
+            else:
+                state_init = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
             if initial_state != None:
                 nisa.dma_copy(
                     dst=state_init[0:dstate, 0:headdim],
@@ -177,10 +196,11 @@ def ssd_block(
                 )
             else:
                 nisa.memset(dst=state_init, value=0.0)
-            nisa.dma_copy(
-                dst=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
-                src=state_init[0:dstate, 0:headdim],
-            )
+            if not state_resident:
+                nisa.dma_copy(
+                    dst=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
+                    src=state_init[0:dstate, 0:headdim],
+                )
 
         # Precompute upper-triangular mask = transpose(causal)
         causal_sb = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.sbuf)
@@ -224,7 +244,7 @@ def ssd_block(
                 hb_size = min(P_MAX, heads_per_core - hb_start)
 
                 # Decay terms for every head in the block at once, as [Q, hb_size] columns
-                dt_T, exp_cs_T, exp_neg_cs_T, decay_T, exp_cs_last_N = _compute_chunk_decay_block(
+                w_intra_T, w_state_T, exp_cs_T, exp_cs_last_N = _compute_chunk_decay_block(
                     dt_2d,
                     A_cols[hb_idx],
                     ones_blk,
@@ -246,12 +266,15 @@ def ssd_block(
                     if has_D:
                         D_col = D_bcasts[hb_idx][0:Q, j : j + 1]
 
-                    # Load state into SBUF — persists across headdim tiles
-                    state_sb = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        dst=state_sb[0:dstate, 0:headdim],
-                        src=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
-                    )
+                    if state_resident:
+                        state_sb = state_tiles[local_head_idx]
+                    else:
+                        # Load state into SBUF — persists across headdim tiles
+                        state_sb = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.dma_copy(
+                            dst=state_sb[0:dstate, 0:headdim],
+                            src=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
+                        )
 
                     # Tile over headdim (only matmul results need PSUM tiling)
                     for d_tile_idx in range(num_hdim_tiles):
@@ -267,11 +290,10 @@ def ssd_block(
                             chunk_start,
                             d_start,
                             d_size,
-                            dt_T[0:Q, j : j + 1],
+                            w_intra_T[0:Q, j : j + 1],
+                            w_state_T[0:Q, j : j + 1],
                             exp_cs_T[0:Q, j : j + 1],
-                            exp_neg_cs_T[0:Q, j : j + 1],
                             exp_cs_last_N[0:dstate, j : j + 1],
-                            decay_T[0:Q, j : j + 1],
                             CB_masked,
                             B_T_tiles,
                             C_T_tiles,
@@ -284,20 +306,24 @@ def ssd_block(
                             has_D,
                         )
 
-                    # Store state back to HBM after all headdim tiles
-                    nisa.dma_copy(
-                        dst=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
-                        src=state_sb[0:dstate, 0:headdim],
-                    )
+                    if not state_resident:
+                        # Store state back to HBM after all headdim tiles
+                        nisa.dma_copy(
+                            dst=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
+                            src=state_sb[0:dstate, 0:headdim],
+                        )
 
         # Copy final state to output
         for local_head_idx in range(heads_per_core):
             global_head_idx = head_offset + local_head_idx
-            final_state = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(
-                dst=final_state[0:dstate, 0:headdim],
-                src=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
-            )
+            if state_resident:
+                final_state = state_tiles[local_head_idx]
+            else:
+                final_state = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=final_state[0:dstate, 0:headdim],
+                    src=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
+                )
             nisa.dma_copy(
                 dst=final_state_out[batch_idx, global_head_idx, 0:dstate, 0:headdim],
                 src=final_state[0:dstate, 0:headdim],
@@ -337,11 +363,10 @@ def _compute_chunk_decay_block(
         dstate (int): State dimension N.
 
     Returns:
-        tuple: (dt_T, exp_cs_T, exp_neg_cs_T, decay_T, exp_cs_last_N)
-            - dt_T: [Q, hb_size], dt per token (column j = head j).
+        tuple: (w_intra_T, w_state_T, exp_cs_T, exp_cs_last_N), column j = head j
+            - w_intra_T: [Q, hb_size], dt * exp(-cs).
+            - w_state_T: [Q, hb_size], dt * exp(cs[Q-1] - cs).
             - exp_cs_T: [Q, hb_size], exp(cs).
-            - exp_neg_cs_T: [Q, hb_size], exp(-cs).
-            - decay_T: [Q, hb_size], exp(cs[Q-1] - cs).
             - exp_cs_last_N: [dstate, hb_size], exp(cs[Q-1]) replicated over dstate.
     """
     Q = chunk_size
@@ -384,15 +409,24 @@ def _compute_chunk_decay_block(
         dst=decay[0:H, 0:Q],
     )
 
+    # Fold dt into the per-token scales once per block, so each head scales x once
+    # per use instead of computing dt * x first.
+    # w_intra = dt * exp(-cs)  (intra-chunk input scale)
+    exp_neg_cs = nl.ndarray((H, Q), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(op=nl.exp, data=cs[0:H, 0:Q], dst=exp_neg_cs[0:H, 0:Q], scale=-1.0)
+    w_intra = nl.ndarray((H, Q), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=w_intra[0:H, 0:Q], data1=dt_f32[0:H, 0:Q], data2=exp_neg_cs[0:H, 0:Q], op=nl.multiply)
+    # w_state = dt * exp(cs_last - cs)  (state-update input scale)
+    w_state = nl.ndarray((H, Q), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=w_state[0:H, 0:Q], data1=dt_f32[0:H, 0:Q], data2=decay[0:H, 0:Q], op=nl.multiply)
+
     # Transpose to token-on-partition layout [Q, H]
-    dt_T = _transpose_to_sbuf(dt_f32, H, Q)
     cs_T = _transpose_to_sbuf(cs, H, Q)
-    decay_T = _transpose_to_sbuf(decay, H, Q)
+    w_intra_T = _transpose_to_sbuf(w_intra, H, Q)
+    w_state_T = _transpose_to_sbuf(w_state, H, Q)
 
     exp_cs_T = nl.ndarray((Q, H), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(op=nl.exp, data=cs_T[0:Q, 0:H], dst=exp_cs_T[0:Q, 0:H])
-    exp_neg_cs_T = nl.ndarray((Q, H), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(op=nl.exp, data=cs_T[0:Q, 0:H], dst=exp_neg_cs_T[0:Q, 0:H], scale=-1.0)
 
     # exp(cs_last) replicated over dstate partitions: pick token row Q-1 via matmul
     exp_cs_last_psum = nl.ndarray((dstate, H), dtype=nl.float32, buffer=nl.psum)
@@ -404,7 +438,7 @@ def _compute_chunk_decay_block(
     exp_cs_last_N = nl.ndarray((dstate, H), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=exp_cs_last_N[0:dstate, 0:H], src=exp_cs_last_psum[0:dstate, 0:H])
 
-    return dt_T, exp_cs_T, exp_neg_cs_T, decay_T, exp_cs_last_N
+    return w_intra_T, w_state_T, exp_cs_T, exp_cs_last_N
 
 
 def _transpose_to_sbuf(src: nl.NkiTensor, rows: int, cols: int) -> nl.NkiTensor:
@@ -519,11 +553,10 @@ def _compute_ssd_head_tile(
     chunk_start: int,
     d_start: int,
     d_size: int,
-    dt_col: nl.NkiTensor,
+    w_intra_col: nl.NkiTensor,
+    w_state_col: nl.NkiTensor,
     exp_cs_col: nl.NkiTensor,
-    exp_neg_cs_col: nl.NkiTensor,
     exp_cs_last_N: nl.NkiTensor,
-    decay_factor: nl.NkiTensor,
     CB_masked: nl.NkiTensor,
     B_T_tiles: list,
     C_T_tiles: list,
@@ -540,6 +573,11 @@ def _compute_ssd_head_tile(
     State lives in SBUF [dstate, headdim] and is sliced along headdim per tile.
     Only matmul results use PSUM (which has the F_MAX constraint).
 
+    Both output terms share the exp(cs) scale, so they accumulate in one PSUM tile:
+        y = exp(cs) * (CB_masked @ (x * w_intra) + C @ state) [+ D * x]
+        state = exp(cs_last) * state + B^T @ (x * w_state)
+    PSUM results are consumed directly, with no PSUM -> SBUF staging copies.
+
     Args:
         x_hbm (nl.NkiTensor): [batch, nheads, seqlen, headdim], Input in HBM.
         y_hbm (nl.NkiTensor): [batch, nheads, seqlen, headdim], Output in HBM.
@@ -549,11 +587,10 @@ def _compute_ssd_head_tile(
         chunk_start (int): Starting sequence position.
         d_start (int): Starting headdim offset for this tile.
         d_size (int): Size of this headdim tile.
-        dt_col (nl.NkiTensor): [Q, 1], Timestep column in SBUF.
+        w_intra_col (nl.NkiTensor): [Q, 1], dt * exp(-cs) column in SBUF.
+        w_state_col (nl.NkiTensor): [Q, 1], dt * exp(cs[-1] - cs) column in SBUF.
         exp_cs_col (nl.NkiTensor): [Q, 1], exp(cs) column in SBUF.
-        exp_neg_cs_col (nl.NkiTensor): [Q, 1], exp(-cs) column in SBUF.
         exp_cs_last_N (nl.NkiTensor): [dstate, 1], exp(cs[-1]) replicated over dstate in SBUF.
-        decay_factor (nl.NkiTensor): [Q, 1], exp(cs[-1] - cs) column in SBUF.
         CB_masked (nl.NkiTensor): [Q, Q], Causal-masked CB^T in SBUF.
         B_T_tiles (list): List of [tile_n, Q] transposed B tiles.
         C_T_tiles (list): List of [tile_n, Q] transposed C tiles.
@@ -572,74 +609,61 @@ def _compute_ssd_head_tile(
         src=x_hbm[batch_idx, global_head_idx, chunk_start : chunk_start + Q, d_start : d_start + d_size],
     )
 
-    # dt * x
-    dtx = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(
-        dst=dtx[0:Q, 0:d_size],
-        data=x_sb[0:Q, 0:d_size],
-        op0=nl.multiply,
-        operand0=dt_col[0:Q, 0:1],
-    )
-
-    # Y_intra = exp(cs) * (CB_causal @ (exp(-cs) * dtx))
+    # Matmul inputs: x scaled by the per-token columns (dt already folded in)
     X_scaled = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(
         dst=X_scaled[0:Q, 0:d_size],
-        data=dtx[0:Q, 0:d_size],
+        data=x_sb[0:Q, 0:d_size],
         op0=nl.multiply,
-        operand0=exp_neg_cs_col[0:Q, 0:1],
+        operand0=w_intra_col[0:Q, 0:1],
     )
-    Y_intra_psum = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(
-        dst=Y_intra_psum[0:Q, 0:d_size],
-        stationary=CB_masked[0:Q, 0:Q],
-        moving=X_scaled[0:Q, 0:d_size],
-    )
-    Y_intra = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=Y_intra[0:Q, 0:d_size], src=Y_intra_psum[0:Q, 0:d_size])
-    nisa.tensor_scalar(
-        dst=Y_intra[0:Q, 0:d_size],
-        data=Y_intra[0:Q, 0:d_size],
-        op0=nl.multiply,
-        operand0=exp_cs_col[0:Q, 0:1],
-    )
-
-    # Y_off = exp(cs) * (C @ state) — accumulate across dstate tiles, read state from SBUF
-    Y_off = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=Y_off, value=0.0)
-    for n_tile_idx in range(num_dstate_tiles):
-        n_start = n_tile_idx * dstate_tile
-        n_size = min(dstate_tile, dstate - n_start)
-        Y_off_psum = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(
-            dst=Y_off_psum[0:Q, 0:d_size],
-            stationary=C_T_tiles[n_tile_idx][0:n_size, 0:Q],
-            moving=state_sb[n_start : n_start + n_size, d_start : d_start + d_size],
-        )
-        Y_off_tile = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=Y_off_tile[0:Q, 0:d_size], src=Y_off_psum[0:Q, 0:d_size])
-        nisa.tensor_tensor(
-            dst=Y_off[0:Q, 0:d_size],
-            data1=Y_off[0:Q, 0:d_size],
-            data2=Y_off_tile[0:Q, 0:d_size],
-            op=nl.add,
-        )
-    nisa.tensor_scalar(
-        dst=Y_off[0:Q, 0:d_size],
-        data=Y_off[0:Q, 0:d_size],
-        op0=nl.multiply,
-        operand0=exp_cs_col[0:Q, 0:1],
-    )
-
-    # State update: state = exp(cs_last) * state + B^T @ (dtx * decay)
-    # State lives in SBUF — update in-place via slicing along headdim
     dtx_decayed = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(
         dst=dtx_decayed[0:Q, 0:d_size],
-        data=dtx[0:Q, 0:d_size],
+        data=x_sb[0:Q, 0:d_size],
         op0=nl.multiply,
-        operand0=decay_factor[0:Q, 0:1],
+        operand0=w_state_col[0:Q, 0:1],
     )
+
+    # Y_intra + Y_off accumulated in one PSUM tile. Reads state before it is updated below.
+    y_psum = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(
+        dst=y_psum[0:Q, 0:d_size],
+        stationary=CB_masked[0:Q, 0:Q],
+        moving=X_scaled[0:Q, 0:d_size],
+        accumulate=False,
+    )
+    for n_tile_idx in range(num_dstate_tiles):
+        n_start = n_tile_idx * dstate_tile
+        n_size = min(dstate_tile, dstate - n_start)
+        nisa.nc_matmul(
+            dst=y_psum[0:Q, 0:d_size],
+            stationary=C_T_tiles[n_tile_idx][0:n_size, 0:Q],
+            moving=state_sb[n_start : n_start + n_size, d_start : d_start + d_size],
+            accumulate=True,
+        )
+
+    # y = exp(cs) * y_psum, read straight from PSUM
+    y_chunk = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=y_chunk[0:Q, 0:d_size],
+        data=y_psum[0:Q, 0:d_size],
+        op0=nl.multiply,
+        operand0=exp_cs_col[0:Q, 0:1],
+    )
+    if has_D:
+        # y += D * x in one fused op. Kept SBUF-only: pairing a sub-128-partition PSUM
+        # tile with an SBUF tile in one instruction fails the partition verifier (Q < 128).
+        nisa.scalar_tensor_tensor(
+            dst=y_chunk[0:Q, 0:d_size],
+            data=x_sb[0:Q, 0:d_size],
+            op0=nl.multiply,
+            operand0=D_col[0:Q, 0:1],
+            op1=nl.add,
+            operand1=y_chunk[0:Q, 0:d_size],
+        )
+
+    # State update in one fused op per dstate tile: state = state * exp(cs_last) + B^T @ dtx_decayed
     for n_tile_idx in range(num_dstate_tiles):
         n_start = n_tile_idx * dstate_tile
         n_size = min(dstate_tile, dstate - n_start)
@@ -650,43 +674,13 @@ def _compute_ssd_head_tile(
             stationary=B_f32_tiles[n_tile_idx][0:Q, 0:n_size],
             moving=dtx_decayed[0:Q, 0:d_size],
         )
-        state_delta = nl.ndarray((n_size, d_size), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=state_delta[0:n_size, 0:d_size], src=state_delta_psum[0:n_size, 0:d_size])
-
-        nisa.tensor_scalar(
+        nisa.scalar_tensor_tensor(
             dst=state_sb[n_start : n_start + n_size, d_start : d_start + d_size],
             data=state_sb[n_start : n_start + n_size, d_start : d_start + d_size],
             op0=nl.multiply,
             operand0=exp_cs_last_N[n_start : n_start + n_size, 0:1],
-        )
-        nisa.tensor_tensor(
-            dst=state_sb[n_start : n_start + n_size, d_start : d_start + d_size],
-            data1=state_sb[n_start : n_start + n_size, d_start : d_start + d_size],
-            data2=state_delta[0:n_size, 0:d_size],
-            op=nl.add,
-        )
-
-    # Combine: y = Y_intra + Y_off [+ D * x]
-    y_chunk = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(
-        dst=y_chunk[0:Q, 0:d_size],
-        data1=Y_intra[0:Q, 0:d_size],
-        data2=Y_off[0:Q, 0:d_size],
-        op=nl.add,
-    )
-    if has_D:
-        Dx = nl.ndarray((Q, d_size), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=Dx[0:Q, 0:d_size],
-            data=x_sb[0:Q, 0:d_size],
-            op0=nl.multiply,
-            operand0=D_col[0:Q, 0:1],
-        )
-        nisa.tensor_tensor(
-            dst=y_chunk[0:Q, 0:d_size],
-            data1=y_chunk[0:Q, 0:d_size],
-            data2=Dx[0:Q, 0:d_size],
-            op=nl.add,
+            op1=nl.add,
+            operand1=state_delta_psum[0:n_size, 0:d_size],
         )
 
     nisa.dma_copy(
