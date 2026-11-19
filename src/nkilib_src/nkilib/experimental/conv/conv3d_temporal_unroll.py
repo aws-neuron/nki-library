@@ -197,7 +197,7 @@ def conv3d_temporal_unroll(
     for d_in in range(D):
         pairs = []
         for d_out in range(D_out):
-            k_d_num = d_in * dilation_d + pad_d_left - d_out * stride_d
+            k_d_num = d_in + pad_d_left - d_out * stride_d
             if k_d_num < 0 or k_d_num >= K_d * dilation_d:
                 continue
             if k_d_num % dilation_d != 0:

@@ -92,6 +92,10 @@ TEMPORAL_UNROLL_FAST_PARAMS = [
     (1, 96, 3, 3, 8, 8, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
     # Larger D (D_out=4, max for single PSUM bank with COL_TILE=32: 4*32=128=P_MAX)
     (1, 96, 3, 4, 8, 8, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
+    # Depth dilation (D_out=4)
+    (1, 96, 3, 6, 4, 4, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 2, 1, 1, True, None, False, nl.float32),
+    # Depth dilation with depth stride and padding (D_out=4)
+    (1, 96, 3, 8, 4, 4, 2, 3, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, True, None, False, nl.float32),
 ]
 
 # Excluded from fast suite: compilation exceeds memory limit or takes too long
