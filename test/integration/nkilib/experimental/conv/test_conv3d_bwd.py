@@ -169,6 +169,11 @@ CONV3D_BWD_BASIC_PARAMS = [
     pytest.param(1, 16, 32, 4, 8, 8, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, True, False, nl.bfloat16, marks=pytest.mark.fast),
     pytest.param(2, 16, 32, 4, 8, 8, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, False, True, nl.bfloat16, marks=pytest.mark.fast),
 
+    # One output depth plane, but depth still matters (col2im path)
+    pytest.param(1, 2, 130, 1, 4, 4, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, False, False, nl.float32, marks=pytest.mark.fast, id="col2im_one_frame_depth_pad"),
+    pytest.param(1, 2, 130, 2, 4, 4, 2, 2, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, False, False, nl.float32, marks=pytest.mark.fast, id="col2im_two_frames_one_out_plane"),
+    pytest.param(1, 2, 3, 1, 5, 5, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, False, False, nl.float32, marks=pytest.mark.fast, id="col2im_one_frame_depth_pad_stride2"),
+
     pytest.param(64, 128, 64, 1, 64, 64, 1, 3, 3, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, True, False, nl.bfloat16, marks=pytest.mark.slow),
 ]
 

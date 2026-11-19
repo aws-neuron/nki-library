@@ -4145,7 +4145,8 @@ def _dxc_alloc(
     wt = _build_wt_per_tap(sbm, filt_flat, n_taps, C_in, C_out, co_tile, n_co, dtype, "dx_wt")
 
     # Band the outer axis (D for 3D, else H); size it so dy_res + plane + result + g fit SBUF.
-    outer_is_d = D_out > 1
+    # The 2D branch uses only the kd = 0 taps and writes only dx's plane 0, so it needs D == K_d == 1.
+    outer_is_d = D_out > 1 or cfg.D > 1 or cfg.K_d > 1
     s_outer = cfg.stride_d if outer_is_d else cfg.stride_h
     row_stride = H_out * W_out if outer_is_d else W_out  # dy cols per outer-output row
     budget = max(1, sbm.get_free_space() - _SBUF_HEADROOM)
