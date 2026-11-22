@@ -17,7 +17,6 @@
 import nki.isa as nisa
 import nki.language as nl
 
-from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
 from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from .ssd_utils import compute_lnc_sharding
@@ -26,7 +25,7 @@ P_MAX = nl.tile_size.pmax
 F_MAX = nl.tile_size.psum_fmax
 
 # Per-partition SBUF bytes the resident SSM states may use (heads_per_core * headdim * fp32).
-# Leaves ample room for the per-chunk tiles; larger configs are rejected.
+# Leaves ample room for the per-chunk tiles; larger configs park states in HBM.
 _STATE_SBUF_BUDGET_BYTES = 64 * 1024
 
 
@@ -82,8 +81,6 @@ def ssd_block(
     Notes:
         - chunk_size <= 128 (must fit in partition dimension)
         - dstate <= 128 (must fit in partition dimension for SBUF state)
-        - heads_per_core * headdim <= 16384 (all SSM states resident in SBUF;
-          e.g. 64 heads at headdim 512 under LNC 2)
         - seqlen must be divisible by chunk_size
         - ngroups=1 (B/C shared across all heads)
         - Uses float32 accumulation internally for numerical stability
@@ -120,14 +117,6 @@ def ssd_block(
     num_hdim_tiles = div_ceil(headdim, HDIM_TILE)
 
     heads_per_core, head_offset = compute_lnc_sharding(nheads)
-
-    # All heads' states must fit in SBUF. The old path that parked state in HBM
-    # between chunks produced wrong results, so larger configs are refused.
-    kernel_assert(
-        heads_per_core * headdim * 4 <= _STATE_SBUF_BUDGET_BYTES,
-        f"ssd_block: heads_per_core * headdim must be <= {_STATE_SBUF_BUDGET_BYTES // 4} "
-        f"(SSM state must fit in SBUF), got {heads_per_core} * {headdim}",
-    )
 
     # Heads are processed in blocks of up to P_MAX so per-chunk decay terms for a
     # whole block can be computed with heads on the partition dimension.
@@ -183,28 +172,58 @@ def ssd_block(
         buffer=nl.shared_hbm,
     )
 
-    # Every head's running state stays resident in SBUF across chunks. The chunk-outer
-    # loop revisits each head once per chunk, so all heads' states are live at once.
-    # One [dstate, group_size * headdim] tile per head group, heads side by side.
-    state_tiles = []
-    state_slot = []  # local head -> (state tile index, position within its group)
-    for hb_idx in range(num_head_blocks):
-        for g_start, g_size in head_groups[hb_idx]:
-            for k in range(g_size):
-                state_slot.append((len(state_tiles), k))
-            state_tiles.append(nl.ndarray((dstate, g_size * headdim), dtype=nl.float32, buffer=nl.sbuf))
+    # Keep every head's running state resident in SBUF across chunks when it fits.
+    # The chunk-outer loop revisits each head once per chunk, so all heads' states
+    # are live at once; resident state removes a per-head, per-chunk HBM round trip
+    # from the critical path. Otherwise fall back to parking states in HBM.
+    state_resident = heads_per_core * headdim * 4 <= _STATE_SBUF_BUDGET_BYTES
+
+    if state_resident:
+        # One [dstate, group_size * headdim] tile per head group, heads side by side
+        state_tiles = []
+        state_slot = []  # local head -> (state tile index, position within its group)
+        for hb_idx in range(num_head_blocks):
+            for g_start, g_size in head_groups[hb_idx]:
+                for k in range(g_size):
+                    state_slot.append((len(state_tiles), k))
+                state_tiles.append(nl.ndarray((dstate, g_size * headdim), dtype=nl.float32, buffer=nl.sbuf))
+    else:
+        # private_hbm: the buffer is indexed by local head, so a shared buffer would let
+        # LNC cores overwrite each other's states. max(., 1) ensures valid allocation
+        # shape when a core has no heads assigned.
+        state_hbm = nl.ndarray(
+            (batch, max(heads_per_core, 1), dstate, headdim),
+            dtype=nl.float32,
+            buffer=nl.private_hbm,
+        )
 
     for batch_idx in range(batch):
         # Initialize state
-        for state_grp in state_tiles:
-            if initial_state == None:
-                nisa.memset(dst=state_grp, value=0.0)
-        if initial_state != None:
+        if state_resident:
+            for state_grp in state_tiles:
+                if initial_state == None:
+                    nisa.memset(dst=state_grp, value=0.0)
+            if initial_state != None:
+                for local_head_idx in range(heads_per_core):
+                    tile_idx, k = state_slot[local_head_idx]
+                    nisa.dma_copy(
+                        dst=state_tiles[tile_idx][0:dstate, k * headdim : (k + 1) * headdim],
+                        src=initial_state[batch_idx, head_offset + local_head_idx, 0:dstate, 0:headdim],
+                    )
+        else:
             for local_head_idx in range(heads_per_core):
-                tile_idx, k = state_slot[local_head_idx]
+                global_head_idx = head_offset + local_head_idx
+                state_init = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                if initial_state != None:
+                    nisa.dma_copy(
+                        dst=state_init[0:dstate, 0:headdim],
+                        src=initial_state[batch_idx, global_head_idx, 0:dstate, 0:headdim],
+                    )
+                else:
+                    nisa.memset(dst=state_init, value=0.0)
                 nisa.dma_copy(
-                    dst=state_tiles[tile_idx][0:dstate, k * headdim : (k + 1) * headdim],
-                    src=initial_state[batch_idx, head_offset + local_head_idx, 0:dstate, 0:headdim],
+                    dst=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
+                    src=state_init[0:dstate, 0:headdim],
                 )
 
         # Precompute upper-triangular mask = transpose(causal)
@@ -266,7 +285,16 @@ def ssd_block(
                     local_head_idx = hb_start + g_start
                     global_head_idx = head_offset + local_head_idx
 
-                    state_sb = state_tiles[state_slot[local_head_idx][0]]
+                    if state_resident:
+                        state_sb = state_tiles[state_slot[local_head_idx][0]]
+                    else:
+                        # Load the group's states into SBUF — persists across headdim tiles
+                        state_sb = nl.ndarray((dstate, g_size * headdim), dtype=nl.float32, buffer=nl.sbuf)
+                        for k in range(g_size):
+                            nisa.dma_copy(
+                                dst=state_sb[0:dstate, k * headdim : (k + 1) * headdim],
+                                src=state_hbm[batch_idx, local_head_idx + k, 0:dstate, 0:headdim],
+                            )
 
                     # Tile over headdim (only matmul results need PSUM tiling); a single
                     # tile whenever heads are grouped, since grouping requires headdim <= F_MAX
@@ -301,14 +329,33 @@ def ssd_block(
                             has_D,
                         )
 
+                    if not state_resident:
+                        # Store states back to HBM after all headdim tiles
+                        for k in range(g_size):
+                            nisa.dma_copy(
+                                dst=state_hbm[batch_idx, local_head_idx + k, 0:dstate, 0:headdim],
+                                src=state_sb[0:dstate, k * headdim : (k + 1) * headdim],
+                            )
+
         # Copy final state to output
         for local_head_idx in range(heads_per_core):
             global_head_idx = head_offset + local_head_idx
-            tile_idx, k = state_slot[local_head_idx]
-            nisa.dma_copy(
-                dst=final_state_out[batch_idx, global_head_idx, 0:dstate, 0:headdim],
-                src=state_tiles[tile_idx][0:dstate, k * headdim : (k + 1) * headdim],
-            )
+            if state_resident:
+                tile_idx, k = state_slot[local_head_idx]
+                nisa.dma_copy(
+                    dst=final_state_out[batch_idx, global_head_idx, 0:dstate, 0:headdim],
+                    src=state_tiles[tile_idx][0:dstate, k * headdim : (k + 1) * headdim],
+                )
+            else:
+                final_state = nl.ndarray((dstate, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=final_state[0:dstate, 0:headdim],
+                    src=state_hbm[batch_idx, local_head_idx, 0:dstate, 0:headdim],
+                )
+                nisa.dma_copy(
+                    dst=final_state_out[batch_idx, global_head_idx, 0:dstate, 0:headdim],
+                    src=final_state[0:dstate, 0:headdim],
+                )
 
     return y, final_state_out
 

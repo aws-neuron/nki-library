@@ -297,6 +297,9 @@ class TestSSDKernel:
         [1, 80, 4096, 64, 128, 128, True, True],
         # large headdim (> 512, single-head groups tiled over headdim)
         [1, 8, 2048, 1024, 128, 128, True, True],
+        # states too large for SBUF (> 64 KiB per partition): HBM state path
+        [1, 80, 1024, 512, 128, 128, True, True],
+        [1, 48, 1024, 1024, 128, 128, True, True],
     ]
     # fmt: on
 
@@ -331,43 +334,4 @@ class TestSSDKernel:
             use_initial_state,
             atol=2e-1,
             rtol=5e-2,
-        )
-
-    # fmt: off
-    _ssd_state_too_large_test_vectors = [
-        # heads_per_core * headdim > 16384 under LNC 2: SSM states do not fit in SBUF
-        [1, 80, 1024, 512, 128, 128, True, True],
-        [1, 48, 1024, 1024, 128, 128, True, True],
-    ]
-    # fmt: on
-
-    @pytest_parametrize(_ssd_large_test_params, _ssd_state_too_large_test_vectors)
-    def test_ssd_state_too_large(
-        self,
-        test_manager: Orchestrator,
-        platform_target: Platforms,
-        batch,
-        nheads,
-        seqlen,
-        headdim,
-        dstate,
-        chunk_size,
-        use_D,
-        use_initial_state,
-    ):
-        """ssd_block must reject configs whose SSM states do not fit in SBUF."""
-        _run_ssd_test(
-            test_manager,
-            platform_target,
-            batch,
-            nheads,
-            seqlen,
-            headdim,
-            dstate,
-            chunk_size,
-            use_D,
-            use_initial_state,
-            atol=2e-1,
-            rtol=5e-2,
-            is_negative_test=True,
         )

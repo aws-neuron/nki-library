@@ -82,8 +82,6 @@ def ssd(
     Notes:
         - chunk_size <= 128 (must fit in partition dimension)
         - dstate <= 128 (must fit in partition dimension for SBUF state)
-        - Chunk-outer path: heads_per_core * headdim <= 16384 (states resident
-          in SBUF; e.g. 64 heads at headdim 512 under LNC 2)
         - seqlen must be divisible by chunk_size
         - ngroups=1 (B/C shared across all heads)
         - Uses float32 accumulation internally for numerical stability
