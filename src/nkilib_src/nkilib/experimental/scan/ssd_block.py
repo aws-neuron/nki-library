@@ -26,7 +26,7 @@ F_MAX = nl.tile_size.psum_fmax
 
 # Per-partition SBUF bytes the resident SSM states may use (heads_per_core * headdim * fp32).
 # Leaves ample room for the per-chunk tiles; larger configs park states in HBM.
-_STATE_SBUF_BUDGET_BYTES = 64 * 1024
+_STATE_SBUF_BUDGET_BYTES = 96 * 1024
 
 
 def ssd_block(

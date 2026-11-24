@@ -297,9 +297,11 @@ class TestSSDKernel:
         [1, 80, 4096, 64, 128, 128, True, True],
         # large headdim (> 512, single-head groups tiled over headdim)
         [1, 8, 2048, 1024, 128, 128, True, True],
-        # states too large for SBUF (> 64 KiB per partition): HBM state path
+        # large resident states (80 KiB and, under LNC 2, exactly the 96 KiB budget per partition)
         [1, 80, 1024, 512, 128, 128, True, True],
         [1, 48, 1024, 1024, 128, 128, True, True],
+        # states too large for SBUF (> 96 KiB per partition): HBM state path
+        [1, 64, 1024, 1024, 128, 128, True, True],
     ]
     # fmt: on
 
