@@ -503,6 +503,21 @@ def _transpose_to_sbuf(src: nl.NkiTensor, rows: int, cols: int) -> nl.NkiTensor:
     return t_sb
 
 
+def _dma_transpose_to_f32(src_hbm: nl.NkiTensor, rows: int, cols: int) -> nl.NkiTensor:
+    """Load an HBM [rows, cols] tile transposed into a new SBUF [cols, rows] fp32 tile.
+
+    Static descriptors (dge_mode.none): hardware DGE transposes only support 2-byte dtypes,
+    and C may be fp32.
+    """
+    t_sb = nl.ndarray((cols, rows), dtype=src_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_transpose(dst=t_sb[0:cols, 0:rows], src=src_hbm, axes=(1, 0), dge_mode=nisa.dge_mode.none)
+    if src_hbm.dtype == nl.float32:
+        return t_sb
+    t_f32 = nl.ndarray((cols, rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=t_f32[0:cols, 0:rows], src=t_sb[0:cols, 0:rows])
+    return t_f32
+
+
 def _compute_chunk_shared_projections_tiled(
     B_hbm: nl.NkiTensor,
     C_hbm: nl.NkiTensor,
@@ -514,7 +529,7 @@ def _compute_chunk_shared_projections_tiled(
     num_dstate_tiles: int,
     triu_sb: nl.NkiTensor,
 ) -> tuple:
-    """Compute B, C transposes and masked CB^T, tiled over dstate.
+    """Compute B, C transposes (C by DMA) and masked CB^T, tiled over dstate.
 
     Args:
         B_hbm (nl.NkiTensor): [batch, seqlen, dstate], Input projection B in HBM.
@@ -547,26 +562,16 @@ def _compute_chunk_shared_projections_tiled(
             dst=B_sb[0:Q, 0:n_size],
             src=B_hbm[batch_idx, chunk_start : chunk_start + Q, n_start : n_start + n_size],
         )
-        C_sb = nl.ndarray((Q, n_size), dtype=C_hbm.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=C_sb[0:Q, 0:n_size],
-            src=C_hbm[batch_idx, chunk_start : chunk_start + Q, n_start : n_start + n_size],
-        )
-
         B_f32 = nl.ndarray((Q, n_size), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=B_f32[0:Q, 0:n_size], src=B_sb[0:Q, 0:n_size])
-        C_f32 = nl.ndarray((Q, n_size), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=C_f32[0:Q, 0:n_size], src=C_sb[0:Q, 0:n_size])
 
-        C_T_psum = nl.ndarray((n_size, Q), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=C_T_psum[0:n_size, 0:Q], data=C_f32[0:Q, 0:n_size])
-        C_T = nl.ndarray((n_size, Q), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=C_T[0:n_size, 0:Q], src=C_T_psum[0:n_size, 0:Q])
-
-        B_T_psum = nl.ndarray((n_size, Q), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=B_T_psum[0:n_size, 0:Q], data=B_f32[0:Q, 0:n_size])
-        B_T = nl.ndarray((n_size, Q), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=B_T[0:n_size, 0:Q], src=B_T_psum[0:n_size, 0:Q])
+        # C is only used dstate-major, so it is transposed inside the HBM load. B is also needed
+        # token-major (state update): transposing it by DMA would mean loading it twice, and was
+        # slower on 64-head shapes.
+        B_T = _transpose_to_sbuf(B_f32, Q, n_size)
+        C_T = _dma_transpose_to_f32(
+            C_hbm[batch_idx, chunk_start : chunk_start + Q, n_start : n_start + n_size], Q, n_size
+        )
 
         CB_tile_psum = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(
