@@ -280,3 +280,60 @@ class TestSSDKernel:
             atol=2e-1,
             rtol=5e-2,
         )
+
+    # fmt: off
+    _ssd_large_test_params = \
+        "batch, nheads, seqlen, headdim, dstate, chunk_size, use_D, use_initial_state"
+    _ssd_large_test_vectors = [
+        # mamba2_1.3b / mamba2_2.7b head shape, long context
+        [1, 64, 8192, 64, 128, 128, True, True],
+        # batch > 1
+        [2, 64, 4096, 64, 128, 128, True, True],
+        # 128 heads (codestral-mamba-7b-like)
+        [1, 128, 4096, 64, 128, 128, True, True],
+        # mamba2_370m head shape, long context
+        [1, 48, 8192, 32, 64, 128, True, True],
+        # mamba2_2.7b full head count (80 heads; 40 per core under LNC 2)
+        [1, 80, 4096, 64, 128, 128, True, True],
+        # large headdim (> 512, single-head groups tiled over headdim)
+        [1, 8, 2048, 1024, 128, 128, True, True],
+        # large resident states (80 KiB and, under LNC 2, exactly the 96 KiB budget per partition)
+        [1, 80, 1024, 512, 128, 128, True, True],
+        [1, 48, 1024, 1024, 128, 128, True, True],
+        # states too large for SBUF (> 96 KiB per partition): HBM state path
+        [1, 64, 1024, 1024, 128, 128, True, True],
+    ]
+    # fmt: on
+
+    @pytest_parametrize(_ssd_large_test_params, _ssd_large_test_vectors)
+    def test_ssd_large(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        nheads,
+        seqlen,
+        headdim,
+        dstate,
+        chunk_size,
+        use_D,
+        use_initial_state,
+    ):
+        """Large chunk-outer (ssd_block) shapes used to benchmark ssd_block performance.
+
+        Tolerances match test_ssd_model so accuracy is checked at the same bar.
+        """
+        _run_ssd_test(
+            test_manager,
+            platform_target,
+            batch,
+            nheads,
+            seqlen,
+            headdim,
+            dstate,
+            chunk_size,
+            use_D,
+            use_initial_state,
+            atol=2e-1,
+            rtol=5e-2,
+        )
