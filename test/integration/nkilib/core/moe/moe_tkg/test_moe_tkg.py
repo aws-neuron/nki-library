@@ -786,6 +786,43 @@ MOE_TKG_SWEEP_PARAM_NAMES = (
 
 
 # =============================================================================
+# FP8 ROW quantization with a partially filled last PSUM bank
+# =============================================================================
+# The all-expert down projection packs perBankT = psum_fmax // T output tiles
+# per PSUM bank. When H1_shard (= H / 128 / vnc) needs more than one bank and
+# is not a multiple of perBankT, the last bank is only partially filled, and
+# the per-row dequant scale for that bank must start at the bank's offset.
+
+# fmt: off
+MOE_TKG_ROW_PARTIAL_PSUM_BANK_PARAMS = [
+    # H1_shard=12: T=48 -> perBankT=10, banks [10, 2]
+    (2, 48,  3072, 256, 4, None, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3, QuantizationType.ROW, nl.float16, True, False),
+    # H1_shard=12: T=64 -> perBankT=8, banks [8, 4]
+    (2, 64,  3072, 256, 4, None, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3, QuantizationType.ROW, nl.float16, True, False),
+    # H1_shard=12: T=96 -> perBankT=5, banks [5, 5, 2]
+    (2, 96,  3072, 256, 4, None, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3, QuantizationType.ROW, nl.float16, True, False),
+    # H1_shard=8: T=160 -> perBankT=3, banks [3, 3, 2]
+    (2, 160, 2048, 256, 4, None, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3, QuantizationType.ROW, nl.float16, True, False),
+    # H1_shard=12: T=128 -> perBankT=4, banks [4, 4, 4] (all banks full)
+    (2, 128, 3072, 256, 4, None, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3, QuantizationType.ROW, nl.float16, True, False),
+]
+# fmt: on
+
+# (vnc, tokens, hidden, intermediate, expert) keys for fast tests: one partial-bank case and the all-full control
+_FAST_ROW_PARTIAL_PSUM_BANK_KEYS = frozenset(
+    {
+        (2, 48, 3072, 256, 4),
+        (2, 128, 3072, 256, 4),
+    }
+)
+
+MOE_TKG_ROW_PARTIAL_PSUM_BANK_ALL_PARAMS = [
+    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:5]) in _FAST_ROW_PARTIAL_PSUM_BANK_KEYS else pytest.param(*c)
+    for c in MOE_TKG_ROW_PARTIAL_PSUM_BANK_PARAMS
+]
+
+
+# =============================================================================
 # Model Config Tests (xfail - coverage tests)
 # =============================================================================
 
@@ -1283,6 +1320,29 @@ class TestMoeTkgKernel:
     ):
         is_negative = _is_negative_test(vnc, hidden, all_expert, tokens)
         assert not is_negative, "Model configs must never be marked as negative test cases"
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        _run_moe_tkg_test(**kwargs)
+
+    @pytest_parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_ROW_PARTIAL_PSUM_BANK_ALL_PARAMS, abbrevs=_ABBREVS)
+    def test_moe_tkg_row_quant_partial_psum_bank(
+        self,
+        test_manager: Orchestrator,
+        vnc: int,
+        tokens: int,
+        hidden: int,
+        intermediate: int,
+        expert: int,
+        top_k,
+        act_fn: ActFnType,
+        scale_mode: ExpertAffinityScaleMode,
+        all_expert: bool,
+        q_dtype,
+        q_type: QuantizationType,
+        dtype,
+        clamp: bool,
+        bias: bool,
+        platform_target,
+    ):
         kwargs = {k: v for k, v in locals().items() if k != "self"}
         _run_moe_tkg_test(**kwargs)
 

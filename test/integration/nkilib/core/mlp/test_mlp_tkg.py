@@ -649,6 +649,33 @@ _TKG_FEATURE_TEST_COMBOS = [
 ]
 
 
+# =============================================================================
+# FP8 ROW quantization with a partially filled last PSUM bank
+# =============================================================================
+# With use_tkg_down_proj_column_tiling=False, the down projection packs
+# perBankT = psum_fmax // T output tiles per PSUM bank. When H1_shard
+# (= H / 128 / vnc) needs more than one bank and is not a multiple of
+# perBankT, the last bank is only partially filled, and the per-row dequant
+# scale for that bank must start at the bank's offset. The default tensor
+# generator fills down_w_scale with a single value, which hides a wrong
+# offset, so this test varies the scale along H.
+
+# fmt: off
+MLP_TKG_ROW_PARTIAL_PSUM_BANK_PARAMS = [
+    # H1_shard=12: T=48 -> perBankT=10, banks [10, 2]
+    pytest.param(2, 48,  1, 3072, 512, marks=pytest.mark.fast),
+    # H1_shard=12: T=64 -> perBankT=8, banks [8, 4]
+    (2, 16,  4, 3072, 512),
+    # H1_shard=12: T=96 -> perBankT=5, banks [5, 5, 2]
+    (2, 96,  1, 3072, 512),
+    # H1_shard=8: T=96 -> perBankT=5, banks [5, 3]
+    (2, 96,  1, 2048, 512),
+    # H1_shard=12: T=128 -> perBankT=4, banks [4, 4, 4] (all banks full)
+    pytest.param(2, 128, 1, 3072, 512, marks=pytest.mark.fast),
+]
+# fmt: on
+
+
 def _tkg_sweep_filter(
     batch: int,
     seqlen: int,
@@ -2403,6 +2430,61 @@ class TestMlpTkgKernel:
             use_tkg_gate_up_proj_column_tiling=False,
             use_tkg_down_proj_column_tiling=False,
             use_tkg_down_proj_optimized_layout=False,
+        )
+
+    @pytest_parametrize(
+        "vnc_degree, batch, seqlen, hidden, intermediate", MLP_TKG_ROW_PARTIAL_PSUM_BANK_PARAMS, abbrevs=_TKG_ABBREVS
+    )
+    def test_mlp_tkg_row_quant_partial_psum_bank(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree: int,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        intermediate: int,
+    ):
+        import numpy as np
+
+        vec_dict = {
+            "vnc_degree": vnc_degree,
+            "batch": batch,
+            "seqlen": seqlen,
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "dtype": nl.bfloat16,
+            "quant_dtype": nl.float8_e4m3,
+            "quant_type": QuantizationType.ROW,
+            "norm_type": NormType.RMS_NORM,
+            "fused_add": False,
+            "store_add": False,
+            "act_fn_type": ActFnType.SiLU,
+            "skip_gate": False,
+            "gate_bias": False,
+            "up_bias": False,
+            "down_bias": False,
+            "norm_bias": False,
+            "use_tkg_gate_up_proj_column_tiling": False,
+            "use_tkg_down_proj_column_tiling": False,
+            "use_tkg_down_proj_optimized_layout": False,
+            "mode": ComputationMode.DECODE,
+        }
+        kernel_input = self._kernel_input_generator(vec_dict)
+
+        # Give every H column its own dequant scale so that a wrong bank offset
+        # changes the output.
+        rng = np.random.default_rng(0)
+        column_factor = rng.uniform(0.5, 2.0, size=(1, hidden)).astype(np.float32)
+        kernel_input["down_w_scale"] = kernel_input["down_w_scale"] * column_factor
+
+        _run_mlp_test(
+            test_manager=test_manager,
+            kernel_input=kernel_input,
+            compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+            output_tensor_descriptor=mlp_output_tensor_descriptor,
+            rtol=4e-2,
+            inference_args=TKG_INFERENCE_ARGS,
         )
 
 
