@@ -159,9 +159,7 @@ def down_projection_lhs_rhs_swap(
 
         if params.quant_params.is_quant_row():
             dequant_tile_view = (
-                dequant_tile.slice(
-                    dim=1, start=psum_tiles.index * psum_tiles.size, end=(psum_tiles.index + 1) * psum_tiles.size
-                )
+                dequant_tile.slice(dim=1, start=psum_tiles.start_offset, end=psum_tiles.end_offset)
                 .expand_dim(dim=2)
                 .broadcast(dim=2, size=T)
             )
