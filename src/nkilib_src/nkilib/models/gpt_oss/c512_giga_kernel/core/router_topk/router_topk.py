@@ -783,6 +783,13 @@ def router_topk(
                     "Should not reach this code branch. Check for valid combination of use_indirect_dma_scatter, act_fn, return_eager_affi.",
                 )
 
+        """ACT1 without Norm: the eager top-K affinities are the top-K activated values."""
+        if pipeline_enable_act1 and not pipeline_enable_norm and return_eager_affi:
+            nisa.tensor_copy(
+                dst=expert_affinities_topk_sb[:t_tile_size, t_tile_idx, :],
+                src=router_logits_topk_sb[:t_tile_size, t_tile_idx, :],
+            )
+
         """Norm."""
 
         if pipeline_enable_norm:
