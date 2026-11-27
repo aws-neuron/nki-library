@@ -350,6 +350,11 @@ def topk_over_score(
                 engine=nisa.engine.vector,
             )
 
+            # FLAT and TILED write k // 16 columns of 16 positions per query.
+            kernel_assert(
+                k % TOPK_QUERY_CHUNKS == 0,
+                f"FLAT/TILED topk output needs index_topk % {TOPK_QUERY_CHUNKS} == 0, got index_topk={k}",
+            )
             c_cnt = k // TOPK_QUERY_CHUNKS
             if emit_tiled:
                 # SPLIT-FIX write (paired with topk_tiled read in
